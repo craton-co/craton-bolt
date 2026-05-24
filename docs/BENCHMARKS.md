@@ -183,6 +183,7 @@ The structural conclusion — that pre-launch overhead is negligible relative to
 
 ## See also
 
+- [`docs/COMPETITIVE_BENCHMARKING.md`](./COMPETITIVE_BENCHMARKING.md) — methodology and discipline for running head-to-head comparisons against DuckDB, Polars, HeavyDB, and friends. Read before publishing any "Javelin vs X" numbers.
 - [`docs/JIT_PIPELINE.md`](./JIT_PIPELINE.md) — what `plan`, `lower`, and `ptx_gen` actually do under the hood, and why each stage exists as a separate measurement.
 - [`docs/SQL_REFERENCE.md`](./SQL_REFERENCE.md) — which SQL features are supported today, which constrains what we can meaningfully benchmark.
 - [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) — overall system architecture.

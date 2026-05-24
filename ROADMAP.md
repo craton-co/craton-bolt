@@ -96,6 +96,10 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 
 ## 1.0 — public API freeze
 
+See [`docs/PATH_TO_1.0.md`](./docs/PATH_TO_1.0.md) for the detailed
+milestone-by-milestone plan, acceptance criteria, open decisions, and
+explicit exclusions. Headlines:
+
 - All `#[doc(hidden)]` IR types (`PhysicalPlan`, `KernelSpec`,
   `AggregateSpec`, `Op`, `Reg`, `Value`, `ColumnIO`) either stabilised
   or replaced with a public builder surface.
@@ -103,3 +107,4 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 - Stable `Engine::sql` contract; `cuda-stub` feature documented as a
   permanent CI helper rather than an experiment.
 - Multi-platform: `aarch64-linux` (Jetson) tested in CI.
+- Regression-CI green; ClickBench numbers published per release.
