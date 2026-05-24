@@ -675,16 +675,16 @@ fn launch_keys_kernel(
 
 /// Launch one aggregate-update kernel for a (typed) input column.
 ///
-/// The integer agg kernel (from `valid_flag_kernels`) declares an
-/// 11-parameter ABI that includes the spill buffers + counter + capacity
-/// at positions 7..=10. The float-MIN/MAX kernel (from `valid_flag_float`)
-/// still has the original 7-parameter ABI but accepts the same prefix; the
-/// 4 extra parameters in the launch array are unused by that kernel
-/// (CUDA's `cuLaunchKernel` doesn't validate param count against the PTX
-/// declaration, so unused trailing entries are harmless). That kernel
-/// therefore can't spill, but the bounded-probe contract on it is
-/// deferred to a future change — at load factor < 0.5 deadlock risk is
-/// already negligible.
+/// Float-MIN/MAX kernel has a 7-param ABI (no spill); other variants have
+/// an 11-param ABI. The integer agg kernel (from `valid_flag_kernels`)
+/// declares the 11-parameter ABI that includes the spill buffers +
+/// counter + capacity at positions 7..=10. The float-MIN/MAX kernel
+/// (from `valid_flag_float`) only takes the 7 non-spill params — it
+/// cannot spill because sm_70 has no native `atom.global.{min,max}.f*`
+/// and the CAS-loop variant resolves in-place. Passing 11 params to its
+/// 7-param ABI would have CUDA read garbage into the trailing slots:
+/// the driver doesn't validate, but the assertion below makes the
+/// mismatch a hard error rather than fragile silence.
 #[allow(clippy::too_many_arguments)]
 fn launch_agg_kernel<T: Pod>(
     op: ReduceOp,
@@ -711,14 +711,17 @@ fn launch_agg_kernel<T: Pod>(
     // so float MIN/MAX go to the CAS-loop kernel in `valid_flag_float`. Both
     // kernels expose the same `VALID_AGG_KERNEL_ENTRY` symbol so the rest of
     // the launch path is identical.
-    let ptx = match (op, input_dtype) {
+    let is_float_min_max = matches!(
+        (op, input_dtype),
         (ReduceOp::Min, DataType::Float32)
-        | (ReduceOp::Max, DataType::Float32)
-        | (ReduceOp::Min, DataType::Float64)
-        | (ReduceOp::Max, DataType::Float64) => {
-            crate::jit::valid_flag_float::compile_agg_valid_float_kernel(op, input_dtype)?
-        }
-        _ => compile_agg_valid_kernel(op, input_dtype)?,
+            | (ReduceOp::Max, DataType::Float32)
+            | (ReduceOp::Min, DataType::Float64)
+            | (ReduceOp::Max, DataType::Float64)
+    );
+    let ptx = if is_float_min_max {
+        crate::jit::valid_flag_float::compile_agg_valid_float_kernel(op, input_dtype)?
+    } else {
+        compile_agg_valid_kernel(op, input_dtype)?
     };
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(VALID_AGG_KERNEL_ENTRY)?;
@@ -735,37 +738,86 @@ fn launch_agg_kernel<T: Pod>(
     let mut spill_counter_ptr: CUdeviceptr = spill_counter.device_ptr();
     let mut max_spill_param: u32 = max_spill;
 
-    let mut params: [*mut c_void; 11] = [
-        &mut group_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut valid_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut n_rows_u32 as *mut u32 as *mut c_void,
-        &mut k_param as *mut u32 as *mut c_void,
-        &mut spill_keys_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut spill_values_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut spill_counter_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut max_spill_param as *mut u32 as *mut c_void,
-    ];
-
+    // Assemble the per-variant param vector. The float-MIN/MAX kernel's
+    // 7-param ABI is the integer kernel's 11-param ABI with the four
+    // spill-related trailing params dropped — same prefix.
     let block = valid_block_size();
     let grid_x = ((n_rows_to_u32(n_rows)? + block - 1) / block).max(1);
 
-    unsafe {
-        cuda_sys::check(cuda_sys::cuLaunchKernel(
-            function.raw(),
-            grid_x,
-            1,
-            1,
-            block,
-            1,
-            1,
-            0,
-            stream.raw(),
-            params.as_mut_ptr(),
-            ptr::null_mut(),
-        ))?;
+    if is_float_min_max {
+        let mut params: [*mut c_void; 7] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut valid_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+        ];
+        // Defense in depth: the float-MIN/MAX kernel ABI is exactly 7
+        // params; if a future refactor desyncs this we want a loud panic
+        // in debug builds rather than the CUDA driver reading garbage
+        // into trailing slots.
+        debug_assert_eq!(
+            params.len(),
+            7,
+            "float-MIN/MAX kernel ABI requires exactly 7 params"
+        );
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
+        // Touch the spill-related host pointers post-launch so the borrow
+        // checker doesn't complain about unused `mut` for variables the
+        // float path intentionally drops.
+        let _ = (spill_keys_ptr, spill_values_ptr, spill_counter_ptr, max_spill_param);
+    } else {
+        let mut params: [*mut c_void; 11] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut valid_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+            &mut spill_keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut spill_values_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut spill_counter_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut max_spill_param as *mut u32 as *mut c_void,
+        ];
+        // Defense in depth: the integer / float-SUM agg kernel ABI is
+        // exactly 11 params.
+        debug_assert_eq!(
+            params.len(),
+            11,
+            "integer/float-SUM kernel ABI requires exactly 11 params"
+        );
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
     }
     stream.synchronize()?;
     let _ = (
@@ -1034,36 +1086,79 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
-            let host: Vec<i32> = pa.values().to_vec();
-            let input_gpu = GpuVec::<i32>::from_slice(&host)?;
-            let init: Vec<i32> = vec![identity_i32(op); k];
-            let mut acc = GpuVec::<i32>::from_slice(&init)?;
-            let (mut spill_keys, mut spill_values, mut spill_counter) =
-                alloc_agg_spill::<i32>()?;
-            launch_agg_kernel::<i32>(
-                op,
-                DataType::Int32,
-                group_col,
-                keys_table,
-                slot_valid,
-                &input_gpu,
-                &mut acc,
-                &mut spill_keys,
-                &mut spill_values,
-                &mut spill_counter,
-                max_spill,
-                n_rows,
-                k_u32,
-                stream,
-            )?;
-            let gpu_acc = acc.to_vec()?;
-            let spill = download_agg_spill(
-                spill_keys,
-                spill_values,
-                spill_counter,
-                "i32 agg kernel",
-            )?;
-            Ok(AccDownload::I32 { gpu_acc, spill })
+            // SUM(Int32) widens to Int64 per
+            // `crate::plan::logical_plan::sum_output_dtype` /
+            // `crate::jit::agg_kernels::reduction_output_dtype`. The
+            // valid-flag agg kernel emits its atomic at the same dtype it
+            // loads at, so to get `atom.global.add.s64` we sign-extend the
+            // input column to i64 on the host and pass `DataType::Int64`
+            // to the kernel compiler. The accumulator buffer, spill values
+            // buffer, and host-side combine path (`combine_i64` via
+            // `AccDownload::I64`) all agree at i64. MIN/MAX preserve the
+            // input dtype and keep the narrow i32 path.
+            if matches!(op, ReduceOp::Sum) {
+                let host: Vec<i64> = pa.values().iter().map(|&v| v as i64).collect();
+                let input_gpu = GpuVec::<i64>::from_slice(&host)?;
+                let init: Vec<i64> = vec![identity_i64(op); k];
+                let mut acc = GpuVec::<i64>::from_slice(&init)?;
+                let (mut spill_keys, mut spill_values, mut spill_counter) =
+                    alloc_agg_spill::<i64>()?;
+                launch_agg_kernel::<i64>(
+                    op,
+                    DataType::Int64,
+                    group_col,
+                    keys_table,
+                    slot_valid,
+                    &input_gpu,
+                    &mut acc,
+                    &mut spill_keys,
+                    &mut spill_values,
+                    &mut spill_counter,
+                    max_spill,
+                    n_rows,
+                    k_u32,
+                    stream,
+                )?;
+                let gpu_acc = acc.to_vec()?;
+                let spill = download_agg_spill(
+                    spill_keys,
+                    spill_values,
+                    spill_counter,
+                    "i64 agg kernel (widened from SUM(Int32))",
+                )?;
+                Ok(AccDownload::I64 { gpu_acc, spill })
+            } else {
+                let host: Vec<i32> = pa.values().to_vec();
+                let input_gpu = GpuVec::<i32>::from_slice(&host)?;
+                let init: Vec<i32> = vec![identity_i32(op); k];
+                let mut acc = GpuVec::<i32>::from_slice(&init)?;
+                let (mut spill_keys, mut spill_values, mut spill_counter) =
+                    alloc_agg_spill::<i32>()?;
+                launch_agg_kernel::<i32>(
+                    op,
+                    DataType::Int32,
+                    group_col,
+                    keys_table,
+                    slot_valid,
+                    &input_gpu,
+                    &mut acc,
+                    &mut spill_keys,
+                    &mut spill_values,
+                    &mut spill_counter,
+                    max_spill,
+                    n_rows,
+                    k_u32,
+                    stream,
+                )?;
+                let gpu_acc = acc.to_vec()?;
+                let spill = download_agg_spill(
+                    spill_keys,
+                    spill_values,
+                    spill_counter,
+                    "i32 agg kernel",
+                )?;
+                Ok(AccDownload::I32 { gpu_acc, spill })
+            }
         }
         DataType::Int64 => {
             let pa = arr

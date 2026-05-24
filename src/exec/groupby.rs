@@ -77,7 +77,9 @@ use crate::jit::hash_kernels::{
     AGG_KERNEL_ENTRY, KEYS_KERNEL_ENTRY,
 };
 use crate::jit::CudaModule;
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
+use crate::plan::logical_plan::{
+    sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema,
+};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 
 /// Empty-slot sentinel; mirrors the literal baked into the keys kernel.
@@ -822,22 +824,54 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
-            let host: Vec<i32> = pa.values().to_vec();
-            let input_gpu = GpuVec::<i32>::from_slice(&host)?;
-            let init: Vec<i32> = vec![identity_i32(op); k];
-            let mut acc = GpuVec::<i32>::from_slice(&init)?;
-            launch_agg_kernel::<i32>(
-                op,
-                DataType::Int32,
-                group_col,
-                keys_table,
-                &input_gpu,
-                &mut acc,
-                n_rows,
-                k_u32,
-                stream,
-            )?;
-            Ok(AccDownload::I32(acc.to_vec()?))
+
+            // SUM(Int32) widens to Int64 per the single-source-of-truth
+            // `crate::plan::logical_plan::sum_output_dtype`: silent i32
+            // overflow inside the GPU atomic was the prior bug. The
+            // groupby agg kernel (`compile_groupby_agg_kernel`) does not
+            // itself sign-extend at load time, so we widen host-side by
+            // upcasting each i32 to i64 before upload, allocate an i64
+            // accumulator, and request the i64-typed kernel — which then
+            // emits `atom.global.add.s64`. MIN/MAX preserve the input
+            // dtype and stay on the i32 path.
+            let widened_dtype = sum_output_dtype(DataType::Int32);
+            let widen_to_i64 = matches!(op, ReduceOp::Sum) && widened_dtype == DataType::Int64;
+            if widen_to_i64 {
+                let host: Vec<i64> =
+                    pa.values().iter().map(|&v| v as i64).collect();
+                let input_gpu = GpuVec::<i64>::from_slice(&host)?;
+                let init: Vec<i64> = vec![identity_i64(op); k];
+                let mut acc = GpuVec::<i64>::from_slice(&init)?;
+                launch_agg_kernel::<i64>(
+                    op,
+                    DataType::Int64,
+                    group_col,
+                    keys_table,
+                    &input_gpu,
+                    &mut acc,
+                    n_rows,
+                    k_u32,
+                    stream,
+                )?;
+                Ok(AccDownload::I64(acc.to_vec()?))
+            } else {
+                let host: Vec<i32> = pa.values().to_vec();
+                let input_gpu = GpuVec::<i32>::from_slice(&host)?;
+                let init: Vec<i32> = vec![identity_i32(op); k];
+                let mut acc = GpuVec::<i32>::from_slice(&init)?;
+                launch_agg_kernel::<i32>(
+                    op,
+                    DataType::Int32,
+                    group_col,
+                    keys_table,
+                    &input_gpu,
+                    &mut acc,
+                    n_rows,
+                    k_u32,
+                    stream,
+                )?;
+                Ok(AccDownload::I32(acc.to_vec()?))
+            }
         }
         DataType::Int64 => {
             let pa = arr
@@ -1036,6 +1070,12 @@ fn build_key_arrays(
 
 /// Build the output Arrow array for one aggregate, indexing the downloaded
 /// accumulator by each group's slot.
+///
+/// For SUM(Int32) the accumulator was widened to i64 host-side per
+/// `crate::plan::logical_plan::sum_output_dtype`, so the `AccDownload` arrives
+/// as `I64` and `out_field.dtype` is `Int64` — `pack_array` consumes those
+/// directly. SUM(Int64), SUM(Float32), SUM(Float64), and all MIN/MAX paths
+/// preserve their input dtype unchanged.
 fn build_agg_array(
     agg: &AggregateExpr,
     out_field: &Field,

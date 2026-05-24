@@ -99,6 +99,19 @@ pub trait LiteralResolver {
 
     /// True if `column` is a registered Utf8 column with a dictionary.
     fn knows(&self, column: &str) -> bool;
+
+    /// Plan dtype of `column`'s index column (`__idx_<col>`). Used by the
+    /// scan-schema extension to declare the correct integer width when no
+    /// upstream pass has already added the field. Defaults to
+    /// [`DataType::Int32`] for back-compat with the historical i32 path;
+    /// resolvers backed by [`DictionaryColumnAny`] must override to honour
+    /// i64-indexed columns, otherwise a width-mismatch will surface at lower
+    /// time when the rewriter emits a `LiteralIndex::I64` literal against an
+    /// `Int32`-declared scan column.
+    fn index_dtype(&self, column: &str) -> DataType {
+        let _ = column;
+        DataType::Int32
+    }
 }
 
 /// Maps a Utf8 column name to the dictionary the engine loaded for it, plus
@@ -189,6 +202,18 @@ impl<'a> LiteralResolver for StringPredicateRewriter<'a> {
     fn knows(&self, column: &str) -> bool {
         self.dicts.contains_key(column)
     }
+
+    fn index_dtype(&self, column: &str) -> DataType {
+        // Mirror the dictionary's own index width so the scan-side schema
+        // matches the literal width chosen in `resolve`. Falls back to the
+        // trait default (`Int32`) for unregistered columns; the scan-extension
+        // path only ever asks about columns it just confirmed via `knows`, so
+        // the fallback is defensive only.
+        self.dicts
+            .get(column)
+            .map(|d| d.index_dtype())
+            .unwrap_or(DataType::Int32)
+    }
 }
 
 /// True for the two ops we can reduce to integer (in)equality via dictionary
@@ -205,12 +230,28 @@ fn is_ordering(op: BinaryOp) -> bool {
     )
 }
 
+/// Peel `Alias(inner, _)` wrappers off `e`, returning the innermost non-alias
+/// expression. Lets predicate-shape matching see through DataFrame-built
+/// `(col AS x) = 'US'` and equivalent forms; the alias is irrelevant for
+/// dictionary-lookup purposes.
+fn strip_alias(e: &Expr) -> &Expr {
+    let mut cur = e;
+    while let Expr::Alias(inner, _) = cur {
+        cur = inner;
+    }
+    cur
+}
+
 /// If exactly one side of `(left, right)` is `Column(c)` and the other is
 /// `Literal(Utf8(s))`, return `(column_name, literal, swapped)` where
 /// `swapped` is true if the literal was originally on the left. Returns
 /// `None` for any other shape.
+///
+/// Both operands are first peeled of any `Alias` wrappers so that DataFrame
+/// expressions like `(col("region") AS "r").eq(lit("US"))` are matched as
+/// `col("region") = 'US'`.
 fn extract_col_and_string_lit(left: &Expr, right: &Expr) -> Option<(String, String, bool)> {
-    match (left, right) {
+    match (strip_alias(left), strip_alias(right)) {
         (Expr::Column(c), Expr::Literal(Literal::Utf8(s))) => Some((c.clone(), s.clone(), false)),
         (Expr::Literal(Literal::Utf8(s)), Expr::Column(c)) => Some((c.clone(), s.clone(), true)),
         _ => None,
@@ -254,6 +295,22 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> JavelinResult<Ex
                             None => {
                                 // Literal not in the dictionary: `=` is
                                 // trivially false, `<>` is trivially true.
+                                //
+                                // Edge case: the empty string `""` is treated
+                                // like any other literal here. If the
+                                // registered dictionary never observed `""`
+                                // at build time, then `WHERE col = ''` folds
+                                // to `Bool(false)` and `WHERE col <> ''`
+                                // folds to `Bool(true)` — i.e. we assume no
+                                // row holds an empty string. This matches the
+                                // dictionary's `index_of` semantics (only
+                                // observed literals are present; NULL lives
+                                // at slot 0, not `""`), and is correct as
+                                // long as the upload path never silently
+                                // coalesces `""` into NULL. Callers that
+                                // need `''` to match real empty-string rows
+                                // must ensure `""` is in the source array
+                                // when the dictionary is built.
                                 let folded = match op {
                                     BinaryOp::Eq => false,
                                     BinaryOp::NotEq => true,
@@ -310,28 +367,32 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 .filter(|f| f.dtype == DataType::Utf8 && r.knows(&f.name))
                 .map(|f| f.name.clone())
                 .collect();
-            // Index-column names we need to append, in deterministic order
-            // (schema order of their parent Utf8 columns).
-            let mut to_add: Vec<String> = Vec::new();
+            // Index-column names + dtypes we need to append, in
+            // deterministic order (schema order of their parent Utf8
+            // columns). The dtype is queried per column from the resolver so
+            // i32- and i64-indexed dictionaries get matching field widths.
+            let mut to_add: Vec<(String, DataType)> = Vec::new();
             for orig in &utf8_cols_present {
                 let mangled = r.index_column_name(orig);
                 if !existing.contains(mangled.as_str())
-                    && !to_add.iter().any(|n| n == &mangled)
+                    && !to_add.iter().any(|(n, _)| n == &mangled)
                 {
-                    to_add.push(mangled);
+                    let dtype = r.index_dtype(orig);
+                    to_add.push((mangled, dtype));
                 }
             }
-            // NOTE: this scan-side schema patch hard-codes Int32. The
-            // registry-driven path (`DictRegistry::extended_schema`) declares
-            // the correct per-column width (Int32 or Int64) before the
-            // rewriter ever sees the plan, so any pre-existing
+            // Previously this branch hard-coded `Int32`, which silently
+            // mismatched the rewritten predicate's literal width whenever the
+            // resolver returned a `LiteralIndex::I64`. The registry-driven
+            // path (`DictRegistry::extended_schema`) already declares the
+            // correct per-column width upstream, so any pre-existing
             // `__idx_<col>` field is left untouched here. This branch only
-            // fires when no upstream pass has already added the field — in
-            // which case Int32 is the safe default for the historical i32
-            // path. The widened i64 path always goes through the registry,
-            // which sets the dtype correctly.
-            for mangled in to_add {
-                fields.push(Field::new(mangled, DataType::Int32, false));
+            // fires when no upstream pass has added the field — and now
+            // honours the resolver's per-column dtype so direct users of
+            // `StringPredicateRewriter` (no registry) also get matching
+            // widths on both sides of the predicate.
+            for (mangled, dtype) in to_add {
+                fields.push(Field::new(mangled, dtype, false));
             }
             Ok(LogicalPlan::Scan {
                 table: table.clone(),
@@ -461,6 +522,19 @@ mod tests {
 
         fn knows(&self, column: &str) -> bool {
             self.columns.contains_key(column)
+        }
+
+        fn index_dtype(&self, column: &str) -> DataType {
+            // Mirror the column's registered width so the mock behaves like
+            // the real `StringPredicateRewriter`. Unknown columns fall back
+            // to the trait default (`Int32`); the rewriter never asks about
+            // an unknown column in practice, so this branch is defensive
+            // only.
+            match self.columns.get(column).copied() {
+                Some(MockWidth::I32) => DataType::Int32,
+                Some(MockWidth::I64) => DataType::Int64,
+                None => DataType::Int32,
+            }
         }
     }
 
@@ -821,6 +895,111 @@ mod tests {
                 }
             }
             other => panic!("expected Alias, got {other:?}"),
+        }
+    }
+
+    /// Regression: `extract_col_and_string_lit` must peel `Alias` wrappers
+    /// off either operand. Without this, DataFrame-built predicates like
+    /// `(col("region") AS "r").eq(lit("US"))` fall through the match arm
+    /// and never fold, leaving a `Utf8 = Utf8` predicate that downstream
+    /// codegen can't handle.
+    #[test]
+    fn peels_alias_in_eq() {
+        let r = MockResolver::new().with_i32("region", "US", 5);
+
+        // Baseline: plain `col = 'US'`.
+        let plain = rewrite_expr_with(&col("region").eq(lit("US")), &r).unwrap();
+
+        // Aliased: `(col AS x) = 'US'` — must fold identically.
+        let aliased_left = rewrite_expr_with(
+            &col("region").alias("r").eq(lit("US")),
+            &r,
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", aliased_left),
+            format!("{:?}", plain),
+            "Alias on the column side should not block rewrite",
+        );
+
+        // Aliased on the literal side too: `col = (lit('US') AS x)`.
+        let aliased_right = rewrite_expr_with(
+            &col("region").eq(lit("US").alias("v")),
+            &r,
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", aliased_right),
+            format!("{:?}", plain),
+            "Alias on the literal side should not block rewrite",
+        );
+
+        // Aliased on both sides, reversed shape: `(lit AS l) = (col AS c)`.
+        let aliased_both_reversed = rewrite_expr_with(
+            &lit("US").alias("l").eq(col("region").alias("c")),
+            &r,
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", aliased_both_reversed),
+            format!("{:?}", plain),
+            "Reversed + both-aliased should also fold to canonical form",
+        );
+
+        // And confirm the canonical shape itself.
+        match plain {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Eq);
+                assert_column(&left, "__idx_region");
+                assert_int32_lit(&right, 5);
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// Regression: when the resolver hands back `LiteralIndex::I64`, the
+    /// scan-extension path must declare the `__idx_<col>` field as `Int64`,
+    /// not the historical hard-coded `Int32`. Otherwise the literal width
+    /// (chosen by the resolver) silently mismatches the scan column width
+    /// (chosen by this rewriter) and the type checker surfaces the error
+    /// far downstream of the actual cause.
+    #[test]
+    fn i64_dict_emits_int64_column() {
+        let r = MockResolver::new().with_i64("user_id", "alice", 1_234_567_890_123);
+        let schema = Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, false),
+        ]);
+        let plan = LogicalPlan::Scan {
+            table: "events".into(),
+            projection: None,
+            schema,
+        };
+        let out = rewrite_plan_with(&plan, &r).unwrap();
+        match out {
+            LogicalPlan::Scan { schema, .. } => {
+                let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+                assert_eq!(names, vec!["user_id", "price", "__idx_user_id"]);
+                let idx_field = schema.field("__idx_user_id").unwrap();
+                // The key assertion: dtype matches the resolver's i64 width,
+                // not the legacy Int32 default.
+                assert_eq!(idx_field.dtype, DataType::Int64);
+                assert!(!idx_field.nullable);
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+
+        // Cross-check: the rewritten predicate against the same column
+        // really does carry an Int64 literal, so the scan-side dtype above
+        // genuinely matches the predicate-side dtype below.
+        let pred = rewrite_expr_with(&col("user_id").eq(lit("alice")), &r).unwrap();
+        match pred {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Eq);
+                assert_column(&left, "__idx_user_id");
+                assert_int64_lit(&right, 1_234_567_890_123);
+            }
+            other => panic!("expected Binary, got {other:?}"),
         }
     }
 }

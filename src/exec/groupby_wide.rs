@@ -28,7 +28,7 @@
 //!
 //! | aggregate | input dtype | accumulator | output dtype |
 //! |-----------|-------------|-------------|--------------|
-//! | `SUM`     | Int32       | `i64`       | Int32 (cast) |
+//! | `SUM`     | Int32       | `i64`       | Int64        |
 //! | `SUM`     | Int64       | `i64`       | Int64        |
 //! | `SUM`     | Float32     | `f64`       | Float32 (cast) |
 //! | `SUM`     | Float64     | `f64`       | Float64      |
@@ -39,10 +39,15 @@
 //! | `COUNT`   | (any)       | `u64`       | Int64        |
 //! | `AVG`     | numeric     | (`f64`, `u64`) | Float64   |
 //!
-//! `SUM` over integers widens to `i64` internally to match the narrow path's
-//! kernel behaviour; we cast the result back to the plan-declared output
-//! dtype on the way out (the narrow path's `pack_array` helper allows the
-//! same Int32 → Int32 narrowing-from-i64-accumulator).
+//! `SUM` over `Int32` widens to `i64` internally **and on output**: the plan-
+//! declared output dtype is `Int64` (see
+//! [`crate::plan::logical_plan::sum_output_dtype`], the single source of truth
+//! for this widening rule, and
+//! [`crate::jit::agg_kernels::reduction_output_dtype`] which mirrors it for
+//! kernel emission). We never narrow back to `Int32`. `SUM` over `Float32`
+//! still accumulates in `f64` and is cast back to `Float32` on the way out —
+//! matching the scalar reducer and the narrow GROUP BY path, which both keep
+//! float output dtype unchanged.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -570,6 +575,13 @@ impl Accumulator {
         match self {
             Accumulator::SumI64 { total } => {
                 let v = value.as_i64()?;
+                // Wrap on i64 overflow to match the GPU narrow path, whose
+                // SUM kernel emits `atom.global.add.s64` (silently wraps on
+                // overflow). Since SUM(Int32) widens to an i64 accumulator
+                // AND the plan-declared output dtype is Int64 (see
+                // `crate::plan::logical_plan::sum_output_dtype`), the wrap
+                // semantics matter only for SUM(Int64), where they match the
+                // GPU and scalar reducer.
                 *total = total.wrapping_add(v);
             }
             Accumulator::SumF64 { total } => {
@@ -964,9 +976,12 @@ enum TypedColumn {
 }
 
 /// Cast a typed column into an Arrow array of `out_dtype`. Mirrors the
-/// cross-dtype matrix in `groupby.rs::pack_array`, plus narrowing paths
-/// (Int64→Int32, Float64→Float32) that we need because our SUM accumulator
-/// widens to the larger type internally.
+/// cross-dtype matrix in `groupby.rs::pack_array`, plus a Float64→Float32
+/// narrowing path needed because SUM(Float32) accumulates in `f64` while
+/// the plan-declared output dtype is `Float32`. There is no analogous
+/// Int64→Int32 narrowing: SUM(Int32) declares an `Int64` output dtype
+/// (see [`crate::plan::logical_plan::sum_output_dtype`]), so the widened
+/// accumulator is preserved end-to-end.
 fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> JavelinResult<ArrayRef> {
     match (col, out_dtype) {
         // Exact-match paths.
@@ -1000,12 +1015,14 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> JavelinResult<Arra
             v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
         )) as ArrayRef),
 
-        // Narrowing paths needed because SUM(Int32) accumulates into i64
-        // (matching the narrow path) but the plan-declared output dtype is
-        // Int32; same for SUM(Float32) → f64 → Float32.
-        (TypedColumn::I64(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(
-            v.into_iter().map(|x| x as i32).collect::<Vec<_>>(),
-        )) as ArrayRef),
+        // Narrowing path for SUM(Float32): we accumulate in f64 to track
+        // partial-sum precision but the plan-declared output dtype remains
+        // Float32. Mirrors the scalar reducer and narrow GROUP BY path.
+        //
+        // Note there is intentionally NO `(I64, Int32)` narrowing path: SUM
+        // over `Int32` now declares an `Int64` output (see
+        // `crate::plan::logical_plan::sum_output_dtype`); the wider
+        // accumulator is preserved end-to-end.
         (TypedColumn::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
             v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
         )) as ArrayRef),

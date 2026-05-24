@@ -67,9 +67,38 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Create an engine using CUDA device 0.
+    /// Create an engine on the default CUDA device (ordinal 0).
+    ///
+    /// Convenience constructor for single-GPU systems. On hosts with more
+    /// than one CUDA device, use [`Engine::new_with_device`] to pick a
+    /// specific GPU.
     pub fn new() -> JavelinResult<Self> {
-        let ctx = CudaContext::new(0)?;
+        Self::new_with_device(0)
+    }
+
+    /// Create an engine bound to the CUDA device at ordinal `device_idx`.
+    ///
+    /// Use this when running on a multi-GPU host and you want to target a
+    /// specific device. The constructor:
+    ///   1. Initializes the CUDA driver (idempotent — safe to call repeatedly).
+    ///   2. Validates `device_idx` against `cuDeviceGetCount`.
+    ///   3. Creates an owned CUDA context on the selected device.
+    ///
+    /// # Errors
+    /// Returns an error if `device_idx < 0` or `device_idx >=
+    /// cuDeviceGetCount()`, or if any underlying CUDA driver call fails
+    /// (e.g. no CUDA-capable device, driver/runtime mismatch).
+    pub fn new_with_device(device_idx: i32) -> JavelinResult<Self> {
+        // Initialize the driver up-front so device_count() is callable.
+        cuda_sys::init()?;
+        let count = cuda_sys::device_count()?;
+        if device_idx < 0 || device_idx >= count {
+            return Err(JavelinError::Other(format!(
+                "CUDA device index {} is out of range: {} device(s) visible to the driver (valid range: 0..{})",
+                device_idx, count, count
+            )));
+        }
+        let ctx = CudaContext::new(device_idx)?;
         Ok(Self {
             tables: HashMap::new(),
             provider: MemTableProvider::new(),

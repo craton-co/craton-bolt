@@ -232,3 +232,149 @@ fn round_up_to_alignment(n: usize, align: usize) -> Option<usize> {
     let mask = align - 1;
     n.checked_add(mask).map(|v| v & !mask)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Host-only tests for the pure helpers in this module.
+    //!
+    //! Nothing in here may touch CUDA: these run on machines without a GPU
+    //! and on docs.rs. Anything that needs the driver belongs in an
+    //! integration test with `#[ignore]` (see `dictionary_i64.rs` for the
+    //! pattern).
+    use super::*;
+    use std::mem::size_of;
+
+    // ---- round_up_to_alignment -------------------------------------------
+
+    #[test]
+    fn round_up_zero_is_zero() {
+        // Zero is already aligned to anything; the function must not promote
+        // it to a non-zero multiple.
+        assert_eq!(round_up_to_alignment(0, ARROW_ALIGNMENT), Some(0));
+    }
+
+    #[test]
+    fn round_up_one_byte_promotes_to_full_alignment() {
+        assert_eq!(round_up_to_alignment(1, ARROW_ALIGNMENT), Some(64));
+    }
+
+    #[test]
+    fn round_up_just_under_alignment() {
+        // 63 -> 64: one byte short of the alignment boundary still rounds up.
+        assert_eq!(round_up_to_alignment(63, ARROW_ALIGNMENT), Some(64));
+    }
+
+    #[test]
+    fn round_up_exact_multiple_is_idempotent() {
+        // Exact multiples must be left alone (no spurious second-bump).
+        assert_eq!(round_up_to_alignment(64, ARROW_ALIGNMENT), Some(64));
+        assert_eq!(round_up_to_alignment(128, ARROW_ALIGNMENT), Some(128));
+        assert_eq!(round_up_to_alignment(64 * 1024, ARROW_ALIGNMENT), Some(64 * 1024));
+    }
+
+    #[test]
+    fn round_up_just_over_alignment() {
+        // 65 -> 128: one byte past a boundary jumps to the next chunk.
+        assert_eq!(round_up_to_alignment(65, ARROW_ALIGNMENT), Some(128));
+    }
+
+    #[test]
+    fn round_up_with_smaller_alignments() {
+        // Function must work for any power-of-two alignment, not just 64.
+        assert_eq!(round_up_to_alignment(0, 8), Some(0));
+        assert_eq!(round_up_to_alignment(1, 8), Some(8));
+        assert_eq!(round_up_to_alignment(7, 8), Some(8));
+        assert_eq!(round_up_to_alignment(8, 8), Some(8));
+        assert_eq!(round_up_to_alignment(9, 8), Some(16));
+        // Alignment of 1 is a no-op (1 is a power of two).
+        assert_eq!(round_up_to_alignment(0, 1), Some(0));
+        assert_eq!(round_up_to_alignment(1, 1), Some(1));
+        assert_eq!(round_up_to_alignment(42, 1), Some(42));
+    }
+
+    #[test]
+    fn round_up_overflow_returns_none() {
+        // `usize::MAX` cannot fit a 64-byte tail; the checked_add must trip
+        // and we surface `None` rather than silently wrapping.
+        assert_eq!(round_up_to_alignment(usize::MAX, ARROW_ALIGNMENT), None);
+
+        // The largest value that *does* fit is `usize::MAX - (ARROW_ALIGNMENT - 1)`,
+        // which rounds to a value with the alignment bits cleared.
+        let max_fitting = usize::MAX - (ARROW_ALIGNMENT - 1);
+        let expected = usize::MAX & !(ARROW_ALIGNMENT - 1);
+        assert_eq!(round_up_to_alignment(max_fitting, ARROW_ALIGNMENT), Some(expected));
+
+        // One byte past that limit overflows.
+        assert_eq!(
+            round_up_to_alignment(max_fitting + 1, ARROW_ALIGNMENT),
+            None
+        );
+    }
+
+    #[test]
+    fn round_up_handles_half_of_usize_max() {
+        // `usize::MAX / 2` plus the 63-byte mask cannot overflow on any
+        // realistic 64-bit host, so the call must succeed and produce an
+        // aligned value.
+        let n = usize::MAX / 2;
+        let result = round_up_to_alignment(n, ARROW_ALIGNMENT).expect("must not overflow");
+        assert_eq!(result % ARROW_ALIGNMENT, 0);
+        assert!(result >= n);
+        assert!(result - n < ARROW_ALIGNMENT);
+    }
+
+    // ---- GpuBuffer::empty + host-only field invariants -------------------
+
+    #[test]
+    fn empty_buffer_has_null_ptr_and_zero_len() {
+        // `empty()` is explicitly documented as not requiring CUDA. Verify
+        // the host-visible invariants the rest of the module relies on:
+        // a null device pointer (so `Drop` skips `mem_free`) and zero len /
+        // capacity.
+        let buf: GpuBuffer<i32> = GpuBuffer::empty();
+        assert_eq!(buf.device_ptr(), 0);
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), 0);
+        assert!(buf.is_empty());
+        // `byte_len` on an empty buffer is trivially zero, regardless of `T`.
+        assert_eq!(buf.byte_len(), 0);
+    }
+
+    #[test]
+    fn empty_buffer_byte_len_scales_with_t_when_len_is_set() {
+        // Reach past the public API to fabricate a buffer with a non-zero
+        // logical length but no allocation. This lets us test `byte_len`'s
+        // multiplication without touching the GPU. Because the test lives in
+        // a child module of `buffer`, the private `len` field is in scope.
+        let mut buf: GpuBuffer<u32> = GpuBuffer::empty();
+        buf.len = 4;
+        // 4 elements * 4 bytes/u32 = 16 bytes.
+        assert_eq!(buf.byte_len(), 4 * size_of::<u32>());
+    }
+
+    #[test]
+    #[should_panic(expected = "byte_len overflow")]
+    fn byte_len_panics_on_overflow() {
+        // Pick an element whose `size_of` is > 1 so `len * size_of::<T>()`
+        // can overflow even though `len` itself fits in `usize`. A 4-byte
+        // `u32` with `len = usize::MAX` multiplies to 4 * usize::MAX, which
+        // overflows and must trip the `expect("byte_len overflow")` guard.
+        //
+        // We never allocate this buffer on the device — we synthesize it
+        // with `empty()` and rewrite `len`. The buffer's `Drop` is a no-op
+        // because `ptr == 0`, so this is safe to leak through panic.
+        let mut buf: GpuBuffer<u32> = GpuBuffer::empty();
+        buf.len = usize::MAX;
+        let _ = buf.byte_len();
+    }
+
+    #[test]
+    fn empty_buffer_drop_is_noop_for_null_ptr() {
+        // Building, dropping, and rebuilding empty buffers must not panic or
+        // call into the CUDA driver. This is the host-only path the rest of
+        // the codebase relies on for placeholder/test-only `GpuVec`s.
+        for _ in 0..16 {
+            let _b: GpuBuffer<u8> = GpuBuffer::empty();
+        }
+    }
+}

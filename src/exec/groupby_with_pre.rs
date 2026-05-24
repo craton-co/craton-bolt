@@ -582,10 +582,18 @@ fn launch_agg_kernel<T: Pod>(
 
 /// Downloaded accumulator table for a single aggregate. The dtype variant
 /// tells the host-side assembler how to read each slot.
+///
+/// `SUM(Int32)` widens to an `i64` accumulator (per
+/// [`crate::plan::logical_plan::sum_output_dtype`] /
+/// [`crate::jit::agg_kernels::reduction_output_dtype`]) and so always lands
+/// in the [`AccDownload::I64`] arm; the [`AccDownload::I32`] arm is reserved
+/// for `MIN`/`MAX(Int32)` only.
 enum AccDownload {
-    /// Int32 SUM/MIN/MAX result column (length `k`).
+    /// Int32 MIN/MAX result column (length `k`). `SUM(Int32)` is widened
+    /// and arrives as [`AccDownload::I64`].
     I32(Vec<i32>),
-    /// Int64 SUM/MIN/MAX/COUNT result column (length `k`).
+    /// Int64 SUM/MIN/MAX/COUNT result column (length `k`). Also carries
+    /// the widened SUM accumulator for `SUM(Int32)` inputs.
     I64(Vec<i64>),
     /// Float32 SUM result column (length `k`).
     F32(Vec<f32>),
@@ -727,6 +735,33 @@ fn run_typed_agg(
 
     match (col_io.dtype, host_col) {
         (DataType::Int32, HostCol::I32(host)) => {
+            // SUM(Int32) widens to an i64 accumulator (matching the scalar
+            // reducer and the narrow GROUP BY path): the plan declares an
+            // Int64 output dtype via `crate::plan::logical_plan::sum_output_dtype`,
+            // and the kernel emits `atom.global.add.s64`. MIN/MAX over Int32
+            // keep their natural i32 width.
+            //
+            // See also `crate::jit::agg_kernels::reduction_output_dtype`,
+            // which mirrors the widening rule on the kernel-emission side.
+            if matches!(op, ReduceOp::Sum) {
+                let widened: Vec<i64> = host.iter().map(|&x| x as i64).collect();
+                let input_gpu = GpuVec::<i64>::from_slice(&widened)?;
+                let init: Vec<i64> = vec![identity_i64(op); k];
+                let mut acc = GpuVec::<i64>::from_slice(&init)?;
+                launch_agg_kernel::<i64>(
+                    op,
+                    DataType::Int64,
+                    group_col,
+                    keys_table,
+                    &input_gpu,
+                    &mut acc,
+                    n_rows,
+                    k_u32,
+                    stream,
+                )?;
+                return Ok(AccDownload::I64(acc.to_vec()?));
+            }
+
             let input_gpu = GpuVec::<i32>::from_slice(host)?;
             let init: Vec<i32> = vec![identity_i32(op); k];
             let mut acc = GpuVec::<i32>::from_slice(&init)?;
