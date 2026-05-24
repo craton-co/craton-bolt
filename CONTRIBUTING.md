@@ -72,20 +72,25 @@ Don't gate behaviour behind feature flags unless there's no other way — the `#
    - A list of any new public API.
    - A note on test coverage.
 
-## What to do when a build error from earlier phases shows up
+## DCO sign-off
 
-The codebase has been built up in waves of parallel agents writing isolated modules. A few times a test has used `.expect_err(...)` on a result whose `T` doesn't implement `Debug` — the fix is to match on the `Result` instead. If `cargo check --lib --tests` shows an `E0277: doesn't implement Debug` error in a test that's calling `.expect_err`, the fix is:
+Every commit must include a `Signed-off-by:` trailer attesting to the
+[Developer Certificate of Origin v1.1](DCO). Use `git commit -s` to add
+it automatically — the trailer is just:
 
-```rust
-// Before:
-let err = some_call().expect_err("must error");
-
-// After:
-match some_call() {
-    Ok(_) => panic!("must error"),
-    Err(e) => assert!(matches!(e, JavelinError::Other(_))),
-}
 ```
+Signed-off-by: Your Name <you@example.com>
+```
+
+The DCO is a lightweight alternative to a CLA: by signing off you certify
+that you have the right to submit the work under the project's Apache-2.0
+license. See the [`DCO`](DCO) file at the repo root for the full text.
+
+## What to work on
+
+See [`ROADMAP.md`](ROADMAP.md) for milestones planned for 0.2 and 1.0.
+Items in the "Known limitations" section under "0.1.x (current)" are
+intentional gaps — flag in your PR if you want to tackle one.
 
 ## Licensing of contributions
 

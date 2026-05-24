@@ -215,3 +215,81 @@ impl<'a, T: Pod> GpuViewMut<'a, T> {
 unsafe impl<'a, T: Pod> Send for GpuViewMut<'a, T> {}
 // Intentionally NOT `Sync`: concurrent mutation through shared references
 // would race on device memory just as `&mut [T]` would on host memory.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_vec_empty_invariants() {
+        let v = GpuVec::<i32>::empty();
+        assert_eq!(v.len(), 0);
+        assert!(v.is_empty());
+        assert_eq!(v.device_ptr(), 0);
+        // GpuVec doesn't expose byte_len directly, but its view does and must agree.
+        assert_eq!(v.view().byte_len(), 0);
+    }
+
+    #[test]
+    fn gpu_view_of_empty_vec() {
+        let v = GpuVec::<i32>::empty();
+        let view = v.view();
+        assert_eq!(view.len(), 0);
+        assert!(view.is_empty());
+        assert_eq!(view.device_ptr(), 0);
+        assert_eq!(view.byte_len(), 0);
+    }
+
+    #[test]
+    fn gpu_view_mut_of_empty_vec() {
+        let mut v = GpuVec::<i32>::empty();
+        let view = v.view_mut();
+        assert_eq!(view.len(), 0);
+        assert!(view.is_empty());
+        assert_eq!(view.device_ptr(), 0);
+        assert_eq!(view.byte_len(), 0);
+    }
+
+    #[test]
+    fn as_view_reborrows_as_shared() {
+        let mut v = GpuVec::<i32>::empty();
+        let m = v.view_mut();
+        let s: GpuView<'_, i32> = m.as_view();
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.device_ptr(), 0);
+        // Compile-time check: explicitly bind the inferred type so a future
+        // refactor that changes `as_view`'s return type breaks this test.
+        let _type_check: GpuView<'_, i32> = s;
+    }
+
+    #[test]
+    fn gpu_view_send_compile_check() {
+        fn assert_send<T: Send>() {}
+        assert_send::<GpuView<'static, i32>>();
+        assert_send::<GpuViewMut<'static, i32>>();
+        assert_send::<GpuVec<i32>>();
+    }
+
+    // gpu_view_not_sync_compile_check:
+    //
+    // GpuView and GpuViewMut are intentionally `!Sync` — the `Cell<()>` (resp.
+    // `&mut [T]`) in their `PhantomData` enforces this at the type level. There
+    // is no stable-Rust positive assertion for "does NOT implement Sync"
+    // (negative trait bounds are unstable), so the invariant is exercised by
+    // the `compile_fail` doctest in `tests/memory_tests.rs` rather than by a
+    // runtime test here. Don't fight the type system.
+
+    #[test]
+    fn gpu_buffer_view_byte_len_matches_t() {
+        let v = GpuVec::<u64>::empty();
+        let view = v.view();
+        assert_eq!(view.byte_len(), view.len() * std::mem::size_of::<u64>());
+        // And specifically for the empty case:
+        assert_eq!(view.byte_len(), 0);
+
+        // The same identity must hold for the mutable view.
+        let mut v2 = GpuVec::<u64>::empty();
+        let vm = v2.view_mut();
+        assert_eq!(vm.byte_len(), vm.len() * std::mem::size_of::<u64>());
+    }
+}

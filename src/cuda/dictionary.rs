@@ -49,6 +49,15 @@ impl DictionaryColumn {
     pub fn from_string_array(arr: &StringArray) -> JavelinResult<Self> {
         let n_rows = arr.len();
         let mut dictionary: Vec<String> = Vec::new();
+        // NOTE: The lookup map keys are owned `String`s, mirroring the entries
+        // in `dictionary`. That means each distinct string is allocated twice
+        // (once for the map key, once for the vec entry). A single-allocation
+        // design would require `Arc<str>` or `&str` keys borrowing from
+        // `dictionary`, but `dictionary: Vec<String>` is a `pub` field with
+        // external callers, so we keep the simple two-alloc pattern here.
+        // TODO(perf): if the dictionary field is ever sealed (made private or
+        // changed to `Vec<Arc<str>>`), revisit to drop one allocation per
+        // distinct string. See wave-6 review notes.
         let mut lookup: HashMap<String, i32> = HashMap::new();
         let mut indices: Vec<i32> = Vec::with_capacity(n_rows);
 
@@ -74,9 +83,13 @@ impl DictionaryColumn {
                     )));
                 }
                 let idx = next_len as i32;
+                // Allocate the owned String exactly once; the lookup map gets
+                // a clone, but we avoid the previous redundant `owned.clone()`
+                // pattern by cloning explicitly into the map and moving the
+                // original into the dictionary.
                 let owned = s.to_string();
-                dictionary.push(owned.clone());
-                lookup.insert(owned, idx);
+                lookup.insert(owned.clone(), idx);
+                dictionary.push(owned);
                 indices.push(idx);
             }
         }
@@ -98,11 +111,35 @@ impl DictionaryColumn {
         // Linear scan keeps `index_of` O(dict) but avoids carrying the
         // construction-time HashMap. Literal lookups happen once per query, so
         // the asymptotic cost is dominated by row count, not dictionary size.
+        // For multi-literal predicates (e.g. `IN ('a', 'b', 'c', ...)`),
+        // prefer [`Self::index_of_many`] which amortizes the scan cost by
+        // building the lookup map once.
         self.dictionary
             .iter()
             .position(|d| d == s)
             // position is 0-based; real indices start at 1.
             .map(|p| (p as i32) + 1)
+    }
+
+    /// Batched variant of [`Self::index_of`].
+    ///
+    /// Builds a temporary `HashMap` once and resolves every query against it,
+    /// turning an `O(N * dict_len)` sequence of `index_of` calls into
+    /// `O(dict_len + N)`. Returns `None` in any slot whose literal is not in
+    /// the dictionary, matching the single-lookup convention. Useful for
+    /// `IN`-list predicates or any path that wants several literal indices
+    /// at once.
+    pub fn index_of_many(&self, queries: &[&str]) -> Vec<Option<i32>> {
+        // Build the reverse map lazily — callers that hit this path already
+        // know they have many queries, so the up-front cost pays for itself.
+        let lookup: HashMap<&str, i32> = self
+            .dictionary
+            .iter()
+            .enumerate()
+            // position is 0-based; real indices start at 1 (slot 0 = NULL).
+            .map(|(i, s)| (s.as_str(), (i as i32) + 1))
+            .collect();
+        queries.iter().map(|q| lookup.get(*q).copied()).collect()
     }
 
     /// Test-only constructor that bypasses any GPU upload.
@@ -203,6 +240,33 @@ mod tests {
     fn index_of_on_empty_dictionary_is_none() {
         let col = DictionaryColumn::new_host_only(Vec::new(), 0);
         assert_eq!(col.index_of("anything"), None);
+    }
+
+    #[test]
+    fn index_of_many_matches_single_lookup_semantics() {
+        // The batched lookup must agree with N calls to `index_of`, including
+        // the `None` slots for unknown literals. This guards against the
+        // common refactor bug of returning 0 (NULL) for misses.
+        let dict = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let col = DictionaryColumn::new_host_only(dict, 0);
+
+        let got = col.index_of_many(&["a", "missing", "c", "b", ""]);
+        assert_eq!(got, vec![Some(1), None, Some(3), Some(2), None]);
+    }
+
+    #[test]
+    fn index_of_many_on_empty_dictionary_is_all_none() {
+        let col = DictionaryColumn::new_host_only(Vec::new(), 0);
+        let got = col.index_of_many(&["x", "y"]);
+        assert_eq!(got, vec![None, None]);
+    }
+
+    #[test]
+    fn index_of_many_with_empty_query_is_empty() {
+        let dict = vec!["a".to_string()];
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        let got = col.index_of_many(&[]);
+        assert!(got.is_empty());
     }
 
     #[test]

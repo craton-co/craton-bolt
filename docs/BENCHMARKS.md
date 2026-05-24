@@ -17,6 +17,14 @@ All times are the median of the criterion `[low, mid, high]` triplet. Throughput
 | `polars/*`          | 6.5173 µs (153.44 Gelem/s) | 2.9405 ms (340.08 Melem/s) | 1.5970 ms (626.16 Melem/s) | Multi-threaded Polars LazyFrame baseline |
 | `engine_execute/*`  | SKIPPED        | SKIPPED        | SKIPPED        | Needs `JAVELIN_BENCH_GPU=1` and a CUDA device      |
 
+These numbers reflect the **0.1.0 baseline**, captured before wave 5's
+codegen and runtime perf changes (PTX cache, `.ptr .global .restrict`,
+`cuMemsetD8`-based `GpuBuffer::zeros`, `#[inline]` on smart-pointer
+accessors). The CPU-side stages were already cheap; the codegen tweaks
+mainly help the `engine_execute/*` path, which still needs a re-run on a
+CUDA host. Treat the table above as a regression floor — anything
+slower in a future run is a regression.
+
 ## The benchmark queries
 
 Three SQL queries are exercised end-to-end through every applicable stage:

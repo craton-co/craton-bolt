@@ -20,18 +20,44 @@ If you don't have CUDA installed yet:
 
 ## What works without CUDA
 
-A surprisingly large fraction of development can happen on a CUDA-less host:
+The `cuda-stub` feature makes the entire crate (including tests) compile,
+link, and run on hosts with no CUDA toolkit installed — every FFI entry
+is replaced by a Rust shim returning `CUDA_ERROR_STUB`, which surfaces as
+`JavelinError::Other("cuda-stub mode: no GPU support compiled in")` at
+runtime. Use it for CI matrix cells without a CUDA toolkit, on `docs.rs`,
+and on developer Macs:
 
 ```bash
-cargo check --lib --tests --benches      # full type-check
-cargo build --lib                         # compiles the library
-cargo doc --no-deps --open                # generates rustdoc
-cargo clippy --all-targets                # lints
+# Type-check + run all offline tests (host-side helpers, PTX-shape
+# snapshots, parser tests, memory-soundness compile-fail doctests).
+cargo check  --lib --tests --no-default-features --features cuda-stub
+cargo test   --lib --tests --no-default-features --features cuda-stub
+cargo test   --doc --test memory_tests --no-default-features --features cuda-stub
+
+# `cargo doc` for docs.rs reproduction.
+cargo doc    --no-deps --no-default-features --features cuda-stub
 ```
 
-These all pass on a host that has no `cuda.lib` because the crate doesn't *invoke* CUDA at compile time — the FFI declarations are just `#[link(name = "cuda")]` symbols that the linker resolves later. The linker errors only kick in when you try to build a binary that actually exercises them: `cargo test` and `cargo bench`.
+Without `--features cuda-stub`, the crate still type-checks on a
+CUDA-less host (the FFI declarations are just `#[link(name = "cuda")]`
+symbols resolved at link time), but `cargo test` / `cargo bench` will
+fail at link time because they actually try to resolve `nvcuda.dll` /
+`libcuda.so`.
 
-The pure-Rust unit tests (PTX-shape assertions, host-side helpers, expression evaluator, dictionary transformations) DO need to link to the CUDA library because they share the binary with code that calls into FFI. They run fine on a CUDA-equipped host without a GPU; the `#[ignore]`-marked tests are the ones that actually launch kernels.
+The `#[ignore]`-marked tests in `tests/memory_tests.rs` and
+`tests/e2e_tests.rs` are the ones that genuinely launch kernels; they
+require a real GPU and run with `cargo test --features cuda-stub --
+--ignored` on a CUDA-equipped host (the stub feature still gates the
+link to `libcuda` — drop `--no-default-features` / `--features
+cuda-stub` to link the real driver).
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy`,
+`cargo check`, `cargo test --lib --tests`, and `cargo test --doc` across
+the matrix `{ubuntu-latest, windows-latest} × {stable, 1.74}`, all under
+the `cuda-stub` feature so no CUDA toolkit is needed on the runners.
+Dependabot tracks Cargo and GitHub-Actions updates weekly.
 
 ## Build commands
 

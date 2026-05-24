@@ -4,22 +4,151 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [Unreleased]
 
-### Changed
-- License is now **Apache-2.0** only (was previously `MIT OR Apache-2.0`).
-  See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). All source files now
-  carry an `// SPDX-License-Identifier: Apache-2.0` header.
-
 ### Added
-- First criterion benchmark run captured. CPU-side numbers (plan, lower,
-  ptx_gen, cpu_reference, polars) measured on a 1M-row dataset across
-  three queries (`proj`, `arith`, `filtered`). See
-  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). The GPU `engine_execute`
-  group still awaits a CUDA-equipped host.
-- `LICENSE` (full Apache-2.0 text) and `NOTICE` (third-party attribution
-  for arrow-rs, sqlparser-rs, polars dev-dep, CUDA driver).
-- `docs/BENCHMARKS.md` — full benchmark methodology, results, and
-  reproduction instructions.
-- New `## License` section in `README.md`.
+- `Engine::new_with_device(idx)` for selecting a specific GPU on
+  multi-GPU hosts. `Engine::new()` delegates to it with device 0.
+- `cuda-stub` feature is now real: the `#[link(name = "cuda")]` block is
+  gated and every FFI entry has a stub returning `CUDA_ERROR_STUB`, so
+  `cargo check --no-default-features --features cuda-stub` works without
+  the CUDA toolkit. `[package.metadata.docs.rs]` requests the feature so
+  `docs.rs` builds the crate.
+- Process-wide PTX cache in `jit_compiler` — FIFO at 256 entries, hashes
+  the emitted PTX text and reuses the loaded `CudaModule` on a hit,
+  skipping `cuModuleLoadDataEx` / PTXAS re-assembly.
+- `BoolNullable` variant in the device-column enums propagates Arrow
+  validity bitmaps for `BooleanArray` columns; the projection round-trip
+  reconstructs a nullable `BooleanArray` on download. Filter / aggregate
+  kernels still consume the values buffer only (TODO marker in
+  `engine.rs`).
+- New FFI bindings and safe wrappers for `cuMemAllocHost_v2`,
+  `cuMemFreeHost`, `cuMemcpyHtoDAsync_v2`, `cuMemcpyDtoHAsync_v2`,
+  `cuMemsetD8_v2`, `cuMemsetD8Async`.
+- New CI workflow `.github/workflows/ci.yml` (Ubuntu + Windows × stable
+  + 1.74) gated on `cuda-stub`, plus `dependabot.yml`, issue / PR
+  templates, `CODEOWNERS`, and `SECURITY.md`.
+- `tests/ptx_golden_tests.rs`: golden-snapshot smoke tests for emitted
+  PTX (substring assertions on `.target sm_70`, `atom.*`, predicate
+  gate, `.restrict`, sign-extension before atomic add, etc.).
+- `tests/parser_tests.rs`: 17 negative parser tests covering DISTINCT,
+  ORDER BY, LIMIT, HAVING, UNION, subqueries, JOIN, CTE, qualified
+  column refs, integer-literal overflow, plus one positive
+  bare-bool-predicate control.
+- 10 offline aggregate / GROUP BY tests in `tests/e2e_tests.rs` covering
+  SUM widening, COUNT(*), AVG, alias preservation, SELECT-order
+  preservation, and `i64::MIN` literal handling.
+- Host-only unit tests on `src/cuda/buffer.rs`, `dictionary.rs`,
+  `dictionary_any.rs`, `smart_ptrs.rs` (via test-only
+  `new_host_only` constructors). `dictionary_any` regains four
+  previously `#[ignore]`'d dispatch tests via host-only execution.
+- `DCO` file at repo root and DCO sign-off section in `CONTRIBUTING.md`.
+- `ROADMAP.md` and `docs/FAQ.md`.
+
+### Changed
+- `SUM(Int32) -> Int64` widening end-to-end (plan output dtype, scalar
+  reducer, GROUP BY accumulator, kernel emits `atom.global.add.s64` with
+  `cvt.s64.s32` sign extension). SUM(Int64), SUM(Float*) unchanged.
+- Float-MIN/MAX GROUP BY launch in `groupby_valid` now passes 7 params
+  (kernel ABI) instead of 11; integer / float-SUM variants keep all 11.
+  `debug_assert_eq!` on arg count at each launch site.
+- `pub fn javelin::sql()` convenience deleted (it constructed an Engine
+  with no tables — unusable).
+- `pub struct Reg(pub u32)` IR type: field demoted to `pub(crate)` with
+  a new `Reg::id() -> u32` accessor.
+- `JavelinError::Cuda` is now a tuple variant `Cuda(String)` (was a
+  struct variant). Internal-only ergonomic; not part of the stable API.
+- `GpuBuffer::zeros` uses `cuMemsetD8` (no host alloc + memcpy).
+- IR types (`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`,
+  `Value`, `ColumnIO`) and internal re-exports under `exec::*` / `jit::*`
+  are marked `#[doc(hidden)]` for 0.1.x.
+- `Cargo.toml` gains `authors`, `repository`, `homepage`,
+  `documentation`, `readme`, `keywords`, `categories`, `rust-version`,
+  `[package.metadata.docs.rs]`. `log = "0.4"` added as a runtime dep.
+- `LICENSE` and `NOTICE` updated to "Copyright 2026 Craton Software
+  Company"; `NOTICE` lists `arrow-array`, `arrow-buffer`, `arrow-schema`,
+  and `log` explicitly.
+- README gains badges (crates.io / docs.rs / CI / license / MSRV), a
+  Platform support subsection, and Security / Releases sections. The
+  string-subset claim is tightened to flag `UPPER`/`LOWER`/`LENGTH`/
+  `CONCAT` as host-only Rust API, not SQL.
+- `docs/SQL_REFERENCE.md`: explicit "Not yet supported (planned)"
+  section; documented `SUM(Int32) -> Int64` widening and all-NULL group
+  semantics. `docs/JIT_PIPELINE.md`: predicate-gate snippet now matches
+  the emitter byte-for-byte; per-instruction CC table.
+  `docs/ARCHITECTURE.md`: `GpuView` corrected to `Send`-only / `!Sync`
+  with rationale; IR-types stability disclaimer.
+- `build.rs`: skips CUDA discovery under `cuda-stub`; picks the
+  highest-version CUDA install on Windows; also searches
+  `lib64/stubs/` on Linux for driverless hosts (NVIDIA's CI shim).
+- `#[inline]` on leaf accessors of `GpuVec`/`GpuView`/`GpuViewMut`.
+- `.ptr .global .restrict .align 16` on emitted kernel column-pointer
+  params (enables PTXAS alias optimizations).
+
+### Fixed
+- **Aggregate output column order was silently rearranged**:
+  `SELECT SUM(x), key FROM t GROUP BY key` previously returned
+  `[key, sum_x]` because the `selected_keys` projection was built but
+  never wrapped around the `Aggregate`. SELECT order is now preserved
+  via a top-level `Project`; aliases on group keys are honored.
+- **Windows linkage**: dropped `kind = "static"` on the
+  `#[link(name = "cuda")]` attribute. `cuda.lib` is an import library
+  for `nvcuda.dll`, not a static archive.
+- **Soundness**: `GpuView` is now `!Sync` (was unsoundly `Sync`). A
+  concurrent writer kernel launched through `GpuViewMut` against the
+  parent `GpuVec` would have raced a `GpuView` reader.
+- **Soundness**: `static mut INIT_RESULT` in `cuda_sys` replaced with
+  `OnceLock<CUresult>` — the previous pattern was a data race and a hard
+  error under Rust 2024.
+- **32-bit hosts**: pointer-truncation bug in `GpuBuffer::with_capacity`
+  alignment check; the `idx`-to-`usize` narrowing in
+  `DictionaryColumnI64::to_string_array`.
+- **`n_rows as u32` silent truncation** across every executor launch
+  site, via a new `n_rows_to_u32(n_rows) -> JavelinResult<u32>` helper.
+- **`pack_keys` UB shift**: bare `<<` replaced with `wrapping_shl` plus
+  `debug_assert!(shift + bit_width <= 64, ...)`.
+- **`BooleanArray` null/false conflation** — upload now distinguishes
+  null from false via the `BoolNullable` variant (round-trip works for
+  projection; filter / agg kernels still see values only).
+- **`__idx_<col>` device→host→device bounce** removed; the engine
+  borrows the dictionary's existing `GpuVec` directly.
+- **Integer literal overflow** in `parse_number`: a positive literal
+  whose magnitude exceeds `i64::MAX` is now rejected with a clear error
+  rather than silently demoted to `Float64`. The `i64::MIN`-magnitude
+  literal `-9223372036854775808` is preserved as `Literal::Int64(i64::MIN)`.
+- **AVG over all-NULL group** in `groupby_valid` now returns SQL `NULL`
+  instead of `0.0` (matches `SQL_REFERENCE.md`).
+- **Test memory_tests**: `shared_view_is_send_but_not_sync` assertion
+  updated to match the new `GpuView: !Sync` contract.
+- **DataFrame builder**: `select`/`filter`/`group_by`/`agg` now validate
+  column references at builder time, deferring the first error via a
+  `String`-typed `first_error` field surfaced through
+  `DataFrame::validation_error()` and `schema()`.
+- **`physical_plan::lower`** now folds arbitrary `Scan / Filter / Project`
+  chain shapes (was: only `Scan` or `Filter(Scan)`). DataFrame chains
+  like `scan().select().filter().select()` no longer produce
+  unlowerable plans.
+- **String literal rewriter**: peels `Alias` wrappers on either side of
+  `BinaryOp::Eq`; `LiteralResolver::index_dtype` lets i64-indexed dicts
+  emit `Int64` index columns rather than the hardcoded `Int32`.
+- **`hash_kernels` classic keys kernel**: bounded probe loop with
+  `MAX_PROBE_FACTOR = 2`; previously could spin forever on a full table.
+- **`jit_compiler::from_ptx`**: uses `cuModuleLoadDataEx` with PTXAS
+  info / error log buffers; failures now surface line numbers.
+- **build.rs Windows fallback** picks the highest CUDA version on disk
+  (was: first NTFS-ordered entry).
+
+### Removed
+- `JavelinError::Nvrtc` variant (Javelin uses `cuModuleLoadDataEx`, not
+  NVRTC). The 4 jit_compiler.rs call sites migrated to `Cuda`.
+- `pub fn javelin::sql(query)` (broken — see Fixed).
+
+### Deprecated
+- `DataFrame::collect()` (use `into_plan()`; tombstone retained for 0.1
+  call-site compatibility).
+
+### Security
+- (none yet — see `SECURITY.md` for the disclosure address.)
+
+## [0.1.0] - 2026-05-23
 
 ## [0.1.0] - 2026-05-23
 

@@ -48,6 +48,30 @@ const KERNEL_ENTRY: &str = "javelin_kernel";
 /// Threads per CUDA block for the 1D launch.
 const BLOCK_SIZE: u32 = 256;
 
+/// Synchronize the default stream and convert any pending CUDA error.
+///
+/// `cuLaunchKernel` is asynchronous: its return value reflects only whether
+/// the launch was *accepted*, not whether the kernel later faulted. If we
+/// don't synchronize, a kernel-side fault (illegal address, OOB shared
+/// memory access, assertion failure, etc.) surfaces at the *next* CUDA API
+/// call — which may be many lines away and in unrelated code, producing
+/// extremely misleading error messages and stack traces during debugging.
+///
+/// In debug builds we call `cuCtxSynchronize` immediately after every
+/// launch site so faults are reported at the actual launch that caused
+/// them. Release builds skip this entirely: the `cfg!(debug_assertions)`
+/// check is a compile-time constant, so the optimiser folds this function
+/// into a no-op (`Ok(())`) and any per-launch latency goes to zero.
+///
+/// Cheap in release: a no-op when `cfg!(debug_assertions)` is false.
+#[inline]
+fn debug_sync_check() -> crate::error::JavelinResult<()> {
+    if cfg!(debug_assertions) {
+        unsafe { crate::cuda::cuda_sys::check(crate::cuda::cuda_sys::cuCtxSynchronize())? };
+    }
+    Ok(())
+}
+
 /// Top-level query engine.
 ///
 /// Field-drop order matters: `dict_registry` owns `DictionaryColumn`s which own
@@ -294,6 +318,9 @@ impl Engine {
                 ptr::null_mut(),
             ))?;
         }
+        // Debug-only synchronize: pin any in-kernel fault to THIS launch
+        // rather than letting it surface at the next CUDA API call.
+        debug_sync_check()?;
         stream.synchronize()?;
 
         // 6. If the kernel has a predicate, run a separate predicate-only
@@ -319,6 +346,9 @@ impl Engine {
                 n_rows_to_u32(n_rows)?,
                 &stream,
             )?;
+            // Debug-only synchronize: surface predicate-kernel faults at
+            // THIS launch site rather than at a later API call.
+            debug_sync_check()?;
 
             let has_utf8_output = kernel.outputs.iter().any(|c| c.dtype == DataType::Utf8);
             if has_utf8_output {
