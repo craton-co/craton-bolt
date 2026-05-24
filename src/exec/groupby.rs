@@ -833,7 +833,9 @@ fn run_typed_agg(
             // itself sign-extend at load time, so we widen host-side by
             // upcasting each i32 to i64 before upload, allocate an i64
             // accumulator, and request the i64-typed kernel — which then
-            // emits `atom.global.add.s64`. MIN/MAX preserve the input
+            // emits `atom.global.add.u64` (PTX has no `.s64` variant of
+            // atom.add — `.u64` is bit-identical for two's-complement signed
+            // addition). MIN/MAX preserve the input
             // dtype and stay on the i32 path.
             let widened_dtype = sum_output_dtype(DataType::Int32);
             let widen_to_i64 = matches!(op, ReduceOp::Sum) && widened_dtype == DataType::Int64;

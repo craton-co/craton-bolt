@@ -580,7 +580,13 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> JavelinResult<&'static str> {
     use ReduceOp::*;
     Ok(match (op, dtype) {
         (Sum, Int32) | (Count, Int32) => "atom.global.add.s32",
-        (Sum, Int64) | (Count, Int64) => "atom.global.add.s64",
+        // PTX has no `atom.add.s64` — only `.u64`. Two's-complement signed
+        // addition is bit-identical to unsigned addition (both wrap modulo
+        // 2^64), so emitting `.u64` for a signed accumulator is sound: any
+        // signed-overflow behavior the user could rely on is undefined in
+        // Rust / C anyway. See PTX ISA, "atom" — supported types are
+        // {u32, s32, u64, f16, f16x2, f32, f64, bf16, bf16x2}.
+        (Sum, Int64) | (Count, Int64) => "atom.global.add.u64",
         (Sum, Float32) | (Count, Float32) => "atom.global.add.f32",
         (Sum, Float64) | (Count, Float64) => "atom.global.add.f64",
 
@@ -708,8 +714,10 @@ mod tests {
             "agg kernel must export the {VALID_AGG_KERNEL_ENTRY} entry point"
         );
         assert!(
-            ptx.contains("atom.global.add.s64"),
-            "agg kernel for (Sum, Int64) must emit atom.global.add.s64:\n{ptx}"
+            ptx.contains("atom.global.add.u64"),
+            "agg kernel for (Sum, Int64) must emit atom.global.add.u64 \
+             (PTX has no .s64 variant for atom.add; .u64 is bit-identical \
+             for two's-complement signed addition):\n{ptx}"
         );
     }
 

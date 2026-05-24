@@ -18,6 +18,7 @@ pub mod string_ops_extended;
 pub mod extended_agg;
 pub mod expr_agg;
 pub mod groupby_valid;
+pub mod gpu_table;
 // Wave-7 executor scaffolds — owned by agents 3-6.
 // Marked #[doc(hidden)] to match the wave-3 sweep: these are internal dispatch
 // surfaces, not part of the public 0.2 API.

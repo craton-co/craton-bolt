@@ -739,7 +739,7 @@ fn run_typed_agg(
             // SUM(Int32) widens to an i64 accumulator (matching the scalar
             // reducer and the narrow GROUP BY path): the plan declares an
             // Int64 output dtype via `crate::plan::logical_plan::sum_output_dtype`,
-            // and the kernel emits `atom.global.add.s64`. MIN/MAX over Int32
+            // and the kernel emits `atom.global.add.u64`. MIN/MAX over Int32
             // keep their natural i32 width.
             //
             // See also `crate::jit::agg_kernels::reduction_output_dtype`,

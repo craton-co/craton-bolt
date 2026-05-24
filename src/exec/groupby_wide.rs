@@ -577,7 +577,7 @@ impl Accumulator {
             Accumulator::SumI64 { total } => {
                 let v = value.as_i64()?;
                 // Wrap on i64 overflow to match the GPU narrow path, whose
-                // SUM kernel emits `atom.global.add.s64` (silently wraps on
+                // SUM kernel emits `atom.global.add.u64` (silently wraps on
                 // overflow). Since SUM(Int32) widens to an i64 accumulator
                 // AND the plan-declared output dtype is Int64 (see
                 // `crate::plan::logical_plan::sum_output_dtype`), the wrap

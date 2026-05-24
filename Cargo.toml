@@ -34,6 +34,10 @@ log = "0.4"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 polars = { version = "0.42", default-features = false, features = ["lazy"] }
+# DuckDB is the canonical embedded-OLAP reference (see docs/COMPETITIVE_BENCHMARKING.md).
+# Bundled feature compiles DuckDB in-tree so the bench is reproducible without an
+# external install; build is slow (~5–10 min first time) but cached thereafter.
+duckdb = { version = "1.0", features = ["bundled"] }
 
 [features]
 default = []
@@ -44,6 +48,10 @@ cuda-stub = []
 
 [[bench]]
 name = "query_benchmarks"
+harness = false
+
+[[bench]]
+name = "olap_benchmarks"
 harness = false
 
 [profile.release]

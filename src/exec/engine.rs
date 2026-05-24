@@ -91,6 +91,9 @@ pub struct Engine {
     provider: MemTableProvider,
     /// Per-table Utf8 dictionaries; drives the string-literal predicate rewrite.
     dict_registry: crate::exec::dict_registry::DictRegistry,
+    /// GPU-resident copies of every registered table. Owns the device
+    /// allocations; must drop BEFORE `_ctx`.
+    gpu_tables: HashMap<String, crate::exec::gpu_table::GpuTable>,
     /// Owned CUDA context — declared LAST so it drops AFTER dictionaries.
     _ctx: CudaContext,
 }
@@ -132,6 +135,7 @@ impl Engine {
             tables: HashMap::new(),
             provider: MemTableProvider::new(),
             dict_registry: crate::exec::dict_registry::DictRegistry::new(),
+            gpu_tables: HashMap::new(),
             _ctx: ctx,
         })
     }
@@ -162,6 +166,51 @@ impl Engine {
         let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
         let extended = self.dict_registry.extended_schema(&name, &base_schema);
         self.provider.register(name.clone(), extended);
+        // Build a GPU-resident copy so execution can query in place.
+        let gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
+        self.gpu_tables.insert(name.clone(), gpu_table);
+        self.tables.insert(name, vec![batch]);
+        Ok(())
+    }
+
+    /// Replace any existing table named `name` with a single-batch table
+    /// holding `batch`. Idempotent; equivalent to "unregister then
+    /// register_table" but performs both halves atomically with respect to
+    /// engine state so a failure mid-rebuild can't leave a torn table.
+    ///
+    /// This is the right entry point when you want to *update* a table's
+    /// contents, e.g. an analytics tool that re-uploads a refreshed snapshot,
+    /// or a benchmark harness that verifies on a small fixture then swaps in
+    /// the timed-run dataset (the use case that motivated this method).
+    ///
+    /// Dictionaries, the SQL-frontend provider schema, the host-side batch
+    /// list, AND the GPU-resident `GpuTable` are all rebuilt from `batch`.
+    /// The previous `GpuTable`'s device allocations are returned to the
+    /// memory pool, where the new upload can recycle them.
+    pub fn replace_table(
+        &mut self,
+        name: impl Into<String>,
+        batch: RecordBatch,
+    ) -> JavelinResult<()> {
+        let name = name.into();
+        // Build the new GPU table FIRST so an upload failure can't leave the
+        // engine half-replaced (we have not yet touched any existing entry).
+        let new_gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
+        let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
+
+        // Drop the old GpuTable explicitly so its device allocations return
+        // to the pool BEFORE we mint the dictionary index columns for the
+        // replacement (those may also allocate from the pool — letting the
+        // pool churn rather than grow keeps RAII tidy).
+        self.gpu_tables.remove(&name);
+        self.dict_registry.unregister_table(&name);
+        // Re-register dictionaries for the new batch.
+        self.dict_registry.register_table(name.clone(), &batch)?;
+        let extended = self.dict_registry.extended_schema(&name, &base_schema);
+        // `MemTableProvider::register` already overwrites — no separate `replace`
+        // entry point needed.
+        self.provider.register(name.clone(), extended);
+        self.gpu_tables.insert(name.clone(), new_gpu_table);
         self.tables.insert(name, vec![batch]);
         Ok(())
     }
@@ -196,6 +245,10 @@ impl Engine {
                 }
             }
             existing.push(batch);
+            // Re-materialize the concatenated batch to update the GPU table
+            let concatenated = self.materialize_table(name)?;
+            let gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&concatenated)?;
+            self.gpu_tables.insert(name.to_string(), gpu_table);
             Ok(())
         } else {
             // First batch for a brand-new table: defer to register_table so the
@@ -392,22 +445,22 @@ impl Engine {
         kernel: &KernelSpec,
         output_schema: &Schema,
     ) -> JavelinResult<QueryHandle> {
-        // Materialise — for a single-batch table this is a cheap clone of
-        // Arc-backed columns; for multi-batch tables it pays a full
-        // concat_batches copy (see field doc on `tables`).
-        let batch = self.materialize_table(table)?;
-        let n_rows = batch.num_rows();
+        let gpu_table = self.gpu_tables.get(table).ok_or_else(|| {
+            JavelinError::Plan(format!("table '{table}' is not registered with the engine"))
+        })?;
+        let n_rows = gpu_table.n_rows;
 
-        // 1. Upload inputs. Keep the owned GpuVecs in `input_cols` so they outlive the launch.
+        // 1. Resolve input device pointers in place — every column already
+        //    lives on the GPU. No host bounce, no per-query upload.
         //
         // `__idx_<col>` inputs come from the dict_registry (they don't exist
         // in the source RecordBatch). They were synthesized by the
         // string-literal rewriter and resolve to the i32/i64 dictionary index
-        // column already on the device — we hand the launch a `Borrowed`
+        // column already on the device — we hand the launch a borrowed
         // device pointer into the registry's `GpuVec` rather than bouncing the
         // index column through the host. `&self` is borrowed for the entire
         // `execute_projection`, so the dictionary's GpuVec outlives the launch.
-        let mut input_cols: Vec<DeviceCol> = Vec::with_capacity(kernel.inputs.len());
+        let mut input_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(kernel.inputs.len());
         for io in &kernel.inputs {
             if let Some(original) = io.name.strip_prefix("__idx_") {
                 let dict = self.dict_registry.dictionary(table, original).ok_or_else(|| {
@@ -435,16 +488,19 @@ impl Engine {
                         d.indices.device_ptr()
                     }
                 };
-                input_cols.push(DeviceCol::Borrowed { ptr });
+                input_ptrs.push(ptr);
                 continue;
             }
-            let idx = batch
-                .schema()
-                .index_of(&io.name)
-                .map_err(|e| JavelinError::Plan(format!("column '{}' not in table '{}': {e}", io.name, table)))?;
-            let arr = batch.column(idx);
-            let dev = DeviceCol::upload(arr.as_ref(), io.dtype)?;
-            input_cols.push(dev);
+            let column = gpu_table.column(&io.name).ok_or_else(|| {
+                JavelinError::Plan(format!("column '{}' not in table '{}'", io.name, table))
+            })?;
+            if column.dtype != io.dtype {
+                return Err(JavelinError::Plan(format!(
+                    "column '{}' dtype mismatch: plan says {:?}, table has {:?}",
+                    io.name, io.dtype, column.dtype
+                )));
+            }
+            input_ptrs.push(column.device_ptr());
         }
 
         // 2. Allocate output buffers, zero-initialised. For Utf8 passthrough
@@ -455,11 +511,12 @@ impl Engine {
         for io in &kernel.outputs {
             let mut col = DeviceCol::alloc_zeros(io.dtype, n_rows)?;
             if io.dtype == DataType::Utf8 {
-                if let Some(src) = input_cols
+                if let Some(src) = kernel
+                    .inputs
                     .iter()
-                    .zip(kernel.inputs.iter())
-                    .find(|(_, in_io)| in_io.name == io.name && in_io.dtype == DataType::Utf8)
-                    .and_then(|(c, _)| c.utf8_dictionary())
+                    .find(|in_io| in_io.name == io.name && in_io.dtype == DataType::Utf8)
+                    .and_then(|in_io| gpu_table.column(&in_io.name))
+                    .and_then(|c| c.utf8_dictionary())
                 {
                     col.set_utf8_dictionary(src.to_vec());
                 }
@@ -477,9 +534,9 @@ impl Engine {
         // `KernelArgs` is monomorphic on `T` per push and cannot store heterogenous
         // column types in one list. We bypass it and assemble raw kernel params
         // directly: inputs first, then outputs, then the row-count `u32`.
-        let mut device_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(input_cols.len() + output_cols.len());
-        for c in &input_cols {
-            device_ptrs.push(c.device_ptr());
+        let mut device_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(input_ptrs.len() + output_cols.len());
+        for p in &input_ptrs {
+            device_ptrs.push(*p);
         }
         for c in &output_cols {
             device_ptrs.push(c.device_ptr());
@@ -520,8 +577,6 @@ impl Engine {
         //    (prefix scan + gather) when every output column is gather-friendly
         //    (primitive + Bool); Utf8 outputs fall back to the host-side path
         //    because the gather kernel can't move variable-width strings.
-        //
-        //    `input_cols` must outlive the predicate launch.
         let arrays: Vec<ArrayRef> = if kernel.predicate.is_some() {
             let pred_ptx =
                 crate::jit::scan_kernel::compile_predicate_kernel(kernel, "javelin_predicate")?;
@@ -529,8 +584,6 @@ impl Engine {
             let pred_function = pred_module.function("javelin_predicate")?;
 
             let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
-            let input_ptrs: Vec<CUdeviceptr> =
-                input_cols.iter().map(|c| c.device_ptr()).collect();
             crate::exec::compact::launch_predicate_kernel(
                 pred_function,
                 &input_ptrs,
@@ -547,7 +600,6 @@ impl Engine {
                 // Host-side fallback: download mask + outputs, then filter.
                 let host_mask =
                     crate::exec::compact::download_mask(mask.device_ptr(), n_rows)?;
-                drop(input_cols);
                 let mut full: Vec<ArrayRef> = Vec::with_capacity(output_cols.len());
                 for col in output_cols {
                     full.push(col.download(n_rows)?);
@@ -567,7 +619,6 @@ impl Engine {
                     &stream,
                 )?;
                 // Output buffers can drop now; gathered owns the compacted data.
-                drop(input_cols);
                 drop(output_cols);
                 let mut out: Vec<ArrayRef> = Vec::with_capacity(gathered.len());
                 for g in &gathered {
@@ -576,7 +627,6 @@ impl Engine {
                 out
             }
         } else {
-            drop(input_cols);
             let mut full: Vec<ArrayRef> = Vec::with_capacity(output_cols.len());
             for col in output_cols {
                 full.push(col.download(n_rows)?);

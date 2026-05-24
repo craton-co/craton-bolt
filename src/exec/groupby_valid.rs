@@ -1091,7 +1091,7 @@ fn run_typed_agg(
             // `crate::plan::logical_plan::sum_output_dtype` /
             // `crate::jit::agg_kernels::reduction_output_dtype`. The
             // valid-flag agg kernel emits its atomic at the same dtype it
-            // loads at, so to get `atom.global.add.s64` we sign-extend the
+            // loads at, so to get `atom.global.add.u64` we sign-extend the
             // input column to i64 on the host and pass `DataType::Int64`
             // to the kernel compiler. The accumulator buffer, spill values
             // buffer, and host-side combine path (`combine_i64` via

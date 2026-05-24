@@ -459,7 +459,11 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> JavelinResult<&'static str> {
     use ReduceOp::*;
     Ok(match (op, dtype) {
         (Sum, Int32) | (Count, Int32) => "atom.global.add.s32",
-        (Sum, Int64) | (Count, Int64) => "atom.global.add.s64",
+        // PTX has no `atom.add.s64` — only `.u64`. Two's-complement signed
+        // addition is bit-identical to unsigned addition, so emitting `.u64`
+        // for an `Int64` accumulator is sound. See PTX ISA, "atom" —
+        // supported types are {u32, s32, u64, f16, f16x2, f32, f64, bf16, bf16x2}.
+        (Sum, Int64) | (Count, Int64) => "atom.global.add.u64",
         (Sum, Float32) | (Count, Float32) => "atom.global.add.f32",
         (Sum, Float64) | (Count, Float64) => "atom.global.add.f64",
 

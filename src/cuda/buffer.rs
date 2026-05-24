@@ -28,6 +28,9 @@ pub struct GpuBuffer<T: Pod> {
     len: usize,
     /// Allocated capacity in T elements (>= len).
     capacity: usize,
+    /// Rounded-up byte size we actually own. Needed so `Drop` returns the
+    /// block to the correct pool bucket.
+    alloc_bytes: usize,
     _t: PhantomData<T>,
 }
 
@@ -39,6 +42,7 @@ impl<T: Pod> GpuBuffer<T> {
             ptr: 0,
             len: 0,
             capacity: 0,
+            alloc_bytes: 0,
             _t: PhantomData,
         }
     }
@@ -56,7 +60,7 @@ impl<T: Pod> GpuBuffer<T> {
         // Round up to ARROW_ALIGNMENT so even small buffers reserve an aligned
         // tail. Zero-sized requests still allocate one aligned chunk so we have
         // a stable, non-null device pointer to hand out.
-        let alloc_bytes = round_up_to_alignment(raw_bytes.max(ARROW_ALIGNMENT), ARROW_ALIGNMENT)
+        let requested = round_up_to_alignment(raw_bytes.max(ARROW_ALIGNMENT), ARROW_ALIGNMENT)
             .ok_or_else(|| {
                 JavelinError::Memory(format!(
                     "GpuBuffer::with_capacity alignment overflow for {} bytes",
@@ -64,23 +68,18 @@ impl<T: Pod> GpuBuffer<T> {
                 ))
             })?;
 
-        let ptr = cuda_sys::mem_alloc(alloc_bytes)?;
-
-        if (ptr % ARROW_ALIGNMENT as u64) != 0 {
-            // Hand it back to the driver before bailing.
-            unsafe {
-                let _ = cuda_sys::mem_free(ptr);
-            }
-            return Err(JavelinError::Memory(format!(
-                "cuMemAlloc returned ptr 0x{:x} which is not {}-byte aligned",
-                ptr, ARROW_ALIGNMENT
-            )));
-        }
+        // Pool buckets round further up to the next power of two; we receive
+        // the actual allocation size back so Drop returns to the right bucket.
+        // The 64-byte alignment invariant is preserved transitively:
+        // `cuMemAlloc_v2` guarantees ≥256-byte alignment, and the pool only
+        // ever stores pointers minted there.
+        let (ptr, alloc_bytes) = crate::cuda::mem_pool::POOL.alloc(requested)?;
 
         Ok(Self {
             ptr,
             len: 0,
             capacity,
+            alloc_bytes,
             _t: PhantomData,
         })
     }
@@ -196,12 +195,10 @@ impl<T: Pod> Drop for GpuBuffer<T> {
         if self.ptr == 0 {
             return;
         }
-        // SAFETY: `self.ptr` came from `cuda_sys::mem_alloc` in a constructor,
-        // is not aliased (we own it), and `Drop` runs after any borrows end.
-        let result = unsafe { cuda_sys::mem_free(self.ptr) };
-        if let Err(e) = result {
-            log::warn!("javelin: GpuBuffer drop failed to free device memory: {}", e);
-        }
+        // Return the block to the pool rather than the driver. The pool's
+        // `drain` (run on process shutdown via `Drop` on the static) will
+        // eventually hand it back to `cuMemFree_v2`.
+        crate::cuda::mem_pool::POOL.free(self.ptr, self.alloc_bytes);
     }
 }
 

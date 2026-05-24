@@ -670,7 +670,7 @@ fn write_signature(out: &mut String, b: &PtxBuilder, spec: &KernelSpec) -> Javel
         let comma = ",";
         writeln!(
             out,
-            "\t.param .u64 .ptr .global .restrict .align 16 {}{}",
+            "\t.param .u64 .ptr .global .align 16 {}{}",
             b.param_name(i),
             comma
         )

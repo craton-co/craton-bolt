@@ -283,6 +283,25 @@ impl Drop for CudaContext {
         if self.raw.is_null() {
             return;
         }
+        // Drain the global device-memory pool BEFORE destroying the context.
+        //
+        // Why: `DeviceMemPool` is a process-wide `static`, so its entries
+        // outlive any single `CudaContext`. Every pooled `CUdeviceptr` is
+        // valid only inside the context that allocated it; once the context
+        // is gone the pointer is dangling. If we don't drain here, a later
+        // `Engine::new()` (which mints a fresh context) inherits stale pool
+        // entries and the next allocation hits an `ACCESS_VIOLATION` the
+        // moment a kernel touches the recycled pointer.
+        //
+        // Draining now — while `self.raw` is still alive and current —
+        // routes each pooled block through `cuMemFree_v2` cleanly. Any
+        // outstanding `GpuBuffer`s drop their pointers BEFORE this runs
+        // because field-drop order in `Engine` puts `_ctx` last.
+        //
+        // We do this via a runtime indirection rather than a direct call so
+        // the cyclic crate-internal dependency (`cuda_sys` → `mem_pool` →
+        // `cuda_sys`) does not show up in the build graph.
+        crate::cuda::mem_pool::POOL.drain();
         let code = unsafe { cuCtxDestroy_v2(self.raw) };
         if code != CUDA_SUCCESS {
             log::warn!(
