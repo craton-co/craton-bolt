@@ -253,7 +253,18 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<L
             .collect::<JavelinResult<_>>()?;
 
         let mut aggregates: Vec<AggregateExpr> = Vec::new();
-        let mut selected_keys: Vec<Expr> = Vec::new();
+        // For each SELECT item, remember how to pull it back out of the Aggregate
+        // node's schema (group keys first, aggregates second per `Aggregate::schema()`).
+        // Each entry is the *output* column name produced by the Aggregate, plus an
+        // optional SELECT alias to rename it to in the final projection.
+        enum SelectSource {
+            /// SELECT references a group key; pull by the key's name in the Aggregate schema.
+            GroupKey { key_name: String, alias: Option<String> },
+            /// SELECT references the Nth aggregate in `aggregates`.
+            Aggregate { index: usize },
+        }
+        let mut select_sources: Vec<SelectSource> = Vec::new();
+
         for (sql_expr, alias) in &items {
             if let Some(agg) = try_aggregate(sql_expr)? {
                 if alias.is_some() {
@@ -261,7 +272,9 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<L
                         "unsupported: alias on aggregate expression".into(),
                     ));
                 }
+                let idx = aggregates.len();
                 aggregates.push(agg);
+                select_sources.push(SelectSource::Aggregate { index: idx });
                 continue;
             }
             // Non-aggregate: must contain no nested aggregate (no post-aggregate exprs).
@@ -277,20 +290,65 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<L
                     "non-aggregate SELECT expression must appear in GROUP BY".into(),
                 ));
             }
-            let lowered = match alias {
-                Some(name) => lowered.alias(name.clone()),
-                None => lowered,
-            };
-            selected_keys.push(lowered);
+            // Determine the *output* column name this key receives inside the Aggregate's
+            // schema. Must mirror the naming rule in `LogicalPlan::schema()` for the
+            // Aggregate arm: bare Column => its name, Alias => its name, else `__group_{i}`.
+            // The aggregate plan's group_by list is the GROUP BY clause itself (not the
+            // SELECT list), so we look up the matching key there to compute its position
+            // and apply the same naming convention.
+            let key_pos = group_by
+                .iter()
+                .position(|g| expr_eq(g, &lowered))
+                .expect("matched above");
+            let key_name = group_key_output_name(&group_by[key_pos], key_pos);
+            select_sources.push(SelectSource::GroupKey {
+                key_name,
+                alias: alias.clone(),
+            });
         }
 
         // The plan's `group_by` is the SQL GROUP BY list (not the SELECT keys);
         // this matches LogicalPlan::Aggregate's contract and types-checks the keys
         // even if SELECT names only a subset of them.
-        plan = LogicalPlan::Aggregate {
+        let aggregate_plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
             group_by,
             aggregates,
+        };
+
+        // Re-project the aggregate's output to honour SELECT-list column order
+        // (Aggregate::schema places keys first, aggregates second — independent
+        // of the user's SELECT order, which would silently swap columns).
+        //
+        // Aggregate output names follow `AggregateExpr::output_name()` in
+        // `logical_plan.rs` (e.g. SUM(x) -> "sum_x", COUNT(*) -> "count"). That
+        // method is private, so we mirror the same convention here in
+        // `aggregate_output_name`. Group-key names mirror the rule in
+        // `LogicalPlan::schema()` for the Aggregate arm.
+        let aggregates_out: &[AggregateExpr] = match &aggregate_plan {
+            LogicalPlan::Aggregate { aggregates, .. } => aggregates,
+            _ => unreachable!("just constructed an Aggregate"),
+        };
+        let mut proj_exprs: Vec<Expr> = Vec::with_capacity(select_sources.len());
+        for src in &select_sources {
+            match src {
+                SelectSource::GroupKey { key_name, alias } => {
+                    let col = Expr::Column(key_name.clone());
+                    proj_exprs.push(match alias {
+                        Some(a) => col.alias(a.clone()),
+                        None => col,
+                    });
+                }
+                SelectSource::Aggregate { index } => {
+                    let name = aggregate_output_name(&aggregates_out[*index]);
+                    proj_exprs.push(Expr::Column(name));
+                }
+            }
+        }
+
+        plan = LogicalPlan::Project {
+            input: Box::new(aggregate_plan),
+            exprs: proj_exprs,
         };
     } else {
         // Scalar projection mode.
@@ -534,10 +592,24 @@ fn lower_value(v: &Value) -> JavelinResult<Expr> {
     }
 }
 
+/// True if `s` is written as a pure integer (no decimal point, no exponent).
+/// Used to distinguish "user meant an integer that overflows" from
+/// "user wrote a float that happens to round-trip through f64".
+fn looks_like_pure_integer(s: &str) -> bool {
+    !s.contains('.') && !s.contains('e') && !s.contains('E')
+}
+
 /// Parse a numeric literal string into `Int64` if it fits, otherwise `Float64`.
+/// Integer-looking literals that overflow `i64` are *rejected* rather than silently
+/// demoted to `Float64` (which would lose precision past 2^53).
 fn parse_number(n: &str) -> JavelinResult<Expr> {
     if let Ok(i) = n.parse::<i64>() {
         return Ok(Expr::Literal(Literal::Int64(i)));
+    }
+    if looks_like_pure_integer(n) {
+        return Err(JavelinError::Sql(format!(
+            "integer literal {n} out of i64 range; use scientific notation or an explicit fractional part for Float64"
+        )));
     }
     match n.parse::<f64>() {
         Ok(f) => Ok(Expr::Literal(Literal::Float64(f))),
@@ -546,10 +618,27 @@ fn parse_number(n: &str) -> JavelinResult<Expr> {
 }
 
 /// Fold `-<number-literal>` into a single signed literal; otherwise lower as `0 - expr`.
+/// The asymmetric `i64` range (`MIN = -2^63`, `MAX = 2^63 - 1`) is handled by
+/// trying `i64::from_str` on the *negated* string, which succeeds at `i64::MIN`
+/// even though `2^63` does not fit in a positive `i64`.
 fn negate_expr(e: &SqlExpr) -> JavelinResult<Expr> {
     if let SqlExpr::Value(Value::Number(n, _)) = e {
+        // Common case: positive literal fits in i64; just negate.
         if let Ok(i) = n.parse::<i64>() {
             return Ok(Expr::Literal(Literal::Int64(-i)));
+        }
+        // Edge case: -i64::MIN. The positive form "9223372036854775808" overflows
+        // i64, but the negated literal "-9223372036854775808" parses cleanly.
+        let negated = format!("-{n}");
+        if let Ok(i) = negated.parse::<i64>() {
+            return Ok(Expr::Literal(Literal::Int64(i)));
+        }
+        // Integer-looking but still out of range (e.g. -10^20): reject, do not
+        // silently demote to Float64.
+        if looks_like_pure_integer(n) {
+            return Err(JavelinError::Sql(format!(
+                "integer literal -{n} out of i64 range; use scientific notation or an explicit fractional part for Float64"
+            )));
         }
         if let Ok(f) = n.parse::<f64>() {
             return Ok(Expr::Literal(Literal::Float64(-f)));
@@ -562,6 +651,36 @@ fn negate_expr(e: &SqlExpr) -> JavelinResult<Expr> {
         left: Box::new(Expr::Literal(Literal::Int64(0))),
         right: Box::new(inner),
     })
+}
+
+/// Mirror of the (private) `AggregateExpr::output_name` rule in
+/// `logical_plan.rs`. Kept in sync by inspection — if that rule changes, this
+/// must change with it. Used to re-project aggregate results in SELECT order.
+fn aggregate_output_name(agg: &AggregateExpr) -> String {
+    fn suffix(e: &Expr) -> String {
+        match e {
+            Expr::Column(n) => format!("_{n}"),
+            Expr::Alias(_, n) => format!("_{n}"),
+            _ => String::new(),
+        }
+    }
+    match agg {
+        AggregateExpr::Count(e) => format!("count{}", suffix(e)),
+        AggregateExpr::Sum(e) => format!("sum{}", suffix(e)),
+        AggregateExpr::Min(e) => format!("min{}", suffix(e)),
+        AggregateExpr::Max(e) => format!("max{}", suffix(e)),
+        AggregateExpr::Avg(e) => format!("avg{}", suffix(e)),
+    }
+}
+
+/// Mirror of the group-key naming rule inside `LogicalPlan::schema()` for the
+/// `Aggregate` arm in `logical_plan.rs`. Kept in sync by inspection.
+fn group_key_output_name(key: &Expr, idx: usize) -> String {
+    match key {
+        Expr::Column(n) => n.clone(),
+        Expr::Alias(_, n) => n.clone(),
+        _ => format!("__group_{idx}"),
+    }
 }
 
 /// Map a `sqlparser` `BinaryOperator` onto our small `BinaryOp` set; reject anything else.

@@ -20,3 +20,22 @@ pub mod groupby_valid;
 
 pub use launch::{launch_1d, CudaStream, KernelArgs};
 pub use engine::{Engine, QueryHandle};
+
+/// Convert a host-side row count to the `u32` shape CUDA kernel launches require,
+/// returning a structured error if the count exceeds `u32::MAX`.
+///
+/// CUDA's `cuLaunchKernel` shape parameters and most of the kernels in this
+/// crate take row counts as `u32`. Truncating a `usize` (or any wider integer
+/// width) with `as u32` would silently wrap on a > 4 GiB-row input and launch
+/// the wrong grid; this helper surfaces that overflow as a `JavelinError::Other`
+/// instead. Every executor that crosses the host/device boundary with a row
+/// count should funnel through this helper rather than rolling its own cast.
+pub(crate) fn n_rows_to_u32(n_rows: usize) -> crate::error::JavelinResult<u32> {
+    u32::try_from(n_rows).map_err(|_| {
+        crate::error::JavelinError::Other(format!(
+            "row count {} exceeds the u32 launch-shape limit ({})",
+            n_rows,
+            u32::MAX
+        ))
+    })
+}

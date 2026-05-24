@@ -449,8 +449,18 @@ fn pack_keys(
         // case we MUST avoid a shift by 64 — only the bit_offset == 0 case
         // is relevant for 64-bit widths and the shift is a no-op.
         let shift = comp.bit_offset;
+        let bit_width = key_bit_width(comp.original_dtype)?;
+        debug_assert!(
+            shift + bit_width <= 64,
+            "pack_keys: shift+width must fit i64"
+        );
+        // Use `wrapping_shl` so that a future regression where `shift == 64`
+        // (e.g. a 32-bit dtype appended after a 64-bit field) produces a
+        // deterministic 0 instead of triggering UB on a bare `<<` overshift.
+        // For the supported case (`shift` in 0..=32 with 32-bit widths, or
+        // `shift == 0` with a 64-bit width) this is identical to `raw << shift`.
         for (i, &raw) in stream.iter().enumerate() {
-            let packed = (raw << shift) as i64;
+            let packed = raw.wrapping_shl(shift) as i64;
             // Bitwise OR (preserving any bits already set by earlier streams).
             keys_i64[i] = ((keys_i64[i] as u64) | (packed as u64)) as i64;
         }

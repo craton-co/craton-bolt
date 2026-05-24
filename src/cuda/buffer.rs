@@ -66,7 +66,7 @@ impl<T: Pod> GpuBuffer<T> {
 
         let ptr = cuda_sys::mem_alloc(alloc_bytes)?;
 
-        if (ptr as usize) % ARROW_ALIGNMENT != 0 {
+        if (ptr % ARROW_ALIGNMENT as u64) != 0 {
             // Hand it back to the driver before bailing.
             unsafe {
                 let _ = cuda_sys::mem_free(ptr);
@@ -134,7 +134,9 @@ impl<T: Pod> GpuBuffer<T> {
 
     /// Valid byte length (`len * size_of::<T>()`).
     pub fn byte_len(&self) -> usize {
-        self.len * size_of::<T>()
+        self.len
+            .checked_mul(size_of::<T>())
+            .expect("byte_len overflow")
     }
 
     /// Allocated capacity in `T` elements.

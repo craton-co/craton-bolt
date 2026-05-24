@@ -364,26 +364,190 @@ fn op_is_logical(op: BinaryOp) -> bool {
     matches!(op, BinaryOp::And | BinaryOp::Or)
 }
 
-/// Resolve a (Scan | Filter{Scan}) source into (table, scan_schema, optional filter).
+/// Result of folding a chain of Scan/Filter/Project nodes down to a single
+/// scan + predicate + (optional) explicit projection list.
+struct ResolvedSource<'a> {
+    /// Source table name.
+    table: &'a str,
+    /// Underlying scan schema (column lookup namespace for all exprs below).
+    scan_schema: &'a Schema,
+    /// Combined predicate, AND-folded, expressed in scan namespace.
+    predicate: Option<Expr>,
+    /// If the outermost layer was a `Project`, its output list as
+    /// `(output_name, scan-namespace expr)`. `None` means no top projection
+    /// was present, so callers should default to "all scan columns".
+    projection: Option<Vec<(String, Expr)>>,
+}
+
+/// Approach (decision note): the `Codegen` emitter is hard-wired to a single
+/// underlying scan schema (every `LoadColumn` references a scan column
+/// ordinal). Composing it across multiple Project layers would require a
+/// larger refactor. Instead we fold `Project`/`Filter` chains by *expression
+/// substitution*: walk the chain top-down, then iteratively rewrite every
+/// outer `Column(name)` reference into the inner `Project`'s expression for
+/// that column. The substituted expression tree then resolves entirely
+/// against the underlying scan schema, which is what `Codegen` already
+/// supports. This collapses any `Project(Filter(Project(... Scan)))` shape
+/// into a single equivalent (scan, AND-folded predicate, projection list).
+/// Because the lowerer handles arbitrary chains now, no defensive guard in
+/// `DataFrame::select`/`filter` is needed.
 fn resolve_source<'a>(
     plan: &'a LogicalPlan,
-) -> JavelinResult<(&'a str, &'a Schema, Option<&'a Expr>)> {
-    match plan {
-        LogicalPlan::Scan { table, schema, .. } => Ok((table.as_str(), schema, None)),
-        LogicalPlan::Filter { input, predicate } => match input.as_ref() {
-            LogicalPlan::Scan { table, schema, .. } => {
-                Ok((table.as_str(), schema, Some(predicate)))
-            }
-            other => Err(JavelinError::Plan(format!(
-                "unsupported plan shape: Filter over {:?}",
-                shape(other)
-            ))),
-        },
-        other => Err(JavelinError::Plan(format!(
-            "unsupported plan shape: expected Scan or Filter(Scan), got {}",
-            shape(other)
-        ))),
+) -> JavelinResult<ResolvedSource<'a>> {
+    // Walk down from the outermost node toward the underlying `Scan`,
+    // collecting each layer. We delay all substitution to the end so each
+    // node's expressions stay in their *own* input namespace until we know
+    // the full chain. At resolution time, every layer's input namespace is
+    // the output namespace of the next-deeper layer (or the scan), so we
+    // can iteratively rewrite from innermost upward.
+    enum Layer {
+        // A `Filter` whose predicate lives in its input layer's namespace.
+        Filter(Expr),
+        // A `Project` whose `exprs` live in its input layer's namespace,
+        // producing the named outputs (in the given order).
+        Project(Vec<(String, Expr)>),
     }
+
+    let mut cur = plan;
+    let mut layers: Vec<Layer> = Vec::new();
+    // Position of the *outermost* Project encountered (== index in `layers`).
+    // The outermost Project defines the chain's effective output schema; any
+    // Filters above it preserve the schema and just AND into the predicate.
+    let mut outermost_project_idx: Option<usize> = None;
+
+    let (table, scan_schema) = loop {
+        match cur {
+            LogicalPlan::Scan { table, schema, .. } => {
+                break (table.as_str(), schema);
+            }
+            LogicalPlan::Filter { input, predicate } => {
+                layers.push(Layer::Filter(predicate.clone()));
+                cur = input.as_ref();
+            }
+            LogicalPlan::Project { input, exprs } => {
+                let mut named: Vec<(String, Expr)> = Vec::with_capacity(exprs.len());
+                for (i, e) in exprs.iter().enumerate() {
+                    let name = output_name_for(e, i);
+                    // Strip the outer Alias — it only affects output naming,
+                    // not substitution semantics. Inner Aliases are left alone.
+                    let body = match e {
+                        Expr::Alias(inner, _) => (**inner).clone(),
+                        _ => e.clone(),
+                    };
+                    named.push((name, body));
+                }
+                if outermost_project_idx.is_none() {
+                    outermost_project_idx = Some(layers.len());
+                }
+                layers.push(Layer::Project(named));
+                cur = input.as_ref();
+            }
+            other => {
+                return Err(JavelinError::Plan(format!(
+                    "unsupported plan shape: expected Scan/Filter/Project chain, got {}",
+                    shape(other)
+                )));
+            }
+        }
+    };
+
+    // `layers` is ordered outermost-first; the innermost (closest to the
+    // scan) is at the end. Walk innermost-to-outermost, maintaining the
+    // current "name -> expression-in-scan-namespace" map (which represents
+    // the output of the layer we just processed) and the accumulated
+    // predicates (already in scan namespace).
+    //
+    // Initial state: just-above-scan output namespace == scan schema, so
+    // every column resolves to itself (no entry needed — `substitute_one`
+    // leaves unknown columns alone, which means "look it up in the scan").
+    let mut name_map: HashMap<String, Expr> = HashMap::new();
+    let mut name_map_active = false;
+    let mut predicates_scan_ns: Vec<Expr> = Vec::new();
+    // The outermost Project's output list, captured (in original order, with
+    // exprs lowered to scan namespace) when we process that layer.
+    let mut top_projection: Option<Vec<(String, Expr)>> = None;
+
+    // Indices iterate from innermost (largest) to outermost (smallest).
+    for (rev_i, layer) in layers.into_iter().enumerate().rev() {
+        match layer {
+            Layer::Filter(pred) => {
+                // The predicate is in the current layer's input namespace
+                // (== output of whatever's directly below). Rewrite into
+                // scan namespace using `name_map` if a Project sits below us.
+                let lowered = if name_map_active {
+                    substitute_one(&pred, &name_map)
+                } else {
+                    pred
+                };
+                predicates_scan_ns.push(lowered);
+            }
+            Layer::Project(named) => {
+                // Each Project replaces the output namespace. Its `exprs`
+                // are in the *current* (below-it) namespace, so rewrite
+                // each through `name_map` first, then install the new map.
+                let mut next: HashMap<String, Expr> = HashMap::new();
+                let mut named_lowered: Vec<(String, Expr)> = Vec::with_capacity(named.len());
+                for (name, body) in named {
+                    let lowered = if name_map_active {
+                        substitute_one(&body, &name_map)
+                    } else {
+                        body
+                    };
+                    next.insert(name.clone(), lowered.clone());
+                    named_lowered.push((name, lowered));
+                }
+                name_map = next;
+                name_map_active = true;
+                // If this is the outermost Project, capture its output list.
+                if Some(rev_i) == outermost_project_idx {
+                    top_projection = Some(named_lowered);
+                }
+            }
+        }
+    }
+
+    Ok(ResolvedSource {
+        table,
+        scan_schema,
+        predicate: and_all(predicates_scan_ns),
+        projection: top_projection,
+    })
+}
+
+/// Substitute `Column(name)` references in `expr` using `map`; leave unknown
+/// columns alone (they pass through to a deeper layer or to the scan).
+fn substitute_one(expr: &Expr, map: &HashMap<String, Expr>) -> Expr {
+    match expr {
+        Expr::Column(name) => match map.get(name) {
+            Some(replacement) => replacement.clone(),
+            None => expr.clone(),
+        },
+        Expr::Literal(_) => expr.clone(),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(substitute_one(left, map)),
+            right: Box::new(substitute_one(right, map)),
+        },
+        Expr::Alias(inner, name) => {
+            Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
+        }
+    }
+}
+
+/// AND-fold a list of predicates into a single optional expression.
+fn and_all(mut preds: Vec<Expr>) -> Option<Expr> {
+    if preds.is_empty() {
+        return None;
+    }
+    let mut acc = preds.remove(0);
+    for p in preds {
+        acc = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(acc),
+            right: Box::new(p),
+        };
+    }
+    Some(acc)
 }
 
 /// Short tag describing a plan node's variant for error messages.
@@ -397,17 +561,19 @@ fn shape(plan: &LogicalPlan) -> &'static str {
 }
 
 /// Build a projection kernel over `input`, producing `exprs` (or all input columns).
-fn lower_projection(
-    input: &LogicalPlan,
-    exprs: Option<&[Expr]>,
-    extra_predicate: Option<&Expr>,
+/// Pure codegen helper: given a scan, optional predicate, and a list of
+/// `(output_name, scan-namespace expr)`, build a `Projection` physical
+/// plan. No chain resolution — all exprs must already reference scan
+/// columns. Both `lower_projection` and `lower_aggregate` funnel through
+/// this after they've folded any Project chain.
+fn build_projection_kernel(
+    table: &str,
+    scan_schema: &Schema,
+    predicate: Option<&Expr>,
+    projected: &[(String, Expr)],
 ) -> JavelinResult<PhysicalPlan> {
-    let (table, scan_schema, scan_predicate) = resolve_source(input)?;
-    let predicate = extra_predicate.or(scan_predicate);
-
     let mut cg = Codegen::new(scan_schema);
 
-    // Emit the predicate first if any, so its register is stable.
     let predicate_reg = if let Some(pred) = predicate {
         let v = cg.emit_expr(pred)?;
         if v.dtype != DataType::Bool {
@@ -421,31 +587,16 @@ fn lower_projection(
         None
     };
 
-    // Build the list of output expressions: either the explicit list or all scan columns.
-    let owned_default: Vec<Expr>;
-    let projected: &[Expr] = match exprs {
-        Some(es) => es,
-        None => {
-            owned_default = scan_schema
-                .fields
-                .iter()
-                .map(|f| Expr::Column(f.name.clone()))
-                .collect();
-            &owned_default
-        }
-    };
-
     let mut outputs = Vec::with_capacity(projected.len());
     let mut output_fields = Vec::with_capacity(projected.len());
-    for (i, expr) in projected.iter().enumerate() {
+    for (i, (name, expr)) in projected.iter().enumerate() {
         let value = cg.emit_expr(expr)?;
-        let name = output_name_for(expr, i);
         cg.emit_store(value, i);
         outputs.push(ColumnIO {
             name: name.clone(),
             dtype: value.dtype,
         });
-        output_fields.push(Field::new(name, value.dtype, true));
+        output_fields.push(Field::new(name.clone(), value.dtype, true));
     }
 
     let kernel = cg.finish(outputs, predicate_reg);
@@ -456,6 +607,83 @@ fn lower_projection(
     })
 }
 
+fn lower_projection(
+    input: &LogicalPlan,
+    exprs: Option<&[Expr]>,
+    extra_predicate: Option<&Expr>,
+) -> JavelinResult<PhysicalPlan> {
+    let resolved = resolve_source(input)?;
+    let ResolvedSource {
+        table,
+        scan_schema,
+        predicate: chain_predicate,
+        projection: chain_projection,
+    } = resolved;
+
+    // Any `extra_predicate` lives in `input`'s output namespace; if a chain
+    // Project sits at the top of `input`, rewrite the predicate through that
+    // Project's output map so it ends up in scan namespace.
+    let mut chain_proj_map: Option<HashMap<String, Expr>> = chain_projection
+        .as_ref()
+        .map(|named| named.iter().cloned().collect());
+
+    let extra_pred_lowered: Option<Expr> = match extra_predicate {
+        Some(p) => Some(match &chain_proj_map {
+            Some(m) => substitute_one(p, m),
+            None => p.clone(),
+        }),
+        None => None,
+    };
+
+    // Combine chain predicate AND extra predicate.
+    let predicate = match (chain_predicate, extra_pred_lowered) {
+        (None, None) => None,
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (Some(a), Some(b)) => Some(Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(a),
+            right: Box::new(b),
+        }),
+    };
+
+    // Determine the projection list, in scan namespace, with output names.
+    // Priority order:
+    //   1. Explicit `exprs` argument (from a top-level Project on `input`),
+    //      substituted through any chain Project map.
+    //   2. The chain's own top Project, if any.
+    //   3. Default: all scan columns as bare references.
+    let owned_default: Vec<(String, Expr)>;
+    let projected: &[(String, Expr)] = if let Some(es) = exprs {
+        let mut subbed: Vec<(String, Expr)> = Vec::with_capacity(es.len());
+        for (i, e) in es.iter().enumerate() {
+            let name = output_name_for(e, i);
+            let body = match e {
+                Expr::Alias(inner, _) => (**inner).clone(),
+                _ => e.clone(),
+            };
+            let lowered = match chain_proj_map.as_mut() {
+                Some(m) => substitute_one(&body, m),
+                None => body,
+            };
+            subbed.push((name, lowered));
+        }
+        owned_default = subbed;
+        &owned_default
+    } else if let Some(named) = chain_projection.as_ref() {
+        named.as_slice()
+    } else {
+        owned_default = scan_schema
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), Expr::Column(f.name.clone())))
+            .collect();
+        &owned_default
+    };
+
+    build_projection_kernel(table, scan_schema, predicate.as_ref(), projected)
+}
+
 /// Build an aggregate plan over `input` with the given group keys and aggregates.
 fn lower_aggregate(
     plan: &LogicalPlan,
@@ -463,7 +691,14 @@ fn lower_aggregate(
     group_by: &[Expr],
     aggregates: &[AggregateExpr],
 ) -> JavelinResult<PhysicalPlan> {
-    let (table, scan_schema, scan_predicate) = resolve_source(input)?;
+    let resolved = resolve_source(input)?;
+    let table = resolved.table;
+    let scan_schema = resolved.scan_schema;
+    let scan_predicate = resolved.predicate;
+    let chain_proj_map: Option<HashMap<String, Expr>> = resolved
+        .projection
+        .as_ref()
+        .map(|named| named.iter().cloned().collect());
     let output_schema = plan.schema()?;
 
     // Collect the expressions that feed the aggregation: group keys first, then per-aggregate input.
@@ -480,9 +715,17 @@ fn lower_aggregate(
     }
 
     // The "feed" exprs are group_by then aggregate inputs, in that order.
+    // These exprs live in `input`'s output namespace; if a chain Project
+    // sits at the top of `input`, substitute them through it so the rest
+    // of this function sees scan-namespace exprs.
     let mut feed: Vec<Expr> = Vec::with_capacity(group_by.len() + agg_input_exprs.len());
-    feed.extend(group_by.iter().cloned());
-    feed.extend(agg_input_exprs.iter().cloned());
+    for e in group_by.iter().chain(agg_input_exprs.iter()) {
+        let lowered = match chain_proj_map.as_ref() {
+            Some(m) => substitute_one(e, m),
+            None => e.clone(),
+        };
+        feed.push(lowered);
+    }
 
     // If there is no filter and every feed expression is a bare column ref, we can skip the
     // pre-aggregation kernel entirely; the aggregator can read those columns straight from the scan.
@@ -521,17 +764,31 @@ fn lower_aggregate(
         (None, inputs, group_ords)
     } else {
         // Emit a pre-aggregation kernel whose outputs are `feed` (group keys then aggregate inputs).
-        let pre_plan = lower_projection(input, Some(&feed), None)?;
+        // `feed` exprs were already substituted into scan namespace above,
+        // and `scan_predicate` is already in scan namespace, so go straight
+        // to the pure-codegen builder (skipping another round of chain
+        // resolution that would double-substitute).
+        let named_feed: Vec<(String, Expr)> = feed
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (output_name_for(e, i), e.clone()))
+            .collect();
+        let pre_plan = build_projection_kernel(
+            table,
+            scan_schema,
+            scan_predicate.as_ref(),
+            &named_feed,
+        )?;
         let (pre_kernel, _pre_schema) = match pre_plan {
             PhysicalPlan::Projection {
                 kernel,
                 output_schema,
                 ..
             } => (kernel, output_schema),
-            // `lower_projection` always returns `Projection`.
+            // `build_projection_kernel` always returns `Projection`.
             _ => {
                 return Err(JavelinError::Plan(
-                    "internal: lower_projection returned non-Projection".into(),
+                    "internal: build_projection_kernel returned non-Projection".into(),
                 ))
             }
         };
@@ -540,10 +797,27 @@ fn lower_aggregate(
         (Some(pre_kernel), inputs, group_ords)
     };
 
+    // Substitute aggregate exprs through any chain Project map so the
+    // column names they reference match what the pre-aggregation kernel
+    // actually exposes (i.e., scan namespace).
+    let lowered_aggregates: Vec<AggregateExpr> = aggregates
+        .iter()
+        .map(|agg| match chain_proj_map.as_ref() {
+            None => agg.clone(),
+            Some(m) => match agg {
+                AggregateExpr::Count(e) => AggregateExpr::Count(substitute_one(e, m)),
+                AggregateExpr::Sum(e) => AggregateExpr::Sum(substitute_one(e, m)),
+                AggregateExpr::Min(e) => AggregateExpr::Min(substitute_one(e, m)),
+                AggregateExpr::Max(e) => AggregateExpr::Max(substitute_one(e, m)),
+                AggregateExpr::Avg(e) => AggregateExpr::Avg(substitute_one(e, m)),
+            },
+        })
+        .collect();
+
     let aggregate = AggregateSpec {
         inputs: agg_inputs,
         group_by: group_indices,
-        aggregates: aggregates.to_vec(),
+        aggregates: lowered_aggregates,
         output_schema,
     };
 

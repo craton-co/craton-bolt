@@ -6,7 +6,7 @@
 //! link `cuda` directly with no feature gates.
 
 use std::ffi::CStr;
-use std::sync::Once;
+use std::sync::OnceLock;
 
 use libc::{c_char, c_int, c_uint, c_void};
 
@@ -32,8 +32,7 @@ pub type CUstream = *mut c_void;
 /// Driver "no error" sentinel.
 pub const CUDA_SUCCESS: CUresult = 0;
 
-#[cfg_attr(target_os = "windows", link(name = "cuda", kind = "static"))]
-#[cfg_attr(not(target_os = "windows"), link(name = "cuda"))]
+#[link(name = "cuda")]
 extern "C" {
     pub fn cuInit(flags: c_uint) -> CUresult;
     pub fn cuDeviceGetCount(count: *mut c_int) -> CUresult;
@@ -98,16 +97,12 @@ pub fn check(code: CUresult) -> JavelinResult<()> {
     Err(JavelinError::Cuda { code, msg })
 }
 
-static INIT: Once = Once::new();
-static mut INIT_RESULT: CUresult = CUDA_SUCCESS;
+static INIT: OnceLock<CUresult> = OnceLock::new();
 
 /// Idempotently call `cuInit(0)`. Safe to invoke from any thread.
 pub fn init() -> JavelinResult<()> {
-    INIT.call_once(|| unsafe {
-        INIT_RESULT = cuInit(0);
-    });
-    // Safe: INIT_RESULT is written exactly once inside call_once and only read after.
-    check(unsafe { INIT_RESULT })
+    let code = *INIT.get_or_init(|| unsafe { cuInit(0) });
+    check(code)
 }
 
 /// Number of CUDA-capable devices visible to the driver.
@@ -127,10 +122,10 @@ pub fn device_get(ordinal: i32) -> JavelinResult<CUdevice> {
 /// Human-readable device name (e.g. "NVIDIA GeForce RTX 4090").
 pub fn device_name(dev: CUdevice) -> JavelinResult<String> {
     const LEN: usize = 256;
-    let mut buf = [0i8; LEN];
-    check(unsafe { cuDeviceGetName(buf.as_mut_ptr() as *mut c_char, LEN as c_int, dev) })?;
+    let mut buf: [c_char; LEN] = [0; LEN];
+    check(unsafe { cuDeviceGetName(buf.as_mut_ptr(), LEN as c_int, dev) })?;
     // Buffer is NUL-terminated by the driver; find the terminator ourselves to be safe.
-    let cstr = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
+    let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
     Ok(cstr.to_string_lossy().trim_end_matches('\0').to_string())
 }
 

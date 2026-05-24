@@ -131,14 +131,21 @@ impl DictionaryColumnI64 {
                     idx
                 )));
             } else {
-                let pos = (idx as u64) as usize - 1;
-                let s = self.dictionary.get(pos).ok_or_else(|| {
-                    JavelinError::Other(format!(
-                        "dictionary decode: index {} out of range (dictionary size {})",
+                // Width-safe decode: validate the 1-based offset against the
+                // dictionary length in u64 before narrowing to usize. On a
+                // 32-bit host a direct `as usize` cast would truncate before
+                // the bounds check, letting `idx > u32::MAX` accidentally hit
+                // a valid slot.
+                let pos_u64 = (idx as u64) - 1;
+                if pos_u64 >= self.dictionary.len() as u64 {
+                    return Err(JavelinError::Other(format!(
+                        "dictionary decode: index {} out of bounds (dictionary size {})",
                         idx,
                         self.dictionary.len()
-                    ))
-                })?;
+                    )));
+                }
+                let pos = pos_u64 as usize;
+                let s = &self.dictionary[pos];
                 out.push(Some(s.as_str()));
             }
         }

@@ -117,11 +117,15 @@ impl<T: Pod> GpuVec<T> {
 }
 
 /// Shared (immutable) GPU view; mirrors `&[T]` semantics.
+///
+/// `Send` only — `!Sync` because a kernel launch reads through this view
+/// while a concurrent thread could launch a writer kernel against the parent
+/// `GpuVec`. Kernels that need write access must take `GpuViewMut` instead.
 #[derive(Copy, Clone)]
 pub struct GpuView<'a, T: Pod> {
     ptr: CUdeviceptr,
     len: usize,
-    _marker: PhantomData<&'a [T]>,
+    _marker: PhantomData<(&'a [T], std::cell::Cell<()>)>,
 }
 
 impl<'a, T: Pod> GpuView<'a, T> {
@@ -149,9 +153,9 @@ impl<'a, T: Pod> GpuView<'a, T> {
 // SAFETY: a `GpuView` is a device pointer plus a length; like `&[u8]` over
 // opaque memory, sharing or moving it across threads cannot race on host state.
 unsafe impl<'a, T: Pod> Send for GpuView<'a, T> {}
-// SAFETY: shared views are read-only and the underlying GPU bytes are opaque
-// to Rust; concurrent `&GpuView` access mirrors `&&[u8]` and is race-free.
-unsafe impl<'a, T: Pod> Sync for GpuView<'a, T> {}
+// Intentionally NOT `Sync`: under Javelin's launch model a kernel can write
+// through the parent `GpuVec` while another thread reads through the view
+// across kernel boundaries. The `Cell<()>` in `_marker` makes this `!Sync`.
 
 /// Exclusive (mutable) GPU view; mirrors `&mut [T]` semantics.
 pub struct GpuViewMut<'a, T: Pod> {

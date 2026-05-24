@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Top-level query engine: wires SQL → logical → physical → PTX → CUDA launch → Arrow.
+//! Top-level engine: dispatches per-shape executors (scalar agg, GROUP BY, etc.);
+//! performs GPU prefix-scan + gather compaction for filter outputs, or a host-side
+//! `arrow::compute::filter` fallback when any output column is Utf8.
 //!
 //! The engine owns a CUDA context and a registry of host-side Arrow `RecordBatch`es.
 //! `Engine::sql` parses, plans, codegens, launches, and returns a `QueryHandle` whose
 //! `record_batch()` exposes the result.
 //!
-//! Note on filter output: filtered rows currently still occupy output slots; the
-//! kernel gates the store but skipped rows leave whatever was in the buffer
-//! (zero-initialised here via `GpuVec::zeros`). A real engine would compact via a
-//! prefix-sum scan; see `execute_projection` for the TODO.
+//! Projection-with-filter flow: a predicate-only kernel materialises a `u8` mask
+//! into a fresh device buffer. When every output column is gather-friendly
+//! (primitive or Bool), the engine then runs `gpu_compact::compact_columns_on_gpu`
+//! (prefix scan + gather) entirely on the device and downloads only the surviving
+//! rows. When any output column is Utf8 — the gather kernel cannot relocate
+//! variable-width strings — the engine falls back to downloading the full
+//! per-column outputs plus the mask and running `compact::compact_arrays`
+//! (Arrow's host-side filter) on the host. Scalar aggregates, group-bys with or
+//! without a `WHERE`, and their `extended_agg`/`expr_agg` variants are
+//! dispatched to dedicated executors in `Engine::execute`.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -28,6 +36,7 @@ use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::{CudaContext, GpuVec};
 use crate::error::{JavelinError, JavelinResult};
 use crate::exec::launch::CudaStream;
+use crate::exec::n_rows_to_u32;
 use crate::jit::{compile_ptx, CudaModule};
 use crate::plan::{
     parse_sql, DataType, Field, KernelSpec, LogicalPlan, MemTableProvider, PhysicalPlan, Schema,
@@ -148,9 +157,11 @@ impl Engine {
         //
         // `__idx_<col>` inputs come from the dict_registry (they don't exist
         // in the source RecordBatch). They were synthesized by the
-        // string-literal rewriter and resolve to the i32 dictionary index
-        // column already on the device — we re-upload via a host bounce
-        // (download + upload) so the engine owns a fresh GpuVec for the launch.
+        // string-literal rewriter and resolve to the i32/i64 dictionary index
+        // column already on the device — we hand the launch a `Borrowed`
+        // device pointer into the registry's `GpuVec` rather than bouncing the
+        // index column through the host. `&self` is borrowed for the entire
+        // `execute_projection`, so the dictionary's GpuVec outlives the launch.
         let mut input_cols: Vec<DeviceCol> = Vec::with_capacity(kernel.inputs.len());
         for io in &kernel.inputs {
             if let Some(original) = io.name.strip_prefix("__idx_") {
@@ -160,25 +171,26 @@ impl Engine {
                         io.name
                     ))
                 })?;
-                let device_col = match dict {
-                    crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
-                        let host = d.indices.to_vec()?;
-                        DeviceCol::I32(GpuVec::<i32>::from_slice(&host)?)
-                    }
-                    crate::cuda::dictionary_any::DictionaryColumnAny::I64(d) => {
-                        let host = d.indices.to_vec()?;
-                        DeviceCol::I64(GpuVec::<i64>::from_slice(&host)?)
-                    }
-                };
-                // Validate the rewriter-declared dtype matches the dict's actual index dtype.
-                // (This catches a stale plan that names __idx_X with the wrong width.)
+                // Fail fast on plan/dict dtype mismatch BEFORE doing any I/O —
+                // this catches a stale plan that names __idx_X with the wrong
+                // width without paying the cost of touching the device.
                 if io.dtype != dict.index_dtype() {
                     return Err(JavelinError::Plan(format!(
                         "rewriter-emitted column '{}' dtype mismatch: plan says {:?}, dictionary is {:?}",
                         io.name, io.dtype, dict.index_dtype()
                     )));
                 }
-                input_cols.push(device_col);
+                // Borrow the device pointer from the registry's existing
+                // index column — no host bounce, no fresh allocation.
+                let ptr = match dict {
+                    crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
+                        d.indices.device_ptr()
+                    }
+                    crate::cuda::dictionary_any::DictionaryColumnAny::I64(d) => {
+                        d.indices.device_ptr()
+                    }
+                };
+                input_cols.push(DeviceCol::Borrowed { ptr });
                 continue;
             }
             let idx = batch
@@ -227,7 +239,7 @@ impl Engine {
         for c in &output_cols {
             device_ptrs.push(c.device_ptr());
         }
-        let mut n_rows_u32: u32 = n_rows as u32;
+        let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
 
         let mut kernel_params: Vec<*mut c_void> = Vec::with_capacity(device_ptrs.len() + 1);
         for p in device_ptrs.iter_mut() {
@@ -275,7 +287,7 @@ impl Engine {
                 pred_function,
                 &input_ptrs,
                 mask.device_ptr(),
-                n_rows as u32,
+                n_rows_to_u32(n_rows)?,
                 &stream,
             )?;
 
@@ -367,6 +379,12 @@ enum DeviceCol {
     Bool(GpuVec<u8>),
     /// Utf8 stored as i32 dictionary indices; host dictionary lives alongside.
     Utf8(DictionaryColumn),
+    /// Borrowed device pointer — the underlying buffer is owned elsewhere
+    /// (today: a dictionary in `dict_registry`). Use ONLY as a kernel input;
+    /// `download()` is unreachable because we drop `input_cols` before reading
+    /// outputs. The lifetime of the owning buffer is enforced by `&self`
+    /// borrowing for the entire duration of `execute_projection`.
+    Borrowed { ptr: CUdeviceptr },
 }
 
 impl DeviceCol {
@@ -410,16 +428,32 @@ impl DeviceCol {
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .ok_or_else(|| type_mismatch_err(arr, "Bool"))?;
+                // FIXME(orchestrator): null/false conflation. The proper fix is
+                // a parallel validity-bitmap `GpuVec<u8>` propagated to
+                // downstream consumers via a wider device-column type (see how
+                // Utf8 carries its own dictionary alongside indices). That
+                // requires extending `DeviceCol::Bool`, `ExtendedDeviceCol`
+                // (src/exec/string_col.rs — owned by a sibling agent), and
+                // every Bool gather/compact path; out of scope for this file.
+                // For now: reject nullable Bool inputs explicitly so we never
+                // silently collapse `null` and `false` into the same byte.
+                // SQL_REFERENCE.md requires nulls remain distinguishable.
+                // Aggregate paths handle nulls via `extended_agg`.
+                if ba.null_count() > 0 {
+                    return Err(JavelinError::Other(
+                        "BooleanArray with nulls is not yet supported in \
+                         projection upload — the device column is one byte per \
+                         row and cannot distinguish null from false. Aggregate \
+                         paths handle Bool nulls via extended_agg; the \
+                         projection path needs a parallel validity-bitmap GPU \
+                         buffer (FIXME)."
+                            .into(),
+                    ));
+                }
                 let n = ba.len();
                 let mut bytes: Vec<u8> = Vec::with_capacity(n);
                 for i in 0..n {
-                    bytes.push(if ba.is_null(i) {
-                        0
-                    } else if ba.value(i) {
-                        1
-                    } else {
-                        0
-                    });
+                    bytes.push(if ba.value(i) { 1 } else { 0 });
                 }
                 Ok(DeviceCol::Bool(GpuVec::<u8>::from_slice(&bytes)?))
             }
@@ -463,6 +497,7 @@ impl DeviceCol {
             DeviceCol::F64(v) => v.device_ptr(),
             DeviceCol::Bool(v) => v.device_ptr(),
             DeviceCol::Utf8(d) => d.indices.device_ptr(),
+            DeviceCol::Borrowed { ptr } => *ptr,
         }
     }
 
@@ -510,6 +545,12 @@ impl DeviceCol {
                 let arr = d.to_string_array()?;
                 Ok(Arc::new(arr) as ArrayRef)
             }
+            DeviceCol::Borrowed { .. } => Err(JavelinError::Other(
+                "internal: cannot download a borrowed device column — \
+                 Borrowed variants are kernel inputs only and must be dropped \
+                 before any output download"
+                    .into(),
+            )),
         }
     }
 }

@@ -57,10 +57,14 @@ fn mut_view_is_send() {
 }
 
 #[test]
-fn shared_view_is_send_and_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<GpuView<'static, i32>>();
-    assert_send_sync::<GpuView<'static, f64>>();
+fn shared_view_is_send_but_not_sync() {
+    // `GpuView` is `Send` so it can be moved between threads, but intentionally
+    // NOT `Sync`: a concurrent thread that still holds the parent `GpuVec`
+    // could launch a writer kernel through `GpuViewMut`, racing the reader.
+    // See `src/cuda/smart_ptrs.rs` for the full rationale.
+    fn assert_send<T: Send>() {}
+    assert_send::<GpuView<'static, i32>>();
+    assert_send::<GpuView<'static, f64>>();
 }
 
 #[test]
