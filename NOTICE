@@ -1,0 +1,19 @@
+Javelin — JIT-compiled GPU SQL engine
+Copyright 2026 The Javelin Authors
+
+This product includes software developed at:
+  - The Apache Arrow project (https://arrow.apache.org)
+    Licensed under Apache License 2.0.
+  - The Apache DataFusion sqlparser-rs project
+    (https://github.com/apache/datafusion-sqlparser-rs)
+    Licensed under Apache License 2.0.
+
+This product depends on, but does not redistribute, the following projects
+in its development setup. Their licenses apply where applicable:
+  - bytemuck, libc, parking_lot, once_cell, thiserror — Apache-2.0 or MIT.
+  - criterion — Apache-2.0 or MIT (dev-dependency only).
+  - polars — MIT (dev-dependency only, used for benchmark comparison).
+
+The CUDA driver API, headers, and runtime libraries are © NVIDIA Corporation
+and are not redistributed with this project. See the EULA accompanying your
+CUDA Toolkit installation.
