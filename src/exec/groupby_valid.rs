@@ -1320,16 +1320,59 @@ fn build_agg_array_from_per_group(
         ) => {
             debug_assert_eq!(sum.len(), n_groups);
             debug_assert_eq!(count.len(), n_groups);
-            let mut out: Vec<f64> = Vec::with_capacity(n_groups);
-            for i in 0..n_groups {
-                let s = sum[i];
-                let c = count[i];
-                let v = if c == 0 { 0.0 } else { s / (c as f64) };
-                out.push(v);
+            // SQL spec (see docs/SQL_REFERENCE.md): aggregate functions over
+            // an all-NULL group return NULL. For AVG specifically, a group
+            // whose count is 0 means every input row in that group was NULL,
+            // so the result must be NULL rather than 0.0 / NaN.
+            //
+            // We therefore bypass `pack_array` here (which only emits
+            // non-nullable arrays) and build a nullable Float64Array directly
+            // via `from_iter(Option<f64>)`. The output schema field already
+            // has `nullable = true` for AVG (the schema-construction path in
+            // logical_plan marks AVG outputs nullable), so this surface
+            // change is transparent to engine.rs, which simply pulls the
+            // ArrayRef out of the RecordBatch.
+            //
+            // Only handle DataType::Float64 here — AVG's output dtype is
+            // always Float64 per the planner contract. If a future plan ever
+            // emits a non-Float64 AVG output we'd need to widen this.
+            match out_field.dtype {
+                DataType::Float64 => {
+                    let iter = (0..n_groups).map(|i| {
+                        let c = count[i];
+                        if c == 0 {
+                            None
+                        } else {
+                            Some(sum[i] / (c as f64))
+                        }
+                    });
+                    Ok(Arc::new(Float64Array::from_iter(iter)) as ArrayRef)
+                }
+                other => Err(JavelinError::Type(format!(
+                    "GROUP BY (valid-flag): AVG output dtype must be Float64, got {:?}",
+                    other
+                ))),
             }
-            pack_array(out_field.dtype, Scalars::F64(out))
         }
         (AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_), other) => {
+            // NOTE on SQL NULL-group semantics: per docs/SQL_REFERENCE.md,
+            // SUM/MIN/MAX over an all-NULL group should return NULL. In this
+            // GROUP BY path a group only exists because at least one input
+            // row carried that key (groups are formed FROM the input rows),
+            // so a structurally-empty group cannot occur here — the
+            // initialiser identity is never observed in the output. The
+            // separate scalar (no-GROUP-BY) aggregate path in
+            // `extended_agg.rs` handles the all-NULL whole-table case and
+            // owns that NULL-projection logic. If a future change ever
+            // introduces a pre-filter that can zero-out a group's rows,
+            // those branches must be revisited to emit a nullable array
+            // (analogous to the AVG branch above).
+            //
+            // MIN(bool)/MAX(bool) are also a NULL concern per the spec, but
+            // this file rejects Bool aggregate inputs at run_typed_agg
+            // (search for "aggregate input dtype" in this file) — the bool
+            // aggregate path lives in extended_agg.rs, which is out of scope
+            // for this module.
             let scalars = match other {
                 AccDownload::I32 { gpu_acc, .. } => Scalars::I32(gpu_acc.clone()),
                 AccDownload::I64 { gpu_acc, .. } => Scalars::I64(gpu_acc.clone()),

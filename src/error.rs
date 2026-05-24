@@ -4,15 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum JavelinError {
-    #[error("CUDA driver error ({code}): {msg}")]
-    Cuda { code: i32, msg: String },
-
-    // FIXME(orchestrator): variant slated for removal (Javelin uses cuModuleLoadData,
-    // not NVRTC), but still referenced by src/jit/jit_compiler.rs (4 call sites).
-    // Migrate those to a more appropriate variant (e.g. `Cuda` or `Other`) before
-    // dropping this variant.
-    #[error("NVRTC compile error: {0}")]
-    Nvrtc(String),
+    #[error("CUDA driver error: {0}")]
+    Cuda(String),
 
     #[error("SQL parse error: {0}")]
     Sql(String),

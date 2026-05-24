@@ -60,7 +60,7 @@ impl Drop for CudaStream {
             unsafe {
                 let rc = cuda_sys::cuStreamDestroy_v2(self.raw);
                 if rc != cuda_sys::CUDA_SUCCESS {
-                    eprintln!("warning: cuStreamDestroy failed ({})", rc);
+                    log::warn!("javelin: cuStreamDestroy failed ({})", rc);
                 }
             }
         }

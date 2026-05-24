@@ -10,10 +10,22 @@ use crate::plan::logical_plan::{
 };
 
 /// SSA register handle. Just an index into the IR's value table.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Reg(pub u32);
+pub struct Reg(pub(crate) u32);
+
+impl Reg {
+    /// Read-only accessor for the underlying register index. Useful for
+    /// external rustdoc consumers / debuggers; the field itself is
+    /// `pub(crate)` so the wire representation isn't part of the public
+    /// SemVer contract.
+    pub fn id(self) -> u32 {
+        self.0
+    }
+}
 
 /// A typed value in the IR: a register plus its known dtype.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct Value {
     /// The register holding the value.
@@ -23,6 +35,7 @@ pub struct Value {
 }
 
 /// A single instruction in the IR.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub enum Op {
     /// Load row `tid` of input column `col_idx` into a register.
@@ -79,6 +92,7 @@ pub enum Op {
 }
 
 /// Description of an input column the kernel consumes.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct ColumnIO {
     /// Column name.
@@ -88,6 +102,7 @@ pub struct ColumnIO {
 }
 
 /// A single GPU kernel description, derived from a fused (Scan -> [Filter ->] Project) chain.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct KernelSpec {
     /// Columns the kernel reads, in load order.
@@ -103,6 +118,7 @@ pub struct KernelSpec {
 }
 
 /// Description of an aggregation kernel.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct AggregateSpec {
     /// Columns read from the pre-aggregation kernel (or directly from the scan).
@@ -116,6 +132,7 @@ pub struct AggregateSpec {
 }
 
 /// The top-level physical plan: a small ordered pipeline of kernels.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
     /// Project (optionally with filter): single fused kernel over a table scan.

@@ -21,7 +21,7 @@ All notable changes to this project will be documented here. The format follows 
   reproduction instructions.
 - New `## License` section in `README.md`.
 
-## [0.1.0] — initial release
+## [0.1.0] - 2026-05-23
 
 ### Added
 
@@ -86,3 +86,6 @@ Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --
 - No NULL-aware GPU aggregates yet — COUNT counts every row, not just non-null. The host-side `extended_agg` path does honour nulls for Bool/Utf8.
 - Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
 - Polars head-to-head numbers are not yet published.
+
+[unreleased]: https://github.com/cratonsoftware/javelin/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/cratonsoftware/javelin/releases/tag/v0.1.0

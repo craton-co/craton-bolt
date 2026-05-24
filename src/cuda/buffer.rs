@@ -201,7 +201,7 @@ impl<T: Pod> Drop for GpuBuffer<T> {
         // is not aliased (we own it), and `Drop` runs after any borrows end.
         let result = unsafe { cuda_sys::mem_free(self.ptr) };
         if let Err(e) = result {
-            eprintln!("javelin: GpuBuffer drop failed to free device memory: {}", e);
+            log::warn!("javelin: GpuBuffer drop failed to free device memory: {}", e);
         }
     }
 }

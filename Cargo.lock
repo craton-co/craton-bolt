@@ -802,6 +802,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "libc",
+ "log",
  "once_cell",
  "parking_lot",
  "polars",

@@ -240,7 +240,16 @@ fn reduce_column_from_batch(
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
             let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
-            reduce_gpu_vec::<i32>(op, col_io.dtype, &dev, n_rows)
+            // SUM(Int32) widens to Int64 (see
+            // `crate::plan::logical_plan::sum_output_dtype`): the GPU kernel
+            // sign-extends each value and accumulates in s64, so the partials
+            // buffer and host-side finalization must also be i64. MIN/MAX
+            // preserve the input dtype and use the i32 path.
+            if matches!(op, ReduceOp::Sum) {
+                reduce_gpu_vec_widened::<i32, i64>(op, col_io.dtype, &dev, n_rows)
+            } else {
+                reduce_gpu_vec::<i32>(op, col_io.dtype, &dev, n_rows)
+            }
         }
         DataType::Int64 => {
             let pa = arr
@@ -346,6 +355,85 @@ where
     let host_partials = partials.to_vec()?;
     drop(partials);
     T::finalize(op, dtype, &host_partials)
+}
+
+/// Variant of `reduce_gpu_vec` for reductions whose accumulator dtype is wider
+/// than the input dtype (currently only `SUM` over a narrow signed integer,
+/// per the widening contract in `crate::plan::logical_plan::sum_output_dtype`).
+///
+/// `TIn` is the input column element type; `TAcc` is the accumulator and
+/// partial-output element type. The JIT'd kernel sign-extends each input load
+/// on the GPU side; this function only has to size the output buffer at
+/// `TAcc` and finalize the host-side reduction at `TAcc`.
+///
+/// `dtype` is the *input* dtype (what the kernel-compiler expects) — kernel
+/// emission internally derives the accumulator dtype using the same rule.
+fn reduce_gpu_vec_widened<TIn, TAcc>(
+    op: ReduceOp,
+    dtype: DataType,
+    input: &GpuVec<TIn>,
+    n_rows: usize,
+) -> JavelinResult<Scalar>
+where
+    TIn: Pod,
+    TAcc: Pod + ReduceScalar,
+{
+    // 0-row degenerate case: skip the launch entirely and return the
+    // accumulator's identity at the widened dtype.
+    if n_rows == 0 {
+        // The accumulator dtype is what the output array expects, which is
+        // the kernel-internal widened dtype. Look it up explicitly.
+        let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);
+        return TAcc::identity_scalar(op, acc_dtype);
+    }
+
+    let block = BLOCK_SIZE;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
+    // Partials buffer is sized in accumulator elements.
+    let partials = GpuVec::<TAcc>::zeros(grid_x as usize)?;
+
+    // Compile + load the kernel. The kernel takes the *input* dtype; it
+    // internally widens to the accumulator dtype.
+    let ptx = compile_reduction_kernel(op, dtype)?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let function = module.function(REDUCTION_KERNEL_ENTRY)?;
+
+    let mut input_ptr: CUdeviceptr = input.device_ptr();
+    let mut output_ptr: CUdeviceptr = partials.device_ptr();
+
+    let mut kernel_params: [*mut c_void; 3] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut output_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+    ];
+
+    let stream = CudaStream::null();
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+
+    let _ = input_ptr;
+    let _ = output_ptr;
+
+    let host_partials = partials.to_vec()?;
+    drop(partials);
+    // Finalize at the accumulator dtype.
+    let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);
+    TAcc::finalize(op, acc_dtype, &host_partials)
 }
 
 /// A typed scalar result of a reduction.

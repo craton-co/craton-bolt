@@ -67,13 +67,20 @@ impl DataFrame {
     }
 
     /// Hand the plan off to the engine.
+    // TODO(1.0): introduce a real `collect()` that materializes the plan to a
+    // `RecordBatch` via `Engine`. The current `collect` alias below is a
+    // doc-hidden tombstone kept only so older internal call sites compile; it
+    // should be removed once that materializing API lands.
     pub fn into_plan(self) -> LogicalPlan {
         self.plan
     }
 
-    /// Terminal builder step — for now just yields the underlying plan.
+    /// Deprecated alias for [`DataFrame::into_plan`]. Hidden from rustdoc
+    /// because the name `collect` is reserved for a future materializing API
+    /// (Polars-style) in 1.0; today this is a no-op rename.
+    #[doc(hidden)]
     pub fn collect(self) -> LogicalPlan {
-        self.plan
+        self.into_plan()
     }
 }
 

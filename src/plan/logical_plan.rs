@@ -421,12 +421,46 @@ impl AggregateExpr {
     }
 
     /// Output dtype of the aggregate against the input schema.
+    ///
+    /// `SUM` widens narrow integer inputs to the corresponding 64-bit type
+    /// to prevent silent overflow under typical workloads (`SUM(Int32)` over
+    /// more than ~2^31 small values would otherwise wrap). Float inputs and
+    /// `Int64`/`UInt64` inputs are not widened (no wider primitive type is
+    /// available); callers must be aware of overflow risk on extreme inputs.
+    ///
+    /// This widening contract is mirrored by the GPU-side accumulator in
+    /// `crate::jit::agg_kernels` and the host-side scalar-aggregate path in
+    /// `crate::exec::aggregate`; keep all three in sync.
     fn output_dtype(&self, input: &Schema) -> JavelinResult<DataType> {
         match self {
             AggregateExpr::Count(_) => Ok(DataType::Int64),
-            AggregateExpr::Sum(e) | AggregateExpr::Min(e) | AggregateExpr::Max(e) => e.dtype(input),
+            AggregateExpr::Sum(e) => Ok(sum_output_dtype(e.dtype(input)?)),
+            AggregateExpr::Min(e) | AggregateExpr::Max(e) => e.dtype(input),
             AggregateExpr::Avg(_) => Ok(DataType::Float64),
         }
+    }
+}
+
+/// Widen the input dtype of a `SUM` aggregate to its accumulator dtype.
+///
+/// Mirrors the widening contract documented on `AggregateExpr::output_dtype`:
+/// narrow signed integers (currently only `Int32` in the supported `DataType`
+/// set) widen to `Int64`; `Int64` and the float types are unchanged. This
+/// helper is the single source of truth for the SUM widening rule and is also
+/// consumed by `crate::jit::agg_kernels` (kernel emission must agree with the
+/// plan's declared output type) and `crate::exec::aggregate` (accumulator
+/// allocation and Arrow array packing).
+pub fn sum_output_dtype(input: DataType) -> DataType {
+    match input {
+        // Narrow signed integer → widen to Int64.
+        DataType::Int32 => DataType::Int64,
+        // Already 64-bit-wide or float: unchanged (no wider primitive in this
+        // engine's `DataType`). Overflow risk on Int64 is acknowledged at the
+        // API boundary.
+        DataType::Int64 | DataType::Float32 | DataType::Float64 => input,
+        // Non-numeric types fall through unchanged; the downstream typecheck
+        // (e.g. `ReduceOp::identity_ptx`) will reject the aggregate.
+        DataType::Bool | DataType::Utf8 => input,
     }
 }
 

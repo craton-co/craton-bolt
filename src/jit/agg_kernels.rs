@@ -25,7 +25,23 @@
 use std::fmt::Write;
 
 use crate::error::{JavelinError, JavelinResult};
-use crate::plan::logical_plan::{AggregateExpr, DataType};
+use crate::plan::logical_plan::{sum_output_dtype, AggregateExpr, DataType};
+
+/// Public helper: the accumulator dtype the reduction kernel emitted by
+/// `compile_reduction_kernel` will write to for `(op, input_dtype)`.
+///
+/// For `Sum` over a narrow signed integer this is the widened (Int64)
+/// accumulator dtype; for every other case it is the input dtype unchanged.
+/// Callers (`crate::exec::aggregate`) use this to size the partial-output
+/// buffer and to pick the matching Arrow array type. This must agree with
+/// `crate::plan::logical_plan::sum_output_dtype` — that helper is the single
+/// source of truth for the widening rule.
+pub fn reduction_output_dtype(op: ReduceOp, input_dtype: DataType) -> DataType {
+    match op {
+        ReduceOp::Sum | ReduceOp::Count => sum_output_dtype(input_dtype),
+        ReduceOp::Min | ReduceOp::Max => input_dtype,
+    }
+}
 
 /// Threads per block for every reduction kernel.
 pub const BLOCK_SIZE: u32 = 256;
@@ -125,16 +141,43 @@ impl ReduceOp {
 /// Generate PTX for a per-block reduction kernel. Each block computes one
 /// partial result and writes it to `output[blockIdx.x]`. The final reduction
 /// across block partials is performed on the host.
+///
+/// `dtype` is the *input* column dtype. The kernel's accumulator (and hence
+/// the output buffer element type) is `reduction_output_dtype(op, dtype)` —
+/// for `SUM` over a narrow signed integer this is wider than `dtype` and the
+/// kernel sign-extends each loaded value before accumulating. See
+/// `crate::plan::logical_plan::sum_output_dtype` for the widening contract.
 pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<String> {
-    let (load_suffix, store_suffix, reg_class, reg_ty, ptx_ty) = ptx_type_info(dtype)?;
-    let identity = op.identity_ptx(dtype)?;
-    let combine = op.combine_ptx(dtype)?;
-    let elem_bytes = dtype.byte_width().ok_or_else(|| {
+    // Input-side PTX info governs the global load from the source column.
+    let (input_load_suffix, _input_store_suffix, input_reg_class, input_reg_ty, _input_imm_ty) =
+        ptx_type_info(dtype)?;
+    // Accumulator-side PTX info governs identity, combine, shared-memory
+    // storage, and the global output store. For SUM(Int32) these diverge:
+    // input is `s32`, accumulator is `s64`.
+    let acc_dtype = reduction_output_dtype(op, dtype);
+    let (acc_load_suffix, acc_store_suffix, acc_reg_class, acc_reg_ty, acc_imm_ty) =
+        ptx_type_info(acc_dtype)?;
+    let widens = acc_dtype != dtype;
+
+    // Identity and combine are computed against the ACCUMULATOR dtype: the
+    // tree reduction in shared memory operates on widened values.
+    let identity = op.identity_ptx(acc_dtype)?;
+    let combine = op.combine_ptx(acc_dtype)?;
+
+    let input_elem_bytes = dtype.byte_width().ok_or_else(|| {
         JavelinError::Other(format!(
             "agg_kernels: variable-width dtype {:?} not supported",
             dtype
         ))
     })?;
+    let acc_elem_bytes = acc_dtype.byte_width().ok_or_else(|| {
+        JavelinError::Other(format!(
+            "agg_kernels: variable-width accumulator dtype {:?} not supported",
+            acc_dtype
+        ))
+    })?;
+    // Shared memory and per-block output are sized by the accumulator dtype.
+    let elem_bytes = acc_elem_bytes;
     let shared_bytes = BLOCK_SIZE as usize * elem_bytes;
 
     let mut ptx = String::new();
@@ -165,7 +208,15 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
     writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b32   %r<16>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<24>;").map_err(write_err)?;
-    writeln!(ptx, "\t.reg .{}   %{}<8>;", reg_ty, reg_class).map_err(write_err)?;
+    writeln!(ptx, "\t.reg .{}   %{}<8>;", acc_reg_ty, acc_reg_class).map_err(write_err)?;
+    // When the kernel widens (e.g. SUM(Int32) -> Int64), allocate a separate
+    // register class for the raw input load that is then sign-extended into
+    // the accumulator register. Skip when input and accumulator dtype agree
+    // to avoid emitting a duplicate `.reg` declaration of the same class.
+    if widens {
+        writeln!(ptx, "\t.reg .{}   %{}<4>;", input_reg_ty, input_reg_class)
+            .map_err(write_err)?;
+    }
     writeln!(ptx).map_err(write_err)?;
 
     // Compute global thread index: gid = ctaid.x * ntid.x + tid.x
@@ -190,21 +241,52 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra LOAD_IDENTITY;").map_err(write_err)?;
+    // Address arithmetic for the source-column load uses the *input* element
+    // size (the source array is laid out at input dtype, not accumulator).
     writeln!(
         ptx,
         "\tmul.wide.s32 %rd1, %r3, {bytes};",
-        bytes = elem_bytes
+        bytes = input_elem_bytes
     )
     .map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.{} %{}0, [%rd2];", load_suffix, reg_class)
+    if widens {
+        // Load the narrow value into an input-class register, then
+        // sign-extend into the accumulator-class register. The acc class is
+        // always wider (currently only s64 from s32), so `cvt.<acc>.<in>`
+        // is the right widening cvt mnemonic.
+        writeln!(
+            ptx,
+            "\tld.global.{} %{}0, [%rd2];",
+            input_load_suffix, input_reg_class
+        )
         .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tcvt.{acc}.{inp} %{arc}0, %{irc}0;",
+            acc = acc_imm_ty,
+            inp = input_load_suffix,
+            arc = acc_reg_class,
+            irc = input_reg_class
+        )
+        .map_err(write_err)?;
+    } else {
+        writeln!(
+            ptx,
+            "\tld.global.{} %{}0, [%rd2];",
+            acc_load_suffix, acc_reg_class
+        )
+        .map_err(write_err)?;
+    }
     writeln!(ptx, "\tbra AFTER_LOAD;").map_err(write_err)?;
     writeln!(ptx, "LOAD_IDENTITY:").map_err(write_err)?;
-    writeln!(ptx, "\tmov.{} %{}0, {};", ptx_ty, reg_class, identity).map_err(write_err)?;
+    // Identity is in accumulator dtype.
+    writeln!(ptx, "\tmov.{} %{}0, {};", acc_imm_ty, acc_reg_class, identity)
+        .map_err(write_err)?;
     writeln!(ptx, "AFTER_LOAD:").map_err(write_err)?;
 
-    // Stash the value into shared memory.
+    // Stash the value into shared memory. Shared memory is sized and indexed
+    // by the accumulator element size, not the input element size.
     writeln!(
         ptx,
         "\tmul.wide.s32 %rd3, %r2, {bytes};",
@@ -213,8 +295,12 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
     .map_err(write_err)?;
     writeln!(ptx, "\tmov.u64 %rd4, sdata;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd4, %rd3;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.{} [%rd5], %{}0;", store_suffix, reg_class)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tst.shared.{} [%rd5], %{}0;",
+        acc_store_suffix, acc_reg_class
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
 
     // Unrolled tree reduction in shared memory. For BLOCK_SIZE=256 this is
@@ -247,29 +333,29 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
         writeln!(
             ptx,
             "\tld.shared.{ld} %{rc}1, [%rd6];",
-            ld = load_suffix,
-            rc = reg_class
+            ld = acc_load_suffix,
+            rc = acc_reg_class
         )
         .map_err(write_err)?;
         writeln!(
             ptx,
             "\tld.shared.{ld} %{rc}2, [%rd5];",
-            ld = load_suffix,
-            rc = reg_class
+            ld = acc_load_suffix,
+            rc = acc_reg_class
         )
         .map_err(write_err)?;
         writeln!(
             ptx,
             "\t{combine} %{rc}3, %{rc}2, %{rc}1;",
             combine = combine,
-            rc = reg_class
+            rc = acc_reg_class
         )
         .map_err(write_err)?;
         writeln!(
             ptx,
             "\tst.shared.{st} [%rd5], %{rc}3;",
-            st = store_suffix,
-            rc = reg_class
+            st = acc_store_suffix,
+            rc = acc_reg_class
         )
         .map_err(write_err)?;
         writeln!(ptx, "SKIP_ADD_{step}:", step = step).map_err(write_err)?;
@@ -298,15 +384,15 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
     writeln!(
         ptx,
         "\tld.shared.{ld} %{rc}4, [%rd4];",
-        ld = load_suffix,
-        rc = reg_class
+        ld = acc_load_suffix,
+        rc = acc_reg_class
     )
     .map_err(write_err)?;
     writeln!(
         ptx,
         "\tst.global.{st} [%rd10], %{rc}4;",
-        st = store_suffix,
-        rc = reg_class
+        st = acc_store_suffix,
+        rc = acc_reg_class
     )
     .map_err(write_err)?;
     writeln!(ptx, "DONE:").map_err(write_err)?;

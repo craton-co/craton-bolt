@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[doc(hidden)]
 pub mod launch;
 pub mod engine;
 pub mod aggregate;
@@ -18,6 +19,7 @@ pub mod extended_agg;
 pub mod expr_agg;
 pub mod groupby_valid;
 
+#[doc(hidden)]
 pub use launch::{launch_1d, CudaStream, KernelArgs};
 pub use engine::{Engine, QueryHandle};
 

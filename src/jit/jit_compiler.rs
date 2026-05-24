@@ -46,7 +46,7 @@ impl CudaModule {
     /// numbers for malformed instructions) is appended to the returned error.
     pub fn from_ptx(ptx: &str) -> JavelinResult<Self> {
         let ptx_cstr = CString::new(ptx).map_err(|e| {
-            JavelinError::Nvrtc(format!("PTX source contains interior NUL byte: {}", e))
+            JavelinError::Cuda(format!("PTX source contains interior NUL byte: {}", e))
         })?;
 
         let mut info_buf: Vec<u8> = vec![0u8; JIT_LOG_BUF_SIZE];
@@ -90,7 +90,7 @@ impl CudaModule {
             } else {
                 format!("{}; ptxas log: {}", inner_msg(&e), ptxas_msg)
             };
-            return Err(JavelinError::Nvrtc(format!(
+            return Err(JavelinError::Cuda(format!(
                 "cuModuleLoadDataEx failed: {}",
                 detail
             )));
@@ -102,7 +102,7 @@ impl CudaModule {
     /// Look up an entry point by name.
     pub fn function(&self, name: &str) -> JavelinResult<CudaFunction<'_>> {
         let name_cstr = CString::new(name).map_err(|e| {
-            JavelinError::Nvrtc(format!(
+            JavelinError::Cuda(format!(
                 "kernel name contains interior NUL byte: {}",
                 e
             ))
@@ -112,7 +112,7 @@ impl CudaModule {
             cuda_sys::cuModuleGetFunction(&mut f, self.raw, name_cstr.as_ptr())
         };
         cuda_sys::check(code).map_err(|e| {
-            JavelinError::Nvrtc(format!(
+            JavelinError::Cuda(format!(
                 "cuModuleGetFunction({}) failed: {}",
                 name,
                 inner_msg(&e)
@@ -175,7 +175,7 @@ pub fn compile_and_load(ptx: &str) -> JavelinResult<CudaModule> {
 /// Extract the human-readable portion of a `JavelinError::Cuda` for wrapping.
 fn inner_msg(e: &JavelinError) -> String {
     match e {
-        JavelinError::Cuda { code, msg } => format!("[{}] {}", code, msg),
+        JavelinError::Cuda(msg) => msg.clone(),
         other => other.to_string(),
     }
 }

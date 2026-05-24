@@ -170,7 +170,7 @@ pub fn check(code: CUresult) -> JavelinResult<()> {
             format!("unknown CUDA error {}", code)
         }
     };
-    Err(JavelinError::Cuda { code, msg })
+    Err(JavelinError::Cuda(format!("CUDA driver error {}: {}", code, msg)))
 }
 
 static INIT: OnceLock<CUresult> = OnceLock::new();
@@ -243,7 +243,7 @@ impl Drop for CudaContext {
         }
         let code = unsafe { cuCtxDestroy_v2(self.raw) };
         if code != CUDA_SUCCESS {
-            eprintln!(
+            log::warn!(
                 "javelin: cuCtxDestroy_v2 failed with code {} (context leaked)",
                 code
             );

@@ -1,5 +1,7 @@
 # Javelin
 
+[![crates.io](https://img.shields.io/crates/v/javelin.svg)](https://crates.io/crates/javelin) [![docs.rs](https://docs.rs/javelin/badge.svg)](https://docs.rs/javelin) [![CI](https://github.com/cratonsoftware/javelin/actions/workflows/ci.yml/badge.svg)](https://github.com/cratonsoftware/javelin/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![MSRV: 1.74](https://img.shields.io/badge/MSRV-1.74-orange.svg)](Cargo.toml)
+
 > JIT-compiled GPU SQL engine. SQL strings go in, NVIDIA PTX comes out at runtime, the GPU does the rest.
 
 Javelin is a SQL execution engine written in Rust that compiles each query into a fresh NVIDIA PTX kernel at runtime, loads it via the CUDA driver, and runs it on the GPU. There is no C++ shim, no precompiled kernel library, and no FFI to a third-party query engine. The full pipeline — parse → plan → codegen → launch — is pure Rust on top of the raw CUDA driver API.
@@ -7,11 +9,11 @@ Javelin is a SQL execution engine written in Rust that compiles each query into 
 The project's two distinguishing ideas:
 
 1. **Kernel fusion via runtime PTX.** Most GPU dataframe engines (RAPIDS / cuDF) chain precompiled kernels and bounce intermediates through global memory. Javelin emits a single PTX kernel per query, keeping the entire fused expression tree in registers. Comparable in spirit to what Polars / DataFusion do for the CPU via codegen and Arrow-native vectorisation, but targeting the GPU.
-2. **Borrow-checked GPU memory ("CUDA-Oxide").** GPU allocations are typed handles (`GpuVec<T>`), borrowed as `GpuView<'a, T>` / `GpuViewMut<'a, T>`. Kernel launches require those borrows, so use-after-free, double-free, and mutable / shared aliasing across kernel boundaries are rejected at compile time. The host-side type system makes the same guarantees Rust already makes for CPU memory.
+2. **Borrow-checked GPU memory ("CUDA-Oxide").** GPU allocations are typed handles (`GpuVec<T>`), borrowed as `GpuView<'a, T>` for read-only access and `GpuViewMut<'a, T>` (a `!Sync`, `!Copy` exclusive handle) for write access. Kernel launches require those borrows, so use-after-free, double-free, and mutable / shared aliasing across kernel boundaries are rejected at compile time. The host-side type system makes the same guarantees Rust already makes for CPU memory.
 
 ## Status
 
-**Active development.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (incl. multi-column, float keys, sentinel-collision-safe), join-free SQL, and a substantial string subset are implemented. Production use is **not** recommended — the public API is unstable and large swaths still want hardening, benchmarking, and battle-testing.
+**Active development.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (incl. multi-column, float keys, sentinel-collision-safe), and join-free SQL are implemented, along with string predicates (=, !=, IN over dictionary-encoded literals) and a small set of host-callable string operations (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`) reachable only via the Rust `string_ops` API, not yet via SQL. Production use is **not** recommended — the public API is unstable and large swaths still want hardening, benchmarking, and battle-testing.
 
 See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported subset.
 
@@ -34,6 +36,13 @@ See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported sub
 
 `cargo check` and `cargo build --lib` work on a host without CUDA installed (everything type-checks). `cargo test` and `cargo bench` require the linker to find `cuda.lib`; the ignored integration tests further require an actual GPU.
 
+### Platform support
+
+- **Linux (x86_64):** supported.
+- **Windows (x86_64 MSVC):** supported.
+- **macOS (any arch):** NOT supported — Apple ended CUDA support in 2019. `cargo check --features cuda-stub` works for type-checking only.
+- **ARM (aarch64-linux):** in theory supported by Jetson; not tested.
+
 ### Build
 
 ```bash
@@ -41,6 +50,8 @@ git clone <repo-url> javelin
 cd javelin
 cargo build --release
 ```
+
+Hosts without a CUDA toolkit can type-check the crate with `cargo build --no-default-features --features cuda-stub` — useful for CI and `docs.rs` builds.
 
 ### Run a query
 
@@ -170,6 +181,7 @@ javelin/
 ├── README.md
 ├── CONTRIBUTING.md
 ├── CODE_OF_CONDUCT.md
+├── SECURITY.md
 ├── CHANGELOG.md
 ├── docs/
 │   ├── ARCHITECTURE.md       # the layer cake and module map
@@ -189,6 +201,14 @@ javelin/
 └── benches/
     └── query_benchmarks.rs   # criterion + Polars head-to-head
 ```
+
+## Security
+
+Security issues should be reported privately per the policy in [SECURITY.md](SECURITY.md). Do not file public GitHub issues for vulnerabilities.
+
+## Releases
+
+Version history and per-release notes live in [`CHANGELOG.md`](CHANGELOG.md). Javelin follows [Semantic Versioning](https://semver.org/); pre-1.0 the public API is unstable and minor bumps may break it.
 
 ## Acknowledgements
 
