@@ -143,42 +143,48 @@ fn unknown_column_errors() {
     assert_err(res, "unknown column");
 }
 
+// The following six tests were originally negative ("unsupported") assertions
+// written before waves 7 and 8 landed DISTINCT / ORDER BY / LIMIT / HAVING /
+// UNION / INNER JOIN. Now that those features are implemented they are kept
+// as positive parse-and-lower smoke tests; representative *still*-unsupported
+// variants (LEFT/CROSS JOIN, non-equi JOIN) are covered by the negative
+// tests further down.
+
 #[test]
-fn select_with_distinct_unsupported() {
+fn select_with_distinct_parses() {
     let provider = fixture_table();
     let res = try_plan("SELECT DISTINCT region_id FROM sales", &provider);
-    assert_err_contains(res, "distinct");
+    assert!(res.is_ok(), "DISTINCT should parse and lower: {res:?}");
 }
 
 #[test]
-fn select_with_order_by_unsupported() {
+fn select_with_order_by_parses() {
     let provider = fixture_table();
     let res = try_plan("SELECT region_id FROM sales ORDER BY region_id", &provider);
-    assert_err_contains(res, "order by");
+    assert!(res.is_ok(), "ORDER BY should parse and lower: {res:?}");
 }
 
 #[test]
-fn select_with_limit_unsupported() {
+fn select_with_limit_parses() {
     let provider = fixture_table();
     let res = try_plan("SELECT * FROM sales LIMIT 10", &provider);
-    assert_err_contains(res, "limit");
+    assert!(res.is_ok(), "LIMIT should parse and lower: {res:?}");
 }
 
 #[test]
-fn select_with_having_unsupported() {
+fn select_with_having_parses() {
     let provider = fixture_table();
     let sql =
         "SELECT region_id, COUNT(*) FROM sales GROUP BY region_id HAVING COUNT(*) > 1";
     let res = try_plan(sql, &provider);
-    assert_err_contains(res, "having");
+    assert!(res.is_ok(), "HAVING with aggregate should parse and lower: {res:?}");
 }
 
 #[test]
-fn union_unsupported() {
+fn union_parses() {
     let provider = fixture_table();
     let res = try_plan("SELECT * FROM sales UNION SELECT * FROM sales", &provider);
-    // Frontend message says "UNION/EXCEPT/INTERSECT".
-    assert_err_contains(res, "union");
+    assert!(res.is_ok(), "UNION should parse and lower: {res:?}");
 }
 
 #[test]
@@ -190,13 +196,35 @@ fn subquery_unsupported() {
 }
 
 #[test]
-fn join_unsupported() {
+fn inner_join_parses() {
     let provider = fixture_with_sales2();
     let res = try_plan(
-        "SELECT * FROM sales JOIN sales2 ON sales.id = sales2.id",
+        "SELECT * FROM sales INNER JOIN sales2 ON sales.id = sales2.id",
         &provider,
     );
-    assert_err_contains(res, "join");
+    assert!(res.is_ok(), "INNER JOIN with equi-predicate should parse and lower: {res:?}");
+}
+
+#[test]
+fn left_join_unsupported() {
+    let provider = fixture_with_sales2();
+    let res = try_plan(
+        "SELECT * FROM sales LEFT JOIN sales2 ON sales.id = sales2.id",
+        &provider,
+    );
+    // 0.1.x supports INNER only; LEFT/RIGHT/FULL/CROSS are deferred.
+    assert_err(res, "non-INNER join");
+}
+
+#[test]
+fn non_equi_join_unsupported() {
+    let provider = fixture_with_sales2();
+    let res = try_plan(
+        "SELECT * FROM sales INNER JOIN sales2 ON sales.id > sales2.id",
+        &provider,
+    );
+    // 0.1.x supports equi predicates only.
+    assert_err(res, "non-equi join predicate");
 }
 
 #[test]

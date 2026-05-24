@@ -674,17 +674,72 @@ impl LogicalPlan {
                 Ok(first)
             }
             LogicalPlan::Join { left, right, .. } => {
-                // 0.1.x scaffold: just concatenate left and right schemas
-                // without name prefixing. Collisions are tolerated here —
-                // the execution layer will reject ambiguous references when
-                // it actually attempts to run the join.
-                let mut l = left.schema()?;
+                // Concatenate left and right schemas, disambiguating right-
+                // side columns whose names collide with anything on the left.
+                // See `join_combined_schema` for the canonical rule (also used
+                // by `PhysicalPlan::Join::output_schema()`); duplicating it
+                // here would risk drift if either copy is edited.
+                let l = left.schema()?;
                 let r = right.schema()?;
-                l.fields.extend(r.fields.into_iter());
-                Ok(l)
+                Ok(join_combined_schema(&l, &r))
             }
         }
     }
+}
+
+/// Build the output schema of an INNER JOIN over `left` and `right`.
+///
+/// Concatenates the two schemas in order, but disambiguates any right-side
+/// field whose name already appears on the left by prefixing it with
+/// `"right."`. Left-side fields keep their bare names so existing
+/// downstream references continue to resolve unchanged. The rule:
+///
+/// * For each right-side field `f`:
+///   * if `f.name` does not collide with any left-side name, keep it as-is;
+///   * otherwise rename it to `"right.{f.name}"`. If `"right.{f.name}"`
+///     itself collides (rare — only if the left side has a literal
+///     `"right.<name>"` column), append `__2`, `__3`, ... until unique.
+///
+/// This is the single source of truth for join output schemas, called by
+/// both [`LogicalPlan::Join::schema`](LogicalPlan#method.schema)
+/// and [`PhysicalPlan::Join::output_schema`](crate::plan::physical_plan::PhysicalPlan::output_schema)
+/// so the logical and physical layers can never disagree on what a join
+/// produces.
+pub fn join_combined_schema(left: &Schema, right: &Schema) -> Schema {
+    let mut fields: Vec<Field> = Vec::with_capacity(left.fields.len() + right.fields.len());
+    fields.extend(left.fields.iter().cloned());
+    // Snapshot the names already taken by the left side so collision lookup
+    // doesn't depend on later right-side insertions.
+    let mut taken: std::collections::HashSet<String> =
+        left.fields.iter().map(|f| f.name.clone()).collect();
+    for rf in &right.fields {
+        let mut name = if taken.contains(&rf.name) {
+            format!("right.{}", rf.name)
+        } else {
+            rf.name.clone()
+        };
+        // Final-resort uniqueness suffix; only triggers if the qualified
+        // name itself collides with an existing left-side column.
+        if taken.contains(&name) {
+            let base = name.clone();
+            let mut i = 2usize;
+            loop {
+                let candidate = format!("{base}__{i}");
+                if !taken.contains(&candidate) {
+                    name = candidate;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        taken.insert(name.clone());
+        fields.push(Field {
+            name,
+            dtype: rf.dtype,
+            nullable: rf.nullable,
+        });
+    }
+    Schema { fields }
 }
 
 /// True if `a` and `b` have the same shape (same number of fields, same dtype

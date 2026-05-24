@@ -5,6 +5,31 @@ All notable changes to this project will be documented here. The format follows 
 ## [Unreleased]
 
 ### Added
+- **`INNER JOIN ... ON <equi predicate>`** — host-side hash join.
+  Recursively executes both sides, builds a
+  `HashMap<JoinKey, Vec<row_idx>>` on the smaller input, probes the
+  larger, and materialises matches via `arrow::compute::take`. One join
+  per `SELECT`; LEFT / RIGHT / FULL / CROSS and non-equi predicates are
+  rejected at the parser. NULL keys never match (SQL
+  `NULL = NULL → UNKNOWN`).
+- **`DISTINCT`, `LIMIT [OFFSET]`, `ORDER BY [ASC|DESC]`, `HAVING`,
+  `UNION [ALL]`** — full plan + parser + standalone executors
+  (`src/exec/{distinct,sort,limit}.rs`). HAVING desugars to a `Filter`
+  over the `Aggregate`; plain `UNION` lowers to `Distinct(Union(..))`,
+  `UNION ALL` stays a flat `Union`. Executors are host-side for 0.1.x.
+- Multi-batch tables: the engine accepts more than one `RecordBatch` per
+  registered table and threads them through the new operators (was:
+  single-batch only).
+- Validity propagation through `compact` / `gpu_compact`: filter
+  selection masks now carry per-row validity for downstream consumers.
+- Warp-shuffle reduction path in `agg_kernels.rs` for the last 5 strides
+  of the agg-kernel tree (replaces the all-stride `__syncthreads` +
+  shared-memory reduction the TODO marker called out).
+- 13 new offline e2e tests in `tests/e2e_tests.rs` covering the new
+  operators: 9 for DISTINCT / LIMIT / ORDER BY / HAVING / UNION (plan
+  shapes, ASC/DESC defaults, `LIMIT -1` parse rejection) and 4 for
+  INNER JOIN (single-key, multi-key, schema disambiguation, combined
+  physical output schema).
 - `Engine::new_with_device(idx)` for selecting a specific GPU on
   multi-GPU hosts. `Engine::new()` delegates to it with device 0.
 - `cuda-stub` feature is now real: the `#[link(name = "cuda")]` block is
@@ -44,6 +69,14 @@ All notable changes to this project will be documented here. The format follows 
 - `ROADMAP.md` and `docs/FAQ.md`.
 
 ### Changed
+- `LogicalPlan::Join::schema()` and `PhysicalPlan::Join::output_schema()`
+  now return the *combined* (left + right) schema with collision-safe
+  naming: any right-side field whose name clashes with a left-side name
+  is prefixed `right.<col>`, with a `__2`, `__3`, … suffix as a final
+  uniqueness guard. Both methods share a single `join_combined_schema`
+  helper so they can't drift. Previously the logical version
+  concatenated without disambiguation (duplicate names) and the physical
+  version returned only the left input.
 - `SUM(Int32) -> Int64` widening end-to-end (plan output dtype, scalar
   reducer, GROUP BY accumulator, kernel emits `atom.global.add.s64` with
   `cvt.s64.s32` sign extension). SUM(Int64), SUM(Float*) unchanged.

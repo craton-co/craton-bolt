@@ -10,6 +10,12 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 
 - SQL → PTX → execution end-to-end for projection, filter, scalar
   aggregate, and GROUP BY (single/multi-column, packed and wide keys).
+- `DISTINCT`, `LIMIT [OFFSET]`, `ORDER BY [ASC|DESC]`, `HAVING`, and
+  `UNION [ALL]` (host-side executors for the non-GROUP-BY paths).
+- `INNER JOIN ... ON <equi predicate>` (host-side hash join: build the
+  smaller side into a `HashMap`, probe the larger). One join per
+  `SELECT`; LEFT/RIGHT/FULL/CROSS and non-equi predicates are out of
+  scope for 0.1.x.
 - Borrow-checked GPU memory primitives (`GpuVec` / `GpuView` /
   `GpuViewMut`) — use-after-free, double-free, and mutable/shared
   aliasing across kernel boundaries are compile-time errors.
@@ -37,9 +43,11 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   tables.
 - One CUDA context, one device per `Engine`. `Engine::new_with_device`
   exists, but multi-GPU means one engine per device.
-- No JOIN of any kind.
-- No DISTINCT, ORDER BY, LIMIT, OFFSET, HAVING, UNION, CTE, subqueries,
-  window functions.
+- JOIN: only `INNER JOIN ... ON <equi predicate>` with one join per
+  `SELECT`; LEFT / RIGHT / FULL / CROSS and non-equi predicates are
+  rejected at the parser. The executor is host-side (build map +
+  probe), not GPU-backed.
+- No CTE, subqueries, window functions.
 - No `IS NULL` / `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, `CASE`,
   `NULLIF`, `COALESCE`, `CAST`, or string concat (`||`).
 - No `NOT` (would need a unary op in the AST).
@@ -77,8 +85,12 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 
 ### Stretch goals
 
-- JOINs (hash join for equi-joins, nested-loop for inequality).
-- HAVING / ORDER BY (with a GPU sort).
+- GPU hash join (the 0.1.x INNER equi-join executor is host-side; a
+  GPU-resident probe path is the natural next step).
+- LEFT / RIGHT / FULL / CROSS joins; non-equi predicates via
+  nested-loop.
+- GPU sort kernel to back `ORDER BY` and the dedup step of
+  `UNION` / `DISTINCT` without round-tripping through host.
 - SQL functions surfaced through the parser (`UPPER`, `LOWER`, `LENGTH`,
   `CONCAT`).
 

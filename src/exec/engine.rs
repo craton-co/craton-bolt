@@ -326,7 +326,62 @@ impl Engine {
                 right,
                 join_type,
                 on,
-            } => crate::exec::join::execute_join(left, right, join_type, on, self),
+                output_schema,
+            } => crate::exec::join::execute_join(
+                left,
+                right,
+                join_type,
+                on,
+                output_schema,
+                self,
+            ),
+            PhysicalPlan::Project {
+                input,
+                exprs,
+                output_schema,
+            } => {
+                // Rename/reorder layer over an arbitrary upstream. Each
+                // `exprs` entry is a bare column reference (possibly aliased)
+                // into the input's schema; we just pick those columns out
+                // and re-wrap them under `output_schema`. No compute.
+                let h = self.execute(input)?;
+                let in_batch = h.batch;
+                let in_schema = in_batch.schema();
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    let name = match e {
+                        crate::plan::Expr::Column(n) => n.as_str(),
+                        crate::plan::Expr::Alias(inner, _) => match inner.as_ref() {
+                            crate::plan::Expr::Column(n) => n.as_str(),
+                            _ => {
+                                return Err(JavelinError::Plan(
+                                    "PhysicalPlan::Project: aliased expression must be a column reference"
+                                        .into(),
+                                ));
+                            }
+                        },
+                        _ => {
+                            return Err(JavelinError::Plan(
+                                "PhysicalPlan::Project: only column references / aliases are supported"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    let idx = in_schema.index_of(name).map_err(|_| {
+                        JavelinError::Plan(format!(
+                            "PhysicalPlan::Project: column '{name}' not found in input schema"
+                        ))
+                    })?;
+                    columns.push(in_batch.column(idx).clone());
+                }
+                let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+                let out = RecordBatch::try_new(arrow_schema, columns).map_err(|e| {
+                    JavelinError::Other(format!(
+                        "failed to build PhysicalPlan::Project RecordBatch: {e}"
+                    ))
+                })?;
+                Ok(QueryHandle { batch: out })
+            }
         }
     }
 

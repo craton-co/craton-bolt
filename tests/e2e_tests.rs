@@ -803,3 +803,226 @@ fn limit_negative_rejected_at_parse() {
         "error should mention LIMIT/non-negative/integer, got: {err}"
     );
 }
+
+// ---- Offline: wave 8 INNER JOIN --------------------------------------------
+//
+// Parse -> plan-shape / schema assertions for INNER JOIN. The host-side
+// hash-join executor lands in this wave; full execution tests (which need
+// a real engine + table data) will arrive behind `#[ignore]` later.
+
+/// Two-table fixture with intentional column-name collisions on `id` and
+/// `region_id` so the schema disambiguation rule has something to chew on.
+/// `t1` (left): id Int32, region_id Int32, qty Int32
+/// `t2` (right): id Int32, region_id Int32, label Utf8
+fn join_provider() -> MemTableProvider {
+    let t1 = Schema::new(vec![
+        Field {
+            name: "id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "region_id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "qty".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+    ]);
+    let t2 = Schema::new(vec![
+        Field {
+            name: "id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "region_id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "label".into(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        },
+    ]);
+    MemTableProvider::new()
+        .with_table("t1", t1)
+        .with_table("t2", t2)
+}
+
+#[test]
+fn inner_join_single_key_plan_shape() {
+    // `SELECT qty, label FROM t1 INNER JOIN t2 ON t1.id = t2.id` parses to
+    // `Project { input: Join { on: [(id, id)] } }` with a single equi-join
+    // pair. We assert on the Join node, not on the outer Project.
+    // (The SELECT uses bare column names because the 0.1.x scalar
+    // expression lowerer doesn't yet accept table-qualified refs; the ON
+    // clause does, via `lower_join_side` which strips the prefix.)
+    let provider = join_provider();
+    let plan = parse_sql(
+        "SELECT qty, label FROM t1 INNER JOIN t2 ON t1.id = t2.id",
+        &provider,
+    )
+    .expect("parse");
+    let join = match plan {
+        LogicalPlan::Project { input, .. } => *input,
+        other => panic!("expected Project at top, got {other:?}"),
+    };
+    match join {
+        LogicalPlan::Join { on, .. } => {
+            assert_eq!(on.len(), 1, "single equi-join pair");
+        }
+        other => panic!("expected Join under Project, got {other:?}"),
+    }
+}
+
+#[test]
+fn inner_join_multi_key_plan_shape() {
+    // Conjunctive ON clause: each `AND`-joined equality becomes a separate
+    // `(left, right)` pair in `on`. Two predicates -> two pairs.
+    let provider = join_provider();
+    let plan = parse_sql(
+        "SELECT qty FROM t1 INNER JOIN t2 ON t1.id = t2.id AND t1.region_id = t2.region_id",
+        &provider,
+    )
+    .expect("parse");
+    let join = match plan {
+        LogicalPlan::Project { input, .. } => *input,
+        other => panic!("expected Project at top, got {other:?}"),
+    };
+    match join {
+        LogicalPlan::Join { on, .. } => {
+            assert_eq!(on.len(), 2, "two equi-join pairs");
+        }
+        other => panic!("expected Join, got {other:?}"),
+    }
+}
+
+#[test]
+fn join_schema_disambiguates_collisions() {
+    // Both `t1` and `t2` have `id` and `region_id`. The logical schema must
+    // include all four (not three with a duplicate dropped) AND must not
+    // panic / error on the duplicate names — fix #1 from wave 8.
+    //
+    // Left side keeps its bare names; right side gets `right.<col>` for any
+    // collision (the convention chosen in `join_combined_schema`).
+    let provider = join_provider();
+    let plan = parse_sql(
+        "SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id",
+        &provider,
+    )
+    .expect("parse");
+    // Walk past any outer wrapper (Project from wildcard expansion) to find
+    // the Join, then ask its own schema().
+    fn find_join(p: &LogicalPlan) -> &LogicalPlan {
+        match p {
+            LogicalPlan::Join { .. } => p,
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. } => find_join(input),
+            other => panic!("expected to find a Join under {other:?}"),
+        }
+    }
+    let join = find_join(&plan);
+    let schema = join.schema().expect("join schema");
+
+    // 3 left + 3 right = 6 fields, no duplicates dropped.
+    assert_eq!(schema.fields.len(), 6, "all six columns present");
+    // Every name must be unique — that's the whole point of the fix.
+    let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for n in &names {
+        assert!(seen.insert(n), "duplicate field name '{n}' in {names:?}");
+    }
+    // Left side keeps bare names.
+    assert!(names.contains(&"id"), "left 'id' must survive bare in {names:?}");
+    assert!(
+        names.contains(&"region_id"),
+        "left 'region_id' must survive bare in {names:?}"
+    );
+    assert!(names.contains(&"qty"), "left-only 'qty' must survive bare in {names:?}");
+    // Right side: colliding columns become `right.<col>`, non-colliders stay bare.
+    assert!(
+        names.contains(&"right.id"),
+        "right 'id' must be renamed to 'right.id' in {names:?}"
+    );
+    assert!(
+        names.contains(&"right.region_id"),
+        "right 'region_id' must be renamed in {names:?}"
+    );
+    assert!(
+        names.contains(&"label"),
+        "right-only 'label' must survive bare in {names:?}"
+    );
+}
+
+#[test]
+fn physical_join_output_schema_combines_sides() {
+    // After lowering, `PhysicalPlan::Join::output_schema()` must return the
+    // same combined+disambiguated schema as the logical layer — not the
+    // pre-wave-8 "left only" approximation.
+    let provider = join_provider();
+    let plan = parse_sql(
+        "SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id",
+        &provider,
+    )
+    .expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+
+    // Find the PhysicalPlan::Join (the outer `SELECT *` lowers to a Project
+    // we can step through, but `lower()` actually drops that outer Project
+    // when it's over a Join — see the `is_scan_chain` branch in
+    // `physical_plan.rs::lower`). Either way: walk until we hit a Join.
+    fn find_phys_join(p: &PhysicalPlan) -> &PhysicalPlan {
+        match p {
+            PhysicalPlan::Join { .. } => p,
+            PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::Sort { input, .. } => find_phys_join(input),
+            other => panic!("expected a Join, got {other:?}"),
+        }
+    }
+    let join = find_phys_join(&phys);
+    let phys_schema = join.output_schema();
+
+    // Should match the logical version exactly (same names + dtypes).
+    let logical_schema = match &plan {
+        LogicalPlan::Join { .. } => plan.schema().unwrap(),
+        // Top-level Project gets dropped by the lowerer; recompute logical
+        // join schema from the inner Join for the comparison.
+        _ => {
+            fn find_logical_join(p: &LogicalPlan) -> &LogicalPlan {
+                match p {
+                    LogicalPlan::Join { .. } => p,
+                    LogicalPlan::Project { input, .. }
+                    | LogicalPlan::Filter { input, .. }
+                    | LogicalPlan::Distinct { input }
+                    | LogicalPlan::Limit { input, .. }
+                    | LogicalPlan::Sort { input, .. } => find_logical_join(input),
+                    other => panic!("expected logical Join under {other:?}"),
+                }
+            }
+            find_logical_join(&plan).schema().unwrap()
+        }
+    };
+
+    assert_eq!(
+        phys_schema.fields.len(),
+        logical_schema.fields.len(),
+        "physical join schema must have the same field count as the logical one"
+    );
+    assert_eq!(phys_schema.fields.len(), 6, "all six columns present");
+    let phys_names: Vec<&str> = phys_schema.fields.iter().map(|f| f.name.as_str()).collect();
+    let logical_names: Vec<&str> =
+        logical_schema.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        phys_names, logical_names,
+        "physical and logical join schemas must agree on field names and order"
+    );
+}

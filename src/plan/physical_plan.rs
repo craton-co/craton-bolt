@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use crate::error::{JavelinError, JavelinResult};
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal, LogicalPlan, Schema,
-    SortExpr,
+    join_combined_schema, AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal,
+    LogicalPlan, Schema, SortExpr,
 };
 
 /// SSA register handle. Just an index into the IR's value table.
@@ -181,9 +181,26 @@ pub enum PhysicalPlan {
         /// Branches to concatenate, in source order.
         inputs: Vec<PhysicalPlan>,
     },
-    /// INNER JOIN scaffold. Execution will currently error with
-    /// "JOIN not yet implemented" — the variant exists so the planner can
-    /// represent the operator end-to-end while the executor is wired up.
+    /// Pure column-rename / reorder layer over `input`. Used when the SQL
+    /// frontend places a `Project` on top of an `Aggregate` (or other
+    /// non-scan-chain operator) purely to surface SELECT-list order and
+    /// aliases. Each `exprs` entry must be `Column(name)` or
+    /// `Alias(Column(name), out_name)`; the executor just rearranges and
+    /// renames the input batch's columns to match `output_schema`. No
+    /// compute happens here — anything more elaborate (e.g. post-aggregate
+    /// arithmetic) is rejected upstream.
+    Project {
+        /// Source plan.
+        input: Box<PhysicalPlan>,
+        /// One entry per output column; each references a column of `input`.
+        exprs: Vec<Expr>,
+        /// Output schema, in `exprs` order with aliases applied.
+        output_schema: Schema,
+    },
+    /// INNER JOIN. The `output_schema` is `left.output_schema() ++ right`
+    /// with right-side collisions disambiguated by `join_combined_schema`;
+    /// it's stored on the variant so `output_schema()` can return a
+    /// borrow-stable `&Schema` without allocating per call.
     Join {
         /// Left input.
         left: Box<PhysicalPlan>,
@@ -193,6 +210,9 @@ pub enum PhysicalPlan {
         join_type: JoinType,
         /// Equi-join predicate pairs `(left_expr, right_expr)`.
         on: Vec<(Expr, Expr)>,
+        /// Combined left ++ right schema with right-side collisions
+        /// renamed; see [`join_combined_schema`].
+        output_schema: Schema,
     },
 }
 
@@ -202,15 +222,11 @@ impl PhysicalPlan {
     /// For the row-shape-preserving wrappers (`Distinct`, `Limit`, `Sort`),
     /// the schema is recursively the input's. `Union` returns the first
     /// branch's schema (UNION ALL semantics; branch compatibility was
-    /// verified at logical-plan time). `Join` returns the concatenated
-    /// left ++ right schema, mirroring `LogicalPlan::schema()`.
-    ///
-    /// Returning a `&Schema` for these arms requires storing the schema
-    /// somewhere borrow-stable — a recursive descent through Boxed children
-    /// is fine because `Box<T>: Deref` and the recursive call's return
-    /// borrows the underlying allocation. For `Join` we'd need to construct
-    /// a fresh `Schema` per call, which doesn't fit the `&Schema` return
-    /// type; this is acknowledged below.
+    /// verified at logical-plan time). `Join` returns its stored
+    /// `output_schema` field — the concatenated left ++ right schema with
+    /// right-side name collisions disambiguated; the same shape
+    /// `LogicalPlan::Join::schema()` produces, computed once at lowering
+    /// time so this accessor can keep the `&Schema` borrow-stable.
     pub fn output_schema(&self) -> &Schema {
         match self {
             PhysicalPlan::Projection { output_schema, .. } => output_schema,
@@ -235,15 +251,8 @@ impl PhysicalPlan {
                     .expect("Union with zero inputs is invalid; rejected upstream")
                     .output_schema()
             }
-            // Join: schema is left ++ right concatenation. The accessor
-            // returns `&Schema`, but the concatenated value isn't stored
-            // anywhere we can borrow — so we return the left input's
-            // schema as a documented approximation. Callers that need the
-            // full join output schema should recompute it via
-            // `LogicalPlan::schema()` on the source plan. This matches the
-            // 0.1.x "execution errors before any output is materialised"
-            // contract.
-            PhysicalPlan::Join { left, .. } => left.output_schema(),
+            PhysicalPlan::Project { output_schema, .. } => output_schema,
+            PhysicalPlan::Join { output_schema, .. } => output_schema,
         }
     }
 }
@@ -953,19 +962,66 @@ fn is_scan_chain(plan: &LogicalPlan) -> bool {
 }
 
 /// Lower a `LogicalPlan` to a `PhysicalPlan`.
+/// True if a `Project { exprs, output_schema }` is a pure pass-through over
+/// `input_schema`: every output field's name and source column line up with
+/// the corresponding input field in the same position. When true, the
+/// caller can drop the Project layer entirely (it would just clone the
+/// input batch as-is). Aliased exprs only count as identity when the alias
+/// happens to match the input column's name.
+fn project_is_identity(
+    exprs: &[Expr],
+    input_schema: &Schema,
+    output_schema: &Schema,
+) -> bool {
+    if exprs.len() != input_schema.fields.len() {
+        return false;
+    }
+    if output_schema.fields.len() != input_schema.fields.len() {
+        return false;
+    }
+    for (i, e) in exprs.iter().enumerate() {
+        let in_name = input_schema.fields[i].name.as_str();
+        let out_name = output_schema.fields[i].name.as_str();
+        // Only bare `Column(name)` exprs can be no-ops: an `Alias(_, _)`
+        // wrapper changes the output column's name even when the source
+        // expression matches the input column, so it's never identity.
+        let src_name = match e {
+            Expr::Column(n) => n.as_str(),
+            _ => return false,
+        };
+        if src_name != in_name || out_name != in_name {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn lower(plan: &LogicalPlan) -> JavelinResult<PhysicalPlan> {
     match plan {
         LogicalPlan::Project { input, exprs } => {
             // Scan/Filter/Project chain → single fused kernel via `lower_projection`.
-            // Otherwise (Project over Join, Distinct, etc.) we can't fold into one
-            // kernel, so we lower the inner plan and drop the outer projection.
-            // The outer projection is semantically a no-op for wave 7's scaffold
-            // operators because execution will surface a "not yet implemented"
-            // error before any projection logic runs.
+            // Otherwise (Project over Aggregate, Join, Distinct, etc.) we
+            // can't fold into one kernel; emit a thin `Project` rename/reorder
+            // layer over the lowered inner plan so SELECT-list order and
+            // aliases survive (wave 1 fix #5: SELECT-order Project on top
+            // of Aggregate must surface aliased / reordered output names).
+            // If the Project is a structural no-op (same field names in the
+            // same order as the lowered inner plan), drop it so downstream
+            // pattern-matchers (and tests) see the bare inner plan.
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
             } else {
-                lower(input)
+                let inner = lower(input)?;
+                let output_schema = plan.schema()?;
+                if project_is_identity(exprs, inner.output_schema(), &output_schema) {
+                    Ok(inner)
+                } else {
+                    Ok(PhysicalPlan::Project {
+                        input: Box::new(inner),
+                        exprs: exprs.clone(),
+                        output_schema,
+                    })
+                }
             }
         }
         LogicalPlan::Filter { input, predicate } => {
@@ -1031,13 +1087,20 @@ pub fn lower(plan: &LogicalPlan) -> JavelinResult<PhysicalPlan> {
         } => {
             let l = lower(left)?;
             let r = lower(right)?;
-            // Schema is implicit (left ++ right); see `output_schema()`'s
-            // caveat about Join.
+            // Build the combined schema *from the physical inputs*: the
+            // logical sides may have been folded / projected differently
+            // than their physical counterparts, but for the operators
+            // currently supported below a Join the two agree. Using the
+            // physical sides keeps the stored schema in lock-step with
+            // what the executor will actually see at run time.
+            let output_schema =
+                join_combined_schema(l.output_schema(), r.output_schema());
             Ok(PhysicalPlan::Join {
                 left: Box::new(l),
                 right: Box::new(r),
                 join_type: *join_type,
                 on: on.clone(),
+                output_schema,
             })
         }
     }

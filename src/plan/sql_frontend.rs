@@ -565,8 +565,15 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<L
     // predicate references aggregate output column names by the names
     // generated in `AggregateExpr::output_name` (mirrored in
     // `aggregate_output_name` above), or group-key column names.
+    //
+    // SQL allows aggregate function *calls* inside HAVING (e.g.
+    // `HAVING SUM(price) > 100`) — the GROUP BY has already established an
+    // aggregation context. We rewrite each such call into a `Column`
+    // reference using the same name the SELECT-order Project produced for
+    // it. Non-aggregate sub-expressions go through the regular
+    // `lower_expr`, which also handles bare group-key columns.
     if let Some(having_sql) = &select.having {
-        let predicate = lower_expr(having_sql)?;
+        let predicate = lower_expr_in_having(having_sql)?;
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate,
@@ -862,6 +869,53 @@ fn contains_aggregate(e: &SqlExpr) -> JavelinResult<bool> {
         SqlExpr::UnaryOp { expr, .. } => contains_aggregate(expr),
         SqlExpr::Nested(inner) => contains_aggregate(inner),
         _ => Ok(false),
+    }
+}
+
+/// Variant of `lower_expr` used inside a HAVING clause. Aggregate function
+/// calls (anywhere in the tree) are rewritten into a bare `Column(name)`
+/// where `name` is the column the post-aggregate Project produces for that
+/// aggregate (per `aggregate_output_name`). Everything else delegates to
+/// `lower_expr`, which keeps the usual rules — bare columns become column
+/// refs, non-aggregate function calls are still rejected, etc.
+fn lower_expr_in_having(e: &SqlExpr) -> JavelinResult<Expr> {
+    if let Some(agg) = try_aggregate(e)? {
+        return Ok(Expr::Column(aggregate_output_name(&agg)));
+    }
+    match e {
+        SqlExpr::Nested(inner) => lower_expr_in_having(inner),
+        SqlExpr::BinaryOp { left, op, right } => {
+            let lop = lower_binary_op(op)?;
+            let l = lower_expr_in_having(left)?;
+            let r = lower_expr_in_having(right)?;
+            Ok(Expr::Binary {
+                op: lop,
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        }
+        SqlExpr::UnaryOp { op, expr } => match op {
+            UnaryOperator::Plus => lower_expr_in_having(expr),
+            UnaryOperator::Minus => {
+                // Re-use the aggregate-aware lowerer for the operand, then
+                // negate by hand (we can't fall through to `negate_expr`
+                // because it would route through `lower_expr` and reject
+                // any aggregate call nested under the unary minus).
+                let inner = lower_expr_in_having(expr)?;
+                Ok(Expr::Binary {
+                    op: BinaryOp::Sub,
+                    left: Box::new(Expr::Literal(Literal::Int64(0))),
+                    right: Box::new(inner),
+                })
+            }
+            other => Err(JavelinError::Sql(format!(
+                "unsupported unary operator: {other:?}"
+            ))),
+        },
+        // Anything else is identical to a scalar HAVING fragment; defer to
+        // the normal lowerer (which handles Identifier, Value, etc., and
+        // still rejects bare non-aggregate Function calls).
+        _ => lower_expr(e),
     }
 }
 
