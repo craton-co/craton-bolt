@@ -56,10 +56,11 @@ pub fn execute_aggregate(
 ) -> JavelinResult<RecordBatch> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
-        PhysicalPlan::Projection { .. } => {
-            return Err(JavelinError::Other(
-                "execute_aggregate: expected Aggregate plan, got Projection".into(),
-            ))
+        other => {
+            return Err(JavelinError::Other(format!(
+                "execute_aggregate: expected Aggregate plan, got {:?}",
+                std::mem::discriminant(other)
+            )))
         }
     };
 

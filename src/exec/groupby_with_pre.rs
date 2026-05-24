@@ -103,10 +103,11 @@ pub fn execute_groupby_with_pre(
     // -- 1. Validate plan shape. --
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
-        PhysicalPlan::Projection { .. } => {
-            return Err(JavelinError::Other(
-                "execute_groupby_with_pre: expected Aggregate plan, got Projection".into(),
-            ))
+        other => {
+            return Err(JavelinError::Other(format!(
+                "execute_groupby_with_pre: expected Aggregate plan, got {:?}",
+                std::mem::discriminant(other)
+            )))
         }
     };
 

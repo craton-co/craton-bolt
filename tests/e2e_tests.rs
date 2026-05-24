@@ -431,7 +431,14 @@ fn integer_literal_i64_min_parses() {
         match p {
             LogicalPlan::Filter { predicate, .. } => Some(predicate),
             LogicalPlan::Project { input, .. }
-            | LogicalPlan::Aggregate { input, .. } => find_filter_predicate(input),
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. } => find_filter_predicate(input),
+            LogicalPlan::Union { inputs } => inputs.iter().find_map(find_filter_predicate),
+            LogicalPlan::Join { left, right, .. } => {
+                find_filter_predicate(left).or_else(|| find_filter_predicate(right))
+            }
             LogicalPlan::Scan { .. } => None,
         }
     }
@@ -603,4 +610,196 @@ fn e2e_large_i64_add() {
     for i in 0..n {
         assert_eq!(actual.value(i), (i as i64) + 1, "row {i}");
     }
+}
+
+// ---- Offline: wave 7 operators ---------------------------------------------
+//
+// Parse -> logical-plan shape -> physical-plan lowering for DISTINCT, LIMIT,
+// ORDER BY, HAVING, UNION. JOIN is a scaffold only — tests for it land later.
+
+#[test]
+fn distinct_wraps_project_in_logical_plan() {
+    // `SELECT DISTINCT region_id FROM sales` should parse to
+    // `Distinct { input: Project { ... } }` and lower to `PhysicalPlan::Distinct`.
+    let provider = sales_provider();
+    let plan = parse_sql("SELECT DISTINCT region_id FROM sales", &provider).expect("parse");
+    match &plan {
+        LogicalPlan::Distinct { input } => match input.as_ref() {
+            LogicalPlan::Project { exprs, .. } => {
+                assert_eq!(exprs.len(), 1, "single projected expression");
+            }
+            other => panic!("expected Project under Distinct, got {other:?}"),
+        },
+        other => panic!("expected Distinct at top, got {other:?}"),
+    }
+    let phys = lower_physical(&plan).expect("lower");
+    assert!(
+        matches!(phys, PhysicalPlan::Distinct { .. }),
+        "expected PhysicalPlan::Distinct, got {phys:?}"
+    );
+}
+
+#[test]
+fn limit_parses_to_limit_node() {
+    // Bare LIMIT: offset defaults to 0.
+    let provider = sales_provider();
+    let plan = parse_sql("SELECT region_id FROM sales LIMIT 10", &provider).expect("parse");
+    match &plan {
+        LogicalPlan::Limit { limit, offset, .. } => {
+            assert_eq!(*limit, 10, "LIMIT 10");
+            assert_eq!(*offset, 0, "no OFFSET clause -> offset 0");
+        }
+        other => panic!("expected Limit at top, got {other:?}"),
+    }
+    let phys = lower_physical(&plan).expect("lower");
+    assert!(
+        matches!(phys, PhysicalPlan::Limit { .. }),
+        "expected PhysicalPlan::Limit, got {phys:?}"
+    );
+}
+
+#[test]
+fn limit_with_offset_carries_both_values() {
+    // `LIMIT n OFFSET k` collapses into a single Limit node carrying both
+    // fields so executors don't need a separate Offset operator.
+    let provider = sales_provider();
+    let plan = parse_sql(
+        "SELECT region_id FROM sales LIMIT 5 OFFSET 3",
+        &provider,
+    )
+    .expect("parse");
+    match &plan {
+        LogicalPlan::Limit { limit, offset, .. } => {
+            assert_eq!(*limit, 5);
+            assert_eq!(*offset, 3);
+        }
+        other => panic!("expected Limit at top, got {other:?}"),
+    }
+}
+
+#[test]
+fn order_by_desc_lowers_to_sort() {
+    // ORDER BY <expr> DESC parses to `Sort { sort_exprs: [{descending: true}] }`
+    // and lowers without error.
+    let provider = sales_provider();
+    let plan = parse_sql(
+        "SELECT region_id, price FROM sales ORDER BY price DESC",
+        &provider,
+    )
+    .expect("parse");
+    match &plan {
+        LogicalPlan::Sort { sort_exprs, .. } => {
+            assert_eq!(sort_exprs.len(), 1, "one sort key");
+            assert!(sort_exprs[0].descending, "DESC sets descending=true");
+        }
+        other => panic!("expected Sort at top, got {other:?}"),
+    }
+    let phys = lower_physical(&plan).expect("lower");
+    assert!(
+        matches!(phys, PhysicalPlan::Sort { .. }),
+        "expected PhysicalPlan::Sort, got {phys:?}"
+    );
+}
+
+#[test]
+fn order_by_default_direction_is_ascending() {
+    // No direction keyword -> ASC.
+    let provider = sales_provider();
+    let plan = parse_sql(
+        "SELECT region_id FROM sales ORDER BY region_id",
+        &provider,
+    )
+    .expect("parse");
+    match &plan {
+        LogicalPlan::Sort { sort_exprs, .. } => {
+            assert_eq!(sort_exprs.len(), 1);
+            assert!(
+                !sort_exprs[0].descending,
+                "no DESC keyword must default to ASC (descending=false)"
+            );
+        }
+        other => panic!("expected Sort at top, got {other:?}"),
+    }
+}
+
+#[test]
+fn having_desugars_to_filter_over_aggregate() {
+    // HAVING wraps the (SELECT-ordered Project over Aggregate) in a Filter.
+    // Walk down from the top to confirm the Aggregate is present below.
+    let provider = agg_provider();
+    let sql =
+        "SELECT region_id, SUM(price) FROM sales GROUP BY region_id HAVING SUM(price) > 100";
+    let plan = parse_sql(sql, &provider).expect("parse");
+
+    // Top must be the HAVING Filter.
+    let inner = match &plan {
+        LogicalPlan::Filter { input, .. } => input.as_ref(),
+        other => panic!("expected Filter (HAVING) at top, got {other:?}"),
+    };
+    // Below the Filter sits the SELECT-order Project (wave 1 fix #5).
+    let proj_input = match inner {
+        LogicalPlan::Project { input, .. } => input.as_ref(),
+        other => panic!("expected Project under HAVING Filter, got {other:?}"),
+    };
+    // And under that Project is the actual Aggregate.
+    assert!(
+        matches!(proj_input, LogicalPlan::Aggregate { .. }),
+        "expected Aggregate under SELECT-order Project, got {proj_input:?}"
+    );
+
+    // Lowering should succeed end-to-end.
+    lower_physical(&plan).expect("lower HAVING plan");
+}
+
+#[test]
+fn union_all_parses_to_two_input_union() {
+    // `UNION ALL` lands directly as a `Union { inputs }` node with two
+    // branches; no Distinct wrapper.
+    let provider = sales_provider();
+    let sql = "SELECT region_id FROM sales UNION ALL SELECT region_id FROM sales";
+    let plan = parse_sql(sql, &provider).expect("parse");
+    match &plan {
+        LogicalPlan::Union { inputs } => {
+            assert_eq!(inputs.len(), 2, "two branches");
+        }
+        other => panic!("expected Union, got {other:?}"),
+    }
+    let phys = lower_physical(&plan).expect("lower");
+    assert!(
+        matches!(phys, PhysicalPlan::Union { .. }),
+        "expected PhysicalPlan::Union, got {phys:?}"
+    );
+}
+
+#[test]
+fn union_dedup_lowers_to_distinct_over_union() {
+    // Plain `UNION` (dedup) is lowered as `Distinct(Union { ... })` so the
+    // executor stack can reuse the existing Distinct path.
+    let provider = sales_provider();
+    let sql = "SELECT region_id FROM sales UNION SELECT region_id FROM sales";
+    let plan = parse_sql(sql, &provider).expect("parse");
+    match &plan {
+        LogicalPlan::Distinct { input } => {
+            assert!(
+                matches!(input.as_ref(), LogicalPlan::Union { .. }),
+                "expected Distinct(Union(..)), got Distinct({:?})",
+                input
+            );
+        }
+        other => panic!("expected Distinct at top for UNION (dedup), got {other:?}"),
+    }
+}
+
+#[test]
+fn limit_negative_rejected_at_parse() {
+    // Wave 7 contract: `LIMIT` must be a non-negative integer literal; the SQL
+    // frontend rejects negatives outright rather than coercing to 0 or wrapping.
+    let provider = sales_provider();
+    let err = parse_sql("SELECT region_id FROM sales LIMIT -1", &provider)
+        .expect_err("LIMIT -1 must be rejected");
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("limit") || msg.contains("non-negative") || msg.contains("integer"),
+        "error should mention LIMIT/non-negative/integer, got: {err}"
+    );
 }

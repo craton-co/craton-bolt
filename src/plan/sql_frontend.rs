@@ -6,14 +6,17 @@ use std::collections::HashMap;
 
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Offset, OrderByExpr, Query,
+    Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
     UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{JavelinError, JavelinResult};
-use crate::plan::logical_plan::{AggregateExpr, BinaryOp, Expr, Literal, LogicalPlan, Schema};
+use crate::plan::logical_plan::{
+    AggregateExpr, BinaryOp, Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr,
+};
 
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
 pub trait TableProvider {
@@ -78,22 +81,15 @@ pub fn parse(sql: &str, provider: &dyn TableProvider) -> JavelinResult<LogicalPl
     plan_query(&query, provider)
 }
 
-/// Lower a top-level `Query` (rejecting CTEs, ORDER BY, LIMIT, OFFSET, FETCH, locks, etc.).
+/// Lower a top-level `Query`. Supports SELECT, UNION [ALL], ORDER BY, LIMIT,
+/// and OFFSET. Rejects CTEs, FETCH, locks, EXCEPT/INTERSECT, and dialect
+/// extensions outside our subset.
 fn plan_query(query: &Query, provider: &dyn TableProvider) -> JavelinResult<LogicalPlan> {
     if query.with.is_some() {
         return Err(JavelinError::Sql("unsupported: WITH / CTEs".into()));
     }
-    if query.order_by.is_some() {
-        return Err(JavelinError::Sql("unsupported: ORDER BY".into()));
-    }
-    if query.limit.is_some() {
-        return Err(JavelinError::Sql("unsupported: LIMIT".into()));
-    }
     if !query.limit_by.is_empty() {
         return Err(JavelinError::Sql("unsupported: LIMIT BY".into()));
-    }
-    if query.offset.is_some() {
-        return Err(JavelinError::Sql("unsupported: OFFSET".into()));
     }
     if query.fetch.is_some() {
         return Err(JavelinError::Sql("unsupported: FETCH".into()));
@@ -111,33 +107,203 @@ fn plan_query(query: &Query, provider: &dyn TableProvider) -> JavelinResult<Logi
         return Err(JavelinError::Sql("unsupported: FORMAT clause".into()));
     }
 
-    let select = match query.body.as_ref() {
-        SetExpr::Select(s) => s.as_ref(),
-        SetExpr::Query(_) => {
-            return Err(JavelinError::Sql("unsupported: nested query body".into()));
-        }
-        SetExpr::SetOperation { .. } => {
-            return Err(JavelinError::Sql("unsupported: UNION/EXCEPT/INTERSECT".into()));
-        }
-        SetExpr::Values(_) => {
-            return Err(JavelinError::Sql("unsupported: VALUES".into()));
-        }
-        SetExpr::Insert(_) | SetExpr::Update(_) => {
-            return Err(JavelinError::Sql("unsupported: write statement in query body".into()));
-        }
-        SetExpr::Table(_) => {
-            return Err(JavelinError::Sql("unsupported: TABLE statement".into()));
-        }
-    };
+    // Lower the body into a base plan; UNION/UNION ALL builds a `Union` (and
+    // optionally a `Distinct` wrapper) here, so the ORDER BY / LIMIT layers
+    // below apply to the *combined* result, matching SQL semantics.
+    let mut plan = lower_set_expr(query.body.as_ref(), provider)?;
 
-    plan_select(select, provider)
+    // ORDER BY: appended *outside* the body so it sees the final schema.
+    if let Some(order_by) = &query.order_by {
+        let sort_exprs = lower_order_by(&order_by.exprs)?;
+        if !sort_exprs.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                sort_exprs,
+            };
+        }
+    }
+
+    // LIMIT [OFFSET]: fold both into a single `Limit` node so a downstream
+    // executor can implement the offset as a skip without needing a separate
+    // operator. Either clause alone is legal; OFFSET without LIMIT is
+    // represented as `Limit { limit: usize::MAX, offset }`.
+    let limit_value = match &query.limit {
+        Some(e) => Some(usize_from_literal(e, "LIMIT")?),
+        None => None,
+    };
+    let offset_value = match &query.offset {
+        Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
+        None => None,
+    };
+    if limit_value.is_some() || offset_value.is_some() {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: limit_value.unwrap_or(usize::MAX),
+            offset: offset_value.unwrap_or(0),
+        };
+    }
+
+    Ok(plan)
 }
 
-/// Lower a `Select` into Scan [→ Filter] → (Project | Aggregate).
+/// Lower a `SetExpr` (SELECT body or UNION/EXCEPT/INTERSECT node) into a
+/// `LogicalPlan`. UNION ALL becomes `Union { inputs }`; plain UNION becomes
+/// `Distinct(Union { inputs })`. EXCEPT/INTERSECT are rejected.
+fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> JavelinResult<LogicalPlan> {
+    match expr {
+        SetExpr::Select(s) => plan_select(s.as_ref(), provider),
+        SetExpr::Query(q) => plan_query(q.as_ref(), provider),
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if *op != SetOperator::Union {
+                return Err(JavelinError::Sql(format!(
+                    "unsupported set operator: {op}; only UNION / UNION ALL"
+                )));
+            }
+            // Reject the BY NAME variants (non-standard, schema-rewriting).
+            let dedup = match set_quantifier {
+                SetQuantifier::All => false,
+                SetQuantifier::Distinct | SetQuantifier::None => true,
+                SetQuantifier::ByName
+                | SetQuantifier::AllByName
+                | SetQuantifier::DistinctByName => {
+                    return Err(JavelinError::Sql(
+                        "unsupported: UNION BY NAME".into(),
+                    ));
+                }
+            };
+            // Flatten left-recursive UNION chains into a single Union node so
+            // `q1 UNION ALL q2 UNION ALL q3` becomes one 3-input Union rather
+            // than a nested binary tree. UNION (dedup) does NOT flatten across
+            // UNION ALL boundaries: their semantics differ.
+            let mut inputs: Vec<LogicalPlan> = Vec::new();
+            collect_union_branches(left, provider, dedup, &mut inputs)?;
+            collect_union_branches(right, provider, dedup, &mut inputs)?;
+            let union = LogicalPlan::Union { inputs };
+            Ok(if dedup {
+                LogicalPlan::Distinct {
+                    input: Box::new(union),
+                }
+            } else {
+                union
+            })
+        }
+        SetExpr::Values(_) => Err(JavelinError::Sql("unsupported: VALUES".into())),
+        SetExpr::Insert(_) | SetExpr::Update(_) => Err(JavelinError::Sql(
+            "unsupported: write statement in query body".into(),
+        )),
+        SetExpr::Table(_) => Err(JavelinError::Sql("unsupported: TABLE statement".into())),
+    }
+}
+
+/// Helper for `lower_set_expr`: if `expr` is itself a same-quantifier UNION,
+/// recurse to collect its operands directly into `out`; otherwise lower it
+/// as a single branch. `parent_dedup` indicates whether the enclosing UNION
+/// is a dedup variant (so we only flatten matching-quantifier children).
+fn collect_union_branches(
+    expr: &SetExpr,
+    provider: &dyn TableProvider,
+    parent_dedup: bool,
+    out: &mut Vec<LogicalPlan>,
+) -> JavelinResult<()> {
+    if let SetExpr::SetOperation {
+        op: SetOperator::Union,
+        set_quantifier,
+        left,
+        right,
+    } = expr
+    {
+        let child_dedup = match set_quantifier {
+            SetQuantifier::All => false,
+            SetQuantifier::Distinct | SetQuantifier::None => true,
+            // Non-flattening cases — fall through to a non-flat lower.
+            SetQuantifier::ByName
+            | SetQuantifier::AllByName
+            | SetQuantifier::DistinctByName => {
+                out.push(lower_set_expr(expr, provider)?);
+                return Ok(());
+            }
+        };
+        if child_dedup == parent_dedup {
+            collect_union_branches(left, provider, parent_dedup, out)?;
+            collect_union_branches(right, provider, parent_dedup, out)?;
+            return Ok(());
+        }
+    }
+    out.push(lower_set_expr(expr, provider)?);
+    Ok(())
+}
+
+/// Lower a list of `OrderByExpr` into our `SortExpr`s. The default sort
+/// direction is ASC; the default NULL placement follows SQL convention
+/// (NULLS FIRST for ASC, NULLS LAST for DESC) when the user omits it.
+fn lower_order_by(exprs: &[OrderByExpr]) -> JavelinResult<Vec<SortExpr>> {
+    let mut out = Vec::with_capacity(exprs.len());
+    for OrderByExpr {
+        expr,
+        asc,
+        nulls_first,
+        with_fill,
+    } in exprs
+    {
+        if with_fill.is_some() {
+            return Err(JavelinError::Sql(
+                "unsupported: ORDER BY ... WITH FILL".into(),
+            ));
+        }
+        let descending = match asc {
+            Some(true) | None => false,
+            Some(false) => true,
+        };
+        // Default NULL placement: NULLS FIRST for ASC, NULLS LAST for DESC.
+        let nulls_first = match nulls_first {
+            Some(b) => *b,
+            None => !descending,
+        };
+        out.push(SortExpr {
+            expr: lower_expr(expr)?,
+            descending,
+            nulls_first,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse a SQL `LIMIT` / `OFFSET` clause value into a `usize`. The clause
+/// must be a non-negative integer literal; anything else is rejected (no
+/// dynamic LIMITs, no expressions). `kind` is used for error messages.
+fn usize_from_literal(e: &SqlExpr, kind: &str) -> JavelinResult<usize> {
+    let value = match e {
+        SqlExpr::Value(Value::Number(n, _)) => n,
+        other => {
+            return Err(JavelinError::Sql(format!(
+                "{kind} must be an integer literal, got: {other}"
+            )));
+        }
+    };
+    let parsed: i64 = value.parse().map_err(|_| {
+        JavelinError::Sql(format!("{kind} value '{value}' is not a valid integer"))
+    })?;
+    if parsed < 0 {
+        return Err(JavelinError::Sql(format!(
+            "{kind} value must be non-negative, got {parsed}"
+        )));
+    }
+    usize::try_from(parsed)
+        .map_err(|_| JavelinError::Sql(format!("{kind} value {parsed} exceeds usize range")))
+}
+
+/// Lower a `Select` into Scan [→ Filter] → (Project | Aggregate), optionally
+/// wrapped in `Filter` (for HAVING) and/or `Distinct` (for SELECT DISTINCT).
+/// Supports a single INNER JOIN in FROM.
 fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<LogicalPlan> {
     reject_unsupported_select(select)?;
 
-    // FROM: exactly one table, no joins, no alias, no TVF args.
+    // FROM: exactly one base table reference. JOINs hang off `twj.joins`.
     if select.from.len() != 1 {
         return Err(JavelinError::Sql(format!(
             "expected exactly one FROM table, got {}",
@@ -145,51 +311,74 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<L
         )));
     }
     let twj = &select.from[0];
-    if !twj.joins.is_empty() {
-        return Err(JavelinError::Sql("unsupported: JOIN".into()));
-    }
-    let table_name = match &twj.relation {
-        TableFactor::Table {
-            name,
-            alias,
-            args,
-            with_hints,
-            version,
-            with_ordinality,
-            partitions,
-        } => {
-            if alias.is_some() {
-                return Err(JavelinError::Sql("unsupported: table alias".into()));
-            }
-            if args.is_some() {
-                return Err(JavelinError::Sql("unsupported: table-valued function".into()));
-            }
-            if !with_hints.is_empty() {
-                return Err(JavelinError::Sql("unsupported: WITH hints".into()));
-            }
-            if version.is_some() {
-                return Err(JavelinError::Sql("unsupported: table version".into()));
-            }
-            if *with_ordinality {
-                return Err(JavelinError::Sql("unsupported: WITH ORDINALITY".into()));
-            }
-            if !partitions.is_empty() {
-                return Err(JavelinError::Sql("unsupported: PARTITION".into()));
-            }
-            single_ident_from_object_name(name)?
-        }
-        _ => {
-            return Err(JavelinError::Sql(
-                "unsupported: only bare table references are allowed in FROM".into(),
-            ));
-        }
-    };
-    let schema = provider.schema(&table_name)?;
-    let scan_schema = schema.clone();
+
+    // Build the base Scan from the first table reference.
+    let (table_name, scan_schema) = lower_table_factor(&twj.relation, provider)?;
+    let schema = scan_schema.clone();
     let mut plan = LogicalPlan::Scan {
         table: table_name,
         projection: None,
         schema,
+    };
+
+    // JOIN handling. We support a single INNER JOIN with an equi-conjunction
+    // ON predicate; the join's right side must itself be a bare table.
+    // The wave-7 executor scaffold rejects anything more elaborate.
+    for join in &twj.joins {
+        if join.global {
+            return Err(JavelinError::Sql(
+                "unsupported: GLOBAL JOIN (ClickHouse extension)".into(),
+            ));
+        }
+        let on_expr = match &join.join_operator {
+            JoinOperator::Inner(JoinConstraint::On(e)) => e,
+            JoinOperator::Inner(JoinConstraint::Using(_)) => {
+                return Err(JavelinError::Sql(
+                    "unsupported: JOIN ... USING; rewrite as ON".into(),
+                ));
+            }
+            JoinOperator::Inner(JoinConstraint::Natural) => {
+                return Err(JavelinError::Sql("unsupported: NATURAL JOIN".into()));
+            }
+            JoinOperator::Inner(JoinConstraint::None) => {
+                return Err(JavelinError::Sql(
+                    "INNER JOIN requires an ON clause".into(),
+                ));
+            }
+            JoinOperator::CrossJoin => {
+                return Err(JavelinError::Sql(
+                    "unsupported: CROSS JOIN; rewrite with explicit ON".into(),
+                ));
+            }
+            other => {
+                return Err(JavelinError::Sql(format!(
+                    "unsupported join kind: {other:?}; only INNER JOIN is supported"
+                )));
+            }
+        };
+        let (rhs_table, rhs_schema) = lower_table_factor(&join.relation, provider)?;
+        let right_plan = LogicalPlan::Scan {
+            table: rhs_table,
+            projection: None,
+            schema: rhs_schema,
+        };
+        let on_pairs = lower_join_on(on_expr)?;
+        plan = LogicalPlan::Join {
+            left: Box::new(plan),
+            right: Box::new(right_plan),
+            join_type: JoinType::Inner,
+            on: on_pairs,
+        };
+    }
+    // After a JOIN, the namespace for WHERE / SELECT items widens to the
+    // join's output schema. The scan_schema below is still used for wildcard
+    // expansion when no JOIN is present; when a JOIN *is* present, wildcard
+    // expansion uses the join's full schema. We compute `scan_schema_for_wildcard`
+    // for the wildcard-expansion branch below.
+    let scan_schema_for_wildcard: Schema = if twj.joins.is_empty() {
+        scan_schema.clone()
+    } else {
+        plan.schema()?
     };
 
     // WHERE
@@ -226,7 +415,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<L
                 items.push((expr.clone(), Some(alias.value.clone())))
             }
             SelectItem::Wildcard(_) => {
-                for f in &scan_schema.fields {
+                for f in &scan_schema_for_wildcard.fields {
                     items.push((SqlExpr::Identifier(Ident::new(f.name.clone())), None));
                 }
             }
@@ -352,6 +541,11 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<L
         };
     } else {
         // Scalar projection mode.
+        if select.having.is_some() {
+            return Err(JavelinError::Sql(
+                "HAVING requires GROUP BY or aggregate functions in SELECT".into(),
+            ));
+        }
         let mut exprs = Vec::with_capacity(items.len());
         for (sql_expr, alias) in items {
             let lowered = lower_expr(&sql_expr)?;
@@ -367,15 +561,144 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> JavelinResult<L
         };
     }
 
+    // HAVING: wrap the (SELECT-ordered) projection with a Filter. The
+    // predicate references aggregate output column names by the names
+    // generated in `AggregateExpr::output_name` (mirrored in
+    // `aggregate_output_name` above), or group-key column names.
+    if let Some(having_sql) = &select.having {
+        let predicate = lower_expr(having_sql)?;
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
+
+    // SELECT DISTINCT: dedup the *output* rows (after projection, HAVING).
+    if matches!(select.distinct, Some(Distinct::Distinct)) {
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+    }
+
     Ok(plan)
 }
 
-/// Reject SELECT-level features outside our supported subset.
+/// Lower a single `TableFactor` into `(table_name, schema)`. Only bare
+/// table references are accepted (no aliases, TVFs, version, hints, etc.).
+fn lower_table_factor(
+    tf: &TableFactor,
+    provider: &dyn TableProvider,
+) -> JavelinResult<(String, Schema)> {
+    match tf {
+        TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+        } => {
+            if alias.is_some() {
+                return Err(JavelinError::Sql("unsupported: table alias".into()));
+            }
+            if args.is_some() {
+                return Err(JavelinError::Sql("unsupported: table-valued function".into()));
+            }
+            if !with_hints.is_empty() {
+                return Err(JavelinError::Sql("unsupported: WITH hints".into()));
+            }
+            if version.is_some() {
+                return Err(JavelinError::Sql("unsupported: table version".into()));
+            }
+            if *with_ordinality {
+                return Err(JavelinError::Sql("unsupported: WITH ORDINALITY".into()));
+            }
+            if !partitions.is_empty() {
+                return Err(JavelinError::Sql("unsupported: PARTITION".into()));
+            }
+            let table_name = single_ident_from_object_name(name)?;
+            let schema = provider.schema(&table_name)?;
+            Ok((table_name, schema))
+        }
+        _ => Err(JavelinError::Sql(
+            "unsupported: only bare table references are allowed in FROM".into(),
+        )),
+    }
+}
+
+/// Look up a join predicate expression as a conjunction of `left.col = right.col`
+/// equalities. Reject non-equi joins and non-conjunctive forms with a clear
+/// message; the executor scaffold only handles equi joins.
+fn lower_join_on(e: &SqlExpr) -> JavelinResult<Vec<(Expr, Expr)>> {
+    let mut out = Vec::new();
+    collect_join_eq(e, &mut out)?;
+    if out.is_empty() {
+        return Err(JavelinError::Sql(
+            "JOIN ON clause must contain at least one equality predicate".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Walk `e` flattening `AND` nodes; each leaf must be `<expr> = <expr>`.
+fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>) -> JavelinResult<()> {
+    match e {
+        SqlExpr::Nested(inner) => collect_join_eq(inner, out),
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_join_eq(left, out)?;
+            collect_join_eq(right, out)
+        }
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let l = lower_join_side(left)?;
+            let r = lower_join_side(right)?;
+            out.push((l, r));
+            Ok(())
+        }
+        other => Err(JavelinError::Sql(format!(
+            "non-equi JOIN not yet supported (ON clause must be a conjunction of `a = b` predicates; got {other})"
+        ))),
+    }
+}
+
+/// Lower one side of an equi-join predicate. We accept either a bare
+/// identifier or a `table.column` qualified identifier so users can
+/// disambiguate same-named columns; both lower to a plain `Column` ref
+/// (qualified column lookups beyond bare-name matching aren't supported
+/// in 0.1.x but the parser accepts them so error messages stay friendly).
+fn lower_join_side(e: &SqlExpr) -> JavelinResult<Expr> {
+    match e {
+        SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
+        SqlExpr::CompoundIdentifier(parts) => {
+            // `table.col` — keep only the trailing column name. Cross-side
+            // matching is the executor's job.
+            let last = parts
+                .last()
+                .ok_or_else(|| JavelinError::Sql("empty compound identifier in JOIN ON".into()))?;
+            Ok(Expr::Column(last.value.clone()))
+        }
+        other => Err(JavelinError::Sql(format!(
+            "non-equi JOIN not yet supported (JOIN ON sides must be column references; got {other})"
+        ))),
+    }
+}
+
+/// Reject SELECT-level features outside our supported subset. `DISTINCT` and
+/// `HAVING` are *not* rejected here — both are recognised by `plan_select`
+/// and lowered into the plan.
 fn reject_unsupported_select(select: &Select) -> JavelinResult<()> {
-    match &select.distinct {
-        None => {}
-        Some(Distinct::Distinct) => return Err(JavelinError::Sql("unsupported: SELECT DISTINCT".into())),
-        Some(Distinct::On(_)) => return Err(JavelinError::Sql("unsupported: DISTINCT ON".into())),
+    // DISTINCT ON (...) is a Postgres extension we don't support; plain
+    // SELECT DISTINCT is handled by `plan_select`.
+    if let Some(Distinct::On(_)) = &select.distinct {
+        return Err(JavelinError::Sql("unsupported: DISTINCT ON".into()));
     }
     if select.top.is_some() {
         return Err(JavelinError::Sql("unsupported: TOP".into()));
@@ -397,9 +720,6 @@ fn reject_unsupported_select(select: &Select) -> JavelinResult<()> {
     }
     if !select.sort_by.is_empty() {
         return Err(JavelinError::Sql("unsupported: SORT BY".into()));
-    }
-    if select.having.is_some() {
-        return Err(JavelinError::Sql("unsupported: HAVING".into()));
     }
     if !select.named_window.is_empty() {
         return Err(JavelinError::Sql("unsupported: WINDOW".into()));
@@ -736,4 +1056,258 @@ fn strip_alias(e: &Expr) -> &Expr {
         cur = inner;
     }
     cur
+}
+
+#[cfg(test)]
+mod wave7_tests {
+    //! Parse-and-lower smoke tests for wave 7 features (DISTINCT, LIMIT,
+    //! ORDER BY, HAVING, UNION [ALL], INNER JOIN). These tests check only
+    //! the logical / physical plan *shape* — actual execution is covered by
+    //! the e2e suite and is out of scope here.
+    use super::*;
+    use crate::plan::logical_plan::DataType;
+    use crate::plan::physical_plan::{lower, PhysicalPlan};
+
+    /// Minimal two-table fixture with stable column dtypes for plan tests.
+    fn provider() -> MemTableProvider {
+        use crate::plan::logical_plan::Field;
+        let t1 = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int64, false),
+        ]);
+        let t2 = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("c", DataType::Float64, false),
+        ]);
+        MemTableProvider::new()
+            .with_table("t1", t1)
+            .with_table("t2", t2)
+    }
+
+    fn lp(sql: &str) -> LogicalPlan {
+        parse(sql, &provider()).unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
+    }
+
+    fn pp(sql: &str) -> PhysicalPlan {
+        let logical = lp(sql);
+        lower(&logical).unwrap_or_else(|e| panic!("lower failed for {sql:?}: {e}"))
+    }
+
+    #[test]
+    fn select_distinct_wraps_in_distinct() {
+        let plan = lp("SELECT DISTINCT a FROM t1");
+        assert!(
+            matches!(plan, LogicalPlan::Distinct { .. }),
+            "expected Distinct at top, got {plan:?}"
+        );
+        let phys = lower(&plan).unwrap();
+        assert!(matches!(phys, PhysicalPlan::Distinct { .. }));
+    }
+
+    #[test]
+    fn limit_offset_parses() {
+        let phys = pp("SELECT a FROM t1 LIMIT 10 OFFSET 5");
+        match phys {
+            PhysicalPlan::Limit {
+                limit,
+                offset,
+                ref input,
+                ..
+            } => {
+                assert_eq!(limit, 10);
+                assert_eq!(offset, 5);
+                assert!(matches!(**input, PhysicalPlan::Projection { .. }));
+            }
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offset_without_limit_uses_usize_max() {
+        let phys = pp("SELECT a FROM t1 OFFSET 3");
+        match phys {
+            PhysicalPlan::Limit { limit, offset, .. } => {
+                assert_eq!(limit, usize::MAX);
+                assert_eq!(offset, 3);
+            }
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_default_direction_and_nulls() {
+        let plan = lp("SELECT a FROM t1 ORDER BY a");
+        match plan {
+            LogicalPlan::Sort { sort_exprs, .. } => {
+                assert_eq!(sort_exprs.len(), 1);
+                assert!(!sort_exprs[0].descending);
+                assert!(sort_exprs[0].nulls_first, "ASC defaults to NULLS FIRST");
+            }
+            other => panic!("expected Sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_desc_defaults_to_nulls_last() {
+        let plan = lp("SELECT a FROM t1 ORDER BY a DESC");
+        match plan {
+            LogicalPlan::Sort { sort_exprs, .. } => {
+                assert!(sort_exprs[0].descending);
+                assert!(!sort_exprs[0].nulls_first, "DESC defaults to NULLS LAST");
+            }
+            other => panic!("expected Sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_with_explicit_nulls_first() {
+        let plan = lp("SELECT a FROM t1 ORDER BY a DESC NULLS FIRST");
+        match plan {
+            LogicalPlan::Sort { sort_exprs, .. } => {
+                assert!(sort_exprs[0].descending);
+                assert!(sort_exprs[0].nulls_first);
+            }
+            other => panic!("expected Sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_then_limit_layering() {
+        // ORDER BY must sit *below* LIMIT in the tree (SQL semantics: sort
+        // first, then truncate). The lowered physical plan mirrors this.
+        let phys = pp("SELECT a FROM t1 ORDER BY a DESC LIMIT 5");
+        match phys {
+            PhysicalPlan::Limit { input, .. } => {
+                assert!(matches!(*input, PhysicalPlan::Sort { .. }));
+            }
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn having_wraps_aggregate_in_filter() {
+        let plan = lp("SELECT a, COUNT(b) FROM t1 GROUP BY a HAVING COUNT(b) > 1");
+        // After the wave-1 SELECT-order Project on the aggregate, HAVING
+        // appears as the outermost Filter.
+        match plan {
+            LogicalPlan::Filter { input, .. } => {
+                // Below the Filter is the Project that fixes SELECT column order.
+                assert!(
+                    matches!(*input, LogicalPlan::Project { .. }),
+                    "expected Project under HAVING Filter, got {input:?}"
+                );
+            }
+            other => panic!("expected Filter (HAVING) at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn having_rejected_without_group_by_or_aggregate() {
+        let err = parse("SELECT a FROM t1 HAVING a > 1", &provider())
+            .expect_err("HAVING without aggregate must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("having"),
+            "error message should mention HAVING, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn union_all_builds_union() {
+        let plan = lp("SELECT a FROM t1 UNION ALL SELECT a FROM t2");
+        match plan {
+            LogicalPlan::Union { inputs } => {
+                assert_eq!(inputs.len(), 2);
+            }
+            other => panic!("expected Union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn union_dedup_wraps_union_in_distinct() {
+        let plan = lp("SELECT a FROM t1 UNION SELECT a FROM t2");
+        match plan {
+            LogicalPlan::Distinct { input } => {
+                assert!(
+                    matches!(*input, LogicalPlan::Union { .. }),
+                    "expected Distinct(Union), got Distinct({input:?})"
+                );
+            }
+            other => panic!("expected Distinct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn union_all_is_flattened() {
+        // Three-way UNION ALL should land as a single 3-input Union, not a
+        // nested 2-tree, so executors can stream branches without recursion.
+        let plan = lp("SELECT a FROM t1 UNION ALL SELECT a FROM t1 UNION ALL SELECT a FROM t2");
+        match plan {
+            LogicalPlan::Union { inputs } => {
+                assert_eq!(inputs.len(), 3, "expected flattened 3-input Union");
+            }
+            other => panic!("expected Union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inner_join_parses_to_join_node() {
+        let plan = lp("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.a");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Join {
+                    join_type,
+                    on,
+                    ..
+                } => {
+                    assert_eq!(join_type, JoinType::Inner);
+                    assert_eq!(on.len(), 1);
+                }
+                other => panic!("expected Join under Project, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inner_join_conjunctive_on_collects_multiple_pairs() {
+        let plan = lp("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.a AND t1.b = t2.c");
+        let join = match plan {
+            LogicalPlan::Project { input, .. } => *input,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        match join {
+            LogicalPlan::Join { on, .. } => assert_eq!(on.len(), 2),
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_equi_join_rejected_with_clear_message() {
+        let err = parse(
+            "SELECT * FROM t1 INNER JOIN t2 ON t1.a > t2.a",
+            &provider(),
+        )
+        .expect_err("non-equi JOIN must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-equi JOIN not yet supported"),
+            "error message should mention non-equi JOIN, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn join_lowers_to_physical_join() {
+        // `SELECT * FROM t1 INNER JOIN t2 ON ...` parses to
+        // `Project { input: Join }`; our lowerer detects that the source
+        // chain isn't a Scan-only chain and falls through to lowering the
+        // inner Join directly. The wave-7 executor surfaces the actual
+        // "JOIN not yet implemented" error at run time; the planner just
+        // needs to produce a PhysicalPlan::Join here.
+        let phys = pp("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.a");
+        assert!(
+            matches!(phys, PhysicalPlan::Join { .. }),
+            "expected PhysicalPlan::Join, got {phys:?}"
+        );
+    }
 }

@@ -18,6 +18,17 @@ pub mod string_ops_extended;
 pub mod extended_agg;
 pub mod expr_agg;
 pub mod groupby_valid;
+// Wave-7 executor scaffolds — owned by agents 3-6.
+// Marked #[doc(hidden)] to match the wave-3 sweep: these are internal dispatch
+// surfaces, not part of the public 0.2 API.
+#[doc(hidden)]
+pub mod distinct;
+#[doc(hidden)]
+pub mod sort;
+#[doc(hidden)]
+pub mod limit;
+#[doc(hidden)]
+pub mod join;
 
 #[doc(hidden)]
 pub use launch::{launch_1d, CudaStream, KernelArgs};

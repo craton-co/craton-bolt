@@ -308,28 +308,35 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
     .map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
 
-    // Unrolled tree reduction in shared memory. For BLOCK_SIZE=256 this is
-    // strides 128, 64, 32, 16, 8, 4, 2, 1.
+    // Two-phase tree reduction: bar.sync for strides > 32, warp shuffle for
+    // strides <= 32.
     //
-    // TODO(perf): warp shuffle reduction for strides 16..=1.
-    //   Strides {16, 8, 4, 2, 1} operate entirely within warp 0 (tid < stride
-    //   <= 16 < 32), so the per-stride bar.sync + shared ld/st can be replaced
-    //   with `shfl.sync.down.b32`/`b64` against an intra-warp value held in
-    //   registers. Estimated savings: 5 bar.syncs + 10 shared mem accesses per
-    //   block. Skipped here because:
-    //     (a) 64-bit accumulator types (Int64/Float64) require splitting the
-    //         value into two b32 halves, shuffling each, and recombining —
-    //         shfl.sync has no .b64 form on sm_70; and
-    //     (b) the existing tree reduction's `tid < stride` short-circuit must
-    //         be replaced with a `tid < 32`-gated warp-uniform code path that
-    //         keeps the membermask (0xffffffff) live — meaning all 32 lanes of
-    //         warp 0 must participate even if they're not "active" in the old
-    //         tree. That's a structural rewrite, not a textual swap.
-    //   Implementing both paths is >30 lines of new PTX emission. Deferred
-    //   pending a benchmark showing the reduction is hot enough to justify it.
-    let mut stride = (BLOCK_SIZE / 2) as i32;
+    // Phase 1 (inter-warp, strides 128, 64, 32): standard shared-memory tree
+    //   with `bar.sync` between halvings and a `tid < stride` short-circuit.
+    //   These strides span multiple warps so a block-wide barrier is required.
+    //
+    // Phase 2 (intra-warp, strides 16, 8, 4, 2, 1): warp 0 only. Each lane
+    //   loads its own value from shared memory into a register *once*, then we
+    //   use `shfl.sync.down` (membermask 0xffffffff, all 32 lanes participate)
+    //   to halve down to lane 0 with no further bar.sync or shared traffic.
+    //
+    //   For 32-bit accumulators (Int32/Float32) we shuffle directly with
+    //   `shfl.sync.down.b32` (going via a `%r` scratch register and `mov.b32`
+    //   for float dtypes since shfl operates on `.b32`).
+    //
+    //   For 64-bit accumulators (Int64/Float64) sm_70 has no native
+    //   `shfl.sync.down.b64`, so we split the value into two `.b32` halves with
+    //   `mov.b64 {lo,hi}, %val;`, shuffle each half, recombine with
+    //   `mov.b64 %tmp, {lo,hi};`, and apply the combine op on the 64-bit
+    //   recombined value.
+    //
+    //   Phase 2 saves 5 bar.syncs and 10 shared loads/stores per block versus
+    //   the all-bar.sync tree.
+    //
+    // Strides 128, 64, 32: inter-warp tree reduction (phase 1).
+    let phase1_strides: [i32; 3] = [128, 64, 32];
     let mut step = 0usize;
-    while stride > 0 {
+    for &stride in &phase1_strides {
         let neighbor_pred = format!("%p{}", 1 + (step % 4));
         let stride_bytes = stride as usize * elem_bytes;
         writeln!(
@@ -382,11 +389,111 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
         .map_err(write_err)?;
         writeln!(ptx, "SKIP_ADD_{step}:", step = step).map_err(write_err)?;
         writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-        stride /= 2;
         step += 1;
     }
 
-    // Thread 0 of each block writes sdata[0] to output[blockIdx.x].
+    // Strides 16, 8, 4, 2, 1: intra-warp shuffle reduction (phase 2).
+    //
+    // Gate on tid < 32: only warp 0 participates, but all 32 lanes of warp 0
+    // must stay live for `shfl.sync` (membermask 0xffffffff). Threads with
+    // tid >= 32 jump straight to DONE — they have no value to contribute and
+    // sdata[0..32] already holds warp 0's working set from phase 1.
+    writeln!(ptx, "\tsetp.ge.s32 %p6, %r2, 32;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra DONE;").map_err(write_err)?;
+
+    // Load this lane's value (sdata[tid]) into a register once. After this
+    // point the warp-0 reduction is register-only.
+    writeln!(
+        ptx,
+        "\tld.shared.{ld} %{rc}5, [%rd5];",
+        ld = acc_load_suffix,
+        rc = acc_reg_class
+    )
+    .map_err(write_err)?;
+
+    for &stride in &[16i32, 8, 4, 2, 1] {
+        match acc_dtype {
+            DataType::Int32 => {
+                // For Int32 the acc register class is "r" (b32), so %r5 is
+                // already a valid `shfl.sync.down.b32` source — no mov needed.
+                // Working value lives in %r5; shfl scratch is %r6.
+                writeln!(
+                    ptx,
+                    "\tshfl.sync.down.b32 %r6, %r5, {stride}, 0x1f, 0xffffffff;",
+                    stride = stride
+                )
+                .map_err(write_err)?;
+                writeln!(ptx, "\t{combine} %r5, %r5, %r6;", combine = combine)
+                    .map_err(write_err)?;
+            }
+            DataType::Float32 => {
+                // Working value lives in %f5; bridge through %r6/%r7 for shfl.
+                writeln!(ptx, "\tmov.b32 %r6, %f5;").map_err(write_err)?;
+                writeln!(
+                    ptx,
+                    "\tshfl.sync.down.b32 %r7, %r6, {stride}, 0x1f, 0xffffffff;",
+                    stride = stride
+                )
+                .map_err(write_err)?;
+                writeln!(ptx, "\tmov.b32 %f6, %r7;").map_err(write_err)?;
+                writeln!(ptx, "\t{combine} %f5, %f5, %f6;", combine = combine)
+                    .map_err(write_err)?;
+            }
+            DataType::Int64 => {
+                // Split %rl5 into two b32 halves, shuffle each, recombine.
+                writeln!(ptx, "\tmov.b64 {{%r8, %r9}}, %rl5;").map_err(write_err)?;
+                writeln!(
+                    ptx,
+                    "\tshfl.sync.down.b32 %r10, %r8, {stride}, 0x1f, 0xffffffff;",
+                    stride = stride
+                )
+                .map_err(write_err)?;
+                writeln!(
+                    ptx,
+                    "\tshfl.sync.down.b32 %r11, %r9, {stride}, 0x1f, 0xffffffff;",
+                    stride = stride
+                )
+                .map_err(write_err)?;
+                writeln!(ptx, "\tmov.b64 %rl6, {{%r10, %r11}};").map_err(write_err)?;
+                writeln!(ptx, "\t{combine} %rl5, %rl5, %rl6;", combine = combine)
+                    .map_err(write_err)?;
+            }
+            DataType::Float64 => {
+                // Split %fd5 into two b32 halves, shuffle each, recombine.
+                writeln!(ptx, "\tmov.b64 {{%r8, %r9}}, %fd5;").map_err(write_err)?;
+                writeln!(
+                    ptx,
+                    "\tshfl.sync.down.b32 %r10, %r8, {stride}, 0x1f, 0xffffffff;",
+                    stride = stride
+                )
+                .map_err(write_err)?;
+                writeln!(
+                    ptx,
+                    "\tshfl.sync.down.b32 %r11, %r9, {stride}, 0x1f, 0xffffffff;",
+                    stride = stride
+                )
+                .map_err(write_err)?;
+                writeln!(ptx, "\tmov.b64 %fd6, {{%r10, %r11}};").map_err(write_err)?;
+                writeln!(ptx, "\t{combine} %fd5, %fd5, %fd6;", combine = combine)
+                    .map_err(write_err)?;
+            }
+            DataType::Bool | DataType::Utf8 => {
+                // ptx_type_info already rejects these dtypes above, so this
+                // arm is unreachable in practice. Keep the match exhaustive.
+                return Err(JavelinError::Type(format!(
+                    "agg_kernels: warp-shuffle reduction over dtype {:?} is not supported",
+                    acc_dtype
+                )));
+            }
+        }
+    }
+
+    // Only lane 0 of warp 0 proceeds to write the block's reduced value to
+    // global output. (All other threads with tid != 0 either branched to DONE
+    // at the start of phase 2 (tid >= 32) or are warp-0 lanes != 0 whose
+    // shuffle results are discarded — only lane 0 holds the fully reduced
+    // value.) The %r5/%f5/%rl5/%fd5 register *is* the final reduction; write
+    // it straight to global memory without round-tripping through sdata[0].
     writeln!(ptx, "\tsetp.ne.s32 %p5, %r2, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra DONE;").map_err(write_err)?;
     writeln!(
@@ -405,14 +512,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
     writeln!(ptx, "\tadd.s64 %rd10, %rd8, %rd9;").map_err(write_err)?;
     writeln!(
         ptx,
-        "\tld.shared.{ld} %{rc}4, [%rd4];",
-        ld = acc_load_suffix,
-        rc = acc_reg_class
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tst.global.{st} [%rd10], %{rc}4;",
+        "\tst.global.{st} [%rd10], %{rc}5;",
         st = acc_store_suffix,
         rc = acc_reg_class
     )

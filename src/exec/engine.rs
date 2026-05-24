@@ -78,8 +78,13 @@ fn debug_sync_check() -> crate::error::JavelinResult<()> {
 /// `GpuVec`s — those must be freed BEFORE `_ctx` tears down the CUDA context.
 /// Rust drops fields in declaration order, so `_ctx` sits last.
 pub struct Engine {
-    /// Registered tables, keyed by name.
-    tables: HashMap<String, RecordBatch>,
+    /// Registered tables, keyed by name. A single table may comprise multiple
+    /// batches (wave-7 multi-batch support): the engine concatenates them via
+    /// `arrow::compute::concat_batches` at query time. This is a 0.2-era
+    /// simplification — a streaming, per-batch query plan is a 0.3 goal — so
+    /// large multi-batch tables pay a full materialisation cost on every
+    /// `sql()` call. Keep the per-table batch count modest until then.
+    tables: HashMap<String, Vec<RecordBatch>>,
     /// Name → Schema provider, kept in sync with `tables`. The schema is
     /// EXTENDED with `__idx_<col>` Int32 columns for every registered Utf8
     /// column so the SQL frontend resolves rewriter-produced column refs.
@@ -131,7 +136,11 @@ impl Engine {
         })
     }
 
-    /// Register a host-side `RecordBatch` under `name`. Replaces any existing entry.
+    /// Register a host-side `RecordBatch` under `name` as a single-batch table.
+    /// Errors if a table with that name already exists; use
+    /// [`Engine::register_batch`] to append additional batches to an existing
+    /// table (wave-7 multi-batch entry).
+    ///
     /// Also builds Utf8 dictionaries for the table and extends the engine-side
     /// schema with `__idx_<col>` Int32 columns so the rewriter's emitted column
     /// references resolve at parse time.
@@ -141,14 +150,85 @@ impl Engine {
         batch: RecordBatch,
     ) -> JavelinResult<()> {
         let name = name.into();
+        if self.tables.contains_key(&name) {
+            return Err(JavelinError::Plan(format!(
+                "table '{name}' is already registered — use register_batch to append \
+                 additional batches to an existing table"
+            )));
+        }
         // Build Utf8 dictionaries first (may fail — surface before we mutate
         // tables/provider).
         self.dict_registry.register_table(name.clone(), &batch)?;
         let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
         let extended = self.dict_registry.extended_schema(&name, &base_schema);
         self.provider.register(name.clone(), extended);
-        self.tables.insert(name, batch);
+        self.tables.insert(name, vec![batch]);
         Ok(())
+    }
+
+    /// Append `batch` to the table named `name`, creating it if absent.
+    /// Multi-batch tables are concatenated into a single `RecordBatch` at
+    /// query time via `arrow::compute::concat_batches` — see the field doc on
+    /// `tables` for the perf caveat.
+    ///
+    /// Subsequent batches MUST share the schema of the first batch; mismatched
+    /// schemas surface a `Plan` error here rather than at query time. The
+    /// dictionary registry is built from the first batch only — appended
+    /// batches with unseen Utf8 values are still queryable, but the string-
+    /// literal rewriter can only match values present in batch 0. (Refreshing
+    /// dictionaries per append is a 0.3 goal.)
+    pub fn register_batch(
+        &mut self,
+        name: &str,
+        batch: RecordBatch,
+    ) -> JavelinResult<()> {
+        if let Some(existing) = self.tables.get_mut(name) {
+            // Schema-check against batch 0 — concat_batches would fail at query
+            // time anyway, but surface it eagerly at registration time.
+            if let Some(first) = existing.first() {
+                if first.schema() != batch.schema() {
+                    return Err(JavelinError::Plan(format!(
+                        "register_batch: schema mismatch for table '{name}' — \
+                         expected {:?}, got {:?}",
+                        first.schema(),
+                        batch.schema()
+                    )));
+                }
+            }
+            existing.push(batch);
+            Ok(())
+        } else {
+            // First batch for a brand-new table: defer to register_table so the
+            // dictionary + provider wiring happens exactly once.
+            self.register_table(name.to_string(), batch)
+        }
+    }
+
+    /// Materialise the concatenated `RecordBatch` for a registered table.
+    ///
+    /// Fast-path: zero batches errors, one batch is cloned cheaply (Arrow
+    /// arrays are Arc-backed). Two or more batches go through
+    /// `arrow::compute::concat_batches`, which copies every column — the
+    /// 0.2 perf cost the field doc on `tables` warns about.
+    fn materialize_table(&self, name: &str) -> JavelinResult<RecordBatch> {
+        let batches = self.tables.get(name).ok_or_else(|| {
+            JavelinError::Plan(format!("table '{name}' is not registered with the engine"))
+        })?;
+        match batches.len() {
+            0 => Err(JavelinError::Plan(format!(
+                "table '{name}' is registered but contains zero batches"
+            ))),
+            1 => Ok(batches[0].clone()),
+            _ => {
+                let schema = batches[0].schema();
+                arrow::compute::concat_batches(&schema, batches.iter()).map_err(|e| {
+                    JavelinError::Other(format!(
+                        "failed to concatenate {} batches for table '{name}': {e}",
+                        batches.len()
+                    ))
+                })
+            }
+        }
     }
 
     /// Compile and execute a SQL query string.
@@ -174,23 +254,79 @@ impl Engine {
                 pre,
                 aggregate,
             } => {
-                let batch = self.tables.get(table).ok_or_else(|| {
-                    JavelinError::Plan(format!(
-                        "table '{table}' is not registered with the engine"
-                    ))
-                })?;
+                let batch = self.materialize_table(table)?;
                 let out = match (!aggregate.group_by.is_empty(), pre.is_some()) {
                     (true, true) => {
-                        crate::exec::groupby_with_pre::execute_groupby_with_pre(phys, batch)?
+                        crate::exec::groupby_with_pre::execute_groupby_with_pre(phys, &batch)?
                     }
-                    (true, false) => crate::exec::groupby::execute_groupby(phys, batch)?,
+                    (true, false) => crate::exec::groupby::execute_groupby(phys, &batch)?,
                     (false, true) => {
-                        crate::exec::agg_with_pre::execute_aggregate_with_pre(phys, batch)?
+                        crate::exec::agg_with_pre::execute_aggregate_with_pre(phys, &batch)?
                     }
-                    (false, false) => crate::exec::aggregate::execute_aggregate(phys, batch)?,
+                    (false, false) => crate::exec::aggregate::execute_aggregate(phys, &batch)?,
                 };
                 Ok(QueryHandle { batch: out })
             }
+            // ----- wave-7 dispatch -----
+            //
+            // The PhysicalPlan variants below are added by agent 1 in the
+            // same wave. If a variant doesn't exist yet at build time, the
+            // match arm will surface a clear compile error pointing at the
+            // missing variant — agent 1 then adds it and the build heals.
+            //
+            // The executor signatures assumed here mirror the wave-7 spec:
+            //   execute_distinct(QueryHandle) -> JavelinResult<QueryHandle>
+            //   execute_limit  (QueryHandle, usize, Option<usize>) -> ...
+            //   execute_sort   (QueryHandle, &[SortExpr]) -> ...
+            //   execute_join   (left, right, join_type, on, &Engine) -> ...
+            // Agents 3-6 match these.
+            PhysicalPlan::Distinct { input } => {
+                let h = self.execute(input)?;
+                crate::exec::distinct::execute_distinct(h)
+            }
+            PhysicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                let h = self.execute(input)?;
+                crate::exec::limit::execute_limit(h, *limit, *offset)
+            }
+            PhysicalPlan::Sort { input, sort_exprs } => {
+                let h = self.execute(input)?;
+                crate::exec::sort::execute_sort(h, sort_exprs)
+            }
+            PhysicalPlan::Union { inputs } => {
+                // UNION ALL: execute each input, concat the result batches.
+                // (Deduplication would happen via a Distinct wrapping the Union
+                // in the logical plan — UNION ALL itself is pure concat.)
+                if inputs.is_empty() {
+                    return Err(JavelinError::Plan(
+                        "Union with zero inputs is not executable".into(),
+                    ));
+                }
+                let mut handles: Vec<QueryHandle> = Vec::with_capacity(inputs.len());
+                for inp in inputs {
+                    handles.push(self.execute(inp)?);
+                }
+                let schema = handles[0].batch.schema();
+                let batches: Vec<RecordBatch> =
+                    handles.into_iter().map(|h| h.batch).collect();
+                let merged = arrow::compute::concat_batches(&schema, batches.iter())
+                    .map_err(|e| {
+                        JavelinError::Other(format!(
+                            "failed to concatenate {} UNION ALL inputs: {e}",
+                            batches.len()
+                        ))
+                    })?;
+                Ok(QueryHandle { batch: merged })
+            }
+            PhysicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+            } => crate::exec::join::execute_join(left, right, join_type, on, self),
         }
     }
 
@@ -201,9 +337,10 @@ impl Engine {
         kernel: &KernelSpec,
         output_schema: &Schema,
     ) -> JavelinResult<QueryHandle> {
-        let batch = self.tables.get(table).ok_or_else(|| {
-            JavelinError::Plan(format!("table '{table}' is not registered with the engine"))
-        })?;
+        // Materialise — for a single-batch table this is a cheap clone of
+        // Arc-backed columns; for multi-batch tables it pays a full
+        // concat_batches copy (see field doc on `tables`).
+        let batch = self.materialize_table(table)?;
         let n_rows = batch.num_rows();
 
         // 1. Upload inputs. Keep the owned GpuVecs in `input_cols` so they outlive the launch.
@@ -416,6 +553,21 @@ impl QueryHandle {
     /// Consume the handle and return the owned record batch.
     pub fn into_record_batch(self) -> RecordBatch {
         self.batch
+    }
+
+    /// Wrap a `RecordBatch` produced by an executor into a `QueryHandle`.
+    ///
+    /// Internal hook for the wave-7 executor chain (Distinct / Limit / Sort /
+    /// Union / Join): the top-level `Engine::execute` runs the child plan,
+    /// hands the resulting `QueryHandle` to an `exec::*::execute_*` helper,
+    /// and the helper rewraps its output with this constructor.
+    ///
+    /// Marked `#[doc(hidden)]` and `pub(crate)`: this is not part of the
+    /// public 0.2 API; downstream consumers should keep going through
+    /// `Engine::sql` / `Engine::execute`.
+    #[doc(hidden)]
+    pub(crate) fn from_record_batch(batch: RecordBatch) -> Self {
+        Self { batch }
     }
 
     /// Number of rows in the result.

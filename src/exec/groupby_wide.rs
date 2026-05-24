@@ -84,10 +84,11 @@ pub fn execute_groupby_wide(
     // 1. Validate the plan shape.
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
-        PhysicalPlan::Projection { .. } => {
-            return Err(JavelinError::Other(
-                "execute_groupby_wide: expected Aggregate plan, got Projection".into(),
-            ))
+        other => {
+            return Err(JavelinError::Other(format!(
+                "execute_groupby_wide: expected Aggregate plan, got {:?}",
+                std::mem::discriminant(other)
+            )))
         }
     };
     if pre.is_some() {

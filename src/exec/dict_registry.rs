@@ -253,7 +253,19 @@ fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
             LogicalPlan::Scan { table, .. } => out.push(table.clone()),
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
-            | LogicalPlan::Aggregate { input, .. } => walk(input, out),
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. } => walk(input, out),
+            LogicalPlan::Union { inputs } => {
+                for inp in inputs {
+                    walk(inp, out);
+                }
+            }
+            LogicalPlan::Join { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
         }
     }
     let mut out = Vec::new();

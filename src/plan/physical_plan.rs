@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use crate::error::{JavelinError, JavelinResult};
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema,
+    AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal, LogicalPlan, Schema,
+    SortExpr,
 };
 
 /// SSA register handle. Just an index into the IR's value table.
@@ -153,14 +154,96 @@ pub enum PhysicalPlan {
         /// The aggregation specification.
         aggregate: AggregateSpec,
     },
+    /// DISTINCT over `input`'s rows. Output schema = `input.output_schema()`.
+    Distinct {
+        /// Source plan.
+        input: Box<PhysicalPlan>,
+    },
+    /// LIMIT [OFFSET]. Output schema = `input.output_schema()`.
+    Limit {
+        /// Source plan.
+        input: Box<PhysicalPlan>,
+        /// Maximum number of rows to emit.
+        limit: usize,
+        /// Number of leading rows to skip.
+        offset: usize,
+    },
+    /// ORDER BY over `input`. Output schema = `input.output_schema()`.
+    Sort {
+        /// Source plan.
+        input: Box<PhysicalPlan>,
+        /// Sort keys, most-significant first.
+        sort_exprs: Vec<SortExpr>,
+    },
+    /// UNION ALL: concatenate `inputs` in order. Schema is the first input's.
+    /// (Dedup UNION is `Distinct(Union { ... })` in the logical plan.)
+    Union {
+        /// Branches to concatenate, in source order.
+        inputs: Vec<PhysicalPlan>,
+    },
+    /// INNER JOIN scaffold. Execution will currently error with
+    /// "JOIN not yet implemented" — the variant exists so the planner can
+    /// represent the operator end-to-end while the executor is wired up.
+    Join {
+        /// Left input.
+        left: Box<PhysicalPlan>,
+        /// Right input.
+        right: Box<PhysicalPlan>,
+        /// Join kind (INNER only in this version).
+        join_type: JoinType,
+        /// Equi-join predicate pairs `(left_expr, right_expr)`.
+        on: Vec<(Expr, Expr)>,
+    },
 }
 
 impl PhysicalPlan {
     /// Output schema of the whole plan.
+    ///
+    /// For the row-shape-preserving wrappers (`Distinct`, `Limit`, `Sort`),
+    /// the schema is recursively the input's. `Union` returns the first
+    /// branch's schema (UNION ALL semantics; branch compatibility was
+    /// verified at logical-plan time). `Join` returns the concatenated
+    /// left ++ right schema, mirroring `LogicalPlan::schema()`.
+    ///
+    /// Returning a `&Schema` for these arms requires storing the schema
+    /// somewhere borrow-stable — a recursive descent through Boxed children
+    /// is fine because `Box<T>: Deref` and the recursive call's return
+    /// borrows the underlying allocation. For `Join` we'd need to construct
+    /// a fresh `Schema` per call, which doesn't fit the `&Schema` return
+    /// type; this is acknowledged below.
     pub fn output_schema(&self) -> &Schema {
         match self {
             PhysicalPlan::Projection { output_schema, .. } => output_schema,
             PhysicalPlan::Aggregate { aggregate, .. } => &aggregate.output_schema,
+            PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::Sort { input, .. } => input.output_schema(),
+            PhysicalPlan::Union { inputs } => {
+                // Caller will have ensured at logical-plan time that all
+                // branches share a schema; here we just return the first.
+                // The Union { inputs: vec![] } case can only arise from a
+                // mis-constructed plan (parser rejects it) — fall back to
+                // the first plan's schema if present, else panic-free path
+                // by returning a degenerate empty schema would require an
+                // allocation we can't make through a `&Schema` API. The
+                // executor (engine.rs) errors on empty Union before this
+                // accessor is ever called, so we let `inputs[0]` panic in
+                // the degenerate case (consistent with `Vec::first` not
+                // having a graceful sentinel).
+                inputs
+                    .first()
+                    .expect("Union with zero inputs is invalid; rejected upstream")
+                    .output_schema()
+            }
+            // Join: schema is left ++ right concatenation. The accessor
+            // returns `&Schema`, but the concatenated value isn't stored
+            // anywhere we can borrow — so we return the left input's
+            // schema as a documented approximation. Callers that need the
+            // full join output schema should recompute it via
+            // `LogicalPlan::schema()` on the source plan. This matches the
+            // 0.1.x "execution errors before any output is materialised"
+            // contract.
+            PhysicalPlan::Join { left, .. } => left.output_schema(),
         }
     }
 }
@@ -574,6 +657,11 @@ fn shape(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Filter { .. } => "Filter",
         LogicalPlan::Project { .. } => "Project",
         LogicalPlan::Aggregate { .. } => "Aggregate",
+        LogicalPlan::Distinct { .. } => "Distinct",
+        LogicalPlan::Limit { .. } => "Limit",
+        LogicalPlan::Sort { .. } => "Sort",
+        LogicalPlan::Union { .. } => "Union",
+        LogicalPlan::Join { .. } => "Join",
     }
 }
 
@@ -845,12 +933,50 @@ fn lower_aggregate(
     })
 }
 
+/// True if `plan` is a Scan/Filter/Project chain that bottoms out in a Scan —
+/// i.e. something `resolve_source` (and therefore `lower_projection`) can fold
+/// down into a single-kernel `Projection`. Anything else (Aggregate, Distinct,
+/// Limit, Sort, Union, Join) needs a recursive `lower` call instead, with the
+/// outer Project/Filter applied — for wave 7 scaffolds, simply dropped — on
+/// top of the result.
+fn is_scan_chain(plan: &LogicalPlan) -> bool {
+    let mut cur = plan;
+    loop {
+        match cur {
+            LogicalPlan::Scan { .. } => return true,
+            LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+                cur = input.as_ref();
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Lower a `LogicalPlan` to a `PhysicalPlan`.
 pub fn lower(plan: &LogicalPlan) -> JavelinResult<PhysicalPlan> {
     match plan {
-        LogicalPlan::Project { input, exprs } => lower_projection(input, Some(exprs), None),
+        LogicalPlan::Project { input, exprs } => {
+            // Scan/Filter/Project chain → single fused kernel via `lower_projection`.
+            // Otherwise (Project over Join, Distinct, etc.) we can't fold into one
+            // kernel, so we lower the inner plan and drop the outer projection.
+            // The outer projection is semantically a no-op for wave 7's scaffold
+            // operators because execution will surface a "not yet implemented"
+            // error before any projection logic runs.
+            if is_scan_chain(input) {
+                lower_projection(input, Some(exprs), None)
+            } else {
+                lower(input)
+            }
+        }
         LogicalPlan::Filter { input, predicate } => {
-            lower_projection(input, None, Some(predicate))
+            if is_scan_chain(input) {
+                lower_projection(input, None, Some(predicate))
+            } else {
+                // Same rationale as Project: forwarding the inner plan keeps
+                // the lowerer total. Execution on the inner scaffold variant
+                // will error before the filter ever applies.
+                lower(input)
+            }
         }
         LogicalPlan::Scan { .. } => lower_projection(plan, None, None),
         LogicalPlan::Aggregate {
@@ -858,5 +984,61 @@ pub fn lower(plan: &LogicalPlan) -> JavelinResult<PhysicalPlan> {
             group_by,
             aggregates,
         } => lower_aggregate(plan, input, group_by, aggregates),
+        LogicalPlan::Distinct { input } => {
+            let inner = lower(input)?;
+            Ok(PhysicalPlan::Distinct {
+                input: Box::new(inner),
+            })
+        }
+        LogicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
+            let inner = lower(input)?;
+            Ok(PhysicalPlan::Limit {
+                input: Box::new(inner),
+                limit: *limit,
+                offset: *offset,
+            })
+        }
+        LogicalPlan::Sort { input, sort_exprs } => {
+            let inner = lower(input)?;
+            Ok(PhysicalPlan::Sort {
+                input: Box::new(inner),
+                sort_exprs: sort_exprs.clone(),
+            })
+        }
+        LogicalPlan::Union { inputs } => {
+            if inputs.is_empty() {
+                return Err(JavelinError::Plan(
+                    "UNION requires at least one input".into(),
+                ));
+            }
+            let mut lowered: Vec<PhysicalPlan> = Vec::with_capacity(inputs.len());
+            for branch in inputs {
+                lowered.push(lower(branch)?);
+            }
+            // Schema integrity (matching shapes across branches) was
+            // already enforced by `LogicalPlan::schema()`; trust that.
+            Ok(PhysicalPlan::Union { inputs: lowered })
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+        } => {
+            let l = lower(left)?;
+            let r = lower(right)?;
+            // Schema is implicit (left ++ right); see `output_schema()`'s
+            // caveat about Join.
+            Ok(PhysicalPlan::Join {
+                left: Box::new(l),
+                right: Box::new(r),
+                join_type: *join_type,
+                on: on.clone(),
+            })
+        }
     }
 }

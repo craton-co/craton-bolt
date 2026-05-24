@@ -473,6 +473,25 @@ fn suffix(e: &Expr) -> String {
     }
 }
 
+/// A single ORDER BY entry: an expression plus direction / null placement.
+#[derive(Debug, Clone)]
+pub struct SortExpr {
+    /// The sort key expression.
+    pub expr: Expr,
+    /// True for DESC, false for ASC.
+    pub descending: bool,
+    /// True if NULLs sort before non-NULLs (NULLS FIRST), false if after.
+    pub nulls_first: bool,
+}
+
+/// Join kind. Wave 7 ships INNER only; other kinds are reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    /// SQL INNER JOIN.
+    Inner,
+    // Left, Right, Full, etc. — out of scope for 0.1.x.
+}
+
 /// Relational logical plan node.
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
@@ -507,6 +526,48 @@ pub enum LogicalPlan {
         group_by: Vec<Expr>,
         /// Aggregate expressions.
         aggregates: Vec<AggregateExpr>,
+    },
+    /// SQL DISTINCT: deduplicate rows from `input`. Schema = input.schema().
+    Distinct {
+        /// Source.
+        input: Box<LogicalPlan>,
+    },
+    /// SQL LIMIT [OFFSET]: keep at most `limit` rows after skipping `offset`.
+    /// Schema = input.schema().
+    Limit {
+        /// Source.
+        input: Box<LogicalPlan>,
+        /// Maximum number of rows to emit.
+        limit: usize,
+        /// Number of leading rows to skip (0 if no OFFSET clause).
+        offset: usize,
+    },
+    /// SQL ORDER BY: sort `input` by `sort_exprs`. Schema = input.schema().
+    Sort {
+        /// Source.
+        input: Box<LogicalPlan>,
+        /// Sort keys, evaluated in order (first is most significant).
+        sort_exprs: Vec<SortExpr>,
+    },
+    /// SQL UNION ALL — concatenation without dedup. UNION (with dedup) is
+    /// parsed and lowered to `Distinct(Union { ... })`. All inputs must share
+    /// the same schema; the result schema is the first input's schema.
+    Union {
+        /// Branches to concatenate, in source order.
+        inputs: Vec<LogicalPlan>,
+    },
+    /// SQL JOIN: combine `left` and `right` rows that satisfy `on`.
+    /// For 0.1.x the executor only supports `JoinType::Inner` with at least
+    /// one equi-join predicate; everything else errors at execution time.
+    Join {
+        /// Left input.
+        left: Box<LogicalPlan>,
+        /// Right input.
+        right: Box<LogicalPlan>,
+        /// Join kind (INNER only in this version).
+        join_type: JoinType,
+        /// Equi-join predicate pairs `(left_expr, right_expr)`; conjunctive.
+        on: Vec<(Expr, Expr)>,
     },
 }
 
@@ -572,6 +633,78 @@ impl LogicalPlan {
                 }
                 Ok(Schema::new(fields))
             }
+            // Row-shape preserving wrappers: schema is the input's schema.
+            LogicalPlan::Distinct { input }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. } => {
+                // For Sort we additionally type-check the sort keys against
+                // the input schema so misnamed columns surface here rather
+                // than at execution time.
+                let s = input.schema()?;
+                if let LogicalPlan::Sort { sort_exprs, .. } = self {
+                    for se in sort_exprs {
+                        // We don't constrain the key dtype (any orderable
+                        // scalar is fine); just resolve it so unknown columns
+                        // produce a Plan error.
+                        let _ = se.expr.dtype(&s)?;
+                    }
+                }
+                Ok(s)
+            }
+            LogicalPlan::Union { inputs } => {
+                if inputs.is_empty() {
+                    return Err(JavelinError::Plan(
+                        "UNION requires at least one input".into(),
+                    ));
+                }
+                let first = inputs[0].schema()?;
+                for (i, branch) in inputs.iter().enumerate().skip(1) {
+                    let other = branch.schema()?;
+                    if !schemas_compatible(&first, &other) {
+                        return Err(JavelinError::Plan(format!(
+                            "UNION branch {i} schema does not match branch 0: \
+                             expected {} fields ({}), got {} fields ({})",
+                            first.fields.len(),
+                            schema_summary(&first),
+                            other.fields.len(),
+                            schema_summary(&other),
+                        )));
+                    }
+                }
+                Ok(first)
+            }
+            LogicalPlan::Join { left, right, .. } => {
+                // 0.1.x scaffold: just concatenate left and right schemas
+                // without name prefixing. Collisions are tolerated here —
+                // the execution layer will reject ambiguous references when
+                // it actually attempts to run the join.
+                let mut l = left.schema()?;
+                let r = right.schema()?;
+                l.fields.extend(r.fields.into_iter());
+                Ok(l)
+            }
         }
     }
+}
+
+/// True if `a` and `b` have the same shape (same number of fields, same dtype
+/// per position). Field names need not match: SQL UNION ALL takes the names
+/// from the leftmost branch.
+fn schemas_compatible(a: &Schema, b: &Schema) -> bool {
+    if a.fields.len() != b.fields.len() {
+        return false;
+    }
+    a.fields
+        .iter()
+        .zip(b.fields.iter())
+        .all(|(x, y)| x.dtype == y.dtype)
+}
+
+/// One-line summary of a schema for error messages (`name: Type, ...`).
+fn schema_summary(s: &Schema) -> String {
+    s.fields
+        .iter()
+        .map(|f| format!("{}: {:?}", f.name, f.dtype))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

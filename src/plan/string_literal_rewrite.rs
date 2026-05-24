@@ -435,6 +435,47 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 aggregates: aggregates.clone(),
             })
         }
+        // Wave 7 variants: rewrite descendants, preserve structure. The
+        // dictionary-encoded `__idx_<col>` extension is applied at every
+        // Scan leaf — the wrappers are transparent for that purpose.
+        LogicalPlan::Distinct { input } => {
+            let new_input = rewrite_plan_with(input, r)?;
+            Ok(LogicalPlan::Distinct {
+                input: Box::new(new_input),
+            })
+        }
+        LogicalPlan::Limit { input, limit, offset } => {
+            let new_input = rewrite_plan_with(input, r)?;
+            Ok(LogicalPlan::Limit {
+                input: Box::new(new_input),
+                limit: *limit,
+                offset: *offset,
+            })
+        }
+        LogicalPlan::Sort { input, sort_exprs } => {
+            let new_input = rewrite_plan_with(input, r)?;
+            Ok(LogicalPlan::Sort {
+                input: Box::new(new_input),
+                sort_exprs: sort_exprs.clone(),
+            })
+        }
+        LogicalPlan::Union { inputs } => {
+            let new_inputs = inputs
+                .iter()
+                .map(|inp| rewrite_plan_with(inp, r))
+                .collect::<JavelinResult<Vec<_>>>()?;
+            Ok(LogicalPlan::Union { inputs: new_inputs })
+        }
+        LogicalPlan::Join { left, right, join_type, on } => {
+            let new_left = rewrite_plan_with(left, r)?;
+            let new_right = rewrite_plan_with(right, r)?;
+            Ok(LogicalPlan::Join {
+                left: Box::new(new_left),
+                right: Box::new(new_right),
+                join_type: *join_type,
+                on: on.clone(),
+            })
+        }
     }
 }
 

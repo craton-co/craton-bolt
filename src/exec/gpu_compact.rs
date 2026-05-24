@@ -85,12 +85,38 @@ pub enum GatheredCol {
     F32(GpuVec<f32>),
     /// Compacted column of `f64` values.
     F64(GpuVec<f64>),
-    /// Compacted column of `u8` values (used for `Bool`).
+    /// Compacted column of `u8` values (used for `Bool`, no nulls).
     Bool(GpuVec<u8>),
+    /// Compacted nullable bool: two parallel `u8`-per-row buffers, both of
+    /// length `n_surviving_rows`. Produced by [`gather_bool_nullable`] when
+    /// the source column was a `BoolNullable` device column. The same
+    /// gather indices are used for both buffers — for any surviving row
+    /// `j`, `values[j]` and `validity[j]` come from the same source row,
+    /// so the per-row null-ness contract is preserved end-to-end:
+    ///
+    /// * `validity[j] == 1` &rarr; row `j` is non-null, `values[j]` is the
+    ///   real bool byte (`0` / `1`).
+    /// * `validity[j] == 0` &rarr; row `j` is null. The byte at
+    ///   `values[j]` is conservatively `0` to keep value-only kernels
+    ///   well-defined, but consumers MUST check `validity[j]` first.
+    BoolNullable {
+        /// Gathered value bytes (`0` = false-or-null, `1` = true).
+        values: GpuVec<u8>,
+        /// Gathered validity bytes (`0` = null, `1` = non-null). Same
+        /// length as `values`.
+        validity: GpuVec<u8>,
+    },
 }
 
 impl GatheredCol {
     /// Raw device pointer of the underlying GpuVec.
+    ///
+    /// For [`GatheredCol::BoolNullable`] this returns the *values* buffer's
+    /// pointer only — the validity buffer is reachable via
+    /// [`Self::validity_device_ptr`]. This mirrors the
+    /// `engine.rs::DeviceCol::BoolNullable::device_ptr()` convention so
+    /// kernels that don't consume validity see the same byte layout as the
+    /// no-null `Bool` variant.
     pub fn device_ptr(&self) -> CUdeviceptr {
         match self {
             GatheredCol::I32(v) => v.device_ptr(),
@@ -98,10 +124,25 @@ impl GatheredCol {
             GatheredCol::F32(v) => v.device_ptr(),
             GatheredCol::F64(v) => v.device_ptr(),
             GatheredCol::Bool(v) => v.device_ptr(),
+            GatheredCol::BoolNullable { values, .. } => values.device_ptr(),
+        }
+    }
+
+    /// Raw device pointer to the validity buffer, if this column carries one.
+    /// Only [`GatheredCol::BoolNullable`] has a validity buffer; all other
+    /// variants return `None`.
+    pub fn validity_device_ptr(&self) -> Option<CUdeviceptr> {
+        match self {
+            GatheredCol::BoolNullable { validity, .. } => Some(validity.device_ptr()),
+            _ => None,
         }
     }
 
     /// Element count of the underlying GpuVec.
+    ///
+    /// For [`GatheredCol::BoolNullable`] the values and validity buffers are
+    /// gathered with the same indices, so they have identical lengths; this
+    /// returns the shared length (i.e. the row count).
     pub fn len(&self) -> usize {
         match self {
             GatheredCol::I32(v) => v.len(),
@@ -109,6 +150,11 @@ impl GatheredCol {
             GatheredCol::F32(v) => v.len(),
             GatheredCol::F64(v) => v.len(),
             GatheredCol::Bool(v) => v.len(),
+            // Invariant: gather_bool_nullable launches the same gather kernel
+            // with the same scan over both buffers, so `values.len() ==
+            // validity.len() == scan.total_count`. We pick `values` here as
+            // the canonical row count.
+            GatheredCol::BoolNullable { values, .. } => values.len(),
         }
     }
 
@@ -123,6 +169,12 @@ impl GatheredCol {
     /// engine can use a single code path after `compact_columns_on_gpu`. The
     /// `Bool` variant goes through `Vec<u8> -> Vec<bool>` because Arrow's
     /// `BooleanArray::from` expects a `Vec<bool>`, not a packed byte buffer.
+    ///
+    /// [`GatheredCol::BoolNullable`] materialises a *nullable* `BooleanArray`
+    /// by zipping the values and validity bytes — the same reconstruction
+    /// that `ExtendedDeviceCol::BoolNullable::download` uses for the
+    /// uncompacted upload-side path. This is what preserves W5A2's
+    /// per-row null-ness across the GPU prefix-scan + gather pipeline.
     pub fn download(&self) -> crate::error::JavelinResult<arrow_array::ArrayRef> {
         use std::sync::Arc;
         match self {
@@ -146,6 +198,30 @@ impl GatheredCol {
                 let host = v.to_vec()?;
                 let bools: Vec<bool> = host.into_iter().map(|b| b != 0).collect();
                 Ok(Arc::new(arrow_array::BooleanArray::from(bools)) as arrow_array::ArrayRef)
+            }
+            GatheredCol::BoolNullable { values, validity } => {
+                let host_values: Vec<u8> = values.to_vec()?;
+                let host_validity: Vec<u8> = validity.to_vec()?;
+                // Defensive: the two buffers must agree on length. The
+                // invariant is enforced at construction (gather_bool_nullable
+                // gathers both with the same `scan`), but if a future caller
+                // hand-builds a `BoolNullable` with mismatched buffers we
+                // want a clean error instead of a silent truncation in
+                // `zip`.
+                if host_values.len() != host_validity.len() {
+                    return Err(JavelinError::Other(format!(
+                        "GatheredCol::BoolNullable buffer length mismatch: \
+                         values={}, validity={}",
+                        host_values.len(),
+                        host_validity.len(),
+                    )));
+                }
+                let arr: arrow_array::BooleanArray = host_values
+                    .into_iter()
+                    .zip(host_validity.into_iter())
+                    .map(|(v, m)| if m == 1 { Some(v == 1) } else { None })
+                    .collect();
+                Ok(Arc::new(arr) as arrow_array::ArrayRef)
             }
         }
     }
@@ -347,6 +423,81 @@ pub fn gather_one(
     Ok(col)
 }
 
+/// Gather BOTH halves of a nullable bool column (values + validity) using a
+/// single shared `ScanResult`, returning a [`GatheredCol::BoolNullable`].
+///
+/// This is the GPU analogue of the host-side path described in
+/// `compact.rs::apply_mask`: per-row nullness is preserved because both
+/// buffers are gathered with the *same* `scan`. For any surviving output
+/// row `j`, both `values[j]` and `validity[j]` are pulled from the
+/// identical source row `i`, so the value/validity correspondence the
+/// `BoolNullable` contract requires is invariant under compaction.
+///
+/// Invariants enforced at call sites:
+///   * `values_ptr` and `validity_ptr` point to device allocations of
+///     length `n_rows` bytes each. The caller owns both — they must
+///     outlive the synchronize inside each `gather_one` call.
+///   * `scan` was produced from a mask of length `n_rows` (the same
+///     `n_rows` argument passed here).
+///
+/// The gather kernel itself is unchanged — it's a generic per-dtype gather.
+/// We just launch it twice with the same scan and box the pair into a
+/// `BoolNullable` variant. Two kernel launches are intentional: the gather
+/// kernel ABI takes a single input pointer, and the two buffers are
+/// physically separate allocations on the device.
+///
+/// Wired in by W7A8. The engine should branch on
+/// `engine.rs::DeviceCol::BoolNullable` and call this in place of
+/// `gather_one` so the validity bitmap survives the filter compaction. Until
+/// the engine plumbing lands, this helper is callable from any code path
+/// that already has the two device pointers in hand.
+pub fn gather_bool_nullable(
+    values_ptr: CUdeviceptr,
+    validity_ptr: CUdeviceptr,
+    n_rows: usize,
+    scan: &ScanResult,
+    stream: &CudaStream,
+) -> JavelinResult<GatheredCol> {
+    // Two independent gather launches, both keyed off the same `scan`. The
+    // kernel ABI handles one buffer at a time; we re-use the scan products
+    // (local_indices + block_bases + mask_ptr + total_count) so the second
+    // launch is just `compile_gather_kernel(Bool)` again on a different
+    // input pointer. JIT caching at the `compile_gather_kernel` layer
+    // means we don't re-compile the PTX for the second call in practice.
+    let gathered_values = gather_one(values_ptr, n_rows, scan, DataType::Bool, stream)?;
+    let gathered_validity = gather_one(validity_ptr, n_rows, scan, DataType::Bool, stream)?;
+
+    // Unwrap to the inner `GpuVec<u8>` for the new variant. Both must come
+    // out of `gather_one(DataType::Bool, ...)` as `GatheredCol::Bool`; any
+    // other shape is a programming error in this file, not a runtime
+    // condition, so we panic-with-message rather than threading a Result.
+    let values = match gathered_values {
+        GatheredCol::Bool(v) => v,
+        _ => unreachable!(
+            "gather_one(DataType::Bool, ...) must return GatheredCol::Bool; \
+             see alloc_gathered match arm"
+        ),
+    };
+    let validity = match gathered_validity {
+        GatheredCol::Bool(v) => v,
+        _ => unreachable!(
+            "gather_one(DataType::Bool, ...) must return GatheredCol::Bool; \
+             see alloc_gathered match arm"
+        ),
+    };
+
+    // Defensive length-equality assertion: both gathers used the same scan,
+    // so they MUST have the same length. If they don't, the downstream
+    // `download()` zip would silently truncate to the shorter buffer.
+    debug_assert_eq!(
+        values.len(),
+        validity.len(),
+        "gather_bool_nullable: values/validity length mismatch despite shared scan"
+    );
+
+    Ok(GatheredCol::BoolNullable { values, validity })
+}
+
 /// Compact a set of pre-allocated, pre-launched output columns end-to-end on
 /// the GPU.
 ///
@@ -368,6 +519,25 @@ pub fn gather_one(
 /// `Utf8` columns return [`JavelinError::Other`] — the gather kernel can only
 /// move fixed-width values, so variable-width strings have to go through the
 /// host-side `compact_arrays` fallback.
+///
+/// ## Nullable bool (W7A8)
+///
+/// This entry point only takes a single device pointer per column, so it
+/// can't directly compact a `BoolNullable` device column (which has a
+/// parallel validity buffer the gather pipeline must also visit). The
+/// engine should branch on `DeviceCol::BoolNullable` BEFORE calling this
+/// function, call [`prefix_scan_mask`] once to amortise the scan, then
+/// call [`gather_bool_nullable`] for the bool-nullable column and
+/// [`gather_one`] for everything else, assembling the resulting
+/// `Vec<GatheredCol>` itself.
+///
+/// We don't add a `(values, validity, DataType)` overload here because
+/// `engine.rs::DeviceCol` is private to the engine module — this file
+/// can't pattern-match on it. Keeping the validity wire-up at the
+/// engine-callsite layer avoids leaking the variant boundary across
+/// modules. (TODO(post-w7): if the engine ever lifts `DeviceCol` to
+/// `pub(crate)`, fold the branch into this function so callers stop
+/// having to know about the two-launch dance.)
 pub fn compact_columns_on_gpu(
     mask_ptr: CUdeviceptr,
     n_rows: usize,
@@ -415,6 +585,12 @@ fn alloc_gathered(dtype: DataType, len: usize) -> JavelinResult<GatheredCol> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Array` is the trait that supplies `.as_any()`, `.len()`,
+    // `.null_count()`, `.is_null()` on every concrete Arrow array. The
+    // BoolNullable download tests below need it; importing here keeps the
+    // test module self-contained without polluting the parent module.
+    #[allow(unused_imports)]
+    use arrow_array::Array;
 
     /// Replicate the host-side exclusive scan that `prefix_scan_mask` runs
     /// over the downloaded `block_sums`. This is the only piece of compaction
@@ -526,5 +702,157 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Pure-host check on the `GatheredCol::BoolNullable` download path: we
+    /// hand-build a fake `BoolNullable` GpuVec pair from known bytes,
+    /// call `download`, and confirm the resulting Arrow array preserves
+    /// per-row null-ness with no `Some(false)` vs `None` collapse. Runs
+    /// only with CUDA available because `GpuVec::from_slice` allocates on
+    /// the device; under `#[ignore]` so non-GPU CI passes.
+    ///
+    /// This guards against any future change to `GatheredCol::download`'s
+    /// zip logic that would re-introduce the W5A2-pre regression
+    /// (dropping validity during compaction).
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime (GpuVec::from_slice allocates on device)"]
+    fn gathered_bool_nullable_download_preserves_validity() {
+        // values:   [1, 0, 0, 1]
+        // validity: [1, 0, 1, 0]
+        // -> Some(true), None, Some(false), None
+        let values = GpuVec::<u8>::from_slice(&[1u8, 0, 0, 1]).expect("upload values");
+        let validity = GpuVec::<u8>::from_slice(&[1u8, 0, 1, 0]).expect("upload validity");
+        let col = GatheredCol::BoolNullable { values, validity };
+
+        // device_ptr + validity_device_ptr must both surface non-NULL
+        // device addresses that DISAGREE (two separate allocations).
+        let vptr = col.device_ptr();
+        let mptr = col.validity_device_ptr().expect("validity must be Some");
+        assert_ne!(vptr, 0, "values device pointer must be non-NULL");
+        assert_ne!(mptr, 0, "validity device pointer must be non-NULL");
+        assert_ne!(
+            vptr, mptr,
+            "values and validity must be distinct device allocations"
+        );
+
+        assert_eq!(col.len(), 4);
+        assert!(!col.is_empty());
+
+        let arr = col.download().expect("download");
+        let ba = arr
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("BooleanArray");
+        assert_eq!(ba.len(), 4);
+        assert_eq!(ba.null_count(), 2);
+        assert_eq!(ba.is_null(0), false);
+        assert_eq!(ba.value(0), true);
+        assert!(ba.is_null(1));
+        assert_eq!(ba.is_null(2), false);
+        assert_eq!(ba.value(2), false);
+        assert!(ba.is_null(3));
+    }
+
+    /// End-to-end GPU-side test: build a u8 mask + a paired (values,
+    /// validity) bool-nullable column, run `prefix_scan_mask`, call
+    /// `gather_bool_nullable`, and verify BOTH buffers were gathered with
+    /// the same indices — i.e. the value/validity correspondence is
+    /// preserved across the GPU prefix-scan + gather pipeline. This is the
+    /// W7A8 acceptance test for the GPU path; ignored on non-GPU CI.
+    ///
+    /// Setup mirrors the host-side `compact_bool_with_nulls_preserves_validity`
+    /// test in `compact.rs`:
+    ///   Source (6 rows):    [true, null, false, true, null, false]
+    ///   Mask (keep/drop):   [keep, keep, drop, keep, keep, drop]
+    ///   Expected output:    [Some(true), None, Some(true), None]
+    ///
+    /// Concretely, the values/validity byte buffers we upload are:
+    ///   values:   [1, 0, 0, 1, 0, 0]   (0 for both false and null)
+    ///   validity: [1, 0, 1, 1, 0, 1]   (1 = non-null)
+    ///   mask:     [1, 1, 0, 1, 1, 0]
+    /// After gather the expected device buffers (length 4) are:
+    ///   values:   [1, 0, 1, 0]
+    ///   validity: [1, 0, 1, 0]
+    /// which the download zip then turns into [Some(true), None, Some(true), None].
+    #[test]
+    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    fn gpu_compact_bool_nullable_gathers_both_buffers() {
+        let stream = CudaStream::null();
+
+        // Upload mask, values, validity.
+        let mask_buf =
+            GpuVec::<u8>::from_slice(&[1u8, 1, 0, 1, 1, 0]).expect("upload mask");
+        let values_buf =
+            GpuVec::<u8>::from_slice(&[1u8, 0, 0, 1, 0, 0]).expect("upload values");
+        let validity_buf =
+            GpuVec::<u8>::from_slice(&[1u8, 0, 1, 1, 0, 1]).expect("upload validity");
+
+        let n_rows = 6usize;
+
+        // Single prefix scan, shared by both gather launches inside
+        // gather_bool_nullable.
+        let scan = prefix_scan_mask(mask_buf.device_ptr(), n_rows, &stream)
+            .expect("prefix_scan_mask");
+        assert_eq!(
+            scan.total_count, 4,
+            "mask keeps 4 of 6 rows; scan total_count must match"
+        );
+
+        let gathered = gather_bool_nullable(
+            values_buf.device_ptr(),
+            validity_buf.device_ptr(),
+            n_rows,
+            &scan,
+            &stream,
+        )
+        .expect("gather_bool_nullable");
+
+        // Variant shape: must be BoolNullable, both buffers length 4.
+        match &gathered {
+            GatheredCol::BoolNullable { values, validity } => {
+                assert_eq!(values.len(), 4, "values gathered to total_count rows");
+                assert_eq!(
+                    validity.len(),
+                    4,
+                    "validity gathered to total_count rows"
+                );
+            }
+            _ => panic!("expected GatheredCol::BoolNullable, got a different variant"),
+        }
+        assert_eq!(gathered.len(), 4);
+        assert!(!gathered.is_empty());
+        // values and validity must occupy distinct device allocations —
+        // critical because otherwise the second gather would have
+        // clobbered the first.
+        assert_ne!(
+            gathered.device_ptr(),
+            gathered
+                .validity_device_ptr()
+                .expect("BoolNullable must expose validity"),
+        );
+
+        // End-to-end download check: per-row nullness preserved.
+        let arr = gathered.download().expect("download");
+        let ba = arr
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("BooleanArray");
+        assert_eq!(ba.len(), 4);
+        let expected: Vec<Option<bool>> =
+            vec![Some(true), None, Some(true), None];
+        let actual: Vec<Option<bool>> = (0..ba.len())
+            .map(|i| if ba.is_null(i) { None } else { Some(ba.value(i)) })
+            .collect();
+        assert_eq!(actual, expected, "per-row validity preserved end-to-end");
+        assert_eq!(ba.null_count(), 2);
+
+        // Keep source buffers alive past the assertions — drop here so
+        // any CUDA double-free surfaces in this test, not somewhere
+        // downstream.
+        drop(gathered);
+        drop(scan);
+        drop(validity_buf);
+        drop(values_buf);
+        drop(mask_buf);
     }
 }

@@ -58,6 +58,24 @@ pub fn download_mask(mask_device_ptr: CUdeviceptr, n_rows: usize) -> JavelinResu
 ///
 /// Internally delegates to `arrow::compute::filter`, the canonical Arrow
 /// compaction kernel.
+///
+/// ## Nullability preservation (W7A8)
+///
+/// `arrow::compute::filter` is documented to preserve per-row null-ness: for
+/// every kept row it copies BOTH the value and the validity bit from the
+/// source array. That means a nullable `BooleanArray` (the host-side
+/// reconstruction of `engine.rs::DeviceCol::BoolNullable`) round-trips
+/// through this function with its validity bitmap intact — null rows that
+/// pass the predicate stay null on the output side, and non-null rows
+/// retain their concrete `true` / `false` value.
+///
+/// The predicate `BooleanArray` we build from `mask` has `null_count() == 0`
+/// by construction (every entry comes from a `Vec<bool>`), so the predicate
+/// itself never injects nullness — only the source array's nulls are
+/// preserved.
+///
+/// This is verified by the `compact_bool_with_nulls_preserves_validity`
+/// test in this file's `#[cfg(test)]` module.
 pub fn apply_mask(arr: &ArrayRef, mask: &[bool]) -> JavelinResult<ArrayRef> {
     if arr.len() != mask.len() {
         return Err(JavelinError::Other(format!(
@@ -68,6 +86,9 @@ pub fn apply_mask(arr: &ArrayRef, mask: &[bool]) -> JavelinResult<ArrayRef> {
     }
     // `BooleanArray::from(Vec<bool>)` is the standard constructor; cloning the
     // slice into an owned Vec is cheap relative to the d2h copy upstream.
+    // The resulting predicate has no nulls of its own — every entry is a
+    // definite keep / drop — so `filter` only ever propagates nulls that
+    // already lived in `arr`.
     let predicate = BooleanArray::from(mask.to_vec());
     let filtered = filter(arr.as_ref(), &predicate).map_err(|e| {
         JavelinError::Other(format!("arrow::compute::filter failed: {e}"))
@@ -170,4 +191,127 @@ pub fn launch_predicate_kernel(
     drop(device_ptrs);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, BooleanArray, Int32Array};
+    use std::sync::Arc;
+
+    /// Sanity check: `apply_mask` over a plain non-nullable Int32 column drops
+    /// the masked-out rows and preserves source order, without introducing
+    /// any nullability. This is the baseline behavior every other test in
+    /// this module builds on.
+    #[test]
+    fn compact_int32_no_nulls() {
+        let src: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50]));
+        let mask = vec![true, false, true, false, true];
+        let out = apply_mask(&src, &mask).expect("apply_mask");
+        let out_i32 = out
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32Array");
+        assert_eq!(out_i32.len(), 3);
+        assert_eq!(out_i32.value(0), 10);
+        assert_eq!(out_i32.value(1), 30);
+        assert_eq!(out_i32.value(2), 50);
+        assert_eq!(out_i32.null_count(), 0);
+    }
+
+    /// W7A8 core test: filter compaction over a nullable `BooleanArray` —
+    /// the host-side reconstruction of `engine.rs::DeviceCol::BoolNullable`
+    /// after download — must preserve per-row validity for every surviving
+    /// row. Concretely:
+    ///
+    ///   * `true`  rows that pass the predicate stay `Some(true)`.
+    ///   * `false` rows that pass stay `Some(false)`.
+    ///   * `null`  rows that pass stay `None` (the bug we're guarding
+    ///     against was that the validity bitmap was dropped during
+    ///     compaction, collapsing nulls into `Some(false)`).
+    ///
+    /// The source layout below covers all three states crossed with both
+    /// mask polarities, so any regression — to "all nulls → false", "no
+    /// nulls at all", or a wrong row count — fails a specific assertion.
+    #[test]
+    fn compact_bool_with_nulls_preserves_validity() {
+        // 6 rows: true, null, false, true, null, false.
+        // Mask:    keep, keep, drop, keep, keep, drop.
+        // Expected output: Some(true), None, Some(true), None  (4 rows).
+        let src: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            None,
+            Some(false),
+        ]));
+        assert_eq!(src.null_count(), 2, "source must have 2 nulls");
+
+        let mask = vec![true, true, false, true, true, false];
+        let out = apply_mask(&src, &mask).expect("apply_mask");
+
+        let out_bool = out
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("filter must return a BooleanArray for a BooleanArray source");
+        assert_eq!(out_bool.len(), 4, "kept 4 of 6 rows");
+
+        // Walk every surviving row; per-row validity must survive verbatim.
+        // We compare to an `Option<bool>` list rather than poking
+        // `is_null` / `value` separately so the assertion failure
+        // message names the offending row directly.
+        let expected: Vec<Option<bool>> =
+            vec![Some(true), None, Some(true), None];
+        let actual: Vec<Option<bool>> = (0..out_bool.len())
+            .map(|i| {
+                if out_bool.is_null(i) {
+                    None
+                } else {
+                    Some(out_bool.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(out_bool.null_count(), 2, "both surviving nulls preserved");
+    }
+
+    /// All-null nullable bool input under an all-pass mask must round-trip
+    /// to an all-null output of the same length. Complements the mixed
+    /// test above by isolating the validity-only path: every `value` byte
+    /// is undefined-or-zero on the upload side, so a regression that
+    /// dropped validity would visibly produce all-`false` rather than
+    /// all-`null`.
+    #[test]
+    fn compact_bool_all_nulls_stay_null() {
+        let src: ArrayRef =
+            Arc::new(BooleanArray::from(vec![None, None, None]));
+        let mask = vec![true, true, true];
+        let out = apply_mask(&src, &mask).expect("apply_mask");
+        let out_bool = out
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
+        assert_eq!(out_bool.len(), 3);
+        assert_eq!(out_bool.null_count(), 3);
+        for i in 0..3 {
+            assert!(out_bool.is_null(i), "row {i} should remain null");
+        }
+    }
+
+    /// Length-mismatch between array and mask must surface as a clean
+    /// `JavelinError::Other`, not a panic. Catches a regression where the
+    /// guard was removed in favor of `arrow::compute::filter`'s own check
+    /// (which produces a less actionable message).
+    #[test]
+    fn compact_length_mismatch_errors() {
+        let src: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let mask = vec![true, false];
+        let err = apply_mask(&src, &mask).expect_err("must reject mismatch");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("length mismatch"),
+            "expected length-mismatch error, got: {msg}"
+        );
+    }
 }
