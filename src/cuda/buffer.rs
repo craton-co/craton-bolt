@@ -85,23 +85,22 @@ impl<T: Pod> GpuBuffer<T> {
         })
     }
 
-    /// Allocate `len` elements and zero them.
+    /// Allocate `len` elements and zero them via `cuMemsetD8`.
     pub fn zeros(len: usize) -> JavelinResult<Self> {
         let mut buf = Self::with_capacity(len)?;
         if len > 0 {
-            // No cuMemsetD8 in the FFI yet; route through an h2d copy from a
-            // zeroed host vector. Slow but correct; we can optimize later.
-            let zeros: Vec<u8> = vec![0u8; len.checked_mul(size_of::<T>()).ok_or_else(|| {
+            let byte_len = len.checked_mul(size_of::<T>()).ok_or_else(|| {
                 JavelinError::Memory(format!(
                     "GpuBuffer::zeros size overflow: {} * {}",
                     len,
                     size_of::<T>()
                 ))
-            })?];
-            // SAFETY: `buf.ptr` was just allocated with at least `zeros.len()`
-            // bytes of capacity, and `zeros` is valid for that many reads.
+            })?;
+            // SAFETY: `buf.ptr` was just allocated with at least `byte_len`
+            // bytes of capacity (rounded up to ARROW_ALIGNMENT).
+            // `buf`'s `Drop` will free the allocation if the memset errors.
             unsafe {
-                cuda_sys::memcpy_h2d::<u8>(buf.ptr, zeros.as_ptr(), zeros.len())?;
+                cuda_sys::memset_d8(buf.ptr, 0, byte_len)?;
             }
         }
         buf.len = len;

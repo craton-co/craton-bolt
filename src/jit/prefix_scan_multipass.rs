@@ -177,6 +177,11 @@ pub fn compile_prefix_scan_u32_kernel() -> JavelinResult<String> {
 
     // -------- Stash the value into ping buffer (sdata[0..BLOCK_SIZE]).
     // base0 = sdata ; base1 = sdata + BLOCK_SIZE*4 ; idx_off = tid * 4
+    // NOTE: keep `mov.u64` here (not `cvta.shared.u64`). %rd5 (and its derived
+    // addresses %rd8/%rd9) feed `st.shared.u32` / `ld.shared.u32` below, which
+    // require a shared-state-space address. `cvta.shared.u64` produces a
+    // generic-space pointer; switching would force every shared ld/st in this
+    // kernel to drop its `.shared` qualifier — outside this cleanup's scope.
     writeln!(ptx, "\tmov.u64 %rd5, sdata;").map_err(write_err)?;
     writeln!(
         ptx,

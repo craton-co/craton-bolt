@@ -59,8 +59,29 @@ extern "C" {
     pub fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
+    pub fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> CUresult;
+    pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
+    pub fn cuMemcpyHtoDAsync_v2(
+        dst: CUdeviceptr,
+        src: *const c_void,
+        bytecount: usize,
+        stream: CUstream,
+    ) -> CUresult;
+    pub fn cuMemcpyDtoHAsync_v2(
+        dst: *mut c_void,
+        src: CUdeviceptr,
+        bytecount: usize,
+        stream: CUstream,
+    ) -> CUresult;
+    pub fn cuMemsetD8_v2(dst: CUdeviceptr, value: u8, count: usize) -> CUresult;
+    pub fn cuMemsetD8Async(
+        dst: CUdeviceptr,
+        value: u8,
+        count: usize,
+        stream: CUstream,
+    ) -> CUresult;
     pub fn cuGetErrorName(error: CUresult, str: *mut *const c_char) -> CUresult;
     pub fn cuGetErrorString(error: CUresult, str: *mut *const c_char) -> CUresult;
     pub fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult;
@@ -116,8 +137,29 @@ mod stubs {
     pub unsafe fn cuCtxSetCurrent(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemAlloc_v2(_dptr: *mut CUdeviceptr, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemFree_v2(_dptr: CUdeviceptr) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemAllocHost_v2(_pp: *mut *mut c_void, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemFreeHost(_p: *mut c_void) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemcpyHtoD_v2(_dst: CUdeviceptr, _src: *const c_void, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemcpyDtoH_v2(_dst: *mut c_void, _src: CUdeviceptr, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemcpyHtoDAsync_v2(
+        _dst: CUdeviceptr,
+        _src: *const c_void,
+        _bytecount: usize,
+        _stream: CUstream,
+    ) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemcpyDtoHAsync_v2(
+        _dst: *mut c_void,
+        _src: CUdeviceptr,
+        _bytecount: usize,
+        _stream: CUstream,
+    ) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemsetD8_v2(_dst: CUdeviceptr, _value: u8, _count: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemsetD8Async(
+        _dst: CUdeviceptr,
+        _value: u8,
+        _count: usize,
+        _stream: CUstream,
+    ) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuGetErrorName(_error: CUresult, _str: *mut *const c_char) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuGetErrorString(_error: CUresult, _str: *mut *const c_char) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuModuleLoadData(_module: *mut CUmodule, _image: *const c_void) -> CUresult { CUDA_ERROR_STUB }
@@ -297,4 +339,32 @@ pub unsafe fn memcpy_d2h<T>(dst: *mut T, src: CUdeviceptr, count: usize) -> Jave
         ))
     })?;
     check(cuMemcpyDtoH_v2(dst as *mut c_void, src, bytes))
+}
+
+/// Allocate `bytes` of page-locked (pinned) host memory via `cuMemAllocHost_v2`.
+///
+/// # Safety
+/// The returned pointer must be freed with [`mem_free_host`]; never with
+/// `free`/`Box::from_raw`/etc. The driver determines validity and alignment.
+pub unsafe fn mem_alloc_host(bytes: usize) -> JavelinResult<*mut c_void> {
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    check(cuMemAllocHost_v2(&mut ptr, bytes))?;
+    Ok(ptr)
+}
+
+/// Free a pinned host allocation previously returned by [`mem_alloc_host`].
+///
+/// # Safety
+/// Caller must guarantee `p` came from [`mem_alloc_host`], is not aliased, and
+/// is not still in use by any in-flight async copy.
+pub unsafe fn mem_free_host(p: *mut c_void) -> JavelinResult<()> {
+    check(cuMemFreeHost(p))
+}
+
+/// Synchronously set `count` bytes at device pointer `ptr` to the byte `value`.
+///
+/// # Safety
+/// `ptr` must point to a live device allocation of at least `count` bytes.
+pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> JavelinResult<()> {
+    check(cuMemsetD8_v2(ptr, value, count))
 }

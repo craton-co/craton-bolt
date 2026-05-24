@@ -404,8 +404,20 @@ enum DeviceCol {
     F32(GpuVec<f32>),
     /// 64-bit float column.
     F64(GpuVec<f64>),
-    /// Bool stored as one byte per row (0 / 1).
+    /// Bool stored as one byte per row (0 / 1). Used when the source Arrow
+    /// array has no nulls.
     Bool(GpuVec<u8>),
+    /// Bool stored as TWO parallel byte-per-row buffers:
+    ///   * `values[i] = 1` iff row `i` is `true`, `0` otherwise (incl. null).
+    ///   * `validity[i] = 1` iff row `i` is non-null, `0` if null.
+    /// Both buffers have the row-count length. The kernel ABI continues to
+    /// see only the values pointer via `device_ptr()`; validity is consumed
+    /// host-side on download and (TODO post-w5) threaded through filter and
+    /// aggregate kernels.
+    BoolNullable {
+        values: GpuVec<u8>,
+        validity: GpuVec<u8>,
+    },
     /// Utf8 stored as i32 dictionary indices; host dictionary lives alongside.
     Utf8(DictionaryColumn),
     /// Borrowed device pointer — the underlying buffer is owned elsewhere
@@ -457,34 +469,44 @@ impl DeviceCol {
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .ok_or_else(|| type_mismatch_err(arr, "Bool"))?;
-                // FIXME(orchestrator): null/false conflation. The proper fix is
-                // a parallel validity-bitmap `GpuVec<u8>` propagated to
-                // downstream consumers via a wider device-column type (see how
-                // Utf8 carries its own dictionary alongside indices). That
-                // requires extending `DeviceCol::Bool`, `ExtendedDeviceCol`
-                // (src/exec/string_col.rs — owned by a sibling agent), and
-                // every Bool gather/compact path; out of scope for this file.
-                // For now: reject nullable Bool inputs explicitly so we never
-                // silently collapse `null` and `false` into the same byte.
-                // SQL_REFERENCE.md requires nulls remain distinguishable.
-                // Aggregate paths handle nulls via `extended_agg`.
-                if ba.null_count() > 0 {
-                    return Err(JavelinError::Other(
-                        "BooleanArray with nulls is not yet supported in \
-                         projection upload — the device column is one byte per \
-                         row and cannot distinguish null from false. Aggregate \
-                         paths handle Bool nulls via extended_agg; the \
-                         projection path needs a parallel validity-bitmap GPU \
-                         buffer (FIXME)."
-                            .into(),
-                    ));
-                }
                 let n = ba.len();
-                let mut bytes: Vec<u8> = Vec::with_capacity(n);
-                for i in 0..n {
-                    bytes.push(if ba.value(i) { 1 } else { 0 });
+                // No-null fast path: single value buffer, the legacy `Bool`
+                // variant. Existing kernels and the gather/compact paths
+                // continue to see the same one-byte-per-row layout.
+                if ba.null_count() == 0 {
+                    let mut bytes: Vec<u8> = Vec::with_capacity(n);
+                    for i in 0..n {
+                        bytes.push(if ba.value(i) { 1 } else { 0 });
+                    }
+                    return Ok(DeviceCol::Bool(GpuVec::<u8>::from_slice(&bytes)?));
                 }
-                Ok(DeviceCol::Bool(GpuVec::<u8>::from_slice(&bytes)?))
+                // Nullable path: build BOTH a value buffer (0 for false-or-null
+                // so value-only kernels see a defined byte) AND a parallel
+                // validity buffer (1 = non-null, 0 = null), then upload both
+                // and produce a `BoolNullable` device column.
+                //
+                // TODO(post-w5): wire validity through filter/agg kernels —
+                // today only the projection download path consumes it to
+                // reconstruct a nullable BooleanArray. Filter/compact and the
+                // aggregate executors still see the value buffer alone via
+                // `device_ptr()` and will treat null rows as `false`.
+                let mut values: Vec<u8> = Vec::with_capacity(n);
+                let mut validity: Vec<u8> = Vec::with_capacity(n);
+                for i in 0..n {
+                    if ba.is_null(i) {
+                        values.push(0);
+                        validity.push(0);
+                    } else {
+                        values.push(if ba.value(i) { 1 } else { 0 });
+                        validity.push(1);
+                    }
+                }
+                let v_gpu = GpuVec::<u8>::from_slice(&values)?;
+                let m_gpu = GpuVec::<u8>::from_slice(&validity)?;
+                Ok(DeviceCol::BoolNullable {
+                    values: v_gpu,
+                    validity: m_gpu,
+                })
             }
             DataType::Utf8 => {
                 let sa = arr
@@ -518,6 +540,11 @@ impl DeviceCol {
     }
 
     /// Raw device pointer for kernel-parameter assembly.
+    ///
+    /// For `BoolNullable`, this returns the values pointer only — the
+    /// validity buffer is not yet exposed to kernels (see
+    /// TODO(post-w5) in the upload path). The buffer's lifetime is
+    /// preserved by `self` because the variant owns both `GpuVec`s.
     fn device_ptr(&self) -> CUdeviceptr {
         match self {
             DeviceCol::I32(v) => v.device_ptr(),
@@ -525,6 +552,7 @@ impl DeviceCol {
             DeviceCol::F32(v) => v.device_ptr(),
             DeviceCol::F64(v) => v.device_ptr(),
             DeviceCol::Bool(v) => v.device_ptr(),
+            DeviceCol::BoolNullable { values, .. } => values.device_ptr(),
             DeviceCol::Utf8(d) => d.indices.device_ptr(),
             DeviceCol::Borrowed { ptr } => *ptr,
         }
@@ -569,6 +597,19 @@ impl DeviceCol {
                 let host = copy_back::<u8>(&v, n_rows)?;
                 let bools: Vec<bool> = host.into_iter().map(|b| b != 0).collect();
                 Ok(Arc::new(BooleanArray::from(bools)) as ArrayRef)
+            }
+            DeviceCol::BoolNullable { values, validity } => {
+                let host_values = copy_back::<u8>(&values, n_rows)?;
+                let host_validity = copy_back::<u8>(&validity, n_rows)?;
+                // Reconstruct a nullable BooleanArray by zipping values with
+                // the validity buffer: null rows become `None`, valid rows
+                // become `Some(value != 0)`.
+                let arr: BooleanArray = host_values
+                    .into_iter()
+                    .zip(host_validity.into_iter())
+                    .map(|(v, m)| if m == 1 { Some(v == 1) } else { None })
+                    .collect();
+                Ok(Arc::new(arr) as ArrayRef)
             }
             DeviceCol::Utf8(d) => {
                 let arr = d.to_string_array()?;

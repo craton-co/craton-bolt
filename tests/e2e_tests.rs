@@ -13,7 +13,8 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 
 use javelin::jit::compile_ptx;
 use javelin::plan::{
-    lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
+    lower_physical, parse_sql, AggregateExpr, DataType, Expr, Field, Literal, LogicalPlan,
+    MemTableProvider, PhysicalPlan, Schema,
 };
 
 // ---- Fixtures ---------------------------------------------------------------
@@ -250,6 +251,226 @@ fn ptx_int64_dtype_load_store_suffixes() {
     let ptx = compile_ptx(kernel, "javelin_kernel").unwrap();
     assert!(ptx.contains("ld.global.s64"), "expected s64 load");
     assert!(ptx.contains("st.global.s64"), "expected s64 store");
+}
+
+// ---- Offline: aggregates and GROUP BY --------------------------------------
+
+/// Wider fixture used by the aggregate / GROUP BY tests below. Adds:
+/// - `sub_region_id` (Int32) for multi-key GROUP BY
+/// - `qty` (Int32) for SUM-widening checks
+/// - `qty32` (Int32) alias-style column for GROUP-BY SUM widening
+fn agg_provider() -> MemTableProvider {
+    let schema = Schema::new(vec![
+        Field {
+            name: "region_id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "sub_region_id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "qty".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "qty32".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "price".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        },
+    ]);
+    MemTableProvider::new().with_table("sales", schema)
+}
+
+#[test]
+fn scalar_sum_int32_widens_to_i64() {
+    let provider = agg_provider();
+    let plan = parse_sql("SELECT SUM(qty) FROM sales", &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let out = phys.output_schema();
+    assert_eq!(out.fields.len(), 1);
+    assert_eq!(
+        out.fields[0].dtype,
+        DataType::Int64,
+        "SUM(Int32) must widen to Int64 (wave 3 regression)"
+    );
+}
+
+#[test]
+fn scalar_avg_returns_float64() {
+    let provider = agg_provider();
+    let plan = parse_sql("SELECT AVG(price) FROM sales", &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let out = phys.output_schema();
+    assert_eq!(out.fields.len(), 1);
+    assert_eq!(out.fields[0].dtype, DataType::Float64);
+}
+
+#[test]
+fn scalar_count_star_parses() {
+    let provider = agg_provider();
+    let plan = parse_sql("SELECT COUNT(*) FROM sales", &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let out = phys.output_schema();
+    assert_eq!(out.fields.len(), 1);
+    assert_eq!(out.fields[0].dtype, DataType::Int64);
+}
+
+#[test]
+fn groupby_single_int_key() {
+    let provider = agg_provider();
+    let sql = "SELECT region_id, SUM(qty) FROM sales GROUP BY region_id";
+    let plan = parse_sql(sql, &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let PhysicalPlan::Aggregate { aggregate, .. } = &phys else {
+        panic!("expected Aggregate, got {phys:?}");
+    };
+    assert_eq!(aggregate.group_by.len(), 1, "one group key");
+    assert_eq!(aggregate.aggregates.len(), 1, "one aggregate");
+    let names: Vec<&str> = aggregate
+        .output_schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["region_id", "sum_qty"], "SELECT-order output");
+}
+
+#[test]
+fn groupby_select_order_sum_first() {
+    // Wave 1 fix #5: output column order must follow SELECT order, not
+    // "group keys first, then aggregates".
+    let provider = agg_provider();
+    let sql = "SELECT SUM(qty), region_id FROM sales GROUP BY region_id";
+    let plan = parse_sql(sql, &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let out = phys.output_schema();
+    let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["sum_qty", "region_id"],
+        "SELECT-order must be preserved (wave 1 fix #5 regression)"
+    );
+}
+
+#[test]
+fn groupby_aliased_key_preserves_alias() {
+    let provider = agg_provider();
+    let sql = "SELECT region_id AS r, SUM(qty) FROM sales GROUP BY region_id";
+    let plan = parse_sql(sql, &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let out = phys.output_schema();
+    assert!(
+        !out.fields.is_empty(),
+        "expected at least one output column"
+    );
+    assert_eq!(out.fields[0].name, "r", "alias on group key must surface");
+}
+
+#[test]
+fn groupby_multi_int_keys() {
+    let provider = agg_provider();
+    let sql = "SELECT region_id, sub_region_id, COUNT(*) FROM sales \
+               GROUP BY region_id, sub_region_id";
+    let plan = parse_sql(sql, &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let PhysicalPlan::Aggregate { aggregate, .. } = &phys else {
+        panic!("expected Aggregate, got {phys:?}");
+    };
+    assert_eq!(aggregate.group_by.len(), 2, "two group keys");
+    assert_eq!(aggregate.aggregates.len(), 1, "one aggregate");
+    assert_eq!(
+        aggregate.output_schema.fields.len(),
+        3,
+        "two keys + one aggregate = three output columns"
+    );
+}
+
+#[test]
+fn integer_literal_overflow_rejected() {
+    // Wave 1 fix #13: integer literals that overflow i64 must be rejected
+    // rather than silently demoted to Float64.
+    let provider = agg_provider();
+    let sql = "SELECT * FROM sales WHERE qty = 9223372036854775808";
+    let result = parse_sql(sql, &provider).and_then(|p| lower_physical(&p));
+    let err = result.expect_err("expected overflow rejection");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("i64"),
+        "error should mention i64 range; got: {msg}"
+    );
+}
+
+#[test]
+fn integer_literal_i64_min_parses() {
+    // Wave 1 fix #13: -9223372036854775808 is exactly i64::MIN; the positive
+    // form overflows but the negated form must parse cleanly to Literal::Int64.
+    let provider = agg_provider();
+    let sql = "SELECT * FROM sales WHERE qty = -9223372036854775808";
+    let plan = parse_sql(sql, &provider).expect("parse i64::MIN literal");
+    // Walk down to the Filter and find the literal in its predicate.
+    fn find_int64_literal(e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Literal(Literal::Int64(v)) => Some(*v),
+            Expr::Binary { left, right, .. } => {
+                find_int64_literal(left).or_else(|| find_int64_literal(right))
+            }
+            Expr::Alias(inner, _) => find_int64_literal(inner),
+            _ => None,
+        }
+    }
+    fn find_filter_predicate(p: &LogicalPlan) -> Option<&Expr> {
+        match p {
+            LogicalPlan::Filter { predicate, .. } => Some(predicate),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. } => find_filter_predicate(input),
+            LogicalPlan::Scan { .. } => None,
+        }
+    }
+    let pred = find_filter_predicate(&plan).expect("Filter present in plan");
+    let lit = find_int64_literal(pred).expect("Int64 literal present in predicate");
+    assert_eq!(lit, i64::MIN, "negated literal must equal i64::MIN");
+    // And the plan still lowers without error.
+    lower_physical(&plan).expect("lower with i64::MIN literal");
+}
+
+#[test]
+fn groupby_sum_int32_widens_to_i64() {
+    // Wave 4: SUM-widening must also fire on the GROUP BY path
+    // (not just scalar aggregates).
+    let provider = agg_provider();
+    let sql = "SELECT region_id, SUM(qty32) FROM sales GROUP BY region_id";
+    let plan = parse_sql(sql, &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let PhysicalPlan::Aggregate { aggregate, .. } = &phys else {
+        panic!("expected Aggregate, got {phys:?}");
+    };
+    // Find the SUM output field by name (avoids depending on key/agg order
+    // beyond what `groupby_single_int_key` already asserts).
+    let sum_field = aggregate
+        .output_schema
+        .fields
+        .iter()
+        .find(|f| f.name == "sum_qty32")
+        .expect("sum_qty32 column in output schema");
+    assert_eq!(
+        sum_field.dtype,
+        DataType::Int64,
+        "GROUP BY SUM(Int32) must widen to Int64 (wave 4)"
+    );
+    // Sanity check: aggregate is what we think it is.
+    assert!(matches!(
+        aggregate.aggregates[0],
+        AggregateExpr::Sum(_)
+    ));
 }
 
 // ---- Online (require CUDA device) ------------------------------------------

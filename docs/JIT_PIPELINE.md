@@ -37,7 +37,7 @@ This is exactly what Polars and DataFusion do on the CPU — codegen a vectorise
 
 The dominant cost is the driver's PTX-to-SASS assembly inside `cuModuleLoadData`. That's milliseconds, not seconds — orders of magnitude faster than invoking LLVM (which is what `rustc` or `clang` would do). For a query that processes millions of rows, the JIT cost amortises away.
 
-A PTX module cache keyed on `KernelSpec` would eliminate even that. It hasn't been built yet, but it's an obvious next optimization.
+A process-wide PTX module cache lives in `src/jit/jit_compiler.rs`. `CudaModule::from_ptx` hashes the emitted PTX text (DefaultHasher) and, on a hit, returns a clone of the cached `Arc<CudaModuleInner>` — skipping PTXAS re-assembly and the `cuModuleLoadDataEx` driver call. Capacity is 256 entries with FIFO eviction; entries hold the PTX `String` alongside the module so a 64-bit hash collision falls through to a fresh load instead of returning the wrong kernel. A `KernelSpec`-keyed cache that skips the codegen step too is still a future optimization.
 
 ## The stages, in detail
 
@@ -144,11 +144,23 @@ DONE:
 
 A few conventions used throughout:
 
-- **Target:** `sm_70` (Volta). Inherits everything from sm_70 forward — sm_70+ GPUs cover everything from V100 onward, which is the realistic deployment floor for serious GPU compute.
+- **Target:** `sm_70` (Volta). Every kernel the JIT emits — projection, predicate, prefix-scan, gather, per-block reduction, GROUP BY insert and aggregate, sentinel-free variants, and float MIN/MAX via CAS — declares `.target sm_70` by default. sm_70+ GPUs cover everything from V100 onward, which is the realistic deployment floor for serious GPU compute.
+
+  | Instruction                        | Min CC required | Where emitted                                                  |
+  |------------------------------------|-----------------|----------------------------------------------------------------|
+  | `atom.global.add.f64`              | sm_60           | scalar + group-by SUM over `Float64` (`agg_kernels.rs`, `hash_kernels.rs`) |
+  | `atom.global.add.f32`              | sm_50           | scalar + group-by SUM over `Float32`                            |
+  | `atom.global.add.s64` / `.min.s64` / `.max.s64` | sm_60   | group-by SUM / MIN / MAX over 64-bit signed integers            |
+  | `atom.global.cas.b64`              | sm_30           | classic GROUP BY key insertion                                  |
+  | `atom.global.cas.b32`              | sm_30           | sentinel-free `slot_valid` insertion (`valid_flag_kernels.rs`) and float MIN/MAX CAS-loop on `Float32` |
+  | `cvta.shared.u64` / `cvta.to.global.u64` | sm_50     | every pointer parameter (`cvta.to.global.u64`) and shared-memory addressing in the reductions |
+  | `shfl.sync.*`                      | sm_70           | warp-level reductions in the per-block aggregator               |
+
+  None of these exceed sm_70, so every kernel is loadable on V100+. If you change the target floor, audit `float_atomics.rs` first — the CAS-loop pattern there is the workaround for the absence of native `atom.global.{min,max}.f*`, which is still unavailable through sm_90.
 - **Address size:** 64-bit pointers. Every parameter is `.param .u64`; addresses are computed via `mul.wide.s32` + `add.s64`.
 - **Globalisation:** Every parameter pointer is converted with `cvta.to.global.u64` before use.
 - **Bounds check:** Each thread bails to `DONE` if `tid >= n_rows`. The last warp on the last block sees partial work.
-- **Predicate gating:** When the kernel has a predicate, a single `setp.ne.s32 %p, <pred_reg>, 0; @!%p bra DONE` skips ALL stores at once — the predicate is computed early, the gate sits right before the first store.
+- **Predicate gating:** When the kernel has a predicate, the emitter inserts a single `setp.eq.s32 %p, <pred_reg>, 0; @%p bra DONE` (positive form — branch when the predicate register is zero, i.e. when the row was masked out) right before the first store, so ALL stores are skipped in one branch. The predicate itself is computed early in the kernel body; the gate sits at the boundary between the load/compute prefix and the store suffix.
 
 Per-dtype register classes:
 - `Bool`, `Int32` → `%r<N>` (b32).

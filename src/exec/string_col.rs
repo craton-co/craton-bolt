@@ -11,11 +11,12 @@
 //!
 //! * **Bool** — Arrow stores booleans as a packed bitmap (1 bit per row); the
 //!   GPU codegen path prefers byte-wide loads. We expand to `u8` per row at
-//!   upload time (`0`/`1`) and re-pack to a bitmap on download. Nulls are
-//!   conservatively materialised as `0` (a documented choice, NOT semantic
-//!   three-valued logic — that's the planner's problem). Round-tripping a
-//!   nullable `BooleanArray` through this path is therefore lossy w.r.t.
-//!   null/false distinction.
+//!   upload time (`0`/`1`) and re-pack to a bitmap on download. For inputs
+//!   with no nulls we use the simpler `Bool` variant; for inputs with nulls
+//!   we use `BoolNullable`, which carries a parallel validity bitmap (one
+//!   byte per row) preserving the null/false distinction. The value byte for
+//!   a null row is conservatively `0` so existing kernels that read only the
+//!   value buffer still produce a defined result.
 //!
 //! * **Utf8** — see `crate::cuda::dictionary::DictionaryColumn`. Index `0`
 //!   means NULL; real strings start at index `1`.
@@ -34,33 +35,70 @@ use crate::error::JavelinResult;
 /// then this enum stands alone so the upload/download halves can be developed
 /// and tested in isolation.
 pub enum ExtendedDeviceCol {
-    /// Boolean column. One `u8` per row on the device: `0` for false/null,
-    /// `1` for true. See module docs for the null caveat.
+    /// Boolean column, no nulls. One `u8` per row on the device: `0` for
+    /// false, `1` for true. Use this variant when the source array has
+    /// `null_count() == 0`; downstream kernels can read the buffer with no
+    /// validity check.
     Bool(GpuVec<u8>),
+    /// Boolean column with nulls. Two parallel byte-per-row device buffers
+    /// of identical length:
+    ///
+    /// * `values[i] == 1` iff row `i` is `true`. `values[i] == 0` if row `i`
+    ///   is `false` OR null — i.e. existing value-only kernels still see a
+    ///   defined byte at every offset and never UB-read uninitialised data.
+    /// * `validity[i] == 1` iff row `i` is non-null, `0` iff row `i` is null.
+    ///   This is the byte-wide expansion of Arrow's packed validity bitmap;
+    ///   the kernel-side ABI is `u8` to match `values`.
+    ///
+    /// Both buffers must have the same length as the logical row count.
+    BoolNullable {
+        values: GpuVec<u8>,
+        validity: GpuVec<u8>,
+    },
     /// UTF-8 string column. Stored as i32 dictionary indices on the device;
     /// the host-side dictionary lives inside the `DictionaryColumn`.
     Utf8(DictionaryColumn),
 }
 
 impl ExtendedDeviceCol {
-    /// Upload a `BooleanArray` as a `u8`-per-row column.
+    /// Upload a `BooleanArray` as one or two `u8`-per-row device buffers.
     ///
-    /// Nulls are written as `0`. Callers that need to preserve null/false
-    /// distinction must layer their own validity bitmap on top.
+    /// * If `arr.null_count() == 0` returns [`ExtendedDeviceCol::Bool`] with
+    ///   a single value buffer.
+    /// * Otherwise returns [`ExtendedDeviceCol::BoolNullable`] with a value
+    ///   buffer (`1`=true, `0`=false-or-null) AND a parallel validity buffer
+    ///   (`1`=non-null, `0`=null). See the variant docs for the contract.
     pub fn upload_bool(arr: &BooleanArray) -> JavelinResult<Self> {
         let n = arr.len();
-        let mut bytes: Vec<u8> = Vec::with_capacity(n);
-        for i in 0..n {
-            // `is_null` checks the validity bitmap; `value` is well-defined
-            // even for null slots (it reads the underlying bit) so guard.
-            if arr.is_null(i) {
-                bytes.push(0);
-            } else {
+        if arr.null_count() == 0 {
+            let mut bytes: Vec<u8> = Vec::with_capacity(n);
+            for i in 0..n {
                 bytes.push(if arr.value(i) { 1 } else { 0 });
             }
+            let gpu = GpuVec::<u8>::from_slice(&bytes)?;
+            return Ok(ExtendedDeviceCol::Bool(gpu));
         }
-        let gpu = GpuVec::<u8>::from_slice(&bytes)?;
-        Ok(ExtendedDeviceCol::Bool(gpu))
+        let mut values: Vec<u8> = Vec::with_capacity(n);
+        let mut validity: Vec<u8> = Vec::with_capacity(n);
+        for i in 0..n {
+            // `is_null` checks the validity bitmap; `value` is well-defined
+            // even for null slots (it reads the underlying bit) but we
+            // conservatively force the value byte to `0` for nulls so
+            // value-only kernels see a defined byte at every offset.
+            if arr.is_null(i) {
+                values.push(0);
+                validity.push(0);
+            } else {
+                values.push(if arr.value(i) { 1 } else { 0 });
+                validity.push(1);
+            }
+        }
+        let gpu_values = GpuVec::<u8>::from_slice(&values)?;
+        let gpu_validity = GpuVec::<u8>::from_slice(&validity)?;
+        Ok(ExtendedDeviceCol::BoolNullable {
+            values: gpu_values,
+            validity: gpu_validity,
+        })
     }
 
     /// Upload a `StringArray` as a dictionary column.
@@ -96,21 +134,47 @@ impl ExtendedDeviceCol {
         }))
     }
 
-    /// Raw device pointer (for `cuLaunchKernel` args).
+    /// Raw device pointer to the *value* buffer (for `cuLaunchKernel` args).
+    ///
+    /// For `BoolNullable`, this is the value buffer only — the validity
+    /// buffer is reachable via [`Self::validity_device_ptr`]. Kernels that
+    /// don't consume validity continue to work unchanged.
     pub fn device_ptr(&self) -> u64 {
         match self {
             ExtendedDeviceCol::Bool(v) => v.device_ptr(),
+            ExtendedDeviceCol::BoolNullable { values, .. } => values.device_ptr(),
             ExtendedDeviceCol::Utf8(d) => d.indices.device_ptr(),
         }
     }
 
-    /// Download back to an Arrow `ArrayRef`.
+    /// Raw device pointer to the validity buffer, if this column carries
+    /// one. Only `BoolNullable` has a validity buffer today; all other
+    /// variants return `None`.
+    pub fn validity_device_ptr(&self) -> Option<u64> {
+        match self {
+            ExtendedDeviceCol::BoolNullable { validity, .. } => Some(validity.device_ptr()),
+            _ => None,
+        }
+    }
+
+    /// Download back to an Arrow `ArrayRef`. `BoolNullable` materialises a
+    /// nullable `BooleanArray` by zipping values with the validity buffer.
     pub fn download(&self) -> JavelinResult<ArrayRef> {
         match self {
             ExtendedDeviceCol::Bool(v) => {
                 let host: Vec<u8> = v.to_vec()?;
                 let bools: Vec<bool> = host.into_iter().map(|b| b != 0).collect();
                 Ok(Arc::new(BooleanArray::from(bools)) as ArrayRef)
+            }
+            ExtendedDeviceCol::BoolNullable { values, validity } => {
+                let host_values: Vec<u8> = values.to_vec()?;
+                let host_validity: Vec<u8> = validity.to_vec()?;
+                let arr: BooleanArray = host_values
+                    .into_iter()
+                    .zip(host_validity.into_iter())
+                    .map(|(v, m)| if m == 1 { Some(v == 1) } else { None })
+                    .collect();
+                Ok(Arc::new(arr) as ArrayRef)
             }
             ExtendedDeviceCol::Utf8(d) => {
                 let arr = d.to_string_array()?;

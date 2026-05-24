@@ -293,6 +293,11 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
         bytes = elem_bytes
     )
     .map_err(write_err)?;
+    // NOTE: keep `mov.u64` here (not `cvta.shared.u64`). The result %rd4 is
+    // used downstream with `st.shared.*` / `ld.shared.*` instructions, which
+    // expect a shared-state-space address. `cvta.shared.u64` would produce a
+    // generic-space address and require a matching state-space change at every
+    // shared load/store below — a wider refactor than this cleanup intends.
     writeln!(ptx, "\tmov.u64 %rd4, sdata;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd4, %rd3;").map_err(write_err)?;
     writeln!(
@@ -305,6 +310,23 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> JavelinResult<
 
     // Unrolled tree reduction in shared memory. For BLOCK_SIZE=256 this is
     // strides 128, 64, 32, 16, 8, 4, 2, 1.
+    //
+    // TODO(perf): warp shuffle reduction for strides 16..=1.
+    //   Strides {16, 8, 4, 2, 1} operate entirely within warp 0 (tid < stride
+    //   <= 16 < 32), so the per-stride bar.sync + shared ld/st can be replaced
+    //   with `shfl.sync.down.b32`/`b64` against an intra-warp value held in
+    //   registers. Estimated savings: 5 bar.syncs + 10 shared mem accesses per
+    //   block. Skipped here because:
+    //     (a) 64-bit accumulator types (Int64/Float64) require splitting the
+    //         value into two b32 halves, shuffling each, and recombining —
+    //         shfl.sync has no .b64 form on sm_70; and
+    //     (b) the existing tree reduction's `tid < stride` short-circuit must
+    //         be replaced with a `tid < 32`-gated warp-uniform code path that
+    //         keeps the membermask (0xffffffff) live — meaning all 32 lanes of
+    //         warp 0 must participate even if they're not "active" in the old
+    //         tree. That's a structural rewrite, not a textual swap.
+    //   Implementing both paths is >30 lines of new PTX emission. Deferred
+    //   pending a benchmark showing the reduction is hot enough to justify it.
     let mut stride = (BLOCK_SIZE / 2) as i32;
     let mut step = 0usize;
     while stride > 0 {

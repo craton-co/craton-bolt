@@ -101,10 +101,14 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `MIN(bool)`    | `Bool`                        | `FALSE < TRUE`. NULL if all-null group.                    |
 | `MIN(utf8)`    | `Utf8`                        | Lexicographic; NULL if all-null group.                     |
 | `MAX(int|float)` | Same dtype as input         | Same caveats as MIN.                                       |
-| `MAX(bool)`    | `Bool`                        |                                                            |
-| `MAX(utf8)`    | `Utf8`                        |                                                            |
+| `MAX(bool)`    | `Bool`                        | NULL if all-null group.                                    |
+| `MAX(utf8)`    | `Utf8`                        | NULL if all-null group.                                    |
 | `AVG(numeric)` | `Float64`                     | Split into `SUM + COUNT` on host.                          |
 | `AVG(bool)`    | `Float64`                     | Fraction of `TRUE` rows. NULL if all-null group.           |
+
+Aggregates over an all-NULL group (Bool/Utf8 inputs, which thread validity through `extended_agg`) return SQL `NULL` in both the scalar and GROUP BY paths. Earlier 0.1.x snapshots could return `0.0` / `false` for those empty groups in the GROUP BY path — fixed in the same wave that wired `extended_agg` through `groupby_with_pre`. Primitive aggregates do not yet read a validity bitmap, so `SUM`/`MIN`/`MAX`/`AVG` over `Int*`/`Float*` treat every row as non-null (see "What's NOT supported").
+
+`SUM` widens narrow integer inputs to the corresponding 64-bit type to prevent silent overflow: `SUM(Int32) -> Int64`. `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The widening is applied consistently in both the scalar and GROUP BY paths via `crate::plan::logical_plan::sum_output_dtype`.
 
 `DISTINCT` inside an aggregate (`COUNT(DISTINCT col)`) is not supported. Aggregate aliasing (`SUM(price) AS total`) is rejected by the SQL frontend — the plan auto-names aggregates and the SQL frontend doesn't carry the alias through.
 
@@ -140,7 +144,6 @@ SELECT price FROM sales WHERE region_id = 1;
 SELECT price * tax FROM sales WHERE region_id = 1 AND price > 100.0;
 SELECT * FROM sales;
 SELECT region, price FROM sales WHERE region = 'US';
-SELECT UPPER(region) FROM sales;             -- via Engine API, not yet wired into SQL frontend
 SELECT SUM(price) FROM sales;
 SELECT SUM(price * tax) FROM sales;
 SELECT SUM(price * tax) FROM sales WHERE region_id = 1;
@@ -170,7 +173,13 @@ These produce explicit errors:
 - `COUNT(DISTINCT col)`.
 - Post-aggregate expressions (`SUM(price) + 1`).
 - Ordering on Utf8 columns (`ORDER BY name` or `WHERE name < 'M'`).
-- String concatenation operator `||`. (The `CONCAT(...)` host function exists in `src/exec/string_ops_extended.rs` but isn't yet wired into the SQL frontend.)
+- String concatenation operator `||`.
 - DDL of any kind. There's no `CREATE TABLE`. Tables are registered via the Rust API (`Engine::register_table`).
+
+## Not yet supported (planned)
+
+### String functions
+
+`UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING` are reachable only from the executor-level `src/exec/string_ops` / `src/exec/string_ops_extended` API; no SQL or DataFrame surface exposes them yet. They run as pure-host dictionary transformations because variable-width device writes remain unsupported by the codegen path. Wiring them through the SQL frontend would mean teaching `sql_frontend::lower` to recognise `Expr::FunctionCall` and routing it to a per-function host-side projection executor.
 
 If you need any of the above for your use case, please open an issue describing the query and the use case.

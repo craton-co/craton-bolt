@@ -660,11 +660,23 @@ fn write_signature(out: &mut String, b: &PtxBuilder, spec: &KernelSpec) -> Javel
     writeln!(out, ".visible .entry {}(", b.kernel_name).map_err(write_err)?;
 
     let total_params = spec.inputs.len() + spec.outputs.len();
+    // NOTE: .ptr .global .restrict relies on the invariant that no two kernel-param
+    // pointers alias. The PhysicalPlan lowering guarantees this — never reuse a
+    // column buffer as both an input and a non-trivial output.
+    // TODO(orchestrator): golden test update — tests/ptx_golden_tests.rs may need
+    // its `.param .u64 ...` assertions widened to allow the new attribute string
+    // (e.g. assert `contains(".restrict")`).
     for i in 0..total_params {
         let comma = ",";
-        writeln!(out, "\t.param .u64 {}{}", b.param_name(i), comma).map_err(write_err)?;
+        writeln!(
+            out,
+            "\t.param .u64 .ptr .global .restrict .align 16 {}{}",
+            b.param_name(i),
+            comma
+        )
+        .map_err(write_err)?;
     }
-    // n_rows is u32, no trailing comma.
+    // n_rows is u32, no trailing comma. Scalar param — no .ptr attributes.
     writeln!(
         out,
         "\t.param .u32 {}",

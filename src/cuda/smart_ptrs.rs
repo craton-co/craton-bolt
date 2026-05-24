@@ -73,26 +73,31 @@ impl<T: Pod> GpuVec<T> {
     }
 
     /// Number of valid `T` elements.
+    #[inline]
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
 
     /// Whether the vec holds zero elements.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
     /// Allocated capacity in `T` elements.
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.buffer.capacity()
     }
 
     /// Raw device pointer (for FFI / kernel-launch glue).
+    #[inline]
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.buffer.device_ptr()
     }
 
     /// Borrow as a shared GPU view; many such views may coexist.
+    #[inline]
     pub fn view(&self) -> GpuView<'_, T> {
         GpuView {
             ptr: self.buffer.device_ptr(),
@@ -102,6 +107,7 @@ impl<T: Pod> GpuVec<T> {
     }
 
     /// Borrow as an exclusive GPU view; only one such view may exist.
+    #[inline]
     pub fn view_mut(&mut self) -> GpuViewMut<'_, T> {
         GpuViewMut {
             ptr: self.buffer.device_ptr(),
@@ -130,21 +136,25 @@ pub struct GpuView<'a, T: Pod> {
 
 impl<'a, T: Pod> GpuView<'a, T> {
     /// Number of `T` elements in the view.
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the view spans zero elements.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Raw device pointer for FFI / kernel launches.
+    #[inline]
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.ptr
     }
 
     /// Byte length of the view (`len * size_of::<T>()`).
+    #[inline]
     pub fn byte_len(&self) -> usize {
         self.len * std::mem::size_of::<T>()
     }
@@ -166,26 +176,31 @@ pub struct GpuViewMut<'a, T: Pod> {
 
 impl<'a, T: Pod> GpuViewMut<'a, T> {
     /// Number of `T` elements in the view.
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the view spans zero elements.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Raw device pointer for FFI / kernel launches.
+    #[inline]
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.ptr
     }
 
     /// Byte length of the view (`len * size_of::<T>()`).
+    #[inline]
     pub fn byte_len(&self) -> usize {
         self.len * std::mem::size_of::<T>()
     }
 
     /// Re-borrow the exclusive view as a shared view for the remaining scope.
+    #[inline]
     pub fn as_view(&self) -> GpuView<'_, T> {
         GpuView {
             ptr: self.ptr,

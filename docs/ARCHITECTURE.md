@@ -125,9 +125,11 @@ GpuVec<T>           // owned device allocation, drops via cuMemFree on Drop
    │ .view() borrows immutably for the GpuVec's lifetime
    │ .view_mut() borrows mutably (exclusive)
    ▼
-GpuView<'a, T>      // PhantomData<&'a [T]>, Copy + Clone + Send + Sync
+GpuView<'a, T>      // PhantomData<(&'a [T], Cell<()>)>, Copy + Clone + Send only — !Sync
 GpuViewMut<'a, T>   // PhantomData<&'a mut [T]>, Send only (not Sync, not Copy)
 ```
+
+`GpuView` was `Send + Sync` in early drafts. It was demoted to `!Sync` in wave 1 because the launch model is concurrency-unsafe at the API surface: a sibling thread holding the parent `GpuVec` can construct a `GpuViewMut` and launch a writer kernel, which would race a reader kernel launched through a shared `GpuView` on this thread. The `Cell<()>` smuggled into the `PhantomData` is what enforces the `!Sync` bound at the type level — it has no runtime cost. `Send` is preserved because moving an exclusive reader across threads is sound; only sharing it is not.
 
 Three properties fall out:
 
@@ -203,3 +205,7 @@ Float MIN/MAX over `Float32` / `Float64` has no native `atom.global.min/max.f*` 
 - **No streaming / multi-batch.** One `RecordBatch` per query. Larger-than-VRAM tables would need a batched executor.
 
 Each of these is a deliberate scope choice for the v0.1 release, not a fundamental limitation.
+
+## Stability of the IR types
+
+`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`, `Value`, `ColumnIO`, and the rest of the physical-plan / IR vocabulary in `src/plan/physical_plan.rs` are marked `#[doc(hidden)]`. They are implementation-internal: the codegen + executor split owns them end-to-end, no public method takes one as a parameter, and they may change shape, gain variants, or be replaced in any 0.1.x release without a deprecation cycle. External code that wants to drive Javelin should hold to the `Engine` and `DataFrame` surface; the planner and IR are explicitly out-of-contract until the API freezes.
