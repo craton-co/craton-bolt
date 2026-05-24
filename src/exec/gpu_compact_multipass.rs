@@ -53,6 +53,7 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::JavelinResult;
 use crate::exec::launch::CudaStream;
+use crate::exec::n_rows_to_u32;
 use crate::jit::jit_compiler::CudaModule;
 use crate::jit::prefix_scan::{compile_prefix_scan_kernel, BLOCK_SIZE, SCAN_KERNEL_ENTRY};
 use crate::jit::prefix_scan_multipass::{
@@ -213,10 +214,9 @@ fn run_u8_scan(
     // The n_rows passed to this kernel always fits in u32: at the top level
     // we accept up to u32::MAX (the dispatch limit); at recursive levels the
     // input is a `block_sums` slice which is itself a count of blocks
-    // (well under u32::MAX). The cast is therefore safe but we mask down
-    // explicitly to avoid surprises if a caller ever wedges this with a
-    // pathological size.
-    let mut n_u32: u32 = n_rows as u32;
+    // (well under u32::MAX). We funnel through `n_rows_to_u32` so a
+    // pathological caller surfaces a structured error rather than wrapping.
+    let mut n_u32: u32 = n_rows_to_u32(n_rows)?;
 
     let mut kernel_params: [*mut c_void; 4] = [
         &mut p_mask as *mut CUdeviceptr as *mut c_void,
@@ -225,7 +225,7 @@ fn run_u8_scan(
         &mut n_u32 as *mut u32 as *mut c_void,
     ];
 
-    let grid_x: u32 = n_rows.div_ceil(BLOCK_SIZE as usize) as u32;
+    let grid_x: u32 = n_rows_to_u32(n_rows.div_ceil(BLOCK_SIZE as usize))?;
     // SAFETY: each kernel_params entry points at a live stack local that
     // outlives the launch+synchronize below; `function` is borrowed from a
     // live `CudaModule`; the buffers behind every pointer outlive the sync
@@ -267,7 +267,7 @@ fn run_u32_scan(
     let mut p_vals: CUdeviceptr = vals.device_ptr();
     let mut p_local: CUdeviceptr = local.device_ptr();
     let mut p_block: CUdeviceptr = block_sums.device_ptr();
-    let mut n_u32: u32 = n as u32;
+    let mut n_u32: u32 = n_rows_to_u32(n)?;
 
     let mut kernel_params: [*mut c_void; 4] = [
         &mut p_vals as *mut CUdeviceptr as *mut c_void,
@@ -276,7 +276,7 @@ fn run_u32_scan(
         &mut n_u32 as *mut u32 as *mut c_void,
     ];
 
-    let grid_x: u32 = n.div_ceil(BLOCK_SIZE as usize) as u32;
+    let grid_x: u32 = n_rows_to_u32(n.div_ceil(BLOCK_SIZE as usize))?;
     // SAFETY: identical to `run_u8_scan`'s argument.
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
@@ -313,7 +313,7 @@ fn run_add_block_bases(
 
     let mut p_indices: CUdeviceptr = indices.device_ptr();
     let mut p_bases: CUdeviceptr = block_bases.device_ptr();
-    let mut n_u32: u32 = n as u32;
+    let mut n_u32: u32 = n_rows_to_u32(n)?;
 
     let mut kernel_params: [*mut c_void; 3] = [
         &mut p_indices as *mut CUdeviceptr as *mut c_void,
@@ -321,7 +321,7 @@ fn run_add_block_bases(
         &mut n_u32 as *mut u32 as *mut c_void,
     ];
 
-    let grid_x: u32 = n.div_ceil(BLOCK_SIZE as usize) as u32;
+    let grid_x: u32 = n_rows_to_u32(n.div_ceil(BLOCK_SIZE as usize))?;
     // SAFETY: identical to `run_u8_scan`'s argument.
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(

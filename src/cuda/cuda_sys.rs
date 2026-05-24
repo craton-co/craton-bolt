@@ -2,8 +2,13 @@
 
 //! Raw FFI bindings and thin safe wrappers around the CUDA Driver API.
 //!
-//! The orchestrator assumes the CUDA Toolkit is installed at link time; we
-//! link `cuda` directly with no feature gates.
+//! Real builds link `cuda` from the installed CUDA Toolkit. When the
+//! `cuda-stub` feature is enabled, the `#[link]` block is omitted and every
+//! FFI entry point is replaced by a Rust shim that returns
+//! [`CUDA_ERROR_STUB`]; [`check`] converts that into
+//! `JavelinError::Other("cuda-stub mode: no GPU support compiled in")`.
+//! Stub mode lets the crate compile on hosts without the CUDA toolkit and on
+//! docs.rs.
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -32,6 +37,12 @@ pub type CUstream = *mut c_void;
 /// Driver "no error" sentinel.
 pub const CUDA_SUCCESS: CUresult = 0;
 
+/// Sentinel error code returned by every FFI shim when the crate is built with
+/// the `cuda-stub` feature. Chosen well above the real CUDA driver error range
+/// (currently < 1000) so it cannot collide with a legitimate `CUresult`.
+pub const CUDA_ERROR_STUB: CUresult = 100_000;
+
+#[cfg(not(feature = "cuda-stub"))]
 #[link(name = "cuda")]
 extern "C" {
     pub fn cuInit(flags: c_uint) -> CUresult;
@@ -81,10 +92,75 @@ extern "C" {
     ) -> CUresult;
 }
 
+// ---------------------------------------------------------------------------
+// `cuda-stub` feature: stand-in implementations so the crate compiles on hosts
+// without the CUDA toolkit (including docs.rs). Every shim returns
+// `CUDA_ERROR_STUB`, which `check()` maps to `JavelinError::Other(...)`.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "cuda-stub")]
+#[allow(non_snake_case, unused_variables)]
+mod stubs {
+    use super::*;
+
+    pub unsafe fn cuInit(_flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuDeviceGetCount(_count: *mut c_int) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuDeviceGet(_device: *mut CUdevice, _ordinal: c_int) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuDeviceGetName(_name: *mut c_char, _len: c_int, _dev: CUdevice) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuDeviceGetAttribute(
+        _pi: *mut c_int,
+        _attrib: CUdevice_attribute,
+        _dev: CUdevice,
+    ) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuCtxCreate_v2(_pctx: *mut CUcontext, _flags: c_uint, _dev: CUdevice) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuCtxDestroy_v2(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuCtxSetCurrent(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemAlloc_v2(_dptr: *mut CUdeviceptr, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemFree_v2(_dptr: CUdeviceptr) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemcpyHtoD_v2(_dst: CUdeviceptr, _src: *const c_void, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemcpyDtoH_v2(_dst: *mut c_void, _src: CUdeviceptr, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuGetErrorName(_error: CUresult, _str: *mut *const c_char) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuGetErrorString(_error: CUresult, _str: *mut *const c_char) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuModuleLoadData(_module: *mut CUmodule, _image: *const c_void) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuModuleLoadDataEx(
+        _module: *mut CUmodule,
+        _image: *const c_void,
+        _num_options: c_uint,
+        _options: *mut i32,
+        _option_values: *mut *mut c_void,
+    ) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuModuleUnload(_module: CUmodule) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuModuleGetFunction(
+        _func: *mut CUfunction,
+        _module: CUmodule,
+        _name: *const c_char,
+    ) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuStreamCreate(_stream: *mut CUstream, _flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuStreamDestroy_v2(_stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuStreamSynchronize(_stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuCtxSynchronize() -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuLaunchKernel(
+        _f: CUfunction,
+        _grid_dim_x: c_uint, _grid_dim_y: c_uint, _grid_dim_z: c_uint,
+        _block_dim_x: c_uint, _block_dim_y: c_uint, _block_dim_z: c_uint,
+        _shared_mem_bytes: c_uint,
+        _stream: CUstream,
+        _kernel_params: *mut *mut c_void,
+        _extra: *mut *mut c_void,
+    ) -> CUresult { CUDA_ERROR_STUB }
+}
+
+#[cfg(feature = "cuda-stub")]
+pub use stubs::*;
+
 /// Convert a `CUresult` into a `JavelinResult`, attaching the driver's message.
 pub fn check(code: CUresult) -> JavelinResult<()> {
     if code == CUDA_SUCCESS {
         return Ok(());
+    }
+    if code == CUDA_ERROR_STUB {
+        return Err(JavelinError::Other(
+            "cuda-stub mode: no GPU support compiled in".into(),
+        ));
     }
     let msg = unsafe {
         let mut ptr: *const c_char = std::ptr::null();

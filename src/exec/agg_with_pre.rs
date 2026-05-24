@@ -51,6 +51,7 @@ use crate::cuda::GpuVec;
 use crate::error::{JavelinError, JavelinResult};
 use crate::exec::expr_agg;
 use crate::exec::launch::CudaStream;
+use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
     compile_reduction_kernel, ReduceOp, BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
 };
@@ -183,7 +184,7 @@ fn run_pre_stage(
     for c in &output_cols {
         device_ptrs.push(c.device_ptr());
     }
-    let mut n_rows_u32: u32 = n_rows as u32;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
 
     let mut kernel_params: Vec<*mut c_void> = Vec::with_capacity(device_ptrs.len() + 1);
     for p in device_ptrs.iter_mut() {
@@ -230,7 +231,7 @@ fn run_pre_stage(
             pred_function,
             &input_ptrs,
             mask.device_ptr(),
-            n_rows as u32,
+            n_rows_to_u32(n_rows)?,
             &stream,
         )?;
         Some(crate::exec::compact::download_mask(mask.device_ptr(), n_rows)?)
@@ -468,7 +469,8 @@ where
     }
 
     let block = BLOCK_SIZE;
-    let grid_x = ((n_rows as u32 + block - 1) / block).max(1);
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
     let partials = GpuVec::<T>::zeros(grid_x as usize)?;
 
     let ptx = compile_reduction_kernel(op, dtype)?;
@@ -477,7 +479,6 @@ where
 
     let mut input_ptr: CUdeviceptr = input.device_ptr();
     let mut output_ptr: CUdeviceptr = partials.device_ptr();
-    let mut n_rows_u32: u32 = n_rows as u32;
 
     let mut kernel_params: [*mut c_void; 3] = [
         &mut input_ptr as *mut CUdeviceptr as *mut c_void,

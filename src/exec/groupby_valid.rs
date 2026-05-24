@@ -68,6 +68,7 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{JavelinError, JavelinResult};
 use crate::exec::launch::CudaStream;
+use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::valid_flag_kernels::{
     compile_agg_valid_kernel, compile_keys_valid_kernel, valid_block_size,
@@ -632,7 +633,7 @@ fn launch_keys_kernel(
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
     let mut keys_ptr: CUdeviceptr = keys_table.device_ptr();
     let mut valid_ptr: CUdeviceptr = slot_valid.device_ptr();
-    let mut n_rows_u32: u32 = n_rows as u32;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
     let mut spill_keys_ptr: CUdeviceptr = spill_keys.device_ptr();
     let mut spill_counter_ptr: CUdeviceptr = spill_counter.device_ptr();
@@ -650,7 +651,7 @@ fn launch_keys_kernel(
     ];
 
     let block = valid_block_size();
-    let grid_x = ((n_rows as u32 + block - 1) / block).max(1);
+    let grid_x = ((n_rows_to_u32(n_rows)? + block - 1) / block).max(1);
 
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
@@ -727,7 +728,7 @@ fn launch_agg_kernel<T: Pod>(
     let mut valid_ptr: CUdeviceptr = slot_valid.device_ptr();
     let mut input_ptr: CUdeviceptr = input_col.device_ptr();
     let mut acc_ptr: CUdeviceptr = acc_table.device_ptr();
-    let mut n_rows_u32: u32 = n_rows as u32;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
     let mut spill_keys_ptr: CUdeviceptr = spill_keys.device_ptr();
     let mut spill_values_ptr: CUdeviceptr = spill_values.device_ptr();
@@ -749,7 +750,7 @@ fn launch_agg_kernel<T: Pod>(
     ];
 
     let block = valid_block_size();
-    let grid_x = ((n_rows as u32 + block - 1) / block).max(1);
+    let grid_x = ((n_rows_to_u32(n_rows)? + block - 1) / block).max(1);
 
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(

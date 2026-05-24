@@ -68,6 +68,7 @@ use crate::cuda::GpuVec;
 use crate::error::{JavelinError, JavelinResult};
 use crate::exec::expr_agg;
 use crate::exec::launch::CudaStream;
+use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_keys_kernel, groupby_block_size,
@@ -367,7 +368,7 @@ fn run_pre_stage(
     for c in &output_cols {
         device_ptrs.push(c.device_ptr());
     }
-    let mut n_rows_u32: u32 = n_rows as u32;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
 
     let mut kernel_params: Vec<*mut c_void> = Vec::with_capacity(device_ptrs.len() + 1);
     for p in device_ptrs.iter_mut() {
@@ -414,7 +415,7 @@ fn run_pre_stage(
             pred_function,
             &input_ptrs,
             mask.device_ptr(),
-            n_rows as u32,
+            n_rows_u32,
             &stream,
         )?;
         Some(crate::exec::compact::download_mask(
@@ -484,7 +485,7 @@ fn launch_keys_kernel(
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
     let mut keys_ptr: CUdeviceptr = keys_table.device_ptr();
-    let mut n_rows_u32: u32 = n_rows as u32;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
 
     let mut params: [*mut c_void; 4] = [
@@ -495,7 +496,7 @@ fn launch_keys_kernel(
     ];
 
     let block = groupby_block_size();
-    let grid_x = ((n_rows as u32 + block - 1) / block).max(1);
+    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
 
     // SAFETY: `function` is borrowed from a live `CudaModule`; every entry of
     // `params` points to a stack local that outlives the synchronize.
@@ -543,7 +544,7 @@ fn launch_agg_kernel<T: Pod>(
     let mut keys_ptr: CUdeviceptr = keys_table.device_ptr();
     let mut input_ptr: CUdeviceptr = input_col.device_ptr();
     let mut acc_ptr: CUdeviceptr = acc_table.device_ptr();
-    let mut n_rows_u32: u32 = n_rows as u32;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
 
     let mut params: [*mut c_void; 6] = [
@@ -556,7 +557,7 @@ fn launch_agg_kernel<T: Pod>(
     ];
 
     let block = groupby_block_size();
-    let grid_x = ((n_rows as u32 + block - 1) / block).max(1);
+    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
 
     // SAFETY: see `launch_keys_kernel`.
     unsafe {

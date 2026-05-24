@@ -41,6 +41,7 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{JavelinError, JavelinResult};
 use crate::exec::launch::CudaStream;
+use crate::exec::n_rows_to_u32;
 use crate::jit::jit_compiler::CudaModule;
 use crate::jit::prefix_scan::{
     compile_gather_kernel, compile_prefix_scan_kernel, gather_kernel_entry, BLOCK_SIZE,
@@ -193,7 +194,7 @@ pub fn prefix_scan_mask(
     let mut p_mask: CUdeviceptr = mask_ptr;
     let mut p_local: CUdeviceptr = local_indices.device_ptr();
     let mut p_block: CUdeviceptr = block_sums.device_ptr();
-    let mut n_rows_u32: u32 = n_rows as u32;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
 
     let mut kernel_params: [*mut c_void; 4] = [
         &mut p_mask as *mut CUdeviceptr as *mut c_void,
@@ -202,7 +203,7 @@ pub fn prefix_scan_mask(
         &mut n_rows_u32 as *mut u32 as *mut c_void,
     ];
 
-    let grid_x: u32 = n_blocks as u32;
+    let grid_x: u32 = n_rows_to_u32(n_blocks)?;
     // SAFETY: every entry in `kernel_params` points at a stack local that
     // outlives the launch+synchronize below; `function` is borrowed from a
     // live `CudaModule`.
@@ -307,7 +308,7 @@ pub fn gather_one(
     let mut p_bases: CUdeviceptr = scan.block_bases.device_ptr();
     let mut p_input: CUdeviceptr = input_ptr;
     let mut p_output: CUdeviceptr = output_ptr;
-    let mut n_rows_u32: u32 = n_rows as u32;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
 
     let mut kernel_params: [*mut c_void; 6] = [
         &mut p_mask as *mut CUdeviceptr as *mut c_void,
@@ -320,7 +321,7 @@ pub fn gather_one(
 
     let block_size = BLOCK_SIZE as usize;
     let n_blocks = n_rows.div_ceil(block_size);
-    let grid_x = n_blocks as u32;
+    let grid_x = n_rows_to_u32(n_blocks)?;
 
     // SAFETY: each kernel_params entry points at a live stack local; `function`
     // is borrowed from a live `CudaModule`; `stream` is live; the device

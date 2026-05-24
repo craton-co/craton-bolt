@@ -1,0 +1,9 @@
+# Javelin code owners
+#
+# These owners are requested for review on every pull request automatically.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+#
+# The team handle below is a placeholder — replace once the GitHub org/team
+# is provisioned.
+
+* @cratonsoftware/javelin-maintainers

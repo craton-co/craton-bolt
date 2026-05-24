@@ -1,10 +1,14 @@
-target/
-/target
+# Rust build artifacts
 /target/
-target
 
+# Editor / IDE
 .idea
-# Default ignored files
+.vscode/
+
+# OS
+.DS_Store
+
+# JetBrains: default ignored files
 /shelf/
 /workspace.xml
 # Ignored default folder with query files

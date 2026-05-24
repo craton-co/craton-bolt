@@ -53,9 +53,11 @@
 //!
 //! ## Restrictions
 //!
-//! `MIN` / `MAX` over floating-point inputs would require a CAS loop on
-//! sm_70 (PTX `atom.global.min/max.fXX` does not exist for `Float32`/
-//! `Float64`); for v1 we surface a clear error and revisit later.
+//! `MIN` / `MAX` over floating-point inputs is implemented via a CAS loop in
+//! [`crate::jit::float_atomics`]; this module only emits integer atomic
+//! kernels. PTX `atom.global.min/max.fXX` does not exist for `Float32` /
+//! `Float64` on sm_70, so float MIN/MAX combinations are rejected here and
+//! the executor dispatches them to the float-atomics path instead.
 
 use std::fmt::Write;
 
@@ -66,6 +68,13 @@ use crate::plan::logical_plan::DataType;
 /// Splitmix-style multiplier used by the per-row hash. Public so tests in the
 /// executor can replay the hash on the host while building the expected
 /// `(key -> slot)` mapping.
+///
+/// This is the canonical declaration of the constant — sibling kernel modules
+/// (notably [`crate::jit::valid_flag_kernels`]) redeclare the same value so
+/// they can be compiled / tested standalone, but the bit pattern must match
+/// the one here byte-for-byte, otherwise host-side hash replay against a
+/// classic-kernel-built table will disagree with a valid-flag-built one.
+// NOTE: this value must match valid_flag_kernels::FX_MUL.
 pub const FX_MUL: i64 = 0x9E3779B97F4A7C15u64 as i64;
 
 /// Entry point of the keys-only kernel emitted by [`compile_groupby_keys_kernel`].
@@ -80,6 +89,14 @@ const BLOCK_SIZE: u32 = 256;
 
 /// PTX `i64::MIN` literal used as the "empty slot" sentinel.
 const EMPTY_KEY_LITERAL: &str = "-9223372036854775808";
+
+/// Upper bound on the linear-probe loop, expressed as a multiple of `k`.
+/// At load factor < 0.5 (enforced by the executor) the expected probe length
+/// is well under `log2(k)`, so a full table sweep is generous. The bound
+/// exists purely to prevent a runaway kernel — if the host's load-factor
+/// invariant is honoured, the bound never triggers. Mirrors the
+/// `MAX_PROBE_FACTOR` constant in [`crate::jit::valid_flag_kernels`].
+const MAX_PROBE_FACTOR: u32 = 2;
 
 /// Generate PTX for the keys-building kernel. The kernel writes only to the
 /// keys table; the accumulator tables are untouched.
@@ -148,6 +165,17 @@ pub fn compile_groupby_keys_kernel() -> JavelinResult<String> {
     .map_err(write_err)?;
     writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
 
+    // max_probes = k * MAX_PROBE_FACTOR. Computed once at kernel entry so
+    // the bounded PROBE_LOOP can compare against it cheaply. The host
+    // enforces load factor < 0.5, so this bound is purely defensive — if it
+    // ever triggers, the thread gives up silently rather than spin forever.
+    writeln!(
+        ptx,
+        "\tmul.lo.u32 %r20, %r5, {factor};",
+        factor = MAX_PROBE_FACTOR
+    )
+    .map_err(write_err)?;
+
     // Load this thread's key value from group_col.
     writeln!(
         ptx,
@@ -179,8 +207,20 @@ pub fn compile_groupby_keys_kernel() -> JavelinResult<String> {
     // %rl4 = EMPTY_KEY ; %rl0 still holds the key.
     writeln!(ptx, "\tmov.s64 %rl4, {};", EMPTY_KEY_LITERAL).map_err(write_err)?;
 
+    // Bounded-probe counter. %r21 increments once per slot examined; on
+    // overflow the thread bails to DONE rather than spinning indefinitely.
+    writeln!(ptx, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+
     // Probe loop. %r8 is the current slot; loops on collision.
     writeln!(ptx, "PROBE_LOOP:").map_err(write_err)?;
+    // Bound check: probe_count += 1 ; if probe_count > max_probes -> DONE.
+    // Give-up-silently semantics — the success path is unchanged. Host-side
+    // post-launch detection of "did every key get placed?" is a separate
+    // concern (see the valid-flag SPILL path for the version that surfaces
+    // the overflow to the host).
+    writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p3, %r21, %r20;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
     // addr = keys_table + slot * 8
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
@@ -211,6 +251,29 @@ pub fn compile_groupby_keys_kernel() -> JavelinResult<String> {
 /// Generate PTX for an aggregate-update kernel parameterised over `op` +
 /// `input_dtype`. Assumes the keys table referenced by `keys_table_ptr` is
 /// already fully populated by a prior [`compile_groupby_keys_kernel`] launch.
+///
+/// ## Cross-kernel synchronisation contract
+///
+/// The keys-kernel writes to `keys_table_ptr` and the agg-kernel reads from
+/// it. The two kernels cooperate via the table but DO NOT synchronise
+/// internally — the agg-kernel's probe loop assumes every slot that will
+/// ever be written has already been written. The host is responsible for
+/// enforcing that ordering, which means one of the following MUST hold
+/// between the two launches:
+///
+/// * Both launches go on the same CUDA stream (CUDA's default in-order
+///   semantics make this a memory-ordering no-op — the agg kernel's loads
+///   are guaranteed to observe every store from the keys kernel), OR
+/// * The host explicitly calls `cuStreamSynchronize` (or an equivalent
+///   event-wait) between the two launches.
+///
+/// Cross-stream launches WITHOUT an explicit synchronise are a bug: the agg
+/// kernel will see a partially-populated keys table, miss its slot during
+/// linear probe, and either spin to the new bounded-probe limit and give up
+/// silently OR (depending on probe path) atomically update the wrong slot.
+/// Neither outcome is recoverable post-hoc. This invariant previously lived
+/// only in scattered executor docstrings; it is restated here because the
+/// agg-kernel PTX itself bakes it in as a pre-condition.
 pub fn compile_groupby_agg_kernel(
     op: ReduceOp,
     input_dtype: DataType,

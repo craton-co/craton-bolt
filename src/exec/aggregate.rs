@@ -38,6 +38,7 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{JavelinError, JavelinResult};
 use crate::exec::launch::CudaStream;
+use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
     compile_reduction_kernel, ReduceOp, BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
 };
@@ -299,7 +300,8 @@ where
     }
 
     let block = BLOCK_SIZE;
-    let grid_x = ((n_rows as u32 + block - 1) / block).max(1);
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
     let partials = GpuVec::<T>::zeros(grid_x as usize)?;
 
     // Compile + load the kernel.
@@ -310,7 +312,6 @@ where
     // Assemble the kernel parameter list (input_ptr, output_ptr, n_rows).
     let mut input_ptr: CUdeviceptr = input.device_ptr();
     let mut output_ptr: CUdeviceptr = partials.device_ptr();
-    let mut n_rows_u32: u32 = n_rows as u32;
 
     let mut kernel_params: [*mut c_void; 3] = [
         &mut input_ptr as *mut CUdeviceptr as *mut c_void,
