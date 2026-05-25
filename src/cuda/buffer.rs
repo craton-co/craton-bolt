@@ -73,6 +73,12 @@ impl<T: Pod> GpuBuffer<T> {
         // The 64-byte alignment invariant is preserved transitively:
         // `cuMemAlloc_v2` guarantees ≥256-byte alignment, and the pool only
         // ever stores pointers minted there.
+        //
+        // Backend routing: under `--features cudarc` the pool's miss path
+        // calls `cudarc_backend::mem_alloc`; otherwise it calls
+        // `cuda_sys::mem_alloc`. Both wrap `cuMemAlloc_v2` and return a
+        // bit-compatible `CUdeviceptr`, so callers of `GpuBuffer` are
+        // backend-agnostic. See `mem_pool::DeviceMemPool::alloc`.
         let (ptr, alloc_bytes) = crate::cuda::mem_pool::POOL.alloc(requested)?;
 
         Ok(Self {
@@ -197,7 +203,10 @@ impl<T: Pod> Drop for GpuBuffer<T> {
         }
         // Return the block to the pool rather than the driver. The pool's
         // `drain` (run on process shutdown via `Drop` on the static) will
-        // eventually hand it back to `cuMemFree_v2`.
+        // eventually hand it back to `cuMemFree_v2` — via the cudarc
+        // backend when `--features cudarc` is active, or via the
+        // hand-rolled FFI otherwise. Either way the call site here is
+        // backend-agnostic because the pool stores raw `CUdeviceptr`s.
         crate::cuda::mem_pool::POOL.free(self.ptr, self.alloc_bytes);
     }
 }

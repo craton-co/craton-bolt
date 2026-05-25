@@ -94,6 +94,138 @@ pub fn execute_groupby(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,
 ) -> JavelinResult<RecordBatch> {
+    // Layered fast-paths. Each `try_execute` returns `Some(_)` only if the
+    // query's shape matches that path's preconditions; misses fall through
+    // to the next. See docs/GROUPBY_PERF.md for the policy + cardinality
+    // breakdown.
+    //
+    //   Tier-1 single-SUM      — single Int32 key, ONE SUM(Float64), small n_groups
+    //   Tier-1 multi-SUM       — single Int32 key, 1..=4 SUMs(Float64), small n_groups
+    //   Tier-1 AVG             — single Int32 key, 1..=4 AVGs(Float64), small n_groups
+    //   Tier-2 hash-partitioned — single Int32 key, ONE SUM(Float64), large n_groups
+    //   GlobalAtomic (below)   — everything else
+    if let Some(result) =
+        crate::exec::groupby_shmem_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    if let Some(result) =
+        crate::exec::groupby_shmem_multi_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    if let Some(result) =
+        crate::exec::groupby_shmem_avg_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    if let Some(result) =
+        crate::exec::groupby_tier2_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Multi-SUM Tier-2: enabled with `MULTI_SUM_MIN_GROUPS = 100_000` floor
+    // in the executor itself. Below 100K groups the global-atomic baseline
+    // wins (q2 / 10K groups regressed 444 ms → 1.05 s when this path was
+    // unconditional); the gate now lets q2 fall through cleanly while
+    // capturing future workloads with more groups.
+    if let Some(result) =
+        crate::exec::groupby_tier2_multi_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Two-key Tier-2: enabled now that `partition_reduce_kernel_i64`
+    // replaces the host-HashMap pass-2 (Tier 2.1 for two-key).
+    if let Some(result) =
+        crate::exec::groupby_tier2_twokey_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Two-key MULTI-aggregate Tier-2.1: `SELECT a, b, SUM(v1), SUM(v2)
+    // FROM x GROUP BY a, b` — combines i64 partitioning with
+    // multi-value reduce. Two-key single-SUM falls through to the line
+    // above first.
+    if let Some(result) =
+        crate::exec::groupby_tier2_twokey_multi_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // AVG-at-Tier-2.1: SUM (via multi-SUM reduce) + COUNT (via count
+    // reduce) → divide host-side. High-cardinality AVG over Float64.
+    if let Some(result) =
+        crate::exec::groupby_tier2_avg_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Two-key multi-AVG Tier-2.1: `SELECT a, b, AVG(v1), AVG(v2), ...
+    // FROM x GROUP BY a, b`. Same shape as the single-key AVG path but
+    // with i64-packed (Int32, Int32) keys.
+    if let Some(result) =
+        crate::exec::groupby_tier2_twokey_avg_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // COUNT(*) at Tier-2.1: high-cardinality `SELECT k, COUNT(*) FROM x
+    // GROUP BY k`. Reuses partition + scatter; one COUNT reduce launch.
+    if let Some(result) =
+        crate::exec::groupby_tier2_count_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Two-key COUNT(*) Tier-2.1: `SELECT a, b, COUNT(*) FROM x GROUP BY
+    // a, b`. Same shape as the single-key COUNT path but with i64-packed
+    // (Int32, Int32) keys.
+    if let Some(result) =
+        crate::exec::groupby_tier2_twokey_count_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Two-key integer MIN/MAX at Tier-2.1: `SELECT a, b, {MIN,MAX}(v)
+    // FROM x GROUP BY a, b` with Int32 / Int64 value column. Routes
+    // through partition_reduce_kernel_minmax_i64. Must come before the
+    // single-key minmax path so the two-key shape isn't mishandled.
+    if let Some(result) =
+        crate::exec::groupby_tier2_twokey_minmax_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Two-key float MIN/MAX at Tier-2.1: same shape, Float64 value
+    // column, CAS-loop kernel (partition_reduce_kernel_minmax_float_i64).
+    if let Some(result) =
+        crate::exec::groupby_tier2_twokey_minmax_float_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // MIN/MAX at Tier-2.1: high-cardinality integer MIN/MAX. Float
+    // MIN/MAX is deferred — needs a CAS-loop kernel and no workload
+    // demands it yet.
+    if let Some(result) =
+        crate::exec::groupby_tier2_minmax_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Float MIN/MAX: routes through partition_reduce_kernel_minmax_float
+    // (CAS-loop kernel). Integer MIN/MAX above catches first; this
+    // handles the float-value-column path.
+    if let Some(result) =
+        crate::exec::groupby_tier2_minmax_float_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Tier-1 COUNT(*): low-cardinality COUNT GROUP BY.
+    if let Some(result) =
+        crate::exec::groupby_shmem_count_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+    // Tier-1 MIN/MAX: low-cardinality integer MIN/MAX. Float MIN/MAX
+    // is deferred — needs a CAS-loop kernel.
+    if let Some(result) =
+        crate::exec::groupby_shmem_minmax_exec::try_execute(plan, table_batch)
+    {
+        return result;
+    }
+
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         other => {

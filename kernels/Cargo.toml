@@ -1,0 +1,43 @@
+# Javelin GPU kernels crate (rust-cuda Wave A spike).
+#
+# This crate is compiled to PTX by `rustc_codegen_nvvm` via `cuda_builder`
+# and is INTENTIONALLY NOT part of the workspace members list (see the root
+# Cargo.toml `[workspace] exclude = [...]` entry). It is consumed only as
+# a `build.rs`-time artefact, never as a normal cargo dependency of the
+# host crate.
+#
+# Why crate-type = ["cdylib", "rlib"]:
+#   - `cdylib`: required by `rustc_codegen_nvvm` to emit a PTX module.
+#     The nvptx64-nvidia-cuda target has no binary crate output; the PTX
+#     comes out of the cdylib-style codegen path.
+#   - `rlib`:   keeps the crate usable as a regular dependency for SHARING
+#     host/device constants (NUM_PARTITIONS, HASH_MULTIPLIER) if we ever
+#     want to in a future wave. Not strictly needed for the partition
+#     spike, but the canonical rust-cuda example layout sets both.
+
+[package]
+name        = "javelin-kernels"
+version     = "0.0.1"
+edition     = "2021"
+publish     = false
+description = "Javelin GPU kernels compiled via rust-cuda (Wave A spike)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned to the latest published versions on crates.io as of 2026-05-25.
+# These are the Feb-2022 cuts; the audit doc (docs/rust_cuda/01_toolchain_audit.md)
+# notes that consumers normally pin a git rev of Rust-GPU/Rust-CUDA HEAD.
+# For the Wave A spike we deliberately try the crates.io path first because
+# it minimises supply-chain surprises. If the build fails because the
+# 0.2.2 cut is too old for our pinned nightly, the documented next step
+# is to flip to a git rev (see the Wave A outcome doc).
+cuda_std = "0.2.2"
+
+[profile.release]
+# rust-cuda canonical setting — debug=false keeps PTX size manageable;
+# lto=false because libnvvm runs its own optimiser.
+debug          = false
+lto            = false
+codegen-units  = 1

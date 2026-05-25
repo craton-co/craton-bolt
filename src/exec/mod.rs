@@ -19,6 +19,33 @@ pub mod extended_agg;
 pub mod expr_agg;
 pub mod groupby_valid;
 pub mod gpu_table;
+pub mod groupby_shmem_dispatch;
+pub mod groupby_shmem_launch;
+pub mod groupby_shmem_exec;
+pub mod groupby_shmem_multi_exec;
+pub mod groupby_shmem_avg_exec;
+pub mod groupby_tier2_dispatch;
+pub mod partition_offsets;
+pub mod groupby_tier2_merge;
+pub mod groupby_tier2_orchestrator;
+pub mod groupby_tier2_exec;
+pub mod groupby_tier2_avg_exec;
+pub mod groupby_tier2_count_exec;
+pub mod groupby_tier2_minmax_exec;
+pub mod groupby_shmem_count_exec;
+pub mod groupby_shmem_minmax_exec;
+pub mod groupby_tier2_twokey_multi_exec;
+pub mod groupby_tier2_minmax_float_exec;
+pub mod groupby_tier2_multi_orchestrator;
+pub mod groupby_tier2_multi_merge;
+pub mod groupby_tier2_multi_exec;
+pub mod groupby_tier2_twokey_orchestrator;
+pub mod groupby_tier2_twokey_merge;
+pub mod groupby_tier2_twokey_exec;
+pub mod groupby_tier2_twokey_count_exec;
+pub mod groupby_tier2_twokey_avg_exec;
+pub mod groupby_tier2_twokey_minmax_exec;
+pub mod groupby_tier2_twokey_minmax_float_exec;
 // Wave-7 executor scaffolds — owned by agents 3-6.
 // Marked #[doc(hidden)] to match the wave-3 sweep: these are internal dispatch
 // surfaces, not part of the public 0.2 API.

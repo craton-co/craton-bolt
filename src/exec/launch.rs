@@ -78,7 +78,16 @@ pub struct KernelArgs<'a> {
     /// Device pointers, kept alive (and at stable addresses) for the launch.
     ptrs: Vec<CUdeviceptr>,
     /// Row count passed as the final `.u32` kernel parameter.
+    ///
+    /// Used by [`launch_1d`] only — kernels that take additional trailing
+    /// scalars push them via [`KernelArgs::push_scalar_u32`] and launch via
+    /// [`launch_with_geometry`].
     n_rows: u32,
+    /// Extra trailing `.u32` scalar parameters, pushed in kernel-order.
+    /// Used by kernels with more than one trailing scalar (e.g. the
+    /// shared-memory GROUP BY kernels which take both `n_rows` AND
+    /// `n_groups`).
+    scalars: Vec<u32>,
     _marker: std::marker::PhantomData<(&'a (), &'a mut ())>,
 }
 
@@ -88,19 +97,101 @@ impl<'a> KernelArgs<'a> {
         Self {
             ptrs: Vec::new(),
             n_rows,
+            scalars: Vec::new(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Construct an empty arg list with no implicit trailing `n_rows`.
+    /// Used by callers that drive their own launch geometry and pass
+    /// `n_rows` (and any other scalars) explicitly via
+    /// [`KernelArgs::push_scalar_u32`].
+    pub fn empty() -> Self {
+        Self {
+            ptrs: Vec::new(),
+            n_rows: 0,
+            scalars: Vec::new(),
             _marker: std::marker::PhantomData,
         }
     }
 
     /// Append an input column's device pointer to the arg list.
-    pub fn push_input<T: bytemuck::Pod>(&mut self, view: &'a GpuView<'a, T>) {
+    ///
+    /// The view's *inner* lifetime (its borrow of the underlying
+    /// `GpuVec`) must outlive `'a` so dropping the vec mid-launch is a
+    /// compile error. The *outer* borrow (the `&` in front of `view`)
+    /// only needs to outlive the call — separated as `'b` so a Vec of
+    /// views can be iterated and pushed without unification problems.
+    pub fn push_input<'b, T: bytemuck::Pod>(&mut self, view: &'b GpuView<'a, T>)
+    where
+        'a: 'b,
+    {
         self.ptrs.push(view.device_ptr());
     }
 
     /// Append an output column's device pointer to the arg list.
-    pub fn push_output<T: bytemuck::Pod>(&mut self, view: &'a mut GpuViewMut<'a, T>) {
+    ///
+    /// Same lifetime split as `push_input`. The `&mut` requirement on
+    /// the outer reference keeps the borrow checker enforcing that no
+    /// shared alias can exist for the duration of the launch.
+    pub fn push_output<'b, T: bytemuck::Pod>(&mut self, view: &'b mut GpuViewMut<'a, T>)
+    where
+        'a: 'b,
+    {
         self.ptrs.push(view.device_ptr());
     }
+
+    /// Append a `u32` scalar to the arg list. Pushed after all device-ptr
+    /// args by [`launch_with_geometry`], in the order they were registered.
+    pub fn push_scalar_u32(&mut self, value: u32) {
+        self.scalars.push(value);
+    }
+}
+
+/// Launch with caller-controlled grid + block geometry and any number of
+/// trailing `u32` scalars (registered via
+/// [`KernelArgs::push_scalar_u32`]). Synchronizes the stream before
+/// returning.
+///
+/// This is the entry point for kernels whose launch geometry isn't
+/// "one thread per row" — shared-memory GROUP BY, partition kernels,
+/// scatter, per-partition reduce — and which take more than one trailing
+/// scalar.
+pub fn launch_with_geometry(
+    function: CudaFunction<'_>,
+    grid_x: u32,
+    block_x: u32,
+    shared_bytes: u32,
+    stream: &CudaStream,
+    args: &mut KernelArgs<'_>,
+) -> JavelinResult<()> {
+    let mut kernel_params: Vec<*mut c_void> =
+        Vec::with_capacity(args.ptrs.len() + args.scalars.len());
+    for p in args.ptrs.iter_mut() {
+        kernel_params.push(p as *mut CUdeviceptr as *mut c_void);
+    }
+    for s in args.scalars.iter_mut() {
+        kernel_params.push(s as *mut u32 as *mut c_void);
+    }
+
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block_x,
+            1,
+            1,
+            shared_bytes,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+
+    stream.synchronize()?;
+    Ok(())
 }
 
 /// Launch the kernel with one thread per row, block size 256, on `stream`.
