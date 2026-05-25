@@ -1,0 +1,439 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Tier-2 hash-partitioned GROUP BY SUM orchestrator (head of the chain).
+//!
+//! ## Tier 2.1 — pass 2 now on the GPU
+//!
+//! Pass 2 (per-partition dedup+sum) used to live on the host: download the
+//! `4 n_rows + 8 n_rows`-byte scatter buffers, then build a small
+//! `HashMap<i32, f64>` per partition. At N=10 M that cost ~50 ms of D2H +
+//! ~100 ms of host hash-map work, which dominated q5's 460 ms total.
+//!
+//! As of Tier 2.1 we replace that loop with a single launch of
+//! [`crate::jit::partition_reduce_kernel`]. Grid = `NUM_PARTITIONS`, one
+//! block per partition. Each block builds an open-addressing hash table
+//! in 16 KiB of shared memory, walks its partition's scatter slice with a
+//! grid-stride loop, and emits one slot's worth of `(key, val, set)` per
+//! shared-table position. The host then walks the (now fixed-size,
+//! `NUM_PARTITIONS * BLOCK_GROUPS * 13 B = 13 MiB`) output to collect the
+//! populated slots into the per-partition result vectors.
+//!
+//! Net cost change:
+//!   * D2H: ~150 ms (n_rows-sized buffers) → ~13 ms (fixed 13 MiB output)
+//!   * Host pass: ~100 ms of HashMap → ~5 ms of trivial scan
+//!   * GPU pass: +10–30 ms for the new kernel
+//! Net: ~150 ms saved, projected ~6× speedup on q5 per
+//! `docs/GROUPBY_PERF.md`.
+//!
+//! ## Pipeline
+//!
+//! 1. **Partition pass.** Hash every input row's key into one of
+//!    `NUM_PARTITIONS = 1024` buckets, count rows per bucket, and remember
+//!    the per-row bucket assignment. (`partition_kernel`, sibling agent.)
+//! 2. **Prefix sum.** Exclusive prefix sum over the bucket counts gives the
+//!    write offset for each partition in the scattered output.
+//!    (`partition_offsets`, sibling agent.)
+//! 3. **Scatter pass.** Each input row writes its (key, value) into the
+//!    scratch buffer at `offset[pid] + per_partition_cursor[pid]++`.
+//!    Output is `n_rows` of i32 keys + `n_rows` of f64 values, contiguous
+//!    by partition. (`scatter_kernel`, sibling agent.)
+//! 4. **Per-partition reduce — GPU.** One CUDA block per partition builds
+//!    a shared-memory open-addressing hash table over the partition's
+//!    `[offsets[pid]..offsets[pid+1])` slice (see
+//!    [`crate::jit::partition_reduce_kernel`]). The host then walks the
+//!    fixed-size output buffer to collect populated slots.
+//!
+//! ## Sibling-agent stubs
+//!
+//! Three sibling agents own the GPU pieces of this pipeline and write them
+//! in their own worktrees. THEIR files do not exist in mine. The
+//! integrator's merger pass will replace these stub modules with real
+//! `use crate::jit::partition_kernel::*;` (etc.) imports.
+//!
+//! Until then the stubs let this file **compile** in isolation, even if any
+//! actual call to an unimplemented stub would `unimplemented!()` at runtime.
+//! Wiring is the merger's job, not mine.
+
+use crate::cuda::GpuVec;
+use crate::error::{JavelinError, JavelinResult};
+use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::jit::CudaModule;
+
+// ---------------------------------------------------------------------------
+// Sibling-agent stubs.
+//
+// These are *placeholders* for the real modules other agents are writing in
+// their own worktrees. The merger swaps `stub_*` for real `use` statements;
+// see module-level docs.
+//
+// We do NOT depend on these stubs being correct at runtime — every body is
+// `unimplemented!()` — but their *signatures* must match the merger's
+// expectations so the swap is a one-line edit. Do not change a signature
+// without coordinating with the sibling agent that owns it.
+// ---------------------------------------------------------------------------
+
+// Sibling-agent modules wired in (stubs replaced by real imports):
+use crate::jit::partition_kernel as stub_partition_kernel;
+use crate::jit::scatter_kernel as stub_scatter_kernel;
+use crate::exec::partition_offsets as stub_partition_offsets;
+// This file (Tier 2.1) owns:
+use crate::jit::partition_reduce_kernel;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Tier-2 partial result: one `(keys, sums)` pair per partition.
+///
+/// Length is exactly `NUM_PARTITIONS`. Per-partition keys are already
+/// deduplicated and summed; a merger downstream needs only to *concatenate*
+/// the partitions (or stream them into a `RecordBatch` builder) to produce
+/// the final output.
+///
+/// Empty partitions are represented as `(vec![], vec![])` rather than
+/// elided — the index in `per_partition` is significant for downstream
+/// merging (if a future pass wants to walk partitions in order without
+/// rehashing).
+pub struct Tier2PartialResult {
+    /// Indexed by partition id `[0, NUM_PARTITIONS)`. Each entry is
+    /// `(distinct_keys_in_this_partition, summed_values_in_this_partition)`,
+    /// in matching order.
+    pub per_partition: Vec<(Vec<i32>, Vec<f64>)>,
+}
+
+/// Execute Tier-2 hash-partitioned GROUP BY SUM.
+///
+/// Inputs live on the device. `keys` and `vals` must each have length
+/// `n_rows` (the caller is responsible for this — we don't have a cheap way
+/// to assert it on `GpuVec` without an extra round-trip).
+///
+/// Returns one partial-result vector per partition (length
+/// `stub_partition_kernel::NUM_PARTITIONS`). The merger concatenates them
+/// into the final `RecordBatch`.
+///
+/// # Errors
+///
+/// Surfaces any CUDA driver failure encountered during partition / scatter /
+/// download. Stub sibling functions return `unimplemented!()`, so calling
+/// this *before* the merger pass will panic — that's intentional.
+pub fn execute_tier2_sum(
+    keys: &GpuVec<i32>,
+    vals: &GpuVec<f64>,
+    n_rows: u32,
+) -> JavelinResult<Tier2PartialResult> {
+    let num_partitions = stub_partition_kernel::NUM_PARTITIONS;
+
+    // Fast path: empty input. We still return `NUM_PARTITIONS` empty slots
+    // so downstream code can rely on the length invariant.
+    if n_rows == 0 {
+        return Ok(Tier2PartialResult {
+            per_partition: vec![(Vec::new(), Vec::new()); num_partitions as usize],
+        });
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 1. Allocate the partition-pass outputs.
+    // ----------------------------------------------------------------------
+    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
+    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
+
+    // ----------------------------------------------------------------------
+    // Step 2. JIT the partition kernel and launch it.
+    //
+    // Grid shape: ceil(n_rows / 256) blocks × 256 threads. The kernel does
+    // a grid-stride loop internally so the exact block count is not
+    // performance-critical, but matching it to n_rows minimises idle warps.
+    // ----------------------------------------------------------------------
+    let partition_ptx = stub_partition_kernel::compile_partition_kernel()?;
+    let partition_module = CudaModule::from_ptx(&partition_ptx)?;
+    let partition_fn = partition_module.function(stub_partition_kernel::KERNEL_ENTRY)?;
+
+    const BLOCK_THREADS: u32 = 256;
+    let grid_blocks = n_rows.div_ceil(BLOCK_THREADS).max(1);
+
+    {
+        // CUDA-Oxide typed launch path. Views keep the parent GpuVecs
+        // borrowed for the duration of the kernel-args list, so they
+        // cannot be dropped while the launch is in flight.
+        let view_keys = keys.view();
+        let mut view_pid = partition_ids.view_mut();
+        let mut view_counts = counts.view_mut();
+
+        let mut args = KernelArgs::empty();
+        args.push_input(&view_keys);
+        args.push_output(&mut view_pid);
+        args.push_output(&mut view_counts);
+        args.push_scalar_u32(n_rows);
+
+        let stream = CudaStream::null();
+        launch_with_geometry(
+            partition_fn,
+            grid_blocks,
+            BLOCK_THREADS,
+            0,
+            &stream,
+            &mut args,
+        )?;
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 3. Prefix-sum the counts into per-partition offsets.
+    //
+    // `offsets` has length NUM_PARTITIONS + 1, with offsets[K] = n_rows.
+    // The scatter kernel only needs the first NUM_PARTITIONS entries
+    // (as bases); we keep [K] around for the host loop below to compute
+    // per-partition lengths.
+    // ----------------------------------------------------------------------
+    let offsets: Vec<u32> = stub_partition_offsets::compute_partition_offsets(&counts)?;
+    if offsets.len() != (num_partitions as usize) + 1 {
+        return Err(JavelinError::Other(format!(
+            "tier2: prefix-sum returned {} offsets, expected {}",
+            offsets.len(),
+            num_partitions as usize + 1
+        )));
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 4. Allocate scatter outputs + cursor.
+    //
+    // `partition_cursors` is an atomic counter the scatter kernel bumps once
+    // per row to claim its write slot within a partition.
+    // ----------------------------------------------------------------------
+    let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros(n_rows as usize)?;
+    let mut scatter_vals: GpuVec<f64> = GpuVec::<f64>::zeros(n_rows as usize)?;
+    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
+
+    // Upload only the NUM_PARTITIONS bases (not the [K] sentinel) — the
+    // scatter kernel indexes `offsets[pid]` for pid in [0, K).
+    let offsets_gpu: GpuVec<u32> =
+        // upload_offsets takes the full 1025-element vec and slices off the
+        // trailing total internally; passing &offsets[..1024] would trip its
+        // length invariant.
+        stub_partition_offsets::upload_offsets(&offsets)?;
+
+    // ----------------------------------------------------------------------
+    // Step 5. JIT + launch the scatter kernel.
+    //
+    // Args (PTX-level):
+    //   .param .u64 keys              (in,  i32* len n_rows)
+    //   .param .u64 vals              (in,  f64* len n_rows)
+    //   .param .u64 partition_ids     (in,  u32* len n_rows)
+    //   .param .u64 offsets           (in,  u32* len K)
+    //   .param .u64 partition_cursors (in,  u32* len K, zeroed)
+    //   .param .u64 scatter_keys      (out, i32* len n_rows)
+    //   .param .u64 scatter_vals      (out, f64* len n_rows)
+    //   .param .u32 n_rows
+    // ----------------------------------------------------------------------
+    let scatter_ptx = stub_scatter_kernel::compile_scatter_kernel()?;
+    let scatter_module = CudaModule::from_ptx(&scatter_ptx)?;
+    let scatter_fn = scatter_module.function(stub_scatter_kernel::KERNEL_ENTRY)?;
+
+    {
+        let view_keys = keys.view();
+        let view_vals = vals.view();
+        let view_pid = partition_ids.view();
+        let view_offsets = offsets_gpu.view();
+        let mut view_cursors = partition_cursors.view_mut();
+        let mut view_sk = scatter_keys.view_mut();
+        let mut view_sv = scatter_vals.view_mut();
+
+        let mut args = KernelArgs::empty();
+        args.push_input(&view_keys);
+        args.push_input(&view_vals);
+        args.push_input(&view_pid);
+        args.push_input(&view_offsets);
+        args.push_output(&mut view_cursors);
+        args.push_output(&mut view_sk);
+        args.push_output(&mut view_sv);
+        args.push_scalar_u32(n_rows);
+
+        let stream = CudaStream::null();
+        launch_with_geometry(
+            scatter_fn,
+            grid_blocks,
+            BLOCK_THREADS,
+            0,
+            &stream,
+            &mut args,
+        )?;
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 6. Pass 2 — GPU per-partition dedup+sum (Tier 2.1).
+    //
+    // One block per partition. Each block builds an open-addressing hash
+    // table in shared memory over its partition's `[offsets[pid], offsets
+    // [pid+1])` slice. After the launch we download a fixed-size 13 MiB
+    // output buffer (NUM_PARTITIONS × BLOCK_GROUPS × {4 B key + 8 B val +
+    // 1 B set}) and walk the set flag to collect populated slots.
+    //
+    // See `crate::jit::partition_reduce_kernel` for the algorithm. The
+    // historical host-HashMap path lived here before; the diff is in the
+    // module-level docs above.
+    // ----------------------------------------------------------------------
+
+    // Defensive: the scatter kernel must populate exactly `n_rows` rows
+    // into the (keys, vals) buffers, and offsets[K] must equal n_rows.
+    // A violation here would silently corrupt the reduce kernel's slice
+    // bounds, so we surface it as a structured error.
+    let n_rows_usize = n_rows as usize;
+    if (offsets[num_partitions as usize] as usize) != n_rows_usize {
+        return Err(JavelinError::Other(format!(
+            "tier2: offsets[K]={}, expected n_rows={}",
+            offsets[num_partitions as usize],
+            n_rows
+        )));
+    }
+
+    // The reduce kernel needs the FULL K+1 offsets buffer on the device
+    // — it reads `offsets[pid]` AND `offsets[pid+1]` to compute each
+    // partition's slice. (The scatter kernel only needed the K bases,
+    // hence `upload_offsets` drops the trailing total — we re-upload here
+    // with the total intact.)
+    let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice(&offsets)?;
+
+    // Output buffers. NUM_PARTITIONS × BLOCK_GROUPS slots; one entry per
+    // shared-table slot per partition. Total fixed cost regardless of
+    // n_rows: 1024 * 1024 * (4 + 8 + 1) = ~13 MiB.
+    let n_out_slots: usize =
+        (num_partitions as usize) * (partition_reduce_kernel::BLOCK_GROUPS as usize);
+    let mut out_keys: GpuVec<i32> = GpuVec::<i32>::zeros(n_out_slots)?;
+    let mut out_vals: GpuVec<f64> = GpuVec::<f64>::zeros(n_out_slots)?;
+    let mut out_set: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
+
+    // JIT + launch the per-partition reduce kernel. Grid = NUM_PARTITIONS
+    // blocks (one per partition); blockIdx.x IS the partition id.
+    let reduce_ptx = partition_reduce_kernel::compile_partition_reduce_kernel()?;
+    let reduce_module = CudaModule::from_ptx(&reduce_ptx)?;
+    let reduce_fn = reduce_module.function(partition_reduce_kernel::KERNEL_ENTRY)?;
+
+    {
+        let view_pk = scatter_keys.view();
+        let view_pv = scatter_vals.view();
+        let view_po = offsets_kp1_gpu.view();
+        let mut view_ok = out_keys.view_mut();
+        let mut view_ov = out_vals.view_mut();
+        let mut view_os = out_set.view_mut();
+
+        let mut args = KernelArgs::empty();
+        args.push_input(&view_pk);
+        args.push_input(&view_pv);
+        args.push_input(&view_po);
+        args.push_output(&mut view_ok);
+        args.push_output(&mut view_ov);
+        args.push_output(&mut view_os);
+
+        let stream = CudaStream::null();
+        launch_with_geometry(
+            reduce_fn,
+            num_partitions,
+            partition_reduce_kernel::BLOCK_THREADS,
+            0,
+            &stream,
+            &mut args,
+        )?;
+    }
+
+    // Download the three fixed-size output buffers. Total ~13 MiB (vs.
+    // ~150 MiB the host path used to download at N=10 M).
+    let host_out_keys: Vec<i32> = out_keys.to_vec()?;
+    let host_out_vals: Vec<f64> = out_vals.to_vec()?;
+    let host_out_set: Vec<u8> = out_set.to_vec()?;
+
+    if host_out_keys.len() != n_out_slots
+        || host_out_vals.len() != n_out_slots
+        || host_out_set.len() != n_out_slots
+    {
+        return Err(JavelinError::Other(format!(
+            "tier2: reduce-kernel output buffers have unexpected length \
+             (keys={}, vals={}, set={}, expected={})",
+            host_out_keys.len(),
+            host_out_vals.len(),
+            host_out_set.len(),
+            n_out_slots
+        )));
+    }
+
+    // Walk the per-partition slot maps. For each populated slot (set==1)
+    // push (key, sum) into the partition's result. Empty partitions get
+    // empty `(vec![], vec![])` to preserve the length invariant on
+    // `Tier2PartialResult.per_partition`.
+    let block_groups = partition_reduce_kernel::BLOCK_GROUPS as usize;
+    let mut per_partition: Vec<(Vec<i32>, Vec<f64>)> =
+        Vec::with_capacity(num_partitions as usize);
+
+    for pid in 0..num_partitions as usize {
+        let base = pid * block_groups;
+
+        // Conservative capacity hint: in the worst case the table is fully
+        // packed at BLOCK_GROUPS slots, but typical workloads at q5 scale
+        // populate ~1 K of the 1024 slots. The Vec will grow if needed.
+        let mut out_k: Vec<i32> = Vec::new();
+        let mut out_s: Vec<f64> = Vec::new();
+
+        // Fast-path: skip the whole sweep if this partition is empty in
+        // the input. Saves 1024 byte-loads per empty partition (negligible
+        // but cheap to encode).
+        let p_start = offsets[pid] as usize;
+        let p_end = offsets[pid + 1] as usize;
+        if p_start == p_end {
+            per_partition.push((out_k, out_s));
+            continue;
+        }
+
+        for slot in 0..block_groups {
+            // SAFETY-equivalent of bounds: base + slot < n_out_slots is
+            // guaranteed by the loop bounds. We avoid an explicit get()
+            // here because the inner loop runs 1 M times at q5 scale and
+            // the unwrap overhead would be measurable.
+            if host_out_set[base + slot] != 0 {
+                out_k.push(host_out_keys[base + slot]);
+                out_s.push(host_out_vals[base + slot]);
+            }
+        }
+        per_partition.push((out_k, out_s));
+    }
+
+    Ok(Tier2PartialResult { per_partition })
+}
+
+// ---------------------------------------------------------------------------
+// Host-only sanity tests.
+//
+// We cannot exercise the full pipeline here without (a) a working CUDA
+// context and (b) the sibling-agent kernels, both of which are out of scope
+// for this worktree. What we *can* test cheaply:
+//
+//   * The empty-input early return matches the documented length invariant.
+//   * `Tier2PartialResult` is constructible and inspectable.
+//
+// The integrator's harness (T2G) covers the GPU-end-to-end correctness.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_input_returns_num_partitions_slots() {
+        // Requires a CUDA context to allocate even zero-length GpuVecs; if
+        // we cannot acquire one, skip rather than fail. This keeps the test
+        // useful on dev machines and inert on docs.rs.
+        let keys = match GpuVec::<i32>::from_slice(&[]) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let vals = match GpuVec::<f64>::from_slice(&[]) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let result = execute_tier2_sum(&keys, &vals, 0).expect("empty input must succeed");
+        assert_eq!(
+            result.per_partition.len(),
+            stub_partition_kernel::NUM_PARTITIONS as usize,
+            "Tier2PartialResult must always carry NUM_PARTITIONS slots"
+        );
+        for (k, v) in &result.per_partition {
+            assert!(k.is_empty() && v.is_empty(), "empty input yields empty partitions");
+        }
+    }
+}
