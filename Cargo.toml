@@ -14,6 +14,26 @@ categories   = ["database", "compilers"]
 rust-version = "1.74"
 exclude      = ["target/*", ".idea/*", ".github/*"]
 
+# --- Workspace shim ---------------------------------------------------------
+#
+# Javelin is a single-crate project, but the rust-cuda spike adds a sibling
+# `kernels/` directory that:
+#   - must NOT be built by the host's `cargo build` (it targets nvptx64 and
+#     needs a separate nightly toolchain — see kernels/rust-toolchain.toml),
+#   - must NOT be implicitly auto-detected as a workspace member, because
+#     cargo would then try to compile it with the host's stable toolchain.
+#
+# Declaring an explicit `[workspace]` block with empty `members` and
+# `kernels/` in `exclude` keeps cargo from descending into it on
+# `cargo build` / `cargo test`. The `kernels/` crate is invoked exclusively
+# via `cuda_builder` from this crate's `build.rs` when the `rust-cuda`
+# feature is enabled.
+#
+# See docs/rust_cuda/04_build_integration.md §5 for the rationale.
+[workspace]
+members  = []
+exclude  = ["kernels", ".claude/worktrees"]
+
 [lib]
 name = "javelin"
 path = "src/lib.rs"
@@ -30,6 +50,11 @@ once_cell = "1"
 bytemuck = { version = "1", features = ["derive"] }
 libc = "0.2"
 log = "0.4"
+# cudarc: optional pure-Rust CUDA Driver API binding. Gated on the
+# `cudarc` feature. See docs/CUDARC_ADOPTION.md for the migration plan.
+# v0.13 supports CUDA 12.x with stable Rust. Default features off — we
+# only need `driver` for Stage 1.
+cudarc = { version = "0.13", optional = true, default-features = false, features = ["driver", "cuda-12060"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -43,8 +68,25 @@ duckdb = { version = "1.0", features = ["bundled"] }
 default = []
 # Stub-mode lets non-CUDA hosts at least compile; real builds use the linked CUDA path.
 cuda-stub = []
+# `cudarc` backend (Stage 1, spike): routes a handful of low-level CUDA
+# driver calls through the `cudarc` crate instead of our hand-rolled
+# `extern "C"` FFI. Not the default yet — turn on with
+# `cargo build --features cudarc` to opt in. See docs/CUDARC_ADOPTION.md.
+cudarc = ["dep:cudarc"]
+# `rust-cuda` (Wave A spike): switches `partition_kernel.rs`'s PTX source
+# from the hand-rolled string emitter to a Rust-source kernel compiled at
+# build time via `cuda_builder` (rustc_codegen_nvvm). Requires the rust-cuda
+# toolchain installed (nightly + libNVVM + LLVM, see kernels/rust-toolchain.toml).
+# Default build remains hand-emit and bit-identical. See
+# docs/rust_cuda/08_wave_a_outcome.md.
+rust-cuda = ["dep:cuda_builder"]
 
 [build-dependencies]
+# `cuda_builder` is the build-time entry point to rust-cuda's NVVM codegen
+# backend. Optional + feature-gated so default builds (which do NOT have
+# the rust-cuda toolchain) ignore the dep entirely. Pulled in only when
+# `--features rust-cuda` is on.
+cuda_builder = { version = "0.3", optional = true }
 
 [[bench]]
 name = "query_benchmarks"

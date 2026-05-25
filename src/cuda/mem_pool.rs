@@ -22,7 +22,13 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 use crate::cuda::buffer::ARROW_ALIGNMENT;
-use crate::cuda::cuda_sys::{self, CUdeviceptr};
+use crate::cuda::cuda_sys::CUdeviceptr;
+// `cuda_sys` is only referenced by the hand-rolled (default) backend
+// path. Under `--features cudarc` the alloc/free hit `cudarc_backend`
+// instead, so the import is feature-gated to keep both builds warning-
+// free.
+#[cfg(not(feature = "cudarc"))]
+use crate::cuda::cuda_sys;
 use crate::error::JavelinResult;
 
 /// Round `bytes` up to the next power of two, with a floor of `ARROW_ALIGNMENT`.
@@ -69,6 +75,15 @@ impl DeviceMemPool {
         }
         // Miss: call the driver. cuMemAlloc_v2 guarantees at least 256-byte
         // alignment, so the ARROW_ALIGNMENT (64) invariant holds trivially.
+        //
+        // Under `--features cudarc`, the alloc is satisfied by cudarc's
+        // `result::malloc_sync`, which calls the same `cuMemAlloc_v2`
+        // under the hood and returns a bit-compatible `CUdeviceptr` — so
+        // pointers stored in the pool remain backend-agnostic and the
+        // drain path can free them via either implementation.
+        #[cfg(feature = "cudarc")]
+        let ptr = crate::cuda::cudarc_backend::mem_alloc(alloc_bytes)?;
+        #[cfg(not(feature = "cudarc"))]
         let ptr = cuda_sys::mem_alloc(alloc_bytes)?;
         Ok((ptr, alloc_bytes))
     }
@@ -94,11 +109,20 @@ impl DeviceMemPool {
             out
         };
         for ptr in drained {
-            // SAFETY: every pointer in the pool came from `cuda_sys::mem_alloc`
-            // and is no longer aliased — it was placed here by a `free` call
-            // that gave up ownership.
+            // SAFETY: every pointer in the pool came from the matching
+            // backend's `mem_alloc` (either `cuda_sys` or `cudarc_backend`,
+            // both of which delegate to `cuMemAlloc_v2`) and is no longer
+            // aliased — it was placed here by a `free` call that gave up
+            // ownership. Pointers are interchangeable across backends
+            // because they share `CUdeviceptr` and the same driver
+            // allocator, so we route the free through whichever backend
+            // is active for this build.
             unsafe {
-                if let Err(e) = cuda_sys::mem_free(ptr) {
+                #[cfg(feature = "cudarc")]
+                let result = crate::cuda::cudarc_backend::mem_free(ptr);
+                #[cfg(not(feature = "cudarc"))]
+                let result = cuda_sys::mem_free(ptr);
+                if let Err(e) = result {
                     eprintln!("javelin: DeviceMemPool drain failed to free ptr: {}", e);
                 }
             }
