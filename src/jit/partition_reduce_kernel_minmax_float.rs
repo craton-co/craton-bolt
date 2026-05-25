@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Per-partition shared-memory **float MIN / MAX** kernel — Tier 2.1
 //! variant for `Float32` and `Float64` value dtypes.
@@ -52,7 +52,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::jit::partition_reduce_kernel_minmax::MinMaxOp;
 
 pub const BLOCK_GROUPS: u32 = 1024;
@@ -103,13 +103,13 @@ pub fn kernel_entry(op: MinMaxOp, dtype: FloatDtype) -> String {
         FloatDtype::Float32 => "f32",
         FloatDtype::Float64 => "f64",
     };
-    format!("javelin_partition_reduce_{}_{}", opn, dt)
+    format!("patina_partition_reduce_{}_{}", opn, dt)
 }
 
 pub fn compile_partition_reduce_kernel_minmax_float(
     op: MinMaxOp,
     dtype: FloatDtype,
-) -> JavelinResult<String> {
+) -> PatinaResult<String> {
     let mut ptx = String::new();
     let entry = kernel_entry(op, dtype);
     let entry = entry.as_str();
@@ -396,7 +396,7 @@ fn emit_cas_loop(
     dtype: FloatDtype,
     label_prefix: &str,
     val_reg: &str,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     let cas_suffix = dtype.ptx_cas_suffix();
     let setp_dt = dtype.ptx_setp_suffix();
     // Comparison: MIN keeps the smaller; MAX keeps the larger. We use
@@ -516,8 +516,8 @@ fn emit_cas_loop(
     Ok(())
 }
 
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!(
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!(
         "partition_reduce_kernel_minmax_float: write failed: {}",
         e
     ))

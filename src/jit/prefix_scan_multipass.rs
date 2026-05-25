@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for the multi-pass prefix-scan compaction path.
 //!
@@ -17,15 +17,15 @@
 //! This module emits the two PTX kernels that path needs *beyond* what
 //! `prefix_scan.rs` already provides:
 //!
-//! 1. [`SCAN_U32_KERNEL_ENTRY`] — `javelin_prefix_scan_u32`: identical shape
+//! 1. [`SCAN_U32_KERNEL_ENTRY`] — `patina_prefix_scan_u32`: identical shape
 //!    to the existing scan kernel, but reads a `u32*` input directly (no u8
 //!    load, no truthiness coercion). Used to scan the intermediate
 //!    `block_sums` arrays.
-//! 2. [`ADD_BASES_KERNEL_ENTRY`] — `javelin_add_block_bases`: per-row,
+//! 2. [`ADD_BASES_KERNEL_ENTRY`] — `patina_add_block_bases`: per-row,
 //!    `indices[i] += block_bases[i / BLOCK_SIZE]`. Used between recursion
 //!    levels to fold a parent's bases into a child's per-row local indices.
 //!
-//! The single-pass `javelin_prefix_scan` kernel is re-exported as-is so the
+//! The single-pass `patina_prefix_scan` kernel is re-exported as-is so the
 //! multipass execution module only needs one import surface.
 //!
 //! No new FFI symbols are introduced — these are JIT-compiled by the same
@@ -33,7 +33,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 // Re-export the single-pass scan kernel so callers can keep one import.
 pub use crate::jit::prefix_scan::{compile_prefix_scan_kernel, SCAN_KERNEL_ENTRY};
@@ -53,24 +53,24 @@ const PTX_ADDRESS_SIZE: &str = ".address_size 64";
 /// Used by [`prefix_scan_mask_multipass`](crate::exec::gpu_compact_multipass::prefix_scan_mask_multipass)
 /// to scan the intermediate `block_sums` arrays produced by the previous
 /// recursion level.
-pub const SCAN_U32_KERNEL_ENTRY: &str = "javelin_prefix_scan_u32";
+pub const SCAN_U32_KERNEL_ENTRY: &str = "patina_prefix_scan_u32";
 
 /// Entry-point name for the `add per-block base` kernel.
 ///
 /// Per row: `indices[i] += block_bases[i / BLOCK_SIZE]`. Used to fold a
 /// parent level's bases into a child level's per-row local indices on the
 /// way back down the recursion.
-pub const ADD_BASES_KERNEL_ENTRY: &str = "javelin_add_block_bases";
+pub const ADD_BASES_KERNEL_ENTRY: &str = "patina_add_block_bases";
 
 /// Generate the per-block exclusive prefix-scan PTX module for a `u32` input.
 ///
 /// ABI:
 /// ```text
-/// .visible .entry javelin_prefix_scan_u32(
-///     .param .u64 javelin_prefix_scan_u32_param_0,   // vals_ptr      (u32*)
-///     .param .u64 javelin_prefix_scan_u32_param_1,   // local_indices (u32*)
-///     .param .u64 javelin_prefix_scan_u32_param_2,   // block_sums    (u32*)
-///     .param .u32 javelin_prefix_scan_u32_param_3    // n
+/// .visible .entry patina_prefix_scan_u32(
+///     .param .u64 patina_prefix_scan_u32_param_0,   // vals_ptr      (u32*)
+///     .param .u64 patina_prefix_scan_u32_param_1,   // local_indices (u32*)
+///     .param .u64 patina_prefix_scan_u32_param_2,   // block_sums    (u32*)
+///     .param .u32 patina_prefix_scan_u32_param_3    // n
 /// )
 /// ```
 ///
@@ -90,7 +90,7 @@ pub const ADD_BASES_KERNEL_ENTRY: &str = "javelin_add_block_bases";
 /// conversion, block-sum store at thread `BLOCK_SIZE - 1`) matches the
 /// single-pass kernel beat-for-beat. Out-of-range lanes contribute zero, so
 /// partial blocks remain correct.
-pub fn compile_prefix_scan_u32_kernel() -> JavelinResult<String> {
+pub fn compile_prefix_scan_u32_kernel() -> PatinaResult<String> {
     // Two u32 buffers of BLOCK_SIZE entries each: ping-pong avoids one
     // bar.sync per round vs. reading and writing the same buffer.
     let elem_bytes: u32 = 4;
@@ -272,10 +272,10 @@ pub fn compile_prefix_scan_u32_kernel() -> JavelinResult<String> {
 ///
 /// ABI:
 /// ```text
-/// .visible .entry javelin_add_block_bases(
-///     .param .u64 javelin_add_block_bases_param_0,   // indices_ptr     (u32* in/out)
-///     .param .u64 javelin_add_block_bases_param_1,   // block_bases_ptr (u32*)
-///     .param .u32 javelin_add_block_bases_param_2    // n
+/// .visible .entry patina_add_block_bases(
+///     .param .u64 patina_add_block_bases_param_0,   // indices_ptr     (u32* in/out)
+///     .param .u64 patina_add_block_bases_param_1,   // block_bases_ptr (u32*)
+///     .param .u32 patina_add_block_bases_param_2    // n
 /// )
 /// ```
 ///
@@ -286,7 +286,7 @@ pub fn compile_prefix_scan_u32_kernel() -> JavelinResult<String> {
 ///
 /// Out-of-range lanes (the last block when `n` is not a multiple of
 /// `BLOCK_SIZE`) early-return without touching memory.
-pub fn compile_add_block_bases_kernel() -> JavelinResult<String> {
+pub fn compile_add_block_bases_kernel() -> PatinaResult<String> {
     let mut ptx = String::new();
     writeln!(ptx, "{}", PTX_VERSION).map_err(write_err)?;
     writeln!(ptx, "{}", PTX_TARGET).map_err(write_err)?;
@@ -356,9 +356,9 @@ pub fn compile_add_block_bases_kernel() -> JavelinResult<String> {
     Ok(ptx)
 }
 
-/// Adapt a `std::fmt::Error` into a `JavelinError`.
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!("prefix_scan_multipass: write failed: {}", e))
+/// Adapt a `std::fmt::Error` into a `PatinaError`.
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!("prefix_scan_multipass: write failed: {}", e))
 }
 
 #[cfg(test)]
@@ -375,11 +375,11 @@ mod tests {
         assert!(ptx.contains(".address_size 64"));
 
         // Signature.
-        assert!(ptx.contains(".visible .entry javelin_prefix_scan_u32("));
-        assert!(ptx.contains(".param .u64 javelin_prefix_scan_u32_param_0,"));
-        assert!(ptx.contains(".param .u64 javelin_prefix_scan_u32_param_1,"));
-        assert!(ptx.contains(".param .u64 javelin_prefix_scan_u32_param_2,"));
-        assert!(ptx.contains(".param .u32 javelin_prefix_scan_u32_param_3"));
+        assert!(ptx.contains(".visible .entry patina_prefix_scan_u32("));
+        assert!(ptx.contains(".param .u64 patina_prefix_scan_u32_param_0,"));
+        assert!(ptx.contains(".param .u64 patina_prefix_scan_u32_param_1,"));
+        assert!(ptx.contains(".param .u64 patina_prefix_scan_u32_param_2,"));
+        assert!(ptx.contains(".param .u32 patina_prefix_scan_u32_param_3"));
 
         // Direct u32 load — no mask-byte machinery.
         assert!(
@@ -430,10 +430,10 @@ mod tests {
         assert!(ptx.contains(".address_size 64"));
 
         // Signature.
-        assert!(ptx.contains(".visible .entry javelin_add_block_bases("));
-        assert!(ptx.contains(".param .u64 javelin_add_block_bases_param_0,"));
-        assert!(ptx.contains(".param .u64 javelin_add_block_bases_param_1,"));
-        assert!(ptx.contains(".param .u32 javelin_add_block_bases_param_2"));
+        assert!(ptx.contains(".visible .entry patina_add_block_bases("));
+        assert!(ptx.contains(".param .u64 patina_add_block_bases_param_0,"));
+        assert!(ptx.contains(".param .u64 patina_add_block_bases_param_1,"));
+        assert!(ptx.contains(".param .u32 patina_add_block_bases_param_2"));
 
         // Core ops: load base for the block, load the index, add, store back.
         assert!(
@@ -460,10 +460,10 @@ mod tests {
     #[test]
     fn reexport_uses_single_pass_entry_name() {
         // Re-export should be the same constant the single-pass module exposes.
-        assert_eq!(SCAN_KERNEL_ENTRY, "javelin_prefix_scan");
+        assert_eq!(SCAN_KERNEL_ENTRY, "patina_prefix_scan");
 
         // And it should compile — we re-export the *function*, not just the name.
         let ptx = compile_prefix_scan_kernel().expect("re-exported scan PTX compiles");
-        assert!(ptx.contains(".visible .entry javelin_prefix_scan("));
+        assert!(ptx.contains(".visible .entry patina_prefix_scan("));
     }
 }

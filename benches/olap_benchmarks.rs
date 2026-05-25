@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! **h2o.ai db-benchmark — groupby subset, three-engine comparison.**
 //!
@@ -9,12 +9,12 @@
 //! Pandas, ClickHouse, and others use for embedded-OLAP comparisons. The
 //! schema and query shapes match the original spec; the only deviation is
 //! that grouping keys are `Int32` instead of categorical strings, so that
-//! Javelin's GPU GROUP-BY (which does not yet hash string keys) can run the
+//! Craton Patina's GPU GROUP-BY (which does not yet hash string keys) can run the
 //! same SQL the CPU engines do.
 //!
 //! Engines
 //! -------
-//! - **Javelin** — GPU SQL engine under test. Gated on `JAVELIN_BENCH_GPU=1`.
+//! - **Craton Patina** — GPU SQL engine under test. Gated on `PATINA_BENCH_GPU=1`.
 //! - **Polars 0.42** — Rust-native, Rayon-threaded.
 //! - **DuckDB 1.2** — embedded, bundled, multi-threaded CPU.
 //!
@@ -95,7 +95,7 @@ const QUERIES: &[(&str, &str)] = &[
 //
 // h2o.ai's generator is random; we use a deterministic hash so every engine
 // sees byte-identical input (no PRNG seed plumbing needed across language
-// boundaries — DuckDB is C++, Polars/Javelin are Rust).
+// boundaries — DuckDB is C++, Polars/Craton Patina are Rust).
 
 fn id1(i: usize) -> i32 {
     ((i.wrapping_mul(2_654_435_761)) as i32).rem_euclid(ID1_CARD)
@@ -355,18 +355,18 @@ fn duckdb_q(conn: &duckdb::Connection, q: &str) -> QueryResult {
     QueryResult { keys, aggs }.canonicalise()
 }
 
-// --- Javelin (GPU)
+// --- Craton Patina (GPU)
 
-fn javelin_q(engine: &javelin::Engine, q: &str) -> QueryResult {
-    let h = engine.sql(q).expect("javelin sql");
-    javelin_decode(&h, q)
+fn patina_q(engine: &craton_patina::Engine, q: &str) -> QueryResult {
+    let h = engine.sql(q).expect("craton-patina sql");
+    patina_decode(&h, q)
 }
 
-/// Decode a Javelin `QueryHandle` into the normalised `QueryResult` shape.
+/// Decode a Craton Patina `QueryHandle` into the normalised `QueryResult` shape.
 /// Takes the original query *constant* `q` (one of `Q1..Q5`) to determine the
 /// expected number of key / agg columns — the actual SQL that produced `h`
 /// may target a verification table name (e.g. `x_verify`) rather than `x`.
-fn javelin_decode(h: &javelin::exec::QueryHandle, q: &str) -> QueryResult {
+fn patina_decode(h: &craton_patina::exec::QueryHandle, q: &str) -> QueryResult {
     let batch = h.record_batch();
     let n = batch.num_rows();
     let n_aggs = match q {
@@ -418,7 +418,7 @@ fn javelin_decode(h: &javelin::exec::QueryHandle, q: &str) -> QueryResult {
             }
         } else {
             panic!(
-                "javelin agg column {} has unexpected type {:?}",
+                "craton-patina agg column {} has unexpected type {:?}",
                 ai,
                 col.data_type()
             );
@@ -468,13 +468,13 @@ fn assert_results_match(label: &str, expected: &QueryResult, actual: &QueryResul
     }
 }
 
-/// Cross-engine equivalence check that does NOT touch Javelin. The process-
+/// Cross-engine equivalence check that does NOT touch Craton Patina. The process-
 /// wide device memory pool stores its entries by raw `CUdeviceptr` against the
 /// context they were minted in; if we created a verification engine here and
 /// dropped it before the bench, the pool would later hand the 10 M-row engine
 /// dangling pointers from the destroyed context. So we keep this check
-/// CPU-only (Polars vs DuckDB) — the Javelin cross-check happens later inside
-/// `bench_javelin_group`, where it shares a single long-lived engine with the
+/// CPU-only (Polars vs DuckDB) — the Craton Patina cross-check happens later inside
+/// `bench_patina_group`, where it shares a single long-lived engine with the
 /// timed runs.
 fn verify_polars_vs_duckdb() {
     eprintln!(
@@ -518,15 +518,15 @@ fn bench_duckdb_group(c: &mut Criterion) {
     g.finish();
 }
 
-fn bench_javelin_group(c: &mut Criterion) {
-    if std::env::var("JAVELIN_BENCH_GPU").ok().as_deref() != Some("1") {
-        eprintln!("[h2o-bench] skipping javelin (set JAVELIN_BENCH_GPU=1 to enable)");
+fn bench_patina_group(c: &mut Criterion) {
+    if std::env::var("PATINA_BENCH_GPU").ok().as_deref() != Some("1") {
+        eprintln!("[h2o-bench] skipping craton-patina (set PATINA_BENCH_GPU=1 to enable)");
         return;
     }
-    let mut engine = match javelin::Engine::new() {
+    let mut engine = match craton_patina::Engine::new() {
         Ok(e) => e,
         Err(err) => {
-            eprintln!("[h2o-bench] skipping javelin: CUDA init failed: {err}");
+            eprintln!("[h2o-bench] skipping craton-patina: CUDA init failed: {err}");
             return;
         }
     };
@@ -539,7 +539,7 @@ fn bench_javelin_group(c: &mut Criterion) {
     // the pool's free-list dangling (now fixed at `CudaContext::drop` time,
     // but using one engine is still the cleaner pattern).
     eprintln!(
-        "[h2o-bench] javelin equivalence check on {VERIFY_ROWS}-row fixture (vs DuckDB)…"
+        "[h2o-bench] craton-patina equivalence check on {VERIFY_ROWS}-row fixture (vs DuckDB)…"
     );
     let verify_duck = duckdb_conn(VERIFY_ROWS);
     engine
@@ -547,8 +547,8 @@ fn bench_javelin_group(c: &mut Criterion) {
         .expect("register verify");
     for (name, sql) in QUERIES {
         let d = duckdb_q(&verify_duck, sql);
-        let j = javelin_q(&engine, sql);
-        assert_results_match(&format!("{name}: DuckDB vs Javelin"), &d, &j);
+        let j = patina_q(&engine, sql);
+        assert_results_match(&format!("{name}: DuckDB vs Craton Patina"), &d, &j);
         eprintln!("[h2o-bench]   {name} ✓");
     }
     drop(verify_duck);
@@ -557,18 +557,18 @@ fn bench_javelin_group(c: &mut Criterion) {
     // entry point. This drops the old GpuTable's allocations back into the
     // memory pool (where the new upload can recycle them) and rebuilds
     // the dictionary registry / provider schema atomically.
-    eprintln!("[h2o-bench] loading {BENCH_ROWS} rows into Javelin (one-time upload to GPU)…");
+    eprintln!("[h2o-bench] loading {BENCH_ROWS} rows into Craton Patina (one-time upload to GPU)…");
     engine
         .replace_table("x", arrow_batch(BENCH_ROWS))
         .expect("replace bench");
-    let mut g = c.benchmark_group("javelin");
+    let mut g = c.benchmark_group("craton-patina");
     g.throughput(Throughput::Elements(BENCH_ROWS as u64));
     g.measurement_time(Duration::from_secs(MEASUREMENT_SECS));
     for (name, sql) in QUERIES {
         g.bench_function(*name, |b| {
             b.iter_batched(
                 || (),
-                |_| black_box(javelin_q(&engine, sql)),
+                |_| black_box(patina_q(&engine, sql)),
                 BatchSize::SmallInput,
             )
         });
@@ -582,7 +582,7 @@ fn bench_entry(c: &mut Criterion) {
     VERIFY_ONCE.call_once(verify_polars_vs_duckdb);
     bench_polars_group(c);
     bench_duckdb_group(c);
-    bench_javelin_group(c);
+    bench_patina_group(c);
 }
 
 criterion_group!(benches, bench_entry);

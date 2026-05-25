@@ -1,14 +1,14 @@
-# Javelin
+﻿# Craton Patina
 
-[![crates.io](https://img.shields.io/crates/v/javelin.svg)](https://crates.io/crates/javelin) [![docs.rs](https://docs.rs/javelin/badge.svg)](https://docs.rs/javelin) [![CI](https://github.com/cratonsoftware/javelin/actions/workflows/ci.yml/badge.svg)](https://github.com/cratonsoftware/javelin/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![MSRV: 1.74](https://img.shields.io/badge/MSRV-1.74-orange.svg)](Cargo.toml)
+[![crates.io](https://img.shields.io/crates/v/craton-patina.svg)](https://crates.io/crates/craton-patina) [![docs.rs](https://docs.rs/craton-patina/badge.svg)](https://docs.rs/craton-patina) [![CI](https://github.com/craton-co/craton-patina/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/craton-patina/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![MSRV: 1.74](https://img.shields.io/badge/MSRV-1.74-orange.svg)](Cargo.toml)
 
 > JIT-compiled GPU SQL engine. SQL strings go in, NVIDIA PTX comes out at runtime, the GPU does the rest.
 
-Javelin is a SQL execution engine written in Rust that compiles each query into a fresh NVIDIA PTX kernel at runtime, loads it via the CUDA driver, and runs it on the GPU. There is no C++ shim, no precompiled kernel library, and no FFI to a third-party query engine. The full pipeline — parse → plan → codegen → launch — is pure Rust on top of the raw CUDA driver API.
+Craton Patina is a SQL execution engine written in Rust that compiles each query into a fresh NVIDIA PTX kernel at runtime, loads it via the CUDA driver, and runs it on the GPU. There is no C++ shim, no precompiled kernel library, and no FFI to a third-party query engine. The full pipeline — parse → plan → codegen → launch — is pure Rust on top of the raw CUDA driver API.
 
 The project's two distinguishing ideas:
 
-1. **Kernel fusion via runtime PTX.** Most GPU dataframe engines (RAPIDS / cuDF) chain precompiled kernels and bounce intermediates through global memory. Javelin emits a single PTX kernel per query, keeping the entire fused expression tree in registers. Comparable in spirit to what Polars / DataFusion do for the CPU via codegen and Arrow-native vectorisation, but targeting the GPU.
+1. **Kernel fusion via runtime PTX.** Most GPU dataframe engines (RAPIDS / cuDF) chain precompiled kernels and bounce intermediates through global memory. Craton Patina emits a single PTX kernel per query, keeping the entire fused expression tree in registers. Comparable in spirit to what Polars / DataFusion do for the CPU via codegen and Arrow-native vectorisation, but targeting the GPU.
 2. **Borrow-checked GPU memory ("CUDA-Oxide").** GPU allocations are typed handles (`GpuVec<T>`), borrowed as `GpuView<'a, T>` for read-only access and `GpuViewMut<'a, T>` (a `!Sync`, `!Copy` exclusive handle) for write access. Kernel launches require those borrows, so use-after-free, double-free, and mutable / shared aliasing across kernel boundaries are rejected at compile time. The host-side type system makes the same guarantees Rust already makes for CPU memory.
 
 ## Status
@@ -46,8 +46,8 @@ See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported sub
 ### Build
 
 ```bash
-git clone <repo-url> javelin
-cd javelin
+git clone <repo-url> craton-patina
+cd craton-patina
 cargo build --release
 ```
 
@@ -59,7 +59,7 @@ Hosts without a CUDA toolkit can type-check the crate with `cargo build --no-def
 use std::sync::Arc;
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use javelin::Engine;
+use craton_patina::Engine;
 
 let mut engine = Engine::new()?;
 
@@ -163,7 +163,7 @@ The bench file is `benches/query_benchmarks.rs`. Run with:
 
 ```bash
 cargo bench                              # CPU-only (plan, codegen, CPU ref, Polars)
-JAVELIN_BENCH_GPU=1 cargo bench          # add the GPU engine path
+PATINA_BENCH_GPU=1 cargo bench          # add the GPU engine path
 ```
 
 For the methodology and a full per-bench breakdown, see
@@ -176,7 +176,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). All non-trivial changes should come wi
 ## Project layout
 
 ```
-javelin/
+craton-patina/
 ├── Cargo.toml
 ├── README.md
 ├── CONTRIBUTING.md
@@ -190,7 +190,7 @@ javelin/
 │   └── DEVELOPMENT.md        # building, testing, benchmarking
 ├── src/
 │   ├── lib.rs                # crate root, public re-exports
-│   ├── error.rs              # JavelinError + JavelinResult
+│   ├── error.rs              # PatinaError + PatinaResult
 │   ├── cuda/                 # driver FFI, GpuVec, dictionaries
 │   ├── plan/                 # AST, DataFrame, SQL frontend, physical IR
 │   ├── jit/                  # PTX codegen + module loader
@@ -208,16 +208,16 @@ Security issues should be reported privately per the policy in [SECURITY.md](SEC
 
 ## Releases
 
-Version history and per-release notes live in [`CHANGELOG.md`](CHANGELOG.md). Javelin follows [Semantic Versioning](https://semver.org/); pre-1.0 the public API is unstable and minor bumps may break it.
+Version history and per-release notes live in [`CHANGELOG.md`](CHANGELOG.md). Craton Patina follows [Semantic Versioning](https://semver.org/); pre-1.0 the public API is unstable and minor bumps may break it.
 
 ## Acknowledgements
 
-Javelin stands on the shoulders of [`arrow-rs`](https://github.com/apache/arrow-rs) (columnar memory format), [`sqlparser-rs`](https://github.com/apache/datafusion-sqlparser-rs) (SQL frontend), and NVIDIA's CUDA driver (everything below `cuModuleLoadData`).
+Craton Patina stands on the shoulders of [`arrow-rs`](https://github.com/apache/arrow-rs) (columnar memory format), [`sqlparser-rs`](https://github.com/apache/datafusion-sqlparser-rs) (SQL frontend), and NVIDIA's CUDA driver (everything below `cuModuleLoadData`).
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
 
-By contributing to Javelin, you agree that your contributions will be
+By contributing to Craton Patina, you agree that your contributions will be
 licensed under the same Apache-2.0 license. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
 for details.

@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen: lower a `KernelSpec` into a complete PTX module string.
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::plan::logical_plan::{BinaryOp, DataType, Literal};
 use crate::plan::physical_plan::{KernelSpec, Op, Reg};
 
@@ -45,7 +45,7 @@ impl RegAlloc {
     }
 
     /// Assign a physical register to logical `reg` based on `dtype`; returns the name.
-    fn assign(&mut self, reg: Reg, dtype: DataType) -> JavelinResult<String> {
+    fn assign(&mut self, reg: Reg, dtype: DataType) -> PatinaResult<String> {
         let class = Self::class_for(dtype)?;
         let name = self.alloc(class);
         self.mapping.insert(reg, name.clone());
@@ -53,15 +53,15 @@ impl RegAlloc {
     }
 
     /// Look up the physical register name previously assigned to `reg`.
-    fn get(&self, reg: Reg) -> JavelinResult<&str> {
+    fn get(&self, reg: Reg) -> PatinaResult<&str> {
         self.mapping
             .get(&reg)
             .map(|s| s.as_str())
-            .ok_or_else(|| JavelinError::Other(format!("ptx_gen: undefined register {:?}", reg)))
+            .ok_or_else(|| PatinaError::Other(format!("ptx_gen: undefined register {:?}", reg)))
     }
 
     /// Map a logical dtype to a PTX register class string.
-    fn class_for(dtype: DataType) -> JavelinResult<RegClass> {
+    fn class_for(dtype: DataType) -> PatinaResult<RegClass> {
         Ok(match dtype {
             DataType::Bool => "r",
             DataType::Int32 => "r",
@@ -69,7 +69,7 @@ impl RegAlloc {
             DataType::Float32 => "f",
             DataType::Float64 => "fd",
             DataType::Utf8 => {
-                return Err(JavelinError::Other(
+                return Err(PatinaError::Other(
                     "Utf8 not supported in PTX codegen yet".into(),
                 ))
             }
@@ -103,15 +103,15 @@ impl PtxBuilder {
     }
 
     /// Append one already-formatted PTX line (with leading tab, no trailing newline).
-    fn emit(&mut self, line: &str) -> JavelinResult<()> {
+    fn emit(&mut self, line: &str) -> PatinaResult<()> {
         writeln!(self.body, "\t{}", line)
-            .map_err(|e| JavelinError::Other(format!("ptx_gen: write failed: {}", e)))
+            .map_err(|e| PatinaError::Other(format!("ptx_gen: write failed: {}", e)))
     }
 
     /// Append a label (no leading tab) at column zero.
-    fn emit_label(&mut self, label: &str) -> JavelinResult<()> {
+    fn emit_label(&mut self, label: &str) -> PatinaResult<()> {
         writeln!(self.body, "{}:", label)
-            .map_err(|e| JavelinError::Other(format!("ptx_gen: write failed: {}", e)))
+            .map_err(|e| PatinaError::Other(format!("ptx_gen: write failed: {}", e)))
     }
 
     /// Build the mangled `.param` identifier for the `i`th parameter.
@@ -130,7 +130,7 @@ impl PtxBuilder {
 }
 
 /// Compile a `KernelSpec` to a complete PTX module.
-pub fn compile(spec: &KernelSpec, kernel_name: &str) -> JavelinResult<String> {
+pub fn compile(spec: &KernelSpec, kernel_name: &str) -> PatinaResult<String> {
     validate_kernel_name(kernel_name)?;
 
     let mut b = PtxBuilder::new(kernel_name);
@@ -166,7 +166,7 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> JavelinResult<String> {
     for (i, col) in spec.inputs.iter().enumerate() {
         // Reject Utf8 inputs eagerly — even if no LoadColumn op references them, we cannot lower.
         if matches!(col.dtype, DataType::Utf8) {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "Utf8 not supported in PTX codegen yet".into(),
             ));
         }
@@ -180,7 +180,7 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> JavelinResult<String> {
     let base = spec.inputs.len();
     for (i, col) in spec.outputs.iter().enumerate() {
         if matches!(col.dtype, DataType::Utf8) {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "Utf8 not supported in PTX codegen yet".into(),
             ));
         }
@@ -250,7 +250,7 @@ fn emit_op(
     input_ptrs: &[String],
     output_ptrs: &[String],
     tid: &str,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     match op {
         Op::LoadColumn { dst, col_idx, dtype } => emit_load(b, *dst, *col_idx, *dtype, input_ptrs, tid),
         Op::Const { dst, lit } => emit_const(b, *dst, lit),
@@ -275,9 +275,9 @@ fn emit_load(
     dtype: DataType,
     input_ptrs: &[String],
     tid: &str,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     if col_idx >= input_ptrs.len() {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "ptx_gen: LoadColumn col_idx {} out of range (have {} inputs)",
             col_idx,
             input_ptrs.len()
@@ -305,9 +305,9 @@ fn emit_store(
     dtype: DataType,
     output_ptrs: &[String],
     tid: &str,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     if col_idx >= output_ptrs.len() {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "ptx_gen: Store col_idx {} out of range (have {} outputs)",
             col_idx,
             output_ptrs.len()
@@ -328,12 +328,12 @@ fn emit_store(
 }
 
 /// Emit a `mov` of an immediate into a fresh register typed by the literal.
-fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> JavelinResult<()> {
+fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> PatinaResult<()> {
     match lit {
-        Literal::Null => Err(JavelinError::Other(
+        Literal::Null => Err(PatinaError::Other(
             "ptx_gen: NULL literal not supported".into(),
         )),
-        Literal::Utf8(_) => Err(JavelinError::Other(
+        Literal::Utf8(_) => Err(PatinaError::Other(
             "ptx_gen: Utf8 literal not supported".into(),
         )),
         Literal::Bool(v) => {
@@ -368,7 +368,7 @@ fn emit_cast(
     src: Reg,
     from: DataType,
     to: DataType,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     let src_name = b.alloc.get(src)?.to_string();
     let dst_name = b.alloc.assign(dst, to)?;
 
@@ -383,7 +383,7 @@ fn emit_cast(
                 Float32 => "f32",
                 Float64 => "f64",
                 Utf8 => {
-                    return Err(JavelinError::Other(
+                    return Err(PatinaError::Other(
                         "ptx_gen: cannot cast Utf8".into(),
                     ))
                 }
@@ -444,7 +444,7 @@ fn emit_cast(
         (Float64, Int64) => format!("cvt.rzi.s64.f64 {}, {};", dst_name, src_name),
 
         (Utf8, _) | (_, Utf8) => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "ptx_gen: Utf8 casts not supported".into(),
             ))
         }
@@ -452,7 +452,7 @@ fn emit_cast(
         // Unreachable: the `a == c` guard above already covers every
         // same-dtype pair, but rustc can't prove guard exhaustiveness.
         _ => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "ptx_gen: internal — unhandled cast {:?} -> {:?}",
                 from, to
             )))
@@ -471,7 +471,7 @@ fn emit_binary(
     rhs: Reg,
     dtype: DataType,
     result_dtype: DataType,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     let lhs_name = b.alloc.get(lhs)?.to_string();
     let rhs_name = b.alloc.get(rhs)?.to_string();
 
@@ -480,13 +480,13 @@ fn emit_binary(
         Add | Sub | Mul | Div => {
             // Arithmetic preserves the operand dtype; the spec already unified.
             if result_dtype != dtype {
-                return Err(JavelinError::Other(format!(
+                return Err(PatinaError::Other(format!(
                     "ptx_gen: arithmetic op {:?} expected result dtype == operand dtype, got {:?}/{:?}",
                     op, dtype, result_dtype
                 )));
             }
             if !is_numeric(dtype) {
-                return Err(JavelinError::Other(format!(
+                return Err(PatinaError::Other(format!(
                     "ptx_gen: arithmetic op {:?} requires numeric operands, got {:?}",
                     op, dtype
                 )));
@@ -500,7 +500,7 @@ fn emit_binary(
         }
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
             if result_dtype != DataType::Bool {
-                return Err(JavelinError::Other(format!(
+                return Err(PatinaError::Other(format!(
                     "ptx_gen: comparison op {:?} must produce Bool, got {:?}",
                     op, result_dtype
                 )));
@@ -516,7 +516,7 @@ fn emit_binary(
         }
         And | Or => {
             if dtype != DataType::Bool || result_dtype != DataType::Bool {
-                return Err(JavelinError::Other(format!(
+                return Err(PatinaError::Other(format!(
                     "ptx_gen: logical op {:?} requires Bool operands, got {:?}",
                     op, dtype
                 )));
@@ -536,7 +536,7 @@ fn emit_binary(
 }
 
 /// Mnemonic string for an arithmetic op at a given dtype.
-fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> JavelinResult<String> {
+fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> PatinaResult<String> {
     use BinaryOp::*;
     use DataType::*;
     let s = match (op, dtype) {
@@ -557,7 +557,7 @@ fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> JavelinResult<String> {
         (Div, Float32) => "div.rn.f32",
         (Div, Float64) => "div.rn.f64",
         _ => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "ptx_gen: unsupported arithmetic {:?} on {:?}",
                 op, dtype
             )))
@@ -567,7 +567,7 @@ fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> JavelinResult<String> {
 }
 
 /// Mnemonic string for a comparison `setp` at a given operand dtype.
-fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> JavelinResult<String> {
+fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> PatinaResult<String> {
     use BinaryOp::*;
     use DataType::*;
     let cond = match op {
@@ -578,7 +578,7 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> JavelinResult<String> {
         Gt => "gt",
         GtEq => "ge",
         _ => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "ptx_gen: not a comparison op: {:?}",
                 op
             )))
@@ -591,7 +591,7 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> JavelinResult<String> {
         Float32 => "f32",
         Float64 => "f64",
         Utf8 => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "ptx_gen: cannot compare Utf8".into(),
             ))
         }
@@ -608,7 +608,7 @@ fn is_numeric(dtype: DataType) -> bool {
 }
 
 /// PTX type suffix used on `ld.global`/`st.global` for `dtype`.
-fn ld_st_suffix(dtype: DataType) -> JavelinResult<&'static str> {
+fn ld_st_suffix(dtype: DataType) -> PatinaResult<&'static str> {
     Ok(match dtype {
         DataType::Bool => "u8",
         DataType::Int32 => "s32",
@@ -616,7 +616,7 @@ fn ld_st_suffix(dtype: DataType) -> JavelinResult<&'static str> {
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
         DataType::Utf8 => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "Utf8 not supported in PTX codegen yet".into(),
             ))
         }
@@ -624,29 +624,29 @@ fn ld_st_suffix(dtype: DataType) -> JavelinResult<&'static str> {
 }
 
 /// Byte width of `dtype`, or an error for variable-width types.
-fn byte_width(dtype: DataType) -> JavelinResult<usize> {
+fn byte_width(dtype: DataType) -> PatinaResult<usize> {
     dtype.byte_width().ok_or_else(|| {
-        JavelinError::Other(format!("ptx_gen: variable-width dtype {:?}", dtype))
+        PatinaError::Other(format!("ptx_gen: variable-width dtype {:?}", dtype))
     })
 }
 
 /// Reject empty / whitespace-bearing kernel names that would break the PTX grammar.
-fn validate_kernel_name(name: &str) -> JavelinResult<()> {
+fn validate_kernel_name(name: &str) -> PatinaResult<()> {
     if name.is_empty() {
-        return Err(JavelinError::Other(
+        return Err(PatinaError::Other(
             "ptx_gen: kernel name must not be empty".into(),
         ));
     }
     let first = name.chars().next().unwrap_or('\0');
     if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "ptx_gen: kernel name '{}' must start with a letter or underscore",
             name
         )));
     }
     for c in name.chars() {
         if !(c.is_ascii_alphanumeric() || c == '_') {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "ptx_gen: kernel name '{}' contains illegal character '{}'",
                 name, c
             )));
@@ -656,7 +656,7 @@ fn validate_kernel_name(name: &str) -> JavelinResult<()> {
 }
 
 /// Write the `.visible .entry` signature, one parameter per line.
-fn write_signature(out: &mut String, b: &PtxBuilder, spec: &KernelSpec) -> JavelinResult<()> {
+fn write_signature(out: &mut String, b: &PtxBuilder, spec: &KernelSpec) -> PatinaResult<()> {
     writeln!(out, ".visible .entry {}(", b.kernel_name).map_err(write_err)?;
 
     let total_params = spec.inputs.len() + spec.outputs.len();
@@ -688,7 +688,7 @@ fn write_signature(out: &mut String, b: &PtxBuilder, spec: &KernelSpec) -> Javel
 }
 
 /// Emit the `.reg` declaration block sized to each class's used count.
-fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> JavelinResult<()> {
+fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> PatinaResult<()> {
     // (class, ptx_type) pairs in deterministic emission order.
     let decls: [(&str, &str); 6] = [
         ("p", "pred"),
@@ -707,7 +707,7 @@ fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> JavelinResult<()> {
     Ok(())
 }
 
-/// Adapt a `std::fmt::Error` into a `JavelinError`.
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!("ptx_gen: write failed: {}", e))
+/// Adapt a `std::fmt::Error` into a `PatinaError`.
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!("ptx_gen: write failed: {}", e))
 }

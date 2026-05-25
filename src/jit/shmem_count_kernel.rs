@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory GROUP BY **COUNT** kernel (Tier 1 fast path).
 //!
@@ -58,7 +58,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 /// Number of slots in each block's shared-memory counter table. Must match
 /// the SUM kernel's `BLOCK_GROUPS` so the AVG executor can share a single
@@ -73,14 +73,14 @@ pub const BLOCK_THREADS: u32 = 256;
 /// Entry-point name embedded in the emitted PTX. Distinct from the SUM
 /// kernel so the AVG executor can load both into a single module-builder
 /// session and look them up by name.
-pub const KERNEL_ENTRY: &str = "javelin_groupby_shmem_count_u64";
+pub const KERNEL_ENTRY: &str = "patina_groupby_shmem_count_u64";
 
 /// Generate PTX for the shared-memory per-block COUNT kernel.
 ///
 /// Kernel signature (PTX-level):
 ///
 /// ```text
-/// .visible .entry javelin_groupby_shmem_count_u64(
+/// .visible .entry patina_groupby_shmem_count_u64(
 ///     .param .u64 keys_ptr,      // const int32_t* keys, length n_rows
 ///     .param .u64 out_count_ptr, // uint64_t*      out_count, length n_groups
 ///     .param .u32 n_rows,
@@ -89,7 +89,7 @@ pub const KERNEL_ENTRY: &str = "javelin_groupby_shmem_count_u64";
 /// ```
 ///
 /// Pure / deterministic: same input -> same output.
-pub fn compile_shmem_count_kernel() -> JavelinResult<String> {
+pub fn compile_shmem_count_kernel() -> PatinaResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
     let block_groups = BLOCK_GROUPS;
@@ -296,9 +296,9 @@ pub fn compile_shmem_count_kernel() -> JavelinResult<String> {
     Ok(ptx)
 }
 
-/// `std::fmt::Error` -> `JavelinError`; matches `shmem_sum_kernel`.
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!("shmem_count_kernel: write failed: {}", e))
+/// `std::fmt::Error` -> `PatinaError`; matches `shmem_sum_kernel`.
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!("shmem_count_kernel: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! CUDA-Oxide memory-safety tests. These prove that Rust's borrow checker
 //! makes the obvious GPU-memory foot-guns impossible.
@@ -16,7 +16,7 @@
 //! All type-level helpers below are concrete on `i32` / `f64` to avoid pulling
 //! `bytemuck` (a non-dev dependency) into the test binary's name resolution.
 
-use javelin::cuda::{GpuVec, GpuView, GpuViewMut};
+use craton_patina::cuda::{GpuVec, GpuView, GpuViewMut};
 
 // ---- Type-level proofs (compile, therefore valid) ---------------------------
 
@@ -84,7 +84,7 @@ fn gpu_vec_is_send() {
 /// **Invariant 1**: a `GpuView` cannot outlive the `GpuVec` it borrows from.
 ///
 /// ```compile_fail
-/// use javelin::cuda::GpuVec;
+/// use craton_patina::cuda::GpuVec;
 /// let view = {
 ///     let vec = GpuVec::<i32>::from_slice(&[1, 2, 3]).unwrap();
 ///     vec.view()
@@ -97,7 +97,7 @@ pub fn _doc_view_outlives_vec() {}
 /// exclusive — no `GpuView` can coexist with it.
 ///
 /// ```compile_fail
-/// use javelin::cuda::GpuVec;
+/// use craton_patina::cuda::GpuVec;
 /// let mut vec = GpuVec::<i32>::from_slice(&[1, 2, 3]).unwrap();
 /// let shared = vec.view();
 /// let _exclusive = vec.view_mut(); // ERROR: cannot borrow `vec` as mutable
@@ -110,7 +110,7 @@ pub fn _doc_mut_excludes_shared() {}
 /// view is live.
 ///
 /// ```compile_fail
-/// use javelin::cuda::GpuVec;
+/// use craton_patina::cuda::GpuVec;
 /// let mut vec = GpuVec::<i32>::from_slice(&[1, 2, 3]).unwrap();
 /// let exclusive = vec.view_mut();
 /// let _shared = vec.view(); // ERROR: cannot borrow `vec` as immutable
@@ -122,7 +122,7 @@ pub fn _doc_shared_excludes_mut() {}
 /// (use-after-free at the Rust level).
 ///
 /// ```compile_fail
-/// use javelin::cuda::GpuVec;
+/// use craton_patina::cuda::GpuVec;
 /// let vec = GpuVec::<i32>::from_slice(&[1, 2, 3]).unwrap();
 /// drop(vec); // moved into `drop`
 /// let _ = vec.len(); // ERROR: borrow of moved value: `vec`
@@ -132,7 +132,7 @@ pub fn _doc_use_after_move() {}
 /// **Invariant 3 (move into function)**: same idea, moved via a function call.
 ///
 /// ```compile_fail
-/// use javelin::cuda::GpuVec;
+/// use craton_patina::cuda::GpuVec;
 /// fn consume(_v: GpuVec<i32>) {}
 /// let vec = GpuVec::<i32>::from_slice(&[1, 2, 3]).unwrap();
 /// consume(vec);
@@ -152,7 +152,7 @@ pub fn _doc_use_after_move_into_fn() {}
 #[test]
 #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
 fn round_trip_i32() {
-    let _ctx = javelin::cuda::CudaContext::new(0).expect("CUDA context");
+    let _ctx = craton_patina::cuda::CudaContext::new(0).expect("CUDA context");
     let data: Vec<i32> = (0..1024).collect();
     let vec = GpuVec::from_slice(&data).expect("alloc + h2d");
     let back = vec.to_vec().expect("d2h");
@@ -162,7 +162,7 @@ fn round_trip_i32() {
 #[test]
 #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
 fn round_trip_f64() {
-    let _ctx = javelin::cuda::CudaContext::new(0).expect("CUDA context");
+    let _ctx = craton_patina::cuda::CudaContext::new(0).expect("CUDA context");
     let data: Vec<f64> = (0..1024).map(|i| i as f64 * 0.5).collect();
     let vec = GpuVec::from_slice(&data).expect("alloc + h2d");
     let back = vec.to_vec().expect("d2h");
@@ -174,7 +174,7 @@ fn round_trip_f64() {
 fn views_observe_same_buffer() {
     // Two shared views of the same vec must report the same length and the
     // same device pointer — they're aliases of one allocation.
-    let _ctx = javelin::cuda::CudaContext::new(0).expect("CUDA context");
+    let _ctx = craton_patina::cuda::CudaContext::new(0).expect("CUDA context");
     let vec = GpuVec::<i32>::from_slice(&[1, 2, 3, 4]).expect("alloc");
     let a = vec.view();
     let b = vec.view();
@@ -188,7 +188,7 @@ fn views_observe_same_buffer() {
 fn mut_view_reborrow_as_shared() {
     // `GpuViewMut::as_view` lets you temporarily downgrade to a shared view
     // without giving up the exclusive borrow.
-    let _ctx = javelin::cuda::CudaContext::new(0).expect("CUDA context");
+    let _ctx = craton_patina::cuda::CudaContext::new(0).expect("CUDA context");
     let mut vec = GpuVec::<i32>::from_slice(&[10, 20, 30]).expect("alloc");
     let exclusive = vec.view_mut();
     let shared = exclusive.as_view();
@@ -202,7 +202,7 @@ fn drop_is_safe_no_double_free() {
     // Dropping a `GpuVec` must call `cuMemFree` exactly once. If `Drop` ever
     // fired twice we'd see a CUDA error on the second free. This test passes
     // simply by completing without panic / abort.
-    let _ctx = javelin::cuda::CudaContext::new(0).expect("CUDA context");
+    let _ctx = craton_patina::cuda::CudaContext::new(0).expect("CUDA context");
     let vec = GpuVec::<i32>::from_slice(&[1, 2, 3]).expect("alloc");
     drop(vec);
 }

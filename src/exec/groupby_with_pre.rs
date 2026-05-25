@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Fused pre-projection + GROUP BY aggregate execution.
 //!
@@ -65,7 +65,7 @@ use bytemuck::Pod;
 use crate::cuda::buffer::primitive_to_gpu;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::expr_agg;
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
@@ -79,10 +79,10 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, KernelSpec, PhysicalPlan};
 
 /// PTX entry-point name for the pre-projection kernel.
-const PRE_KERNEL_ENTRY: &str = "javelin_pre_kernel";
+const PRE_KERNEL_ENTRY: &str = "patina_pre_kernel";
 
 /// PTX entry-point name for the predicate-only kernel that materialises the mask.
-const PRE_PREDICATE_ENTRY: &str = "javelin_pre_predicate";
+const PRE_PREDICATE_ENTRY: &str = "patina_pre_predicate";
 
 /// Threads per block for the pre-projection / predicate launches.
 const PRE_BLOCK_SIZE: u32 = 256;
@@ -93,18 +93,18 @@ const EMPTY_KEY: i64 = i64::MIN;
 /// Execute an `Aggregate` plan that has BOTH a pre kernel AND a non-empty
 /// `group_by`. Single-column GROUP BY only; Int32 / Int64 keys only.
 ///
-/// Errors with a clear `JavelinError` if the plan does not match this shape
+/// Errors with a clear `PatinaError` if the plan does not match this shape
 /// — callers should dispatch to one of the other executors for the trivial
 /// cases.
 pub fn execute_groupby_with_pre(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     // -- 1. Validate plan shape. --
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         other => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "execute_groupby_with_pre: expected Aggregate plan, got {:?}",
                 std::mem::discriminant(other)
             )))
@@ -112,20 +112,20 @@ pub fn execute_groupby_with_pre(
     };
 
     let pre_spec = pre.as_ref().ok_or_else(|| {
-        JavelinError::Other(
+        PatinaError::Other(
             "execute_groupby_with_pre: pre kernel is None; use execute_groupby".into(),
         )
     })?;
 
     if aggregate.group_by.is_empty() {
-        return Err(JavelinError::Other(
+        return Err(PatinaError::Other(
             "execute_groupby_with_pre: aggregate has no GROUP BY columns; \
              use execute_aggregate_with_pre"
                 .into(),
         ));
     }
     if aggregate.group_by.len() > 1 {
-        return Err(JavelinError::Other(
+        return Err(PatinaError::Other(
             "agg pre+groupby: multi-column GROUP BY not yet supported".into(),
         ));
     }
@@ -142,14 +142,14 @@ pub fn execute_groupby_with_pre(
     // Resolve the single GROUP BY key column to its compacted host vector.
     let key_ord_in_inputs = aggregate.group_by[0];
     let key_io = aggregate.inputs.get(key_ord_in_inputs).ok_or_else(|| {
-        JavelinError::Plan(format!(
+        PatinaError::Plan(format!(
             "execute_groupby_with_pre: group_by ordinal {} out of range (only {} inputs)",
             key_ord_in_inputs,
             aggregate.inputs.len()
         ))
     })?;
     let key_pre_ord = *name_to_pre_ord.get(&key_io.name).ok_or_else(|| {
-        JavelinError::Plan(format!(
+        PatinaError::Plan(format!(
             "execute_groupby_with_pre: GROUP BY key '{}' not among pre kernel outputs",
             key_io.name
         ))
@@ -163,24 +163,24 @@ pub fn execute_groupby_with_pre(
     match original_key_dtype {
         DataType::Int32 | DataType::Int64 => {}
         DataType::Float32 | DataType::Float64 => {
-            return Err(JavelinError::Type(
+            return Err(PatinaError::Type(
                 "float GROUP BY keys not yet supported".into(),
             ))
         }
         DataType::Utf8 => {
-            return Err(JavelinError::Type(
+            return Err(PatinaError::Type(
                 "Utf8 GROUP BY keys not yet supported".into(),
             ))
         }
         DataType::Bool => {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "GROUP BY key dtype {:?} not supported",
                 original_key_dtype
             )))
         }
     }
     if !host_col_matches_dtype(key_host, original_key_dtype) {
-        return Err(JavelinError::Type(format!(
+        return Err(PatinaError::Type(format!(
             "GROUP BY key '{}' compacted column dtype does not match plan dtype {:?}",
             key_io.name, original_key_dtype
         )));
@@ -189,7 +189,7 @@ pub fn execute_groupby_with_pre(
     let host_keys: Vec<i64> = key_host.to_i64_for_key(&key_io.name)?;
     let n_compacted = host_keys.len();
     if n_compacted != compacted.n_rows() {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "internal: key column length {} disagrees with compacted row count {}",
             n_compacted,
             compacted.n_rows()
@@ -198,7 +198,7 @@ pub fn execute_groupby_with_pre(
 
     // Validate no key collides with the EMPTY_KEY sentinel.
     if host_keys.iter().any(|&k| k == EMPTY_KEY) {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "GROUP BY key column '{}' contains the reserved sentinel value i64::MIN",
             key_io.name
         )));
@@ -208,7 +208,7 @@ pub fn execute_groupby_with_pre(
     let n_unique = unique_count(&host_keys);
     let k = next_pow2((n_unique.saturating_mul(2)).saturating_add(16)).max(64);
     let k_u32 = u32::try_from(k).map_err(|_| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "GROUP BY hash table size {} exceeds u32::MAX",
             k
         ))
@@ -273,7 +273,7 @@ pub fn execute_groupby_with_pre(
     // Columns 1..N+1: one per aggregate.
     for (i, agg) in aggregate.aggregates.iter().enumerate() {
         let out_field = aggregate.output_schema.fields.get(1 + i).ok_or_else(|| {
-            JavelinError::Other(format!(
+            PatinaError::Other(format!(
                 "execute_groupby_with_pre: output_schema missing field for aggregate index {}",
                 i
             ))
@@ -284,7 +284,7 @@ pub fn execute_groupby_with_pre(
 
     let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "failed to build GROUP-BY-with-pre RecordBatch: {e}"
         ))
     })
@@ -315,13 +315,13 @@ fn run_pre_stage(
     spec: &KernelSpec,
     table_batch: &RecordBatch,
     n_rows: usize,
-) -> JavelinResult<CompactedPreOutputs> {
+) -> PatinaResult<CompactedPreOutputs> {
     // Reject pre outputs of Bool / Utf8 up front — the downstream group-by
     // and aggregation paths cannot consume them.
     for io in &spec.outputs {
         match io.dtype {
             DataType::Bool | DataType::Utf8 => {
-                return Err(JavelinError::Type(
+                return Err(PatinaError::Type(
                     "Bool/Utf8 in pre outputs not yet supported".into(),
                 ))
             }
@@ -333,7 +333,7 @@ fn run_pre_stage(
     let mut input_cols: Vec<PreCol> = Vec::with_capacity(spec.inputs.len());
     for io in &spec.inputs {
         let idx = table_batch.schema().index_of(&io.name).map_err(|e| {
-            JavelinError::Plan(format!(
+            PatinaError::Plan(format!(
                 "pre kernel input column '{}' not present in table batch: {}",
                 io.name, e
             ))
@@ -341,7 +341,7 @@ fn run_pre_stage(
         let arr = table_batch.column(idx);
         let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
         if arr_dtype != io.dtype {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "pre kernel input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
                 io.name, io.dtype, arr_dtype
             )));
@@ -452,13 +452,13 @@ fn run_pre_stage(
 
 /// Build a `name -> j` index where `j` is the ordinal into `pre.outputs` (and,
 /// equivalently, into `CompactedPreOutputs::cols`).
-fn build_pre_output_index(pre_spec: &KernelSpec) -> JavelinResult<HashMap<String, usize>> {
+fn build_pre_output_index(pre_spec: &KernelSpec) -> PatinaResult<HashMap<String, usize>> {
     let mut map: HashMap<String, usize> = HashMap::with_capacity(pre_spec.outputs.len());
     for (j, io) in pre_spec.outputs.iter().enumerate() {
         // If the lowering ever emitted duplicate output names this would be a
         // logic bug — flag rather than silently overwrite.
         if map.insert(io.name.clone(), j).is_some() {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "execute_groupby_with_pre: duplicate pre output name '{}'",
                 io.name
             )));
@@ -474,7 +474,7 @@ fn launch_keys_kernel(
     n_rows: usize,
     k_u32: u32,
     stream: &CudaStream,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     if n_rows == 0 {
         // Nothing to insert; the empty keys table is already correct.
         return Ok(());
@@ -532,7 +532,7 @@ fn launch_agg_kernel<T: Pod>(
     n_rows: usize,
     k_u32: u32,
     stream: &CudaStream,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     if n_rows == 0 {
         return Ok(());
     }
@@ -622,7 +622,7 @@ fn run_one_aggregate(
     k: usize,
     k_u32: u32,
     stream: &CudaStream,
-) -> JavelinResult<AccDownload> {
+) -> PatinaResult<AccDownload> {
     match agg {
         AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_) => {
             let op = ReduceOp::from_agg(agg)?;
@@ -726,9 +726,9 @@ fn run_typed_agg(
     k: usize,
     k_u32: u32,
     stream: &CudaStream,
-) -> JavelinResult<AccDownload> {
+) -> PatinaResult<AccDownload> {
     if !host_col_matches_dtype(host_col, col_io.dtype) {
-        return Err(JavelinError::Type(format!(
+        return Err(PatinaError::Type(format!(
             "aggregate input '{}' compacted dtype does not match plan dtype {:?}",
             col_io.name, col_io.dtype
         )));
@@ -798,7 +798,7 @@ fn run_typed_agg(
         }
         (DataType::Float32, HostCol::F32(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
-                return Err(JavelinError::Other(
+                return Err(PatinaError::Other(
                     "MIN/MAX over float not yet supported".into(),
                 ));
             }
@@ -820,7 +820,7 @@ fn run_typed_agg(
         }
         (DataType::Float64, HostCol::F64(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
-                return Err(JavelinError::Other(
+                return Err(PatinaError::Other(
                     "MIN/MAX over float not yet supported".into(),
                 ));
             }
@@ -840,11 +840,11 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::F64(acc.to_vec()?))
         }
-        (DataType::Bool, _) | (DataType::Utf8, _) => Err(JavelinError::Type(format!(
+        (DataType::Bool, _) | (DataType::Utf8, _) => Err(PatinaError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
-        (dt, _) => Err(JavelinError::Type(format!(
+        (dt, _) => Err(PatinaError::Type(format!(
             "internal: aggregate input '{}' compacted column variant disagrees with dtype {:?}",
             col_io.name, dt
         ))),
@@ -872,9 +872,9 @@ fn resolve_agg_input_slow<'a>(
     input_ord: usize,
     name_to_pre_ord: &HashMap<String, usize>,
     compacted: &'a CompactedPreOutputs,
-) -> JavelinResult<(&'a ColumnIO, ResolvedHostCol<'a>)> {
+) -> PatinaResult<(&'a ColumnIO, ResolvedHostCol<'a>)> {
     let col_io = aggregate.inputs.get(input_ord).ok_or_else(|| {
-        JavelinError::Plan(format!(
+        PatinaError::Plan(format!(
             "groupby_with_pre: aggregate input ordinal {} out of range (only {} inputs)",
             input_ord,
             aggregate.inputs.len()
@@ -887,7 +887,7 @@ fn resolve_agg_input_slow<'a>(
     if let Some(name) = expr_agg::try_bare_column(inner) {
         if let Some(&pre_ord) = name_to_pre_ord.get(name) {
             let host_col = compacted.cols.get(pre_ord).ok_or_else(|| {
-                JavelinError::Other(format!(
+                PatinaError::Other(format!(
                     "internal: pre output ordinal {} out of range (have {} compacted cols)",
                     pre_ord,
                     compacted.cols.len()
@@ -897,7 +897,7 @@ fn resolve_agg_input_slow<'a>(
         }
         // Bare-column but no matching pre output — preserve the legacy error
         // shape so plan-level mismatches surface the same way as before.
-        return Err(JavelinError::Plan(format!(
+        return Err(PatinaError::Plan(format!(
             "aggregate input '{}' not found among pre kernel outputs",
             name
         )));
@@ -991,7 +991,7 @@ fn to_expr_host(c: &HostCol) -> expr_agg::HostColumn {
 /// to the dtype's zero, matching the zero-initialised slots that the pre
 /// kernel writes for masked-out rows. Bool / Utf8 materialisations are
 /// rejected — the GPU agg kernels only accept primitive numeric inputs.
-fn from_expr_host(c: expr_agg::HostColumn) -> JavelinResult<HostCol> {
+fn from_expr_host(c: expr_agg::HostColumn) -> PatinaResult<HostCol> {
     match c {
         expr_agg::HostColumn::I32(v) => {
             Ok(HostCol::I32(v.into_iter().map(|x| x.unwrap_or(0)).collect()))
@@ -1006,7 +1006,7 @@ fn from_expr_host(c: expr_agg::HostColumn) -> JavelinResult<HostCol> {
             v.into_iter().map(|x| x.unwrap_or(0.0)).collect(),
         )),
         expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => {
-            Err(JavelinError::Type(
+            Err(PatinaError::Type(
                 "groupby_with_pre: Bool/Utf8 aggregate inputs not supported by the \
                  primitive reduction path"
                     .into(),
@@ -1023,13 +1023,13 @@ fn from_expr_host(c: expr_agg::HostColumn) -> JavelinResult<HostCol> {
 fn build_key_array(
     groups: &[(i64, usize)],
     original_key_dtype: DataType,
-) -> JavelinResult<ArrayRef> {
+) -> PatinaResult<ArrayRef> {
     match original_key_dtype {
         DataType::Int32 => {
             let mut out: Vec<i32> = Vec::with_capacity(groups.len());
             for (k, _) in groups {
                 let v = i32::try_from(*k).map_err(|_| {
-                    JavelinError::Type(format!(
+                    PatinaError::Type(format!(
                         "GROUP BY: key {} does not fit in Int32 on output",
                         k
                     ))
@@ -1042,7 +1042,7 @@ fn build_key_array(
             let out: Vec<i64> = groups.iter().map(|(k, _)| *k).collect();
             Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
         }
-        other => Err(JavelinError::Type(format!(
+        other => Err(PatinaError::Type(format!(
             "GROUP BY key dtype {:?} not supported on output",
             other
         ))),
@@ -1057,7 +1057,7 @@ fn build_agg_array(
     acc: &AccDownload,
     groups: &[(i64, usize)],
     n_groups: usize,
-) -> JavelinResult<ArrayRef> {
+) -> PatinaResult<ArrayRef> {
     match (agg, acc) {
         (AggregateExpr::Count(_), AccDownload::I64(host)) => {
             let mut out: Vec<i64> = Vec::with_capacity(n_groups);
@@ -1091,14 +1091,14 @@ fn build_agg_array(
                     groups.iter().map(|(_, slot)| host[*slot]).collect(),
                 ),
                 AccDownload::Avg { .. } => {
-                    return Err(JavelinError::Other(
+                    return Err(PatinaError::Other(
                         "internal: AVG accumulator passed to non-AVG aggregate".into(),
                     ))
                 }
             };
             pack_array(out_field.dtype, scalars)
         }
-        (_, _) => Err(JavelinError::Other(
+        (_, _) => Err(PatinaError::Other(
             "internal: aggregate / accumulator-variant mismatch".into(),
         )),
     }
@@ -1117,7 +1117,7 @@ enum Scalars {
 }
 
 /// Cast a `Scalars` batch into an Arrow array of `out_dtype`.
-fn pack_array(out_dtype: DataType, scalars: Scalars) -> JavelinResult<ArrayRef> {
+fn pack_array(out_dtype: DataType, scalars: Scalars) -> PatinaResult<ArrayRef> {
     match (scalars, out_dtype) {
         (Scalars::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v)) as ArrayRef),
         (Scalars::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
@@ -1145,7 +1145,7 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> JavelinResult<ArrayRef> 
             v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
         )) as ArrayRef),
 
-        (_, dt) => Err(JavelinError::Type(format!(
+        (_, dt) => Err(PatinaError::Type(format!(
             "GROUP BY: cannot pack scalars into output dtype {:?}",
             dt
         ))),
@@ -1166,7 +1166,7 @@ enum PreCol {
 
 impl PreCol {
     /// Upload an Arrow array to the GPU, downcasting per `dtype`.
-    fn upload(arr: &dyn Array, dtype: DataType) -> JavelinResult<Self> {
+    fn upload(arr: &dyn Array, dtype: DataType) -> PatinaResult<Self> {
         match dtype {
             DataType::Int32 => {
                 let pa = arr
@@ -1196,7 +1196,7 @@ impl PreCol {
                     .ok_or_else(|| downcast_err("input", "Float64"))?;
                 Ok(PreCol::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?)))
             }
-            DataType::Bool | DataType::Utf8 => Err(JavelinError::Type(format!(
+            DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
                 "groupby_with_pre: pre kernel column dtype {:?} not supported",
                 dtype
             ))),
@@ -1204,13 +1204,13 @@ impl PreCol {
     }
 
     /// Allocate a zero-initialised device column of `n` rows.
-    fn alloc_zeros(dtype: DataType, n: usize) -> JavelinResult<Self> {
+    fn alloc_zeros(dtype: DataType, n: usize) -> PatinaResult<Self> {
         match dtype {
             DataType::Int32 => Ok(PreCol::I32(GpuVec::<i32>::zeros(n)?)),
             DataType::Int64 => Ok(PreCol::I64(GpuVec::<i64>::zeros(n)?)),
             DataType::Float32 => Ok(PreCol::F32(GpuVec::<f32>::zeros(n)?)),
             DataType::Float64 => Ok(PreCol::F64(GpuVec::<f64>::zeros(n)?)),
-            DataType::Bool | DataType::Utf8 => Err(JavelinError::Type(format!(
+            DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
                 "groupby_with_pre: pre kernel output dtype {:?} not supported",
                 dtype
             ))),
@@ -1228,7 +1228,7 @@ impl PreCol {
     }
 
     /// Download the column to host and verify the length matches `n_rows`.
-    fn to_host_col(self, n_rows: usize) -> JavelinResult<HostCol> {
+    fn to_host_col(self, n_rows: usize) -> PatinaResult<HostCol> {
         match self {
             PreCol::I32(v) => Ok(HostCol::I32(copy_back::<i32>(&v, n_rows)?)),
             PreCol::I64(v) => Ok(HostCol::I64(copy_back::<i64>(&v, n_rows)?)),
@@ -1258,9 +1258,9 @@ impl HostCol {
     }
 
     /// Return a new column containing only positions where `mask[i]` is true.
-    fn compact(self, mask: &[bool]) -> JavelinResult<HostCol> {
+    fn compact(self, mask: &[bool]) -> PatinaResult<HostCol> {
         if mask.len() != self.len() {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "groupby_with_pre: mask length {} != column length {}",
                 mask.len(),
                 self.len()
@@ -1276,11 +1276,11 @@ impl HostCol {
 
     /// Convert the column to a `Vec<i64>` for use as a GROUP BY key. Int32
     /// upcasts; everything else is an error.
-    fn to_i64_for_key(&self, col_name: &str) -> JavelinResult<Vec<i64>> {
+    fn to_i64_for_key(&self, col_name: &str) -> PatinaResult<Vec<i64>> {
         match self {
             HostCol::I32(v) => Ok(v.iter().map(|&x| x as i64).collect()),
             HostCol::I64(v) => Ok(v.clone()),
-            HostCol::F32(_) | HostCol::F64(_) => Err(JavelinError::Type(format!(
+            HostCol::F32(_) | HostCol::F64(_) => Err(PatinaError::Type(format!(
                 "float GROUP BY keys not yet supported (column '{}')",
                 col_name
             ))),
@@ -1290,7 +1290,7 @@ impl HostCol {
     /// Convert the column to a `Vec<f64>` for use as an AVG input. Any
     /// numeric variant upcasts. `col_name` is only used to enrich a future
     /// error message if we ever extend this to reject non-numeric variants.
-    fn to_f64(&self, _col_name: &str) -> JavelinResult<Vec<f64>> {
+    fn to_f64(&self, _col_name: &str) -> PatinaResult<Vec<f64>> {
         match self {
             HostCol::I32(v) => Ok(v.iter().map(|&x| x as f64).collect()),
             HostCol::I64(v) => Ok(v.iter().map(|&x| x as f64).collect()),
@@ -1320,13 +1320,13 @@ fn filter_vec<T: Copy>(v: Vec<T>, mask: &[bool]) -> Vec<T> {
 }
 
 /// Copy back a `GpuVec<T>` into a host `Vec<T>` of length `n_rows`.
-fn copy_back<T>(v: &GpuVec<T>, n_rows: usize) -> JavelinResult<Vec<T>>
+fn copy_back<T>(v: &GpuVec<T>, n_rows: usize) -> PatinaResult<Vec<T>>
 where
     T: Pod,
 {
     let host = v.to_vec()?;
     if host.len() != n_rows {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "internal: device buffer length {} did not match expected {}",
             host.len(),
             n_rows
@@ -1400,15 +1400,15 @@ fn next_pow2(n: usize) -> usize {
 }
 
 /// Build a `Type` error for a failed Arrow downcast.
-fn downcast_err(role: &str, expected: &str) -> JavelinError {
-    JavelinError::Type(format!(
+fn downcast_err(role: &str, expected: &str) -> PatinaError {
+    PatinaError::Type(format!(
         "groupby_with_pre: pre kernel {} could not be downcast to {}",
         role, expected
     ))
 }
 
 /// Map Arrow `DataType` to our plan `DataType`.
-fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
+fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
         ArrowDataType::Int64 => Ok(DataType::Int64),
@@ -1416,7 +1416,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        other => Err(JavelinError::Type(format!(
+        other => Err(PatinaError::Type(format!(
             "unsupported Arrow dtype {:?}",
             other
         ))),
@@ -1424,7 +1424,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
 }
 
 /// Map our plan `DataType` to Arrow `DataType`.
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -1436,7 +1436,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

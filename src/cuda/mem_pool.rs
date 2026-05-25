@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Process-wide device-memory pool / arena allocator.
 //!
@@ -29,7 +29,7 @@ use crate::cuda::cuda_sys::CUdeviceptr;
 // free.
 #[cfg(not(feature = "cudarc"))]
 use crate::cuda::cuda_sys;
-use crate::error::JavelinResult;
+use crate::error::PatinaResult;
 
 /// Round `bytes` up to the next power of two, with a floor of `ARROW_ALIGNMENT`.
 /// This is the canonical bucket key.
@@ -63,7 +63,7 @@ impl DeviceMemPool {
     /// `cuMemAlloc` on a miss. Returns `(ptr, actual_alloc_bytes)`; the caller
     /// must remember `actual_alloc_bytes` and pass it to `free` so we return
     /// to the right bucket.
-    pub fn alloc(&self, bytes: usize) -> JavelinResult<(CUdeviceptr, usize)> {
+    pub fn alloc(&self, bytes: usize) -> PatinaResult<(CUdeviceptr, usize)> {
         let alloc_bytes = bucket_size(bytes);
         {
             let mut buckets = self.buckets.lock();
@@ -123,7 +123,7 @@ impl DeviceMemPool {
                 #[cfg(not(feature = "cudarc"))]
                 let result = cuda_sys::mem_free(ptr);
                 if let Err(e) = result {
-                    eprintln!("javelin: DeviceMemPool drain failed to free ptr: {}", e);
+                    eprintln!("craton-patina: DeviceMemPool drain failed to free ptr: {}", e);
                 }
             }
         }

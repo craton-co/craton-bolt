@@ -1,4 +1,4 @@
-# 0.3 Milestone Proposal — Rust-CUDA Kernel Migration
+﻿# 0.3 Milestone Proposal — Rust-CUDA Kernel Migration
 
 **Milestone:** Rust-source GPU kernels via `rustc_codegen_nvvm`
 **Target release:** 0.3
@@ -7,7 +7,7 @@
 
 ## Executive summary
 
-Today every GPU kernel in Javelin is emitted as PTX text from a Rust
+Today every GPU kernel in Craton Patina is emitted as PTX text from a Rust
 function in `src/jit/*_kernel*.rs`. That worked through 0.1 and 0.2, but
 the project is at ~18 kernels and growing — Tier-2 GROUP BY alone added
 the `partition_*`, `scatter_*`, and `partition_reduce_*` families in the
@@ -32,7 +32,7 @@ GPU sort all want kernels in 0.3+).
 
 ### Borrow-checked GPU code, end to end
 
-Javelin already gets compile-time safety on the host side through
+Craton Patina already gets compile-time safety on the host side through
 `GpuVec` / `GpuView` / `GpuViewMut` — use-after-free, double-free, and
 mutable/shared aliasing across kernel boundaries are rejected at
 compile. Inside the kernels themselves we have none of that: the PTX

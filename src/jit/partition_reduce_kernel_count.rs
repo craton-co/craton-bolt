@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Per-partition shared-memory GROUP BY **COUNT(*)** kernel — Tier 2.1
 //! companion to `partition_reduce_kernel_multi`.
@@ -34,7 +34,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 /// Open-addressing slot count per block. Must match
 /// `partition_reduce_kernel{,_multi,_i64}::BLOCK_GROUPS`.
@@ -51,13 +51,13 @@ pub const NUM_PARTITIONS: u32 = 4096;
 const MAX_PROBES: u32 = BLOCK_GROUPS;
 
 /// Entry-point name.
-pub const KERNEL_ENTRY: &str = "javelin_partition_reduce_count";
+pub const KERNEL_ENTRY: &str = "patina_partition_reduce_count";
 
 /// Generate PTX for the COUNT(*) per-partition reduce kernel.
 ///
 /// Kernel signature (PTX-level):
 /// ```text
-/// .visible .entry javelin_partition_reduce_count(
+/// .visible .entry patina_partition_reduce_count(
 ///     .param .u64 partition_keys,    // const int32_t* scatter_keys[n_rows]
 ///     .param .u64 partition_offsets, // const uint32_t* offsets[NUM_PARTITIONS+1]
 ///     .param .u64 out_keys,          //       int32_t* [NUM_PARTITIONS*BLOCK_GROUPS]
@@ -67,7 +67,7 @@ pub const KERNEL_ENTRY: &str = "javelin_partition_reduce_count";
 /// ```
 ///
 /// Launch geometry: `grid = NUM_PARTITIONS, block = BLOCK_THREADS`.
-pub fn compile_partition_reduce_kernel_count() -> JavelinResult<String> {
+pub fn compile_partition_reduce_kernel_count() -> PatinaResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
     let block_groups = BLOCK_GROUPS;
@@ -306,8 +306,8 @@ pub fn compile_partition_reduce_kernel_count() -> JavelinResult<String> {
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!(
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!(
         "partition_reduce_kernel_count: write failed: {}",
         e
     ))
@@ -326,7 +326,7 @@ mod tests {
     fn has_correct_entry() {
         let ptx = compile_partition_reduce_kernel_count().unwrap();
         assert!(
-            ptx.contains(".visible .entry javelin_partition_reduce_count("),
+            ptx.contains(".visible .entry patina_partition_reduce_count("),
             "entry-point not found"
         );
     }

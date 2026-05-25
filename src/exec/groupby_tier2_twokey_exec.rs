@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY executor — **two-key (Int32, Int32)
 //! shim**.
@@ -24,7 +24,7 @@
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::groupby_tier2_twokey_merge::build_tier2_twokey_result;
 use crate::exec::groupby_tier2_twokey_orchestrator::execute_tier2_twokey_sum;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
@@ -68,7 +68,7 @@ fn pack_two_i32(col0: &[i32], col1: &[i32]) -> Vec<i64> {
 pub fn try_execute(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
-) -> Option<JavelinResult<RecordBatch>> {
+) -> Option<PatinaResult<RecordBatch>> {
     // --- 1. Plan shape: pre-less Aggregate with exactly two group keys
     //        and one aggregate.
     let (pre, aggregate) = match plan {
@@ -123,7 +123,7 @@ fn execute_inner(
     k0_arr: &Int32Array,
     k1_arr: &Int32Array,
     val_arr: &Float64Array,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     let n_rows = k0_arr.len();
     // Host-side pack. `pack_keys` (the production helper in groupby.rs)
     // would do the same thing for the (Int32, Int32) shape; we re-implement
@@ -137,7 +137,7 @@ fn execute_inner(
     let vals_gpu = GpuVec::<f64>::from_slice(val_arr.values())?;
 
     let n_rows_u32 = u32::try_from(n_rows).map_err(|_| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "groupby_tier2_twokey_exec: row count {} exceeds u32 launch-shape limit",
             n_rows
         ))
@@ -148,7 +148,7 @@ fn execute_inner(
     let aggregate = match plan {
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "groupby_tier2_twokey_exec: non-Aggregate plan reached execute_inner".into(),
             ))
         }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! PTX → loaded CUDA module via the driver's in-process assembler.
 //!
@@ -50,7 +50,7 @@ use libc::c_void;
 use parking_lot::Mutex;
 
 use crate::cuda::cuda_sys::{self, CUfunction, CUmodule};
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 // --- CUjit_option constants -------------------------------------------------
 // Mirrored from <cuda.h> — declared here (rather than in cuda_sys.rs) per the
@@ -91,7 +91,7 @@ impl Drop for CudaModuleInner {
             // route this through stderr. Library consumers will want a proper
             // logging facade — swap this `eprintln!` the moment one lands.
             eprintln!(
-                "javelin: cuModuleUnload failed with code {} (module leaked)",
+                "craton-patina: cuModuleUnload failed with code {} (module leaked)",
                 code
             );
         }
@@ -159,7 +159,7 @@ impl CudaModule {
     ///
     /// On failure the driver's PTXAS error log (which usually includes line
     /// numbers for malformed instructions) is appended to the returned error.
-    pub fn from_ptx(ptx: &str) -> JavelinResult<Self> {
+    pub fn from_ptx(ptx: &str) -> PatinaResult<Self> {
         // Fast path: look up by hash, confirm via full-text compare to defend
         // against the (astronomically unlikely) 64-bit collision.
         let key = hash_ptx(ptx);
@@ -207,9 +207,9 @@ impl CudaModule {
 
     /// Internal: drive `cuModuleLoadDataEx` and wrap the resulting handle in
     /// an `Arc<CudaModuleInner>`. Used only by the cache miss path.
-    fn load_uncached(ptx: &str) -> JavelinResult<Self> {
+    fn load_uncached(ptx: &str) -> PatinaResult<Self> {
         let ptx_cstr = CString::new(ptx).map_err(|e| {
-            JavelinError::Cuda(format!("PTX source contains interior NUL byte: {}", e))
+            PatinaError::Cuda(format!("PTX source contains interior NUL byte: {}", e))
         })?;
 
         let mut info_buf: Vec<u8> = vec![0u8; JIT_LOG_BUF_SIZE];
@@ -253,7 +253,7 @@ impl CudaModule {
             } else {
                 format!("{}; ptxas log: {}", inner_msg(&e), ptxas_msg)
             };
-            return Err(JavelinError::Cuda(format!(
+            return Err(PatinaError::Cuda(format!(
                 "cuModuleLoadDataEx failed: {}",
                 detail
             )));
@@ -265,9 +265,9 @@ impl CudaModule {
     }
 
     /// Look up an entry point by name.
-    pub fn function(&self, name: &str) -> JavelinResult<CudaFunction<'_>> {
+    pub fn function(&self, name: &str) -> PatinaResult<CudaFunction<'_>> {
         let name_cstr = CString::new(name).map_err(|e| {
-            JavelinError::Cuda(format!(
+            PatinaError::Cuda(format!(
                 "kernel name contains interior NUL byte: {}",
                 e
             ))
@@ -277,7 +277,7 @@ impl CudaModule {
             cuda_sys::cuModuleGetFunction(&mut f, self.inner.raw, name_cstr.as_ptr())
         };
         cuda_sys::check(code).map_err(|e| {
-            JavelinError::Cuda(format!(
+            PatinaError::Cuda(format!(
                 "cuModuleGetFunction({}) failed: {}",
                 name,
                 inner_msg(&e)
@@ -320,14 +320,14 @@ impl<'a> CudaFunction<'a> {
 }
 
 /// One-shot: load PTX and return the module. Caller invokes `.function(entry)`.
-pub fn compile_and_load(ptx: &str) -> JavelinResult<CudaModule> {
+pub fn compile_and_load(ptx: &str) -> PatinaResult<CudaModule> {
     CudaModule::from_ptx(ptx)
 }
 
-/// Extract the human-readable portion of a `JavelinError::Cuda` for wrapping.
-fn inner_msg(e: &JavelinError) -> String {
+/// Extract the human-readable portion of a `PatinaError::Cuda` for wrapping.
+fn inner_msg(e: &PatinaError) -> String {
     match e {
-        JavelinError::Cuda(msg) => msg.clone(),
+        PatinaError::Cuda(msg) => msg.clone(),
         other => other.to_string(),
     }
 }

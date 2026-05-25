@@ -1,14 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory GROUP BY SUM kernel (Tier 1 of the GROUP BY perf
 //! plan).
 //!
 //! ## Why this exists
 //!
-//! Javelin's previous GROUP BY path issues one `atom.global.add` per input row
+//! Craton Patina's previous GROUP BY path issues one `atom.global.add` per input row
 //! against a single device-global hash table. With the h2o.ai db-benchmark
 //! workload (10 M rows × 100 distinct groups) every row contends for one of
-//! 100 cache lines — the GPU's atomic unit serialises hard and Javelin runs
+//! 100 cache lines — the GPU's atomic unit serialises hard and Craton Patina runs
 //! 2–44× slower than Polars / DuckDB.
 //!
 //! This kernel implements the standard fix: each CUDA block first reduces its
@@ -91,7 +91,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 /// Number of slots in each block's shared-memory accumulator. Must be a
 /// compile-time constant for shared-memory allocation. Sized to comfortably
@@ -106,14 +106,14 @@ pub const BLOCK_GROUPS: u32 = 1024;
 pub const BLOCK_THREADS: u32 = 256;
 
 /// Entry-point name embedded in the emitted PTX.
-pub const KERNEL_ENTRY: &str = "javelin_groupby_shmem_sum_f64";
+pub const KERNEL_ENTRY: &str = "patina_groupby_shmem_sum_f64";
 
 /// Generate PTX for the shared-memory per-block SUM kernel.
 ///
 /// Kernel signature (PTX-level):
 ///
 /// ```text
-/// .visible .entry javelin_groupby_shmem_sum_f64(
+/// .visible .entry patina_groupby_shmem_sum_f64(
 ///     .param .u64 keys_ptr,     // const int32_t* keys, length n_rows
 ///     .param .u64 vals_ptr,     // const double*  vals, length n_rows
 ///     .param .u64 out_ptr,      // double*        out,  length n_groups
@@ -124,7 +124,7 @@ pub const KERNEL_ENTRY: &str = "javelin_groupby_shmem_sum_f64";
 ///
 /// See module-level docs for the algorithm. `compile_shmem_sum_kernel()` is
 /// deterministic and pure: it returns a fixed PTX string and has no I/O.
-pub fn compile_shmem_sum_kernel() -> JavelinResult<String> {
+pub fn compile_shmem_sum_kernel() -> PatinaResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
     let block_groups = BLOCK_GROUPS;
@@ -358,11 +358,11 @@ pub fn compile_shmem_sum_kernel() -> JavelinResult<String> {
     Ok(ptx)
 }
 
-/// Adapt a `std::fmt::Error` into a `JavelinError`. Same shape as the helper
+/// Adapt a `std::fmt::Error` into a `PatinaError`. Same shape as the helper
 /// in `valid_flag_kernels.rs` — kept local so changes to one file don't
 /// surprise the other.
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!("shmem_sum_kernel: write failed: {}", e))
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!("shmem_sum_kernel: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------

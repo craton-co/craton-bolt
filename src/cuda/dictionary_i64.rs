@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Host-side string dictionary paired with on-device **i64** indices.
 //!
@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use arrow_array::{Array, StringArray};
 
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 /// Threshold for picking i64 over i32 indices.
 ///
@@ -55,9 +55,9 @@ impl DictionaryColumnI64 {
     ///
     /// Nulls in `arr` map to index `0`. Distinct non-null strings are
     /// deduplicated and assigned sequential indices starting at `1`, in
-    /// first-occurrence order. Returns `JavelinError::Other` if the unique
+    /// first-occurrence order. Returns `PatinaError::Other` if the unique
     /// count would overflow `i64::MAX` (defensive — unreachable in practice).
-    pub fn from_string_array(arr: &StringArray) -> JavelinResult<Self> {
+    pub fn from_string_array(arr: &StringArray) -> PatinaResult<Self> {
         let n_rows = arr.len();
         let mut dictionary: Vec<String> = Vec::new();
         let mut lookup: HashMap<String, i64> = HashMap::new();
@@ -74,12 +74,12 @@ impl DictionaryColumnI64 {
             } else {
                 // Next index = current dictionary length + 1 (slot 0 reserved for NULL).
                 let next_len = dictionary.len().checked_add(1).ok_or_else(|| {
-                    JavelinError::Other(
+                    PatinaError::Other(
                         "dictionary overflow: more than usize::MAX unique strings".into(),
                     )
                 })?;
                 if (next_len as u128) > (i64::MAX as u128) {
-                    return Err(JavelinError::Other(format!(
+                    return Err(PatinaError::Other(format!(
                         "dictionary overflow: more than {} unique strings (i64 index space)",
                         i64::MAX
                     )));
@@ -117,16 +117,16 @@ impl DictionaryColumnI64 {
     /// Download indices and reconstruct a `StringArray`.
     ///
     /// Index `0` becomes a SQL `NULL`. Negative indices or indices outside
-    /// `1..=dictionary.len()` surface as `JavelinError::Other` — that would
+    /// `1..=dictionary.len()` surface as `PatinaError::Other` — that would
     /// indicate a kernel wrote something the host dictionary cannot decode.
-    pub fn to_string_array(&self) -> JavelinResult<StringArray> {
+    pub fn to_string_array(&self) -> PatinaResult<StringArray> {
         let host_indices: Vec<i64> = self.indices.to_vec()?;
         let mut out: Vec<Option<&str>> = Vec::with_capacity(host_indices.len());
         for &idx in &host_indices {
             if idx == 0 {
                 out.push(None);
             } else if idx < 0 {
-                return Err(JavelinError::Other(format!(
+                return Err(PatinaError::Other(format!(
                     "dictionary decode: negative index {} (NULL is encoded as 0)",
                     idx
                 )));
@@ -138,7 +138,7 @@ impl DictionaryColumnI64 {
                 // a valid slot.
                 let pos_u64 = (idx as u64) - 1;
                 if pos_u64 >= self.dictionary.len() as u64 {
-                    return Err(JavelinError::Other(format!(
+                    return Err(PatinaError::Other(format!(
                         "dictionary decode: index {} out of bounds (dictionary size {})",
                         idx,
                         self.dictionary.len()
@@ -160,7 +160,7 @@ impl DictionaryColumnI64 {
     /// from the source `StringArray`: no hashing, no string allocation, no
     /// duplicate scan — just one device→host copy, an `as i64` widen, and one
     /// host→device copy.
-    pub fn from_i32(input: &crate::cuda::dictionary::DictionaryColumn) -> JavelinResult<Self> {
+    pub fn from_i32(input: &crate::cuda::dictionary::DictionaryColumn) -> PatinaResult<Self> {
         let narrow: Vec<i32> = input.indices.to_vec()?;
         let wide: Vec<i64> = narrow.into_iter().map(|x| x as i64).collect();
         let device_indices = GpuVec::<i64>::from_slice(&wide)?;
@@ -176,20 +176,20 @@ impl DictionaryColumnI64 {
     ///
     /// Downloads the indices, checks each against `[0, i32::MAX]`, narrows to
     /// `Vec<i32>`, and uploads via `GpuVec::<i32>::from_slice`. Returns
-    /// `JavelinError::Other` on the first index that falls outside the i32
+    /// `PatinaError::Other` on the first index that falls outside the i32
     /// range (including negatives — those were always invalid).
-    pub fn try_into_i32(self) -> JavelinResult<crate::cuda::dictionary::DictionaryColumn> {
+    pub fn try_into_i32(self) -> PatinaResult<crate::cuda::dictionary::DictionaryColumn> {
         let wide: Vec<i64> = self.indices.to_vec()?;
         let mut narrow: Vec<i32> = Vec::with_capacity(wide.len());
         for &idx in &wide {
             if idx < 0 {
-                return Err(JavelinError::Other(format!(
+                return Err(PatinaError::Other(format!(
                     "narrow to i32: negative index {} (invalid; NULL is 0)",
                     idx
                 )));
             }
             if idx > i32::MAX as i64 {
-                return Err(JavelinError::Other(format!(
+                return Err(PatinaError::Other(format!(
                     "narrow to i32: index {} exceeds i32::MAX ({})",
                     idx,
                     i32::MAX
@@ -221,7 +221,7 @@ impl DictionaryColumnI64 {
     pub(crate) fn new_host_only(
         dictionary: Vec<String>,
         n_rows: usize,
-    ) -> JavelinResult<Self> {
+    ) -> PatinaResult<Self> {
         Ok(Self {
             dictionary,
             indices: GpuVec::<i64>::empty(),
@@ -343,8 +343,8 @@ mod tests {
         // can't derive (its inner GpuVec doesn't impl Debug). Match instead.
         match col.try_into_i32() {
             Ok(_) => panic!("oversized index must reject narrowing"),
-            Err(JavelinError::Other(msg)) => assert!(msg.contains("exceeds i32::MAX")),
-            Err(other) => panic!("expected JavelinError::Other, got {:?}", other),
+            Err(PatinaError::Other(msg)) => assert!(msg.contains("exceeds i32::MAX")),
+            Err(other) => panic!("expected PatinaError::Other, got {:?}", other),
         }
     }
 }

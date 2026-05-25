@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY **result merger**.
 //!
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::plan::logical_plan::{DataType, Schema};
 
 /// Per-partition (deduplicated keys, per-group sums) produced by the
@@ -46,7 +46,7 @@ pub type PerPartition = Vec<(Vec<i32>, Vec<f64>)>;
 pub fn build_tier2_result(
     per_partition: PerPartition,
     output_schema: &Schema,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     // 1. Total result rows across all partitions.
     let total: usize = per_partition.iter().map(|(k, _)| k.len()).sum();
 
@@ -56,7 +56,7 @@ pub fn build_tier2_result(
     let mut sums_out: Vec<f64> = Vec::with_capacity(total);
     for (keys, sums) in per_partition.into_iter() {
         if keys.len() != sums.len() {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "tier2_merge: partition length mismatch (keys={}, sums={})",
                 keys.len(),
                 sums.len()
@@ -90,7 +90,7 @@ pub fn build_tier2_result(
     let key_array = Arc::new(Int32Array::from(keys_out));
     let sum_array = Arc::new(Float64Array::from(sums_out));
     RecordBatch::try_new(arrow_schema, vec![key_array, sum_array]).map_err(|e| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "tier2_merge: failed to build output RecordBatch: {e}"
         ))
     })
@@ -101,7 +101,7 @@ pub fn build_tier2_result(
 // carries its own copy; consolidating them is a separate refactor.
 // ---------------------------------------------------------------------------
 
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -112,7 +112,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
     }
 }
 
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! DISTINCT executor — host-side deduplication of a RecordBatch.
 //!
@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::QueryHandle;
 
 /// Apply DISTINCT to the input handle, returning a new handle whose
@@ -23,7 +23,7 @@ use crate::exec::QueryHandle;
 ///
 /// Host-side implementation. For wide schemas or large row counts this
 /// is the slow path; the 0.2 release will add a GPU sort-based variant.
-pub fn execute_distinct(input: QueryHandle) -> JavelinResult<QueryHandle> {
+pub fn execute_distinct(input: QueryHandle) -> PatinaResult<QueryHandle> {
     let batch = input.into_record_batch();
     let n_rows = batch.num_rows();
     if n_rows == 0 {
@@ -46,7 +46,7 @@ pub fn execute_distinct(input: QueryHandle) -> JavelinResult<QueryHandle> {
         .columns()
         .iter()
         .map(|c| arrow::compute::filter(c.as_ref(), &mask).map_err(arrow_err))
-        .collect::<JavelinResult<Vec<_>>>()?;
+        .collect::<PatinaResult<Vec<_>>>()?;
     let out = RecordBatch::try_new(batch.schema(), filtered_cols).map_err(arrow_err)?;
     Ok(QueryHandle::from_record_batch(out))
 }
@@ -105,8 +105,8 @@ fn hash_array_row(array: &dyn Array, row: usize, h: &mut impl Hasher) {
     }
 }
 
-fn arrow_err(e: arrow::error::ArrowError) -> JavelinError {
-    JavelinError::Other(format!("arrow: {}", e))
+fn arrow_err(e: arrow::error::ArrowError) -> PatinaError {
+    PatinaError::Other(format!("arrow: {}", e))
 }
 
 #[cfg(test)]

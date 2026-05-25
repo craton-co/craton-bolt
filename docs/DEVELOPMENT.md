@@ -1,6 +1,6 @@
-# Development
+﻿# Development
 
-How to build, test, benchmark, and extend Javelin.
+How to build, test, benchmark, and extend Craton Patina.
 
 ## Prerequisites
 
@@ -10,20 +10,20 @@ How to build, test, benchmark, and extend Javelin.
 | `cargo`                  | Standard.                                                               |
 | CUDA Toolkit 12.x        | Provides `cuda.lib` (Windows) / `libcuda.so` (Linux) for the linker.    |
 | NVIDIA driver matching the toolkit | Required only for running tests / benchmarks on a real GPU.   |
-| NVIDIA GPU with compute capability ≥ 7.0 | Required only for `cargo test -- --ignored` and `cargo bench` with `JAVELIN_BENCH_GPU=1`. |
+| NVIDIA GPU with compute capability ≥ 7.0 | Required only for `cargo test -- --ignored` and `cargo bench` with `PATINA_BENCH_GPU=1`. |
 
 If you don't have CUDA installed yet:
 
 - **Linux**: see [NVIDIA's package manager instructions](https://developer.nvidia.com/cuda-downloads). Make sure `/usr/local/cuda/lib64` is in `LD_LIBRARY_PATH` and `/usr/local/cuda/lib64/stubs` (or the equivalent) provides `libcuda.so` for the linker.
 - **Windows**: install the CUDA Toolkit from the [official installer](https://developer.nvidia.com/cuda-toolkit). The installer adds `cuda.lib` to the linker path (`%CUDA_PATH%\lib\x64`) automatically when you open a fresh Developer Command Prompt.
-- **macOS**: NVIDIA dropped Mac support years ago; you cannot run Javelin on a Mac with an actual GPU. `cargo check` still works.
+- **macOS**: NVIDIA dropped Mac support years ago; you cannot run Craton Patina on a Mac with an actual GPU. `cargo check` still works.
 
 ## What works without CUDA
 
 The `cuda-stub` feature makes the entire crate (including tests) compile,
 link, and run on hosts with no CUDA toolkit installed — every FFI entry
 is replaced by a Rust shim returning `CUDA_ERROR_STUB`, which surfaces as
-`JavelinError::Other("cuda-stub mode: no GPU support compiled in")` at
+`PatinaError::Other("cuda-stub mode: no GPU support compiled in")` at
 runtime. Use it for CI matrix cells without a CUDA toolkit, on `docs.rs`,
 and on developer Macs:
 
@@ -111,8 +111,8 @@ cargo test ptx_for_trivial_select_contains
 cargo bench
 
 # Add the GPU engine path. Requires an actual NVIDIA GPU.
-JAVELIN_BENCH_GPU=1 cargo bench           # bash
-$env:JAVELIN_BENCH_GPU="1"; cargo bench   # PowerShell
+PATINA_BENCH_GPU=1 cargo bench           # bash
+$env:PATINA_BENCH_GPU="1"; cargo bench   # PowerShell
 
 # A single bench group.
 cargo bench --bench query_benchmarks -- plan
@@ -135,7 +135,7 @@ Criterion writes HTML reports to `target/criterion/`. The bench file is `benches
 
 ### Adding a new aggregate path
 
-The pattern: write a self-contained executor in `src/exec/<your_executor>.rs`, expose a public `pub fn execute_<shape>(plan, batch) -> JavelinResult<RecordBatch>`, then wire it into `Engine::execute`'s match in `src/exec/engine.rs`.
+The pattern: write a self-contained executor in `src/exec/<your_executor>.rs`, expose a public `pub fn execute_<shape>(plan, batch) -> PatinaResult<RecordBatch>`, then wire it into `Engine::execute`'s match in `src/exec/engine.rs`.
 
 Look at `src/exec/groupby_with_pre.rs` for a recent example. The pattern is:
 
@@ -147,7 +147,7 @@ Look at `src/exec/groupby_with_pre.rs` for a recent example. The pattern is:
 
 ### Adding a new PTX kernel
 
-Place it in `src/jit/<your_kernel>.rs`. Expose a `pub fn compile_<name>_kernel(...) -> JavelinResult<String>` and a `pub const <NAME>_ENTRY: &str = "..."` constant for the symbol-lookup name.
+Place it in `src/jit/<your_kernel>.rs`. Expose a `pub fn compile_<name>_kernel(...) -> PatinaResult<String>` and a `pub const <NAME>_ENTRY: &str = "..."` constant for the symbol-lookup name.
 
 Conventions:
 
@@ -156,7 +156,7 @@ Conventions:
 - Bounds check at the top with `setp.ge.s32 %p, %tid, %n_rows; @%p bra DONE`.
 - Globalise every pointer parameter with `cvta.to.global.u64` before use.
 - Generous `.reg` declarations (PTX `.reg` only allocates names, not physical registers).
-- All errors flow through `JavelinResult`. No `unwrap` in the codegen.
+- All errors flow through `PatinaResult`. No `unwrap` in the codegen.
 
 Add a PTX-shape test in the same file:
 
@@ -205,7 +205,7 @@ let err = some_call().expect_err("must error");
 // After (compiles):
 match some_call() {
     Ok(_) => panic!("must error"),
-    Err(e) => assert!(matches!(e, JavelinError::Other(_))),
+    Err(e) => assert!(matches!(e, PatinaError::Other(_))),
 }
 ```
 
@@ -223,7 +223,7 @@ Criterion benchmarks need a quiet machine. Close Chrome, Slack, Spotify. The `cp
 
 - **One-line `///` doc comments** on public items. Longer prose goes in `//!` module-level docs.
 - **`// SAFETY:` comments** on every `unsafe` block explaining the invariant.
-- **`JavelinResult<T>`** everywhere a fallible operation could happen in library code. Never `unwrap()` in `src/`.
+- **`PatinaResult<T>`** everywhere a fallible operation could happen in library code. Never `unwrap()` in `src/`.
 - **`#[cfg(test)] mod tests`** at the bottom of each file for unit tests.
 - **No `panic!()`** in library code. Tests can panic; benches can panic; library code returns errors.
 - **`debug_assert!`** for invariants the type system can't express but you want to catch in debug builds.
@@ -234,7 +234,7 @@ Open an issue with the [`question`] label. Include the query, the API call, and 
 
 ## Licensing
 
-Javelin is Apache-2.0-licensed. See [`../LICENSE`](../LICENSE) for the
+Craton Patina is Apache-2.0-licensed. See [`../LICENSE`](../LICENSE) for the
 canonical text and [`../NOTICE`](../NOTICE) for third-party attribution.
 
 Two practical implications for day-to-day work:

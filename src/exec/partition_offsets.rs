@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Exclusive prefix-sum offsets for Tier-2 hash-partitioned GROUP BY.
 //!
@@ -29,7 +29,7 @@
 //! larger without also blowing up the per-partition hashtable budget.
 
 use crate::cuda::GpuVec;
-use crate::error::JavelinResult;
+use crate::error::PatinaResult;
 
 /// Number of hash partitions used by Tier-2 GROUP BY.
 ///
@@ -51,10 +51,10 @@ pub const NUM_PARTITIONS: u32 = 4096;
 /// Mechanism: downloads the 1024 `u32`s (4 KiB) over PCIe, prefix-sums
 /// on the host with one tight loop, returns. See the module docs for
 /// the cost rationale.
-pub fn compute_partition_offsets(counts: &GpuVec<u32>) -> JavelinResult<Vec<u32>> {
+pub fn compute_partition_offsets(counts: &GpuVec<u32>) -> PatinaResult<Vec<u32>> {
     let expected = NUM_PARTITIONS as usize;
     if counts.len() != expected {
-        return Err(crate::error::JavelinError::Other(format!(
+        return Err(crate::error::PatinaError::Other(format!(
             "compute_partition_offsets: counts.len() = {} but expected NUM_PARTITIONS = {}",
             counts.len(),
             expected,
@@ -72,10 +72,10 @@ pub fn compute_partition_offsets(counts: &GpuVec<u32>) -> JavelinResult<Vec<u32>
 /// trailing total). Callers that need the total should grab
 /// `offsets[NUM_PARTITIONS as usize]` from the host slice before
 /// uploading.
-pub fn upload_offsets(offsets: &[u32]) -> JavelinResult<GpuVec<u32>> {
+pub fn upload_offsets(offsets: &[u32]) -> PatinaResult<GpuVec<u32>> {
     let expected = NUM_PARTITIONS as usize + 1;
     if offsets.len() != expected {
-        return Err(crate::error::JavelinError::Other(format!(
+        return Err(crate::error::PatinaError::Other(format!(
             "upload_offsets: offsets.len() = {} but expected NUM_PARTITIONS + 1 = {}",
             offsets.len(),
             expected,

@@ -1,6 +1,6 @@
----
+﻿---
 name: Feature request
-about: Suggest a new capability for Javelin
+about: Suggest a new capability for Craton Patina
 title: "[feature] "
 labels: enhancement
 ---

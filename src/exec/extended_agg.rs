@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Host-side aggregate execution for the dtypes the GPU reduction kernels
 //! don't cover: `Bool` (any aggregate) and `Utf8` (COUNT/MIN/MAX only).
@@ -16,7 +16,7 @@
 //! | MAX   | Utf8  | Utf8    | lexicographic; NULL if all-null group         |
 //! | COUNT | Utf8  | Int64   | non-null row count                            |
 //!
-//! SUM/AVG over `Utf8` is not defined and returns `JavelinError::Type`.
+//! SUM/AVG over `Utf8` is not defined and returns `PatinaError::Type`.
 //!
 //! The GPU reduction path covers fixed-width primitives end-to-end. For
 //! `Bool`/`Utf8` the input cardinalities the planner expects to hit this
@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field};
 
 /// True iff `(op, input_dtype)` is handled by this module.
@@ -76,7 +76,7 @@ pub fn execute_extended_scalar(
     expr: &AggregateExpr,
     out_field: &Field,
     table_batch: &RecordBatch,
-) -> JavelinResult<ArrayRef> {
+) -> PatinaResult<ArrayRef> {
     let (input_dtype, array) = resolve_input_array(expr, table_batch)?;
     validate_output_dtype(expr, input_dtype, out_field.dtype)?;
 
@@ -118,9 +118,9 @@ pub fn execute_extended_scalar(
             Ok(Arc::new(utf8_max_array(strs, 0..strs.len())) as ArrayRef)
         }
         (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => Err(
-            JavelinError::Type("SUM/AVG over Utf8 is not defined".into()),
+            PatinaError::Type("SUM/AVG over Utf8 is not defined".into()),
         ),
-        (_, dt) => Err(JavelinError::Other(format!(
+        (_, dt) => Err(PatinaError::Other(format!(
             "extended_agg: unhandled (aggregate, input dtype) combination for {:?}",
             dt
         ))),
@@ -138,7 +138,7 @@ pub fn execute_extended_grouped(
     out_field: &Field,
     table_batch: &RecordBatch,
     group_rows: &[Vec<usize>],
-) -> JavelinResult<ArrayRef> {
+) -> PatinaResult<ArrayRef> {
     let (input_dtype, array) = resolve_input_array(expr, table_batch)?;
     validate_output_dtype(expr, input_dtype, out_field.dtype)?;
 
@@ -209,9 +209,9 @@ pub fn execute_extended_grouped(
             Ok(Arc::new(StringArray::from(out)) as ArrayRef)
         }
         (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => Err(
-            JavelinError::Type("SUM/AVG over Utf8 is not defined".into()),
+            PatinaError::Type("SUM/AVG over Utf8 is not defined".into()),
         ),
-        (_, dt) => Err(JavelinError::Other(format!(
+        (_, dt) => Err(PatinaError::Other(format!(
             "extended_agg: unhandled (aggregate, input dtype) combination for {:?}",
             dt
         ))),
@@ -232,10 +232,10 @@ fn unwrap_alias(expr: &Expr) -> &Expr {
 
 /// Extract the column name from a bare-column-ref expression, transparently
 /// unwrapping any aliases. Other expression shapes are rejected with `Other`.
-fn bare_column_name(expr: &Expr) -> JavelinResult<&str> {
+fn bare_column_name(expr: &Expr) -> PatinaResult<&str> {
     match unwrap_alias(expr) {
         Expr::Column(name) => Ok(name.as_str()),
-        _ => Err(JavelinError::Other(
+        _ => Err(PatinaError::Other(
             "extended_agg: aggregate input must be a bare column reference".into(),
         )),
     }
@@ -257,13 +257,13 @@ fn aggregate_inner(expr: &AggregateExpr) -> &Expr {
 fn resolve_input_array<'a>(
     expr: &AggregateExpr,
     table_batch: &'a RecordBatch,
-) -> JavelinResult<(DataType, &'a dyn Array)> {
+) -> PatinaResult<(DataType, &'a dyn Array)> {
     let col_name = bare_column_name(aggregate_inner(expr))?;
     let idx = table_batch
         .schema()
         .index_of(col_name)
         .map_err(|e| {
-            JavelinError::Plan(format!(
+            PatinaError::Plan(format!(
                 "extended_agg input column '{}' not present in batch: {}",
                 col_name, e
             ))
@@ -273,7 +273,7 @@ fn resolve_input_array<'a>(
         arrow_schema::DataType::Boolean => DataType::Bool,
         arrow_schema::DataType::Utf8 => DataType::Utf8,
         other => {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "extended_agg: column '{}' has unsupported Arrow dtype {:?}",
                 col_name, other
             )))
@@ -287,7 +287,7 @@ fn validate_output_dtype(
     expr: &AggregateExpr,
     input_dtype: DataType,
     out_dtype: DataType,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     let expected = match (expr, input_dtype) {
         (AggregateExpr::Sum(_), DataType::Bool) => DataType::Int64,
         (AggregateExpr::Avg(_), DataType::Bool) => DataType::Float64,
@@ -298,19 +298,19 @@ fn validate_output_dtype(
         (AggregateExpr::Max(_), DataType::Utf8) => DataType::Utf8,
         (AggregateExpr::Count(_), DataType::Utf8) => DataType::Int64,
         (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => {
-            return Err(JavelinError::Type(
+            return Err(PatinaError::Type(
                 "SUM/AVG over Utf8 is not defined".into(),
             ))
         }
         (_, dt) => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "extended_agg: unsupported (aggregate, input dtype) combo with input {:?}",
                 dt
             )))
         }
     };
     if expected != out_dtype {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "extended_agg: output dtype mismatch: plan says {:?}, expected {:?}",
             out_dtype, expected
         )));
@@ -318,9 +318,9 @@ fn validate_output_dtype(
     Ok(())
 }
 
-fn downcast_bool<'a>(array: &'a dyn Array, op_name: &str) -> JavelinResult<&'a BooleanArray> {
+fn downcast_bool<'a>(array: &'a dyn Array, op_name: &str) -> PatinaResult<&'a BooleanArray> {
     array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-        JavelinError::Type(format!(
+        PatinaError::Type(format!(
             "extended_agg: {} expected BooleanArray, got {:?}",
             op_name,
             array.data_type()
@@ -328,9 +328,9 @@ fn downcast_bool<'a>(array: &'a dyn Array, op_name: &str) -> JavelinResult<&'a B
     })
 }
 
-fn downcast_str<'a>(array: &'a dyn Array, op_name: &str) -> JavelinResult<&'a StringArray> {
+fn downcast_str<'a>(array: &'a dyn Array, op_name: &str) -> PatinaResult<&'a StringArray> {
     array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        JavelinError::Type(format!(
+        PatinaError::Type(format!(
             "extended_agg: {} expected StringArray, got {:?}",
             op_name,
             array.data_type()
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(max_arr.value(0), "cherry");
     }
 
-    /// 7. SUM over Utf8 returns a `JavelinError::Type`.
+    /// 7. SUM over Utf8 returns a `PatinaError::Type`.
     #[test]
     fn sum_utf8_errors() {
         let batch = utf8_col("s", vec![Some("a"), Some("b")]);
@@ -785,13 +785,13 @@ mod tests {
         )
         .expect_err("should error");
         match err {
-            JavelinError::Type(msg) => {
+            PatinaError::Type(msg) => {
                 assert!(
                     msg.contains("SUM/AVG over Utf8"),
                     "unexpected message: {msg}"
                 );
             }
-            other => panic!("expected JavelinError::Type, got {other:?}"),
+            other => panic!("expected PatinaError::Type, got {other:?}"),
         }
     }
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Test scaffolding for Tier 1 of the GROUP BY perf plan: a per-block
 //! shared-memory pre-aggregation kernel.
@@ -264,7 +264,7 @@ fn shmem_kernel_matches_cpu_model() {
     //
     //   1. Build a `RecordBatch` with two columns: `id1` (Int32) from `keys`
     //      and `v1` (Float64) from `vals`.
-    //   2. `let mut engine = javelin::Engine::new().unwrap();`
+    //   2. `let mut engine = craton_patina::Engine::new().unwrap();`
     //      `engine.register_table("x", batch).unwrap();`
     //   3. `let h = engine.sql("SELECT id1, SUM(v1) FROM x GROUP BY id1").unwrap();`
     //      `let out = h.record_batch();`

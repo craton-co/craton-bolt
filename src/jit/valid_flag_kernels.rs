@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Sentinel-free open-addressing GROUP BY kernels.
 //!
@@ -97,7 +97,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::jit::agg_kernels::ReduceOp;
 use crate::plan::logical_plan::DataType;
 
@@ -108,11 +108,11 @@ pub const FX_MUL: i64 = 0x9E3779B97F4A7C15u64 as i64;
 
 /// Entry-point name of the keys kernel produced by
 /// [`compile_keys_valid_kernel`].
-pub const VALID_KEYS_KERNEL_ENTRY: &str = "javelin_groupby_keys_valid";
+pub const VALID_KEYS_KERNEL_ENTRY: &str = "patina_groupby_keys_valid";
 
 /// Entry-point name of the aggregate kernel produced by
 /// [`compile_agg_valid_kernel`].
-pub const VALID_AGG_KERNEL_ENTRY: &str = "javelin_groupby_agg_valid";
+pub const VALID_AGG_KERNEL_ENTRY: &str = "patina_groupby_agg_valid";
 
 /// Threads per block. Matched to the classic variant for parity.
 const BLOCK_SIZE: u32 = 256;
@@ -139,7 +139,7 @@ pub fn valid_block_size() -> u32 {
 /// ## ABI
 ///
 /// ```text
-/// .visible .entry javelin_groupby_keys_valid(
+/// .visible .entry patina_groupby_keys_valid(
 ///     .param .u64 group_col_ptr,      // i64 keys, length n_rows
 ///     .param .u64 keys_table_ptr,     // i64, length k, contents arbitrary at entry
 ///     .param .u64 slot_valid_ptr,     // u32, length k, host-initialised to 0
@@ -159,7 +159,7 @@ pub fn valid_block_size() -> u32 {
 /// increments `spill_counter_ptr` and (if `< max_spill`) writes its key
 /// into `spill_keys_ptr`. The host folds the spill buffer into the result
 /// after kernel sync.
-pub fn compile_keys_valid_kernel() -> JavelinResult<String> {
+pub fn compile_keys_valid_kernel() -> PatinaResult<String> {
     let mut ptx = String::new();
     let entry = VALID_KEYS_KERNEL_ENTRY;
 
@@ -318,7 +318,7 @@ pub fn compile_keys_valid_kernel() -> JavelinResult<String> {
 /// ## ABI
 ///
 /// ```text
-/// .visible .entry javelin_groupby_agg_valid(
+/// .visible .entry patina_groupby_agg_valid(
 ///     .param .u64 group_col_ptr,      // i64 keys, length n_rows
 ///     .param .u64 keys_table_ptr,     // i64, length k, populated by the keys kernel
 ///     .param .u64 slot_valid_ptr,     // u32, length k, populated by the keys kernel
@@ -343,13 +343,13 @@ pub fn compile_keys_valid_kernel() -> JavelinResult<String> {
 pub fn compile_agg_valid_kernel(
     op: ReduceOp,
     input_dtype: DataType,
-) -> JavelinResult<String> {
+) -> PatinaResult<String> {
     // Reject unsupported (op, dtype) combinations up front with explicit errors.
     let atomic = atomic_for(op, input_dtype)?;
 
     let (load_suffix, reg_class) = ptx_type_info(input_dtype)?;
     let elem_bytes = input_dtype.byte_width().ok_or_else(|| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "valid_flag_kernels: variable-width dtype {:?} not supported",
             input_dtype
         ))
@@ -575,7 +575,7 @@ pub fn compile_agg_valid_kernel(
 /// PTX `atom.global.*` mnemonic (with no operands) for the given op + dtype.
 /// Mirrors `hash_kernels::atomic_for` — kept private here so that file stays
 /// the source of truth for which combinations the classic path supports too.
-fn atomic_for(op: ReduceOp, dtype: DataType) -> JavelinResult<&'static str> {
+fn atomic_for(op: ReduceOp, dtype: DataType) -> PatinaResult<&'static str> {
     use DataType::*;
     use ReduceOp::*;
     Ok(match (op, dtype) {
@@ -596,14 +596,14 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> JavelinResult<&'static str> {
         (Max, Int64) => "atom.global.max.s64",
 
         (Min, Float32) | (Min, Float64) | (Max, Float32) | (Max, Float64) => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "MIN/MAX over float not yet supported in GROUP BY (valid-flag variant)"
                     .into(),
             ))
         }
 
         (_, Bool) | (_, Utf8) => {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "valid_flag_kernels: aggregate over dtype {:?} not supported",
                 dtype
             )))
@@ -612,14 +612,14 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> JavelinResult<&'static str> {
 }
 
 /// `(ld_suffix, reg_class)` for the input column / accumulator value type.
-fn ptx_type_info(dtype: DataType) -> JavelinResult<(&'static str, &'static str)> {
+fn ptx_type_info(dtype: DataType) -> PatinaResult<(&'static str, &'static str)> {
     Ok(match dtype {
         DataType::Int32 => ("s32", "vr"),
         DataType::Int64 => ("s64", "vl"),
         DataType::Float32 => ("f32", "vf"),
         DataType::Float64 => ("f64", "vd"),
         DataType::Bool | DataType::Utf8 => {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "valid_flag_kernels: dtype {:?} not supported in aggregate kernel",
                 dtype
             )))
@@ -630,14 +630,14 @@ fn ptx_type_info(dtype: DataType) -> JavelinResult<(&'static str, &'static str)>
 /// PTX `st.global.<suffix>` mnemonic for storing a value of `dtype` into the
 /// spill_values buffer. Same width as the `ld.global.<suffix>` used to load
 /// the input column.
-fn ptx_store_suffix(dtype: DataType) -> JavelinResult<&'static str> {
+fn ptx_store_suffix(dtype: DataType) -> PatinaResult<&'static str> {
     Ok(match dtype {
         DataType::Int32 => "s32",
         DataType::Int64 => "s64",
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
         DataType::Bool | DataType::Utf8 => {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "valid_flag_kernels: dtype {:?} not supported in aggregate kernel spill",
                 dtype
             )))
@@ -646,14 +646,14 @@ fn ptx_store_suffix(dtype: DataType) -> JavelinResult<&'static str> {
 }
 
 /// PTX `.reg` declaration type for the input-value register class.
-fn reg_decl_ty(dtype: DataType) -> JavelinResult<&'static str> {
+fn reg_decl_ty(dtype: DataType) -> PatinaResult<&'static str> {
     Ok(match dtype {
         DataType::Int32 => "b32",
         DataType::Int64 => "b64",
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
         DataType::Bool | DataType::Utf8 => {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "valid_flag_kernels: dtype {:?} not supported in aggregate kernel",
                 dtype
             )))
@@ -661,9 +661,9 @@ fn reg_decl_ty(dtype: DataType) -> JavelinResult<&'static str> {
     })
 }
 
-/// Adapt a `std::fmt::Error` into a `JavelinError`.
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!("valid_flag_kernels: write failed: {}", e))
+/// Adapt a `std::fmt::Error` into a `PatinaError`.
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!("valid_flag_kernels: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------

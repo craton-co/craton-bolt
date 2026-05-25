@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory GROUP BY kernel with **multiple SUM aggregates**
 //! computed in a single pass (Tier-1 extension).
@@ -86,7 +86,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 /// Number of slots in each block's shared-memory accumulator table. Matches
 /// the single-SUM kernel so the two share dispatcher constants.
@@ -109,7 +109,7 @@ pub const MAX_VALS: u32 = 4;
 /// We carry `n_vals` in the name so the JIT cache can keep one compiled
 /// module per width without name collisions.
 pub fn kernel_entry(n_vals: u32) -> String {
-    format!("javelin_groupby_shmem_multi_sum_f64_{n_vals}")
+    format!("patina_groupby_shmem_multi_sum_f64_{n_vals}")
 }
 
 /// Generate PTX for the multi-SUM shared-memory GROUP BY kernel.
@@ -117,7 +117,7 @@ pub fn kernel_entry(n_vals: u32) -> String {
 /// Kernel signature (PTX-level), with `N = n_vals`:
 ///
 /// ```text
-/// .visible .entry javelin_groupby_shmem_multi_sum_f64_N(
+/// .visible .entry patina_groupby_shmem_multi_sum_f64_N(
 ///     .param .u64 keys_ptr,            // const int32_t* keys
 ///     .param .u64 vals_0_ptr,          // const double*  vals_0
 ///     .param .u64 vals_1_ptr,          // (only if N >= 2)
@@ -136,9 +136,9 @@ pub fn kernel_entry(n_vals: u32) -> String {
 ///
 /// Returns an error if `n_vals` is outside `1..=MAX_VALS`. Same-input ->
 /// same-output: a JIT cache can memoise on `n_vals` alone.
-pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> JavelinResult<String> {
+pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> PatinaResult<String> {
     if n_vals == 0 || n_vals > MAX_VALS {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "shmem_multi_sum_kernel: n_vals must be in 1..={MAX_VALS}, got {n_vals}"
         )));
     }
@@ -500,8 +500,8 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> JavelinResult<String> {
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!("shmem_multi_sum_kernel: write failed: {}", e))
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!("shmem_multi_sum_kernel: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------

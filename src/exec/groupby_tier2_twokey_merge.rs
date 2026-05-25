@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY **two-key result merger**.
 //!
@@ -41,7 +41,7 @@ use std::sync::Arc;
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::groupby_tier2_twokey_orchestrator::Tier2TwokeyPartial;
 use crate::plan::logical_plan::{DataType, Schema};
 
@@ -64,7 +64,7 @@ fn unpack_i64(packed: i64) -> (i32, i32) {
 pub fn build_tier2_twokey_result(
     partial: Tier2TwokeyPartial,
     output_schema: &Schema,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     // 1. Total result rows across all partitions.
     let total: usize = partial.per_partition.iter().map(|(k, _)| k.len()).sum();
 
@@ -76,7 +76,7 @@ pub fn build_tier2_twokey_result(
     let mut sums_out: Vec<f64> = Vec::with_capacity(total);
     for (keys_i64, sums) in partial.per_partition.into_iter() {
         if keys_i64.len() != sums.len() {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "tier2_twokey_merge: partition length mismatch (keys={}, sums={})",
                 keys_i64.len(),
                 sums.len()
@@ -120,7 +120,7 @@ pub fn build_tier2_twokey_result(
     // 4. Build the output `RecordBatch` against the planner-supplied
     //    schema. Schema must have exactly 3 fields: (Int32, Int32, Float64).
     if output_schema.fields.len() != 3 {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "tier2_twokey_merge: output_schema must have 3 fields (key1, key2, sum), \
              got {}",
             output_schema.fields.len()
@@ -131,7 +131,7 @@ pub fn build_tier2_twokey_result(
     let k2_arr = Arc::new(Int32Array::from(key2_out));
     let sum_arr = Arc::new(Float64Array::from(sums_out));
     RecordBatch::try_new(arrow_schema, vec![k1_arr, k2_arr, sum_arr]).map_err(|e| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "tier2_twokey_merge: failed to build output RecordBatch: {e}"
         ))
     })
@@ -142,7 +142,7 @@ pub fn build_tier2_twokey_result(
 // single-key merger; consolidation across executors is a separate refactor.
 // ---------------------------------------------------------------------------
 
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -153,7 +153,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
     }
 }
 
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

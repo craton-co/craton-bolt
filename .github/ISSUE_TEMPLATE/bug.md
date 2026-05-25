@@ -1,6 +1,6 @@
----
+﻿---
 name: Bug report
-about: Report a defect in Javelin
+about: Report a defect in Craton Patina
 title: "[bug] "
 labels: bug
 ---
@@ -23,7 +23,7 @@ labels: bug
 - **CUDA driver / toolkit version:**
 - **OS:**
 - **Rust version (`rustc --version`):**
-- **Javelin version / commit:**
+- **Craton Patina version / commit:**
 - **Cargo features enabled:** <!-- e.g. default, cuda-stub -->
 
 ### Minimal reproduction

@@ -1,9 +1,9 @@
-# Blocked actions — what an automated coding assistant cannot do for you
+﻿# Blocked actions — what an automated coding assistant cannot do for you
 
 This document enumerates the concrete actions a coding assistant (me, the
 Claude Code agent operating in this repository) **cannot execute on its own**
 and which therefore require a human with the right credentials, hardware,
-or social authority. It exists so that "ship Javelin to the world" can be
+or social authority. It exists so that "ship Craton Patina to the world" can be
 decomposed into a clean human-side checklist alongside the
 already-completed code-side work.
 
@@ -29,10 +29,10 @@ The list is grouped by domain. Each item has:
 
 ### 1.2 Publish to crates.io
 
-- **Who can do it:** A crates.io account holder with publish rights on the `javelin` crate name.
+- **Who can do it:** A crates.io account holder with publish rights on the `craton-patina` crate name.
 - **What's needed from me:** `Cargo.toml` `[package]` fields complete, `README.md` rendering verified, `cargo package --list` clean, license fields populated.
 - **Status:** `prepared` — `Cargo.toml` already has `description`, `license = "Apache-2.0"`, `repository`, `readme`, `keywords`, `categories`. Run `cargo publish --dry-run` first.
-- **Blocker:** Crate name `javelin` may already be taken on crates.io; you'll need to verify or pick an alternative (`javelin-sql`, `javelin-rs`, etc.) before publish.
+- **Blocker:** Crate name `craton-patina` may already be taken on crates.io; you'll need to verify or pick an alternative (`craton-patina-sql`, `craton-patina-rs`, etc.) before publish.
 
 ### 1.3 Verify docs.rs build
 
@@ -81,7 +81,7 @@ The list is grouped by domain. Each item has:
 ### 3.1 Re-run benches on production-class hardware (V100 / A100 / H100)
 
 - **Who can do it:** Anyone with access to such hardware (cloud GPU rental, university cluster, NVIDIA partner program, employer's infrastructure).
-- **What's needed from me:** The benches already exist and are reproducible — `JAVELIN_BENCH_GPU=1 cargo bench --bench olap_benchmarks`. The numbers in [`BENCHMARKS.md`](BENCHMARKS.md) and [`MARKETING.md`](MARKETING.md) are all from an RTX 2060, which is a **consumer-grade card from 2019**. Numbers on data-center GPUs would be substantially better.
+- **What's needed from me:** The benches already exist and are reproducible — `PATINA_BENCH_GPU=1 cargo bench --bench olap_benchmarks`. The numbers in [`BENCHMARKS.md`](BENCHMARKS.md) and [`MARKETING.md`](MARKETING.md) are all from an RTX 2060, which is a **consumer-grade card from 2019**. Numbers on data-center GPUs would be substantially better.
 - **Status:** `prepared` — bench harness verified working on the RTX 2060 in-tree.
 
 ### 3.2 Capture cross-platform CI bench results
@@ -93,7 +93,7 @@ The list is grouped by domain. Each item has:
 ### 3.3 Run against TPC-H or TPC-DS at scale-factor ≥ 10
 
 - **Who can do it:** Anyone with disk + memory headroom and either licensed dataset access or a generator that produces compatible data (`duckdb` ships `tpch-gen`).
-- **What's needed from me:** Right now Javelin doesn't have all the SQL features TPC-H needs (no JOIN, no ORDER BY, limited DATE handling). I can scope which queries from TPC-H subset are runnable today and add scaffolding for the rest.
+- **What's needed from me:** Right now Craton Patina doesn't have all the SQL features TPC-H needs (no JOIN, no ORDER BY, limited DATE handling). I can scope which queries from TPC-H subset are runnable today and add scaffolding for the rest.
 - **Status:** `not started` — this is itself a roadmap item, not a one-shot bench.
 
 ---
@@ -121,7 +121,7 @@ The list is grouped by domain. Each item has:
 ### 4.4 Engage with the Polars / DuckDB / DataFusion communities
 
 - **Who can do it:** The maintainer (or any contributor willing to attach their name).
-- **What's needed:** A blog post or GitHub Discussion that's honest about Javelin's positioning vs each of these projects. Being honest about losses on q1 / q2 / q4 (we are) and clear about wins on q3 / q5 (we are) is the right tone.
+- **What's needed:** A blog post or GitHub Discussion that's honest about Craton Patina's positioning vs each of these projects. Being honest about losses on q1 / q2 / q4 (we are) and clear about wins on q3 / q5 (we are) is the right tone.
 - **Status:** `not started`.
 
 ### 4.5 Write a "compared to RAPIDS" blog post
@@ -134,11 +134,11 @@ The list is grouped by domain. Each item has:
 
 ## 5. Legal & IP
 
-### 5.1 Trademark check on "Javelin" / "javelin"
+### 5.1 Trademark check on "Craton Patina" / "craton-patina"
 
 - **Who can do it:** Anyone via a trademark database (USPTO TESS, EUIPO eSearch, WIPO Global Brand). For thoroughness: a lawyer.
 - **What's needed from me:** Nothing — I cannot perform legal research with binding authority.
-- **Status:** `not started`. **Likely conflict:** "Javelin" is a common English word; trademark search results will be noisy. Worth doing before any large-scale marketing push.
+- **Status:** `not started`. **Likely conflict:** "Craton Patina" is a common English word; trademark search results will be noisy. Worth doing before any large-scale marketing push.
 
 ### 5.2 Set up a CLA (or stick with DCO)
 
@@ -223,7 +223,7 @@ state of the repository as of this commit:
 4. **Decide** whether to:
    - Cut v0.2.0 now (recommended — the hand-emit PTX path is feature-complete).
    - Hold the tag for one more pass of `cudarc` integration polish.
-5. **Trademark search** on "Javelin" before any public launch.
+5. **Trademark search** on "Craton Patina" before any public launch.
 6. **Run benches on production hardware** (cloud-rent an A100 for an hour for ~$2; numbers will be much better than the in-tree RTX 2060 results).
 7. **Post** the launch wherever the maintainer prefers, using [`MARKETING.md`](MARKETING.md) as source material.
 

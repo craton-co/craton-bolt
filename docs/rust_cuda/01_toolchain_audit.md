@@ -1,4 +1,4 @@
-# Rust-CUDA Toolchain Audit (Javelin 0.3 milestone)
+﻿# Rust-CUDA Toolchain Audit (Craton Patina 0.3 milestone)
 
 Date of audit: 2026-05-25. All cited facts checked against GitHub HEAD,
 crates.io JSON API, and the `rust-gpu.github.io` blog.
@@ -26,7 +26,7 @@ posts through Aug 2025 (no 2026 status post yet).
 **Relationship to `cudarc`.** `cudarc` (0.19.7, **2026-05-15**) is a *host-side
 only* safe driver-API wrapper. It does not compile Rust to PTX, it only loads
 PTX/cubin and launches kernels. It is orthogonal to `rustc_codegen_nvvm` and
-complementary to (not a replacement for) `cust_raw`. Javelin already uses
+complementary to (not a replacement for) `cust_raw`. Craton Patina already uses
 cudarc-style host plumbing; the question here is purely about the
 **device-side** compiler.
 
@@ -42,7 +42,7 @@ small (≈4–6 active contributors).
 - The guide requires **CUDA 12.0 or later**; CUDA 12 and CUDA 13 are both
   exercised in CI containers (issue `#386`, May 2026 — `ubuntu24-cuda13` image
   with LLVM 19.1.7). CUDA 11.x support is dropped on `main`.
-- **Javelin's CUDA 12.6 lands cleanly inside the supported window.**
+- **Craton Patina's CUDA 12.6 lands cleanly inside the supported window.**
 - The `NvvmArch` enum on HEAD includes `Compute50` through `Compute121` plus
   `*a` / `*f` family variants. **`Compute70` (sm_70 / Volta) is listed and is
   not deprecated.** The default `arch` is gated by the `llvm19` cargo feature:
@@ -64,14 +64,14 @@ must match the one the backend was built against. Nightly bumps happen
 roughly every 4–8 weeks based on the commit log (e.g. `nightly-2025-06-23`
 → `nightly-2026-04-02`).
 
-**Avoiding nightly contamination of Javelin proper.** The nightly pin is per
+**Avoiding nightly contamination of Craton Patina proper.** The nightly pin is per
 package — `rust-toolchain.toml` files are tracked per directory. The supported
 pattern (see `examples/vecadd/`) is:
 
 ```
-javelin/
+craton-patina/
   Cargo.toml                  # workspace, stable rustc
-  src/                        # current Javelin, stable
+  src/                        # current Craton Patina, stable
   kernels/                    # NEW: separate workspace member
     Cargo.toml                # depends on cuda_std (git)
     rust-toolchain.toml       # nightly-2026-04-02
@@ -80,7 +80,7 @@ javelin/
 ```
 
 `cuda_builder` shells out to a sub-`cargo` with the kernel crate's nightly
-toolchain, so the parent crate can stay on stable. Javelin's `src/jit/` PTX
+toolchain, so the parent crate can stay on stable. Craton Patina's `src/jit/` PTX
 emitter can be kept untouched during a parallel migration.
 
 ## 4. Build-system integration
@@ -91,7 +91,7 @@ The canonical pattern from `examples/vecadd/build.rs`:
 use cuda_builder::CudaBuilder;
 CudaBuilder::new("kernels")        // path to the kernel crate
     .copy_to(out_dir.join("kernels.ptx"))
-    .arch(NvvmArch::Compute70)     // sm_70 for Javelin's target
+    .arch(NvvmArch::Compute70)     // sm_70 for Craton Patina's target
     .build()
     .unwrap();
 ```
@@ -99,7 +99,7 @@ CudaBuilder::new("kernels")        // path to the kernel crate
 Plus `cargo:rerun-if-changed=kernels` to retrigger on kernel edits and
 optional `RUST_CUDA_DUMP_FINAL_MODULE` / `RUST_CUDA_EMIT_LLVM_IR` env vars
 for debugging. The PTX artifact is then loaded with cudarc/cust at runtime
-exactly like Javelin's current hand-emitted PTX.
+exactly like Craton Patina's current hand-emitted PTX.
 
 There is **no Bazel / Buck / non-cargo integration story**. Everything is
 `build.rs` + cargo workspaces.
@@ -131,7 +131,7 @@ Risks:
 
 ## Bottom line
 
-**Don't bet 0.3 on rust-cuda; bet 0.4.** The technical pieces Javelin
+**Don't bet 0.3 on rust-cuda; bet 0.4.** The technical pieces Craton Patina
 needs — sm_70, CUDA 12.6, shared memory, atomics, warp intrinsics — all
 exist and work today, and the `build.rs` + isolated-nightly-workspace
 pattern keeps the blast radius contained. But shipping 0.3 against a

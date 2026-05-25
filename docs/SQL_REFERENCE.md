@@ -1,6 +1,6 @@
-# SQL Reference
+﻿# SQL Reference
 
-The exact subset of SQL Javelin's frontend accepts. The grammar is built on top of [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs); anything outside this surface produces a clear `JavelinError::Sql(...)` or `JavelinError::Plan(...)` with the unsupported construct.
+The exact subset of SQL Craton Patina's frontend accepts. The grammar is built on top of [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs); anything outside this surface produces a clear `PatinaError::Sql(...)` or `PatinaError::Plan(...)` with the unsupported construct.
 
 For the JIT pipeline that lowers and executes these queries, see [`JIT_PIPELINE.md`](JIT_PIPELINE.md).
 
@@ -13,7 +13,7 @@ SELECT <select_list>
  [GROUP BY <expr_list>]
 ```
 
-**Hard restrictions** (everything else returns a `JavelinError`):
+**Hard restrictions** (everything else returns a `PatinaError`):
 
 - One `SELECT` per query. No UNION, INTERSECT, EXCEPT, CTE, subquery in FROM, subquery in WHERE.
 - Exactly one table in `FROM`. No JOIN. No schema-qualified names.
@@ -85,7 +85,7 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 
 - Every non-aggregate SELECT item must appear in `GROUP BY` (verified via structural equality).
 - Aggregate inputs that aren't bare columns are routed through the `pre` kernel (which materialises the expression) then the standard reduction.
-- Post-aggregate expressions (`SUM(price) + 1`) are not yet supported — emits a `JavelinError::Sql("post-aggregate expressions not yet supported")`.
+- Post-aggregate expressions (`SUM(price) + 1`) are not yet supported — emits a `PatinaError::Sql("post-aggregate expressions not yet supported")`.
 
 ## Aggregate functions
 

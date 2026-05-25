@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for GPU-side filter compaction (prefix scan + gather).
 //!
@@ -32,7 +32,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::plan::logical_plan::DataType;
 
 /// PTX target metadata baked into every emitted module.
@@ -49,7 +49,7 @@ const PTX_ADDRESS_SIZE: &str = ".address_size 64";
 pub const BLOCK_SIZE: u32 = 256;
 
 /// Entry-point name for the per-block prefix-scan kernel.
-pub const SCAN_KERNEL_ENTRY: &str = "javelin_prefix_scan";
+pub const SCAN_KERNEL_ENTRY: &str = "patina_prefix_scan";
 
 /// Entry-point name for the per-dtype gather kernel.
 ///
@@ -58,12 +58,12 @@ pub const SCAN_KERNEL_ENTRY: &str = "javelin_prefix_scan";
 /// invalid dtypes surface during PTX generation rather than name lookup.
 pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
     match dtype {
-        DataType::Bool => "javelin_gather_bool",
-        DataType::Int32 => "javelin_gather_i32",
-        DataType::Int64 => "javelin_gather_i64",
-        DataType::Float32 => "javelin_gather_f32",
-        DataType::Float64 => "javelin_gather_f64",
-        DataType::Utf8 => "javelin_gather_utf8_unsupported",
+        DataType::Bool => "patina_gather_bool",
+        DataType::Int32 => "patina_gather_i32",
+        DataType::Int64 => "patina_gather_i64",
+        DataType::Float32 => "patina_gather_f32",
+        DataType::Float64 => "patina_gather_f64",
+        DataType::Utf8 => "patina_gather_utf8_unsupported",
     }
 }
 
@@ -71,18 +71,18 @@ pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
 ///
 /// ABI:
 /// ```text
-/// .visible .entry javelin_prefix_scan(
-///     .param .u64 javelin_prefix_scan_param_0,   // mask_ptr      (u8*)
-///     .param .u64 javelin_prefix_scan_param_1,   // local_indices (u32*)
-///     .param .u64 javelin_prefix_scan_param_2,   // block_sums    (u32*)
-///     .param .u32 javelin_prefix_scan_param_3    // n_rows
+/// .visible .entry patina_prefix_scan(
+///     .param .u64 patina_prefix_scan_param_0,   // mask_ptr      (u8*)
+///     .param .u64 patina_prefix_scan_param_1,   // local_indices (u32*)
+///     .param .u64 patina_prefix_scan_param_2,   // block_sums    (u32*)
+///     .param .u32 patina_prefix_scan_param_3    // n_rows
 /// )
 /// ```
 ///
 /// `local_indices[i]` holds the exclusive prefix sum within the row's block;
 /// `block_sums[blockIdx.x]` holds the inclusive sum of the entire block (the
 /// number of "kept" rows in that block).
-pub fn compile_prefix_scan_kernel() -> JavelinResult<String> {
+pub fn compile_prefix_scan_kernel() -> PatinaResult<String> {
     // Two u32 buffers of BLOCK_SIZE entries each: ping-pong avoids one
     // bar.sync per round vs. reading and writing the same buffer.
     let elem_bytes: u32 = 4;
@@ -287,7 +287,7 @@ pub fn compile_prefix_scan_kernel() -> JavelinResult<String> {
 ///
 /// ABI (per `<dtype>`):
 /// ```text
-/// .visible .entry javelin_gather_<dtype>(
+/// .visible .entry patina_gather_<dtype>(
 ///     .param .u64 ..._param_0,   // mask_ptr          (u8*)
 ///     .param .u64 ..._param_1,   // local_indices_ptr (u32*)
 ///     .param .u64 ..._param_2,   // block_bases_ptr   (u32*)
@@ -300,16 +300,16 @@ pub fn compile_prefix_scan_kernel() -> JavelinResult<String> {
 /// Each thread reads its mask byte; on `m != 0` it computes
 /// `idx = block_bases[blockIdx.x] + local_indices[gid]` and copies
 /// `input[gid]` to `output[idx]`.
-pub fn compile_gather_kernel(dtype: DataType) -> JavelinResult<String> {
+pub fn compile_gather_kernel(dtype: DataType) -> PatinaResult<String> {
     let entry = gather_kernel_entry(dtype);
     let elem_bytes = dtype.byte_width().ok_or_else(|| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "prefix_scan: gather not supported for variable-width dtype {:?}",
             dtype
         ))
     })?;
     if matches!(dtype, DataType::Utf8) {
-        return Err(JavelinError::Other(
+        return Err(PatinaError::Other(
             "prefix_scan: gather Utf8 not supported (variable-width)".into(),
         ));
     }
@@ -433,7 +433,7 @@ pub fn compile_gather_kernel(dtype: DataType) -> JavelinResult<String> {
 /// The suffix is used for both loads and stores of the value (e.g. `s32` for
 /// Int32). The register class matches `ptx_gen.rs`'s conventions so the same
 /// `.reg` decls work.
-fn gather_type_info(dtype: DataType) -> JavelinResult<(&'static str, &'static str, &'static str)> {
+fn gather_type_info(dtype: DataType) -> PatinaResult<(&'static str, &'static str, &'static str)> {
     Ok(match dtype {
         DataType::Bool => ("u8", "rs", "b16"),
         DataType::Int32 => ("s32", "r", "b32"),
@@ -441,7 +441,7 @@ fn gather_type_info(dtype: DataType) -> JavelinResult<(&'static str, &'static st
         DataType::Float32 => ("f32", "f", "f32"),
         DataType::Float64 => ("f64", "fd", "f64"),
         DataType::Utf8 => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "prefix_scan: gather Utf8 not supported (variable-width)".into(),
             ))
         }
@@ -469,11 +469,11 @@ mod tests {
         );
 
         // Signature.
-        assert!(ptx.contains(".visible .entry javelin_prefix_scan("));
-        assert!(ptx.contains(".param .u64 javelin_prefix_scan_param_0,"));
-        assert!(ptx.contains(".param .u64 javelin_prefix_scan_param_1,"));
-        assert!(ptx.contains(".param .u64 javelin_prefix_scan_param_2,"));
-        assert!(ptx.contains(".param .u32 javelin_prefix_scan_param_3"));
+        assert!(ptx.contains(".visible .entry patina_prefix_scan("));
+        assert!(ptx.contains(".param .u64 patina_prefix_scan_param_0,"));
+        assert!(ptx.contains(".param .u64 patina_prefix_scan_param_1,"));
+        assert!(ptx.contains(".param .u64 patina_prefix_scan_param_2,"));
+        assert!(ptx.contains(".param .u32 patina_prefix_scan_param_3"));
 
         // Hillis-Steele: one bar.sync per round + the seed sync. BLOCK_SIZE=256
         // -> log2(256)=8 rounds, plus one for the initial load.
@@ -503,15 +503,15 @@ mod tests {
     fn gather_i32_ptx_has_shape() {
         let ptx = compile_gather_kernel(DataType::Int32).expect("i32 gather PTX compiles");
 
-        assert!(ptx.contains(".visible .entry javelin_gather_i32("));
+        assert!(ptx.contains(".visible .entry patina_gather_i32("));
         // Six params: mask, local_indices, block_bases, input, output, n_rows.
         for i in 0..=4 {
             assert!(
-                ptx.contains(&format!(".param .u64 javelin_gather_i32_param_{i},")),
+                ptx.contains(&format!(".param .u64 patina_gather_i32_param_{i},")),
                 "missing u64 param {i}"
             );
         }
-        assert!(ptx.contains(".param .u32 javelin_gather_i32_param_5"));
+        assert!(ptx.contains(".param .u32 patina_gather_i32_param_5"));
 
         // i32 load/store uses .s32.
         assert!(ptx.contains("ld.global.s32"), "missing typed input load");
@@ -530,11 +530,11 @@ mod tests {
 
     #[test]
     fn gather_entry_names_match_dtype() {
-        assert_eq!(gather_kernel_entry(DataType::Bool), "javelin_gather_bool");
-        assert_eq!(gather_kernel_entry(DataType::Int32), "javelin_gather_i32");
-        assert_eq!(gather_kernel_entry(DataType::Int64), "javelin_gather_i64");
-        assert_eq!(gather_kernel_entry(DataType::Float32), "javelin_gather_f32");
-        assert_eq!(gather_kernel_entry(DataType::Float64), "javelin_gather_f64");
+        assert_eq!(gather_kernel_entry(DataType::Bool), "patina_gather_bool");
+        assert_eq!(gather_kernel_entry(DataType::Int32), "patina_gather_i32");
+        assert_eq!(gather_kernel_entry(DataType::Int64), "patina_gather_i64");
+        assert_eq!(gather_kernel_entry(DataType::Float32), "patina_gather_f32");
+        assert_eq!(gather_kernel_entry(DataType::Float64), "patina_gather_f64");
 
         // Every supported dtype's PTX should use the matching entry name.
         for dtype in [
@@ -563,7 +563,7 @@ mod tests {
     }
 }
 
-/// Adapt a `std::fmt::Error` into a `JavelinError`.
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!("prefix_scan: write failed: {}", e))
+/// Adapt a `std::fmt::Error` into a `PatinaError`.
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!("prefix_scan: write failed: {}", e))
 }

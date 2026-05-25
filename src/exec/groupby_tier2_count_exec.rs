@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! **COUNT(*) at Tier 2.1** — high-cardinality `SELECT key, COUNT(*) FROM x
 //! GROUP BY key` executor.
@@ -32,7 +32,7 @@ use arrow_array::{Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::partition_offsets;
 use crate::jit::{
@@ -47,7 +47,7 @@ const BLOCK_THREADS: u32 = 256;
 pub fn try_execute(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
-) -> Option<JavelinResult<RecordBatch>> {
+) -> Option<PatinaResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -110,7 +110,7 @@ pub fn try_execute(
     Some(execute_inner(plan, key_arr))
 }
 
-fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> JavelinResult<RecordBatch> {
+fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> PatinaResult<RecordBatch> {
     let n_rows = key_arr.len() as u32;
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice(key_arr.values())?;
 
@@ -262,13 +262,13 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> JavelinResult<Rec
         ],
     )
     .map_err(|e| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "groupby_tier2_count_exec: failed to build RecordBatch: {e}"
         ))
     })
 }
 
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -279,7 +279,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
     }
 }
 
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

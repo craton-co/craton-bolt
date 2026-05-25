@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY executor for **multiple SUM** aggregates
 //! (top-level shim).
@@ -19,7 +19,7 @@
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::groupby_tier2_dispatch::{
     dispatch_v2, AggOp, DispatchInputsV2, GroupByStrategyV2,
 };
@@ -38,7 +38,7 @@ pub const MAX_VALS: usize = 4;
 pub fn try_execute(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
-) -> Option<JavelinResult<RecordBatch>> {
+) -> Option<PatinaResult<RecordBatch>> {
     // --- Plan-shape eligibility ------------------------------------------
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -168,7 +168,7 @@ fn execute_inner(
     plan: &PhysicalPlan,
     key_arr: &Int32Array,
     val_arrs: &[&Float64Array],
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     let n_rows = key_arr.len() as u32;
 
     // Upload key column + each value column independently. Sharing a single
@@ -190,7 +190,7 @@ fn execute_inner(
     let aggregate = match plan {
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "groupby_tier2_multi_exec: non-Aggregate plan reached execute_inner".into(),
             ))
         }

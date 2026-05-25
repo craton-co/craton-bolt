@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! **MIN / MAX at Tier 2.1** — high-cardinality executor for
 //! `SELECT key, {MIN,MAX}(val) FROM x GROUP BY key`.
@@ -19,7 +19,7 @@ use arrow_array::{Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::{
@@ -36,7 +36,7 @@ const BLOCK_THREADS: u32 = 256;
 pub fn try_execute(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
-) -> Option<JavelinResult<RecordBatch>> {
+) -> Option<PatinaResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -115,7 +115,7 @@ fn execute_inner(
     val_col: &dyn arrow_array::Array,
     op: MinMaxOp,
     val_dtype: MinMaxDtype,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     let n_rows = key_arr.len() as u32;
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice(key_arr.values())?;
 
@@ -127,14 +127,14 @@ fn execute_inner(
             let a = val_col
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .ok_or_else(|| JavelinError::Other("expected Int32Array".into()))?;
+                .ok_or_else(|| PatinaError::Other("expected Int32Array".into()))?;
             (Some(GpuVec::<i32>::from_slice(a.values())?), None)
         }
         MinMaxDtype::Int64 => {
             let a = val_col
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| JavelinError::Other("expected Int64Array".into()))?;
+                .ok_or_else(|| PatinaError::Other("expected Int64Array".into()))?;
             (None, Some(GpuVec::<i64>::from_slice(a.values())?))
         }
     };
@@ -288,7 +288,7 @@ fn run_reduce_phase(
     scatter_keys: GpuVec<i32>,
     offsets: Vec<u32>,
     num_partitions: u32,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice(&offsets)?;
     let block_groups = BLOCK_GROUPS as usize;
     let n_out_slots = (num_partitions as usize) * block_groups;
@@ -360,7 +360,7 @@ fn run_reduce_phase(
         ],
     )
     .map_err(|e| {
-        JavelinError::Other(format!("groupby_tier2_minmax_exec(i32): build error: {e}"))
+        PatinaError::Other(format!("groupby_tier2_minmax_exec(i32): build error: {e}"))
     })
 }
 
@@ -371,7 +371,7 @@ fn run_reduce_phase_i64(
     scatter_keys: GpuVec<i32>,
     offsets: Vec<u32>,
     num_partitions: u32,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice(&offsets)?;
     let block_groups = BLOCK_GROUPS as usize;
     let n_out_slots = (num_partitions as usize) * block_groups;
@@ -443,11 +443,11 @@ fn run_reduce_phase_i64(
         ],
     )
     .map_err(|e| {
-        JavelinError::Other(format!("groupby_tier2_minmax_exec(i64): build error: {e}"))
+        PatinaError::Other(format!("groupby_tier2_minmax_exec(i64): build error: {e}"))
     })
 }
 
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -458,7 +458,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
     }
 }
 
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

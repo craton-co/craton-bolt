@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Top-level engine: dispatches per-shape executors (scalar agg, GROUP BY, etc.);
 //! performs GPU prefix-scan + gather compaction for filter outputs, or a host-side
@@ -34,7 +34,7 @@ use crate::cuda::buffer::primitive_to_gpu;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::{CudaContext, GpuVec};
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::{compile_ptx, CudaModule};
@@ -43,7 +43,7 @@ use crate::plan::{
 };
 
 /// PTX entry-point name; matches the symbol `ptx_gen` emits.
-const KERNEL_ENTRY: &str = "javelin_kernel";
+const KERNEL_ENTRY: &str = "patina_kernel";
 
 /// Threads per CUDA block for the 1D launch.
 const BLOCK_SIZE: u32 = 256;
@@ -65,7 +65,7 @@ const BLOCK_SIZE: u32 = 256;
 ///
 /// Cheap in release: a no-op when `cfg!(debug_assertions)` is false.
 #[inline]
-fn debug_sync_check() -> crate::error::JavelinResult<()> {
+fn debug_sync_check() -> crate::error::PatinaResult<()> {
     if cfg!(debug_assertions) {
         unsafe { crate::cuda::cuda_sys::check(crate::cuda::cuda_sys::cuCtxSynchronize())? };
     }
@@ -104,7 +104,7 @@ impl Engine {
     /// Convenience constructor for single-GPU systems. On hosts with more
     /// than one CUDA device, use [`Engine::new_with_device`] to pick a
     /// specific GPU.
-    pub fn new() -> JavelinResult<Self> {
+    pub fn new() -> PatinaResult<Self> {
         Self::new_with_device(0)
     }
 
@@ -120,12 +120,12 @@ impl Engine {
     /// Returns an error if `device_idx < 0` or `device_idx >=
     /// cuDeviceGetCount()`, or if any underlying CUDA driver call fails
     /// (e.g. no CUDA-capable device, driver/runtime mismatch).
-    pub fn new_with_device(device_idx: i32) -> JavelinResult<Self> {
+    pub fn new_with_device(device_idx: i32) -> PatinaResult<Self> {
         // Initialize the driver up-front so device_count() is callable.
         cuda_sys::init()?;
         let count = cuda_sys::device_count()?;
         if device_idx < 0 || device_idx >= count {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "CUDA device index {} is out of range: {} device(s) visible to the driver (valid range: 0..{})",
                 device_idx, count, count
             )));
@@ -152,10 +152,10 @@ impl Engine {
         &mut self,
         name: impl Into<String>,
         batch: RecordBatch,
-    ) -> JavelinResult<()> {
+    ) -> PatinaResult<()> {
         let name = name.into();
         if self.tables.contains_key(&name) {
-            return Err(JavelinError::Plan(format!(
+            return Err(PatinaError::Plan(format!(
                 "table '{name}' is already registered — use register_batch to append \
                  additional batches to an existing table"
             )));
@@ -191,7 +191,7 @@ impl Engine {
         &mut self,
         name: impl Into<String>,
         batch: RecordBatch,
-    ) -> JavelinResult<()> {
+    ) -> PatinaResult<()> {
         let name = name.into();
         // Build the new GPU table FIRST so an upload failure can't leave the
         // engine half-replaced (we have not yet touched any existing entry).
@@ -230,13 +230,13 @@ impl Engine {
         &mut self,
         name: &str,
         batch: RecordBatch,
-    ) -> JavelinResult<()> {
+    ) -> PatinaResult<()> {
         if let Some(existing) = self.tables.get_mut(name) {
             // Schema-check against batch 0 — concat_batches would fail at query
             // time anyway, but surface it eagerly at registration time.
             if let Some(first) = existing.first() {
                 if first.schema() != batch.schema() {
-                    return Err(JavelinError::Plan(format!(
+                    return Err(PatinaError::Plan(format!(
                         "register_batch: schema mismatch for table '{name}' — \
                          expected {:?}, got {:?}",
                         first.schema(),
@@ -263,19 +263,19 @@ impl Engine {
     /// arrays are Arc-backed). Two or more batches go through
     /// `arrow::compute::concat_batches`, which copies every column — the
     /// 0.2 perf cost the field doc on `tables` warns about.
-    fn materialize_table(&self, name: &str) -> JavelinResult<RecordBatch> {
+    fn materialize_table(&self, name: &str) -> PatinaResult<RecordBatch> {
         let batches = self.tables.get(name).ok_or_else(|| {
-            JavelinError::Plan(format!("table '{name}' is not registered with the engine"))
+            PatinaError::Plan(format!("table '{name}' is not registered with the engine"))
         })?;
         match batches.len() {
-            0 => Err(JavelinError::Plan(format!(
+            0 => Err(PatinaError::Plan(format!(
                 "table '{name}' is registered but contains zero batches"
             ))),
             1 => Ok(batches[0].clone()),
             _ => {
                 let schema = batches[0].schema();
                 arrow::compute::concat_batches(&schema, batches.iter()).map_err(|e| {
-                    JavelinError::Other(format!(
+                    PatinaError::Other(format!(
                         "failed to concatenate {} batches for table '{name}': {e}",
                         batches.len()
                     ))
@@ -285,7 +285,7 @@ impl Engine {
     }
 
     /// Compile and execute a SQL query string.
-    pub fn sql(&self, query: &str) -> JavelinResult<QueryHandle> {
+    pub fn sql(&self, query: &str) -> PatinaResult<QueryHandle> {
         let plan: LogicalPlan = parse_sql(query, &self.provider)?;
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding __idx_<col> i32 column.
@@ -295,7 +295,7 @@ impl Engine {
     }
 
     /// Execute a pre-built `PhysicalPlan`.
-    pub fn execute(&self, phys: &PhysicalPlan) -> JavelinResult<QueryHandle> {
+    pub fn execute(&self, phys: &PhysicalPlan) -> PatinaResult<QueryHandle> {
         match phys {
             PhysicalPlan::Projection {
                 table,
@@ -328,7 +328,7 @@ impl Engine {
             // missing variant — agent 1 then adds it and the build heals.
             //
             // The executor signatures assumed here mirror the wave-7 spec:
-            //   execute_distinct(QueryHandle) -> JavelinResult<QueryHandle>
+            //   execute_distinct(QueryHandle) -> PatinaResult<QueryHandle>
             //   execute_limit  (QueryHandle, usize, Option<usize>) -> ...
             //   execute_sort   (QueryHandle, &[SortExpr]) -> ...
             //   execute_join   (left, right, join_type, on, &Engine) -> ...
@@ -354,7 +354,7 @@ impl Engine {
                 // (Deduplication would happen via a Distinct wrapping the Union
                 // in the logical plan — UNION ALL itself is pure concat.)
                 if inputs.is_empty() {
-                    return Err(JavelinError::Plan(
+                    return Err(PatinaError::Plan(
                         "Union with zero inputs is not executable".into(),
                     ));
                 }
@@ -367,7 +367,7 @@ impl Engine {
                     handles.into_iter().map(|h| h.batch).collect();
                 let merged = arrow::compute::concat_batches(&schema, batches.iter())
                     .map_err(|e| {
-                        JavelinError::Other(format!(
+                        PatinaError::Other(format!(
                             "failed to concatenate {} UNION ALL inputs: {e}",
                             batches.len()
                         ))
@@ -407,21 +407,21 @@ impl Engine {
                         crate::plan::Expr::Alias(inner, _) => match inner.as_ref() {
                             crate::plan::Expr::Column(n) => n.as_str(),
                             _ => {
-                                return Err(JavelinError::Plan(
+                                return Err(PatinaError::Plan(
                                     "PhysicalPlan::Project: aliased expression must be a column reference"
                                         .into(),
                                 ));
                             }
                         },
                         _ => {
-                            return Err(JavelinError::Plan(
+                            return Err(PatinaError::Plan(
                                 "PhysicalPlan::Project: only column references / aliases are supported"
                                     .into(),
                             ));
                         }
                     };
                     let idx = in_schema.index_of(name).map_err(|_| {
-                        JavelinError::Plan(format!(
+                        PatinaError::Plan(format!(
                             "PhysicalPlan::Project: column '{name}' not found in input schema"
                         ))
                     })?;
@@ -429,7 +429,7 @@ impl Engine {
                 }
                 let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
                 let out = RecordBatch::try_new(arrow_schema, columns).map_err(|e| {
-                    JavelinError::Other(format!(
+                    PatinaError::Other(format!(
                         "failed to build PhysicalPlan::Project RecordBatch: {e}"
                     ))
                 })?;
@@ -444,9 +444,9 @@ impl Engine {
         table: &str,
         kernel: &KernelSpec,
         output_schema: &Schema,
-    ) -> JavelinResult<QueryHandle> {
+    ) -> PatinaResult<QueryHandle> {
         let gpu_table = self.gpu_tables.get(table).ok_or_else(|| {
-            JavelinError::Plan(format!("table '{table}' is not registered with the engine"))
+            PatinaError::Plan(format!("table '{table}' is not registered with the engine"))
         })?;
         let n_rows = gpu_table.n_rows;
 
@@ -464,7 +464,7 @@ impl Engine {
         for io in &kernel.inputs {
             if let Some(original) = io.name.strip_prefix("__idx_") {
                 let dict = self.dict_registry.dictionary(table, original).ok_or_else(|| {
-                    JavelinError::Plan(format!(
+                    PatinaError::Plan(format!(
                         "rewriter-emitted column '{}' has no dictionary in registry",
                         io.name
                     ))
@@ -473,7 +473,7 @@ impl Engine {
                 // this catches a stale plan that names __idx_X with the wrong
                 // width without paying the cost of touching the device.
                 if io.dtype != dict.index_dtype() {
-                    return Err(JavelinError::Plan(format!(
+                    return Err(PatinaError::Plan(format!(
                         "rewriter-emitted column '{}' dtype mismatch: plan says {:?}, dictionary is {:?}",
                         io.name, io.dtype, dict.index_dtype()
                     )));
@@ -492,10 +492,10 @@ impl Engine {
                 continue;
             }
             let column = gpu_table.column(&io.name).ok_or_else(|| {
-                JavelinError::Plan(format!("column '{}' not in table '{}'", io.name, table))
+                PatinaError::Plan(format!("column '{}' not in table '{}'", io.name, table))
             })?;
             if column.dtype != io.dtype {
-                return Err(JavelinError::Plan(format!(
+                return Err(PatinaError::Plan(format!(
                     "column '{}' dtype mismatch: plan says {:?}, table has {:?}",
                     io.name, io.dtype, column.dtype
                 )));
@@ -579,9 +579,9 @@ impl Engine {
         //    because the gather kernel can't move variable-width strings.
         let arrays: Vec<ArrayRef> = if kernel.predicate.is_some() {
             let pred_ptx =
-                crate::jit::scan_kernel::compile_predicate_kernel(kernel, "javelin_predicate")?;
+                crate::jit::scan_kernel::compile_predicate_kernel(kernel, "patina_predicate")?;
             let pred_module = CudaModule::from_ptx(&pred_ptx)?;
-            let pred_function = pred_module.function("javelin_predicate")?;
+            let pred_function = pred_module.function("patina_predicate")?;
 
             let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
             crate::exec::compact::launch_predicate_kernel(
@@ -637,7 +637,7 @@ impl Engine {
         // 9. Build the result RecordBatch.
         let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
         let batch_out = RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-            JavelinError::Other(format!("failed to build output RecordBatch: {e}"))
+            PatinaError::Other(format!("failed to build output RecordBatch: {e}"))
         })?;
         Ok(QueryHandle { batch: batch_out })
     }
@@ -717,7 +717,7 @@ enum DeviceCol {
 
 impl DeviceCol {
     /// Upload an Arrow array to the GPU, downcasting per `dtype`.
-    fn upload(arr: &dyn Array, dtype: DataType) -> JavelinResult<Self> {
+    fn upload(arr: &dyn Array, dtype: DataType) -> PatinaResult<Self> {
         match dtype {
             DataType::Int32 => {
                 let pa = arr
@@ -811,7 +811,7 @@ impl DeviceCol {
     /// with the source column's dictionary before download (today this only
     /// works for pure column-passthrough projections — `output_schema` field
     /// name matching an input column name).
-    fn alloc_zeros(dtype: DataType, n: usize) -> JavelinResult<Self> {
+    fn alloc_zeros(dtype: DataType, n: usize) -> PatinaResult<Self> {
         match dtype {
             DataType::Int32 => Ok(DeviceCol::I32(GpuVec::<i32>::zeros(n)?)),
             DataType::Int64 => Ok(DeviceCol::I64(GpuVec::<i64>::zeros(n)?)),
@@ -862,7 +862,7 @@ impl DeviceCol {
     }
 
     /// Copy the device column back to a host Arrow array of length `n_rows`.
-    fn download(self, n_rows: usize) -> JavelinResult<ArrayRef> {
+    fn download(self, n_rows: usize) -> PatinaResult<ArrayRef> {
         match self {
             DeviceCol::I32(v) => {
                 let host = copy_back::<i32>(&v, n_rows)?;
@@ -902,7 +902,7 @@ impl DeviceCol {
                 let arr = d.to_string_array()?;
                 Ok(Arc::new(arr) as ArrayRef)
             }
-            DeviceCol::Borrowed { .. } => Err(JavelinError::Other(
+            DeviceCol::Borrowed { .. } => Err(PatinaError::Other(
                 "internal: cannot download a borrowed device column — \
                  Borrowed variants are kernel inputs only and must be dropped \
                  before any output download"
@@ -916,13 +916,13 @@ impl DeviceCol {
 ///
 /// Output buffers are allocated via `GpuVec::zeros(n_rows)`, whose `len()` is `n_rows`,
 /// so `to_vec()` returns exactly that many elements.
-fn copy_back<T>(v: &GpuVec<T>, n_rows: usize) -> JavelinResult<Vec<T>>
+fn copy_back<T>(v: &GpuVec<T>, n_rows: usize) -> PatinaResult<Vec<T>>
 where
     T: bytemuck::Pod,
 {
     let host = v.to_vec()?;
     if host.len() != n_rows {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "internal: device buffer length {} did not match expected {}",
             host.len(),
             n_rows
@@ -932,8 +932,8 @@ where
 }
 
 /// Build a `Type` error for an Arrow downcast failure.
-fn type_mismatch_err(arr: &dyn Array, expected: &str) -> JavelinError {
-    JavelinError::Type(format!(
+fn type_mismatch_err(arr: &dyn Array, expected: &str) -> PatinaError {
+    PatinaError::Type(format!(
         "Arrow array dtype {:?} does not match expected {}",
         arr.data_type(),
         expected
@@ -941,7 +941,7 @@ fn type_mismatch_err(arr: &dyn Array, expected: &str) -> JavelinError {
 }
 
 /// Map our plan `DataType` to Arrow `DataType`.
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -953,7 +953,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
 }
 
 /// Map Arrow `DataType` to our plan `DataType`. Errors on unsupported types.
-fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
+fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
         ArrowDataType::Int64 => Ok(DataType::Int64),
@@ -961,7 +961,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        other => Err(JavelinError::Type(format!(
+        other => Err(PatinaError::Type(format!(
             "unsupported Arrow dtype {:?}",
             other
         ))),
@@ -969,7 +969,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
 }
 
 /// Convert an `arrow_schema::Schema` into our plan `Schema`.
-fn arrow_schema_to_plan_schema(s: &ArrowSchema) -> JavelinResult<Schema> {
+fn arrow_schema_to_plan_schema(s: &ArrowSchema) -> PatinaResult<Schema> {
     let mut fields = Vec::with_capacity(s.fields().len());
     for f in s.fields() {
         let dt = arrow_dtype_to_plan(f.data_type())?;
@@ -979,7 +979,7 @@ fn arrow_schema_to_plan_schema(s: &ArrowSchema) -> JavelinResult<Schema> {
 }
 
 /// Convert our plan `Schema` to an `arrow_schema::Schema` (used for output `RecordBatch`).
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

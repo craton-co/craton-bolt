@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! **cudarc-backed CUDA Driver API spike** (Stage 1).
 //!
@@ -36,7 +36,7 @@ use cudarc::driver::{result, CudaDevice};
 use std::sync::Arc;
 
 use crate::cuda::cuda_sys::CUdeviceptr;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 /// Per-process cudarc device cache. `CudaDevice::new` returns an
 /// `Arc<CudaDevice>` and binds a primary context; we keep one around
@@ -44,12 +44,12 @@ use crate::error::{JavelinError, JavelinResult};
 static GLOBAL_DEVICE: once_cell::sync::OnceCell<Arc<CudaDevice>> =
     once_cell::sync::OnceCell::new();
 
-fn device() -> JavelinResult<Arc<CudaDevice>> {
+fn device() -> PatinaResult<Arc<CudaDevice>> {
     GLOBAL_DEVICE
         .get_or_try_init(|| {
             CudaDevice::new(0)
                 .map_err(|e| {
-                    JavelinError::Cuda(format!("cudarc CudaDevice::new failed: {e:?}"))
+                    PatinaError::Cuda(format!("cudarc CudaDevice::new failed: {e:?}"))
                 })
         })
         .map(Arc::clone)
@@ -57,13 +57,13 @@ fn device() -> JavelinResult<Arc<CudaDevice>> {
 
 /// Allocate `bytes` of device memory via cudarc's raw `malloc_sync`.
 /// Returned pointer is bit-compatible with `cuda_sys::mem_alloc`.
-pub fn mem_alloc(bytes: usize) -> JavelinResult<CUdeviceptr> {
+pub fn mem_alloc(bytes: usize) -> PatinaResult<CUdeviceptr> {
     // Ensure the primary context is current on this thread.
     let _dev = device()?;
     unsafe {
         result::malloc_sync(bytes)
             .map(|p| p as CUdeviceptr)
-            .map_err(|e| JavelinError::Cuda(format!("cudarc malloc_sync: {e:?}")))
+            .map_err(|e| PatinaError::Cuda(format!("cudarc malloc_sync: {e:?}")))
     }
 }
 
@@ -72,9 +72,9 @@ pub fn mem_alloc(bytes: usize) -> JavelinResult<CUdeviceptr> {
 /// # Safety
 /// `ptr` must have been returned by `mem_alloc` (or by
 /// `cuda_sys::mem_alloc` — both call into the same `cuMemAlloc_v2`).
-pub unsafe fn mem_free(ptr: CUdeviceptr) -> JavelinResult<()> {
+pub unsafe fn mem_free(ptr: CUdeviceptr) -> PatinaResult<()> {
     result::free_sync(ptr as cudarc::driver::sys::CUdeviceptr)
-        .map_err(|e| JavelinError::Cuda(format!("cudarc free_sync: {e:?}")))
+        .map_err(|e| PatinaError::Cuda(format!("cudarc free_sync: {e:?}")))
 }
 
 /// Copy `count` elements of `T` from host to device.
@@ -86,16 +86,16 @@ pub unsafe fn memcpy_h2d<T>(
     dst: CUdeviceptr,
     src: *const T,
     count: usize,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
-        JavelinError::Memory(format!(
+        PatinaError::Memory(format!(
             "cudarc memcpy_h2d size overflow: {count} * {}",
             std::mem::size_of::<T>()
         ))
     })?;
     let src_bytes = std::slice::from_raw_parts(src as *const u8, bytes);
     result::memcpy_htod_sync(dst as cudarc::driver::sys::CUdeviceptr, src_bytes)
-        .map_err(|e| JavelinError::Cuda(format!("cudarc memcpy_htod_sync: {e:?}")))
+        .map_err(|e| PatinaError::Cuda(format!("cudarc memcpy_htod_sync: {e:?}")))
 }
 
 /// Copy `count` elements of `T` from device to host.
@@ -107,16 +107,16 @@ pub unsafe fn memcpy_d2h<T>(
     dst: *mut T,
     src: CUdeviceptr,
     count: usize,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
-        JavelinError::Memory(format!(
+        PatinaError::Memory(format!(
             "cudarc memcpy_d2h size overflow: {count} * {}",
             std::mem::size_of::<T>()
         ))
     })?;
     let dst_bytes = std::slice::from_raw_parts_mut(dst as *mut u8, bytes);
     result::memcpy_dtoh_sync(dst_bytes, src as cudarc::driver::sys::CUdeviceptr)
-        .map_err(|e| JavelinError::Cuda(format!("cudarc memcpy_dtoh_sync: {e:?}")))
+        .map_err(|e| PatinaError::Cuda(format!("cudarc memcpy_dtoh_sync: {e:?}")))
 }
 
 #[cfg(test)]
@@ -124,10 +124,10 @@ mod tests {
     use super::*;
 
     /// Smoke test that the cudarc context comes up at all. Gated on
-    /// `JAVELIN_BENCH_GPU=1` for the same reason as the engine tests —
+    /// `PATINA_BENCH_GPU=1` for the same reason as the engine tests —
     /// we can't acquire a context on a non-CUDA host.
     #[test]
-    #[ignore = "requires CUDA device (set JAVELIN_BENCH_GPU=1 + run with --ignored)"]
+    #[ignore = "requires CUDA device (set PATINA_BENCH_GPU=1 + run with --ignored)"]
     fn cudarc_alloc_roundtrip() {
         let host_in: Vec<i32> = (0..1024).collect();
         let dev_ptr = mem_alloc(host_in.len() * 4).expect("alloc");

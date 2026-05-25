@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Negative parser/lower tests for the SQL frontend.
 //!
@@ -8,7 +8,7 @@
 //! query and asserts that an error is returned, with a substring check on the
 //! message where the message is load-bearing.
 
-use javelin::plan::{
+use craton_patina::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema,
 };
 

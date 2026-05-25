@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 //
 // Golden snapshot tests for emitted PTX. Updates to these tests are intentional
 // codegen contract changes — review the PTX diff carefully before accepting.
@@ -19,12 +19,12 @@
 //   (which mnemonics, which dtypes, which structural markers) without
 //   pinning the allocator state.
 
-use javelin::jit::agg_kernels::{compile_reduction_kernel, ReduceOp};
-use javelin::jit::compile_ptx;
-use javelin::jit::float_atomics::compile_groupby_float_atomic_kernel;
-use javelin::jit::hash_kernels::compile_groupby_keys_kernel;
-use javelin::jit::prefix_scan::compile_prefix_scan_kernel;
-use javelin::plan::{
+use craton_patina::jit::agg_kernels::{compile_reduction_kernel, ReduceOp};
+use craton_patina::jit::compile_ptx;
+use craton_patina::jit::float_atomics::compile_groupby_float_atomic_kernel;
+use craton_patina::jit::hash_kernels::compile_groupby_keys_kernel;
+use craton_patina::jit::prefix_scan::compile_prefix_scan_kernel;
+use craton_patina::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
 };
 
@@ -95,7 +95,7 @@ fn build_ptx_for(sql: &str) -> String {
              aggregation queries must compile their kernels directly"
         ),
     };
-    compile_ptx(kernel, "javelin_test_kernel").expect("compile_ptx")
+    compile_ptx(kernel, "patina_test_kernel").expect("compile_ptx")
 }
 
 // ---- Tests: scalar projection ----------------------------------------------
@@ -112,7 +112,7 @@ fn golden_scalar_projection_int32_smoke() {
     );
     // Entry name comes from the `kernel_name` arg.
     assert!(
-        ptx.contains(".visible .entry javelin_test_kernel"),
+        ptx.contains(".visible .entry patina_test_kernel"),
         "wrong entry name\n{ptx}"
     );
     // `int_col + 1` widens to s64 (int literals are Int64 by parse default),

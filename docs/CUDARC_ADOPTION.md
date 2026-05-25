@@ -1,8 +1,8 @@
-# cudarc adoption design doc
+﻿# cudarc adoption design doc
 
 ## TL;DR
 
-Replace Javelin's hand-rolled CUDA Driver API FFI in `src/cuda/cuda_sys.rs`
+Replace Craton Patina's hand-rolled CUDA Driver API FFI in `src/cuda/cuda_sys.rs`
 (~470 LOC) and `src/cuda/buffer.rs` (~250 LOC) with
 [**cudarc**](https://github.com/coreylowman/cudarc), a well-maintained
 pure-Rust CUDA Driver / Runtime / NVRTC binding crate. Migration is
@@ -61,7 +61,7 @@ Costs:
                               libcuda / nvcuda.dll
 ```
 
-Javelin's design already cleanly separates the borrow-checked Rust types
+Craton Patina's design already cleanly separates the borrow-checked Rust types
 (`GpuVec` and friends) from the raw FFI. The CUDA-Oxide types stay the
 public-facing API; cudarc just becomes a better implementation
 underneath.
@@ -102,14 +102,14 @@ extern "C" {
     // ... ~30 more lines of extern "C" bindings
 }
 
-pub fn mem_alloc(bytes: usize) -> JavelinResult<CUdeviceptr> {
+pub fn mem_alloc(bytes: usize) -> PatinaResult<CUdeviceptr> {
     let mut ptr: CUdeviceptr = 0;
     check(unsafe { cuMemAlloc_v2(&mut ptr, bytes) })?;
     Ok(ptr)
 }
 
 // AFTER (cudarc-backed):
-pub fn mem_alloc(bytes: usize) -> JavelinResult<CUdeviceptr> {
+pub fn mem_alloc(bytes: usize) -> PatinaResult<CUdeviceptr> {
     let device = current_device()?;     // cudarc's CudaDevice
     let slice = device.alloc_zeros::<u8>(bytes)?;
     Ok(slice.as_kernel_param() as CUdeviceptr)
@@ -240,7 +240,7 @@ regressions, delete the hand-rolled path entirely.
    `&str` for `load_ptx_from_string`. Should be a no-op at the call
    site.
 3. **Error type interop.** cudarc returns `cudarc::driver::result::DriverError`.
-   We'd add a `From<DriverError> for JavelinError::Cuda` impl in
+   We'd add a `From<DriverError> for PatinaError::Cuda` impl in
    `src/error.rs` (~5 lines).
 4. **`cuda-stub` feature.** The current crate has a `cuda-stub` feature
    for docs.rs builds on hosts with no CUDA. cudarc handles this with a
@@ -255,7 +255,7 @@ cudarc replacements at the API level (verified against cudarc 0.13's
 
 | Hand-rolled (today) | cudarc 0.13 equivalent | Notes |
 | --- | --- | --- |
-| `check(code: CUresult)` | `?` on cudarc results | cudarc returns `Result<_, DriverError>` directly. Add `From<DriverError> for JavelinError::Cuda` (~5 LOC in `src/error.rs`). |
+| `check(code: CUresult)` | `?` on cudarc results | cudarc returns `Result<_, DriverError>` directly. Add `From<DriverError> for PatinaError::Cuda` (~5 LOC in `src/error.rs`). |
 | `init()` | `CudaContext::new(0)?` (Lazy) | cudarc initialises the driver on first device acquisition. The current `init_once` indirection becomes a `OnceLock<Arc<CudaContext>>`. |
 | `device_count()` | `cudarc::driver::result::device::get_count()` | Direct port. |
 | `device_get(ordinal)` | `CudaContext::new(ordinal)?` | cudarc combines device-handle + context creation into one call — fewer footguns. |
@@ -291,20 +291,20 @@ mod backend {
     static GLOBAL_CTX: once_cell::sync::OnceCell<Arc<CudaContext>> =
         once_cell::sync::OnceCell::new();
 
-    pub fn current_context(ordinal: i32) -> JavelinResult<Arc<CudaContext>> {
+    pub fn current_context(ordinal: i32) -> PatinaResult<Arc<CudaContext>> {
         GLOBAL_CTX
             .get_or_try_init(|| {
                 CudaContext::new(ordinal as usize)
                     .map(Arc::new)
-                    .map_err(|e| JavelinError::Cuda(format!("cudarc: {e}")))
+                    .map_err(|e| PatinaError::Cuda(format!("cudarc: {e}")))
             })
             .map(Arc::clone)
     }
 
-    pub fn mem_alloc(bytes: usize) -> JavelinResult<CudaSlice<u8>> {
+    pub fn mem_alloc(bytes: usize) -> PatinaResult<CudaSlice<u8>> {
         current_context(0)?
             .alloc_zeros::<u8>(bytes)
-            .map_err(|e| JavelinError::Cuda(format!("cudarc alloc: {e}")))
+            .map_err(|e| PatinaError::Cuda(format!("cudarc alloc: {e}")))
     }
     // … memcpy / device_count / etc.
 }
@@ -352,7 +352,7 @@ What's deliberately **not** done in this session:
   GPU. The one `#[ignore]`'d smoke test in `cudarc_backend.rs` is a
   template for that follow-up.
 
-The spike's purpose was: prove cudarc COMPILES inside Javelin behind a
+The spike's purpose was: prove cudarc COMPILES inside Craton Patina behind a
 feature flag and exposes the right primitives for the migration. That's
 done. The actual migration (call-site swap, pool reconciliation, test
 sweep) is the next 1–2 day unit of work.

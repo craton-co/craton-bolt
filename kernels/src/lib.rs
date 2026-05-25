@@ -1,9 +1,9 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 //
-// Javelin GPU kernels (rust-cuda Wave A spike).
+// Craton Patina GPU kernels (rust-cuda Wave A spike).
 //
 // This crate is compiled to PTX by `rustc_codegen_nvvm` via `cuda_builder`.
-// Wave A scope: ONE kernel — `javelin_partition` — the simplest non-trivial
+// Wave A scope: ONE kernel — `patina_partition` — the simplest non-trivial
 // PTX emitter in `src/jit/`. See:
 //   - docs/rust_cuda/03_partition_kernel_spike.md  (design + symbol cites)
 //   - docs/rust_cuda/05_ptx_loader_compat.md       (proves the host loader
@@ -29,7 +29,7 @@
 // continues to consume the originals from that module; the duplicates here
 // are device-side only and exist because `no_std` on nvptx64 cannot pull in
 // the host's `crate::jit::partition_kernel::*` symbols. If we ever flip the
-// build so the host imports `javelin-kernels` as an `rlib`, these become the
+// build so the host imports `craton-patina-kernels` as an `rlib`, these become the
 // single source of truth and the host re-exports them.
 
 /// Number of hash partitions. Must be a power of two so that `% N` lowers to
@@ -64,7 +64,7 @@ mod gpu {
     ///
     /// Equivalent C-with-CUDA:
     /// ```c
-    /// __global__ void javelin_partition(
+    /// __global__ void patina_partition(
     ///     const int32_t* keys,
     ///     uint32_t*      partition_ids,
     ///     uint32_t*      counts,
@@ -93,8 +93,8 @@ mod gpu {
     /// exactly: four `.u64 / .u32` slots in declaration order.
     #[kernel]
     #[allow(improper_ctypes_definitions)]
-    #[export_name = "javelin_partition"]
-    pub unsafe fn javelin_partition(
+    #[export_name = "patina_partition"]
+    pub unsafe fn patina_partition(
         keys: *const i32,
         partition_ids: *mut u32,
         counts: *mut u32,
@@ -132,9 +132,9 @@ mod gpu {
     }
 }
 
-// Re-export so the symbol name `javelin_partition` is reachable. With
-// `#[export_name = "javelin_partition"]` and the `#[kernel]` attribute the
+// Re-export so the symbol name `patina_partition` is reachable. With
+// `#[export_name = "patina_partition"]` and the `#[kernel]` attribute the
 // PTX itself uses the unmangled name; this re-export keeps `cargo check`
 // happy on the host where the gpu module is gated out.
 #[cfg(target_arch = "nvptx64")]
-pub use gpu::javelin_partition;
+pub use gpu::patina_partition;

@@ -1,6 +1,6 @@
-# 04 — Build-System Integration for Javelin 0.3 (rust-cuda)
+﻿# 04 — Build-System Integration for Craton Patina 0.3 (rust-cuda)
 
-Status: design draft. Targets Javelin's planned migration from runtime
+Status: design draft. Targets Craton Patina's planned migration from runtime
 string-emitted PTX to compile-time Rust-to-PTX via `rustc_codegen_nvvm`.
 
 All claims about the upstream toolchain are dated; the rust-cuda project
@@ -12,7 +12,7 @@ update of 2025-03-18 ([rust-gpu.github.io/blog/2025/03/18/rust-cuda-update/](htt
 
 ## 1. Workspace shape
 
-Javelin today is a single crate with a single `Cargo.toml`. rust-cuda
+Craton Patina today is a single crate with a single `Cargo.toml`. rust-cuda
 fundamentally requires a *separate compilation unit* for code that runs
 on the GPU, because that unit must target `nvptx64-nvidia-cuda` and use
 the alternative codegen backend. The canonical layout in the rust-cuda
@@ -20,12 +20,12 @@ guide ([Getting Started](https://rust-gpu.github.io/rust-cuda/guide/getting_star
 is a Cargo workspace:
 
 ```
-javelin/
+craton-patina/
 ├── Cargo.toml              # workspace root + host crate
 ├── rust-toolchain.toml     # (omitted at root — see §5)
 ├── .cargo/config.toml      # optional; see §2
 ├── build.rs                # host build script; runs cuda_builder
-├── src/                    # existing Javelin host code
+├── src/                    # existing Craton Patina host code
 ├── kernels/
 │   ├── Cargo.toml          # crate-type = ["cdylib", "rlib"]
 │   ├── rust-toolchain.toml # pins nightly-2025-03-02 (or current)
@@ -71,7 +71,7 @@ This requires nightly (`-Z` flags) and that the `rustc_codegen_nvvm.so`
 rustc with the right flags. Pattern from the guide:
 
 ```rust
-// build.rs at javelin/build.rs
+// build.rs at craton-patina/build.rs
 use std::{env, path::PathBuf};
 use cuda_builder::CudaBuilder;
 
@@ -81,7 +81,7 @@ fn main() {
 
     CudaBuilder::new(manifest.join("kernels"))
         .copy_to(out_dir.join("kernels.ptx"))
-        .arch(cuda_builder::NvvmArch::Compute75)  // tune per Javelin support matrix
+        .arch(cuda_builder::NvvmArch::Compute75)  // tune per Craton Patina support matrix
         .build()
         .unwrap();
 }
@@ -126,7 +126,7 @@ let module = CudaModule::load_ptx(KERNELS_PTX)?;
 
 **Recommendation: (b).** It is the officially documented path, it is
 what every rust-cuda example uses, and it absorbs upstream changes to
-the nvptx target flags. (a) is only worthwhile if Javelin needs to
+the nvptx target flags. (a) is only worthwhile if Craton Patina needs to
 build PTX outside of cargo (e.g. a Bazel migration), which is not on
 the 0.3 roadmap.
 
@@ -160,7 +160,7 @@ much larger.
 ## 5. Toolchain pinning
 
 The naive option — a single `rust-toolchain.toml` at the workspace
-root pinning `nightly-2025-03-02` — drags every Javelin contributor
+root pinning `nightly-2025-03-02` — drags every Craton Patina contributor
 onto nightly, including those who never touch GPU code. This is the
 wrong default.
 
@@ -171,7 +171,7 @@ per member by placing a `rust-toolchain.toml` *inside* the member
 directory:
 
 ```
-javelin/
+craton-patina/
 ├── rust-toolchain.toml         # channel = "stable"  (or omitted)
 └── kernels/
     └── rust-toolchain.toml     # channel = "nightly-2025-03-02"
@@ -192,7 +192,7 @@ root toolchain. We avoid this by **not listing `kernels` in
 
 ## 6. Feature-flag interaction with `cuda-stub`
 
-Javelin currently has a `cuda-stub` feature for docs.rs and for
+Craton Patina currently has a `cuda-stub` feature for docs.rs and for
 contributors on machines without a CUDA toolkit. After the migration,
 `cuda_builder` itself requires CUDA + LLVM 7 + nvptx target installed,
 which most docs.rs builders do not have.
@@ -222,7 +222,7 @@ metadata is set the same way.
 
 `rustc_codegen_nvvm` is a *known-fragile* dependency. It pins rustc
 internals and historically went three years without a working build
-(2021 → 2024). The 2025 reboot has a small maintainer pool. Javelin
+(2021 → 2024). The 2025 reboot has a small maintainer pool. Craton Patina
 must have a recovery path:
 
 1. **Snapshot PTX in `kernels/snapshot/`.** On every green release,
@@ -246,7 +246,7 @@ must have a recovery path:
 flowchart LR
     A["kernels/src/*.rs<br/>(Rust, GPU code)"]
     B["rust-toolchain.toml<br/>nightly-2025-03-02"]
-    C["cuda_builder<br/>(in javelin/build.rs)"]
+    C["cuda_builder<br/>(in craton-patina/build.rs)"]
     D["rustc + rustc_codegen_nvvm<br/>target = nvptx64-nvidia-cuda"]
     E["OUT_DIR/kernels.ptx"]
     F["include_str!<br/>(in src/exec/launch.rs)"]
@@ -268,7 +268,7 @@ flowchart LR
         D
         E
     end
-    subgraph runtime["javelin process"]
+    subgraph runtime["craton-patina process"]
         F
         G
         H
@@ -277,7 +277,7 @@ flowchart LR
 
 ---
 
-## Two concrete options for Javelin 0.3
+## Two concrete options for Craton Patina 0.3
 
 ### Option A — Full workspace + nvvm adoption
 
@@ -292,8 +292,8 @@ crate pins `nightly-2025-03-02`.
   runners), plus dealing with the inevitable LLVM 7 / NVVM oddities.
 - **Pros:** kernels become real, debuggable Rust. Shared types
   between host and device. `cargo check` covers kernel code.
-- **Cons:** binds Javelin to a small upstream project. Every nightly
-  bump in rust-cuda becomes a Javelin chore. CUDA toolkit becomes a
+- **Cons:** binds Craton Patina to a small upstream project. Every nightly
+  bump in rust-cuda becomes a Craton Patina chore. CUDA toolkit becomes a
   hard build dependency for any contributor who wants to touch
   kernel code.
 
@@ -309,7 +309,7 @@ proof of concept.
 - **Effort:** ~2 weeks (1 engineer). Workspace plumbing + two ported
   kernels + CI job that exercises `--features rust-cuda`.
 - **Pros:** zero risk to existing users. Lets us learn the rust-cuda
-  developer experience on real Javelin kernels before committing.
+  developer experience on real Craton Patina kernels before committing.
   If upstream regresses, we delete the feature with no user impact.
 - **Cons:** two codepaths to maintain for 1–2 releases. Doesn't
   realize the "kernels are real Rust" benefits until we commit.

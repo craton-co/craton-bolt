@@ -1,9 +1,9 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum JavelinError {
+pub enum PatinaError {
     #[error("CUDA driver error: {0}")]
     Cuda(String),
 
@@ -26,10 +26,10 @@ pub enum JavelinError {
     Other(String),
 }
 
-impl From<sqlparser::parser::ParserError> for JavelinError {
+impl From<sqlparser::parser::ParserError> for PatinaError {
     fn from(e: sqlparser::parser::ParserError) -> Self {
-        JavelinError::Sql(format!("{}", e))
+        PatinaError::Sql(format!("{}", e))
     }
 }
 
-pub type JavelinResult<T> = Result<T, JavelinError>;
+pub type PatinaResult<T> = Result<T, PatinaError>;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY SUM orchestrator (head of the chain).
 //!
@@ -55,7 +55,7 @@
 //! Wiring is the merger's job, not mine.
 
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::jit::CudaModule;
 
@@ -120,7 +120,7 @@ pub fn execute_tier2_sum(
     keys: &GpuVec<i32>,
     vals: &GpuVec<f64>,
     n_rows: u32,
-) -> JavelinResult<Tier2PartialResult> {
+) -> PatinaResult<Tier2PartialResult> {
     let num_partitions = stub_partition_kernel::NUM_PARTITIONS;
 
     // Fast path: empty input. We still return `NUM_PARTITIONS` empty slots
@@ -186,7 +186,7 @@ pub fn execute_tier2_sum(
     // ----------------------------------------------------------------------
     let offsets: Vec<u32> = stub_partition_offsets::compute_partition_offsets(&counts)?;
     if offsets.len() != (num_partitions as usize) + 1 {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "tier2: prefix-sum returned {} offsets, expected {}",
             offsets.len(),
             num_partitions as usize + 1
@@ -278,7 +278,7 @@ pub fn execute_tier2_sum(
     // bounds, so we surface it as a structured error.
     let n_rows_usize = n_rows as usize;
     if (offsets[num_partitions as usize] as usize) != n_rows_usize {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "tier2: offsets[K]={}, expected n_rows={}",
             offsets[num_partitions as usize],
             n_rows
@@ -344,7 +344,7 @@ pub fn execute_tier2_sum(
         || host_out_vals.len() != n_out_slots
         || host_out_set.len() != n_out_slots
     {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "tier2: reduce-kernel output buffers have unexpected length \
              (keys={}, vals={}, set={}, expected={})",
             host_out_keys.len(),

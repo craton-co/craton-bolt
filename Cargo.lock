@@ -746,6 +746,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "craton-patina"
+version = "0.1.0"
+dependencies = [
+ "arrow 53.4.1",
+ "arrow-array 53.4.1",
+ "arrow-buffer 53.4.1",
+ "arrow-schema 53.4.1",
+ "bytemuck",
+ "criterion",
+ "cuda_builder",
+ "cudarc",
+ "duckdb",
+ "libc",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "polars",
+ "sqlparser",
+ "thiserror",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1211,28 +1233,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "javelin"
-version = "0.1.0"
-dependencies = [
- "arrow 53.4.1",
- "arrow-array 53.4.1",
- "arrow-buffer 53.4.1",
- "arrow-schema 53.4.1",
- "bytemuck",
- "criterion",
- "cuda_builder",
- "cudarc",
- "duckdb",
- "libc",
- "log",
- "once_cell",
- "parking_lot",
- "polars",
- "sqlparser",
- "thiserror",
-]
 
 [[package]]
 name = "jobserver"

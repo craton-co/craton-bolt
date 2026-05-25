@@ -1,12 +1,12 @@
-# FAQ
+﻿# FAQ
 
-Frequently asked questions about Javelin. For the supported SQL surface
+Frequently asked questions about Craton Patina. For the supported SQL surface
 see [`SQL_REFERENCE.md`](SQL_REFERENCE.md); for planned work see
 [`../ROADMAP.md`](../ROADMAP.md).
 
 ## Q1. Why no NVRTC or runtime LLVM?
 
-NVRTC compiles CUDA C++ to PTX; Javelin emits PTX directly from Rust, so
+NVRTC compiles CUDA C++ to PTX; Craton Patina emits PTX directly from Rust, so
 NVRTC would buy us nothing. To go PTX → SASS we call the driver's
 `cuModuleLoadDataEx`, which assembles internally. The result is that the
 only runtime dependency is the CUDA driver itself — no `libnvrtc`, no
@@ -88,7 +88,7 @@ unavailable through sm_90.
 
 ## Q12. Why does `cargo bench` show `engine_execute` as skipped?
 
-The bench file gates GPU benches on the `JAVELIN_BENCH_GPU=1`
+The bench file gates GPU benches on the `PATINA_BENCH_GPU=1`
 environment variable so that contributors without a GPU can still run
 `cargo bench` for the planner / codegen / CPU-reference / Polars
 comparisons. Set the variable to include the GPU path. See

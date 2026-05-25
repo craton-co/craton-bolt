@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for the sentinel-free GROUP BY `MIN(float)` / `MAX(float)`
 //! aggregate kernel.
@@ -80,7 +80,7 @@
 //! produced the PTX:
 //!
 //! ```text
-//! .visible .entry javelin_groupby_agg_valid(
+//! .visible .entry patina_groupby_agg_valid(
 //!     .param .u64 group_col_ptr,        // i64 keys, length n_rows
 //!     .param .u64 keys_table_ptr,       // i64, length k, populated by the keys kernel
 //!     .param .u64 slot_valid_ptr,       // u32, length k, populated by the keys kernel
@@ -97,7 +97,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::jit::agg_kernels::ReduceOp;
 use crate::plan::logical_plan::DataType;
 
@@ -127,18 +127,18 @@ const SPIN_STEP_LIMIT: u32 = 1024;
 /// [`crate::jit::valid_flag_kernels::VALID_AGG_KERNEL_ENTRY`] so that the
 /// host-side launcher can use a single symbol-lookup name regardless of which
 /// compiler ran.
-pub const VALID_AGG_FLOAT_ENTRY: &str = "javelin_groupby_agg_valid";
+pub const VALID_AGG_FLOAT_ENTRY: &str = "patina_groupby_agg_valid";
 
 /// Generate the valid-flag-aware float MIN/MAX agg kernel.
 ///
 /// See the module docs for the ABI and algorithm. Only the
 /// `(MIN | MAX, Float32 | Float64)` combinations are valid for this kernel;
-/// any other `(op, dtype)` returns [`JavelinError::Other`] so the dispatch
+/// any other `(op, dtype)` returns [`PatinaError::Other`] so the dispatch
 /// site fails loudly rather than silently emitting the wrong code.
 pub fn compile_agg_valid_float_kernel(
     op: ReduceOp,
     dtype: DataType,
-) -> JavelinResult<String> {
+) -> PatinaResult<String> {
     // Resolve the per-(op, dtype) PTX comparison mnemonic, validating both
     // inputs up front. SUM/COUNT go through the integer-agg kernel (which
     // can use the native `atom.global.add.f{32,64}` instruction); we reject
@@ -149,7 +149,7 @@ pub fn compile_agg_valid_float_kernel(
         (ReduceOp::Min, DataType::Float64) => "setp.lt.f64",
         (ReduceOp::Max, DataType::Float64) => "setp.gt.f64",
         (ReduceOp::Sum, _) | (ReduceOp::Count, _) => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "valid_flag_float: only MIN/MAX are supported here (got {:?}); \
                  use valid_flag_kernels::compile_agg_valid_kernel for SUM/COUNT",
                 op
@@ -159,7 +159,7 @@ pub fn compile_agg_valid_float_kernel(
         | (_, DataType::Int32)
         | (_, DataType::Int64)
         | (_, DataType::Utf8) => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "valid_flag_float: dtype {:?} is not a floating-point type; \
                  use valid_flag_kernels::compile_agg_valid_kernel for integer MIN/MAX",
                 dtype
@@ -180,7 +180,7 @@ pub fn compile_agg_valid_float_kernel(
         // Unreachable thanks to the validation above; preserved to keep the
         // match total.
         _ => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "valid_flag_float: unexpected dtype {:?}",
                 dtype
             )));
@@ -503,9 +503,9 @@ pub fn compile_agg_valid_float_kernel(
     Ok(ptx)
 }
 
-/// Adapt a `std::fmt::Error` into a `JavelinError`.
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!("valid_flag_float: write failed: {}", e))
+/// Adapt a `std::fmt::Error` into a `PatinaError`.
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!("valid_flag_float: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +537,7 @@ mod tests {
             "expected SPIN label in emitted PTX (valid-flag probe), got:\n{ptx}"
         );
         assert!(
-            ptx.contains("javelin_groupby_agg_valid"),
+            ptx.contains("patina_groupby_agg_valid"),
             "expected entry-point name in emitted PTX, got:\n{ptx}"
         );
         // New spill-ABI assertions.
@@ -558,7 +558,7 @@ mod tests {
         // matches inside comments, which we don't emit, but checking the
         // highest-indexed symbol is the strongest assertion).
         assert!(
-            ptx.contains("javelin_groupby_agg_valid_param_10"),
+            ptx.contains("patina_groupby_agg_valid_param_10"),
             "expected 11-parameter ABI (param_10 = max_spill) in emitted PTX, got:\n{ptx}"
         );
         // Count `.param ` occurrences in the signature directly. 11 params

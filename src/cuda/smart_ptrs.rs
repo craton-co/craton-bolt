@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Lifetime-tracked typed handles to GPU memory ("CUDA-Oxide").
 //!
@@ -30,7 +30,7 @@ use bytemuck::Pod;
 
 use crate::cuda::buffer::GpuBuffer;
 use crate::cuda::cuda_sys::CUdeviceptr;
-use crate::error::JavelinResult;
+use crate::error::PatinaResult;
 
 /// Owned, typed handle to a column of `T` on the GPU.
 pub struct GpuVec<T: Pod> {
@@ -47,21 +47,21 @@ impl<T: Pod> GpuVec<T> {
     }
 
     /// Allocate a device vector and copy `slice` into it.
-    pub fn from_slice(slice: &[T]) -> JavelinResult<Self> {
+    pub fn from_slice(slice: &[T]) -> PatinaResult<Self> {
         Ok(Self {
             buffer: GpuBuffer::<T>::from_slice(slice)?,
         })
     }
 
     /// Allocate `len` zero-initialized elements on the device.
-    pub fn zeros(len: usize) -> JavelinResult<Self> {
+    pub fn zeros(len: usize) -> PatinaResult<Self> {
         Ok(Self {
             buffer: GpuBuffer::<T>::zeros(len)?,
         })
     }
 
     /// Allocate room for `cap` elements with logical length zero.
-    pub fn with_capacity(cap: usize) -> JavelinResult<Self> {
+    pub fn with_capacity(cap: usize) -> PatinaResult<Self> {
         Ok(Self {
             buffer: GpuBuffer::<T>::with_capacity(cap)?,
         })
@@ -117,7 +117,7 @@ impl<T: Pod> GpuVec<T> {
     }
 
     /// Copy the vec back to a host `Vec<T>` (synchronous).
-    pub fn to_vec(&self) -> JavelinResult<Vec<T>> {
+    pub fn to_vec(&self) -> PatinaResult<Vec<T>> {
         self.buffer.to_vec()
     }
 }
@@ -163,7 +163,7 @@ impl<'a, T: Pod> GpuView<'a, T> {
 // SAFETY: a `GpuView` is a device pointer plus a length; like `&[u8]` over
 // opaque memory, sharing or moving it across threads cannot race on host state.
 unsafe impl<'a, T: Pod> Send for GpuView<'a, T> {}
-// Intentionally NOT `Sync`: under Javelin's launch model a kernel can write
+// Intentionally NOT `Sync`: under Craton Patina's launch model a kernel can write
 // through the parent `GpuVec` while another thread reads through the view
 // across kernel boundaries. The `Cell<()>` in `_marker` makes this `!Sync`.
 

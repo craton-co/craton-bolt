@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Lazy DataFrame builder over [`LogicalPlan`].
 //!
@@ -40,7 +40,7 @@
 //! the current 0.1 signature constraints (terminal `into_plan()` returns a
 //! bare `LogicalPlan`, so propagation is necessarily limited).
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::plan::logical_plan::{AggregateExpr, Expr, LogicalPlan, Schema};
 
 /// Lazy DataFrame — wraps a `LogicalPlan` and offers a builder API.
@@ -53,11 +53,11 @@ pub struct DataFrame {
     /// query for errors via [`DataFrame::validation_error`].
     //
     // TODO(post-0.1): once we are free to break the public builder API,
-    // change the combinators to return `JavelinResult<Self>` and drop this
+    // change the combinators to return `PatinaResult<Self>` and drop this
     // field — propagating errors through a side channel is a 0.1 workaround.
     //
-    // Stored as `Option<String>` (not `Option<JavelinError>`) because
-    // `JavelinError` is intentionally not `Clone` (it owns a `std::io::Error`
+    // Stored as `Option<String>` (not `Option<PatinaError>`) because
+    // `PatinaError` is intentionally not `Clone` (it owns a `std::io::Error`
     // for the `Io` variant); a string snapshot is sufficient for surfacing the
     // first builder-time error via `validation_error()` / `schema()`.
     first_error: Option<String>,
@@ -151,11 +151,11 @@ impl DataFrame {
     }
 
     /// Type-check the plan and return its output schema.
-    pub fn schema(&self) -> JavelinResult<Schema> {
+    pub fn schema(&self) -> PatinaResult<Schema> {
         if let Some(e) = &self.first_error {
             // Mirror the stored builder-time error so `schema()` does not
             // silently succeed when an upstream combinator was invalid.
-            return Err(JavelinError::Plan(e.clone()));
+            return Err(PatinaError::Plan(e.clone()));
         }
         self.plan.schema()
     }
@@ -184,7 +184,7 @@ impl DataFrame {
     // a `RecordBatch` via `Engine`. The current `collect` alias below is a
     // doc-hidden tombstone kept only so older internal call sites compile;
     // it should be removed once that materializing API lands.
-    // TODO(post-0.1): change this to `JavelinResult<LogicalPlan>` so the
+    // TODO(post-0.1): change this to `PatinaResult<LogicalPlan>` so the
     // stored `first_error` can be surfaced here instead of via the separate
     // `validation_error()` accessor.
     pub fn into_plan(self) -> LogicalPlan {
@@ -264,12 +264,12 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
 
 /// Resolve `plan`'s output schema and verify every column referenced in
 /// `exprs` exists in it. Returns the first unresolved column as a
-/// [`JavelinError::Plan`]; `op` is included in the message for context.
+/// [`PatinaError::Plan`]; `op` is included in the message for context.
 fn validate_exprs_against_plan(
     plan: &LogicalPlan,
     exprs: &[Expr],
     op: &str,
-) -> JavelinResult<()> {
+) -> PatinaResult<()> {
     // If the plan itself is already malformed enough that we can't compute a
     // schema, defer to the downstream type-checker rather than emitting a
     // misleading "column not found" — the real error is upstream.
@@ -283,7 +283,7 @@ fn validate_exprs_against_plan(
     }
     for name in refs {
         if schema.index_of(name).is_err() {
-            return Err(JavelinError::Plan(format!(
+            return Err(PatinaError::Plan(format!(
                 "{op}: column '{name}' not found in input schema"
             )));
         }

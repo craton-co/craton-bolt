@@ -1,4 +1,4 @@
-# 0.4 Milestone Proposal — Kernel Parameterisation, Backend Convergence
+﻿# 0.4 Milestone Proposal — Kernel Parameterisation, Backend Convergence
 
 **Milestone:** Consolidate the GPU backend decision; ship const-generic kernels
 **Target release:** 0.4
@@ -11,7 +11,7 @@
 The bet may win cleanly, fail outright, or land somewhere in the middle.
 0.4 cannot wait for the answer to be uniform — it has to plan for all
 three. The headline of 0.4 is **backend convergence**: by the end of the
-cycle Javelin ships exactly one device-side codegen story (rust-cuda,
+cycle Craton Patina ships exactly one device-side codegen story (rust-cuda,
 hand-emit PTX, or — speculatively — NVIDIA's CUDA-Oxide), the others are
 removed or feature-gated to history, and the cudarc host-side track from
 `docs/CUDARC_ADOPTION.md` is fully soaked. The secondary headline is
@@ -34,7 +34,7 @@ post-0.3 status review names one of:
 - **Scenario B — Fallback B fired.** Wave A or a later wave hit
   Risk R1 / R3 / R4 from `07_risk_assessment.md` hard enough to trigger
   the full revert documented as "Fallback B". The `kernels/` workspace
-  member is shelved on a `rust-cuda-experiment` branch. Javelin is
+  member is shelved on a `rust-cuda-experiment` branch. Craton Patina is
   back on hand-emit. The recovery window between the revert and 0.3
   tag was likely spent pushing the cudarc adoption further — Stage 1
   certainly landed (already in tree as of this writing), and Stage 2
@@ -150,7 +150,7 @@ nvcc/PTX pipeline more directly), different release cadence (no tagged
 - Both target Rust source → PTX → existing CUDA driver runtime.
 - Both expose a `#[kernel]`-style annotation surface.
 - Both are positioned as alternatives to writing PTX-emitting Rust
-  functions (Javelin's pre-0.3 path) or NVRTC-driven C++ kernels.
+  functions (Craton Patina's pre-0.3 path) or NVRTC-driven C++ kernels.
 
 ### Where do they diverge?
 
@@ -177,12 +177,12 @@ review asks three questions. Each needs fresh investigation — none of
 the answers exist as of 2026-05-25.
 
 1. **Does CUDA-Oxide 0.2 support PTX-text loading via the existing
-   `CudaModule::from_ptx` path?** Javelin's host-side loader is
+   `CudaModule::from_ptx` path?** Craton Patina's host-side loader is
    `cuModuleLoadDataEx`-based and the cudarc track will keep it that
    way. A CUDA-Oxide pivot is only cheap if its PTX output drops into
    that loader unchanged. *(Needs investigation.)*
 2. **Does CUDA-Oxide 0.2 support sm_70 (Volta) as a first-class
-   target?** sm_70 is Javelin's published floor (see
+   target?** sm_70 is Craton Patina's published floor (see
    `01_toolchain_audit.md` §2). If CUDA-Oxide 0.2 ships sm_75-only or
    Blackwell-first, the pivot waits. *(Needs investigation.)*
 3. **Can hand-emit PTX and CUDA-Oxide-emitted PTX coexist in one
@@ -218,12 +218,12 @@ requires picking a kernel-source story first.
   streaming `register_table_stream` flow that batches in fixed
   chunks; the GROUP BY tier-2 orchestrator already accumulates across
   partitions in a shape that maps well to streaming inputs.
-- **DataFusion executor integration.** Javelin as a DataFusion
+- **DataFusion executor integration.** Craton Patina as a DataFusion
   physical-plan executor: SQL parsing and logical planning happen in
-  DataFusion, the executor offloads to Javelin's PhysicalPlan/Kernel
-  pipeline. This is the route to plugging Javelin into a higher-level
+  DataFusion, the executor offloads to Craton Patina's PhysicalPlan/Kernel
+  pipeline. This is the route to plugging Craton Patina into a higher-level
   query engine (Ballista, etc.) without owning the SQL frontend.
-  Scope-limited to the kernel shapes Javelin already supports —
+  Scope-limited to the kernel shapes Craton Patina already supports —
   unsupported shapes fall back to DataFusion's CPU executor.
 - **Async memcpy + pinned host buffers** (carry-over from
   `ROADMAP.md` 0.2 — FFI bound, integration deferred). Lands here
@@ -237,7 +237,7 @@ requires picking a kernel-source story first.
 - **Distributed query execution.** Multi-node query planning, network
   shuffle, distributed joins. 1.0 territory; see
   [`docs/PATH_TO_1.0.md`](PATH_TO_1.0.md).
-- **Persistent storage / catalog.** Javelin remains a stateless
+- **Persistent storage / catalog.** Craton Patina remains a stateless
   engine driven by `register_table*` on every session. 1.0 territory.
 
 ## Success criteria

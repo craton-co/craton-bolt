@@ -1,8 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Logical plan AST: schemas, expressions, and relational nodes.
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 /// Minimal set of column data types the GPU engine handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,15 +86,15 @@ impl Schema {
     }
 
     /// Index of `name` in this schema, or a `Plan` error if absent.
-    pub fn index_of(&self, name: &str) -> JavelinResult<usize> {
+    pub fn index_of(&self, name: &str) -> PatinaResult<usize> {
         self.fields
             .iter()
             .position(|f| f.name == name)
-            .ok_or_else(|| JavelinError::Plan(format!("column '{name}' not found in schema")))
+            .ok_or_else(|| PatinaError::Plan(format!("column '{name}' not found in schema")))
     }
 
     /// Lookup a field by name, or a `Plan` error if absent.
-    pub fn field(&self, name: &str) -> JavelinResult<&Field> {
+    pub fn field(&self, name: &str) -> PatinaResult<&Field> {
         let i = self.index_of(name)?;
         Ok(&self.fields[i])
     }
@@ -330,18 +330,18 @@ impl Expr {
     }
 
     /// Resolve the static type of this expression against `schema`.
-    pub fn dtype(&self, schema: &Schema) -> JavelinResult<DataType> {
+    pub fn dtype(&self, schema: &Schema) -> PatinaResult<DataType> {
         match self {
             Expr::Column(name) => Ok(schema.field(name)?.dtype),
             Expr::Literal(lit) => lit
                 .dtype()
-                .ok_or_else(|| JavelinError::Type("untyped NULL literal".into())),
+                .ok_or_else(|| PatinaError::Type("untyped NULL literal".into())),
             Expr::Binary { op, left, right } => {
                 let l = left.dtype(schema)?;
                 let r = right.dtype(schema)?;
                 if op.is_arithmetic() {
                     if !l.is_numeric() || !r.is_numeric() {
-                        return Err(JavelinError::Type(format!(
+                        return Err(PatinaError::Type(format!(
                             "arithmetic {op:?} requires numeric operands, got {l:?} and {r:?}"
                         )));
                     }
@@ -354,7 +354,7 @@ impl Expr {
                         let _ = unify_numeric(l, r)?;
                         Ok(DataType::Bool)
                     } else {
-                        Err(JavelinError::Type(format!(
+                        Err(PatinaError::Type(format!(
                             "cannot compare {l:?} with {r:?}"
                         )))
                     }
@@ -362,12 +362,12 @@ impl Expr {
                     if l == DataType::Bool && r == DataType::Bool {
                         Ok(DataType::Bool)
                     } else {
-                        Err(JavelinError::Type(format!(
+                        Err(PatinaError::Type(format!(
                             "logical {op:?} requires Bool operands, got {l:?} and {r:?}"
                         )))
                     }
                 } else {
-                    Err(JavelinError::Type(format!("unsupported operator {op:?}")))
+                    Err(PatinaError::Type(format!("unsupported operator {op:?}")))
                 }
             }
             Expr::Alias(inner, _) => inner.dtype(schema),
@@ -376,10 +376,10 @@ impl Expr {
 }
 
 /// Promote two numeric types to the wider one (float beats int, 64 beats 32).
-fn unify_numeric(a: DataType, b: DataType) -> JavelinResult<DataType> {
+fn unify_numeric(a: DataType, b: DataType) -> PatinaResult<DataType> {
     use DataType::*;
     if !a.is_numeric() || !b.is_numeric() {
-        return Err(JavelinError::Type(format!(
+        return Err(PatinaError::Type(format!(
             "cannot unify non-numeric types {a:?} and {b:?}"
         )));
     }
@@ -431,7 +431,7 @@ impl AggregateExpr {
     /// This widening contract is mirrored by the GPU-side accumulator in
     /// `crate::jit::agg_kernels` and the host-side scalar-aggregate path in
     /// `crate::exec::aggregate`; keep all three in sync.
-    fn output_dtype(&self, input: &Schema) -> JavelinResult<DataType> {
+    fn output_dtype(&self, input: &Schema) -> PatinaResult<DataType> {
         match self {
             AggregateExpr::Count(_) => Ok(DataType::Int64),
             AggregateExpr::Sum(e) => Ok(sum_output_dtype(e.dtype(input)?)),
@@ -573,7 +573,7 @@ pub enum LogicalPlan {
 
 impl LogicalPlan {
     /// Type-check the plan and return its output schema.
-    pub fn schema(&self) -> JavelinResult<Schema> {
+    pub fn schema(&self) -> PatinaResult<Schema> {
         match self {
             LogicalPlan::Scan {
                 projection, schema, ..
@@ -591,7 +591,7 @@ impl LogicalPlan {
                 let s = input.schema()?;
                 let pt = predicate.dtype(&s)?;
                 if pt != DataType::Bool {
-                    return Err(JavelinError::Type(format!(
+                    return Err(PatinaError::Type(format!(
                         "filter predicate must be Bool, got {pt:?}"
                     )));
                 }
@@ -653,7 +653,7 @@ impl LogicalPlan {
             }
             LogicalPlan::Union { inputs } => {
                 if inputs.is_empty() {
-                    return Err(JavelinError::Plan(
+                    return Err(PatinaError::Plan(
                         "UNION requires at least one input".into(),
                     ));
                 }
@@ -661,7 +661,7 @@ impl LogicalPlan {
                 for (i, branch) in inputs.iter().enumerate().skip(1) {
                     let other = branch.schema()?;
                     if !schemas_compatible(&first, &other) {
-                        return Err(JavelinError::Plan(format!(
+                        return Err(PatinaError::Plan(format!(
                             "UNION branch {i} schema does not match branch 0: \
                              expected {} fields ({}), got {} fields ({})",
                             first.fields.len(),

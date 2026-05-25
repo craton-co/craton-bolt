@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY orchestrator for **multiple SUM** aggregates.
 //!
@@ -76,7 +76,7 @@
 
 // HashMap removed: pass-2 now runs on the GPU via partition_reduce_kernel_multi.
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::partition_offsets;
 use crate::jit::{partition_kernel, partition_reduce_kernel_multi, scatter_kernel, CudaModule};
@@ -115,10 +115,10 @@ pub fn execute_tier2_multi_sum(
     keys: &GpuVec<i32>,
     vals: &[&GpuVec<f64>],
     n_rows: u32,
-) -> JavelinResult<Tier2MultiPartial> {
+) -> PatinaResult<Tier2MultiPartial> {
     let n_vals = vals.len();
     if n_vals == 0 || n_vals > 4 {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "tier2_multi: n_vals must be in 1..=4, got {n_vals}"
         )));
     }
@@ -183,7 +183,7 @@ pub fn execute_tier2_multi_sum(
     // ----------------------------------------------------------------------
     let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
     if offsets.len() != (num_partitions as usize) + 1 {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "tier2_multi: prefix-sum returned {} offsets, expected {}",
             offsets.len(),
             num_partitions as usize + 1
@@ -279,7 +279,7 @@ pub fn execute_tier2_multi_sum(
     // ----------------------------------------------------------------------
     let n_rows_usize = n_rows as usize;
     if (offsets[num_partitions as usize] as usize) != n_rows_usize {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "tier2_multi: offsets[K]={}, expected n_rows={}",
             offsets[num_partitions as usize],
             n_rows

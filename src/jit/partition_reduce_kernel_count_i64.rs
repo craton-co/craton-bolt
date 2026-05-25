@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Per-partition COUNT(*) reduce kernel — **i64 key variant**.
 //!
@@ -17,20 +17,20 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 
 pub const BLOCK_GROUPS: u32 = 1024;
 pub const BLOCK_THREADS: u32 = 256;
 pub const NUM_PARTITIONS: u32 = 4096;
 const MAX_PROBES: u32 = BLOCK_GROUPS;
 
-pub const KERNEL_ENTRY: &str = "javelin_partition_reduce_count_i64";
+pub const KERNEL_ENTRY: &str = "patina_partition_reduce_count_i64";
 
 /// Generate PTX for the i64-key COUNT(*) per-partition reduce kernel.
 ///
 /// Signature:
 /// ```text
-/// .visible .entry javelin_partition_reduce_count_i64(
+/// .visible .entry patina_partition_reduce_count_i64(
 ///     .param .u64 partition_keys,    // const int64_t* scatter_keys[n_rows]
 ///     .param .u64 partition_offsets, // const uint32_t* offsets[K+1]
 ///     .param .u64 out_keys,          //       int64_t* [K*BG]
@@ -38,7 +38,7 @@ pub const KERNEL_ENTRY: &str = "javelin_partition_reduce_count_i64";
 ///     .param .u64 out_set            //       uint8_t* [K*BG]
 /// )
 /// ```
-pub fn compile_partition_reduce_kernel_count_i64() -> JavelinResult<String> {
+pub fn compile_partition_reduce_kernel_count_i64() -> PatinaResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
     let block_groups = BLOCK_GROUPS;
@@ -258,8 +258,8 @@ pub fn compile_partition_reduce_kernel_count_i64() -> JavelinResult<String> {
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!(
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!(
         "partition_reduce_kernel_count_i64: write failed: {}",
         e
     ))
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn has_correct_entry() {
         let ptx = compile_partition_reduce_kernel_count_i64().unwrap();
-        assert!(ptx.contains(".visible .entry javelin_partition_reduce_count_i64("));
+        assert!(ptx.contains(".visible .entry patina_partition_reduce_count_i64("));
     }
 
     #[test]

@@ -1,13 +1,13 @@
-# Spike 03 — Rewriting `partition_kernel` in Rust-CUDA
+﻿# Spike 03 — Rewriting `partition_kernel` in Rust-CUDA
 
-**Target.** `src/jit/partition_kernel.rs` — the simplest non-trivial Javelin
+**Target.** `src/jit/partition_kernel.rs` — the simplest non-trivial Craton Patina
 kernel: a grid-stride loop that hashes one `i32` key per row, masks to a
 partition id, increments a per-partition counter via one global atomic, and
 writes the pid back. No shared memory, no reduction, no warp intrinsics.
 
 **Question.** Can we hand-roll the same kernel in Rust on the
 `rustc_codegen_nvvm` toolchain, produce equivalent PTX, and integrate it into
-Javelin's existing JIT pipeline without giving up runtime parameterisation?
+Craton Patina's existing JIT pipeline without giving up runtime parameterisation?
 
 ---
 
@@ -21,11 +21,11 @@ Javelin's existing JIT pipeline without giving up runtime parameterisation?
 .target sm_70
 .address_size 64
 
-.visible .entry javelin_partition(
-    .param .u64 javelin_partition_param_0,   // keys     (const i32*)
-    .param .u64 javelin_partition_param_1,   // pids     (u32*)
-    .param .u64 javelin_partition_param_2,   // counts   (u32*)
-    .param .u32 javelin_partition_param_3    // n_rows
+.visible .entry patina_partition(
+    .param .u64 patina_partition_param_0,   // keys     (const i32*)
+    .param .u64 patina_partition_param_1,   // pids     (u32*)
+    .param .u64 patina_partition_param_2,   // counts   (u32*)
+    .param .u32 patina_partition_param_3    // n_rows
 )
 {
     .reg .pred  %p<4>;
@@ -83,7 +83,7 @@ the bar Rust-CUDA has to clear.
 ## 2. Rust kernel rewrite
 
 Hypothetical placement: `kernels/src/partition.rs` in a new workspace member
-`javelin-kernels`. The kernel itself, with every `cuda_std` symbol verified
+`craton-patina-kernels`. The kernel itself, with every `cuda_std` symbol verified
 against [`cuda_std` 0.2.2 docs](https://docs.rs/cuda_std/0.2.2/cuda_std/)
 and the
 [`cuda_std::atomic::intrinsics`](https://docs.rs/cuda_std/latest/cuda_std/atomic/intrinsics/index.html)
@@ -104,7 +104,7 @@ const MASK: u32       = NUM_PARTS - 1;
 /// Pass-1 of the Tier-2 GROUP BY: count rows per partition and
 /// record each row's pid for the scatter pass.
 #[kernel]
-pub unsafe fn javelin_partition(
+pub unsafe fn patina_partition(
     keys: &[i32],              // length-checked slice (length passed via launch)
     pids: *mut u32,            // n_rows
     counts: *mut u32,          // NUM_PARTS
@@ -149,7 +149,7 @@ tracks integer atomic wrappers). The intrinsic is the supported path today.
 Workspace layout:
 
 ```
-javelin/
+craton-patina/
 ├── Cargo.toml                    # workspace
 ├── src/...                       # host crate (unchanged)
 ├── build.rs                      # extended: invoke CudaBuilder
@@ -164,7 +164,7 @@ javelin/
 
 ```toml
 [package]
-name    = "javelin-kernels"
+name    = "craton-patina-kernels"
 edition = "2021"
 
 [lib]
@@ -198,18 +198,18 @@ fn main() {
 Host consumption (in place of `compile_partition_kernel()`):
 
 ```rust
-pub fn compile_partition_kernel() -> JavelinResult<String> {
+pub fn compile_partition_kernel() -> PatinaResult<String> {
     Ok(include_str!(concat!(env!("OUT_DIR"), "/partition.ptx")).to_owned())
 }
 ```
 
-The dispatcher's `cuModuleLoadDataEx` + `cuModuleGetFunction("javelin_partition")`
+The dispatcher's `cuModuleLoadDataEx` + `cuModuleGetFunction("patina_partition")`
 path stays identical — the `#[kernel]` attribute produces `.visible .entry`
 with the function's name.
 
 ---
 
-## 4. What Javelin loses and gains
+## 4. What Craton Patina loses and gains
 
 ### Loss — runtime kernel specialisation
 
@@ -233,7 +233,7 @@ right spike target.
 ### Loss — toolchain weight
 
 `rustc_codegen_nvvm` needs the libNVVM static libs from the CUDA toolkit, a
-compatible LLVM, and a pinned nightly. Today Javelin's only build dep is a
+compatible LLVM, and a pinned nightly. Today Craton Patina's only build dep is a
 working `nvcc`/driver. Adding a codegen backend is a real CI surface.
 
 ### Gain — borrow-checked GPU code
@@ -268,7 +268,7 @@ deterministically.
    trigger of `cargo:rerun-if-changed=kernels`. Touching one kernel file
    re-codegens every kernel in that crate. Mitigation: split kernels into
    separate workspace crates, each with its own `CudaBuilder` invocation, so
-   editing `partition.rs` only rebuilds `javelin-kernel-partition`. Adds
+   editing `partition.rs` only rebuilds `craton-patina-kernel-partition`. Adds
    workspace bookkeeping but matches the granularity we already have in
    `src/jit/`.
 
@@ -284,8 +284,8 @@ deterministically.
 
 4. **Can we ship pre-compiled PTX in the cargo package?** Yes — the PTX is a
    plain UTF-8 string captured at build time, and `include_str!` embeds it
-   in the host binary. End users of Javelin do **not** need the Rust-CUDA
-   toolchain; only Javelin's CI does, and only when a kernel source
+   in the host binary. End users of Craton Patina do **not** need the Rust-CUDA
+   toolchain; only Craton Patina's CI does, and only when a kernel source
    changes. The PTX itself can be checked in alongside the source and
    refreshed by `cargo xtask rebuild-kernels`, mirroring how some
    `wgpu`/SPIR-V projects ship pre-compiled shaders.
@@ -309,7 +309,7 @@ parameterised kernels and only migrating fixed-shape kernels (partition,
 scatter, shmem_count, shmem_sum) to Rust.
 
 **Next concrete step.** Build the kernel out-of-tree (separate scratch repo,
-no Javelin integration) using `cuda_builder` against `NvvmArch::Compute70`,
+no Craton Patina integration) using `cuda_builder` against `NvvmArch::Compute70`,
 dump the emitted PTX, and diff it against the hand-emitted version above.
 If the inner loop comes out within a couple of instructions of identical
 and the atomic lowers to `atom.global.add.u32`, open a tracking issue for

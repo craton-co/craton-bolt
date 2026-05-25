@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! GROUP BY execution for "wide" composite keys — those whose total bit
 //! width exceeds 64 (e.g. `GROUP BY (a, b)` where both are `Int64`, or any
@@ -59,7 +59,7 @@ use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 
@@ -80,24 +80,24 @@ use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 pub fn execute_groupby_wide(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     // 1. Validate the plan shape.
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         other => {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "execute_groupby_wide: expected Aggregate plan, got {:?}",
                 std::mem::discriminant(other)
             )))
         }
     };
     if pre.is_some() {
-        return Err(JavelinError::Other(
+        return Err(PatinaError::Other(
             "wide GROUP BY with pre kernel not yet supported".into(),
         ));
     }
     if aggregate.group_by.is_empty() {
-        return Err(JavelinError::Other(
+        return Err(PatinaError::Other(
             "execute_groupby_wide: aggregate has no GROUP BY columns".into(),
         ));
     }
@@ -168,7 +168,7 @@ pub fn execute_groupby_wide(
     //     plan-declared output dtype.
     for (i, agg) in aggregate.aggregates.iter().enumerate() {
         let out_field = aggregate.output_schema.fields.get(m_keys + i).ok_or_else(|| {
-            JavelinError::Other(format!(
+            PatinaError::Other(format!(
                 "execute_groupby_wide: output_schema missing field for aggregate index {}",
                 i
             ))
@@ -179,7 +179,7 @@ pub fn execute_groupby_wide(
 
     let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "failed to build wide GROUP BY RecordBatch: {e}"
         ))
     })
@@ -225,11 +225,11 @@ struct TupleKey(Vec<KeyValue>);
 fn resolve_key_columns<'a>(
     aggregate: &AggregateSpec,
     batch: &'a RecordBatch,
-) -> JavelinResult<Vec<KeyColumn<'a>>> {
+) -> PatinaResult<Vec<KeyColumn<'a>>> {
     let mut out: Vec<KeyColumn<'a>> = Vec::with_capacity(aggregate.group_by.len());
     for &ord in &aggregate.group_by {
         let io = aggregate.inputs.get(ord).ok_or_else(|| {
-            JavelinError::Plan(format!(
+            PatinaError::Plan(format!(
                 "wide GROUP BY: group_by ordinal {} out of range ({} inputs)",
                 ord,
                 aggregate.inputs.len()
@@ -239,20 +239,20 @@ fn resolve_key_columns<'a>(
         match io.dtype {
             DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 => {}
             DataType::Utf8 => {
-                return Err(JavelinError::Type(format!(
+                return Err(PatinaError::Type(format!(
                     "Utf8 keys in wide GROUP BY not yet supported (column '{}')",
                     io.name
                 )))
             }
             DataType::Bool => {
-                return Err(JavelinError::Type(format!(
+                return Err(PatinaError::Type(format!(
                     "Bool keys not supported (column '{}')",
                     io.name
                 )))
             }
         }
         let idx = batch.schema().index_of(&io.name).map_err(|e| {
-            JavelinError::Plan(format!(
+            PatinaError::Plan(format!(
                 "wide GROUP BY: key column '{}' not in batch: {}",
                 io.name, e
             ))
@@ -261,7 +261,7 @@ fn resolve_key_columns<'a>(
         // Validate the Arrow dtype matches the plan's declared dtype.
         let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
         if arr_dtype != io.dtype {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "wide GROUP BY: key '{}' dtype mismatch: plan says {:?}, batch has {:?}",
                 io.name, io.dtype, arr_dtype
             )));
@@ -276,7 +276,7 @@ fn resolve_key_columns<'a>(
 }
 
 /// Extract one [`KeyValue`] from a [`KeyColumn`] at `row`.
-fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> JavelinResult<KeyValue> {
+fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> PatinaResult<KeyValue> {
     match kc.dtype {
         DataType::Int32 => {
             let pa = kc
@@ -310,7 +310,7 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> JavelinResult<KeyValue> {
                 .ok_or_else(|| downcast_err(&kc.name, "Float64"))?;
             Ok(KeyValue::F64Bits(pa.value(row).to_bits()))
         }
-        DataType::Bool | DataType::Utf8 => Err(JavelinError::Type(format!(
+        DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
             "wide GROUP BY: key dtype {:?} not supported",
             kc.dtype
         ))),
@@ -404,7 +404,7 @@ impl AggKind {
 fn resolve_aggregates<'a>(
     aggregate: &AggregateSpec,
     batch: &'a RecordBatch,
-) -> JavelinResult<Vec<AggInputPlan<'a>>> {
+) -> PatinaResult<Vec<AggInputPlan<'a>>> {
     let mut out: Vec<AggInputPlan<'a>> = Vec::with_capacity(aggregate.aggregates.len());
     for agg in &aggregate.aggregates {
         let expr = match agg {
@@ -420,7 +420,7 @@ fn resolve_aggregates<'a>(
             .iter()
             .find(|c| c.name == col_name)
             .ok_or_else(|| {
-                JavelinError::Plan(format!(
+                PatinaError::Plan(format!(
                     "wide GROUP BY: aggregate input column '{}' not in plan inputs",
                     col_name
                 ))
@@ -429,14 +429,14 @@ fn resolve_aggregates<'a>(
         match io.dtype {
             DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 => {}
             DataType::Bool | DataType::Utf8 => {
-                return Err(JavelinError::Type(format!(
+                return Err(PatinaError::Type(format!(
                     "wide GROUP BY: Bool/Utf8 aggregate inputs not supported (column '{}')",
                     io.name
                 )))
             }
         }
         let idx = batch.schema().index_of(&io.name).map_err(|e| {
-            JavelinError::Plan(format!(
+            PatinaError::Plan(format!(
                 "wide GROUP BY: aggregate input '{}' not in batch: {}",
                 io.name, e
             ))
@@ -444,7 +444,7 @@ fn resolve_aggregates<'a>(
         let arr = batch.column(idx).as_ref();
         let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
         if arr_dtype != io.dtype {
-            return Err(JavelinError::Type(format!(
+            return Err(PatinaError::Type(format!(
                 "wide GROUP BY: aggregate input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
                 io.name, io.dtype, arr_dtype
             )));
@@ -460,7 +460,7 @@ fn resolve_aggregates<'a>(
 }
 
 /// Extract one [`AggInputValue`] from an [`AggInputPlan`] at `row`.
-fn agg_input_at(plan: &AggInputPlan<'_>, row: usize) -> JavelinResult<AggInputValue> {
+fn agg_input_at(plan: &AggInputPlan<'_>, row: usize) -> PatinaResult<AggInputValue> {
     match plan.dtype {
         DataType::Int32 => {
             let pa = plan
@@ -494,7 +494,7 @@ fn agg_input_at(plan: &AggInputPlan<'_>, row: usize) -> JavelinResult<AggInputVa
                 .ok_or_else(|| downcast_err(&plan.name, "Float64"))?;
             Ok(AggInputValue::F64(pa.value(row)))
         }
-        DataType::Bool | DataType::Utf8 => Err(JavelinError::Type(format!(
+        DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
             "wide GROUP BY: aggregate input dtype {:?} not supported (column '{}')",
             plan.dtype, plan.name
         ))),
@@ -522,11 +522,11 @@ impl AggInputValue {
     }
 
     /// Widen to i64 (used by integer SUM).
-    fn as_i64(self) -> JavelinResult<i64> {
+    fn as_i64(self) -> PatinaResult<i64> {
         match self {
             AggInputValue::I32(v) => Ok(v as i64),
             AggInputValue::I64(v) => Ok(v),
-            AggInputValue::F32(_) | AggInputValue::F64(_) => Err(JavelinError::Type(
+            AggInputValue::F32(_) | AggInputValue::F64(_) => Err(PatinaError::Type(
                 "wide GROUP BY: internal — tried to widen float to i64".into(),
             )),
         }
@@ -572,7 +572,7 @@ enum Accumulator {
 
 impl Accumulator {
     /// Fold one row's value into the accumulator.
-    fn update(&mut self, value: AggInputValue) -> JavelinResult<()> {
+    fn update(&mut self, value: AggInputValue) -> PatinaResult<()> {
         match self {
             Accumulator::SumI64 { total } => {
                 let v = value.as_i64()?;
@@ -684,15 +684,15 @@ impl Accumulator {
 }
 
 /// Wrap a "got the wrong AggInputValue variant" error.
-fn variant_mismatch_err(acc_name: &str) -> JavelinError {
-    JavelinError::Other(format!(
+fn variant_mismatch_err(acc_name: &str) -> PatinaError {
+    PatinaError::Other(format!(
         "wide GROUP BY: internal — accumulator {acc_name} received a value of the wrong dtype"
     ))
 }
 
 /// Allocate the initial accumulator vector for one group (one entry per
 /// aggregate, picked by the (agg-kind, input-dtype) pair).
-fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> JavelinResult<Vec<Accumulator>> {
+fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> PatinaResult<Vec<Accumulator>> {
     let mut out = Vec::with_capacity(plan.len());
     for p in plan {
         let acc = match (p.kind, p.dtype) {
@@ -737,7 +737,7 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> JavelinResult<Vec<Acc
             (AggKind::Count, _) => Accumulator::Count { n: 0 },
             (AggKind::Avg, _) => Accumulator::Avg { sum: 0.0, n: 0 },
             (_, DataType::Bool) | (_, DataType::Utf8) => {
-                return Err(JavelinError::Type(format!(
+                return Err(PatinaError::Type(format!(
                     "wide GROUP BY: cannot make accumulator for ({:?}, {:?}) on column '{}'",
                     p.kind, p.dtype, p.name
                 )))
@@ -757,7 +757,7 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> JavelinResult<Vec<Acc
 fn build_key_arrays(
     sorted: &[(TupleKey, Vec<Accumulator>)],
     key_cols: &[KeyColumn<'_>],
-) -> JavelinResult<Vec<ArrayRef>> {
+) -> PatinaResult<Vec<ArrayRef>> {
     let m = key_cols.len();
     let n = sorted.len();
 
@@ -777,7 +777,7 @@ fn build_key_arrays(
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
             DataType::Bool | DataType::Utf8 => {
-                return Err(JavelinError::Type(format!(
+                return Err(PatinaError::Type(format!(
                     "wide GROUP BY: key dtype {:?} not supported on output",
                     kc.dtype
                 )))
@@ -787,7 +787,7 @@ fn build_key_arrays(
 
     for (tuple, _) in sorted {
         if tuple.0.len() != m {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "wide GROUP BY: internal — tuple length {} != key column count {}",
                 tuple.0.len(),
                 m
@@ -800,7 +800,7 @@ fn build_key_arrays(
                 (ColBuf::F32(v), KeyValue::F32Bits(bits)) => v.push(f32::from_bits(*bits)),
                 (ColBuf::F64(v), KeyValue::F64Bits(bits)) => v.push(f64::from_bits(*bits)),
                 _ => {
-                    return Err(JavelinError::Other(
+                    return Err(PatinaError::Other(
                         "wide GROUP BY: internal — tuple variant mismatched key column dtype"
                             .into(),
                     ))
@@ -828,7 +828,7 @@ fn finalize_agg_column(
     out_field: &Field,
     i: usize,
     sorted: &[(TupleKey, Vec<Accumulator>)],
-) -> JavelinResult<ArrayRef> {
+) -> PatinaResult<ArrayRef> {
     match agg {
         AggregateExpr::Count(_) => {
             // COUNT always outputs Int64.
@@ -837,7 +837,7 @@ fn finalize_agg_column(
                 match accs.get(i) {
                     Some(Accumulator::Count { n }) => out.push(*n as i64),
                     _ => {
-                        return Err(JavelinError::Other(
+                        return Err(PatinaError::Other(
                             "wide GROUP BY: internal — COUNT accumulator missing or wrong variant"
                                 .into(),
                         ))
@@ -856,7 +856,7 @@ fn finalize_agg_column(
                         out.push(v);
                     }
                     _ => {
-                        return Err(JavelinError::Other(
+                        return Err(PatinaError::Other(
                             "wide GROUP BY: internal — AVG accumulator missing or wrong variant"
                                 .into(),
                         ))
@@ -883,13 +883,13 @@ fn collect_sum_min_max(
     sorted: &[(TupleKey, Vec<Accumulator>)],
     i: usize,
     out_dtype: DataType,
-) -> JavelinResult<ArrayRef> {
+) -> PatinaResult<ArrayRef> {
     // Peek the first non-empty group to choose the natural collector type.
     let first = sorted
         .first()
         .and_then(|(_, accs)| accs.get(i))
         .ok_or_else(|| {
-            JavelinError::Other(
+            PatinaError::Other(
                 "wide GROUP BY: internal — no groups when finalising aggregate".into(),
             )
         })?;
@@ -960,7 +960,7 @@ fn collect_sum_min_max(
             TypedColumn::F64(out)
         }
         Accumulator::Count { .. } | Accumulator::Avg { .. } => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "wide GROUP BY: internal — COUNT/AVG variant in SUM/MIN/MAX path".into(),
             ))
         }
@@ -983,7 +983,7 @@ enum TypedColumn {
 /// Int64→Int32 narrowing: SUM(Int32) declares an `Int64` output dtype
 /// (see [`crate::plan::logical_plan::sum_output_dtype`]), so the widened
 /// accumulator is preserved end-to-end.
-fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> JavelinResult<ArrayRef> {
+fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> PatinaResult<ArrayRef> {
     match (col, out_dtype) {
         // Exact-match paths.
         (TypedColumn::I32(v), DataType::Int32) => {
@@ -1028,7 +1028,7 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> JavelinResult<Arra
             v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
         )) as ArrayRef),
 
-        (_, dt) => Err(JavelinError::Type(format!(
+        (_, dt) => Err(PatinaError::Type(format!(
             "wide GROUP BY: cannot pack scalars into output dtype {:?}",
             dt
         ))),
@@ -1041,26 +1041,26 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> JavelinResult<Arra
 
 /// Extract the column name from a bare-column-ref expression. Rejects
 /// computed expressions like `SUM(a * b)`.
-fn bare_column_name(expr: &Expr) -> JavelinResult<&str> {
+fn bare_column_name(expr: &Expr) -> PatinaResult<&str> {
     match expr {
         Expr::Column(name) => Ok(name.as_str()),
         Expr::Alias(inner, _) => bare_column_name(inner),
-        _ => Err(JavelinError::Other(
+        _ => Err(PatinaError::Other(
             "wide GROUP BY: aggregate input must be a bare column reference".into(),
         )),
     }
 }
 
 /// `Type` error for a failed Arrow downcast on column `name`.
-fn downcast_err(name: &str, expected: &str) -> JavelinError {
-    JavelinError::Type(format!(
+fn downcast_err(name: &str, expected: &str) -> PatinaError {
+    PatinaError::Type(format!(
         "wide GROUP BY input column '{}' could not be downcast to {}",
         name, expected
     ))
 }
 
 /// Map Arrow `DataType` to our plan `DataType` (mirrors `groupby.rs`).
-fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
+fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
         ArrowDataType::Int64 => Ok(DataType::Int64),
@@ -1068,7 +1068,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        other => Err(JavelinError::Type(format!(
+        other => Err(PatinaError::Type(format!(
             "wide GROUP BY: unsupported Arrow dtype {:?}",
             other
         ))),
@@ -1076,7 +1076,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> JavelinResult<DataType> {
 }
 
 /// Map our plan `DataType` to Arrow `DataType` (mirrors `groupby.rs`).
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -1088,7 +1088,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

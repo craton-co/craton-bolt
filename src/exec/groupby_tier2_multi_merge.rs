@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY **multi-SUM** result merger.
 //!
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::groupby_tier2_multi_orchestrator::Tier2MultiPartial;
 use crate::plan::logical_plan::{DataType, Schema};
 
@@ -38,7 +38,7 @@ use crate::plan::logical_plan::{DataType, Schema};
 pub fn build_tier2_multi_result(
     partial: Tier2MultiPartial,
     output_schema: &Schema,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     let Tier2MultiPartial {
         per_partition,
         n_vals,
@@ -47,7 +47,7 @@ pub fn build_tier2_multi_result(
     // 0. Schema width check: 1 key + n_vals sums.
     let expected_fields = 1 + n_vals;
     if output_schema.fields.len() != expected_fields {
-        return Err(JavelinError::Other(format!(
+        return Err(PatinaError::Other(format!(
             "tier2_multi_merge: output_schema has {} fields, expected {} (1 key + {} sums)",
             output_schema.fields.len(),
             expected_fields,
@@ -67,7 +67,7 @@ pub fn build_tier2_multi_result(
         // Each partition must carry exactly n_vals inner sum columns, each
         // aligned to `keys`.
         if sums.len() != n_vals {
-            return Err(JavelinError::Other(format!(
+            return Err(PatinaError::Other(format!(
                 "tier2_multi_merge: partition has {} sum columns, expected {}",
                 sums.len(),
                 n_vals
@@ -75,7 +75,7 @@ pub fn build_tier2_multi_result(
         }
         for (j, s) in sums.iter().enumerate() {
             if s.len() != keys.len() {
-                return Err(JavelinError::Other(format!(
+                return Err(PatinaError::Other(format!(
                     "tier2_multi_merge: partition sums[{}].len()={} != keys.len()={}",
                     j,
                     s.len(),
@@ -129,7 +129,7 @@ pub fn build_tier2_multi_result(
     }
 
     RecordBatch::try_new(arrow_schema, columns).map_err(|e| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "tier2_multi_merge: failed to build output RecordBatch: {e}"
         ))
     })
@@ -139,7 +139,7 @@ pub fn build_tier2_multi_result(
 // Local plan-schema → Arrow-schema conversion. Per the crate convention.
 // ---------------------------------------------------------------------------
 
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -150,7 +150,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
     }
 }
 
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

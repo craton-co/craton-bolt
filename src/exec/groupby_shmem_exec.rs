@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory pre-aggregation **executor** (Tier 1 fast path).
 //!
@@ -29,7 +29,7 @@ use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::exec::groupby_shmem_dispatch::{
     dispatch, AggOp, DispatchInputs, GroupByStrategy,
 };
@@ -49,7 +49,7 @@ use crate::plan::physical_plan::PhysicalPlan;
 pub fn try_execute(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
-) -> Option<JavelinResult<RecordBatch>> {
+) -> Option<PatinaResult<RecordBatch>> {
     // --- Plan-shape eligibility ------------------------------------------
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -137,7 +137,7 @@ fn execute_inner(
     key_arr: &Int32Array,
     val_arr: &Float64Array,
     n_groups: u32,
-) -> JavelinResult<RecordBatch> {
+) -> PatinaResult<RecordBatch> {
     let n_rows = key_arr.len();
 
     // --- Upload inputs ----------------------------------------------------
@@ -167,7 +167,7 @@ fn execute_inner(
         max_shared_per_block: None,
     };
     let params = tune(tune_in).map_err(|e| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "shmem_exec: launch-param tuner refused: {e} \
              (n_rows={n_rows}, n_groups={n_groups})"
         ))
@@ -248,7 +248,7 @@ fn execute_inner(
     let sum_array = Arc::new(Float64Array::from(out_sums));
 
     RecordBatch::try_new(arrow_schema, vec![key_array, sum_array]).map_err(|e| {
-        JavelinError::Other(format!(
+        PatinaError::Other(format!(
             "shmem_exec: failed to build output RecordBatch: {e}"
         ))
     })
@@ -257,11 +257,11 @@ fn execute_inner(
 /// Build a 0-row output `RecordBatch` matching the plan's output schema.
 /// Used when the input has 0 rows or only negative keys (we treat the
 /// latter as "no eligible groups" rather than as a hard error).
-fn build_empty_result(plan: &PhysicalPlan) -> JavelinResult<RecordBatch> {
+fn build_empty_result(plan: &PhysicalPlan) -> PatinaResult<RecordBatch> {
     let aggregate = match plan {
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => {
-            return Err(JavelinError::Other(
+            return Err(PatinaError::Other(
                 "shmem_exec::build_empty_result: non-Aggregate plan".into(),
             ))
         }
@@ -270,7 +270,7 @@ fn build_empty_result(plan: &PhysicalPlan) -> JavelinResult<RecordBatch> {
     let key_array = Arc::new(Int32Array::from(Vec::<i32>::new()));
     let sum_array = Arc::new(Float64Array::from(Vec::<f64>::new()));
     RecordBatch::try_new(arrow_schema, vec![key_array, sum_array])
-        .map_err(|e| JavelinError::Other(format!("empty result build failed: {e}")))
+        .map_err(|e| PatinaError::Other(format!("empty result build failed: {e}")))
 }
 
 // Silence "unused import" if BLOCK_THREADS ever stops being referenced
@@ -281,7 +281,7 @@ const _BLOCK_THREADS_REF: u32 = BLOCK_THREADS;
 // Local copy of the plan-schema → Arrow-schema conversion. Every executor
 // in this crate carries its own copy; consolidating them is a separate
 // refactor.
-fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -292,7 +292,7 @@ fn plan_dtype_to_arrow(d: DataType) -> JavelinResult<ArrowDataType> {
     }
 }
 
-fn plan_schema_to_arrow_schema(s: &Schema) -> JavelinResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

@@ -1,18 +1,18 @@
-# GROUP BY performance — analysis and proposed optimizations
+﻿# GROUP BY performance — analysis and proposed optimizations
 
 ## What the measurements say
 
 From the h2o.ai db-benchmark groupby subset, three-engine table (10 M rows,
 RTX 2060) in [`BENCHMARKS.md`](./BENCHMARKS.md):
 
-| Query                   | DuckDB    | Polars     | Javelin    | Javelin gap |
+| Query                   | DuckDB    | Polars     | Craton Patina    | Craton Patina gap |
 | ----------------------- | --------- | ---------- | ---------- | ----------- |
 | q1: SUM by id1 (100)    | 6.12 ms   | 16.4 ms    | 269 ms     | **44× / 16×** |
 | q2: 2-SUM by id2 (10 K) | 43.7 ms   | 79.5 ms    | 406 ms     | **9.3× / 5.1×** |
 | q3: SUM by (id1, id2)   | 448 ms    | **296 ms** | 704 ms     | **1.6× / 2.4×** |
 | q5: SUM by id3 (1 M)    | 549 ms    | **241 ms** | 770 ms     | **1.4× / 3.2×** |
 
-Javelin loses on every query. The gap is widest at low cardinality (q1, q2)
+Craton Patina loses on every query. The gap is widest at low cardinality (q1, q2)
 and narrowest at high cardinality (q3, q5) — the opposite of what a naive
 "GPUs are good at parallelism" intuition predicts.
 

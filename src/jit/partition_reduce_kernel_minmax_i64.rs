@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
 //! Per-partition shared-memory GROUP BY **MIN / MAX** kernel — i64-key
 //! variant (Tier 2.1 for two-key MIN/MAX).
@@ -31,7 +31,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{JavelinError, JavelinResult};
+use crate::error::{PatinaError, PatinaResult};
 use crate::jit::partition_reduce_kernel_minmax::{MinMaxDtype, MinMaxOp};
 
 pub const BLOCK_GROUPS: u32 = 1024;
@@ -51,7 +51,7 @@ pub fn kernel_entry(op: MinMaxOp, dtype: MinMaxDtype) -> String {
         MinMaxDtype::Int32 => "i32",
         MinMaxDtype::Int64 => "i64",
     };
-    format!("javelin_partition_reduce_{}_{}_keyi64", opn, dt)
+    format!("patina_partition_reduce_{}_{}_keyi64", opn, dt)
 }
 
 fn val_load(dtype: MinMaxDtype) -> &'static str {
@@ -112,7 +112,7 @@ fn op_name(op: MinMaxOp) -> &'static str {
 pub fn compile_partition_reduce_kernel_minmax_i64(
     op: MinMaxOp,
     dtype: MinMaxDtype,
-) -> JavelinResult<String> {
+) -> PatinaResult<String> {
     let mut ptx = String::new();
     let entry = kernel_entry(op, dtype);
     let entry = entry.as_str();
@@ -393,8 +393,8 @@ pub fn compile_partition_reduce_kernel_minmax_i64(
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> JavelinError {
-    JavelinError::Other(format!(
+fn write_err(e: std::fmt::Error) -> PatinaError {
+    PatinaError::Other(format!(
         "partition_reduce_kernel_minmax_i64: write failed: {}",
         e
     ))
