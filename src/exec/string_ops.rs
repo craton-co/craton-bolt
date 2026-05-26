@@ -44,7 +44,7 @@ use arrow_array::{BooleanArray, Int32Array};
 
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 // ---------------------------------------------------------------------------
 // Pure helpers (no GPU). These exist so the transformation logic can be unit
@@ -67,7 +67,7 @@ use crate::error::{PatinaError, PatinaResult};
 /// impossible in practice (input dictionary was already i32-bounded and
 /// the transform can only shrink the unique count), but we surface it
 /// rather than silently truncating.
-fn dedup_transformed(transformed: Vec<String>) -> PatinaResult<(Vec<String>, Vec<i32>)> {
+fn dedup_transformed(transformed: Vec<String>) -> BoltResult<(Vec<String>, Vec<i32>)> {
     let n_old = transformed.len();
     let mut new_dict: Vec<String> = Vec::new();
     // Borrow-friendly map: key is owned so we can clone-on-insert and avoid
@@ -83,12 +83,12 @@ fn dedup_transformed(transformed: Vec<String>) -> PatinaResult<(Vec<String>, Vec
             // Reserve slot before pushing so we surface overflow before the
             // dictionary grows past the i32 index space.
             let next_len = new_dict.len().checked_add(1).ok_or_else(|| {
-                PatinaError::Other(
+                BoltError::Other(
                     "dictionary overflow: more than usize::MAX unique strings".into(),
                 )
             })?;
             if next_len > i32::MAX as usize {
-                return Err(PatinaError::Other(format!(
+                return Err(BoltError::Other(format!(
                     "dictionary overflow: more than {} unique strings (i32 index space)",
                     i32::MAX
                 )));
@@ -106,13 +106,13 @@ fn dedup_transformed(transformed: Vec<String>) -> PatinaResult<(Vec<String>, Vec
 
 /// Pure-host implementation of `UPPER` over a dictionary slice. Returns the
 /// `(new_dict, remap_table)` pair. See [`dedup_transformed`] for layout.
-fn upper_dict_pure(old_dict: &[String]) -> PatinaResult<(Vec<String>, Vec<i32>)> {
+fn upper_dict_pure(old_dict: &[String]) -> BoltResult<(Vec<String>, Vec<i32>)> {
     let transformed: Vec<String> = old_dict.iter().map(|s| s.to_uppercase()).collect();
     dedup_transformed(transformed)
 }
 
 /// Pure-host implementation of `LOWER` over a dictionary slice.
-fn lower_dict_pure(old_dict: &[String]) -> PatinaResult<(Vec<String>, Vec<i32>)> {
+fn lower_dict_pure(old_dict: &[String]) -> BoltResult<(Vec<String>, Vec<i32>)> {
     let transformed: Vec<String> = old_dict.iter().map(|s| s.to_lowercase()).collect();
     dedup_transformed(transformed)
 }
@@ -124,13 +124,13 @@ fn lower_dict_pure(old_dict: &[String]) -> PatinaResult<(Vec<String>, Vec<i32>)>
 ///
 /// Errors if any individual string's byte length exceeds `i32::MAX` — which
 /// would also be an absurd 2 GiB single value.
-fn lengths_table_pure(old_dict: &[String]) -> PatinaResult<Vec<i32>> {
+fn lengths_table_pure(old_dict: &[String]) -> BoltResult<Vec<i32>> {
     let mut out: Vec<i32> = Vec::with_capacity(old_dict.len() + 1);
     out.push(0); // NULL slot
     for s in old_dict {
         let len = s.len();
         if len > i32::MAX as usize {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "LENGTH: string of {} bytes exceeds i32::MAX",
                 len
             )));
@@ -153,14 +153,14 @@ fn lengths_table_pure(old_dict: &[String]) -> PatinaResult<Vec<i32>> {
 ///
 /// Cost: one device→host copy of `n_rows` i32s, one host→device copy of the
 /// same. No kernel launch.
-pub fn upper(input: &DictionaryColumn) -> PatinaResult<DictionaryColumn> {
+pub fn upper(input: &DictionaryColumn) -> BoltResult<DictionaryColumn> {
     let (new_dict, remap) = upper_dict_pure(&input.dictionary)?;
     remap_and_upload(input, new_dict, &remap)
 }
 
 /// Apply `LOWER` to a dictionary column. See [`upper`] — same shape, just
 /// `to_lowercase` instead of `to_uppercase`.
-pub fn lower(input: &DictionaryColumn) -> PatinaResult<DictionaryColumn> {
+pub fn lower(input: &DictionaryColumn) -> BoltResult<DictionaryColumn> {
     let (new_dict, remap) = lower_dict_pure(&input.dictionary)?;
     remap_and_upload(input, new_dict, &remap)
 }
@@ -171,7 +171,7 @@ pub fn lower(input: &DictionaryColumn) -> PatinaResult<DictionaryColumn> {
 /// returned `Int32Array` has no validity bitmap.
 ///
 /// Cost: one device→host copy of `n_rows` i32s + an O(dict) table build.
-pub fn length(input: &DictionaryColumn) -> PatinaResult<Int32Array> {
+pub fn length(input: &DictionaryColumn) -> BoltResult<Int32Array> {
     let table = lengths_table_pure(&input.dictionary)?;
     let indices: Vec<i32> = input.indices.to_vec()?;
 
@@ -181,14 +181,14 @@ pub fn length(input: &DictionaryColumn) -> PatinaResult<Int32Array> {
         // something the dictionary cannot decode. Mirror the strictness of
         // `DictionaryColumn::to_string_array`.
         if idx < 0 {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "LENGTH: negative dictionary index {} (NULL is encoded as 0)",
                 idx
             )));
         }
         let pos = idx as usize;
         let len = *table.get(pos).ok_or_else(|| {
-            PatinaError::Other(format!(
+            BoltError::Other(format!(
                 "LENGTH: index {} out of range (dictionary size {})",
                 idx,
                 input.dictionary.len()
@@ -212,7 +212,7 @@ pub fn length(input: &DictionaryColumn) -> PatinaResult<Int32Array> {
 pub fn input_eq_literal(
     input: &DictionaryColumn,
     literal: &str,
-) -> PatinaResult<BooleanArray> {
+) -> BoltResult<BooleanArray> {
     let n = input.n_rows;
     match input.index_of(literal) {
         None => Ok(BooleanArray::from(vec![false; n])),
@@ -234,7 +234,7 @@ fn remap_and_upload(
     input: &DictionaryColumn,
     new_dict: Vec<String>,
     remap: &[i32],
-) -> PatinaResult<DictionaryColumn> {
+) -> BoltResult<DictionaryColumn> {
     let old: Vec<i32> = input.indices.to_vec()?;
 
     let mut new_indices: Vec<i32> = Vec::with_capacity(old.len());
@@ -242,14 +242,14 @@ fn remap_and_upload(
         // Same strict bounds check as decode: negative or out-of-range is a
         // kernel-side bug we'd rather surface than mask.
         if idx < 0 {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "string_ops: negative dictionary index {} (NULL is encoded as 0)",
                 idx
             )));
         }
         let pos = idx as usize;
         let mapped = *remap.get(pos).ok_or_else(|| {
-            PatinaError::Other(format!(
+            BoltError::Other(format!(
                 "string_ops: index {} out of range (old dictionary size {})",
                 idx,
                 input.dictionary.len()

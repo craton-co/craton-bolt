@@ -63,7 +63,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// Number of slots in each block's shared-memory open-addressing table.
 /// Must match [`crate::jit::partition_reduce_kernel::BLOCK_GROUPS`] so the
@@ -78,7 +78,7 @@ pub const BLOCK_THREADS: u32 = 256;
 pub const NUM_PARTITIONS: u32 = 4096;
 
 /// Entry-point name embedded in the emitted PTX.
-pub const KERNEL_ENTRY: &str = "patina_partition_reduce_i64";
+pub const KERNEL_ENTRY: &str = "bolt_partition_reduce_i64";
 
 /// Probe bound. Same as i32 sibling.
 const MAX_PROBES: u32 = BLOCK_GROUPS;
@@ -87,7 +87,7 @@ const MAX_PROBES: u32 = BLOCK_GROUPS;
 ///
 /// Kernel signature (PTX-level):
 /// ```text
-/// .visible .entry patina_partition_reduce_i64(
+/// .visible .entry bolt_partition_reduce_i64(
 ///     .param .u64 partition_keys,    // const int64_t*  scatter_keys[n_rows]
 ///     .param .u64 partition_vals,    // const double*   scatter_vals[n_rows]
 ///     .param .u64 partition_offsets, // const uint32_t* offsets[NUM_PARTITIONS+1]
@@ -99,7 +99,7 @@ const MAX_PROBES: u32 = BLOCK_GROUPS;
 ///
 /// Launch geometry: `grid = NUM_PARTITIONS, block = BLOCK_THREADS`. One
 /// block per partition.
-pub fn compile_partition_reduce_kernel_i64() -> PatinaResult<String> {
+pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
     let block_groups = BLOCK_GROUPS;
@@ -362,8 +362,8 @@ pub fn compile_partition_reduce_kernel_i64() -> PatinaResult<String> {
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("partition_reduce_kernel_i64: write failed: {}", e))
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("partition_reduce_kernel_i64: write failed: {}", e))
 }
 
 #[cfg(test)]
@@ -380,7 +380,7 @@ mod tests {
     fn has_correct_entry() {
         let ptx = compile_partition_reduce_kernel_i64().expect("compile");
         assert!(
-            ptx.contains(".visible .entry patina_partition_reduce_i64("),
+            ptx.contains(".visible .entry bolt_partition_reduce_i64("),
             "entry point not found"
         );
     }

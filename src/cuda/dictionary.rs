@@ -15,14 +15,14 @@
 //!   * Real strings start at index `1`. The i-th unique non-null string is
 //!     stored at `dictionary[i - 1]`.
 //!   * Indices are `i32`. Allowing > `i32::MAX` distinct strings would break
-//!     downstream codegen; we surface that as a `PatinaError::Other`.
+//!     downstream codegen; we surface that as a `BoltError::Other`.
 
 use std::collections::HashMap;
 
 use arrow_array::{Array, StringArray};
 
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// On-host string dictionary + on-device i32 indices.
 ///
@@ -46,7 +46,7 @@ impl DictionaryColumn {
     /// Nulls in `arr` map to index `0`. Distinct non-null strings are
     /// deduplicated and assigned sequential indices starting at `1`, in
     /// first-occurrence order.
-    pub fn from_string_array(arr: &StringArray) -> PatinaResult<Self> {
+    pub fn from_string_array(arr: &StringArray) -> BoltResult<Self> {
         let n_rows = arr.len();
         let mut dictionary: Vec<String> = Vec::new();
         // NOTE: The lookup map keys are owned `String`s, mirroring the entries
@@ -72,12 +72,12 @@ impl DictionaryColumn {
             } else {
                 // Next index = current dictionary length + 1 (slot 0 reserved for NULL).
                 let next_len = dictionary.len().checked_add(1).ok_or_else(|| {
-                    PatinaError::Other(
+                    BoltError::Other(
                         "dictionary overflow: more than usize::MAX unique strings".into(),
                     )
                 })?;
                 if next_len > i32::MAX as usize {
-                    return Err(PatinaError::Other(format!(
+                    return Err(BoltError::Other(format!(
                         "dictionary overflow: more than {} unique strings (i32 index space)",
                         i32::MAX
                     )));
@@ -165,23 +165,23 @@ impl DictionaryColumn {
     /// Download indices and reconstruct a `StringArray`.
     ///
     /// Index `0` becomes a SQL `NULL`. Indices outside `1..=dictionary.len()`
-    /// surface as `PatinaError::Other` — that would indicate a kernel wrote
+    /// surface as `BoltError::Other` — that would indicate a kernel wrote
     /// something the host dictionary cannot decode.
-    pub fn to_string_array(&self) -> PatinaResult<StringArray> {
+    pub fn to_string_array(&self) -> BoltResult<StringArray> {
         let host_indices: Vec<i32> = self.indices.to_vec()?;
         let mut out: Vec<Option<&str>> = Vec::with_capacity(host_indices.len());
         for &idx in &host_indices {
             if idx == 0 {
                 out.push(None);
             } else if idx < 0 {
-                return Err(PatinaError::Other(format!(
+                return Err(BoltError::Other(format!(
                     "dictionary decode: negative index {} (NULL is encoded as 0)",
                     idx
                 )));
             } else {
                 let pos = (idx as usize) - 1;
                 let s = self.dictionary.get(pos).ok_or_else(|| {
-                    PatinaError::Other(format!(
+                    BoltError::Other(format!(
                         "dictionary decode: index {} out of range (dictionary size {})",
                         idx,
                         self.dictionary.len()

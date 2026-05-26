@@ -1,4 +1,4 @@
-﻿# Craton Patina GPU kernels crate (rust-cuda Wave A spike).
+﻿# Craton Bolt GPU kernels crate (rust-cuda Wave A spike).
 #
 # This crate is compiled to PTX by `rustc_codegen_nvvm` via `cuda_builder`
 # and is INTENTIONALLY NOT part of the workspace members list (see the root
@@ -16,11 +16,11 @@
 #     spike, but the canonical rust-cuda example layout sets both.
 
 [package]
-name        = "craton-patina-kernels"
+name        = "craton-bolt-kernels"
 version     = "0.0.1"
 edition     = "2021"
 publish     = false
-description = "Craton Patina GPU kernels compiled via rust-cuda (Wave A spike)."
+description = "Craton Bolt GPU kernels compiled via rust-cuda (Wave A spike)."
 
 [lib]
 crate-type = ["cdylib", "rlib"]

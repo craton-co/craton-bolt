@@ -1,13 +1,13 @@
 ﻿[package]
-name = "craton-patina"
+name = "craton-bolt"
 version = "0.1.0"
 edition = "2021"
 description = "JIT-compiled GPU SQL engine — runtime PTX codegen with Rust-tracked CUDA memory safety"
 license = "Apache-2.0"
 authors      = ["Craton Software Company <opensource@cratonsoftware.com>"]
-repository   = "https://github.com/craton-co/craton-patina"
-homepage     = "https://github.com/craton-co/craton-patina"
-documentation = "https://docs.rs/craton-patina"
+repository   = "https://github.com/craton-co/craton-bolt"
+homepage     = "https://github.com/craton-co/craton-bolt"
+documentation = "https://docs.rs/craton-bolt"
 readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
 categories   = ["database", "compilers"]
@@ -16,7 +16,7 @@ exclude      = ["target/*", ".idea/*", ".github/*"]
 
 # --- Workspace shim ---------------------------------------------------------
 #
-# Craton Patina is a single-crate project, but the rust-cuda spike adds a sibling
+# Craton Bolt is a single-crate project, but the rust-cuda spike adds a sibling
 # `kernels/` directory that:
 #   - must NOT be built by the host's `cargo build` (it targets nvptx64 and
 #     needs a separate nightly toolchain — see kernels/rust-toolchain.toml),
@@ -35,7 +35,7 @@ members  = []
 exclude  = ["kernels", ".claude/worktrees"]
 
 [lib]
-name = "craton_patina"
+name = "craton_bolt"
 path = "src/lib.rs"
 
 [dependencies]

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     join_combined_schema, AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal,
     LogicalPlan, Schema, SortExpr,
@@ -258,7 +258,7 @@ impl PhysicalPlan {
 }
 
 /// Promote two numeric types to the wider one (float beats int, 64 beats 32).
-fn unify_numeric(a: DataType, b: DataType) -> PatinaResult<DataType> {
+fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
     use DataType::*;
     match (a, b) {
         (x, y) if x == y => Ok(x),
@@ -267,7 +267,7 @@ fn unify_numeric(a: DataType, b: DataType) -> PatinaResult<DataType> {
         (Float32, _) | (_, Float32) => Ok(Float32),
         (Int64, _) | (_, Int64) => Ok(Int64),
         (Int32, _) | (_, Int32) => Ok(Int32),
-        _ => Err(PatinaError::Type(format!(
+        _ => Err(BoltError::Type(format!(
             "cannot unify {:?} and {:?}",
             a, b
         ))),
@@ -322,7 +322,7 @@ impl<'a> Codegen<'a> {
     }
 
     /// Emit ops for `e`, returning the produced value.
-    fn emit_expr(&mut self, e: &Expr) -> PatinaResult<Value> {
+    fn emit_expr(&mut self, e: &Expr) -> BoltResult<Value> {
         match e {
             Expr::Column(name) => self.emit_column(name),
             Expr::Literal(lit) => self.emit_literal(lit),
@@ -332,7 +332,7 @@ impl<'a> Codegen<'a> {
     }
 
     /// Emit (or reuse) a column load.
-    fn emit_column(&mut self, name: &str) -> PatinaResult<Value> {
+    fn emit_column(&mut self, name: &str) -> BoltResult<Value> {
         if let Some((_, v)) = self.column_cache.get(name) {
             return Ok(*v);
         }
@@ -352,10 +352,10 @@ impl<'a> Codegen<'a> {
     }
 
     /// Emit a constant literal load.
-    fn emit_literal(&mut self, lit: &Literal) -> PatinaResult<Value> {
+    fn emit_literal(&mut self, lit: &Literal) -> BoltResult<Value> {
         let dtype = lit
             .dtype()
-            .ok_or_else(|| PatinaError::Type("untyped NULL literal".into()))?;
+            .ok_or_else(|| BoltError::Type("untyped NULL literal".into()))?;
         let dst = self.fresh();
         self.ops.push(Op::Const {
             dst,
@@ -380,7 +380,7 @@ impl<'a> Codegen<'a> {
     }
 
     /// Emit a binary op, inserting casts and computing the result dtype.
-    fn emit_binary(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> PatinaResult<Value> {
+    fn emit_binary(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> BoltResult<Value> {
         let l = self.emit_expr(left)?;
         let r = self.emit_expr(right)?;
 
@@ -401,14 +401,14 @@ impl<'a> Codegen<'a> {
             }
         } else if op_is_logical(op) {
             if l.dtype != DataType::Bool || r.dtype != DataType::Bool {
-                return Err(PatinaError::Type(format!(
+                return Err(BoltError::Type(format!(
                     "logical {op:?} requires Bool operands, got {:?} and {:?}",
                     l.dtype, r.dtype
                 )));
             }
             (l, r, DataType::Bool, DataType::Bool)
         } else {
-            return Err(PatinaError::Type(format!("unsupported operator {op:?}")));
+            return Err(BoltError::Type(format!("unsupported operator {op:?}")));
         };
 
         let dst = self.fresh();
@@ -502,7 +502,7 @@ struct ResolvedSource<'a> {
 /// `DataFrame::select`/`filter` is needed.
 fn resolve_source<'a>(
     plan: &'a LogicalPlan,
-) -> PatinaResult<ResolvedSource<'a>> {
+) -> BoltResult<ResolvedSource<'a>> {
     // Walk down from the outermost node toward the underlying `Scan`,
     // collecting each layer. We delay all substitution to the end so each
     // node's expressions stay in their *own* input namespace until we know
@@ -552,7 +552,7 @@ fn resolve_source<'a>(
                 cur = input.as_ref();
             }
             other => {
-                return Err(PatinaError::Plan(format!(
+                return Err(BoltError::Plan(format!(
                     "unsupported plan shape: expected Scan/Filter/Project chain, got {}",
                     shape(other)
                 )));
@@ -685,13 +685,13 @@ fn build_projection_kernel(
     scan_schema: &Schema,
     predicate: Option<&Expr>,
     projected: &[(String, Expr)],
-) -> PatinaResult<PhysicalPlan> {
+) -> BoltResult<PhysicalPlan> {
     let mut cg = Codegen::new(scan_schema);
 
     let predicate_reg = if let Some(pred) = predicate {
         let v = cg.emit_expr(pred)?;
         if v.dtype != DataType::Bool {
-            return Err(PatinaError::Type(format!(
+            return Err(BoltError::Type(format!(
                 "filter predicate must be Bool, got {:?}",
                 v.dtype
             )));
@@ -725,7 +725,7 @@ fn lower_projection(
     input: &LogicalPlan,
     exprs: Option<&[Expr]>,
     extra_predicate: Option<&Expr>,
-) -> PatinaResult<PhysicalPlan> {
+) -> BoltResult<PhysicalPlan> {
     let resolved = resolve_source(input)?;
     let ResolvedSource {
         table,
@@ -804,7 +804,7 @@ fn lower_aggregate(
     input: &LogicalPlan,
     group_by: &[Expr],
     aggregates: &[AggregateExpr],
-) -> PatinaResult<PhysicalPlan> {
+) -> BoltResult<PhysicalPlan> {
     let resolved = resolve_source(input)?;
     let table = resolved.table;
     let scan_schema = resolved.scan_schema;
@@ -855,7 +855,7 @@ fn lower_aggregate(
                 Expr::Column(n) => n.clone(),
                 // `all_bare_columns` guarantees this branch is unreachable.
                 _ => {
-                    return Err(PatinaError::Plan(
+                    return Err(BoltError::Plan(
                         "internal: trivial aggregate feed contained non-column expression".into(),
                     ))
                 }
@@ -901,7 +901,7 @@ fn lower_aggregate(
             } => (kernel, output_schema),
             // `build_projection_kernel` always returns `Projection`.
             _ => {
-                return Err(PatinaError::Plan(
+                return Err(BoltError::Plan(
                     "internal: build_projection_kernel returned non-Projection".into(),
                 ))
             }
@@ -996,7 +996,7 @@ fn project_is_identity(
     true
 }
 
-pub fn lower(plan: &LogicalPlan) -> PatinaResult<PhysicalPlan> {
+pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
     match plan {
         LogicalPlan::Project { input, exprs } => {
             // Scan/Filter/Project chain → single fused kernel via `lower_projection`.
@@ -1067,7 +1067,7 @@ pub fn lower(plan: &LogicalPlan) -> PatinaResult<PhysicalPlan> {
         }
         LogicalPlan::Union { inputs } => {
             if inputs.is_empty() {
-                return Err(PatinaError::Plan(
+                return Err(BoltError::Plan(
                     "UNION requires at least one input".into(),
                 ));
             }

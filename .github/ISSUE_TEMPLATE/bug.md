@@ -1,6 +1,6 @@
 ﻿---
 name: Bug report
-about: Report a defect in Craton Patina
+about: Report a defect in Craton Bolt
 title: "[bug] "
 labels: bug
 ---
@@ -23,7 +23,7 @@ labels: bug
 - **CUDA driver / toolkit version:**
 - **OS:**
 - **Rust version (`rustc --version`):**
-- **Craton Patina version / commit:**
+- **Craton Bolt version / commit:**
 - **Cargo features enabled:** <!-- e.g. default, cuda-stub -->
 
 ### Minimal reproduction

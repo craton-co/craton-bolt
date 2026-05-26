@@ -23,7 +23,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 pub const BLOCK_GROUPS: u32 = 1024;
 pub const BLOCK_THREADS: u32 = 256;
@@ -32,12 +32,12 @@ pub const NUM_PARTITIONS: u32 = 4096;
 const MAX_PROBES: u32 = BLOCK_GROUPS;
 
 pub fn kernel_entry(n_vals: u32) -> String {
-    format!("patina_partition_reduce_multi_sum_i64_{}", n_vals)
+    format!("bolt_partition_reduce_multi_sum_i64_{}", n_vals)
 }
 
-pub fn compile_partition_reduce_kernel_multi_i64(n_vals: u32) -> PatinaResult<String> {
+pub fn compile_partition_reduce_kernel_multi_i64(n_vals: u32) -> BoltResult<String> {
     if n_vals == 0 || n_vals > MAX_VALS {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "partition_reduce_kernel_multi_i64: n_vals must be 1..={MAX_VALS}, got {n_vals}"
         )));
     }
@@ -343,8 +343,8 @@ pub fn compile_partition_reduce_kernel_multi_i64(n_vals: u32) -> PatinaResult<St
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!(
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!(
         "partition_reduce_kernel_multi_i64: write failed: {}",
         e
     ))

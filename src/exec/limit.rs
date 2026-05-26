@@ -5,13 +5,13 @@
 //! `RecordBatch::slice(offset, length)` is a constant-time zero-copy
 //! operation that produces a new batch sharing the same buffers.
 
-use crate::error::PatinaResult;
+use crate::error::BoltResult;
 use crate::exec::QueryHandle;
 
 /// Apply LIMIT (and optional OFFSET) to the input. `offset == 0` skips the
 /// offset step; `limit` is interpreted as an upper bound on the result row
 /// count (the returned batch has `min(limit, n_rows - offset)` rows).
-pub fn execute_limit(input: QueryHandle, limit: usize, offset: usize) -> PatinaResult<QueryHandle> {
+pub fn execute_limit(input: QueryHandle, limit: usize, offset: usize) -> BoltResult<QueryHandle> {
     let batch = input.into_record_batch();
     let n_rows = batch.num_rows();
 

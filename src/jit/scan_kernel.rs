@@ -10,12 +10,12 @@
 //! ABI of the emitted kernel:
 //!
 //! ```text
-//! .visible .entry patina_predicate(
-//!     .param .u64 patina_predicate_param_0,        // input col 0
+//! .visible .entry bolt_predicate(
+//!     .param .u64 bolt_predicate_param_0,        // input col 0
 //!     ...
-//!     .param .u64 patina_predicate_param_{N-1},    // input col N-1
-//!     .param .u64 patina_predicate_param_{N},      // mask output (u8*)
-//!     .param .u32 patina_predicate_param_{N+1}_n_rows
+//!     .param .u64 bolt_predicate_param_{N-1},    // input col N-1
+//!     .param .u64 bolt_predicate_param_{N},      // mask output (u8*)
+//!     .param .u32 bolt_predicate_param_{N+1}_n_rows
 //! )
 //! ```
 //!
@@ -35,7 +35,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{BinaryOp, DataType, Literal};
 use crate::plan::physical_plan::{KernelSpec, Op, Reg};
 
@@ -78,7 +78,7 @@ impl RegAlloc {
     }
 
     /// Assign a physical register to logical `reg` based on `dtype`; returns the name.
-    fn assign(&mut self, reg: Reg, dtype: DataType) -> PatinaResult<String> {
+    fn assign(&mut self, reg: Reg, dtype: DataType) -> BoltResult<String> {
         let class = Self::class_for(dtype)?;
         let name = self.alloc(class);
         self.mapping.insert(reg, name.clone());
@@ -86,14 +86,14 @@ impl RegAlloc {
     }
 
     /// Look up the physical register name previously assigned to `reg`.
-    fn get(&self, reg: Reg) -> PatinaResult<&str> {
+    fn get(&self, reg: Reg) -> BoltResult<&str> {
         self.mapping.get(&reg).map(|s| s.as_str()).ok_or_else(|| {
-            PatinaError::Other(format!("scan_kernel: undefined register {:?}", reg))
+            BoltError::Other(format!("scan_kernel: undefined register {:?}", reg))
         })
     }
 
     /// Map a logical dtype to a PTX register class string.
-    fn class_for(dtype: DataType) -> PatinaResult<RegClass> {
+    fn class_for(dtype: DataType) -> BoltResult<RegClass> {
         Ok(match dtype {
             DataType::Bool => "r",
             DataType::Int32 => "r",
@@ -101,7 +101,7 @@ impl RegAlloc {
             DataType::Float32 => "f",
             DataType::Float64 => "fd",
             DataType::Utf8 => {
-                return Err(PatinaError::Other(
+                return Err(BoltError::Other(
                     "scan_kernel: Utf8 not supported in PTX codegen".into(),
                 ))
             }
@@ -130,14 +130,14 @@ impl PtxBuilder {
         }
     }
 
-    fn emit(&mut self, line: &str) -> PatinaResult<()> {
+    fn emit(&mut self, line: &str) -> BoltResult<()> {
         writeln!(self.body, "\t{}", line)
-            .map_err(|e| PatinaError::Other(format!("scan_kernel: write failed: {}", e)))
+            .map_err(|e| BoltError::Other(format!("scan_kernel: write failed: {}", e)))
     }
 
-    fn emit_label(&mut self, label: &str) -> PatinaResult<()> {
+    fn emit_label(&mut self, label: &str) -> BoltResult<()> {
         writeln!(self.body, "{}:", label)
-            .map_err(|e| PatinaError::Other(format!("scan_kernel: write failed: {}", e)))
+            .map_err(|e| BoltError::Other(format!("scan_kernel: write failed: {}", e)))
     }
 
     /// Mangled `.param` identifier for the `i`th parameter.
@@ -160,11 +160,11 @@ impl PtxBuilder {
 /// Errors if `spec.predicate` is `None` (this kernel only makes sense for
 /// filtered queries) or if the predicate references unsupported types
 /// (`Utf8` in any form).
-pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> PatinaResult<String> {
+pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
     validate_kernel_name(kernel_name)?;
 
     let predicate_reg = spec.predicate.ok_or_else(|| {
-        PatinaError::Other(
+        BoltError::Other(
             "scan_kernel: compile_predicate_kernel requires a predicate; spec.predicate is None"
                 .into(),
         )
@@ -196,7 +196,7 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> PatinaR
     let mut input_ptrs: Vec<String> = Vec::with_capacity(spec.inputs.len());
     for (i, col) in spec.inputs.iter().enumerate() {
         if matches!(col.dtype, DataType::Utf8) {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "scan_kernel: Utf8 inputs not supported in PTX codegen".into(),
             ));
         }
@@ -289,7 +289,7 @@ fn emit_op(
     op: &Op,
     input_ptrs: &[String],
     tid: &str,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     match op {
         Op::LoadColumn { dst, col_idx, dtype } => {
             emit_load(b, *dst, *col_idx, *dtype, input_ptrs, tid)
@@ -304,7 +304,7 @@ fn emit_op(
             dtype,
             result_dtype,
         } => emit_binary(b, *dst, *op, *lhs, *rhs, *dtype, *result_dtype),
-        Op::Store { .. } => Err(PatinaError::Other(
+        Op::Store { .. } => Err(BoltError::Other(
             "scan_kernel: emit_op should not be called with a Store op".into(),
         )),
     }
@@ -318,9 +318,9 @@ fn emit_load(
     dtype: DataType,
     input_ptrs: &[String],
     tid: &str,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     if col_idx >= input_ptrs.len() {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "scan_kernel: LoadColumn col_idx {} out of range (have {} inputs)",
             col_idx,
             input_ptrs.len()
@@ -341,12 +341,12 @@ fn emit_load(
 }
 
 /// Emit a `mov` of an immediate into a fresh register typed by the literal.
-fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> PatinaResult<()> {
+fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
     match lit {
-        Literal::Null => Err(PatinaError::Other(
+        Literal::Null => Err(BoltError::Other(
             "scan_kernel: NULL literal not supported".into(),
         )),
-        Literal::Utf8(_) => Err(PatinaError::Other(
+        Literal::Utf8(_) => Err(BoltError::Other(
             "scan_kernel: Utf8 literal not supported".into(),
         )),
         Literal::Bool(v) => {
@@ -380,7 +380,7 @@ fn emit_cast(
     src: Reg,
     from: DataType,
     to: DataType,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let src_name = b.alloc.get(src)?.to_string();
     let dst_name = b.alloc.assign(dst, to)?;
 
@@ -394,7 +394,7 @@ fn emit_cast(
                 Float32 => "f32",
                 Float64 => "f64",
                 Utf8 => {
-                    return Err(PatinaError::Other(
+                    return Err(BoltError::Other(
                         "scan_kernel: cannot cast Utf8".into(),
                     ))
                 }
@@ -448,13 +448,13 @@ fn emit_cast(
         (Float64, Int64) => format!("cvt.rzi.s64.f64 {}, {};", dst_name, src_name),
 
         (Utf8, _) | (_, Utf8) => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "scan_kernel: Utf8 casts not supported".into(),
             ))
         }
 
         _ => {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "scan_kernel: unhandled cast {:?} -> {:?}",
                 from, to
             )))
@@ -473,7 +473,7 @@ fn emit_binary(
     rhs: Reg,
     dtype: DataType,
     result_dtype: DataType,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let lhs_name = b.alloc.get(lhs)?.to_string();
     let rhs_name = b.alloc.get(rhs)?.to_string();
 
@@ -481,13 +481,13 @@ fn emit_binary(
     match op {
         Add | Sub | Mul | Div => {
             if result_dtype != dtype {
-                return Err(PatinaError::Other(format!(
+                return Err(BoltError::Other(format!(
                     "scan_kernel: arithmetic op {:?} expected result == operand dtype, got {:?}/{:?}",
                     op, dtype, result_dtype
                 )));
             }
             if !is_numeric(dtype) {
-                return Err(PatinaError::Other(format!(
+                return Err(BoltError::Other(format!(
                     "scan_kernel: arithmetic op {:?} requires numeric operands, got {:?}",
                     op, dtype
                 )));
@@ -501,7 +501,7 @@ fn emit_binary(
         }
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
             if result_dtype != DataType::Bool {
-                return Err(PatinaError::Other(format!(
+                return Err(BoltError::Other(format!(
                     "scan_kernel: comparison op {:?} must produce Bool, got {:?}",
                     op, result_dtype
                 )));
@@ -514,7 +514,7 @@ fn emit_binary(
         }
         And | Or => {
             if dtype != DataType::Bool || result_dtype != DataType::Bool {
-                return Err(PatinaError::Other(format!(
+                return Err(BoltError::Other(format!(
                     "scan_kernel: logical op {:?} requires Bool operands, got {:?}",
                     op, dtype
                 )));
@@ -534,7 +534,7 @@ fn emit_binary(
 }
 
 /// Mnemonic string for an arithmetic op at a given dtype.
-fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> PatinaResult<String> {
+fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
     use BinaryOp::*;
     use DataType::*;
     let s = match (op, dtype) {
@@ -555,7 +555,7 @@ fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> PatinaResult<String> {
         (Div, Float32) => "div.rn.f32",
         (Div, Float64) => "div.rn.f64",
         _ => {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "scan_kernel: unsupported arithmetic {:?} on {:?}",
                 op, dtype
             )))
@@ -565,7 +565,7 @@ fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> PatinaResult<String> {
 }
 
 /// Mnemonic string for a comparison `setp` at a given operand dtype.
-fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> PatinaResult<String> {
+fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
     use BinaryOp::*;
     use DataType::*;
     let cond = match op {
@@ -576,7 +576,7 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> PatinaResult<String> {
         Gt => "gt",
         GtEq => "ge",
         _ => {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "scan_kernel: not a comparison op: {:?}",
                 op
             )))
@@ -589,7 +589,7 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> PatinaResult<String> {
         Float32 => "f32",
         Float64 => "f64",
         Utf8 => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "scan_kernel: cannot compare Utf8".into(),
             ))
         }
@@ -606,7 +606,7 @@ fn is_numeric(dtype: DataType) -> bool {
 }
 
 /// PTX type suffix used on `ld.global`/`st.global` for `dtype`.
-fn ld_st_suffix(dtype: DataType) -> PatinaResult<&'static str> {
+fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
     Ok(match dtype {
         DataType::Bool => "u8",
         DataType::Int32 => "s32",
@@ -614,7 +614,7 @@ fn ld_st_suffix(dtype: DataType) -> PatinaResult<&'static str> {
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
         DataType::Utf8 => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "scan_kernel: Utf8 not supported in PTX codegen".into(),
             ))
         }
@@ -622,29 +622,29 @@ fn ld_st_suffix(dtype: DataType) -> PatinaResult<&'static str> {
 }
 
 /// Byte width of `dtype`, or an error for variable-width types.
-fn byte_width(dtype: DataType) -> PatinaResult<usize> {
+fn byte_width(dtype: DataType) -> BoltResult<usize> {
     dtype.byte_width().ok_or_else(|| {
-        PatinaError::Other(format!("scan_kernel: variable-width dtype {:?}", dtype))
+        BoltError::Other(format!("scan_kernel: variable-width dtype {:?}", dtype))
     })
 }
 
 /// Reject empty / whitespace-bearing kernel names that would break the PTX grammar.
-fn validate_kernel_name(name: &str) -> PatinaResult<()> {
+fn validate_kernel_name(name: &str) -> BoltResult<()> {
     if name.is_empty() {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "scan_kernel: kernel name must not be empty".into(),
         ));
     }
     let first = name.chars().next().unwrap_or('\0');
     if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "scan_kernel: kernel name '{}' must start with a letter or underscore",
             name
         )));
     }
     for c in name.chars() {
         if !(c.is_ascii_alphanumeric() || c == '_') {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "scan_kernel: kernel name '{}' contains illegal character '{}'",
                 name, c
             )));
@@ -654,7 +654,7 @@ fn validate_kernel_name(name: &str) -> PatinaResult<()> {
 }
 
 /// Write the `.visible .entry` signature: N input ptrs, mask output ptr, n_rows.
-fn write_signature(out: &mut String, b: &PtxBuilder, n_inputs: usize) -> PatinaResult<()> {
+fn write_signature(out: &mut String, b: &PtxBuilder, n_inputs: usize) -> BoltResult<()> {
     writeln!(out, ".visible .entry {}(", b.kernel_name).map_err(write_err)?;
 
     // N input column pointers + 1 mask output pointer, all `.u64`.
@@ -669,7 +669,7 @@ fn write_signature(out: &mut String, b: &PtxBuilder, n_inputs: usize) -> PatinaR
 }
 
 /// Emit the `.reg` declaration block sized to each class's used count.
-fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> PatinaResult<()> {
+fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> BoltResult<()> {
     // (class, ptx_type) pairs in deterministic emission order. `rs` is the
     // 16-bit register class we use for the narrowed mask byte source.
     let decls: [(&str, &str); 7] = [
@@ -690,9 +690,9 @@ fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> PatinaResult<()> {
     Ok(())
 }
 
-/// Adapt a `std::fmt::Error` into a `PatinaError`.
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("scan_kernel: write failed: {}", e))
+/// Adapt a `std::fmt::Error` into a `BoltError`.
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("scan_kernel: write failed: {}", e))
 }
 
 #[cfg(test)]
@@ -743,7 +743,7 @@ mod tests {
     fn requires_predicate() {
         let mut spec = region_eq_1_spec();
         spec.predicate = None;
-        let err = compile_predicate_kernel(&spec, "patina_predicate")
+        let err = compile_predicate_kernel(&spec, "bolt_predicate")
             .expect_err("must reject spec without a predicate");
         let msg = format!("{}", err);
         assert!(msg.contains("requires a predicate"), "got: {msg}");
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn region_eq_1_smoke() {
         let spec = region_eq_1_spec();
-        let ptx = compile_predicate_kernel(&spec, "patina_predicate")
+        let ptx = compile_predicate_kernel(&spec, "bolt_predicate")
             .expect("PTX codegen should succeed for a trivial integer predicate");
 
         // Header sanity.
@@ -761,10 +761,10 @@ mod tests {
         assert!(ptx.contains(".address_size 64"));
 
         // Signature: one input pointer, one mask pointer, one u32 n_rows.
-        assert!(ptx.contains(".visible .entry patina_predicate("));
-        assert!(ptx.contains(".param .u64 patina_predicate_param_0,"));
-        assert!(ptx.contains(".param .u64 patina_predicate_param_1,"));
-        assert!(ptx.contains(".param .u32 patina_predicate_param_2_n_rows"));
+        assert!(ptx.contains(".visible .entry bolt_predicate("));
+        assert!(ptx.contains(".param .u64 bolt_predicate_param_0,"));
+        assert!(ptx.contains(".param .u64 bolt_predicate_param_1,"));
+        assert!(ptx.contains(".param .u32 bolt_predicate_param_2_n_rows"));
 
         // Body: the predicate eq + the mask byte store.
         assert!(ptx.contains("setp.eq.s32"));
@@ -779,7 +779,7 @@ mod tests {
     fn rejects_utf8_input() {
         let mut spec = region_eq_1_spec();
         spec.inputs[0].dtype = DataType::Utf8;
-        let err = compile_predicate_kernel(&spec, "patina_predicate")
+        let err = compile_predicate_kernel(&spec, "bolt_predicate")
             .expect_err("must reject Utf8 inputs");
         assert!(format!("{}", err).contains("Utf8"));
     }

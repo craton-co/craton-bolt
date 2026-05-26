@@ -1,12 +1,12 @@
 ﻿// SPDX-License-Identifier: Apache-2.0
 
-//! Craton Patina micro-benchmarks. Measures plan + codegen latency on CPU; gated
-//! end-to-end GPU execution behind `PATINA_BENCH_GPU=1`.
+//! Craton Bolt micro-benchmarks. Measures plan + codegen latency on CPU; gated
+//! end-to-end GPU execution behind `BOLT_BENCH_GPU=1`.
 //!
 //! The `bench_polars` group provides a head-to-head comparison against Polars
 //! using the same three queries and row count as `bench_engine_execute`. Polars
 //! runs on its default rayon-based thread pool (all CPU cores), so this is a
-//! fair fight: Craton Patina-on-GPU vs Polars-on-all-CPU-cores — exactly the
+//! fair fight: Craton Bolt-on-GPU vs Polars-on-all-CPU-cores — exactly the
 //! comparison we want to publish.
 //!
 //! Workload sizing
@@ -26,8 +26,8 @@ use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
-use craton_patina::jit::compile_ptx;
-use craton_patina::plan::{
+use craton_bolt::jit::compile_ptx;
+use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
 };
 
@@ -171,7 +171,7 @@ fn bench_ptx_gen(c: &mut Criterion) {
         let PhysicalPlan::Projection { kernel, .. } = phys else { panic!() };
         g.bench_function(name, |b| {
             b.iter(|| {
-                let ptx = compile_ptx(black_box(&kernel), "patina_kernel").unwrap();
+                let ptx = compile_ptx(black_box(&kernel), "bolt_kernel").unwrap();
                 black_box(ptx)
             })
         });
@@ -300,13 +300,13 @@ fn bench_polars(c: &mut Criterion) {
     g.finish();
 }
 
-/// End-to-end GPU benchmark. Skipped unless `PATINA_BENCH_GPU=1`.
+/// End-to-end GPU benchmark. Skipped unless `BOLT_BENCH_GPU=1`.
 fn bench_engine_execute(c: &mut Criterion) {
-    if std::env::var("PATINA_BENCH_GPU").ok().as_deref() != Some("1") {
-        eprintln!("skipping engine_execute (set PATINA_BENCH_GPU=1 to enable)");
+    if std::env::var("BOLT_BENCH_GPU").ok().as_deref() != Some("1") {
+        eprintln!("skipping engine_execute (set BOLT_BENCH_GPU=1 to enable)");
         return;
     }
-    use craton_patina::Engine;
+    use craton_bolt::Engine;
     let mut engine = match Engine::new() {
         Ok(e) => e,
         Err(err) => {

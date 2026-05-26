@@ -1,4 +1,4 @@
-﻿# Craton Patina — a JIT-compiled GPU SQL engine in pure Rust
+﻿# Craton Bolt — a JIT-compiled GPU SQL engine in pure Rust
 
 *Marketing one-pager. For technical depth see [`README.md`](../README.md),
 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md), and [`docs/BENCHMARKS.md`](BENCHMARKS.md).*
@@ -14,7 +14,7 @@ device pointer.**
 ## The pitch in three sentences
 
 Most GPU SQL engines are C++ kernel libraries with a Python or Rust wrapper.
-Craton Patina is the inverse: a Rust crate that compiles every query into a fresh
+Craton Bolt is the inverse: a Rust crate that compiles every query into a fresh
 NVIDIA PTX kernel at execution time, fuses the whole expression tree into one
 register-resident pipeline, and loads it via the raw CUDA driver — no C++,
 no NVRTC, no third-party query engine. Borrow-checked GPU memory primitives
@@ -35,7 +35,7 @@ mutable aliasing across kernel boundaries compile-time errors.
 | Polars / DuckDB on CPU | Excellent CPU engines, no GPU path | Will not benefit from the GPU you already paid for. |
 | DataFusion + cudf adapters | Active but adapter-heavy | Each operator boundary is a copy; you get the worst of both worlds for fused arithmetic. |
 
-### What Craton Patina does differently
+### What Craton Bolt does differently
 
 1. **Whole-query kernel fusion.** A query like `SELECT (a * b + c * d) * 1.0825 FROM t WHERE id > 100` becomes **one** PTX kernel. All seven operations stay in registers — no intermediate materialisation, no D2D round-trips. The compiler-level analog to what Polars / DataFusion do for the CPU, applied to the GPU.
 
@@ -44,11 +44,11 @@ mutable aliasing across kernel boundaries compile-time errors.
    - Double-free (drops route through a pool with refcount safety)
    - Concurrent mutable aliasing across kernel boundaries
    - Reading a buffer being written by another in-flight kernel
-   Other engines push these guarantees to runtime asserts (at best) or rely on convention (at worst). Craton Patina enforces them at compile time, in pure-safe Rust.
+   Other engines push these guarantees to runtime asserts (at best) or rely on convention (at worst). Craton Bolt enforces them at compile time, in pure-safe Rust.
 
 3. **Sub-25 µs CPU-side overhead.** Parse → plan → codegen → PTX-string in under 25 microseconds end-to-end. JIT-compiling every query is a viable execution model, not a performance footgun.
 
-4. **Pure-Rust, single-crate deployable.** No LLVM. No NVRTC. No C++ runtime to ship. Just `cargo add craton-patina` and a CUDA driver.
+4. **Pure-Rust, single-crate deployable.** No LLVM. No NVRTC. No C++ runtime to ship. Just `cargo add craton-bolt` and a CUDA driver.
 
 5. **Multi-tier GROUP BY.** Three-tier execution strategy gated on cardinality:
    - **Tier 1** (≤ 1024 groups): per-block shared-memory pre-aggregation
@@ -66,7 +66,7 @@ Full table in [`docs/BENCHMARKS.md`](BENCHMARKS.md).*
 
 ### h2o.ai db-benchmark groupby subset (community standard)
 
-| Query                          | Polars (CPU MT) | DuckDB (CPU MT) | **Craton Patina (GPU)** | Δ vs cold baseline |
+| Query                          | Polars (CPU MT) | DuckDB (CPU MT) | **Craton Bolt (GPU)** | Δ vs cold baseline |
 | ------------------------------ | --------------- | --------------- | ----------------- | ------------------ |
 | q1 low-card SUM (100 grps)     | 19.0 ms         | 6.9 ms          | **51.4 ms**       | **5.5× faster**    |
 | q2 med-card 2-SUM (10 K)       | 99.4 ms         | 46.4 ms         | **384 ms**        | **1.15× faster**   |
@@ -74,11 +74,11 @@ Full table in [`docs/BENCHMARKS.md`](BENCHMARKS.md).*
 | q4 low-card 3-AVG (100 grps)   | 97.0 ms         | 12.9 ms         | **70.5 ms**       | **6.4× faster**    |
 | q5 high-card SUM (1 M grps)    | 358 ms          | 623 ms          | **237 ms** ⭐      | **3.7× faster**    |
 
-⭐ Craton Patina wins outright vs both Polars and DuckDB.
+⭐ Craton Bolt wins outright vs both Polars and DuckDB.
 
 ### Heavy-arithmetic OLAP (50 M rows, fused multi-operator)
 
-| Query                                   | Polars     | **Craton Patina (GPU)**     | Speedup |
+| Query                                   | Polars     | **Craton Bolt (GPU)**     | Speedup |
 | --------------------------------------- | ---------- | --------------------- | ------- |
 | 11-op arithmetic chain (10× *, 10× ± )  | 4.05 s     | **124.8 ms**          | **32.4× faster** |
 | Filter + 4-op arithmetic                | 369 ms     | **41.8 ms**           | **8.8× faster**  |
@@ -86,12 +86,12 @@ Full table in [`docs/BENCHMARKS.md`](BENCHMARKS.md).*
 The arithmetic win is the structural story: GPU register fusion vs CPU
 intermediate materialisation. On idiomatic OLAP groupby (the table above)
 the wins are smaller but on the **two hardest workloads** — q3 two-key
-high-cardinality, q5 1 M-group high-cardinality — **Craton Patina is currently
+high-cardinality, q5 1 M-group high-cardinality — **Craton Bolt is currently
 the fastest of the three**.
 
 ---
 
-## Where Craton Patina fits
+## Where Craton Bolt fits
 
 ### Good fit
 
@@ -125,7 +125,7 @@ subset are in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Differentiators at a glance
 
-| Dimension                | RAPIDS / cuDF         | HeavyDB            | DataFusion+adapter      | **Craton Patina**             |
+| Dimension                | RAPIDS / cuDF         | HeavyDB            | DataFusion+adapter      | **Craton Bolt**             |
 | ------------------------ | --------------------- | ------------------ | ----------------------- | ----------------------- |
 | Language                 | C++ + Python wrapper  | C++                | Rust + C++ kernels      | **Pure Rust**           |
 | Kernel strategy          | Pre-compiled library  | LLVM JIT           | Pre-compiled adapters   | **Runtime PTX codegen** |
@@ -152,11 +152,11 @@ The full roadmap with dates and decision points is in [`ROADMAP.md`](../ROADMAP.
 ## Try it
 
 ```bash
-git clone <repo-url> craton-patina
-cd craton-patina
+git clone <repo-url> craton-bolt
+cd craton-bolt
 cargo build --release                                       # default
 cargo build --release --features cudarc                     # cudarc backend
-PATINA_BENCH_GPU=1 cargo bench --bench olap_benchmarks     # h2o.ai vs Polars vs DuckDB
+BOLT_BENCH_GPU=1 cargo bench --bench olap_benchmarks     # h2o.ai vs Polars vs DuckDB
 ```
 
 Sample usage in 12 lines in [`README.md#run-a-query`](../README.md#run-a-query).
@@ -173,6 +173,6 @@ Sample usage in 12 lines in [`README.md#run-a-query`](../README.md#run-a-query).
 
 ---
 
-*Craton Patina stands on `arrow-rs`, `sqlparser-rs`, and NVIDIA's CUDA driver.
+*Craton Bolt stands on `arrow-rs`, `sqlparser-rs`, and NVIDIA's CUDA driver.
 Everything above the driver is ours; everything in this document is
 reproducible from the source tree.*

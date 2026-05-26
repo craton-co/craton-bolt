@@ -300,7 +300,7 @@ fn tier2_multi_pipeline_matches_cpu_model() {
     // Wire-up:
     //   1. Build a RecordBatch with columns: `id2` (Int32) from `keys`,
     //      `v1` (Float64) from `vals[0]`, `v2` (Float64) from `vals[1]`.
-    //   2. let mut engine = craton_patina::Engine::new().unwrap();
+    //   2. let mut engine = craton_bolt::Engine::new().unwrap();
     //      engine.register_table("x", batch).unwrap();
     //   3. let h = engine.sql("SELECT id2, SUM(v1), SUM(v2) FROM x GROUP BY id2").unwrap();
     //      let out = h.record_batch();

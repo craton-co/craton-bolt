@@ -56,7 +56,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// Open-addressing slot count per block. Must match
 /// [`crate::jit::partition_reduce_kernel::BLOCK_GROUPS`].
@@ -80,7 +80,7 @@ const MAX_PROBES: u32 = BLOCK_GROUPS;
 /// Entry-point name for the emitted PTX. Includes `n_vals` so each variant
 /// is cache-distinct in the PTX cache.
 pub fn kernel_entry(n_vals: u32) -> String {
-    format!("patina_partition_reduce_multi_sum_{}", n_vals)
+    format!("bolt_partition_reduce_multi_sum_{}", n_vals)
 }
 
 /// Generate PTX for the multi-value per-partition reduce kernel.
@@ -98,9 +98,9 @@ pub fn kernel_entry(n_vals: u32) -> String {
 /// ```
 ///
 /// Launch geometry: `grid = NUM_PARTITIONS`, `block = BLOCK_THREADS`.
-pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> PatinaResult<String> {
+pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> {
     if n_vals == 0 || n_vals > MAX_VALS {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "partition_reduce_kernel_multi: n_vals must be 1..={MAX_VALS}, got {n_vals}"
         )));
     }
@@ -445,8 +445,8 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> PatinaResult<String
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!(
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!(
         "partition_reduce_kernel_multi: write failed: {}",
         e
     ))

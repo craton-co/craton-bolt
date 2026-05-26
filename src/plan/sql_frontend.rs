@@ -13,7 +13,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     AggregateExpr, BinaryOp, Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr,
 };
@@ -21,7 +21,7 @@ use crate::plan::logical_plan::{
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
 pub trait TableProvider {
     /// Return the schema for `name`, or a `Plan` error if the table is unknown.
-    fn schema(&self, name: &str) -> PatinaResult<Schema>;
+    fn schema(&self, name: &str) -> BoltResult<Schema>;
 }
 
 /// In-memory `name → Schema` provider; useful in tests and as a default.
@@ -50,21 +50,21 @@ impl MemTableProvider {
 }
 
 impl TableProvider for MemTableProvider {
-    fn schema(&self, name: &str) -> PatinaResult<Schema> {
+    fn schema(&self, name: &str) -> BoltResult<Schema> {
         self.tables
             .get(name)
             .cloned()
-            .ok_or_else(|| PatinaError::Plan(format!("unknown table '{name}'")))
+            .ok_or_else(|| BoltError::Plan(format!("unknown table '{name}'")))
     }
 }
 
 /// Parse a SQL string into a single `LogicalPlan` using the given provider.
-pub fn parse(sql: &str, provider: &dyn TableProvider) -> PatinaResult<LogicalPlan> {
+pub fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
     let dialect = GenericDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| PatinaError::Sql(e.to_string()))?;
+    let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| BoltError::Sql(e.to_string()))?;
 
     if stmts.len() != 1 {
-        return Err(PatinaError::Sql(format!(
+        return Err(BoltError::Sql(format!(
             "expected exactly one statement, got {}",
             stmts.len()
         )));
@@ -73,7 +73,7 @@ pub fn parse(sql: &str, provider: &dyn TableProvider) -> PatinaResult<LogicalPla
     let query = match stmt {
         Statement::Query(q) => q,
         other => {
-            return Err(PatinaError::Sql(format!(
+            return Err(BoltError::Sql(format!(
                 "only SELECT queries are supported, got: {other}"
             )));
         }
@@ -84,27 +84,27 @@ pub fn parse(sql: &str, provider: &dyn TableProvider) -> PatinaResult<LogicalPla
 /// Lower a top-level `Query`. Supports SELECT, UNION [ALL], ORDER BY, LIMIT,
 /// and OFFSET. Rejects CTEs, FETCH, locks, EXCEPT/INTERSECT, and dialect
 /// extensions outside our subset.
-fn plan_query(query: &Query, provider: &dyn TableProvider) -> PatinaResult<LogicalPlan> {
+fn plan_query(query: &Query, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
     if query.with.is_some() {
-        return Err(PatinaError::Sql("unsupported: WITH / CTEs".into()));
+        return Err(BoltError::Sql("unsupported: WITH / CTEs".into()));
     }
     if !query.limit_by.is_empty() {
-        return Err(PatinaError::Sql("unsupported: LIMIT BY".into()));
+        return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
     }
     if query.fetch.is_some() {
-        return Err(PatinaError::Sql("unsupported: FETCH".into()));
+        return Err(BoltError::Sql("unsupported: FETCH".into()));
     }
     if !query.locks.is_empty() {
-        return Err(PatinaError::Sql("unsupported: FOR UPDATE/SHARE".into()));
+        return Err(BoltError::Sql("unsupported: FOR UPDATE/SHARE".into()));
     }
     if query.for_clause.is_some() {
-        return Err(PatinaError::Sql("unsupported: FOR clause".into()));
+        return Err(BoltError::Sql("unsupported: FOR clause".into()));
     }
     if query.settings.is_some() {
-        return Err(PatinaError::Sql("unsupported: SETTINGS clause".into()));
+        return Err(BoltError::Sql("unsupported: SETTINGS clause".into()));
     }
     if query.format_clause.is_some() {
-        return Err(PatinaError::Sql("unsupported: FORMAT clause".into()));
+        return Err(BoltError::Sql("unsupported: FORMAT clause".into()));
     }
 
     // Lower the body into a base plan; UNION/UNION ALL builds a `Union` (and
@@ -149,7 +149,7 @@ fn plan_query(query: &Query, provider: &dyn TableProvider) -> PatinaResult<Logic
 /// Lower a `SetExpr` (SELECT body or UNION/EXCEPT/INTERSECT node) into a
 /// `LogicalPlan`. UNION ALL becomes `Union { inputs }`; plain UNION becomes
 /// `Distinct(Union { inputs })`. EXCEPT/INTERSECT are rejected.
-fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> PatinaResult<LogicalPlan> {
+fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
     match expr {
         SetExpr::Select(s) => plan_select(s.as_ref(), provider),
         SetExpr::Query(q) => plan_query(q.as_ref(), provider),
@@ -160,7 +160,7 @@ fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> PatinaResult<
             right,
         } => {
             if *op != SetOperator::Union {
-                return Err(PatinaError::Sql(format!(
+                return Err(BoltError::Sql(format!(
                     "unsupported set operator: {op}; only UNION / UNION ALL"
                 )));
             }
@@ -171,7 +171,7 @@ fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> PatinaResult<
                 SetQuantifier::ByName
                 | SetQuantifier::AllByName
                 | SetQuantifier::DistinctByName => {
-                    return Err(PatinaError::Sql(
+                    return Err(BoltError::Sql(
                         "unsupported: UNION BY NAME".into(),
                     ));
                 }
@@ -192,11 +192,11 @@ fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> PatinaResult<
                 union
             })
         }
-        SetExpr::Values(_) => Err(PatinaError::Sql("unsupported: VALUES".into())),
-        SetExpr::Insert(_) | SetExpr::Update(_) => Err(PatinaError::Sql(
+        SetExpr::Values(_) => Err(BoltError::Sql("unsupported: VALUES".into())),
+        SetExpr::Insert(_) | SetExpr::Update(_) => Err(BoltError::Sql(
             "unsupported: write statement in query body".into(),
         )),
-        SetExpr::Table(_) => Err(PatinaError::Sql("unsupported: TABLE statement".into())),
+        SetExpr::Table(_) => Err(BoltError::Sql("unsupported: TABLE statement".into())),
     }
 }
 
@@ -209,7 +209,7 @@ fn collect_union_branches(
     provider: &dyn TableProvider,
     parent_dedup: bool,
     out: &mut Vec<LogicalPlan>,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     if let SetExpr::SetOperation {
         op: SetOperator::Union,
         set_quantifier,
@@ -241,7 +241,7 @@ fn collect_union_branches(
 /// Lower a list of `OrderByExpr` into our `SortExpr`s. The default sort
 /// direction is ASC; the default NULL placement follows SQL convention
 /// (NULLS FIRST for ASC, NULLS LAST for DESC) when the user omits it.
-fn lower_order_by(exprs: &[OrderByExpr]) -> PatinaResult<Vec<SortExpr>> {
+fn lower_order_by(exprs: &[OrderByExpr]) -> BoltResult<Vec<SortExpr>> {
     let mut out = Vec::with_capacity(exprs.len());
     for OrderByExpr {
         expr,
@@ -251,7 +251,7 @@ fn lower_order_by(exprs: &[OrderByExpr]) -> PatinaResult<Vec<SortExpr>> {
     } in exprs
     {
         if with_fill.is_some() {
-            return Err(PatinaError::Sql(
+            return Err(BoltError::Sql(
                 "unsupported: ORDER BY ... WITH FILL".into(),
             ));
         }
@@ -276,36 +276,36 @@ fn lower_order_by(exprs: &[OrderByExpr]) -> PatinaResult<Vec<SortExpr>> {
 /// Parse a SQL `LIMIT` / `OFFSET` clause value into a `usize`. The clause
 /// must be a non-negative integer literal; anything else is rejected (no
 /// dynamic LIMITs, no expressions). `kind` is used for error messages.
-fn usize_from_literal(e: &SqlExpr, kind: &str) -> PatinaResult<usize> {
+fn usize_from_literal(e: &SqlExpr, kind: &str) -> BoltResult<usize> {
     let value = match e {
         SqlExpr::Value(Value::Number(n, _)) => n,
         other => {
-            return Err(PatinaError::Sql(format!(
+            return Err(BoltError::Sql(format!(
                 "{kind} must be an integer literal, got: {other}"
             )));
         }
     };
     let parsed: i64 = value.parse().map_err(|_| {
-        PatinaError::Sql(format!("{kind} value '{value}' is not a valid integer"))
+        BoltError::Sql(format!("{kind} value '{value}' is not a valid integer"))
     })?;
     if parsed < 0 {
-        return Err(PatinaError::Sql(format!(
+        return Err(BoltError::Sql(format!(
             "{kind} value must be non-negative, got {parsed}"
         )));
     }
     usize::try_from(parsed)
-        .map_err(|_| PatinaError::Sql(format!("{kind} value {parsed} exceeds usize range")))
+        .map_err(|_| BoltError::Sql(format!("{kind} value {parsed} exceeds usize range")))
 }
 
 /// Lower a `Select` into Scan [→ Filter] → (Project | Aggregate), optionally
 /// wrapped in `Filter` (for HAVING) and/or `Distinct` (for SELECT DISTINCT).
 /// Supports a single INNER JOIN in FROM.
-fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<LogicalPlan> {
+fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
     reject_unsupported_select(select)?;
 
     // FROM: exactly one base table reference. JOINs hang off `twj.joins`.
     if select.from.len() != 1 {
-        return Err(PatinaError::Sql(format!(
+        return Err(BoltError::Sql(format!(
             "expected exactly one FROM table, got {}",
             select.from.len()
         )));
@@ -326,32 +326,32 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
     // The wave-7 executor scaffold rejects anything more elaborate.
     for join in &twj.joins {
         if join.global {
-            return Err(PatinaError::Sql(
+            return Err(BoltError::Sql(
                 "unsupported: GLOBAL JOIN (ClickHouse extension)".into(),
             ));
         }
         let on_expr = match &join.join_operator {
             JoinOperator::Inner(JoinConstraint::On(e)) => e,
             JoinOperator::Inner(JoinConstraint::Using(_)) => {
-                return Err(PatinaError::Sql(
+                return Err(BoltError::Sql(
                     "unsupported: JOIN ... USING; rewrite as ON".into(),
                 ));
             }
             JoinOperator::Inner(JoinConstraint::Natural) => {
-                return Err(PatinaError::Sql("unsupported: NATURAL JOIN".into()));
+                return Err(BoltError::Sql("unsupported: NATURAL JOIN".into()));
             }
             JoinOperator::Inner(JoinConstraint::None) => {
-                return Err(PatinaError::Sql(
+                return Err(BoltError::Sql(
                     "INNER JOIN requires an ON clause".into(),
                 ));
             }
             JoinOperator::CrossJoin => {
-                return Err(PatinaError::Sql(
+                return Err(BoltError::Sql(
                     "unsupported: CROSS JOIN; rewrite with explicit ON".into(),
                 ));
             }
             other => {
-                return Err(PatinaError::Sql(format!(
+                return Err(BoltError::Sql(format!(
                     "unsupported join kind: {other:?}; only INNER JOIN is supported"
                 )));
             }
@@ -393,11 +393,11 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
     // GROUP BY (must precede projection decision)
     let group_by_sql: Vec<&SqlExpr> = match &select.group_by {
         GroupByExpr::All(_) => {
-            return Err(PatinaError::Sql("unsupported: GROUP BY ALL".into()));
+            return Err(BoltError::Sql("unsupported: GROUP BY ALL".into()));
         }
         GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
-                return Err(PatinaError::Sql(
+                return Err(BoltError::Sql(
                     "unsupported: GROUP BY modifiers (ROLLUP/CUBE/TOTALS)".into(),
                 ));
             }
@@ -420,7 +420,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
                 }
             }
             SelectItem::QualifiedWildcard(_, _) => {
-                return Err(PatinaError::Sql("unsupported: qualified wildcard".into()));
+                return Err(BoltError::Sql("unsupported: qualified wildcard".into()));
             }
         }
     }
@@ -428,7 +428,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
     let has_agg_in_select = items
         .iter()
         .map(|(e, _)| try_aggregate(e))
-        .collect::<PatinaResult<Vec<_>>>()?
+        .collect::<BoltResult<Vec<_>>>()?
         .iter()
         .any(|o| o.is_some());
 
@@ -439,7 +439,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
         let group_by: Vec<Expr> = group_by_sql
             .iter()
             .map(|e| lower_expr(e))
-            .collect::<PatinaResult<_>>()?;
+            .collect::<BoltResult<_>>()?;
 
         let mut aggregates: Vec<AggregateExpr> = Vec::new();
         // For each SELECT item, remember how to pull it back out of the Aggregate
@@ -457,7 +457,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
         for (sql_expr, alias) in &items {
             if let Some(agg) = try_aggregate(sql_expr)? {
                 if alias.is_some() {
-                    return Err(PatinaError::Sql(
+                    return Err(BoltError::Sql(
                         "unsupported: alias on aggregate expression".into(),
                     ));
                 }
@@ -468,14 +468,14 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
             }
             // Non-aggregate: must contain no nested aggregate (no post-aggregate exprs).
             if contains_aggregate(sql_expr)? {
-                return Err(PatinaError::Sql(
+                return Err(BoltError::Sql(
                     "post-aggregate expressions not yet supported".into(),
                 ));
             }
             let lowered = lower_expr(sql_expr)?;
             // Must match some declared GROUP BY key by structural equality of the lowered form.
             if !group_by.iter().any(|g| expr_eq(g, &lowered)) {
-                return Err(PatinaError::Sql(
+                return Err(BoltError::Sql(
                     "non-aggregate SELECT expression must appear in GROUP BY".into(),
                 ));
             }
@@ -542,7 +542,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
     } else {
         // Scalar projection mode.
         if select.having.is_some() {
-            return Err(PatinaError::Sql(
+            return Err(BoltError::Sql(
                 "HAVING requires GROUP BY or aggregate functions in SELECT".into(),
             ));
         }
@@ -595,7 +595,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> PatinaResult<Lo
 fn lower_table_factor(
     tf: &TableFactor,
     provider: &dyn TableProvider,
-) -> PatinaResult<(String, Schema)> {
+) -> BoltResult<(String, Schema)> {
     match tf {
         TableFactor::Table {
             name,
@@ -607,28 +607,28 @@ fn lower_table_factor(
             partitions,
         } => {
             if alias.is_some() {
-                return Err(PatinaError::Sql("unsupported: table alias".into()));
+                return Err(BoltError::Sql("unsupported: table alias".into()));
             }
             if args.is_some() {
-                return Err(PatinaError::Sql("unsupported: table-valued function".into()));
+                return Err(BoltError::Sql("unsupported: table-valued function".into()));
             }
             if !with_hints.is_empty() {
-                return Err(PatinaError::Sql("unsupported: WITH hints".into()));
+                return Err(BoltError::Sql("unsupported: WITH hints".into()));
             }
             if version.is_some() {
-                return Err(PatinaError::Sql("unsupported: table version".into()));
+                return Err(BoltError::Sql("unsupported: table version".into()));
             }
             if *with_ordinality {
-                return Err(PatinaError::Sql("unsupported: WITH ORDINALITY".into()));
+                return Err(BoltError::Sql("unsupported: WITH ORDINALITY".into()));
             }
             if !partitions.is_empty() {
-                return Err(PatinaError::Sql("unsupported: PARTITION".into()));
+                return Err(BoltError::Sql("unsupported: PARTITION".into()));
             }
             let table_name = single_ident_from_object_name(name)?;
             let schema = provider.schema(&table_name)?;
             Ok((table_name, schema))
         }
-        _ => Err(PatinaError::Sql(
+        _ => Err(BoltError::Sql(
             "unsupported: only bare table references are allowed in FROM".into(),
         )),
     }
@@ -637,11 +637,11 @@ fn lower_table_factor(
 /// Look up a join predicate expression as a conjunction of `left.col = right.col`
 /// equalities. Reject non-equi joins and non-conjunctive forms with a clear
 /// message; the executor scaffold only handles equi joins.
-fn lower_join_on(e: &SqlExpr) -> PatinaResult<Vec<(Expr, Expr)>> {
+fn lower_join_on(e: &SqlExpr) -> BoltResult<Vec<(Expr, Expr)>> {
     let mut out = Vec::new();
     collect_join_eq(e, &mut out)?;
     if out.is_empty() {
-        return Err(PatinaError::Sql(
+        return Err(BoltError::Sql(
             "JOIN ON clause must contain at least one equality predicate".into(),
         ));
     }
@@ -649,7 +649,7 @@ fn lower_join_on(e: &SqlExpr) -> PatinaResult<Vec<(Expr, Expr)>> {
 }
 
 /// Walk `e` flattening `AND` nodes; each leaf must be `<expr> = <expr>`.
-fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>) -> PatinaResult<()> {
+fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>) -> BoltResult<()> {
     match e {
         SqlExpr::Nested(inner) => collect_join_eq(inner, out),
         SqlExpr::BinaryOp {
@@ -670,7 +670,7 @@ fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>) -> PatinaResult<()>
             out.push((l, r));
             Ok(())
         }
-        other => Err(PatinaError::Sql(format!(
+        other => Err(BoltError::Sql(format!(
             "non-equi JOIN not yet supported (ON clause must be a conjunction of `a = b` predicates; got {other})"
         ))),
     }
@@ -681,7 +681,7 @@ fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>) -> PatinaResult<()>
 /// disambiguate same-named columns; both lower to a plain `Column` ref
 /// (qualified column lookups beyond bare-name matching aren't supported
 /// in 0.1.x but the parser accepts them so error messages stay friendly).
-fn lower_join_side(e: &SqlExpr) -> PatinaResult<Expr> {
+fn lower_join_side(e: &SqlExpr) -> BoltResult<Expr> {
     match e {
         SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
         SqlExpr::CompoundIdentifier(parts) => {
@@ -689,10 +689,10 @@ fn lower_join_side(e: &SqlExpr) -> PatinaResult<Expr> {
             // matching is the executor's job.
             let last = parts
                 .last()
-                .ok_or_else(|| PatinaError::Sql("empty compound identifier in JOIN ON".into()))?;
+                .ok_or_else(|| BoltError::Sql("empty compound identifier in JOIN ON".into()))?;
             Ok(Expr::Column(last.value.clone()))
         }
-        other => Err(PatinaError::Sql(format!(
+        other => Err(BoltError::Sql(format!(
             "non-equi JOIN not yet supported (JOIN ON sides must be column references; got {other})"
         ))),
     }
@@ -701,52 +701,52 @@ fn lower_join_side(e: &SqlExpr) -> PatinaResult<Expr> {
 /// Reject SELECT-level features outside our supported subset. `DISTINCT` and
 /// `HAVING` are *not* rejected here — both are recognised by `plan_select`
 /// and lowered into the plan.
-fn reject_unsupported_select(select: &Select) -> PatinaResult<()> {
+fn reject_unsupported_select(select: &Select) -> BoltResult<()> {
     // DISTINCT ON (...) is a Postgres extension we don't support; plain
     // SELECT DISTINCT is handled by `plan_select`.
     if let Some(Distinct::On(_)) = &select.distinct {
-        return Err(PatinaError::Sql("unsupported: DISTINCT ON".into()));
+        return Err(BoltError::Sql("unsupported: DISTINCT ON".into()));
     }
     if select.top.is_some() {
-        return Err(PatinaError::Sql("unsupported: TOP".into()));
+        return Err(BoltError::Sql("unsupported: TOP".into()));
     }
     if select.into.is_some() {
-        return Err(PatinaError::Sql("unsupported: SELECT INTO".into()));
+        return Err(BoltError::Sql("unsupported: SELECT INTO".into()));
     }
     if !select.lateral_views.is_empty() {
-        return Err(PatinaError::Sql("unsupported: LATERAL VIEW".into()));
+        return Err(BoltError::Sql("unsupported: LATERAL VIEW".into()));
     }
     if select.prewhere.is_some() {
-        return Err(PatinaError::Sql("unsupported: PREWHERE".into()));
+        return Err(BoltError::Sql("unsupported: PREWHERE".into()));
     }
     if !select.cluster_by.is_empty() {
-        return Err(PatinaError::Sql("unsupported: CLUSTER BY".into()));
+        return Err(BoltError::Sql("unsupported: CLUSTER BY".into()));
     }
     if !select.distribute_by.is_empty() {
-        return Err(PatinaError::Sql("unsupported: DISTRIBUTE BY".into()));
+        return Err(BoltError::Sql("unsupported: DISTRIBUTE BY".into()));
     }
     if !select.sort_by.is_empty() {
-        return Err(PatinaError::Sql("unsupported: SORT BY".into()));
+        return Err(BoltError::Sql("unsupported: SORT BY".into()));
     }
     if !select.named_window.is_empty() {
-        return Err(PatinaError::Sql("unsupported: WINDOW".into()));
+        return Err(BoltError::Sql("unsupported: WINDOW".into()));
     }
     if select.qualify.is_some() {
-        return Err(PatinaError::Sql("unsupported: QUALIFY".into()));
+        return Err(BoltError::Sql("unsupported: QUALIFY".into()));
     }
     if select.value_table_mode.is_some() {
-        return Err(PatinaError::Sql("unsupported: SELECT AS STRUCT/VALUE".into()));
+        return Err(BoltError::Sql("unsupported: SELECT AS STRUCT/VALUE".into()));
     }
     if select.connect_by.is_some() {
-        return Err(PatinaError::Sql("unsupported: CONNECT BY".into()));
+        return Err(BoltError::Sql("unsupported: CONNECT BY".into()));
     }
     Ok(())
 }
 
 /// Pull a single-part identifier out of an `ObjectName`, rejecting schema-qualified names.
-fn single_ident_from_object_name(name: &ObjectName) -> PatinaResult<String> {
+fn single_ident_from_object_name(name: &ObjectName) -> BoltResult<String> {
     if name.0.len() != 1 {
-        return Err(PatinaError::Sql(format!(
+        return Err(BoltError::Sql(format!(
             "qualified table names not supported: {name}"
         )));
     }
@@ -754,7 +754,7 @@ fn single_ident_from_object_name(name: &ObjectName) -> PatinaResult<String> {
 }
 
 /// Recognize a top-level aggregate function call. Returns `Ok(None)` for non-aggregates.
-fn try_aggregate(e: &SqlExpr) -> PatinaResult<Option<AggregateExpr>> {
+fn try_aggregate(e: &SqlExpr) -> BoltResult<Option<AggregateExpr>> {
     let func = match e {
         SqlExpr::Function(f) => f,
         _ => return Ok(None),
@@ -770,25 +770,25 @@ fn try_aggregate(e: &SqlExpr) -> PatinaResult<Option<AggregateExpr>> {
 
     // Disallow OVER (window), FILTER, ORDER BY, WITHIN GROUP, parameters.
     if func.over.is_some() {
-        return Err(PatinaError::Sql(
+        return Err(BoltError::Sql(
             "unsupported: window functions (OVER)".into(),
         ));
     }
     if func.filter.is_some() {
-        return Err(PatinaError::Sql("unsupported: FILTER on aggregate".into()));
+        return Err(BoltError::Sql("unsupported: FILTER on aggregate".into()));
     }
     if func.null_treatment.is_some() {
-        return Err(PatinaError::Sql(
+        return Err(BoltError::Sql(
             "unsupported: IGNORE/RESPECT NULLS on aggregate".into(),
         ));
     }
     if !func.within_group.is_empty() {
-        return Err(PatinaError::Sql(
+        return Err(BoltError::Sql(
             "unsupported: WITHIN GROUP on aggregate".into(),
         ));
     }
     if !matches!(func.parameters, FunctionArguments::None) {
-        return Err(PatinaError::Sql(
+        return Err(BoltError::Sql(
             "unsupported: parametric aggregate function".into(),
         ));
     }
@@ -796,26 +796,26 @@ fn try_aggregate(e: &SqlExpr) -> PatinaResult<Option<AggregateExpr>> {
     let arg_list = match &func.args {
         FunctionArguments::List(list) => list,
         FunctionArguments::None => {
-            return Err(PatinaError::Sql(format!("{kind} requires arguments")));
+            return Err(BoltError::Sql(format!("{kind} requires arguments")));
         }
         FunctionArguments::Subquery(_) => {
-            return Err(PatinaError::Sql(format!(
+            return Err(BoltError::Sql(format!(
                 "unsupported: subquery argument to {kind}"
             )));
         }
     };
     if arg_list.duplicate_treatment.is_some() {
-        return Err(PatinaError::Sql(format!(
+        return Err(BoltError::Sql(format!(
             "unsupported: DISTINCT/ALL inside {kind}"
         )));
     }
     if !arg_list.clauses.is_empty() {
-        return Err(PatinaError::Sql(format!(
+        return Err(BoltError::Sql(format!(
             "unsupported: argument clauses on {kind}"
         )));
     }
     if arg_list.args.len() != 1 {
-        return Err(PatinaError::Sql(format!(
+        return Err(BoltError::Sql(format!(
             "{kind} expects exactly one argument, got {}",
             arg_list.args.len()
         )));
@@ -825,12 +825,12 @@ fn try_aggregate(e: &SqlExpr) -> PatinaResult<Option<AggregateExpr>> {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
         FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {
-            return Err(PatinaError::Sql(format!(
+            return Err(BoltError::Sql(format!(
                 "unsupported: qualified wildcard in {kind}"
             )));
         }
         FunctionArg::Named { .. } => {
-            return Err(PatinaError::Sql(format!(
+            return Err(BoltError::Sql(format!(
                 "unsupported: named argument to {kind}"
             )));
         }
@@ -840,7 +840,7 @@ fn try_aggregate(e: &SqlExpr) -> PatinaResult<Option<AggregateExpr>> {
         Some(e) => lower_expr(e)?,
         None => {
             if kind != "COUNT" {
-                return Err(PatinaError::Sql(format!("{kind}(*) is not supported")));
+                return Err(BoltError::Sql(format!("{kind}(*) is not supported")));
             }
             // COUNT(*) sentinel: a literal 1; counted rows are independent of value.
             Expr::Literal(Literal::Int64(1))
@@ -858,7 +858,7 @@ fn try_aggregate(e: &SqlExpr) -> PatinaResult<Option<AggregateExpr>> {
 }
 
 /// True if `e` contains any aggregate function call (anywhere in the tree).
-fn contains_aggregate(e: &SqlExpr) -> PatinaResult<bool> {
+fn contains_aggregate(e: &SqlExpr) -> BoltResult<bool> {
     if try_aggregate(e)?.is_some() {
         return Ok(true);
     }
@@ -878,7 +878,7 @@ fn contains_aggregate(e: &SqlExpr) -> PatinaResult<bool> {
 /// aggregate (per `aggregate_output_name`). Everything else delegates to
 /// `lower_expr`, which keeps the usual rules — bare columns become column
 /// refs, non-aggregate function calls are still rejected, etc.
-fn lower_expr_in_having(e: &SqlExpr) -> PatinaResult<Expr> {
+fn lower_expr_in_having(e: &SqlExpr) -> BoltResult<Expr> {
     if let Some(agg) = try_aggregate(e)? {
         return Ok(Expr::Column(aggregate_output_name(&agg)));
     }
@@ -908,7 +908,7 @@ fn lower_expr_in_having(e: &SqlExpr) -> PatinaResult<Expr> {
                     right: Box::new(inner),
                 })
             }
-            other => Err(PatinaError::Sql(format!(
+            other => Err(BoltError::Sql(format!(
                 "unsupported unary operator: {other:?}"
             ))),
         },
@@ -921,10 +921,10 @@ fn lower_expr_in_having(e: &SqlExpr) -> PatinaResult<Expr> {
 
 /// Lower a scalar SQL expression into our `Expr`. Aggregates are rejected here —
 /// callers must split them off via `try_aggregate` first.
-fn lower_expr(e: &SqlExpr) -> PatinaResult<Expr> {
+fn lower_expr(e: &SqlExpr) -> BoltResult<Expr> {
     match e {
         SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
-        SqlExpr::CompoundIdentifier(_) => Err(PatinaError::Sql(
+        SqlExpr::CompoundIdentifier(_) => Err(BoltError::Sql(
             "unsupported: qualified column references (no table aliases yet)".into(),
         )),
         SqlExpr::Value(v) => lower_value(v),
@@ -942,27 +942,27 @@ fn lower_expr(e: &SqlExpr) -> PatinaResult<Expr> {
         SqlExpr::UnaryOp { op, expr } => match op {
             UnaryOperator::Plus => lower_expr(expr),
             UnaryOperator::Minus => negate_expr(expr),
-            other => Err(PatinaError::Sql(format!(
+            other => Err(BoltError::Sql(format!(
                 "unsupported unary operator: {other:?}"
             ))),
         },
-        SqlExpr::Function(_) => Err(PatinaError::Sql(
+        SqlExpr::Function(_) => Err(BoltError::Sql(
             "function calls are only allowed as top-level aggregates in SELECT".into(),
         )),
-        other => Err(PatinaError::Sql(format!(
+        other => Err(BoltError::Sql(format!(
             "unsupported expression: {other}"
         ))),
     }
 }
 
 /// Translate a SQL literal `Value` into our `Literal` expression.
-fn lower_value(v: &Value) -> PatinaResult<Expr> {
+fn lower_value(v: &Value) -> BoltResult<Expr> {
     match v {
         Value::Number(n, _long) => parse_number(n),
         Value::SingleQuotedString(s) => Ok(Expr::Literal(Literal::Utf8(s.clone()))),
         Value::Boolean(b) => Ok(Expr::Literal(Literal::Bool(*b))),
         Value::Null => Ok(Expr::Literal(Literal::Null)),
-        other => Err(PatinaError::Sql(format!("unsupported literal: {other}"))),
+        other => Err(BoltError::Sql(format!("unsupported literal: {other}"))),
     }
 }
 
@@ -976,18 +976,18 @@ fn looks_like_pure_integer(s: &str) -> bool {
 /// Parse a numeric literal string into `Int64` if it fits, otherwise `Float64`.
 /// Integer-looking literals that overflow `i64` are *rejected* rather than silently
 /// demoted to `Float64` (which would lose precision past 2^53).
-fn parse_number(n: &str) -> PatinaResult<Expr> {
+fn parse_number(n: &str) -> BoltResult<Expr> {
     if let Ok(i) = n.parse::<i64>() {
         return Ok(Expr::Literal(Literal::Int64(i)));
     }
     if looks_like_pure_integer(n) {
-        return Err(PatinaError::Sql(format!(
+        return Err(BoltError::Sql(format!(
             "integer literal {n} out of i64 range; use scientific notation or an explicit fractional part for Float64"
         )));
     }
     match n.parse::<f64>() {
         Ok(f) => Ok(Expr::Literal(Literal::Float64(f))),
-        Err(_) => Err(PatinaError::Sql(format!("invalid number literal '{n}'"))),
+        Err(_) => Err(BoltError::Sql(format!("invalid number literal '{n}'"))),
     }
 }
 
@@ -995,7 +995,7 @@ fn parse_number(n: &str) -> PatinaResult<Expr> {
 /// The asymmetric `i64` range (`MIN = -2^63`, `MAX = 2^63 - 1`) is handled by
 /// trying `i64::from_str` on the *negated* string, which succeeds at `i64::MIN`
 /// even though `2^63` does not fit in a positive `i64`.
-fn negate_expr(e: &SqlExpr) -> PatinaResult<Expr> {
+fn negate_expr(e: &SqlExpr) -> BoltResult<Expr> {
     if let SqlExpr::Value(Value::Number(n, _)) = e {
         // Common case: positive literal fits in i64; just negate.
         if let Ok(i) = n.parse::<i64>() {
@@ -1010,14 +1010,14 @@ fn negate_expr(e: &SqlExpr) -> PatinaResult<Expr> {
         // Integer-looking but still out of range (e.g. -10^20): reject, do not
         // silently demote to Float64.
         if looks_like_pure_integer(n) {
-            return Err(PatinaError::Sql(format!(
+            return Err(BoltError::Sql(format!(
                 "integer literal -{n} out of i64 range; use scientific notation or an explicit fractional part for Float64"
             )));
         }
         if let Ok(f) = n.parse::<f64>() {
             return Ok(Expr::Literal(Literal::Float64(-f)));
         }
-        return Err(PatinaError::Sql(format!("invalid number literal '{n}'")));
+        return Err(BoltError::Sql(format!("invalid number literal '{n}'")));
     }
     let inner = lower_expr(e)?;
     Ok(Expr::Binary {
@@ -1058,7 +1058,7 @@ fn group_key_output_name(key: &Expr, idx: usize) -> String {
 }
 
 /// Map a `sqlparser` `BinaryOperator` onto our small `BinaryOp` set; reject anything else.
-fn lower_binary_op(op: &BinaryOperator) -> PatinaResult<BinaryOp> {
+fn lower_binary_op(op: &BinaryOperator) -> BoltResult<BinaryOp> {
     Ok(match op {
         BinaryOperator::Plus => BinaryOp::Add,
         BinaryOperator::Minus => BinaryOp::Sub,
@@ -1073,7 +1073,7 @@ fn lower_binary_op(op: &BinaryOperator) -> PatinaResult<BinaryOp> {
         BinaryOperator::And => BinaryOp::And,
         BinaryOperator::Or => BinaryOp::Or,
         other => {
-            return Err(PatinaError::Sql(format!(
+            return Err(BoltError::Sql(format!(
                 "unsupported binary operator: {other}"
             )));
         }

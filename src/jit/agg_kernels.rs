@@ -13,7 +13,7 @@
 //!
 //! ABI of every emitted kernel:
 //! ```text
-//! .visible .entry patina_reduce(
+//! .visible .entry bolt_reduce(
 //!     .param .u64 input_ptr,
 //!     .param .u64 output_ptr,
 //!     .param .u32 n_rows
@@ -24,7 +24,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{sum_output_dtype, AggregateExpr, DataType};
 
 /// Public helper: the accumulator dtype the reduction kernel emitted by
@@ -47,7 +47,7 @@ pub fn reduction_output_dtype(op: ReduceOp, input_dtype: DataType) -> DataType {
 pub const BLOCK_SIZE: u32 = 256;
 
 /// PTX kernel entry-point name.
-pub const REDUCTION_KERNEL_ENTRY: &str = "patina_reduce";
+pub const REDUCTION_KERNEL_ENTRY: &str = "bolt_reduce";
 
 /// Reduction operator the codegen needs to emit identity + combine for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,20 +65,20 @@ pub enum ReduceOp {
 impl ReduceOp {
     /// Map an `AggregateExpr` to its underlying reduction op. `Avg` is not a
     /// single reduction and must be decomposed (sum + count) by the caller.
-    pub fn from_agg(agg: &AggregateExpr) -> PatinaResult<Self> {
+    pub fn from_agg(agg: &AggregateExpr) -> BoltResult<Self> {
         match agg {
             AggregateExpr::Sum(_) => Ok(ReduceOp::Sum),
             AggregateExpr::Min(_) => Ok(ReduceOp::Min),
             AggregateExpr::Max(_) => Ok(ReduceOp::Max),
             AggregateExpr::Count(_) => Ok(ReduceOp::Count),
-            AggregateExpr::Avg(_) => Err(PatinaError::Other(
+            AggregateExpr::Avg(_) => Err(BoltError::Other(
                 "agg_kernels: AVG must be decomposed into Sum + Count by the caller".into(),
             )),
         }
     }
 
     /// PTX literal expression for the identity value of `self` at `dtype`.
-    pub fn identity_ptx(self, dtype: DataType) -> PatinaResult<String> {
+    pub fn identity_ptx(self, dtype: DataType) -> BoltResult<String> {
         use DataType::*;
         use ReduceOp::*;
         match (self, dtype) {
@@ -100,7 +100,7 @@ impl ReduceOp {
             (Max, Float32) => Ok(format!("0f{:08X}", f32::NEG_INFINITY.to_bits())),
             (Max, Float64) => Ok(format!("0d{:016X}", f64::NEG_INFINITY.to_bits())),
 
-            (_, Bool) | (_, Utf8) => Err(PatinaError::Type(format!(
+            (_, Bool) | (_, Utf8) => Err(BoltError::Type(format!(
                 "agg_kernels: reduction over dtype {:?} is not supported",
                 dtype
             ))),
@@ -108,7 +108,7 @@ impl ReduceOp {
     }
 
     /// PTX combine instruction mnemonic for `self` at `dtype`.
-    pub fn combine_ptx(self, dtype: DataType) -> PatinaResult<String> {
+    pub fn combine_ptx(self, dtype: DataType) -> BoltResult<String> {
         use DataType::*;
         use ReduceOp::*;
         let s = match (self, dtype) {
@@ -128,7 +128,7 @@ impl ReduceOp {
             (Max, Float64) => "max.f64",
 
             (_, Bool) | (_, Utf8) => {
-                return Err(PatinaError::Type(format!(
+                return Err(BoltError::Type(format!(
                     "agg_kernels: reduction over dtype {:?} is not supported",
                     dtype
                 )))
@@ -147,7 +147,7 @@ impl ReduceOp {
 /// for `SUM` over a narrow signed integer this is wider than `dtype` and the
 /// kernel sign-extends each loaded value before accumulating. See
 /// `crate::plan::logical_plan::sum_output_dtype` for the widening contract.
-pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> PatinaResult<String> {
+pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<String> {
     // Input-side PTX info governs the global load from the source column.
     let (input_load_suffix, _input_store_suffix, input_reg_class, input_reg_ty, _input_imm_ty) =
         ptx_type_info(dtype)?;
@@ -165,13 +165,13 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> PatinaResult<S
     let combine = op.combine_ptx(acc_dtype)?;
 
     let input_elem_bytes = dtype.byte_width().ok_or_else(|| {
-        PatinaError::Other(format!(
+        BoltError::Other(format!(
             "agg_kernels: variable-width dtype {:?} not supported",
             dtype
         ))
     })?;
     let acc_elem_bytes = acc_dtype.byte_width().ok_or_else(|| {
-        PatinaError::Other(format!(
+        BoltError::Other(format!(
             "agg_kernels: variable-width accumulator dtype {:?} not supported",
             acc_dtype
         ))
@@ -480,7 +480,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> PatinaResult<S
             DataType::Bool | DataType::Utf8 => {
                 // ptx_type_info already rejects these dtypes above, so this
                 // arm is unreachable in practice. Keep the match exhaustive.
-                return Err(PatinaError::Type(format!(
+                return Err(BoltError::Type(format!(
                     "agg_kernels: warp-shuffle reduction over dtype {:?} is not supported",
                     acc_dtype
                 )));
@@ -532,14 +532,14 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> PatinaResult<S
 /// need to differ.
 fn ptx_type_info(
     dtype: DataType,
-) -> PatinaResult<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
+) -> BoltResult<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
     Ok(match dtype {
         DataType::Int32 => ("s32", "s32", "r", "b32", "s32"),
         DataType::Int64 => ("s64", "s64", "rl", "b64", "s64"),
         DataType::Float32 => ("f32", "f32", "f", "f32", "f32"),
         DataType::Float64 => ("f64", "f64", "fd", "f64", "f64"),
         DataType::Bool | DataType::Utf8 => {
-            return Err(PatinaError::Type(format!(
+            return Err(BoltError::Type(format!(
                 "agg_kernels: dtype {:?} not supported in reduction kernels",
                 dtype
             )))
@@ -547,7 +547,7 @@ fn ptx_type_info(
     })
 }
 
-/// Adapt an `std::fmt::Error` into a `PatinaError`.
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("agg_kernels: write failed: {}", e))
+/// Adapt an `std::fmt::Error` into a `BoltError`.
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("agg_kernels: write failed: {}", e))
 }

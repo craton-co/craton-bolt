@@ -138,7 +138,7 @@ the "Heavy-workload GPU results (2026-05-24, RTX 2060)" section of
 
 Plus the h2o.ai db-benchmark groupby subset (q1 / q2 / q3 / q4 /
 q5 at N = 10 M rows) must verify equivalent across Polars 0.42,
-DuckDB 1.2 and Craton Patina on the 100 K-row fixture before timing —
+DuckDB 1.2 and Craton Bolt on the 100 K-row fixture before timing —
 the same protocol as the original measurement run.
 
 If post-merge bench numbers do **not** match within ±3 %, the
@@ -155,9 +155,9 @@ Run before requesting review:
 - [ ] `cargo test --release --features cuda` — all tests green.
 - [ ] `cargo test --release --no-default-features --features cuda-stub`
       — stub-path tests green.
-- [ ] `PATINA_BENCH_GPU=1 cargo bench --bench query_benchmarks`
+- [ ] `BOLT_BENCH_GPU=1 cargo bench --bench query_benchmarks`
       — heavy-workload GPU numbers match `v0.2-handemit` within ±3 %.
-- [ ] `PATINA_BENCH_GPU=1 cargo bench --bench olap_benchmarks`
+- [ ] `BOLT_BENCH_GPU=1 cargo bench --bench olap_benchmarks`
       — h2o.ai subset verifies equivalent across all three engines
       on the 100 K-row fixture, then timings match `v0.2-handemit`
       within ±3 %.

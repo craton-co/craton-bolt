@@ -83,11 +83,11 @@ All notable changes to this project will be documented here. The format follows 
 - Float-MIN/MAX GROUP BY launch in `groupby_valid` now passes 7 params
   (kernel ABI) instead of 11; integer / float-SUM variants keep all 11.
   `debug_assert_eq!` on arg count at each launch site.
-- `pub fn craton_patina::sql()` convenience deleted (it constructed an Engine
+- `pub fn craton_bolt::sql()` convenience deleted (it constructed an Engine
   with no tables — unusable).
 - `pub struct Reg(pub u32)` IR type: field demoted to `pub(crate)` with
   a new `Reg::id() -> u32` accessor.
-- `PatinaError::Cuda` is now a tuple variant `Cuda(String)` (was a
+- `BoltError::Cuda` is now a tuple variant `Cuda(String)` (was a
   struct variant). Internal-only ergonomic; not part of the stable API.
 - `GpuBuffer::zeros` uses `cuMemsetD8` (no host alloc + memcpy).
 - IR types (`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`,
@@ -135,7 +135,7 @@ All notable changes to this project will be documented here. The format follows 
   alignment check; the `idx`-to-`usize` narrowing in
   `DictionaryColumnI64::to_string_array`.
 - **`n_rows as u32` silent truncation** across every executor launch
-  site, via a new `n_rows_to_u32(n_rows) -> PatinaResult<u32>` helper.
+  site, via a new `n_rows_to_u32(n_rows) -> BoltResult<u32>` helper.
 - **`pack_keys` UB shift**: bare `<<` replaced with `wrapping_shl` plus
   `debug_assert!(shift + bit_width <= 64, ...)`.
 - **`BooleanArray` null/false conflation** — upload now distinguishes
@@ -170,9 +170,9 @@ All notable changes to this project will be documented here. The format follows 
   (was: first NTFS-ordered entry).
 
 ### Removed
-- `PatinaError::Nvrtc` variant (Craton Patina uses `cuModuleLoadDataEx`, not
+- `BoltError::Nvrtc` variant (Craton Bolt uses `cuModuleLoadDataEx`, not
   NVRTC). The 4 jit_compiler.rs call sites migrated to `Cuda`.
-- `pub fn craton_patina::sql(query)` (broken — see Fixed).
+- `pub fn craton_bolt::sql(query)` (broken — see Fixed).
 
 ### Deprecated
 - `DataFrame::collect()` (use `into_plan()`; tombstone retained for 0.1
@@ -236,7 +236,7 @@ All notable changes to this project will be documented here. The format follows 
 #### Tests & benches
 - Memory-safety tests (`tests/memory_tests.rs`) — type-level proofs, compile-fail doctests, ignored live-GPU round-trips.
 - End-to-end tests (`tests/e2e_tests.rs`) — parser → plan → PTX-shape assertions; ignored live-GPU query verification.
-- Criterion benchmarks (`benches/query_benchmarks.rs`) — plan / lower / ptx_gen, CPU reference, Polars head-to-head, GPU engine path (gated behind `PATINA_BENCH_GPU=1`).
+- Criterion benchmarks (`benches/query_benchmarks.rs`) — plan / lower / ptx_gen, CPU reference, Polars head-to-head, GPU engine path (gated behind `BOLT_BENCH_GPU=1`).
 
 ### Build status
 
@@ -249,5 +249,5 @@ Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --
 - Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
 - Polars head-to-head numbers are not yet published.
 
-[unreleased]: https://github.com/craton-co/craton-patina/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/craton-co/craton-patina/releases/tag/v0.1.0
+[unreleased]: https://github.com/craton-co/craton-bolt/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/craton-co/craton-bolt/releases/tag/v0.1.0

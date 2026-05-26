@@ -14,7 +14,7 @@ use arrow_array::{Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::jit::partition_reduce_kernel_minmax::{MinMaxDtype, MinMaxOp};
@@ -30,7 +30,7 @@ const MIN_ROWS_FAST_PATH: usize = 64 * 1024;
 pub fn try_execute(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
-) -> Option<PatinaResult<RecordBatch>> {
+) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -102,7 +102,7 @@ fn execute_inner(
     op: MinMaxOp,
     val_dtype: MinMaxDtype,
     n_groups: u32,
-) -> PatinaResult<RecordBatch> {
+) -> BoltResult<RecordBatch> {
     let n_rows = key_arr.len() as u32;
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice(key_arr.values())?;
 
@@ -118,7 +118,7 @@ fn execute_inner(
             let vals_in: Vec<i32> = val_col
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .ok_or_else(|| PatinaError::Other("expected Int32Array".into()))?
+                .ok_or_else(|| BoltError::Other("expected Int32Array".into()))?
                 .values()
                 .to_vec();
             let vals_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice(&vals_in)?;
@@ -155,7 +155,7 @@ fn execute_inner(
                 ],
             )
             .map_err(|e| {
-                PatinaError::Other(format!(
+                BoltError::Other(format!(
                     "groupby_shmem_minmax_exec(i32): build error: {e}"
                 ))
             })
@@ -168,7 +168,7 @@ fn execute_inner(
             let vals_in: Vec<i64> = val_col
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| PatinaError::Other("expected Int64Array".into()))?
+                .ok_or_else(|| BoltError::Other("expected Int64Array".into()))?
                 .values()
                 .to_vec();
             let vals_gpu: GpuVec<i64> = GpuVec::<i64>::from_slice(&vals_in)?;
@@ -205,7 +205,7 @@ fn execute_inner(
                 ],
             )
             .map_err(|e| {
-                PatinaError::Other(format!(
+                BoltError::Other(format!(
                     "groupby_shmem_minmax_exec(i64): build error: {e}"
                 ))
             })
@@ -222,7 +222,7 @@ fn run_launch_i32(
     out_set_gpu: &mut GpuVec<u8>,
     n_rows: u32,
     n_groups: u32,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let ptx = compile_shmem_minmax_kernel(op, val_dtype)?;
     let module = CudaModule::from_ptx(&ptx)?;
     let entry = kernel_entry(op, val_dtype);
@@ -234,7 +234,7 @@ fn run_launch_i32(
         bytes_per_acc_slot: 4,
         max_shared_per_block: None,
     })
-    .map_err(|e| PatinaError::Other(format!("minmax tuner refused: {e}")))?;
+    .map_err(|e| BoltError::Other(format!("minmax tuner refused: {e}")))?;
 
     let view_keys = keys_gpu.view();
     let view_vals = vals_gpu.view();
@@ -269,7 +269,7 @@ fn run_launch_i64(
     out_set_gpu: &mut GpuVec<u8>,
     n_rows: u32,
     n_groups: u32,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let ptx = compile_shmem_minmax_kernel(op, val_dtype)?;
     let module = CudaModule::from_ptx(&ptx)?;
     let entry = kernel_entry(op, val_dtype);
@@ -281,7 +281,7 @@ fn run_launch_i64(
         bytes_per_acc_slot: 8,
         max_shared_per_block: None,
     })
-    .map_err(|e| PatinaError::Other(format!("minmax tuner refused: {e}")))?;
+    .map_err(|e| BoltError::Other(format!("minmax tuner refused: {e}")))?;
 
     let view_keys = keys_gpu.view();
     let view_vals = vals_gpu.view();
@@ -307,7 +307,7 @@ fn run_launch_i64(
     )
 }
 
-fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -318,7 +318,7 @@ fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
     }
 }
 
-fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

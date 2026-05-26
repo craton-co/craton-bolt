@@ -49,7 +49,7 @@
 //! dispatch through a single code path:
 //!
 //! ```text
-//! .visible .entry patina_groupby_agg(
+//! .visible .entry bolt_groupby_agg(
 //!     .param .u64 group_col_ptr,   // i64 group keys, length n_rows
 //!     .param .u64 keys_table_ptr,  // i64, length k, fully populated
 //!     .param .u64 input_col_ptr,   // T (Float32 or Float64), length n_rows
@@ -61,7 +61,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::jit::agg_kernels::ReduceOp;
 use crate::plan::logical_plan::DataType;
 
@@ -78,7 +78,7 @@ const EMPTY_KEY_LITERAL: &str = "-9223372036854775808";
 /// Entry-point name of the emitted kernel. Matches
 /// `hash_kernels::AGG_KERNEL_ENTRY` so the host can look the symbol up under a
 /// single name regardless of which compiler produced the PTX.
-pub const FLOAT_ATOMIC_AGG_ENTRY: &str = "patina_groupby_agg";
+pub const FLOAT_ATOMIC_AGG_ENTRY: &str = "bolt_groupby_agg";
 
 /// Generate a PTX kernel for `GROUP BY MIN(float)` / `MAX(float)`.
 ///
@@ -88,7 +88,7 @@ pub const FLOAT_ATOMIC_AGG_ENTRY: &str = "patina_groupby_agg";
 ///
 /// # Errors
 ///
-/// Returns `PatinaError::Other` for any `(op, dtype)` combination outside
+/// Returns `BoltError::Other` for any `(op, dtype)` combination outside
 /// `(Min | Max, Float32 | Float64)`. Sum/Count and integer dtypes are handled
 /// by `hash_kernels::compile_groupby_agg_kernel`; routing the wrong case here
 /// is a programmer error and we surface it loudly instead of silently
@@ -96,7 +96,7 @@ pub const FLOAT_ATOMIC_AGG_ENTRY: &str = "patina_groupby_agg";
 pub fn compile_groupby_float_atomic_kernel(
     op: ReduceOp,
     dtype: DataType,
-) -> PatinaResult<String> {
+) -> BoltResult<String> {
     // Validate inputs up front so the rest of the function can assume them.
     let cmp_setp = match (op, dtype) {
         (ReduceOp::Min, DataType::Float32) => "setp.lt.f32",
@@ -104,7 +104,7 @@ pub fn compile_groupby_float_atomic_kernel(
         (ReduceOp::Min, DataType::Float64) => "setp.lt.f64",
         (ReduceOp::Max, DataType::Float64) => "setp.gt.f64",
         (ReduceOp::Sum, _) | (ReduceOp::Count, _) => {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "float_atomics: only MIN/MAX are supported here (got {:?}); \
                  use hash_kernels::compile_groupby_agg_kernel for SUM/COUNT",
                 op
@@ -114,7 +114,7 @@ pub fn compile_groupby_float_atomic_kernel(
         | (_, DataType::Int32)
         | (_, DataType::Int64)
         | (_, DataType::Utf8) => {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "float_atomics: dtype {:?} is not a floating-point type; \
                  use hash_kernels::compile_groupby_agg_kernel for integer MIN/MAX",
                 dtype
@@ -130,7 +130,7 @@ pub fn compile_groupby_float_atomic_kernel(
         DataType::Float64 => ("b64", "f64", 8usize, "atom.global.cas.b64", "vrl", "vfd"),
         // Unreachable thanks to the validation above, but keep the match total.
         _ => {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "float_atomics: unexpected dtype {:?}",
                 dtype
             )));
@@ -373,9 +373,9 @@ pub fn compile_groupby_float_atomic_kernel(
     Ok(ptx)
 }
 
-/// Adapt a `std::fmt::Error` into a `PatinaError`.
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("float_atomics: write failed: {}", e))
+/// Adapt a `std::fmt::Error` into a `BoltError`.
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("float_atomics: write failed: {}", e))
 }
 
 #[cfg(test)]
@@ -395,7 +395,7 @@ mod tests {
             "expected setp.lt.f32 (MIN comparison) in emitted PTX, got:\n{ptx}"
         );
         assert!(
-            ptx.contains("patina_groupby_agg"),
+            ptx.contains("bolt_groupby_agg"),
             "expected entry point name in emitted PTX, got:\n{ptx}"
         );
         assert!(
@@ -417,7 +417,7 @@ mod tests {
             "expected setp.gt.f64 (MAX comparison) in emitted PTX, got:\n{ptx}"
         );
         assert!(
-            ptx.contains("patina_groupby_agg"),
+            ptx.contains("bolt_groupby_agg"),
             "expected entry point name in emitted PTX, got:\n{ptx}"
         );
     }

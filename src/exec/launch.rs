@@ -10,7 +10,7 @@ use std::ptr;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr, CUstream};
 use crate::cuda::{GpuView, GpuViewMut};
-use crate::error::PatinaResult;
+use crate::error::BoltResult;
 use crate::jit::CudaFunction;
 
 /// Threads per block for the 1D launch (one thread per row).
@@ -32,7 +32,7 @@ impl CudaStream {
     }
 
     /// Create a new non-blocking stream.
-    pub fn new() -> PatinaResult<Self> {
+    pub fn new() -> BoltResult<Self> {
         let mut s: CUstream = ptr::null_mut();
         unsafe {
             cuda_sys::check(cuda_sys::cuStreamCreate(&mut s, 0))?;
@@ -49,7 +49,7 @@ impl CudaStream {
     }
 
     /// Block the caller until all prior work on this stream completes.
-    pub fn synchronize(&self) -> PatinaResult<()> {
+    pub fn synchronize(&self) -> BoltResult<()> {
         unsafe { cuda_sys::check(cuda_sys::cuStreamSynchronize(self.raw)) }
     }
 }
@@ -60,7 +60,7 @@ impl Drop for CudaStream {
             unsafe {
                 let rc = cuda_sys::cuStreamDestroy_v2(self.raw);
                 if rc != cuda_sys::CUDA_SUCCESS {
-                    log::warn!("craton-patina: cuStreamDestroy failed ({})", rc);
+                    log::warn!("craton-bolt: cuStreamDestroy failed ({})", rc);
                 }
             }
         }
@@ -164,7 +164,7 @@ pub fn launch_with_geometry(
     shared_bytes: u32,
     stream: &CudaStream,
     args: &mut KernelArgs<'_>,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let mut kernel_params: Vec<*mut c_void> =
         Vec::with_capacity(args.ptrs.len() + args.scalars.len());
     for p in args.ptrs.iter_mut() {
@@ -200,7 +200,7 @@ pub fn launch_1d(
     function: CudaFunction<'_>,
     stream: &CudaStream,
     args: &mut KernelArgs<'_>,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let grid_x = ((args.n_rows + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE).max(1);
 
     // Build the kernel-parameter pointer array. Each entry is a *mut c_void

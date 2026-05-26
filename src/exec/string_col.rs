@@ -27,7 +27,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
 
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::GpuVec;
-use crate::error::PatinaResult;
+use crate::error::BoltResult;
 
 /// Extension of `engine.rs`'s `DeviceCol` enum for non-primitive dtypes.
 ///
@@ -68,7 +68,7 @@ impl ExtendedDeviceCol {
     /// * Otherwise returns [`ExtendedDeviceCol::BoolNullable`] with a value
     ///   buffer (`1`=true, `0`=false-or-null) AND a parallel validity buffer
     ///   (`1`=non-null, `0`=null). See the variant docs for the contract.
-    pub fn upload_bool(arr: &BooleanArray) -> PatinaResult<Self> {
+    pub fn upload_bool(arr: &BooleanArray) -> BoltResult<Self> {
         let n = arr.len();
         if arr.null_count() == 0 {
             let mut bytes: Vec<u8> = Vec::with_capacity(n);
@@ -102,14 +102,14 @@ impl ExtendedDeviceCol {
     }
 
     /// Upload a `StringArray` as a dictionary column.
-    pub fn upload_utf8(arr: &StringArray) -> PatinaResult<Self> {
+    pub fn upload_utf8(arr: &StringArray) -> BoltResult<Self> {
         let dict = DictionaryColumn::from_string_array(arr)?;
         Ok(ExtendedDeviceCol::Utf8(dict))
     }
 
     /// Allocate a zero-initialised Bool column of `len` rows (all bytes 0 →
     /// all rows decode to `false`).
-    pub fn alloc_bool(len: usize) -> PatinaResult<Self> {
+    pub fn alloc_bool(len: usize) -> BoltResult<Self> {
         let gpu = GpuVec::<u8>::zeros(len)?;
         Ok(ExtendedDeviceCol::Bool(gpu))
     }
@@ -125,7 +125,7 @@ impl ExtendedDeviceCol {
     /// can be uploaded/used as a kernel target, but `download()` will only
     /// succeed if every output index is `0` (NULL). Use `None` only when the
     /// column will be overwritten before any decode.
-    pub fn alloc_utf8(len: usize, dict: Option<Vec<String>>) -> PatinaResult<Self> {
+    pub fn alloc_utf8(len: usize, dict: Option<Vec<String>>) -> BoltResult<Self> {
         let indices = GpuVec::<i32>::zeros(len)?;
         Ok(ExtendedDeviceCol::Utf8(DictionaryColumn {
             dictionary: dict.unwrap_or_default(),
@@ -159,7 +159,7 @@ impl ExtendedDeviceCol {
 
     /// Download back to an Arrow `ArrayRef`. `BoolNullable` materialises a
     /// nullable `BooleanArray` by zipping values with the validity buffer.
-    pub fn download(&self) -> PatinaResult<ArrayRef> {
+    pub fn download(&self) -> BoltResult<ArrayRef> {
         match self {
             ExtendedDeviceCol::Bool(v) => {
                 let host: Vec<u8> = v.to_vec()?;

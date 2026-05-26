@@ -1,6 +1,6 @@
 ﻿---
 name: Feature request
-about: Suggest a new capability for Craton Patina
+about: Suggest a new capability for Craton Bolt
 title: "[feature] "
 labels: enhancement
 ---

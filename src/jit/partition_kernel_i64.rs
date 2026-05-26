@@ -58,7 +58,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// Number of hash partitions. MUST match the i32 sibling so the host-side
 /// orchestrator can use the same `compute_partition_offsets` and Tier-2
@@ -76,14 +76,14 @@ pub const BLOCK_THREADS: u32 = 256;
 
 /// Entry-point name embedded in the emitted PTX. Distinct from the i32
 /// sibling so both modules can be loaded into the same CUDA context.
-pub const KERNEL_ENTRY: &str = "patina_partition_i64";
+pub const KERNEL_ENTRY: &str = "bolt_partition_i64";
 
 /// Generate PTX for the **i64-key** hash-partition pass-1 kernel.
 ///
 /// Kernel signature (PTX-level):
 ///
 /// ```text
-/// .visible .entry patina_partition_i64(
+/// .visible .entry bolt_partition_i64(
 ///     .param .u64 keys_ptr,           // const int64_t*  keys[n_rows]
 ///     .param .u64 partition_ids_ptr,  //       uint32_t* partition_ids[n_rows]
 ///     .param .u64 counts_ptr,         //       uint32_t* counts[NUM_PARTITIONS]
@@ -94,7 +94,7 @@ pub const KERNEL_ENTRY: &str = "patina_partition_i64";
 /// `counts` MUST be zero-initialised by the caller before launch.
 ///
 /// Deterministic and pure: same input → same output, no I/O.
-pub fn compile_partition_kernel_i64() -> PatinaResult<String> {
+pub fn compile_partition_kernel_i64() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
     // Shift count = 64 - log2(NUM_PARTITIONS). For K=4096 → 52.
@@ -210,8 +210,8 @@ pub fn compile_partition_kernel_i64() -> PatinaResult<String> {
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("partition_kernel_i64: write failed: {}", e))
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("partition_kernel_i64: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ mod tests {
             "PTX must declare .visible .entry {}(  — got:\n{ptx}",
             KERNEL_ENTRY
         );
-        assert_eq!(KERNEL_ENTRY, "patina_partition_i64");
+        assert_eq!(KERNEL_ENTRY, "bolt_partition_i64");
     }
 
     /// The partition id is the TOP 10 bits of the 64-bit multiplied product,
@@ -286,7 +286,7 @@ mod tests {
         assert!(!ptx.is_empty(), "compile returned empty PTX");
         assert!(
             ptx.contains(".version 7.5") && ptx.contains(".target sm_70"),
-            "PTX must include the standard Craton Patina module header:\n{ptx}"
+            "PTX must include the standard Craton Bolt module header:\n{ptx}"
         );
     }
 }

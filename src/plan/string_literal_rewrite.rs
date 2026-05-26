@@ -18,7 +18,7 @@
 //!   * If `'lit'` is not in the dictionary, the predicate is constant-folded:
 //!     `=` → `Bool(false)`, `<>` → `Bool(true)`.
 //!
-//! Unsupported (returns `PatinaError::Plan`):
+//! Unsupported (returns `BoltError::Plan`):
 //!   * `< <= > >=` on Utf8 columns with Utf8 literals — dictionary indices
 //!     reflect insertion order, not lexicographic order, so these can't be
 //!     reduced to integer comparison without a collation pass.
@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 
 use crate::cuda::dictionary_any::DictionaryColumnAny;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema,
 };
@@ -177,8 +177,8 @@ impl<'a> StringPredicateRewriter<'a> {
     /// columns when they're not already present.
     ///
     /// Returns a new owned plan. Unsupported string ops (`Lt`/`Gt`/...)
-    /// yield [`PatinaError::Plan`].
-    pub fn rewrite(&self, plan: &LogicalPlan) -> PatinaResult<LogicalPlan> {
+    /// yield [`BoltError::Plan`].
+    pub fn rewrite(&self, plan: &LogicalPlan) -> BoltResult<LogicalPlan> {
         rewrite_plan_with(plan, self)
     }
 }
@@ -259,7 +259,7 @@ fn extract_col_and_string_lit(left: &Expr, right: &Expr) -> Option<(String, Stri
 }
 
 /// Recursive expression rewrite, post-order: children first, then `self`.
-fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> PatinaResult<Expr> {
+fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> BoltResult<Expr> {
     match expr {
         Expr::Column(_) | Expr::Literal(_) => Ok(expr.clone()),
         Expr::Alias(inner, name) => {
@@ -320,7 +320,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> PatinaResult<Exp
                             }
                         }
                     } else if is_ordering(*op) {
-                        return Err(PatinaError::Plan(format!(
+                        return Err(BoltError::Plan(format!(
                             "ordering comparison {op:?} on Utf8 column '{col_name}' \
                              requires dictionary collation (not yet implemented)"
                         )));
@@ -346,7 +346,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> PatinaResult<Exp
 fn rewrite_plan_with<R: LiteralResolver>(
     plan: &LogicalPlan,
     r: &R,
-) -> PatinaResult<LogicalPlan> {
+) -> BoltResult<LogicalPlan> {
     match plan {
         LogicalPlan::Scan {
             table,
@@ -463,7 +463,7 @@ fn rewrite_plan_with<R: LiteralResolver>(
             let new_inputs = inputs
                 .iter()
                 .map(|inp| rewrite_plan_with(inp, r))
-                .collect::<PatinaResult<Vec<_>>>()?;
+                .collect::<BoltResult<Vec<_>>>()?;
             Ok(LogicalPlan::Union { inputs: new_inputs })
         }
         LogicalPlan::Join { left, right, join_type, on } => {
@@ -777,14 +777,14 @@ mod tests {
         let expr = col("region").lt(lit("US"));
         let err = rewrite_expr_with(&expr, &r).unwrap_err();
         match err {
-            PatinaError::Plan(msg) => {
+            BoltError::Plan(msg) => {
                 assert!(
                     msg.contains("ordering comparison"),
                     "expected ordering message, got: {msg}"
                 );
                 assert!(msg.contains("region"), "expected column name in: {msg}");
             }
-            other => panic!("expected PatinaError::Plan, got {other:?}"),
+            other => panic!("expected BoltError::Plan, got {other:?}"),
         }
     }
 

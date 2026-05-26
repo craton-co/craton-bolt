@@ -1,6 +1,6 @@
 ﻿# 05 — PTX Loader Compatibility
 
-> **Scope.** Can Craton Patina's existing PTX loader (`crate::jit::jit_compiler::CudaModule::from_ptx`) consume PTX emitted by `rustc_codegen_nvvm` (the rust-cuda backend) without modification? This note compares the two PTX dialects, identifies sharp corners, and ends with a drop-in test plan.
+> **Scope.** Can Craton Bolt's existing PTX loader (`crate::jit::jit_compiler::CudaModule::from_ptx`) consume PTX emitted by `rustc_codegen_nvvm` (the rust-cuda backend) without modification? This note compares the two PTX dialects, identifies sharp corners, and ends with a drop-in test plan.
 
 ## 1. What does `rustc_codegen_nvvm` output look like?
 
@@ -38,15 +38,15 @@ A representative header from a `cuda_std`-based kernel compiled for the default 
 }
 ```
 
-Craton Patina's `partition_kernel::compile_partition_kernel()` emits:
+Craton Bolt's `partition_kernel::compile_partition_kernel()` emits:
 
 ```ptx
 .version 7.5
 .target sm_70
 .address_size 64
 
-.visible .entry patina_partition(
-	.param .u64 patina_partition_param_0,
+.visible .entry bolt_partition(
+	.param .u64 bolt_partition_param_0,
 	...
 ```
 
@@ -56,10 +56,10 @@ Craton Patina's `partition_kernel::compile_partition_kernel()` emits:
 
 **Yes**, in the common case. The driver's in-process assembler is the same one that swallows hand-written PTX, NVCC PTX, and NVRTC PTX. Specifically:
 
-- **`.version` skew is fine.** The driver accepts any `.version` ≤ the PTX ISA its libnvvm/PTXAS supports. Craton Patina links CUDA 12.6, which supports PTX ISA 8.5; both 7.5 and 7.8 are well below the ceiling. Forward-compat (loading a 7.8 module on a CUDA 11.x driver) would fail, but Craton Patina's stated baseline is CUDA 12.6.
+- **`.version` skew is fine.** The driver accepts any `.version` ≤ the PTX ISA its libnvvm/PTXAS supports. Craton Bolt links CUDA 12.6, which supports PTX ISA 8.5; both 7.5 and 7.8 are well below the ceiling. Forward-compat (loading a 7.8 module on a CUDA 11.x driver) would fail, but Craton Bolt's stated baseline is CUDA 12.6.
 - **`.extern .func vprintf` is benign.** It is satisfied by an implicit driver-provided stub — no host action needed. The same is true for `malloc`/`free` (the device heap is allocated by the runtime on first use).
 - **libdevice math (`__nv_*`).** `rustc_codegen_nvvm`'s pipeline runs libdevice link + DCE **inside libnvvm at PTX-emit time** (this is the whole point of going through NVVM rather than the upstream LLVM nvptx backend). The emitted PTX is therefore *self-contained*: any `__nv_sinf` / `__nv_log` calls have been inlined or specialised, and the resulting PTX has no unresolved math externs that `cuModuleLoadDataEx` would need to link.
-- **Device-side intrinsics requiring special linking.** None in the practical set: `vprintf` is auto-linked; dynamic parallelism (`cudaLaunchDevice`) would need `cuLink*`, but Craton Patina doesn't use it and `cuda_std` doesn't emit it for ordinary kernels.
+- **Device-side intrinsics requiring special linking.** None in the practical set: `vprintf` is auto-linked; dynamic parallelism (`cudaLaunchDevice`) would need `cuLink*`, but Craton Bolt doesn't use it and `cuda_std` doesn't emit it for ordinary kernels.
 
 **Bottom line:** dropping a `rustc_codegen_nvvm`-emitted PTX string into `CudaModule::from_ptx(&str)` works in v0 without changes to the loader.
 
@@ -67,24 +67,24 @@ Craton Patina's `partition_kernel::compile_partition_kernel()` emits:
 
 `cuModuleLoadData` will also accept NVVM IR / LLVM bitcode, but only via the bitcode path — and `rustc_codegen_nvvm` does **not** hand you bitcode by default. `cuda_builder` writes `.ptx` text. The PTX is produced inside `cuda_builder` by calling into `libnvvm` (the NVVM → PTX JIT) before the artifact ever reaches user code.
 
-This means: **no load-path change**. The bytes Craton Patina will hash and `CString::new` are still PTX text, identical in *kind* to what `compile_partition_kernel()` returns today. The `nvvm_options` knobs (`-arch=compute_70`, `-O3`, `-ftz=1`, etc.) are passed to `cuda_builder`, not to the driver — they bake into the produced PTX.
+This means: **no load-path change**. The bytes Craton Bolt will hash and `CString::new` are still PTX text, identical in *kind* to what `compile_partition_kernel()` returns today. The `nvvm_options` knobs (`-arch=compute_70`, `-O3`, `-ftz=1`, etc.) are passed to `cuda_builder`, not to the driver — they bake into the produced PTX.
 
 ## 4. Cache compatibility (`PtxCache`)
 
-Craton Patina's `PtxCache` keys off `DefaultHasher::hash(ptx_text)`. The cache contract requires that **the same logical kernel produces byte-identical PTX text**. For hand-emitted PTX this is true by construction (deterministic Rust string builder).
+Craton Bolt's `PtxCache` keys off `DefaultHasher::hash(ptx_text)`. The cache contract requires that **the same logical kernel produces byte-identical PTX text**. For hand-emitted PTX this is true by construction (deterministic Rust string builder).
 
 For `rustc_codegen_nvvm` output, determinism has two layers:
 
 1. **Within one rustc invocation:** deterministic. NVVM is deterministic, libnvvm's PTX printer is deterministic, and `cuda_builder` does not inject timestamps into the PTX body (the comment banner does carry a build ID, but that's stable across re-runs of the same toolchain).
 2. **Across rustc upgrades / toolchain changes:** NOT deterministic. A nightly bump can change MIR optimisation, LLVM versions inside libnvvm, or NVVM's PTX printer style (whitespace, register naming, basic-block ordering). The build ID comment alone will change.
 
-This is fine for Craton Patina's cache because the cache is **process-wide**, not on-disk. Within one process the PTX is fixed (it was either compiled at `build.rs` time and `include_str!`-ed, or fetched once and reused). Cache hits on PTX-text equality will hit; cross-process determinism is not required.
+This is fine for Craton Bolt's cache because the cache is **process-wide**, not on-disk. Within one process the PTX is fixed (it was either compiled at `build.rs` time and `include_str!`-ed, or fetched once and reused). Cache hits on PTX-text equality will hit; cross-process determinism is not required.
 
 **One actionable note:** if 0.3 also adds an on-disk PTX cache, key it by `(rust-cuda crate version, target-cpu, source-crate hash)` — *not* by PTX hash — because the toolchain dependency makes the PTX hash a leaky cache key.
 
 ## 5. Kernel entry-point naming
 
-Craton Patina currently resolves entry points like `"patina_partition"` via `cuModuleGetFunction`. Rust's mangling will produce something like `_ZN16my_kernels_crate9partition17h<hash>E` by default — fatal for a name-keyed lookup.
+Craton Bolt currently resolves entry points like `"bolt_partition"` via `cuModuleGetFunction`. Rust's mangling will produce something like `_ZN16my_kernels_crate9partition17h<hash>E` by default — fatal for a name-keyed lookup.
 
 The standard rust-cuda fix is the **`#[kernel]`** attribute (provided by `cuda_std` / `cuda_macros`), which expands to roughly:
 
@@ -93,22 +93,22 @@ The standard rust-cuda fix is the **`#[kernel]`** attribute (provided by `cuda_s
 pub unsafe extern "ptx-kernel" fn partition(...) { ... }
 ```
 
-`#[no_mangle]` produces a plain symbol; `extern "ptx-kernel"` emits `.visible .entry` rather than a `.visible .func`. Together these yield exactly the symbol Craton Patina's existing `function(name)` call expects.
+`#[no_mangle]` produces a plain symbol; `extern "ptx-kernel"` emits `.visible .entry` rather than a `.visible .func`. Together these yield exactly the symbol Craton Bolt's existing `function(name)` call expects.
 
-If finer control is needed, `#[export_name = "patina_partition"]` overrides the symbol used. Use that to keep the dispatcher's hard-coded `KERNEL_ENTRY = "patina_partition"` constants unchanged when porting a kernel: the Rust function can still be called `partition` in source while emitting as `patina_partition` in PTX.
+If finer control is needed, `#[export_name = "bolt_partition"]` overrides the symbol used. Use that to keep the dispatcher's hard-coded `KERNEL_ENTRY = "bolt_partition"` constants unchanged when porting a kernel: the Rust function can still be called `partition` in source while emitting as `bolt_partition` in PTX.
 
 ## 6. Atomic instruction lowering
 
-Craton Patina's hand-emit uses `atom.global.add.u32`, `atom.shared.cas.b32`, etc. — single PTX instructions that map 1:1 to SM 7.0+ hardware atomics.
+Craton Bolt's hand-emit uses `atom.global.add.u32`, `atom.shared.cas.b32`, etc. — single PTX instructions that map 1:1 to SM 7.0+ hardware atomics.
 
 `cuda_std::atomic::*` lowers via inline asm to the same family:
 
 - `AtomicU32::fetch_add(Relaxed)` → `atom.relaxed.gpu.global.add.u32`
 - `AtomicU32::compare_exchange(...)` → `atom.relaxed.gpu.global.cas.b32`
 
-The `.sem` qualifier (`relaxed`/`acquire`/`release`/`acq_rel`) is added — this is **stricter** than Craton Patina's bare `atom.global.add.u32` (which defaults to relaxed). The bare form and `atom.relaxed.*` form lower to the same SASS on SM 7.0+; performance and semantics are equivalent. On pre-SM 7.0, `cuda_std` falls back to a CAS loop with `membar.sys`, but Craton Patina's target is `sm_70`+, so that path is not exercised.
+The `.sem` qualifier (`relaxed`/`acquire`/`release`/`acq_rel`) is added — this is **stricter** than Craton Bolt's bare `atom.global.add.u32` (which defaults to relaxed). The bare form and `atom.relaxed.*` form lower to the same SASS on SM 7.0+; performance and semantics are equivalent. On pre-SM 7.0, `cuda_std` falls back to a CAS loop with `membar.sys`, but Craton Bolt's target is `sm_70`+, so that path is not exercised.
 
-Float atomic add on f64 is the one to watch: Craton Patina's `float_atomics.rs` emits an explicit CAS loop. `cuda_std::AtomicF64::fetch_add` for SM 6.0+ uses native `atom.add.f64` (Pascal+ has it). The two are semantically equivalent (IEEE-relaxed) but lower to different SASS. No correctness issue — just don't expect bit-identical numerical results on multi-thread reductions, which was already a moot expectation (atomic float reductions are non-associative).
+Float atomic add on f64 is the one to watch: Craton Bolt's `float_atomics.rs` emits an explicit CAS loop. `cuda_std::AtomicF64::fetch_add` for SM 6.0+ uses native `atom.add.f64` (Pascal+ has it). The two are semantically equivalent (IEEE-relaxed) but lower to different SASS. No correctness issue — just don't expect bit-identical numerical results on multi-thread reductions, which was already a moot expectation (atomic float reductions are non-associative).
 
 ## 7. Mixed-mode loading
 
@@ -116,7 +116,7 @@ The `PtxCache` stores `Arc<CudaModuleInner>` keyed by PTX text. There is **no pe
 
 Two latent pitfalls worth noting:
 
-- **CUDA context.** Both paths assume a current context (set by Craton Patina's executor). `cuda_builder` examples often use the runtime API in the host shim; `cuda_std` kernels themselves don't care. As long as Craton Patina keeps using the driver API (`cuCtxSetCurrent`), there's no conflict.
+- **CUDA context.** Both paths assume a current context (set by Craton Bolt's executor). `cuda_builder` examples often use the runtime API in the host shim; `cuda_std` kernels themselves don't care. As long as Craton Bolt keeps using the driver API (`cuCtxSetCurrent`), there's no conflict.
 - **`libnvvm` static state.** `libnvvm` is only invoked at `cuda_builder` build time (offline), not at runtime — so there is no in-process global to worry about. The driver's PTXAS runs in a worker thread but is re-entrant.
 
 Mixed-mode is therefore safe today. Both PTX strings flow through the same `cuModuleLoadDataEx`, populate distinct cache slots, and produce distinct `CUmodule` handles.
@@ -132,7 +132,7 @@ A minimal end-to-end test that proves rust-cuda PTX → `CudaModule::from_ptx` w
 use cuda_std::prelude::*;
 
 #[kernel]
-#[export_name = "patina_rust_cuda_smoke"]
+#[export_name = "bolt_rust_cuda_smoke"]
 pub unsafe fn smoke(input: &[i32], out: *mut i32) {
     let i = thread::index_1d() as usize;
     if i < input.len() {
@@ -146,27 +146,27 @@ pub unsafe fn smoke(input: &[i32], out: *mut i32) {
 **Host test** (`tests/rust_cuda_smoke.rs`):
 
 ```rust
-use craton_patina::jit::jit_compiler::CudaModule;
+use craton_bolt::jit::jit_compiler::CudaModule;
 // PTX embedded at build time by cuda_builder
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/rust_cuda_kernel.ptx"));
 
 #[test]
 fn rust_cuda_ptx_loads_and_runs() {
-    // 1. Ensure CUDA context is current (Craton Patina's standard setup helper).
-    let _ctx = craton_patina::cuda::test_support::ensure_ctx();
+    // 1. Ensure CUDA context is current (Craton Bolt's standard setup helper).
+    let _ctx = craton_bolt::cuda::test_support::ensure_ctx();
 
-    // 2. Load via Craton Patina's existing PTX loader — no special path.
+    // 2. Load via Craton Bolt's existing PTX loader — no special path.
     let module = CudaModule::from_ptx(PTX).expect("from_ptx accepts rust-cuda PTX");
 
     // 3. Symbol lookup by the export_name from the Rust source.
-    let func = module.function("patina_rust_cuda_smoke")
+    let func = module.function("bolt_rust_cuda_smoke")
         .expect("entry point resolved by name");
 
     // 4. Launch with a small input and verify the sum.
     let input: Vec<i32> = (0..1024).collect();
     let mut out: u32 = 0;
-    // (use Craton Patina's existing launch helper from src/exec/launch.rs)
-    craton_patina::exec::launch::launch_smoke(func, &input, &mut out);
+    // (use Craton Bolt's existing launch helper from src/exec/launch.rs)
+    craton_bolt::exec::launch::launch_smoke(func, &input, &mut out);
 
     assert_eq!(out as i32, input.iter().sum::<i32>());
 
@@ -178,6 +178,6 @@ fn rust_cuda_ptx_loads_and_runs() {
 }
 ```
 
-**What this proves**, in order: (1) `cuModuleLoadDataEx` accepts rust-cuda PTX bytes-for-bytes; (2) `#[export_name]` controls the symbol exactly as expected; (3) `cuda_std` atomics lower to instructions the driver assembles for `sm_70`; (4) Craton Patina's process-wide cache treats rust-cuda PTX identically to hand-emitted PTX.
+**What this proves**, in order: (1) `cuModuleLoadDataEx` accepts rust-cuda PTX bytes-for-bytes; (2) `#[export_name]` controls the symbol exactly as expected; (3) `cuda_std` atomics lower to instructions the driver assembles for `sm_70`; (4) Craton Bolt's process-wide cache treats rust-cuda PTX identically to hand-emitted PTX.
 
 If all four assertions hold, the milestone-0.3 migration is a **per-kernel** replacement of `compile_*_kernel() -> String` with `include_str!`, with no loader/cache/launch changes required.

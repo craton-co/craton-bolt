@@ -1,4 +1,4 @@
-﻿# Contributing to Craton Patina
+﻿# Contributing to Craton Bolt
 
 Thank you for considering a contribution. This file covers what you need to know to get a useful change into the tree.
 
@@ -29,7 +29,7 @@ See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the full build and test wor
 
 ```bash
 git clone <your-fork>
-cd craton-patina
+cd craton-bolt
 cargo check --lib --tests --benches      # works without CUDA installed
 cargo test                                # needs cuda.lib on the linker path
 cargo test -- --ignored                   # needs an actual GPU
@@ -39,7 +39,7 @@ cargo test -- --ignored                   # needs an actual GPU
 
 - `rustfmt` defaults. Run `cargo fmt` before committing.
 - `clippy` lints clean. Run `cargo clippy --all-targets`. Pragmatic exceptions allowed if you explain.
-- **No `unwrap()` or `panic!()` in library code.** Errors must flow through `PatinaResult<T>` / `PatinaError`. `unwrap` is fine in `#[cfg(test)]` modules and in benchmarks where the harness can't surface a Result.
+- **No `unwrap()` or `panic!()` in library code.** Errors must flow through `BoltResult<T>` / `BoltError`. `unwrap` is fine in `#[cfg(test)]` modules and in benchmarks where the harness can't surface a Result.
 - **No `unsafe` outside the documented FFI boundaries.** The CUDA driver calls in `src/cuda/cuda_sys.rs` and the raw `cuLaunchKernel` parameter assembly in `src/exec/engine.rs` are the only sanctioned exceptions. New `unsafe` blocks need a `// SAFETY:` comment explaining the invariant.
 - **No new dependencies without discussion.** The current dep set is deliberate. If you need a new crate, justify it in the PR description.
 
@@ -47,7 +47,7 @@ cargo test -- --ignored                   # needs an actual GPU
 
 - Adding a new `pub mod foo` requires adding it to the corresponding `mod.rs`.
 - New executors go in `src/exec/`. The `Engine::execute` dispatch in `src/exec/engine.rs` is the integration point.
-- New PTX kernels go in `src/jit/`. The convention is: emitters return `PatinaResult<String>` and entry-point names are `pub const` symbols.
+- New PTX kernels go in `src/jit/`. The convention is: emitters return `BoltResult<String>` and entry-point names are `pub const` symbols.
 - New CUDA layer types (alternative dictionaries, buffer flavours) go in `src/cuda/`.
 - Plan / IR work goes in `src/plan/`.
 
@@ -94,7 +94,7 @@ intentional gaps — flag in your PR if you want to tackle one.
 
 ## Licensing of contributions
 
-Craton Patina is licensed under the [Apache License, Version 2.0](LICENSE). By
+Craton Bolt is licensed under the [Apache License, Version 2.0](LICENSE). By
 submitting a pull request, issue, or patch, you confirm that you have the
 right to license the contribution under those terms and that you agree to
 do so. No separate Contributor License Agreement (CLA) is required —

@@ -40,7 +40,7 @@ use arrow_schema::DataType as ArrowDataType;
 
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::dictionary_any::DictionaryColumnAny;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{DataType, Field, LogicalPlan, Schema};
 use crate::plan::string_literal_rewrite::{index_column_name, StringPredicateRewriter};
 
@@ -80,7 +80,7 @@ impl DictRegistry {
         &mut self,
         table: impl Into<String>,
         batch: &RecordBatch,
-    ) -> PatinaResult<()> {
+    ) -> BoltResult<()> {
         let table = table.into();
         let mut cols: HashMap<String, DictionaryColumnAny> = HashMap::new();
 
@@ -94,7 +94,7 @@ impl DictRegistry {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| {
-                    PatinaError::Type(format!(
+                    BoltError::Type(format!(
                         "column '{}' in table '{}' declared Utf8 but did not downcast to StringArray (got {:?})",
                         field.name(),
                         table,
@@ -134,7 +134,7 @@ impl DictRegistry {
     /// If no scanned table has any Utf8 dictionaries the rewriter is empty
     /// and the returned plan is functionally a clone of `plan` (the
     /// rewriter is a no-op when `knows()` returns false for every column).
-    pub fn rewrite_plan(&self, plan: &LogicalPlan) -> PatinaResult<LogicalPlan> {
+    pub fn rewrite_plan(&self, plan: &LogicalPlan) -> BoltResult<LogicalPlan> {
         let tables = collect_scan_tables(plan);
         let mut rewriter = StringPredicateRewriter::new();
         for table in &tables {

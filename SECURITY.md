@@ -1,10 +1,10 @@
 ﻿# Security Policy
 
-Thank you for helping keep Craton Patina and its users safe.
+Thank you for helping keep Craton Bolt and its users safe.
 
 ## Supported versions
 
-Craton Patina is pre-1.0. Only the latest `0.1.x` release line receives security
+Craton Bolt is pre-1.0. Only the latest `0.1.x` release line receives security
 fixes. Older `0.1.x` patches are not backported.
 
 | Version | Supported          |
@@ -48,7 +48,7 @@ if you prefer.
 
 ## Scope
 
-In scope: anything shipped from this repository — the Craton Patina Rust crate,
+In scope: anything shipped from this repository — the Craton Bolt Rust crate,
 its build scripts, CI workflows, and documentation.
 
 Out of scope: vulnerabilities in upstream dependencies (please report

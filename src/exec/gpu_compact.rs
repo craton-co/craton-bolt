@@ -39,7 +39,7 @@ use std::ptr;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::jit_compiler::CudaModule;
@@ -175,7 +175,7 @@ impl GatheredCol {
     /// that `ExtendedDeviceCol::BoolNullable::download` uses for the
     /// uncompacted upload-side path. This is what preserves W5A2's
     /// per-row null-ness across the GPU prefix-scan + gather pipeline.
-    pub fn download(&self) -> crate::error::PatinaResult<arrow_array::ArrayRef> {
+    pub fn download(&self) -> crate::error::BoltResult<arrow_array::ArrayRef> {
         use std::sync::Arc;
         match self {
             GatheredCol::I32(v) => {
@@ -209,7 +209,7 @@ impl GatheredCol {
                 // want a clean error instead of a silent truncation in
                 // `zip`.
                 if host_values.len() != host_validity.len() {
-                    return Err(PatinaError::Other(format!(
+                    return Err(BoltError::Other(format!(
                         "GatheredCol::BoolNullable buffer length mismatch: \
                          values={}, validity={}",
                         host_values.len(),
@@ -236,7 +236,7 @@ pub fn prefix_scan_mask(
     mask_ptr: CUdeviceptr,
     n_rows: usize,
     stream: &CudaStream,
-) -> PatinaResult<ScanResult> {
+) -> BoltResult<ScanResult> {
     if n_rows == 0 {
         return Ok(ScanResult {
             local_indices: GpuVec::<u32>::empty(),
@@ -342,20 +342,20 @@ pub fn gather_one(
     scan: &ScanResult,
     dtype: DataType,
     stream: &CudaStream,
-) -> PatinaResult<GatheredCol> {
+) -> BoltResult<GatheredCol> {
     if matches!(dtype, DataType::Utf8) {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "gpu_compact: gather Utf8 not supported (variable-width)".into(),
         ));
     }
     if scan.n_rows != n_rows {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "gpu_compact: scan.n_rows={} mismatches input n_rows={}",
             scan.n_rows, n_rows
         )));
     }
     if scan.local_indices.len() != n_rows {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "gpu_compact: scan.local_indices.len()={} mismatches n_rows={}",
             scan.local_indices.len(),
             n_rows
@@ -457,7 +457,7 @@ pub fn gather_bool_nullable(
     n_rows: usize,
     scan: &ScanResult,
     stream: &CudaStream,
-) -> PatinaResult<GatheredCol> {
+) -> BoltResult<GatheredCol> {
     // Two independent gather launches, both keyed off the same `scan`. The
     // kernel ABI handles one buffer at a time; we re-use the scan products
     // (local_indices + block_bases + mask_ptr + total_count) so the second
@@ -516,7 +516,7 @@ pub fn gather_bool_nullable(
 ///   3. Returns the `Vec<GatheredCol>` (parallel to `columns`) and the total
 ///      count. The caller downloads each column to host with `GatheredCol::download`.
 ///
-/// `Utf8` columns return [`PatinaError::Other`] — the gather kernel can only
+/// `Utf8` columns return [`BoltError::Other`] — the gather kernel can only
 /// move fixed-width values, so variable-width strings have to go through the
 /// host-side `compact_arrays` fallback.
 ///
@@ -543,14 +543,14 @@ pub fn compact_columns_on_gpu(
     n_rows: usize,
     columns: &[(CUdeviceptr, DataType)],
     stream: &CudaStream,
-) -> PatinaResult<(Vec<GatheredCol>, usize)> {
+) -> BoltResult<(Vec<GatheredCol>, usize)> {
     // Validate dtypes BEFORE launching the scan so a Utf8 column can't waste a
     // kernel launch + sync. `prefix_scan_mask` already short-circuits on
     // n_rows == 0, so the empty-columns + zero-rows path costs just the scan
     // call's early return and the Vec allocation below.
     for (_, dtype) in columns {
         if matches!(dtype, DataType::Utf8) {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "Utf8 gather not supported on GPU (use host-side compact_arrays)".into(),
             ));
         }
@@ -567,7 +567,7 @@ pub fn compact_columns_on_gpu(
 }
 
 /// Allocate a `GpuVec<T>` matching `dtype` with `len` elements and wrap it.
-fn alloc_gathered(dtype: DataType, len: usize) -> PatinaResult<GatheredCol> {
+fn alloc_gathered(dtype: DataType, len: usize) -> BoltResult<GatheredCol> {
     Ok(match dtype {
         DataType::Bool => GatheredCol::Bool(GpuVec::<u8>::zeros(len)?),
         DataType::Int32 => GatheredCol::I32(GpuVec::<i32>::zeros(len)?),
@@ -575,7 +575,7 @@ fn alloc_gathered(dtype: DataType, len: usize) -> PatinaResult<GatheredCol> {
         DataType::Float32 => GatheredCol::F32(GpuVec::<f32>::zeros(len)?),
         DataType::Float64 => GatheredCol::F64(GpuVec::<f64>::zeros(len)?),
         DataType::Utf8 => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "gpu_compact: gather Utf8 not supported (variable-width)".into(),
             ))
         }

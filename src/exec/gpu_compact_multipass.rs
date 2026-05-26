@@ -20,7 +20,7 @@
 //! ```
 //!
 //! Walking back DOWN the stack, each level runs
-//! [`patina_add_block_bases`](crate::jit::prefix_scan_multipass::ADD_BASES_KERNEL_ENTRY)
+//! [`bolt_add_block_bases`](crate::jit::prefix_scan_multipass::ADD_BASES_KERNEL_ENTRY)
 //! to fold the parent's per-block bases into the child's per-row local indices,
 //! so the lowest-level `local_indices` ends up holding the global exclusive
 //! prefix sum. The TOP level's per-row `local_indices` IS the per-row
@@ -29,11 +29,11 @@
 //!
 //! ## Why a separate u32 scan kernel
 //!
-//! The single-pass `patina_prefix_scan` kernel reads a `u8` mask byte and
+//! The single-pass `bolt_prefix_scan` kernel reads a `u8` mask byte and
 //! coerces non-zero to 1; the recursive levels need to scan a `u32` count
 //! array verbatim. Rather than parameterize the kernel by input dtype we emit
 //! a sibling kernel
-//! ([`patina_prefix_scan_u32`](crate::jit::prefix_scan_multipass::SCAN_U32_KERNEL_ENTRY))
+//! ([`bolt_prefix_scan_u32`](crate::jit::prefix_scan_multipass::SCAN_U32_KERNEL_ENTRY))
 //! whose body is identical except for the per-thread load.
 //!
 //! ## What's deferred / non-goals
@@ -51,7 +51,7 @@ use std::ptr;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
-use crate::error::PatinaResult;
+use crate::error::BoltResult;
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::jit_compiler::CudaModule;
@@ -77,7 +77,7 @@ pub fn prefix_scan_mask_multipass(
     mask_ptr: CUdeviceptr,
     n_rows: usize,
     stream: &CudaStream,
-) -> PatinaResult<ScanResult> {
+) -> BoltResult<ScanResult> {
     if n_rows == 0 {
         return Ok(ScanResult {
             local_indices: GpuVec::<u32>::empty(),
@@ -125,7 +125,7 @@ pub fn prefix_scan_mask_multipass(
 fn scan_block_sums(
     vals: GpuVec<u32>,
     stream: &CudaStream,
-) -> PatinaResult<(GpuVec<u32>, usize)> {
+) -> BoltResult<(GpuVec<u32>, usize)> {
     if should_host_scan(vals.len()) {
         let host = vals.to_vec()?;
         let (bases, total) = host_exclusive_scan(&host);
@@ -153,10 +153,10 @@ pub(crate) fn should_host_scan(len: usize) -> bool {
 /// Invariant on entry: `vals.len() > BLOCK_SIZE`. (Callers must check
 /// [`should_host_scan`] first.)
 ///
-/// 1. Run [`patina_prefix_scan_u32`](SCAN_U32_KERNEL_ENTRY) on `vals` to
+/// 1. Run [`bolt_prefix_scan_u32`](SCAN_U32_KERNEL_ENTRY) on `vals` to
 ///    produce per-entry `local_indices` and per-block `block_sums`.
 /// 2. Recursively turn that `block_sums` into `parent_bases` (+ total).
-/// 3. Run [`patina_add_block_bases`](ADD_BASES_KERNEL_ENTRY) to fold the
+/// 3. Run [`bolt_add_block_bases`](ADD_BASES_KERNEL_ENTRY) to fold the
 ///    parent bases into `local_indices`, making them globally correct.
 /// 4. Return `(local_indices, total)`. The caller's `block_bases` is OUR
 ///    `local_indices`: every entry `i` of our input array now maps to its
@@ -164,7 +164,7 @@ pub(crate) fn should_host_scan(len: usize) -> bool {
 fn recursive_scan_u32(
     vals: GpuVec<u32>,
     stream: &CudaStream,
-) -> PatinaResult<(GpuVec<u32>, usize)> {
+) -> BoltResult<(GpuVec<u32>, usize)> {
     let n = vals.len();
     debug_assert!(
         n > BLOCK_SIZE as usize,
@@ -192,7 +192,7 @@ fn recursive_scan_u32(
     Ok((local, total))
 }
 
-/// Launch the single-pass `patina_prefix_scan` kernel over a u8 mask.
+/// Launch the single-pass `bolt_prefix_scan` kernel over a u8 mask.
 ///
 /// Mirrors the launch glue in `gpu_compact::prefix_scan_mask`'s body — we
 /// don't call into that function because it does its own host-side scan over
@@ -203,7 +203,7 @@ fn run_u8_scan(
     block_sums: &GpuVec<u32>,
     n_rows: usize,
     stream: &CudaStream,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let ptx = compile_prefix_scan_kernel()?;
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(SCAN_KERNEL_ENTRY)?;
@@ -249,7 +249,7 @@ fn run_u8_scan(
     Ok(())
 }
 
-/// Launch the `patina_prefix_scan_u32` kernel over a u32 input.
+/// Launch the `bolt_prefix_scan_u32` kernel over a u32 input.
 ///
 /// Same launch glue as `run_u8_scan` — the only difference is the kernel
 /// entry name and the input load width inside the PTX.
@@ -259,7 +259,7 @@ fn run_u32_scan(
     block_sums: &GpuVec<u32>,
     n: usize,
     stream: &CudaStream,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let ptx = compile_prefix_scan_u32_kernel()?;
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(SCAN_U32_KERNEL_ENTRY)?;
@@ -297,7 +297,7 @@ fn run_u32_scan(
     Ok(())
 }
 
-/// Launch the `patina_add_block_bases` kernel.
+/// Launch the `bolt_add_block_bases` kernel.
 ///
 /// MUST use `BLOCK_SIZE` so `blockIdx.x = gid / BLOCK_SIZE` and the per-block
 /// base lookup is correct.
@@ -306,7 +306,7 @@ fn run_add_block_bases(
     block_bases: &GpuVec<u32>,
     n: usize,
     stream: &CudaStream,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let ptx = compile_add_block_bases_kernel()?;
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(ADD_BASES_KERNEL_ENTRY)?;

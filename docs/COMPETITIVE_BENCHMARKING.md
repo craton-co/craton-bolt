@@ -1,20 +1,20 @@
 ﻿# Competitive Benchmarking Guide
 
-How to compare Craton Patina against other SQL engines without lying to yourself or
+How to compare Craton Bolt against other SQL engines without lying to yourself or
 your readers. This document is for engineers running an evaluation, contributors
-adding head-to-head numbers, and anyone publishing a "Craton Patina vs X" post.
+adding head-to-head numbers, and anyone publishing a "Craton Bolt vs X" post.
 
-It is **not** the place where Craton Patina's own measured numbers live — those are in
+It is **not** the place where Craton Bolt's own measured numbers live — those are in
 [`BENCHMARKS.md`](./BENCHMARKS.md). This is the methodology and discipline doc
 that any future numbers should follow.
 
 ## TL;DR
 
-- Craton Patina 0.1.x is a single-node, single-batch, in-memory GPU SQL engine. Pick
+- Craton Bolt 0.1.x is a single-node, single-batch, in-memory GPU SQL engine. Pick
   competitors that occupy the same niche; treat cross-niche comparisons as
   illustrative, not damning.
 - Use **ClickBench** as your primary suite: it's single-table, aggregation-heavy,
-  and lands squarely inside what Craton Patina can run today.
+  and lands squarely inside what Craton Bolt can run today.
 - Always run cold and warm separately. Always verify result equivalence. Always
   publish the queries you ran, not just the summary.
 - Report **geometric mean** for the headline number, **per-query** for the
@@ -24,9 +24,9 @@ that any future numbers should follow.
 
 ---
 
-## 1. What category is Craton Patina in?
+## 1. What category is Craton Bolt in?
 
-Be specific about the contest before you measure. Craton Patina 0.1.x is:
+Be specific about the contest before you measure. Craton Bolt 0.1.x is:
 
 - **Single-node** (one process, one GPU).
 - **Single-batch in-memory** (no streaming, no larger-than-VRAM tables, no
@@ -38,7 +38,7 @@ Be specific about the contest before you measure. Craton Patina 0.1.x is:
   <equi>`. See [`SQL_REFERENCE.md`](./SQL_REFERENCE.md) for the exact list.
 
 These constraints determine which comparisons are *fair*. A comparison is fair
-when Craton Patina and the competitor can both execute the workload natively, with
+when Craton Bolt and the competitor can both execute the workload natively, with
 neither system stretched outside its design center.
 
 ## 2. The competitor matrix
@@ -58,15 +58,15 @@ neither system stretched outside its design center.
 | **PostgreSQL / MySQL** | None  | Different category (transactional row store). Don't bother.                |
 
 The systems in the "High" niche-overlap rows are the ones you must include
-before claiming "Craton Patina vs the world." DuckDB in particular is the rigorous
-modern benchmark; if Craton Patina doesn't beat DuckDB on a workload, the GPU isn't
+before claiming "Craton Bolt vs the world." DuckDB in particular is the rigorous
+modern benchmark; if Craton Bolt doesn't beat DuckDB on a workload, the GPU isn't
 buying anything *on that workload*, full stop.
 
 ## 3. Choosing the workload
 
 ### 3.1 Standard suites, ranked by fit
 
-| Suite | Tables | Queries | Fits Craton Patina 0.1.x?       | Comment |
+| Suite | Tables | Queries | Fits Craton Bolt 0.1.x?       | Comment |
 | ----- | ------ | ------- | ------------------------- | ------- |
 | **ClickBench**     | 1 (`hits`)   | 43 | Yes (most queries)     | Aggregation-heavy single-table. Ideal. |
 | **SSB** (denormalised flat) | 1 | 13 | Yes              | Star Schema Benchmark; "denorm" form fits 0.1.x. |
@@ -77,7 +77,7 @@ buying anything *on that workload*, full stop.
 | **YCSB**           | 1            | KV  | No                     | Wrong category (transactional).        |
 
 **Default recommendation: ClickBench**. It's the modern standard, it's
-single-table, it's aggregation-heavy, and the queries map cleanly onto Craton Patina's
+single-table, it's aggregation-heavy, and the queries map cleanly onto Craton Bolt's
 supported SQL. If you can run all 43 (or document which fail and why), you have
 a credible result.
 
@@ -101,7 +101,7 @@ Don't benchmark:
 
 - **Queries no one writes.** `SELECT 1` tells you nothing.
 - **One-row tables.** Launch overhead dominates everything.
-- **Queries Craton Patina doesn't support.** Use a different suite or reduce the
+- **Queries Craton Bolt doesn't support.** Use a different suite or reduce the
   query; do not paper over a parse error.
 - **Result rendering or pretty-printing.** Time the engine's "result available"
   point, not stdout flush.
@@ -125,7 +125,7 @@ Always report both. Define them up front:
 - **Warm** = data resident in engine memory, plan / kernel caches populated.
   Run **≥ 5 iterations after a discard-1 warmup**. Report p50 and p95.
 
-Craton Patina's warm path is where the GPU should win. Its cold path is where it
+Craton Bolt's warm path is where the GPU should win. Its cold path is where it
 pays the worst tax (PTX assembly + module load + first H2D transfer). Both
 matter; don't conflate them.
 
@@ -170,11 +170,11 @@ Pin and disclose every one of these:
 | Thread count   | Set explicit per-engine thread count; don't accept defaults blindly |
 | NUMA           | Single-socket pin if applicable; otherwise document NUMA topology |
 
-A common failure mode is comparing a tuned competitor to default Craton Patina or
+A common failure mode is comparing a tuned competitor to default Craton Bolt or
 vice-versa. Set every engine's thread count and memory budget explicitly; cite
 the values in your writeup.
 
-## 6. What Craton Patina will likely win and lose at
+## 6. What Craton Bolt will likely win and lose at
 
 Setting reader expectations honestly is part of the deliverable. As of 0.1.x:
 
@@ -201,7 +201,7 @@ Setting reader expectations honestly is part of the deliverable. As of 0.1.x:
 - Distributed queries.
 - Anything from TPC-DS.
 
-If you find Craton Patina winning on a workload in the "Likely losses" bucket, that's
+If you find Craton Bolt winning on a workload in the "Likely losses" bucket, that's
 suspicious — recheck your correctness assertions before publishing.
 
 ## 7. Running each competitor
@@ -230,7 +230,7 @@ duckdb -c "
 
 ```rust
 let df = LazyFrame::scan_parquet("hits.parquet", Default::default())?
-    .with_streaming(false)        // match Craton Patina's in-memory model
+    .with_streaming(false)        // match Craton Bolt's in-memory model
     .collect()?;                  // materialise once before timing.
 
 // Per warm iteration:
@@ -273,14 +273,14 @@ heavysql -p HyperInteractive -u admin
 ```
 
 Document `EXPLAIN` output. HeavyDB will reveal its plan, which lets readers
-verify it's running the same shape as Craton Patina.
+verify it's running the same shape as Craton Bolt.
 
-### Craton Patina
+### Craton Bolt
 
 Use the existing harness shape:
 
 ```bash
-PATINA_BENCH_GPU=1 cargo bench --bench query_benchmarks
+BOLT_BENCH_GPU=1 cargo bench --bench query_benchmarks
 ```
 
 For non-criterion runs (e.g. ClickBench), call `Engine::sql_and_execute` in a
@@ -323,7 +323,7 @@ The single most common ways benchmarks lie. Avoid all of them.
 - **GPU warm-up not counted.** The first kernel after driver init pays a
   one-time tax. Either bracket it into "cold" or run a separate warm-up kernel
   before "cold" timing starts. Document either way.
-- **Asymmetric data placement.** Craton Patina holds data in VRAM after the first
+- **Asymmetric data placement.** Craton Bolt holds data in VRAM after the first
   query; DuckDB holds it in OS memory after the first query. The "warm" point
   is engine-specific.
 - **Different row counts.** ClickBench's `hits` table at 100M rows is *not*
@@ -340,9 +340,9 @@ The single most common ways benchmarks lie. Avoid all of them.
 
 ## 10. See also
 
-- [`BENCHMARKS.md`](./BENCHMARKS.md) — Craton Patina's own measured numbers and the
+- [`BENCHMARKS.md`](./BENCHMARKS.md) — Craton Bolt's own measured numbers and the
   internal bench-suite description.
-- [`SQL_REFERENCE.md`](./SQL_REFERENCE.md) — which SQL Craton Patina actually
+- [`SQL_REFERENCE.md`](./SQL_REFERENCE.md) — which SQL Craton Bolt actually
   supports today; constrains what's benchable.
 - [`ROADMAP.md`](../ROADMAP.md) — known limitations, by design.
 - [`benches/query_benchmarks.rs`](../benches/query_benchmarks.rs) — the

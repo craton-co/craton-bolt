@@ -70,7 +70,7 @@ git status   # MUST be clean — no untracked, no modified
 
 # Cut the tag. Message body comes from the heredoc below.
 git tag -a v0.2-handemit -F - <<'EOF'
-Craton Patina v0.2 hand-emit PTX baseline — recovery floor for the
+Craton Bolt v0.2 hand-emit PTX baseline — recovery floor for the
 rust-cuda migration (0.3 milestone).
 
 This tag is the Fallback B target per
@@ -81,9 +81,9 @@ Reference benchmark numbers at this commit (RTX 2060, driver
 591.86, CUDA 12.6, see docs/BENCHMARKS.md "Heavy-workload GPU
 results, 2026-05-24" for the full table):
 
-  proj       (passthrough)       Craton Patina   115.5  ms   (432.9 Melem/s)
-  arith      (11-op chain)       Craton Patina   124.8  ms   (400.7 Melem/s)
-  filtered   (filter + 4-op)     Craton Patina    41.8  ms   ( 1.196 Gelem/s)
+  proj       (passthrough)       Craton Bolt   115.5  ms   (432.9 Melem/s)
+  arith      (11-op chain)       Craton Bolt   124.8  ms   (400.7 Melem/s)
+  filtered   (filter + 4-op)     Craton Bolt    41.8  ms   ( 1.196 Gelem/s)
 
 h2o.ai db-benchmark groupby subset, N = 10 M rows, three-engine
 verified equivalent before timing — see the "h2o.ai db-benchmark"
@@ -104,7 +104,7 @@ git push origin v0.2-handemit
 ### GitHub release
 
 Cut a GitHub release pointing at the tag, with the same body as the
-annotation. Mark it **pre-release** (it is not a published Craton Patina
+annotation. Mark it **pre-release** (it is not a published Craton Bolt
 version) and **not** the latest release. Title: `v0.2-handemit
 (rust-cuda migration recovery floor)`.
 
@@ -194,7 +194,7 @@ generic path has failed.
 
 This tag will **not** be force-pushed, deleted, moved, or rewritten.
 
-It is the floor — the version of Craton Patina we commit to being able
+It is the floor — the version of Craton Bolt we commit to being able
 to ship if the rust-cuda migration goes wrong at any point. Anyone
 with push access to `origin` who deletes or moves this tag is
 defeating the entire risk framework in

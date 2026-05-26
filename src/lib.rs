@@ -1,6 +1,6 @@
 ﻿// SPDX-License-Identifier: Apache-2.0
 
-//! Craton Patina — JIT-compiled GPU SQL engine.
+//! Craton Bolt — JIT-compiled GPU SQL engine.
 //!
 //! Pipeline: SQL string → Logical Plan → Physical Plan → IR → PTX string →
 //! NVRTC-compiled cubin → CUDA launch → result Arrow array.
@@ -17,7 +17,7 @@ pub mod jit;
 pub mod exec;
 
 mod error;
-pub use error::{PatinaError, PatinaResult};
+pub use error::{BoltError, BoltResult};
 
 pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
 pub use plan::{DataFrame, LogicalPlan, PhysicalPlan, Expr};

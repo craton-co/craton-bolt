@@ -14,12 +14,12 @@ use std::sync::Arc;
 use arrow::compute::{lexsort_to_indices, take, SortColumn, SortOptions};
 use arrow_array::{Array, RecordBatch, UInt32Array};
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::QueryHandle;
 use crate::plan::logical_plan::{Expr, SortExpr};
 
 /// Apply ORDER BY to the input handle.
-pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> PatinaResult<QueryHandle> {
+pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<QueryHandle> {
     let batch = input.into_record_batch();
     if batch.num_rows() == 0 || sort_exprs.is_empty() {
         return Ok(QueryHandle::from_record_batch(batch));
@@ -43,26 +43,26 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> PatinaResult
         .columns()
         .iter()
         .map(|c| take(c.as_ref(), &indices, None).map_err(arrow_err))
-        .collect::<PatinaResult<Vec<_>>>()?;
+        .collect::<BoltResult<Vec<_>>>()?;
     let out = RecordBatch::try_new(batch.schema(), new_cols).map_err(arrow_err)?;
     Ok(QueryHandle::from_record_batch(out))
 }
 
 /// Sort keys must currently be bare column references (possibly aliased).
 /// Computed sort keys (`ORDER BY a + b`) error with a clear message.
-fn expr_to_column_name(e: &Expr) -> PatinaResult<String> {
+fn expr_to_column_name(e: &Expr) -> BoltResult<String> {
     match e {
         Expr::Column(name) => Ok(name.clone()),
         Expr::Alias(inner, _) => expr_to_column_name(inner),
-        other => Err(PatinaError::Other(format!(
+        other => Err(BoltError::Other(format!(
             "ORDER BY currently supports only column references, got {:?}",
             other
         ))),
     }
 }
 
-fn arrow_err(e: arrow::error::ArrowError) -> PatinaError {
-    PatinaError::Other(format!("arrow: {}", e))
+fn arrow_err(e: arrow::error::ArrowError) -> BoltError {
+    BoltError::Other(format!("arrow: {}", e))
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// Number of hash partitions. Matches both Tier-1 `BLOCK_GROUPS` and the
 /// partition-kernel sibling so all three kernels in the Tier-2 chain agree
@@ -25,14 +25,14 @@ pub const BLOCK_THREADS: u32 = 256;
 
 /// Entry-point name embedded in the emitted PTX. Distinct from the i32
 /// sibling so both kernels can co-exist in the same CUDA context.
-pub const KERNEL_ENTRY: &str = "patina_scatter_i64";
+pub const KERNEL_ENTRY: &str = "bolt_scatter_i64";
 
 /// Generate PTX for the i64-key partition-scatter kernel.
 ///
 /// Kernel signature (PTX-level):
 ///
 /// ```text
-/// .visible .entry patina_scatter_i64(
+/// .visible .entry bolt_scatter_i64(
 ///     .param .u64 keys_ptr,                // const int64_t*  keys[n_rows]
 ///     .param .u64 vals_ptr,                // const double*   vals[n_rows]
 ///     .param .u64 partition_ids_ptr,       // const uint32_t* partition_ids[n_rows]
@@ -45,7 +45,7 @@ pub const KERNEL_ENTRY: &str = "patina_scatter_i64";
 /// ```
 ///
 /// `compile_scatter_kernel_i64()` is deterministic and pure.
-pub fn compile_scatter_kernel_i64() -> PatinaResult<String> {
+pub fn compile_scatter_kernel_i64() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
 
@@ -169,8 +169,8 @@ pub fn compile_scatter_kernel_i64() -> PatinaResult<String> {
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("scatter_kernel_i64: write failed: {}", e))
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("scatter_kernel_i64: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -233,18 +233,18 @@ mod tests {
             "PTX must declare .visible .entry {}(  — got:\n{ptx}",
             KERNEL_ENTRY
         );
-        assert_eq!(KERNEL_ENTRY, "patina_scatter_i64");
+        assert_eq!(KERNEL_ENTRY, "bolt_scatter_i64");
     }
 
     /// `compile_scatter_kernel_i64()` must succeed and return non-empty PTX
-    /// with the standard Craton Patina module header.
+    /// with the standard Craton Bolt module header.
     #[test]
     fn compile_returns_non_empty_ptx() {
         let ptx = compile_scatter_kernel_i64().expect("kernel compiles");
         assert!(!ptx.is_empty(), "compile returned empty PTX");
         assert!(
             ptx.contains(".version 7.5") && ptx.contains(".target sm_70"),
-            "PTX must include the standard Craton Patina module header:\n{ptx}"
+            "PTX must include the standard Craton Bolt module header:\n{ptx}"
         );
     }
 }

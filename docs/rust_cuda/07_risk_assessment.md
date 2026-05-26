@@ -60,7 +60,7 @@ Evaluate at the end of Wave A (the toolchain spike, ~2 weeks). All five must be 
 - [ ] Output PTX loads via `CudaModule::from_ptx` and produces bit-identical results to hand-emit on the canonical test fixture.
 - [ ] Bench delta on the spike kernel ≤ 5% vs hand-emit on the bench host (3 runs, median).
 - [ ] Build time impact on full `cargo build` (clean target, all features): ≤ +60 s.
-- [ ] Successfully pinned Rust nightly via per-workspace-member `rust-toolchain.toml`; the host crate `craton-patina` still builds on stable.
+- [ ] Successfully pinned Rust nightly via per-workspace-member `rust-toolchain.toml`; the host crate `craton-bolt` still builds on stable.
 
 If any box stays unchecked → stop. Choose between Fallback C (if the failure is NVVM-specific) or deferring the milestone to 0.4 (if the failure is structural — e.g. const-generics not viable for R5). Do not push into Wave B with red boxes; the cost of unwinding doubles every wave.
 
@@ -72,11 +72,11 @@ Scenario: we are at the end of Wave D (Tier-1 GROUP BY kernels migrated, ~halfwa
 
 **Day 0–7 — monitor.** Don't react. First commits often resume quietly after a maintainer break; archived-then-revived projects sometimes show this pattern. Keep building and benching against the pinned commit. No public statement.
 
-**Day 7–30 — entrench.** Snapshot the rust-cuda commit we depend on; pin in Cargo.toml as `rev = "..."` (not branch). Mirror the repos under a `craton-patina-org/` GitHub mirror as cold backup. Assume from here on that we are self-maintaining the toolchain. Write up the "if you must patch rust-cuda" doc in `docs/rust_cuda/`.
+**Day 7–30 — entrench.** Snapshot the rust-cuda commit we depend on; pin in Cargo.toml as `rev = "..."` (not branch). Mirror the repos under a `craton-bolt-org/` GitHub mirror as cold backup. Assume from here on that we are self-maintaining the toolchain. Write up the "if you must patch rust-cuda" doc in `docs/rust_cuda/`.
 
 **Day 30+ — decide.** Three branches:
 
-- **(a) Fork upstream**: take ownership of `Rust-CUDA/Rust-CUDA` as `craton-patina-org/rust-cuda`, accept the maintenance burden. Justified only if we expect to ship multiple kernels per release. Probably not worth it for a single product.
+- **(a) Fork upstream**: take ownership of `Rust-CUDA/Rust-CUDA` as `craton-bolt-org/rust-cuda`, accept the maintenance burden. Justified only if we expect to ship multiple kernels per release. Probably not worth it for a single product.
 - **(b) Finish migration with the snapshot.** Accept that no upstream updates come. Works if the snapshot is stable against our pinned nightly. Re-evaluate at 0.4.
 - **(c) Fallback B** (revert the migration). The right call if Wave E-onward kernels need toolchain features we haven't yet exercised, because we'd be debugging the toolchain ourselves without upstream help.
 

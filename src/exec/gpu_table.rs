@@ -13,7 +13,7 @@ use crate::cuda::buffer::primitive_to_gpu;
 use crate::cuda::cuda_sys::CUdeviceptr;
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::plan::DataType;
 
 /// One column resident on the device.
@@ -69,7 +69,7 @@ impl GpuColumnData {
 
 impl GpuColumn {
     /// Upload an Arrow array to the GPU, downcasting per `dtype`.
-    pub fn upload(name: String, arr: &dyn Array, dtype: DataType) -> PatinaResult<Self> {
+    pub fn upload(name: String, arr: &dyn Array, dtype: DataType) -> BoltResult<Self> {
         let data = match dtype {
             DataType::Int32 => {
                 let pa = arr
@@ -174,7 +174,7 @@ pub struct GpuTable {
 
 impl GpuTable {
     /// Upload every column of `batch` to the device.
-    pub fn from_record_batch(batch: &RecordBatch) -> PatinaResult<Self> {
+    pub fn from_record_batch(batch: &RecordBatch) -> BoltResult<Self> {
         let n_rows = batch.num_rows();
         let schema = batch.schema();
         let mut columns: Vec<GpuColumn> = Vec::with_capacity(batch.num_columns());
@@ -188,7 +188,7 @@ impl GpuTable {
                 arrow_schema::DataType::Boolean => DataType::Bool,
                 arrow_schema::DataType::Utf8 => DataType::Utf8,
                 other => {
-                    return Err(PatinaError::Type(format!(
+                    return Err(BoltError::Type(format!(
                         "GpuTable: unsupported Arrow dtype {:?} for column '{}'",
                         other,
                         field.name()
@@ -213,8 +213,8 @@ impl GpuTable {
 }
 
 /// Build a `Type` error for an Arrow downcast failure.
-fn type_mismatch_err(arr: &dyn Array, expected: &str) -> PatinaError {
-    PatinaError::Type(format!(
+fn type_mismatch_err(arr: &dyn Array, expected: &str) -> BoltError {
+    BoltError::Type(format!(
         "Arrow array dtype {:?} does not match expected {}",
         arr.data_type(),
         expected

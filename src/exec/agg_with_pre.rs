@@ -48,7 +48,7 @@ use bytemuck::Pod;
 use crate::cuda::buffer::primitive_to_gpu;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::expr_agg;
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
@@ -60,10 +60,10 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 use crate::plan::physical_plan::{AggregateSpec, KernelSpec, PhysicalPlan};
 
 /// PTX entry-point name for the pre-projection kernel.
-const PRE_KERNEL_ENTRY: &str = "patina_pre_kernel";
+const PRE_KERNEL_ENTRY: &str = "bolt_pre_kernel";
 
 /// PTX entry-point name for the predicate-only kernel that materialises the mask.
-const PRE_PREDICATE_ENTRY: &str = "patina_pre_predicate";
+const PRE_PREDICATE_ENTRY: &str = "bolt_pre_predicate";
 
 /// Threads per block for the pre-projection / predicate launches.
 const PRE_BLOCK_SIZE: u32 = 256;
@@ -84,11 +84,11 @@ const PRE_BLOCK_SIZE: u32 = 256;
 pub fn execute_aggregate_with_pre(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,
-) -> PatinaResult<RecordBatch> {
+) -> BoltResult<RecordBatch> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         other => {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "execute_aggregate_with_pre: expected Aggregate plan, got {:?}",
                 std::mem::discriminant(other)
             )))
@@ -96,14 +96,14 @@ pub fn execute_aggregate_with_pre(
     };
 
     let pre_spec = pre.as_ref().ok_or_else(|| {
-        PatinaError::Other(
+        BoltError::Other(
             "execute_aggregate_with_pre: pre kernel is None; use aggregate::execute_aggregate"
                 .into(),
         )
     })?;
 
     if !aggregate.group_by.is_empty() {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "agg_with_pre: GROUP BY handled separately".into(),
         ));
     }
@@ -119,7 +119,7 @@ pub fn execute_aggregate_with_pre(
     let arrays = build_scalar_aggregates(aggregate, pre_spec, &compacted)?;
 
     RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-        PatinaError::Other(format!("failed to build aggregate RecordBatch: {e}"))
+        BoltError::Other(format!("failed to build aggregate RecordBatch: {e}"))
     })
 }
 
@@ -144,12 +144,12 @@ fn run_pre_stage(
     spec: &KernelSpec,
     table_batch: &RecordBatch,
     n_rows: usize,
-) -> PatinaResult<CompactedPreOutputs> {
+) -> BoltResult<CompactedPreOutputs> {
     // -- Upload inputs.
     let mut input_cols: Vec<PreCol> = Vec::with_capacity(spec.inputs.len());
     for io in &spec.inputs {
         let idx = table_batch.schema().index_of(&io.name).map_err(|e| {
-            PatinaError::Plan(format!(
+            BoltError::Plan(format!(
                 "pre kernel input column '{}' not present in table batch: {}",
                 io.name, e
             ))
@@ -157,7 +157,7 @@ fn run_pre_stage(
         let arr = table_batch.column(idx);
         let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
         if arr_dtype != io.dtype {
-            return Err(PatinaError::Type(format!(
+            return Err(BoltError::Type(format!(
                 "pre kernel input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
                 io.name, io.dtype, arr_dtype
             )));
@@ -263,9 +263,9 @@ fn build_scalar_aggregates(
     aggregate: &AggregateSpec,
     pre_spec: &KernelSpec,
     compacted: &CompactedPreOutputs,
-) -> PatinaResult<Vec<ArrayRef>> {
+) -> BoltResult<Vec<ArrayRef>> {
     if aggregate.output_schema.fields.len() != aggregate.aggregates.len() {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "internal: aggregate output schema has {} fields but plan has {} aggregates",
             aggregate.output_schema.fields.len(),
             aggregate.aggregates.len()
@@ -287,7 +287,7 @@ fn build_one_aggregate(
     out_field: &Field,
     pre_spec: &KernelSpec,
     compacted: &CompactedPreOutputs,
-) -> PatinaResult<ArrayRef> {
+) -> BoltResult<ArrayRef> {
     match agg {
         AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
             let op = ReduceOp::from_agg(agg)?;
@@ -334,20 +334,20 @@ fn resolve_agg_input_col<'a>(
     pre_spec: &KernelSpec,
     compacted: &'a CompactedPreOutputs,
     expected_dtype: DataType,
-) -> PatinaResult<ResolvedHostCol<'a>> {
+) -> BoltResult<ResolvedHostCol<'a>> {
     if let Some(name) = expr_agg::try_bare_column(expr) {
         let idx = pre_spec
             .outputs
             .iter()
             .position(|o| o.name == name)
             .ok_or_else(|| {
-                PatinaError::Plan(format!(
+                BoltError::Plan(format!(
                     "aggregate input '{}' not found among pre kernel outputs",
                     name
                 ))
             })?;
         if idx >= compacted.cols.len() {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "internal: pre output ordinal {} out of range (have {} compacted cols)",
                 idx,
                 compacted.cols.len()
@@ -410,7 +410,7 @@ fn to_expr_host(c: &HostCol) -> expr_agg::HostColumn {
 /// for SUM/COUNT, so this preserves the existing semantics). Bool / Utf8
 /// materialisations are rejected — the reduction kernels only accept
 /// primitive numeric inputs.
-fn from_expr_host(c: expr_agg::HostColumn) -> PatinaResult<HostCol> {
+fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
     match c {
         expr_agg::HostColumn::I32(v) => {
             Ok(HostCol::I32(v.into_iter().map(|x| x.unwrap_or(0)).collect()))
@@ -425,7 +425,7 @@ fn from_expr_host(c: expr_agg::HostColumn) -> PatinaResult<HostCol> {
             v.into_iter().map(|x| x.unwrap_or(0.0)).collect(),
         )),
         expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => {
-            Err(PatinaError::Type(
+            Err(BoltError::Type(
                 "agg_with_pre: Bool/Utf8 aggregate inputs not supported by the \
                  primitive reduction path"
                     .into(),
@@ -435,7 +435,7 @@ fn from_expr_host(c: expr_agg::HostColumn) -> PatinaResult<HostCol> {
 }
 
 /// Run a GPU reduction over `col` and return the scalar result.
-fn reduce_host_col(op: ReduceOp, col: &HostCol) -> PatinaResult<Scalar> {
+fn reduce_host_col(op: ReduceOp, col: &HostCol) -> BoltResult<Scalar> {
     match col {
         HostCol::I32(v) => reduce_host_slice::<i32>(op, DataType::Int32, v),
         HostCol::I64(v) => reduce_host_slice::<i64>(op, DataType::Int64, v),
@@ -445,7 +445,7 @@ fn reduce_host_col(op: ReduceOp, col: &HostCol) -> PatinaResult<Scalar> {
 }
 
 /// Upload a host slice, then run the standard GPU reduction over it.
-fn reduce_host_slice<T>(op: ReduceOp, dtype: DataType, host: &[T]) -> PatinaResult<Scalar>
+fn reduce_host_slice<T>(op: ReduceOp, dtype: DataType, host: &[T]) -> BoltResult<Scalar>
 where
     T: Pod + ReduceScalar,
 {
@@ -460,7 +460,7 @@ fn reduce_gpu_vec<T>(
     dtype: DataType,
     input: &GpuVec<T>,
     n_rows: usize,
-) -> PatinaResult<Scalar>
+) -> BoltResult<Scalar>
 where
     T: Pod + ReduceScalar,
 {
@@ -528,7 +528,7 @@ enum PreCol {
 
 impl PreCol {
     /// Upload an Arrow array to the GPU, downcasting per `dtype`.
-    fn upload(arr: &dyn Array, dtype: DataType) -> PatinaResult<Self> {
+    fn upload(arr: &dyn Array, dtype: DataType) -> BoltResult<Self> {
         match dtype {
             DataType::Int32 => {
                 let pa = arr
@@ -558,7 +558,7 @@ impl PreCol {
                     .ok_or_else(|| downcast_err("input", "Float64"))?;
                 Ok(PreCol::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?)))
             }
-            DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
+            DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
                 "agg_with_pre: pre kernel column dtype {:?} not supported",
                 dtype
             ))),
@@ -566,13 +566,13 @@ impl PreCol {
     }
 
     /// Allocate a zero-initialised device column of `n` rows.
-    fn alloc_zeros(dtype: DataType, n: usize) -> PatinaResult<Self> {
+    fn alloc_zeros(dtype: DataType, n: usize) -> BoltResult<Self> {
         match dtype {
             DataType::Int32 => Ok(PreCol::I32(GpuVec::<i32>::zeros(n)?)),
             DataType::Int64 => Ok(PreCol::I64(GpuVec::<i64>::zeros(n)?)),
             DataType::Float32 => Ok(PreCol::F32(GpuVec::<f32>::zeros(n)?)),
             DataType::Float64 => Ok(PreCol::F64(GpuVec::<f64>::zeros(n)?)),
-            DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
+            DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
                 "agg_with_pre: pre kernel output dtype {:?} not supported",
                 dtype
             ))),
@@ -590,7 +590,7 @@ impl PreCol {
     }
 
     /// Download the column to host and verify the length matches `n_rows`.
-    fn to_host_col(self, n_rows: usize) -> PatinaResult<HostCol> {
+    fn to_host_col(self, n_rows: usize) -> BoltResult<HostCol> {
         match self {
             PreCol::I32(v) => Ok(HostCol::I32(copy_back::<i32>(&v, n_rows)?)),
             PreCol::I64(v) => Ok(HostCol::I64(copy_back::<i64>(&v, n_rows)?)),
@@ -622,9 +622,9 @@ impl HostCol {
     /// Return a new column containing only positions where `mask[i]` is true.
     /// The pre-projection kernel leaves zeros in masked slots, so we drop those
     /// positions and keep the rest in original order.
-    fn compact(self, mask: &[bool]) -> PatinaResult<HostCol> {
+    fn compact(self, mask: &[bool]) -> BoltResult<HostCol> {
         if mask.len() != self.len() {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "agg_with_pre: mask length {} != column length {}",
                 mask.len(),
                 self.len()
@@ -648,13 +648,13 @@ fn filter_vec<T: Copy>(v: Vec<T>, mask: &[bool]) -> Vec<T> {
 }
 
 /// Copy back a `GpuVec<T>` into a host `Vec<T>` of length `n_rows`.
-fn copy_back<T>(v: &GpuVec<T>, n_rows: usize) -> PatinaResult<Vec<T>>
+fn copy_back<T>(v: &GpuVec<T>, n_rows: usize) -> BoltResult<Vec<T>>
 where
     T: Pod,
 {
     let host = v.to_vec()?;
     if host.len() != n_rows {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "internal: device buffer length {} did not match expected {}",
             host.len(),
             n_rows
@@ -675,12 +675,12 @@ enum Scalar {
 /// Per-`T` helpers for the GPU reduction path. Mirrors the trait in
 /// `aggregate.rs` exactly so this module stays self-contained.
 trait ReduceScalar: Sized + Copy {
-    fn finalize(op: ReduceOp, dtype: DataType, host: &[Self]) -> PatinaResult<Scalar>;
-    fn identity_scalar(op: ReduceOp, dtype: DataType) -> PatinaResult<Scalar>;
+    fn finalize(op: ReduceOp, dtype: DataType, host: &[Self]) -> BoltResult<Scalar>;
+    fn identity_scalar(op: ReduceOp, dtype: DataType) -> BoltResult<Scalar>;
 }
 
 impl ReduceScalar for i32 {
-    fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> PatinaResult<Scalar> {
+    fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
             ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0i32, i32::wrapping_add),
             ReduceOp::Min => host.iter().copied().fold(i32::MAX, i32::min),
@@ -688,7 +688,7 @@ impl ReduceScalar for i32 {
         };
         Ok(Scalar::I32(acc))
     }
-    fn identity_scalar(op: ReduceOp, _dtype: DataType) -> PatinaResult<Scalar> {
+    fn identity_scalar(op: ReduceOp, _dtype: DataType) -> BoltResult<Scalar> {
         Ok(Scalar::I32(match op {
             ReduceOp::Sum | ReduceOp::Count => 0,
             ReduceOp::Min => i32::MAX,
@@ -698,7 +698,7 @@ impl ReduceScalar for i32 {
 }
 
 impl ReduceScalar for i64 {
-    fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> PatinaResult<Scalar> {
+    fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
             ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0i64, i64::wrapping_add),
             ReduceOp::Min => host.iter().copied().fold(i64::MAX, i64::min),
@@ -706,7 +706,7 @@ impl ReduceScalar for i64 {
         };
         Ok(Scalar::I64(acc))
     }
-    fn identity_scalar(op: ReduceOp, _dtype: DataType) -> PatinaResult<Scalar> {
+    fn identity_scalar(op: ReduceOp, _dtype: DataType) -> BoltResult<Scalar> {
         Ok(Scalar::I64(match op {
             ReduceOp::Sum | ReduceOp::Count => 0,
             ReduceOp::Min => i64::MAX,
@@ -716,7 +716,7 @@ impl ReduceScalar for i64 {
 }
 
 impl ReduceScalar for f32 {
-    fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> PatinaResult<Scalar> {
+    fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
             ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0.0f32, |a, b| a + b),
             ReduceOp::Min => host.iter().copied().fold(f32::INFINITY, f32::min),
@@ -724,7 +724,7 @@ impl ReduceScalar for f32 {
         };
         Ok(Scalar::F32(acc))
     }
-    fn identity_scalar(op: ReduceOp, _dtype: DataType) -> PatinaResult<Scalar> {
+    fn identity_scalar(op: ReduceOp, _dtype: DataType) -> BoltResult<Scalar> {
         Ok(Scalar::F32(match op {
             ReduceOp::Sum | ReduceOp::Count => 0.0,
             ReduceOp::Min => f32::INFINITY,
@@ -734,7 +734,7 @@ impl ReduceScalar for f32 {
 }
 
 impl ReduceScalar for f64 {
-    fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> PatinaResult<Scalar> {
+    fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
             ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0.0f64, |a, b| a + b),
             ReduceOp::Min => host.iter().copied().fold(f64::INFINITY, f64::min),
@@ -742,7 +742,7 @@ impl ReduceScalar for f64 {
         };
         Ok(Scalar::F64(acc))
     }
-    fn identity_scalar(op: ReduceOp, _dtype: DataType) -> PatinaResult<Scalar> {
+    fn identity_scalar(op: ReduceOp, _dtype: DataType) -> BoltResult<Scalar> {
         Ok(Scalar::F64(match op {
             ReduceOp::Sum | ReduceOp::Count => 0.0,
             ReduceOp::Min => f64::INFINITY,
@@ -752,7 +752,7 @@ impl ReduceScalar for f64 {
 }
 
 /// Convert a `Scalar` into a single-element Arrow array of `out_dtype`.
-fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> PatinaResult<ArrayRef> {
+fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> {
     match (scalar, out_dtype) {
         (Scalar::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(vec![v])) as ArrayRef),
         (Scalar::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(vec![v])) as ArrayRef),
@@ -780,7 +780,7 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> PatinaResult<ArrayRef
             Ok(Arc::new(Float64Array::from(vec![v as f64])) as ArrayRef)
         }
 
-        (s, dt) => Err(PatinaError::Type(format!(
+        (s, dt) => Err(BoltError::Type(format!(
             "agg_with_pre: cannot pack scalar {:?} into output dtype {:?}",
             s, dt
         ))),
@@ -788,7 +788,7 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> PatinaResult<ArrayRef
 }
 
 /// Cast a scalar to f64 (used by AVG).
-fn scalar_to_f64(s: Scalar) -> PatinaResult<f64> {
+fn scalar_to_f64(s: Scalar) -> BoltResult<f64> {
     Ok(match s {
         Scalar::I32(v) => v as f64,
         Scalar::I64(v) => v as f64,
@@ -798,8 +798,8 @@ fn scalar_to_f64(s: Scalar) -> PatinaResult<f64> {
 }
 
 /// Build a `Type` error for a failed Arrow downcast.
-fn downcast_err(role: &str, expected: &str) -> PatinaError {
-    PatinaError::Type(format!(
+fn downcast_err(role: &str, expected: &str) -> BoltError {
+    BoltError::Type(format!(
         "agg_with_pre: pre kernel {} could not be downcast to {}",
         role, expected
     ))
@@ -808,7 +808,7 @@ fn downcast_err(role: &str, expected: &str) -> PatinaError {
 /// Map Arrow `DataType` to our plan `DataType`. Mirror of the helper in
 /// `aggregate.rs` and `engine.rs`, copied here to avoid reaching across module
 /// privacy.
-fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
+fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
         ArrowDataType::Int64 => Ok(DataType::Int64),
@@ -816,7 +816,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        other => Err(PatinaError::Type(format!(
+        other => Err(BoltError::Type(format!(
             "unsupported Arrow dtype {:?}",
             other
         ))),
@@ -824,7 +824,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
 }
 
 /// Map our plan `DataType` to Arrow `DataType`.
-fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -836,7 +836,7 @@ fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
-fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

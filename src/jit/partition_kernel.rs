@@ -64,7 +64,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// Number of hash partitions. MUST be a power of two so `% NUM_PARTITIONS`
 /// can be implemented as `and.b32 %r, %r, (NUM_PARTITIONS - 1)`.
@@ -91,14 +91,14 @@ pub const BLOCK_THREADS: u32 = 256;
 
 /// Entry-point name embedded in the emitted PTX. The dispatcher resolves
 /// this via `cuModuleGetFunction` after `cuModuleLoadDataEx`.
-pub const KERNEL_ENTRY: &str = "patina_partition";
+pub const KERNEL_ENTRY: &str = "bolt_partition";
 
 /// Generate PTX for the hash-partition pass-1 kernel.
 ///
 /// Kernel signature (PTX-level):
 ///
 /// ```text
-/// .visible .entry patina_partition(
+/// .visible .entry bolt_partition(
 ///     .param .u64 keys_ptr,           // const int32_t*  keys[n_rows]
 ///     .param .u64 partition_ids_ptr,  //       uint32_t* partition_ids[n_rows]
 ///     .param .u64 counts_ptr,         //       uint32_t* counts[NUM_PARTITIONS]
@@ -119,14 +119,14 @@ pub const KERNEL_ENTRY: &str = "patina_partition";
 /// `cuda_builder` + `rustc_codegen_nvvm`) instead of the hand-emitted
 /// string below. The two paths are interchangeable from the dispatcher's
 /// point of view: both produce a PTX module that exports a single
-/// `.visible .entry patina_partition(.param .u64, .param .u64, .param .u64, .param .u32)`
+/// `.visible .entry bolt_partition(.param .u64, .param .u64, .param .u64, .param .u32)`
 /// symbol, and both load via `CudaModule::from_ptx`. The hand-emit path
 /// is the default and remains the only path until Wave B.
 ///
 /// See docs/rust_cuda/03_partition_kernel_spike.md and
 /// docs/rust_cuda/08_wave_a_outcome.md.
 #[cfg(feature = "rust-cuda")]
-pub fn compile_partition_kernel() -> PatinaResult<String> {
+pub fn compile_partition_kernel() -> BoltResult<String> {
     // Compiled by build.rs via cuda_builder when --features rust-cuda is on.
     // Layout: kernels/src/lib.rs --rustc_codegen_nvvm--> $OUT_DIR/partition.ptx.
     const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/partition.ptx"));
@@ -135,7 +135,7 @@ pub fn compile_partition_kernel() -> PatinaResult<String> {
         // Defensive: build.rs must have populated the file when the
         // feature is on. An empty string means cuda_builder silently
         // failed or the feature gate logic in build.rs is broken.
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "partition_kernel: rust-cuda PTX artefact is empty — \
              cuda_builder did not produce a valid PTX file. See \
              docs/rust_cuda/08_wave_a_outcome.md."
@@ -147,7 +147,7 @@ pub fn compile_partition_kernel() -> PatinaResult<String> {
 }
 
 #[cfg(not(feature = "rust-cuda"))]
-pub fn compile_partition_kernel() -> PatinaResult<String> {
+pub fn compile_partition_kernel() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
     let mask = NUM_PARTITIONS - 1; // 0x3FF for NUM_PARTITIONS = 1024
@@ -262,10 +262,10 @@ pub fn compile_partition_kernel() -> PatinaResult<String> {
     Ok(ptx)
 }
 
-/// Adapt a `std::fmt::Error` into a `PatinaError`. Mirrors the helper in
+/// Adapt a `std::fmt::Error` into a `BoltError`. Mirrors the helper in
 /// `shmem_sum_kernel.rs` — kept local so the two files stay independent.
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("partition_kernel: write failed: {}", e))
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("partition_kernel: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +337,7 @@ mod tests {
 
     /// PTX module preamble must match the rest of `src/jit/*` — same
     /// target, same version. A mismatched header would prevent the driver
-    /// from co-loading this module with other Craton Patina kernels.
+    /// from co-loading this module with other Craton Bolt kernels.
     #[test]
     fn ptx_header_matches_project_conventions() {
         let ptx = compile_partition_kernel().expect("kernel compiles");

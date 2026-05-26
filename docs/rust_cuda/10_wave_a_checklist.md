@@ -76,13 +76,13 @@ Sibling docs:
 - **Test:** with the `kernels/` member's `rust-toolchain.toml`
   pinning nightly, run `cargo +stable build --release` at the
   workspace root *targeting only the host crate*
-  (`cargo build -p craton-patina`). Then confirm the host crate's
+  (`cargo build -p craton-bolt`). Then confirm the host crate's
   `Cargo.lock` and feature flags do not require nightly anywhere.
   CI matrix should exercise both `(stub, stable)` and
   `(real-cuda, nightly, rust-cuda)` rows per R7 in
   `07_risk_assessment.md`.
-- **Expected:** `craton-patina` builds on stable; `kernels` builds on
-  nightly; no `#![feature(...)]` leakage into `craton-patina`.
+- **Expected:** `craton-bolt` builds on stable; `kernels` builds on
+  nightly; no `#![feature(...)]` leakage into `craton-bolt`.
 - **Result:** _Pass / Fail / Inconclusive — fill in._
 
 ### 6. Pre-tag `v0.2-handemit` exists and is reachable

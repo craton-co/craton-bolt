@@ -1,6 +1,6 @@
 ﻿# Architecture
 
-This document maps Craton Patina's source tree to the runtime pipeline, and explains the major design decisions. For the SQL → PTX deep-dive read [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the full supported subset see [`SQL_REFERENCE.md`](SQL_REFERENCE.md).
+This document maps Craton Bolt's source tree to the runtime pipeline, and explains the major design decisions. For the SQL → PTX deep-dive read [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the full supported subset see [`SQL_REFERENCE.md`](SQL_REFERENCE.md).
 
 ## Layer cake
 
@@ -117,7 +117,7 @@ A `Engine::sql(query)` call walks the following stages. Every arrow below is a f
 
 ## Memory safety: CUDA-Oxide
 
-The single most important design idea in the crate. GPU memory in C++ is a foot-gun magnet (use-after-free, double-free, concurrent mutation across CPU and GPU). Craton Patina lifts those problems into Rust's type system:
+The single most important design idea in the crate. GPU memory in C++ is a foot-gun magnet (use-after-free, double-free, concurrent mutation across CPU and GPU). Craton Bolt lifts those problems into Rust's type system:
 
 ```
 GpuVec<T>           // owned device allocation, drops via cuMemFree on Drop
@@ -160,7 +160,7 @@ The intent is that every routing decision is local and explicit: a contributor a
 
 ## Dictionary encoding for Utf8
 
-Variable-width strings are a poor fit for fused-codegen GPU kernels. Every comparison would force a pointer-dereference + length check that defeats coalesced loads. Craton Patina's answer: encode Utf8 columns as dictionaries on the host, ship only fixed-width integer indices to the device.
+Variable-width strings are a poor fit for fused-codegen GPU kernels. Every comparison would force a pointer-dereference + length check that defeats coalesced loads. Craton Bolt's answer: encode Utf8 columns as dictionaries on the host, ship only fixed-width integer indices to the device.
 
 ```
 StringArray ──► DictionaryColumn { dictionary: Vec<String>, indices: GpuVec<i32 or i64> }
@@ -208,4 +208,4 @@ Each of these is a deliberate scope choice for the v0.1 release, not a fundament
 
 ## Stability of the IR types
 
-`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`, `Value`, `ColumnIO`, and the rest of the physical-plan / IR vocabulary in `src/plan/physical_plan.rs` are marked `#[doc(hidden)]`. They are implementation-internal: the codegen + executor split owns them end-to-end, no public method takes one as a parameter, and they may change shape, gain variants, or be replaced in any 0.1.x release without a deprecation cycle. External code that wants to drive Craton Patina should hold to the `Engine` and `DataFrame` surface; the planner and IR are explicitly out-of-contract until the API freezes.
+`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`, `Value`, `ColumnIO`, and the rest of the physical-plan / IR vocabulary in `src/plan/physical_plan.rs` are marked `#[doc(hidden)]`. They are implementation-internal: the codegen + executor split owns them end-to-end, no public method takes one as a parameter, and they may change shape, gain variants, or be replaced in any 0.1.x release without a deprecation cycle. External code that wants to drive Craton Bolt should hold to the `Engine` and `DataFrame` surface; the planner and IR are explicitly out-of-contract until the API freezes.

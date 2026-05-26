@@ -25,7 +25,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::jit::partition_reduce_kernel_minmax::MinMaxOp;
 use crate::jit::partition_reduce_kernel_minmax_float::FloatDtype;
 
@@ -45,7 +45,7 @@ pub fn kernel_entry(op: MinMaxOp, dtype: FloatDtype) -> String {
         FloatDtype::Float32 => "f32",
         FloatDtype::Float64 => "f64",
     };
-    format!("patina_partition_reduce_{}_{}_keyi64", opn, dt)
+    format!("bolt_partition_reduce_{}_{}_keyi64", opn, dt)
 }
 
 fn val_bytes(dtype: FloatDtype) -> u32 {
@@ -79,7 +79,7 @@ fn ptx_setp_suffix(dtype: FloatDtype) -> &'static str {
 pub fn compile_partition_reduce_kernel_minmax_float_i64(
     op: MinMaxOp,
     dtype: FloatDtype,
-) -> PatinaResult<String> {
+) -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = kernel_entry(op, dtype);
     let entry = entry.as_str();
@@ -367,7 +367,7 @@ fn emit_cas_loop(
     dtype: FloatDtype,
     label_prefix: &str,
     val_reg: &str,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     let cas_suffix = ptx_cas_suffix(dtype);
     let setp_dt = ptx_setp_suffix(dtype);
     let cmp = match op {
@@ -463,8 +463,8 @@ fn emit_cas_loop(
     Ok(())
 }
 
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!(
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!(
         "partition_reduce_kernel_minmax_float_i64: write failed: {}",
         e
     ))

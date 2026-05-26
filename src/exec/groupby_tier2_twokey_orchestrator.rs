@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::partition_offsets;
 use crate::jit::partition_kernel_i64;
@@ -81,7 +81,7 @@ pub fn execute_tier2_twokey_sum(
     keys_packed: &GpuVec<i64>,
     vals: &GpuVec<f64>,
     n_rows: u32,
-) -> PatinaResult<Tier2TwokeyPartial> {
+) -> BoltResult<Tier2TwokeyPartial> {
     let num_partitions = partition_kernel_i64::NUM_PARTITIONS;
 
     // Fast path: empty input. Preserve the length invariant so downstream
@@ -142,7 +142,7 @@ pub fn execute_tier2_twokey_sum(
     // ----------------------------------------------------------------------
     let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
     if offsets.len() != (num_partitions as usize) + 1 {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "tier2_twokey: prefix-sum returned {} offsets, expected {}",
             offsets.len(),
             num_partitions as usize + 1
@@ -214,7 +214,7 @@ pub fn execute_tier2_twokey_sum(
     // ----------------------------------------------------------------------
     let n_rows_usize = n_rows as usize;
     if (offsets[num_partitions as usize] as usize) != n_rows_usize {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "tier2_twokey: offsets[K]={}, expected n_rows={}",
             offsets[num_partitions as usize], n_rows
         )));
@@ -268,7 +268,7 @@ pub fn execute_tier2_twokey_sum(
         || host_out_vals.len() != n_out_slots
         || host_out_set.len() != n_out_slots
     {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "tier2_twokey: reduce-kernel output buffers have unexpected length \
              (keys={}, vals={}, set={}, expected={})",
             host_out_keys.len(),

@@ -1,6 +1,6 @@
 ﻿# JIT Pipeline
 
-This document is the deep dive into Craton Patina's distinctive technical bet: **compile each SQL query into a fresh NVIDIA PTX kernel at runtime**, rather than chaining precompiled kernels. If you only read one design doc, read this one.
+This document is the deep dive into Craton Bolt's distinctive technical bet: **compile each SQL query into a fresh NVIDIA PTX kernel at runtime**, rather than chaining precompiled kernels. If you only read one design doc, read this one.
 
 For the layer map, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For the user-facing SQL surface, see [`SQL_REFERENCE.md`](SQL_REFERENCE.md).
 
@@ -20,7 +20,7 @@ load(region_id)  →  cmp_eq(1)  →  load(price)  →  load(tax)  →  multiply
 
 Six kernel launches, six round trips to global memory, six chunks of intermediate output buffer. The GPU's L2 cache is fast but global memory is not; reading and writing the same row five times before the user sees a result is wasteful.
 
-Craton Patina's bet: **fuse all six steps into one kernel** by emitting it from the SQL query at runtime. The whole expression tree lives in registers for the duration of one thread's work on one row. Global memory is touched exactly twice: once to read the inputs, once to write the output (or not, if the predicate gates the store).
+Craton Bolt's bet: **fuse all six steps into one kernel** by emitting it from the SQL query at runtime. The whole expression tree lives in registers for the duration of one thread's work on one row. Global memory is touched exactly twice: once to read the inputs, once to write the output (or not, if the predicate gates the store).
 
 This is exactly what Polars and DataFusion do on the CPU — codegen a vectorised pipeline per query. It hasn't been done in OSS for the GPU because the cost of "compile a kernel at query time" sounds expensive. It turns out it isn't, if you skip LLVM and emit PTX directly.
 
@@ -45,7 +45,7 @@ A process-wide PTX module cache lives in `src/jit/jit_compiler.rs`. `CudaModule:
 
 Source: `src/plan/sql_frontend.rs`.
 
-Uses [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) as the lexer/parser. We don't accept the full SQL grammar — `parse_sql` walks the parser's AST and only accepts shapes Craton Patina can execute:
+Uses [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) as the lexer/parser. We don't accept the full SQL grammar — `parse_sql` walks the parser's AST and only accepts shapes Craton Bolt can execute:
 
 - `SELECT` with optional `WHERE`, `GROUP BY`. No UNION, no CTE, no subqueries, no JOIN, no ORDER BY, no LIMIT, no HAVING.
 - A single table in `FROM`. No schema-qualified names.
@@ -53,7 +53,7 @@ Uses [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) as the lex
 - Aggregate functions in SELECT: `COUNT(*)`, `COUNT(expr)`, `SUM`, `MIN`, `MAX`, `AVG`.
 - Implicit GROUP BY validation: every non-aggregate SELECT item must appear in `GROUP BY` if the query has aggregates.
 
-Anything outside this surface produces a clear `PatinaError::Sql(...)` with the unsupported shape.
+Anything outside this surface produces a clear `BoltError::Sql(...)` with the unsupported shape.
 
 The resulting `LogicalPlan` is a small enum (`Scan`, `Filter`, `Project`, `Aggregate`) wrapping `Expr` trees. Type-checking lives in `LogicalPlan::schema` and `Expr::dtype(&schema)`.
 
@@ -72,7 +72,7 @@ The codegen path doesn't speak Utf8 — variable-width strings would defeat coal
    WHERE __idx_region = Int32(5)
 ```
 
-If the literal isn't in the dictionary (no row has that string), the predicate is constant-folded to `Literal(Bool(false))` for `=` or `Literal(Bool(true))` for `<>`. Ordering comparisons (`< > <= >=`) on Utf8 columns return `PatinaError::Plan` — dictionary indices reflect insertion order, not lex order.
+If the literal isn't in the dictionary (no row has that string), the predicate is constant-folded to `Literal(Bool(false))` for `=` or `Literal(Bool(true))` for `<>`. Ordering comparisons (`< > <= >=`) on Utf8 columns return `BoltError::Plan` — dictionary indices reflect insertion order, not lex order.
 
 The rewriter accepts both i32-indexed and i64-indexed dictionaries via a `LiteralIndex { I32(i32), I64(i64) }` enum; the output literal carries the matching dtype. The `__idx_<col>` column is appended to the scan's logical schema by `DictRegistry::extended_schema`, so the SQL frontend can resolve the rewriter's emitted column references at parse time.
 
@@ -110,10 +110,10 @@ Every emitter is a Rust function that builds a `String`. The output is real PTX 
 .target sm_70
 .address_size 64
 
-.visible .entry patina_kernel(
-	.param .u64 patina_kernel_param_0,         // price input pointer
-	.param .u64 patina_kernel_param_1,         // price output pointer
-	.param .u32 patina_kernel_param_2_n_rows
+.visible .entry bolt_kernel(
+	.param .u64 bolt_kernel_param_0,         // price input pointer
+	.param .u64 bolt_kernel_param_1,         // price output pointer
+	.param .u32 bolt_kernel_param_2_n_rows
 )
 {
 	.reg .pred %p<1>;
@@ -124,12 +124,12 @@ Every emitter is a Rust function that builds a `String`. The output is real PTX 
 	mov.u32       %r1, %ntid.x;
 	mov.u32       %r2, %tid.x;
 	mad.lo.s32    %r3, %r0, %r1, %r2;          // global thread idx
-	ld.param.u32  %r4, [patina_kernel_param_2_n_rows];
+	ld.param.u32  %r4, [bolt_kernel_param_2_n_rows];
 	setp.ge.s32   %p0, %r3, %r4;
 	@%p0 bra DONE;                              // bounds check
-	ld.param.u64  %rd0, [patina_kernel_param_0];
+	ld.param.u64  %rd0, [bolt_kernel_param_0];
 	cvta.to.global.u64 %rd0, %rd0;
-	ld.param.u64  %rd1, [patina_kernel_param_1];
+	ld.param.u64  %rd1, [bolt_kernel_param_1];
 	cvta.to.global.u64 %rd1, %rd1;
 	mul.wide.s32  %rd2, %r3, 8;
 	add.s64       %rd3, %rd0, %rd2;
@@ -181,7 +181,7 @@ Common confusion: NVRTC compiles **CUDA C++** to PTX. To go PTX → cubin you us
 
 ```rust
 let module = CudaModule::from_ptx(ptx_string)?;
-let function = module.function("patina_kernel")?;
+let function = module.function("bolt_kernel")?;
 ```
 
 `CudaModule` owns the cubin; `Drop` calls `cuModuleUnload`. `CudaFunction<'a>` is a borrowed handle with a `PhantomData<&'a CudaModule>` so it can't outlive the module.

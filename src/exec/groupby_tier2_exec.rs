@@ -15,7 +15,7 @@
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_tier2_dispatch::{
     dispatch_v2, AggOp, DispatchInputsV2, GroupByStrategyV2,
 };
@@ -29,7 +29,7 @@ use crate::plan::physical_plan::PhysicalPlan;
 pub fn try_execute(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
-) -> Option<PatinaResult<RecordBatch>> {
+) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -108,7 +108,7 @@ fn execute_inner(
     plan: &PhysicalPlan,
     key_arr: &Int32Array,
     val_arr: &Float64Array,
-) -> PatinaResult<RecordBatch> {
+) -> BoltResult<RecordBatch> {
     let n_rows = key_arr.len() as u32;
     let keys_gpu = GpuVec::<i32>::from_slice(key_arr.values())?;
     let vals_gpu = GpuVec::<f64>::from_slice(val_arr.values())?;
@@ -118,7 +118,7 @@ fn execute_inner(
     let aggregate = match plan {
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "groupby_tier2_exec: non-Aggregate plan reached execute_inner".into(),
             ))
         }

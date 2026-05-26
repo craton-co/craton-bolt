@@ -30,7 +30,7 @@
 //!     * Comparison Eq/NotEq/Lt/LtEq/Gt/GtEq → `Bool` output.
 //!     * Logical And/Or on `Bool` operands → `Bool` output.
 //!
-//! Anything else returns `PatinaError::Other` with a `{:?}` of the
+//! Anything else returns `BoltError::Other` with a `{:?}` of the
 //! offending expression. CAST, CASE, NULLIF, unary ops, scalar functions
 //! and so on are explicitly out of scope: the lowering does not produce
 //! them today, and adding them belongs in a separate change so that the
@@ -69,7 +69,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{AggregateExpr, BinaryOp, DataType, Expr, Literal};
 
 // ---------------------------------------------------------------------------
@@ -178,10 +178,10 @@ pub fn eval_expr(
     env: &ColumnEnv<'_>,
     out_dtype: DataType,
     n_rows: usize,
-) -> PatinaResult<HostColumn> {
+) -> BoltResult<HostColumn> {
     let raw = eval_inner(expr, env, n_rows)?;
     if raw.len() != n_rows {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "expr_agg: eval_expr produced {} rows, expected {}",
             raw.len(),
             n_rows
@@ -222,7 +222,7 @@ pub fn materialize_agg_input(
     env: &ColumnEnv<'_>,
     expected_dtype: DataType,
     n_rows: usize,
-) -> PatinaResult<HostColumn> {
+) -> BoltResult<HostColumn> {
     let inner = match agg {
         AggregateExpr::Sum(e)
         | AggregateExpr::Min(e)
@@ -243,7 +243,7 @@ fn eval_inner(
     expr: &Expr,
     env: &ColumnEnv<'_>,
     n_rows: usize,
-) -> PatinaResult<HostColumn> {
+) -> BoltResult<HostColumn> {
     match expr {
         Expr::Column(name) => eval_column(name, env, n_rows),
         Expr::Literal(lit) => eval_literal(lit, n_rows),
@@ -259,14 +259,14 @@ fn eval_column(
     name: &str,
     env: &ColumnEnv<'_>,
     n_rows: usize,
-) -> PatinaResult<HostColumn> {
+) -> BoltResult<HostColumn> {
     let col = env.get(name).ok_or_else(|| {
-        PatinaError::Plan(format!(
+        BoltError::Plan(format!(
             "expr_agg: column '{name}' not found in evaluator env"
         ))
     })?;
     if col.len() != n_rows {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "expr_agg: column '{}' has {} rows, expected {}",
             name,
             col.len(),
@@ -280,7 +280,7 @@ fn eval_column(
 /// has no static dtype, so we produce an `I64` column of `None`s — the
 /// outer cast lifts it to the caller-chosen `out_dtype`. (NULL of any
 /// dtype is still NULL.)
-fn eval_literal(lit: &Literal, n_rows: usize) -> PatinaResult<HostColumn> {
+fn eval_literal(lit: &Literal, n_rows: usize) -> BoltResult<HostColumn> {
     Ok(match lit {
         Literal::Null => HostColumn::I64(vec![None; n_rows]),
         Literal::Bool(b) => HostColumn::Bool(vec![Some(*b); n_rows]),
@@ -301,11 +301,11 @@ fn eval_binary(
     right: &Expr,
     env: &ColumnEnv<'_>,
     n_rows: usize,
-) -> PatinaResult<HostColumn> {
+) -> BoltResult<HostColumn> {
     let l = eval_inner(left, env, n_rows)?;
     let r = eval_inner(right, env, n_rows)?;
     if l.len() != n_rows || r.len() != n_rows {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "expr_agg: binary operand length mismatch: lhs={}, rhs={}, expected={}",
             l.len(),
             r.len(),
@@ -320,7 +320,7 @@ fn eval_binary(
     } else if is_logical(op) {
         eval_logical(op, l, r)
     } else {
-        Err(PatinaError::Other(format!(
+        Err(BoltError::Other(format!(
             "expr_agg: unsupported operator {:?}",
             op
         )))
@@ -337,11 +337,11 @@ fn eval_arithmetic(
     op: BinaryOp,
     lhs: HostColumn,
     rhs: HostColumn,
-) -> PatinaResult<HostColumn> {
+) -> BoltResult<HostColumn> {
     let l_dt = lhs.dtype();
     let r_dt = rhs.dtype();
     if !is_numeric(l_dt) || !is_numeric(r_dt) {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "expr_agg: arithmetic {:?} requires numeric operands, got {:?} and {:?}",
             op, l_dt, r_dt
         )));
@@ -357,7 +357,7 @@ fn eval_arithmetic(
         // Unification only produces the four numeric variants above; any
         // other shape here means `cast_column` and `unify_numeric` got out
         // of sync, which would be an internal bug.
-        (other_l, other_r) => Err(PatinaError::Other(format!(
+        (other_l, other_r) => Err(BoltError::Other(format!(
             "expr_agg: internal: arithmetic operand shape ({:?}, {:?})",
             other_l.dtype(),
             other_r.dtype()
@@ -509,7 +509,7 @@ fn eval_comparison(
     op: BinaryOp,
     lhs: HostColumn,
     rhs: HostColumn,
-) -> PatinaResult<HostColumn> {
+) -> BoltResult<HostColumn> {
     let l_dt = lhs.dtype();
     let r_dt = rhs.dtype();
 
@@ -523,7 +523,7 @@ fn eval_comparison(
             (HostColumn::I64(a), HostColumn::I64(b)) => Ok(HostColumn::Bool(zip_cmp(op, &a, &b))),
             (HostColumn::F32(a), HostColumn::F32(b)) => Ok(HostColumn::Bool(zip_cmp(op, &a, &b))),
             (HostColumn::F64(a), HostColumn::F64(b)) => Ok(HostColumn::Bool(zip_cmp(op, &a, &b))),
-            (other_l, other_r) => Err(PatinaError::Other(format!(
+            (other_l, other_r) => Err(BoltError::Other(format!(
                 "expr_agg: internal: comparison operand shape ({:?}, {:?})",
                 other_l.dtype(),
                 other_r.dtype()
@@ -532,7 +532,7 @@ fn eval_comparison(
     }
 
     if l_dt != r_dt {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "expr_agg: cannot compare {:?} with {:?}",
             l_dt, r_dt
         )));
@@ -541,7 +541,7 @@ fn eval_comparison(
     match (lhs, rhs) {
         (HostColumn::Bool(a), HostColumn::Bool(b)) => Ok(HostColumn::Bool(zip_cmp(op, &a, &b))),
         (HostColumn::Utf8(a), HostColumn::Utf8(b)) => Ok(HostColumn::Bool(zip_cmp_str(op, &a, &b))),
-        (l, r) => Err(PatinaError::Other(format!(
+        (l, r) => Err(BoltError::Other(format!(
             "expr_agg: internal: comparison fell through with shapes ({:?}, {:?})",
             l.dtype(),
             r.dtype()
@@ -609,11 +609,11 @@ fn eval_logical(
     op: BinaryOp,
     lhs: HostColumn,
     rhs: HostColumn,
-) -> PatinaResult<HostColumn> {
+) -> BoltResult<HostColumn> {
     let l_dt = lhs.dtype();
     let r_dt = rhs.dtype();
     if l_dt != DataType::Bool || r_dt != DataType::Bool {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "expr_agg: logical {:?} requires Bool operands, got {:?} and {:?}",
             op, l_dt, r_dt
         )));
@@ -651,7 +651,7 @@ fn eval_logical(
 /// (saturating for narrowing). Bool ↔ numeric: `true=1`, `false=0`, and
 /// nonzero numeric → `true`. Utf8 only converts to Utf8 — anything else
 /// is a type error.
-fn cast_column(col: HostColumn, to: DataType) -> PatinaResult<HostColumn> {
+fn cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
     if col.dtype() == to {
         return Ok(col);
     }
@@ -667,7 +667,7 @@ fn cast_column(col: HostColumn, to: DataType) -> PatinaResult<HostColumn> {
 
 /// Cast to `Vec<Option<i32>>`. Bool → 0/1; numerics use `as i32`
 /// (saturating); Utf8 errors.
-fn cast_to_i32(col: HostColumn) -> PatinaResult<Vec<Option<i32>>> {
+fn cast_to_i32(col: HostColumn) -> BoltResult<Vec<Option<i32>>> {
     Ok(match col {
         HostColumn::Bool(v) => v.into_iter().map(|o| o.map(|b| b as i32)).collect(),
         HostColumn::I32(v) => v,
@@ -675,7 +675,7 @@ fn cast_to_i32(col: HostColumn) -> PatinaResult<Vec<Option<i32>>> {
         HostColumn::F32(v) => v.into_iter().map(|o| o.map(|x| x as i32)).collect(),
         HostColumn::F64(v) => v.into_iter().map(|o| o.map(|x| x as i32)).collect(),
         HostColumn::Utf8(_) => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "expr_agg: cannot cast Utf8 to Int32".into(),
             ))
         }
@@ -683,7 +683,7 @@ fn cast_to_i32(col: HostColumn) -> PatinaResult<Vec<Option<i32>>> {
 }
 
 /// Cast to `Vec<Option<i64>>`.
-fn cast_to_i64(col: HostColumn) -> PatinaResult<Vec<Option<i64>>> {
+fn cast_to_i64(col: HostColumn) -> BoltResult<Vec<Option<i64>>> {
     Ok(match col {
         HostColumn::Bool(v) => v.into_iter().map(|o| o.map(|b| b as i64)).collect(),
         HostColumn::I32(v) => v.into_iter().map(|o| o.map(|x| x as i64)).collect(),
@@ -691,7 +691,7 @@ fn cast_to_i64(col: HostColumn) -> PatinaResult<Vec<Option<i64>>> {
         HostColumn::F32(v) => v.into_iter().map(|o| o.map(|x| x as i64)).collect(),
         HostColumn::F64(v) => v.into_iter().map(|o| o.map(|x| x as i64)).collect(),
         HostColumn::Utf8(_) => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "expr_agg: cannot cast Utf8 to Int64".into(),
             ))
         }
@@ -699,7 +699,7 @@ fn cast_to_i64(col: HostColumn) -> PatinaResult<Vec<Option<i64>>> {
 }
 
 /// Cast to `Vec<Option<f32>>`.
-fn cast_to_f32(col: HostColumn) -> PatinaResult<Vec<Option<f32>>> {
+fn cast_to_f32(col: HostColumn) -> BoltResult<Vec<Option<f32>>> {
     Ok(match col {
         HostColumn::Bool(v) => v
             .into_iter()
@@ -710,7 +710,7 @@ fn cast_to_f32(col: HostColumn) -> PatinaResult<Vec<Option<f32>>> {
         HostColumn::F32(v) => v,
         HostColumn::F64(v) => v.into_iter().map(|o| o.map(|x| x as f32)).collect(),
         HostColumn::Utf8(_) => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "expr_agg: cannot cast Utf8 to Float32".into(),
             ))
         }
@@ -718,7 +718,7 @@ fn cast_to_f32(col: HostColumn) -> PatinaResult<Vec<Option<f32>>> {
 }
 
 /// Cast to `Vec<Option<f64>>`.
-fn cast_to_f64(col: HostColumn) -> PatinaResult<Vec<Option<f64>>> {
+fn cast_to_f64(col: HostColumn) -> BoltResult<Vec<Option<f64>>> {
     Ok(match col {
         HostColumn::Bool(v) => v
             .into_iter()
@@ -729,7 +729,7 @@ fn cast_to_f64(col: HostColumn) -> PatinaResult<Vec<Option<f64>>> {
         HostColumn::F32(v) => v.into_iter().map(|o| o.map(|x| x as f64)).collect(),
         HostColumn::F64(v) => v,
         HostColumn::Utf8(_) => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "expr_agg: cannot cast Utf8 to Float64".into(),
             ))
         }
@@ -737,7 +737,7 @@ fn cast_to_f64(col: HostColumn) -> PatinaResult<Vec<Option<f64>>> {
 }
 
 /// Cast to `Vec<Option<bool>>`. Numeric → `x != 0`; Utf8 errors.
-fn cast_to_bool(col: HostColumn) -> PatinaResult<Vec<Option<bool>>> {
+fn cast_to_bool(col: HostColumn) -> BoltResult<Vec<Option<bool>>> {
     Ok(match col {
         HostColumn::Bool(v) => v,
         HostColumn::I32(v) => v.into_iter().map(|o| o.map(|x| x != 0)).collect(),
@@ -745,7 +745,7 @@ fn cast_to_bool(col: HostColumn) -> PatinaResult<Vec<Option<bool>>> {
         HostColumn::F32(v) => v.into_iter().map(|o| o.map(|x| x != 0.0)).collect(),
         HostColumn::F64(v) => v.into_iter().map(|o| o.map(|x| x != 0.0)).collect(),
         HostColumn::Utf8(_) => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "expr_agg: cannot cast Utf8 to Bool".into(),
             ))
         }
@@ -753,10 +753,10 @@ fn cast_to_bool(col: HostColumn) -> PatinaResult<Vec<Option<bool>>> {
 }
 
 /// Cast to `Vec<Option<String>>`. Only legal from Utf8 itself.
-fn cast_to_utf8(col: HostColumn) -> PatinaResult<Vec<Option<String>>> {
+fn cast_to_utf8(col: HostColumn) -> BoltResult<Vec<Option<String>>> {
     match col {
         HostColumn::Utf8(v) => Ok(v),
-        other => Err(PatinaError::Other(format!(
+        other => Err(BoltError::Other(format!(
             "expr_agg: cannot cast {:?} to Utf8",
             other.dtype()
         ))),
@@ -768,7 +768,7 @@ fn cast_to_utf8(col: HostColumn) -> PatinaResult<Vec<Option<String>>> {
 // `crate::plan::physical_plan::unify_numeric`, intentionally private here.
 // ---------------------------------------------------------------------------
 
-fn unify_numeric(a: DataType, b: DataType) -> PatinaResult<DataType> {
+fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
     use DataType::*;
     match (a, b) {
         (x, y) if x == y => Ok(x),
@@ -777,7 +777,7 @@ fn unify_numeric(a: DataType, b: DataType) -> PatinaResult<DataType> {
         (Float32, _) | (_, Float32) => Ok(Float32),
         (Int64, _) | (_, Int64) => Ok(Int64),
         (Int32, _) | (_, Int32) => Ok(Int32),
-        _ => Err(PatinaError::Other(format!(
+        _ => Err(BoltError::Other(format!(
             "expr_agg: cannot unify {:?} and {:?}",
             a, b
         ))),

@@ -19,12 +19,12 @@
 //   (which mnemonics, which dtypes, which structural markers) without
 //   pinning the allocator state.
 
-use craton_patina::jit::agg_kernels::{compile_reduction_kernel, ReduceOp};
-use craton_patina::jit::compile_ptx;
-use craton_patina::jit::float_atomics::compile_groupby_float_atomic_kernel;
-use craton_patina::jit::hash_kernels::compile_groupby_keys_kernel;
-use craton_patina::jit::prefix_scan::compile_prefix_scan_kernel;
-use craton_patina::plan::{
+use craton_bolt::jit::agg_kernels::{compile_reduction_kernel, ReduceOp};
+use craton_bolt::jit::compile_ptx;
+use craton_bolt::jit::float_atomics::compile_groupby_float_atomic_kernel;
+use craton_bolt::jit::hash_kernels::compile_groupby_keys_kernel;
+use craton_bolt::jit::prefix_scan::compile_prefix_scan_kernel;
+use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
 };
 
@@ -95,7 +95,7 @@ fn build_ptx_for(sql: &str) -> String {
              aggregation queries must compile their kernels directly"
         ),
     };
-    compile_ptx(kernel, "patina_test_kernel").expect("compile_ptx")
+    compile_ptx(kernel, "bolt_test_kernel").expect("compile_ptx")
 }
 
 // ---- Tests: scalar projection ----------------------------------------------
@@ -112,7 +112,7 @@ fn golden_scalar_projection_int32_smoke() {
     );
     // Entry name comes from the `kernel_name` arg.
     assert!(
-        ptx.contains(".visible .entry patina_test_kernel"),
+        ptx.contains(".visible .entry bolt_test_kernel"),
         "wrong entry name\n{ptx}"
     );
     // `int_col + 1` widens to s64 (int literals are Int64 by parse default),

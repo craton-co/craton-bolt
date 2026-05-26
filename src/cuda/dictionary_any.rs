@@ -26,7 +26,7 @@ use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::dictionary_i64::{
     estimate_distinct_count, DictionaryColumnI64, I32_INDEX_THRESHOLD,
 };
-use crate::error::PatinaResult;
+use crate::error::BoltResult;
 use crate::plan::logical_plan::DataType;
 
 /// Unified wrapper over the two dictionary variants.
@@ -54,7 +54,7 @@ impl DictionaryColumnAny {
     ///
     /// Both branches forward to the underlying type's `from_string_array`,
     /// which in turn uploads the index column to the device.
-    pub fn from_string_array(arr: &StringArray) -> PatinaResult<Self> {
+    pub fn from_string_array(arr: &StringArray) -> BoltResult<Self> {
         let distinct = estimate_distinct_count(arr);
         if distinct >= I32_INDEX_THRESHOLD {
             // Wide path: i64 indices, headroom up to i64::MAX.
@@ -166,7 +166,7 @@ impl DictionaryColumnAny {
     pub(crate) fn new_host_only(
         dictionary: Vec<String>,
         n_rows: usize,
-    ) -> PatinaResult<Self> {
+    ) -> BoltResult<Self> {
         if dictionary.len() >= I32_INDEX_THRESHOLD {
             // Wide path: i64 indices. The i64 sibling's constructor is
             // fallible (mirrors its production counterpart), so propagate.

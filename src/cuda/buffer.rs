@@ -13,7 +13,7 @@ use std::mem::size_of;
 use bytemuck::Pod;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// Arrow's mandated minimum buffer alignment, in bytes.
 pub const ARROW_ALIGNMENT: usize = 64;
@@ -48,10 +48,10 @@ impl<T: Pod> GpuBuffer<T> {
     }
 
     /// Allocate an empty buffer with room for `capacity` elements of `T`.
-    pub fn with_capacity(capacity: usize) -> PatinaResult<Self> {
+    pub fn with_capacity(capacity: usize) -> BoltResult<Self> {
         let elem_size = size_of::<T>();
         let raw_bytes = capacity.checked_mul(elem_size).ok_or_else(|| {
-            PatinaError::Memory(format!(
+            BoltError::Memory(format!(
                 "GpuBuffer::with_capacity size overflow: {} * {}",
                 capacity, elem_size
             ))
@@ -62,7 +62,7 @@ impl<T: Pod> GpuBuffer<T> {
         // a stable, non-null device pointer to hand out.
         let requested = round_up_to_alignment(raw_bytes.max(ARROW_ALIGNMENT), ARROW_ALIGNMENT)
             .ok_or_else(|| {
-                PatinaError::Memory(format!(
+                BoltError::Memory(format!(
                     "GpuBuffer::with_capacity alignment overflow for {} bytes",
                     raw_bytes
                 ))
@@ -91,11 +91,11 @@ impl<T: Pod> GpuBuffer<T> {
     }
 
     /// Allocate `len` elements and zero them via `cuMemsetD8`.
-    pub fn zeros(len: usize) -> PatinaResult<Self> {
+    pub fn zeros(len: usize) -> BoltResult<Self> {
         let mut buf = Self::with_capacity(len)?;
         if len > 0 {
             let byte_len = len.checked_mul(size_of::<T>()).ok_or_else(|| {
-                PatinaError::Memory(format!(
+                BoltError::Memory(format!(
                     "GpuBuffer::zeros size overflow: {} * {}",
                     len,
                     size_of::<T>()
@@ -113,7 +113,7 @@ impl<T: Pod> GpuBuffer<T> {
     }
 
     /// Allocate and copy `slice` from host to device.
-    pub fn from_slice(slice: &[T]) -> PatinaResult<Self> {
+    pub fn from_slice(slice: &[T]) -> BoltResult<Self> {
         let mut buf = Self::with_capacity(slice.len())?;
         if !slice.is_empty() {
             // SAFETY: `buf.ptr` was allocated with capacity for `slice.len()`
@@ -154,7 +154,7 @@ impl<T: Pod> GpuBuffer<T> {
     }
 
     /// Copy the buffer's contents back to a fresh host `Vec<T>`.
-    pub fn to_vec(&self) -> PatinaResult<Vec<T>> {
+    pub fn to_vec(&self) -> BoltResult<Vec<T>> {
         let mut out: Vec<T> = Vec::with_capacity(self.len);
         if self.len > 0 {
             // SAFETY: `out` has capacity for `self.len` elements; we copy
@@ -169,9 +169,9 @@ impl<T: Pod> GpuBuffer<T> {
     }
 
     /// Copy the buffer's contents into `dst`. Errors if lengths differ.
-    pub fn copy_to_slice(&self, dst: &mut [T]) -> PatinaResult<()> {
+    pub fn copy_to_slice(&self, dst: &mut [T]) -> BoltResult<()> {
         if dst.len() != self.len {
-            return Err(PatinaError::Memory(format!(
+            return Err(BoltError::Memory(format!(
                 "GpuBuffer::copy_to_slice length mismatch: dst={}, buffer={}",
                 dst.len(),
                 self.len
@@ -191,7 +191,7 @@ impl<T: Pod> GpuBuffer<T> {
 
 impl GpuBuffer<u8> {
     /// Copy the raw bytes of an Arrow CPU buffer into a fresh device buffer.
-    pub fn from_arrow_bytes(buf: &arrow_buffer::Buffer) -> PatinaResult<GpuBuffer<u8>> {
+    pub fn from_arrow_bytes(buf: &arrow_buffer::Buffer) -> BoltResult<GpuBuffer<u8>> {
         GpuBuffer::<u8>::from_slice(buf.as_slice())
     }
 }
@@ -222,7 +222,7 @@ unsafe impl<T: Pod> Send for GpuBuffer<T> {}
 /// Upload an Arrow primitive array's value buffer to the GPU as a typed buffer.
 pub fn primitive_to_gpu<P>(
     arr: &arrow_array::PrimitiveArray<P>,
-) -> PatinaResult<GpuBuffer<P::Native>>
+) -> BoltResult<GpuBuffer<P::Native>>
 where
     P: arrow_array::types::ArrowPrimitiveType,
     P::Native: Pod,

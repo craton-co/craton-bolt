@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum PatinaError {
+pub enum BoltError {
     #[error("CUDA driver error: {0}")]
     Cuda(String),
 
@@ -26,10 +26,10 @@ pub enum PatinaError {
     Other(String),
 }
 
-impl From<sqlparser::parser::ParserError> for PatinaError {
+impl From<sqlparser::parser::ParserError> for BoltError {
     fn from(e: sqlparser::parser::ParserError) -> Self {
-        PatinaError::Sql(format!("{}", e))
+        BoltError::Sql(format!("{}", e))
     }
 }
 
-pub type PatinaResult<T> = Result<T, PatinaError>;
+pub type BoltResult<T> = Result<T, BoltError>;

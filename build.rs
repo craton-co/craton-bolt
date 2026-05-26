@@ -115,7 +115,7 @@ fn compile_rust_cuda_kernels() {
     println!("cargo:rerun-if-changed=kernels/Cargo.toml");
     println!("cargo:rerun-if-changed=kernels/rust-toolchain.toml");
 
-    // sm_70 matches Craton Patina's hand-emit `.target sm_70` line so the PTX is
+    // sm_70 matches Craton Bolt's hand-emit `.target sm_70` line so the PTX is
     // co-loadable with the other kernels (see docs/rust_cuda/05_ptx_loader_compat.md).
     CudaBuilder::new(&kernels_dir)
         .copy_to(&ptx_out)

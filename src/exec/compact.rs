@@ -26,7 +26,7 @@ use arrow_array::{ArrayRef, BooleanArray};
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
 use crate::jit::CudaFunction;
 
@@ -40,7 +40,7 @@ const PREDICATE_BLOCK_SIZE: u32 = 256;
 /// byte per row, `1` for "keep" and `0` for "drop". Any non-zero byte is
 /// treated as `true` to be tolerant of mask kernels that emit other truthy
 /// values.
-pub fn download_mask(mask_device_ptr: CUdeviceptr, n_rows: usize) -> PatinaResult<Vec<bool>> {
+pub fn download_mask(mask_device_ptr: CUdeviceptr, n_rows: usize) -> BoltResult<Vec<bool>> {
     if n_rows == 0 {
         return Ok(Vec::new());
     }
@@ -76,9 +76,9 @@ pub fn download_mask(mask_device_ptr: CUdeviceptr, n_rows: usize) -> PatinaResul
 ///
 /// This is verified by the `compact_bool_with_nulls_preserves_validity`
 /// test in this file's `#[cfg(test)]` module.
-pub fn apply_mask(arr: &ArrayRef, mask: &[bool]) -> PatinaResult<ArrayRef> {
+pub fn apply_mask(arr: &ArrayRef, mask: &[bool]) -> BoltResult<ArrayRef> {
     if arr.len() != mask.len() {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "compact::apply_mask length mismatch: array={}, mask={}",
             arr.len(),
             mask.len()
@@ -91,7 +91,7 @@ pub fn apply_mask(arr: &ArrayRef, mask: &[bool]) -> PatinaResult<ArrayRef> {
     // already lived in `arr`.
     let predicate = BooleanArray::from(mask.to_vec());
     let filtered = filter(arr.as_ref(), &predicate).map_err(|e| {
-        PatinaError::Other(format!("arrow::compute::filter failed: {e}"))
+        BoltError::Other(format!("arrow::compute::filter failed: {e}"))
     })?;
     // `filter` returns `ArrayRef` (== `Arc<dyn Array>`) directly in arrow 53;
     // no extra wrap needed.
@@ -102,7 +102,7 @@ pub fn apply_mask(arr: &ArrayRef, mask: &[bool]) -> PatinaResult<ArrayRef> {
 ///
 /// Convenience for the engine: a projected `RecordBatch` is `Vec<ArrayRef>`
 /// plus a schema, and the schema is unchanged by compaction.
-pub fn compact_arrays(arrays: &[ArrayRef], mask: &[bool]) -> PatinaResult<Vec<ArrayRef>> {
+pub fn compact_arrays(arrays: &[ArrayRef], mask: &[bool]) -> BoltResult<Vec<ArrayRef>> {
     arrays.iter().map(|a| apply_mask(a, mask)).collect()
 }
 
@@ -111,7 +111,7 @@ pub fn compact_arrays(arrays: &[ArrayRef], mask: &[bool]) -> PatinaResult<Vec<Ar
 /// The returned `GpuVec<u8>` owns the allocation and frees it on drop, so the
 /// engine should keep it alive until after the predicate kernel launch and
 /// d2h copy complete.
-pub fn alloc_mask_buffer(n: usize) -> PatinaResult<GpuVec<u8>> {
+pub fn alloc_mask_buffer(n: usize) -> BoltResult<GpuVec<u8>> {
     GpuVec::<u8>::zeros(n)
 }
 
@@ -138,7 +138,7 @@ pub fn launch_predicate_kernel(
     mask_ptr: CUdeviceptr,
     n_rows: u32,
     stream: &CudaStream,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     if n_rows == 0 {
         // Nothing to do; an empty launch is wasted work and would have a
         // grid_x of 1 with all threads OOB. Be explicit.
@@ -300,7 +300,7 @@ mod tests {
     }
 
     /// Length-mismatch between array and mask must surface as a clean
-    /// `PatinaError::Other`, not a panic. Catches a regression where the
+    /// `BoltError::Other`, not a panic. Catches a regression where the
     /// guard was removed in favor of `arrow::compute::filter`'s own check
     /// (which produces a less actionable message).
     #[test]

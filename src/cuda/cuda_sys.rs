@@ -6,7 +6,7 @@
 //! `cuda-stub` feature is enabled, the `#[link]` block is omitted and every
 //! FFI entry point is replaced by a Rust shim that returns
 //! [`CUDA_ERROR_STUB`]; [`check`] converts that into
-//! `PatinaError::Other("cuda-stub mode: no GPU support compiled in")`.
+//! `BoltError::Other("cuda-stub mode: no GPU support compiled in")`.
 //! Stub mode lets the crate compile on hosts without the CUDA toolkit and on
 //! docs.rs.
 
@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use libc::{c_char, c_int, c_uint, c_void};
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// CUDA driver error code (0 == success).
 pub type CUresult = i32;
@@ -116,7 +116,7 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // `cuda-stub` feature: stand-in implementations so the crate compiles on hosts
 // without the CUDA toolkit (including docs.rs). Every shim returns
-// `CUDA_ERROR_STUB`, which `check()` maps to `PatinaError::Other(...)`.
+// `CUDA_ERROR_STUB`, which `check()` maps to `BoltError::Other(...)`.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "cuda-stub")]
 #[allow(non_snake_case, unused_variables)]
@@ -194,13 +194,13 @@ mod stubs {
 #[cfg(feature = "cuda-stub")]
 pub use stubs::*;
 
-/// Convert a `CUresult` into a `PatinaResult`, attaching the driver's message.
-pub fn check(code: CUresult) -> PatinaResult<()> {
+/// Convert a `CUresult` into a `BoltResult`, attaching the driver's message.
+pub fn check(code: CUresult) -> BoltResult<()> {
     if code == CUDA_SUCCESS {
         return Ok(());
     }
     if code == CUDA_ERROR_STUB {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "cuda-stub mode: no GPU support compiled in".into(),
         ));
     }
@@ -212,33 +212,33 @@ pub fn check(code: CUresult) -> PatinaResult<()> {
             format!("unknown CUDA error {}", code)
         }
     };
-    Err(PatinaError::Cuda(format!("CUDA driver error {}: {}", code, msg)))
+    Err(BoltError::Cuda(format!("CUDA driver error {}: {}", code, msg)))
 }
 
 static INIT: OnceLock<CUresult> = OnceLock::new();
 
 /// Idempotently call `cuInit(0)`. Safe to invoke from any thread.
-pub fn init() -> PatinaResult<()> {
+pub fn init() -> BoltResult<()> {
     let code = *INIT.get_or_init(|| unsafe { cuInit(0) });
     check(code)
 }
 
 /// Number of CUDA-capable devices visible to the driver.
-pub fn device_count() -> PatinaResult<i32> {
+pub fn device_count() -> BoltResult<i32> {
     let mut n: c_int = 0;
     check(unsafe { cuDeviceGetCount(&mut n) })?;
     Ok(n as i32)
 }
 
 /// Resolve the `ordinal`-th device handle.
-pub fn device_get(ordinal: i32) -> PatinaResult<CUdevice> {
+pub fn device_get(ordinal: i32) -> BoltResult<CUdevice> {
     let mut dev: CUdevice = 0;
     check(unsafe { cuDeviceGet(&mut dev, ordinal as c_int) })?;
     Ok(dev)
 }
 
 /// Human-readable device name (e.g. "NVIDIA GeForce RTX 4090").
-pub fn device_name(dev: CUdevice) -> PatinaResult<String> {
+pub fn device_name(dev: CUdevice) -> BoltResult<String> {
     const LEN: usize = 256;
     let mut buf: [c_char; LEN] = [0; LEN];
     check(unsafe { cuDeviceGetName(buf.as_mut_ptr(), LEN as c_int, dev) })?;
@@ -259,7 +259,7 @@ unsafe impl Send for CudaContext {}
 
 impl CudaContext {
     /// Initialize the driver and create a primary-style context on `device_ordinal`.
-    pub fn new(device_ordinal: i32) -> PatinaResult<Self> {
+    pub fn new(device_ordinal: i32) -> BoltResult<Self> {
         init()?;
         let dev = device_get(device_ordinal)?;
         let mut raw: CUcontext = std::ptr::null_mut();
@@ -268,7 +268,7 @@ impl CudaContext {
     }
 
     /// Bind this context to the calling thread.
-    pub fn set_current(&self) -> PatinaResult<()> {
+    pub fn set_current(&self) -> BoltResult<()> {
         check(unsafe { cuCtxSetCurrent(self.raw) })
     }
 
@@ -305,7 +305,7 @@ impl Drop for CudaContext {
         let code = unsafe { cuCtxDestroy_v2(self.raw) };
         if code != CUDA_SUCCESS {
             log::warn!(
-                "craton-patina: cuCtxDestroy_v2 failed with code {} (context leaked)",
+                "craton-bolt: cuCtxDestroy_v2 failed with code {} (context leaked)",
                 code
             );
         }
@@ -313,7 +313,7 @@ impl Drop for CudaContext {
 }
 
 /// Allocate `bytes` of device memory and return the raw pointer.
-pub fn mem_alloc(bytes: usize) -> PatinaResult<CUdeviceptr> {
+pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
     let mut ptr: CUdeviceptr = 0;
     check(unsafe { cuMemAlloc_v2(&mut ptr, bytes) })?;
     Ok(ptr)
@@ -324,7 +324,7 @@ pub fn mem_alloc(bytes: usize) -> PatinaResult<CUdeviceptr> {
 /// # Safety
 /// Caller must guarantee `ptr` is live, came from `mem_alloc`, is not aliased,
 /// and that no in-flight kernel still references it.
-pub unsafe fn mem_free(ptr: CUdeviceptr) -> PatinaResult<()> {
+pub unsafe fn mem_free(ptr: CUdeviceptr) -> BoltResult<()> {
     check(cuMemFree_v2(ptr))
 }
 
@@ -333,9 +333,9 @@ pub unsafe fn mem_free(ptr: CUdeviceptr) -> PatinaResult<()> {
 /// # Safety
 /// `src` must be valid for reads of `count * size_of::<T>()` bytes and `dst`
 /// must point to a device allocation of at least the same size.
-pub unsafe fn memcpy_h2d<T>(dst: CUdeviceptr, src: *const T, count: usize) -> PatinaResult<()> {
+pub unsafe fn memcpy_h2d<T>(dst: CUdeviceptr, src: *const T, count: usize) -> BoltResult<()> {
     let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
-        PatinaError::Memory(format!(
+        BoltError::Memory(format!(
             "memcpy_h2d size overflow: {} * {}",
             count,
             std::mem::size_of::<T>()
@@ -349,9 +349,9 @@ pub unsafe fn memcpy_h2d<T>(dst: CUdeviceptr, src: *const T, count: usize) -> Pa
 /// # Safety
 /// `dst` must be valid for writes of `count * size_of::<T>()` bytes and `src`
 /// must point to a live device allocation of at least the same size.
-pub unsafe fn memcpy_d2h<T>(dst: *mut T, src: CUdeviceptr, count: usize) -> PatinaResult<()> {
+pub unsafe fn memcpy_d2h<T>(dst: *mut T, src: CUdeviceptr, count: usize) -> BoltResult<()> {
     let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
-        PatinaError::Memory(format!(
+        BoltError::Memory(format!(
             "memcpy_d2h size overflow: {} * {}",
             count,
             std::mem::size_of::<T>()
@@ -365,7 +365,7 @@ pub unsafe fn memcpy_d2h<T>(dst: *mut T, src: CUdeviceptr, count: usize) -> Pati
 /// # Safety
 /// The returned pointer must be freed with [`mem_free_host`]; never with
 /// `free`/`Box::from_raw`/etc. The driver determines validity and alignment.
-pub unsafe fn mem_alloc_host(bytes: usize) -> PatinaResult<*mut c_void> {
+pub unsafe fn mem_alloc_host(bytes: usize) -> BoltResult<*mut c_void> {
     let mut ptr: *mut c_void = std::ptr::null_mut();
     check(cuMemAllocHost_v2(&mut ptr, bytes))?;
     Ok(ptr)
@@ -376,7 +376,7 @@ pub unsafe fn mem_alloc_host(bytes: usize) -> PatinaResult<*mut c_void> {
 /// # Safety
 /// Caller must guarantee `p` came from [`mem_alloc_host`], is not aliased, and
 /// is not still in use by any in-flight async copy.
-pub unsafe fn mem_free_host(p: *mut c_void) -> PatinaResult<()> {
+pub unsafe fn mem_free_host(p: *mut c_void) -> BoltResult<()> {
     check(cuMemFreeHost(p))
 }
 
@@ -384,6 +384,6 @@ pub unsafe fn mem_free_host(p: *mut c_void) -> PatinaResult<()> {
 ///
 /// # Safety
 /// `ptr` must point to a live device allocation of at least `count` bytes.
-pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> PatinaResult<()> {
+pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> BoltResult<()> {
     check(cuMemsetD8_v2(ptr, value, count))
 }

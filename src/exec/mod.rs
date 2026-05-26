@@ -68,12 +68,12 @@ pub use engine::{Engine, QueryHandle};
 /// CUDA's `cuLaunchKernel` shape parameters and most of the kernels in this
 /// crate take row counts as `u32`. Truncating a `usize` (or any wider integer
 /// width) with `as u32` would silently wrap on a > 4 GiB-row input and launch
-/// the wrong grid; this helper surfaces that overflow as a `PatinaError::Other`
+/// the wrong grid; this helper surfaces that overflow as a `BoltError::Other`
 /// instead. Every executor that crosses the host/device boundary with a row
 /// count should funnel through this helper rather than rolling its own cast.
-pub(crate) fn n_rows_to_u32(n_rows: usize) -> crate::error::PatinaResult<u32> {
+pub(crate) fn n_rows_to_u32(n_rows: usize) -> crate::error::BoltResult<u32> {
     u32::try_from(n_rows).map_err(|_| {
-        crate::error::PatinaError::Other(format!(
+        crate::error::BoltError::Other(format!(
             "row count {} exceeds the u32 launch-shape limit ({})",
             n_rows,
             u32::MAX

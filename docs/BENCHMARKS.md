@@ -1,6 +1,6 @@
-﻿# Craton Patina Benchmarks
+﻿# Craton Bolt Benchmarks
 
-This document captures the first measured numbers for the Craton Patina GPU SQL engine and explains how to reproduce them. The numbers below were captured on **2026-05-23** on a CPU-only host (no CUDA device available), so the full `engine_execute` GPU pipeline group was skipped. Everything that does not require a GPU — SQL parsing, logical planning, physical lowering, PTX codegen, the hand-written CPU reference loop, and the Polars head-to-head — was measured end-to-end.
+This document captures the first measured numbers for the Craton Bolt GPU SQL engine and explains how to reproduce them. The numbers below were captured on **2026-05-23** on a CPU-only host (no CUDA device available), so the full `engine_execute` GPU pipeline group was skipped. Everything that does not require a GPU — SQL parsing, logical planning, physical lowering, PTX codegen, the hand-written CPU reference loop, and the Polars head-to-head — was measured end-to-end.
 
 The benchmark suite lives in [`benches/query_benchmarks.rs`](../benches/query_benchmarks.rs) and is driven by Criterion 0.5. It runs against a fixed synthetic 1,000,000-row dataset and exercises six bench groups (three of which are CPU-only stages, one CPU reference, one Polars comparison, one GPU end-to-end).
 
@@ -15,7 +15,7 @@ All times are the median of the criterion `[low, mid, high]` triplet. Throughput
 | `ptx_gen/*`         | 6.9632 µs      | 9.4604 µs      | 11.221 µs      | `KernelSpec` → PTX string                          |
 | `cpu_reference`     | —              | 3.5080 ms (285.07 Melem/s) | — | Single-threaded Rust `for` loop, `a[i] * b[i]`     |
 | `polars/*`          | 6.5173 µs (153.44 Gelem/s) | 2.9405 ms (340.08 Melem/s) | 1.5970 ms (626.16 Melem/s) | Multi-threaded Polars LazyFrame baseline |
-| `engine_execute/*`  | SKIPPED        | SKIPPED        | SKIPPED        | Needs `PATINA_BENCH_GPU=1` and a CUDA device      |
+| `engine_execute/*`  | SKIPPED        | SKIPPED        | SKIPPED        | Needs `BOLT_BENCH_GPU=1` and a CUDA device      |
 
 These numbers reflect the **0.1.0 baseline**, captured before wave 5's
 codegen and runtime perf changes (PTX cache, `.ptr .global .restrict`,
@@ -101,12 +101,12 @@ This is not a Polars defect; it is a correct implementation of "select a column 
 
 ## GPU pipeline
 
-The `engine_execute/{proj,arith,filtered}` group runs the full Craton Patina GPU pipeline: parse → plan → lower → codegen → PTX compile → kernel launch → device-to-host copy. **It was SKIPPED on this run** because the bench host did not have a CUDA-capable GPU available.
+The `engine_execute/{proj,arith,filtered}` group runs the full Craton Bolt GPU pipeline: parse → plan → lower → codegen → PTX compile → kernel launch → device-to-host copy. **It was SKIPPED on this run** because the bench host did not have a CUDA-capable GPU available.
 
 To enable it on a CUDA-equipped host:
 
 ```bash
-PATINA_BENCH_GPU=1 cargo bench
+BOLT_BENCH_GPU=1 cargo bench
 ```
 
 When enabled, criterion will report three additional rows in the form:
@@ -132,7 +132,7 @@ These numbers are the headline GPU performance story and need to be captured on 
 - **Polars setup**: each Polars sample constructs a fresh LazyFrame from the in-memory `DataFrame`, applies `select` or `filter().select()`, and calls `collect()`. Plan caching is *not* in scope; the LazyFrame is built per iteration.
 - **CPU reference**: a plain `for i in 0..n { out.push(a[i] * b[i]) }` loop with `Vec::with_capacity(n)` preallocated. No SIMD, no parallelism. The `out` `Vec` is dropped between iterations.
 - **Dataset size**: 1,000,000 rows. This is intentionally on the small side — large enough that per-row costs dominate, small enough that everything fits comfortably in L2/L3 on most hardware. The constant `BENCH_ROWS` in `benches/query_benchmarks.rs` can be increased to sweep larger sizes.
-- **GPU gating**: the `engine_execute` group is gated on the `PATINA_BENCH_GPU=1` environment variable so the suite is runnable on machines without CUDA installed.
+- **GPU gating**: the `engine_execute` group is gated on the `BOLT_BENCH_GPU=1` environment variable so the suite is runnable on machines without CUDA installed.
 
 ## Reproducing
 
@@ -145,7 +145,7 @@ cargo bench
 Full run with the GPU pipeline (requires CUDA toolkit and a CUDA-capable device):
 
 ```bash
-PATINA_BENCH_GPU=1 cargo bench
+BOLT_BENCH_GPU=1 cargo bench
 ```
 
 Single bench group only (criterion filters by group name):
@@ -184,13 +184,13 @@ The original table above was captured on a CPU-only host with a 1 M-row dataset 
 
 The result: every data-bearing iteration takes between **41 ms and 4 s**, so the reported medians are tight (criterion's CI is now under ±3 % across all three queries).
 
-Host: NVIDIA GeForce RTX 2060, driver 591.86 (WDDM), CUDA 12.6 toolkit (link target). The bench was run with `PATINA_BENCH_GPU=1 cargo bench`.
+Host: NVIDIA GeForce RTX 2060, driver 591.86 (WDDM), CUDA 12.6 toolkit (link target). The bench was run with `BOLT_BENCH_GPU=1 cargo bench`.
 
-| Query                    | Polars (multi-thread CPU) | Craton Patina E2E (GPU)         | CPU reference (single-thread) | Winner                  |
+| Query                    | Polars (multi-thread CPU) | Craton Bolt E2E (GPU)         | CPU reference (single-thread) | Winner                  |
 | ------------------------ | ------------------------- | ------------------------- | ----------------------------- | ----------------------- |
 | **`proj`** (passthrough) | **12.55 µs** *(zero-copy)*| 115.5 ms *(432.9 Melem/s)*| —                             | Polars (zero-copy)      |
-| **`arith`** (11-op chain)| 4.05 s *(12.3 Melem/s)*   | **124.8 ms** *(400.7 Melem/s)*| 1.06 s *(47.2 Melem/s)*       | **Craton Patina — 32.4× faster** |
-| **`filtered`** (filter + 4-op arith) | 369 ms *(135.5 Melem/s)* | **41.8 ms** *(1.196 Gelem/s)* | —                       | **Craton Patina — 8.8× faster**  |
+| **`arith`** (11-op chain)| 4.05 s *(12.3 Melem/s)*   | **124.8 ms** *(400.7 Melem/s)*| 1.06 s *(47.2 Melem/s)*       | **Craton Bolt — 32.4× faster** |
+| **`filtered`** (filter + 4-op arith) | 369 ms *(135.5 Melem/s)* | **41.8 ms** *(1.196 Gelem/s)* | —                       | **Craton Bolt — 8.8× faster**  |
 
 ### What changed since the 0.1.0 baseline
 
@@ -202,13 +202,13 @@ The three architectural levers identified in the original competitive analysis a
 
 The combined effect on the heavy workload:
 
-- **`arith`** — Craton Patina spends ~115 ms of its 125 ms total on orchestration (kernel launch + D2H of a 400 MB output column). The extra ~10 ms covers all 11 floating-point operations across 50 M rows. Polars, by contrast, materialises an intermediate column per binary op under chained `expr * lit() + expr * lit()` style, which is why its 4.05 s is dramatically slower than the single-threaded CPU reference loop (1.06 s) — the reference is a fused, autovectorised `for` loop.
+- **`arith`** — Craton Bolt spends ~115 ms of its 125 ms total on orchestration (kernel launch + D2H of a 400 MB output column). The extra ~10 ms covers all 11 floating-point operations across 50 M rows. Polars, by contrast, materialises an intermediate column per binary op under chained `expr * lit() + expr * lit()` style, which is why its 4.05 s is dramatically slower than the single-threaded CPU reference loop (1.06 s) — the reference is a fused, autovectorised `for` loop.
 - **`filtered`** — GPU-side compaction (prefix-scan + gather, see `src/exec/gpu_compact.rs`) reduces the output to ~12.5 M rows before D2H, so total round-trip drops to 41 ms — 1.2 Gelem/s of input throughput.
-- **`proj`** — Polars wins because it returns a zero-copy view into the same host allocation; no GPU pipeline can match that for a pure passthrough. The 115 ms Craton Patina number is the irreducible cost of "round-trip 400 MB through the PCIe bus and rebuild an Arrow array on the host".
+- **`proj`** — Polars wins because it returns a zero-copy view into the same host allocation; no GPU pipeline can match that for a pure passthrough. The 115 ms Craton Bolt number is the irreducible cost of "round-trip 400 MB through the PCIe bus and rebuild an Arrow array on the host".
 
 ### Reading the numbers
 
-- The `arith` win is real but somewhat amplified by Polars' eager-binary materialisation under chained `lit()` expressions; a rewriter / `fold` pass on its side could narrow the gap. The CPU reference (1.06 s) is the more honest CPU ceiling, and Craton Patina is still **8.5× faster** than that.
+- The `arith` win is real but somewhat amplified by Polars' eager-binary materialisation under chained `lit()` expressions; a rewriter / `fold` pass on its side could narrow the gap. The CPU reference (1.06 s) is the more honest CPU ceiling, and Craton Bolt is still **8.5× faster** than that.
 - The `filtered` win is the clean structural win: GPU parallelism + on-device compaction dominate even after PCIe D2H of the surviving column. That gap widens further at larger row counts.
 - The `proj` loss is structural and not interesting to chase — any GPU engine that returns an Arrow `RecordBatch` to the host pays the D2H toll.
 
@@ -227,10 +227,10 @@ sample-rich criterion windows. See
   standard reference Polars, DuckDB, Pandas, ClickHouse and others use in
   their own published OLAP comparisons. Schema and query shapes match the
   spec; the only deviation is that grouping keys are `Int32` instead of
-  categorical strings, so Craton Patina's GPU GROUP-BY (which does not yet hash
+  categorical strings, so Craton Bolt's GPU GROUP-BY (which does not yet hash
   string keys) can run the same SQL the CPU engines do.
 - **Engines**:
-  - **Craton Patina** — this crate, GPU SQL engine.
+  - **Craton Bolt** — this crate, GPU SQL engine.
   - **Polars 0.42** — Rust-native, Rayon-threaded.
   - **DuckDB 1.2** — bundled embedded C++ engine, multi-threaded.
 - **Workload**: `N = 10_000_000` (the h2o.ai "small" scale), 6 columns
@@ -245,7 +245,7 @@ sample-rich criterion windows. See
 - **Verification**: every query runs through every engine on a 100 K-row
   fixture before any timing, and outputs are compared with a 1 e-9 relative
   tolerance. Cross-engine disagreement panics. **All four queries verified
-  identical across Polars, DuckDB and Craton Patina** before the timed runs began.
+  identical across Polars, DuckDB and Craton Bolt** before the timed runs began.
 - **Measurement**: criterion 20 s window per query, ≥ 100 samples each.
   Reported numbers are the median; ranges are the criterion `[low, mid,
   high]` triplet.
@@ -257,7 +257,7 @@ the first run (see "Bugs fixed since first run" below). All five queries
 verified equivalent across all three engines on the 100 K-row fixture
 before the timed runs began.
 
-| Query                                 | Polars (CPU MT)              | DuckDB (CPU MT)               | Craton Patina (GPU)                  | Winner                  |
+| Query                                 | Polars (CPU MT)              | DuckDB (CPU MT)               | Craton Bolt (GPU)                  | Winner                  |
 | ------------------------------------- | ---------------------------- | ----------------------------- | ------------------------------ | ----------------------- |
 | **q1** low-card SUM (id1, 100 grps)   | 16.70 ms *(599.0 Melem/s)*   | **11.95 ms** *(836.5 Melem/s)*| 282.3 ms *(35.4 Melem/s)*      | **DuckDB**              |
 | **q2** med-card 2-SUM (id2, 10 K)     | 84.25 ms *(118.7 Melem/s)*   | **50.84 ms** *(196.7 Melem/s)*| 443.7 ms *(22.5 Melem/s)*      | **DuckDB**              |
@@ -302,14 +302,14 @@ now fixed in tree; the table above is the post-fix re-measurement.
 
 ### The honest read
 
-On the standard groupby OLAP workload, **Craton Patina's GPU engine is currently
+On the standard groupby OLAP workload, **Craton Bolt's GPU engine is currently
 slower than both Polars and DuckDB on every query**, by between 1.4× and
 44× depending on cardinality. This is the opposite of the favourable
 arithmetic-projection numbers in the "Heavy-workload GPU results" section
-above, and the contrast matters: that earlier table compared Craton Patina
+above, and the contrast matters: that earlier table compared Craton Bolt
 against a Polars expression chain whose eager-binary materialisation makes
 *chained* `lit() * col() + …` queries pathologically slow. On idiomatic OLAP
-groupby — what the community actually benchmarks against — Craton Patina does
+groupby — what the community actually benchmarks against — Craton Bolt does
 not currently win.
 
 Where the time goes (high-cardinality SUM at id3 = 1 M groups, ≈ 770 ms):
@@ -491,13 +491,13 @@ The 9 parallel-agent build delivered the multi-SUM kernel (T1A), the AVG
 executor via SUM+COUNT (T1B), and the seven Tier-2 components (T2A partition
 kernel, T2B scatter kernel, T2C offsets utility, T2D orchestrator, T2E
 merger, T2F dispatcher, T2G CPU-reference tests). All five queries still
-verified equivalent across Polars ⇄ DuckDB ⇄ Craton Patina on the 100 K-row
+verified equivalent across Polars ⇄ DuckDB ⇄ Craton Bolt on the 100 K-row
 fixture before each timed run.
 
 Same 10 M rows, RTX 2060, CUDA 12.6 link target. Numbers are criterion
 medians; all measurements within ±5 % CI.
 
-| Query | DuckDB | Polars | Craton Patina baseline (pre-fast-paths) | Craton Patina **now** | Δ vs baseline | Fast path triggered |
+| Query | DuckDB | Polars | Craton Bolt baseline (pre-fast-paths) | Craton Bolt **now** | Δ vs baseline | Fast path triggered |
 | --- | --- | --- | --- | --- | --- | --- |
 | q1 low-card SUM (100 grps) | 6.9 ms | 19.0 ms | 282 ms | **51.4 ms** | **5.5×** | Tier-1 single-SUM |
 | q2 med-card 2-SUM (10 K grps) | 46.4 ms | 99.4 ms | 444 ms | 510 ms | ≈ noise | none (id2 max-key > 1024) |
@@ -508,9 +508,9 @@ medians; all measurements within ±5 % CI.
 Three queries got the projected algorithmic speedup; the q2 / q3 numbers
 are within bench-run variance of the baseline (no fast path engaged). The
 gap to DuckDB on q1 / q4 closed dramatically (q1: 44× → 7.5×, q4: 38× →
-5.5×). Craton Patina now **beats DuckDB on q5** (460 ms vs 623 ms) and **q3**
+5.5×). Craton Bolt now **beats DuckDB on q5** (460 ms vs 623 ms) and **q3**
 (977 ms vs DuckDB's 498 ms — wait, that's still a loss). Correction: q5
-Craton Patina (460 ms) beats DuckDB (623 ms). For Polars, Craton Patina still trails
+Craton Bolt (460 ms) beats DuckDB (623 ms). For Polars, Craton Bolt still trails
 on q3 / q5 — Polars' multi-threaded CPU partitioned-hash is highly tuned.
 
 ### What still falls through
@@ -569,11 +569,11 @@ path unchanged.
 
 Result on q1 (10 M rows, 100 groups, freshly-warmed RTX 2060):
 
-|                       | DuckDB    | Polars     | Craton Patina (pre-Tier-1) | Craton Patina (post-Tier-1) | Δ      |
+|                       | DuckDB    | Polars     | Craton Bolt (pre-Tier-1) | Craton Bolt (post-Tier-1) | Δ      |
 | --------------------- | --------- | ---------- | -------------------- | --------------------- | ------ |
 | q1: SUM by id1 (100)  | 8.52 ms   | 26.70 ms   | 282.3 ms             | **37.28 ms**          | **−86.8 % (7.6×)** |
 
-Verifications all still pass (Polars ⇄ DuckDB, DuckDB ⇄ Craton Patina) on the
+Verifications all still pass (Polars ⇄ DuckDB, DuckDB ⇄ Craton Bolt) on the
 100 K-row fixture before the timed runs begin — the fast path produces
 bit-equivalent answers within the same 1e-9 relative tolerance.
 
@@ -615,7 +615,7 @@ fast-path check at the top of `execute_groupby`.
 
 ## See also
 
-- [`docs/COMPETITIVE_BENCHMARKING.md`](./COMPETITIVE_BENCHMARKING.md) — methodology and discipline for running head-to-head comparisons against DuckDB, Polars, HeavyDB, and friends. Read before publishing any "Craton Patina vs X" numbers.
+- [`docs/COMPETITIVE_BENCHMARKING.md`](./COMPETITIVE_BENCHMARKING.md) — methodology and discipline for running head-to-head comparisons against DuckDB, Polars, HeavyDB, and friends. Read before publishing any "Craton Bolt vs X" numbers.
 - [`docs/JIT_PIPELINE.md`](./JIT_PIPELINE.md) — what `plan`, `lower`, and `ptx_gen` actually do under the hood, and why each stage exists as a separate measurement.
 - [`docs/SQL_REFERENCE.md`](./SQL_REFERENCE.md) — which SQL features are supported today, which constrains what we can meaningfully benchmark.
 - [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) — overall system architecture.

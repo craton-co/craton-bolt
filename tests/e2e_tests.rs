@@ -1,6 +1,6 @@
 ﻿// SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end query tests for Craton Patina.
+//! End-to-end query tests for Craton Bolt.
 //!
 //! Offline tests (no GPU): SQL parse -> plan -> PTX shape. Run by `cargo test`.
 //! Online tests (#[ignore]'d): full engine execute on a CUDA device. Run with
@@ -11,8 +11,8 @@ use std::sync::Arc;
 use arrow_array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
-use craton_patina::jit::compile_ptx;
-use craton_patina::plan::{
+use craton_bolt::jit::compile_ptx;
+use craton_bolt::plan::{
     lower_physical, parse_sql, AggregateExpr, DataType, Expr, Field, Literal, LogicalPlan,
     MemTableProvider, PhysicalPlan, Schema,
 };
@@ -166,7 +166,7 @@ fn ptx_for_trivial_select_contains_required_directives() {
     let PhysicalPlan::Projection { kernel, .. } = &phys else {
         panic!("expected Projection");
     };
-    let ptx = compile_ptx(kernel, "patina_kernel").expect("ptx");
+    let ptx = compile_ptx(kernel, "bolt_kernel").expect("ptx");
 
     assert!(ptx.contains(".version 7.5"), "missing .version directive\n{ptx}");
     assert!(ptx.contains(".target sm_70"), "missing .target directive\n{ptx}");
@@ -175,7 +175,7 @@ fn ptx_for_trivial_select_contains_required_directives() {
         "missing .address_size directive"
     );
     assert!(
-        ptx.contains(".visible .entry patina_kernel"),
+        ptx.contains(".visible .entry bolt_kernel"),
         "missing entry directive"
     );
     // Kernel-parameter load order is established by `ld.param.u64` (column ptrs) and
@@ -199,7 +199,7 @@ fn ptx_with_predicate_contains_gate_before_store() {
         panic!("expected Projection");
     };
     assert!(kernel.predicate.is_some());
-    let ptx = compile_ptx(kernel, "patina_kernel").unwrap();
+    let ptx = compile_ptx(kernel, "bolt_kernel").unwrap();
 
     // The predicate `setp` and the predicate-gate `bra DONE` should precede the store.
     let store_pos = ptx.find("st.global").expect("store present");
@@ -230,7 +230,7 @@ fn ptx_int32_dtype_load_store_suffixes() {
     let PhysicalPlan::Projection { kernel, .. } = &phys else {
         panic!("expected Projection");
     };
-    let ptx = compile_ptx(kernel, "patina_kernel").unwrap();
+    let ptx = compile_ptx(kernel, "bolt_kernel").unwrap();
     assert!(ptx.contains("ld.global.s32"), "expected s32 load");
     assert!(ptx.contains("st.global.s32"), "expected s32 store");
 }
@@ -248,7 +248,7 @@ fn ptx_int64_dtype_load_store_suffixes() {
     let PhysicalPlan::Projection { kernel, .. } = &phys else {
         panic!("expected Projection");
     };
-    let ptx = compile_ptx(kernel, "patina_kernel").unwrap();
+    let ptx = compile_ptx(kernel, "bolt_kernel").unwrap();
     assert!(ptx.contains("ld.global.s64"), "expected s64 load");
     assert!(ptx.contains("st.global.s64"), "expected s64 store");
 }
@@ -485,7 +485,7 @@ fn groupby_sum_int32_widens_to_i64() {
 #[test]
 #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
 fn e2e_simple_projection() {
-    use craton_patina::Engine;
+    use craton_bolt::Engine;
 
     let mut engine = Engine::new().expect("ctx");
     let batch = sales_batch(1024);
@@ -512,7 +512,7 @@ fn e2e_simple_projection() {
 #[test]
 #[ignore = "requires CUDA device"]
 fn e2e_arithmetic_projection() {
-    use craton_patina::Engine;
+    use craton_bolt::Engine;
 
     let mut engine = Engine::new().expect("ctx");
     let batch = sales_batch(4096);
@@ -546,7 +546,7 @@ fn e2e_arithmetic_projection() {
 #[test]
 #[ignore = "requires CUDA device"]
 fn e2e_filtered_select() {
-    use craton_patina::Engine;
+    use craton_bolt::Engine;
 
     let mut engine = Engine::new().expect("ctx");
     let batch = sales_batch(2048);
@@ -586,7 +586,7 @@ fn e2e_filtered_select() {
 #[test]
 #[ignore = "requires CUDA device"]
 fn e2e_large_i64_add() {
-    use craton_patina::Engine;
+    use craton_bolt::Engine;
 
     let mut engine = Engine::new().expect("ctx");
     let n: usize = 100_000;

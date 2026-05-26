@@ -51,28 +51,28 @@ use std::collections::HashMap;
 
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 // ---------------------------------------------------------------------------
 // Internal: shared dictionary-overflow checked insert.
 // ---------------------------------------------------------------------------
 
 /// Insert `s` into (`dict`, `lookup`) if absent and return its 1-based index.
-/// Surfaces dictionary overflow as `PatinaError::Other`, matching the
+/// Surfaces dictionary overflow as `BoltError::Other`, matching the
 /// existing `string_ops` / `from_string_array` conventions.
 fn intern(
     dict: &mut Vec<String>,
     lookup: &mut HashMap<String, i32>,
     s: String,
-) -> PatinaResult<i32> {
+) -> BoltResult<i32> {
     if let Some(&idx) = lookup.get(&s) {
         return Ok(idx);
     }
     let next_len = dict.len().checked_add(1).ok_or_else(|| {
-        PatinaError::Other("dictionary overflow: more than usize::MAX unique strings".into())
+        BoltError::Other("dictionary overflow: more than usize::MAX unique strings".into())
     })?;
     if next_len > i32::MAX as usize {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "dictionary overflow: more than {} unique strings (i32 index space)",
             i32::MAX
         )));
@@ -89,7 +89,7 @@ fn intern(
 /// This is the same shape as `string_ops::dedup_transformed`; duplicating it
 /// here rather than reaching across modules avoids coupling these two
 /// independently-evolving feature sets.
-fn dedup_transformed(transformed: Vec<String>) -> PatinaResult<(Vec<String>, Vec<i32>)> {
+fn dedup_transformed(transformed: Vec<String>) -> BoltResult<(Vec<String>, Vec<i32>)> {
     let n_old = transformed.len();
     let mut new_dict: Vec<String> = Vec::new();
     let mut lookup: HashMap<String, i32> = HashMap::new();
@@ -179,17 +179,17 @@ fn round_down_to_char_boundary(s: &str, mut byte_idx: usize) -> usize {
 /// == right_indices.len()`. NULL on either side propagates as index `0`.
 ///
 /// Errors:
-/// * `PatinaError::Other` if the input index vectors have different lengths.
-/// * `PatinaError::Other` if either index falls outside `0..=dict.len()`.
-/// * `PatinaError::Other` on dictionary overflow (>= i32::MAX outputs).
+/// * `BoltError::Other` if the input index vectors have different lengths.
+/// * `BoltError::Other` if either index falls outside `0..=dict.len()`.
+/// * `BoltError::Other` on dictionary overflow (>= i32::MAX outputs).
 fn concat_pure(
     left_dict: &[String],
     left_indices: &[i32],
     right_dict: &[String],
     right_indices: &[i32],
-) -> PatinaResult<(Vec<String>, Vec<i32>)> {
+) -> BoltResult<(Vec<String>, Vec<i32>)> {
     if left_indices.len() != right_indices.len() {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "CONCAT: n_rows mismatch (left = {}, right = {})",
             left_indices.len(),
             right_indices.len()
@@ -208,13 +208,13 @@ fn concat_pure(
         // Strict bounds: a negative index would indicate a kernel-side bug
         // we'd rather surface than mask. Same posture as `string_ops`.
         if li < 0 {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "CONCAT: negative left index {} at row {} (NULL is encoded as 0)",
                 li, i
             )));
         }
         if ri < 0 {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "CONCAT: negative right index {} at row {} (NULL is encoded as 0)",
                 ri, i
             )));
@@ -229,7 +229,7 @@ fn concat_pure(
         let lpos = (li as usize) - 1;
         let rpos = (ri as usize) - 1;
         let lstr = left_dict.get(lpos).ok_or_else(|| {
-            PatinaError::Other(format!(
+            BoltError::Other(format!(
                 "CONCAT: left index {} out of range (dictionary size {}) at row {}",
                 li,
                 left_dict.len(),
@@ -237,7 +237,7 @@ fn concat_pure(
             ))
         })?;
         let rstr = right_dict.get(rpos).ok_or_else(|| {
-            PatinaError::Other(format!(
+            BoltError::Other(format!(
                 "CONCAT: right index {} out of range (dictionary size {}) at row {}",
                 ri,
                 right_dict.len(),
@@ -261,7 +261,7 @@ fn substring_pure(
     input_dict: &[String],
     start: i32,
     length: i32,
-) -> PatinaResult<(Vec<String>, Vec<i32>)> {
+) -> BoltResult<(Vec<String>, Vec<i32>)> {
     let transformed: Vec<String> = input_dict
         .iter()
         .map(|s| sql_substring(s, start, length))
@@ -276,17 +276,17 @@ fn substring_pure(
 /// empty string (a real, non-NULL dictionary entry), not SQL NULL.
 ///
 /// Errors:
-/// * `PatinaError::Other` if `inputs` is empty (no columns to join — the
+/// * `BoltError::Other` if `inputs` is empty (no columns to join — the
 ///   planner should never emit this, but we surface it rather than panic).
-/// * `PatinaError::Other` if column row counts disagree.
-/// * `PatinaError::Other` on any negative or out-of-range index.
-/// * `PatinaError::Other` on dictionary overflow.
+/// * `BoltError::Other` if column row counts disagree.
+/// * `BoltError::Other` on any negative or out-of-range index.
+/// * `BoltError::Other` on dictionary overflow.
 fn concat_ws_pure(
     separator: &str,
     inputs: &[(&[String], &[i32])],
-) -> PatinaResult<(Vec<String>, Vec<i32>)> {
+) -> BoltResult<(Vec<String>, Vec<i32>)> {
     if inputs.is_empty() {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "CONCAT_WS: at least one input column is required".into(),
         ));
     }
@@ -294,7 +294,7 @@ fn concat_ws_pure(
     let n = inputs[0].1.len();
     for (k, (_, idx)) in inputs.iter().enumerate().skip(1) {
         if idx.len() != n {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "CONCAT_WS: n_rows mismatch (column 0 = {}, column {} = {})",
                 n,
                 k,
@@ -314,7 +314,7 @@ fn concat_ws_pure(
         for (col_k, (dict, idx_vec)) in inputs.iter().enumerate() {
             let idx = idx_vec[i];
             if idx < 0 {
-                return Err(PatinaError::Other(format!(
+                return Err(BoltError::Other(format!(
                     "CONCAT_WS: negative index {} at row {}, column {} (NULL is encoded as 0)",
                     idx, i, col_k
                 )));
@@ -325,7 +325,7 @@ fn concat_ws_pure(
             }
             let pos = (idx as usize) - 1;
             let s = dict.get(pos).ok_or_else(|| {
-                PatinaError::Other(format!(
+                BoltError::Other(format!(
                     "CONCAT_WS: index {} out of range (column {} dictionary size {}) at row {}",
                     idx,
                     col_k,
@@ -364,9 +364,9 @@ fn concat_ws_pure(
 pub fn concat(
     left: &DictionaryColumn,
     right: &DictionaryColumn,
-) -> PatinaResult<DictionaryColumn> {
+) -> BoltResult<DictionaryColumn> {
     if left.n_rows != right.n_rows {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "CONCAT: n_rows mismatch (left = {}, right = {})",
             left.n_rows, right.n_rows
         )));
@@ -399,21 +399,21 @@ pub fn substring(
     input: &DictionaryColumn,
     start: i32,
     length: i32,
-) -> PatinaResult<DictionaryColumn> {
+) -> BoltResult<DictionaryColumn> {
     let (new_dict, remap) = substring_pure(&input.dictionary, start, length)?;
     let old: Vec<i32> = input.indices.to_vec()?;
 
     let mut new_indices: Vec<i32> = Vec::with_capacity(old.len());
     for &idx in &old {
         if idx < 0 {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "SUBSTRING: negative dictionary index {} (NULL is encoded as 0)",
                 idx
             )));
         }
         let pos = idx as usize;
         let mapped = *remap.get(pos).ok_or_else(|| {
-            PatinaError::Other(format!(
+            BoltError::Other(format!(
                 "SUBSTRING: index {} out of range (old dictionary size {})",
                 idx,
                 input.dictionary.len()
@@ -440,16 +440,16 @@ pub fn substring(
 pub fn concat_ws(
     separator: &str,
     columns: &[&DictionaryColumn],
-) -> PatinaResult<DictionaryColumn> {
+) -> BoltResult<DictionaryColumn> {
     if columns.is_empty() {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "CONCAT_WS: at least one input column is required".into(),
         ));
     }
     let n_rows = columns[0].n_rows;
     for (k, c) in columns.iter().enumerate().skip(1) {
         if c.n_rows != n_rows {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "CONCAT_WS: n_rows mismatch (column 0 = {}, column {} = {})",
                 n_rows, k, c.n_rows
             )));
@@ -462,7 +462,7 @@ pub fn concat_ws(
     let downloaded: Vec<Vec<i32>> = columns
         .iter()
         .map(|c| c.indices.to_vec())
-        .collect::<PatinaResult<_>>()?;
+        .collect::<BoltResult<_>>()?;
     let inputs: Vec<(&[String], &[i32])> = columns
         .iter()
         .zip(downloaded.iter())
@@ -538,7 +538,7 @@ mod tests {
         let r_dict = owned(&["b"]);
         let err = concat_pure(&l_dict, &[1, 1], &r_dict, &[1]).unwrap_err();
         match err {
-            PatinaError::Other(msg) => assert!(msg.contains("n_rows mismatch")),
+            BoltError::Other(msg) => assert!(msg.contains("n_rows mismatch")),
             _ => panic!("expected Other(n_rows mismatch), got {:?}", err),
         }
     }
@@ -583,7 +583,7 @@ mod tests {
         // left index 2 is out of range for a 1-entry dict.
         let err = concat_pure(&l_dict, &[2], &r_dict, &[1]).unwrap_err();
         match err {
-            PatinaError::Other(msg) => assert!(msg.contains("out of range")),
+            BoltError::Other(msg) => assert!(msg.contains("out of range")),
             _ => panic!("expected Other(out of range), got {:?}", err),
         }
     }
@@ -594,7 +594,7 @@ mod tests {
         let r_dict = owned(&["b"]);
         let err = concat_pure(&l_dict, &[-1], &r_dict, &[1]).unwrap_err();
         match err {
-            PatinaError::Other(msg) => assert!(msg.contains("negative")),
+            BoltError::Other(msg) => assert!(msg.contains("negative")),
             _ => panic!("expected Other(negative), got {:?}", err),
         }
     }
@@ -784,7 +784,7 @@ mod tests {
         let b = owned(&["b"]);
         let err = concat_ws_pure("-", &[(&a, &[1, 1]), (&b, &[1])]).unwrap_err();
         match err {
-            PatinaError::Other(msg) => assert!(msg.contains("n_rows mismatch")),
+            BoltError::Other(msg) => assert!(msg.contains("n_rows mismatch")),
             _ => panic!("expected Other(n_rows mismatch), got {:?}", err),
         }
     }
@@ -793,7 +793,7 @@ mod tests {
     fn concat_ws_empty_input_list_errors() {
         let err = concat_ws_pure("-", &[]).unwrap_err();
         match err {
-            PatinaError::Other(msg) => {
+            BoltError::Other(msg) => {
                 assert!(msg.contains("at least one input column"))
             }
             _ => panic!("expected Other(at least one input), got {:?}", err),

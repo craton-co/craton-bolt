@@ -54,7 +54,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// Number of hash partitions. Matches Tier-1 `BLOCK_GROUPS` so a downstream
 /// per-partition Tier-1 kernel can fit each partition's group set in a
@@ -68,14 +68,14 @@ pub const NUM_PARTITIONS: u32 = 4096;
 pub const BLOCK_THREADS: u32 = 256;
 
 /// Entry-point name embedded in the emitted PTX.
-pub const KERNEL_ENTRY: &str = "patina_scatter";
+pub const KERNEL_ENTRY: &str = "bolt_scatter";
 
 /// Generate PTX for the partition-scatter kernel.
 ///
 /// Kernel signature (PTX-level):
 ///
 /// ```text
-/// .visible .entry patina_scatter(
+/// .visible .entry bolt_scatter(
 ///     .param .u64 keys_ptr,                // const int32_t*  keys[n_rows]
 ///     .param .u64 vals_ptr,                // const double*   vals[n_rows]
 ///     .param .u64 partition_ids_ptr,       // const uint32_t* partition_ids[n_rows]
@@ -89,7 +89,7 @@ pub const KERNEL_ENTRY: &str = "patina_scatter";
 ///
 /// `compile_scatter_kernel()` is deterministic and pure: it returns a fixed
 /// PTX string with no I/O.
-pub fn compile_scatter_kernel() -> PatinaResult<String> {
+pub fn compile_scatter_kernel() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
 
@@ -240,10 +240,10 @@ pub fn compile_scatter_kernel() -> PatinaResult<String> {
     Ok(ptx)
 }
 
-/// Adapt a `std::fmt::Error` into a `PatinaError`. Same shape as the helper
+/// Adapt a `std::fmt::Error` into a `BoltError`. Same shape as the helper
 /// in `shmem_sum_kernel.rs`.
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("scatter_kernel: write failed: {}", e))
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("scatter_kernel: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------

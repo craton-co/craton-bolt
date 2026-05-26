@@ -94,7 +94,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 /// Number of slots in each block's shared-memory open-addressing table.
 /// Power of two so probe wrap is `& (BLOCK_GROUPS - 1)`. Sized for the
@@ -114,7 +114,7 @@ pub const BLOCK_THREADS: u32 = 256;
 pub const NUM_PARTITIONS: u32 = 4096;
 
 /// Entry-point name embedded in the emitted PTX.
-pub const KERNEL_ENTRY: &str = "patina_partition_reduce";
+pub const KERNEL_ENTRY: &str = "bolt_partition_reduce";
 
 /// Probe bound: how many slots a single key will examine before giving
 /// up. Equal to BLOCK_GROUPS so we walk the whole table at worst, which
@@ -128,7 +128,7 @@ const MAX_PROBES: u32 = BLOCK_GROUPS;
 /// Kernel signature (PTX-level):
 ///
 /// ```text
-/// .visible .entry patina_partition_reduce(
+/// .visible .entry bolt_partition_reduce(
 ///     .param .u64 partition_keys,    // const int32_t*  scatter_keys[n_rows]
 ///     .param .u64 partition_vals,    // const double*   scatter_vals[n_rows]
 ///     .param .u64 partition_offsets, // const uint32_t* offsets[NUM_PARTITIONS+1]
@@ -143,7 +143,7 @@ const MAX_PROBES: u32 = BLOCK_GROUPS;
 ///
 /// `compile_partition_reduce_kernel()` is deterministic and pure: same
 /// input → same output, no I/O. The dispatcher caches the result.
-pub fn compile_partition_reduce_kernel() -> PatinaResult<String> {
+pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
     let block_groups = BLOCK_GROUPS;
@@ -461,11 +461,11 @@ pub fn compile_partition_reduce_kernel() -> PatinaResult<String> {
     Ok(ptx)
 }
 
-/// Adapt a `std::fmt::Error` into a `PatinaError`. Same shape as the
+/// Adapt a `std::fmt::Error` into a `BoltError`. Same shape as the
 /// helpers in sibling JIT files — kept local so each kernel emitter is
 /// independent.
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("partition_reduce_kernel: write failed: {}", e))
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("partition_reduce_kernel: write failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -589,7 +589,7 @@ mod tests {
 
     /// PTX module preamble must match the rest of `src/jit/*` — same
     /// target, same address size. A mismatch would prevent the driver
-    /// from co-loading this kernel with other Craton Patina modules.
+    /// from co-loading this kernel with other Craton Bolt modules.
     #[test]
     fn ptx_header_matches_project_conventions() {
         let ptx = compile_partition_reduce_kernel().expect("kernel compiles");

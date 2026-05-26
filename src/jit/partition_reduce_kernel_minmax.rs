@@ -32,7 +32,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 
 pub const BLOCK_GROUPS: u32 = 1024;
 pub const BLOCK_THREADS: u32 = 256;
@@ -114,7 +114,7 @@ pub fn kernel_entry(op: MinMaxOp, dtype: MinMaxDtype) -> String {
         MinMaxDtype::Int32 => "i32",
         MinMaxDtype::Int64 => "i64",
     };
-    format!("patina_partition_reduce_{}_{}", op.name(), dt)
+    format!("bolt_partition_reduce_{}_{}", op.name(), dt)
 }
 
 /// Emit PTX for the MIN/MAX per-partition reduce kernel.
@@ -133,7 +133,7 @@ pub fn kernel_entry(op: MinMaxOp, dtype: MinMaxDtype) -> String {
 pub fn compile_partition_reduce_kernel_minmax(
     op: MinMaxOp,
     dtype: MinMaxDtype,
-) -> PatinaResult<String> {
+) -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = kernel_entry(op, dtype);
     let entry = entry.as_str();
@@ -412,8 +412,8 @@ pub fn compile_partition_reduce_kernel_minmax(
     Ok(ptx)
 }
 
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!(
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!(
         "partition_reduce_kernel_minmax: write failed: {}",
         e
     ))

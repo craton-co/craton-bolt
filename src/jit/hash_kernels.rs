@@ -4,13 +4,13 @@
 //!
 //! Two kernels back the GROUP BY executor in `crate::exec::groupby`:
 //!
-//! 1. [`KEYS_KERNEL_ENTRY`] — `patina_groupby_keys`. One thread per input row.
+//! 1. [`KEYS_KERNEL_ENTRY`] — `bolt_groupby_keys`. One thread per input row.
 //!    Each thread hashes its key, then performs a linear-probe `atom.cas` loop
 //!    on the keys table until either (a) it inserts the key into an empty slot
 //!    or (b) it finds an existing slot containing the same key. No aggregate
 //!    table is touched.
 //!
-//! 2. [`AGG_KERNEL_ENTRY`] — `patina_groupby_agg`. Re-runs the same hash +
+//! 2. [`AGG_KERNEL_ENTRY`] — `bolt_groupby_agg`. Re-runs the same hash +
 //!    probe sequence against an already-populated keys table to find the slot
 //!    for this row, then issues a single `atom.global.<op>.<dtype>` on that
 //!    slot in the accumulator table. The kernel handles ONE aggregate at a
@@ -25,7 +25,7 @@
 //!
 //! Keys kernel:
 //! ```text
-//! .visible .entry patina_groupby_keys(
+//! .visible .entry bolt_groupby_keys(
 //!     .param .u64 group_col_ptr,   // i64 group keys, length n_rows
 //!     .param .u64 keys_table_ptr,  // i64, length k, init'd to EMPTY_KEY
 //!     .param .u32 n_rows,
@@ -35,7 +35,7 @@
 //!
 //! Agg kernel (input dtype `T` parameterises the load + atomic instruction):
 //! ```text
-//! .visible .entry patina_groupby_agg(
+//! .visible .entry bolt_groupby_agg(
 //!     .param .u64 group_col_ptr,   // i64 group keys, length n_rows
 //!     .param .u64 keys_table_ptr,  // i64, length k, fully populated
 //!     .param .u64 input_col_ptr,   // T, length n_rows
@@ -61,7 +61,7 @@
 
 use std::fmt::Write;
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::jit::agg_kernels::ReduceOp;
 use crate::plan::logical_plan::DataType;
 
@@ -78,11 +78,11 @@ use crate::plan::logical_plan::DataType;
 pub const FX_MUL: i64 = 0x9E3779B97F4A7C15u64 as i64;
 
 /// Entry point of the keys-only kernel emitted by [`compile_groupby_keys_kernel`].
-pub const KEYS_KERNEL_ENTRY: &str = "patina_groupby_keys";
+pub const KEYS_KERNEL_ENTRY: &str = "bolt_groupby_keys";
 
 /// Entry point of the aggregate-update kernel emitted by
 /// [`compile_groupby_agg_kernel`].
-pub const AGG_KERNEL_ENTRY: &str = "patina_groupby_agg";
+pub const AGG_KERNEL_ENTRY: &str = "bolt_groupby_agg";
 
 /// Threads per block for both grouping kernels.
 const BLOCK_SIZE: u32 = 256;
@@ -119,7 +119,7 @@ const MAX_PROBE_FACTOR: u32 = 2;
 ///
 /// Because every supported encoding is LOSSLESS (distinct tuples ↦ distinct
 /// i64), this kernel needs no awareness of the per-row column count.
-pub fn compile_groupby_keys_kernel() -> PatinaResult<String> {
+pub fn compile_groupby_keys_kernel() -> BoltResult<String> {
     let mut ptx = String::new();
 
     writeln!(ptx, ".version 7.5").map_err(write_err)?;
@@ -277,13 +277,13 @@ pub fn compile_groupby_keys_kernel() -> PatinaResult<String> {
 pub fn compile_groupby_agg_kernel(
     op: ReduceOp,
     input_dtype: DataType,
-) -> PatinaResult<String> {
+) -> BoltResult<String> {
     // Reject unsupported (op, dtype) combinations up front with explicit errors.
     let atomic = atomic_for(op, input_dtype)?;
 
     let (load_suffix, reg_class) = ptx_type_info(input_dtype)?;
     let elem_bytes = input_dtype.byte_width().ok_or_else(|| {
-        PatinaError::Other(format!(
+        BoltError::Other(format!(
             "hash_kernels: variable-width dtype {:?} not supported",
             input_dtype
         ))
@@ -454,7 +454,7 @@ pub fn groupby_block_size() -> u32 {
 /// PTX `atom.global.*` mnemonic (with no operands) for the given op + dtype.
 /// Returns an error for combinations the v1 implementation does not support
 /// (most notably float MIN/MAX, which would need a CAS loop).
-fn atomic_for(op: ReduceOp, dtype: DataType) -> PatinaResult<&'static str> {
+fn atomic_for(op: ReduceOp, dtype: DataType) -> BoltResult<&'static str> {
     use DataType::*;
     use ReduceOp::*;
     Ok(match (op, dtype) {
@@ -473,13 +473,13 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> PatinaResult<&'static str> {
         (Max, Int64) => "atom.global.max.s64",
 
         (Min, Float32) | (Min, Float64) | (Max, Float32) | (Max, Float64) => {
-            return Err(PatinaError::Other(
+            return Err(BoltError::Other(
                 "MIN/MAX over float not yet supported in GROUP BY".into(),
             ))
         }
 
         (_, Bool) | (_, Utf8) => {
-            return Err(PatinaError::Type(format!(
+            return Err(BoltError::Type(format!(
                 "hash_kernels: aggregate over dtype {:?} not supported",
                 dtype
             )))
@@ -491,14 +491,14 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> PatinaResult<&'static str> {
 ///
 /// The register class is intentionally distinct from the `%r`, `%rl`, `%rd`
 /// classes used for hashing/probing so the two namespaces don't collide.
-fn ptx_type_info(dtype: DataType) -> PatinaResult<(&'static str, &'static str)> {
+fn ptx_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str)> {
     Ok(match dtype {
         DataType::Int32 => ("s32", "vr"),
         DataType::Int64 => ("s64", "vl"),
         DataType::Float32 => ("f32", "vf"),
         DataType::Float64 => ("f64", "vd"),
         DataType::Bool | DataType::Utf8 => {
-            return Err(PatinaError::Type(format!(
+            return Err(BoltError::Type(format!(
                 "hash_kernels: dtype {:?} not supported in aggregate kernel",
                 dtype
             )))
@@ -508,14 +508,14 @@ fn ptx_type_info(dtype: DataType) -> PatinaResult<(&'static str, &'static str)> 
 
 /// PTX `.reg` declaration type for the input-value register class returned by
 /// [`ptx_type_info`].
-fn reg_decl_ty(dtype: DataType) -> PatinaResult<&'static str> {
+fn reg_decl_ty(dtype: DataType) -> BoltResult<&'static str> {
     Ok(match dtype {
         DataType::Int32 => "b32",
         DataType::Int64 => "b64",
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
         DataType::Bool | DataType::Utf8 => {
-            return Err(PatinaError::Type(format!(
+            return Err(BoltError::Type(format!(
                 "hash_kernels: dtype {:?} not supported in aggregate kernel",
                 dtype
             )))
@@ -523,7 +523,7 @@ fn reg_decl_ty(dtype: DataType) -> PatinaResult<&'static str> {
     })
 }
 
-/// Adapt a `std::fmt::Error` into a `PatinaError`.
-fn write_err(e: std::fmt::Error) -> PatinaError {
-    PatinaError::Other(format!("hash_kernels: write failed: {}", e))
+/// Adapt a `std::fmt::Error` into a `BoltError`.
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("hash_kernels: write failed: {}", e))
 }

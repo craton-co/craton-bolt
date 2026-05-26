@@ -1,6 +1,6 @@
 ﻿# Path to 1.0
 
-A proposal for how Craton Patina gets from 0.1.x (current) to a stable, semver-bound
+A proposal for how Craton Bolt gets from 0.1.x (current) to a stable, semver-bound
 1.0. This document is **strategic, not contractual** — version numbers and dates
 are illustrative, milestone *ordering* and *acceptance criteria* are the
 substance.
@@ -37,7 +37,7 @@ Three concrete promises:
 2. **Production-acceptable defaults.** Out of the box, on supported hardware,
    running supported SQL on in-spec data, the engine returns correct answers,
    doesn't leak GPU memory, and doesn't crash the host on OOM.
-3. **Documented limits.** Where Craton Patina doesn't fit a workload, the limit is
+3. **Documented limits.** Where Craton Bolt doesn't fit a workload, the limit is
    stated up front (in `SQL_REFERENCE.md`, `ROADMAP.md`, or the error message
    itself), not discovered at runtime.
 
@@ -205,7 +205,7 @@ attaching a debugger.
 - `tracing` spans for every query phase: parse, plan, lower, codegen,
   PTX-load, launch, transfer, materialize. Off by default, opt-in via env or
   config.
-- Structured errors: `PatinaError::Parse { msg, span }`, similar for plan /
+- Structured errors: `BoltError::Parse { msg, span }`, similar for plan /
   lower / runtime. Errors carry source spans where applicable.
 - "Did you mean...?" suggestions for unknown columns / tables (cheap
   edit-distance).
@@ -214,9 +214,9 @@ attaching a debugger.
   "what to do when something fails," "performance tuning."
 
 **Acceptance**
-- Every error type in `PatinaError` documented with an example and the
+- Every error type in `BoltError` documented with an example and the
   recovery path.
-- The user guide walks a reader from `cargo add craton-patina` to a working
+- The user guide walks a reader from `cargo add craton-bolt` to a working
   GROUP BY in under 10 minutes.
 
 **Why for 1.0**: API stability without ergonomics is a stable bad experience.
@@ -232,7 +232,7 @@ attaching a debugger.
   in `docs/perf/<version>.md` and indexed in `BENCHMARKS.md`.
 - `KernelSpec`-keyed cache (the existing PTX cache is keyed on emitted text;
   this skips codegen entirely on a hit).
-- Optional disk-backed PTX cache (`~/.cache/craton-patina/ptx/<hash>.cubin`),
+- Optional disk-backed PTX cache (`~/.cache/craton-bolt/ptx/<hash>.cubin`),
   controlled by `Engine::Builder::persistent_cache(path)`.
 
 **Acceptance**
@@ -313,7 +313,7 @@ A single checklist. If any item is unchecked, we are not at 1.0.
 - [ ] Last RC ran clean on all three CI platforms (Linux x86_64, Windows
       x86_64, Linux aarch64).
 - [ ] ClickBench result published; geometric mean within 2× of DuckDB on the
-      queries we support; no Craton Patina query is > 10× slower than DuckDB on
+      queries we support; no Craton Bolt query is > 10× slower than DuckDB on
       that suite.
 - [ ] No `#[doc(hidden)]` items in the public crate root.
 - [ ] Every public item has rustdoc with at least one example.
@@ -325,14 +325,14 @@ A single checklist. If any item is unchecked, we are not at 1.0.
 
 ## 5. What 1.0 is NOT
 
-Explicit exclusions, to be cited at the top of any "Craton Patina 1.0 release" post:
+Explicit exclusions, to be cited at the top of any "Craton Bolt 1.0 release" post:
 
 - **Not a wire-protocol-compatible drop-in for PostgreSQL/MySQL.** Embed via
   the Rust crate. Network exposure is post-1.0.
 - **Not a distributed engine.** Single node, single process.
 - **Not feature-complete vs the SQL standard.** Window functions, recursive
   CTEs, full subquery support, MERGE, etc. are post-1.0.
-- **Not a CPU fallback engine.** If a query uses a feature Craton Patina doesn't
+- **Not a CPU fallback engine.** If a query uses a feature Craton Bolt doesn't
   GPU-support, it errors — it does not silently fall back to a host pipeline.
 - **Not a transactional store.** Read-only at 1.0; no `INSERT` / `UPDATE` /
   `DELETE`. Data is registered, not mutated.
@@ -383,7 +383,7 @@ behind a `DataFrame`-only API.
 
 **Trade-off**:
 - Promote: power users can construct plans directly, build alternate frontends
-  (e.g. Substrait → Craton Patina). Locks us into the current shape.
+  (e.g. Substrait → Craton Bolt). Locks us into the current shape.
 - Hide: free to refactor the IR forever. Locks out plan-level integrations.
 
 **Recommendation**: hide behind `DataFrame`, but expose a stable `Substrait`
@@ -417,7 +417,7 @@ heuristics.
 
 ### 8.4 Error type granularity
 
-**Choice**: single `PatinaError` enum (current direction) vs typed errors per
+**Choice**: single `BoltError` enum (current direction) vs typed errors per
 phase (`ParseError`, `PlanError`, `RuntimeError`).
 
 **Trade-off**:
@@ -426,7 +426,7 @@ phase (`ParseError`, `PlanError`, `RuntimeError`).
 - Typed errors: precise contracts, but `?` requires `From` impls or a
   consolidated public wrapper anyway.
 
-**Recommendation**: single `PatinaError` with structured variants. Add
+**Recommendation**: single `BoltError` with structured variants. Add
 phase-specific error subtypes only if M5 user feedback demands it.
 
 ### 8.5 Async API
@@ -451,7 +451,7 @@ What "frozen" means, operationally, at 1.0:
 - **Function signatures**: parameter changes are breaking. Add new functions
   instead.
 - **Trait methods**: cannot add required methods. Default methods are fine.
-- **Error variants**: `PatinaError` is `#[non_exhaustive]` from 1.0; adding
+- **Error variants**: `BoltError` is `#[non_exhaustive]` from 1.0; adding
   variants is non-breaking, renaming is breaking.
 - **Feature flags**: existing flags don't change meaning. New flags are fine.
 - **MSRV**: bumping is breaking *in cargo's view*; flag it loudly in the
@@ -479,11 +479,11 @@ declaration of "1.0" being marketing:
 
 - A third party ships an integration using only the public API and *does not
   reach into `#[doc(hidden)]`*.
-- An issue filed against "Craton Patina produces wrong answer for X" is the
+- An issue filed against "Craton Bolt produces wrong answer for X" is the
   exception, not the norm.
-- A "Craton Patina vs DuckDB" benchmark from someone other than us appears, and we
+- A "Craton Bolt vs DuckDB" benchmark from someone other than us appears, and we
   don't have to apologize for the result.
-- A user's first 10 minutes with Craton Patina (registration → first query →
+- A user's first 10 minutes with Craton Bolt (registration → first query →
   inspect result) happens without reading source.
 
 ## 12. See also

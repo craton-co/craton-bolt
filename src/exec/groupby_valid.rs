@@ -66,7 +66,7 @@ use bytemuck::Pod;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
@@ -106,11 +106,11 @@ const SPILL_EMPTY_KEY: i64 = i64::MIN;
 pub fn execute_groupby_valid(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,
-) -> PatinaResult<RecordBatch> {
+) -> BoltResult<RecordBatch> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         other => {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "execute_groupby_valid: expected Aggregate plan, got {:?}",
                 std::mem::discriminant(other)
             )))
@@ -118,12 +118,12 @@ pub fn execute_groupby_valid(
     };
 
     if aggregate.group_by.is_empty() {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "execute_groupby_valid: aggregate has no GROUP BY columns; use execute_aggregate".into(),
         ));
     }
     if pre.is_some() {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "GROUP BY (valid-flag) with projection/filter pre-kernel not yet implemented".into(),
         ));
     }
@@ -142,7 +142,7 @@ pub fn execute_groupby_valid(
     let n_unique = unique_count(&host_keys);
     let k = next_pow2((n_unique.saturating_mul(2)).saturating_add(16)).max(64);
     let k_u32 = u32::try_from(k).map_err(|_| {
-        PatinaError::Other(format!(
+        BoltError::Other(format!(
             "GROUP BY hash table size {} exceeds u32::MAX",
             k
         ))
@@ -163,7 +163,7 @@ pub fn execute_groupby_valid(
         GpuVec::<i64>::from_slice(&vec![SPILL_EMPTY_KEY; SPILL_CAPACITY])?;
     let mut keys_spill_counter = GpuVec::<u32>::from_slice(&[0u32])?;
     let max_spill_u32 = u32::try_from(SPILL_CAPACITY).map_err(|_| {
-        PatinaError::Other(format!(
+        BoltError::Other(format!(
             "SPILL_CAPACITY {} exceeds u32::MAX",
             SPILL_CAPACITY
         ))
@@ -217,7 +217,7 @@ pub fn execute_groupby_valid(
     // add them as new groups on the host.
     let keys_spill_count_raw = keys_spill_counter.to_vec()?[0] as usize;
     if keys_spill_count_raw > SPILL_CAPACITY {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "GROUP BY spill overflow ({} rows lost from keys kernel); \
              increase load factor or SPILL_CAPACITY",
             keys_spill_count_raw - SPILL_CAPACITY
@@ -309,7 +309,7 @@ pub fn execute_groupby_valid(
     for (i, agg) in aggregate.aggregates.iter().enumerate() {
         let out_field =
             aggregate.output_schema.fields.get(m_keys + i).ok_or_else(|| {
-                PatinaError::Other(format!(
+                BoltError::Other(format!(
                     "execute_groupby_valid: output_schema missing field for aggregate index {}",
                     i
                 ))
@@ -321,7 +321,7 @@ pub fn execute_groupby_valid(
 
     let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-        PatinaError::Other(format!(
+        BoltError::Other(format!(
             "failed to build GROUP BY (valid-flag) RecordBatch: {e}"
         ))
     })
@@ -355,11 +355,11 @@ struct GroupEntry {
 // ---------------------------------------------------------------------------
 
 /// Number of bits a column's encoded value occupies inside a packed i64 key.
-fn key_bit_width(dtype: DataType) -> PatinaResult<u32> {
+fn key_bit_width(dtype: DataType) -> BoltResult<u32> {
     match dtype {
         DataType::Int32 | DataType::Float32 => Ok(32),
         DataType::Int64 | DataType::Float64 => Ok(64),
-        DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
+        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "GROUP BY key dtype {:?} not supported in v1",
             dtype
         ))),
@@ -392,9 +392,9 @@ struct PackedKeys {
 fn load_key_column_bits(
     key_io: &ColumnIO,
     batch: &RecordBatch,
-) -> PatinaResult<Vec<u64>> {
+) -> BoltResult<Vec<u64>> {
     let idx = batch.schema().index_of(&key_io.name).map_err(|e| {
-        PatinaError::Plan(format!(
+        BoltError::Plan(format!(
             "GROUP BY key '{}' not present in table batch: {}",
             key_io.name, e
         ))
@@ -403,7 +403,7 @@ fn load_key_column_bits(
 
     let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
     if arr_dtype != key_io.dtype {
-        return Err(PatinaError::Type(format!(
+        return Err(BoltError::Type(format!(
             "GROUP BY key '{}' dtype mismatch: plan says {:?}, batch has {:?}",
             key_io.name, key_io.dtype, arr_dtype
         )));
@@ -438,7 +438,7 @@ fn load_key_column_bits(
                 .ok_or_else(|| downcast_err(&key_io.name, "Float64"))?;
             Ok(pa.values().iter().map(|&v| v.to_bits()).collect())
         }
-        DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
+        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "GROUP BY key dtype {:?} not supported in v1",
             key_io.dtype
         ))),
@@ -450,9 +450,9 @@ fn load_key_column_bits(
 fn pack_keys(
     aggregate: &AggregateSpec,
     batch: &RecordBatch,
-) -> PatinaResult<PackedKeys> {
+) -> BoltResult<PackedKeys> {
     if aggregate.group_by.is_empty() {
-        return Err(PatinaError::Other(
+        return Err(BoltError::Other(
             "pack_keys: aggregate has no GROUP BY columns".into(),
         ));
     }
@@ -461,7 +461,7 @@ fn pack_keys(
     let mut total_bits: u32 = 0;
     for &ord in &aggregate.group_by {
         let io = aggregate.inputs.get(ord).ok_or_else(|| {
-            PatinaError::Plan(format!(
+            BoltError::Plan(format!(
                 "pack_keys: group_by ordinal {} out of range (only {} inputs)",
                 ord,
                 aggregate.inputs.len()
@@ -473,14 +473,14 @@ fn pack_keys(
     }
 
     if aggregate.group_by.len() > 2 {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "multi-column GROUP BY with > 64 bits of key width not yet supported \
              ({} columns requested)",
             aggregate.group_by.len()
         )));
     }
     if total_bits > 64 {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "multi-column GROUP BY with > 64 bits of key width not yet supported \
              (requested columns total {} bits)",
             total_bits
@@ -507,7 +507,7 @@ fn pack_keys(
         let bits_hi = load_key_column_bits(io_hi, batch)?;
         let bits_lo = load_key_column_bits(io_lo, batch)?;
         if bits_hi.len() != bits_lo.len() {
-            return Err(PatinaError::Other(format!(
+            return Err(BoltError::Other(format!(
                 "pack_keys: group-by columns '{}' and '{}' have different row \
                  counts ({} vs {})",
                 io_hi.name,
@@ -622,7 +622,7 @@ fn launch_keys_kernel(
     n_rows: usize,
     k_u32: u32,
     stream: &CudaStream,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     if n_rows == 0 {
         return Ok(());
     }
@@ -702,7 +702,7 @@ fn launch_agg_kernel<T: Pod>(
     n_rows: usize,
     k_u32: u32,
     stream: &CudaStream,
-) -> PatinaResult<()> {
+) -> BoltResult<()> {
     if n_rows == 0 {
         return Ok(());
     }
@@ -870,7 +870,7 @@ enum AccDownload {
 /// Allocate the (keys, values, counter) spill triple for a typed agg
 /// kernel launch. `T` matches the input column dtype.
 fn alloc_agg_spill<T: Pod + Default>(
-) -> PatinaResult<(GpuVec<i64>, GpuVec<T>, GpuVec<u32>)> {
+) -> BoltResult<(GpuVec<i64>, GpuVec<T>, GpuVec<u32>)> {
     let keys = GpuVec::<i64>::from_slice(&vec![SPILL_EMPTY_KEY; SPILL_CAPACITY])?;
     // `Pod: Copy` gives us Clone for free; the explicit vec! lets the
     // value type fall back to Default at construction time.
@@ -888,10 +888,10 @@ fn download_agg_spill<T: Pod>(
     spill_values: GpuVec<T>,
     spill_counter: GpuVec<u32>,
     label: &str,
-) -> PatinaResult<Vec<(i64, T)>> {
+) -> BoltResult<Vec<(i64, T)>> {
     let count_raw = spill_counter.to_vec()?[0] as usize;
     if count_raw > SPILL_CAPACITY {
-        return Err(PatinaError::Other(format!(
+        return Err(BoltError::Other(format!(
             "GROUP BY spill overflow ({} rows lost from {}); \
              increase load factor or SPILL_CAPACITY",
             count_raw - SPILL_CAPACITY,
@@ -927,7 +927,7 @@ fn run_one_aggregate(
     k_u32: u32,
     max_spill: u32,
     stream: &CudaStream,
-) -> PatinaResult<AccDownload> {
+) -> BoltResult<AccDownload> {
     match agg {
         AggregateExpr::Sum(expr)
         | AggregateExpr::Min(expr)
@@ -1065,9 +1065,9 @@ fn run_typed_agg(
     k_u32: u32,
     max_spill: u32,
     stream: &CudaStream,
-) -> PatinaResult<AccDownload> {
+) -> BoltResult<AccDownload> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
-        PatinaError::Plan(format!(
+        BoltError::Plan(format!(
             "aggregate input '{}' not present in table batch: {}",
             col_io.name, e
         ))
@@ -1075,7 +1075,7 @@ fn run_typed_agg(
     let arr = batch.column(idx);
     let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
     if arr_dtype != col_io.dtype {
-        return Err(PatinaError::Type(format!(
+        return Err(BoltError::Type(format!(
             "aggregate input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
             col_io.name, col_io.dtype, arr_dtype
         )));
@@ -1269,7 +1269,7 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::F64 { gpu_acc, spill })
         }
-        DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
+        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -1280,9 +1280,9 @@ fn run_typed_agg(
 fn load_input_column_as_f64(
     col_io: &ColumnIO,
     batch: &RecordBatch,
-) -> PatinaResult<Vec<f64>> {
+) -> BoltResult<Vec<f64>> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
-        PatinaError::Plan(format!(
+        BoltError::Plan(format!(
             "AVG input '{}' not present in table batch: {}",
             col_io.name, e
         ))
@@ -1317,7 +1317,7 @@ fn load_input_column_as_f64(
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
             Ok(pa.values().to_vec())
         }
-        DataType::Bool | DataType::Utf8 => Err(PatinaError::Type(format!(
+        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "AVG input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -1334,7 +1334,7 @@ fn load_input_column_as_f64(
 fn build_key_arrays_from_entries(
     groups: &[GroupEntry],
     components: &[KeyComponent],
-) -> PatinaResult<Vec<ArrayRef>> {
+) -> BoltResult<Vec<ArrayRef>> {
     let m = components.len();
     let n = groups.len();
 
@@ -1353,7 +1353,7 @@ fn build_key_arrays_from_entries(
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
             DataType::Bool | DataType::Utf8 => {
-                return Err(PatinaError::Type(format!(
+                return Err(BoltError::Type(format!(
                     "GROUP BY key dtype {:?} not supported on output",
                     comp.original_dtype
                 )))
@@ -1370,7 +1370,7 @@ fn build_key_arrays_from_entries(
                 (ColBuf::F32(v), KeyValue::F32(x)) => v.push(*x),
                 (ColBuf::F64(v), KeyValue::F64(x)) => v.push(*x),
                 _ => {
-                    return Err(PatinaError::Other(
+                    return Err(BoltError::Other(
                         "internal: decode_key produced a KeyValue variant \
                          that disagrees with its KeyComponent dtype"
                             .into(),
@@ -1400,7 +1400,7 @@ fn build_agg_array_from_per_group(
     out_field: &Field,
     acc: &AccDownload,
     n_groups: usize,
-) -> PatinaResult<ArrayRef> {
+) -> BoltResult<ArrayRef> {
     match (agg, acc) {
         (AggregateExpr::Count(_), AccDownload::I64 { gpu_acc, .. }) => {
             debug_assert_eq!(gpu_acc.len(), n_groups);
@@ -1444,7 +1444,7 @@ fn build_agg_array_from_per_group(
                     });
                     Ok(Arc::new(Float64Array::from_iter(iter)) as ArrayRef)
                 }
-                other => Err(PatinaError::Type(format!(
+                other => Err(BoltError::Type(format!(
                     "GROUP BY (valid-flag): AVG output dtype must be Float64, got {:?}",
                     other
                 ))),
@@ -1475,7 +1475,7 @@ fn build_agg_array_from_per_group(
                 AccDownload::F32 { gpu_acc, .. } => Scalars::F32(gpu_acc.clone()),
                 AccDownload::F64 { gpu_acc, .. } => Scalars::F64(gpu_acc.clone()),
                 AccDownload::Avg { .. } => {
-                    return Err(PatinaError::Other(
+                    return Err(BoltError::Other(
                         "internal: AVG accumulator passed to non-AVG aggregate"
                             .into(),
                     ))
@@ -1483,7 +1483,7 @@ fn build_agg_array_from_per_group(
             };
             pack_array(out_field.dtype, scalars)
         }
-        (_, _) => Err(PatinaError::Other(
+        (_, _) => Err(BoltError::Other(
             "internal: aggregate / accumulator-variant mismatch".into(),
         )),
     }
@@ -1516,7 +1516,7 @@ fn fold_acc_with_spill(
     op: ReduceOp,
     groups: &[GroupEntry],
     key_to_group: &HashMap<i64, usize>,
-) -> PatinaResult<AccDownload> {
+) -> BoltResult<AccDownload> {
     match acc {
         AccDownload::I32 { gpu_acc, spill } => {
             let per_group = reindex_i32(&gpu_acc, groups, op);
@@ -1635,7 +1635,7 @@ fn apply_spill_i32(
     spill: &[(i64, i32)],
     op: ReduceOp,
     key_to_group: &HashMap<i64, usize>,
-) -> PatinaResult<Vec<i32>> {
+) -> BoltResult<Vec<i32>> {
     for &(key, val) in spill {
         let idx = key_to_group.get(&key).copied().ok_or_else(|| spill_lookup_err(key))?;
         acc[idx] = combine_i32(op, acc[idx], val);
@@ -1647,7 +1647,7 @@ fn apply_spill_i64(
     spill: &[(i64, i64)],
     op: ReduceOp,
     key_to_group: &HashMap<i64, usize>,
-) -> PatinaResult<Vec<i64>> {
+) -> BoltResult<Vec<i64>> {
     for &(key, val) in spill {
         let idx = key_to_group.get(&key).copied().ok_or_else(|| spill_lookup_err(key))?;
         acc[idx] = combine_i64(op, acc[idx], val);
@@ -1659,7 +1659,7 @@ fn apply_spill_f32(
     spill: &[(i64, f32)],
     op: ReduceOp,
     key_to_group: &HashMap<i64, usize>,
-) -> PatinaResult<Vec<f32>> {
+) -> BoltResult<Vec<f32>> {
     for &(key, val) in spill {
         let idx = key_to_group.get(&key).copied().ok_or_else(|| spill_lookup_err(key))?;
         acc[idx] = combine_f32(op, acc[idx], val);
@@ -1671,7 +1671,7 @@ fn apply_spill_f64(
     spill: &[(i64, f64)],
     op: ReduceOp,
     key_to_group: &HashMap<i64, usize>,
-) -> PatinaResult<Vec<f64>> {
+) -> BoltResult<Vec<f64>> {
     for &(key, val) in spill {
         let idx = key_to_group.get(&key).copied().ok_or_else(|| spill_lookup_err(key))?;
         acc[idx] = combine_f64(op, acc[idx], val);
@@ -1743,8 +1743,8 @@ fn combine_f64(op: ReduceOp, a: f64, b: f64) -> f64 {
     }
 }
 
-fn spill_lookup_err(key: i64) -> PatinaError {
-    PatinaError::Other(format!(
+fn spill_lookup_err(key: i64) -> BoltError {
+    BoltError::Other(format!(
         "internal: spilled key {} not present in any group — keys-kernel \
          spill should have created an entry",
         key
@@ -1760,7 +1760,7 @@ enum Scalars {
 }
 
 /// Cast a `Scalars` batch into an Arrow array of `out_dtype`.
-fn pack_array(out_dtype: DataType, scalars: Scalars) -> PatinaResult<ArrayRef> {
+fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
     match (scalars, out_dtype) {
         (Scalars::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v)) as ArrayRef),
         (Scalars::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
@@ -1787,7 +1787,7 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> PatinaResult<ArrayRef> {
             v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
         )) as ArrayRef),
 
-        (_, dt) => Err(PatinaError::Type(format!(
+        (_, dt) => Err(BoltError::Type(format!(
             "GROUP BY (valid-flag): cannot pack scalars into output dtype {:?}",
             dt
         ))),
@@ -1835,9 +1835,9 @@ fn identity_f64(op: ReduceOp) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Resolve `name` to its `ColumnIO` within `inputs`.
-fn resolve_input<'a>(inputs: &'a [ColumnIO], name: &str) -> PatinaResult<&'a ColumnIO> {
+fn resolve_input<'a>(inputs: &'a [ColumnIO], name: &str) -> BoltResult<&'a ColumnIO> {
     inputs.iter().find(|c| c.name == name).ok_or_else(|| {
-        PatinaError::Plan(format!(
+        BoltError::Plan(format!(
             "aggregate input column '{}' not found in plan inputs",
             name
         ))
@@ -1845,26 +1845,26 @@ fn resolve_input<'a>(inputs: &'a [ColumnIO], name: &str) -> PatinaResult<&'a Col
 }
 
 /// Extract the column name from a bare-column-ref expression.
-fn bare_column_name(expr: &Expr) -> PatinaResult<&str> {
+fn bare_column_name(expr: &Expr) -> BoltResult<&str> {
     match expr {
         Expr::Column(name) => Ok(name.as_str()),
         Expr::Alias(inner, _) => bare_column_name(inner),
-        _ => Err(PatinaError::Other(
+        _ => Err(BoltError::Other(
             "GROUP BY (valid-flag): aggregate input must be a bare column reference in v1".into(),
         )),
     }
 }
 
 /// `Type` error for a failed Arrow downcast on column `name`.
-fn downcast_err(name: &str, expected: &str) -> PatinaError {
-    PatinaError::Type(format!(
+fn downcast_err(name: &str, expected: &str) -> BoltError {
+    BoltError::Type(format!(
         "GROUP BY input column '{}' could not be downcast to {}",
         name, expected
     ))
 }
 
 /// Map Arrow `DataType` to our plan `DataType`.
-fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
+fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
         ArrowDataType::Int64 => Ok(DataType::Int64),
@@ -1872,7 +1872,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        other => Err(PatinaError::Type(format!(
+        other => Err(BoltError::Type(format!(
             "unsupported Arrow dtype {:?}",
             other
         ))),
@@ -1880,7 +1880,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> PatinaResult<DataType> {
 }
 
 /// Map our plan `DataType` to Arrow `DataType`.
-fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
         DataType::Int64 => Ok(ArrowDataType::Int64),
@@ -1892,7 +1892,7 @@ fn plan_dtype_to_arrow(d: DataType) -> PatinaResult<ArrowDataType> {
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
-fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;

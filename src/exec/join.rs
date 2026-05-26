@@ -37,7 +37,7 @@ use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 
-use crate::error::{PatinaError, PatinaResult};
+use crate::error::{BoltError, BoltResult};
 use crate::exec::{Engine, QueryHandle};
 use crate::plan::logical_plan::{Expr, JoinType, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
@@ -56,7 +56,7 @@ pub fn execute_join(
     on: &[(Expr, Expr)],
     output_schema: &Schema,
     engine: &Engine,
-) -> PatinaResult<QueryHandle> {
+) -> BoltResult<QueryHandle> {
     // Wave 8 is INNER-only. Match the variant so future kinds force a
     // compile-time decision rather than a silent INNER fallback.
     match join_type {
@@ -64,7 +64,7 @@ pub fn execute_join(
     }
 
     if on.is_empty() {
-        return Err(PatinaError::Plan(
+        return Err(BoltError::Plan(
             "INNER JOIN requires at least one equi-join predicate; \
              the parser should have rejected this upstream"
                 .into(),
@@ -99,7 +99,7 @@ pub fn execute_join(
             .fields()
             .iter()
             .map(|f| empty_array_for_dtype(f.data_type()))
-            .collect::<PatinaResult<Vec<_>>>()?;
+            .collect::<BoltResult<Vec<_>>>()?;
         let out = RecordBatch::try_new(arrow_schema, cols).map_err(arrow_err)?;
         return Ok(QueryHandle::from_record_batch(out));
     }
@@ -125,7 +125,7 @@ pub fn execute_join(
         let bdt = build_batch.column(*b).data_type();
         let pdt = probe_batch.column(*p).data_type();
         if bdt != pdt {
-            return Err(PatinaError::Plan(format!(
+            return Err(BoltError::Plan(format!(
                 "INNER JOIN key dtype mismatch: build side {bdt:?}, probe side {pdt:?}; \
                  cross-dtype equi-join is not yet supported"
             )));
@@ -153,7 +153,7 @@ pub fn execute_join(
             .fields()
             .iter()
             .map(|f| empty_array_for_dtype(f.data_type()))
-            .collect::<PatinaResult<Vec<_>>>()?;
+            .collect::<BoltResult<Vec<_>>>()?;
         let out = RecordBatch::try_new(arrow_schema, cols).map_err(arrow_err)?;
         return Ok(QueryHandle::from_record_batch(out));
     }
@@ -181,7 +181,7 @@ pub fn execute_join(
             .fields()
             .iter()
             .map(|f| empty_array_for_dtype(f.data_type()))
-            .collect::<PatinaResult<Vec<_>>>()?;
+            .collect::<BoltResult<Vec<_>>>()?;
         let out = RecordBatch::try_new(arrow_schema, cols).map_err(arrow_err)?;
         return Ok(QueryHandle::from_record_batch(out));
     }
@@ -242,7 +242,7 @@ fn extract_key(
     batch: &RecordBatch,
     indices: &[usize],
     row: usize,
-) -> PatinaResult<Option<JoinKey>> {
+) -> BoltResult<Option<JoinKey>> {
     let mut key: JoinKey = Vec::with_capacity(indices.len());
     for &idx in indices {
         let arr = batch.column(idx);
@@ -281,7 +281,7 @@ fn extract_key(
                     .to_string(),
             ),
             other => {
-                return Err(PatinaError::Type(format!(
+                return Err(BoltError::Type(format!(
                     "INNER JOIN: unsupported key dtype {other:?}"
                 )));
             }
@@ -293,11 +293,11 @@ fn extract_key(
 
 /// Look up every name in `names` in the batch's schema, returning the
 /// resolved column ordinals in the same order.
-fn lookup_columns(batch: &RecordBatch, names: &[String]) -> PatinaResult<Vec<usize>> {
+fn lookup_columns(batch: &RecordBatch, names: &[String]) -> BoltResult<Vec<usize>> {
     let mut out: Vec<usize> = Vec::with_capacity(names.len());
     for n in names {
         let idx = batch.schema().index_of(n).map_err(|e| {
-            PatinaError::Plan(format!("INNER JOIN: key column '{n}' not in batch: {e}"))
+            BoltError::Plan(format!("INNER JOIN: key column '{n}' not in batch: {e}"))
         })?;
         out.push(idx);
     }
@@ -307,11 +307,11 @@ fn lookup_columns(batch: &RecordBatch, names: &[String]) -> PatinaResult<Vec<usi
 /// Reject non-column join keys with a clear message. The parser already
 /// rewrites `t1.col = t2.col` into bare `Expr::Column` refs, so anything
 /// else here is a logic bug (or a future computed-key extension).
-fn column_name(e: &Expr, side: &str) -> PatinaResult<String> {
+fn column_name(e: &Expr, side: &str) -> BoltResult<String> {
     match e {
         Expr::Column(n) => Ok(n.clone()),
         Expr::Alias(inner, _) => column_name(inner, side),
-        other => Err(PatinaError::Plan(format!(
+        other => Err(BoltError::Plan(format!(
             "INNER JOIN {side}-side key must be a column reference, got {other:?}; \
              computed join keys are a 0.2 target"
         ))),
@@ -320,7 +320,7 @@ fn column_name(e: &Expr, side: &str) -> PatinaResult<String> {
 
 /// Build an empty Arrow array of the given dtype, for the
 /// "join produced zero rows" early-return paths.
-fn empty_array_for_dtype(dt: &ArrowDataType) -> PatinaResult<ArrayRef> {
+fn empty_array_for_dtype(dt: &ArrowDataType) -> BoltResult<ArrayRef> {
     Ok(match dt {
         ArrowDataType::Int32 => Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
         ArrowDataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
@@ -335,7 +335,7 @@ fn empty_array_for_dtype(dt: &ArrowDataType) -> PatinaResult<ArrayRef> {
         }
         ArrowDataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
         other => {
-            return Err(PatinaError::Type(format!(
+            return Err(BoltError::Type(format!(
                 "INNER JOIN: unsupported output dtype {other:?}"
             )))
         }
@@ -346,24 +346,24 @@ fn empty_array_for_dtype(dt: &ArrowDataType) -> PatinaResult<ArrayRef> {
 /// requires for its indices array. Mirrors `exec::n_rows_to_u32`'s
 /// rationale: silent truncation past u32::MAX would point `take` at the
 /// wrong row.
-fn row_to_u32(row: usize) -> PatinaResult<u32> {
+fn row_to_u32(row: usize) -> BoltResult<u32> {
     u32::try_from(row).map_err(|_| {
-        PatinaError::Other(format!(
+        BoltError::Other(format!(
             "INNER JOIN row index {row} exceeds the u32 take-indices limit ({})",
             u32::MAX
         ))
     })
 }
 
-fn arrow_err(e: arrow::error::ArrowError) -> PatinaError {
-    PatinaError::Other(format!("arrow: {}", e))
+fn arrow_err(e: arrow::error::ArrowError) -> BoltError {
+    BoltError::Other(format!("arrow: {}", e))
 }
 
 /// Convert our plan `Schema` to an `arrow_schema::Schema`. Inline copy of
 /// the same helper in `engine.rs` — that one is `fn`-private to engine.rs
 /// and duplicating it here keeps the join executor self-contained without
 /// pulling that helper out into a shared module just for one call site.
-fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
+fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(s.fields.len());
     for f in &s.fields {
         let dt = plan_dtype_to_arrow(f.dtype)?;
@@ -372,7 +372,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> PatinaResult<Arc<ArrowSchema>> {
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
 
-fn plan_dtype_to_arrow(d: crate::plan::logical_plan::DataType) -> PatinaResult<ArrowDataType> {
+fn plan_dtype_to_arrow(d: crate::plan::logical_plan::DataType) -> BoltResult<ArrowDataType> {
     use crate::plan::logical_plan::DataType as D;
     Ok(match d {
         D::Int32 => ArrowDataType::Int32,
