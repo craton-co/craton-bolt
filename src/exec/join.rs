@@ -300,6 +300,22 @@ fn execute_outer_join(
     let probe_idx = lookup_columns(probe_batch, probe_keys)?;
     check_key_dtypes(build_batch, &build_idx, probe_batch, &probe_idx, "OUTER JOIN")?;
 
+    // Stage-2 GPU OUTER fast path. Gate-misses return Ok(None); kernel
+    // failures fall through to the host path with a debug log.
+    if let Some(out) = try_gpu_outer_join(
+        &lhs,
+        &rhs,
+        join_type,
+        build_is_left,
+        build_batch,
+        &build_idx,
+        probe_batch,
+        &probe_idx,
+        arrow_schema.clone(),
+    )? {
+        return Ok(QueryHandle::from_record_batch(out));
+    }
+
     let map = build_hash_map(build_batch, &build_idx)?;
 
     // First pass: probe side drives matches + NULL-padded unmatched.
@@ -728,18 +744,16 @@ fn plan_dtype_to_arrow(d: crate::plan::logical_plan::DataType) -> BoltResult<Arr
 ///   We deliberately surface these — they indicate a CUDA-layer bug, not a
 ///   "gate miss".
 ///
-/// Gates (all must hold; first miss returns `Ok(None)`):
-///   1. Exactly one equi-predicate (`build_idx.len() == 1`).
-///   2. Key dtype is Int32 or Int64.
-///   3. `build_n_rows >= GPU_JOIN_MIN_ROWS` AND `probe_n_rows >= GPU_JOIN_MIN_ROWS`.
-///   4. `null_count() == 0` on both key columns.
-///   5. Build-side keys are unique (no duplicates). The Stage 1 hash table
-///      stores exactly one row index per slot; duplicates would silently
-///      drop all-but-one match per duplicated key.
-///   6. Encoded key set fits the hash-table cap (~2.8M build rows for the
-///      64 MiB budget). Enforced inside `hash_join_indices_on_gpu`, which
-///      returns Err on overflow — we map that to Ok(None) so the host path
-///      transparently handles it.
+/// Two layered paths share one entry point:
+///
+/// * **Stage-1 fast path** — single Int32/Int64 key, unique build keys, no
+///   NULLs, ≥ 1024 rows / side. Routes through the byte-stable Stage-1
+///   build+probe kernels.
+/// * **Stage-2 generalised path** — multi-key (TwoI32) + bool/float keys
+///   + duplicate build keys + collision-list kernels. Activates only when
+///   Stage-1 declines but Stage-2 still applies.
+///
+/// CROSS still falls through to host (no equi-predicate).
 fn try_gpu_inner_join(
     lhs: &RecordBatch,
     rhs: &RecordBatch,
@@ -750,23 +764,16 @@ fn try_gpu_inner_join(
     probe_idx: &[usize],
     arrow_schema: Arc<ArrowSchema>,
 ) -> BoltResult<Option<RecordBatch>> {
-    // Gate 1: single equi-key only.
-    if build_idx.len() != 1 || probe_idx.len() != 1 {
+    // ---- Shared gates (apply to Stage 1 + Stage 2) ----
+
+    // Gate A: equal arity on both sides (always true if the planner is
+    // honoured; cheap sanity check).
+    if build_idx.len() != probe_idx.len() || build_idx.is_empty() {
         return Ok(None);
     }
-    let b_key_idx = build_idx[0];
-    let p_key_idx = probe_idx[0];
 
-    // Gate 2: dtype is Int32 or Int64. Both sides already validated equal.
-    let arrow_dtype = build_batch.column(b_key_idx).data_type();
-    let dtype = match arrow_dtype {
-        ArrowDataType::Int32 => crate::plan::logical_plan::DataType::Int32,
-        ArrowDataType::Int64 => crate::plan::logical_plan::DataType::Int64,
-        _ => return Ok(None),
-    };
-
-    // Gate 3: minimum row counts. The GPU path eats a JIT compile + h2d
-    // round-trip; below ~1k rows the host path wins.
+    // Gate B: minimum row counts. Sub-1k joins are host-bound by the
+    // JIT-compile + h2d round trip.
     let n_build = build_batch.num_rows();
     let n_probe = probe_batch.num_rows();
     if n_build < crate::exec::gpu_join::GPU_JOIN_MIN_ROWS
@@ -775,43 +782,221 @@ fn try_gpu_inner_join(
         return Ok(None);
     }
 
-    // Gate 4: no NULLs in the key columns. The kernel treats every i64 as
+    // Gate C: no NULLs in the key columns. The kernel treats every i64 as
     // a real key; NULLs would either collide with the sentinel or produce
     // false matches.
-    let b_key_col = build_batch.column(b_key_idx);
-    let p_key_col = probe_batch.column(p_key_idx);
-    if b_key_col.null_count() > 0 || p_key_col.null_count() > 0 {
-        return Ok(None);
+    for &b in build_idx {
+        if build_batch.column(b).null_count() > 0 {
+            return Ok(None);
+        }
+    }
+    for &p in probe_idx {
+        if probe_batch.column(p).null_count() > 0 {
+            return Ok(None);
+        }
     }
 
-    // Gate 5: build keys must be unique. Stage 1 stores one row-index per
-    // slot; duplicates would silently drop matches. The check is O(n) via
-    // a HashSet — cheap relative to the GPU launch.
-    if !build_keys_are_unique(b_key_col, dtype) {
-        return Ok(None);
+    // ---- Stage 1: single Int32/Int64 + unique build keys ----
+    if build_idx.len() == 1 {
+        let b_key_idx = build_idx[0];
+        let p_key_idx = probe_idx[0];
+        let arrow_dtype = build_batch.column(b_key_idx).data_type();
+        let dtype_s1 = match arrow_dtype {
+            ArrowDataType::Int32 => Some(crate::plan::logical_plan::DataType::Int32),
+            ArrowDataType::Int64 => Some(crate::plan::logical_plan::DataType::Int64),
+            _ => None,
+        };
+        if let Some(dtype) = dtype_s1 {
+            let b_key_col = build_batch.column(b_key_idx);
+            // Stage 1 needs unique build keys.
+            if build_keys_are_unique(b_key_col, dtype) {
+                match crate::exec::gpu_join::execute_inner_join_on_gpu(
+                    lhs,
+                    rhs,
+                    build_is_left,
+                    b_key_idx,
+                    p_key_idx,
+                    dtype,
+                    arrow_schema.clone(),
+                ) {
+                    Ok(batch) => return Ok(Some(batch)),
+                    Err(e) => {
+                        log::debug!(
+                            "gpu_join: Stage-1 fast path declined ({e}); \
+                             trying Stage 2"
+                        );
+                        // Fall through to Stage 2.
+                    }
+                }
+            }
+        }
     }
 
-    // Hand off to the GPU executor. If it returns Err — typically because
-    // the hash table would exceed the byte cap, or a key collides with the
-    // i64::MIN sentinel — we treat that as a gate miss and fall through to
-    // the host path.
-    match crate::exec::gpu_join::execute_inner_join_on_gpu(
+    // ---- Stage 2: multi-key + bool/float + duplicate build keys ----
+    let shape = match gpu_key_shape_for(build_batch, build_idx) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    if !shape.is_exact_in_i64() {
+        // Lossy fold — host hash-join takes over to avoid false matches.
+        return Ok(None);
+    }
+    // Both sides must have matching dtypes per column (sanity — the planner
+    // already enforced this at the schema level).
+    for (b, p) in build_idx.iter().zip(probe_idx.iter()) {
+        if build_batch.column(*b).data_type() != probe_batch.column(*p).data_type() {
+            return Ok(None);
+        }
+    }
+
+    match crate::exec::gpu_join::execute_inner_join_on_gpu_with_shape(
         lhs,
         rhs,
         build_is_left,
-        b_key_idx,
-        p_key_idx,
-        dtype,
+        build_idx,
+        probe_idx,
+        shape,
         arrow_schema,
     ) {
         Ok(batch) => Ok(Some(batch)),
         Err(e) => {
-            // Fall back silently — the host path is a real correctness
-            // fallback. Log the reason at debug level for post-hoc
-            // visibility without flooding the normal stream.
-            log::debug!("gpu_join: fast path declined ({e}); falling back to host");
+            log::debug!("gpu_join: Stage-2 path declined ({e}); falling back to host");
             Ok(None)
         }
+    }
+}
+
+/// Try the Stage-2 GPU OUTER-join path. Returns the same `Ok(Some(_)) /
+/// Ok(None) / Err(_)` contract as `try_gpu_inner_join`.
+///
+/// Gates (all must hold):
+///   * Equi-join only (caller already verified non-empty `on`).
+///   * `KeyShape::is_exact_in_i64()` (no lossy fold). Multi-i64 / multi-i32
+///     fall through to the host path.
+///   * Both sides ≥ `GPU_JOIN_MIN_ROWS` rows.
+///   * No NULLs in any key column (NULL keys never match in SQL; the
+///     preserved-side rows for those still need to surface via the host
+///     path because the kernel-side encoding can't distinguish NULL from a
+///     legitimate sentinel-adjacent value).
+///
+/// For LEFT outer the GPU build side is the RIGHT table (probe = LEFT,
+/// preserved). For RIGHT outer the GPU build side is the LEFT table
+/// (probe = RIGHT, preserved). FULL emits both sides — same orientation as
+/// LEFT, plus a second-pass kernel over the build (= right) bitmap.
+#[allow(clippy::too_many_arguments)]
+fn try_gpu_outer_join(
+    lhs: &RecordBatch,
+    rhs: &RecordBatch,
+    join_type: JoinType,
+    build_is_left: bool,
+    build_batch: &RecordBatch,
+    build_idx: &[usize],
+    probe_batch: &RecordBatch,
+    probe_idx: &[usize],
+    arrow_schema: Arc<ArrowSchema>,
+) -> BoltResult<Option<RecordBatch>> {
+    if build_idx.len() != probe_idx.len() || build_idx.is_empty() {
+        return Ok(None);
+    }
+
+    let n_build = build_batch.num_rows();
+    let n_probe = probe_batch.num_rows();
+    if n_build < crate::exec::gpu_join::GPU_JOIN_MIN_ROWS
+        || n_probe < crate::exec::gpu_join::GPU_JOIN_MIN_ROWS
+    {
+        return Ok(None);
+    }
+
+    for &b in build_idx {
+        if build_batch.column(b).null_count() > 0 {
+            return Ok(None);
+        }
+    }
+    for &p in probe_idx {
+        if probe_batch.column(p).null_count() > 0 {
+            return Ok(None);
+        }
+    }
+    for (b, p) in build_idx.iter().zip(probe_idx.iter()) {
+        if build_batch.column(*b).data_type() != probe_batch.column(*p).data_type() {
+            return Ok(None);
+        }
+    }
+
+    let shape = match gpu_key_shape_for(build_batch, build_idx) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    if !shape.is_exact_in_i64() {
+        return Ok(None);
+    }
+
+    // Translate join_type into emit flags. preserve_probe = LEFT/RIGHT/FULL
+    // (probe is always the preserved side per build_is_left choice).
+    // preserve_build = FULL only (second-pass kernel walks unmatched build).
+    let emit_unmatched_probe = matches!(
+        join_type,
+        JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
+    );
+    let emit_unmatched_build = matches!(join_type, JoinType::FullOuter);
+
+    match crate::exec::gpu_join::execute_outer_join_on_gpu(
+        lhs,
+        rhs,
+        build_is_left,
+        build_idx,
+        probe_idx,
+        shape,
+        emit_unmatched_probe,
+        emit_unmatched_build,
+        arrow_schema,
+    ) {
+        Ok(batch) => Ok(Some(batch)),
+        Err(e) => {
+            log::debug!("gpu_join: outer-join path declined ({e}); falling back to host");
+            Ok(None)
+        }
+    }
+}
+
+/// Map the build-side key columns to a [`crate::jit::hash_join_kernel::KeyShape`]
+/// that the GPU host-side encoder understands. Returns `None` if no shape
+/// matches (e.g. Utf8 keys, or a Float32 column mixed with an Int64 column).
+fn gpu_key_shape_for(
+    batch: &RecordBatch,
+    indices: &[usize],
+) -> Option<crate::jit::hash_join_kernel::KeyShape> {
+    use crate::jit::hash_join_kernel::KeyShape;
+    match indices.len() {
+        1 => match batch.column(indices[0]).data_type() {
+            ArrowDataType::Int32 => Some(KeyShape::SingleI32),
+            ArrowDataType::Int64 => Some(KeyShape::SingleI64),
+            ArrowDataType::Boolean => Some(KeyShape::SingleBool),
+            ArrowDataType::Float32 => Some(KeyShape::SingleF32),
+            ArrowDataType::Float64 => Some(KeyShape::SingleF64),
+            _ => None,
+        },
+        2 => {
+            let a = batch.column(indices[0]).data_type();
+            let b = batch.column(indices[1]).data_type();
+            match (a, b) {
+                (ArrowDataType::Int32, ArrowDataType::Int32) => Some(KeyShape::TwoI32),
+                (ArrowDataType::Int64, ArrowDataType::Int64) => Some(KeyShape::TwoI64),
+                _ => None,
+            }
+        }
+        n if n >= 3 && n <= u8::MAX as usize => {
+            // Only support all-Int32 tuples for now; mixed dtypes fall back.
+            let all_i32 = indices
+                .iter()
+                .all(|&i| matches!(batch.column(i).data_type(), ArrowDataType::Int32));
+            if all_i32 {
+                Some(KeyShape::MultiI32(n as u8))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

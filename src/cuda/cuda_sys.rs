@@ -55,6 +55,7 @@ extern "C" {
         attrib: CUdevice_attribute,
         dev: CUdevice,
     ) -> CUresult;
+    pub fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> CUresult;
     pub fn cuCtxCreate_v2(pctx: *mut CUcontext, flags: c_uint, dev: CUdevice) -> CUresult;
     pub fn cuCtxDestroy_v2(ctx: CUcontext) -> CUresult;
     pub fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
@@ -133,6 +134,7 @@ mod stubs {
         _attrib: CUdevice_attribute,
         _dev: CUdevice,
     ) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuDeviceTotalMem_v2(_bytes: *mut usize, _dev: CUdevice) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuCtxCreate_v2(_pctx: *mut CUcontext, _flags: c_uint, _dev: CUdevice) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuCtxDestroy_v2(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuCtxSetCurrent(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
@@ -292,6 +294,17 @@ pub fn device_get(ordinal: i32) -> BoltResult<CUdevice> {
     let mut dev: CUdevice = 0;
     check(unsafe { cuDeviceGet(&mut dev, ordinal as c_int) })?;
     Ok(dev)
+}
+
+/// Total global memory available on `dev`, in bytes. Wraps
+/// `cuDeviceTotalMem_v2`. Returns the bytes the device reports — note this is
+/// the total physical VRAM, NOT the free portion at the moment of the call.
+///
+/// Used by `gpu_join` to opt large-VRAM cards into a wider hash-table cap.
+pub fn device_total_mem(dev: CUdevice) -> BoltResult<usize> {
+    let mut bytes: usize = 0;
+    check(unsafe { cuDeviceTotalMem_v2(&mut bytes, dev) })?;
+    Ok(bytes)
 }
 
 /// Human-readable device name (e.g. "NVIDIA GeForce RTX 4090").
