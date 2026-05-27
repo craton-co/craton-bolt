@@ -379,6 +379,8 @@ fn key_bit_width(dtype: DataType) -> BoltResult<u32> {
 #[derive(Debug, Clone)]
 struct KeyComponent {
     /// Column name (used for error messages and field naming).
+    // used by: pack_keys_two_int32 test (asserts component identity)
+    #[allow(dead_code)]
     name: String,
     /// Original dtype as declared by the plan (drives encode/decode).
     original_dtype: DataType,

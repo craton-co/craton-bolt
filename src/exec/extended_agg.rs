@@ -610,7 +610,7 @@ mod tests {
     use super::*;
 
     use arrow_array::Float64Array;
-    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
     /// Build a one-column `RecordBatch` from a typed Arrow array.
     fn one_col_batch(name: &str, arr: ArrayRef) -> RecordBatch {

@@ -369,8 +369,6 @@ fn key_bit_width(dtype: DataType) -> BoltResult<u32> {
 /// Per-group-by-column metadata: dtype + bit offset inside the i64 key.
 #[derive(Debug, Clone)]
 struct KeyComponent {
-    /// Column name (used for error messages and field naming).
-    name: String,
     /// Original dtype as declared by the plan (drives encode/decode).
     original_dtype: DataType,
     /// Bit position within the i64 key — low = 0, high = 32 for the
@@ -496,7 +494,6 @@ fn pack_keys(
         let io = col_ios[0];
         let bits = load_key_column_bits(io, batch)?;
         components.push(KeyComponent {
-            name: io.name.clone(),
             original_dtype: io.dtype,
             bit_offset: 0,
         });
@@ -517,12 +514,10 @@ fn pack_keys(
             )));
         }
         components.push(KeyComponent {
-            name: io_hi.name.clone(),
             original_dtype: io_hi.dtype,
             bit_offset: 32,
         });
         components.push(KeyComponent {
-            name: io_lo.name.clone(),
             original_dtype: io_lo.dtype,
             bit_offset: 0,
         });
