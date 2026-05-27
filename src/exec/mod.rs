@@ -54,6 +54,8 @@ pub mod distinct;
 #[doc(hidden)]
 pub mod sort;
 #[doc(hidden)]
+pub(crate) mod gpu_sort;
+#[doc(hidden)]
 pub mod limit;
 #[doc(hidden)]
 pub mod join;
