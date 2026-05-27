@@ -37,7 +37,7 @@ use crate::cuda::buffer::primitive_to_gpu;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
-use crate::exec::launch::CudaStream;
+use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
     compile_reduction_kernel, ReduceOp, BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
@@ -311,7 +311,7 @@ where
 
     let block = BLOCK_SIZE;
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
-    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
+    let grid_x = grid_x_for(n_rows_u32, block);
     let partials = GpuVec::<T>::zeros(grid_x as usize)?;
 
     // Compile + load the kernel.
@@ -390,7 +390,7 @@ where
 
     let block = BLOCK_SIZE;
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
-    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
+    let grid_x = grid_x_for(n_rows_u32, block);
     // Partials buffer is sized in accumulator elements.
     let partials = GpuVec::<TAcc>::zeros(grid_x as usize)?;
 
