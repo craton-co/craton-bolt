@@ -10,7 +10,7 @@ that any future numbers should follow.
 
 ## TL;DR
 
-- Craton Bolt 0.3.0 is a single-node, single-batch, in-memory GPU SQL engine. Pick
+- Craton Bolt 0.3.0 is a single-node, multi-batch in-memory GPU SQL engine. Pick
   competitors that occupy the same niche; treat cross-niche comparisons as
   illustrative, not damning.
 - Use **ClickBench** as your primary suite: it's single-table, aggregation-heavy,
@@ -283,8 +283,8 @@ Use the existing harness shape:
 BOLT_BENCH_GPU=1 cargo bench --bench query_benchmarks
 ```
 
-For non-criterion runs (e.g. ClickBench), call `Engine::sql_and_execute` in a
-loop with `Instant::now()` bracketing — see
+For non-criterion runs (e.g. ClickBench), call `Engine::sql` (which returns a
+`QueryHandle`) in a loop with `Instant::now()` bracketing — see
 `benches/query_benchmarks.rs` for the established pattern.
 
 ## 8. Recording and publishing results

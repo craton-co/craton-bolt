@@ -1,14 +1,14 @@
 ﻿# Path to 1.0
 
-A proposal for how Craton Bolt gets from 0.1.x (current) to a stable, semver-bound
+A proposal for how Craton Bolt gets from 0.3.0 (current) to a stable, semver-bound
 1.0. This document is **strategic, not contractual** — version numbers and dates
 are illustrative, milestone *ordering* and *acceptance criteria* are the
 substance.
 
 The existing [`ROADMAP.md`](../ROADMAP.md) is the index of where we are and what
-we're skipping for 0.1.x. This doc is the depth behind its "1.0" section: what
-each milestone contains, what counts as done, and where we will have to make
-real decisions before shipping the freeze.
+we're skipping for the current 0.x line. This doc is the depth behind its "1.0"
+section: what each milestone contains, what counts as done, and where we will
+have to make real decisions before shipping the freeze.
 
 ## TL;DR
 
@@ -55,12 +55,12 @@ inclusions.
 
 ## 2. The gap, at a glance
 
-Where 0.1.x sits and what stands between it and 1.0:
+Where 0.3.0 sits and what stands between it and 1.0:
 
-| Axis              | 0.1.x today                                   | 1.0 target                                              |
+| Axis              | 0.3.0 today                                   | 1.0 target                                              |
 | ----------------- | --------------------------------------------- | ------------------------------------------------------- |
 | API stability     | All IR types `#[doc(hidden)]`. Frequent breaks | Public surface enumerated; semver-bound                 |
-| Table model       | Single in-memory batch per table              | Multi-batch streaming, larger-than-VRAM via spill       |
+| Table model       | Multi-batch in-memory tables; no streaming / spill | Multi-batch streaming, larger-than-VRAM via spill       |
 | SQL scalars       | Arithmetic, comparison, bool                  | + `IS NULL`, `LIKE`, `IN`, `BETWEEN`, `CASE`, `CAST`, `COALESCE`, `||` |
 | SQL aggregates    | `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`           | + `STDDEV`, `VAR`, `PERCENTILE`, `MEDIAN`               |
 | Joins             | `INNER` equi, one per `SELECT`                | `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS`, multi-join per `SELECT`, non-equi |
@@ -81,12 +81,12 @@ Each row is a milestone or part of one. The next section sequences them.
 Eight milestones, four phases. Names are mnemonic; version numbers are
 suggested.
 
-### Phase A — Foundation (0.2)
+### Phase A — Foundation (0.4)
 
 #### M1: Streaming tables + async memcpy + full validity
 
-The current single-batch model bottoms out fast. M1 unblocks every later
-milestone.
+The current in-memory multi-batch model bottoms out once a table no longer fits
+in VRAM. M1 unblocks every later milestone.
 
 **Goal**: support tables that don't fit in one batch, transfer data without
 stalling, and propagate Arrow validity through every kernel.
@@ -108,17 +108,17 @@ stalling, and propagate Arrow validity through every kernel.
   table.
 - `COUNT(col)` on a column with 30% nulls returns the same answer as DuckDB.
 
-**Why for 1.0**: any production user hits the single-batch ceiling on day one.
-Cannot ship 1.0 without this.
+**Why for 1.0**: any production user hits the in-memory-table ceiling the first
+time their dataset exceeds VRAM. Cannot ship 1.0 without this.
 
 ---
 
-### Phase B — Coverage (0.3, 0.4, 0.5)
+### Phase B — Coverage (0.5, 0.6, 0.7)
 
 Three milestones, each delivering a chunk of the SQL surface. Order is by
 dependency: scalars feed joins (predicate evaluation); types feed everything.
 
-#### M2: SQL scalar completeness (0.3)
+#### M2: SQL scalar completeness (0.5)
 
 **Goal**: every common scalar expression a user might write parses and runs.
 
@@ -148,15 +148,15 @@ dependency: scalars feed joins (predicate evaluation); types feed everything.
 **Why for 1.0**: shipping without `IS NULL` / `CASE` / `CAST` would be
 embarrassing. These are table stakes.
 
-#### M3: Join expansion + GPU sort (0.4)
+#### M3: Join expansion + GPU sort (0.6)
 
-**Goal**: the join story stops being a 0.1.x asterisk.
+**Goal**: the join story stops being a 0.x asterisk.
 
 **Deliverables**
 - `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`.
 - Non-equi join via nested-loop kernel (small inner side only; warned if
   cardinality > threshold).
-- Multiple joins per `SELECT` (the 0.1.x parser rejects this).
+- Multiple joins per `SELECT` (the 0.3.0 parser rejects this).
 - GPU hash-join kernel replacing the host-side build/probe from wave 8.
 - GPU sort kernel (radix or merge) backing `ORDER BY` and the dedup step of
   `UNION` / `DISTINCT`, eliminating the host round-trip.
@@ -171,7 +171,7 @@ embarrassing. These are table stakes.
 sort unblocks ORDER BY as a first-class operator instead of the apologetic
 host-side fallback.
 
-#### M4: Typesystem expansion (0.5)
+#### M4: Typesystem expansion (0.7)
 
 **Goal**: real analytic workloads stop hitting "unsupported type" errors.
 
@@ -192,11 +192,11 @@ non-negotiable for anything time-series.
 
 ---
 
-### Phase C — Quality (0.6, 0.7)
+### Phase C — Quality (0.8, 0.9)
 
 Coverage doesn't ship without quality discipline behind it.
 
-#### M5: Observability + ergonomics (0.6)
+#### M5: Observability + ergonomics (0.8)
 
 **Goal**: when something goes wrong, the user knows what and why without
 attaching a debugger.
@@ -221,7 +221,7 @@ attaching a debugger.
 
 **Why for 1.0**: API stability without ergonomics is a stable bad experience.
 
-#### M6: Performance discipline (0.7)
+#### M6: Performance discipline (0.9)
 
 **Goal**: never ship a regression silently.
 
@@ -245,9 +245,9 @@ whatever it happens to be when we tag it."
 
 ---
 
-### Phase D — Freeze (0.8, 0.9, 1.0)
+### Phase D — Freeze (0.10, 0.11, 1.0)
 
-#### M7: API stabilization preview (0.8)
+#### M7: API stabilization preview (0.10)
 
 **Goal**: enumerate the public surface; force the breaking changes now, not
 during the RC.
@@ -258,7 +258,7 @@ during the RC.
   /method that doesn't leak the internal shape).
 - `Engine::Builder` (replacing the current `Engine::new` / `new_with_device`
   pair) with explicit knobs for device, memory budget, cache, tracing.
-- `DataFrame::collect()` becomes a real materializing terminal (the 0.1.x
+- `DataFrame::collect()` becomes a real materializing terminal (the 0.x
   tombstone is removed).
 - `Reg`, `Op`, `Value`, `KernelSpec`, `AggregateSpec`, `ColumnIO`,
   `PhysicalPlan`, `LogicalPlan` — decision and implementation per the
@@ -279,12 +279,12 @@ during the RC.
 **Why for 1.0**: this is where 1.0 actually lives. Everything else is
 prerequisite.
 
-#### M8: RC, audit, freeze (0.9, 1.0)
+#### M8: RC, audit, freeze (0.11, 1.0)
 
 **Goal**: ship.
 
 **Deliverables**
-- 0.9-rc.N releases until two consecutive RCs land with no API-affecting
+- 0.11-rc.N releases until two consecutive RCs land with no API-affecting
   changes.
 - External security review (focused on the FFI surface — `cuda_sys.rs`,
   buffer ownership, PTX cache poisoning).
@@ -309,7 +309,7 @@ prerequisite.
 A single checklist. If any item is unchecked, we are not at 1.0.
 
 - [ ] All M1-M7 deliverables shipped.
-- [ ] `cargo public-api` diff vs 0.9 final is empty.
+- [ ] `cargo public-api` diff vs 0.11 final is empty.
 - [ ] Last RC ran clean on all three CI platforms (Linux x86_64, Windows
       x86_64, Linux aarch64).
 - [ ] ClickBench result published; geometric mean within 2× of DuckDB on the
