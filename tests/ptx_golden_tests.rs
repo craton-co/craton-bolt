@@ -22,7 +22,9 @@
 use craton_bolt::jit::agg_kernels::{compile_reduction_kernel, ReduceOp};
 use craton_bolt::jit::compile_ptx;
 use craton_bolt::jit::float_atomics::compile_groupby_float_atomic_kernel;
-use craton_bolt::jit::hash_kernels::compile_groupby_keys_kernel;
+use craton_bolt::jit::hash_kernels::{
+    compile_groupby_agg_kernel, compile_groupby_keys_kernel,
+};
 use craton_bolt::jit::prefix_scan::compile_prefix_scan_kernel;
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
@@ -251,6 +253,52 @@ fn golden_groupby_keys_kernel_has_probe_bound() {
     assert!(
         bra_pos < 100,
         "bra DONE too far from setp.gt.u32 (probe bound check broken)\n{ptx}"
+    );
+}
+
+#[test]
+fn golden_groupby_agg_kernel_has_probe_bound() {
+    // The agg kernel runs a read-only linear-probe loop over an already-
+    // populated keys table. Previously this loop had no bound, so a
+    // partially-populated keys table (caused by a violated cross-stream
+    // synchronisation contract — see the doc comment on
+    // `compile_groupby_agg_kernel`) would spin forever and hang the SM.
+    // The fix mirrors the keys kernel's `MAX_PROBE_FACTOR * k` cap:
+    // increment a probe counter each iteration, `setp.gt.u32` against the
+    // precomputed `max_probes` register, and branch to the `DONE` exit
+    // label on overflow (silent-drop semantics — no atomic is issued for
+    // the over-probing row, matching the keys kernel).
+    let ptx = compile_groupby_agg_kernel(ReduceOp::Sum, DataType::Int32)
+        .expect("compile agg kernel");
+    assert!(
+        ptx.contains("PROBE_LOOP:"),
+        "missing PROBE_LOOP label\n{ptx}"
+    );
+    assert!(
+        ptx.contains("setp.gt.u32"),
+        "missing setp.gt.u32 probe-bound check\n{ptx}"
+    );
+    // The bound check must live inside the probe loop and be followed
+    // quickly by a `bra DONE` exit path — this is the give-up branch.
+    let probe_start = ptx.find("PROBE_LOOP:").expect("PROBE_LOOP exists");
+    let setp_pos = ptx[probe_start..]
+        .find("setp.gt.u32")
+        .expect("setp.gt.u32 should live inside the probe loop");
+    let bra_pos = ptx[probe_start + setp_pos..]
+        .find("bra DONE")
+        .expect("expected @%pN bra DONE immediately after the probe bound");
+    assert!(
+        bra_pos < 100,
+        "bra DONE too far from setp.gt.u32 (probe bound check broken)\n{ptx}"
+    );
+    // The give-up `bra DONE` must precede the `FOUND` label so a thread
+    // that exceeds the bound exits without issuing the atomic update.
+    let bra_done_abs = probe_start + setp_pos + bra_pos;
+    let found_pos = ptx.find("FOUND:").expect("FOUND label exists");
+    assert!(
+        bra_done_abs < found_pos,
+        "probe-bound `bra DONE` must precede the FOUND label (otherwise the \
+         atomic update still fires on over-probe)\n{ptx}"
     );
 }
 

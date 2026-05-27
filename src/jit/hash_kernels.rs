@@ -274,6 +274,18 @@ pub fn compile_groupby_keys_kernel() -> BoltResult<String> {
 /// Neither outcome is recoverable post-hoc. This invariant previously lived
 /// only in scattered executor docstrings; it is restated here because the
 /// agg-kernel PTX itself bakes it in as a pre-condition.
+///
+/// ## Probe-loop bound
+///
+/// The non-mutating probe loop here mirrors the bounded-probe pattern in
+/// [`compile_groupby_keys_kernel`]: a per-thread counter increments once per
+/// slot examined and the thread gives up silently (no atomic update issued)
+/// after `MAX_PROBE_FACTOR * k` slots. Without this bound a thread whose key
+/// is absent from the table — which can happen if the cross-kernel ordering
+/// contract above is violated — would spin forever and hang the streaming
+/// multiprocessor. Silent-drop matches the keys kernel's behaviour: the
+/// kernel ABI is unchanged and the host's load-factor invariant ensures the
+/// bound never triggers on a correctly-sequenced launch.
 pub fn compile_groupby_agg_kernel(
     op: ReduceOp,
     input_dtype: DataType,
@@ -345,6 +357,19 @@ pub fn compile_groupby_agg_kernel(
     .map_err(write_err)?;
     writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
 
+    // max_probes = k * MAX_PROBE_FACTOR. Computed once at kernel entry so the
+    // bounded PROBE_LOOP can compare against it cheaply. Mirrors the
+    // identically-named computation in `compile_groupby_keys_kernel`; without
+    // this bound a thread whose key is absent (which can only happen on a
+    // partially-populated keys table — see the cross-kernel synchronisation
+    // contract above) would spin forever and hang the SM.
+    writeln!(
+        ptx,
+        "\tmul.lo.u32 %r20, %r5, {factor};",
+        factor = MAX_PROBE_FACTOR
+    )
+    .map_err(write_err)?;
+
     // Load the key for this row.
     writeln!(
         ptx,
@@ -373,10 +398,23 @@ pub fn compile_groupby_agg_kernel(
     .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
 
+    // Bounded-probe counter. %r21 increments once per slot examined; on
+    // overflow the thread bails to DONE rather than spinning indefinitely.
+    // Matches the same idiom in `compile_groupby_keys_kernel`.
+    writeln!(ptx, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+
     // Probe loop — non-mutating; the keys table is read-only here. We just
-    // walk slots until we find the one whose key matches ours. (Keys kernel
-    // ran first so we are guaranteed to find a matching slot.)
+    // walk slots until we find the one whose key matches ours. The host's
+    // cross-kernel synchronisation contract (see the doc comment above)
+    // guarantees a matching slot exists; the bounded counter below is the
+    // defensive fallback if that contract is violated.
     writeln!(ptx, "PROBE_LOOP:").map_err(write_err)?;
+    // Bound check: probe_count += 1 ; if probe_count > max_probes -> DONE.
+    // Give-up-silently semantics — no atomic update is issued for this row.
+    // Same shape as the keys kernel's bound (setp.gt.u32 against %r20).
+    writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p3, %r21, %r20;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl5, [%rd5];").map_err(write_err)?;
