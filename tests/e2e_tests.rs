@@ -1026,3 +1026,83 @@ fn physical_join_output_schema_combines_sides() {
         "physical and logical join schemas must agree on field names and order"
     );
 }
+
+// ---- Online: Option B pre-stage NULL propagation ---------------------------
+
+/// Build a sales batch where `price` carries `n_null` NULL entries
+/// (spread across the column) and `tax` is fully populated. Used to
+/// exercise the Option B path: `SUM(price * tax)` must return the sum
+/// of non-NULL `(price * tax)` rather than erroring out (Option A) or
+/// silently summing garbage (the pre-Option-A behaviour).
+fn sales_batch_with_nulls(n: usize, n_null: usize) -> RecordBatch {
+    let region: Int32Array = (0..n as i32).map(|i| i % 4).collect();
+    let price: Float64Array = (0..n)
+        .map(|i| {
+            if i % (n / n_null.max(1)) == 0 && (i / (n / n_null.max(1))) < n_null {
+                None
+            } else {
+                Some((i + 1) as f64)
+            }
+        })
+        .collect();
+    let tax: Float64Array = (0..n).map(|_| Some(0.1_f64)).collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("region_id", ArrowDataType::Int32, false),
+        ArrowField::new("price", ArrowDataType::Float64, true),
+        ArrowField::new("tax", ArrowDataType::Float64, false),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(region), Arc::new(price), Arc::new(tax)]).unwrap()
+}
+
+#[test]
+#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+fn e2e_sum_price_times_tax_with_nulls_in_price() {
+    // Option B contract: `SELECT SUM(price * tax) FROM sales` where
+    // `price` has NULL rows must propagate validity through the pre
+    // kernel (price * tax marked NULL where price is NULL) and the
+    // scalar reducer must skip NULL rows. Result = sum of
+    // non-NULL `(price * tax)`.
+    use craton_bolt::Engine;
+
+    let n = 100usize;
+    let n_null = 10usize;
+    let batch = sales_batch_with_nulls(n, n_null);
+
+    // Compute expected on the host using the same NULL set.
+    let price = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let tax = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let mut expected: f64 = 0.0;
+    for i in 0..n {
+        if !price.is_null(i) {
+            expected += price.value(i) * tax.value(i);
+        }
+    }
+
+    let mut engine = Engine::new().expect("ctx");
+    engine.register_table("sales", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT SUM(price * tax) FROM sales")
+        .expect("execute");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), 1);
+    let got = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
+    assert!(
+        (got - expected).abs() < 1e-6,
+        "Option B NULL propagation: got SUM={got}, want {expected} \
+         (10/100 NULL rows in price)"
+    );
+}

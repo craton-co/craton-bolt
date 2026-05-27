@@ -292,3 +292,9 @@ fn golden_float_atomic_min_uses_cas_loop() {
         "MIN(f64) must use float < comparison\n{ptx}"
     );
 }
+
+// NOTE: Option B pre-stage validity propagation golden tests live in
+// `src/jit/ptx_gen.rs` (the unit-test module) because they need to
+// construct a `physical_plan::Reg` directly and `Reg`'s tuple field is
+// `pub(crate)`. Keeping the codegen smoke tests next to the codegen
+// itself also matches the existing structure of `scan_kernel.rs::tests`.

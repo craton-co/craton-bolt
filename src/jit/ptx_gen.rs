@@ -120,11 +120,20 @@ impl PtxBuilder {
     }
 
     /// Build the mangled `.param` identifier for the row-count parameter.
-    fn n_rows_param_name(&self, n_inputs: usize, n_outputs: usize) -> String {
+    ///
+    /// The row-count param sits AFTER the value pointers AND any optional
+    /// validity pointers — callers must pass `n_extra_validity_params` so
+    /// the index matches the host-side parameter list.
+    fn n_rows_param_name(
+        &self,
+        n_inputs: usize,
+        n_outputs: usize,
+        n_extra_validity_params: usize,
+    ) -> String {
         format!(
             "{}_param_{}_n_rows",
             self.kernel_name,
-            n_inputs + n_outputs
+            n_inputs + n_outputs + n_extra_validity_params
         )
     }
 }
@@ -132,6 +141,40 @@ impl PtxBuilder {
 /// Compile a `KernelSpec` to a complete PTX module.
 pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
     validate_kernel_name(kernel_name)?;
+
+    // -------- Validity wiring (Option B). The `input_has_validity` /
+    //          `output_has_validity` fields are opt-in: when both are empty
+    //          we emit the historical PTX shape verbatim (no extra params,
+    //          no validity loads / stores) and every existing caller
+    //          continues to work bit-for-bit. When set, they MUST be
+    //          parallel to `inputs` / `outputs`.
+    let input_valid: Vec<bool> = if spec.input_has_validity.is_empty() {
+        vec![false; spec.inputs.len()]
+    } else {
+        if spec.input_has_validity.len() != spec.inputs.len() {
+            return Err(BoltError::Other(format!(
+                "ptx_gen: input_has_validity len {} != inputs len {}",
+                spec.input_has_validity.len(),
+                spec.inputs.len()
+            )));
+        }
+        spec.input_has_validity.clone()
+    };
+    let output_valid: Vec<bool> = if spec.output_has_validity.is_empty() {
+        vec![false; spec.outputs.len()]
+    } else {
+        if spec.output_has_validity.len() != spec.outputs.len() {
+            return Err(BoltError::Other(format!(
+                "ptx_gen: output_has_validity len {} != outputs len {}",
+                spec.output_has_validity.len(),
+                spec.outputs.len()
+            )));
+        }
+        spec.output_has_validity.clone()
+    };
+    let n_input_validity: usize = input_valid.iter().filter(|b| **b).count();
+    let n_output_validity: usize = output_valid.iter().filter(|b| **b).count();
+    let n_extra_validity_params: usize = n_input_validity + n_output_validity;
 
     let mut b = PtxBuilder::new(kernel_name);
 
@@ -153,7 +196,7 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
     b.emit(&format!(
         "ld.param.u32 {}, [{}];",
         n_rows,
-        b.n_rows_param_name(spec.inputs.len(), spec.outputs.len())
+        b.n_rows_param_name(spec.inputs.len(), spec.outputs.len(), n_extra_validity_params)
     ))?;
     b.emit(&format!(
         "setp.ge.s32 {}, {}, {};",
@@ -194,6 +237,85 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
         output_ptrs.push(rd);
     }
 
+    // -------- (Option B) Load validity pointers in the order they appear
+    //          in the param list: all flagged-input validities first, then
+    //          all flagged-output validities. The host side
+    //          (`agg_with_pre.rs::run_pre_stage`) builds the param list in
+    //          the same order.
+    let mut input_validity_ptrs: Vec<Option<String>> = vec![None; spec.inputs.len()];
+    let mut next_param = base + spec.outputs.len();
+    for (i, has) in input_valid.iter().enumerate() {
+        if *has {
+            let rd = b.alloc.alloc("rd");
+            b.emit(&format!(
+                "ld.param.u64 {}, [{}];",
+                rd,
+                b.param_name(next_param)
+            ))?;
+            b.emit(&format!("cvta.to.global.u64 {}, {};", rd, rd))?;
+            input_validity_ptrs[i] = Some(rd);
+            next_param += 1;
+        }
+    }
+    let mut output_validity_ptrs: Vec<Option<String>> = vec![None; spec.outputs.len()];
+    for (i, has) in output_valid.iter().enumerate() {
+        if *has {
+            let rd = b.alloc.alloc("rd");
+            b.emit(&format!(
+                "ld.param.u64 {}, [{}];",
+                rd,
+                b.param_name(next_param)
+            ))?;
+            b.emit(&format!("cvta.to.global.u64 {}, {};", rd, rd))?;
+            output_validity_ptrs[i] = Some(rd);
+            next_param += 1;
+        }
+    }
+
+    // -------- Compute the combined input validity: AND of every flagged
+    //          input's validity byte at row tid. This is a conservative
+    //          per-output validity (every output is marked valid only if
+    //          EVERY input row is valid). A finer per-output dataflow
+    //          analysis is a Stage C follow-up; for the common case
+    //          (`SUM(price * tax)` etc.) every input feeds every output,
+    //          so AND-of-all is exact.
+    //
+    //          When no input carries validity we still need a register
+    //          holding `1` to drive flagged output stores (e.g. a kernel
+    //          whose inputs are all-valid but whose outputs nonetheless
+    //          carry a validity column for downstream-shape reasons).
+    let combined_valid: Option<String> = if n_input_validity == 0 && n_output_validity == 0 {
+        None
+    } else {
+        let combined = b.alloc.alloc("r");
+        b.emit(&format!("mov.b32 {}, 1;", combined))?;
+        for (i, opt) in input_validity_ptrs.iter().enumerate() {
+            let Some(vptr) = opt else { continue };
+            let _ = i;
+            // off = tid (u8 stride => offset = tid).
+            let off = b.alloc.alloc("rd");
+            let addr = b.alloc.alloc("rd");
+            let byte_reg = b.alloc.alloc("r");
+            b.emit(&format!("cvt.s64.s32 {}, {};", off, tid))?;
+            b.emit(&format!(
+                "add.s64 {}, {}, {};",
+                addr, vptr, off
+            ))?;
+            b.emit(&format!(
+                "ld.global.u8 {}, [{}];",
+                byte_reg, addr
+            ))?;
+            // AND combined with this validity byte. Both live in the b32
+            // (r) register class with 0/1 values; `and.b32` matches the
+            // pattern used by logical Bool ops (see emit_binary).
+            b.emit(&format!(
+                "and.b32 {}, {}, {};",
+                combined, combined, byte_reg
+            ))?;
+        }
+        Some(combined)
+    };
+
     // -------- Split ops into "compute" and "store" so the predicate gate sits between them.
     let mut compute_ops: Vec<&Op> = Vec::with_capacity(spec.ops.len());
     let mut store_ops: Vec<&Op> = Vec::with_capacity(spec.outputs.len());
@@ -222,6 +344,29 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
         emit_op(&mut b, op, &input_ptrs, &output_ptrs, &tid)?;
     }
 
+    // -------- (Option B) Per-output validity stores. Each flagged output
+    //          receives the same combined input validity at row tid. This
+    //          runs AFTER the value stores so a Stage C optimisation that
+    //          skips the value math when validity is 0 has a single,
+    //          obvious gate site.
+    if let Some(combined) = &combined_valid {
+        for (i, opt) in output_validity_ptrs.iter().enumerate() {
+            let Some(vptr) = opt else { continue };
+            let _ = i;
+            let off = b.alloc.alloc("rd");
+            let addr = b.alloc.alloc("rd");
+            b.emit(&format!("cvt.s64.s32 {}, {};", off, tid))?;
+            b.emit(&format!(
+                "add.s64 {}, {}, {};",
+                addr, vptr, off
+            ))?;
+            b.emit(&format!(
+                "st.global.u8 [{}], {};",
+                addr, combined
+            ))?;
+        }
+    }
+
     // -------- Done label + return.
     b.emit_label("DONE")?;
     b.emit("ret;")?;
@@ -233,7 +378,7 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
     writeln!(out, "{}", PTX_ADDRESS_SIZE).map_err(write_err)?;
     writeln!(out).map_err(write_err)?;
 
-    write_signature(&mut out, &b, spec)?;
+    write_signature(&mut out, &b, spec, n_extra_validity_params)?;
 
     writeln!(out, "{{").map_err(write_err)?;
     write_reg_decls(&mut out, &b.alloc)?;
@@ -656,13 +801,20 @@ fn validate_kernel_name(name: &str) -> BoltResult<()> {
 }
 
 /// Write the `.visible .entry` signature, one parameter per line.
-fn write_signature(out: &mut String, b: &PtxBuilder, spec: &KernelSpec) -> BoltResult<()> {
+fn write_signature(
+    out: &mut String,
+    b: &PtxBuilder,
+    spec: &KernelSpec,
+    n_extra_validity_params: usize,
+) -> BoltResult<()> {
     writeln!(out, ".visible .entry {}(", b.kernel_name).map_err(write_err)?;
 
-    let total_params = spec.inputs.len() + spec.outputs.len();
+    let total_params = spec.inputs.len() + spec.outputs.len() + n_extra_validity_params;
     // NOTE: .ptr .global .restrict relies on the invariant that no two kernel-param
     // pointers alias. The PhysicalPlan lowering guarantees this — never reuse a
-    // column buffer as both an input and a non-trivial output.
+    // column buffer as both an input and a non-trivial output. Validity
+    // pointers (when present) are fresh `GpuVec<u8>` allocations on the host
+    // side, separate from any value buffer, so they also satisfy non-alias.
     // TODO(orchestrator): golden test update — tests/ptx_golden_tests.rs may need
     // its `.param .u64 ...` assertions widened to allow the new attribute string
     // (e.g. assert `contains(".restrict")`).
@@ -680,7 +832,7 @@ fn write_signature(out: &mut String, b: &PtxBuilder, spec: &KernelSpec) -> BoltR
     writeln!(
         out,
         "\t.param .u32 {}",
-        b.n_rows_param_name(spec.inputs.len(), spec.outputs.len())
+        b.n_rows_param_name(spec.inputs.len(), spec.outputs.len(), n_extra_validity_params)
     )
     .map_err(write_err)?;
     writeln!(out, ")").map_err(write_err)?;
@@ -710,4 +862,155 @@ fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> BoltResult<()> {
 /// Adapt a `std::fmt::Error` into a `BoltError`.
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("ptx_gen: write failed: {}", e))
+}
+
+#[cfg(test)]
+mod validity_emission_tests {
+    //! Golden tests for the Option B validity-propagation codegen. These
+    //! live inline because they need to construct a `Reg` directly, and
+    //! its tuple field is `pub(crate)`.
+    use super::*;
+    use crate::plan::logical_plan::BinaryOp;
+    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
+
+    /// Build a minimal hand-crafted `KernelSpec` for `out0 = in0 * in1`
+    /// (Int64) with validity wired on both inputs and the single output.
+    /// Mirrors what the planner would emit for `SUM(price * tax)`
+    /// once the SQL frontend learns to set the validity flags from
+    /// `arr.null_count() > 0` — for now the host side
+    /// (`exec::agg_with_pre::run_pre_stage`) sets them per-call.
+    fn mul_with_validity_spec() -> KernelSpec {
+        let ops = vec![
+            Op::LoadColumn {
+                dst: Reg(0),
+                col_idx: 0,
+                dtype: DataType::Int64,
+            },
+            Op::LoadColumn {
+                dst: Reg(1),
+                col_idx: 1,
+                dtype: DataType::Int64,
+            },
+            Op::Binary {
+                dst: Reg(2),
+                op: BinaryOp::Mul,
+                lhs: Reg(0),
+                rhs: Reg(1),
+                dtype: DataType::Int64,
+                result_dtype: DataType::Int64,
+            },
+            Op::Store {
+                src: Reg(2),
+                col_idx: 0,
+                dtype: DataType::Int64,
+            },
+        ];
+        KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "in0".into(),
+                    dtype: DataType::Int64,
+                },
+                ColumnIO {
+                    name: "in1".into(),
+                    dtype: DataType::Int64,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "out0".into(),
+                dtype: DataType::Int64,
+            }],
+            ops,
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![true, true],
+            output_has_validity: vec![true],
+        }
+    }
+
+    #[test]
+    fn validity_emits_and_b32_and_u8_store() {
+        // Contract:
+        //   1. Each flagged input contributes an `ld.global.u8` for its
+        //      per-row validity byte.
+        //   2. The bytes are AND-folded into a single combined register
+        //      via `and.b32` (booleans live in the b32 register class).
+        //   3. The combined byte is written via `st.global.u8` to every
+        //      flagged output's validity buffer.
+        //   4. Param signature carries `n_inputs + n_outputs + n_flagged
+        //      input/output validity` pointer params plus one `.u32`
+        //      n_rows.
+        let spec = mul_with_validity_spec();
+        let ptx = compile(&spec, "bolt_pre_kernel_validity").expect("compile");
+
+        // 2 u8 loads (one per flagged input).
+        let n_u8_loads = ptx.matches("ld.global.u8").count();
+        assert!(
+            n_u8_loads >= 2,
+            "expected >=2 ld.global.u8 for input validity, got {n_u8_loads}\n{ptx}"
+        );
+
+        // and.b32 for the combined-validity fold (Mul doesn't emit one).
+        assert!(
+            ptx.contains("and.b32"),
+            "expected and.b32 for combined input validity\n{ptx}"
+        );
+
+        // st.global.u8 for the output validity write.
+        let n_u8_stores = ptx.matches("st.global.u8").count();
+        assert!(
+            n_u8_stores >= 1,
+            "expected >=1 st.global.u8 for output validity, got {n_u8_stores}\n{ptx}"
+        );
+
+        // 2 inputs + 1 output + 2 input-validity + 1 output-validity = 6
+        // pointer params.
+        let n_ptr_params = ptx.matches(".param .u64 .ptr").count();
+        assert_eq!(
+            n_ptr_params, 6,
+            "expected 6 .ptr params (3 value + 3 validity), got {n_ptr_params}\n{ptx}"
+        );
+    }
+
+    #[test]
+    fn no_validity_emits_original_shape() {
+        // Regression guard: when `*_has_validity` is empty the emitter
+        // MUST produce the historical PTX shape (no extra params, no u8
+        // loads/stores, original `n_rows` param index). The projection
+        // path in `engine.rs` relies on this byte-for-byte
+        // compatibility.
+        let mut spec = mul_with_validity_spec();
+        spec.input_has_validity = vec![];
+        spec.output_has_validity = vec![];
+        let ptx = compile(&spec, "bolt_pre_kernel_no_validity").expect("compile");
+
+        let n_ptr_params = ptx.matches(".param .u64 .ptr").count();
+        assert_eq!(
+            n_ptr_params, 3,
+            "expected 3 .ptr params (2 inputs + 1 output, no validity), got {n_ptr_params}\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("ld.global.u8"),
+            "expected NO ld.global.u8 in the no-validity path\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("st.global.u8"),
+            "expected NO st.global.u8 in the no-validity path\n{ptx}"
+        );
+    }
+
+    #[test]
+    fn validity_param_count_mismatch_is_error() {
+        // Defensive: a non-empty `input_has_validity` of the wrong length
+        // is a planning bug. The emitter must surface it rather than
+        // silently produce a kernel with a desynchronised param list.
+        let mut spec = mul_with_validity_spec();
+        spec.input_has_validity = vec![true]; // should be len 2
+        let err = compile(&spec, "bolt_pre_kernel_bad").expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("input_has_validity") || msg.contains("validity"),
+            "error should mention validity, got: {msg}"
+        );
+    }
 }
