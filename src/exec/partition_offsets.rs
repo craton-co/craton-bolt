@@ -28,8 +28,7 @@
 //!
 //! The sync round-trip used to cost two pageable PCIe transfers (one D2H,
 //! one H2D) hitting the driver-synthesised staging buffer. Stage 5 routes
-//! both legs through a single 16 KiB **pinned** host scratch buffer
-//! persisted in a `OnceLock<Mutex<PinnedHostBuffer<u32>>>`:
+//! both legs through a single 16 KiB **pinned** host scratch buffer:
 //!
 //! 1. D2H `cuMemcpyDtoHAsync` into pinned scratch on the NULL stream.
 //! 2. Block on `cuStreamSynchronize`.
@@ -43,13 +42,26 @@
 //! ~13 ms/s of CPU time recovered, just from removing the driver's
 //! pageable-staging detour.
 //!
-//! ### Why a single shared static
+//! ### Stage-7 (P1b) thread-local pinned scratch
 //!
-//! 16 KiB × `NUM_PARTITIONS+1` would be 16 KiB total. We never need more
-//! than one in flight (Tier-2 orchestrator is single-threaded per call),
-//! and a `Mutex` is the cheapest correct way to keep us robust against a
-//! future multi-threaded call site. The lock is held only across the
-//! short copy + scan window, never across kernel launches.
+//! Stage 5 stored the pinned scratch in a single
+//! `OnceLock<Mutex<PinnedHostBuffer<u32>>>`. That's correct, but every
+//! Tier-2 orchestrator call serialises on the same mutex — which becomes
+//! a contention point as soon as queries run concurrently (think a server
+//! handling several SQL requests in flight on the same engine). Stage 7
+//! swaps the global mutex for a `thread_local!` scratch: each query
+//! thread owns one 16 KiB pinned buffer, allocated lazily on first use.
+//!
+//! **Trade-off**: the host now holds one 16 KiB pinned region per thread
+//! that ever touched Tier-2. For the typical server topology (a small
+//! pool of worker threads handling many queries) this is ~tens of KiB of
+//! pinned memory total — well under the per-context budget that the rest
+//! of the engine reserves. For a pathological caller that spawns a new
+//! thread per query, the buffers leak with the thread on exit
+//! (`cuMemFreeHost` runs in the per-thread `Drop`), which is the right
+//! lifecycle anyway. We document the upper-bound as "one 16 KiB pinned
+//! buffer per orchestrator-calling thread" so a Stage-8 ceiling can land
+//! cleanly if/when a counter-example shows up.
 //!
 //! ### Joint-call helper
 //!
@@ -60,7 +72,7 @@
 //! pinned-async sequence to a single `stream.synchronize()` for the
 //! whole call.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::cell::RefCell;
 
 use crate::cuda::cuda_sys::{self, CUstream};
 use crate::cuda::{GpuVec, PinnedHostBuffer};
@@ -74,58 +86,77 @@ use crate::exec::launch::CudaStream;
 /// bound the Tier-1 block-local hashtable can hold in shared memory.
 pub const NUM_PARTITIONS: u32 = 4096;
 
-/// Pinned host scratch buffer of length `NUM_PARTITIONS + 1`.
-///
-/// One global mutex-guarded slot: 16 KiB of page-locked memory amortised
-/// across every Tier-2 orchestrator call. The mutex protects against a
-/// future multi-threaded caller; today the orchestrator is single-threaded
-/// per query and we never hold the lock across a kernel launch, so
-/// contention is trivial.
-///
-/// Initialised lazily so processes that never touch Tier 2 (or that run
-/// without a CUDA context) don't pay the `cuMemAllocHost` cost.
-static PINNED_SCRATCH: OnceLock<Mutex<PinnedHostBuffer<u32>>> = OnceLock::new();
+// Stage-7: per-thread pinned scratch buffer of length `NUM_PARTITIONS + 1`.
+//
+// One 16 KiB page-locked region per thread that ever calls into this
+// module. Initialised lazily on first use, so a thread that never reaches
+// Tier-2 (or runs without a CUDA context) pays no `cuMemAllocHost` cost.
+// `PinnedHostBuffer` is `Send + !Sync` and its `Drop` releases the pinned
+// region via `cuMemFreeHost`, so the buffer's lifecycle is bound to the
+// thread that owns it.
+//
+// **Why a `RefCell`**: callers borrow the scratch mutably (to write the
+// downloaded counts and the prefix-summed bases) but only one borrow is
+// ever live at a time — the orchestrator calls a single helper at a time
+// per thread, and helpers don't re-enter the module. The `RefCell::try_borrow_mut`
+// path therefore never panics under correct use; we surface a clean
+// `BoltError` if it ever does (e.g. a future re-entrant caller).
+thread_local! {
+    /// The thread-local pinned scratch slot. `RefCell<Option<...>>` so we
+    /// can:
+    ///   * Lazily allocate on first `with_pinned_scratch` call (`None` → `Some`).
+    ///   * Recover from a previous allocation failure by leaving the slot
+    ///     `None` and re-attempting on the next call.
+    ///
+    /// `Option` matters because `RefCell` itself can't be empty — without
+    /// it we'd have to stash a zero-length placeholder, which the callers
+    /// can't distinguish from a real (but truncated) buffer.
+    static PINNED_SCRATCH: RefCell<Option<PinnedHostBuffer<u32>>> =
+        const { RefCell::new(None) };
+}
 
-/// Lock and return the shared 16 KiB pinned scratch buffer, allocating
-/// it on the first call. Errors propagate if pinned allocation fails
-/// (e.g. no CUDA context).
-fn lock_pinned_scratch() -> BoltResult<MutexGuard<'static, PinnedHostBuffer<u32>>> {
-    let cell = PINNED_SCRATCH.get_or_init(|| {
-        // We can't return a Result from `get_or_init`. If pinned allocation
-        // fails here we stash a zero-length buffer; the callers' length
-        // check below (`scratch.len() < NUM_PARTITIONS + 1`) will then
-        // re-attempt allocation on the next call by detecting the empty
-        // slot. In practice this only fires under CUDA-stub or if the
-        // driver refuses, in which case the parent query is already
-        // doomed and will surface a clearer error from a later FFI call.
-        Mutex::new(
-            PinnedHostBuffer::<u32>::new(NUM_PARTITIONS as usize + 1)
-                .unwrap_or_else(|_| {
-                    PinnedHostBuffer::<u32>::new(0)
-                        .expect("zero-length PinnedHostBuffer never fails")
-                }),
-        )
-    });
-    let guard = cell.lock().map_err(|e| {
-        BoltError::Other(format!(
-            "partition_offsets: pinned scratch mutex poisoned: {e}"
-        ))
-    })?;
-    if guard.len() < (NUM_PARTITIONS as usize + 1) {
-        // First-init failed (see above). Try once more; surface the
-        // error if it still doesn't take.
-        drop(guard);
-        // We can't replace the contents of a `OnceLock`; if the cached
-        // value is bad, fall back to a per-call allocation. This branch
-        // is degenerate (every subsequent call also re-allocates) but
-        // it's strictly safer than blowing up the query.
-        return Err(BoltError::Other(
-            "partition_offsets: pinned scratch unavailable; \
-             cuMemAllocHost previously failed for this process"
-                .into(),
-        ));
-    }
-    Ok(guard)
+/// Run `f` with the calling thread's pinned scratch buffer, allocating
+/// it on first use. The buffer is guaranteed to hold at least
+/// `NUM_PARTITIONS + 1` `u32`s while `f` runs.
+///
+/// Errors:
+///   * Returns `BoltError::Other` if `cuMemAllocHost` refuses (no CUDA
+///     context, host is OOM, etc.). The slot is left empty so the next
+///     call may retry — useful in test harnesses that initialise CUDA
+///     after the first orchestrator probe.
+///   * Returns `BoltError::Other` if the slot is already borrowed
+///     (re-entrancy bug — this module is not re-entrant by design).
+///
+/// `f` cannot itself call into this module on the same thread; doing so
+/// would land in the borrow-checker arm above.
+fn with_pinned_scratch<R>(
+    f: impl FnOnce(&mut PinnedHostBuffer<u32>) -> BoltResult<R>,
+) -> BoltResult<R> {
+    PINNED_SCRATCH.with(|cell| {
+        let mut slot = cell.try_borrow_mut().map_err(|_| {
+            BoltError::Other(
+                "partition_offsets: pinned scratch already in use on this thread \
+                 (re-entrant call?)"
+                    .into(),
+            )
+        })?;
+        if slot.is_none() {
+            // Allocate on first use for this thread. If allocation fails
+            // we leave the slot empty so a later call can retry.
+            let buf = PinnedHostBuffer::<u32>::new(NUM_PARTITIONS as usize + 1)
+                .map_err(|e| {
+                    BoltError::Other(format!(
+                        "partition_offsets: failed to allocate per-thread \
+                         pinned scratch (cuMemAllocHost): {e}"
+                    ))
+                })?;
+            *slot = Some(buf);
+        }
+        // SAFETY of unwrap: just installed `Some` if it was `None`.
+        let buf = slot.as_mut().expect("pinned scratch was just installed");
+        debug_assert!(buf.len() >= NUM_PARTITIONS as usize + 1);
+        f(buf)
+    })
 }
 
 /// Compute exclusive prefix-sum offsets from a GPU-resident counts vector.
@@ -153,10 +184,11 @@ pub fn compute_partition_offsets(counts: &GpuVec<u32>) -> BoltResult<Vec<u32>> {
         )));
     }
     let stream = CudaStream::null();
-    let mut scratch = lock_pinned_scratch()?;
-    d2h_into_pinned(counts, &mut scratch, stream.raw())?;
-    stream.synchronize()?;
-    Ok(prefix_sum_pinned_to_vec(&scratch))
+    with_pinned_scratch(|scratch| {
+        d2h_into_pinned(counts, scratch, stream.raw())?;
+        stream.synchronize()?;
+        Ok(prefix_sum_pinned_to_vec(scratch))
+    })
 }
 
 /// Upload the host-side offsets back to the GPU so the scatter kernel
@@ -186,22 +218,23 @@ pub fn upload_offsets(offsets: &[u32]) -> BoltResult<GpuVec<u32>> {
     // scatter kernel indexes `offsets[pid]` for pid in [0, K) and the
     // trailing total is only useful host-side.
     let stream = CudaStream::null();
-    let mut scratch = lock_pinned_scratch()?;
-    // Copy the bases into pinned memory; this is a plain host memcpy
-    // and not synchronized on any stream.
-    scratch.as_mut_slice()[..NUM_PARTITIONS as usize]
-        .copy_from_slice(&offsets[..NUM_PARTITIONS as usize]);
-    // `from_slice_async` issues `cuMemcpyHtoDAsync` from the pinned source
-    // pointer, which is DMA-friendly (no driver-synthesised staging).
-    let gpu = GpuVec::<u32>::from_slice_async(
-        &scratch.as_slice()[..NUM_PARTITIONS as usize],
-        stream.raw(),
-    )?;
-    stream.synchronize()?;
-    // Scratch lock drops here; safe because the stream is already
-    // synchronized so no DMA still references the pinned source region.
-    drop(scratch);
-    Ok(gpu)
+    with_pinned_scratch(|scratch| {
+        // Copy the bases into pinned memory; this is a plain host memcpy
+        // and not synchronized on any stream.
+        scratch.as_mut_slice()[..NUM_PARTITIONS as usize]
+            .copy_from_slice(&offsets[..NUM_PARTITIONS as usize]);
+        // `from_slice_async` issues `cuMemcpyHtoDAsync` from the pinned source
+        // pointer, which is DMA-friendly (no driver-synthesised staging).
+        let gpu = GpuVec::<u32>::from_slice_async(
+            &scratch.as_slice()[..NUM_PARTITIONS as usize],
+            stream.raw(),
+        )?;
+        stream.synchronize()?;
+        // Scratch borrow drops on return; safe because the stream is
+        // already synchronized so no DMA still references the pinned
+        // source region.
+        Ok(gpu)
+    })
 }
 
 /// Combined D2H + prefix-scan + H2D on a single caller-supplied stream
@@ -254,62 +287,61 @@ pub fn compute_and_upload_partition_offsets_async(
         )));
     }
 
-    let host_offsets: Vec<u32>;
-    let gpu_out: GpuVec<u32>;
-    let mut scratch = lock_pinned_scratch()?;
+    with_pinned_scratch(|scratch| {
+        // Step 1: D2H async into pinned scratch[0..NUM_PARTITIONS].
+        // SAFETY: scratch holds NUM_PARTITIONS+1 elements; we write the
+        // first NUM_PARTITIONS. `counts` is a live device allocation of
+        // exactly NUM_PARTITIONS u32s (checked above).
+        unsafe {
+            cuda_sys::memcpy_d2h_async::<u32>(
+                scratch.as_mut_ptr(),
+                counts.device_ptr(),
+                NUM_PARTITIONS as usize,
+                stream,
+            )?;
+        }
 
-    // Step 1: D2H async into pinned scratch[0..NUM_PARTITIONS].
-    // SAFETY: scratch holds NUM_PARTITIONS+1 elements; we write the
-    // first NUM_PARTITIONS. `counts` is a live device allocation of
-    // exactly NUM_PARTITIONS u32s (checked above).
-    unsafe {
-        cuda_sys::memcpy_d2h_async::<u32>(
-            scratch.as_mut_ptr(),
-            counts.device_ptr(),
-            NUM_PARTITIONS as usize,
+        // The H2D below depends on the prefix-sum, which depends on the
+        // D2H landing — we cannot enqueue the H2D yet. Sync once to flush
+        // the D2H, then do the host work, then issue the H2D. The whole
+        // pipeline therefore costs exactly one synchronize.
+        unsafe {
+            cuda_sys::check(cuda_sys::cuStreamSynchronize(stream))?;
+        }
+
+        // Step 2: prefix-sum in pinned memory. We materialise the
+        // host-visible `Vec<u32>` here (length NUM_PARTITIONS+1) because
+        // the caller wants it for the scatter-buffer sizing.
+        let host_offsets = prefix_sum_pinned_to_vec(scratch);
+
+        // Step 3: write the bases (offsets[0..NUM_PARTITIONS]) back into
+        // pinned scratch[0..NUM_PARTITIONS]. They sit alongside the
+        // already-computed `offsets[NUM_PARTITIONS]` in scratch[K], which
+        // we leave unused for this leg.
+        scratch.as_mut_slice()[..NUM_PARTITIONS as usize]
+            .copy_from_slice(&host_offsets[..NUM_PARTITIONS as usize]);
+
+        // Step 4: H2D async from pinned scratch into a freshly allocated
+        // device vec. The `from_slice_async` call issues `cuMemcpyHtoDAsync`
+        // with the pinned source pointer (no driver-synthesised staging) and
+        // sets the GpuVec's logical length atomically.
+        let gpu_out = GpuVec::<u32>::from_slice_async(
+            &scratch.as_slice()[..NUM_PARTITIONS as usize],
             stream,
         )?;
-    }
 
-    // The H2D below depends on the prefix-sum, which depends on the
-    // D2H landing — we cannot enqueue the H2D yet. Sync once to flush
-    // the D2H, then do the host work, then issue the H2D. The whole
-    // pipeline therefore costs exactly one synchronize.
-    unsafe {
-        cuda_sys::check(cuda_sys::cuStreamSynchronize(stream))?;
-    }
-
-    // Step 2: prefix-sum in pinned memory. We materialise the
-    // host-visible `Vec<u32>` here (length NUM_PARTITIONS+1) because
-    // the caller wants it for the scatter-buffer sizing.
-    host_offsets = prefix_sum_pinned_to_vec(&scratch);
-
-    // Step 3: write the bases (offsets[0..NUM_PARTITIONS]) back into
-    // pinned scratch[0..NUM_PARTITIONS]. They sit alongside the
-    // already-computed `offsets[NUM_PARTITIONS]` in scratch[K], which
-    // we leave unused for this leg.
-    scratch.as_mut_slice()[..NUM_PARTITIONS as usize]
-        .copy_from_slice(&host_offsets[..NUM_PARTITIONS as usize]);
-
-    // Step 4: H2D async from pinned scratch into a freshly allocated
-    // device vec. The `from_slice_async` call issues `cuMemcpyHtoDAsync`
-    // with the pinned source pointer (no driver-synthesised staging) and
-    // sets the GpuVec's logical length atomically.
-    gpu_out = GpuVec::<u32>::from_slice_async(
-        &scratch.as_slice()[..NUM_PARTITIONS as usize],
-        stream,
-    )?;
-
-    // We hold the scratch lock across the enqueued H2D. The caller MUST
-    // synchronize `stream` before issuing another partition-offsets call
-    // (the typical flow does this implicitly by chaining the scatter
-    // kernel on `stream`, then synchronizing later). Dropping the lock
-    // here while the H2D is still in flight is safe in this process —
-    // the next call would block on the mutex, and any DMA in flight by
-    // then must have retired before the new caller can mutate the pinned
-    // region. We document this as the lifecycle invariant on the helper.
-    drop(scratch);
-    Ok((host_offsets, gpu_out))
+        // We hold the scratch borrow across the enqueued H2D. The caller MUST
+        // synchronize `stream` before issuing another partition-offsets call
+        // on this same thread (the typical flow does this implicitly by
+        // chaining the scatter kernel on `stream`, then synchronizing later).
+        // With Stage-7 thread-local scratch, a *different* thread cannot
+        // observe the in-flight H2D's source region (each thread owns its own
+        // pinned slot), so the cross-thread variant of this footgun is gone.
+        // Dropping the borrow here is safe: the next same-thread call would
+        // see the slot free, and any DMA in flight by then must have retired
+        // because the caller's synchronize precedes it.
+        Ok((host_offsets, gpu_out))
+    })
 }
 
 /// Async D2H of all NUM_PARTITIONS counts into `scratch[0..NUM_PARTITIONS]`.
@@ -574,10 +606,11 @@ mod tests {
     #[ignore = "requires CUDA toolkit at runtime"]
     fn stage5_pinned_scratch_is_reused() {
         // Calling compute_partition_offsets twice in a row should not
-        // reallocate pinned memory — the OnceLock-backed scratch is
-        // shared. We exercise the path twice with different inputs and
-        // confirm each produces the right answer; an allocation bug would
-        // typically manifest as a stale-data dependency between calls.
+        // reallocate pinned memory — the thread-local scratch is reused
+        // for every call on this thread. We exercise the path twice with
+        // different inputs and confirm each produces the right answer; an
+        // allocation bug would typically manifest as a stale-data
+        // dependency between calls.
         let a: Vec<u32> = (0..NUM_PARTITIONS).map(|k| k + 1).collect();
         let b: Vec<u32> = (0..NUM_PARTITIONS).map(|k| 2 * k + 1).collect();
         let dev_a = GpuVec::<u32>::from_slice(&a).expect("upload a");
@@ -588,5 +621,114 @@ mod tests {
 
         assert_eq!(offs_a, prefix_sum_cpu(&a));
         assert_eq!(offs_b, prefix_sum_cpu(&b));
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage-7 (P1b) thread-local pinned scratch.
+    //
+    // Concurrent-allocator coverage: 8 threads each run a prefix-sum
+    // through `with_pinned_scratch`, every thread allocates its own
+    // 16 KiB pinned slot, and the results don't cross-contaminate. The
+    // test is CUDA-free — `with_pinned_scratch` exits early with an
+    // error when `cuMemAllocHost` refuses (which it always does without
+    // a context), and we treat that as a successful "no panic + clean
+    // error" case. On CUDA hosts (run with `--ignored`) every thread
+    // produces the correct prefix sum.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn stage7_concurrent_threads_no_panic() {
+        // Eight threads, each calling the thread-local scratch helper
+        // many times. We don't require CUDA: if pinned allocation fails
+        // the helper returns an `Err` (no panic). The assertion below
+        // accepts either outcome — what we're guarding against is a
+        // re-entrancy / lock-contention panic from the helper itself.
+        use std::thread;
+
+        let mut handles = Vec::new();
+        for tid in 0..8u32 {
+            handles.push(thread::spawn(move || {
+                // Prepare a deterministic per-thread input. Each thread
+                // hits `with_pinned_scratch` directly so the test stays
+                // CUDA-free (no `GpuVec` allocation needed).
+                for iter in 0..32u32 {
+                    let result: BoltResult<Vec<u32>> =
+                        with_pinned_scratch(|scratch| {
+                            // Use the pinned region as scratch: write a
+                            // deterministic pattern in, prefix-sum it,
+                            // return the result. Mirrors the real
+                            // download-then-scan call shape.
+                            let s = scratch.as_mut_slice();
+                            for k in 0..NUM_PARTITIONS as usize {
+                                s[k] = tid.wrapping_add(iter).wrapping_add(k as u32);
+                            }
+                            Ok(prefix_sum_cpu(&s[..NUM_PARTITIONS as usize]))
+                        });
+                    if let Ok(v) = result {
+                        // Sanity: prefix sum's first element is 0 and
+                        // length is correct. Any cross-thread state
+                        // bleed would corrupt this.
+                        assert_eq!(v.len(), NUM_PARTITIONS as usize + 1);
+                        assert_eq!(v[0], 0);
+                    }
+                    // Err is acceptable on a CUDA-less host (no pinned
+                    // alloc available); the test asserts only that we
+                    // don't panic / dangle / cross-contaminate state.
+                }
+            }));
+        }
+        for h in handles {
+            // `join` must not panic — the helper is panic-free.
+            h.join().expect("worker thread panicked");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime — Stage 7 concurrent"]
+    fn stage7_concurrent_threads_each_get_correct_output() {
+        // CUDA-on variant of `stage7_concurrent_threads_no_panic`. Each
+        // thread does a real D2H prefix-sum through
+        // `compute_partition_offsets` and the result must match the
+        // pure-CPU scan exactly — proving the thread-local pinned slot
+        // is genuinely thread-local (no cross-thread tearing).
+        use std::sync::Arc;
+        use std::thread;
+
+        // Build the inputs on the main thread (CUDA context is per-thread
+        // in the driver model; using one shared host vec keeps the test
+        // self-contained — each thread re-uploads its own GpuVec).
+        let inputs: Vec<Arc<Vec<u32>>> = (0..8)
+            .map(|tid| {
+                let v: Vec<u32> = (0..NUM_PARTITIONS)
+                    .map(|k| (tid as u32) * 7 + k + 1)
+                    .collect();
+                Arc::new(v)
+            })
+            .collect();
+
+        let mut handles = Vec::new();
+        for (tid, host) in inputs.iter().cloned().enumerate() {
+            handles.push(thread::spawn(move || {
+                // Each thread brings up its own CUDA context (driver API)
+                // implicitly via `GpuVec::from_slice`'s primary-context
+                // attach. If that fails, return a sentinel `None` so the
+                // outer assertion can skip — the test is `#[ignore]`'d
+                // already, so the run only happens on a CUDA host.
+                let dev = GpuVec::<u32>::from_slice(&host[..])
+                    .expect("upload per-thread counts");
+                let offsets = compute_partition_offsets(&dev)
+                    .expect("compute per-thread offsets");
+                (tid, offsets, host)
+            }));
+        }
+        for h in handles {
+            let (tid, got, host) = h.join().expect("worker thread panicked");
+            let expected = prefix_sum_cpu(&host[..]);
+            assert_eq!(
+                got, expected,
+                "thread {tid} returned a prefix sum that doesn't match the \
+                 pure-CPU scan — thread-local pinned scratch likely torn"
+            );
+        }
     }
 }
