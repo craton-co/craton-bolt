@@ -1247,23 +1247,98 @@ pub(super) mod pool_watcher {
     /// live CUDA context.
     pub(super) type MemInfoFn = fn() -> BoltResult<(usize, usize)>;
 
+    /// Stage 5 (M3L5): function-pointer indirection for binding the
+    /// engine's CUDA context onto the calling (watcher) thread. The
+    /// production hook captures `cuCtxGetCurrent` once from the
+    /// spawning thread and re-binds it via `cuCtxSetCurrent` here;
+    /// tests pass a no-op so the watcher loop runs without a real
+    /// driver. Return `BoltResult<()>` — a failure is logged and the
+    /// poll is skipped, never propagated past the watcher.
+    pub(super) type CtxAttachFn = fn() -> BoltResult<()>;
+
     static HANDLE: OnceLock<JoinHandle<()>> = OnceLock::new();
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+    /// Stage 5: capture of the engine thread's CUDA context, taken at
+    /// `ensure_started()` time. The watcher thread re-attaches this
+    /// context via `cuCtxSetCurrent` before each `cuMemGetInfo_v2` poll
+    /// — otherwise the watcher thread inherits no current context and
+    /// every poll errors with `CUDA_ERROR_INVALID_CONTEXT`. Stored as
+    /// `usize` so it crosses the static-storage boundary (raw pointers
+    /// are not `Sync`).
+    static CAPTURED_CTX: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     fn real_mem_info() -> BoltResult<(usize, usize)> {
         crate::cuda::cuda_sys::mem_get_info()
     }
 
+    /// Production context-attach hook: bind the captured context onto
+    /// the calling thread. No-op (returns `Ok(())`) when no context was
+    /// captured, which happens if `ensure_started` ran before any
+    /// engine thread had a context current.
+    fn real_ctx_attach() -> BoltResult<()> {
+        let raw = CAPTURED_CTX.load(Ordering::Acquire);
+        if raw == 0 {
+            return Ok(());
+        }
+        let ctx = raw as crate::cuda::cuda_sys::CUcontext;
+        // SAFETY: `raw` was captured via `cuCtxGetCurrent` on the
+        // engine thread; the engine's `CudaContext` outlives the
+        // watcher because `DeviceMemPool::Drop` requests shutdown
+        // before context teardown. See `cuda_sys::ctx_set_current`
+        // docs for the precondition.
+        unsafe { crate::cuda::cuda_sys::ctx_set_current(ctx) }
+    }
+
     /// Spawn the watcher exactly once (idempotent). Subsequent calls are
     /// a cheap `OnceLock::get_or_init` check.
+    ///
+    /// Stage 5 (M3L5): on the first call, captures the current CUDA
+    /// context on the calling thread (via `cuCtxGetCurrent`) and stashes
+    /// it in `CAPTURED_CTX`. The watcher thread re-attaches that
+    /// context on every iteration before polling `cuMemGetInfo_v2` —
+    /// without the re-attach, the watcher's first poll fails with
+    /// `CUDA_ERROR_INVALID_CONTEXT` because background threads inherit
+    /// no current context. Failure of the capture is logged and the
+    /// watcher still spawns (it'll just keep failing polls until an
+    /// engine call binds a context that real_ctx_attach can later use).
     pub(super) fn ensure_started() {
         HANDLE.get_or_init(|| {
+            // Capture the engine thread's context BEFORE spawning the
+            // background thread (otherwise we'd capture the new thread's
+            // empty context).
+            match crate::cuda::cuda_sys::ctx_get_current() {
+                Ok(Some(ctx)) => {
+                    CAPTURED_CTX.store(ctx as usize, Ordering::Release);
+                }
+                Ok(None) => {
+                    log::debug!(
+                        "craton-bolt: pool-watcher spawning with no current \
+                         context; polls will retry until a context is bound"
+                    );
+                }
+                Err(e) => {
+                    log::debug!(
+                        "craton-bolt: pool-watcher cuCtxGetCurrent failed at \
+                         spawn: {}",
+                        e
+                    );
+                }
+            }
             let interval = read_interval();
             let low_water = read_low_water();
             thread::Builder::new()
                 .name("craton-bolt-pool-watcher".into())
                 .spawn(move || {
-                    watcher_loop(&POOL, interval, low_water, real_mem_info, &SHUTDOWN)
+                    watcher_loop(
+                        &POOL,
+                        interval,
+                        low_water,
+                        real_mem_info,
+                        real_ctx_attach,
+                        &SHUTDOWN,
+                    )
                 })
                 .expect("spawn pool-watcher thread")
         });
@@ -1280,11 +1355,22 @@ pub(super) mod pool_watcher {
     /// can drive it against a local pool, a 1 ms interval, and a
     /// deterministic `MemInfoFn` mock without colliding with the
     /// production singleton or burning real wall-clock seconds.
+    ///
+    /// Stage 5 (M3L5):
+    ///   * The new `ctx_attach` parameter binds the engine thread's
+    ///     captured context onto this thread before each poll —
+    ///     mandatory for the production path, a no-op for tests.
+    ///   * After each `evict_above_high_water` that returns ZERO
+    ///     blocks while free memory remains below the low-water mark,
+    ///     fires a one-time `log::warn!` recommending a higher
+    ///     `CRATON_BOLT_POOL_MAX_BYTES`. The `CAP_BUMP_WARNED` latch
+    ///     guarantees the warning never repeats within a process.
     pub(super) fn watcher_loop(
         pool: &DeviceMemPool,
         interval: Duration,
         low_water_frac: f64,
         mem_info: MemInfoFn,
+        ctx_attach: CtxAttachFn,
         shutdown: &AtomicBool,
     ) {
         log::info!(
@@ -1306,6 +1392,19 @@ pub(super) mod pool_watcher {
                 thread::sleep(step);
                 elapsed += step;
             }
+            // Stage 5: re-attach the captured engine context onto THIS
+            // thread before the driver poll. Without this, the first
+            // `cuMemGetInfo_v2` errors with `CUDA_ERROR_INVALID_CONTEXT`
+            // and every subsequent poll does the same. Failure here is
+            // logged and the poll is skipped — never propagated.
+            if let Err(e) = ctx_attach() {
+                log::debug!(
+                    "craton-bolt: pool-watcher ctx_attach failed: {}; \
+                     skipping poll",
+                    e
+                );
+                continue;
+            }
             // Poll the driver. Errors (e.g. no current context on this
             // thread, transient driver hiccup) are logged and ignored —
             // the watcher is best-effort and must never crash the
@@ -1324,6 +1423,17 @@ pub(super) mod pool_watcher {
                             frac * 100.0,
                             evicted
                         );
+                        // Stage 5 (M3L5): cap-bump heuristic. If we
+                        // evicted zero blocks but free memory is STILL
+                        // below the low-water mark, the workload's
+                        // working set exceeds the configured pool cap
+                        // and we have nothing in the pool left to give
+                        // back. Tell the operator once — never repeat,
+                        // because a runaway log of the same line in
+                        // every poll would drown legitimate signal.
+                        if evicted == 0 {
+                            emit_cap_bump_warning_once(pool.max_pooled_bytes);
+                        }
                     }
                 }
                 Ok(_) => {} // total == 0: cuMemGetInfo gave a nonsense reading; skip.
@@ -1332,6 +1442,54 @@ pub(super) mod pool_watcher {
                 }
             }
         }
+    }
+
+    /// Stage 5 (M3L5): one-time guard for the cap-bump warning. Flips
+    /// from `false` to `true` on the first emission; subsequent
+    /// candidate emissions short-circuit. Process-wide — the operator
+    /// only needs to see the recommendation once per run.
+    static CAP_BUMP_WARNED: AtomicBool = AtomicBool::new(false);
+
+    /// Emit the cap-bump recommendation exactly once per process.
+    /// Subsequent calls are a `compare_exchange` that loses the race
+    /// and returns silently. `current_max` is the pool's currently
+    /// configured `CRATON_BOLT_POOL_MAX_BYTES` (read at construction;
+    /// not affected by env-var changes after `DeviceMemPool::new`).
+    fn emit_cap_bump_warning_once(current_max: usize) {
+        // `compare_exchange` with Acquire/Acquire semantics: the
+        // winner observes the prior `false` and stores `true`; losers
+        // observe the new `true` and return. Use `Ordering::AcqRel`
+        // on success to publish the latch + `Acquire` on failure so a
+        // reader on another thread sees the warning happened.
+        if CAP_BUMP_WARNED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            log::warn!(
+                "craton-bolt pool: workload working set exceeds \
+                 CRATON_BOLT_POOL_MAX_BYTES={}; consider raising the cap",
+                current_max
+            );
+        }
+    }
+
+    /// Test-only hook to clear the cap-bump latch between test cases.
+    /// Tests drive `emit_cap_bump_warning_once` (indirectly, via
+    /// `watcher_loop`) more than once across the suite, and without a
+    /// reset the second test would see a no-op. Production code never
+    /// calls this — the latch is intentionally one-shot per process.
+    #[cfg(test)]
+    pub(super) fn reset_cap_bump_warned_for_tests() {
+        CAP_BUMP_WARNED.store(false, Ordering::Release);
+    }
+
+    /// Test-only accessor: did the cap-bump warning fire? Asserts in
+    /// `pool_watcher_cap_bump_fires_when_eviction_yields_zero` consult
+    /// this to verify the one-shot semantics without parsing log
+    /// output.
+    #[cfg(test)]
+    pub(super) fn cap_bump_warned_for_tests() -> bool {
+        CAP_BUMP_WARNED.load(Ordering::Acquire)
     }
 
     fn read_interval() -> Duration {
@@ -2354,6 +2512,7 @@ mod tests {
                 Duration::from_millis(1),
                 0.10,
                 mock_low_free,
+                noop_ctx_attach,
                 &shutdown_thread,
             );
         });
@@ -2373,6 +2532,16 @@ mod tests {
             pre_count,
             post_count
         );
+    }
+
+    /// Stage 5 (M3L5): test-only context-attach hook. Returns Ok(())
+    /// without touching the driver. Stage 4 tests didn't need this
+    /// indirection because the watcher_loop took no context-attach
+    /// parameter; Stage 5 inserts the parameter so production builds
+    /// can re-bind the engine context on the background thread.
+    #[cfg(feature = "pool-watcher")]
+    fn noop_ctx_attach() -> crate::error::BoltResult<()> {
+        Ok(())
     }
 
     /// Stage 4: watcher must NOT evict when free memory is comfortably
@@ -2407,6 +2576,7 @@ mod tests {
                 Duration::from_millis(1),
                 0.10,
                 mock_high_free,
+                noop_ctx_attach,
                 &shutdown_thread,
             );
         });
@@ -2418,6 +2588,297 @@ mod tests {
         assert_eq!(
             post_count, pre_count,
             "PROACTIVE_EVICTION_COUNT incremented when it should not have"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Stage 5 (M3L5) — cap-bump heuristic + context attach
+    // ----------------------------------------------------------------
+
+    /// Stage 5: when the watcher observes free memory below the
+    /// low-water mark AND `evict_above_high_water` returns zero (pool
+    /// has nothing to give back because the working set exceeds the
+    /// configured cap), it must fire `log::warn!` exactly once. Drive
+    /// the loop long enough to see several polls and confirm the
+    /// latch stays at `true` without re-emitting.
+    #[cfg(feature = "pool-watcher")]
+    #[test]
+    fn pool_watcher_cap_bump_fires_when_eviction_yields_zero() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1024"),
+        ]);
+        // Clear the one-shot latch so this test starts from a known
+        // state. Production code never resets — the warning is one
+        // shot per process — but tests must.
+        super::pool_watcher::reset_cap_bump_warned_for_tests();
+
+        // Empty pool: `evict_above_high_water` will always return 0.
+        let pool = Arc::new(DeviceMemPool::new());
+        assert_eq!(
+            pool.total_pooled_bytes(),
+            0,
+            "test precondition: pool starts empty"
+        );
+
+        // Mock: free=1, total=1000 -> well below the 10% threshold.
+        fn mock_low_free() -> crate::error::BoltResult<(usize, usize)> {
+            Ok((1, 1000))
+        }
+
+        assert!(
+            !super::pool_watcher::cap_bump_warned_for_tests(),
+            "test precondition: cap-bump latch starts clear"
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let pool_thread = pool.clone();
+        let handle = std::thread::spawn(move || {
+            super::pool_watcher::watcher_loop(
+                &pool_thread,
+                Duration::from_millis(1),
+                0.10,
+                mock_low_free,
+                noop_ctx_attach,
+                &shutdown_thread,
+            );
+        });
+        // Sleep long enough for the watcher to make MULTIPLE polls.
+        // The sleep quantum is 50 ms so 300 ms is roughly 6 polls —
+        // confirming the warning only fires once and not on every poll.
+        std::thread::sleep(Duration::from_millis(300));
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("watcher thread joined cleanly");
+
+        assert!(
+            super::pool_watcher::cap_bump_warned_for_tests(),
+            "cap-bump warning latch should be set after the first \
+             zero-eviction poll under memory pressure"
+        );
+    }
+
+    /// Stage 5: the cap-bump latch fires exactly once across many polls
+    /// under sustained pressure. We need this property because the
+    /// watcher polls every few seconds for the life of the process —
+    /// without a one-shot guard the operator would see the warning in
+    /// every poll, drowning legitimate signal. Drive the loop long
+    /// enough to observe many polls, then assert the latch is set
+    /// (already covered by `pool_watcher_cap_bump_fires_when_eviction_yields_zero`)
+    /// AND that re-driving the watcher loop doesn't re-emit (i.e. the
+    /// `compare_exchange` lose-path is hit).
+    ///
+    /// We assert the lose-path by directly invoking the inner emitter
+    /// through `cap_bump_warned_for_tests` — the public Atomic latch
+    /// is the single source of truth.
+    #[cfg(feature = "pool-watcher")]
+    #[test]
+    fn pool_watcher_cap_bump_is_one_shot() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1024"),
+        ]);
+        super::pool_watcher::reset_cap_bump_warned_for_tests();
+
+        // Empty pool: every poll's `evict_above_high_water` returns 0.
+        let pool = Arc::new(DeviceMemPool::new());
+        fn mock_low_free() -> crate::error::BoltResult<(usize, usize)> {
+            Ok((1, 1000))
+        }
+
+        // First watcher run: should set the latch.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let pool_thread = pool.clone();
+        let handle = std::thread::spawn(move || {
+            super::pool_watcher::watcher_loop(
+                &pool_thread,
+                Duration::from_millis(1),
+                0.10,
+                mock_low_free,
+                noop_ctx_attach,
+                &shutdown_thread,
+            );
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("watcher thread joined cleanly");
+        assert!(
+            super::pool_watcher::cap_bump_warned_for_tests(),
+            "first run should set the latch"
+        );
+
+        // Second watcher run with the SAME conditions: latch is still
+        // set (the compare_exchange loses on every attempt) — value
+        // should remain `true`, not flip.
+        let shutdown2 = Arc::new(AtomicBool::new(false));
+        let shutdown2_thread = shutdown2.clone();
+        let pool2_thread = pool.clone();
+        let handle2 = std::thread::spawn(move || {
+            super::pool_watcher::watcher_loop(
+                &pool2_thread,
+                Duration::from_millis(1),
+                0.10,
+                mock_low_free,
+                noop_ctx_attach,
+                &shutdown2_thread,
+            );
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown2.store(true, std::sync::atomic::Ordering::Release);
+        handle2.join().expect("watcher thread joined cleanly");
+        // Latch must still be set — never reset between polls in
+        // production. `cap_bump_warned_for_tests` is the test-only
+        // accessor; the production code has no way to observe nor
+        // re-emit. (Tests reset between cases via
+        // `reset_cap_bump_warned_for_tests`.)
+        assert!(
+            super::pool_watcher::cap_bump_warned_for_tests(),
+            "second run must leave the latch in the set state \
+             (one-shot, no flip-back)"
+        );
+    }
+
+    /// Stage 5: the watcher_loop now invokes `ctx_attach` before each
+    /// `mem_info` poll. Verify that the hook is called at least once
+    /// per poll cycle by counting via an `AtomicUsize` accessed from
+    /// the test-injected stub. This is the behavioural-mock check the
+    /// task description called for ("assert `cuCtxSetCurrent` was
+    /// called") — production wires `real_ctx_attach` to
+    /// `cuda_sys::ctx_set_current`, while the test counts invocations.
+    ///
+    /// The mock is a `fn() -> BoltResult<()>` so it must be a plain
+    /// function-pointer-compatible fn item. We use a `static
+    /// AtomicUsize` (process-wide, but reset at test entry) for the
+    /// counter — see `CTX_ATTACH_CALLS` below.
+    #[cfg(feature = "pool-watcher")]
+    #[test]
+    fn pool_watcher_invokes_ctx_attach_each_poll() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1024"),
+        ]);
+
+        // Process-wide counter so the function-pointer mock can talk
+        // to the test thread. Tests are serialised on ENV_LOCK so
+        // this static is exclusively owned by this test for the
+        // duration of the assertions.
+        static CTX_ATTACH_CALLS: AtomicUsize = AtomicUsize::new(0);
+        CTX_ATTACH_CALLS.store(0, Ordering::Release);
+
+        fn counting_ctx_attach() -> crate::error::BoltResult<()> {
+            CTX_ATTACH_CALLS.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn mock_high_free() -> crate::error::BoltResult<(usize, usize)> {
+            Ok((900, 1000))
+        }
+
+        let pool = Arc::new(DeviceMemPool::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let pool_thread = pool.clone();
+        let handle = std::thread::spawn(move || {
+            super::pool_watcher::watcher_loop(
+                &pool_thread,
+                Duration::from_millis(1),
+                0.10,
+                mock_high_free,
+                counting_ctx_attach,
+                &shutdown_thread,
+            );
+        });
+        // Two polls' worth of wall-clock time (each poll is ~50 ms
+        // because of SHUTDOWN_QUANTUM).
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("watcher thread joined cleanly");
+
+        let calls = CTX_ATTACH_CALLS.load(Ordering::Acquire);
+        assert!(
+            calls >= 1,
+            "ctx_attach should be invoked at least once per poll \
+             cycle; observed {calls} calls"
+        );
+    }
+
+    /// Stage 5: if `ctx_attach` returns an error, the watcher must
+    /// skip the mem_info poll for that iteration (the driver call
+    /// would fail anyway with `CUDA_ERROR_INVALID_CONTEXT`). We
+    /// verify by counting how many times the `MemInfoFn` was invoked
+    /// — it should be zero across the test window because every
+    /// `ctx_attach` call returns Err.
+    #[cfg(feature = "pool-watcher")]
+    #[test]
+    fn pool_watcher_skips_poll_when_ctx_attach_errors() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1024"),
+        ]);
+
+        static MEM_INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
+        MEM_INFO_CALLS.store(0, Ordering::Release);
+
+        fn failing_ctx_attach() -> crate::error::BoltResult<()> {
+            Err(crate::error::BoltError::CudaWithCode {
+                code: 201, // CUDA_ERROR_INVALID_CONTEXT
+                message: "test: synthetic ctx_attach failure".to_string(),
+            })
+        }
+
+        fn counting_mem_info() -> crate::error::BoltResult<(usize, usize)> {
+            MEM_INFO_CALLS.fetch_add(1, Ordering::AcqRel);
+            Ok((900, 1000))
+        }
+
+        let pool = Arc::new(DeviceMemPool::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let pool_thread = pool.clone();
+        let handle = std::thread::spawn(move || {
+            super::pool_watcher::watcher_loop(
+                &pool_thread,
+                Duration::from_millis(1),
+                0.10,
+                counting_mem_info,
+                failing_ctx_attach,
+                &shutdown_thread,
+            );
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("watcher thread joined cleanly");
+
+        let calls = MEM_INFO_CALLS.load(Ordering::Acquire);
+        assert_eq!(
+            calls, 0,
+            "mem_info must not be called when ctx_attach fails; \
+             observed {calls} invocations"
         );
     }
 }

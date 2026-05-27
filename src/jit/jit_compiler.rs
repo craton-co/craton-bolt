@@ -354,10 +354,18 @@ impl CudaModule {
             } else {
                 format!("{}; ptxas log: {}", inner_msg(&e), ptxas_msg)
             };
-            return Err(BoltError::Cuda(format!(
-                "cuModuleLoadDataEx failed: {}",
-                detail
-            )));
+            // Stage 5 (M3L5): preserve the raw `CUresult` integer from
+            // the underlying `check()` call so downstream pattern-match
+            // code (`mem_pool::is_oom_error` and any future code-aware
+            // wrappers) keeps working transparently through this
+            // re-wrap. Falling back to `Cuda(String)` would erase the
+            // code. `inner_code` returns the underlying driver code
+            // when `e` is a `CudaWithCode`, or `code` (the local
+            // CUresult we just checked) as a safety net.
+            return Err(BoltError::CudaWithCode {
+                code: inner_code(&e).unwrap_or(code),
+                message: format!("cuModuleLoadDataEx failed: {}", detail),
+            });
         }
 
         Ok(Self {
@@ -378,11 +386,18 @@ impl CudaModule {
             cuda_sys::cuModuleGetFunction(&mut f, self.inner.raw, name_cstr.as_ptr())
         };
         cuda_sys::check(code).map_err(|e| {
-            BoltError::Cuda(format!(
-                "cuModuleGetFunction({}) failed: {}",
-                name,
-                inner_msg(&e)
-            ))
+            // Stage 5 (M3L5): forward the raw `CUresult` integer through
+            // the rewrap so callers can still recognise specific driver
+            // errors (e.g. `CUDA_ERROR_NOT_FOUND` for a missing entry
+            // point) without parsing the formatted string.
+            BoltError::CudaWithCode {
+                code: inner_code(&e).unwrap_or(code),
+                message: format!(
+                    "cuModuleGetFunction({}) failed: {}",
+                    name,
+                    inner_msg(&e)
+                ),
+            }
         })?;
         Ok(CudaFunction {
             raw: f,
@@ -425,11 +440,34 @@ pub fn compile_and_load(ptx: &str) -> BoltResult<CudaModule> {
     CudaModule::from_ptx(ptx)
 }
 
-/// Extract the human-readable portion of a `BoltError::Cuda` for wrapping.
+/// Extract the human-readable portion of a CUDA-flavoured `BoltError`
+/// for wrapping into a more specific error message.
+///
+/// Stage 5 (M3L5): aware of both the legacy `Cuda(String)` shape and the
+/// typed `CudaWithCode { code, message }` shape introduced in Stage 4.
+/// For `CudaWithCode` we surface just the inner `message` (not the
+/// formatted `"CUDA driver error <code>: <msg>"`) so a subsequent
+/// `format!("X failed: {}", inner_msg(...))` doesn't double-print the
+/// "CUDA driver error" prefix — and so the outer wrapper can re-emit
+/// `CudaWithCode` with a clean message that the Display impl renders
+/// uniformly.
 fn inner_msg(e: &BoltError) -> String {
     match e {
         BoltError::Cuda(msg) => msg.clone(),
+        BoltError::CudaWithCode { message, .. } => message.clone(),
         other => other.to_string(),
+    }
+}
+
+/// Extract the raw `CUresult` integer from a `CudaWithCode` error, if
+/// the error is of that shape. Used by wrappers around `cuda_sys::check`
+/// to forward the driver code through layered error contexts so a
+/// downstream caller can still recognise e.g. `CUDA_ERROR_OUT_OF_MEMORY`
+/// or `CUDA_ERROR_NOT_FOUND` without parsing the formatted string.
+fn inner_code(e: &BoltError) -> Option<i32> {
+    match e {
+        BoltError::CudaWithCode { code, .. } => Some(*code),
+        _ => None,
     }
 }
 
@@ -624,6 +662,54 @@ mod tests {
             1,
             "warm-hit lookups must not re-invoke the loader"
         );
+    }
+
+    // -- Stage 5 (M3L5) error-shape migration -------------------------------
+    //
+    // The PTX cache + module-load path previously surfaced driver errors as
+    // `BoltError::Cuda(format!("CUDA driver error N: ..."))`. Stage 5 routes
+    // them through `BoltError::CudaWithCode { code, message }` instead so
+    // downstream code (`mem_pool::is_oom_error`) can pattern-match the raw
+    // `CUresult` integer without parsing the formatted string.
+
+    /// `inner_msg` extracts the message body from BOTH the legacy
+    /// `Cuda(String)` variant AND the new `CudaWithCode { message, .. }`
+    /// variant — without re-prepending the "CUDA driver error <code>:"
+    /// prefix that the Display impl adds.
+    #[test]
+    fn inner_msg_handles_both_cuda_variants() {
+        let legacy = BoltError::Cuda("legacy text".to_string());
+        assert_eq!(inner_msg(&legacy), "legacy text");
+
+        let typed = BoltError::CudaWithCode {
+            code: 7,
+            message: "typed text".to_string(),
+        };
+        // Just the message body — not "CUDA driver error 7: typed text".
+        assert_eq!(inner_msg(&typed), "typed text");
+
+        let other = BoltError::Other("misc".to_string());
+        // Non-CUDA variants fall back to the Display rendering.
+        assert_eq!(inner_msg(&other), "misc");
+    }
+
+    /// `inner_code` returns `Some(code)` for `CudaWithCode` and `None`
+    /// otherwise. The from_ptx / function() wrappers rely on this to
+    /// forward the underlying `CUresult` integer through their re-wrap so
+    /// callers can still recognise specific driver errors after layering.
+    #[test]
+    fn inner_code_extracts_cuda_with_code_integer() {
+        let typed = BoltError::CudaWithCode {
+            code: 2,
+            message: "OOM".to_string(),
+        };
+        assert_eq!(inner_code(&typed), Some(2));
+
+        let legacy = BoltError::Cuda("anything".to_string());
+        assert_eq!(inner_code(&legacy), None);
+
+        let other = BoltError::Other("misc".to_string());
+        assert_eq!(inner_code(&other), None);
     }
 
     /// A loader that fails leaves the cell empty rather than poisoning the

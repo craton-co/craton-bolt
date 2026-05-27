@@ -63,6 +63,16 @@ extern "C" {
     // current CUDA context. Needed by `gpu_join::resolve_byte_cap_from_driver`
     // so multi-GPU rigs detect the right card's VRAM cap.
     pub fn cuCtxGetDevice(device: *mut CUdevice) -> CUresult;
+    /// Stage 5 (M3L5): return the CUDA context currently bound to the
+    /// calling thread. Used by the pool-watcher (`mem_pool::pool_watcher`)
+    /// to capture the engine thread's context once at spawn time and
+    /// re-bind it on the background thread before each `cuMemGetInfo_v2`
+    /// poll — the watcher otherwise inherits no current context and the
+    /// driver returns `CUDA_ERROR_INVALID_CONTEXT` for every call.
+    ///
+    /// Writes `NULL` into `*pctx` if no context is current on this
+    /// thread; that is NOT an error from the driver's perspective.
+    pub fn cuCtxGetCurrent(pctx: *mut CUcontext) -> CUresult;
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
     pub fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> CUresult;
@@ -151,6 +161,11 @@ mod stubs {
     pub unsafe fn cuCtxSetCurrent(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
     // Stage-4 (GJ): mirror of the production `cuCtxGetDevice` for stub builds.
     pub unsafe fn cuCtxGetDevice(_device: *mut CUdevice) -> CUresult { CUDA_ERROR_STUB }
+    // Stage 5 (M3L5): mirror of the production `cuCtxGetCurrent` for stub
+    // builds. Pool-watcher only invokes this under the real CUDA backend;
+    // the stub return path is exercised only by tests that explicitly
+    // build `--features cuda-stub`.
+    pub unsafe fn cuCtxGetCurrent(_pctx: *mut CUcontext) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemAlloc_v2(_dptr: *mut CUdeviceptr, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemFree_v2(_dptr: CUdeviceptr) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemAllocHost_v2(_pp: *mut *mut c_void, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
@@ -592,6 +607,46 @@ pub fn mem_get_info() -> BoltResult<(usize, usize)> {
     Ok((free, total))
 }
 
+/// Stage 5 (M3L5): return the CUDA context currently bound to the
+/// calling thread, or `Ok(None)` if no context is current.
+///
+/// Wraps `cuCtxGetCurrent`. Used by the pool-watcher to capture the
+/// engine thread's context at spawn time and re-bind it on the
+/// background watcher thread before each `cuMemGetInfo_v2` poll —
+/// otherwise the watcher thread inherits no context and every poll
+/// errors with `CUDA_ERROR_INVALID_CONTEXT`.
+///
+/// A null context is NOT an error from the driver's standpoint
+/// (it just means no context is current), so we surface that as
+/// `Ok(None)` and let the caller decide how to react.
+pub fn ctx_get_current() -> BoltResult<Option<CUcontext>> {
+    let mut ctx: CUcontext = std::ptr::null_mut();
+    check(unsafe { cuCtxGetCurrent(&mut ctx) })?;
+    if ctx.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(ctx))
+    }
+}
+
+/// Stage 5 (M3L5): bind `ctx` to the calling thread. Wraps
+/// `cuCtxSetCurrent`. Counterpart to [`ctx_get_current`] — the
+/// pool-watcher captures a context on the engine thread via
+/// `ctx_get_current` then re-attaches it on its own thread with
+/// this function.
+///
+/// # Safety
+/// `ctx` must be a live `CUcontext` returned by the driver (e.g.
+/// via [`ctx_get_current`] on a thread that already had one current),
+/// AND it must not have been destroyed by another thread before this
+/// call returns. The watcher pairs the capture and re-bind closely
+/// enough that this holds in practice — the engine's `CudaContext`
+/// outlives the watcher because `DeviceMemPool::Drop` requests
+/// shutdown before context teardown.
+pub unsafe fn ctx_set_current(ctx: CUcontext) -> BoltResult<()> {
+    check(cuCtxSetCurrent(ctx))
+}
+
 #[cfg(test)]
 mod init_cache_tests {
     //! Host-only tests for the `cuInit(0)` cache (Bug #2 regression).
@@ -692,6 +747,58 @@ mod init_cache_tests {
             FLAKY_CALLS.load(Ordering::SeqCst),
             3,
             "driver was called after success latched"
+        );
+    }
+
+    /// Stage 5 (M3L5): `check()` must return [`BoltError::CudaWithCode`]
+    /// (NOT the legacy `Cuda(String)` shape) for every non-success
+    /// driver code. `check()` invokes the real `cuGetErrorString` FFI
+    /// to populate the message, but the typed-variant shape is decided
+    /// before that call returns. We only need to confirm `check(2)`
+    /// (the OOM code that `mem_pool::is_oom_error` depends on) takes
+    /// the `CudaWithCode` branch.
+    ///
+    /// `check(CUDA_SUCCESS)` short-circuits without an FFI call, and
+    /// `check(CUDA_ERROR_STUB)` short-circuits to `BoltError::Other`;
+    /// both branches are exercised here too without touching the
+    /// driver.
+    #[test]
+    fn check_special_codes_take_documented_branches() {
+        // Success short-circuits.
+        assert!(check(CUDA_SUCCESS).is_ok());
+
+        // Stub sentinel maps to `BoltError::Other`, NOT CudaWithCode —
+        // documented in `check()` and depended on by the docs.rs path.
+        let stub = check(CUDA_ERROR_STUB).expect_err("stub must be Err");
+        assert!(
+            matches!(stub, BoltError::Other(_)),
+            "CUDA_ERROR_STUB must surface as Other(_), got: {stub:?}"
+        );
+    }
+
+    /// Stage 5 (M3L5): explicit codepath-level assertion that for any
+    /// non-success, non-stub code, `check()` returns
+    /// `BoltError::CudaWithCode { code, .. }` carrying the SAME integer
+    /// passed in. We avoid invoking the live FFI by going through
+    /// `check()` only when a real driver is present — under
+    /// `--features cuda-stub` every code becomes `CUDA_ERROR_STUB`
+    /// and the test would no-op. Without `cuda-stub` the unit test
+    /// still works because `cuGetErrorString` either succeeds (real
+    /// driver) or returns non-success (and we use the
+    /// `"unknown CUDA error N"` fallback) — either way the returned
+    /// variant is `CudaWithCode`.
+    ///
+    /// This is the property that `mem_pool::is_oom_error` relies on —
+    /// if `check(2)` ever degraded back to `Cuda(String)` the
+    /// OOM-recovery hook would silently break.
+    #[cfg(not(feature = "cuda-stub"))]
+    #[test]
+    fn check_returns_cuda_with_code_for_nonzero_codes() {
+        // CUDA_ERROR_OUT_OF_MEMORY is the canonical case.
+        let err = check(2).expect_err("non-zero code must produce Err");
+        assert!(
+            matches!(err, BoltError::CudaWithCode { code: 2, .. }),
+            "check(2) must produce CudaWithCode {{ code: 2, .. }}, got: {err:?}"
         );
     }
 }
