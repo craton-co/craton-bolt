@@ -443,7 +443,9 @@ fn shmem_variant_small_input() {
         direction: SortDirection::Asc,
         nulls_first: false,
     }];
-    let (layout, perm) = sort_indices_on_gpu_multi(&keys).expect("shmem sort");
+    let (layout, perm) = sort_indices_on_gpu_multi(&keys)
+        .expect("shmem sort")
+        .expect("shmem sort: non-fallback path on int32");
     assert!(
         matches!(layout, SortLayout::Shmem),
         "n_pow2=128 must take the Shmem dispatch path; got {:?}",
@@ -609,7 +611,9 @@ fn dict_utf8_key_sort() {
         direction: SortDirection::Asc,
         nulls_first: false,
     }];
-    let (_layout, perm) = sort_indices_on_gpu_multi(&sort_keys).expect("dict-Utf8 sort");
+    let (_layout, perm) = sort_indices_on_gpu_multi(&sort_keys)
+        .expect("dict-Utf8 sort")
+        .expect("dict-Utf8 sort: non-fallback path");
     assert_eq!(perm.len(), n);
 
     // Apply the perm to the original index column; result must be ASC.
@@ -835,4 +839,68 @@ fn e2e_small_input_uses_host_path() {
     let mut expected = values;
     expected.sort();
     assert_eq!(actual, expected);
+}
+
+// ============================================================================
+// Stage 5 — adaptive high-cardinality Utf8 gate. Above the threshold the GPU
+// path returns Ok(None) from `host_values_for_key`'s Utf8 arm and the
+// executor falls through to `lexsort_to_indices`. The result must still be
+// a correct sort.
+// ============================================================================
+
+/// `ORDER BY s ASC` over a 16k-row Utf8 column with every row distinct.
+/// The Stage-5 sample-and-fallback gate must abort the GPU path; the host
+/// `lexsort_to_indices` then produces the sort. We can't directly observe
+/// the dispatch decision from outside, but we *can* assert the result is
+/// correct — which is the load-bearing property.
+#[test]
+#[ignore = "requires CUDA device (engine SQL pipeline)"]
+fn high_cardinality_utf8_e2e_via_host_path() {
+    use arrow_array::StringArray;
+    let mut engine = Engine::new().expect("ctx");
+    // N_BIG (16 384) rows, every one a distinct string. The row count
+    // clears `GPU_SORT_MIN_ROWS` (otherwise `try_gpu_sort` would skip on
+    // the size gate before reaching the Stage-5 cardinality check), and
+    // the all-distinct strings push the sampler ratio to ~1.0 — well past
+    // `HIGH_CARDINALITY_THRESHOLD = 0.6` — so the GPU path returns
+    // `Ok(None)` and the executor falls through to `lexsort_to_indices`.
+    let n = N_BIG;
+    let strings: Vec<String> = (0..n).map(|i| format!("payload_{i:010}")).collect();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(strings.clone()))],
+    )
+    .unwrap();
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT s FROM t ORDER BY s")
+        .expect("ORDER BY s ASC over high-cardinality Utf8");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), n);
+
+    let arr = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("StringArray");
+    // Non-decreasing lex order.
+    for i in 1..n {
+        let a = arr.value(i - 1);
+        let b = arr.value(i);
+        assert!(
+            a <= b,
+            "high-cardinality ORDER BY s ASC violated at row {i}: {a:?} > {b:?}"
+        );
+    }
+    // Result is a true permutation of the input.
+    let mut expected: Vec<String> = strings;
+    expected.sort();
+    let actual: Vec<String> = (0..n).map(|i| arr.value(i).to_string()).collect();
+    assert_eq!(actual, expected, "high-cardinality Utf8 sort must equal sorted(input)");
 }

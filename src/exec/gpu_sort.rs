@@ -46,6 +46,13 @@
 //! driver subsumes them — single-key sorts are now expressed as a
 //! `SortKernelSpec` with one entry.
 //!
+//! ## Scope (Stage 5)
+//!
+//! - Adaptive Utf8 gate: sample the column for distinct-value density and
+//!   abort the GPU path when the inline dictionary builder would do more
+//!   work than the host sort. See [`HIGH_CARDINALITY_THRESHOLD`] for the
+//!   threshold and [`host_values_for_key`]'s Utf8 arm for the sampler.
+//!
 //! ## Padding strategy
 //!
 //! Bitonic sort requires `n_pow2 = 2^k` elements. We pad with a sentinel that
@@ -62,6 +69,7 @@
 //! order relative to each other, but the padded indices (>= n_rows) are
 //! filtered out by the final truncation step, never returned to the caller.
 
+use std::collections::HashSet;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
@@ -225,6 +233,78 @@ fn build_is_padded(n_rows: usize, n_pow2: usize) -> Vec<u8> {
     out
 }
 
+/// **Stage 5** — sample-and-fallback gate for the plain-Utf8 path. When the
+/// fraction of distinct values in a uniform sample of the column exceeds
+/// this threshold we abort the GPU path and let the host `lexsort_to_indices`
+/// handle the sort.
+///
+/// ## Rationale
+///
+/// The Stage-4 inline-dictionary builder costs O(n) hash probes + O(d) string
+/// clones + O(d log d) lex remap, where `d` is the number of distinct
+/// values. When `d ≈ n` (every row unique) the dict build itself dominates
+/// the GPU launch + h2d/d2h round trip — and worse, it does so on the host
+/// side serially, leaving the device idle. At a ~0.6 sample-distinct ratio,
+/// the full dict will allocate ~60% as many strings as it rejects, so the
+/// host build work dominates the GPU launch overhead.
+///
+/// 0.6 is a defensive guess, not a measured break-even. A real benchmark
+/// would refine this — see Stage 6 follow-up. Tunable so callers / tests
+/// can reason about the dispatch decision without observing it through a
+/// counter.
+pub(crate) const HIGH_CARDINALITY_THRESHOLD: f64 = 0.6;
+
+/// **Stage 5** — sample size for the high-cardinality gate. We sample
+/// `min(MAX, n_rows / STRIDE)` rows at uniform strides across the column,
+/// then count distinct values in the sample. Bounded above by `1024` so the
+/// sample cost stays trivial relative to the full dict build it gates.
+pub(crate) const HIGH_CARDINALITY_SAMPLE_MAX: usize = 1024;
+
+/// **Stage 5** — sampling stride divisor. We sample `n_rows / 16` rows,
+/// capped at [`HIGH_CARDINALITY_SAMPLE_MAX`]. Picked so the sample covers
+/// at least 6.25% of the column — enough to catch common-case low-cardinality
+/// patterns (enum columns, country codes, status flags) without scanning the
+/// whole column.
+pub(crate) const HIGH_CARDINALITY_SAMPLE_STRIDE_DIV: usize = 16;
+
+/// Sample `min(HIGH_CARDINALITY_SAMPLE_MAX, n_rows / HIGH_CARDINALITY_SAMPLE_STRIDE_DIV)`
+/// rows from `sa` at uniform strides, returning `(sample_size, distinct_in_sample)`.
+/// NULL rows are sampled but contribute a single distinct slot (their value
+/// byte is not compared — they all collapse into one "NULL" bucket). For
+/// very small `n_rows` (smaller than `HIGH_CARDINALITY_SAMPLE_STRIDE_DIV`)
+/// the `.max(1)` clamp shrinks the target to a single sample — the GPU
+/// path's row-count gate (`GPU_SORT_MIN_ROWS` in `crate::exec::sort`)
+/// already rules out small columns, so this branch is effectively
+/// unreachable from the executor; the clamp is defensive only.
+fn sample_distinct_utf8(sa: &StringArray) -> (usize, usize) {
+    let n = sa.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let target = (n / HIGH_CARDINALITY_SAMPLE_STRIDE_DIV)
+        .max(1)
+        .min(HIGH_CARDINALITY_SAMPLE_MAX);
+    // Stride: distribute `target` samples across `n` rows. `step` is at least
+    // 1 (target <= n implied by the .min(n) clamp in the caller — but be
+    // defensive in case `target == 0`).
+    let step = (n / target).max(1);
+    let mut seen: HashSet<&str> = HashSet::with_capacity(target);
+    let mut had_null = false;
+    let mut sample_size = 0usize;
+    let mut i = 0usize;
+    while i < n && sample_size < target {
+        if sa.is_null(i) {
+            had_null = true;
+        } else {
+            seen.insert(sa.value(i));
+        }
+        sample_size += 1;
+        i += step;
+    }
+    let distinct = seen.len() + if had_null { 1 } else { 0 };
+    (sample_size, distinct)
+}
+
 /// Build per-row dictionary indices for a plain `StringArray` such that the
 /// integer order of the indices matches the lexicographic order of the
 /// underlying strings. Used by the Stage-4 plain-Utf8 GPU sort adapter.
@@ -296,9 +376,16 @@ fn build_inline_dict_indices(sa: &StringArray) -> Vec<i32> {
 /// Utf8 by building an inline dictionary on the fly (see
 /// `build_inline_dict_indices`). For everything else this is a straight
 /// `.values().to_vec()`.
-fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<HostKeyValues> {
+///
+/// **Stage 5** changes the signature to `BoltResult<Option<HostKeyValues>>`.
+/// `Ok(None)` is the "fall through to the host sort" signal: today it fires
+/// only on the high-cardinality plain-Utf8 path (see
+/// [`HIGH_CARDINALITY_THRESHOLD`]), but the option is the natural extension
+/// point for any future per-column gate that wants to abort the GPU launch
+/// without erroring (e.g. an mm-detector for runs already in sort order).
+fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<Option<HostKeyValues>> {
     use arrow_schema::DataType as A;
-    Ok(match (dtype, arr.data_type()) {
+    Ok(Some(match (dtype, arr.data_type()) {
         (DataType::Int32, A::Int32) => HostKeyValues::I32(
             arr.as_any()
                 .downcast_ref::<Int32Array>()
@@ -370,9 +457,15 @@ fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<HostKeyVa
         // win: d << n keeps the dict build at near-O(n) and the i32 kernel
         // crushes the sort. High-cardinality columns (d ≈ n, every row
         // unique) push the dict build itself to O(n log n) — at that point
-        // the host's `lexsort_to_indices` is competitive and a Stage-5 path
-        // could detect this (sample-and-estimate distinct count, fall back
-        // to the host sort when the ratio crosses some threshold).
+        // the host's `lexsort_to_indices` is competitive.
+        //
+        // **Stage 5** wires this gate: we sample the column up-front (see
+        // `sample_distinct_utf8`) and return `Ok(None)` when the distinct-
+        // value density exceeds `HIGH_CARDINALITY_THRESHOLD`. The caller
+        // (`sort_indices_on_gpu_multi`) propagates the None up to
+        // `try_gpu_sort`, which then falls through to the host's
+        // `lexsort_to_indices`. No partial allocation: the sampler stops
+        // before any string is cloned into the inline dictionary.
         //
         // The Utf8 column doesn't reach the kernel — only the indices do —
         // so the final `take` over the original StringArray (in
@@ -383,6 +476,15 @@ fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<HostKeyVa
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| BoltError::Other("gpu_sort: utf8 downcast failed".into()))?;
+            // Stage 5 high-cardinality gate. Sample first; if the column is
+            // too distinct-heavy, abort the GPU path entirely.
+            let (sample_size, distinct) = sample_distinct_utf8(sa);
+            if sample_size > 0 {
+                let ratio = (distinct as f64) / (sample_size as f64);
+                if ratio > HIGH_CARDINALITY_THRESHOLD {
+                    return Ok(None);
+                }
+            }
             HostKeyValues::I32(build_inline_dict_indices(sa))
         }
         // Stage 3 dictionary-Utf8 adapter: read the dictionary's index column
@@ -414,7 +516,7 @@ fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<HostKeyVa
                 dt, arrow_dt
             )))
         }
-    })
+    }))
 }
 
 /// Heterogeneous host-side key buffer pre-upload. Existed inline before
@@ -443,9 +545,14 @@ fn upload_padded_key_for_dtype(
     dtype: DataType,
     dir: SortDirection,
     n_pow2: usize,
-) -> BoltResult<KeyDeviceBuf> {
-    let values = host_values_for_key(arr, dtype)?;
-    Ok(match values {
+) -> BoltResult<Option<KeyDeviceBuf>> {
+    let values = match host_values_for_key(arr, dtype)? {
+        Some(v) => v,
+        // Stage 5: `host_values_for_key` returned the fall-through signal
+        // (e.g. plain Utf8 sample looks too distinct-heavy). Propagate.
+        None => return Ok(None),
+    };
+    Ok(Some(match values {
         HostKeyValues::I32(host) => {
             let sentinel = match dir {
                 SortDirection::Asc => i32::MAX,
@@ -489,7 +596,7 @@ fn upload_padded_key_for_dtype(
             let padded = pad_to_pow2(&host, n_pow2, sentinel);
             KeyDeviceBuf::Bool(GpuVec::<u8>::from_slice(&padded)?)
         }
-    })
+    }))
 }
 
 /// Type-erased wrapper around a GpuVec of the key dtype. Lets the multi-key
@@ -545,9 +652,15 @@ const SHMEM_VARIANT_MAX_NPOW2: u32 = SORT_BLOCK_SIZE;
 ///
 /// Returns the (taken_path, permutation) pair so callers/tests can verify
 /// the dispatch decision without observing it through a counter.
+///
+/// **Stage 5** — the return type wraps an `Option` so a per-key
+/// `host_values_for_key` fall-through signal (currently the high-cardinality
+/// Utf8 gate) can bubble out without erroring. `Ok(None)` means "the caller
+/// should run the host sort instead"; callers (`sort_record_batch_on_gpu_multi`,
+/// `try_gpu_sort`) propagate `None` upward.
 pub fn sort_indices_on_gpu_multi<'a>(
     keys: &[GpuSortKey<'a>],
-) -> BoltResult<(SortLayout, UInt32Array)> {
+) -> BoltResult<Option<(SortLayout, UInt32Array)>> {
     if keys.is_empty() {
         return Err(BoltError::Other(
             "gpu_sort: sort_indices_on_gpu_multi needs at least 1 key".into(),
@@ -586,7 +699,10 @@ pub fn sort_indices_on_gpu_multi<'a>(
         }
     }
     if n_rows == 0 {
-        return Ok((SortLayout::MultiLaunch, UInt32Array::from(Vec::<u32>::new())));
+        return Ok(Some((
+            SortLayout::MultiLaunch,
+            UInt32Array::from(Vec::<u32>::new()),
+        )));
     }
     let n_pow2 = next_pow2_u32(n_rows)?;
     let n_pow2_usize = n_pow2 as usize;
@@ -625,7 +741,14 @@ pub fn sort_indices_on_gpu_multi<'a>(
     let mut key_bufs: Vec<KeyDeviceBuf> = Vec::with_capacity(keys.len());
     let mut validity_bufs: Vec<Option<GpuVec<u8>>> = Vec::with_capacity(keys.len());
     for (k, kd) in keys.iter().zip(key_descs.iter()) {
-        let kb = upload_padded_key_for_dtype(k.column, k.dtype, k.direction, n_pow2_usize)?;
+        let kb = match upload_padded_key_for_dtype(k.column, k.dtype, k.direction, n_pow2_usize)? {
+            Some(buf) => buf,
+            // Stage 5: per-key fall-through (high-cardinality Utf8). Drop any
+            // device buffers we've already allocated and tell the caller to
+            // take the host path. RAII via the existing GpuVec drops on
+            // function exit handles cleanup — we just return here.
+            None => return Ok(None),
+        };
         key_bufs.push(kb);
         if kd.nullable {
             let bm = build_validity_padded(k.column, n_pow2_usize);
@@ -793,14 +916,19 @@ pub fn sort_indices_on_gpu_multi<'a>(
     drop(idx_dev);
     drop(is_padded_dev);
 
-    Ok((layout, UInt32Array::from(out)))
+    Ok(Some((layout, UInt32Array::from(out))))
 }
 
 /// Sort an entire `RecordBatch` by `keys` on the GPU, gather every column.
+///
+/// **Stage 5** — returns `Ok(None)` if any key column triggers the
+/// per-key fall-through gate (today: the high-cardinality plain-Utf8
+/// sampler). The caller (`try_gpu_sort`) propagates `None` upward and the
+/// host `lexsort_to_indices` handles the sort.
 pub fn sort_record_batch_on_gpu_multi(
     batch: &RecordBatch,
     keys: &[(usize, DataType, SortDirection, bool /*nulls_first*/)],
-) -> BoltResult<RecordBatch> {
+) -> BoltResult<Option<RecordBatch>> {
     let sort_keys: Vec<GpuSortKey> = keys
         .iter()
         .map(|(idx, dtype, dir, nf)| GpuSortKey {
@@ -810,7 +938,10 @@ pub fn sort_record_batch_on_gpu_multi(
             nulls_first: *nf,
         })
         .collect();
-    let (_layout, perm) = sort_indices_on_gpu_multi(&sort_keys)?;
+    let (_layout, perm) = match sort_indices_on_gpu_multi(&sort_keys)? {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
     let new_cols: Vec<ArrayRef> = batch
         .columns()
         .iter()
@@ -821,6 +952,7 @@ pub fn sort_record_batch_on_gpu_multi(
         })
         .collect::<BoltResult<Vec<_>>>()?;
     RecordBatch::try_new(batch.schema(), new_cols)
+        .map(Some)
         .map_err(|e| BoltError::Other(format!("gpu_sort multi-key: RecordBatch build failed: {e}")))
 }
 
@@ -1033,7 +1165,9 @@ mod tests {
             direction: SortDirection::Asc,
             nulls_first: false,
         }];
-        let (_layout, perm) = sort_indices_on_gpu_multi(&keys).expect("gpu sort");
+        let (_layout, perm) = sort_indices_on_gpu_multi(&keys)
+            .expect("gpu sort")
+            .expect("non-fallback path on int32");
 
         // Apply the permutation host-side and verify ASC order.
         let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -1061,7 +1195,9 @@ mod tests {
             direction: SortDirection::Desc,
             nulls_first: false,
         }];
-        let (_layout, perm) = sort_indices_on_gpu_multi(&keys).expect("gpu sort");
+        let (_layout, perm) = sort_indices_on_gpu_multi(&keys)
+            .expect("gpu sort")
+            .expect("non-fallback path on int64");
         assert_eq!(perm.len(), n, "output length must equal n_rows");
 
         let sorted: Vec<i64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -1088,7 +1224,9 @@ mod tests {
             direction: SortDirection::Asc,
             nulls_first: false,
         }];
-        let (_layout, perm) = sort_indices_on_gpu_multi(&keys).expect("gpu sort");
+        let (_layout, perm) = sort_indices_on_gpu_multi(&keys)
+            .expect("gpu sort")
+            .expect("non-fallback path on float64");
         assert_eq!(perm.len(), n);
 
         let sorted: Vec<f64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -1137,7 +1275,8 @@ mod tests {
             &batch,
             &[(0, DataType::Int32, SortDirection::Asc, false)],
         )
-        .expect("gpu sort batch");
+        .expect("gpu sort batch")
+        .expect("non-fallback path on int32 batch");
         assert_eq!(out.num_rows(), n);
 
         let k_sorted = out
@@ -1161,5 +1300,130 @@ mod tests {
         for i in 1..n {
             assert!(k_sorted.value(i - 1) <= k_sorted.value(i));
         }
+    }
+
+    // -- Stage 5 — high-cardinality sampling gate. Pure host, no CUDA. --
+
+    /// Smoke test for the threshold constants. Keeps the documented values
+    /// (and their ordering) under review in case someone tunes one without
+    /// the other.
+    #[test]
+    fn stage5_threshold_constants_within_documented_range() {
+        assert!(
+            HIGH_CARDINALITY_THRESHOLD > 0.0 && HIGH_CARDINALITY_THRESHOLD < 1.0,
+            "threshold must be a strict fraction"
+        );
+        assert!(
+            HIGH_CARDINALITY_SAMPLE_MAX >= 64,
+            "sample cap must be large enough that ratio noise stays low"
+        );
+        assert!(
+            HIGH_CARDINALITY_SAMPLE_STRIDE_DIV >= 2,
+            "stride divisor of 1 would scan the whole column — defeats the sampler"
+        );
+    }
+
+    /// `sample_distinct_utf8` on a low-cardinality column reports few
+    /// distinct values. 1024 rows cycling through 16 strings — every other
+    /// stride lands on the same residue class, so distinct count stays
+    /// bounded by 16 regardless of stride.
+    #[test]
+    fn sample_distinct_utf8_low_cardinality() {
+        let n = 1024usize;
+        let alphabet = [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+        ];
+        let strings: Vec<&str> = (0..n).map(|i| alphabet[i % alphabet.len()]).collect();
+        let sa = StringArray::from(strings);
+        let (sample, distinct) = sample_distinct_utf8(&sa);
+        assert!(sample > 0, "sample must be non-empty for n_rows=1024");
+        assert!(
+            distinct <= 16,
+            "low-cardinality column should sample at most 16 distinct values; got {distinct}"
+        );
+        let ratio = (distinct as f64) / (sample as f64);
+        assert!(
+            ratio < HIGH_CARDINALITY_THRESHOLD,
+            "low-cardinality ratio {ratio} must be under the gate threshold {}",
+            HIGH_CARDINALITY_THRESHOLD
+        );
+    }
+
+    /// `sample_distinct_utf8` on an all-unique column reports near-100%
+    /// distinct ratio. Every row a distinct string — sampler picks
+    /// `sample_size` rows and finds `sample_size` distinct values.
+    #[test]
+    fn sample_distinct_utf8_high_cardinality() {
+        let n = 1024usize;
+        let strings: Vec<String> = (0..n).map(|i| format!("row_{i:08}")).collect();
+        let sa = StringArray::from(strings);
+        let (sample, distinct) = sample_distinct_utf8(&sa);
+        assert!(sample > 0);
+        assert_eq!(
+            distinct, sample,
+            "all-unique column: every sampled row should be a distinct value"
+        );
+        let ratio = (distinct as f64) / (sample as f64);
+        assert!(
+            ratio > HIGH_CARDINALITY_THRESHOLD,
+            "all-unique ratio {ratio} must exceed the gate threshold {}",
+            HIGH_CARDINALITY_THRESHOLD
+        );
+    }
+
+    /// `host_values_for_key` returns `Ok(None)` for a high-cardinality Utf8
+    /// column. The 1024-distinct-row fixture pushes the sampler well past
+    /// `HIGH_CARDINALITY_THRESHOLD`, so the GPU path must abort.
+    #[test]
+    fn high_cardinality_utf8_falls_through_to_host() {
+        let n = 1024usize;
+        let strings: Vec<String> = (0..n).map(|i| format!("payload_{i:010}")).collect();
+        let sa = StringArray::from(strings);
+        let res = host_values_for_key(&sa, DataType::Int32)
+            .expect("host_values_for_key must not error on plain Utf8");
+        assert!(
+            res.is_none(),
+            "high-cardinality Utf8 (1024 distinct strings) must trigger the Stage-5 fall-through"
+        );
+    }
+
+    /// `host_values_for_key` returns `Ok(Some(_))` for a low-cardinality
+    /// Utf8 column — the inline dictionary builder is still the right path.
+    #[test]
+    fn low_cardinality_utf8_takes_gpu_path() {
+        let n = 1024usize;
+        // 16 distinct strings cycled. The sampler steps by `n/target = 16`
+        // (target = n/stride_div = 64), so it lands on the same residue
+        // class — distinct comes out as 1, ratio ≈ 0.016, well under the
+        // threshold. Other low-cardinality layouts (random shuffle) would
+        // sample a few distinct values; either way the ratio stays low.
+        let alphabet = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+        ];
+        let strings: Vec<&str> = (0..n).map(|i| alphabet[i % alphabet.len()]).collect();
+        let sa = StringArray::from(strings);
+        let res = host_values_for_key(&sa, DataType::Int32)
+            .expect("host_values_for_key must not error on plain Utf8");
+        let values = res.expect("low-cardinality Utf8 must take the GPU path");
+        // Sanity-check the variant: low-cardinality Utf8 routes through the
+        // i32 numeric kernel.
+        assert!(matches!(values, HostKeyValues::I32(_)));
+        // And the indices buffer has one entry per row.
+        if let HostKeyValues::I32(v) = values {
+            assert_eq!(v.len(), n);
+        }
+    }
+
+    /// Edge case: empty StringArray. `sample_distinct_utf8` returns `(0, 0)`
+    /// and the gate must NOT fire (no rows to sort means no dictionary work
+    /// to gate — return the empty `Some(I32(empty))`).
+    #[test]
+    fn empty_utf8_does_not_trip_gate() {
+        let sa = StringArray::from(Vec::<&str>::new());
+        let res = host_values_for_key(&sa, DataType::Int32)
+            .expect("empty Utf8 must not error");
+        let values = res.expect("empty Utf8 must NOT trip the high-cardinality gate");
+        assert!(matches!(values, HostKeyValues::I32(_)));
     }
 }
