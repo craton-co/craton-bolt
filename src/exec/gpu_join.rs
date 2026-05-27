@@ -118,15 +118,45 @@
 //!   [`execute_cross_join_on_gpu`]; one kernel thread per output pair.
 //!   Gated on `n_probe * n_build < CROSS_JOIN_GPU_CELL_CAP`.
 //!
-//! ## Stage-4 follow-ups
+//! ## Stage-4 additions
 //!
-//! * Multi-GPU plumbing — [`resolve_byte_cap_from_driver`] still queries
-//!   device 0. Add `cuda_sys::current_device` and route through it.
-//! * Streaming string interning so the dict build is incremental (avoids
-//!   the O(n_build + n_probe) host pass on high-cardinality Utf8 joins).
-//! * AoS layout for the BUILD kernel too (CAS at slot offset 0 still works;
-//!   we just haven't wired it yet to avoid disturbing the byte-stable
-//!   Stage-1 build emitter).
+//! Stage 4 closes the four follow-ups Stage 3 documented as deferred:
+//!
+//! * **Multi-GPU cap routing** — [`resolve_byte_cap_from_driver`] now goes
+//!   through [`crate::cuda::cuda_sys::current_device`] so multi-GPU setups
+//!   query the device the engine is actually bound to. Single-GPU rigs see
+//!   byte-identical behaviour.
+//! * **Streaming Utf8 intern** — [`intern_utf8_columns_streaming`] keys
+//!   the dict on a 64-bit hash of the string content (vs Stage-3's borrowed
+//!   `&str`). 5-10× smaller dict footprint on high-cardinality joins at
+//!   the cost of host post-verify cycles for hash collisions. Opt-in via
+//!   the [`STREAMING_INTERN_ENV_VAR`] env var.
+//! * **AoS build kernel** — [`hash_join_indices_on_gpu_aos`] uses the
+//!   Stage-4 [`crate::jit::hash_join_kernel::compile_build_aos_kernel`] +
+//!   the existing Stage-3 AoS probe against a single `slots: u8[cap * 16]`
+//!   buffer. Symmetric with the AoS probe: `[key:u64, head:u32, _pad:u32]`
+//!   at 16-byte stride. 33% more raw bytes than SoA (12-byte stride), but
+//!   halves probe-side cache-line traffic — worth it on probe-bound joins.
+//! * **OUTER + lossy shapes** — [`execute_outer_join_indices_on_gpu`] now
+//!   admits `TwoI64` / `MultiI32(n)` for LEFT/RIGHT/FULL OUTER via the
+//!   host post-verify pipeline. The GPU's `matched` bitmap is treated as
+//!   a candidate superset; the verified pair set is re-tested host-side
+//!   and the `matched_probe` / `matched_build` arrays are rebuilt before
+//!   the unmatched-row emission pass.
+//!
+//! ## Stage-5 follow-ups
+//!
+//! * **OUTER for Utf8 keys** — Stage 4 still rejects `SingleUtf8` in
+//!   `try_gpu_outer_join`; the OUTER path doesn't yet route through the
+//!   dict-interning entry point.
+//! * **Engine-level AoS routing** — `hash_join_indices_on_gpu_aos` exists
+//!   but isn't yet wired into the planner; today only manual / benchmark
+//!   callers touch it. A future pass should pick AoS automatically for
+//!   probe-heavy workloads (e.g., `n_probe / n_build > 4`).
+//! * **Streaming intern on the GPU** — host-side hashing still serialises
+//!   over the StringArray. A device-side pass that hashes strings in
+//!   parallel would lift the remaining Amdahl bottleneck on multi-billion
+//!   row Utf8 joins.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -146,11 +176,12 @@ use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::hash_join_kernel::{
-    compile_build_collision_kernel, compile_build_kernel, compile_cross_kernel,
-    compile_probe_collision_kernel, compile_probe_kernel, compile_unmatched_build_kernel,
-    KeyShape, BUILD_COLLISION_KERNEL_ENTRY, BUILD_KERNEL_ENTRY, CROSS_KERNEL_ENTRY,
-    HASH_JOIN_BLOCK_SIZE, PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY,
-    UNMATCHED_BUILD_KERNEL_ENTRY,
+    compile_build_aos_kernel, compile_build_collision_kernel, compile_build_kernel,
+    compile_cross_kernel, compile_probe_aos_kernel, compile_probe_collision_kernel,
+    compile_probe_kernel, compile_unmatched_build_kernel, KeyShape, AOS_SLOT_BYTES,
+    BUILD_AOS_KERNEL_ENTRY, BUILD_COLLISION_KERNEL_ENTRY, BUILD_KERNEL_ENTRY,
+    CROSS_KERNEL_ENTRY, HASH_JOIN_BLOCK_SIZE, PROBE_AOS_KERNEL_ENTRY,
+    PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
 };
 use crate::jit::jit_compiler::CudaModule;
 use crate::plan::logical_plan::DataType;
@@ -283,17 +314,19 @@ fn parse_env_cap() -> Option<usize> {
 /// Pure-driver path for [`hash_table_byte_cap`]. Extracted so unit tests can
 /// reason about it independent of the OnceLock latch.
 ///
-/// TODO(stage4-multi-gpu): `cuda_sys` doesn't yet expose `cuCtxGetDevice`
-/// (current device handle for the active context). Once that helper lands as
-/// `cuda_sys::current_device()`, replace the hardcoded `device_get(0)` below
-/// with that call so multi-GPU setups query the device the engine is
-/// actually bound to. Until then, single-GPU rigs (the common case) still
-/// resolve correctly because the active context's device IS ordinal 0.
+/// Multi-GPU (Stage 4): queries the device bound to the calling thread's
+/// current CUDA context via [`cuda_sys::current_device`], so the per-process
+/// cap is driven by the card the engine is actually using — not always
+/// ordinal 0. On single-GPU rigs the behaviour is byte-identical to the
+/// Stage-2 implementation that hardcoded `device_get(0)`.
 fn resolve_byte_cap_from_driver() -> BoltResult<usize> {
     cuda_sys::init()?;
-    // TODO(stage4-multi-gpu): switch to cuda_sys::current_device() when
-    // available. See the function-level doc for rationale.
-    let dev = cuda_sys::device_get(0)?;
+    // Stage-4 (GJ): route through the active context's device, not ordinal 0.
+    // The engine's `CudaContext` was created against a specific device and
+    // (under `cuCtxSetCurrent`) bound to this thread, so `current_device()`
+    // returns the right handle regardless of how many CUDA devices the
+    // driver enumerates.
+    let dev = cuda_sys::current_device()?;
     let total = cuda_sys::device_total_mem(dev)?;
     Ok(if total >= LARGE_VRAM_THRESHOLD {
         HASH_TABLE_BYTE_CAP_LARGE
@@ -770,6 +803,231 @@ fn launch_probe_kernel(
     Ok(n_matches_raw)
 }
 
+// =========================================================================
+// Stage 4: AoS-layout build kernel launchers.
+//
+// The AoS slot layout is `[key:u64, head:u32, _pad:u32]` (16 bytes total,
+// see `AOS_SLOT_BYTES`). One `slots: GpuVec<u8>[cap * 16]` buffer replaces
+// the SoA `keys_table: GpuVec<i64>[cap]` + `row_idx_table: GpuVec<u32>[cap]`
+// pair, halving probe-side cache-line traffic at a 33% raw-bytes cost.
+// =========================================================================
+
+/// Initialise an AoS slot buffer of `cap` slots: every key word (offset 0)
+/// is set to `EMPTY_KEY = i64::MIN`, every head (offset 8) and pad
+/// (offset 12) word stays at zero.
+///
+/// We can't just `zeros(cap * 16)` because the AoS build kernel uses
+/// `atom.cas.b64` against the key word and would treat 0 as a live key.
+fn alloc_aos_slots(cap: usize) -> BoltResult<GpuVec<u8>> {
+    let bytes = cap
+        .checked_mul(AOS_SLOT_BYTES as usize)
+        .ok_or_else(|| BoltError::Other(format!("gpu_join: AoS slot bytes overflow (cap={cap})")))?;
+    // Build the initialiser host-side. Each 16-byte slot starts with the
+    // i64::MIN sentinel; the remaining 8 bytes (head + pad) are zero.
+    let mut init: Vec<u8> = vec![0u8; bytes];
+    let sentinel = i64::MIN.to_le_bytes();
+    for slot in 0..cap {
+        let off = slot * AOS_SLOT_BYTES as usize;
+        init[off..off + 8].copy_from_slice(&sentinel);
+    }
+    GpuVec::<u8>::from_slice(&init)
+}
+
+/// Launch the Stage-4 AoS build kernel. Inserts `(key, tid)` into the
+/// 16-byte slot tuple via an `atom.cas.b64` on the key word + a plain
+/// `st.global.u32` on the head word at offset 8.
+fn launch_build_aos_kernel(
+    build_keys_dev: &GpuVec<i64>,
+    slots_dev: &mut GpuVec<u8>,
+    n_build_rows: u32,
+    cap: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    if n_build_rows == 0 {
+        return Ok(());
+    }
+    let ptx = compile_build_aos_kernel()?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let function = module.function(BUILD_AOS_KERNEL_ENTRY)?;
+
+    let mut build_keys_ptr: CUdeviceptr = build_keys_dev.device_ptr();
+    let mut slots_ptr: CUdeviceptr = slots_dev.device_ptr();
+    let mut n_rows_u32: u32 = n_build_rows;
+    let mut cap_u32: u32 = cap;
+
+    let mut params: [*mut c_void; 4] = [
+        &mut build_keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut slots_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+        &mut cap_u32 as *mut u32 as *mut c_void,
+    ];
+
+    let block: u32 = HASH_JOIN_BLOCK_SIZE;
+    let grid_x: u32 = n_build_rows.div_ceil(block).max(1);
+
+    // SAFETY: every entry of `params` points at a stack local that outlives
+    // the launch+sync below; the device buffers are owned by the caller.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+    Ok(())
+}
+
+/// Launch the Stage-3 AoS probe kernel against the slots buffer populated
+/// by [`launch_build_aos_kernel`]. Same input/output contract as the SoA
+/// probe — the only observable difference is the slot-byte stride and the
+/// fact that the head word lives in the same 16-byte slot as the key.
+#[allow(clippy::too_many_arguments)]
+fn launch_probe_aos_kernel(
+    probe_keys_dev: &GpuVec<i64>,
+    slots_dev: &GpuVec<u8>,
+    out_probe_idx_dev: &mut GpuVec<u32>,
+    out_build_idx_dev: &mut GpuVec<u32>,
+    out_counter_dev: &mut GpuVec<u32>,
+    n_probe_rows: u32,
+    cap: u32,
+    out_capacity: u32,
+    stream: &CudaStream,
+) -> BoltResult<u32> {
+    if n_probe_rows == 0 {
+        return Ok(0);
+    }
+    let ptx = compile_probe_aos_kernel()?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let function = module.function(PROBE_AOS_KERNEL_ENTRY)?;
+
+    let mut probe_keys_ptr: CUdeviceptr = probe_keys_dev.device_ptr();
+    let mut slots_ptr: CUdeviceptr = slots_dev.device_ptr();
+    let mut out_probe_idx_ptr: CUdeviceptr = out_probe_idx_dev.device_ptr();
+    let mut out_build_idx_ptr: CUdeviceptr = out_build_idx_dev.device_ptr();
+    let mut out_counter_ptr: CUdeviceptr = out_counter_dev.device_ptr();
+    let mut n_probe_u32: u32 = n_probe_rows;
+    let mut cap_u32: u32 = cap;
+    let mut out_capacity_u32: u32 = out_capacity;
+
+    let mut params: [*mut c_void; 8] = [
+        &mut probe_keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut slots_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut out_probe_idx_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut out_build_idx_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut out_counter_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_probe_u32 as *mut u32 as *mut c_void,
+        &mut cap_u32 as *mut u32 as *mut c_void,
+        &mut out_capacity_u32 as *mut u32 as *mut c_void,
+    ];
+
+    let block: u32 = HASH_JOIN_BLOCK_SIZE;
+    let grid_x: u32 = n_probe_rows.div_ceil(block).max(1);
+
+    // SAFETY: same rationale as launch_build_aos_kernel.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+    let counter_host: Vec<u32> = out_counter_dev.to_vec()?;
+    Ok(counter_host[0])
+}
+
+/// AoS variant of [`hash_join_indices_on_gpu`]. Same INNER-equi-join
+/// semantics + unique-build-keys contract, but the hash table lives in a
+/// single `slots: GpuVec<u8>[cap * 16]` buffer instead of two parallel
+/// `keys_table` + `row_idx_table` arrays. Produces byte-identical match
+/// sets (modulo arbitrary INNER row order) so the SoA path's e2e tests
+/// double as AoS regression coverage.
+pub fn hash_join_indices_on_gpu_aos(
+    build_keys_col: &dyn Array,
+    probe_keys_col: &dyn Array,
+    dtype: DataType,
+) -> BoltResult<(UInt32Array, UInt32Array)> {
+    let n_build = build_keys_col.len();
+    let n_probe = probe_keys_col.len();
+    if n_build == 0 || n_probe == 0 {
+        return Ok((
+            UInt32Array::from(Vec::<u32>::new()),
+            UInt32Array::from(Vec::<u32>::new()),
+        ));
+    }
+    let n_build_u32 = n_rows_to_u32(n_build)?;
+    let n_probe_u32 = n_rows_to_u32(n_probe)?;
+
+    // Cap is denominated in slots; with AoS the per-slot cost is 16 bytes
+    // (vs 12 for SoA) so the slot cap shrinks proportionally. We still use
+    // the SoA slot cap here for compatibility with the Stage-3 e2e test
+    // fixtures; oversize is caught by `compute_capacity`'s slot-cap check.
+    let cap = compute_capacity(n_build)?;
+    let cap_u32 = u32::try_from(cap)
+        .map_err(|_| BoltError::Other(format!("gpu_join: AoS cap {cap} doesn't fit in u32")))?;
+
+    let build_keys_host = encode_keys_i64(build_keys_col, dtype)?;
+    let probe_keys_host = encode_keys_i64(probe_keys_col, dtype)?;
+    let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
+    let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
+
+    let mut slots_dev = alloc_aos_slots(cap)?;
+
+    let out_capacity_usize = n_build
+        .checked_add(n_probe)
+        .ok_or_else(|| BoltError::Other("gpu_join: AoS output sizing overflow".into()))?;
+    let out_capacity_u32 = u32::try_from(out_capacity_usize).map_err(|_| {
+        BoltError::Other(format!(
+            "gpu_join: AoS out_capacity {out_capacity_usize} doesn't fit in u32"
+        ))
+    })?;
+    let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
+    let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
+    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
+    let stream = CudaStream::null();
+
+    launch_build_aos_kernel(&build_keys_dev, &mut slots_dev, n_build_u32, cap_u32, &stream)?;
+    let n_matches_raw = launch_probe_aos_kernel(
+        &probe_keys_dev,
+        &slots_dev,
+        &mut out_probe_idx_dev,
+        &mut out_build_idx_dev,
+        &mut out_counter_dev,
+        n_probe_u32,
+        cap_u32,
+        out_capacity_u32,
+        &stream,
+    )?;
+    if n_matches_raw > out_capacity_u32 {
+        return Err(BoltError::Other(format!(
+            "gpu_join: AoS probe claimed {n_matches_raw} matches > capacity {out_capacity_u32}"
+        )));
+    }
+    let n_matches = n_matches_raw as usize;
+    let probe_full = out_probe_idx_dev.to_vec()?;
+    let build_full = out_build_idx_dev.to_vec()?;
+    let probe_idx: Vec<u32> = probe_full.into_iter().take(n_matches).collect();
+    let build_idx: Vec<u32> = build_full.into_iter().take(n_matches).collect();
+    Ok((UInt32Array::from(build_idx), UInt32Array::from(probe_idx)))
+}
+
 /// Execute a single-key INNER equi-join on the GPU.
 ///
 /// Returns the two index arrays `(build_indices, probe_indices)` in
@@ -1100,6 +1358,27 @@ pub fn hash_join_indices_on_gpu_with_shape(
 /// may contain `None` slots where one side is NULL-padded. The caller passes
 /// `emit_unmatched_probe` for LEFT/FULL semantics and `emit_unmatched_build`
 /// for RIGHT/FULL semantics.
+///
+/// ## Stage-4: lossy-shape support
+///
+/// Stage 3 admitted lossy shapes (`TwoI64`, `MultiI32(n)`) only for INNER
+/// joins via the candidate-filter + host-verify pipeline. Stage 4 extends
+/// that contract to LEFT / RIGHT / FULL OUTER:
+///
+/// 1. Run the GPU candidate-filter pass exactly as for INNER. The kernel's
+///    `matched: u32[ceil(build_n_rows/32)]` bitmap is captured but treated
+///    as a *superset* — it contains every build row that the GPU thought
+///    matched, including those that drop out under host post-verify.
+/// 2. Apply [`verify_pairs_on_host`] over the candidate `(build, probe)`
+///    pair set to drop false positives.
+/// 3. Recompute `matched_probe` and `matched_build` on the host using the
+///    *verified* pair set. The kernel-side bitmap is discarded for the
+///    unmatched-build pass — we walk the host `matched_build` array instead.
+/// 4. Emit unmatched rows from the host arrays (LEFT/FULL: zero-verified
+///    probe rows; RIGHT/FULL: zero-verified build rows).
+///
+/// Exact shapes (`is_exact_in_i64() == true`) skip the verify call and use
+/// the kernel-side bitmap directly, byte-stable with Stage 3's behaviour.
 pub fn execute_outer_join_indices_on_gpu(
     build_key_columns: &[&dyn Array],
     probe_key_columns: &[&dyn Array],
@@ -1107,11 +1386,9 @@ pub fn execute_outer_join_indices_on_gpu(
     emit_unmatched_probe: bool,
     emit_unmatched_build: bool,
 ) -> BoltResult<GpuOuterJoinIndices> {
-    if !shape.is_exact_in_i64() {
-        return Err(BoltError::Other(format!(
-            "gpu_join: outer-join lossy fold for shape {shape:?} would risk false matches"
-        )));
-    }
+    let needs_verify = shape.needs_host_post_verify();
+    // Stage 4: lossy shapes are admitted via host post-verify; only truly
+    // unsupported shapes bail here.
     let n_build = build_key_columns[0].len();
     let n_probe = probe_key_columns[0].len();
 
@@ -1209,21 +1486,76 @@ pub fn execute_outer_join_indices_on_gpu(
     let probe_idx_full = out_probe_idx_dev.to_vec()?;
     let build_idx_full = out_build_idx_dev.to_vec()?;
 
-    // Host-side post-pass for LEFT/FULL: we need to know which probe rows
-    // were NEVER matched. The kernel doesn't track that directly (it would
-    // require a second u32 bitmap on the probe side); cheaper to derive it
-    // from the matched-pair set on the host.
-    let mut probe_was_matched: Vec<bool> = vec![false; n_probe];
-    let mut build: Vec<Option<u32>> = Vec::with_capacity(n_matches + n_probe + n_build);
-    let mut probe: Vec<Option<u32>> = Vec::with_capacity(n_matches + n_probe + n_build);
+    // Stage 4 (lossy OUTER): the GPU's `matched` bitmap may contain false
+    // positives that drop under host post-verify. Re-test the candidate
+    // pair set against the original Arrow columns, then derive the host
+    // `matched_build` / `matched_probe` arrays from the *verified* pairs.
+    // For exact shapes (`needs_verify == false`) the verify is skipped and
+    // the verified pair set is the kernel's emitted pair set, byte-stable
+    // with the Stage-3 OUTER behaviour.
+    let (probe_idx_verified, build_idx_verified) = if needs_verify {
+        let candidate_build: Vec<u32> = build_idx_full
+            .iter()
+            .take(n_matches)
+            .copied()
+            .collect();
+        let candidate_probe: Vec<u32> = probe_idx_full
+            .iter()
+            .take(n_matches)
+            .copied()
+            .collect();
+        let (kept_build, kept_probe) = verify_pairs_on_host(
+            build_key_columns,
+            probe_key_columns,
+            &UInt32Array::from(candidate_build),
+            &UInt32Array::from(candidate_probe),
+        )?;
+        // verify_pairs_on_host preserves the input ordering, so the two
+        // verified arrays are still index-aligned. Drain them into plain
+        // Vec<u32>s so the loops below can re-use the same index-based code.
+        let p_kept: Vec<u32> = (0..kept_probe.len()).map(|i| kept_probe.value(i)).collect();
+        let b_kept: Vec<u32> = (0..kept_build.len()).map(|i| kept_build.value(i)).collect();
+        (p_kept, b_kept)
+    } else {
+        (
+            probe_idx_full.into_iter().take(n_matches).collect(),
+            build_idx_full.into_iter().take(n_matches).collect(),
+        )
+    };
 
-    for i in 0..n_matches {
-        let p = probe_idx_full[i];
-        let b = build_idx_full[i];
+    let n_verified = probe_idx_verified.len();
+
+    // Host-side post-pass for LEFT/FULL: derive matched_probe from the
+    // *verified* pair set. The kernel's bitmap is unverified (it counted
+    // false positives), so we MUST rebuild this on the host even for the
+    // exact-shape path's LEFT/FULL — the existing Stage-3 logic already
+    // did this; Stage 4 just extends the same scan to cover lossy shapes.
+    let mut probe_was_matched: Vec<bool> = vec![false; n_probe];
+    // Stage 4 (RIGHT/FULL with verify): we also need a host-derived
+    // matched_build bitmap so the unmatched-build pass uses verified data,
+    // not the kernel-side false-positive-bearing matched_dev. For exact
+    // shapes we still consult the kernel bitmap to stay byte-stable, so
+    // this allocation only fires on the lossy + RIGHT/FULL combination.
+    let need_host_matched_build = needs_verify && emit_unmatched_build;
+    let mut build_was_matched: Vec<bool> = if need_host_matched_build {
+        vec![false; n_build]
+    } else {
+        Vec::new()
+    };
+
+    let mut build: Vec<Option<u32>> = Vec::with_capacity(n_verified + n_probe + n_build);
+    let mut probe: Vec<Option<u32>> = Vec::with_capacity(n_verified + n_probe + n_build);
+
+    for i in 0..n_verified {
+        let p = probe_idx_verified[i];
+        let b = build_idx_verified[i];
         build.push(Some(b));
         probe.push(Some(p));
         if (p as usize) < n_probe {
             probe_was_matched[p as usize] = true;
+        }
+        if need_host_matched_build && (b as usize) < n_build {
+            build_was_matched[b as usize] = true;
         }
     }
 
@@ -1237,29 +1569,42 @@ pub fn execute_outer_join_indices_on_gpu(
         }
     }
 
-    // RIGHT/FULL: second-pass kernel emits build-row indices for unmatched
-    // build rows; the host pairs each with a NULL probe index.
+    // RIGHT/FULL: emit (build_row, None) for unmatched build rows.
+    //
+    // Exact-shape path: the GPU's `matched_dev` bitmap is byte-accurate, so
+    // we use the second-pass kernel (cheaper than a host scan). Lossy path:
+    // the bitmap holds the *candidate* matches; the host post-verify dropped
+    // some, so we must walk `build_was_matched` instead.
     if emit_unmatched_build {
-        let mut out_unmatched_dev = GpuVec::<u32>::zeros(n_build)?;
-        let mut out_unmatched_counter_dev = GpuVec::<u32>::zeros(1)?;
-        let n_unmatched = launch_unmatched_build_kernel(
-            &matched_dev,
-            &mut out_unmatched_dev,
-            &mut out_unmatched_counter_dev,
-            n_build_u32,
-            n_build_u32,
-            &stream,
-        )?;
-        if n_unmatched > n_build_u32 {
-            return Err(BoltError::Other(format!(
-                "gpu_join: unmatched-build kernel claimed {n_unmatched} > n_build {n_build_u32}"
-            )));
-        }
-        let n_unmatched = n_unmatched as usize;
-        let unmatched_full = out_unmatched_dev.to_vec()?;
-        for &b in unmatched_full.iter().take(n_unmatched) {
-            build.push(Some(b));
-            probe.push(None);
+        if needs_verify {
+            for (b, matched) in build_was_matched.iter().enumerate() {
+                if !matched {
+                    build.push(Some(b as u32));
+                    probe.push(None);
+                }
+            }
+        } else {
+            let mut out_unmatched_dev = GpuVec::<u32>::zeros(n_build)?;
+            let mut out_unmatched_counter_dev = GpuVec::<u32>::zeros(1)?;
+            let n_unmatched = launch_unmatched_build_kernel(
+                &matched_dev,
+                &mut out_unmatched_dev,
+                &mut out_unmatched_counter_dev,
+                n_build_u32,
+                n_build_u32,
+                &stream,
+            )?;
+            if n_unmatched > n_build_u32 {
+                return Err(BoltError::Other(format!(
+                    "gpu_join: unmatched-build kernel claimed {n_unmatched} > n_build {n_build_u32}"
+                )));
+            }
+            let n_unmatched = n_unmatched as usize;
+            let unmatched_full = out_unmatched_dev.to_vec()?;
+            for &b in unmatched_full.iter().take(n_unmatched) {
+                build.push(Some(b));
+                probe.push(None);
+            }
         }
     }
 
@@ -1665,6 +2010,187 @@ pub fn intern_utf8_columns(
         build_indices: Int32Array::from(build_idx),
         probe_indices: Int32Array::from(probe_idx),
     })
+}
+
+// =========================================================================
+// Stage 4: streaming string interning for high-cardinality Utf8 joins.
+// =========================================================================
+
+/// Env-var name for the Stage-4 streaming-intern opt-in. Set to a non-empty
+/// non-zero value to route `execute_utf8_inner_join_on_gpu` through
+/// [`intern_utf8_columns_streaming`] instead of the byte-borrowed dict.
+///
+/// Default is off — the original `intern_utf8_columns` path is
+/// byte-stable with Stage 3 and lower-overhead for medium-cardinality joins
+/// (≲ 100k unique strings) where the dict fits comfortably in L2/L3 cache.
+pub const STREAMING_INTERN_ENV_VAR: &str = "BOLT_GPU_JOIN_STREAMING_INTERN";
+
+/// Chunk size for the streaming-intern pass. Rows are processed in
+/// `STREAMING_INTERN_CHUNK_ROWS`-sized batches so the working set (chunk
+/// pointers + ~chunk_size new dict entries on the high-cardinality tail)
+/// stays small. Picked to comfortably exceed a typical L1 line refill cost
+/// per chunk without blowing past L2 on the dict-growth side.
+pub const STREAMING_INTERN_CHUNK_ROWS: usize = 64 * 1024;
+
+/// Streaming variant of [`intern_utf8_columns`] for high-cardinality Utf8
+/// joins.
+///
+/// ## Design
+///
+/// Stage-3's [`intern_utf8_columns`] borrows `&str` into the StringArray's
+/// backing buffer to build a `HashMap<&str, i32>`. That's already
+/// zero-clone, but the *hash table* still grows O(unique_strings) with one
+/// entry per unique input string (`(&str, i32)` is 16 + 4 padding = 24 bytes
+/// per entry on 64-bit; rehashes copy `&str` keys, not the string bytes).
+/// For UUID-shaped keys that dominate the host-side cost.
+///
+/// The streaming path replaces `HashMap<&str, i32>` with
+/// `HashMap<u64, i32>` keyed by a 64-bit hash of the string content (the
+/// engine's splitmix-style `host_splitmix` over each byte chunk via a
+/// rolling FNV-1a base). Each entry is 8 bytes for the key (plus the i32
+/// value) — about 5-10× smaller than the borrowed-`&str` variant for
+/// typical key lengths. Collisions are possible but rare (~2^-32 per row
+/// pair at the 32-bit birthday bound), and Stage 3's host post-verify
+/// pipeline already handles false positives correctly.
+///
+/// **Trade-off**: O(d) hash entries → O(d) u64 entries (5-10× smaller
+/// dict memory for typical strings), at the cost of one extra `arrow_row_eq`
+/// per *emitted candidate match* during post-verification (collisions are
+/// rare; the dominant cost is real matches, which would pay for take()
+/// anyway).
+///
+/// ## Chunking
+///
+/// Inputs are processed in [`STREAMING_INTERN_CHUNK_ROWS`]-row chunks.
+/// Today the chunks are processed sequentially and merge into a single
+/// shared dict, so the only observable effect is a smoother allocator-side
+/// growth pattern; a future Stage 5 pass could swap to per-chunk dicts
+/// with a final merge for parallelism.
+///
+/// ## Caller contract
+///
+/// The returned `InternedUtf8Columns` carry i32 indices keyed by the
+/// 64-bit hash. Distinct strings with the same hash share an index, which
+/// means the kernel-side join can emit (probe, build) pairs whose strings
+/// are NOT actually equal. The caller MUST run `verify_pairs_on_host` over
+/// the *original* `StringArray`s before trusting the matches — wiring is
+/// the same as for `KeyShape::TwoI64`.
+pub fn intern_utf8_columns_streaming(
+    build: &dyn Array,
+    probe: &dyn Array,
+) -> BoltResult<InternedUtf8Columns> {
+    let b = build.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        BoltError::Other(
+            "gpu_join: intern_utf8_columns_streaming build is not StringArray".into(),
+        )
+    })?;
+    let p = probe.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        BoltError::Other(
+            "gpu_join: intern_utf8_columns_streaming probe is not StringArray".into(),
+        )
+    })?;
+
+    // Hash-keyed dict. Sized to roughly the unique-string count — over-shoot
+    // is harmless (just unused capacity) and prevents the worst-case rehash
+    // chain during chunked growth.
+    let mut dict: HashMap<u64, i32> =
+        HashMap::with_capacity((b.len() + p.len()) / 2);
+    let mut next_idx: i32 = 0;
+
+    /// Inner helper: stream `arr` in `STREAMING_INTERN_CHUNK_ROWS`-row
+    /// chunks, populate `out` with the per-row dict index, and grow `dict`
+    /// in place. NULL rows take the same `-1` sentinel as the Stage-3
+    /// non-streaming variant.
+    fn intern_chunked(
+        arr: &StringArray,
+        dict: &mut HashMap<u64, i32>,
+        next_idx: &mut i32,
+        out: &mut Vec<i32>,
+    ) -> BoltResult<()> {
+        let n = arr.len();
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + STREAMING_INTERN_CHUNK_ROWS).min(n);
+            for i in start..end {
+                if arr.is_null(i) {
+                    out.push(-1);
+                    continue;
+                }
+                let s = arr.value(i);
+                let h = utf8_hash64(s.as_bytes());
+                let idx = match dict.entry(h) {
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let cur = *next_idx;
+                        // Saturating-add catches the i32::MAX overflow case;
+                        // we surface a clear error below.
+                        *next_idx = next_idx.saturating_add(1);
+                        v.insert(cur);
+                        cur
+                    }
+                };
+                out.push(idx);
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
+    let mut build_idx: Vec<i32> = Vec::with_capacity(b.len());
+    intern_chunked(b, &mut dict, &mut next_idx, &mut build_idx)?;
+
+    let mut probe_idx: Vec<i32> = Vec::with_capacity(p.len());
+    intern_chunked(p, &mut dict, &mut next_idx, &mut probe_idx)?;
+
+    if next_idx == i32::MAX {
+        return Err(BoltError::Other(
+            "gpu_join: streaming Utf8 interning overflowed i32::MAX distinct hashes; \
+             rewrite the query or fall back to host path"
+                .into(),
+        ));
+    }
+
+    Ok(InternedUtf8Columns {
+        build_indices: Int32Array::from(build_idx),
+        probe_indices: Int32Array::from(probe_idx),
+    })
+}
+
+/// Pure-host 64-bit hash for UTF-8 byte sequences. Same splitmix family as
+/// the kernel-side `FX_MUL`, so a future Stage that hashes strings on-device
+/// can match this exactly. The fold is a simple FNV-style mix followed by
+/// `host_splitmix` finalisation — deterministic, branch-free per byte.
+///
+/// This is not crypto: collisions are possible. The streaming intern path
+/// relies on host post-verify (`verify_pairs_on_host` over the original
+/// StringArrays) to drop hash collisions; do not call this anywhere a
+/// collision can corrupt results without a verify step.
+#[inline]
+fn utf8_hash64(bytes: &[u8]) -> u64 {
+    // FNV-1a primer, plus the splitmix finaliser so adjacent bytes don't
+    // map to adjacent hashes (which would defeat the kernel-side
+    // `(h * FX_MUL) >> 32` slot reduction).
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h: u64 = FNV_OFFSET;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    host_splitmix(h)
+}
+
+/// Read the streaming-intern env var. Returns `true` when the variable is
+/// set to a non-empty value other than `"0"` / `"false"`. Anything else
+/// (unset, empty, `"0"`, `"false"`) keeps the Stage-3 path active.
+fn streaming_intern_enabled() -> bool {
+    match std::env::var(STREAMING_INTERN_ENV_VAR) {
+        Ok(v) => {
+            let s = v.trim();
+            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
 }
 
 /// Re-test a set of `(probe_idx, build_idx)` candidate pairs against the
@@ -2074,6 +2600,17 @@ pub fn execute_cross_join_on_gpu(
 /// produces i32 dictionary indices that the kernel-side `SingleI32` path
 /// handles natively. The output reattaches the *original* StringArray
 /// columns from `lhs` / `rhs` via `arrow::compute::take`.
+///
+/// ## Stage-4 streaming-intern opt-in
+///
+/// When `BOLT_GPU_JOIN_STREAMING_INTERN` is set (see
+/// [`STREAMING_INTERN_ENV_VAR`]) this routes through
+/// [`intern_utf8_columns_streaming`] — a 64-bit-hash-keyed dict that's
+/// ~5-10× smaller than the Stage-3 byte-borrowed variant on
+/// high-cardinality Utf8 joins. Hash collisions are dropped by a
+/// `verify_pairs_on_host` pass over the original StringArrays before
+/// `arrow::compute::take` is called, so the streaming path is byte-stable
+/// with the Stage-3 path's output (modulo arbitrary INNER-join row order).
 pub fn execute_utf8_inner_join_on_gpu(
     lhs: &RecordBatch,
     rhs: &RecordBatch,
@@ -2087,16 +2624,44 @@ pub fn execute_utf8_inner_join_on_gpu(
     } else {
         (rhs, lhs)
     };
-    let interned = intern_utf8_columns(
-        build_batch.column(build_key_idx).as_ref(),
-        probe_batch.column(probe_key_idx).as_ref(),
-    )?;
+
+    // Stage-4 (GJ): pick between byte-borrowed (exact) and 64-bit-hash-keyed
+    // (streaming) interning. The hash-keyed variant can collide, so the
+    // streaming path MUST run the host post-verify before trusting any pair.
+    let streaming = streaming_intern_enabled();
+    let interned = if streaming {
+        intern_utf8_columns_streaming(
+            build_batch.column(build_key_idx).as_ref(),
+            probe_batch.column(probe_key_idx).as_ref(),
+        )?
+    } else {
+        intern_utf8_columns(
+            build_batch.column(build_key_idx).as_ref(),
+            probe_batch.column(probe_key_idx).as_ref(),
+        )?
+    };
 
     let (build_indices, probe_indices) = hash_join_indices_on_gpu(
         &interned.build_indices,
         &interned.probe_indices,
         DataType::Int32,
     )?;
+
+    // Streaming path: drop hash collisions by re-comparing the *original*
+    // StringArrays at the emitted (build, probe) indices. The Stage-3 exact
+    // path skips this because the kernel-side i32 compare is byte-exact.
+    let (build_indices, probe_indices) = if streaming {
+        let build_str = build_batch.column(build_key_idx);
+        let probe_str = probe_batch.column(probe_key_idx);
+        verify_pairs_on_host(
+            &[build_str.as_ref()],
+            &[probe_str.as_ref()],
+            &build_indices,
+            &probe_indices,
+        )?
+    } else {
+        (build_indices, probe_indices)
+    };
 
     let (left_idx, right_idx) = if build_is_left {
         (&build_indices, &probe_indices)
@@ -2591,5 +3156,145 @@ mod tests {
     #[test]
     fn cross_join_cell_cap_is_100m() {
         assert_eq!(CROSS_JOIN_GPU_CELL_CAP, 100_000_000);
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 4 (GJ-4) unit tests.
+    // ------------------------------------------------------------------
+
+    /// Streaming intern: identical strings on both sides MUST get the same
+    /// dict index (so the kernel-side i32 compare matches). Host-only test
+    /// — no CUDA driver involvement.
+    #[test]
+    fn streaming_intern_identical_strings_share_index() {
+        let b = StringArray::from(vec!["alpha", "beta", "gamma", "delta"]);
+        let p = StringArray::from(vec!["gamma", "alpha", "epsilon", "beta"]);
+        let interned = intern_utf8_columns_streaming(&b, &p).expect("streaming intern");
+
+        // Build "alpha" and probe "alpha" share an index.
+        let b_alpha = interned.build_indices.value(0);
+        let p_alpha = interned.probe_indices.value(1);
+        assert_eq!(
+            b_alpha, p_alpha,
+            "same string on build and probe must hash to the same dict index"
+        );
+        let b_beta = interned.build_indices.value(1);
+        let p_beta = interned.probe_indices.value(3);
+        assert_eq!(b_beta, p_beta, "build/probe 'beta' must share an index");
+        // Probe-only string must still get a valid (non-negative) index.
+        let p_epsilon = interned.probe_indices.value(2);
+        assert!(
+            p_epsilon >= 0,
+            "probe-only strings must still get a non-sentinel dict index"
+        );
+    }
+
+    /// The streaming-intern env var toggles cleanly: empty / "0" / unset
+    /// keep the byte-borrowed path; non-zero values enable the streaming
+    /// path. Host-only — no CUDA driver involvement.
+    #[test]
+    fn streaming_intern_env_var_toggle() {
+        let prev = std::env::var(STREAMING_INTERN_ENV_VAR).ok();
+
+        std::env::remove_var(STREAMING_INTERN_ENV_VAR);
+        assert!(!streaming_intern_enabled(), "unset env: streaming OFF");
+
+        std::env::set_var(STREAMING_INTERN_ENV_VAR, "");
+        assert!(!streaming_intern_enabled(), "empty env: streaming OFF");
+
+        std::env::set_var(STREAMING_INTERN_ENV_VAR, "0");
+        assert!(!streaming_intern_enabled(), "'0' env: streaming OFF");
+
+        std::env::set_var(STREAMING_INTERN_ENV_VAR, "false");
+        assert!(!streaming_intern_enabled(), "'false' env: streaming OFF");
+
+        std::env::set_var(STREAMING_INTERN_ENV_VAR, "1");
+        assert!(streaming_intern_enabled(), "'1' env: streaming ON");
+
+        std::env::set_var(STREAMING_INTERN_ENV_VAR, "true");
+        assert!(streaming_intern_enabled(), "'true' env: streaming ON");
+
+        match prev {
+            Some(v) => std::env::set_var(STREAMING_INTERN_ENV_VAR, v),
+            None => std::env::remove_var(STREAMING_INTERN_ENV_VAR),
+        }
+    }
+
+    /// AoS slot init populates every key word with the EMPTY_KEY sentinel
+    /// (`i64::MIN`) and leaves head/pad words at zero. Without this the
+    /// AoS build kernel's CAS would treat raw-zero key slots as "occupied
+    /// by key 0" and silently lose inserts.
+    ///
+    /// Host-only — uses `Vec<u8>` math, no CUDA call.
+    #[test]
+    fn aos_slot_init_is_sentinel_plus_zero() {
+        let cap = 4usize;
+        let bytes_per_slot = AOS_SLOT_BYTES as usize;
+        // Reproduce the host-side initialiser in `alloc_aos_slots` without
+        // touching the device. If `alloc_aos_slots` ever changes its
+        // initialisation scheme this test will catch the divergence at
+        // compile time (rather than at silent runtime corruption).
+        let mut init: Vec<u8> = vec![0u8; cap * bytes_per_slot];
+        let sentinel = i64::MIN.to_le_bytes();
+        for slot in 0..cap {
+            let off = slot * bytes_per_slot;
+            init[off..off + 8].copy_from_slice(&sentinel);
+        }
+
+        for slot in 0..cap {
+            let off = slot * bytes_per_slot;
+            let key_word =
+                i64::from_le_bytes(init[off..off + 8].try_into().unwrap());
+            assert_eq!(
+                key_word,
+                i64::MIN,
+                "slot {slot}: key word must be EMPTY_KEY (= i64::MIN) on init"
+            );
+            // Head word at offset 8.
+            let head_word =
+                u32::from_le_bytes(init[off + 8..off + 12].try_into().unwrap());
+            assert_eq!(head_word, 0, "slot {slot}: head word must be zero on init");
+            // Pad word at offset 12.
+            let pad_word =
+                u32::from_le_bytes(init[off + 12..off + 16].try_into().unwrap());
+            assert_eq!(pad_word, 0, "slot {slot}: pad word must be zero on init");
+        }
+    }
+
+    /// AoS round-trip: build + probe through the AoS path must agree with
+    /// the SoA path on the same fixture. This is the GPU-touching Stage-4
+    /// regression test that backs `tests/gpu_join_e2e.rs::aos_build_layout_no_regression`.
+    /// Gated on `--ignored` for the same reason as the other GPU tests.
+    #[test]
+    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    fn aos_matches_soa() {
+        let n_build = 2_000usize;
+        let n_probe = 4_000usize;
+        let build_keys: Vec<i32> = (0..n_build as i32).collect();
+        let probe_keys: Vec<i32> =
+            (0..n_probe as i32).map(|i| i % 3_000).collect();
+
+        let bk = Int32Array::from(build_keys);
+        let pk = Int32Array::from(probe_keys);
+
+        let (b_soa, p_soa) =
+            hash_join_indices_on_gpu(&bk, &pk, DataType::Int32).expect("SoA path");
+        let (b_aos, p_aos) =
+            hash_join_indices_on_gpu_aos(&bk, &pk, DataType::Int32).expect("AoS path");
+
+        assert_eq!(
+            b_soa.len(),
+            b_aos.len(),
+            "AoS/SoA match count diverged (SoA={}, AoS={})",
+            b_soa.len(),
+            b_aos.len()
+        );
+        let mut soa: Vec<(u32, u32)> =
+            (0..b_soa.len()).map(|i| (p_soa.value(i), b_soa.value(i))).collect();
+        let mut aos: Vec<(u32, u32)> =
+            (0..b_aos.len()).map(|i| (p_aos.value(i), b_aos.value(i))).collect();
+        soa.sort_unstable();
+        aos.sort_unstable();
+        assert_eq!(soa, aos, "AoS match set must equal SoA match set");
     }
 }

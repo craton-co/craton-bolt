@@ -189,11 +189,33 @@ pub const CROSS_KERNEL_ENTRY: &str = "bolt_cross_join";
 /// traffic on workloads where the probe loop is DRAM-bound.
 pub const PROBE_AOS_KERNEL_ENTRY: &str = "bolt_hash_join_probe_aos";
 
+/// Entry-point name of the Stage-4 AoS-layout build kernel — symmetric with
+/// [`PROBE_AOS_KERNEL_ENTRY`]. Inserts `(key, row_idx)` into the same
+/// `[key:u64, head:u32, _pad:u32]` slot layout: the i64-aligned CAS at
+/// slot offset 0 still drives slot ownership, but instead of writing into
+/// a parallel `row_idx_table[cap]` the winning thread writes its tid into
+/// the same 16-byte slot at offset 8. The `_pad` word at offset 12 is left
+/// zero so the slot stays compatible with the AoS probe's 16-byte fused
+/// load.
+pub const BUILD_AOS_KERNEL_ENTRY: &str = "bolt_hash_join_build_aos";
+
 /// AoS slot footprint in bytes: `i64 key (8) + u32 head (4) + u32 _pad (4)
 /// = 16`. The pad keeps each slot 16-byte aligned for the `ld.global.v4.u32`
 /// fused load the AoS probe issues. Memory cost vs. SoA is 16/12 = 1.33× —
 /// the extra padding buys one fused load per slot read instead of two
 /// scattered loads against parallel arrays.
+///
+/// **Stage-4 memory analysis** (paired with [`compile_build_aos_kernel`]):
+/// * SoA (Stage 1/2/3): `keys_table: i64[cap]` + `row_idx_table: u32[cap]`
+///   = `cap * 12` bytes.
+/// * AoS (Stage 4): `slots: u8[cap * 16]` = `cap * 16` bytes.
+///
+/// AoS is **33% larger in raw bytes** (`16/12 = 1.333…`) but halves the
+/// number of probe-side cache lines touched: one load brings both `key`
+/// and `head` (= `row_idx`) into the same 16-byte transaction, vs the
+/// SoA path's two scattered loads against parallel arrays. On probe-bound
+/// workloads (which dominate join cost) the cache-line saving is worth
+/// the extra padding.
 pub const AOS_SLOT_BYTES: u32 = 16;
 
 /// Shape of the join key, as seen by the host-side encoder. The kernels
@@ -1236,6 +1258,160 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tcvta.to.global.u64 %rd12, %rd12;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd13, %rd12, %rd10;").map_err(write_err)?;
     writeln!(p, "\tst.global.u32 [%rd13], %r9;").map_err(write_err)?;
+
+    writeln!(p, "DONE:").map_err(write_err)?;
+    writeln!(p, "\tret;").map_err(write_err)?;
+    writeln!(p, "}}").map_err(write_err)?;
+    Ok(p)
+}
+
+/// Compile the Stage-4 AoS-layout build kernel. Symmetric counterpart to
+/// [`compile_probe_aos_kernel`]: inserts `(key, row_idx)` into the same
+/// `[key:u64, head:u32, _pad:u32]` 16-byte slot layout.
+///
+/// ## Slot address math
+///
+/// `slot_addr = slots + slot_idx * 16` (golden:
+/// `mul.lo.u32 ..., ..., 16`). Per-slot field offsets:
+/// * Key (`i64`)      — `[slot_addr + 0]`. CAS target.
+/// * Head (`u32`)     — `[slot_addr + 8]`. Row index of the inserting thread.
+/// * Pad (`u32`)      — `[slot_addr + 12]`. Left untouched so the AoS
+///                      probe's 16-byte fused load remains well-formed.
+///
+/// ## Why the CAS still works
+///
+/// The slot starts on a 16-byte boundary (host allocates `cap * 16` as a
+/// single `GpuVec<u8>` and CUDA's allocator hands back 256-byte aligned
+/// pointers), so the i64 at offset 0 is naturally 8-byte aligned —
+/// `atom.cas.b64` works against it exactly as in the Stage-1 SoA build.
+/// The atomic-CAS is the load-bearing instruction; flipping the surrounding
+/// layout from SoA to AoS does not change its semantics.
+///
+/// ## Memory trade-off
+///
+/// SoA: `cap * 12` bytes. AoS: `cap * 16` bytes — **33% larger**, in
+/// exchange for halving probe-side cache-line traffic. See
+/// [`AOS_SLOT_BYTES`] for the full analysis. Worth it on probe-heavy
+/// workloads, which is most joins.
+///
+/// ## ABI
+///
+/// ```text
+/// .visible .entry bolt_hash_join_build_aos(
+///     .param .u64 keys_col_ptr,      // i64, length n_rows (encoded keys)
+///     .param .u64 slots_ptr,         // u8, length cap * 16
+///     .param .u32 n_rows,
+///     .param .u32 cap                // power-of-two
+/// )
+/// ```
+///
+/// Grid: 1D, one thread per build row, block size [`HASH_JOIN_BLOCK_SIZE`].
+/// Slot bytes MUST be zero-initialised by the host so that:
+/// * The i64 key word reads as `0` initially; the host stores `EMPTY_KEY =
+///   i64::MIN` (`-9223372036854775808`) into every slot key BEFORE this
+///   kernel launches. (See `gpu_join::execute_inner_join_on_gpu_aos`.)
+/// * The u32 head word is `0` until a winner writes its tid — but the
+///   reader must NOT treat 0 as "no row" because tid 0 is a legitimate
+///   row index. Readers consult the key word's sentinel instead.
+pub fn compile_build_aos_kernel() -> BoltResult<String> {
+    let mut p = String::new();
+    writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
+    writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
+    writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    let entry = BUILD_AOS_KERNEL_ENTRY;
+    writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_2,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_3").map_err(write_err)?;
+    writeln!(p, ")").map_err(write_err)?;
+    writeln!(p, "{{").map_err(write_err)?;
+
+    // Register file — same shape as the Stage-1 SoA build kernel; slot math
+    // changes (mul-by-16, not mul-by-8) but the rest is identical.
+    writeln!(p, "\t.reg .pred  %p<8>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32   %r<24>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rd<16>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    // tid = ctaid * ntid + tid.x ; bail if tid >= n_rows.
+    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // cap, mask, max_probes.
+    writeln!(p, "\tld.param.u32 %r5, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(p, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
+    writeln!(p, "\tmul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};").map_err(write_err)?;
+
+    // Load this row's key.
+    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+
+    // hash + slot.
+    writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
+    writeln!(p, "\tmul.lo.s64 %rl2, %rl0, %rl1;").map_err(write_err)?;
+    writeln!(p, "\tshr.u64 %rl3, %rl2, 32;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
+
+    // slots base pointer.
+    writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+
+    // EMPTY_KEY sentinel + probe counter.
+    writeln!(p, "\tmov.s64 %rl4, {EMPTY_KEY_LITERAL};").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+
+    // PROBE_LOOP — AoS edition. slot_addr = slots + slot_idx * 16.
+    writeln!(p, "PROBE_LOOP:").map_err(write_err)?;
+    writeln!(p, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
+    writeln!(p, "\tsetp.gt.u32 %p3, %r21, %r20;").map_err(write_err)?;
+    writeln!(p, "\t@%p3 bra DONE;").map_err(write_err)?;
+
+    // slot_offset = slot_idx * 16. Golden: `mul.lo.u32 ..., ..., 16`.
+    // Matches the AoS probe's offset math byte-for-byte so the two kernels
+    // address the same byte positions.
+    writeln!(p, "\tmul.lo.u32 %r10, %r8, {AOS_SLOT_BYTES};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd5, %r10, 1;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
+
+    // atom.cas.b64 against the key word at offset 0. The slot is 16-byte
+    // aligned (host allocates `cap * 16` as one buffer; CUDA hands back
+    // 256-byte aligned pointers), so the i64 at offset 0 is naturally
+    // 8-byte aligned and the CAS is well-defined.
+    writeln!(p, "\tatom.global.cas.b64 %rl5, [%rd6], %rl4, %rl0;").map_err(write_err)?;
+
+    // prev == EMPTY -> we own this slot.
+    writeln!(p, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
+    writeln!(p, "\t@%p1 bra INSERTED;").map_err(write_err)?;
+
+    // prev == key   -> another thread already inserted this key; bail.
+    // Mirrors the Stage-1 SoA build's first-writer-wins contract. The host
+    // enforces uniqueness before reaching here.
+    writeln!(p, "\tsetp.eq.s64 %p2, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(p, "\t@%p2 bra DONE;").map_err(write_err)?;
+
+    // Collision: advance slot.
+    writeln!(p, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
+
+    // INSERTED: write row index at slot offset 8 (the `head` word in the
+    // AoS slot tuple). The `_pad` word at offset 12 is left at its
+    // zero-initialised state.
+    writeln!(p, "INSERTED:").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd6 + 8], %r3;").map_err(write_err)?;
 
     writeln!(p, "DONE:").map_err(write_err)?;
     writeln!(p, "\tret;").map_err(write_err)?;

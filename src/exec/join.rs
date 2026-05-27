@@ -906,8 +906,11 @@ fn try_gpu_inner_join(
 ///
 /// Gates (all must hold):
 ///   * Equi-join only (caller already verified non-empty `on`).
-///   * `KeyShape::is_exact_in_i64()` (no lossy fold). Multi-i64 / multi-i32
-///     fall through to the host path.
+///   * `KeyShape != SingleUtf8` — Stage 4 doesn't yet route OUTER through
+///     the Utf8 dict-interning entry point (Stage 5 follow-up). Stage 4
+///     DID lift the Stage-3 `is_exact_in_i64()` gate so lossy shapes
+///     (`TwoI64`, `MultiI32`) now flow through the host post-verify path
+///     inside `execute_outer_join_indices_on_gpu`.
 ///   * Both sides ≥ `GPU_JOIN_MIN_ROWS` rows.
 ///   * No NULLs in any key column (NULL keys never match in SQL; the
 ///     preserved-side rows for those still need to surface via the host
@@ -962,7 +965,13 @@ fn try_gpu_outer_join(
         Some(s) => s,
         None => return Ok(None),
     };
-    if !shape.is_exact_in_i64() {
+    // Stage-4 (GJ): lossy shapes (TwoI64, MultiI32) are now admitted for
+    // OUTER joins via the host post-verify pipeline inside
+    // `execute_outer_join_indices_on_gpu`. Stage-3 wholesale-rejected them
+    // here; the only remaining shape we don't yet handle for OUTER is
+    // SingleUtf8 (the outer-join path doesn't go through the dict-interning
+    // entry point yet — that lands in Stage 5).
+    if matches!(shape, crate::jit::hash_join_kernel::KeyShape::SingleUtf8) {
         return Ok(None);
     }
 
