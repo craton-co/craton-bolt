@@ -680,6 +680,132 @@ fn sentinel_collision_does_not_drop_row() {
     }
 }
 
+/// Symmetric companion to `sentinel_collision_does_not_drop_row`: DESC pads
+/// with `i32::MIN`. A real row whose value is `i32::MIN` was the
+/// symmetric risk pre-Stage-3 fix — without the explicit `is_padded` bit
+/// routing it would have tied the sentinel and could end up at an index
+/// past the truncation point. Stage 3's padded routing makes the real
+/// value win the tiebreak regardless of direction; this test locks the
+/// DESC half of that behaviour.
+#[test]
+#[ignore = "requires CUDA device"]
+fn sentinel_collision_desc_i32_min_does_not_drop_row() {
+    use arrow_array::Int32Array;
+    let mut engine = Engine::new().expect("ctx");
+    // Same non-power-of-2 size choice as the ASC test so n_pow2 > n_rows
+    // and the padding is non-trivial.
+    let n = N_BIG + 137;
+    let mut values: Vec<i32> = (0..n as i32).collect();
+    // Sprinkle ~50 i32::MIN values. These would have tied the DESC pad
+    // sentinel pre-Stage-3.
+    for k in 0..50 {
+        values[k * 211 % n] = i32::MIN;
+    }
+    let target_count = values.iter().filter(|v| **v == i32::MIN).count();
+    assert!(
+        target_count >= 1,
+        "test setup should produce at least one i32::MIN row"
+    );
+    let batch = int32_batch("a", values.clone());
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT a FROM t ORDER BY a DESC")
+        .expect("ORDER BY a DESC");
+    let out = h.record_batch();
+    assert_eq!(
+        out.num_rows(),
+        n,
+        "Stage-3 padded routing must preserve every real row (including i32::MIN) under DESC"
+    );
+    let arr = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    // Count i32::MIN in output — must equal input.
+    let out_min = (0..n).filter(|i| arr.value(*i) == i32::MIN).count();
+    assert_eq!(
+        out_min, target_count,
+        "Stage-3 DESC: lost {} i32::MIN rows under sentinel collision",
+        target_count - out_min
+    );
+    // And the whole output is DESC.
+    for i in 1..n {
+        assert!(
+            arr.value(i - 1) >= arr.value(i),
+            "DESC monotonic violated at row {i}: {} < {}",
+            arr.value(i - 1),
+            arr.value(i)
+        );
+    }
+    // i32::MIN values must be the trailing run under DESC.
+    let last_idx = n - 1;
+    assert_eq!(
+        arr.value(last_idx),
+        i32::MIN,
+        "DESC: last row must be i32::MIN (the smallest value present)"
+    );
+}
+
+/// Stage 4 — `ORDER BY s ASC` over a plain Utf8 (StringArray) column.
+/// Drives the inline-dictionary builder in `gpu_sort::host_values_for_key`
+/// via the public SQL path. 16k rows with 16 distinct strings exercises
+/// the low-cardinality case where the dict-build cost is amortised across
+/// many rows.
+#[test]
+#[ignore = "requires CUDA device"]
+fn utf8_sort_via_inline_dictionary() {
+    use arrow_array::StringArray;
+    let mut engine = Engine::new().expect("ctx");
+    let n = N_BIG; // 16_384 — above GPU_SORT_MIN_ROWS so the GPU path engages.
+    // 16 distinct strings, cycled. Pick names with mixed lengths and
+    // mixed alphabetic position so the lex order isn't a no-op of the
+    // dict-build order.
+    let alphabet = [
+        "delta", "alpha", "echo", "bravo", "foxtrot", "charlie", "golf",
+        "india", "hotel", "kilo", "juliet", "mike", "lima", "november",
+        "oscar", "papa",
+    ];
+    let strings: Vec<String> = (0..n)
+        .map(|i| alphabet[i % alphabet.len()].to_string())
+        .collect();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(strings.clone()))],
+    )
+    .unwrap();
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT s FROM t ORDER BY s")
+        .expect("ORDER BY s ASC over Utf8");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), n);
+
+    let arr = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("StringArray");
+    // Strictly non-decreasing lex order.
+    for i in 1..n {
+        let a = arr.value(i - 1);
+        let b = arr.value(i);
+        assert!(a <= b, "ORDER BY s ASC violated at row {i}: {a:?} > {b:?}");
+    }
+    // Result must be a true permutation of the input.
+    let mut expected: Vec<String> = strings;
+    expected.sort();
+    let actual: Vec<String> = (0..n).map(|i| arr.value(i).to_string()).collect();
+    assert_eq!(actual, expected, "Utf8 ASC sort must equal sorted(input)");
+}
+
 /// Below the GPU threshold the host path must still produce correct output.
 /// This test guards against an accidental gate inversion that would route
 /// small queries through the GPU and break on its preconditions.

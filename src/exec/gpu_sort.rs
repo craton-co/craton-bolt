@@ -24,14 +24,27 @@
 //!  sorted RecordBatch
 //! ```
 //!
-//! ## Stage 1 scope
+//! ## Scope (Stage 1 / 2 / 3 / 4)
 //!
-//! - Single sort key. Multi-key (lexicographic) is `TODO(s1-stage2)`.
-//! - Dtype: Int32, Int64, Float32, Float64. (Bool / Utf8 stay host-side.)
-//! - ASC and DESC. NULLs `null_count() == 0` only — `TODO(s1-stage2)` to plumb
-//!   a parallel validity buffer through the comparator.
+//! - Sort keys: up to [`MAX_SORT_KEYS`] (the soft cap; the real ceiling is
+//!   the sm_70 register budget, validated by `compile_sort_kernel_spec`).
+//!   Single-key sorts are a [`SortKernelSpec`] with `keys.len() == 1`.
+//! - Dtype: Int32, Int64, Float32, Float64, Bool, Utf8,
+//!   Dictionary(Int32|Int64, Utf8). Utf8 (Stage 4) routes through an
+//!   inline dictionary builder; Dictionary(_, Utf8) reads the dictionary's
+//!   index column.
+//! - ASC and DESC, per-key. NULLs handled by a per-key validity bitmap +
+//!   `nulls_first` flag (Stage 2).
+//! - Padded-row routing via an explicit `is_padded` bitmap (Stage 3) so
+//!   real values colliding with the sentinel survive the truncation step.
 //! - `n_rows <= u32::MAX` and the padded `n_pow2` must fit too (so practical
 //!   limit is `n_rows <= 2^31` since `n_pow2 = next_pow2(n_rows) <= 2^32`).
+//!
+//! Stage 4 also retired the legacy Stage-1 single-key entry points
+//! (`sort_indices_on_gpu`, `sort_record_batch_on_gpu`, `run_bitonic_passes`)
+//! and the matching PTX module (`compile_sort_kernel`). The multi-key
+//! driver subsumes them — single-key sorts are now expressed as a
+//! `SortKernelSpec` with one entry.
 //!
 //! ## Padding strategy
 //!
@@ -49,12 +62,13 @@
 //! order relative to each other, but the padded indices (>= n_rows) are
 //! filtered out by the final truncation step, never returned to the caller.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, UInt32Array,
+    Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow::compute::take;
@@ -66,9 +80,8 @@ use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::jit_compiler::CudaModule;
 use crate::jit::sort_kernel::{
-    compile_sort_kernel, compile_sort_kernel_spec, sort_kernel_entry,
-    sort_kernel_entry_spec, KeyDesc, SortDirection, SortKernelSpec, SortLayout,
-    MAX_SORT_KEYS, SORT_BLOCK_SIZE,
+    compile_sort_kernel_spec, sort_kernel_entry_spec, KeyDesc, SortDirection,
+    SortKernelSpec, SortLayout, MAX_SORT_KEYS, SORT_BLOCK_SIZE,
 };
 use crate::plan::logical_plan::DataType;
 
@@ -115,316 +128,6 @@ fn pad_to_pow2<T: Copy>(values: &[T], n_pow2: usize, sentinel: T) -> Vec<T> {
     out
 }
 
-/// Launch the `log2(n_pow2) * (log2(n_pow2)+1) / 2` bitonic substages over
-/// `(keys_dev, idx_dev)`. After this call, `keys_dev` and `idx_dev` are both
-/// permuted such that `keys_dev` is sorted in `dir` order and `idx_dev` is
-/// the corresponding permutation of the identity 0..n_pow2.
-///
-/// The two device buffers must have exactly `n_pow2` elements each.
-#[allow(dead_code)] // reason: Stage-1 single-key bitonic kept for golden-test surface; multi-key driver now dispatches all sorts.
-fn run_bitonic_passes(
-    keys_dev_ptr: CUdeviceptr,
-    idx_dev_ptr: CUdeviceptr,
-    n_pow2: u32,
-    dtype: DataType,
-    dir: SortDirection,
-    stream: &CudaStream,
-) -> BoltResult<()> {
-    if n_pow2 <= 1 {
-        // A single-element sort is a no-op. The padded buffer of length 1 is
-        // already trivially sorted.
-        return Ok(());
-    }
-
-    let ptx = compile_sort_kernel(dtype, dir)?;
-    let module = CudaModule::from_ptx(&ptx)?;
-    let entry = sort_kernel_entry(dtype, dir)?;
-    let function = module.function(entry)?;
-
-    let log2_n = log2_pow2(n_pow2);
-
-    // Launch grid: one thread per element, block size 256 (matches the rest
-    // of the engine).
-    let block_size: u32 = SORT_BLOCK_SIZE;
-    let grid_x: u32 = n_pow2.div_ceil(block_size);
-
-    // TODO(s1-stage2): coalesce in-block substages into a single shared-mem
-    // kernel launch (~5-10x fewer launches for n_pow2 <= block_size pairs).
-
-    // Pre-bind the device-pointer args; only stage + substage_mask change
-    // per launch.
-    let mut p_keys: CUdeviceptr = keys_dev_ptr;
-    let mut p_idx: CUdeviceptr = idx_dev_ptr;
-    let mut p_n_pow2: u32 = n_pow2;
-
-    // Outer loop: stages 1..=log2(n).
-    for stage in 1..=log2_n {
-        // Inner loop: substages stage..=1, in decreasing order. We pass the
-        // substage MASK (1 << (substage - 1)) to the kernel so it can XOR
-        // without an extra shift.
-        let mut substage = stage;
-        loop {
-            let substage_mask: u32 = 1u32 << (substage - 1);
-            let mut p_stage: u32 = stage;
-            let mut p_mask: u32 = substage_mask;
-
-            let mut kernel_params: [*mut c_void; 5] = [
-                &mut p_keys as *mut CUdeviceptr as *mut c_void,
-                &mut p_idx as *mut CUdeviceptr as *mut c_void,
-                &mut p_n_pow2 as *mut u32 as *mut c_void,
-                &mut p_stage as *mut u32 as *mut c_void,
-                &mut p_mask as *mut u32 as *mut c_void,
-            ];
-
-            // SAFETY: every entry in `kernel_params` points at a stack local
-            // that outlives the launch+synchronize below; `function` is borrowed
-            // from a live `CudaModule`; the keys and indices buffers are owned
-            // by the caller and outlive every launch in this loop.
-            unsafe {
-                cuda_sys::check(cuda_sys::cuLaunchKernel(
-                    function.raw(),
-                    grid_x,
-                    1,
-                    1,
-                    block_size,
-                    1,
-                    1,
-                    0,
-                    stream.raw(),
-                    kernel_params.as_mut_ptr(),
-                    ptr::null_mut(),
-                ))?;
-            }
-            // Synchronise between substages: the next substage reads what
-            // this substage wrote. (Stage 1: one global sync per substage.
-            // Stage 2: amortise via shared-memory in-block bitonic.)
-            stream.synchronize()?;
-
-            if substage == 1 {
-                break;
-            }
-            substage -= 1;
-        }
-    }
-
-    Ok(())
-}
-
-/// Upload a typed key column, sort it on the GPU, and download the resulting
-/// permutation indices (truncated to `n_rows`).
-///
-/// This is the heart of the GPU ORDER BY fast path. The four type parameters
-/// have explicit branches so the compiler can monomorphise the host-side
-/// upload/download — the actual sort kernel is dtype-aware on the device.
-#[allow(dead_code)] // reason: Stage-1 single-key entry kept for golden-test surface; sort_indices_on_gpu_multi now dispatches.
-pub fn sort_indices_on_gpu(
-    column: &dyn Array,
-    dtype: DataType,
-    dir: SortDirection,
-) -> BoltResult<UInt32Array> {
-    let n_rows = column.len();
-    if n_rows == 0 {
-        return Ok(UInt32Array::from(Vec::<u32>::new()));
-    }
-    if n_rows > (u32::MAX as usize) {
-        return Err(BoltError::Other(format!(
-            "gpu_sort: n_rows {} exceeds u32::MAX",
-            n_rows
-        )));
-    }
-
-    let n_pow2 = next_pow2_u32(n_rows)?;
-    let n_pow2_usize = n_pow2 as usize;
-
-    let stream = CudaStream::null();
-
-    // Build the identity index vector and upload it; same for the (padded)
-    // keys vector. The per-dtype branches differ only in the sentinel and
-    // the GpuVec element type.
-    let idx_host: Vec<u32> = (0..n_pow2).collect();
-    let idx_dev = GpuVec::<u32>::from_slice(&idx_host)?;
-
-    match dtype {
-        DataType::Int32 => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| {
-                    BoltError::Other("gpu_sort: column dtype said Int32 but downcast failed".into())
-                })?;
-            let host: Vec<i32> = arr.values().as_ref().to_vec();
-            let sentinel = match dir {
-                SortDirection::Asc => i32::MAX,
-                SortDirection::Desc => i32::MIN,
-            };
-            let padded = pad_to_pow2(&host, n_pow2_usize, sentinel);
-            let keys_dev = GpuVec::<i32>::from_slice(&padded)?;
-            run_bitonic_passes(
-                keys_dev.device_ptr(),
-                idx_dev.device_ptr(),
-                n_pow2,
-                dtype,
-                dir,
-                &stream,
-            )?;
-            drop(keys_dev);
-        }
-        DataType::Int64 => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    BoltError::Other("gpu_sort: column dtype said Int64 but downcast failed".into())
-                })?;
-            let host: Vec<i64> = arr.values().as_ref().to_vec();
-            let sentinel = match dir {
-                SortDirection::Asc => i64::MAX,
-                SortDirection::Desc => i64::MIN,
-            };
-            let padded = pad_to_pow2(&host, n_pow2_usize, sentinel);
-            let keys_dev = GpuVec::<i64>::from_slice(&padded)?;
-            run_bitonic_passes(
-                keys_dev.device_ptr(),
-                idx_dev.device_ptr(),
-                n_pow2,
-                dtype,
-                dir,
-                &stream,
-            )?;
-            drop(keys_dev);
-        }
-        DataType::Float32 => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| {
-                    BoltError::Other(
-                        "gpu_sort: column dtype said Float32 but downcast failed".into(),
-                    )
-                })?;
-            let host: Vec<f32> = arr.values().as_ref().to_vec();
-            let sentinel = match dir {
-                SortDirection::Asc => f32::INFINITY,
-                SortDirection::Desc => f32::NEG_INFINITY,
-            };
-            let padded = pad_to_pow2(&host, n_pow2_usize, sentinel);
-            let keys_dev = GpuVec::<f32>::from_slice(&padded)?;
-            run_bitonic_passes(
-                keys_dev.device_ptr(),
-                idx_dev.device_ptr(),
-                n_pow2,
-                dtype,
-                dir,
-                &stream,
-            )?;
-            drop(keys_dev);
-        }
-        DataType::Float64 => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    BoltError::Other(
-                        "gpu_sort: column dtype said Float64 but downcast failed".into(),
-                    )
-                })?;
-            let host: Vec<f64> = arr.values().as_ref().to_vec();
-            let sentinel = match dir {
-                SortDirection::Asc => f64::INFINITY,
-                SortDirection::Desc => f64::NEG_INFINITY,
-            };
-            let padded = pad_to_pow2(&host, n_pow2_usize, sentinel);
-            let keys_dev = GpuVec::<f64>::from_slice(&padded)?;
-            run_bitonic_passes(
-                keys_dev.device_ptr(),
-                idx_dev.device_ptr(),
-                n_pow2,
-                dtype,
-                dir,
-                &stream,
-            )?;
-            drop(keys_dev);
-        }
-        _ => {
-            return Err(BoltError::Other(format!(
-                "gpu_sort: dtype {:?} not supported (Stage 1: Int32/Int64/Float32/Float64)",
-                dtype
-            )))
-        }
-    }
-
-    // Download the sorted indices and truncate to n_rows.
-    //
-    // After the bitonic sort the layout is:
-    //   - Real rows (in sorted order)         : the n_rows entries whose index < n_rows
-    //   - Padded rows (sentinel-valued)       : the (n_pow2 - n_rows) entries whose index >= n_rows
-    //
-    // For ASC: real rows < sentinel = MAX, so real rows are at positions
-    //   0..n_rows and padded rows are at positions n_rows..n_pow2. Truncate
-    //   the tail.
-    // For DESC: real rows > sentinel = MIN (treating -INF as "smallest"),
-    //   so real rows are at positions 0..n_rows. Same truncation.
-    //
-    // Either way the first n_rows indices are the answer. Filter any index
-    // that's >= n_rows as a defensive safety net (would only happen if a
-    // real key tied the sentinel, which is a precision-loss corner case
-    // for ASC + i32::MAX-valued real data; in that case we silently drop
-    // that row from the output — TODO(s1-stage2): handle sentinel ties
-    // via an explicit "is_padded" parallel mask).
-    let idx_host_sorted: Vec<u32> = idx_dev.to_vec()?;
-    let n_rows_u32 = n_rows_to_u32(n_rows)?;
-    let mut out: Vec<u32> = Vec::with_capacity(n_rows);
-    for v in &idx_host_sorted {
-        if *v < n_rows_u32 {
-            out.push(*v);
-        }
-        if out.len() == n_rows {
-            break;
-        }
-    }
-    if out.len() != n_rows {
-        return Err(BoltError::Other(format!(
-            "gpu_sort: post-sort recovered only {} indices for {} real rows \
-             (real keys probably collided with the padding sentinel)",
-            out.len(),
-            n_rows
-        )));
-    }
-
-    Ok(UInt32Array::from(out))
-}
-
-/// Sort `batch` by a single key column on the GPU, returning a freshly built
-/// `RecordBatch` whose rows are permuted accordingly.
-///
-/// `key_idx` is the column index of the sort key within `batch`. The caller
-/// is expected to have already validated the precondition gates (single key,
-/// supported dtype, n_rows threshold, no NULLs); this entry point just
-/// executes the sort and the gather.
-#[allow(dead_code)] // reason: Stage-1 single-key entry kept for golden-test surface; sort_record_batch_on_gpu_multi now dispatches.
-pub fn sort_record_batch_on_gpu(
-    batch: &RecordBatch,
-    key_idx: usize,
-    dtype: DataType,
-    dir: SortDirection,
-) -> BoltResult<RecordBatch> {
-    let key_col = batch.column(key_idx);
-    let perm = sort_indices_on_gpu(key_col.as_ref(), dtype, dir)?;
-
-    let new_cols: Vec<ArrayRef> = batch
-        .columns()
-        .iter()
-        .map(|c| {
-            take(c.as_ref(), &perm, None).map_err(|e| {
-                BoltError::Other(format!("gpu_sort: arrow take failed: {e}"))
-            })
-        })
-        .collect::<BoltResult<Vec<_>>>()?;
-
-    RecordBatch::try_new(batch.schema(), new_cols)
-        .map_err(|e| BoltError::Other(format!("gpu_sort: building RecordBatch failed: {e}")))
-}
-
 /// Arrow `DataType` -> our internal `DataType`. Returns `None` if the column
 /// type isn't one of the GPU-sortable kinds (the caller falls through to
 /// the host-side sort).
@@ -433,9 +136,14 @@ pub fn sort_record_batch_on_gpu(
 ///   - `Boolean` -> `Bool` (loaded as u8, compared as s32 0/1).
 ///   - `Dictionary(I32 | I64, Utf8)` -> the index dtype (Int32 / Int64). The
 ///     dictionary's *values* are immaterial for the sort: the indices alone
-///     induce the lex order the dictionary was built with. Non-dict Utf8
-///     keys stay on the host path; encoder is responsible for converting if
-///     they want the GPU win — see the Stage 4 follow-up note.
+///     induce the lex order the dictionary was built with.
+///
+/// **Stage 4** addition:
+///   - `Utf8` -> `Int32`. The GPU sort path now builds an inline dictionary
+///     on the fly inside `host_values_for_key` and feeds the i32 numeric
+///     kernel with the per-row dictionary indices. After the sort the
+///     original `StringArray` is gathered via `arrow::compute::take` like any
+///     other column, so the output schema is unchanged.
 pub fn arrow_dtype_to_internal(d: &arrow_schema::DataType) -> Option<DataType> {
     use arrow_schema::DataType as A;
     match d {
@@ -444,6 +152,14 @@ pub fn arrow_dtype_to_internal(d: &arrow_schema::DataType) -> Option<DataType> {
         A::Float32 => Some(DataType::Float32),
         A::Float64 => Some(DataType::Float64),
         A::Boolean => Some(DataType::Bool),
+        // Stage 4: plain `Utf8` flows through the inline-dictionary builder
+        // in `host_values_for_key` and ends up driving the i32 numeric
+        // kernel. Cost note: O(n) hash + alloc per *distinct* string; for
+        // very-low-cardinality columns this is a clear win, for
+        // high-cardinality (every row unique) the dict-build is the
+        // dominant cost and a Stage-5 path could detect that and skip the
+        // GPU. See `host_values_for_key`'s Utf8 arm for the full comment.
+        A::Utf8 => Some(DataType::Int32),
         A::Dictionary(key_ty, value_ty) => {
             // Only string-valued dictionaries are accepted for the Stage 3
             // adapter. The numeric values would already match one of the
@@ -509,10 +225,77 @@ fn build_is_padded(n_rows: usize, n_pow2: usize) -> Vec<u8> {
     out
 }
 
+/// Build per-row dictionary indices for a plain `StringArray` such that the
+/// integer order of the indices matches the lexicographic order of the
+/// underlying strings. Used by the Stage-4 plain-Utf8 GPU sort adapter.
+///
+/// Two-pass: first pass populates `dict_of_first_seen` (Vec<String>) and
+/// `tmp_idx` (per-row index into `dict_of_first_seen`); second pass
+/// computes the lex-order remap and rewrites each row's index. NULL rows
+/// contribute index 0 (the same as any other value — the value byte is
+/// don't-care because the validity bitmap controls NULL routing in the
+/// kernel; the caller is responsible for setting `nullable: true` on the
+/// `GpuSortKey` if the column has nulls so the kernel reads validity).
+///
+/// Returns a `Vec<i32>` of length `sa.len()`.
+fn build_inline_dict_indices(sa: &StringArray) -> Vec<i32> {
+    let n = sa.len();
+    // Pass 1: gather distinct strings in first-seen order, record each row's
+    // first-seen index.
+    //
+    // We keep the dict as `Vec<String>` so the keys outlive the borrow on
+    // `sa.value(i)` (which is a `&str` borrowed from the StringArray). The
+    // HashMap interns strings via the index into `dict_seen`.
+    let mut dict_seen: Vec<String> = Vec::new();
+    let mut lookup: HashMap<String, i32> = HashMap::new();
+    let mut tmp_idx: Vec<i32> = Vec::with_capacity(n);
+    for i in 0..n {
+        if sa.is_null(i) {
+            tmp_idx.push(0);
+            continue;
+        }
+        let v = sa.value(i);
+        // Use a direct `get` then `insert` rather than `entry().or_insert`
+        // so we only clone the string on the cold (new-value) path.
+        if let Some(&idx) = lookup.get(v) {
+            tmp_idx.push(idx);
+        } else {
+            let new_idx = dict_seen.len() as i32;
+            dict_seen.push(v.to_string());
+            lookup.insert(v.to_string(), new_idx);
+            tmp_idx.push(new_idx);
+        }
+    }
+    // Pass 2: compute the lex-order remap. `order[k]` = the rank of
+    // `dict_seen[k]` in lex order. After the remap, sorting the i32
+    // indices ASCending is equivalent to sorting the strings ASC.
+    let d = dict_seen.len();
+    let mut perm: Vec<usize> = (0..d).collect();
+    perm.sort_by(|&a, &b| dict_seen[a].cmp(&dict_seen[b]));
+    let mut remap = vec![0i32; d];
+    for (rank, original) in perm.into_iter().enumerate() {
+        remap[original] = rank as i32;
+    }
+    // Apply remap. NULL rows kept their `0` placeholder above — the kernel's
+    // validity bitmap (built separately by `build_validity_padded`) will
+    // route NULLs by the `nulls_first` flag, so the value byte is unused
+    // for those rows.
+    for ix in tmp_idx.iter_mut() {
+        if !dict_seen.is_empty() {
+            // Guard against the all-null case (d==0): tmp_idx is all 0s and
+            // there's nothing to remap.
+            *ix = remap[*ix as usize];
+        }
+    }
+    tmp_idx
+}
+
 /// Extract a numeric "host view" from a sortable Arrow column. Stage 3
 /// addition: handles Bool (-> u8 0/1 widened to i32) and dictionary-encoded
-/// Utf8 (-> index column as i32 or i64). For everything else this is a
-/// straight `.values().to_vec()`.
+/// Utf8 (-> index column as i32 or i64). Stage 4 addition: handles plain
+/// Utf8 by building an inline dictionary on the fly (see
+/// `build_inline_dict_indices`). For everything else this is a straight
+/// `.values().to_vec()`.
 fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<HostKeyValues> {
     use arrow_schema::DataType as A;
     Ok(match (dtype, arr.data_type()) {
@@ -566,6 +349,41 @@ fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<HostKeyVa
                 }
             }
             HostKeyValues::Bool(out)
+        }
+        // Stage 4 plain-Utf8 adapter: build an inline dictionary on the fly
+        // (HashMap<&str, i32> + Vec<String>), assign each row its dict
+        // index, and feed those indices through the i32 numeric kernel.
+        // Because the dictionary is constructed in *first-seen* order the
+        // resulting integer order is not the lexicographic order of the
+        // strings — so before returning we *remap* the indices so that
+        // `idx[i] < idx[j]` iff `s[i] < s[j]` lex (this is what makes a
+        // numeric ASC sort produce a Utf8 ASC sort). The remap is a single
+        // sort over the distinct values: O(d log d) where d = #distinct.
+        //
+        // Cost model (host-side, per call):
+        //   - O(n) hash probes      (each row looked up + maybe inserted)
+        //   - O(d) string clones    (one per distinct value, into the dict)
+        //   - O(d log d) remap sort (lex order over the distinct strings)
+        //   - O(n) i32 writes       (the final per-row index buffer)
+        //
+        // Low-cardinality columns (e.g. a country code, an enum) are a clear
+        // win: d << n keeps the dict build at near-O(n) and the i32 kernel
+        // crushes the sort. High-cardinality columns (d ≈ n, every row
+        // unique) push the dict build itself to O(n log n) — at that point
+        // the host's `lexsort_to_indices` is competitive and a Stage-5 path
+        // could detect this (sample-and-estimate distinct count, fall back
+        // to the host sort when the ratio crosses some threshold).
+        //
+        // The Utf8 column doesn't reach the kernel — only the indices do —
+        // so the final `take` over the original StringArray (in
+        // `sort_record_batch_on_gpu_multi`) preserves the column's storage
+        // exactly. No re-encoding into a dictionary array.
+        (DataType::Int32, A::Utf8) => {
+            let sa = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: utf8 downcast failed".into()))?;
+            HostKeyValues::I32(build_inline_dict_indices(sa))
         }
         // Stage 3 dictionary-Utf8 adapter: read the dictionary's index column
         // (`Int32` or `Int64`); the dictionary values themselves never reach
@@ -1077,8 +895,13 @@ mod tests {
             Some(DataType::Float64)
         );
         // Stage 3 additions: Boolean -> Bool; Dictionary(I32|I64, Utf8) ->
-        // the index dtype. Plain Utf8 still falls through to host.
-        assert_eq!(arrow_dtype_to_internal(&ArrowDataType::Utf8), None);
+        // the index dtype.
+        // Stage 4 addition: plain Utf8 -> Int32 (inline-dictionary on the
+        // fly inside `host_values_for_key`).
+        assert_eq!(
+            arrow_dtype_to_internal(&ArrowDataType::Utf8),
+            Some(DataType::Int32)
+        );
         assert_eq!(
             arrow_dtype_to_internal(&ArrowDataType::Boolean),
             Some(DataType::Bool)
@@ -1108,6 +931,51 @@ mod tests {
         );
     }
 
+    /// Stage 4 inline-dictionary builder: each row gets an i32 index such
+    /// that the integer ASC order matches the lex ASC order of the strings.
+    #[test]
+    fn build_inline_dict_indices_assigns_lex_order() {
+        let sa = StringArray::from(vec!["bravo", "alpha", "charlie", "alpha", "bravo"]);
+        let idx = build_inline_dict_indices(&sa);
+        // Distinct strings are {alpha, bravo, charlie} -> lex ranks 0,1,2.
+        assert_eq!(idx, vec![1, 0, 2, 0, 1]);
+    }
+
+    /// Sorting the inline-dict indices ASC must produce the same row order
+    /// as sorting the strings ASC.
+    #[test]
+    fn build_inline_dict_indices_matches_string_sort() {
+        let inputs = vec!["zebra", "apple", "mango", "apple", "banana", "zebra"];
+        let sa = StringArray::from(inputs.clone());
+        let idx = build_inline_dict_indices(&sa);
+        // Pair (idx, original_position) and sort by idx; the resulting row
+        // order must match the row order from sorting `inputs` directly.
+        let mut by_idx: Vec<(i32, usize)> =
+            idx.iter().copied().zip(0..inputs.len()).collect();
+        by_idx.sort_by_key(|p| p.0);
+        let mut by_str: Vec<(&str, usize)> =
+            inputs.iter().copied().zip(0..inputs.len()).collect();
+        by_str.sort_by_key(|p| p.0);
+        assert_eq!(
+            by_idx.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            by_str.iter().map(|(_, i)| *i).collect::<Vec<_>>()
+        );
+    }
+
+    /// Empty StringArray and all-null StringArray are degenerate but mustn't
+    /// panic — they hit the `dict_seen.is_empty()` guard.
+    #[test]
+    fn build_inline_dict_indices_empty_and_all_null() {
+        let sa_empty = StringArray::from(Vec::<&str>::new());
+        let idx = build_inline_dict_indices(&sa_empty);
+        assert!(idx.is_empty());
+
+        // All-null: every row contributes the placeholder 0.
+        let sa_nulls = StringArray::from(vec![None::<&str>, None, None]);
+        let idx = build_inline_dict_indices(&sa_nulls);
+        assert_eq!(idx, vec![0, 0, 0]);
+    }
+
     /// Stage 3 padded-bit bitmap layout: padded slots at indices >= n_rows
     /// get bit=1; real rows get bit=0. Length is `ceil(n_pow2 / 8)`.
     #[test]
@@ -1130,10 +998,17 @@ mod tests {
     }
 
     // -- GPU round-trip (ignored on hostless CI) --
+    //
+    // Stage 4: migrated from the (now-deleted) Stage-1 `sort_indices_on_gpu`
+    // single-key entry point to the multi-key driver. The Stage-1 PTX module
+    // was unreachable after Stage 3 routed every supported case through the
+    // multi-key driver; deleting it removes a parallel code path that was
+    // exercising the same `compile_sort_kernel_spec` PTX surface in a
+    // narrower form.
 
     /// End-to-end ASC int32 sort. Builds a 16k-row scrambled column, runs it
-    /// through `sort_indices_on_gpu`, gathers, and asserts strictly
-    /// ascending output.
+    /// through `sort_indices_on_gpu_multi` (single-key spec), gathers, and
+    /// asserts strictly ascending output.
     #[test]
     #[ignore = "requires CUDA toolkit + driver at runtime"]
     fn gpu_sort_int32_asc_round_trip() {
@@ -1152,8 +1027,13 @@ mod tests {
         }
         let arr = Int32Array::from(values.clone());
 
-        let perm =
-            sort_indices_on_gpu(&arr, DataType::Int32, SortDirection::Asc).expect("gpu sort");
+        let keys = vec![GpuSortKey {
+            column: &arr,
+            dtype: DataType::Int32,
+            direction: SortDirection::Asc,
+            nulls_first: false,
+        }];
+        let (_layout, perm) = sort_indices_on_gpu_multi(&keys).expect("gpu sort");
 
         // Apply the permutation host-side and verify ASC order.
         let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -1175,8 +1055,13 @@ mod tests {
         let values: Vec<i64> = (0..n as i64).map(|i| (i * 7919) % 1_000_000).collect();
         let arr = Int64Array::from(values.clone());
 
-        let perm =
-            sort_indices_on_gpu(&arr, DataType::Int64, SortDirection::Desc).expect("gpu sort");
+        let keys = vec![GpuSortKey {
+            column: &arr,
+            dtype: DataType::Int64,
+            direction: SortDirection::Desc,
+            nulls_first: false,
+        }];
+        let (_layout, perm) = sort_indices_on_gpu_multi(&keys).expect("gpu sort");
         assert_eq!(perm.len(), n, "output length must equal n_rows");
 
         let sorted: Vec<i64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -1197,8 +1082,13 @@ mod tests {
         let values: Vec<f64> = (0..n).map(|i| ((i as f64) * 1.61803398875).sin()).collect();
         let arr = Float64Array::from(values.clone());
 
-        let perm =
-            sort_indices_on_gpu(&arr, DataType::Float64, SortDirection::Asc).expect("gpu sort");
+        let keys = vec![GpuSortKey {
+            column: &arr,
+            dtype: DataType::Float64,
+            direction: SortDirection::Asc,
+            nulls_first: false,
+        }];
+        let (_layout, perm) = sort_indices_on_gpu_multi(&keys).expect("gpu sort");
         assert_eq!(perm.len(), n);
 
         let sorted: Vec<f64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -1212,9 +1102,9 @@ mod tests {
         }
     }
 
-    /// `sort_record_batch_on_gpu` glues the index sort to the full-batch
-    /// gather. Build a two-column batch (key + payload), sort by the key,
-    /// and confirm the payload tracks.
+    /// `sort_record_batch_on_gpu_multi` glues the index sort to the
+    /// full-batch gather. Build a two-column batch (key + payload), sort by
+    /// the key, and confirm the payload tracks.
     #[test]
     #[ignore = "requires CUDA toolkit + driver at runtime"]
     fn gpu_sort_record_batch_keeps_columns_in_sync() {
@@ -1243,8 +1133,11 @@ mod tests {
         )
         .unwrap();
 
-        let out = sort_record_batch_on_gpu(&batch, 0, DataType::Int32, SortDirection::Asc)
-            .expect("gpu sort batch");
+        let out = sort_record_batch_on_gpu_multi(
+            &batch,
+            &[(0, DataType::Int32, SortDirection::Asc, false)],
+        )
+        .expect("gpu sort batch");
         assert_eq!(out.num_rows(), n);
 
         let k_sorted = out

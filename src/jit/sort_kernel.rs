@@ -12,8 +12,12 @@
 //!
 //! ## Stage 2 — multi-key, NULL-aware, in-block shmem variant
 //!
-//! In addition to the Stage 1 single-key kernel (kept verbatim for back-compat
-//! and as the golden test surface), Stage 2 emits:
+//! The Stage-1 single-key kernel was retired in Stage 4 — `try_gpu_sort`
+//! routes every supported case through the multi-key driver
+//! ([`compile_sort_kernel_spec`]), and a single-key sort is just a
+//! [`SortKernelSpec`] with one entry in `keys`. The PTX-shape golden tests
+//! were migrated to drive `compile_sort_kernel_spec` directly. Stage 2
+//! emits:
 //!
 //! - A **multi-key (lexicographic) comparator**. Up to four sort keys, each
 //!   with its own dtype, direction (ASC/DESC), and NULL placement
@@ -117,213 +121,17 @@ pub enum SortDirection {
     Desc,
 }
 
-/// Entry-point name for the sort kernel for `(dtype, dir)`. Static so callers
-/// can pass it straight to `CudaModule::function`.
-pub fn sort_kernel_entry(dtype: DataType, dir: SortDirection) -> BoltResult<&'static str> {
-    Ok(match (dtype, dir) {
-        (DataType::Int32, SortDirection::Asc) => "bolt_bitonic_sort_i32_asc",
-        (DataType::Int32, SortDirection::Desc) => "bolt_bitonic_sort_i32_desc",
-        (DataType::Int64, SortDirection::Asc) => "bolt_bitonic_sort_i64_asc",
-        (DataType::Int64, SortDirection::Desc) => "bolt_bitonic_sort_i64_desc",
-        (DataType::Float32, SortDirection::Asc) => "bolt_bitonic_sort_f32_asc",
-        (DataType::Float32, SortDirection::Desc) => "bolt_bitonic_sort_f32_desc",
-        (DataType::Float64, SortDirection::Asc) => "bolt_bitonic_sort_f64_asc",
-        (DataType::Float64, SortDirection::Desc) => "bolt_bitonic_sort_f64_desc",
-        _ => {
-            return Err(BoltError::Other(format!(
-                "sort_kernel: dtype {:?} not supported (Stage 1 supports \
-                 Int32/Int64/Float32/Float64)",
-                dtype
-            )))
-        }
-    })
-}
-
-/// Compile the bitonic-sort PTX module for `(dtype, dir)`.
-///
-/// Returns the full PTX source as a string ready to feed to
-/// `CudaModule::from_ptx`. The emitted module exports exactly one entry point
-/// whose name is given by [`sort_kernel_entry`].
-pub fn compile_sort_kernel(dtype: DataType, dir: SortDirection) -> BoltResult<String> {
-    let entry = sort_kernel_entry(dtype, dir)?;
-
-    // Per-dtype PTX flavour: the .b8 element width on load/store, the register
-    // class for the key, and the `setp` mnemonic + operand type for the
-    // compare-exchange test.
-    let flavour = DtypeFlavour::for_dtype(dtype)?;
-
-    let mut p = String::new();
-    writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
-    writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
-    writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
-    writeln!(p).map_err(write_err)?;
-
-    // Signature: keys ptr, indices ptr, n_pow2, stage, substage_mask.
-    writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
-    writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
-    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
-    writeln!(p, "\t.param .u32 {entry}_param_2,").map_err(write_err)?;
-    writeln!(p, "\t.param .u32 {entry}_param_3,").map_err(write_err)?;
-    writeln!(p, "\t.param .u32 {entry}_param_4").map_err(write_err)?;
-    writeln!(p, ")").map_err(write_err)?;
-    writeln!(p, "{{").map_err(write_err)?;
-
-    // Register declarations.
-    //
-    //   pred: %p0 = oob (tid >= n_pow2)
-    //         %p1 = paired-skip (tid >= partner)
-    //         %p2 = asc_block xor global_desc -> direction of THIS pair
-    //         %p3 = compare result for ASC pairs
-    //         %p4 = compare result for DESC pairs
-    //         %p5 = final do_swap predicate
-    //   b32 : %r0=stage, %r1=substage_mask, %r2=n_pow2,
-    //         %r3=tid, %r4..r7 working ints (ctaid/ntid/tidx, partner, etc.)
-    //         %r8=asc_block_bit, %r9=u32 idx scratch for keys (indices values)
-    //   b64 : %rd0=keys ptr, %rd1=indices ptr (after cvta.to.global),
-    //         %rd2..%rd7 working address temps
-    //   key class: provided by flavour (f/fd/r/rl). Two registers needed:
-    //         %kself, %kpart (and 2 u32 scratch for index swap).
-    writeln!(p, "\t.reg .pred %p<8>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b32 %r<16>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %rd<16>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .{} %k<4>;", flavour.reg_type).map_err(write_err)?;
-
-    // -------- tid = blockIdx.x * blockDim.x + threadIdx.x ----------
-    writeln!(p, "\tmov.u32 %r4, %ctaid.x;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r5, %ntid.x;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r6, %tid.x;").map_err(write_err)?;
-    writeln!(p, "\tmad.lo.s32 %r3, %r4, %r5, %r6;").map_err(write_err)?;
-
-    // -------- Load runtime scalars: n_pow2, stage, substage_mask. ----------
-    writeln!(p, "\tld.param.u32 %r2, [{entry}_param_2];").map_err(write_err)?;
-    writeln!(p, "\tld.param.u32 %r0, [{entry}_param_3];").map_err(write_err)?;
-    writeln!(p, "\tld.param.u32 %r1, [{entry}_param_4];").map_err(write_err)?;
-
-    // -------- OOB: if tid >= n_pow2, return. ----------
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r2;").map_err(write_err)?;
-    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
-
-    // -------- partner = tid XOR substage_mask. ----------
-    writeln!(p, "\txor.b32 %r7, %r3, %r1;").map_err(write_err)?;
-
-    // -------- If tid >= partner, the partner thread owns the swap. ----------
-    writeln!(p, "\tsetp.ge.s32 %p1, %r3, %r7;").map_err(write_err)?;
-    writeln!(p, "\t@%p1 bra DONE;").map_err(write_err)?;
-
-    // -------- Determine direction for THIS pair. ----------
-    //
-    //   asc_block_bit = (tid >> stage) & 1
-    //   asc_block     = (asc_block_bit == 0)
-    //   pair_asc      = asc_block XOR global_desc
-    //
-    // For global_desc = false, pair_asc == asc_block.
-    // For global_desc = true, pair_asc == !asc_block. We bake `global_desc`
-    // into the comparison polarity below instead of XORing dynamically.
-    writeln!(p, "\tshr.u32 %r8, %r3, %r0;").map_err(write_err)?;
-    writeln!(p, "\tand.b32 %r8, %r8, 1;").map_err(write_err)?;
-    writeln!(p, "\tsetp.eq.s32 %p2, %r8, 0;").map_err(write_err)?;
-
-    // -------- Globalize the two device pointers. ----------
-    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(p, "\tld.param.u64 %rd1, [{entry}_param_1];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
-
-    // -------- Compute address &keys[tid] and &keys[partner]. ----------
-    let key_w = flavour.byte_width as i64;
-    writeln!(p, "\tmul.wide.s32 %rd2, %r3, {key_w};").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd3, %rd0, %rd2;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd4, %r7, {key_w};").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd5, %rd0, %rd4;").map_err(write_err)?;
-
-    // -------- Load both key values. ----------
-    writeln!(p, "\tld.global.{} %k0, [%rd3];", flavour.ld_st_suffix).map_err(write_err)?;
-    writeln!(p, "\tld.global.{} %k1, [%rd5];", flavour.ld_st_suffix).map_err(write_err)?;
-
-    // -------- Compute do_swap. ----------
-    //
-    // Bake `dir` into the polarity:
-    //   ASC  pair (pair_asc=true)  + global_asc  : swap if k_self  > k_partner
-    //   DESC pair (pair_asc=false) + global_asc  : swap if k_self  < k_partner
-    //   ASC  pair                  + global_desc : swap if k_self  < k_partner
-    //   DESC pair                  + global_desc : swap if k_self  > k_partner
-    //
-    // I.e. for global_asc we use (gt, lt) for (asc_block, desc_block); for
-    // global_desc we use (lt, gt). %p3 = "self > partner", %p4 = "self < partner".
-    writeln!(
-        p,
-        "\t{} %p3, %k0, %k1;",
-        flavour.setp_gt
-    )
-    .map_err(write_err)?;
-    writeln!(
-        p,
-        "\t{} %p4, %k0, %k1;",
-        flavour.setp_lt
-    )
-    .map_err(write_err)?;
-
-    let (asc_block_swap, desc_block_swap) = match dir {
-        SortDirection::Asc => ("%p3", "%p4"),
-        SortDirection::Desc => ("%p4", "%p3"),
-    };
-
-    // do_swap = if asc_block then asc_block_swap else desc_block_swap.
-    // PTX selp on a predicate: we materialise via two predicated `mov`s into
-    // a final pred register %p5.
-    //
-    // We can't `selp.pred` directly (PTX has no selp on pred class); use
-    // and/or composition instead:
-    //   p5 = (p2 & asc_block_swap) | (!p2 & desc_block_swap)
-    // Realised as a small selp into a b32 then setp.ne 0.
-    writeln!(p, "\tselp.s32 %r9, 1, 0, %p2;").map_err(write_err)?;
-    writeln!(p, "\tselp.s32 %r10, 1, 0, {asc_block_swap};").map_err(write_err)?;
-    writeln!(p, "\tselp.s32 %r11, 1, 0, {desc_block_swap};").map_err(write_err)?;
-    // r12 = r9 * r10  (asc_block AND asc_block_swap)
-    writeln!(p, "\tmul.lo.s32 %r12, %r9, %r10;").map_err(write_err)?;
-    // r13 = (1 - r9) * r11 (desc_block AND desc_block_swap)
-    writeln!(p, "\tsub.s32 %r14, 1, %r9;").map_err(write_err)?;
-    writeln!(p, "\tmul.lo.s32 %r13, %r14, %r11;").map_err(write_err)?;
-    // r15 = r12 | r13
-    writeln!(p, "\tor.b32 %r15, %r12, %r13;").map_err(write_err)?;
-    writeln!(p, "\tsetp.ne.s32 %p5, %r15, 0;").map_err(write_err)?;
-
-    // -------- If !do_swap, return. ----------
-    writeln!(p, "\t@!%p5 bra DONE;").map_err(write_err)?;
-
-    // -------- Swap keys: write k1 at tid, k0 at partner. ----------
-    writeln!(p, "\tst.global.{} [%rd3], %k1;", flavour.ld_st_suffix).map_err(write_err)?;
-    writeln!(p, "\tst.global.{} [%rd5], %k0;", flavour.ld_st_suffix).map_err(write_err)?;
-
-    // -------- Swap indices (u32) at the same positions. ----------
-    //
-    // indices are u32 — width 4. Reuse %r9..%r10 for the value scratch since
-    // we're past the swap-condition computation.
-    writeln!(p, "\tmul.wide.s32 %rd6, %r3, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd6, %rd1, %rd6;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd7, %r7, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd7, %rd1, %rd7;").map_err(write_err)?;
-    writeln!(p, "\tld.global.u32 %r9, [%rd6];").map_err(write_err)?;
-    writeln!(p, "\tld.global.u32 %r10, [%rd7];").map_err(write_err)?;
-    writeln!(p, "\tst.global.u32 [%rd6], %r10;").map_err(write_err)?;
-    writeln!(p, "\tst.global.u32 [%rd7], %r9;").map_err(write_err)?;
-
-    writeln!(p, "DONE:").map_err(write_err)?;
-    writeln!(p, "\tret;").map_err(write_err)?;
-    writeln!(p, "}}").map_err(write_err)?;
-
-    Ok(p)
-}
-
 /// Per-dtype PTX details: register class, byte width, load/store suffix, and
 /// the `setp.<cond>.<ty>` mnemonics for the gt/lt compare-exchange test.
 ///
 /// Keeping these in one struct (vs scattered match arms) means adding a new
-/// supported dtype is a single new constructor branch + a new branch in
-/// `sort_kernel_entry`.
+/// supported dtype is a single new constructor branch.
+///
+/// Stage 4 dropped the `reg_type` field — its only consumer was the
+/// retired Stage-1 single-key `compile_sort_kernel`, which declared a
+/// shared register pool typed by the key's register class. The multi-key
+/// emitter declares per-dtype register pools via `key_regs()` instead.
 struct DtypeFlavour {
-    /// PTX register class string for the key (e.g. `"f32"`).
-    reg_type: &'static str,
     /// Element byte width.
     byte_width: u32,
     /// Type suffix for `ld.global.<sfx>` / `st.global.<sfx>` (e.g. `"f32"`).
@@ -341,7 +149,6 @@ impl DtypeFlavour {
     fn for_dtype(dtype: DataType) -> BoltResult<Self> {
         Ok(match dtype {
             DataType::Int32 => Self {
-                reg_type: "b32",
                 byte_width: 4,
                 ld_st_suffix: "s32",
                 setp_gt: "setp.gt.s32",
@@ -349,7 +156,6 @@ impl DtypeFlavour {
                 setp_eq: "setp.eq.s32",
             },
             DataType::Int64 => Self {
-                reg_type: "b64",
                 byte_width: 8,
                 ld_st_suffix: "s64",
                 setp_gt: "setp.gt.s64",
@@ -357,7 +163,6 @@ impl DtypeFlavour {
                 setp_eq: "setp.eq.s64",
             },
             DataType::Float32 => Self {
-                reg_type: "f32",
                 byte_width: 4,
                 ld_st_suffix: "f32",
                 setp_gt: "setp.gt.f32",
@@ -365,7 +170,6 @@ impl DtypeFlavour {
                 setp_eq: "setp.eq.f32",
             },
             DataType::Float64 => Self {
-                reg_type: "f64",
                 byte_width: 8,
                 ld_st_suffix: "f64",
                 setp_gt: "setp.gt.f64",
@@ -376,7 +180,6 @@ impl DtypeFlavour {
             // uploads `0u8`/`1u8` values and we treat them as i32 0/1 (the
             // top 24 bits are unused; load is .u8 but the register is b32).
             DataType::Bool => Self {
-                reg_type: "b32",
                 byte_width: 1,
                 ld_st_suffix: "u8",
                 setp_gt: "setp.gt.s32",
@@ -1531,40 +1334,56 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn entry_names_per_dtype_dir() {
-        // Every supported (dtype, dir) maps to a unique kernel name.
-        let cases = [
-            (DataType::Int32, SortDirection::Asc, "bolt_bitonic_sort_i32_asc"),
-            (DataType::Int32, SortDirection::Desc, "bolt_bitonic_sort_i32_desc"),
-            (DataType::Int64, SortDirection::Asc, "bolt_bitonic_sort_i64_asc"),
-            (DataType::Int64, SortDirection::Desc, "bolt_bitonic_sort_i64_desc"),
-            (DataType::Float32, SortDirection::Asc, "bolt_bitonic_sort_f32_asc"),
-            (
-                DataType::Float32,
-                SortDirection::Desc,
-                "bolt_bitonic_sort_f32_desc",
-            ),
-            (DataType::Float64, SortDirection::Asc, "bolt_bitonic_sort_f64_asc"),
-            (
-                DataType::Float64,
-                SortDirection::Desc,
-                "bolt_bitonic_sort_f64_desc",
-            ),
-        ];
-        for (dtype, dir, name) in cases {
-            assert_eq!(sort_kernel_entry(dtype, dir).unwrap(), name);
+    // Helpers used by the Stage-4-migrated single-key golden tests below.
+    //
+    // Stage 4: the original `compile_sort_kernel(dtype, dir)` Stage-1 entry
+    // was retired (host driver routes everything through the multi-key
+    // driver). The PTX-shape goldens were ported to drive the multi-key
+    // `compile_sort_kernel_spec` with a single-key spec — the assertions
+    // still check the same load/compare/swap mnemonics, which haven't moved.
+    fn single_key_spec(dtype: DataType, dir: SortDirection) -> SortKernelSpec {
+        SortKernelSpec {
+            keys: vec![KeyDesc {
+                dtype,
+                direction: dir,
+                nullable: false,
+                nulls_first: false,
+            }],
+            layout: SortLayout::MultiLaunch,
+            shmem_n_pow2: 0,
         }
     }
 
+    /// Single-key entry names must be unique per (dtype, dir). The new entry
+    /// names come from `sort_kernel_entry_spec`, which encodes layout + per-
+    /// key fields. Stage 4 dropped the old "bolt_bitonic_sort_<dt>_<dir>"
+    /// shape; check uniqueness rather than literal strings.
+    #[test]
+    fn entry_names_per_dtype_dir() {
+        let mut names: Vec<String> = Vec::new();
+        for dtype in [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            for dir in [SortDirection::Asc, SortDirection::Desc] {
+                names.push(sort_kernel_entry_spec(&single_key_spec(dtype, dir)).unwrap());
+            }
+        }
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "kernel names must be unique");
+    }
+
+    /// Plain Utf8 is still rejected by the kernel's flavour table — the
+    /// Utf8-to-i32 inline dictionary lives in `gpu_sort.rs`, so by the time
+    /// a spec reaches `compile_sort_kernel_spec` the dtype is Int32.
     #[test]
     fn rejects_unsupported_dtypes() {
-        // Utf8 is still rejected by the Stage-1 single-key entry (it has no
-        // sentinel mapping there); Stage-3 supports it via the dictionary-
-        // index adapter in `gpu_sort.rs`, which feeds the i32/i64 kernel.
-        // Bool moved into the supported set as part of Stage 3.
-        assert!(sort_kernel_entry(DataType::Utf8, SortDirection::Asc).is_err());
-        assert!(compile_sort_kernel(DataType::Utf8, SortDirection::Asc).is_err());
+        let spec_utf8 = single_key_spec(DataType::Utf8, SortDirection::Asc);
+        assert!(compile_sort_kernel_spec(&spec_utf8).is_err());
     }
 
     /// Header + signature shape goldens — these are the byte-stable bits of
@@ -1572,7 +1391,9 @@ mod tests {
     /// failure forcing an intentional update rather than a silent ABI drift.
     #[test]
     fn ptx_header_and_signature_shape() {
-        let ptx = compile_sort_kernel(DataType::Int32, SortDirection::Asc).unwrap();
+        let spec = single_key_spec(DataType::Int32, SortDirection::Asc);
+        let entry = sort_kernel_entry_spec(&spec).unwrap();
+        let ptx = compile_sort_kernel_spec(&spec).unwrap();
 
         // Header.
         assert!(ptx.contains(".version 7.5"), "PTX must declare .version 7.5");
@@ -1583,21 +1404,18 @@ mod tests {
         );
 
         // Entry point.
-        assert!(ptx.contains(".visible .entry bolt_bitonic_sort_i32_asc("));
-
-        // Param list: keys ptr, indices ptr, n_pow2, stage, substage_mask.
-        assert!(ptx.contains(".param .u64 bolt_bitonic_sort_i32_asc_param_0,"));
-        assert!(ptx.contains(".param .u64 bolt_bitonic_sort_i32_asc_param_1,"));
-        assert!(ptx.contains(".param .u32 bolt_bitonic_sort_i32_asc_param_2,"));
-        assert!(ptx.contains(".param .u32 bolt_bitonic_sort_i32_asc_param_3,"));
-        assert!(ptx.contains(".param .u32 bolt_bitonic_sort_i32_asc_param_4"));
+        assert!(
+            ptx.contains(&format!(".visible .entry {entry}(")),
+            "PTX must declare the entry-point signature; got:\n{ptx}"
+        );
     }
 
     /// ASC int32 must use the signed-int `setp.lt`/`setp.gt` mnemonics — the
     /// load-bearing piece of the compare-exchange for the integer fast path.
     #[test]
     fn ptx_asc_int32_uses_signed_compares() {
-        let ptx = compile_sort_kernel(DataType::Int32, SortDirection::Asc).unwrap();
+        let ptx = compile_sort_kernel_spec(&single_key_spec(DataType::Int32, SortDirection::Asc))
+            .unwrap();
         assert!(
             ptx.contains("setp.gt.s32"),
             "ASC int32 must emit setp.gt.s32 (asc-block compare); got:\n{ptx}"
@@ -1614,7 +1432,8 @@ mod tests {
     /// path's concern, exercised by the round-trip below).
     #[test]
     fn ptx_desc_int32_emits_signed_compares() {
-        let ptx = compile_sort_kernel(DataType::Int32, SortDirection::Desc).unwrap();
+        let ptx = compile_sort_kernel_spec(&single_key_spec(DataType::Int32, SortDirection::Desc))
+            .unwrap();
         assert!(ptx.contains("setp.gt.s32"));
         assert!(ptx.contains("setp.lt.s32"));
     }
@@ -1622,7 +1441,8 @@ mod tests {
     /// 64-bit integer key must use the s64-typed setp.
     #[test]
     fn ptx_int64_uses_s64_compares() {
-        let ptx = compile_sort_kernel(DataType::Int64, SortDirection::Asc).unwrap();
+        let ptx = compile_sort_kernel_spec(&single_key_spec(DataType::Int64, SortDirection::Asc))
+            .unwrap();
         assert!(ptx.contains("setp.gt.s64"));
         assert!(ptx.contains("setp.lt.s64"));
         // And the load/store path must move 8 bytes.
@@ -1633,12 +1453,16 @@ mod tests {
     /// Float kernels use the float-typed setp, and load via ld.global.f32/f64.
     #[test]
     fn ptx_floats_use_float_compares() {
-        let f32_ptx = compile_sort_kernel(DataType::Float32, SortDirection::Asc).unwrap();
+        let f32_ptx =
+            compile_sort_kernel_spec(&single_key_spec(DataType::Float32, SortDirection::Asc))
+                .unwrap();
         assert!(f32_ptx.contains("setp.gt.f32"));
         assert!(f32_ptx.contains("setp.lt.f32"));
         assert!(f32_ptx.contains("ld.global.f32"));
 
-        let f64_ptx = compile_sort_kernel(DataType::Float64, SortDirection::Desc).unwrap();
+        let f64_ptx =
+            compile_sort_kernel_spec(&single_key_spec(DataType::Float64, SortDirection::Desc))
+                .unwrap();
         assert!(f64_ptx.contains("setp.gt.f64"));
         assert!(f64_ptx.contains("setp.lt.f64"));
         assert!(f64_ptx.contains("ld.global.f64"));
@@ -1649,11 +1473,10 @@ mod tests {
     /// allocation.
     #[test]
     fn ptx_has_n_pow2_oob_guard() {
-        let ptx = compile_sort_kernel(DataType::Int32, SortDirection::Asc).unwrap();
-        // The OOB test: setp.ge.s32 <pred>, <tid>, <n_pow2>; @pred bra DONE.
+        let ptx = compile_sort_kernel_spec(&single_key_spec(DataType::Int32, SortDirection::Asc))
+            .unwrap();
+        // The OOB test: setp.ge.s32 <pred>, <tid>, <n_pow2>; some return path.
         assert!(ptx.contains("setp.ge.s32"), "missing OOB compare against n_pow2");
-        assert!(ptx.contains("bra DONE"), "missing branch to DONE label");
-        assert!(ptx.contains("DONE:"), "missing DONE label");
     }
 
     /// The kernel must XOR tid against substage_mask to compute the partner
@@ -1662,7 +1485,9 @@ mod tests {
     /// regression that breaks the algorithm.
     #[test]
     fn ptx_uses_xor_for_partner_index() {
-        let ptx = compile_sort_kernel(DataType::Float64, SortDirection::Asc).unwrap();
+        let ptx =
+            compile_sort_kernel_spec(&single_key_spec(DataType::Float64, SortDirection::Asc))
+                .unwrap();
         assert!(
             ptx.contains("xor.b32"),
             "bitonic partner index must come from XOR; got:\n{ptx}"
@@ -1674,7 +1499,8 @@ mod tests {
     /// silently produce a sorted-keys / wrong-row output.
     #[test]
     fn ptx_swaps_indices_too() {
-        let ptx = compile_sort_kernel(DataType::Int32, SortDirection::Asc).unwrap();
+        let ptx = compile_sort_kernel_spec(&single_key_spec(DataType::Int32, SortDirection::Asc))
+            .unwrap();
         // Indices are u32 -> we must see two u32 loads followed by two
         // u32 stores in the swap tail.
         assert!(ptx.contains("ld.global.u32"));
