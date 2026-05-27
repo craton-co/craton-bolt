@@ -818,6 +818,7 @@ fn launch_probe_kernel(
 ///
 /// We can't just `zeros(cap * 16)` because the AoS build kernel uses
 /// `atom.cas.b64` against the key word and would treat 0 as a live key.
+#[allow(dead_code)] // reason: GJ-stage4 AoS helper; planner-level routing to AoS path lands in Stage 5.
 fn alloc_aos_slots(cap: usize) -> BoltResult<GpuVec<u8>> {
     let bytes = cap
         .checked_mul(AOS_SLOT_BYTES as usize)
@@ -836,6 +837,7 @@ fn alloc_aos_slots(cap: usize) -> BoltResult<GpuVec<u8>> {
 /// Launch the Stage-4 AoS build kernel. Inserts `(key, tid)` into the
 /// 16-byte slot tuple via an `atom.cas.b64` on the key word + a plain
 /// `st.global.u32` on the head word at offset 8.
+#[allow(dead_code)] // reason: GJ-stage4 AoS helper; planner-level routing to AoS path lands in Stage 5.
 fn launch_build_aos_kernel(
     build_keys_dev: &GpuVec<i64>,
     slots_dev: &mut GpuVec<u8>,
@@ -891,6 +893,7 @@ fn launch_build_aos_kernel(
 /// probe — the only observable difference is the slot-byte stride and the
 /// fact that the head word lives in the same 16-byte slot as the key.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // reason: GJ-stage4 AoS helper; planner-level routing to AoS path lands in Stage 5.
 fn launch_probe_aos_kernel(
     probe_keys_dev: &GpuVec<i64>,
     slots_dev: &GpuVec<u8>,
@@ -959,6 +962,7 @@ fn launch_probe_aos_kernel(
 /// `keys_table` + `row_idx_table` arrays. Produces byte-identical match
 /// sets (modulo arbitrary INNER row order) so the SoA path's e2e tests
 /// double as AoS regression coverage.
+#[allow(dead_code)] // reason: GJ-stage4 AoS helper; planner-level routing to AoS path lands in Stage 5.
 pub fn hash_join_indices_on_gpu_aos(
     build_keys_col: &dyn Array,
     probe_keys_col: &dyn Array,
