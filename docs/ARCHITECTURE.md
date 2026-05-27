@@ -2,6 +2,8 @@
 
 This document maps Craton Bolt's source tree to the runtime pipeline, and explains the major design decisions. For the SQL → PTX deep-dive read [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the full supported subset see [`SQL_REFERENCE.md`](SQL_REFERENCE.md).
 
+> **What changed since 0.1.** 0.3.0 added `INNER JOIN`, multi-batch tables, `DISTINCT` / `LIMIT [OFFSET]` / `ORDER BY` / `HAVING` / `UNION [ALL]`, a process-wide PTX module cache, the `cuda-stub` feature, and the Tier-1 / Tier-2 hash-partitioned GROUP BY family. The layer cake and exclusion list below reflect 0.3.0; see [`CHANGELOG.md`](../CHANGELOG.md) for the full delta and [`ROADMAP.md`](../ROADMAP.md) for what's still open.
+
 ## Layer cake
 
 ```
@@ -9,37 +11,70 @@ This document maps Craton Bolt's source tree to the runtime pipeline, and explai
 │  src/exec/engine.rs        Engine        ── public surface          │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  Per-shape executors  ────────────────────────────────────          │
-│    src/exec/aggregate.rs            scalar SUM/MIN/MAX/COUNT/AVG    │
-│    src/exec/agg_with_pre.rs         scalar agg + pre kernel         │
-│    src/exec/groupby.rs              packed-i64-key GROUP BY         │
-│    src/exec/groupby_with_pre.rs     pre + GROUP BY                  │
-│    src/exec/groupby_wide.rs         host fallback for >64-bit keys  │
-│    src/exec/groupby_valid.rs        sentinel-free GROUP BY          │
-│    src/exec/extended_agg.rs         Bool/Utf8 aggregate inputs      │
-│    src/exec/expr_agg.rs             host-side expr evaluator        │
-│    src/exec/compact.rs              host-side filter compaction     │
-│    src/exec/gpu_compact.rs          GPU-side compaction             │
-│    src/exec/gpu_compact_multipass.rs  multi-pass scan driver         │
-│    src/exec/launch.rs               CudaStream, kernel launch glue  │
-│    src/exec/dict_registry.rs        per-table Utf8 dictionaries     │
-│    src/exec/string_col.rs           Bool/Utf8 device columns        │
-│    src/exec/string_ops.rs           UPPER / LOWER / LENGTH          │
-│    src/exec/string_ops_extended.rs  CONCAT / SUBSTRING              │
+│  Per-shape executors (src/exec/)  ─────────────────────────         │
+│    Scalar / classic GROUP BY                                        │
+│      aggregate.rs                   scalar SUM/MIN/MAX/COUNT/AVG    │
+│      agg_with_pre.rs                scalar agg + pre kernel         │
+│      groupby.rs                     packed-i64-key GROUP BY         │
+│      groupby_with_pre.rs            pre + GROUP BY                  │
+│      groupby_wide.rs                host fallback for >64-bit keys  │
+│      groupby_valid.rs               sentinel-free GROUP BY          │
+│      extended_agg.rs                Bool/Utf8 aggregate inputs      │
+│      expr_agg.rs                    host-side expr evaluator        │
+│    Tier-1 shared-memory GROUP BY                                    │
+│      groupby_shmem_*.rs             single-block shared-memory      │
+│                                     hash GROUP BY (count / sum /    │
+│                                     minmax / multi + dispatch +     │
+│                                     launch wrappers)                │
+│    Tier-2 hash-partitioned GROUP BY                                 │
+│      groupby_tier2_*.rs             partition → per-partition       │
+│                                     reduce → host merge; single-    │
+│                                     and two-key variants across     │
+│                                     count / sum / avg / minmax      │
+│                                     (int and float) / multi-agg     │
+│      partition_offsets.rs           per-partition output offsets    │
+│    Standalone relational operators                                  │
+│      join.rs                        host-side INNER hash-equi join  │
+│      sort.rs                        host-side ORDER BY              │
+│      distinct.rs                    host-side DISTINCT              │
+│      limit.rs                       host-side LIMIT [OFFSET]        │
+│      gpu_table.rs                   multi-batch GPU table model     │
+│    Filter compaction                                                │
+│      compact.rs                     host-side filter compaction     │
+│      gpu_compact.rs                 GPU-side compaction             │
+│      gpu_compact_multipass.rs       multi-pass scan driver          │
+│    Glue                                                             │
+│      launch.rs                      CudaStream, kernel launch glue  │
+│      dict_registry.rs               per-table Utf8 dictionaries     │
+│      string_col.rs                  Bool/Utf8 device columns        │
+│      string_ops.rs                  UPPER / LOWER / LENGTH          │
+│      string_ops_extended.rs         CONCAT / SUBSTRING              │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  PTX codegen + module loading  ────────────────────────────         │
-│    src/jit/ptx_gen.rs               projection kernels              │
-│    src/jit/scan_kernel.rs           predicate-only kernels          │
-│    src/jit/agg_kernels.rs           per-block reductions            │
-│    src/jit/hash_kernels.rs          GROUP BY hash insert / agg      │
-│    src/jit/float_atomics.rs         float MIN/MAX via atom.cas      │
-│    src/jit/valid_flag_kernels.rs    sentinel-free GROUP BY kernels  │
-│    src/jit/valid_flag_float.rs      sentinel-free float MIN/MAX     │
-│    src/jit/prefix_scan.rs           Hillis-Steele scan + gather     │
-│    src/jit/prefix_scan_multipass.rs recursive scan over block sums  │
-│    src/jit/jit_compiler.rs          cuModuleLoadData wrapper        │
+│  PTX codegen + module loading (src/jit/)  ─────────────────         │
+│    Classic kernels                                                  │
+│      ptx_gen.rs                     projection kernels              │
+│      scan_kernel.rs                 predicate-only kernels          │
+│      agg_kernels.rs                 per-block reductions            │
+│      hash_kernels.rs                GROUP BY hash insert / agg      │
+│      float_atomics.rs               float MIN/MAX via atom.cas      │
+│      valid_flag_kernels.rs          sentinel-free GROUP BY kernels  │
+│      valid_flag_float.rs            sentinel-free float MIN/MAX     │
+│      prefix_scan.rs                 Hillis-Steele scan + gather     │
+│      prefix_scan_multipass.rs       recursive scan over block sums  │
+│      jit_compiler.rs                cuModuleLoadDataEx + PTX cache  │
+│    Tier-1 shared-memory GROUP BY kernels                            │
+│      shmem_count_kernel.rs          shared-memory COUNT             │
+│      shmem_sum_kernel.rs            shared-memory SUM               │
+│      shmem_minmax_kernel.rs         shared-memory MIN/MAX           │
+│      shmem_multi_sum_kernel.rs      multi-aggregate SUM             │
+│    Tier-2 partition + per-partition reduce kernels                  │
+│      partition_kernel{,_i64}.rs     key → partition assignment      │
+│      scatter_kernel{,_i64}.rs       per-partition row scatter       │
+│      partition_reduce_kernel*.rs    per-partition reductions:       │
+│                                     count, sum, minmax (int/float), │
+│                                     multi-agg; i32 and i64 keys     │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
@@ -56,6 +91,8 @@ This document maps Craton Bolt's source tree to the runtime pipeline, and explai
 │    src/cuda/cuda_sys.rs             raw driver FFI                  │
 │    src/cuda/buffer.rs               GpuBuffer<T> (Arrow-aligned)    │
 │    src/cuda/smart_ptrs.rs           GpuVec<T> + borrow-checked views│
+│    src/cuda/mem_pool.rs             reusable device-allocation pool │
+│    src/cuda/cudarc_backend.rs       optional cudarc backend shim    │
 │    src/cuda/dictionary.rs           DictionaryColumn (i32 indices)  │
 │    src/cuda/dictionary_i64.rs       DictionaryColumnI64             │
 │    src/cuda/dictionary_any.rs       unified enum, cardinality-driven│
@@ -199,13 +236,18 @@ Float MIN/MAX over `Float32` / `Float64` has no native `atom.global.min/max.f*` 
 ## What's deliberately *not* in this architecture
 
 - **No process model.** Everything runs in a single Rust process.
-- **No multi-GPU.** One context, one device, one stream (by default). Multiple streams are a future change.
-- **No persistent dictionary or query cache.** Every query JITs fresh. A PTX cache keyed on `KernelSpec` is an obvious next optimization.
-- **No optimiser passes beyond the lowering.** No predicate pushdown, no constant folding (beyond what's already in `LogicalPlan::schema` type-checking), no join reordering (because there are no joins). The flat pipeline is the optimisation budget today.
-- **No streaming / multi-batch.** One `RecordBatch` per query. Larger-than-VRAM tables would need a batched executor.
+- **No multi-GPU per engine.** One context, one device, one default stream per `Engine`. `Engine::new_with_device(idx)` picks the device; multi-GPU means one engine per device. Multiple streams are a future change.
+- **No streaming / larger-than-VRAM tables.** Multi-batch tables work (`register_table` accepts more than one `RecordBatch`), but the whole table is uploaded eagerly. A `register_table_stream` API and batched, spill-aware execution are 0.4 work.
+- **No async memcpy yet.** The async H2D / D2H FFI bindings landed in 0.3.0; integration into the executors is 0.4.
+- **No GPU hash join.** `INNER JOIN ... ON <equi predicate>` works in 0.3.0, but the executor is host-side: build a `HashMap` on the smaller side, probe the larger, materialise via `arrow::compute::take`. A GPU-resident build+probe path is a 0.4 stretch goal.
+- **No LEFT / RIGHT / FULL / CROSS join, no non-equi predicates.** Only `INNER JOIN ... ON <equi predicate>` with one join per `SELECT` is accepted; everything else is rejected at the parser.
+- **No GPU sort kernel.** `ORDER BY` (and the dedup step of `DISTINCT` / plain `UNION`) runs host-side via `sort.rs` / `distinct.rs`. A device-resident sort is 0.4 stretch.
+- **No CTEs, subqueries, or window functions.** The parser rejects them outright.
+- **No `KernelSpec`-keyed codegen cache.** The 0.3.0 PTX cache keys on the *emitted PTX hash*, so PTXAS reassembly is skipped on a hit but codegen itself still runs. A `KernelSpec`-level cache that also skips codegen is 0.4.
+- **No optimiser passes beyond the lowering.** No predicate pushdown, no constant folding (beyond what's already in `LogicalPlan::schema` type-checking), no join reordering. The flat pipeline is the optimisation budget today.
 
-Each of these is a deliberate scope choice for the v0.1 release, not a fundamental limitation.
+Each of these is a deliberate scope choice for 0.3.0, not a fundamental limitation. See [`ROADMAP.md`](../ROADMAP.md) for the milestone mapping.
 
 ## Stability of the IR types
 
-`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`, `Value`, `ColumnIO`, and the rest of the physical-plan / IR vocabulary in `src/plan/physical_plan.rs` are marked `#[doc(hidden)]`. They are implementation-internal: the codegen + executor split owns them end-to-end, no public method takes one as a parameter, and they may change shape, gain variants, or be replaced in any 0.1.x release without a deprecation cycle. External code that wants to drive Craton Bolt should hold to the `Engine` and `DataFrame` surface; the planner and IR are explicitly out-of-contract until the API freezes.
+`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`, `Value`, `ColumnIO`, and the rest of the physical-plan / IR vocabulary in `src/plan/physical_plan.rs` are marked `#[doc(hidden)]`. They are implementation-internal: the codegen + executor split owns them end-to-end, no public method takes one as a parameter, and they may change shape, gain variants, or be replaced in any pre-1.0 release without a deprecation cycle. External code that wants to drive Craton Bolt should hold to the `Engine` and `DataFrame` surface; the planner and IR are explicitly out-of-contract until the 1.0 API freeze.
