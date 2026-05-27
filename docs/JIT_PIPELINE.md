@@ -47,8 +47,8 @@ Source: `src/plan/sql_frontend.rs`.
 
 Uses [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) as the lexer/parser. We don't accept the full SQL grammar — `parse_sql` walks the parser's AST and only accepts shapes Craton Bolt can execute:
 
-- `SELECT` with optional `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT [OFFSET]`, `DISTINCT`, `UNION [ALL]`, and a single `INNER JOIN ... ON <equi predicate>` per `SELECT`. CTEs, subqueries, window functions, and non-equi / outer / cross joins are still rejected at parse time. See [`SQL_REFERENCE.md`](SQL_REFERENCE.md) for the full surface; the rest of this section focuses on the parts that drive PTX codegen.
-- A single base table in `FROM` (plus at most one joined table via `INNER JOIN`). No schema-qualified names.
+- `SELECT` with optional `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT [OFFSET]`, `DISTINCT`, `UNION [ALL]`, and a single JOIN per `SELECT` — `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]` (all with equi `ON` predicates), or `CROSS` (no `ON`). All joins execute host-side. CTEs, subqueries, window functions, and non-equi join predicates are still rejected at parse time. See [`SQL_REFERENCE.md`](SQL_REFERENCE.md) for the full surface; the rest of this section focuses on the parts that drive PTX codegen.
+- A single base table in `FROM` (plus at most one joined table via the supported JOIN forms). No schema-qualified names.
 - Scalar expressions: column references, integer / float / string / bool / null literals, binary arithmetic (`+ - * /`), comparison (`= <> < <= > >=`), logical (`AND OR`), parenthesised sub-expressions, unary minus on literals (folded), unary plus (no-op).
 - Aggregate functions in SELECT: `COUNT(*)`, `COUNT(expr)`, `SUM`, `MIN`, `MAX`, `AVG`.
 - Implicit GROUP BY validation: every non-aggregate SELECT item must appear in `GROUP BY` if the query has aggregates.
@@ -280,7 +280,7 @@ For non-bare aggregate inputs that aren't covered by the pre kernel's outputs (r
 
 - **NULL handling.** The current reduction kernels don't read a validity bitmap. `COUNT(expr)` counts every row, not just non-null rows. The host-side `extended_agg` path (Bool, Utf8) does honour nulls.
 - **Variable-width string outputs.** CONCAT producing genuinely new strings works via host-side dictionary cross-product (`src/exec/string_ops_extended.rs`), not on the GPU.
-- **Joins.** `INNER JOIN ... ON <equi predicate>` works (one per `SELECT`), but the executor is a host-side hash join — no GPU join kernel yet. LEFT / RIGHT / FULL / CROSS and non-equi predicates are rejected at parse time.
+- **Joins.** `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS` joins all work (one per `SELECT`), but the executor is a host-side hash join (build smaller side into a HashMap, probe the larger; CROSS is a host-side cartesian product) — no GPU join kernel yet. Non-equi predicates are rejected at parse time. A GPU-resident hash-join path is a 0.4 target.
 - **Window functions.** Not yet.
 - **CASE / NULLIF / CAST / unary ops beyond folded minus.** The expression evaluator covers the standard binary set; the AST doesn't model these.
 

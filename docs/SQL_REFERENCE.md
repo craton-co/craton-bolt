@@ -20,7 +20,7 @@ Two queries can be combined with `UNION` or `UNION ALL`; the optional `ORDER BY`
 
 **Hard restrictions** (everything else returns a `BoltError`):
 
-- Exactly one base table in `FROM`, optionally widened by **one** `INNER JOIN ... ON <equi predicate>`. `LEFT` / `RIGHT` / `FULL` / `CROSS` joins, `JOIN USING`, `NATURAL JOIN`, non-equi predicates, and chaining more than one JOIN per `SELECT` are rejected at the parser.
+- Exactly one base table in `FROM`, optionally widened by **one** JOIN per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an equi `ON` predicate, or `CROSS JOIN` (no `ON`). All joins execute host-side. `JOIN USING`, `NATURAL JOIN`, non-equi predicates, computed join keys, and chaining more than one JOIN per `SELECT` are rejected at the parser. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities.
 - No CTEs (`WITH`), no subqueries in `FROM` or `WHERE`, no correlated subqueries, no `EXISTS`.
 - No `EXCEPT`, `INTERSECT`, `UNION BY NAME`.
 - No `WINDOW`, `OVER`, `QUALIFY`, `LATERAL`, table-valued functions, `PREWHERE` (ClickHouse-ism), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `FETCH`, `FOR UPDATE/SHARE`, `INTO`.
@@ -260,15 +260,33 @@ SELECT *
     ON orders.id = line_items.order_id AND orders.region = line_items.region;
 ```
 
+## JOIN
+
+```
+SELECT ... FROM <table>
+  [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table> ON <equi_predicate>]
+  [CROSS JOIN <table>]
+  ...
+```
+
+- The ON predicate is a conjunction of `left.col = right.col` equalities. Non-equi predicates and non-conjunctive shapes are rejected.
+- `CROSS JOIN` has no ON clause. The output row count is `|left| × |right|`; rewrite your query if it would exceed the engine's `u32::MAX`-row materialisation limit (an explicit `BoltError::Plan` surfaces at execute time when it would).
+- For `LEFT` / `RIGHT` / `FULL [OUTER]`, columns coming from the *non-preserved* side are marked nullable in the output schema. Unmatched preserved-side rows emit with NULLs in those columns.
+- Right-side column names that collide with a left-side name are prefixed with `right.` (e.g. left `id` and right `id` → output has `id` and `right.id`).
+- Both sides of an equi-join key must have the same dtype; cross-dtype equi-joins (e.g. `Int32 = Int64`) are rejected.
+- SQL NULL semantics on keys: `NULL = NULL` is `UNKNOWN`, so NULL-keyed rows never match. For OUTER joins they still emit on the preserved side with the opposite side NULL-padded.
+- The executor is host-side (build smaller side into a HashMap, probe larger; for CROSS, a host-side cartesian product). GPU hash join is a 0.4 target.
+
 ## What's NOT supported
 
 These produce explicit errors at parse / plan time:
 
-### Joins beyond one-INNER-equi
-- `LEFT`, `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `OUTER` joins of any flavour.
-- Non-equi `ON` predicates (`>`, `<`, function calls, `BETWEEN`).
+### Joins beyond the supported set
+- `NATURAL JOIN`.
+- Non-equi `ON` predicates (`>`, `<`, function calls, `BETWEEN`, range joins).
 - `JOIN ... USING (...)` (rewrite as `ON`).
-- More than one `INNER JOIN` per `SELECT`.
+- More than one JOIN per `SELECT` (chained joins).
+- Computed join keys (`ON l.a + 1 = r.b`).
 
 ### Query composition
 - Subqueries anywhere (`FROM`, `WHERE`, scalar, correlated, `EXISTS`).

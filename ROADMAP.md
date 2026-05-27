@@ -12,10 +12,11 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   aggregate, and GROUP BY (single/multi-column, packed and wide keys).
 - `DISTINCT`, `LIMIT [OFFSET]`, `ORDER BY [ASC|DESC]`, `HAVING`, and
   `UNION [ALL]` (host-side executors for the non-GROUP-BY paths).
-- `INNER JOIN ... ON <equi predicate>` (host-side hash join: build the
-  smaller side into a `HashMap`, probe the larger). One join per
-  `SELECT`; LEFT/RIGHT/FULL/CROSS and non-equi predicates are out of
-  scope for 0.3.0.
+- `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS`
+  joins (host-side hash join: build one side into a `HashMap`, probe the
+  other; CROSS is a host-side cartesian product capped at the
+  `arrow::compute::take` u32 row limit). Multiple joins per `SELECT` are
+  permitted. Non-equi predicates remain out of scope.
 - Borrow-checked GPU memory primitives (`GpuVec` / `GpuView` /
   `GpuViewMut`) — use-after-free, double-free, and mutable/shared
   aliasing across kernel boundaries are compile-time errors.
@@ -43,10 +44,10 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   larger-than-VRAM tables yet.
 - One CUDA context, one device per `Engine`. `Engine::new_with_device`
   exists, but multi-GPU means one engine per device.
-- JOIN: only `INNER JOIN ... ON <equi predicate>` with one join per
-  `SELECT`; LEFT / RIGHT / FULL / CROSS and non-equi predicates are
-  rejected at the parser. The executor is host-side (build map +
-  probe), not GPU-backed.
+- JOIN: INNER / LEFT / RIGHT / FULL / CROSS supported, equi predicates
+  (or no predicate for CROSS) only; non-equi predicates remain rejected
+  at the parser. The executor is host-side (build map + probe; cartesian
+  product for CROSS), not GPU-backed.
 - No CTE, subqueries, window functions.
 - No `IS NULL` / `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, `CASE`,
 - `NULLIF`, `COALESCE`, `CAST`, or string concat (`||`).
@@ -89,10 +90,10 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 
 ### Stretch goals
 
-- GPU hash join (the 0.3.0 INNER equi-join executor is host-side; a
-  GPU-resident probe path is the natural next step).
-- LEFT / RIGHT / FULL / CROSS joins; non-equi predicates via
-  nested-loop.
+- GPU hash join (the 0.3.x INNER / LEFT / RIGHT / FULL / CROSS equi-join
+  executor is host-side; a GPU-resident probe path is the natural next
+  step).
+- Non-equi predicates via nested-loop.
 - GPU sort kernel to back `ORDER BY` and the dedup step of
   `UNION` / `DISTINCT` without round-tripping through host.
 - SQL functions surfaced through the parser (`UPPER`, `LOWER`, `LENGTH`,

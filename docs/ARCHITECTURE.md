@@ -239,8 +239,7 @@ Float MIN/MAX over `Float32` / `Float64` has no native `atom.global.min/max.f*` 
 - **No multi-GPU per engine.** One context, one device, one default stream per `Engine`. `Engine::new_with_device(idx)` picks the device; multi-GPU means one engine per device. Multiple streams are a future change.
 - **No streaming / larger-than-VRAM tables.** Multi-batch tables work (`register_table` accepts more than one `RecordBatch`), but the whole table is uploaded eagerly. A `register_table_stream` API and batched, spill-aware execution are 0.4 work.
 - **No async memcpy yet.** The async H2D / D2H FFI bindings landed in 0.3.0; integration into the executors is 0.4.
-- **No GPU hash join.** `INNER JOIN ... ON <equi predicate>` works in 0.3.0, but the executor is host-side: build a `HashMap` on the smaller side, probe the larger, materialise via `arrow::compute::take`. A GPU-resident build+probe path is a 0.4 stretch goal.
-- **No LEFT / RIGHT / FULL / CROSS join, no non-equi predicates.** Only `INNER JOIN ... ON <equi predicate>` with one join per `SELECT` is accepted; everything else is rejected at the parser.
+- **No GPU hash join.** `INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, and `CROSS` joins all work in 0.3.0, but the executors are host-side: build a `HashMap` on the smaller side, probe the larger, materialise via `arrow::compute::take`; `CROSS` is a host-side cartesian product. Non-equi predicates are still rejected. A GPU-resident build+probe path is a 0.4 stretch goal.
 - **No GPU sort kernel.** `ORDER BY` (and the dedup step of `DISTINCT` / plain `UNION`) runs host-side via `sort.rs` / `distinct.rs`. A device-resident sort is 0.4 stretch.
 - **No CTEs, subqueries, or window functions.** The parser rejects them outright.
 - **No `KernelSpec`-keyed codegen cache.** The 0.3.0 PTX cache keys on the *emitted PTX hash*, so PTXAS reassembly is skipped on a hit but codegen itself still runs. A `KernelSpec`-level cache that also skips codegen is 0.4.

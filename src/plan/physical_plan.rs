@@ -213,21 +213,25 @@ pub enum PhysicalPlan {
         /// Boolean expression evaluated against `input`'s output schema.
         predicate: Expr,
     },
-    /// INNER JOIN. The `output_schema` is `left.output_schema() ++ right`
-    /// with right-side collisions disambiguated by `join_combined_schema`;
-    /// it's stored on the variant so `output_schema()` can return a
-    /// borrow-stable `&Schema` without allocating per call.
+    /// JOIN (INNER, LEFT, RIGHT, FULL, CROSS). The `output_schema` is
+    /// `left.output_schema() ++ right` with right-side collisions
+    /// disambiguated by `join_combined_schema`, and with nullability of
+    /// the non-preserved side widened for outer joins; it's stored on the
+    /// variant so `output_schema()` can return a borrow-stable `&Schema`
+    /// without allocating per call.
     Join {
         /// Left input.
         left: Box<PhysicalPlan>,
         /// Right input.
         right: Box<PhysicalPlan>,
-        /// Join kind (INNER only in this version).
+        /// Join kind.
         join_type: JoinType,
-        /// Equi-join predicate pairs `(left_expr, right_expr)`.
+        /// Equi-join predicate pairs `(left_expr, right_expr)`. Empty for
+        /// `CROSS` joins (which have no ON clause).
         on: Vec<(Expr, Expr)>,
         /// Combined left ++ right schema with right-side collisions
-        /// renamed; see [`join_combined_schema`].
+        /// renamed and outer-side nullability widened; see
+        /// [`join_combined_schema`].
         output_schema: Schema,
     },
 }
@@ -1121,8 +1125,11 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             // currently supported below a Join the two agree. Using the
             // physical sides keeps the stored schema in lock-step with
             // what the executor will actually see at run time.
-            let output_schema =
-                join_combined_schema(l.output_schema(), r.output_schema());
+            let output_schema = join_combined_schema(
+                l.output_schema(),
+                r.output_schema(),
+                *join_type,
+            );
             Ok(PhysicalPlan::Join {
                 left: Box::new(l),
                 right: Box::new(r),

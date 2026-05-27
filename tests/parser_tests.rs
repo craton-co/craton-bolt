@@ -143,12 +143,12 @@ fn unknown_column_errors() {
     assert_err(res, "unknown column");
 }
 
-// The following six tests were originally negative ("unsupported") assertions
+// The following tests were originally negative ("unsupported") assertions
 // written before waves 7 and 8 landed DISTINCT / ORDER BY / LIMIT / HAVING /
-// UNION / INNER JOIN. Now that those features are implemented they are kept
-// as positive parse-and-lower smoke tests; representative *still*-unsupported
-// variants (LEFT/CROSS JOIN, non-equi JOIN) are covered by the negative
-// tests further down.
+// UNION / INNER JOIN. Now that those features (and LEFT / RIGHT / FULL /
+// CROSS joins as of 0.3.1) are implemented they are kept as positive
+// parse-and-lower smoke tests; representative *still*-unsupported
+// variants (non-equi JOIN) are covered by the negative tests further down.
 
 #[test]
 fn select_with_distinct_parses() {
@@ -206,14 +206,40 @@ fn inner_join_parses() {
 }
 
 #[test]
-fn left_join_unsupported() {
+fn left_join_parses() {
     let provider = fixture_with_sales2();
     let res = try_plan(
         "SELECT * FROM sales LEFT JOIN sales2 ON sales.id = sales2.id",
         &provider,
     );
-    // 0.1.x supports INNER only; LEFT/RIGHT/FULL/CROSS are deferred.
-    assert_err(res, "non-INNER join");
+    assert!(res.is_ok(), "LEFT JOIN should parse and lower: {res:?}");
+}
+
+#[test]
+fn right_join_parses() {
+    let provider = fixture_with_sales2();
+    let res = try_plan(
+        "SELECT * FROM sales RIGHT JOIN sales2 ON sales.id = sales2.id",
+        &provider,
+    );
+    assert!(res.is_ok(), "RIGHT JOIN should parse and lower: {res:?}");
+}
+
+#[test]
+fn full_outer_join_parses() {
+    let provider = fixture_with_sales2();
+    let res = try_plan(
+        "SELECT * FROM sales FULL OUTER JOIN sales2 ON sales.id = sales2.id",
+        &provider,
+    );
+    assert!(res.is_ok(), "FULL OUTER JOIN should parse and lower: {res:?}");
+}
+
+#[test]
+fn cross_join_parses() {
+    let provider = fixture_with_sales2();
+    let res = try_plan("SELECT * FROM sales CROSS JOIN sales2", &provider);
+    assert!(res.is_ok(), "CROSS JOIN should parse and lower: {res:?}");
 }
 
 #[test]
@@ -223,7 +249,7 @@ fn non_equi_join_unsupported() {
         "SELECT * FROM sales INNER JOIN sales2 ON sales.id > sales2.id",
         &provider,
     );
-    // 0.1.x supports equi predicates only.
+    // 0.3.x supports equi predicates only.
     assert_err(res, "non-equi join predicate");
 }
 
