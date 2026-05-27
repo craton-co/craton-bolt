@@ -37,8 +37,6 @@
 //! Pass-2-on-GPU is sibling agent (c)'s work and lands in a separate file
 //! at integration time; we do NOT depend on it here.
 
-use std::collections::HashMap;
-
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
