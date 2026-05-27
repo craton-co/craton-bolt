@@ -30,6 +30,7 @@ pub mod partition_reduce_kernel_minmax_i64;
 pub mod partition_reduce_kernel_minmax_float_i64;
 pub mod partition_kernel_i64;
 pub mod scatter_kernel_i64;
+pub mod sort_kernel;
 
 #[doc(hidden)]
 pub use ptx_gen::compile as compile_ptx;

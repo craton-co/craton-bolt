@@ -7,7 +7,12 @@
 //! to obtain an `UInt32Array` of permutation indices, then `take` each
 //! column to produce the sorted RecordBatch.
 //!
-//! Host-side. GPU sort (radix or merge) is a 0.2 target — see ROADMAP.md.
+//! Host-side by default. A GPU fast path (bitonic sort) kicks in for
+//! single-key, fixed-dtype, large-enough, no-NULL inputs — see
+//! [`try_gpu_sort`] and `crate::exec::gpu_sort`. The host-side
+//! lexsort_to_indices stays as the fallback for everything else (multi-key,
+//! NULLable columns, tiny inputs where the upload cost dominates, Utf8/Bool
+//! keys, etc.).
 
 use std::sync::Arc;
 
@@ -18,11 +23,24 @@ use crate::error::{BoltError, BoltResult};
 use crate::exec::QueryHandle;
 use crate::plan::logical_plan::{Expr, SortExpr};
 
+/// Row-count threshold below which we keep the sort host-side. Empirically the
+/// GPU h2d/d2h round-trip + JIT load dominates below ~10k rows; 16k gives the
+/// device path enough work to amortise the launch overhead. Adjust as the
+/// bitonic-kernel-launch-count overhead is profiled.
+const GPU_SORT_MIN_ROWS: usize = 16_384;
+
 /// Apply ORDER BY to the input handle.
 pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<QueryHandle> {
     let batch = input.into_record_batch();
     if batch.num_rows() == 0 || sort_exprs.is_empty() {
         return Ok(QueryHandle::from_record_batch(batch));
+    }
+
+    // Fast path: GPU bitonic sort for the single-key, fixed-dtype, no-NULL,
+    // large-input case. On any precondition miss, fall through to the
+    // existing host path.
+    if let Some(sorted) = try_gpu_sort(&batch, sort_exprs)? {
+        return Ok(QueryHandle::from_record_batch(sorted));
     }
 
     let mut sort_cols: Vec<SortColumn> = Vec::with_capacity(sort_exprs.len());
@@ -46,6 +64,84 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
         .collect::<BoltResult<Vec<_>>>()?;
     let out = RecordBatch::try_new(batch.schema(), new_cols).map_err(arrow_err)?;
     Ok(QueryHandle::from_record_batch(out))
+}
+
+/// Try the GPU sort fast path. Returns `Ok(Some(sorted_batch))` on success,
+/// `Ok(None)` if any precondition isn't met (the caller falls through to the
+/// host path), or `Err(...)` only on a hard GPU error (out-of-memory, kernel
+/// launch failure, etc.).
+///
+/// Stage 1 gates (every gate must hold):
+///   1. Exactly one sort key.
+///   2. Sort key is a bare column reference (no computed exprs).
+///   3. Column dtype is one of Int32 / Int64 / Float32 / Float64.
+///   4. `n_rows >= GPU_SORT_MIN_ROWS` — below this, h2d/d2h overhead wins.
+///   5. `n_rows <= u32::MAX` (and tightened to `<= 2^31` inside `gpu_sort`
+///      because the bitonic padding doubles).
+///   6. Column has `null_count() == 0`. NULLs are `TODO(s1-stage2)`.
+///
+/// On any miss we return `Ok(None)`; the host path handles the input
+/// correctly. We deliberately don't propagate gate misses as errors because
+/// the host path is a real, correct fallback.
+fn try_gpu_sort(
+    batch: &RecordBatch,
+    sort_exprs: &[SortExpr],
+) -> BoltResult<Option<RecordBatch>> {
+    // Gate 1: single key only. Multi-key bitonic is TODO(s1-stage2).
+    if sort_exprs.len() != 1 {
+        return Ok(None);
+    }
+    let se = &sort_exprs[0];
+
+    // Gate 2: bare column reference (or Alias-of-Column). We reuse the same
+    // helper as the host path so behaviour stays consistent.
+    let col_name = match expr_to_column_name(&se.expr) {
+        Ok(name) => name,
+        // Computed exprs (the only other case) fall through to host path,
+        // which will produce the proper error message.
+        Err(_) => return Ok(None),
+    };
+
+    let col_idx = match batch.schema().index_of(&col_name) {
+        Ok(i) => i,
+        Err(_) => return Ok(None),
+    };
+    let column = batch.column(col_idx);
+
+    // Gate 3: supported dtype.
+    let dtype = match crate::exec::gpu_sort::arrow_dtype_to_internal(column.data_type()) {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    // Gate 4: row count threshold.
+    let n_rows = batch.num_rows();
+    if n_rows < GPU_SORT_MIN_ROWS {
+        return Ok(None);
+    }
+
+    // Gate 5: fits the bitonic-padding bound. We check the upper bound here
+    // (gpu_sort enforces the stricter 2^31 bound internally) so any miss
+    // falls through to host without a hard error.
+    if n_rows > (u32::MAX as usize) {
+        return Ok(None);
+    }
+
+    // Gate 6: no NULLs in the key column. The bitonic comparator doesn't
+    // currently understand validity; TODO(s1-stage2) is to thread a parallel
+    // validity buffer through the kernel.
+    if column.null_count() > 0 {
+        return Ok(None);
+    }
+
+    let dir = if se.descending {
+        crate::jit::sort_kernel::SortDirection::Desc
+    } else {
+        crate::jit::sort_kernel::SortDirection::Asc
+    };
+
+    let sorted = crate::exec::gpu_sort::sort_record_batch_on_gpu(batch, col_idx, dtype, dir)?;
+    Ok(Some(sorted))
 }
 
 /// Sort keys must currently be bare column references (possibly aliased).
