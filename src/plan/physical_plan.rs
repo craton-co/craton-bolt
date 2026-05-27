@@ -116,6 +116,28 @@ pub struct KernelSpec {
     pub predicate: Option<Reg>,
     /// Number of registers used by this kernel.
     pub register_count: u32,
+    /// Pre-stage NULL handling (Option B): one entry per input column. `true`
+    /// means the caller will pass a parallel `*u8` validity pointer (1=valid,
+    /// 0=null) AFTER the value+output pointer list and the codegen should
+    /// load the validity byte at `tid` and AND it into the combined-validity
+    /// register that drives every output's validity store.
+    ///
+    /// Default is `Vec::new()` which is treated as "no input carries
+    /// validity" and the existing PTX layout is emitted verbatim — every
+    /// existing caller (e.g. the projection path in `engine.rs`) continues
+    /// to work bit-for-bit. When non-empty, must be parallel to `inputs`.
+    #[doc(hidden)]
+    pub input_has_validity: Vec<bool>,
+    /// Pre-stage NULL handling (Option B): one entry per output column.
+    /// `true` means the caller will pass a parallel `*u8` validity pointer
+    /// where the kernel writes the per-row combined-validity result. The
+    /// validity stores are appended after the regular value stores.
+    ///
+    /// Default `Vec::new()` => no output carries validity (no validity
+    /// pointers added, no validity stores emitted). When non-empty, must
+    /// be parallel to `outputs`.
+    #[doc(hidden)]
+    pub output_has_validity: Vec<bool>,
 }
 
 /// Description of an aggregation kernel.
@@ -464,6 +486,11 @@ impl<'a> Codegen<'a> {
             ops: self.ops,
             predicate,
             register_count: self.next_reg,
+            // Validity propagation (Option B) is opt-in: callers populate
+            // these via `KernelSpec::with_input_validity` etc. The default
+            // codegen path emits the historical PTX shape unchanged.
+            input_has_validity: Vec::new(),
+            output_has_validity: Vec::new(),
         }
     }
 }

@@ -553,6 +553,8 @@ mod tests {
                 ops: vec![],
                 predicate: None,
                 register_count: 0,
+                input_has_validity: vec![],
+                output_has_validity: vec![],
             });
         }
         let batch = twokey_float_batch(300_000);

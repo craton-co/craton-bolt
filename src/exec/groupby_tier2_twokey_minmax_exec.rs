@@ -792,6 +792,8 @@ mod eligibility_tests {
                 ops: vec![],
                 predicate: None,
                 register_count: 0,
+                input_has_validity: vec![],
+                output_has_validity: vec![],
             });
         }
         let batch = twokey_minmax_batch_i32(300_000);

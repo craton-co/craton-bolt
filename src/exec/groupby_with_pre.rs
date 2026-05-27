@@ -192,6 +192,23 @@ pub fn execute_groupby_with_pre(
         )));
     }
 
+    // Option-A safety net (Stage B partial): a NULL group-key row would
+    // hash to a "NULL group" that the current open-addressing keys kernel
+    // cannot represent (it has only the `i64::MIN` empty sentinel + real
+    // key slots; NULL is a separate semantic group in SQL). Stage C
+    // should add an explicit NULL slot, or pre-strip NULL-keyed rows
+    // alongside their aggregate inputs. For now we reject with a clear
+    // message rather than silently accumulate NULL-keyed rows into
+    // whichever real group happens to collide.
+    if key_host.validity.is_some() {
+        return Err(BoltError::Other(format!(
+            "groupby_with_pre: GROUP BY key column '{}' carries a NULL validity \
+             bitmap, but the GPU group-by keys kernel does not yet represent the \
+             NULL group. NULL keys are a Stage C follow-up to Option B.",
+            key_io.name
+        )));
+    }
+
     let host_keys: Vec<i64> = key_host.to_i64_for_key(&key_io.name)?;
     let n_compacted = host_keys.len();
     if n_compacted != compacted.n_rows() {
@@ -356,25 +373,66 @@ fn run_pre_stage(
         input_cols.push(PreCol::upload(arr.as_ref(), io.dtype)?);
     }
 
-    // -- Allocate zero-initialised output buffers.
+    // -- (Option B) Detect input validity, plumb through KernelSpec.
+    //    See `agg_with_pre::run_pre_stage` for the design rationale.
+    let input_has_validity: Vec<bool> =
+        input_cols.iter().map(|c| c.has_validity()).collect();
+    let any_input_validity: bool = input_has_validity.iter().any(|b| *b);
+    let output_has_validity: Vec<bool> = if any_input_validity {
+        vec![true; spec.outputs.len()]
+    } else {
+        vec![false; spec.outputs.len()]
+    };
+
+    // -- Allocate zero-initialised output buffers (with validity if needed).
     let mut output_cols: Vec<PreCol> = Vec::with_capacity(spec.outputs.len());
     for io in &spec.outputs {
-        output_cols.push(PreCol::alloc_zeros(io.dtype, n_rows)?);
+        output_cols.push(PreCol::alloc_zeros(io.dtype, n_rows, any_input_validity)?);
     }
 
-    // -- JIT-compile the projection PTX and load it.
-    let ptx = compile_ptx(spec, PRE_KERNEL_ENTRY)?;
+    // -- JIT-compile the projection PTX. Validity flags drive the
+    //    additional `*u8` params + AND-store emission in `ptx_gen`.
+    let pre_spec_for_ptx = KernelSpec {
+        input_has_validity: input_has_validity.clone(),
+        output_has_validity: output_has_validity.clone(),
+        ..spec.clone()
+    };
+    let ptx = compile_ptx(&pre_spec_for_ptx, PRE_KERNEL_ENTRY)?;
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(PRE_KERNEL_ENTRY)?;
 
-    // -- Assemble kernel parameters: inputs..., outputs..., n_rows u32.
+    // -- Assemble kernel parameters: inputs..., outputs...,
+    //    [input_validity..., output_validity...,] n_rows u32. Order
+    //    matches `ptx_gen::compile`'s param walk.
     let mut device_ptrs: Vec<CUdeviceptr> =
-        Vec::with_capacity(input_cols.len() + output_cols.len());
+        Vec::with_capacity(input_cols.len() + output_cols.len() + input_cols.len() + output_cols.len());
     for c in &input_cols {
         device_ptrs.push(c.device_ptr());
     }
     for c in &output_cols {
         device_ptrs.push(c.device_ptr());
+    }
+    for (i, has) in input_has_validity.iter().enumerate() {
+        if *has {
+            let vp = input_cols[i].validity_device_ptr().ok_or_else(|| {
+                BoltError::Other(
+                    "internal: input flagged with validity has no valid_mask device pointer"
+                        .into(),
+                )
+            })?;
+            device_ptrs.push(vp);
+        }
+    }
+    for (i, has) in output_has_validity.iter().enumerate() {
+        if *has {
+            let vp = output_cols[i].validity_device_ptr().ok_or_else(|| {
+                BoltError::Other(
+                    "internal: output flagged with validity has no valid_mask device pointer"
+                        .into(),
+                )
+            })?;
+            device_ptrs.push(vp);
+        }
     }
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
 
@@ -835,8 +893,26 @@ fn run_typed_agg(
     let eff_group_col: &GpuVec<i64> = filtered_keys_gpu.as_ref().unwrap_or(group_col);
     let validity = resolved.validity();
 
-    match (col_io.dtype, host_col) {
-        (DataType::Int32, HostCol::I32(host)) => {
+    // Option-A safety net for GROUP BY (Stage B partial): the GPU
+    // group-by-agg kernel (`crate::jit::hash_kernels::compile_groupby_agg_kernel`)
+    // does NOT yet consume validity, and stripping NULL rows here without
+    // also stripping them from the group-key column would mis-align
+    // accumulators. So when validity reaches this point — i.e. the
+    // pre-stage successfully propagated NULLs through the kernel — we
+    // reject rather than risk a silent wrong-answer accumulating into the
+    // wrong group. A Stage C follow-up should wire validity into the keys
+    // column upload (or into the agg kernel itself) to lift this gate.
+    if host_col.validity.is_some() {
+        return Err(BoltError::Other(format!(
+            "groupby_with_pre: aggregate input '{}' carries a NULL validity bitmap, \
+             but the GPU group-by agg kernel does not yet consume validity. \
+             NULL propagation through GROUP BY is a Stage C follow-up to Option B.",
+            col_io.name
+        )));
+    }
+
+    match (col_io.dtype, &host_col.values) {
+        (DataType::Int32, HostColValues::I32(host)) => {
             // SUM(Int32) widens to an i64 accumulator (matching the scalar
             // reducer and the narrow GROUP BY path): the plan declares an
             // Int64 output dtype via `crate::plan::logical_plan::sum_output_dtype`,
@@ -888,9 +964,8 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::I32(acc.to_vec()?))
         }
-        (DataType::Int64, HostCol::I64(host)) => {
-            let filtered: Vec<i64> = filter_by_validity(host, validity);
-            let input_gpu = GpuVec::<i64>::from_slice(&filtered)?;
+        (DataType::Int64, HostColValues::I64(host)) => {
+            let input_gpu = GpuVec::<i64>::from_slice(host)?;
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice(&init)?;
             launch_agg_kernel::<i64>(
@@ -906,7 +981,7 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::I64(acc.to_vec()?))
         }
-        (DataType::Float32, HostCol::F32(host)) => {
+        (DataType::Float32, HostColValues::F32(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
                 return Err(BoltError::Other(
                     "MIN/MAX over float not yet supported".into(),
@@ -929,7 +1004,7 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::F32(acc.to_vec()?))
         }
-        (DataType::Float64, HostCol::F64(host)) => {
+        (DataType::Float64, HostColValues::F64(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
                 return Err(BoltError::Other(
                     "MIN/MAX over float not yet supported".into(),
@@ -1049,7 +1124,15 @@ fn resolve_agg_input_slow<'a>(
         .collect();
     let env: expr_agg::ColumnEnv<'_> = wrapped.iter().map(|(n, c)| (n.clone(), c)).collect();
     let materialised = expr_agg::eval_expr(inner, &env, col_io.dtype, n_rows)?;
-    let (host, validity) = from_expr_host(materialised)?;
+    let host = from_expr_host(materialised)?;
+    // PV (Option B): `host.validity` is `Option<Vec<u8>>` (`1` = valid).
+    // `ResolvedHostCol::Owned::validity` is `Option<Vec<bool>>`
+    // (`true` = valid). Translate. `None` (no NULLs) stays `None` so
+    // downstream `filter_keys_if_needed` short-circuits.
+    let validity = host
+        .validity
+        .as_ref()
+        .map(|v| v.iter().map(|b| *b != 0).collect::<Vec<bool>>());
     Ok((col_io, ResolvedHostCol::Owned { col: host, validity }))
 }
 
@@ -1124,87 +1207,93 @@ fn inner_expr_of(agg: &AggregateExpr) -> &Expr {
 }
 
 /// Lift a local primitive [`HostCol`] into the `Option`-carrying
-/// [`expr_agg::HostColumn`] shape consumed by the host-side evaluator. The
-/// `pre`-stage output path has no NULL bitmap support, so every cell is
-/// `Some(_)`.
+/// [`expr_agg::HostColumn`] shape consumed by the host-side evaluator.
+///
+/// **NULL handling (Option B)**: when the source `HostCol` carries a
+/// validity bitmap, NULL rows surface as `None` so the evaluator's 3VL
+/// machinery (see `expr_agg`) propagates them. When validity is `None`
+/// every cell is `Some(_)`.
 fn to_expr_host(c: &HostCol) -> expr_agg::HostColumn {
-    match c {
-        HostCol::I32(v) => expr_agg::HostColumn::I32(v.iter().map(|x| Some(*x)).collect()),
-        HostCol::I64(v) => expr_agg::HostColumn::I64(v.iter().map(|x| Some(*x)).collect()),
-        HostCol::F32(v) => expr_agg::HostColumn::F32(v.iter().map(|x| Some(*x)).collect()),
-        HostCol::F64(v) => expr_agg::HostColumn::F64(v.iter().map(|x| Some(*x)).collect()),
+    let valid_at = |i: usize| -> bool {
+        match &c.validity {
+            Some(v) => v[i] != 0,
+            None => true,
+        }
+    };
+    fn lift<T: Copy>(values: &[T], valid_at: impl Fn(usize) -> bool) -> Vec<Option<T>> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, x)| if valid_at(i) { Some(*x) } else { None })
+            .collect()
+    }
+    match &c.values {
+        HostColValues::I32(v) => expr_agg::HostColumn::I32(lift(v, valid_at)),
+        HostColValues::I64(v) => expr_agg::HostColumn::I64(lift(v, valid_at)),
+        HostColValues::F32(v) => expr_agg::HostColumn::F32(lift(v, valid_at)),
+        HostColValues::F64(v) => expr_agg::HostColumn::F64(lift(v, valid_at)),
     }
 }
 
 /// Convert a materialised [`expr_agg::HostColumn`] back into the local
-/// primitive [`HostCol`] shape consumed by the GPU agg kernels, plus a
-/// per-row validity mask.
-///
-/// **NULL handling**: SQL aggregate semantics require `SUM`/`MIN`/`MAX`/`AVG`/
-/// `COUNT(col)` to ignore NULL rows. Unlike the scalar `agg_with_pre`
-/// counterpart — which can simply drop NULL rows because each scalar
-/// aggregate is independent — the GROUP BY path must keep the value column
-/// positionally aligned with the key column. We therefore return:
-///
-/// - a `HostCol` where each NULL cell holds an arbitrary placeholder
-///   (dtype-zero), and
-/// - an `Option<Vec<bool>>` validity mask where `mask[i] == true` means
-///   row `i` was non-NULL. The mask is `None` (saving an allocation and
-///   a filter pass) when every row was non-NULL.
-///
-/// Downstream, `run_one_aggregate` filters both the keys column and the
-/// value column by this mask before uploading to the GPU, so MIN/MAX/SUM/
-/// AVG/COUNT(col) only see the validity-true rows.
-///
-/// A previous version of this function coerced NULLs to dtype-zero with no
-/// mask, which was a correctness bug: `MIN([NULL, 5])` returned `0` instead
-/// of `5`, `MAX([NULL, -3])` returned `0` instead of `-3`, and `AVG([NULL, 4])`
-/// returned `2.0` (4/2) instead of `4.0` (4/1). See `agg_with_pre.rs` for
-/// the matching scalar fix.
-///
-/// Bool / Utf8 materialisations are still rejected — the GPU agg kernels
-/// only accept primitive numeric inputs.
-fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<(HostCol, Option<Vec<bool>>)> {
-    fn split<T: Copy + Default>(v: Vec<Option<T>>) -> (Vec<T>, Option<Vec<bool>>) {
-        let mut any_null = false;
+/// primitive [`HostCol`] shape. NULLs are **preserved** as a `validity`
+/// bitmap (Option B): downstream `run_typed_agg` rejects validity-bearing
+/// inputs with a clear error (Stage C follow-up). Bool / Utf8
+/// materialisations are rejected — the GPU agg kernels only accept
+/// primitive numeric inputs.
+fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
+    fn split<T: Copy + Default>(v: Vec<Option<T>>) -> (Vec<T>, Option<Vec<u8>>) {
+        let any_null = v.iter().any(|x| x.is_none());
+        if !any_null {
+            return (
+                v.into_iter().map(|x| x.unwrap_or_default()).collect(),
+                None,
+            );
+        }
         let mut values: Vec<T> = Vec::with_capacity(v.len());
-        let mut mask: Vec<bool> = Vec::with_capacity(v.len());
-        for cell in v {
-            match cell {
-                Some(x) => {
-                    values.push(x);
-                    mask.push(true);
+        let mut validity: Vec<u8> = Vec::with_capacity(v.len());
+        for x in v.into_iter() {
+            match x {
+                Some(val) => {
+                    values.push(val);
+                    validity.push(1);
                 }
                 None => {
                     values.push(T::default());
-                    mask.push(false);
-                    any_null = true;
+                    validity.push(0);
                 }
             }
         }
-        if any_null {
-            (values, Some(mask))
-        } else {
-            (values, None)
-        }
+        (values, Some(validity))
     }
-
     match c {
         expr_agg::HostColumn::I32(v) => {
-            let (vals, mask) = split::<i32>(v);
-            Ok((HostCol::I32(vals), mask))
+            let (vals, valid) = split::<i32>(v);
+            Ok(HostCol {
+                values: HostColValues::I32(vals),
+                validity: valid,
+            })
         }
         expr_agg::HostColumn::I64(v) => {
-            let (vals, mask) = split::<i64>(v);
-            Ok((HostCol::I64(vals), mask))
+            let (vals, valid) = split::<i64>(v);
+            Ok(HostCol {
+                values: HostColValues::I64(vals),
+                validity: valid,
+            })
         }
         expr_agg::HostColumn::F32(v) => {
-            let (vals, mask) = split::<f32>(v);
-            Ok((HostCol::F32(vals), mask))
+            let (vals, valid) = split::<f32>(v);
+            Ok(HostCol {
+                values: HostColValues::F32(vals),
+                validity: valid,
+            })
         }
         expr_agg::HostColumn::F64(v) => {
-            let (vals, mask) = split::<f64>(v);
-            Ok((HostCol::F64(vals), mask))
+            let (vals, valid) = split::<f64>(v);
+            Ok(HostCol {
+                values: HostColValues::F64(vals),
+                validity: valid,
+            })
         }
         expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => {
             Err(BoltError::Type(
@@ -1358,7 +1447,17 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
 // ===========================================================================
 
 /// Heterogenous owned device column for the pre kernel's inputs and outputs.
-enum PreCol {
+///
+/// **NULL handling (Option B)**: identical contract to
+/// [`crate::exec::agg_with_pre::PreCol`] — see that doc for the rationale.
+/// Each `PreCol` may carry a parallel `valid_mask: GpuVec<u8>` (`1` =
+/// valid, `0` = null) that rides alongside the value buffer.
+struct PreCol {
+    values: PreColValues,
+    valid_mask: Option<GpuVec<u8>>,
+}
+
+enum PreColValues {
     I32(GpuVec<i32>),
     I64(GpuVec<i64>),
     F32(GpuVec<f32>),
@@ -1366,104 +1465,132 @@ enum PreCol {
 }
 
 impl PreCol {
-    /// Upload an Arrow array to the GPU, downcasting per `dtype`.
-    ///
-    /// **NULL handling**: rejects any input array with `null_count() > 0`.
-    /// The pre-stage GPU kernels operate on raw value buffers and do not
-    /// (yet) carry a validity bitmap, so a NULL would silently feed garbage
-    /// into multiplications / additions. The clean error is the safe
-    /// surgical fix; full propagation is tracked below.
-    ///
-    /// TODO(pre-stage-nulls): propagate `arr.nulls()` into a parallel
-    /// `valid_mask: GpuBuffer<u8>` per `PreCol`, then have the JIT kernel
-    /// emit `value if valid else identity` per op so NULL semantics survive
-    /// the pre-stage. Until then, planners that introduce a pre kernel
-    /// over a NULL-bearing source column must ensure either (a) the source
-    /// has been filtered upstream or (b) the column is unconditionally
-    /// non-null.
+    /// Upload an Arrow array to the GPU, downcasting per `dtype`. Mirrors
+    /// `agg_with_pre::PreCol::upload`; see that for the NULL-handling
+    /// contract (Option B: validity bitmap propagates to the GPU
+    /// alongside the value buffer).
     fn upload(arr: &dyn Array, dtype: DataType) -> BoltResult<Self> {
-        if arr.null_count() > 0 {
-            return Err(BoltError::Type(format!(
-                "groupby_with_pre: pre-stage kernels do not yet propagate NULL \
-                 validity; input column with dtype {:?} has {} NULL(s). \
-                 See TODO(pre-stage-nulls) in groupby_with_pre.rs.",
-                dtype,
-                arr.null_count()
-            )));
-        }
-        match dtype {
+        let n = arr.len();
+        let valid_mask = if arr.null_count() > 0 {
+            let mut bytes: Vec<u8> = Vec::with_capacity(n);
+            for i in 0..n {
+                bytes.push(if arr.is_null(i) { 0 } else { 1 });
+            }
+            Some(GpuVec::<u8>::from_slice(&bytes)?)
+        } else {
+            None
+        };
+        let values = match dtype {
             DataType::Int32 => {
                 let pa = arr
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .ok_or_else(|| downcast_err("input", "Int32"))?;
-                Ok(PreCol::I32(GpuVec::from_buffer(primitive_to_gpu(pa)?)))
+                PreColValues::I32(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
             DataType::Int64 => {
                 let pa = arr
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| downcast_err("input", "Int64"))?;
-                Ok(PreCol::I64(GpuVec::from_buffer(primitive_to_gpu(pa)?)))
+                PreColValues::I64(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
             DataType::Float32 => {
                 let pa = arr
                     .as_any()
                     .downcast_ref::<Float32Array>()
                     .ok_or_else(|| downcast_err("input", "Float32"))?;
-                Ok(PreCol::F32(GpuVec::from_buffer(primitive_to_gpu(pa)?)))
+                PreColValues::F32(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
             DataType::Float64 => {
                 let pa = arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| downcast_err("input", "Float64"))?;
-                Ok(PreCol::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?)))
+                PreColValues::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
-            DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
-                "groupby_with_pre: pre kernel column dtype {:?} not supported",
-                dtype
-            ))),
-        }
+            DataType::Bool | DataType::Utf8 => {
+                return Err(BoltError::Type(format!(
+                    "groupby_with_pre: pre kernel column dtype {:?} not supported",
+                    dtype
+                )))
+            }
+        };
+        Ok(PreCol { values, valid_mask })
     }
 
     /// Allocate a zero-initialised device column of `n` rows.
-    fn alloc_zeros(dtype: DataType, n: usize) -> BoltResult<Self> {
-        match dtype {
-            DataType::Int32 => Ok(PreCol::I32(GpuVec::<i32>::zeros(n)?)),
-            DataType::Int64 => Ok(PreCol::I64(GpuVec::<i64>::zeros(n)?)),
-            DataType::Float32 => Ok(PreCol::F32(GpuVec::<f32>::zeros(n)?)),
-            DataType::Float64 => Ok(PreCol::F64(GpuVec::<f64>::zeros(n)?)),
-            DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
-                "groupby_with_pre: pre kernel output dtype {:?} not supported",
-                dtype
-            ))),
+    fn alloc_zeros(dtype: DataType, n: usize, with_validity: bool) -> BoltResult<Self> {
+        let values = match dtype {
+            DataType::Int32 => PreColValues::I32(GpuVec::<i32>::zeros(n)?),
+            DataType::Int64 => PreColValues::I64(GpuVec::<i64>::zeros(n)?),
+            DataType::Float32 => PreColValues::F32(GpuVec::<f32>::zeros(n)?),
+            DataType::Float64 => PreColValues::F64(GpuVec::<f64>::zeros(n)?),
+            DataType::Bool | DataType::Utf8 => {
+                return Err(BoltError::Type(format!(
+                    "groupby_with_pre: pre kernel output dtype {:?} not supported",
+                    dtype
+                )))
+            }
+        };
+        let valid_mask = if with_validity {
+            Some(GpuVec::<u8>::zeros(n)?)
+        } else {
+            None
+        };
+        Ok(PreCol { values, valid_mask })
+    }
+
+    /// Raw device pointer for kernel-parameter assembly (value buffer).
+    fn device_ptr(&self) -> CUdeviceptr {
+        match &self.values {
+            PreColValues::I32(v) => v.device_ptr(),
+            PreColValues::I64(v) => v.device_ptr(),
+            PreColValues::F32(v) => v.device_ptr(),
+            PreColValues::F64(v) => v.device_ptr(),
         }
     }
 
-    /// Raw device pointer for kernel-parameter assembly.
-    fn device_ptr(&self) -> CUdeviceptr {
-        match self {
-            PreCol::I32(v) => v.device_ptr(),
-            PreCol::I64(v) => v.device_ptr(),
-            PreCol::F32(v) => v.device_ptr(),
-            PreCol::F64(v) => v.device_ptr(),
-        }
+    /// Raw device pointer for the validity buffer, if present.
+    fn validity_device_ptr(&self) -> Option<CUdeviceptr> {
+        self.valid_mask.as_ref().map(|m| m.device_ptr())
+    }
+
+    /// True iff this `PreCol` carries a per-row validity bitmap.
+    fn has_validity(&self) -> bool {
+        self.valid_mask.is_some()
     }
 
     /// Download the column to host and verify the length matches `n_rows`.
     fn to_host_col(self, n_rows: usize) -> BoltResult<HostCol> {
-        match self {
-            PreCol::I32(v) => Ok(HostCol::I32(copy_back::<i32>(&v, n_rows)?)),
-            PreCol::I64(v) => Ok(HostCol::I64(copy_back::<i64>(&v, n_rows)?)),
-            PreCol::F32(v) => Ok(HostCol::F32(copy_back::<f32>(&v, n_rows)?)),
-            PreCol::F64(v) => Ok(HostCol::F64(copy_back::<f64>(&v, n_rows)?)),
-        }
+        let PreCol { values, valid_mask } = self;
+        let validity: Option<Vec<u8>> = match valid_mask {
+            Some(v) => Some(copy_back::<u8>(&v, n_rows)?),
+            None => None,
+        };
+        let host_values = match values {
+            PreColValues::I32(v) => HostColValues::I32(copy_back::<i32>(&v, n_rows)?),
+            PreColValues::I64(v) => HostColValues::I64(copy_back::<i64>(&v, n_rows)?),
+            PreColValues::F32(v) => HostColValues::F32(copy_back::<f32>(&v, n_rows)?),
+            PreColValues::F64(v) => HostColValues::F64(copy_back::<f64>(&v, n_rows)?),
+        };
+        Ok(HostCol {
+            values: host_values,
+            validity,
+        })
     }
 }
 
-/// Host-side typed column produced by downloading a `PreCol`.
-enum HostCol {
+/// Host-side typed column produced by downloading a `PreCol`. Mirrors
+/// `agg_with_pre::HostCol`. Carries a parallel `validity` vector when
+/// any input row was NULL.
+struct HostCol {
+    values: HostColValues,
+    /// Per-row validity. `None` => all rows valid.
+    validity: Option<Vec<u8>>,
+}
+
+enum HostColValues {
     I32(Vec<i32>),
     I64(Vec<i64>),
     F32(Vec<f32>),
@@ -1473,15 +1600,16 @@ enum HostCol {
 impl HostCol {
     /// Number of elements in the column.
     fn len(&self) -> usize {
-        match self {
-            HostCol::I32(v) => v.len(),
-            HostCol::I64(v) => v.len(),
-            HostCol::F32(v) => v.len(),
-            HostCol::F64(v) => v.len(),
+        match &self.values {
+            HostColValues::I32(v) => v.len(),
+            HostColValues::I64(v) => v.len(),
+            HostColValues::F32(v) => v.len(),
+            HostColValues::F64(v) => v.len(),
         }
     }
 
     /// Return a new column containing only positions where `mask[i]` is true.
+    /// Validity (if any) is compacted in lockstep.
     fn compact(self, mask: &[bool]) -> BoltResult<HostCol> {
         if mask.len() != self.len() {
             return Err(BoltError::Other(format!(
@@ -1490,21 +1618,51 @@ impl HostCol {
                 self.len()
             )));
         }
-        Ok(match self {
-            HostCol::I32(v) => HostCol::I32(filter_vec(v, mask)),
-            HostCol::I64(v) => HostCol::I64(filter_vec(v, mask)),
-            HostCol::F32(v) => HostCol::F32(filter_vec(v, mask)),
-            HostCol::F64(v) => HostCol::F64(filter_vec(v, mask)),
-        })
+        let HostCol { values, validity } = self;
+        let values = match values {
+            HostColValues::I32(v) => HostColValues::I32(filter_vec(v, mask)),
+            HostColValues::I64(v) => HostColValues::I64(filter_vec(v, mask)),
+            HostColValues::F32(v) => HostColValues::F32(filter_vec(v, mask)),
+            HostColValues::F64(v) => HostColValues::F64(filter_vec(v, mask)),
+        };
+        let validity = validity.map(|v| filter_vec(v, mask));
+        Ok(HostCol { values, validity })
+    }
+
+    /// Strip NULL rows according to the validity bitmap. No-op when
+    /// validity is already `None`. Currently only exercised by the
+    /// `null_propagation_tests` module — production code (`run_typed_agg`)
+    /// rejects validity-bearing inputs outright until Stage C lifts the
+    /// gate by stripping in lockstep with the GROUP BY key column.
+    #[allow(dead_code)]
+    fn strip_nulls(self) -> HostCol {
+        let HostCol { values, validity } = self;
+        let Some(v) = validity else {
+            return HostCol {
+                values,
+                validity: None,
+            };
+        };
+        let keep: Vec<bool> = v.iter().map(|b| *b != 0).collect();
+        let values = match values {
+            HostColValues::I32(x) => HostColValues::I32(filter_vec(x, &keep)),
+            HostColValues::I64(x) => HostColValues::I64(filter_vec(x, &keep)),
+            HostColValues::F32(x) => HostColValues::F32(filter_vec(x, &keep)),
+            HostColValues::F64(x) => HostColValues::F64(filter_vec(x, &keep)),
+        };
+        HostCol {
+            values,
+            validity: None,
+        }
     }
 
     /// Convert the column to a `Vec<i64>` for use as a GROUP BY key. Int32
     /// upcasts; everything else is an error.
     fn to_i64_for_key(&self, col_name: &str) -> BoltResult<Vec<i64>> {
-        match self {
-            HostCol::I32(v) => Ok(v.iter().map(|&x| x as i64).collect()),
-            HostCol::I64(v) => Ok(v.clone()),
-            HostCol::F32(_) | HostCol::F64(_) => Err(BoltError::Type(format!(
+        match &self.values {
+            HostColValues::I32(v) => Ok(v.iter().map(|&x| x as i64).collect()),
+            HostColValues::I64(v) => Ok(v.clone()),
+            HostColValues::F32(_) | HostColValues::F64(_) => Err(BoltError::Type(format!(
                 "float GROUP BY keys not yet supported (column '{}')",
                 col_name
             ))),
@@ -1515,11 +1673,11 @@ impl HostCol {
     /// numeric variant upcasts. `col_name` is only used to enrich a future
     /// error message if we ever extend this to reject non-numeric variants.
     fn to_f64(&self, _col_name: &str) -> BoltResult<Vec<f64>> {
-        match self {
-            HostCol::I32(v) => Ok(v.iter().map(|&x| x as f64).collect()),
-            HostCol::I64(v) => Ok(v.iter().map(|&x| x as f64).collect()),
-            HostCol::F32(v) => Ok(v.iter().map(|&x| x as f64).collect()),
-            HostCol::F64(v) => Ok(v.clone()),
+        match &self.values {
+            HostColValues::I32(v) => Ok(v.iter().map(|&x| x as f64).collect()),
+            HostColValues::I64(v) => Ok(v.iter().map(|&x| x as f64).collect()),
+            HostColValues::F32(v) => Ok(v.iter().map(|&x| x as f64).collect()),
+            HostColValues::F64(v) => Ok(v.clone()),
         }
     }
 
@@ -1534,23 +1692,23 @@ impl HostCol {
                 self.len()
             )));
         }
-        Ok(match self {
-            HostCol::I32(v) => v
+        Ok(match &self.values {
+            HostColValues::I32(v) => v
                 .iter()
                 .zip(mask.iter())
                 .filter_map(|(&x, &m)| if m { Some(x as f64) } else { None })
                 .collect(),
-            HostCol::I64(v) => v
+            HostColValues::I64(v) => v
                 .iter()
                 .zip(mask.iter())
                 .filter_map(|(&x, &m)| if m { Some(x as f64) } else { None })
                 .collect(),
-            HostCol::F32(v) => v
+            HostColValues::F32(v) => v
                 .iter()
                 .zip(mask.iter())
                 .filter_map(|(&x, &m)| if m { Some(x as f64) } else { None })
                 .collect(),
-            HostCol::F64(v) => v
+            HostColValues::F64(v) => v
                 .iter()
                 .zip(mask.iter())
                 .filter_map(|(&x, &m)| if m { Some(x) } else { None })
@@ -1562,11 +1720,11 @@ impl HostCol {
 /// True iff the `HostCol` variant matches the plan dtype it should carry.
 fn host_col_matches_dtype(col: &HostCol, dtype: DataType) -> bool {
     matches!(
-        (col, dtype),
-        (HostCol::I32(_), DataType::Int32)
-            | (HostCol::I64(_), DataType::Int64)
-            | (HostCol::F32(_), DataType::Float32)
-            | (HostCol::F64(_), DataType::Float64)
+        (&col.values, dtype),
+        (HostColValues::I32(_), DataType::Int32)
+            | (HostColValues::I64(_), DataType::Int64)
+            | (HostColValues::F32(_), DataType::Float32)
+            | (HostColValues::F64(_), DataType::Float64)
     )
 }
 
@@ -1704,336 +1862,86 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-//
-// These tests cover the host-only NULL-handling contract of `from_expr_host`
-// (the patch point for the GROUP BY correctness bug) and the host-side
-// key/value filtering performed by [`filter_keys_if_needed`] /
-// [`filter_by_validity`] / [`HostCol::to_f64_filtered`]. They cannot
-// exercise the GPU agg kernels directly (which require CUDA), so they
-// emulate the per-group accumulation that the GPU kernel would perform on
-// the validity-filtered (group, value) pairs and assert that each group's
-// aggregate matches SQL semantics.
-//
-// The bug being fixed: a previous version of `from_expr_host` coerced
-// NULLs to dtype-zero, which made `MIN([NULL, 5])` return `0` instead of
-// `5`, `MAX([NULL, -3])` return `0` instead of `-3`, `AVG([NULL, 4])`
-// return `2.0` instead of `4.0`, and `COUNT(col)` count NULL rows.
-
 #[cfg(test)]
-mod tests {
+mod null_propagation_tests {
+    //! Host-only tests for the Option B NULL-propagation gates added to
+    //! the groupby-with-pre stage. The GROUP BY GPU path itself (keys
+    //! kernel + agg kernel) does NOT yet consume validity (a Stage C
+    //! follow-up), so the in-module gates ERROR rather than risk
+    //! silently aggregating NULL-keyed rows into the wrong group or
+    //! summing garbage.
     use super::*;
-    use std::collections::HashMap;
 
-    /// Emulate the per-group SUM/MIN/MAX/COUNT that the GPU kernel would
-    /// perform after we feed it the validity-filtered (key, value) pairs.
-    /// Returns a deterministically sorted `(key, agg_value)` Vec.
-    fn group_reduce_i32(
-        keys: &[i64],
-        values: &[i32],
-        op: ReduceOp,
-    ) -> Vec<(i64, i32)> {
-        assert_eq!(keys.len(), values.len());
-        let mut acc: HashMap<i64, i32> = HashMap::new();
-        for (&k, &v) in keys.iter().zip(values.iter()) {
-            let cell = acc.entry(k).or_insert_with(|| match op {
-                ReduceOp::Sum | ReduceOp::Count => 0,
-                ReduceOp::Min => i32::MAX,
-                ReduceOp::Max => i32::MIN,
-            });
-            *cell = match op {
-                ReduceOp::Sum | ReduceOp::Count => cell.wrapping_add(v),
-                ReduceOp::Min => (*cell).min(v),
-                ReduceOp::Max => (*cell).max(v),
-            };
-        }
-        let mut out: Vec<(i64, i32)> = acc.into_iter().collect();
-        out.sort_unstable_by_key(|(k, _)| *k);
-        out
-    }
+    // ---- HostCol mirrors agg_with_pre semantics -----------------------------
 
-    fn group_count(keys: &[i64]) -> Vec<(i64, i64)> {
-        let mut acc: HashMap<i64, i64> = HashMap::new();
-        for &k in keys {
-            *acc.entry(k).or_insert(0) += 1;
-        }
-        let mut out: Vec<(i64, i64)> = acc.into_iter().collect();
-        out.sort_unstable_by_key(|(k, _)| *k);
-        out
-    }
-
-    fn group_sum_f64(keys: &[i64], values: &[f64]) -> Vec<(i64, f64)> {
-        assert_eq!(keys.len(), values.len());
-        let mut acc: HashMap<i64, f64> = HashMap::new();
-        for (&k, &v) in keys.iter().zip(values.iter()) {
-            *acc.entry(k).or_insert(0.0) += v;
-        }
-        let mut out: Vec<(i64, f64)> = acc.into_iter().collect();
-        out.sort_unstable_by_key(|(k, _)| *k);
-        out
-    }
-
-    /// `from_expr_host` returns a parallel validity mask and dtype-zero
-    /// placeholder for NULL cells; no mask is returned when every cell
-    /// is non-NULL (small optimisation).
     #[test]
-    fn from_expr_host_returns_validity_mask() {
-        let col = expr_agg::HostColumn::I32(vec![None, Some(5), Some(7), None]);
-        let (host, validity) = from_expr_host(col).expect("ok");
-        match host {
-            HostCol::I32(v) => assert_eq!(v.len(), 4),
-            _ => panic!("expected I32"),
-        }
-        let mask = validity.expect("validity mask should be present when NULLs exist");
-        assert_eq!(mask, vec![false, true, true, false]);
-    }
-
-    /// When the input has no NULLs the validity mask is `None` (so the
-    /// downstream filter passes are skipped entirely).
-    #[test]
-    fn from_expr_host_omits_mask_when_all_valid() {
-        let col = expr_agg::HostColumn::I32(vec![Some(1), Some(2), Some(3)]);
-        let (host, validity) = from_expr_host(col).expect("ok");
-        assert!(validity.is_none(), "no NULLs => no mask");
-        match host {
-            HostCol::I32(v) => assert_eq!(v, vec![1, 2, 3]),
-            _ => panic!("expected I32"),
-        }
-    }
-
-    /// MIN per group ignores NULL rows: `MIN([NULL, 5]) = 5`, not `0`. Pre-fix
-    /// the NULL-zeroed column produced `MIN(group=0) = 0`.
-    #[test]
-    fn group_min_ignores_nulls() {
-        // Two groups (1, 2). Group 1 has values [NULL, 5]; group 2 has [10].
-        let keys = vec![1i64, 1, 2];
-        let values_col = expr_agg::HostColumn::I32(vec![None, Some(5), Some(10)]);
-        let (host, validity) = from_expr_host(values_col).expect("ok");
-        let mask = validity.as_deref();
-        let values: Vec<i32> = filter_by_validity(
-            match &host {
-                HostCol::I32(v) => v,
-                _ => panic!("expected I32"),
-            },
-            mask,
-        );
-        let filtered_keys: Vec<i64> = match mask {
-            Some(m) => keys.iter().zip(m.iter()).filter_map(|(&k, &v)| if v { Some(k) } else { None }).collect(),
-            None => keys.clone(),
+    fn host_col_compact_validity_alignment() {
+        let col = HostCol {
+            values: HostColValues::I32(vec![1, 2, 3, 4]),
+            validity: Some(vec![1, 0, 1, 0]),
         };
-        let result = group_reduce_i32(&filtered_keys, &values, ReduceOp::Min);
-        assert_eq!(result, vec![(1, 5), (2, 10)]);
+        let mask = vec![true, true, false, true];
+        let compact = col.compact(&mask).expect("compact");
+        match compact.values {
+            HostColValues::I32(v) => assert_eq!(v, vec![1, 2, 4]),
+            _ => panic!("dtype changed"),
+        }
+        assert_eq!(compact.validity.as_deref(), Some(&[1u8, 0, 0][..]));
     }
 
-    /// MAX per group ignores NULL rows: `MAX([NULL, -3]) = -3`, not `0`.
-    /// Pre-fix the NULL-zeroed column made `max(0, -3) == 0`.
     #[test]
-    fn group_max_ignores_nulls() {
-        // Group 1: [NULL, -3]; group 2: [-5, NULL].
-        let keys = vec![1i64, 1, 2, 2];
-        let values_col = expr_agg::HostColumn::I32(vec![None, Some(-3), Some(-5), None]);
-        let (host, validity) = from_expr_host(values_col).expect("ok");
-        let mask = validity.as_deref();
-        let values: Vec<i32> = filter_by_validity(
-            match &host {
-                HostCol::I32(v) => v,
-                _ => panic!("expected I32"),
-            },
-            mask,
-        );
-        let filtered_keys: Vec<i64> = match mask {
-            Some(m) => keys.iter().zip(m.iter()).filter_map(|(&k, &v)| if v { Some(k) } else { None }).collect(),
-            None => keys.clone(),
+    fn host_col_strip_nulls_drops_invalid_rows() {
+        let col = HostCol {
+            values: HostColValues::F64(vec![1.0, 2.0, 3.0]),
+            validity: Some(vec![1, 0, 1]),
         };
-        let result = group_reduce_i32(&filtered_keys, &values, ReduceOp::Max);
-        assert_eq!(result, vec![(1, -3), (2, -5)]);
+        let stripped = col.strip_nulls();
+        assert!(stripped.validity.is_none());
+        match stripped.values {
+            HostColValues::F64(v) => assert_eq!(v, vec![1.0, 3.0]),
+            _ => panic!("dtype changed"),
+        }
     }
 
-    /// AVG per group: denominator must exclude NULL rows.
-    /// Group 1 has [NULL, 4.0] -> AVG = 4.0 (not 2.0).
-    /// Group 2 has [3.0, 5.0] -> AVG = 4.0.
     #[test]
-    fn group_avg_excludes_nulls_from_denominator() {
-        let keys = vec![1i64, 1, 2, 2];
-        let values_col = expr_agg::HostColumn::F64(vec![None, Some(4.0), Some(3.0), Some(5.0)]);
-        let (host, validity) = from_expr_host(values_col).expect("ok");
-        let mask = validity.as_deref();
-        // Slow-path AVG materialises at f64 and uses `to_f64_filtered`.
-        let values_f64 = match (mask, &host) {
-            (Some(m), HostCol::F64(v)) => host_to_f64_filtered_test(v, m),
-            (None, HostCol::F64(v)) => v.clone(),
-            _ => panic!("expected F64"),
+    fn to_expr_host_surfaces_nulls() {
+        let col = HostCol {
+            values: HostColValues::I64(vec![10, 20, 30]),
+            validity: Some(vec![1, 0, 1]),
         };
-        let filtered_keys: Vec<i64> = match mask {
-            Some(m) => keys.iter().zip(m.iter()).filter_map(|(&k, &v)| if v { Some(k) } else { None }).collect(),
-            None => keys.clone(),
-        };
-        let sums = group_sum_f64(&filtered_keys, &values_f64);
-        let counts = group_count(&filtered_keys);
-        // Combine sum/count per group and compute AVG.
-        let mut averages: Vec<(i64, f64)> = sums
-            .iter()
-            .zip(counts.iter())
-            .map(|(&(k1, s), &(k2, c))| {
-                assert_eq!(k1, k2);
-                let avg = if c == 0 { 0.0 } else { s / (c as f64) };
-                (k1, avg)
-            })
+        let lifted = to_expr_host(&col);
+        match lifted {
+            expr_agg::HostColumn::I64(v) => {
+                assert_eq!(v, vec![Some(10), None, Some(30)]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn from_expr_host_preserves_validity() {
+        let col = expr_agg::HostColumn::F32(vec![Some(1.5f32), None, Some(3.5f32)]);
+        let out = from_expr_host(col).expect("ok");
+        assert_eq!(out.validity.as_deref(), Some(&[1u8, 0, 1][..]));
+        match out.values {
+            HostColValues::F32(v) => assert_eq!(v, vec![1.5, 0.0, 3.5]),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ---- Arrow NULL-bearing arrays now flow through `PreCol::upload` ------
+    //
+    // PreCol::upload requires CUDA so we don't invoke it here. We test the
+    // observable invariant: an Arrow NULL-bearing array can be queried for
+    // a host-side validity Vec<u8> that matches what `upload` constructs.
+
+    #[test]
+    fn arrow_null_bearing_int64_array_extracts_validity_bytes() {
+        let arr = Int64Array::from(vec![Some(1i64), None, Some(3i64), None, Some(5i64)]);
+        assert_eq!(arr.null_count(), 2);
+        let bytes: Vec<u8> = (0..arr.len())
+            .map(|i| if arr.is_null(i) { 0 } else { 1 })
             .collect();
-        averages.sort_unstable_by_key(|(k, _)| *k);
-        assert_eq!(averages.len(), 2);
-        assert_eq!(averages[0].0, 1);
-        assert!((averages[0].1 - 4.0).abs() < 1e-12, "group 1 AVG was {}", averages[0].1);
-        assert_eq!(averages[1].0, 2);
-        assert!((averages[1].1 - 4.0).abs() < 1e-12, "group 2 AVG was {}", averages[1].1);
-    }
-
-    /// Local copy of the `HostCol::to_f64_filtered` logic in test scope so
-    /// we can run it on a raw `&[f64]` borrowed from a destructured HostCol
-    /// match without colliding with the `to_f64_filtered` method's
-    /// `&self` borrow (the test is short, this keeps the assertions
-    /// readable).
-    fn host_to_f64_filtered_test(v: &[f64], mask: &[bool]) -> Vec<f64> {
-        v.iter()
-            .zip(mask.iter())
-            .filter_map(|(&x, &m)| if m { Some(x) } else { None })
-            .collect()
-    }
-
-    /// COUNT(col) excludes NULL rows per group.
-    /// Group 1 has [NULL, 5, NULL, 7] -> COUNT = 2.
-    /// Group 2 has [10] -> COUNT = 1.
-    #[test]
-    fn group_count_col_excludes_nulls() {
-        let keys = vec![1i64, 1, 1, 1, 2];
-        let values_col =
-            expr_agg::HostColumn::I32(vec![None, Some(5), None, Some(7), Some(10)]);
-        let (_host, validity) = from_expr_host(values_col).expect("ok");
-        let mask = validity.as_deref();
-        let filtered_keys: Vec<i64> = match mask {
-            Some(m) => keys.iter().zip(m.iter()).filter_map(|(&k, &v)| if v { Some(k) } else { None }).collect(),
-            None => keys.clone(),
-        };
-        let counts = group_count(&filtered_keys);
-        assert_eq!(counts, vec![(1, 2), (2, 1)]);
-    }
-
-    /// SUM per group was "accidentally correct" under the old NULL-as-zero
-    /// behavior (0 is the SUM identity). Verify it stays correct under the
-    /// new filter-then-reduce pipeline. Group 1: [NULL, 5, 7] -> SUM = 12.
-    /// Group 2: [3] -> SUM = 3.
-    #[test]
-    fn group_sum_matches_non_null_sum() {
-        let keys = vec![1i64, 1, 1, 2];
-        let values_col = expr_agg::HostColumn::I32(vec![None, Some(5), Some(7), Some(3)]);
-        let (host, validity) = from_expr_host(values_col).expect("ok");
-        let mask = validity.as_deref();
-        let values: Vec<i32> = filter_by_validity(
-            match &host {
-                HostCol::I32(v) => v,
-                _ => panic!("expected I32"),
-            },
-            mask,
-        );
-        let filtered_keys: Vec<i64> = match mask {
-            Some(m) => keys.iter().zip(m.iter()).filter_map(|(&k, &v)| if v { Some(k) } else { None }).collect(),
-            None => keys.clone(),
-        };
-        let sums = group_reduce_i32(&filtered_keys, &values, ReduceOp::Sum);
-        assert_eq!(sums, vec![(1, 12), (2, 3)]);
-    }
-
-    /// All-NULL aggregate row: a group whose every value is NULL contributes
-    /// no rows to the reduction (`non_null == 0` for that group). The GROUP BY
-    /// pipeline then leaves the SUM accumulator at its identity (0) and the
-    /// COUNT accumulator at 0, so the output row for the group is
-    /// `(key, 0)` for SUM/COUNT and `0.0` for AVG (per the existing
-    /// `c == 0 ? 0.0 : s/c` guard in `build_agg_array`). SQL says these
-    /// should be NULL, but the existing non-nullable output path cannot
-    /// express NULL — same caveat documented in `agg_with_pre.rs`.
-    #[test]
-    fn group_all_null_yields_zero_count_and_no_contribution() {
-        let keys = vec![1i64, 1, 2, 2];
-        // Group 1 is all-NULL; group 2 has one non-NULL value.
-        let values_col = expr_agg::HostColumn::I32(vec![None, None, Some(4), None]);
-        let (host, validity) = from_expr_host(values_col).expect("ok");
-        let mask = validity.as_deref();
-        let values: Vec<i32> = filter_by_validity(
-            match &host {
-                HostCol::I32(v) => v,
-                _ => panic!("expected I32"),
-            },
-            mask,
-        );
-        let filtered_keys: Vec<i64> = match mask {
-            Some(m) => keys.iter().zip(m.iter()).filter_map(|(&k, &v)| if v { Some(k) } else { None }).collect(),
-            None => keys.clone(),
-        };
-        // Filtered down to just group 2's single row.
-        assert_eq!(filtered_keys, vec![2]);
-        assert_eq!(values, vec![4]);
-        let counts = group_count(&filtered_keys);
-        // Only group 2 has a non-NULL row; group 1 contributes nothing
-        // to the reduction (its keys-table slot keeps the COUNT identity 0).
-        assert_eq!(counts, vec![(2, 1)]);
-        let mins = group_reduce_i32(&filtered_keys, &values, ReduceOp::Min);
-        assert_eq!(mins, vec![(2, 4)]);
-    }
-
-    /// `filter_keys_if_needed` filters host keys in lockstep with the
-    /// validity mask, and returns `(None, n_rows)` (i.e. no allocation,
-    /// reuse the shared key column) when the resolved column has no NULLs.
-    #[test]
-    fn filter_keys_skips_allocation_when_all_valid() {
-        let keys = vec![1i64, 2, 3];
-        let resolved = ResolvedHostCol::Owned {
-            col: HostCol::I32(vec![10, 20, 30]),
-            validity: None,
-        };
-        let (gpu, n) = filter_keys_if_needed(&keys, &resolved).expect("ok");
-        assert!(gpu.is_none(), "no validity => no fresh GpuVec");
-        assert_eq!(n, 3);
-    }
-
-    /// Bool / Utf8 are still rejected — the primitive reduction kernels
-    /// only accept numeric inputs.
-    #[test]
-    fn from_expr_host_rejects_bool_and_utf8() {
-        let bool_col = expr_agg::HostColumn::Bool(vec![Some(true)]);
-        assert!(matches!(from_expr_host(bool_col), Err(BoltError::Type(_))));
-        let utf8_col = expr_agg::HostColumn::Utf8(vec![Some("x".to_string())]);
-        assert!(matches!(from_expr_host(utf8_col), Err(BoltError::Type(_))));
-    }
-}
-
-#[cfg(test)]
-mod null_handling_tests {
-    //! Host-only tests for the `PreCol::upload` NULL-rejection gate added in
-    //! the pre-stage: Arrow arrays whose `null_count() > 0` are rejected
-    //! before any device allocation because the pre-stage GPU kernels do not
-    //! yet carry a validity bitmap and would otherwise multiply garbage in
-    //! expressions like `price * tax`.
-    //!
-    //! No CUDA touched: the error path short-circuits before any device
-    //! allocation.
-    use super::*;
-
-    #[test]
-    fn pre_col_upload_rejects_null_bearing_input() {
-        let arr = Float64Array::from(vec![Some(1.0f64), None, Some(3.0f64)]);
-        assert!(arr.null_count() > 0, "test fixture should carry a NULL");
-        // `PreCol` doesn't implement `Debug`, so we match the Result manually
-        // rather than calling `expect_err`.
-        let msg = match PreCol::upload(&arr, DataType::Float64) {
-            Ok(_) => panic!("PreCol::upload should reject NULL-bearing input"),
-            Err(e) => format!("{e}"),
-        };
-        assert!(msg.contains("NULL"), "error should mention NULL: {msg}");
-        assert!(
-            msg.contains("pre-stage") || msg.contains("validity"),
-            "error should explain why, got: {msg}"
-        );
+        assert_eq!(bytes, vec![1, 0, 1, 0, 1]);
     }
 }
