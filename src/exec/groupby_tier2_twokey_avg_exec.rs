@@ -32,12 +32,15 @@
 //!   The lower-bound `BLOCK_GROUPS` check is implicit at this row
 //!   threshold for two-key plans — no Tier-1 two-key AVG exists.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
@@ -52,6 +55,48 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
+
+// ---------------------------------------------------------------------------
+// Per-executor module cache. See `groupby_tier2_count_exec.rs` for the
+// motivation and concurrency notes — the design is identical, but over the
+// i64-key kernel variants with the multi-SUM reduce parameterised on
+// `n_vals`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum KernelSpec {
+    PartitionI64,
+    ScatterI64,
+    ReduceMultiI64 { n_vals: u32 },
+    ReduceCountI64,
+}
+
+static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
+    if let Some(m) = MODULE_CACHE.lock().get(spec) {
+        return Ok(m.clone());
+    }
+    let ptx = match spec {
+        KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
+        KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
+        KernelSpec::ReduceMultiI64 { n_vals } => {
+            partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64(*n_vals)?
+        }
+        KernelSpec::ReduceCountI64 => {
+            partition_reduce_kernel_count_i64::compile_partition_reduce_kernel_count_i64()?
+        }
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    #[cfg(test)]
+    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut cache = MODULE_CACHE.lock();
+    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+}
 
 /// Try the two-key Tier-2.1 multi-AVG fast path. `None` on any
 /// precondition miss so the caller falls through to the next strategy.
@@ -151,10 +196,9 @@ fn execute_inner(
     // ---- Partition pass (i64) ------------------------------------------
     let counts: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
     let partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
+    let partition_module = get_or_build_module(&KernelSpec::PartitionI64)?;
     {
-        let ptx = partition_kernel_i64::compile_partition_kernel_i64()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_kernel_i64::KERNEL_ENTRY)?;
+        let func = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
         let mut keys_ptr = keys_gpu.device_ptr();
         let mut pids_ptr = partition_ids.device_ptr();
         let mut counts_ptr = counts.device_ptr();
@@ -196,9 +240,8 @@ fn execute_inner(
         scatter_vals.push(GpuVec::<f64>::zeros(n_rows as usize)?);
     }
     {
-        let ptx = scatter_kernel_i64::compile_scatter_kernel_i64()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
+        let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
+        let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
 
         for j in 0..n_vals {
@@ -263,13 +306,12 @@ fn execute_inner(
     let count_out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
 
     // ---- Multi-SUM reduce (i64-key) ------------------------------------
+    let reduce_multi_module = get_or_build_module(&KernelSpec::ReduceMultiI64 {
+        n_vals: n_vals as u32,
+    })?;
     {
-        let ptx = partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64(
-            n_vals as u32,
-        )?;
-        let module = CudaModule::from_ptx(&ptx)?;
         let entry = partition_reduce_kernel_multi_i64::kernel_entry(n_vals as u32);
-        let func = module.function(&entry)?;
+        let func = reduce_multi_module.function(&entry)?;
 
         let mut storage: Vec<CUdeviceptr> = Vec::with_capacity(4 + 2 * n_vals);
         storage.push(scatter_keys.device_ptr());
@@ -307,10 +349,9 @@ fn execute_inner(
     }
 
     // ---- COUNT reduce (i64-key) ----------------------------------------
+    let reduce_count_module = get_or_build_module(&KernelSpec::ReduceCountI64)?;
     {
-        let ptx = partition_reduce_kernel_count_i64::compile_partition_reduce_kernel_count_i64()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_reduce_kernel_count_i64::KERNEL_ENTRY)?;
+        let func = reduce_count_module.function(partition_reduce_kernel_count_i64::KERNEL_ENTRY)?;
         let mut keys_ptr = scatter_keys.device_ptr();
         let mut offsets_ptr = offsets_kp1_gpu.device_ptr();
         let mut ok_ptr = count_out_keys_gpu.device_ptr();
@@ -426,4 +467,41 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Module-cache mechanics tests. Skip on CPU-only hosts.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn second_call_same_spec_is_cache_hit() {
+        let m1 = match get_or_build_module(&KernelSpec::PartitionI64) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let after_first = LOAD_COUNT.load(Ordering::SeqCst);
+        let m2 = get_or_build_module(&KernelSpec::PartitionI64).expect("hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), after_first);
+        assert_eq!(m1.raw(), m2.raw());
+    }
+
+    #[test]
+    fn different_n_vals_are_distinct_cache_keys() {
+        let _ = match get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 1 }) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 })
+            .expect("n_vals=2 build");
+        let baseline = LOAD_COUNT.load(Ordering::SeqCst);
+        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 1 })
+            .expect("n_vals=1 hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 })
+            .expect("n_vals=2 hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
+    }
 }

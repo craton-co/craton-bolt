@@ -12,10 +12,13 @@
 //! v0 supports Float64 only. Float32 promotion is a one-line addition
 //! once a workload demands it; the kernel handles both widths already.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -31,6 +34,75 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
+
+// ---------------------------------------------------------------------------
+// Per-executor module cache. See `groupby_tier2_count_exec.rs` for the
+// motivation and concurrency notes — the design is identical.
+//
+// The float MIN/MAX reduce is parameterised on `(MinMaxOp, FloatDtype)`. We
+// mirror those as cache-key variants because neither upstream enum derives
+// `Hash`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+enum ReduceFloatKey {
+    MinF32,
+    MaxF32,
+    MinF64,
+    MaxF64,
+}
+
+impl ReduceFloatKey {
+    fn from_pair(op: MinMaxOp, dt: FloatDtype) -> Self {
+        match (op, dt) {
+            (MinMaxOp::Min, FloatDtype::Float32) => ReduceFloatKey::MinF32,
+            (MinMaxOp::Max, FloatDtype::Float32) => ReduceFloatKey::MaxF32,
+            (MinMaxOp::Min, FloatDtype::Float64) => ReduceFloatKey::MinF64,
+            (MinMaxOp::Max, FloatDtype::Float64) => ReduceFloatKey::MaxF64,
+        }
+    }
+
+    fn into_pair(self) -> (MinMaxOp, FloatDtype) {
+        match self {
+            ReduceFloatKey::MinF32 => (MinMaxOp::Min, FloatDtype::Float32),
+            ReduceFloatKey::MaxF32 => (MinMaxOp::Max, FloatDtype::Float32),
+            ReduceFloatKey::MinF64 => (MinMaxOp::Min, FloatDtype::Float64),
+            ReduceFloatKey::MaxF64 => (MinMaxOp::Max, FloatDtype::Float64),
+        }
+    }
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum KernelSpec {
+    Partition,
+    Scatter,
+    ReduceMinMaxFloat(ReduceFloatKey),
+}
+
+static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
+    if let Some(m) = MODULE_CACHE.lock().get(spec) {
+        return Ok(m.clone());
+    }
+    let ptx = match spec {
+        KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
+        KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
+        KernelSpec::ReduceMinMaxFloat(rk) => {
+            let (op, dt) = rk.into_pair();
+            compile_partition_reduce_kernel_minmax_float(op, dt)?
+        }
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    #[cfg(test)]
+    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut cache = MODULE_CACHE.lock();
+    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+}
 
 pub fn try_execute(
     plan: &PhysicalPlan,
@@ -127,10 +199,9 @@ fn execute_inner(
     // --- Partition pass ---
     let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
     let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
+    let partition_module = get_or_build_module(&KernelSpec::Partition)?;
     {
-        let ptx = partition_kernel::compile_partition_kernel()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_kernel::KERNEL_ENTRY)?;
+        let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
 
         let view_keys = keys_gpu.view();
         let mut view_pids = partition_ids.view_mut();
@@ -153,10 +224,9 @@ fn execute_inner(
     // --- Scatter (f64 vals — no conversion needed) ---
     let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros(n_rows as usize)?;
     let mut scatter_vals: GpuVec<f64> = GpuVec::<f64>::zeros(n_rows as usize)?;
+    let scatter_module = get_or_build_module(&KernelSpec::Scatter)?;
     {
-        let ptx = scatter_kernel::compile_scatter_kernel()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(scatter_kernel::KERNEL_ENTRY)?;
+        let func = scatter_module.function(scatter_kernel::KERNEL_ENTRY)?;
         let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
 
         let view_keys = keys_gpu.view();
@@ -191,12 +261,12 @@ fn execute_inner(
     let mut out_vals_gpu: GpuVec<f64> = GpuVec::<f64>::zeros(n_out_slots)?;
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
 
+    let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMaxFloat(
+        ReduceFloatKey::from_pair(op, float_dtype),
+    ))?;
     {
-        let ptx =
-            compile_partition_reduce_kernel_minmax_float(op, float_dtype)?;
-        let module = CudaModule::from_ptx(&ptx)?;
         let entry = minmax_float_entry(op, float_dtype);
-        let func = module.function(&entry)?;
+        let func = reduce_module.function(&entry)?;
 
         let view_pk = scatter_keys.view();
         let view_pv = scatter_vals.view();
@@ -279,4 +349,43 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Module-cache mechanics tests. Skip on CPU-only hosts.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn second_call_same_spec_is_cache_hit() {
+        let m1 = match get_or_build_module(&KernelSpec::Partition) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let after_first = LOAD_COUNT.load(Ordering::SeqCst);
+        let m2 = get_or_build_module(&KernelSpec::Partition).expect("hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), after_first);
+        assert_eq!(m1.raw(), m2.raw());
+    }
+
+    #[test]
+    fn op_dtype_combinations_are_distinct_cache_keys() {
+        let _ = match get_or_build_module(&KernelSpec::ReduceMinMaxFloat(
+            ReduceFloatKey::MinF64,
+        )) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = get_or_build_module(&KernelSpec::ReduceMinMaxFloat(ReduceFloatKey::MaxF64))
+            .expect("max-f64 build");
+        let baseline = LOAD_COUNT.load(Ordering::SeqCst);
+        let _ = get_or_build_module(&KernelSpec::ReduceMinMaxFloat(ReduceFloatKey::MinF64))
+            .expect("min-f64 hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceMinMaxFloat(ReduceFloatKey::MaxF64))
+            .expect("max-f64 hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
+    }
 }

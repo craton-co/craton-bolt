@@ -37,10 +37,13 @@
 //! - `max(key) >= BLOCK_GROUPS` so Tier-1 AVG doesn't already win this
 //! - `max(key) < 100 M` (Tier-2 dispatcher cap)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -54,6 +57,64 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
+
+// ---------------------------------------------------------------------------
+// Per-executor module cache.
+//
+// `CudaModule::from_ptx` (in `src/jit/jit_compiler.rs`) already deduplicates
+// PTX → SASS by hashing the PTX text, but the AVG path issues *four* distinct
+// kernel launches per query (partition, scatter, multi-SUM-reduce, count-
+// reduce) and each one used to rebuild a kilobyte-scale PTX string only to
+// hit the cache. We add a second layer keyed by the small set of parameters
+// that *select* a PTX template, so a repeat call skips PTX construction
+// entirely and gets a cheap `CudaModule` clone (the inner CUmodule handle
+// is `Arc`-shared with the lower cache).
+//
+// `CudaModule` is `Clone` over an internal `Arc<CudaModuleInner>`, so we
+// hand callers fresh clones — no extra wrapping needed.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum KernelSpec {
+    /// `partition_kernel::compile_partition_kernel()`.
+    Partition,
+    /// `scatter_kernel::compile_scatter_kernel()`.
+    Scatter,
+    /// `partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(n_vals)`.
+    /// `n_vals` is the per-row fan-out (1..=`MAX_VALS`).
+    ReduceMulti { n_vals: u32 },
+    /// `partition_reduce_kernel_count::compile_partition_reduce_kernel_count()`.
+    ReduceCount,
+}
+
+static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Test-only counter of cache-miss compile passes.
+#[cfg(test)]
+static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Cache-aware module loader. See module-cache comment above.
+fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
+    if let Some(m) = MODULE_CACHE.lock().get(spec) {
+        return Ok(m.clone());
+    }
+    let ptx = match spec {
+        KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
+        KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
+        KernelSpec::ReduceMulti { n_vals } => {
+            partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(*n_vals)?
+        }
+        KernelSpec::ReduceCount => {
+            partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
+        }
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    #[cfg(test)]
+    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut cache = MODULE_CACHE.lock();
+    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+}
 
 /// Try to execute `plan` against `batch` via the Tier-2.1 AVG fast path.
 /// `None` on any miss — caller falls through to the next strategy.
@@ -160,10 +221,9 @@ fn execute_inner(
     let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
     let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
 
+    let partition_module = get_or_build_module(&KernelSpec::Partition)?;
     {
-        let ptx = partition_kernel::compile_partition_kernel()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_kernel::KERNEL_ENTRY)?;
+        let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
 
         let view_keys = keys_gpu.view();
         let mut view_pids = partition_ids.view_mut();
@@ -192,17 +252,14 @@ fn execute_inner(
     }
 
     {
-        let ptx = scatter_kernel::compile_scatter_kernel()?;
-        let module = CudaModule::from_ptx(&ptx)?;
+        let scatter_module = get_or_build_module(&KernelSpec::Scatter)?;
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
 
         for j in 0..n_vals {
-            // Recompile/reload per iteration is wasteful, but we need a
-            // fresh `CudaFunction` per launch_with_geometry call because
-            // the function borrows the module. The module lives for the
-            // whole loop, so reuse it; obtain a new function handle each
-            // launch.
-            let func = module.function(scatter_kernel::KERNEL_ENTRY)?;
+            // Reuse the cached module across all N value-column scatters;
+            // obtain a fresh `CudaFunction` handle per launch since it
+            // borrows the module for the duration of the kernel args.
+            let func = scatter_module.function(scatter_kernel::KERNEL_ENTRY)?;
 
             let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
 
@@ -248,13 +305,11 @@ fn execute_inner(
     let mut count_out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
 
     // ---- Multi-SUM reduce -----------------------------------------------
+    let reduce_multi_module =
+        get_or_build_module(&KernelSpec::ReduceMulti { n_vals: n_vals as u32 })?;
     {
-        let ptx = partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(
-            n_vals as u32,
-        )?;
-        let module = CudaModule::from_ptx(&ptx)?;
         let entry = partition_reduce_kernel_multi::kernel_entry(n_vals as u32);
-        let func = module.function(&entry)?;
+        let func = reduce_multi_module.function(&entry)?;
 
         let view_sk = scatter_keys.view();
         let views_sv: Vec<_> = scatter_vals.iter().map(|g| g.view()).collect();
@@ -287,10 +342,9 @@ fn execute_inner(
     }
 
     // ---- COUNT reduce ----------------------------------------------------
+    let reduce_count_module = get_or_build_module(&KernelSpec::ReduceCount)?;
     {
-        let ptx = partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_reduce_kernel_count::KERNEL_ENTRY)?;
+        let func = reduce_count_module.function(partition_reduce_kernel_count::KERNEL_ENTRY)?;
 
         let view_keys = scatter_keys.view();
         let view_offsets = offsets_kp1_gpu.view();
@@ -405,4 +459,57 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Module-cache mechanics tests. Skip gracefully on CPU-only hosts (no CUDA
+// context, so `from_ptx` errors). Verify:
+//   * a repeat call with the same `KernelSpec` does not re-compile;
+//   * two specs that differ only in `n_vals` are distinct cache keys
+//     (separate miss + subsequent hit).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn second_call_same_spec_is_cache_hit() {
+        let m1 = match get_or_build_module(&KernelSpec::Partition) {
+            Ok(m) => m,
+            Err(_) => return, // no CUDA context — skip.
+        };
+        let after_first = LOAD_COUNT.load(Ordering::SeqCst);
+        let m2 = get_or_build_module(&KernelSpec::Partition)
+            .expect("second lookup must succeed");
+        let after_second = LOAD_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            after_second, after_first,
+            "repeat call must not increment LOAD_COUNT (was {} -> {})",
+            after_first, after_second
+        );
+        assert_eq!(m1.raw(), m2.raw(), "clones must share the same CUmodule");
+    }
+
+    #[test]
+    fn different_n_vals_are_distinct_cache_keys() {
+        // Warm two different reduce-multi specs and confirm a follow-up
+        // lookup hits each without recompiling.
+        let _ = match get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 1 }) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 2 })
+            .expect("n_vals=2 build");
+        let baseline = LOAD_COUNT.load(Ordering::SeqCst);
+        let _ = get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 1 })
+            .expect("n_vals=1 hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 2 })
+            .expect("n_vals=2 hit");
+        assert_eq!(
+            LOAD_COUNT.load(Ordering::SeqCst),
+            baseline,
+            "both warm specs must be cache hits on the second lookup"
+        );
+    }
 }
