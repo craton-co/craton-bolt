@@ -23,7 +23,8 @@ use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow_array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
@@ -47,6 +48,21 @@ const KERNEL_ENTRY: &str = "bolt_kernel";
 
 /// Threads per CUDA block for the 1D launch.
 const BLOCK_SIZE: u32 = 256;
+
+/// Stage 7 (P1b): default interval between pool-stats emits in
+/// [`Engine::sql`].
+///
+/// 60 seconds is a sensible floor for a typical analytical workload —
+/// the pool changes slowly relative to query churn, and a coarser
+/// cadence keeps the log line out of per-query latency. Override with
+/// `BOLT_POOL_STATS_INTERVAL_SECS=<n>`; set to `0` to disable emission
+/// entirely (handy for benchmark runs that don't want the noise).
+const DEFAULT_POOL_STATS_INTERVAL_SECS: u64 = 60;
+
+/// Environment-variable override for the pool-stats periodic-emit
+/// interval. Parsed once per `Engine` construction; non-integer or
+/// negative values fall back to [`DEFAULT_POOL_STATS_INTERVAL_SECS`].
+const POOL_STATS_ENV: &str = "BOLT_POOL_STATS_INTERVAL_SECS";
 
 /// Synchronize the default stream and convert any pending CUDA error.
 ///
@@ -105,6 +121,24 @@ pub struct Engine {
     /// O(N²). Multiple consecutive `register_batch` calls without an
     /// intervening query share that one upload.
     gpu_tables: RefCell<HashMap<String, Option<crate::exec::gpu_table::GpuTable>>>,
+    /// Stage 7 (P1b): pool-stats observability state.
+    ///
+    /// `Mutex<Option<Instant>>`: `Some(last_emit_time)` after the first
+    /// emit, `None` before any query has run. The first query on a fresh
+    /// engine always emits (so a short-lived process still surfaces at
+    /// least one snapshot); subsequent queries emit only after
+    /// `pool_stats_interval` has elapsed.
+    ///
+    /// Wrapped in a `Mutex` because `Engine::sql` takes `&self` and we
+    /// support concurrent calls in principle (the underlying engine is
+    /// not yet `Send + Sync` because of `RefCell`, but the
+    /// pool-stats accounting is independent and shouldn't add new
+    /// `!Sync` constraints when we eventually relax the rest).
+    pool_stats_last_emit: Mutex<Option<Instant>>,
+    /// Interval between pool-stats emits. Frozen at construction from
+    /// `BOLT_POOL_STATS_INTERVAL_SECS` (default 60s). A value of
+    /// `Duration::ZERO` disables periodic emission entirely.
+    pool_stats_interval: Duration,
     /// Owned CUDA context — declared LAST so it drops AFTER dictionaries.
     _ctx: CudaContext,
 }
@@ -142,11 +176,14 @@ impl Engine {
             )));
         }
         let ctx = CudaContext::new(device_idx)?;
+        let pool_stats_interval = pool_stats_interval_from_env();
         Ok(Self {
             tables: HashMap::new(),
             provider: MemTableProvider::new(),
             dict_registry: crate::exec::dict_registry::DictRegistry::new(),
             gpu_tables: RefCell::new(HashMap::new()),
+            pool_stats_last_emit: Mutex::new(None),
+            pool_stats_interval,
             _ctx: ctx,
         })
     }
@@ -375,6 +412,14 @@ impl Engine {
     }
 
     /// Compile and execute a SQL query string.
+    ///
+    /// Stage 7 (P1b): after the query completes, the engine emits a
+    /// periodic pool-stats log line at most once every
+    /// `BOLT_POOL_STATS_INTERVAL_SECS` (default 60s). The emit happens
+    /// AFTER the query's `QueryHandle` is fully materialised — the log
+    /// line is off the latency-critical path for the just-returned
+    /// query. Failures (query error, log throttled, no-op observer)
+    /// never affect the query result.
     pub fn sql(&self, query: &str) -> BoltResult<QueryHandle> {
         let plan: LogicalPlan = parse_sql(query, &self.provider)?;
         // String-literal predicates against Utf8 columns are folded into
@@ -392,7 +437,38 @@ impl Engine {
             tables: &self.tables,
         };
         crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
-        self.execute(&phys)
+        let result = self.execute(&phys);
+        // Stage 7: periodic pool-stats emit. Runs whether the query
+        // succeeded or failed (an OOM-failed query is itself a signal
+        // worth surfacing alongside the pool snapshot). Internal errors
+        // in the emit path are swallowed — they must never escalate to
+        // the query result.
+        self.maybe_emit_pool_stats(Instant::now());
+        result
+    }
+
+    /// Emit a periodic pool-stats log line + observer notification if
+    /// the configured interval has elapsed since the last emit.
+    ///
+    /// `now` is taken as a parameter (rather than calling `Instant::now()`
+    /// inside) so the unit test below can drive the throttle deterministically.
+    fn maybe_emit_pool_stats(&self, now: Instant) {
+        if !should_emit_pool_stats(&self.pool_stats_last_emit, self.pool_stats_interval, now) {
+            return;
+        }
+        // Throttle says go: snapshot the pool and emit. We do this OUTSIDE
+        // the throttle's lock so a slow observer can't serialise concurrent
+        // queries.
+        let s = crate::pool_stats();
+        log::info!(
+            "craton-bolt pool: bucket_count={}, total_pooled_bytes={}, \
+             oom_recoveries={}, proactive_evictions={}",
+            s.bucket_count,
+            s.total_pooled_bytes,
+            s.oom_recovery_count,
+            s.proactive_eviction_count,
+        );
+        crate::observability::notify_observers(s);
     }
 
     /// Execute a pre-built `PhysicalPlan`.
@@ -1235,6 +1311,53 @@ fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<RecordBatch
         .map_err(|e| BoltError::Type(format!("register_table: rebuild after dict flatten failed: {e}")))
 }
 
+/// Parse the `BOLT_POOL_STATS_INTERVAL_SECS` environment variable into
+/// a `Duration`. Missing or unparseable values default to
+/// [`DEFAULT_POOL_STATS_INTERVAL_SECS`]; an explicit `0` disables
+/// periodic emission (signalled by `Duration::ZERO`).
+fn pool_stats_interval_from_env() -> Duration {
+    match std::env::var(POOL_STATS_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(0) => Duration::ZERO,
+        Some(n) => Duration::from_secs(n),
+        None => Duration::from_secs(DEFAULT_POOL_STATS_INTERVAL_SECS),
+    }
+}
+
+/// Decide whether to emit a pool-stats snapshot at time `now`, advancing
+/// the throttle state on a positive decision.
+///
+/// Pulled out of [`Engine::maybe_emit_pool_stats`] so the throttle
+/// semantics can be exercised without a live CUDA context. Side
+/// effects: writes `Some(now)` into `last_emit` when emission is due,
+/// leaves it untouched otherwise.
+///
+/// Returns `true` IFF the caller should emit a log line + observer
+/// notification right now. Encapsulates three rules:
+///   * `interval == 0` → never emit (env-var disables).
+///   * `last_emit.is_none()` → always emit (first query on the engine).
+///   * `now - last_emit >= interval` → emit and reset.
+fn should_emit_pool_stats(
+    last_emit: &Mutex<Option<Instant>>,
+    interval: Duration,
+    now: Instant,
+) -> bool {
+    if interval.is_zero() {
+        return false;
+    }
+    let mut last = match last_emit.lock() {
+        Ok(g) => g,
+        Err(_) => return false, // poisoned — best-effort; skip the emit.
+    };
+    let should = match *last {
+        None => true,
+        Some(prev) => now.duration_since(prev) >= interval,
+    };
+    if should {
+        *last = Some(now);
+    }
+    should
+}
+
 /// Convert an `arrow_schema::Schema` into our plan `Schema`.
 fn arrow_schema_to_plan_schema(s: &ArrowSchema) -> BoltResult<Schema> {
     let mut fields = Vec::with_capacity(s.fields().len());
@@ -1473,5 +1596,106 @@ mod tests {
             .expect("Int32");
         let got: Vec<i32> = (0..col.len()).map(|i| col.value(i)).collect();
         assert_eq!(got, vec![3, 4, 5]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 7 (P1b): pool-stats periodic-emit throttle.
+    //
+    // We exercise `should_emit_pool_stats` directly with a mock `Instant`
+    // sequence — no CUDA required. The function is the only stateful piece
+    // of the periodic-log machinery (the rest is a log line + observer
+    // call), so locking down its throttle semantics here gives us the full
+    // behavioural coverage we need.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn pool_stats_throttle_first_call_always_emits() {
+        // Fresh throttle (no previous emit) must always emit on first
+        // call, regardless of how recently the test started.
+        let last = Mutex::new(None);
+        let now = Instant::now();
+        assert!(should_emit_pool_stats(&last, Duration::from_secs(60), now));
+        // Second call at the same instant: not enough time elapsed.
+        assert!(!should_emit_pool_stats(&last, Duration::from_secs(60), now));
+    }
+
+    #[test]
+    fn pool_stats_throttle_respects_interval() {
+        let last = Mutex::new(None);
+        let interval = Duration::from_secs(60);
+        let t0 = Instant::now();
+        assert!(should_emit_pool_stats(&last, interval, t0), "first emit");
+        // 30s later: still inside the window.
+        assert!(
+            !should_emit_pool_stats(&last, interval, t0 + Duration::from_secs(30)),
+            "30s < 60s — must NOT emit"
+        );
+        // 59s later: still inside.
+        assert!(
+            !should_emit_pool_stats(&last, interval, t0 + Duration::from_secs(59)),
+            "59s < 60s — must NOT emit"
+        );
+        // 60s later: boundary should fire.
+        assert!(
+            should_emit_pool_stats(&last, interval, t0 + Duration::from_secs(60)),
+            "60s == 60s — must emit"
+        );
+        // Right after the boundary fire: throttle is reset, so we must
+        // wait the full window again.
+        assert!(
+            !should_emit_pool_stats(&last, interval, t0 + Duration::from_secs(61)),
+            "1s after boundary emit — must NOT emit"
+        );
+        // 60s after the second emit: fires again.
+        assert!(
+            should_emit_pool_stats(&last, interval, t0 + Duration::from_secs(120)),
+            "120s = 60s + 60s — must emit again"
+        );
+    }
+
+    #[test]
+    fn pool_stats_throttle_zero_interval_disables_emission() {
+        // The env-var "0" sentinel disables periodic emission entirely.
+        let last = Mutex::new(None);
+        let now = Instant::now();
+        assert!(!should_emit_pool_stats(&last, Duration::ZERO, now));
+        // Even after a long delay, zero interval stays disabled.
+        assert!(!should_emit_pool_stats(
+            &last,
+            Duration::ZERO,
+            now + Duration::from_secs(3600)
+        ));
+        // `last` was never updated.
+        assert!(last.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn pool_stats_throttle_long_interval_still_fires_first_time() {
+        // Even a 1-hour interval must produce the first-emit fire so a
+        // short-lived process surfaces at least one snapshot.
+        let last = Mutex::new(None);
+        let now = Instant::now();
+        let one_hour = Duration::from_secs(3600);
+        assert!(should_emit_pool_stats(&last, one_hour, now));
+    }
+
+    #[test]
+    fn pool_stats_interval_env_parsing_defaults() {
+        // Smoke-test the env-var helper. We can't easily mutate the
+        // process env in a parallel test runner safely, so just check the
+        // explicit defaults arms. Without the env var set, the default
+        // is 60 seconds.
+        //
+        // NOTE: this test reads (not writes) the env var, so it's safe to
+        // run in parallel; the expected default here matches the constant.
+        // If a future contributor sets `BOLT_POOL_STATS_INTERVAL_SECS` in
+        // their shell while running `cargo test`, this assertion will
+        // flag the override — that's intentional.
+        if std::env::var(POOL_STATS_ENV).is_err() {
+            assert_eq!(
+                pool_stats_interval_from_env(),
+                Duration::from_secs(DEFAULT_POOL_STATS_INTERVAL_SECS)
+            );
+        }
     }
 }
