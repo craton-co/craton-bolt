@@ -197,6 +197,22 @@ pub enum PhysicalPlan {
         /// Output schema, in `exprs` order with aliases applied.
         output_schema: Schema,
     },
+    /// Host-side post-aggregate (or other non-scan-chain) filter layer.
+    ///
+    /// Used when a `LogicalPlan::Filter` sits above an operator that
+    /// `lower_projection` can't fold into a single fused kernel — most
+    /// importantly `HAVING`, which produces `Filter { Project { Aggregate { .. } } }`.
+    /// The aggregate's output is already a small `RecordBatch` (one row per
+    /// group), so the executor evaluates `predicate` host-side via
+    /// `expr_agg::eval_expr` and applies `arrow::compute::filter` to keep
+    /// only the surviving rows. The output schema is `input.output_schema()`
+    /// — Filter doesn't add or rename columns.
+    Filter {
+        /// Source plan whose output rows are filtered.
+        input: Box<PhysicalPlan>,
+        /// Boolean expression evaluated against `input`'s output schema.
+        predicate: Expr,
+    },
     /// INNER JOIN. The `output_schema` is `left.output_schema() ++ right`
     /// with right-side collisions disambiguated by `join_combined_schema`;
     /// it's stored on the variant so `output_schema()` can return a
@@ -233,7 +249,8 @@ impl PhysicalPlan {
             PhysicalPlan::Aggregate { aggregate, .. } => &aggregate.output_schema,
             PhysicalPlan::Distinct { input }
             | PhysicalPlan::Limit { input, .. }
-            | PhysicalPlan::Sort { input, .. } => input.output_schema(),
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Filter { input, .. } => input.output_schema(),
             PhysicalPlan::Union { inputs } => {
                 // Caller will have ensured at logical-plan time that all
                 // branches share a schema; here we just return the first.
@@ -1028,10 +1045,21 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             if is_scan_chain(input) {
                 lower_projection(input, None, Some(predicate))
             } else {
-                // Same rationale as Project: forwarding the inner plan keeps
-                // the lowerer total. Execution on the inner scaffold variant
-                // will error before the filter ever applies.
-                lower(input)
+                // Non-scan-chain inputs (Aggregate, Project-over-Aggregate,
+                // Join, etc.) can't be folded into the predicate kernel. The
+                // classic case is HAVING, which the SQL frontend produces as
+                // `Filter { Project { Aggregate { .. } } }`. Lower the inner
+                // plan and wrap it in a host-side `PhysicalPlan::Filter`; the
+                // executor evaluates `predicate` against the inner plan's
+                // output RecordBatch via `expr_agg::eval_expr` and drops the
+                // rows that don't satisfy it. The inner plan's output is
+                // typically tiny (one row per group for HAVING), so a
+                // host-side pass is fine for 0.3.
+                let inner = lower(input)?;
+                Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                })
             }
         }
         LogicalPlan::Scan { .. } => lower_projection(plan, None, None),
@@ -1102,6 +1130,93 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
                 on: on.clone(),
                 output_schema,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::logical_plan::{
+        AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema,
+    };
+
+    /// Regression: HAVING produces `Filter { Project { Aggregate { .. } } }` in
+    /// the logical plan. Before the fix the lowerer silently dropped the outer
+    /// Filter (returning the unfiltered aggregate); now the predicate must
+    /// survive lowering as a `PhysicalPlan::Filter` wrapper.
+    #[test]
+    fn having_filter_over_project_aggregate_retains_predicate() {
+        // Build the same shape `plan_select` produces for
+        // `SELECT k, SUM(v) FROM t GROUP BY k HAVING SUM(v) > 10`.
+        let scan_schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int64, false),
+        ]);
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: scan_schema,
+        };
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(scan),
+            group_by: vec![Expr::Column("k".into())],
+            aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+        };
+        // SELECT-order Project on top of the aggregate, surfacing the
+        // aggregate output name `sum_v`.
+        let project = LogicalPlan::Project {
+            input: Box::new(aggregate),
+            exprs: vec![
+                Expr::Column("k".into()),
+                Expr::Column("sum_v".into()),
+            ],
+        };
+        // HAVING SUM(v) > 10 — the SQL frontend rewrites the SUM(v) call into
+        // a reference to the aggregate-output column `sum_v`.
+        let having = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Column("sum_v".into())),
+            right: Box::new(Expr::Literal(Literal::Int64(10))),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(project),
+            predicate: having.clone(),
+        };
+
+        let phys = lower(&plan).expect("lower must succeed");
+        match phys {
+            PhysicalPlan::Filter { input, predicate } => {
+                // Predicate must be the same shape we built.
+                match predicate {
+                    Expr::Binary { op, left, right } => {
+                        assert_eq!(op, BinaryOp::Gt);
+                        assert!(matches!(*left, Expr::Column(ref n) if n == "sum_v"));
+                        assert!(matches!(*right, Expr::Literal(Literal::Int64(10))));
+                    }
+                    other => panic!("predicate not preserved: {other:?}"),
+                }
+                // The inner plan is the lowered Project/Aggregate. The
+                // SELECT-order Project here is *not* a structural no-op (its
+                // output schema follows SELECT order, but the lowered
+                // Aggregate already places group keys first / aggregates
+                // second in the same order, so it happens to be identity for
+                // this query and the Project layer collapses). Accept either
+                // shape: a bare Aggregate, or a Project wrapping an Aggregate.
+                match *input {
+                    PhysicalPlan::Aggregate { .. } => {}
+                    PhysicalPlan::Project { input: inner, .. } => {
+                        assert!(
+                            matches!(*inner, PhysicalPlan::Aggregate { .. }),
+                            "expected Aggregate under Project, got something else"
+                        );
+                    }
+                    other => panic!(
+                        "expected Aggregate or Project(Aggregate) under Filter, got {other:?}"
+                    ),
+                }
+            }
+            other => panic!("expected PhysicalPlan::Filter at top, got {other:?}"),
         }
     }
 }

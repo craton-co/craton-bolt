@@ -57,6 +57,8 @@ pub mod sort;
 pub mod limit;
 #[doc(hidden)]
 pub mod join;
+#[doc(hidden)]
+pub mod filter;
 
 #[doc(hidden)]
 pub use launch::{launch_1d, CudaStream, KernelArgs};

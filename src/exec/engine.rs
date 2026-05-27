@@ -388,6 +388,17 @@ impl Engine {
                 output_schema,
                 self,
             ),
+            PhysicalPlan::Filter { input, predicate } => {
+                // Host-side post-aggregate (or other non-scan-chain) filter.
+                // The lowerer emits this for `HAVING` and any `Filter`
+                // wrapping an operator that can't fold into a fused
+                // projection kernel. The inner plan's output is materialised
+                // as a host-side RecordBatch; we evaluate `predicate` against
+                // it via `expr_agg::eval_expr` and drop the rows that don't
+                // satisfy it. See `crate::exec::filter::execute_filter`.
+                let h = self.execute(input)?;
+                crate::exec::filter::execute_filter(h, predicate)
+            }
             PhysicalPlan::Project {
                 input,
                 exprs,
