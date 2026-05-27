@@ -63,6 +63,10 @@ polars = { version = "0.42", default-features = false, features = ["lazy"] }
 # Bundled feature compiles DuckDB in-tree so the bench is reproducible without an
 # external install; build is slow (~5–10 min first time) but cached thereafter.
 duckdb = { version = "1.2", features = ["bundled"] }
+# proptest drives the property-test harness in tests/sql_proptest.rs: random
+# SQL queries from a constrained grammar are fed through parser+lowerer and
+# we assert no panics + type-consistent plans on success.
+proptest = "1"
 
 [features]
 default = []
