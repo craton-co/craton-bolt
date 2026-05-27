@@ -63,6 +63,11 @@ polars = { version = "0.42", default-features = false, features = ["lazy"] }
 # Bundled feature compiles DuckDB in-tree so the bench is reproducible without an
 # external install; build is slow (~5–10 min first time) but cached thereafter.
 duckdb = { version = "1.2", features = ["bundled"] }
+# `insta` powers the PTX snapshot tests in `tests/ptx_golden_tests.rs`. We use
+# the default feature set (no YAML / JSON / RON — plain text snapshots are all
+# we need for normalized PTX). Snapshot files live under `tests/snapshots/` and
+# are reviewed via `cargo insta review` / `cargo insta accept`.
+insta = "1"
 
 [features]
 default = []
