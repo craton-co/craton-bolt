@@ -372,10 +372,22 @@ impl DtypeFlavour {
                 setp_lt: "setp.lt.f64",
                 setp_eq: "setp.eq.f64",
             },
+            // Stage 3: Bool keys are widened to i32 on the device — the host
+            // uploads `0u8`/`1u8` values and we treat them as i32 0/1 (the
+            // top 24 bits are unused; load is .u8 but the register is b32).
+            DataType::Bool => Self {
+                reg_type: "b32",
+                byte_width: 1,
+                ld_st_suffix: "u8",
+                setp_gt: "setp.gt.s32",
+                setp_lt: "setp.lt.s32",
+                setp_eq: "setp.eq.s32",
+            },
             _ => {
                 return Err(BoltError::Other(format!(
-                    "sort_kernel: dtype {:?} not supported by Stage 1 \
-                     (Int32, Int64, Float32, Float64 only)",
+                    "sort_kernel: dtype {:?} not supported \
+                     (Int32/Int64/Float32/Float64/Bool — Utf8 only via the \
+                     dictionary-index adapter in gpu_sort.rs)",
                     dtype
                 )))
             }
@@ -387,13 +399,47 @@ impl DtypeFlavour {
 // Stage 2: multi-key + NULL-aware + in-block shmem variant.
 // ============================================================================
 
-/// Maximum number of sort keys the Stage 2 emitter supports per kernel.
+/// Hard upper bound on sort-key count for the Stage-2/3 emitter.
 ///
-/// 4 is a soft cap chosen for register pressure: each active key needs two
-/// key registers (self / partner) and ~3 working bytes for the validity
-/// branch. PTX permits more, but going beyond 4 starts spilling to local
-/// memory on sm_70 with float64 keys. Bumping the cap is a Stage-3 follow-up.
-pub const MAX_SORT_KEYS: usize = 4;
+/// **Stage 3:** the historical Stage-2 cap of 4 is lifted — the real
+/// constraint is per-thread register pressure, not the literal key count.
+/// `MAX_SORT_KEYS` is kept as a safety ceiling at 12 (well below any plausible
+/// SQL `ORDER BY` arity), and the per-spec validator additionally rejects
+/// kernels whose tallied key-register budget exceeds [`SM70_KEY_REG_BUDGET`].
+///
+/// Practical width — sm_70 (Volta) gives every thread 64 registers before
+/// spills bite occupancy. We reserve ~32 for the bitonic scaffold (tid /
+/// partner / addresses / predicate scratch) and budget the remaining 32 for
+/// keys. Per-dtype cost:
+///
+///   - `i32`/`f32`        : 2 regs/key (self + partner, b32)
+///   - `i64`/`f64`        : 4 regs/key (self + partner, b64 = 2× b32)
+///   - `bool`             : 2 regs/key (loaded into b32 like i32)
+///
+/// So the comparator handles up to **16 i32-style keys**, **8 i64-style
+/// keys**, or any mix that tallies to <=32 b32-register equivalents. The
+/// soft cap of 12 covers every observed SQL workload while keeping the
+/// per-key-register pool [`MAX_SORT_KEYS * 2`] declarations below 32.
+pub const MAX_SORT_KEYS: usize = 12;
+
+/// Register budget (in b32-equivalent units) per thread for the key
+/// comparator on sm_70. Anything beyond this risks register spills which
+/// halve occupancy on the bitonic kernel.
+///
+/// `64 total regs - 32 reserved for the bitonic scaffold = 32 left for keys`.
+pub const SM70_KEY_REG_BUDGET: u32 = 32;
+
+/// Per-key b32-register cost. b64 dtypes count twice. Used by the validator
+/// to enforce [`SM70_KEY_REG_BUDGET`] before the PTX is even compiled.
+pub fn key_reg_cost(dtype: DataType) -> u32 {
+    match dtype {
+        DataType::Int32 | DataType::Float32 | DataType::Bool => 2,
+        DataType::Int64 | DataType::Float64 => 4,
+        // Utf8 is dictionary-decoded into i32/i64 indices in gpu_sort; the
+        // dtype that reaches the kernel is always one of the numeric ones.
+        DataType::Utf8 => 4,
+    }
+}
 
 /// One sort key in a (possibly) multi-key bitonic sort.
 ///
@@ -453,17 +499,26 @@ impl SortKernelSpec {
         }
         if self.keys.len() > MAX_SORT_KEYS {
             return Err(BoltError::Other(format!(
-                "sort_kernel: SortKernelSpec.keys has {} entries; max is {} \
-                 (Stage 2 limit — going beyond requires Stage-3 register-pressure work)",
+                "sort_kernel: SortKernelSpec.keys has {} entries; hard cap is {} \
+                 (sm_70 register budget — practical SQL ORDER BY rarely exceeds 8)",
                 self.keys.len(),
                 MAX_SORT_KEYS
             )));
         }
+        let mut reg_tally: u32 = 0;
         for (i, k) in self.keys.iter().enumerate() {
-            // Reject unsupported dtypes early; reuses the Stage-1 flavour
-            // table as the single source of truth for what's emittable.
+            // Reject unsupported dtypes early; reuses the flavour table as
+            // the single source of truth for what's emittable.
             DtypeFlavour::for_dtype(k.dtype)
                 .map_err(|e| BoltError::Other(format!("sort_kernel: key[{i}]: {e}")))?;
+            reg_tally = reg_tally.saturating_add(key_reg_cost(k.dtype));
+        }
+        if reg_tally > SM70_KEY_REG_BUDGET {
+            return Err(BoltError::Other(format!(
+                "sort_kernel: keys tally {} b32-register equivalents; sm_70 budget \
+                 is {} (drop a key or split into a multi-pass sort)",
+                reg_tally, SM70_KEY_REG_BUDGET
+            )));
         }
         if matches!(self.layout, SortLayout::Shmem) {
             if !self.shmem_n_pow2.is_power_of_two() {
@@ -507,6 +562,7 @@ pub fn sort_kernel_entry_spec(spec: &SortKernelSpec) -> BoltResult<String> {
             DataType::Int64 => "i64",
             DataType::Float32 => "f32",
             DataType::Float64 => "f64",
+            DataType::Bool => "b",
             _ => unreachable!("validate() rejects other dtypes"),
         };
         let dir = match k.direction {
@@ -571,9 +627,18 @@ fn emit_multikey_multilaunch(
     spec: &SortKernelSpec,
 ) -> BoltResult<()> {
     // -- Signature ----------------------------------------------------
+    //
+    // Stage 3 ABI extension: a trailing pointer (`is_padded_ptr`) is added
+    // after the indices pointer. It is a packed-bit array (1 bit per row,
+    // LSB-first, Arrow-style packed u8). Bit=1 means "this row is part of
+    // the padding to next-pow2; route it past every real row regardless of
+    // its sentinel value". This eliminates the Stage-2 silent-row-drop bug
+    // when real keys equal the sentinel (e.g. `i32::MAX` as a legitimate
+    // value with the ASC `+INF`-style pad).
     writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
-    let total_params = MAX_SORT_KEYS * 2 + 1 + 3; // (k,v)*MAX + indices + n_pow2 + stage + mask
-    for i in 0..(MAX_SORT_KEYS * 2 + 1) {
+    let n_ptr_params = MAX_SORT_KEYS * 2 + 2; // (k,v)*MAX + indices + is_padded
+    let total_params = n_ptr_params + 3; // + n_pow2 + stage + mask
+    for i in 0..n_ptr_params {
         // All pointers are .u64.
         writeln!(p, "\t.param .u64 {entry}_param_{i},").map_err(write_err)?;
     }
@@ -605,10 +670,18 @@ fn emit_multikey_multilaunch(
     writeln!(p, "\t.reg .pred %p_pn2;").map_err(write_err)?;
     writeln!(p, "\t.reg .pred %p_self_null;").map_err(write_err)?;
     writeln!(p, "\t.reg .pred %p_partner_null;").map_err(write_err)?;
+    // Stage 3 padded-routing predicates.
+    writeln!(p, "\t.reg .pred %p_self_pad;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_partner_pad;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_both_pad;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_sp1;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_sp2;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_pp1;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_pp2;").map_err(write_err)?;
     writeln!(p, "\t.reg .b32 %r<32>;").map_err(write_err)?;
     writeln!(p, "\t.reg .b64 %rd<48>;").map_err(write_err)?;
     // Key registers: 2 per key (self/partner), max across all dtype reg
-    // classes — emit a small pool per width.
+    // classes — emit a small pool per width. Bool keys share the i32 pool.
     writeln!(p, "\t.reg .b32 %ki32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
     writeln!(p, "\t.reg .b64 %ki64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
     writeln!(p, "\t.reg .f32 %kf32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
@@ -621,7 +694,7 @@ fn emit_multikey_multilaunch(
     writeln!(p, "\tmad.lo.s32 %r3, %r4, %r5, %r6;").map_err(write_err)?;
 
     // -- n_pow2, stage, substage_mask ---------------------------------
-    let p_n_pow2 = MAX_SORT_KEYS * 2 + 1;
+    let p_n_pow2 = MAX_SORT_KEYS * 2 + 2;
     let p_stage = p_n_pow2 + 1;
     let p_mask = p_n_pow2 + 2;
     writeln!(p, "\tld.param.u32 %r2, [{entry}_param_{}];", p_n_pow2).map_err(write_err)?;
@@ -644,6 +717,20 @@ fn emit_multikey_multilaunch(
     //    jump to DECIDED. If all keys equal we fall through to DECIDED
     //    with %r10=0 (no swap).
     writeln!(p, "\tmov.b32 %r10, 0;").map_err(write_err)?;
+
+    // -- Stage 3: padded-row pre-routing -------------------------------
+    //
+    // Read `is_padded[self]` and `is_padded[partner]` from the trailing
+    // packed-bit pointer (Arrow-style: byte i>>3, bit i&7, 1=padded).
+    // Three outcomes:
+    //   - both padded     -> tied, fall through to lex compare
+    //   - self padded only -> route to global END (swap iff in ASC block)
+    //   - partner padded only -> route partner to global END (swap iff DESC block)
+    // This dodges the Stage-2 sentinel-tie corruption: real `i32::MAX`
+    // values (the ASC sentinel) no longer fight with padded slots over the
+    // last position; the explicit padded bit wins.
+    let padded_param_idx = MAX_SORT_KEYS * 2 + 1;
+    emit_padded_route_global(p, entry, padded_param_idx)?;
 
     let indices_param_idx = MAX_SORT_KEYS * 2;
     for (ki, k) in spec.keys.iter().enumerate() {
@@ -852,9 +939,13 @@ fn emit_key_compare(
 }
 
 /// PTX register names for a key's (self, partner) registers.
+///
+/// Bool keys share the b32 (`ki32`) register pool: bytes are loaded with
+/// `ld.global.u8 %ki32X, [...]`, which PTX zero-extends into the 32-bit
+/// register. The compare then uses the same s32 mnemonic as Int32.
 fn key_regs(ki: usize, dtype: DataType) -> (String, String) {
     let prefix = match dtype {
-        DataType::Int32 => "ki32",
+        DataType::Int32 | DataType::Bool => "ki32",
         DataType::Int64 => "ki64",
         DataType::Float32 => "kf32",
         DataType::Float64 => "kf64",
@@ -864,6 +955,67 @@ fn key_regs(ki: usize, dtype: DataType) -> (String, String) {
         format!("%{}{}", prefix, ki * 2),
         format!("%{}{}", prefix, ki * 2 + 1),
     )
+}
+
+/// **Stage 3** — emit the padded-row pre-routing block for the multi-launch
+/// kernel (global-memory `is_padded` bitmap).
+///
+/// Reads bit `tid` and bit `partner` from a packed-bit array (Arrow-style:
+/// `byte = i >> 3`, `bit = i & 7`, 1 = padded). On a one-sided padded result
+/// the routing decision is baked: padded rows always sort to the global end.
+/// If both rows are padded we fall through to the lex comparator unchanged
+/// (they're tied — doesn't matter which "wins"; the truncation step in
+/// `gpu_sort` drops them all).
+///
+/// The decision matches the null-routing logic with `null_left = false`:
+///   - self_padded && !partner_padded -> swap iff in ASC block (`%p2`)
+///   - !self_padded && partner_padded -> swap iff in DESC block (`!%p2`)
+///
+/// Writing into `%r10` and branching to `DECIDED` short-circuits the entire
+/// per-key compare loop.
+fn emit_padded_route_global(p: &mut String, entry: &str, padded_param_idx: usize) -> BoltResult<()> {
+    writeln!(p, "// ---- stage3: padded-row pre-routing (is_padded bitmap) ----")
+        .map_err(write_err)?;
+    // Load padded bit for self into %r16.
+    writeln!(p, "\tld.param.u64 %rd44, [{entry}_param_{}];", padded_param_idx)
+        .map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd44, %rd44;").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r16, %r3, 3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r17, %r3, 7;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd45, %r16, 1;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd45, %rd44, %rd45;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u8 %r18, [%rd45];").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r18, %r18, %r17;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r18, %r18, 1;").map_err(write_err)?; // %r18 = self_padded
+    // partner bit -> %r19.
+    writeln!(p, "\tshr.u32 %r20, %r7, 3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r21, %r7, 7;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd46, %r20, 1;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd46, %rd44, %rd46;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u8 %r19, [%rd46];").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r19, %r19, %r21;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r19, %r19, 1;").map_err(write_err)?; // %r19 = partner_padded
+    // Both padded -> fall through.
+    writeln!(p, "\tand.b32 %r22, %r18, %r19;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ne.s32 %p_both_pad, %r22, 0;").map_err(write_err)?;
+    // self_pad && !partner_pad
+    writeln!(p, "\tsetp.ne.s32 %p_sp1, %r18, 0;").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s32 %p_sp2, %r19, 0;").map_err(write_err)?;
+    writeln!(p, "\tand.pred %p_self_pad, %p_sp1, %p_sp2;").map_err(write_err)?;
+    // partner_pad && !self_pad
+    writeln!(p, "\tsetp.ne.s32 %p_pp1, %r19, 0;").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s32 %p_pp2, %r18, 0;").map_err(write_err)?;
+    writeln!(p, "\tand.pred %p_partner_pad, %p_pp1, %p_pp2;").map_err(write_err)?;
+    // Apply decision: self padded -> swap iff p2 (ASC block).
+    writeln!(p, "\t@%p_self_pad selp.b32 %r23, 1, 0, %p2;").map_err(write_err)?;
+    writeln!(p, "\t@%p_self_pad mov.b32 %r10, %r23;").map_err(write_err)?;
+    writeln!(p, "\t@%p_self_pad bra DECIDED;").map_err(write_err)?;
+    // Partner padded -> swap iff !p2 (DESC block).
+    writeln!(p, "\t@%p_partner_pad selp.b32 %r24, 0, 1, %p2;").map_err(write_err)?;
+    writeln!(p, "\t@%p_partner_pad mov.b32 %r10, %r24;").map_err(write_err)?;
+    writeln!(p, "\t@%p_partner_pad bra DECIDED;").map_err(write_err)?;
+    // Otherwise (both real, or both padded -> tie): fall through to lex.
+    Ok(())
 }
 
 /// Emit a load from global memory for key `ki` (self & partner).
@@ -933,23 +1085,34 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
 
     // Shared-memory arrays at module scope (matches the convention used by
     // shmem_count_kernel.rs / shmem_sum_kernel.rs). One key buffer per key,
-    // optional validity buffer per nullable key, and a u32 indices buffer.
+    // optional validity buffer per nullable key, a u32 indices buffer, and
+    // a packed-bit is_padded array.
+    //
+    // **Stage 3** — validity is now packed at 1 bit per row (u32 per 32
+    // elements) instead of 1 byte per row. For n_pow2=256 this drops shmem
+    // from `keys*256B (validity)` to `keys*32B`, an 8× reduction. The
+    // is_padded array uses the same packed-bit layout.
+    let pad_words = ((n_pow2 + 31) / 32) as u64; // ceil(n_pow2 / 32)
     for (ki, k) in spec.keys.iter().enumerate() {
         let flavour = DtypeFlavour::for_dtype(k.dtype)?;
         let bytes = (n_pow2 as u64) * (flavour.byte_width as u64);
         writeln!(p, ".shared .align 8 .b8 sh_k{}[{}];", ki, bytes).map_err(write_err)?;
         if k.nullable {
-            // One byte per element keeps shmem addressing trivial; still
-            // fits comfortably for n_pow2 <= 256.
-            writeln!(p, ".shared .align 4 .b8 sh_v{}[{}];", ki, n_pow2).map_err(write_err)?;
+            // Packed bits, u32 words. Each u32 holds 32 validity bits.
+            writeln!(p, ".shared .align 4 .b8 sh_v{}[{}];", ki, pad_words * 4)
+                .map_err(write_err)?;
         }
     }
     writeln!(p, ".shared .align 4 .b8 sh_idx[{}];", (n_pow2 as u64) * 4).map_err(write_err)?;
+    // is_padded as a packed-bit u32 array (Stage 3).
+    writeln!(p, ".shared .align 4 .b8 sh_pad[{}];", pad_words * 4).map_err(write_err)?;
     writeln!(p).map_err(write_err)?;
 
-    // Signature: (k0, v0, ..., kN-1, vN-1, indices, n_pow2). No stage/mask.
+    // Signature: (k0, v0, ..., kN-1, vN-1, indices, is_padded, n_pow2).
+    // No stage/mask. Stage 3: trailing pointer is `is_padded` (Arrow-style
+    // packed u8 bitmap).
     writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
-    let total_ptr_params = MAX_SORT_KEYS * 2 + 1;
+    let total_ptr_params = MAX_SORT_KEYS * 2 + 2;
     for i in 0..total_ptr_params {
         writeln!(p, "\t.param .u64 {entry}_param_{i},").map_err(write_err)?;
     }
@@ -972,8 +1135,15 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
     writeln!(p, "\t.reg .pred %p_pn2;").map_err(write_err)?;
     writeln!(p, "\t.reg .pred %p_selfn;").map_err(write_err)?;
     writeln!(p, "\t.reg .pred %p_partn;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b32 %r<32>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %rd<32>;").map_err(write_err)?;
+    // Stage 3 padded-routing predicates (shmem variant).
+    writeln!(p, "\t.reg .pred %p_self_pad;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_partner_pad;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_sp1;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_sp2;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_pp1;").map_err(write_err)?;
+    writeln!(p, "\t.reg .pred %p_pp2;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %r<40>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %rd<40>;").map_err(write_err)?;
     writeln!(p, "\t.reg .b32 %ki32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
     writeln!(p, "\t.reg .b64 %ki64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
     writeln!(p, "\t.reg .f32 %kf32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
@@ -988,6 +1158,26 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
 
     // -- Load all keys + indices from global into shmem. --------------
     writeln!(p, "\tsetp.lt.s32 %p_in, %r3, %r2;").map_err(write_err)?;
+
+    // Stage 3: initialise the packed-bit shmem buffers to zero before any
+    // atomic-OR sets bits into them. One thread covers each u32 word.
+    // For n_pow2<=block_size, every thread whose tid < pad_words zeroes
+    // one word. Validity buffers are also packed-bit; same init.
+    writeln!(p, "\tsetp.lt.s32 %p_skip, %r3, {};", pad_words).map_err(write_err)?;
+    for (ki, k) in spec.keys.iter().enumerate() {
+        if k.nullable {
+            writeln!(p, "\tmov.u64 %rd0, sh_v{};", ki).map_err(write_err)?;
+            writeln!(p, "\tmul.wide.s32 %rd1, %r3, 4;").map_err(write_err)?;
+            writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+            writeln!(p, "\t@%p_skip st.shared.u32 [%rd2], 0;").map_err(write_err)?;
+        }
+    }
+    writeln!(p, "\tmov.u64 %rd0, sh_pad;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(p, "\t@%p_skip st.shared.u32 [%rd2], 0;").map_err(write_err)?;
+    writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
+
     for (ki, k) in spec.keys.iter().enumerate() {
         let flavour = DtypeFlavour::for_dtype(k.dtype)?;
         let kw = flavour.byte_width as i64;
@@ -1006,7 +1196,9 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
             .map_err(write_err)?;
 
         if k.nullable {
-            // Load validity bit & store as a 0/1 byte in sh_v<ki>.
+            // Stage 3: pack into bits. Load the validity bit for `tid` from
+            // global (Arrow-packed u8 bitmap), then atom.or into the u32
+            // word at `sh_v<ki>[tid>>5]` shifted to bit `tid & 31`.
             writeln!(p, "\tld.param.u64 %rd5, [{entry}_param_{}];", ki * 2 + 1).map_err(write_err)?;
             writeln!(p, "\tcvta.to.global.u64 %rd5, %rd5;").map_err(write_err)?;
             writeln!(p, "\tshr.u32 %r10, %r3, 3;").map_err(write_err)?;
@@ -1016,12 +1208,39 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
             writeln!(p, "\t@%p_in ld.global.u8 %r12, [%rd6];").map_err(write_err)?;
             writeln!(p, "\tshr.u32 %r12, %r12, %r11;").map_err(write_err)?;
             writeln!(p, "\tand.b32 %r12, %r12, 1;").map_err(write_err)?;
+            // Compute shmem word address: sh_v<ki> + (tid>>5)*4
+            writeln!(p, "\tshr.u32 %r13, %r3, 5;").map_err(write_err)?;
+            writeln!(p, "\tand.b32 %r14, %r3, 31;").map_err(write_err)?;
             writeln!(p, "\tmov.u64 %rd7, sh_v{};", ki).map_err(write_err)?;
-            writeln!(p, "\tmul.wide.u32 %rd8, %r3, 1;").map_err(write_err)?;
+            writeln!(p, "\tmul.wide.u32 %rd8, %r13, 4;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd8, %rd7, %rd8;").map_err(write_err)?;
-            writeln!(p, "\t@%p_in st.shared.u8 [%rd8], %r12;").map_err(write_err)?;
+            // Shifted bit: %r12 << (tid & 31)
+            writeln!(p, "\tshl.b32 %r12, %r12, %r14;").map_err(write_err)?;
+            writeln!(p, "\t@%p_in atom.shared.or.b32 %r15, [%rd8], %r12;").map_err(write_err)?;
         }
     }
+
+    // Stage 3: load is_padded bit for `tid` into sh_pad packed bits.
+    {
+        writeln!(p, "\tld.param.u64 %rd5, [{entry}_param_{}];", MAX_SORT_KEYS * 2 + 1)
+            .map_err(write_err)?;
+        writeln!(p, "\tcvta.to.global.u64 %rd5, %rd5;").map_err(write_err)?;
+        writeln!(p, "\tshr.u32 %r10, %r3, 3;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r11, %r3, 7;").map_err(write_err)?;
+        writeln!(p, "\tmul.wide.u32 %rd6, %r10, 1;").map_err(write_err)?;
+        writeln!(p, "\tadd.s64 %rd6, %rd5, %rd6;").map_err(write_err)?;
+        writeln!(p, "\tld.global.u8 %r12, [%rd6];").map_err(write_err)?;
+        writeln!(p, "\tshr.u32 %r12, %r12, %r11;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r12, %r12, 1;").map_err(write_err)?;
+        writeln!(p, "\tshr.u32 %r13, %r3, 5;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r14, %r3, 31;").map_err(write_err)?;
+        writeln!(p, "\tmov.u64 %rd7, sh_pad;").map_err(write_err)?;
+        writeln!(p, "\tmul.wide.u32 %rd8, %r13, 4;").map_err(write_err)?;
+        writeln!(p, "\tadd.s64 %rd8, %rd7, %rd8;").map_err(write_err)?;
+        writeln!(p, "\tshl.b32 %r12, %r12, %r14;").map_err(write_err)?;
+        writeln!(p, "\tatom.shared.or.b32 %r15, [%rd8], %r12;").map_err(write_err)?;
+    }
+
     // Identity index in shmem
     writeln!(p, "\tmov.u64 %rd9, sh_idx;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.s32 %rd10, %r3, 4;").map_err(write_err)?;
@@ -1059,6 +1278,12 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
 
             writeln!(p, "\tmov.b32 %r10, 0;").map_err(write_err)?;
             writeln!(p, "\t@%p_skip bra SH_S{}_T{}_AFTER;", stage, substage).map_err(write_err)?;
+
+            // Stage 3 padded-row pre-routing (shmem variant) — read
+            // is_padded for self and partner via the indices indirection
+            // (sh_idx[cell] gives the original row index), then test the
+            // packed-bit sh_pad array.
+            emit_padded_route_shmem(p, stage, substage)?;
 
             // Lex compare (read shmem instead of global).
             for (ki, k) in spec.keys.iter().enumerate() {
@@ -1112,10 +1337,71 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
     Ok(())
 }
 
+/// **Stage 3** — emit the shmem padded-row pre-routing block.
+///
+/// The shmem variant keeps `sh_pad` indexed by ORIGINAL row index (i.e. it
+/// is not permuted by the in-block swaps; only `sh_k*` and `sh_idx` move).
+/// To read the padded bit for the current pair we look up
+/// `orig_self = sh_idx[self_cell]` and `orig_partner = sh_idx[partner_cell]`,
+/// then bfe the corresponding bit out of `sh_pad[orig >> 5]`.
+///
+/// Routing matches `emit_padded_route_global`: padded rows go to the global
+/// end (= ASC-direction "max").
+fn emit_padded_route_shmem(p: &mut String, stage: u32, substage: u32) -> BoltResult<()> {
+    writeln!(p, "// ---- stage3 shmem: padded-row pre-routing ----")
+        .map_err(write_err)?;
+    // Read orig indices for self and partner from sh_idx.
+    writeln!(p, "\tmov.u64 %rd33, sh_idx;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.s32 %rd34, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd34, %rd33, %rd34;").map_err(write_err)?;
+    writeln!(p, "\tld.shared.u32 %r25, [%rd34];").map_err(write_err)?; // orig_self
+    writeln!(p, "\tmul.wide.s32 %rd35, %r7, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd35, %rd33, %rd35;").map_err(write_err)?;
+    writeln!(p, "\tld.shared.u32 %r26, [%rd35];").map_err(write_err)?; // orig_partner
+
+    // sh_pad lookup: word = sh_pad[orig >> 5]; bit = (word >> (orig & 31)) & 1.
+    writeln!(p, "\tmov.u64 %rd36, sh_pad;").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r27, %r25, 5;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r28, %r25, 31;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd37, %r27, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd37, %rd36, %rd37;").map_err(write_err)?;
+    writeln!(p, "\tld.shared.u32 %r29, [%rd37];").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r29, %r29, %r28;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r29, %r29, 1;").map_err(write_err)?; // self_padded
+    writeln!(p, "\tshr.u32 %r30, %r26, 5;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r31, %r26, 31;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd38, %r30, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd38, %rd36, %rd38;").map_err(write_err)?;
+    writeln!(p, "\tld.shared.u32 %r32, [%rd38];").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r32, %r32, %r31;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r32, %r32, 1;").map_err(write_err)?; // partner_padded
+
+    // self_pad && !partner_pad -> swap iff p2.
+    writeln!(p, "\tsetp.ne.s32 %p_sp1, %r29, 0;").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s32 %p_sp2, %r32, 0;").map_err(write_err)?;
+    writeln!(p, "\tand.pred %p_self_pad, %p_sp1, %p_sp2;").map_err(write_err)?;
+    writeln!(p, "\t@%p_self_pad selp.b32 %r33, 1, 0, %p2;").map_err(write_err)?;
+    writeln!(p, "\t@%p_self_pad mov.b32 %r10, %r33;").map_err(write_err)?;
+    writeln!(p, "\t@%p_self_pad bra SH_S{}_T{}_DECIDED;", stage, substage).map_err(write_err)?;
+    writeln!(p, "\tsetp.ne.s32 %p_pp1, %r32, 0;").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s32 %p_pp2, %r29, 0;").map_err(write_err)?;
+    writeln!(p, "\tand.pred %p_partner_pad, %p_pp1, %p_pp2;").map_err(write_err)?;
+    writeln!(p, "\t@%p_partner_pad selp.b32 %r34, 0, 1, %p2;").map_err(write_err)?;
+    writeln!(p, "\t@%p_partner_pad mov.b32 %r10, %r34;").map_err(write_err)?;
+    writeln!(p, "\t@%p_partner_pad bra SH_S{}_T{}_DECIDED;", stage, substage).map_err(write_err)?;
+    Ok(())
+}
+
 /// Per-key compare against shmem within the shmem kernel's stage loop.
 ///
 /// Generates per-(key, stage, substage) labels so multiple compares can
 /// coexist in the same kernel.
+///
+/// **Stage 3**: validity is now stored as a packed-bit u32 array indexed by
+/// ORIGINAL row index (not by cell position). We look up
+/// `orig = sh_idx[cell]` and extract bit `orig & 31` from word
+/// `sh_v<ki>[orig >> 5]`. This cuts shmem usage 8× vs the Stage-2
+/// 1-byte-per-element layout (n=256, 1 nullable key: 256B -> 32B).
 fn emit_shmem_key_compare(
     p: &mut String,
     ki: usize,
@@ -1129,14 +1415,33 @@ fn emit_shmem_key_compare(
     let lbl_next = format!("SH_S{}_T{}_K{}_NEXT", stage, substage, ki);
 
     if k.nullable {
-        // Validity bytes are stored 1-byte-per-elem in shmem.
-        writeln!(p, "\tmov.u64 %rd15, sh_v{};", ki).map_err(write_err)?;
-        writeln!(p, "\tmul.wide.s32 %rd16, %r3, 1;").map_err(write_err)?;
+        // Pull original indices for self / partner from sh_idx (these were
+        // already read by `emit_padded_route_shmem`; reload defensively in
+        // case a future refactor reorders the blocks).
+        writeln!(p, "\tmov.u64 %rd15, sh_idx;").map_err(write_err)?;
+        writeln!(p, "\tmul.wide.s32 %rd16, %r3, 4;").map_err(write_err)?;
         writeln!(p, "\tadd.s64 %rd16, %rd15, %rd16;").map_err(write_err)?;
-        writeln!(p, "\tld.shared.u8 %r22, [%rd16];").map_err(write_err)?;
-        writeln!(p, "\tmul.wide.s32 %rd17, %r7, 1;").map_err(write_err)?;
+        writeln!(p, "\tld.shared.u32 %r20, [%rd16];").map_err(write_err)?; // orig_self
+        writeln!(p, "\tmul.wide.s32 %rd17, %r7, 4;").map_err(write_err)?;
         writeln!(p, "\tadd.s64 %rd17, %rd15, %rd17;").map_err(write_err)?;
-        writeln!(p, "\tld.shared.u8 %r25, [%rd17];").map_err(write_err)?;
+        writeln!(p, "\tld.shared.u32 %r21, [%rd17];").map_err(write_err)?; // orig_partner
+
+        // Packed-bit validity load. Stage 3.
+        writeln!(p, "\tmov.u64 %rd15, sh_v{};", ki).map_err(write_err)?;
+        writeln!(p, "\tshr.u32 %r12, %r20, 5;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r13, %r20, 31;").map_err(write_err)?;
+        writeln!(p, "\tmul.wide.u32 %rd16, %r12, 4;").map_err(write_err)?;
+        writeln!(p, "\tadd.s64 %rd16, %rd15, %rd16;").map_err(write_err)?;
+        writeln!(p, "\tld.shared.u32 %r22, [%rd16];").map_err(write_err)?;
+        writeln!(p, "\tshr.u32 %r22, %r22, %r13;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r22, %r22, 1;").map_err(write_err)?; // self_valid
+        writeln!(p, "\tshr.u32 %r14, %r21, 5;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r16, %r21, 31;").map_err(write_err)?;
+        writeln!(p, "\tmul.wide.u32 %rd17, %r14, 4;").map_err(write_err)?;
+        writeln!(p, "\tadd.s64 %rd17, %rd15, %rd17;").map_err(write_err)?;
+        writeln!(p, "\tld.shared.u32 %r25, [%rd17];").map_err(write_err)?;
+        writeln!(p, "\tshr.u32 %r25, %r25, %r16;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r25, %r25, 1;").map_err(write_err)?; // partner_valid
 
         // both null
         writeln!(p, "\tor.b32 %r26, %r22, %r25;").map_err(write_err)?;
@@ -1194,6 +1499,12 @@ fn emit_shmem_key_compare(
 }
 
 /// Swap shmem cells for key `ki`.
+///
+/// **Stage 3**: only the key values and `sh_idx` (handled separately) move.
+/// The packed-bit validity (`sh_v*`) and is_padded (`sh_pad`) arrays stay
+/// indexed by ORIGINAL row index — the comparator reads them via
+/// `sh_idx[cell]` indirection. Saves swap traffic and avoids costly
+/// atomic-bit twiddling for what is functionally a constant lookup.
 fn emit_shmem_key_swap(p: &mut String, ki: usize, k: &KeyDesc) -> BoltResult<()> {
     let flavour = DtypeFlavour::for_dtype(k.dtype)?;
     let kw = flavour.byte_width as i64;
@@ -1207,19 +1518,6 @@ fn emit_shmem_key_swap(p: &mut String, ki: usize, k: &KeyDesc) -> BoltResult<()>
     writeln!(p, "\tld.shared.{} {}, [%rd27];", flavour.ld_st_suffix, part_reg).map_err(write_err)?;
     writeln!(p, "\tst.shared.{} [%rd26], {};", flavour.ld_st_suffix, part_reg).map_err(write_err)?;
     writeln!(p, "\tst.shared.{} [%rd27], {};", flavour.ld_st_suffix, self_reg).map_err(write_err)?;
-    if k.nullable {
-        // Swap validity bytes too — unlike global mem, shmem is throw-away
-        // per launch so we don't disturb the host validity buffer.
-        writeln!(p, "\tmov.u64 %rd28, sh_v{};", ki).map_err(write_err)?;
-        writeln!(p, "\tmul.wide.s32 %rd29, %r3, 1;").map_err(write_err)?;
-        writeln!(p, "\tadd.s64 %rd29, %rd28, %rd29;").map_err(write_err)?;
-        writeln!(p, "\tmul.wide.s32 %rd30, %r7, 1;").map_err(write_err)?;
-        writeln!(p, "\tadd.s64 %rd30, %rd28, %rd30;").map_err(write_err)?;
-        writeln!(p, "\tld.shared.u8 %r17, [%rd29];").map_err(write_err)?;
-        writeln!(p, "\tld.shared.u8 %r18, [%rd30];").map_err(write_err)?;
-        writeln!(p, "\tst.shared.u8 [%rd29], %r18;").map_err(write_err)?;
-        writeln!(p, "\tst.shared.u8 [%rd30], %r17;").map_err(write_err)?;
-    }
     Ok(())
 }
 
@@ -1261,11 +1559,12 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_dtypes() {
-        // Utf8 + Bool are explicitly out of Stage 1 scope.
+        // Utf8 is still rejected by the Stage-1 single-key entry (it has no
+        // sentinel mapping there); Stage-3 supports it via the dictionary-
+        // index adapter in `gpu_sort.rs`, which feeds the i32/i64 kernel.
+        // Bool moved into the supported set as part of Stage 3.
         assert!(sort_kernel_entry(DataType::Utf8, SortDirection::Asc).is_err());
-        assert!(sort_kernel_entry(DataType::Bool, SortDirection::Asc).is_err());
         assert!(compile_sort_kernel(DataType::Utf8, SortDirection::Asc).is_err());
-        assert!(compile_sort_kernel(DataType::Bool, SortDirection::Asc).is_err());
     }
 
     /// Header + signature shape goldens — these are the byte-stable bits of
@@ -1592,5 +1891,149 @@ mod tests {
         assert_ne!(a, c);
         assert_ne!(a, d);
         assert_ne!(d, e); // different shmem_n_pow2 -> different module
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 3: lifted key cap, padded-row routing, Bool/Utf8-via-dict,
+    // packed-bit shmem validity.
+    // ------------------------------------------------------------------
+
+    /// 8 i32 keys (= 16 b32 regs) is well within the sm_70 budget and must
+    /// compile despite exceeding the old Stage-2 hard cap of 4. The compiled
+    /// PTX must emit one `setp.eq.s32` block per key (early-equal-skip).
+    #[test]
+    fn ptx_eight_key_compiles_and_emits_per_key_setp() {
+        let spec = SortKernelSpec {
+            keys: (0..8)
+                .map(|_| key(DataType::Int32, SortDirection::Asc, false, false))
+                .collect(),
+            layout: SortLayout::MultiLaunch,
+            shmem_n_pow2: 0,
+        };
+        let ptx = compile_sort_kernel_spec(&spec).unwrap();
+        // 8 keys -> at least 8 setp.eq.s32 (one per key).
+        assert!(
+            ptx.matches("setp.eq.s32").count() >= 8,
+            "8-key comparator must emit >=8 setp.eq.s32 blocks; PTX:\n{ptx}"
+        );
+        for ki in 0..8 {
+            assert!(
+                ptx.contains(&format!("KEY_{}_NEXT:", ki)),
+                "missing KEY_{}_NEXT label for 8-key sort",
+                ki
+            );
+        }
+    }
+
+    /// The register budget rejects specs that would spill on sm_70.
+    /// 9 Int64 keys = 36 b32 regs, > 32 budget.
+    #[test]
+    fn rejects_over_register_budget() {
+        let spec = SortKernelSpec {
+            keys: (0..9)
+                .map(|_| key(DataType::Int64, SortDirection::Asc, false, false))
+                .collect(),
+            layout: SortLayout::MultiLaunch,
+            shmem_n_pow2: 0,
+        };
+        assert!(
+            compile_sort_kernel_spec(&spec).is_err(),
+            "9 i64 keys (36 b32 regs) must be rejected by the sm_70 budget"
+        );
+    }
+
+    /// Bool keys emit the s32 compare mnemonics (Bool is widened to i32 0/1
+    /// after load via `ld.global.u8`).
+    #[test]
+    fn ptx_bool_key_emits_signed_compare_with_byte_load() {
+        let spec = SortKernelSpec {
+            keys: vec![key(DataType::Bool, SortDirection::Asc, false, false)],
+            layout: SortLayout::MultiLaunch,
+            shmem_n_pow2: 0,
+        };
+        let ptx = compile_sort_kernel_spec(&spec).unwrap();
+        assert!(
+            ptx.contains("ld.global.u8"),
+            "Bool key must load via ld.global.u8; got:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s32"),
+            "Bool compare uses the s32 mnemonic; got:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.lt.s32"),
+            "Bool compare uses the s32 mnemonic; got:\n{ptx}"
+        );
+    }
+
+    /// Every multi-key kernel must declare and consult the `is_padded`
+    /// parameter so real values colliding with the sentinel are routed past
+    /// padded rows (Stage 3 sentinel-tie fix).
+    #[test]
+    fn ptx_multikey_has_padded_routing_block() {
+        let spec = SortKernelSpec {
+            keys: vec![key(DataType::Int32, SortDirection::Asc, false, false)],
+            layout: SortLayout::MultiLaunch,
+            shmem_n_pow2: 0,
+        };
+        let ptx = compile_sort_kernel_spec(&spec).unwrap();
+        // The marker comment from emit_padded_route_global.
+        assert!(
+            ptx.contains("padded-row pre-routing"),
+            "Stage 3 padded-routing block missing; PTX:\n{ptx}"
+        );
+        // Two u8 bitmap loads (self + partner pad bits).
+        assert!(
+            ptx.matches("ld.global.u8").count() >= 2,
+            "padded routing must load self & partner pad bits; PTX:\n{ptx}"
+        );
+        // is_padded predicate names.
+        assert!(ptx.contains("%p_self_pad"));
+        assert!(ptx.contains("%p_partner_pad"));
+    }
+
+    /// The shmem variant must use a packed-bit u32 validity layout (one
+    /// 32-bit word per 32 elements) and an `atom.shared.or.b32` to set the
+    /// per-thread bit during the load. Stage-3 8× footprint reduction.
+    #[test]
+    fn ptx_shmem_uses_packed_bit_validity_and_atomic_or() {
+        let spec = SortKernelSpec {
+            keys: vec![key(DataType::Int32, SortDirection::Asc, true, true)],
+            layout: SortLayout::Shmem,
+            shmem_n_pow2: 128,
+        };
+        let ptx = compile_sort_kernel_spec(&spec).unwrap();
+        // sh_v0 must be declared as (128/32)*4 = 16 bytes (packed bits).
+        assert!(
+            ptx.contains(".shared .align 4 .b8 sh_v0[16];"),
+            "Stage 3 shmem must declare packed-bit sh_v0 (16B for n=128); PTX:\n{ptx}"
+        );
+        // Atomic OR for the per-thread bit set in shmem.
+        assert!(
+            ptx.contains("atom.shared.or.b32"),
+            "packed-bit shmem validity must use atom.shared.or.b32; PTX:\n{ptx}"
+        );
+        // Validity read uses ld.shared.u32 + shr/and (bfe-style extraction).
+        assert!(
+            ptx.contains("ld.shared.u32"),
+            "packed-bit shmem validity read must use ld.shared.u32; PTX:\n{ptx}"
+        );
+        // sh_pad packed-bit array also present.
+        assert!(
+            ptx.contains("sh_pad"),
+            "Stage 3 shmem must declare sh_pad packed-bit array; PTX:\n{ptx}"
+        );
+    }
+
+    /// `key_reg_cost` matches the per-dtype expectations the budget math
+    /// in `MAX_SORT_KEYS` documentation builds on. Regression guard if a
+    /// new dtype is added without bumping the budget.
+    #[test]
+    fn key_reg_costs_per_dtype() {
+        assert_eq!(key_reg_cost(DataType::Int32), 2);
+        assert_eq!(key_reg_cost(DataType::Float32), 2);
+        assert_eq!(key_reg_cost(DataType::Bool), 2);
+        assert_eq!(key_reg_cost(DataType::Int64), 4);
+        assert_eq!(key_reg_cost(DataType::Float64), 4);
     }
 }

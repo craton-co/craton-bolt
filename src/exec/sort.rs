@@ -71,18 +71,24 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
 /// host path), or `Err(...)` only on a hard GPU error (out-of-memory, kernel
 /// launch failure, etc.).
 ///
-/// ## Stage 1 + Stage 2 gates
+/// ## Stage 1 / 2 / 3 gates
 ///
-///   1. Number of sort keys is in `1..=MAX_SORT_KEYS` (Stage 2 lifted the
-///      single-key restriction; Stage-3 may extend beyond 4).
+///   1. Number of sort keys is in `1..=MAX_SORT_KEYS` (Stage 3 raised the
+///      ceiling from 4 to 12; the real ceiling is the per-spec sm_70
+///      register budget, validated by `compile_sort_kernel_spec`).
 ///   2. Each sort key is a bare column reference (no computed exprs).
-///   3. Each column dtype is one of Int32 / Int64 / Float32 / Float64.
+///   3. Each column dtype is one of Int32 / Int64 / Float32 / Float64 /
+///      Bool / Dictionary(Int32|Int64, Utf8) — Stage 3 added Bool and
+///      dictionary-encoded Utf8 (the latter sorts on the dictionary's
+///      index column). Plain Utf8 still falls through to the host path.
 ///   4. `n_rows >= GPU_SORT_MIN_ROWS` — below this, h2d/d2h overhead wins.
-///   5. `n_rows <= u32::MAX` (and tightened to `<= 2^31` inside `gpu_sort`
+///   5. `n_rows <= u32::MAX` (tightened to `<= 2^31` inside `gpu_sort`
 ///      because the bitonic padding doubles).
 ///
 /// NULLs are handled by Stage 2 via a per-key validity bitmap + nulls_first
-/// flag — they no longer disqualify the GPU path.
+/// flag — they no longer disqualify the GPU path. Stage 3 additionally
+/// adds an `is_padded` bitmap that disambiguates real-vs-sentinel ties
+/// (a Stage-2 silent-drop bug).
 ///
 /// On any miss we return `Ok(None)`; the host path handles the input
 /// correctly.
@@ -132,19 +138,15 @@ fn try_gpu_sort(
         resolved.push((col_idx, dtype, dir, se.nulls_first));
     }
 
-    // Single-key path stays on the Stage-1 entry for back-compat with the
-    // golden PTX assertions; multi-key + any NULL-bearing key uses the
-    // Stage-2 multi-key driver.
-    let any_nulls = resolved
-        .iter()
-        .any(|(idx, _, _, _)| batch.column(*idx).null_count() > 0);
-    if resolved.len() == 1 && !any_nulls {
-        let (col_idx, dtype, dir, _) = resolved[0];
-        let sorted = crate::exec::gpu_sort::sort_record_batch_on_gpu(batch, col_idx, dtype, dir)?;
-        return Ok(Some(sorted));
-    }
-
-    // Multi-key (or null-aware single-key) path.
+    // Stage 3: route every supported case through the multi-key driver.
+    // The driver carries the `is_padded` bitmap that fixes the sentinel-tie
+    // row-drop bug — a legitimate `i32::MAX` value (or any other value
+    // colliding with the dtype's sentinel) used to be silently dropped by
+    // the single-key Stage-1 path; the multi-key driver routes padded rows
+    // explicitly, preserving real ties. The single-key Stage-1 entry point
+    // and its PTX module are kept for the golden-test surface (they still
+    // exercise the dtype-mnemonic round-trip) but are no longer reached
+    // from the executor.
     let sorted = crate::exec::gpu_sort::sort_record_batch_on_gpu_multi(batch, &resolved)?;
     Ok(Some(sorted))
 }

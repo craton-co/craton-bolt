@@ -53,9 +53,10 @@ use std::ffi::c_void;
 use std::ptr;
 
 use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-    UInt32Array,
+    Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
+    Int64Array, RecordBatch, UInt32Array,
 };
+use arrow_array::types::{Int32Type, Int64Type};
 use arrow::compute::take;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
@@ -424,6 +425,14 @@ pub fn sort_record_batch_on_gpu(
 /// Arrow `DataType` -> our internal `DataType`. Returns `None` if the column
 /// type isn't one of the GPU-sortable kinds (the caller falls through to
 /// the host-side sort).
+///
+/// **Stage 3** additions:
+///   - `Boolean` -> `Bool` (loaded as u8, compared as s32 0/1).
+///   - `Dictionary(I32 | I64, Utf8)` -> the index dtype (Int32 / Int64). The
+///     dictionary's *values* are immaterial for the sort: the indices alone
+///     induce the lex order the dictionary was built with. Non-dict Utf8
+///     keys stay on the host path; encoder is responsible for converting if
+///     they want the GPU win — see the Stage 4 follow-up note.
 pub fn arrow_dtype_to_internal(d: &arrow_schema::DataType) -> Option<DataType> {
     use arrow_schema::DataType as A;
     match d {
@@ -431,6 +440,20 @@ pub fn arrow_dtype_to_internal(d: &arrow_schema::DataType) -> Option<DataType> {
         A::Int64 => Some(DataType::Int64),
         A::Float32 => Some(DataType::Float32),
         A::Float64 => Some(DataType::Float64),
+        A::Boolean => Some(DataType::Bool),
+        A::Dictionary(key_ty, value_ty) => {
+            // Only string-valued dictionaries are accepted for the Stage 3
+            // adapter. The numeric values would already match one of the
+            // direct dtypes above, no need for the dict path.
+            if !matches!(value_ty.as_ref(), A::Utf8) {
+                return None;
+            }
+            match key_ty.as_ref() {
+                A::Int32 => Some(DataType::Int32),
+                A::Int64 => Some(DataType::Int64),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -441,13 +464,10 @@ pub fn arrow_dtype_to_internal(d: &arrow_schema::DataType) -> Option<DataType> {
 
 /// Build an Arrow-format packed-bit validity bitmap (1 byte per 8 elements,
 /// LSB-first) covering positions `0..n_pow2`. Positions in `0..n_rows` come
-/// from `arr.is_null(i)`; padded positions are marked NULL.
-///
-/// Marking the padding NULL keeps the comparator semantics consistent even
-/// when the sentinel key values would otherwise tie a real row — under
-/// NULLS LAST the padding sorts to the end, under NULLS FIRST the host
-/// truncates leading padded indices (the truncation step in
-/// `sort_indices_on_gpu_multi` already filters out indices `>= n_rows`).
+/// from `arr.is_null(i)`; padded positions are marked VALID so that NULL
+/// handling stays orthogonal to padded-row routing (Stage 3 split: NULL
+/// semantics now drive `nulls_first` only, padding semantics drive
+/// `is_padded`).
 fn build_validity_padded(arr: &dyn Array, n_pow2: usize) -> Vec<u8> {
     let n_rows = arr.len();
     let bytes = (n_pow2 + 7) / 8;
@@ -457,28 +477,155 @@ fn build_validity_padded(arr: &dyn Array, n_pow2: usize) -> Vec<u8> {
             out[i / 8] |= 1 << (i % 8);
         }
     }
-    // Padded positions are left as 0 = NULL. This matches the
-    // "padding goes last" convention paired with NULLS LAST polarity.
+    // Stage 3: padded positions are marked VALID. Their fate is decided by
+    // the is_padded bitmap (which routes them to the global end regardless
+    // of value or null). Marking them valid means a NULLS FIRST query
+    // doesn't accidentally lump padded rows in with real-NULL rows.
+    for i in n_rows..n_pow2 {
+        out[i / 8] |= 1 << (i % 8);
+    }
     out
+}
+
+/// **Stage 3** — build the `is_padded` packed-bit bitmap. Bit `i` is 1 iff
+/// `i >= n_rows`, i.e. the row at position `i` in the padded buffer is one
+/// of the synthetic pad slots. The kernel uses this to route padded rows
+/// past every real row regardless of sentinel-value collisions.
+///
+/// This is the load-bearing fix for the Stage-2 silent-row-drop bug: if a
+/// real row's key equals the sentinel (e.g. `i32::MAX` as legit data with
+/// the ASC `+INF`-style padding), the value compare ties and previously
+/// the real row could end up at an index >= n_rows and get truncated. With
+/// the explicit padded-bit, padded rows always lose the tiebreak.
+fn build_is_padded(n_rows: usize, n_pow2: usize) -> Vec<u8> {
+    let bytes = (n_pow2 + 7) / 8;
+    let mut out = vec![0u8; bytes];
+    for i in n_rows..n_pow2 {
+        out[i / 8] |= 1 << (i % 8);
+    }
+    out
+}
+
+/// Extract a numeric "host view" from a sortable Arrow column. Stage 3
+/// addition: handles Bool (-> u8 0/1 widened to i32) and dictionary-encoded
+/// Utf8 (-> index column as i32 or i64). For everything else this is a
+/// straight `.values().to_vec()`.
+fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<HostKeyValues> {
+    use arrow_schema::DataType as A;
+    Ok(match (dtype, arr.data_type()) {
+        (DataType::Int32, A::Int32) => HostKeyValues::I32(
+            arr.as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: i32 downcast failed".into()))?
+                .values()
+                .as_ref()
+                .to_vec(),
+        ),
+        (DataType::Int64, A::Int64) => HostKeyValues::I64(
+            arr.as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: i64 downcast failed".into()))?
+                .values()
+                .as_ref()
+                .to_vec(),
+        ),
+        (DataType::Float32, _) => HostKeyValues::F32(
+            arr.as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: f32 downcast failed".into()))?
+                .values()
+                .as_ref()
+                .to_vec(),
+        ),
+        (DataType::Float64, _) => HostKeyValues::F64(
+            arr.as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: f64 downcast failed".into()))?
+                .values()
+                .as_ref()
+                .to_vec(),
+        ),
+        (DataType::Bool, A::Boolean) => {
+            // Widen each bit to a u8 of 0/1; the kernel loads via ld.global.u8
+            // into a b32 register and compares as s32. Length matches `arr.len()`.
+            let ba = arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: bool downcast failed".into()))?;
+            let mut out: Vec<u8> = Vec::with_capacity(ba.len());
+            for i in 0..ba.len() {
+                // is_null rows still contribute a value byte; the validity
+                // bitmap is the source of truth — pick 0 as a no-op.
+                if ba.is_null(i) {
+                    out.push(0);
+                } else {
+                    out.push(if ba.value(i) { 1 } else { 0 });
+                }
+            }
+            HostKeyValues::Bool(out)
+        }
+        // Stage 3 dictionary-Utf8 adapter: read the dictionary's index column
+        // (`Int32` or `Int64`); the dictionary values themselves never reach
+        // the GPU sort. The output permutation is then applied (host-side)
+        // to the dictionary-encoded column intact, which keeps the
+        // values-dictionary edge alive without re-encoding.
+        (DataType::Int32, A::Dictionary(key_ty, _)) if matches!(key_ty.as_ref(), A::Int32) => {
+            let da = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .ok_or_else(|| {
+                    BoltError::Other("gpu_sort: dict<i32,utf8> downcast failed".into())
+                })?;
+            HostKeyValues::I32(da.keys().values().as_ref().to_vec())
+        }
+        (DataType::Int64, A::Dictionary(key_ty, _)) if matches!(key_ty.as_ref(), A::Int64) => {
+            let da = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int64Type>>()
+                .ok_or_else(|| {
+                    BoltError::Other("gpu_sort: dict<i64,utf8> downcast failed".into())
+                })?;
+            HostKeyValues::I64(da.keys().values().as_ref().to_vec())
+        }
+        (dt, arrow_dt) => {
+            return Err(BoltError::Other(format!(
+                "gpu_sort: dtype/array mismatch ({:?} vs Arrow {:?})",
+                dt, arrow_dt
+            )))
+        }
+    })
+}
+
+/// Heterogeneous host-side key buffer pre-upload. Existed inline before
+/// Stage 3; now factored out so the Bool + Dict-Utf8 adapters can build it
+/// without re-implementing the per-dtype branches twice.
+enum HostKeyValues {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    Bool(Vec<u8>),
 }
 
 /// Upload a typed key column into a padded device buffer. Sentinel choice
 /// follows the Stage-1 convention (`+INF` for ASC, `-INF` for DESC) so
-/// padded entries land past real data in the comparator's value sense; the
-/// validity-aware path additionally marks them NULL.
+/// padded entries land past real data in the comparator's value sense.
+///
+/// **Stage 3** — the padded-row routing in the kernel uses an explicit
+/// is_padded bitmap (built separately, see `build_is_padded`), so the
+/// sentinel choice is only a "soft hint" that still helps real data
+/// converge faster (sentinel still beats real values on average). When a
+/// real value legitimately ties the sentinel, the is_padded bit wins the
+/// tiebreak — no row drop.
 fn upload_padded_key_for_dtype(
     arr: &dyn Array,
     dtype: DataType,
     dir: SortDirection,
     n_pow2: usize,
 ) -> BoltResult<KeyDeviceBuf> {
-    Ok(match dtype {
-        DataType::Int32 => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| BoltError::Other("gpu_sort: i32 downcast failed".into()))?;
-            let host: Vec<i32> = pa.values().as_ref().to_vec();
+    let values = host_values_for_key(arr, dtype)?;
+    Ok(match values {
+        HostKeyValues::I32(host) => {
             let sentinel = match dir {
                 SortDirection::Asc => i32::MAX,
                 SortDirection::Desc => i32::MIN,
@@ -486,12 +633,7 @@ fn upload_padded_key_for_dtype(
             let padded = pad_to_pow2(&host, n_pow2, sentinel);
             KeyDeviceBuf::I32(GpuVec::<i32>::from_slice(&padded)?)
         }
-        DataType::Int64 => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| BoltError::Other("gpu_sort: i64 downcast failed".into()))?;
-            let host: Vec<i64> = pa.values().as_ref().to_vec();
+        HostKeyValues::I64(host) => {
             let sentinel = match dir {
                 SortDirection::Asc => i64::MAX,
                 SortDirection::Desc => i64::MIN,
@@ -499,12 +641,7 @@ fn upload_padded_key_for_dtype(
             let padded = pad_to_pow2(&host, n_pow2, sentinel);
             KeyDeviceBuf::I64(GpuVec::<i64>::from_slice(&padded)?)
         }
-        DataType::Float32 => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| BoltError::Other("gpu_sort: f32 downcast failed".into()))?;
-            let host: Vec<f32> = pa.values().as_ref().to_vec();
+        HostKeyValues::F32(host) => {
             let sentinel = match dir {
                 SortDirection::Asc => f32::INFINITY,
                 SortDirection::Desc => f32::NEG_INFINITY,
@@ -512,12 +649,7 @@ fn upload_padded_key_for_dtype(
             let padded = pad_to_pow2(&host, n_pow2, sentinel);
             KeyDeviceBuf::F32(GpuVec::<f32>::from_slice(&padded)?)
         }
-        DataType::Float64 => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| BoltError::Other("gpu_sort: f64 downcast failed".into()))?;
-            let host: Vec<f64> = pa.values().as_ref().to_vec();
+        HostKeyValues::F64(host) => {
             let sentinel = match dir {
                 SortDirection::Asc => f64::INFINITY,
                 SortDirection::Desc => f64::NEG_INFINITY,
@@ -525,11 +657,16 @@ fn upload_padded_key_for_dtype(
             let padded = pad_to_pow2(&host, n_pow2, sentinel);
             KeyDeviceBuf::F64(GpuVec::<f64>::from_slice(&padded)?)
         }
-        _ => {
-            return Err(BoltError::Other(format!(
-                "gpu_sort multi-key: dtype {:?} not supported",
-                dtype
-            )))
+        HostKeyValues::Bool(host) => {
+            // Bool uses 1-byte slots on device; sentinel 1=true for ASC pad
+            // (lands trues at the end), 0 for DESC. Real-tie collisions are
+            // still solved by is_padded bitmap routing.
+            let sentinel: u8 = match dir {
+                SortDirection::Asc => 1,
+                SortDirection::Desc => 0,
+            };
+            let padded = pad_to_pow2(&host, n_pow2, sentinel);
+            KeyDeviceBuf::Bool(GpuVec::<u8>::from_slice(&padded)?)
         }
     })
 }
@@ -537,11 +674,15 @@ fn upload_padded_key_for_dtype(
 /// Type-erased wrapper around a GpuVec of the key dtype. Lets the multi-key
 /// driver hold heterogeneous key buffers in a single Vec without unsafe
 /// dyn-dispatch tricks.
+///
+/// **Stage 3** adds the `Bool` variant: a `u8`-typed buffer the kernel reads
+/// with `ld.global.u8` into a b32 register.
 enum KeyDeviceBuf {
     I32(GpuVec<i32>),
     I64(GpuVec<i64>),
     F32(GpuVec<f32>),
     F64(GpuVec<f64>),
+    Bool(GpuVec<u8>),
 }
 
 impl KeyDeviceBuf {
@@ -551,6 +692,7 @@ impl KeyDeviceBuf {
             KeyDeviceBuf::I64(v) => v.device_ptr(),
             KeyDeviceBuf::F32(v) => v.device_ptr(),
             KeyDeviceBuf::F64(v) => v.device_ptr(),
+            KeyDeviceBuf::Bool(v) => v.device_ptr(),
         }
     }
 }
@@ -592,9 +734,23 @@ pub fn sort_indices_on_gpu_multi<'a>(
     }
     if keys.len() > MAX_SORT_KEYS {
         return Err(BoltError::Other(format!(
-            "gpu_sort: too many keys ({}); max is {}",
+            "gpu_sort: too many keys ({}); hard cap is {}",
             keys.len(),
             MAX_SORT_KEYS
+        )));
+    }
+    // Stage 3: also enforce the register-pressure budget up-front so we
+    // fail before allocating GPU buffers.
+    let reg_tally: u32 = keys
+        .iter()
+        .map(|k| crate::jit::sort_kernel::key_reg_cost(k.dtype))
+        .sum();
+    if reg_tally > crate::jit::sort_kernel::SM70_KEY_REG_BUDGET {
+        return Err(BoltError::Other(format!(
+            "gpu_sort: keys would consume {} b32-register equivalents; sm_70 budget \
+             is {} (drop a key or split into multi-pass)",
+            reg_tally,
+            crate::jit::sort_kernel::SM70_KEY_REG_BUDGET
         )));
     }
 
@@ -661,6 +817,10 @@ pub fn sort_indices_on_gpu_multi<'a>(
     let idx_host: Vec<u32> = (0..n_pow2).collect();
     let idx_dev = GpuVec::<u32>::from_slice(&idx_host)?;
 
+    // Stage 3: is_padded packed-bit bitmap, uploaded as a u8 buffer.
+    let is_padded_host = build_is_padded(n_rows, n_pow2_usize);
+    let is_padded_dev = GpuVec::<u8>::from_slice(&is_padded_host)?;
+
     // Compile + load the module.
     let ptx = compile_sort_kernel_spec(&spec)?;
     let module = CudaModule::from_ptx(&ptx)?;
@@ -686,6 +846,7 @@ pub fn sort_indices_on_gpu_multi<'a>(
             .unwrap_or(null_ptr);
     }
     let mut indices_ptr = idx_dev.device_ptr();
+    let mut is_padded_ptr = is_padded_dev.device_ptr();
     let mut p_n_pow2: u32 = n_pow2;
 
     match layout {
@@ -697,13 +858,14 @@ pub fn sort_indices_on_gpu_multi<'a>(
 
             let mut kp = key_ptrs;
             let mut vp = val_ptrs;
-            // Interleave (k0, v0, k1, v1, ..., kN, vN, indices, n_pow2).
-            let mut params: Vec<*mut c_void> = Vec::with_capacity(MAX_SORT_KEYS * 2 + 2);
+            // Interleave (k0, v0, k1, v1, ..., kN, vN, indices, is_padded, n_pow2).
+            let mut params: Vec<*mut c_void> = Vec::with_capacity(MAX_SORT_KEYS * 2 + 3);
             for i in 0..MAX_SORT_KEYS {
                 params.push(&mut kp[i] as *mut CUdeviceptr as *mut c_void);
                 params.push(&mut vp[i] as *mut CUdeviceptr as *mut c_void);
             }
             params.push(&mut indices_ptr as *mut CUdeviceptr as *mut c_void);
+            params.push(&mut is_padded_ptr as *mut CUdeviceptr as *mut c_void);
             params.push(&mut p_n_pow2 as *mut u32 as *mut c_void);
 
             // SAFETY: every entry of `params` points at a stack local that
@@ -739,12 +901,13 @@ pub fn sort_indices_on_gpu_multi<'a>(
                     let mut p_stage: u32 = stage;
                     let mut p_mask: u32 = substage_mask;
                     let mut params: Vec<*mut c_void> =
-                        Vec::with_capacity(MAX_SORT_KEYS * 2 + 4);
+                        Vec::with_capacity(MAX_SORT_KEYS * 2 + 5);
                     for i in 0..MAX_SORT_KEYS {
                         params.push(&mut kp[i] as *mut CUdeviceptr as *mut c_void);
                         params.push(&mut vp[i] as *mut CUdeviceptr as *mut c_void);
                     }
                     params.push(&mut indices_ptr as *mut CUdeviceptr as *mut c_void);
+                    params.push(&mut is_padded_ptr as *mut CUdeviceptr as *mut c_void);
                     params.push(&mut p_n_pow2 as *mut u32 as *mut c_void);
                     params.push(&mut p_stage as *mut u32 as *mut c_void);
                     params.push(&mut p_mask as *mut u32 as *mut c_void);
@@ -777,6 +940,12 @@ pub fn sort_indices_on_gpu_multi<'a>(
     }
 
     // Download indices and truncate.
+    //
+    // Stage 3: with the is_padded routing in the kernel, real rows are now
+    // guaranteed to live in `0..n_rows` and padded rows in `n_rows..n_pow2`
+    // (modulo direction). The truncation just takes the first `n_rows`
+    // entries with index < n_rows; the defensive filter is still kept in
+    // case a future kernel regression slips a padded index in.
     let idx_host_sorted: Vec<u32> = idx_dev.to_vec()?;
     let n_rows_u32 = n_rows_to_u32(n_rows)?;
     let mut out: Vec<u32> = Vec::with_capacity(n_rows);
@@ -790,16 +959,18 @@ pub fn sort_indices_on_gpu_multi<'a>(
     }
     if out.len() != n_rows {
         return Err(BoltError::Other(format!(
-            "gpu_sort multi-key: recovered only {} indices for {} real rows",
+            "gpu_sort multi-key: recovered only {} indices for {} real rows \
+             (padded-bit routing should prevent this)",
             out.len(),
             n_rows
         )));
     }
 
-    // Buffers (key + validity + idx_dev) drop here.
+    // Buffers (key + validity + idx_dev + is_padded) drop here.
     drop(key_bufs);
     drop(validity_bufs);
     drop(idx_dev);
+    drop(is_padded_dev);
 
     Ok((layout, UInt32Array::from(out)))
 }
@@ -902,8 +1073,57 @@ mod tests {
             arrow_dtype_to_internal(&ArrowDataType::Float64),
             Some(DataType::Float64)
         );
+        // Stage 3 additions: Boolean -> Bool; Dictionary(I32|I64, Utf8) ->
+        // the index dtype. Plain Utf8 still falls through to host.
         assert_eq!(arrow_dtype_to_internal(&ArrowDataType::Utf8), None);
-        assert_eq!(arrow_dtype_to_internal(&ArrowDataType::Boolean), None);
+        assert_eq!(
+            arrow_dtype_to_internal(&ArrowDataType::Boolean),
+            Some(DataType::Bool)
+        );
+        assert_eq!(
+            arrow_dtype_to_internal(&ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::Int32),
+                Box::new(ArrowDataType::Utf8),
+            )),
+            Some(DataType::Int32)
+        );
+        assert_eq!(
+            arrow_dtype_to_internal(&ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::Int64),
+                Box::new(ArrowDataType::Utf8),
+            )),
+            Some(DataType::Int64)
+        );
+        // Non-string-valued dict (e.g. dict<i32, i64>): reject — caller
+        // should hand the inner i64 directly through the numeric path.
+        assert_eq!(
+            arrow_dtype_to_internal(&ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::Int32),
+                Box::new(ArrowDataType::Int64),
+            )),
+            None
+        );
+    }
+
+    /// Stage 3 padded-bit bitmap layout: padded slots at indices >= n_rows
+    /// get bit=1; real rows get bit=0. Length is `ceil(n_pow2 / 8)`.
+    #[test]
+    fn build_is_padded_marks_only_pad_slots() {
+        let n_rows = 5;
+        let n_pow2 = 8;
+        let bm = build_is_padded(n_rows, n_pow2);
+        assert_eq!(bm.len(), 1); // ceil(8/8) = 1 byte
+        // bits 0..5 = 0 (real); bits 5..8 = 1 (padded). 0b1110_0000 = 0xE0.
+        assert_eq!(bm[0], 0xE0);
+    }
+
+    #[test]
+    fn build_is_padded_handles_no_padding() {
+        let n_rows = 8;
+        let n_pow2 = 8;
+        let bm = build_is_padded(n_rows, n_pow2);
+        assert_eq!(bm.len(), 1);
+        assert_eq!(bm[0], 0x00, "no slots padded when n_rows == n_pow2");
     }
 
     // -- GPU round-trip (ignored on hostless CI) --

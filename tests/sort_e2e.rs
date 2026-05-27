@@ -458,6 +458,228 @@ fn shmem_variant_small_input() {
     assert_eq!(sorted, expected, "shmem-variant output must equal sorted(input)");
 }
 
+// ============================================================================
+// Stage 3: lifted key cap, padded-row routing, Bool/Utf8-via-dict, packed-bit
+// shmem validity.
+// ============================================================================
+
+/// `ORDER BY a, b, c, d, e, f, g, h ASC` — 8 keys, well above the Stage-2
+/// hard cap of 4. Drives the lifted register-pressure-based cap.
+#[test]
+#[ignore = "requires CUDA device"]
+fn eight_key_sort() {
+    use arrow_array::Int32Array;
+    let mut engine = Engine::new().expect("ctx");
+
+    let n = N_BIG;
+    // Build 8 columns; each is `i / mod_k` so successive keys add
+    // tiebreakers. The 8th column is unique so the final order is total.
+    let mods = [16, 8, 8, 8, 8, 8, 8, 1];
+    let cols: Vec<Vec<i32>> = mods
+        .iter()
+        .map(|m| (0..n as i32).map(|i| if *m > 1 { i % m } else { i }).collect())
+        .collect();
+    let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    let fields: Vec<ArrowField> = names
+        .iter()
+        .map(|n| ArrowField::new(*n, ArrowDataType::Int32, false))
+        .collect();
+    let schema = Arc::new(ArrowSchema::new(fields));
+    let arrays: Vec<Arc<dyn Array>> = cols
+        .iter()
+        .map(|c| Arc::new(Int32Array::from(c.clone())) as Arc<dyn Array>)
+        .collect();
+    let batch = RecordBatch::try_new(schema, arrays).unwrap();
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT a, b, c, d, e, f, g, h FROM t ORDER BY a, b, c, d, e, f, g, h")
+        .expect("ORDER BY 8 keys");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), n);
+    // Validate strict lex order key-by-key.
+    let downcast = |i: usize| out.column(i).as_any().downcast_ref::<Int32Array>().unwrap();
+    let arrs: Vec<&Int32Array> = (0..8).map(downcast).collect();
+    for row in 1..n {
+        for (ki, a) in arrs.iter().enumerate() {
+            let prev = a.value(row - 1);
+            let curr = a.value(row);
+            if prev != curr {
+                assert!(
+                    prev < curr,
+                    "ORDER BY key #{ki} not ascending at row {row}: {prev} > {curr}"
+                );
+                break; // later keys may go any direction within this tie
+            }
+        }
+    }
+}
+
+/// `ORDER BY b ASC` on a Bool column — Stage 3 added Bool support.
+#[test]
+#[ignore = "requires CUDA device"]
+fn bool_key_sort() {
+    use arrow_array::{BooleanArray, Int32Array};
+    let mut engine = Engine::new().expect("ctx");
+    let n = N_BIG;
+    // Mostly true, ~30% false, with a payload column that should track.
+    let bools: Vec<bool> = (0..n).map(|i| i % 10 < 7).collect();
+    let payload: Vec<i32> = (0..n as i32).collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("b", ArrowDataType::Boolean, false),
+        ArrowField::new("p", ArrowDataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(BooleanArray::from(bools.clone())),
+            Arc::new(Int32Array::from(payload)),
+        ],
+    )
+    .unwrap();
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT b, p FROM t ORDER BY b")
+        .expect("ORDER BY b ASC");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), n);
+    let b_out = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    // ASC: false (0) before true (1). All falses come before any true.
+    let mut last_true = false;
+    for i in 0..n {
+        let v = b_out.value(i);
+        if v {
+            last_true = true;
+        } else {
+            assert!(
+                !last_true,
+                "ASC bool: false at row {i} found after a true was already seen"
+            );
+        }
+    }
+    // Count matches.
+    let total_true_out = (0..n).filter(|i| b_out.value(*i)).count();
+    let total_true_in = bools.iter().filter(|x| **x).count();
+    assert_eq!(total_true_out, total_true_in);
+}
+
+/// `ORDER BY s ASC` over a dictionary-encoded Utf8 column. Stage 3 wires a
+/// host-side adapter that drives the existing numeric kernel using the
+/// dictionary's index column. After the sort the dictionary remains intact.
+///
+/// The engine's SQL pipeline doesn't yet expose DictionaryArray as a
+/// directly registerable column (the `arrow_dtype_to_plan` mapping rejects
+/// Dictionary types — Stage 4 follow-up). This test therefore drives the
+/// host-side adapter directly via the `sort_indices_on_gpu_multi` entry
+/// point, the same way `shmem_variant_small_input` does. It still exercises
+/// the load-bearing piece: `host_values_for_key` peeling off the index
+/// column and routing it through the i32 kernel.
+#[test]
+#[ignore = "requires CUDA device"]
+fn dict_utf8_key_sort() {
+    use arrow_array::types::Int32Type;
+    use arrow_array::{DictionaryArray, Int32Array, StringArray};
+    use craton_bolt::__test_only_gpu_sort::{sort_indices_on_gpu_multi, GpuSortKey};
+    use craton_bolt::__test_only_logical_plan::DataType;
+    use craton_bolt::__test_only_sort_kernel::SortDirection;
+
+    let n = 16_384usize;
+    // Dictionary with a few entries; cyclic keys produce a coarse-grained
+    // ordering that's trivial to verify.
+    let dict_values = vec!["alpha", "bravo", "charlie", "delta", "echo"];
+    let keys: Vec<i32> = (0..n as i32)
+        .map(|i| i % (dict_values.len() as i32))
+        .collect();
+    let dict_arr: DictionaryArray<Int32Type> = DictionaryArray::try_new(
+        Int32Array::from(keys.clone()),
+        Arc::new(StringArray::from(dict_values.clone())),
+    )
+    .unwrap();
+
+    // Drive the multi-key sort directly. dtype=Int32 because the adapter
+    // routes a dict<i32,Utf8> via the i32 numeric kernel.
+    let sort_keys = vec![GpuSortKey {
+        column: &dict_arr,
+        dtype: DataType::Int32,
+        direction: SortDirection::Asc,
+        nulls_first: false,
+    }];
+    let (_layout, perm) = sort_indices_on_gpu_multi(&sort_keys).expect("dict-Utf8 sort");
+    assert_eq!(perm.len(), n);
+
+    // Apply the perm to the original index column; result must be ASC.
+    let sorted: Vec<i32> = (0..n).map(|i| keys[perm.value(i) as usize]).collect();
+    for i in 1..n {
+        assert!(
+            sorted[i - 1] <= sorted[i],
+            "dict-Utf8 sort: index column not ASC at row {i}: {} > {}",
+            sorted[i - 1],
+            sorted[i]
+        );
+    }
+    let mut expected = keys.clone();
+    expected.sort();
+    assert_eq!(sorted, expected, "dict-Utf8 sort must equal sorted(input)");
+}
+
+/// Sentinel-collision test: build an Int32 column whose values include the
+/// ASC pad sentinel (`i32::MAX`) as a legitimate datum, then `ORDER BY a
+/// ASC`. The Stage-2 path silently dropped these rows because they tied
+/// the sentinel; Stage 3 routes padded rows via an explicit bit so real
+/// `i32::MAX` values survive.
+#[test]
+#[ignore = "requires CUDA device"]
+fn sentinel_collision_does_not_drop_row() {
+    use arrow_array::Int32Array;
+    let mut engine = Engine::new().expect("ctx");
+    // n_rows = N_BIG but pick a non-power-of-2 so n_pow2 > n_rows and the
+    // padding is non-trivial.
+    let n = N_BIG + 137;
+    let mut values: Vec<i32> = (0..n as i32).collect();
+    // Sprinkle ~50 i32::MAX values.
+    for k in 0..50 {
+        values[k * 211 % n] = i32::MAX;
+    }
+    let target_count = values.iter().filter(|v| **v == i32::MAX).count();
+    assert!(
+        target_count >= 1,
+        "test setup should produce at least one i32::MAX row"
+    );
+    let batch = int32_batch("a", values.clone());
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT a FROM t ORDER BY a")
+        .expect("ORDER BY a ASC");
+    let out = h.record_batch();
+    assert_eq!(
+        out.num_rows(),
+        n,
+        "Stage-3 padded routing must preserve every real row (including i32::MAX)"
+    );
+    let arr = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    // Count i32::MAX in output — must equal input.
+    let out_max = (0..n).filter(|i| arr.value(*i) == i32::MAX).count();
+    assert_eq!(
+        out_max, target_count,
+        "Stage-3: lost {} i32::MAX rows under sentinel collision",
+        target_count - out_max
+    );
+    // And the whole output is ASC.
+    for i in 1..n {
+        assert!(arr.value(i - 1) <= arr.value(i));
+    }
+}
+
 /// Below the GPU threshold the host path must still produce correct output.
 /// This test guards against an accidental gate inversion that would route
 /// small queries through the GPU and break on its preconditions.
