@@ -97,6 +97,21 @@ impl DeviceMemPool {
         buckets.entry(alloc_bytes).or_default().push(ptr);
     }
 
+    /// Total number of pooled (i.e. currently-freed-but-not-returned-to-driver)
+    /// blocks across all buckets. Intended for tests and diagnostics only.
+    #[doc(hidden)]
+    pub fn pooled_block_count(&self) -> usize {
+        self.buckets.lock().values().map(|v| v.len()).sum()
+    }
+
+    /// Number of pooled blocks in the bucket that would satisfy an allocation
+    /// of `bytes`. Intended for tests and diagnostics only.
+    #[doc(hidden)]
+    pub fn bucket_len_for(&self, bytes: usize) -> usize {
+        let key = bucket_size(bytes);
+        self.buckets.lock().get(&key).map(|v| v.len()).unwrap_or(0)
+    }
+
     /// Release every pooled block back to the driver. Called on `Drop`, and
     /// usable by tests / shutdown paths that want a clean slate.
     pub fn drain(&self) {
@@ -144,3 +159,12 @@ impl Drop for DeviceMemPool {
 
 /// Global, process-wide pool instance. Lazily initialized on first touch.
 pub(crate) static POOL: Lazy<DeviceMemPool> = Lazy::new(DeviceMemPool::new);
+
+/// Test-only accessor for the process-wide pool. Hidden from the rendered
+/// docs because external callers must not rely on it: the pool is an
+/// implementation detail of `GpuBuffer` and may change shape. Integration
+/// tests use this to assert invariants on pool occupancy.
+#[doc(hidden)]
+pub fn __test_pool() -> &'static DeviceMemPool {
+    &POOL
+}
