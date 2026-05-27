@@ -1114,6 +1114,14 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 /// variants. Materialising once at registration is O(n) per dict column —
 /// the same cost the engine's own dictionary builder pays — and keeps every
 /// downstream stage's Utf8 handling unified on `StringArray`.
+///
+/// **Stage 5** added a native `GpuColumnData::DictUtf8` variant to
+/// `GpuTable` so callers that go directly through `GpuTable::from_record_batch`
+/// (skipping the engine's registry / `MemTableProvider`) can preserve the
+/// input dictionary instead of materialising it. The engine's SQL pipeline
+/// still flattens here because the `dict_registry` and `MemTableProvider`
+/// both work in terms of `StringArray`; teaching them to consume `DictUtf8`
+/// is the Stage-6 follow-up that finally retires this function.
 fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<RecordBatch> {
     use arrow_array::{Array, DictionaryArray, StringArray};
     use arrow_array::types::{Int32Type, Int64Type};

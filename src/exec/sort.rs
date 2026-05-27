@@ -151,8 +151,13 @@ fn try_gpu_sort(
     // here is the only path on the way to the GPU. Single-key sorts are
     // expressed as a `SortKernelSpec` with one entry in `keys`; the PTX-
     // shape golden tests were migrated to that form.
+    //
+    // Stage 5: the multi-key driver now returns `Ok(None)` when a per-key
+    // gate decides the GPU path isn't worth it (today: the high-cardinality
+    // plain-Utf8 sampler in `host_values_for_key`). We just forward that
+    // None and let the caller fall through to `lexsort_to_indices`.
     let sorted = crate::exec::gpu_sort::sort_record_batch_on_gpu_multi(batch, &resolved)?;
-    Ok(Some(sorted))
+    Ok(sorted)
 }
 
 /// Sort keys must currently be bare column references (possibly aliased).
