@@ -19,18 +19,18 @@
 //! without a `WHERE`, and their `extended_agg`/`expr_agg` variants are
 //! dispatched to dedicated executors in `Engine::execute`.
 
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch,
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
-use crate::cuda::buffer::primitive_to_gpu;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::{CudaContext, GpuVec};
@@ -93,7 +93,18 @@ pub struct Engine {
     dict_registry: crate::exec::dict_registry::DictRegistry,
     /// GPU-resident copies of every registered table. Owns the device
     /// allocations; must drop BEFORE `_ctx`.
-    gpu_tables: HashMap<String, crate::exec::gpu_table::GpuTable>,
+    ///
+    /// Wrapped in `RefCell<Option<_>>` to support a lazy-upload strategy:
+    /// `register_batch` only mutates the host-side `tables` and sets the slot
+    /// to `None` (dirty). The actual upload happens on the next query, in
+    /// `ensure_gpu_table` from inside `execute_projection`. This collapses a
+    /// streaming append workload that uploaded `1+2+…+N = N(N+1)/2` batches'
+    /// worth of bytes (the per-append re-upload bug) down to a single upload
+    /// per query of the current concatenated table — i.e. O(N) total bytes
+    /// across the lifetime of a streaming-then-query session, instead of
+    /// O(N²). Multiple consecutive `register_batch` calls without an
+    /// intervening query share that one upload.
+    gpu_tables: RefCell<HashMap<String, Option<crate::exec::gpu_table::GpuTable>>>,
     /// Owned CUDA context — declared LAST so it drops AFTER dictionaries.
     _ctx: CudaContext,
 }
@@ -135,7 +146,7 @@ impl Engine {
             tables: HashMap::new(),
             provider: MemTableProvider::new(),
             dict_registry: crate::exec::dict_registry::DictRegistry::new(),
-            gpu_tables: HashMap::new(),
+            gpu_tables: RefCell::new(HashMap::new()),
             _ctx: ctx,
         })
     }
@@ -168,7 +179,9 @@ impl Engine {
         self.provider.register(name.clone(), extended);
         // Build a GPU-resident copy so execution can query in place.
         let gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
-        self.gpu_tables.insert(name.clone(), gpu_table);
+        self.gpu_tables
+            .borrow_mut()
+            .insert(name.clone(), Some(gpu_table));
         self.tables.insert(name, vec![batch]);
         Ok(())
     }
@@ -202,7 +215,7 @@ impl Engine {
         // to the pool BEFORE we mint the dictionary index columns for the
         // replacement (those may also allocate from the pool — letting the
         // pool churn rather than grow keeps RAII tidy).
-        self.gpu_tables.remove(&name);
+        self.gpu_tables.borrow_mut().remove(&name);
         self.dict_registry.unregister_table(&name);
         // Re-register dictionaries for the new batch.
         self.dict_registry.register_table(name.clone(), &batch)?;
@@ -210,7 +223,9 @@ impl Engine {
         // `MemTableProvider::register` already overwrites — no separate `replace`
         // entry point needed.
         self.provider.register(name.clone(), extended);
-        self.gpu_tables.insert(name.clone(), new_gpu_table);
+        self.gpu_tables
+            .borrow_mut()
+            .insert(name.clone(), Some(new_gpu_table));
         self.tables.insert(name, vec![batch]);
         Ok(())
     }
@@ -226,6 +241,14 @@ impl Engine {
     /// batches with unseen Utf8 values are still queryable, but the string-
     /// literal rewriter can only match values present in batch 0. (Refreshing
     /// dictionaries per append is a 0.3 goal.)
+    ///
+    /// Performance: this method does NOT re-upload anything to the GPU. It
+    /// only pushes the host-side `RecordBatch` and marks the corresponding
+    /// `gpu_tables` slot dirty (`None`). The combined upload of the
+    /// concatenated table happens lazily, inside the next query that touches
+    /// this table, via `ensure_gpu_table`. Without this, a streaming-append
+    /// workload would re-upload the *entire* concatenated history on every
+    /// append — `1+2+…+N = N(N+1)/2` batches' worth of bytes for N appends.
     pub fn register_batch(
         &mut self,
         name: &str,
@@ -245,16 +268,64 @@ impl Engine {
                 }
             }
             existing.push(batch);
-            // Re-materialize the concatenated batch to update the GPU table
-            let concatenated = self.materialize_table(name)?;
-            let gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&concatenated)?;
-            self.gpu_tables.insert(name.to_string(), gpu_table);
+            // Mark the GPU-resident copy dirty. The next query that hits this
+            // table will rebuild it from the concatenated host batches. We
+            // explicitly insert `None` (rather than `remove`) so the entry's
+            // existence still signals "this table has been registered" — keeps
+            // a future audit / introspection path simple.
+            self.gpu_tables.borrow_mut().insert(name.to_string(), None);
             Ok(())
         } else {
             // First batch for a brand-new table: defer to register_table so the
             // dictionary + provider wiring happens exactly once.
             self.register_table(name.to_string(), batch)
         }
+    }
+
+    /// Make sure the GPU-resident copy of `name` is fresh, uploading from the
+    /// host-side concatenated batches if the slot is dirty (`None`) or absent.
+    /// Returns a `Ref` borrowing the inner `GpuTable` for the caller to use
+    /// during a single query.
+    ///
+    /// Held for the duration of `execute_projection`; the borrow lifetime is
+    /// enforced by the returned `Ref` (`RefCell` will panic if a second
+    /// `borrow_mut` is attempted while the `Ref` is live, but no engine method
+    /// touches `gpu_tables` mutably while a query is in flight).
+    fn ensure_gpu_table(
+        &self,
+        name: &str,
+    ) -> BoltResult<Ref<'_, crate::exec::gpu_table::GpuTable>> {
+        // Fast path: borrow read-only and check for a hit. If the slot holds
+        // `Some(GpuTable)`, project the `Ref<HashMap<_>>` down to the inner
+        // `Ref<GpuTable>` and return it.
+        {
+            let g = self.gpu_tables.borrow();
+            if matches!(g.get(name), Some(Some(_))) {
+                return Ok(Ref::map(g, |m| {
+                    // Safe: matched `Some(Some(_))` above and no mutation of
+                    // `gpu_tables` happens between the matches! check and the
+                    // map (the &self borrow forbids it).
+                    m.get(name)
+                        .expect("hit by matches! above")
+                        .as_ref()
+                        .expect("hit by matches! above")
+                }));
+            }
+        }
+        // Miss path: the slot is dirty (`None`) or missing. Build the GpuTable
+        // from the host-concatenated batch, then re-borrow.
+        let concatenated = self.materialize_table(name)?;
+        let gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&concatenated)?;
+        self.gpu_tables
+            .borrow_mut()
+            .insert(name.to_string(), Some(gpu_table));
+        let g = self.gpu_tables.borrow();
+        Ok(Ref::map(g, |m| {
+            m.get(name)
+                .expect("just inserted")
+                .as_ref()
+                .expect("just inserted Some")
+        }))
     }
 
     /// Materialise the concatenated `RecordBatch` for a registered table.
@@ -445,9 +516,12 @@ impl Engine {
         kernel: &KernelSpec,
         output_schema: &Schema,
     ) -> BoltResult<QueryHandle> {
-        let gpu_table = self.gpu_tables.get(table).ok_or_else(|| {
-            BoltError::Plan(format!("table '{table}' is not registered with the engine"))
-        })?;
+        // Lazy upload: if `register_batch` ran since the last query, this
+        // rebuilds the GPU-resident copy from the host-concatenated batches.
+        // The returned `Ref` is held across the kernel launch — no other
+        // engine method touches `gpu_tables` mutably while `&self` is borrowed.
+        let gpu_table_ref = self.ensure_gpu_table(table)?;
+        let gpu_table: &crate::exec::gpu_table::GpuTable = &gpu_table_ref;
         let n_rows = gpu_table.n_rows;
 
         // 1. Resolve input device pointers in place — every column already
@@ -682,6 +756,15 @@ impl QueryHandle {
 }
 
 /// Heterogenous owned device column. Keeps each `GpuVec<T>` alive past the kernel launch.
+///
+/// Used only for OUTPUT buffers in `execute_projection`. Input columns are
+/// resolved through `GpuTable` (uploaded once at table-registration time) and
+/// fed to kernels as raw `CUdeviceptr`s; the upload-from-Arrow path that used
+/// to live here as `DeviceCol::upload` is gone — `GpuColumn::upload` in
+/// `gpu_table.rs` is the single source of truth for host→device column
+/// uploads. The historical `BoolNullable` and `Borrowed` variants and the
+/// `utf8_dictionary` accessor went with it; both were only reachable through
+/// `upload`.
 enum DeviceCol {
     /// 32-bit signed integer column.
     I32(GpuVec<i32>),
@@ -694,117 +777,11 @@ enum DeviceCol {
     /// Bool stored as one byte per row (0 / 1). Used when the source Arrow
     /// array has no nulls.
     Bool(GpuVec<u8>),
-    /// Bool stored as TWO parallel byte-per-row buffers:
-    ///   * `values[i] = 1` iff row `i` is `true`, `0` otherwise (incl. null).
-    ///   * `validity[i] = 1` iff row `i` is non-null, `0` if null.
-    /// Both buffers have the row-count length. The kernel ABI continues to
-    /// see only the values pointer via `device_ptr()`; validity is consumed
-    /// host-side on download and (TODO post-w5) threaded through filter and
-    /// aggregate kernels.
-    BoolNullable {
-        values: GpuVec<u8>,
-        validity: GpuVec<u8>,
-    },
     /// Utf8 stored as i32 dictionary indices; host dictionary lives alongside.
     Utf8(DictionaryColumn),
-    /// Borrowed device pointer — the underlying buffer is owned elsewhere
-    /// (today: a dictionary in `dict_registry`). Use ONLY as a kernel input;
-    /// `download()` is unreachable because we drop `input_cols` before reading
-    /// outputs. The lifetime of the owning buffer is enforced by `&self`
-    /// borrowing for the entire duration of `execute_projection`.
-    Borrowed { ptr: CUdeviceptr },
 }
 
 impl DeviceCol {
-    /// Upload an Arrow array to the GPU, downcasting per `dtype`.
-    fn upload(arr: &dyn Array, dtype: DataType) -> BoltResult<Self> {
-        match dtype {
-            DataType::Int32 => {
-                let pa = arr
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| type_mismatch_err(arr, "Int32"))?;
-                let buf = primitive_to_gpu(pa)?;
-                Ok(DeviceCol::I32(GpuVec::from_buffer(buf)))
-            }
-            DataType::Int64 => {
-                let pa = arr
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| type_mismatch_err(arr, "Int64"))?;
-                let buf = primitive_to_gpu(pa)?;
-                Ok(DeviceCol::I64(GpuVec::from_buffer(buf)))
-            }
-            DataType::Float32 => {
-                let pa = arr
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| type_mismatch_err(arr, "Float32"))?;
-                let buf = primitive_to_gpu(pa)?;
-                Ok(DeviceCol::F32(GpuVec::from_buffer(buf)))
-            }
-            DataType::Float64 => {
-                let pa = arr
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| type_mismatch_err(arr, "Float64"))?;
-                let buf = primitive_to_gpu(pa)?;
-                Ok(DeviceCol::F64(GpuVec::from_buffer(buf)))
-            }
-            DataType::Bool => {
-                let ba = arr
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| type_mismatch_err(arr, "Bool"))?;
-                let n = ba.len();
-                // No-null fast path: single value buffer, the legacy `Bool`
-                // variant. Existing kernels and the gather/compact paths
-                // continue to see the same one-byte-per-row layout.
-                if ba.null_count() == 0 {
-                    let mut bytes: Vec<u8> = Vec::with_capacity(n);
-                    for i in 0..n {
-                        bytes.push(if ba.value(i) { 1 } else { 0 });
-                    }
-                    return Ok(DeviceCol::Bool(GpuVec::<u8>::from_slice(&bytes)?));
-                }
-                // Nullable path: build BOTH a value buffer (0 for false-or-null
-                // so value-only kernels see a defined byte) AND a parallel
-                // validity buffer (1 = non-null, 0 = null), then upload both
-                // and produce a `BoolNullable` device column.
-                //
-                // TODO(post-w5): wire validity through filter/agg kernels —
-                // today only the projection download path consumes it to
-                // reconstruct a nullable BooleanArray. Filter/compact and the
-                // aggregate executors still see the value buffer alone via
-                // `device_ptr()` and will treat null rows as `false`.
-                let mut values: Vec<u8> = Vec::with_capacity(n);
-                let mut validity: Vec<u8> = Vec::with_capacity(n);
-                for i in 0..n {
-                    if ba.is_null(i) {
-                        values.push(0);
-                        validity.push(0);
-                    } else {
-                        values.push(if ba.value(i) { 1 } else { 0 });
-                        validity.push(1);
-                    }
-                }
-                let v_gpu = GpuVec::<u8>::from_slice(&values)?;
-                let m_gpu = GpuVec::<u8>::from_slice(&validity)?;
-                Ok(DeviceCol::BoolNullable {
-                    values: v_gpu,
-                    validity: m_gpu,
-                })
-            }
-            DataType::Utf8 => {
-                let sa = arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| type_mismatch_err(arr, "Utf8"))?;
-                Ok(DeviceCol::Utf8(DictionaryColumn::from_string_array(sa)?))
-            }
-        }
-    }
-
     /// Allocate a zero-initialised device column of `n` rows.
     ///
     /// Utf8 outputs allocate an empty dictionary; the engine must replace it
@@ -827,11 +804,6 @@ impl DeviceCol {
     }
 
     /// Raw device pointer for kernel-parameter assembly.
-    ///
-    /// For `BoolNullable`, this returns the values pointer only — the
-    /// validity buffer is not yet exposed to kernels (see
-    /// TODO(post-w5) in the upload path). The buffer's lifetime is
-    /// preserved by `self` because the variant owns both `GpuVec`s.
     fn device_ptr(&self) -> CUdeviceptr {
         match self {
             DeviceCol::I32(v) => v.device_ptr(),
@@ -839,9 +811,7 @@ impl DeviceCol {
             DeviceCol::F32(v) => v.device_ptr(),
             DeviceCol::F64(v) => v.device_ptr(),
             DeviceCol::Bool(v) => v.device_ptr(),
-            DeviceCol::BoolNullable { values, .. } => values.device_ptr(),
             DeviceCol::Utf8(d) => d.indices.device_ptr(),
-            DeviceCol::Borrowed { ptr } => *ptr,
         }
     }
 
@@ -850,14 +820,6 @@ impl DeviceCol {
     fn set_utf8_dictionary(&mut self, dict: Vec<String>) {
         if let DeviceCol::Utf8(d) = self {
             d.dictionary = dict;
-        }
-    }
-
-    /// Borrow the inner dictionary if this is a Utf8 column.
-    fn utf8_dictionary(&self) -> Option<&[String]> {
-        match self {
-            DeviceCol::Utf8(d) => Some(&d.dictionary),
-            _ => None,
         }
     }
 
@@ -885,29 +847,10 @@ impl DeviceCol {
                 let bools: Vec<bool> = host.into_iter().map(|b| b != 0).collect();
                 Ok(Arc::new(BooleanArray::from(bools)) as ArrayRef)
             }
-            DeviceCol::BoolNullable { values, validity } => {
-                let host_values = copy_back::<u8>(&values, n_rows)?;
-                let host_validity = copy_back::<u8>(&validity, n_rows)?;
-                // Reconstruct a nullable BooleanArray by zipping values with
-                // the validity buffer: null rows become `None`, valid rows
-                // become `Some(value != 0)`.
-                let arr: BooleanArray = host_values
-                    .into_iter()
-                    .zip(host_validity.into_iter())
-                    .map(|(v, m)| if m == 1 { Some(v == 1) } else { None })
-                    .collect();
-                Ok(Arc::new(arr) as ArrayRef)
-            }
             DeviceCol::Utf8(d) => {
                 let arr = d.to_string_array()?;
                 Ok(Arc::new(arr) as ArrayRef)
             }
-            DeviceCol::Borrowed { .. } => Err(BoltError::Other(
-                "internal: cannot download a borrowed device column — \
-                 Borrowed variants are kernel inputs only and must be dropped \
-                 before any output download"
-                    .into(),
-            )),
         }
     }
 }
@@ -929,15 +872,6 @@ where
         )));
     }
     Ok(host)
-}
-
-/// Build a `Type` error for an Arrow downcast failure.
-fn type_mismatch_err(arr: &dyn Array, expected: &str) -> BoltError {
-    BoltError::Type(format!(
-        "Arrow array dtype {:?} does not match expected {}",
-        arr.data_type(),
-        expected
-    ))
 }
 
 /// Map our plan `DataType` to Arrow `DataType`.
@@ -986,4 +920,91 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Online tests for the lazy-upload `register_batch` path.
+    //!
+    //! These tests exist to lock in the fix for the O(N²) PCIe re-upload bug
+    //! described on the `gpu_tables` field: appending N batches must not cost
+    //! `1+2+…+N` batches' worth of host→device traffic. They verify the
+    //! observable correctness of the lazy path (rows from every appended batch
+    //! are visible to the next query). They're `#[ignore]`'d because they
+    //! launch real kernels — run with `cargo test -- --ignored` on a GPU host.
+    use super::*;
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    /// Build a single-column `RecordBatch` whose `x` column holds the half-open
+    /// range `[start, start+n)` as `Int64`. The schema is shared across all
+    /// fixtures so `register_batch`'s schema check passes.
+    fn int64_batch(start: i64, n: usize) -> RecordBatch {
+        let col: Int64Array = (start..start + n as i64).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+    fn register_batch_two_batches_query_sees_both() {
+        // Register two batches, then SELECT the only column. The lazy-upload
+        // path must rebuild the GpuTable from BOTH batches at query time, so
+        // every row from both batches has to be visible in the result.
+        let mut engine = Engine::new().expect("ctx");
+        engine
+            .register_batch("t", int64_batch(0, 4))
+            .expect("first batch");
+        engine
+            .register_batch("t", int64_batch(4, 4))
+            .expect("second batch");
+
+        let h = engine.sql("SELECT x FROM t").expect("execute");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 8, "8 rows after two 4-row batches");
+        let actual = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 column");
+        let got: Vec<i64> = (0..actual.len()).map(|i| actual.value(i)).collect();
+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+    fn register_batch_ten_batches_combined_row_count() {
+        // Append ten 100-row batches in a loop, then query. With the bug we
+        // were fixing, this would upload 1+2+…+10 = 55 batches' worth of bytes
+        // across the loop; with the fix it uploads zero bytes during the loop
+        // and exactly one combined upload at query time. Correctness check:
+        // the result has all 1000 rows and they sum to the expected total.
+        let mut engine = Engine::new().expect("ctx");
+        let n_batches = 10usize;
+        let rows_per_batch = 100usize;
+        for i in 0..n_batches {
+            engine
+                .register_batch("t", int64_batch((i * rows_per_batch) as i64, rows_per_batch))
+                .unwrap_or_else(|e| panic!("register_batch {i}: {e}"));
+        }
+        let total_rows = n_batches * rows_per_batch;
+
+        let h = engine.sql("SELECT x FROM t").expect("execute");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), total_rows, "row count after 10 appends");
+
+        let actual = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 column");
+        let sum: i64 = (0..actual.len()).map(|i| actual.value(i)).sum();
+        let expected_sum: i64 = (0..total_rows as i64).sum();
+        assert_eq!(sum, expected_sum, "sum of x column across all 10 batches");
+    }
 }
