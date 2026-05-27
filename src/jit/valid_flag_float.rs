@@ -139,6 +139,19 @@ pub fn compile_agg_valid_float_kernel(
     op: ReduceOp,
     dtype: DataType,
 ) -> BoltResult<String> {
+    emit_agg_valid_float_kernel(op, dtype, /* with_validity = */ false)
+}
+
+/// Internal: shared emitter for both the no-validity and `_with_validity`
+/// float MIN/MAX agg kernels. `with_validity = true` appends a packed-bit
+/// `validity_ptr` (Arrow LE, one bit per row) as the trailing `.param`, and
+/// emits a `bfe.u32`-based bit-test at the top of the body that branches
+/// past the CAS loop on NULL rows.
+fn emit_agg_valid_float_kernel(
+    op: ReduceOp,
+    dtype: DataType,
+    with_validity: bool,
+) -> BoltResult<String> {
     // Resolve the per-(op, dtype) PTX comparison mnemonic, validating both
     // inputs up front. SUM/COUNT go through the integer-agg kernel (which
     // can use the native `atom.global.add.f{32,64}` instruction); we reject
@@ -188,7 +201,11 @@ pub fn compile_agg_valid_float_kernel(
     };
 
     let mut ptx = String::new();
-    let entry = VALID_AGG_FLOAT_ENTRY;
+    let entry = if with_validity {
+        VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY
+    } else {
+        VALID_AGG_FLOAT_ENTRY
+    };
 
     writeln!(ptx, ".version 7.5").map_err(write_err)?;
     writeln!(ptx, ".target sm_70").map_err(write_err)?;
@@ -199,6 +216,10 @@ pub fn compile_agg_valid_float_kernel(
     // match `valid_flag_kernels::compile_agg_valid_kernel` after its
     // matching spill rework — both kernels are dispatched under the same
     // symbol name and the host launcher binds args positionally.
+    //
+    // The `_with_validity` variant appends a 12th `.param .u64 validity_ptr`
+    // (Arrow LE packed-bit bitmap, one bit per row) — the kernel reads bit
+    // `tid` and branches past the CAS loop on NULL rows.
     writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {entry}_param_0,").map_err(write_err)?; // group_col_ptr
     writeln!(ptx, "\t.param .u64 {entry}_param_1,").map_err(write_err)?; // keys_table_ptr
@@ -210,7 +231,12 @@ pub fn compile_agg_valid_float_kernel(
     writeln!(ptx, "\t.param .u64 {entry}_param_7,").map_err(write_err)?; // spill_counter_ptr
     writeln!(ptx, "\t.param .u32 {entry}_param_8,").map_err(write_err)?; // n_rows
     writeln!(ptx, "\t.param .u32 {entry}_param_9,").map_err(write_err)?; // k
-    writeln!(ptx, "\t.param .u32 {entry}_param_10").map_err(write_err)?; // max_spill
+    if with_validity {
+        writeln!(ptx, "\t.param .u32 {entry}_param_10,").map_err(write_err)?; // max_spill
+        writeln!(ptx, "\t.param .u64 {entry}_param_11").map_err(write_err)?; // validity_ptr
+    } else {
+        writeln!(ptx, "\t.param .u32 {entry}_param_10").map_err(write_err)?; // max_spill
+    }
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -250,6 +276,40 @@ pub fn compile_agg_valid_float_kernel(
     writeln!(ptx, "\tld.param.u32 %r4, [{entry}_param_8];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // === Stage E: validity bit-test (only in the `_with_validity` variant).
+    //
+    // Validity is an Arrow LE packed-bit bitmap (one bit per row, bit
+    // `tid % 8` of byte `tid / 8` is row `tid`'s validity flag, 1 = valid).
+    // Load the byte at `validity_ptr + tid / 8`, extract bit `tid % 8` via
+    // `bfe.u32`, and branch past the CAS loop on NULL rows. The candidate
+    // value is NOT loaded for NULL rows, so a column whose NULL slots hold
+    // garbage bit patterns is still safe — no atomic update is issued, and
+    // the SPILL block is also bypassed (NULL rows can't deadlock the
+    // probe loop because they never enter it).
+    //
+    // Uses high-numbered registers (%r40..%r43, %p10) to stay out of the
+    // way of the existing probe / CAS / SPILL register namespace.
+    if with_validity {
+        writeln!(ptx, "\tld.param.u64 %rd40, [{entry}_param_11];")
+            .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd40, %rd40;").map_err(write_err)?;
+        // byte_idx = tid >> 3 ; bit_off = tid & 7
+        writeln!(ptx, "\tshr.u32 %r40, %r3, 3;").map_err(write_err)?;
+        writeln!(ptx, "\tand.b32 %r41, %r3, 7;").map_err(write_err)?;
+        // addr = validity_ptr + byte_idx
+        writeln!(ptx, "\tmul.wide.u32 %rd41, %r40, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd42, %rd40, %rd41;").map_err(write_err)?;
+        // Load byte (zero-extended into u32 reg). `bfe.u32 dst, src, off, len`
+        // extracts `len` bits at `off` from `src`; for a 1-bit extract this
+        // is the cheapest way to test bit `bit_off` of the loaded byte.
+        writeln!(ptx, "\tld.global.u8 %r42, [%rd42];").map_err(write_err)?;
+        writeln!(ptx, "\tbfe.u32 %r43, %r42, %r41, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tsetp.eq.s32 %p10, %r43, 0;").map_err(write_err)?;
+        // NULL row: branch past the CAS loop (and past SPILL — DONE is the
+        // single exit point of the kernel).
+        writeln!(ptx, "\t@%p10 bra DONE;").map_err(write_err)?;
+    }
 
     // k and mask = k - 1.
     writeln!(ptx, "\tld.param.u32 %r5, [{entry}_param_9];").map_err(write_err)?;
@@ -551,54 +611,123 @@ pub const VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY: &str =
 ///     .param .u32 n_rows,
 ///     .param .u32 k,
 ///     .param .u32 max_spill,
-///     .param .u64 validity_ptr           // NEW — Arrow LE packed-bit bitmap
+///     .param .u64 validity_ptr           // Arrow LE packed-bit bitmap
 /// )
 /// ```
 ///
-/// Implementation: at v1, we delegate to the no-validity emitter and
-/// document the additional parameter on the host-side launcher. A future
-/// stage may inline the bit-test directly into the emitted PTX.
-///
-/// For now, this function returns an error if called — the executor falls
-/// back to the host-strip path for float MIN/MAX over null-bearing
-/// columns until the native-validity emitter is wired in.
-///
-/// # Stage E follow-up
-///
-/// Inline the validity bit-test at the top of the kernel body (mirroring
-/// the integer variant in `valid_flag_kernels`) and remove the error
-/// return below.
+/// PV-stage-e: implements the bit-test inline at the top of the kernel
+/// body via `bfe.u32`. NULL rows (validity bit 0) branch past the entire
+/// CAS loop AND the SPILL block — no atomic update is issued and the
+/// candidate value is never loaded, so columns whose NULL slots hold
+/// garbage bit patterns are safe.
 pub fn compile_agg_valid_float_kernel_with_validity(
     op: ReduceOp,
     dtype: DataType,
 ) -> BoltResult<String> {
-    let _ = compile_agg_valid_float_kernel(op, dtype)?;
-    Err(BoltError::Other(
-        "valid_flag_float: validity-aware float MIN/MAX kernel not yet \
-         implemented; executor falls back to host-strip path. \
-         Stage E will inline the bit-test into the CAS-loop body."
-            .into(),
-    ))
+    emit_agg_valid_float_kernel(op, dtype, /* with_validity = */ true)
 }
 
 #[cfg(test)]
 mod with_validity_tests {
     use super::*;
 
-    /// The validity-aware float kernel errors out for now — verify the
-    /// expected fallback message so callers can pattern-match on it.
+    /// MIN/Float32 with validity must emit the `bfe.u32` bit-test against
+    /// the loaded validity byte, a `setp.eq` comparing the extracted bit
+    /// to zero, and a `@%p10 bra DONE` branch that skips past the
+    /// `atom.global.cas.b32` retry loop and the SPILL block. Param count
+    /// must be 12 (one more than the no-validity variant) and the entry
+    /// name must be `bolt_groupby_agg_valid_float_with_validity`.
     #[test]
-    fn float_with_validity_returns_fallback_error() {
-        let err = compile_agg_valid_float_kernel_with_validity(
+    fn min_f32_with_validity_emits_bfe_setp_branch_past_cas() {
+        let ptx = compile_agg_valid_float_kernel_with_validity(
             ReduceOp::Min,
             DataType::Float32,
         )
-        .expect_err("v1 stage-D should defer the float-validity kernel");
-        let msg = err.to_string();
+        .expect("kernel should compile");
+
+        // Entry-point rename.
         assert!(
-            msg.contains("host-strip") || msg.contains("not yet implemented"),
-            "expected fallback message, got: {msg}"
+            ptx.contains(VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY),
+            "expected `_with_validity` entry name, got:\n{ptx}"
         );
+        assert!(
+            !ptx.contains(".visible .entry bolt_groupby_agg_valid("),
+            "PTX should not re-emit the no-validity entry name; got:\n{ptx}"
+        );
+
+        // bfe.u32 + setp.eq + branch-past-CAS — the canonical "Stage E
+        // bit-test" shape spelled out by the task description.
+        assert!(
+            ptx.contains("bfe.u32 %r43, %r42, %r41, 1"),
+            "expected `bfe.u32` bit-extract on loaded validity byte:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s32 %p10, %r43, 0"),
+            "expected `setp.eq` against extracted validity bit:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("@%p10 bra DONE"),
+            "expected `@%p10 bra DONE` to skip past the CAS loop on NULL:\n{ptx}"
+        );
+
+        // The CAS loop is still present — the bit-test is a *gate*, not a
+        // replacement.
+        assert!(
+            ptx.contains("atom.global.cas.b32"),
+            "expected the `atom.global.cas.b32` retry to still be emitted:\n{ptx}"
+        );
+        // The CAS_LOOP label must appear LATER in the PTX than the
+        // `@%p10 bra DONE` so the branch genuinely skips the loop.
+        let branch_pos = ptx.find("@%p10 bra DONE").unwrap();
+        let cas_pos = ptx.find("CAS_LOOP:").unwrap();
+        assert!(
+            branch_pos < cas_pos,
+            "validity bit-test must precede CAS_LOOP in PTX layout:\n{ptx}"
+        );
+
+        // Param count: 12 (vs 11 for the no-validity variant).
+        let param_count = ptx.matches(".param ").count();
+        assert_eq!(
+            param_count, 12,
+            "expected 12 `.param ` decls (added validity_ptr), got {param_count}:\n{ptx}"
+        );
+        // Highest-indexed param symbol.
+        assert!(
+            ptx.contains(&format!(
+                "{}_param_11",
+                VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY
+            )),
+            "expected param_11 (validity_ptr) in emitted PTX:\n{ptx}"
+        );
+    }
+
+    /// MAX/Float64 with validity must use `b64` CAS and the `setp.gt.f64`
+    /// comparison, plus the same `bfe.u32`-based bit-test gate.
+    #[test]
+    fn max_f64_with_validity_emits_bit_test_and_b64_cas() {
+        let ptx = compile_agg_valid_float_kernel_with_validity(
+            ReduceOp::Max,
+            DataType::Float64,
+        )
+        .expect("kernel should compile");
+        assert!(
+            ptx.contains("atom.global.cas.b64"),
+            "expected `atom.global.cas.b64` for Float64 CAS:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.gt.f64"),
+            "expected `setp.gt.f64` for MAX comparison:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("bfe.u32 %r43, %r42, %r41, 1"),
+            "expected `bfe.u32` validity bit-test:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("@%p10 bra DONE"),
+            "expected branch past CAS on NULL:\n{ptx}"
+        );
+        let param_count = ptx.matches(".param ").count();
+        assert_eq!(param_count, 12);
     }
 
     /// The validity-aware float kernel must reject Sum/Count for the same
@@ -609,11 +738,46 @@ mod with_validity_tests {
             ReduceOp::Sum,
             DataType::Float32,
         )
-        .expect_err("Sum should be rejected before the v1 deferral");
+        .expect_err("Sum should be rejected by the MIN/MAX-only kernel");
         let msg = err.to_string();
         assert!(
             msg.contains("MIN/MAX") || msg.contains("Sum"),
             "expected MIN/MAX-only error, got: {msg}"
+        );
+    }
+
+    /// The validity-aware kernel must reject integer dtypes for the same
+    /// reason its no-validity sibling does.
+    #[test]
+    fn float_with_validity_rejects_int_dtype() {
+        let err = compile_agg_valid_float_kernel_with_validity(
+            ReduceOp::Min,
+            DataType::Int32,
+        )
+        .expect_err("Int32 should be rejected by the float-only kernel");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Int32") || msg.contains("floating-point"),
+            "expected integer-dtype rejection, got: {msg}"
+        );
+    }
+
+    /// The entry-point constant must match the symbol actually emitted in
+    /// the PTX so the host-side launcher's symbol lookup succeeds.
+    #[test]
+    fn with_validity_entry_constant_matches_emitted_name() {
+        let ptx = compile_agg_valid_float_kernel_with_validity(
+            ReduceOp::Min,
+            DataType::Float32,
+        )
+        .unwrap();
+        let entry = format!(
+            ".visible .entry {}(",
+            VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY
+        );
+        assert!(
+            ptx.contains(&entry),
+            "PTX should declare entry as {entry:?}, got:\n{ptx}"
         );
     }
 }

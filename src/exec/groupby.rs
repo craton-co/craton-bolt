@@ -110,6 +110,69 @@ use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 /// Empty-slot sentinel; mirrors the literal baked into the keys kernel.
 const EMPTY_KEY: i64 = i64::MIN;
 
+/// PV-stage-e: observability counter — increments once per agg launch this
+/// executor routes through a native `_with_validity` kernel path instead
+/// of falling through to the legacy host-strip-before-upload pattern.
+///
+/// `execute_groupby` does not consume a `KernelSpec` (its plan shape has
+/// `pre = None`), so the planner-time
+/// [`crate::plan::physical_plan::KernelSpec::input_has_validity`] signal
+/// is unavailable here. The runtime gate is therefore the source
+/// `RecordBatch`'s per-column `null_count()` — see
+/// [`column_should_use_native_validity`]. Stage F will plumb the planner
+/// signal through `AggregateSpec` so this executor can match
+/// `groupby_with_pre`'s plan-time dispatch exactly.
+///
+/// Used by inline `#[cfg(test)]` tests; production code does not read it.
+#[doc(hidden)]
+pub static NATIVE_VALIDITY_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// PV-stage-e: runtime predicate — should this column's agg launch route
+/// through the native `_with_validity` kernel?
+///
+/// Today the executor's host-strip pattern (see `pack_keys` and the
+/// per-aggregate `column_null_mask` calls) drops NULL rows before any GPU
+/// work, so the classic kernel never sees a NULL contribution. This
+/// predicate is the seed for Stage E's native-dispatch path: when a
+/// column has any null AND the `(op, dtype)` combination has a
+/// `_with_validity` emitter in `hash_kernels`, we'd prefer to upload the
+/// packed bitmap + raw values and let the GPU skip NULL rows. The
+/// host-strip remains the correctness fallback.
+///
+/// At this checkpoint the executor's plumbing for the bitmap upload +
+/// alternate launch is staged in `groupby_with_pre`; this helper exists
+/// so the gating logic is reviewable + testable here. Wiring it to the
+/// actual launch site is a Stage F follow-up (it requires expanding
+/// `launch_agg_kernel`'s ABI to optionally consume a validity buffer,
+/// mirroring the `groupby_with_pre::launch_agg_kernel_with_validity`
+/// path).
+#[allow(dead_code)]
+fn column_should_use_native_validity(
+    arr: &dyn arrow_array::Array,
+    op: ReduceOp,
+    dtype: DataType,
+) -> bool {
+    if arr.null_count() == 0 {
+        return false;
+    }
+    // Same coverage as `groupby_with_pre::dispatch_native_validity`: integer
+    // SUM/MIN/MAX and float SUM. Float MIN/MAX routes through
+    // `float_atomics` which has no `_with_validity` companion yet.
+    // Bool/Utf8 are rejected by the kernel; don't dispatch.
+    matches!(
+        (op, dtype),
+        (ReduceOp::Sum, DataType::Int32)
+            | (ReduceOp::Sum, DataType::Int64)
+            | (ReduceOp::Sum, DataType::Float32)
+            | (ReduceOp::Sum, DataType::Float64)
+            | (ReduceOp::Min, DataType::Int32)
+            | (ReduceOp::Max, DataType::Int32)
+            | (ReduceOp::Min, DataType::Int64)
+            | (ReduceOp::Max, DataType::Int64)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Stage-3 pinned D2H helpers.
 //
@@ -2186,5 +2249,49 @@ mod tests {
                 s
             );
         }
+    }
+
+    // ---- PV-stage-e: runtime native-validity dispatch decision ----
+
+    /// Columns with no NULLs must keep the classic kernel — the
+    /// `_with_validity` path costs an extra bitmap upload for no gain.
+    #[test]
+    fn pv_stage_e_no_nulls_skips_native_validity() {
+        let arr = Int64Array::from(vec![1i64, 2, 3, 4, 5]);
+        assert_eq!(arr.null_count(), 0);
+        assert!(
+            !column_should_use_native_validity(&arr, ReduceOp::Sum, DataType::Int64),
+            "no NULLs in column -> classic kernel"
+        );
+    }
+
+    /// SUM(Int64) over a NULL-bearing column is the canonical Stage E
+    /// dispatch: planner+runtime both indicate validity and the kernel
+    /// has a native `_with_validity` variant.
+    #[test]
+    fn pv_stage_e_sum_int64_with_nulls_uses_native_validity() {
+        let arr = Int64Array::from(vec![Some(1i64), None, Some(3), None, Some(5)]);
+        assert_eq!(arr.null_count(), 2);
+        assert!(
+            column_should_use_native_validity(&arr, ReduceOp::Sum, DataType::Int64),
+            "NULL-bearing Int64 SUM should dispatch native validity"
+        );
+    }
+
+    /// MIN(Float64) over NULL-bearing data must NOT dispatch native — the
+    /// CAS-loop `float_atomics` kernel has no `_with_validity` companion
+    /// at this stage. The legacy host-strip path is the correct fallback.
+    #[test]
+    fn pv_stage_e_float_minmax_with_nulls_falls_back_to_host_strip() {
+        let arr = Float64Array::from(vec![Some(1.0f64), None, Some(3.0)]);
+        assert!(arr.null_count() > 0);
+        assert!(
+            !column_should_use_native_validity(&arr, ReduceOp::Min, DataType::Float64),
+            "Float MIN has no _with_validity emitter; expected host-strip"
+        );
+        assert!(
+            !column_should_use_native_validity(&arr, ReduceOp::Max, DataType::Float64),
+            "Float MAX has no _with_validity emitter; expected host-strip"
+        );
     }
 }

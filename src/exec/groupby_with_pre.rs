@@ -118,6 +118,78 @@ const PRE_BLOCK_SIZE: u32 = 256;
 /// Empty-slot sentinel; mirrors the literal baked into the keys kernel.
 const EMPTY_KEY: i64 = i64::MIN;
 
+/// PV-stage-e: observability counter — increments once per agg launch that
+/// successfully dispatches through the native `_with_validity` GPU kernel
+/// path (i.e. uploads a packed-bit validity bitmap and skips the host strip).
+///
+/// Used by inline `#[cfg(test)]` tests to assert that the planner-time
+/// `KernelSpec::input_has_validity` signal actually drives runtime
+/// dispatch, rather than silently falling through to the host-strip
+/// fallback. Production code does not read this counter — it's purely
+/// for test observability.
+#[doc(hidden)]
+pub static NATIVE_VALIDITY_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// PV-stage-e: dispatch predicate — should this `(op, dtype, validity, planner_flag)`
+/// combination route through the native `_with_validity` kernel variant
+/// instead of the host-strip fallback?
+///
+/// Three conditions must hold:
+///
+/// 1. The planner signalled that at least one pre-stage input may carry
+///    validity (`any_input_has_validity == true`). When the planner is
+///    confident no input has nulls (e.g. `TableProvider::has_nulls` returned
+///    false for every column), the native dispatch is skipped — the host
+///    strip is a no-op in that case anyway, so the test serves as a
+///    correctness gate rather than a perf bypass.
+///
+/// 2. The resolved host column actually carries a validity mask. If the
+///    pre stage didn't produce one (e.g. all inputs are non-null in this
+///    batch), there's no bitmap to upload and the classic kernel is
+///    bit-for-bit equivalent.
+///
+/// 3. The `(op, dtype)` combination has a native validity-aware emitter.
+///    `compile_groupby_agg_kernel_with_validity` covers integer SUM/MIN/MAX
+///    and float SUM; float MIN/MAX still routes through `float_atomics`
+///    (no validity variant there yet — Stage F follow-up). COUNT goes
+///    through a synthetic-ones path that's already correct, so it's not
+///    eligible for native validity dispatch here.
+fn dispatch_native_validity(
+    any_input_has_validity: bool,
+    validity: Option<&[bool]>,
+    op: ReduceOp,
+    dtype: DataType,
+) -> bool {
+    if !any_input_has_validity {
+        return false;
+    }
+    let Some(mask) = validity else {
+        return false;
+    };
+    // No nulls in this batch even though the planner flagged validity?
+    // Skip the native path — classic kernel is equivalent.
+    if mask.iter().all(|&v| v) {
+        return false;
+    }
+    // Native `_with_validity` kernel coverage: integer SUM/MIN/MAX and
+    // float SUM. Float MIN/MAX is routed elsewhere (float_atomics) and
+    // has no `_with_validity` companion yet — fall through to host-strip.
+    // Bool/Utf8 are rejected by the kernel itself, so don't dispatch.
+    match (op, dtype) {
+        (ReduceOp::Sum, DataType::Int32)
+        | (ReduceOp::Sum, DataType::Int64)
+        | (ReduceOp::Sum, DataType::Float32)
+        | (ReduceOp::Sum, DataType::Float64)
+        | (ReduceOp::Min, DataType::Int32)
+        | (ReduceOp::Max, DataType::Int32)
+        | (ReduceOp::Min, DataType::Int64)
+        | (ReduceOp::Max, DataType::Int64) => true,
+        // Float MIN/MAX, COUNT, Bool/Utf8, anything else: host-strip.
+        _ => false,
+    }
+}
+
 /// Execute an `Aggregate` plan that has BOTH a pre kernel AND a non-empty
 /// `group_by`. Single-column GROUP BY only; Int32 / Int64 keys only.
 ///
@@ -282,6 +354,17 @@ pub fn execute_groupby_with_pre(
     //       per-aggregate input column is at position `group_by.len() + i` in
     //       `aggregate.inputs` (mirroring the feed-order lowering in
     //       `physical_plan::lower_aggregate`).
+    //
+    // PV-stage-e: read the planner-time validity signal off `pre_spec`. If
+    // ANY pre input was flagged by `populate_input_validity`, the pre stage
+    // may have produced validity-bearing outputs; the per-aggregate
+    // dispatch below uses this together with the resolved column's
+    // validity mask to decide between native `_with_validity` and the
+    // host-strip fallback. An empty (legacy / safe-default) flag vector
+    // collapses to `false` so existing call sites are bit-identical.
+    let any_input_has_validity: bool =
+        pre_spec.input_has_validity.iter().any(|&v| v);
+
     let n_group_keys = aggregate.group_by.len();
     let mut acc_results: Vec<AccDownload> = Vec::with_capacity(aggregate.aggregates.len());
     for (i, agg) in aggregate.aggregates.iter().enumerate() {
@@ -299,6 +382,7 @@ pub fn execute_groupby_with_pre(
             k,
             k_u32,
             &stream,
+            any_input_has_validity,
         )?;
         acc_results.push(acc);
     }
@@ -677,11 +761,12 @@ fn launch_agg_kernel<T: Pod>(
 /// on the device (no atomic update issued). Length must equal
 /// [`packed_validity_word_count`]`(n_rows)`.
 ///
-/// Currently unused — the production path keeps the host-strip-in-lockstep
-/// fallback (see `run_typed_agg`). The wrapper exists so future
-/// performance work can flip individual call sites to the native GPU
-/// path without re-deriving the kernel-launch boilerplate.
-#[allow(dead_code)]
+/// PV-stage-e: now invoked from `run_typed_agg_native_validity` whenever
+/// the planner's `KernelSpec::input_has_validity` signal lights up and
+/// the resolved aggregate column has a non-trivial validity mask. The
+/// host-strip path in `run_typed_agg` is preserved as the fallback for
+/// shapes the native kernel can't handle (Utf8 keys, float MIN/MAX,
+/// etc.) — see `dispatch_native_validity` for the gating predicate.
 fn launch_agg_kernel_with_validity<T: Pod>(
     op: ReduceOp,
     input_dtype: DataType,
@@ -890,6 +975,7 @@ fn run_one_aggregate(
     k: usize,
     k_u32: u32,
     stream: &CudaStream,
+    any_input_has_validity: bool,
 ) -> BoltResult<AccDownload> {
     match agg {
         AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_) => {
@@ -907,6 +993,7 @@ fn run_one_aggregate(
                 k,
                 k_u32,
                 stream,
+                any_input_has_validity,
             )
         }
 
@@ -1039,6 +1126,138 @@ fn filter_keys_if_needed(
     }
 }
 
+/// PV-stage-e: native validity dispatch — the planner-driven hot path.
+///
+/// Instead of host-filtering NULL rows before upload, we:
+///
+/// 1. Upload the FULL value column verbatim (NULL slots may hold garbage
+///    bit patterns — the kernel will skip them).
+/// 2. Upload the FULL key column (same — kernel won't touch the slot).
+/// 3. Pack the resolved column's validity mask into the kernel's
+///    expected layout via [`pack_validity_bits`] (Vec<u32> words,
+///    little-endian bit order, one bit per row).
+/// 4. Dispatch to [`launch_agg_kernel_with_validity`], which routes
+///    through `compile_groupby_agg_kernel_with_validity` and emits a
+///    `bfe.u32`-based bit-test before the atomic update.
+///
+/// Increments [`NATIVE_VALIDITY_LAUNCHES`] once per call so inline tests
+/// can assert the planner signal actually drove dispatch (rather than
+/// falling through to the host-strip path).
+///
+/// `validity` MUST be `Some(_)` and have at least one false bit — both
+/// conditions are checked by [`dispatch_native_validity`] before this
+/// function is invoked.
+#[allow(clippy::too_many_arguments)]
+fn run_typed_agg_native_validity(
+    op: ReduceOp,
+    col_io: &ColumnIO,
+    resolved: &ResolvedHostCol<'_>,
+    host_keys: &[i64],
+    group_col: &GpuVec<i64>,
+    keys_table: &GpuVec<i64>,
+    n_rows: usize,
+    k: usize,
+    k_u32: u32,
+    stream: &CudaStream,
+) -> BoltResult<AccDownload> {
+    let host_col = resolved.as_ref();
+    let validity = resolved.validity().ok_or_else(|| {
+        BoltError::Other(
+            "groupby_with_pre: native-validity dispatch invoked without a validity mask"
+                .into(),
+        )
+    })?;
+    if validity.len() != host_keys.len() {
+        return Err(BoltError::Other(format!(
+            "groupby_with_pre: validity mask length {} != key column length {}",
+            validity.len(),
+            host_keys.len()
+        )));
+    }
+    debug_assert_eq!(
+        n_rows,
+        host_keys.len(),
+        "native-validity dispatch invariant: n_rows == host_keys.len()"
+    );
+
+    // Pack the validity mask into the kernel's u32-word layout. The mask
+    // is `&[bool]` here; we project to the `u8` representation
+    // `pack_validity_bits` consumes (1 = valid, 0 = null) and feed it.
+    let validity_bytes: Vec<u8> =
+        validity.iter().map(|&v| if v { 1u8 } else { 0u8 }).collect();
+    let packed = pack_validity_bits(&validity_bytes);
+    let validity_gpu = GpuVec::<u32>::from_slice(&packed)?;
+
+    // Account the native-dispatch launch. The counter is observed by
+    // inline tests; the production path does not read it.
+    NATIVE_VALIDITY_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    match (col_io.dtype, &host_col.values) {
+        (DataType::Int32, HostColValues::I32(host)) => {
+            // SUM(Int32) widens to i64; MIN/MAX(Int32) keep i32 width.
+            // Mirror the host-strip branch above.
+            if matches!(op, ReduceOp::Sum) {
+                let widened: Vec<i64> = host.iter().map(|&x| x as i64).collect();
+                let input_gpu = GpuVec::<i64>::from_slice(&widened)?;
+                let init: Vec<i64> = vec![identity_i64(op); k];
+                let mut acc = GpuVec::<i64>::from_slice(&init)?;
+                launch_agg_kernel_with_validity::<i64>(
+                    op, DataType::Int64, group_col, keys_table, &input_gpu,
+                    &mut acc, &validity_gpu, n_rows, k_u32, stream,
+                )?;
+                return Ok(AccDownload::I64(acc.to_vec()?));
+            }
+            let input_gpu = GpuVec::<i32>::from_slice(host)?;
+            let init: Vec<i32> = vec![identity_i32(op); k];
+            let mut acc = GpuVec::<i32>::from_slice(&init)?;
+            launch_agg_kernel_with_validity::<i32>(
+                op, DataType::Int32, group_col, keys_table, &input_gpu, &mut acc,
+                &validity_gpu, n_rows, k_u32, stream,
+            )?;
+            Ok(AccDownload::I32(acc.to_vec()?))
+        }
+        (DataType::Int64, HostColValues::I64(host)) => {
+            let input_gpu = GpuVec::<i64>::from_slice(host)?;
+            let init: Vec<i64> = vec![identity_i64(op); k];
+            let mut acc = GpuVec::<i64>::from_slice(&init)?;
+            launch_agg_kernel_with_validity::<i64>(
+                op, DataType::Int64, group_col, keys_table, &input_gpu, &mut acc,
+                &validity_gpu, n_rows, k_u32, stream,
+            )?;
+            Ok(AccDownload::I64(acc.to_vec()?))
+        }
+        (DataType::Float32, HostColValues::F32(host)) => {
+            // Float MIN/MAX is filtered out by `dispatch_native_validity`,
+            // so only SUM reaches here.
+            debug_assert!(matches!(op, ReduceOp::Sum));
+            let input_gpu = GpuVec::<f32>::from_slice(host)?;
+            let init: Vec<f32> = vec![identity_f32(op); k];
+            let mut acc = GpuVec::<f32>::from_slice(&init)?;
+            launch_agg_kernel_with_validity::<f32>(
+                op, DataType::Float32, group_col, keys_table, &input_gpu,
+                &mut acc, &validity_gpu, n_rows, k_u32, stream,
+            )?;
+            Ok(AccDownload::F32(acc.to_vec()?))
+        }
+        (DataType::Float64, HostColValues::F64(host)) => {
+            debug_assert!(matches!(op, ReduceOp::Sum));
+            let input_gpu = GpuVec::<f64>::from_slice(host)?;
+            let init: Vec<f64> = vec![identity_f64(op); k];
+            let mut acc = GpuVec::<f64>::from_slice(&init)?;
+            launch_agg_kernel_with_validity::<f64>(
+                op, DataType::Float64, group_col, keys_table, &input_gpu,
+                &mut acc, &validity_gpu, n_rows, k_u32, stream,
+            )?;
+            Ok(AccDownload::F64(acc.to_vec()?))
+        }
+        (dt, _) => Err(BoltError::Type(format!(
+            "groupby_with_pre: native-validity dispatch reached unsupported dtype {:?} \
+             for column '{}'",
+            dt, col_io.name
+        ))),
+    }
+}
+
 /// Common path for SUM/MIN/MAX. Uploads the typed input from the compacted
 /// host column, allocates a typed accumulator initialised to the op's
 /// identity, launches the agg kernel, and downloads the accumulator.
@@ -1059,6 +1278,7 @@ fn run_typed_agg(
     k: usize,
     k_u32: u32,
     stream: &CudaStream,
+    any_input_has_validity: bool,
 ) -> BoltResult<AccDownload> {
     let host_col = resolved.as_ref();
     if !host_col_matches_dtype(host_col, col_io.dtype) {
@@ -1073,13 +1293,26 @@ fn run_typed_agg(
         "groupby_with_pre: host_keys / n_rows mismatch — invariant violated by caller"
     );
 
-    // If the resolved column has a validity mask with any false bits, filter
-    // both (keys, values) together so the GPU sees a parallel pair of rows
-    // with no NULL slots. The keys-table is shared and remains correct
-    // because it indexes the original key set.
+    // PV-stage-e: planner signal + dtype gate — when the native
+    // `_with_validity` kernel can handle this row, dispatch to it and
+    // skip the host strip. The `dispatch_native_validity` helper
+    // documents the three preconditions (planner flag, validity mask
+    // present, supported `(op, dtype)`); failing any of them falls
+    // through to the legacy host-strip path below.
+    let validity = resolved.validity();
+    if dispatch_native_validity(any_input_has_validity, validity, op, col_io.dtype) {
+        return run_typed_agg_native_validity(
+            op, col_io, resolved, host_keys, group_col, keys_table, n_rows, k, k_u32,
+            stream,
+        );
+    }
+
+    // Legacy host-strip path. If the resolved column has a validity mask
+    // with any false bits, filter both (keys, values) together so the GPU
+    // sees a parallel pair of rows with no NULL slots. The keys-table is
+    // shared and remains correct because it indexes the original key set.
     let (filtered_keys_gpu, n_eff) = filter_keys_if_needed(host_keys, resolved)?;
     let eff_group_col: &GpuVec<i64> = filtered_keys_gpu.as_ref().unwrap_or(group_col);
-    let validity = resolved.validity();
 
     // Stage C: the Stage-B reject error is lifted. NULL value rows are
     // dropped in lockstep with the GROUP BY key column via
@@ -2180,5 +2413,99 @@ mod null_propagation_tests {
     fn pack_validity_bits_empty_pads_to_one_word() {
         let packed = pack_validity_bits(&[]);
         assert_eq!(packed, vec![0u32]);
+    }
+
+    // ---- PV-stage-e: dispatch decision (planner flag → native path) ----
+
+    /// When the planner flagged no input as null-bearing, the dispatch
+    /// predicate returns false regardless of the resolved-column mask —
+    /// the host-strip path remains the default.
+    #[test]
+    fn dispatch_native_validity_off_when_planner_flag_false() {
+        let mask = [true, false, true];
+        let chose = dispatch_native_validity(
+            /* any_input_has_validity = */ false,
+            Some(&mask[..]),
+            ReduceOp::Sum,
+            DataType::Int64,
+        );
+        assert!(
+            !chose,
+            "planner flag is the gate: without it we must stay on host-strip"
+        );
+    }
+
+    /// When the planner says "may have validity" AND the resolved mask
+    /// carries a real NULL row AND the (op, dtype) is covered by the
+    /// native `_with_validity` kernel, the predicate returns true.
+    #[test]
+    fn dispatch_native_validity_on_for_supported_op_with_mask() {
+        let mask = [true, false, true];
+        for (op, dtype) in [
+            (ReduceOp::Sum, DataType::Int32),
+            (ReduceOp::Sum, DataType::Int64),
+            (ReduceOp::Sum, DataType::Float32),
+            (ReduceOp::Sum, DataType::Float64),
+            (ReduceOp::Min, DataType::Int32),
+            (ReduceOp::Max, DataType::Int64),
+        ] {
+            assert!(
+                dispatch_native_validity(true, Some(&mask[..]), op, dtype),
+                "expected native dispatch for ({:?}, {:?})",
+                op, dtype
+            );
+        }
+    }
+
+    /// Float MIN/MAX has no `_with_validity` emitter yet (Stage F follow-up
+    /// — `float_atomics` would need a sibling), so the predicate must
+    /// fall through to host-strip even when planner + mask line up.
+    #[test]
+    fn dispatch_native_validity_off_for_float_minmax() {
+        let mask = [true, false, true];
+        for (op, dtype) in [
+            (ReduceOp::Min, DataType::Float32),
+            (ReduceOp::Max, DataType::Float32),
+            (ReduceOp::Min, DataType::Float64),
+            (ReduceOp::Max, DataType::Float64),
+        ] {
+            assert!(
+                !dispatch_native_validity(true, Some(&mask[..]), op, dtype),
+                "Float MIN/MAX has no _with_validity emitter; expected host-strip for ({:?}, {:?})",
+                op, dtype
+            );
+        }
+    }
+
+    /// All-valid masks short-circuit to host-strip — the classic kernel is
+    /// bit-for-bit equivalent in that case, no need to allocate a packed
+    /// bitmap and use the heavier `_with_validity` PTX.
+    #[test]
+    fn dispatch_native_validity_off_when_mask_all_true() {
+        let mask = [true, true, true, true];
+        let chose = dispatch_native_validity(
+            true,
+            Some(&mask[..]),
+            ReduceOp::Sum,
+            DataType::Int64,
+        );
+        assert!(
+            !chose,
+            "all-true mask means no NULLs in this batch; skip the native dispatch"
+        );
+    }
+
+    /// Missing mask (`None`) means the pre stage didn't produce one even
+    /// though the planner flagged input validity — fall back to host-strip
+    /// (which is a no-op for None).
+    #[test]
+    fn dispatch_native_validity_off_when_mask_none() {
+        let chose = dispatch_native_validity(
+            true,
+            None,
+            ReduceOp::Sum,
+            DataType::Int64,
+        );
+        assert!(!chose, "no mask -> no native dispatch");
     }
 }
