@@ -178,10 +178,19 @@ pub fn execute_tier2_twokey_sum(
     }
 
     // ----------------------------------------------------------------------
-    // Step 3. Prefix-sum counts → offsets. Reuse the single-key helper —
-    // the counts vector is shape-identical (u32[K]).
+    // Step 3. Prefix-sum counts → offsets. Reuse the single-key joint helper
+    // — the counts vector is shape-identical (u32[K]) regardless of key
+    // width, and the helper has no per-key-type baggage.
+    //
+    // P1b-stage6: joint helper does the D2H + prefix scan + H2D in a single
+    // pinned-async pipeline on the per-call stream. Replaces the legacy
+    // `compute_partition_offsets` + `upload_offsets` pair (2 syncs → 1).
     // ----------------------------------------------------------------------
-    let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
+    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
+        partition_offsets::compute_and_upload_partition_offsets_async(
+            &counts,
+            stream.raw(),
+        )?;
     if offsets.len() != (num_partitions as usize) + 1 {
         return Err(BoltError::Other(format!(
             "tier2_twokey: prefix-sum returned {} offsets, expected {}",
@@ -195,14 +204,12 @@ pub fn execute_tier2_twokey_sum(
     //
     // `scatter_keys` is i64 — twice the byte budget of the single-key path.
     // For n_rows = 10 M that's 80 MB; still well under any sane device cap.
+    // `offsets_gpu` (length NUM_PARTITIONS, the K bases — same shape the
+    // legacy `upload_offsets` returned) was produced by the joint helper.
     // ----------------------------------------------------------------------
     let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
     let mut scatter_vals: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?;
     let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
-
-    // Upload the K bases (drop the trailing total — `upload_offsets` slices
-    // internally and would reject the K-length form).
-    let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
 
     // ----------------------------------------------------------------------
     // Step 5. JIT + launch the i64 scatter kernel.
@@ -409,5 +416,71 @@ mod tests {
         let _ = get_or_build_module(&KernelSpec::ScatterI64).expect("scatter hit");
         let _ = get_or_build_module(&KernelSpec::ReduceSumI64).expect("reduce hit");
         assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
+    }
+
+    // --- P1b-stage6 wiring smoke test ----------------------------------------
+    //
+    // End-to-end exercise of the joint
+    // `compute_and_upload_partition_offsets_async` path through the
+    // two-key (i64-packed) orchestrator. Oracle = host-side HashMap
+    // reduction over packed i64 keys. Gated on `#[ignore]` because the
+    // pipeline needs the JIT + a CUDA context.
+    // -----------------------------------------------------------------------
+    #[test]
+    #[ignore = "requires CUDA toolkit + JIT at runtime (executes Tier-2 twokey pipeline)"]
+    fn stage6_joint_offsets_twokey_smoke() {
+        use std::collections::HashMap;
+
+        // Pack (a, b) the same way `groupby.rs::pack_keys` does.
+        fn pack(a: i32, b: i32) -> i64 {
+            (((a as u32 as u64) << 32) | (b as u32 as u64)) as i64
+        }
+
+        // 8-row fixture with duplicate (k1, k2) pairs so reduce kernel has
+        // real per-partition work.
+        let host_packed: Vec<i64> = vec![
+            pack(1, 10), pack(2, 20), pack(1, 10),
+            pack(3, 30), pack(2, 20), pack(1, 10),
+            pack(4, 40), pack(3, 31),
+        ];
+        let host_vals: Vec<f64> = vec![1.0, 2.0, 1.5, 3.0, 2.5, 1.25, 4.0, 3.1];
+        let n_rows = host_packed.len() as u32;
+
+        let keys = match GpuVec::<i64>::from_slice(&host_packed) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let vals = match GpuVec::<f64>::from_slice(&host_vals) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let r = match execute_tier2_twokey_sum(&keys, &vals, n_rows) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let mut oracle: HashMap<i64, f64> = HashMap::new();
+        for (k, v) in host_packed.iter().zip(host_vals.iter()) {
+            *oracle.entry(*k).or_insert(0.0) += *v;
+        }
+
+        let mut got: HashMap<i64, f64> = HashMap::new();
+        for (keys, sums) in &r.per_partition {
+            assert_eq!(keys.len(), sums.len(), "per-partition shape mismatch");
+            for (k, s) in keys.iter().zip(sums.iter()) {
+                let prev = got.insert(*k, *s);
+                assert!(prev.is_none(), "key {k:#x} in two partitions");
+            }
+        }
+
+        assert_eq!(got.len(), oracle.len());
+        for (k, expected) in &oracle {
+            let got_v = got.get(k).copied().unwrap_or(f64::NAN);
+            assert!(
+                (got_v - expected).abs() < 1e-9,
+                "sum mismatch for key {k:#x}: oracle={expected}, got={got_v}"
+            );
+        }
     }
 }

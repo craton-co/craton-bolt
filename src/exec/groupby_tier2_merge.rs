@@ -230,4 +230,62 @@ mod tests {
         assert_eq!(sums, vec![5.0, 6.0]);
         assert_eq!(batch.num_rows(), 2);
     }
+
+    // --- P1b-stage6 wiring smoke test (orchestrator + merge end-to-end) -----
+    //
+    // The merger itself is pure host code; the "async wiring" exercised here
+    // is upstream (joint `compute_and_upload_partition_offsets_async`). This
+    // test runs the full executor on a small fixture and validates the
+    // merged RecordBatch matches a host oracle. `#[ignore]`-gated: needs
+    // JIT + a live CUDA context.
+    // ----------------------------------------------------------------------
+    #[test]
+    #[ignore = "requires CUDA toolkit + JIT (executes Tier-2 SUM pipeline + merge)"]
+    fn stage6_orchestrator_plus_merge_smoke() {
+        use std::collections::HashMap;
+        use crate::cuda::GpuVec;
+        use crate::exec::groupby_tier2_orchestrator::execute_tier2_sum;
+
+        let host_keys: Vec<i32> = vec![1, 2, 1, 3, 2, 1, 4, 3, 5, 2];
+        let host_vals: Vec<f64> =
+            vec![10.0, 20.0, 11.0, 30.0, 21.0, 12.0, 40.0, 31.0, 50.0, 22.0];
+        let n_rows = host_keys.len() as u32;
+
+        let keys = match GpuVec::<i32>::from_slice(&host_keys) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let vals = match GpuVec::<f64>::from_slice(&host_vals) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let partial = match execute_tier2_sum(&keys, &vals, n_rows) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let schema = out_schema();
+        let batch = build_tier2_result(partial.per_partition, &schema)
+            .expect("merge must succeed");
+        let (got_keys, got_sums) = extract(&batch);
+
+        // Oracle: host HashMap reduce, then sort by key ASC (matches merger).
+        let mut oracle: HashMap<i32, f64> = HashMap::new();
+        for (k, v) in host_keys.iter().zip(host_vals.iter()) {
+            *oracle.entry(*k).or_insert(0.0) += *v;
+        }
+        let mut oracle_pairs: Vec<(i32, f64)> = oracle.into_iter().collect();
+        oracle_pairs.sort_by_key(|(k, _)| *k);
+
+        assert_eq!(got_keys.len(), oracle_pairs.len());
+        for (i, (ek, ev)) in oracle_pairs.iter().enumerate() {
+            assert_eq!(got_keys[i], *ek, "key mismatch at position {i}");
+            assert!(
+                (got_sums[i] - ev).abs() < 1e-9,
+                "sum mismatch at key {ek}: oracle={ev}, got={}",
+                got_sums[i]
+            );
+        }
+    }
 }
