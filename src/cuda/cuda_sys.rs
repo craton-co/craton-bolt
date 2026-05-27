@@ -11,7 +11,6 @@
 //! docs.rs.
 
 use std::ffi::CStr;
-use std::sync::OnceLock;
 
 use libc::{c_char, c_int, c_uint, c_void};
 
@@ -215,12 +214,68 @@ pub fn check(code: CUresult) -> BoltResult<()> {
     Err(BoltError::Cuda(format!("CUDA driver error {}: {}", code, msg)))
 }
 
-static INIT: OnceLock<CUresult> = OnceLock::new();
+/// Successful-init latch. Stores `true` exactly once when `cuInit(0)`
+/// has returned `CUDA_SUCCESS`. Deliberately *not* an `OnceLock<CUresult>`:
+/// the old design cached the first result, success or failure, so a
+/// transient driver-load hiccup at startup (DSO not yet ready, driver
+/// service still coming up, container with a deferred GPU mount, …)
+/// poisoned every subsequent `init()` for the lifetime of the process,
+/// even after the driver became usable.
+///
+/// We use a `parking_lot::Mutex<bool>` rather than `OnceLock<()>` so the
+/// test path can clear the latch between cases — `OnceLock::take` is not
+/// stabilised until Rust 1.79 and our MSRV is 1.74. The fast path stays
+/// O(1) and uncontended in production: a single un-poisoned mutex
+/// acquire per `init()` call, which itself is called O(1) times per
+/// process.
+static INIT_OK: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
+
+/// Indirection so the inline unit test can substitute a deterministic
+/// fake for `cuInit`. Production code always uses [`real_cu_init`].
+type CuInitFn = fn() -> CUresult;
+
+fn real_cu_init() -> CUresult {
+    unsafe { cuInit(0) }
+}
 
 /// Idempotently call `cuInit(0)`. Safe to invoke from any thread.
+///
+/// Only `CUDA_SUCCESS` is cached — on any error this returns `Err` *and*
+/// leaves the cache empty, so the next call retries the driver. That
+/// matters for processes where the driver/DSO is only fully usable
+/// shortly after startup (deferred container GPU mounts, lazy
+/// `libcuda.so` load on first kernel-module probe, etc.).
 pub fn init() -> BoltResult<()> {
-    let code = *INIT.get_or_init(|| unsafe { cuInit(0) });
-    check(code)
+    init_with(real_cu_init)
+}
+
+/// Test-friendly inner: factored out so the host-side unit test can
+/// inject a fake `cuInit` and exercise the cache-retry behaviour
+/// without a real GPU.
+fn init_with(cu_init: CuInitFn) -> BoltResult<()> {
+    // Fast path: already latched.
+    if *INIT_OK.lock() {
+        return Ok(());
+    }
+    // Slow path: call the driver. We don't hold the lock across the FFI
+    // call — a concurrent `init()` from another thread is fine (the
+    // driver's own `cuInit(0)` is idempotent; both callers will see the
+    // same outcome) and avoids tying GPU-driver latency to a global mutex.
+    let code = cu_init();
+    if code == CUDA_SUCCESS {
+        *INIT_OK.lock() = true;
+        Ok(())
+    } else {
+        // Deliberately do NOT cache the error: the next caller retries.
+        check(code)
+    }
+}
+
+/// Test-only helper: clears the success latch so a fresh `init_with`
+/// call starts from a known-empty state. Not exposed outside the crate.
+#[cfg(test)]
+pub(crate) fn _test_reset_init_cache() {
+    *INIT_OK.lock() = false;
 }
 
 /// Number of CUDA-capable devices visible to the driver.
@@ -248,7 +303,32 @@ pub fn device_name(dev: CUdevice) -> BoltResult<String> {
 }
 
 /// Owned CUDA context. Thread-pinned by the driver: `Send` but not `Sync`.
+///
+/// # Two backends, one type
+///
+/// In the default build, `CudaContext::new` calls `cuCtxCreate_v2` and
+/// `Drop` calls `cuCtxDestroy_v2` — one process-owned context per
+/// `Engine` instance.
+///
+/// Under `--features cudarc`, the cudarc backend creates a CUDA *primary*
+/// context internally on first use of `cudarc_backend::device()`. Having
+/// `CudaContext::new` also call `cuCtxCreate_v2` would mint a SECOND,
+/// parallel context — pointers from one backend would be invalid in the
+/// other, and the process-wide `mem_pool` would alias both. To prevent
+/// that two-context lifetime bug, under `cudarc` we ALIAS the cudarc
+/// primary context: `CudaContext::new` just forces cudarc's
+/// `GLOBAL_DEVICE` cell to initialise, stores no handle of its own
+/// (`raw` stays null), and `Drop` only drains the pool — cudarc owns
+/// the context teardown.
+///
+/// This makes `CudaContext` a thin handle whose lifetime maps to *one*
+/// pool drain, regardless of backend. Multiple `Engine::new()` calls
+/// each get their own `CudaContext` instance, but under cudarc they
+/// share the same underlying primary context.
 pub struct CudaContext {
+    /// Hand-rolled context handle. Only populated when `cudarc` is OFF.
+    /// Under `--features cudarc` this stays null and Drop skips
+    /// `cuCtxDestroy_v2` entirely.
     raw: CUcontext,
 }
 
@@ -258,7 +338,18 @@ pub struct CudaContext {
 unsafe impl Send for CudaContext {}
 
 impl CudaContext {
-    /// Initialize the driver and create a primary-style context on `device_ordinal`.
+    /// Initialize the driver and acquire a CUDA context on `device_ordinal`.
+    ///
+    /// In the default build this calls `cuCtxCreate_v2` and the resulting
+    /// `CudaContext` owns the lifetime of that context.
+    ///
+    /// Under `--features cudarc` this instead forces cudarc's
+    /// process-wide primary context to initialise (via
+    /// `cudarc_backend::ensure_device(ordinal)`) and the returned
+    /// `CudaContext` is a *handle* — `Drop` does not destroy the
+    /// underlying context (cudarc owns that). See the type-level docs
+    /// for the rationale.
+    #[cfg(not(feature = "cudarc"))]
     pub fn new(device_ordinal: i32) -> BoltResult<Self> {
         init()?;
         let dev = device_get(device_ordinal)?;
@@ -267,12 +358,34 @@ impl CudaContext {
         Ok(Self { raw })
     }
 
-    /// Bind this context to the calling thread.
-    pub fn set_current(&self) -> BoltResult<()> {
-        check(unsafe { cuCtxSetCurrent(self.raw) })
+    /// cudarc-flavored constructor: defers context ownership to cudarc.
+    #[cfg(feature = "cudarc")]
+    pub fn new(device_ordinal: i32) -> BoltResult<Self> {
+        // Force cudarc's primary-context init. From this point on every
+        // alloc / free / memcpy in the engine routes through that single
+        // context — there is no parallel hand-rolled context to leak.
+        crate::cuda::cudarc_backend::ensure_device(device_ordinal)?;
+        Ok(Self { raw: std::ptr::null_mut() })
     }
 
-    /// Raw handle accessor for downstream submodules.
+    /// Bind this context to the calling thread.
+    ///
+    /// Under `--features cudarc` this is a no-op: cudarc primary contexts
+    /// are bound automatically when the device handle is used.
+    pub fn set_current(&self) -> BoltResult<()> {
+        #[cfg(not(feature = "cudarc"))]
+        {
+            check(unsafe { cuCtxSetCurrent(self.raw) })
+        }
+        #[cfg(feature = "cudarc")]
+        {
+            Ok(())
+        }
+    }
+
+    /// Raw handle accessor for downstream submodules. Returns null under
+    /// `--features cudarc` (cudarc owns the context; callers should use
+    /// the cudarc backend's APIs instead of poking at a raw `CUcontext`).
     pub fn raw(&self) -> CUcontext {
         self.raw
     }
@@ -280,9 +393,6 @@ impl CudaContext {
 
 impl Drop for CudaContext {
     fn drop(&mut self) {
-        if self.raw.is_null() {
-            return;
-        }
         // Drain the global device-memory pool BEFORE destroying the context.
         //
         // Why: `DeviceMemPool` is a process-wide `static`, so its entries
@@ -293,7 +403,7 @@ impl Drop for CudaContext {
         // entries and the next allocation hits an `ACCESS_VIOLATION` the
         // moment a kernel touches the recycled pointer.
         //
-        // Draining now — while `self.raw` is still alive and current —
+        // Draining now — while the context is still alive and current —
         // routes each pooled block through `cuMemFree_v2` cleanly. Any
         // outstanding `GpuBuffer`s drop their pointers BEFORE this runs
         // because field-drop order in `Engine` puts `_ctx` last.
@@ -301,13 +411,28 @@ impl Drop for CudaContext {
         // We do this via a runtime indirection rather than a direct call so
         // the cyclic crate-internal dependency (`cuda_sys` → `mem_pool` →
         // `cuda_sys`) does not show up in the build graph.
+        //
+        // The drain runs on BOTH backends — under `--features cudarc` the
+        // pool's free path already uses `cudarc_backend::mem_free`, so the
+        // pointers are freed against cudarc's still-live primary context.
         crate::cuda::mem_pool::POOL.drain();
-        let code = unsafe { cuCtxDestroy_v2(self.raw) };
-        if code != CUDA_SUCCESS {
-            log::warn!(
-                "craton-bolt: cuCtxDestroy_v2 failed with code {} (context leaked)",
-                code
-            );
+
+        // Default backend only: tear down the hand-rolled context.
+        // Under `--features cudarc` we never minted one (`raw` is null);
+        // cudarc owns its primary context and will release it at process
+        // exit via its own static `Drop`.
+        #[cfg(not(feature = "cudarc"))]
+        {
+            if self.raw.is_null() {
+                return;
+            }
+            let code = unsafe { cuCtxDestroy_v2(self.raw) };
+            if code != CUDA_SUCCESS {
+                log::warn!(
+                    "craton-bolt: cuCtxDestroy_v2 failed with code {} (context leaked)",
+                    code
+                );
+            }
         }
     }
 }
@@ -386,4 +511,108 @@ pub unsafe fn mem_free_host(p: *mut c_void) -> BoltResult<()> {
 /// `ptr` must point to a live device allocation of at least `count` bytes.
 pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> BoltResult<()> {
     check(cuMemsetD8_v2(ptr, value, count))
+}
+
+#[cfg(test)]
+mod init_cache_tests {
+    //! Host-only tests for the `cuInit(0)` cache (Bug #2 regression).
+    //!
+    //! Verifies that:
+    //!   * a successful init latches and short-circuits subsequent calls,
+    //!   * an error result is NOT cached (the next call retries),
+    //!   * a transient error followed by a success eventually latches.
+    //!
+    //! Tests inject a fake `cuInit` via the function-pointer indirection
+    //! `init_with(cu_init)` and reset the latch with
+    //! `_test_reset_init_cache()` between cases.
+    //!
+    //! Cargo runs unit tests inside a single binary on N threads, so
+    //! every test here must serialize through `TEST_GATE` — otherwise
+    //! concurrent tests would see each other's latch state and the
+    //! "calls counted" assertions would be racy. The gate is local to
+    //! this module and only ever held for the duration of a single
+    //! test body.
+    use super::*;
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Process-wide gate. Each test acquires it for its full duration.
+    static TEST_GATE: Mutex<()> = Mutex::new(());
+
+    /// `cuInit` fake that always succeeds. Counts calls.
+    static OK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn fake_ok() -> CUresult {
+        OK_CALLS.fetch_add(1, Ordering::SeqCst);
+        CUDA_SUCCESS
+    }
+
+    /// `cuInit` fake that always returns a non-success code. Counts calls.
+    static ERR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn fake_err() -> CUresult {
+        ERR_CALLS.fetch_add(1, Ordering::SeqCst);
+        // 999 is well below CUDA_ERROR_STUB and unlikely to collide
+        // with a real driver code in this test context.
+        999
+    }
+
+    /// `cuInit` fake that fails the first N times then succeeds. Counts calls.
+    static FLAKY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn fake_flaky_3() -> CUresult {
+        let n = FLAKY_CALLS.fetch_add(1, Ordering::SeqCst);
+        if n < 2 { 999 } else { CUDA_SUCCESS }
+    }
+
+    #[test]
+    fn success_latches_and_short_circuits() {
+        let _g = TEST_GATE.lock();
+        _test_reset_init_cache();
+        OK_CALLS.store(0, Ordering::SeqCst);
+
+        assert!(init_with(fake_ok).is_ok());
+        // Subsequent calls must NOT re-invoke the driver.
+        assert!(init_with(fake_ok).is_ok());
+        assert!(init_with(fake_ok).is_ok());
+        assert_eq!(
+            OK_CALLS.load(Ordering::SeqCst),
+            1,
+            "fake_ok called more than once after success"
+        );
+    }
+
+    #[test]
+    fn error_is_not_cached() {
+        let _g = TEST_GATE.lock();
+        _test_reset_init_cache();
+        ERR_CALLS.store(0, Ordering::SeqCst);
+
+        // The pre-bug behaviour cached `999` forever; the fix retries.
+        assert!(init_with(fake_err).is_err());
+        assert!(init_with(fake_err).is_err());
+        assert!(init_with(fake_err).is_err());
+        assert_eq!(
+            ERR_CALLS.load(Ordering::SeqCst),
+            3,
+            "error result was cached instead of retried"
+        );
+    }
+
+    #[test]
+    fn transient_error_then_success_eventually_latches() {
+        let _g = TEST_GATE.lock();
+        _test_reset_init_cache();
+        FLAKY_CALLS.store(0, Ordering::SeqCst);
+
+        // Two errors, then a success, then short-circuited.
+        assert!(init_with(fake_flaky_3).is_err());
+        assert!(init_with(fake_flaky_3).is_err());
+        assert!(init_with(fake_flaky_3).is_ok());
+        assert!(init_with(fake_flaky_3).is_ok());
+        assert!(init_with(fake_flaky_3).is_ok());
+        // Once success latches we stop calling.
+        assert_eq!(
+            FLAKY_CALLS.load(Ordering::SeqCst),
+            3,
+            "driver was called after success latched"
+        );
+    }
 }

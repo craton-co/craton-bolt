@@ -72,6 +72,13 @@ cuda-stub = []
 # driver calls through the `cudarc` crate instead of our hand-rolled
 # `extern "C"` FFI. Not the default yet — turn on with
 # `cargo build --features cudarc` to opt in. See docs/CUDARC_ADOPTION.md.
+#
+# When `cudarc` is enabled, the engine uses cudarc's primary context
+# (`CudaDevice::new`) as the ONLY CUDA context — the hand-rolled
+# `cuCtxCreate_v2` / `cuCtxDestroy_v2` path is bypassed. This avoids
+# the two-context lifetime bug where pool pointers minted in one
+# context were freed against the other at teardown. See
+# `CudaContext::new` in `src/cuda/cuda_sys.rs`.
 cudarc = ["dep:cudarc"]
 # `rust-cuda` (experimental): switches `partition_kernel.rs`'s PTX source
 # from the hand-rolled string emitter to a Rust-source kernel compiled at

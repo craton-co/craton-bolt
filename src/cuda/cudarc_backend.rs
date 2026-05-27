@@ -40,17 +40,48 @@ use crate::error::{BoltError, BoltResult};
 
 /// Per-process cudarc device cache. `CudaDevice::new` returns an
 /// `Arc<CudaDevice>` and binds a primary context; we keep one around
-/// for device 0. Multi-GPU is a Stage 2+ concern.
+/// for the chosen ordinal. Multi-GPU is a Stage 2+ concern — the
+/// current backend wires every alloc through device 0 once it's
+/// latched here, but `ensure_device(n)` lets `CudaContext::new`
+/// initialise the cell with a non-default ordinal on a single-GPU
+/// system as a transitional step.
 static GLOBAL_DEVICE: once_cell::sync::OnceCell<Arc<CudaDevice>> =
     once_cell::sync::OnceCell::new();
 
-fn device() -> BoltResult<Arc<CudaDevice>> {
+/// Initialise the cudarc primary context on `ordinal` if it isn't
+/// already. This is the canonical entry point for `CudaContext::new`
+/// under `--features cudarc` — calling it makes the cudarc-owned
+/// context current on the calling thread and ensures every subsequent
+/// `mem_alloc` / `mem_free` / `memcpy_*` routes through the SAME
+/// context (fixing the historical two-context bug where
+/// `cuCtxCreate_v2` minted a parallel context that the pool's
+/// pointers did not belong to).
+///
+/// If the cell is already latched, this returns the existing device
+/// — subsequent calls with a different `ordinal` are silently ignored
+/// (single-GPU only for now; tracked in
+/// `docs/CUDARC_ADOPTION.md` Stage 2).
+pub(crate) fn ensure_device(ordinal: i32) -> BoltResult<()> {
     GLOBAL_DEVICE
         .get_or_try_init(|| {
-            CudaDevice::new(0)
-                .map_err(|e| {
-                    BoltError::Cuda(format!("cudarc CudaDevice::new failed: {e:?}"))
-                })
+            CudaDevice::new(ordinal as usize).map_err(|e| {
+                BoltError::Cuda(format!(
+                    "cudarc CudaDevice::new({ordinal}) failed: {e:?}"
+                ))
+            })
+        })
+        .map(|_| ())
+}
+
+fn device() -> BoltResult<Arc<CudaDevice>> {
+    // Lazily initialise on device 0 if nobody called `ensure_device`
+    // first. This preserves the original spike behaviour for callers
+    // that go directly through this module's `mem_alloc` etc.
+    GLOBAL_DEVICE
+        .get_or_try_init(|| {
+            CudaDevice::new(0).map_err(|e| {
+                BoltError::Cuda(format!("cudarc CudaDevice::new failed: {e:?}"))
+            })
         })
         .map(Arc::clone)
 }
