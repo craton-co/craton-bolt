@@ -157,9 +157,20 @@ pub fn execute_tier2_multi_sum(
     }
 
     // ----------------------------------------------------------------------
-    // Step 3. Prefix-sum counts into per-partition offsets (host-side scan).
+    // Step 3. Prefix-sum counts into per-partition offsets.
+    //
+    // P1b-stage6: joint helper does the D2H + prefix scan + H2D in a single
+    // pinned-async pipeline on the per-call stream. Replaces the legacy
+    // `compute_partition_offsets` + `upload_offsets` pair (2 syncs → 1).
+    // Returns the K+1 host offsets (needed for scatter-buffer sizing and
+    // pass-2 slice bounds) plus the K-base device offsets the scatter
+    // kernel consumes.
     // ----------------------------------------------------------------------
-    let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
+    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
+        partition_offsets::compute_and_upload_partition_offsets_async(
+            &counts,
+            stream.raw(),
+        )?;
     if offsets.len() != (num_partitions as usize) + 1 {
         return Err(BoltError::Other(format!(
             "tier2_multi: prefix-sum returned {} offsets, expected {}",
@@ -183,8 +194,6 @@ pub fn execute_tier2_multi_sum(
     //                                   lockstep with the key column.
     //   - `partition_cursors[K]`   u32: zero-init; the atomic-claim pass
     //                                   bumps it. Not reused after that.
-    //
-    // Upload offsets once.
     // ----------------------------------------------------------------------
     let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_rows as usize, stream.raw())?;
     let mut scatter_vals: Vec<GpuVec<f64>> = Vec::with_capacity(n_vals);
@@ -193,8 +202,6 @@ pub fn execute_tier2_multi_sum(
     }
     let mut dest_idx: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
     let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
-
-    let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
 
     // ----------------------------------------------------------------------
     // Step 5. Atomic-claim pass — runs ONCE.
@@ -491,6 +498,75 @@ mod tests {
             for s in sums {
                 assert!(s.is_empty(), "empty input yields empty sums");
             }
+        }
+    }
+
+    // --- P1b-stage6 wiring smoke test ----------------------------------------
+    //
+    // End-to-end exercise of the joint
+    // `compute_and_upload_partition_offsets_async` path through the multi-SUM
+    // orchestrator. Two value columns; oracle = host-side HashMap reduction.
+    // Gated on `#[ignore]` because the pipeline needs the JIT + a CUDA context.
+    // -----------------------------------------------------------------------
+    #[test]
+    #[ignore = "requires CUDA toolkit + JIT at runtime (executes Tier-2 multi pipeline)"]
+    fn stage6_joint_offsets_multi_smoke() {
+        use std::collections::HashMap;
+
+        let host_keys: Vec<i32> = vec![1, 2, 1, 3, 2, 1, 4, 3];
+        let host_v0: Vec<f64> = vec![10.0, 20.0, 11.0, 30.0, 21.0, 12.0, 40.0, 31.0];
+        let host_v1: Vec<f64> = vec![1.0, 2.0, 1.1, 3.0, 2.1, 1.2, 4.0, 3.1];
+        let n_rows = host_keys.len() as u32;
+
+        let keys = match GpuVec::<i32>::from_slice(&host_keys) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let v0 = match GpuVec::<f64>::from_slice(&host_v0) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let v1 = match GpuVec::<f64>::from_slice(&host_v1) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let vals = vec![&v0, &v1];
+
+        let r = match execute_tier2_multi_sum(&keys, &vals, n_rows) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        assert_eq!(r.n_vals, 2);
+
+        // Oracle: per-key sums for both value columns.
+        let mut oracle: HashMap<i32, (f64, f64)> = HashMap::new();
+        for i in 0..host_keys.len() {
+            let e = oracle.entry(host_keys[i]).or_insert((0.0, 0.0));
+            e.0 += host_v0[i];
+            e.1 += host_v1[i];
+        }
+
+        let mut got: HashMap<i32, (f64, f64)> = HashMap::new();
+        for (keys, sums) in &r.per_partition {
+            assert_eq!(sums.len(), 2, "per-partition must carry n_vals=2 sum cols");
+            assert_eq!(keys.len(), sums[0].len());
+            assert_eq!(keys.len(), sums[1].len());
+            for i in 0..keys.len() {
+                let prev = got.insert(keys[i], (sums[0][i], sums[1][i]));
+                assert!(
+                    prev.is_none(),
+                    "key {} appeared in two partitions (disjoint invariant)",
+                    keys[i]
+                );
+            }
+        }
+
+        assert_eq!(got.len(), oracle.len());
+        for (k, (e0, e1)) in &oracle {
+            let (g0, g1) = got.get(k).copied().unwrap_or((f64::NAN, f64::NAN));
+            assert!((g0 - e0).abs() < 1e-9, "col0 mismatch for key {k}");
+            assert!((g1 - e1).abs() < 1e-9, "col1 mismatch for key {k}");
         }
     }
 }

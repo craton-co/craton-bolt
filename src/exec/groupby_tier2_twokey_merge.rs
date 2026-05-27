@@ -320,4 +320,66 @@ mod tests {
         assert_eq!(k2, vec![1, 4, 9]);
         assert_eq!(s, vec![51.0, 54.0, 59.0]);
     }
+
+    // --- P1b-stage6 wiring smoke test (orchestrator + merge end-to-end) -----
+    //
+    // The merger itself is pure host code; "async wiring" exercised here is
+    // upstream (joint `compute_and_upload_partition_offsets_async`). Runs
+    // the twokey orchestrator on a small fixture and validates the merged
+    // RecordBatch matches a host oracle. `#[ignore]`-gated.
+    // ----------------------------------------------------------------------
+    #[test]
+    #[ignore = "requires CUDA toolkit + JIT (executes Tier-2 twokey pipeline + merge)"]
+    fn stage6_orchestrator_plus_merge_twokey_smoke() {
+        use std::collections::HashMap;
+        use crate::cuda::GpuVec;
+        use crate::exec::groupby_tier2_twokey_orchestrator::execute_tier2_twokey_sum;
+
+        // 8-row fixture with duplicate (k1, k2) pairs.
+        let host_packed: Vec<i64> = vec![
+            pack(1, 10), pack(2, 20), pack(1, 10),
+            pack(3, 30), pack(2, 20), pack(1, 10),
+            pack(4, 40), pack(3, 31),
+        ];
+        let host_vals: Vec<f64> = vec![1.0, 2.0, 1.5, 3.0, 2.5, 1.25, 4.0, 3.1];
+        let n_rows = host_packed.len() as u32;
+
+        let keys = match GpuVec::<i64>::from_slice(&host_packed) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let vals = match GpuVec::<f64>::from_slice(&host_vals) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let partial = match execute_tier2_twokey_sum(&keys, &vals, n_rows) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let schema = out_schema();
+        let batch = build_tier2_twokey_result(partial, &schema).expect("merge ok");
+        let (got_k1, got_k2, got_s) = extract(&batch);
+
+        // Oracle: unpack, reduce, sort by (k1, k2).
+        let mut oracle: HashMap<(i32, i32), f64> = HashMap::new();
+        for (kp, v) in host_packed.iter().zip(host_vals.iter()) {
+            let (a, b) = unpack_i64(*kp);
+            *oracle.entry((a, b)).or_insert(0.0) += *v;
+        }
+        let mut oracle_rows: Vec<((i32, i32), f64)> = oracle.into_iter().collect();
+        oracle_rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(got_k1.len(), oracle_rows.len());
+        for (i, ((a, b), v)) in oracle_rows.iter().enumerate() {
+            assert_eq!(got_k1[i], *a, "k1 mismatch at row {i}");
+            assert_eq!(got_k2[i], *b, "k2 mismatch at row {i}");
+            assert!(
+                (got_s[i] - v).abs() < 1e-9,
+                "sum mismatch at ({a}, {b}): oracle={v}, got={}",
+                got_s[i]
+            );
+        }
+    }
 }
