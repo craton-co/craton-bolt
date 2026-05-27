@@ -101,8 +101,10 @@ fn execute_inner(
     n_groups: u32,
 ) -> BoltResult<RecordBatch> {
     let n_rows = key_arr.len();
-    let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice(key_arr.values())?;
-    let mut out_gpu: GpuVec<u64> = GpuVec::<u64>::zeros(n_groups as usize)?;
+    // Stage-4 (P1b): per-call stream shared across H2D, kernel, and D2H.
+    let stream = CudaStream::null_or_default();
+    let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
+    let mut out_gpu: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_groups as usize, stream.raw())?;
 
     let ptx = compile_shmem_count_kernel()?;
     let module = CudaModule::from_ptx(&ptx)?;
@@ -129,7 +131,6 @@ fn execute_inner(
     args.push_scalar_u32(n_rows as u32);
     args.push_scalar_u32(n_groups);
 
-    let stream = CudaStream::null();
     launch_with_geometry(
         function,
         params.grid_blocks,
@@ -139,11 +140,14 @@ fn execute_inner(
         &mut args,
     )?;
 
+    // Stage-4 (P1b): pinned D2H; sync once.
     // Build the result: which slots are populated. We use a host-side
     // presence map (same as the SUM executor) to decide which slots
     // make it into the output. For COUNT, a count > 0 directly tells us
     // — no separate set buffer needed.
-    let host_counts: Vec<u64> = out_gpu.to_vec()?;
+    let pinned_counts = out_gpu.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_counts: Vec<u64> = pinned_counts.as_slice().to_vec();
 
     let mut out_keys: Vec<i32> = Vec::new();
     let mut out_counts: Vec<i64> = Vec::new();
@@ -205,3 +209,57 @@ const _UNUSED_IMPORT_GUARDS: usize = {
     let _ = cuda_sys::CUDA_SUCCESS;
     0
 };
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async round-trip smoke test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::{Expr, Field, Literal};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_shmem_count_round_trip() {
+        let n: usize = 1024;
+        let n_groups: usize = 8;
+        let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
+        let mut expected = vec![0i64; n_groups];
+        for &k in &keys {
+            expected[k as usize] += 1;
+        }
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![ColumnIO { name: "k".into(), dtype: DataType::Int32 }],
+                group_by: vec![0],
+                aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Null))],
+                output_schema: Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("count_star", DataType::Int64, true),
+                ]),
+            },
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef],
+        )
+        .unwrap();
+        let out = match try_execute(&plan, &batch) {
+            Some(Ok(b)) => b,
+            _ => return,
+        };
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let cs = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..out.num_rows() {
+            assert_eq!(cs.value(i), expected[ks.value(i) as usize]);
+        }
+    }
+}

@@ -131,11 +131,15 @@ pub fn execute_tier2_twokey_sum(
         });
     }
 
+    // Stage-4 (P1b): per-call stream so device allocs, launches, and
+    // the final D2H share one ordering domain.
+    let stream = CudaStream::null_or_default();
+
     // ----------------------------------------------------------------------
     // Step 1. Allocate partition-pass outputs.
     // ----------------------------------------------------------------------
-    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
-    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
+    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
 
     // ----------------------------------------------------------------------
     // Step 2. JIT + launch the i64 partition kernel.
@@ -163,7 +167,6 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_counts);
         args.push_scalar_u32(n_rows);
 
-        let stream = CudaStream::null();
         launch_with_geometry(
             partition_fn,
             grid_blocks,
@@ -193,9 +196,9 @@ pub fn execute_tier2_twokey_sum(
     // `scatter_keys` is i64 — twice the byte budget of the single-key path.
     // For n_rows = 10 M that's 80 MB; still well under any sane device cap.
     // ----------------------------------------------------------------------
-    let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros(n_rows as usize)?;
-    let mut scatter_vals: GpuVec<f64> = GpuVec::<f64>::zeros(n_rows as usize)?;
-    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
+    let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut scatter_vals: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     // Upload the K bases (drop the trailing total — `upload_offsets` slices
     // internally and would reject the K-length form).
@@ -226,7 +229,6 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_sv);
         args.push_scalar_u32(n_rows);
 
-        let stream = CudaStream::null();
         launch_with_geometry(
             scatter_fn,
             grid_blocks,
@@ -258,13 +260,13 @@ pub fn execute_tier2_twokey_sum(
     }
 
     // Reduce kernel needs the FULL K+1 offsets buffer on the device.
-    let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice(&offsets)?;
+    let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice_async(&offsets, stream.raw())?;
 
     let n_out_slots: usize =
         (num_partitions as usize) * (partition_reduce_kernel_i64::BLOCK_GROUPS as usize);
-    let mut out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros(n_out_slots)?;
-    let mut out_vals_gpu: GpuVec<f64> = GpuVec::<f64>::zeros(n_out_slots)?;
-    let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
+    let mut out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
+    let mut out_vals_gpu: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_out_slots, stream.raw())?;
+    let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
 
     let reduce_module = get_or_build_module(&KernelSpec::ReduceSumI64)?;
     let reduce_fn = reduce_module.function(partition_reduce_kernel_i64::KERNEL_ENTRY)?;
@@ -285,7 +287,6 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_ov);
         args.push_output(&mut view_os);
 
-        let stream = CudaStream::null();
         launch_with_geometry(
             reduce_fn,
             num_partitions,
@@ -296,9 +297,14 @@ pub fn execute_tier2_twokey_sum(
         )?;
     }
 
-    let host_out_keys: Vec<i64> = out_keys_gpu.to_vec()?;
-    let host_out_vals: Vec<f64> = out_vals_gpu.to_vec()?;
-    let host_out_set: Vec<u8> = out_set_gpu.to_vec()?;
+    // Stage-4 (P1b): pinned D2H for the three fixed-size outputs; sync once.
+    let pinned_keys = out_keys_gpu.to_pinned_async(stream.raw())?;
+    let pinned_vals = out_vals_gpu.to_pinned_async(stream.raw())?;
+    let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
+    let host_out_vals: Vec<f64> = pinned_vals.as_slice().to_vec();
+    let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
 
     if host_out_keys.len() != n_out_slots
         || host_out_vals.len() != n_out_slots

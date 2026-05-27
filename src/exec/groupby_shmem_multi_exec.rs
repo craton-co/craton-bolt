@@ -164,21 +164,24 @@ fn execute_inner(
     let n_rows = key_arr.len();
     let n_vals = val_arrs.len() as u32;
 
+    // Stage-4 (P1b): per-call stream shared across H2D / kernel / D2H.
+    let stream = CudaStream::null_or_default();
+
     // --- Upload inputs ----------------------------------------------------
     //
     // We upload each value column independently; sharing a single buffer
     // would require concatenation (extra copy) for no kernel benefit since
     // the PTX issues independent `ld.global.f64` per aggregate anyway.
-    let keys_gpu = GpuVec::<i32>::from_slice(key_arr.values())?;
+    let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
     let mut vals_gpus: Vec<GpuVec<f64>> = Vec::with_capacity(val_arrs.len());
     for v in val_arrs {
-        vals_gpus.push(GpuVec::<f64>::from_slice(v.values())?);
+        vals_gpus.push(GpuVec::<f64>::from_slice_async(v.values(), stream.raw())?);
     }
 
     // One output buffer per aggregate, all sized to n_groups.
     let mut out_gpus: Vec<GpuVec<f64>> = Vec::with_capacity(val_arrs.len());
     for _ in 0..n_vals {
-        out_gpus.push(GpuVec::<f64>::zeros(n_groups as usize)?);
+        out_gpus.push(GpuVec::<f64>::zeros_async(n_groups as usize, stream.raw())?);
     }
 
     // --- JIT + load the kernel --------------------------------------------
@@ -233,7 +236,6 @@ fn execute_inner(
     args.push_scalar_u32(n_rows as u32);
     args.push_scalar_u32(n_groups);
 
-    let stream = CudaStream::null();
     launch_with_geometry(
         function,
         params.grid_blocks,
@@ -244,15 +246,21 @@ fn execute_inner(
         &mut args,
     )?;
 
-    // --- Download + build the output RecordBatch -------------------------
+    // --- Stage-4 (P1b): pinned D2H per output buffer; sync once. ---------
     //
     // One f64 vector per aggregate, plus a presence mask so empty groups
     // are omitted (matches SQL semantics: SUM over empty group = absent,
     // not 0).
-    let mut host_sums_per_agg: Vec<Vec<f64>> = Vec::with_capacity(out_gpus.len());
+    let mut pinned_outs: Vec<crate::cuda::PinnedHostBuffer<f64>> =
+        Vec::with_capacity(out_gpus.len());
     for og in &out_gpus {
-        host_sums_per_agg.push(og.to_vec()?);
+        pinned_outs.push(og.to_pinned_async(stream.raw())?);
     }
+    stream.synchronize()?;
+    let host_sums_per_agg: Vec<Vec<f64>> = pinned_outs
+        .iter()
+        .map(|p| p.as_slice().to_vec())
+        .collect();
 
     let mut present = vec![false; n_groups as usize];
     for &k in key_arr.values() {
@@ -356,4 +364,77 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async round-trip smoke test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::Field;
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_shmem_multi_round_trip() {
+        let n: usize = 1024;
+        let n_groups: usize = 8;
+        let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
+        let v1: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let v2: Vec<f64> = (0..n).map(|i| (i * 2) as f64).collect();
+        let mut sum1 = vec![0.0f64; n_groups];
+        let mut sum2 = vec![0.0f64; n_groups];
+        for (i, &k) in keys.iter().enumerate() {
+            sum1[k as usize] += v1[i];
+            sum2[k as usize] += v2[i];
+        }
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "v1".into(), dtype: DataType::Float64 },
+                    ColumnIO { name: "v2".into(), dtype: DataType::Float64 },
+                ],
+                group_by: vec![0],
+                aggregates: vec![
+                    AggregateExpr::Sum(Expr::Column("v1".into())),
+                    AggregateExpr::Sum(Expr::Column("v2".into())),
+                ],
+                output_schema: Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("sum_v1", DataType::Float64, true),
+                    Field::new("sum_v2", DataType::Float64, true),
+                ]),
+            },
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v1", ArrowDataType::Float64, false),
+            ArrowField::new("v2", ArrowDataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v1)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v2)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        let out = match try_execute(&plan, &batch) {
+            Some(Ok(b)) => b,
+            _ => return,
+        };
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let s1 = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let s2 = out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..out.num_rows() {
+            let k = ks.value(i) as usize;
+            assert_eq!(s1.value(i), sum1[k]);
+            assert_eq!(s2.value(i), sum2[k]);
+        }
+    }
 }

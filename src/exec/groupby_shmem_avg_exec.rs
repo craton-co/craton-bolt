@@ -186,8 +186,11 @@ fn execute_inner(
     let n_rows = key_arr.len();
     let n_aggs = val_arrs.len();
 
+    // Stage-4 (P1b): per-call stream shared across every H2D / kernel / D2H.
+    let stream = CudaStream::null_or_default();
+
     // --- Upload key column ONCE; reused by every SUM + the one COUNT. ----
-    let keys_gpu = GpuVec::<i32>::from_slice(key_arr.values())?;
+    let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
 
     // --- JIT both kernels (PTX cache hits after first run) ---------------
     let sum_ptx = compile_shmem_sum_kernel()?;
@@ -216,7 +219,6 @@ fn execute_inner(
         ))
     })?;
 
-    let stream = CudaStream::null();
     let n_rows_u32 = n_rows as u32;
     let n_groups_u32 = n_groups;
 
@@ -229,8 +231,8 @@ fn execute_inner(
     // `keys + N vals + N sums + 1 counts`.
     let mut host_sums: Vec<Vec<f64>> = Vec::with_capacity(n_aggs);
     for val_arr in val_arrs.iter() {
-        let vals_gpu = GpuVec::<f64>::from_slice(val_arr.values())?;
-        let mut sum_out_gpu = GpuVec::<f64>::zeros(n_groups as usize)?;
+        let vals_gpu = GpuVec::<f64>::from_slice_async(val_arr.values(), stream.raw())?;
+        let mut sum_out_gpu = GpuVec::<f64>::zeros_async(n_groups as usize, stream.raw())?;
 
         // CUDA-Oxide typed launch path. Kernel ABI:
         //   keys_ptr, vals_ptr, sum_ptr, n_rows, n_groups
@@ -259,7 +261,13 @@ fn execute_inner(
             )?;
         }
 
-        host_sums.push(sum_out_gpu.to_vec()?);
+        // Stage-4 (P1b): pinned D2H per SUM accumulator. We sync once
+        // per iteration so the per-iteration GpuVec drops happen safely
+        // (the buffers are released back to the pool only after the
+        // outstanding async copy completes).
+        let pinned = sum_out_gpu.to_pinned_async(stream.raw())?;
+        stream.synchronize()?;
+        host_sums.push(pinned.as_slice().to_vec());
         // `vals_gpu` and `sum_out_gpu` are dropped at the end of the
         // iteration, freeing the device memory before the next AVG's
         // value column is uploaded.
@@ -272,7 +280,7 @@ fn execute_inner(
     //
     // CUDA-Oxide typed launch path. Kernel ABI:
     //   keys_ptr, count_ptr, n_rows, n_groups
-    let mut count_gpu = GpuVec::<u64>::zeros(n_groups as usize)?;
+    let mut count_gpu = GpuVec::<u64>::zeros_async(n_groups as usize, stream.raw())?;
     {
         let view_keys = keys_gpu.view();
         let mut view_count = count_gpu.view_mut();
@@ -292,7 +300,10 @@ fn execute_inner(
             &mut args,
         )?;
     }
-    let host_counts: Vec<u64> = count_gpu.to_vec()?;
+    // Stage-4 (P1b): pinned D2H for the count vector; sync once.
+    let pinned_counts = count_gpu.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_counts: Vec<u64> = pinned_counts.as_slice().to_vec();
 
     // --- Host-side: AVG = SUM / COUNT, build output ----------------------
     //
@@ -382,4 +393,68 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async round-trip smoke test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::Field;
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_shmem_avg_round_trip() {
+        let n: usize = 1024;
+        let n_groups: usize = 8;
+        let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
+        let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let mut sums = vec![0.0f64; n_groups];
+        let mut counts = vec![0u64; n_groups];
+        for (i, &k) in keys.iter().enumerate() {
+            sums[k as usize] += vals[i];
+            counts[k as usize] += 1;
+        }
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                ],
+                group_by: vec![0],
+                aggregates: vec![AggregateExpr::Avg(Expr::Column("v".into()))],
+                output_schema: Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("avg_v", DataType::Float64, true),
+                ]),
+            },
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(vals)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        let out = match try_execute(&plan, &batch) {
+            Some(Ok(b)) => b,
+            _ => return,
+        };
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let avs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..out.num_rows() {
+            let k = ks.value(i) as usize;
+            let expected = sums[k] / counts[k] as f64;
+            assert!((avs.value(i) - expected).abs() < 1e-6);
+        }
+    }
 }

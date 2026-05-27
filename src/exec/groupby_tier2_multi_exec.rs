@@ -25,6 +25,7 @@ use crate::exec::groupby_tier2_dispatch::{
 };
 use crate::exec::groupby_tier2_multi_merge::build_tier2_multi_result;
 use crate::exec::groupby_tier2_multi_orchestrator::execute_tier2_multi_sum;
+use crate::exec::launch::CudaStream;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -171,14 +172,24 @@ fn execute_inner(
 ) -> BoltResult<RecordBatch> {
     let n_rows = key_arr.len() as u32;
 
+    // Stage-4 (P1b): mint a per-call stream for the input H2D uploads.
+    // The orchestrator mints its own stream for the kernel + D2H phase;
+    // splitting the input upload from the launch keeps the orchestrator
+    // signature stable (it doesn't take a stream parameter).
+    let stream = CudaStream::null_or_default();
+
     // Upload key column + each value column independently. Sharing a single
     // buffer would require concatenation; the scatter kernel reads per-row
     // from one `vals_ptr` so independent buffers are the natural shape.
-    let keys_gpu = GpuVec::<i32>::from_slice(key_arr.values())?;
+    let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
     let mut vals_gpus: Vec<GpuVec<f64>> = Vec::with_capacity(val_arrs.len());
     for v in val_arrs {
-        vals_gpus.push(GpuVec::<f64>::from_slice(v.values())?);
+        vals_gpus.push(GpuVec::<f64>::from_slice_async(v.values(), stream.raw())?);
     }
+    // Synchronize before handing off to the orchestrator: its stream is a
+    // distinct ordering domain, so we must finish the H2D before the
+    // orchestrator's kernels start reading these buffers.
+    stream.synchronize()?;
 
     // Build the borrow slice the orchestrator wants. The orchestrator never
     // mutates these — `&[&GpuVec<f64>]` matches its signature exactly so we
@@ -197,4 +208,79 @@ fn execute_inner(
     };
 
     build_tier2_multi_result(partial, &aggregate.output_schema)
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async round-trip smoke test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::{Field, Schema};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_tier2_multi_sum_round_trip() {
+        let n: usize = 300_000;
+        let n_groups: usize = 4096;
+        let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
+        let v1: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let v2: Vec<f64> = (0..n).map(|i| (i as f64) * 2.0).collect();
+        let mut sum1 = vec![0.0f64; n_groups];
+        let mut sum2 = vec![0.0f64; n_groups];
+        for (i, &k) in keys.iter().enumerate() {
+            sum1[k as usize] += v1[i];
+            sum2[k as usize] += v2[i];
+        }
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "v1".into(), dtype: DataType::Float64 },
+                    ColumnIO { name: "v2".into(), dtype: DataType::Float64 },
+                ],
+                group_by: vec![0],
+                aggregates: vec![
+                    AggregateExpr::Sum(Expr::Column("v1".into())),
+                    AggregateExpr::Sum(Expr::Column("v2".into())),
+                ],
+                output_schema: Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("sum_v1", DataType::Float64, true),
+                    Field::new("sum_v2", DataType::Float64, true),
+                ]),
+            },
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v1", ArrowDataType::Float64, false),
+            ArrowField::new("v2", ArrowDataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v1)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v2)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        let out = match try_execute(&plan, &batch) {
+            Some(Ok(b)) => b,
+            _ => return,
+        };
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let s1 = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let s2 = out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..out.num_rows() {
+            let k = ks.value(i) as usize;
+            assert_eq!(s1.value(i), sum1[k]);
+            assert_eq!(s2.value(i), sum2[k]);
+        }
+    }
 }
