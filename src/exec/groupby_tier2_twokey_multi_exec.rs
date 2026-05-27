@@ -333,3 +333,155 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
+
+// ---------------------------------------------------------------------------
+// Host-only eligibility-gate tests for the two-key multi-SUM exec.
+//
+// Note: this exec rejects `n_vals < 2` deliberately (single-SUM two-key has
+// its own faster shim, `groupby_tier2_twokey_exec`). Tests below pin that
+// boundary explicitly so a future refactor doesn't accidentally widen the
+// scope and shadow the single-agg path.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::logical_plan::Field;
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    /// Plan for `SELECT k1, k2, SUM(v0), SUM(v1), … FROM t GROUP BY k1, k2`.
+    fn build_twokey_multi_plan(n_vals: usize) -> PhysicalPlan {
+        let mut inputs = vec![
+            ColumnIO {
+                name: "k1".into(),
+                dtype: DataType::Int32,
+            },
+            ColumnIO {
+                name: "k2".into(),
+                dtype: DataType::Int32,
+            },
+        ];
+        let mut aggregates = Vec::with_capacity(n_vals);
+        let mut out_fields = vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Int32, false),
+        ];
+        for i in 0..n_vals {
+            let name = format!("v{i}");
+            inputs.push(ColumnIO {
+                name: name.clone(),
+                dtype: DataType::Float64,
+            });
+            aggregates.push(AggregateExpr::Sum(Expr::Column(name.clone())));
+            out_fields.push(Field::new(format!("sum_{name}"), DataType::Float64, true));
+        }
+        PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs,
+                group_by: vec![0, 1],
+                aggregates,
+                output_schema: Schema::new(out_fields),
+            },
+        }
+    }
+
+    fn twokey_multi_batch(n: usize, n_vals: usize) -> RecordBatch {
+        let k1: Vec<i32> = (0..n as i32).collect();
+        let k2: Vec<i32> = (0..n as i32).map(|i| i + 1).collect();
+        let mut fields: Vec<ArrowField> = vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+        ];
+        let mut cols: Vec<arrow_array::ArrayRef> = vec![
+            Arc::new(Int32Array::from(k1)) as arrow_array::ArrayRef,
+            Arc::new(Int32Array::from(k2)) as arrow_array::ArrayRef,
+        ];
+        for i in 0..n_vals {
+            fields.push(ArrowField::new(
+                format!("v{i}"),
+                ArrowDataType::Float64,
+                false,
+            ));
+            let v: Vec<f64> = (0..n).map(|j| j as f64).collect();
+            cols.push(Arc::new(Float64Array::from(v)) as arrow_array::ArrayRef);
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    /// Non-Aggregate plan: reject.
+    #[test]
+    fn rejects_non_aggregate_plan() {
+        let plan = PhysicalPlan::Union { inputs: vec![] };
+        let batch = twokey_multi_batch(0, 2);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Single-key plan: reject (single-key multi exec owns it).
+    #[test]
+    fn rejects_single_key_plan() {
+        let mut plan = build_twokey_multi_plan(2);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.group_by = vec![0];
+        }
+        let batch = twokey_multi_batch(300_000, 2);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Single SUM (n_vals == 1) belongs to the single-agg two-key shim.
+    /// This exec must NOT shadow it.
+    #[test]
+    fn rejects_single_aggregate() {
+        let plan = build_twokey_multi_plan(1);
+        let batch = twokey_multi_batch(300_000, 1);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Above MAX_VALS → reject (kernel doesn't compile beyond that).
+    #[test]
+    fn rejects_above_max_vals() {
+        let n_vals = (partition_reduce_kernel_multi_i64::MAX_VALS as usize) + 1;
+        let plan = build_twokey_multi_plan(n_vals);
+        let batch = twokey_multi_batch(300_000, n_vals);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// AVG/MIN/MAX mixed in → not our shape.
+    #[test]
+    fn rejects_avg_aggregate() {
+        let mut plan = build_twokey_multi_plan(2);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            // Second agg is AVG, not SUM.
+            aggregate.aggregates[1] = AggregateExpr::Avg(Expr::Column("v1".into()));
+        }
+        let batch = twokey_multi_batch(300_000, 2);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Below the row threshold → defer.
+    #[test]
+    fn rejects_below_row_threshold() {
+        let plan = build_twokey_multi_plan(2);
+        let batch = twokey_multi_batch(2_048, 2);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// `pre` kernel present → defer.
+    #[test]
+    fn rejects_plan_with_pre_kernel() {
+        use crate::plan::physical_plan::KernelSpec;
+        let mut plan = build_twokey_multi_plan(2);
+        if let PhysicalPlan::Aggregate { pre, .. } = &mut plan {
+            *pre = Some(KernelSpec {
+                inputs: vec![],
+                outputs: vec![],
+                ops: vec![],
+                predicate: None,
+                register_count: 0,
+            });
+        }
+        let batch = twokey_multi_batch(300_000, 2);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+}

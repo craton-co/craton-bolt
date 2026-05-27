@@ -333,3 +333,143 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
+
+// ---------------------------------------------------------------------------
+// Host-only eligibility-gate tests for the two-key Tier-2.1 COUNT(*) exec.
+//
+// These are all pure-host: `try_execute` rejects long before the kernel-launch
+// machinery comes into play. End-to-end GPU coverage lives in the dedicated
+// e2e suite.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::logical_plan::{Expr, Field, Literal};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    /// Plan for `SELECT k1, k2, COUNT(*) FROM t GROUP BY k1, k2`.
+    fn build_twokey_count_plan(k1_dtype: DataType, k2_dtype: DataType) -> PhysicalPlan {
+        let inputs = vec![
+            ColumnIO {
+                name: "k1".into(),
+                dtype: k1_dtype,
+            },
+            ColumnIO {
+                name: "k2".into(),
+                dtype: k2_dtype,
+            },
+        ];
+        let output_schema = Schema::new(vec![
+            Field::new("k1", k1_dtype, false),
+            Field::new("k2", k2_dtype, false),
+            Field::new("count_star", DataType::Int64, true),
+        ]);
+        PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs,
+                group_by: vec![0, 1],
+                aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Null))],
+                output_schema,
+            },
+        }
+    }
+
+    fn twokey_int32_batch(n: usize) -> RecordBatch {
+        let k1: Vec<i32> = (0..n as i32).collect();
+        let k2: Vec<i32> = (0..n as i32).map(|i| i + 1).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k1)) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(k2)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Wrong plan variant → defer.
+    #[test]
+    fn rejects_non_aggregate_plan() {
+        let plan = PhysicalPlan::Union { inputs: vec![] };
+        let batch = twokey_int32_batch(0);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Single-key plans belong to the single-key exec.
+    #[test]
+    fn rejects_single_key_plan() {
+        let mut plan = build_twokey_count_plan(DataType::Int32, DataType::Int32);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.group_by = vec![0];
+        }
+        let batch = twokey_int32_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Any non-Int32 key dtype → defer.
+    #[test]
+    fn rejects_int64_first_key() {
+        let plan = build_twokey_count_plan(DataType::Int64, DataType::Int32);
+        // Mismatched arrow dtype follows — downcast in try_execute fails
+        // cleanly; either branch (dtype-check or downcast) returns None.
+        let batch = twokey_int32_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Aggregate must be COUNT — SUM/MIN/MAX/AVG go elsewhere.
+    #[test]
+    fn rejects_sum_aggregate() {
+        let mut plan = build_twokey_count_plan(DataType::Int32, DataType::Int32);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.aggregates = vec![AggregateExpr::Sum(Expr::Column("k1".into()))];
+        }
+        let batch = twokey_int32_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Two aggregates → multi-exec territory.
+    #[test]
+    fn rejects_two_aggregates() {
+        let mut plan = build_twokey_count_plan(DataType::Int32, DataType::Int32);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.aggregates = vec![
+                AggregateExpr::Count(Expr::Literal(Literal::Null)),
+                AggregateExpr::Count(Expr::Literal(Literal::Null)),
+            ];
+        }
+        let batch = twokey_int32_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Below the row threshold — a smaller path should take this.
+    #[test]
+    fn rejects_below_row_threshold() {
+        let plan = build_twokey_count_plan(DataType::Int32, DataType::Int32);
+        let batch = twokey_int32_batch(2_048);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// `pre` kernel present → with-pre executor handles this.
+    #[test]
+    fn rejects_plan_with_pre_kernel() {
+        use crate::plan::physical_plan::KernelSpec;
+        let mut plan = build_twokey_count_plan(DataType::Int32, DataType::Int32);
+        if let PhysicalPlan::Aggregate { pre, .. } = &mut plan {
+            *pre = Some(KernelSpec {
+                inputs: vec![],
+                outputs: vec![],
+                ops: vec![],
+                predicate: None,
+                register_count: 0,
+            });
+        }
+        let batch = twokey_int32_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+}

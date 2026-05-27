@@ -301,3 +301,194 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
+
+// ---------------------------------------------------------------------------
+// Host-only eligibility-gate tests for the two-key float MIN/MAX exec.
+//
+// Mirror of the integer-MIN/MAX exec's host tests; we just swap to the
+// f64-value path. Numerical correctness is GPU-bound and lives in the
+// e2e suite.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::logical_plan::Field;
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+    use arrow_array::Int64Array;
+
+    /// Plan for `SELECT k1, k2, MIN(v) FROM t GROUP BY k1, k2`. Caller
+    /// picks the value column dtype to probe different reject paths.
+    fn build_twokey_float_minmax_plan(op_is_min: bool, val_dtype: DataType) -> PhysicalPlan {
+        let inputs = vec![
+            ColumnIO {
+                name: "k1".into(),
+                dtype: DataType::Int32,
+            },
+            ColumnIO {
+                name: "k2".into(),
+                dtype: DataType::Int32,
+            },
+            ColumnIO {
+                name: "v".into(),
+                dtype: val_dtype,
+            },
+        ];
+        let agg = if op_is_min {
+            AggregateExpr::Min(Expr::Column("v".into()))
+        } else {
+            AggregateExpr::Max(Expr::Column("v".into()))
+        };
+        let output_schema = Schema::new(vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Int32, false),
+            Field::new("v", val_dtype, true),
+        ]);
+        PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs,
+                group_by: vec![0, 1],
+                aggregates: vec![agg],
+                output_schema,
+            },
+        }
+    }
+
+    fn twokey_float_batch(n: usize) -> RecordBatch {
+        let k1: Vec<i32> = (0..n as i32).collect();
+        let k2: Vec<i32> = (0..n as i32).map(|i| i + 1).collect();
+        let v: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k1)) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(k2)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Non-Aggregate plan: reject.
+    #[test]
+    fn rejects_non_aggregate_plan() {
+        let plan = PhysicalPlan::Union { inputs: vec![] };
+        let batch = twokey_float_batch(0);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Single-key plan: reject (single-key sibling owns it).
+    #[test]
+    fn rejects_single_key_plan() {
+        let mut plan = build_twokey_float_minmax_plan(true, DataType::Float64);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.group_by = vec![0];
+        }
+        let batch = twokey_float_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// SUM aggregate → reject.
+    #[test]
+    fn rejects_sum_aggregate() {
+        let mut plan = build_twokey_float_minmax_plan(true, DataType::Float64);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.aggregates = vec![AggregateExpr::Sum(Expr::Column("v".into()))];
+        }
+        let batch = twokey_float_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Two aggregates → reject.
+    #[test]
+    fn rejects_two_aggregates() {
+        let mut plan = build_twokey_float_minmax_plan(true, DataType::Float64);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate
+                .aggregates
+                .push(AggregateExpr::Max(Expr::Column("v".into())));
+        }
+        let batch = twokey_float_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Int64 value column → integer-minmax sibling, not this exec.
+    #[test]
+    fn rejects_int64_value_column() {
+        let plan = build_twokey_float_minmax_plan(true, DataType::Int64);
+        let n = 300_000;
+        let k: Vec<i32> = (0..n as i32).collect();
+        let v: Vec<i64> = (0..n).map(|i| i as i64).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k.clone())) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(k)) as arrow_array::ArrayRef,
+                Arc::new(Int64Array::from(v)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Float32 value column → v0 doesn't accept it yet; reject.
+    #[test]
+    fn rejects_float32_value_column() {
+        let plan = build_twokey_float_minmax_plan(true, DataType::Float32);
+        let n = 300_000;
+        let k: Vec<i32> = (0..n as i32).collect();
+        let v: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k.clone())) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(k)) as arrow_array::ArrayRef,
+                Arc::new(arrow_array::Float32Array::from(v)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Below row threshold → defer.
+    #[test]
+    fn rejects_below_row_threshold() {
+        let plan = build_twokey_float_minmax_plan(true, DataType::Float64);
+        let batch = twokey_float_batch(1_024);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// `pre` kernel present → defer.
+    #[test]
+    fn rejects_plan_with_pre_kernel() {
+        use crate::plan::physical_plan::KernelSpec;
+        let mut plan = build_twokey_float_minmax_plan(true, DataType::Float64);
+        if let PhysicalPlan::Aggregate { pre, .. } = &mut plan {
+            *pre = Some(KernelSpec {
+                inputs: vec![],
+                outputs: vec![],
+                ops: vec![],
+                predicate: None,
+                register_count: 0,
+            });
+        }
+        let batch = twokey_float_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+}

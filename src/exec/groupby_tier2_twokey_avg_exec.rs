@@ -427,3 +427,172 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
+
+// ---------------------------------------------------------------------------
+// Host-only eligibility-gate tests for the two-key Tier-2.1 multi-AVG exec.
+//
+// We only exercise `try_execute`'s shape-gate logic; the kernel launch path
+// is GPU-bound and covered by the dedicated e2e suite.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::logical_plan::Field;
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    /// Plan for `SELECT k1, k2, AVG(v) FROM t GROUP BY k1, k2`.
+    fn build_twokey_avg_plan(n_vals: usize) -> PhysicalPlan {
+        let mut inputs = vec![
+            ColumnIO {
+                name: "k1".into(),
+                dtype: DataType::Int32,
+            },
+            ColumnIO {
+                name: "k2".into(),
+                dtype: DataType::Int32,
+            },
+        ];
+        let mut aggregates = Vec::with_capacity(n_vals);
+        let mut out_fields = vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Int32, false),
+        ];
+        for i in 0..n_vals {
+            let name = format!("v{i}");
+            inputs.push(ColumnIO {
+                name: name.clone(),
+                dtype: DataType::Float64,
+            });
+            aggregates.push(AggregateExpr::Avg(Expr::Column(name.clone())));
+            out_fields.push(Field::new(format!("avg_{name}"), DataType::Float64, true));
+        }
+        PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs,
+                group_by: vec![0, 1],
+                aggregates,
+                output_schema: Schema::new(out_fields),
+            },
+        }
+    }
+
+    /// Build a matching `(k1: Int32, k2: Int32, v0..vN-1: Float64)` batch.
+    fn twokey_avg_batch(n: usize, n_vals: usize) -> RecordBatch {
+        let k1: Vec<i32> = (0..n as i32).collect();
+        let k2: Vec<i32> = (0..n as i32).map(|i| i + 1).collect();
+        let mut fields: Vec<ArrowField> = vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+        ];
+        let mut cols: Vec<arrow_array::ArrayRef> = vec![
+            Arc::new(Int32Array::from(k1)) as arrow_array::ArrayRef,
+            Arc::new(Int32Array::from(k2)) as arrow_array::ArrayRef,
+        ];
+        for i in 0..n_vals {
+            fields.push(ArrowField::new(
+                format!("v{i}"),
+                ArrowDataType::Float64,
+                false,
+            ));
+            let v: Vec<f64> = (0..n).map(|j| j as f64).collect();
+            cols.push(Arc::new(Float64Array::from(v)) as arrow_array::ArrayRef);
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    /// Non-Aggregate plans are not our business.
+    #[test]
+    fn rejects_non_aggregate_plan() {
+        let plan = PhysicalPlan::Union { inputs: vec![] };
+        let batch = twokey_avg_batch(0, 1);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Single-key plans → single-key sibling.
+    #[test]
+    fn rejects_single_key_plan() {
+        let mut plan = build_twokey_avg_plan(1);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.group_by = vec![0];
+        }
+        let batch = twokey_avg_batch(300_000, 1);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// SUM mixed in → fall through (we want pure AVG).
+    #[test]
+    fn rejects_mixed_aggregates() {
+        let mut plan = build_twokey_avg_plan(1);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.aggregates =
+                vec![AggregateExpr::Sum(Expr::Column("v0".into()))];
+        }
+        let batch = twokey_avg_batch(300_000, 1);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Zero aggregates → reject.
+    #[test]
+    fn rejects_zero_aggregates() {
+        let mut plan = build_twokey_avg_plan(1);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.aggregates.clear();
+        }
+        let batch = twokey_avg_batch(300_000, 1);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Below-threshold rows → defer.
+    #[test]
+    fn rejects_below_row_threshold() {
+        let plan = build_twokey_avg_plan(2);
+        let batch = twokey_avg_batch(1_024, 2);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Non-Float64 value column → reject (we only accept f64 today).
+    #[test]
+    fn rejects_int64_value_column() {
+        let plan = build_twokey_avg_plan(1);
+        let n = 300_000;
+        let k1: Vec<i32> = (0..n as i32).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+            ArrowField::new("v0", ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k1.clone())) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(k1)) as arrow_array::ArrayRef,
+                Arc::new(arrow_array::Int64Array::from(
+                    (0..n).map(|i| i as i64).collect::<Vec<_>>(),
+                )) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// `pre` kernel present → defer.
+    #[test]
+    fn rejects_plan_with_pre_kernel() {
+        use crate::plan::physical_plan::KernelSpec;
+        let mut plan = build_twokey_avg_plan(1);
+        if let PhysicalPlan::Aggregate { pre, .. } = &mut plan {
+            *pre = Some(KernelSpec {
+                inputs: vec![],
+                outputs: vec![],
+                ops: vec![],
+                predicate: None,
+                register_count: 0,
+            });
+        }
+        let batch = twokey_avg_batch(300_000, 1);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+}
