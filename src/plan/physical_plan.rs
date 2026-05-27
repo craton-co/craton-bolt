@@ -168,6 +168,25 @@ pub struct AggregateSpec {
     pub aggregates: Vec<AggregateExpr>,
     /// Output schema (group-by columns first, then aggregate result columns).
     pub output_schema: Schema,
+    /// PV-stage-f: parallel to `inputs` — `true` means the underlying
+    /// table column carries an Arrow validity bitmap (i.e. its
+    /// `null_count() > 0` per the [`crate::plan::sql_frontend::TableProvider`]
+    /// extension).
+    ///
+    /// Default is `Vec::new()` which is treated as "no input carries
+    /// validity" — every existing call site that builds an `AggregateSpec`
+    /// without consulting the provider sees the legacy host-strip
+    /// fallback. When non-empty, must be parallel to `inputs`.
+    ///
+    /// Populated at lowering time by [`populate_input_validity`] (which
+    /// also fills [`KernelSpec::input_has_validity`] for projection /
+    /// pre-aggregation kernels). The single-key GROUP BY executors
+    /// ([`crate::exec::groupby`], [`crate::exec::groupby_valid`]) consult
+    /// this flag together with the runtime per-column null check to
+    /// decide whether to dispatch through the native `_with_validity`
+    /// kernel variants or fall back to the host-strip path.
+    #[doc(hidden)]
+    pub input_has_validity: Vec<bool>,
 }
 
 /// The top-level physical plan: a small ordered pipeline of kernels.
@@ -1005,6 +1024,10 @@ fn lower_aggregate(
         group_by: group_indices,
         aggregates: lowered_aggregates,
         output_schema,
+        // PV-stage-f: filled in by `populate_input_validity` after lowering.
+        // Empty (safe-default) for callers that build a plan directly without
+        // consulting a `TableProvider`.
+        input_has_validity: Vec::new(),
     };
 
     Ok(PhysicalPlan::Aggregate {
@@ -1095,10 +1118,20 @@ pub fn populate_input_validity(
         PhysicalPlan::Projection { table, kernel, .. } => {
             populate_one_kernel(kernel, table, provider);
         }
-        PhysicalPlan::Aggregate { table, pre, .. } => {
+        PhysicalPlan::Aggregate {
+            table,
+            pre,
+            aggregate,
+        } => {
             if let Some(k) = pre.as_mut() {
                 populate_one_kernel(k, table, provider);
             }
+            // PV-stage-f: mirror the same provider signal onto
+            // `AggregateSpec::input_has_validity` so the no-pre executors
+            // (`groupby.rs` / `groupby_valid.rs`) see the same plan-time
+            // hint that `groupby_with_pre` already consumes via
+            // `KernelSpec::input_has_validity`.
+            populate_aggregate_spec(aggregate, table, provider);
         }
         PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
@@ -1146,6 +1179,39 @@ fn populate_one_kernel(
         flags.push(has);
     }
     kernel.input_has_validity = flags;
+}
+
+/// PV-stage-f: populate one `AggregateSpec`'s `input_has_validity` from
+/// the provider. Mirror of [`populate_one_kernel`] for the no-pre GROUP
+/// BY executors that consume an `AggregateSpec` directly (rather than a
+/// `KernelSpec`).
+///
+/// Scans `aggregate.inputs` and asks the provider for each column's
+/// null-bearing status by name. Columns not found in the provider's
+/// schema (e.g. synthesised pre-aggregation outputs whose names won't
+/// resolve there, which happens in the non-trivial path that emits a
+/// `pre` kernel) inherit safe-`false` — under-flagging is sound because
+/// the executor's run-time host-strip remains the correctness fallback.
+fn populate_aggregate_spec(
+    aggregate: &mut AggregateSpec,
+    table: &str,
+    provider: &dyn crate::plan::sql_frontend::TableProvider,
+) {
+    let schema = match provider.schema(table) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut flags = Vec::with_capacity(aggregate.inputs.len());
+    for io in &aggregate.inputs {
+        let has = schema
+            .fields
+            .iter()
+            .position(|f| f.name == io.name)
+            .map(|idx| provider.has_nulls(table, idx))
+            .unwrap_or(false);
+        flags.push(has);
+    }
+    aggregate.input_has_validity = flags;
 }
 
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
@@ -1355,6 +1421,117 @@ mod tests {
                 }
             }
             other => panic!("expected PhysicalPlan::Filter at top, got {other:?}"),
+        }
+    }
+
+    // ---- PV-stage-f: populate_aggregate_spec from TableProvider ----
+
+    /// Tiny in-memory provider for the populate-validity tests below.
+    /// Two columns: "k" with no nulls, "v" with nulls.
+    struct FakeProvider;
+
+    impl crate::plan::sql_frontend::TableProvider for FakeProvider {
+        fn schema(&self, name: &str) -> BoltResult<Schema> {
+            if name == "t" {
+                Ok(Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("v", DataType::Int64, true),
+                ]))
+            } else {
+                Err(BoltError::Plan(format!("unknown table {name}")))
+            }
+        }
+        fn has_nulls(&self, table: &str, col_idx: usize) -> bool {
+            // "v" (idx 1) has nulls; everything else doesn't.
+            table == "t" && col_idx == 1
+        }
+        fn null_count(&self, table: &str, col_idx: usize) -> Option<usize> {
+            if table == "t" && col_idx == 1 {
+                Some(2)
+            } else if table == "t" {
+                Some(0)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// `populate_input_validity` must fill `AggregateSpec::input_has_validity`
+    /// parallel to `aggregate.inputs`, surfacing the provider's `has_nulls`
+    /// signal column-by-column. Mirrors the existing `KernelSpec`
+    /// population covered in PV-stage-d.
+    #[test]
+    fn pv_stage_f_populate_aggregate_spec_mirrors_provider_signal() {
+        let scan_schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int64, true),
+        ]);
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: scan_schema,
+        };
+        let agg = LogicalPlan::Aggregate {
+            input: Box::new(scan),
+            group_by: vec![Expr::Column("k".into())],
+            aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+        };
+        let mut phys = lower(&agg).expect("lower must succeed");
+        let provider = FakeProvider;
+        populate_input_validity(&mut phys, &provider);
+        match phys {
+            PhysicalPlan::Aggregate { aggregate, .. } => {
+                assert_eq!(
+                    aggregate.input_has_validity.len(),
+                    aggregate.inputs.len(),
+                    "input_has_validity must be parallel to inputs"
+                );
+                // Inputs are (k, v) in feed order; only `v` has nulls per the
+                // provider mock. The post-lowering input order matches the
+                // group-by-keys-first / aggregate-inputs-second contract in
+                // `lower_aggregate`, so input 0 = "k" (no nulls), input 1 = "v"
+                // (has nulls).
+                let by_name: std::collections::HashMap<&str, bool> = aggregate
+                    .inputs
+                    .iter()
+                    .zip(aggregate.input_has_validity.iter())
+                    .map(|(io, &v)| (io.name.as_str(), v))
+                    .collect();
+                assert_eq!(by_name.get("k"), Some(&false), "k has no nulls");
+                assert_eq!(by_name.get("v"), Some(&true), "v has nulls");
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    /// Before `populate_input_validity` runs, `AggregateSpec::input_has_validity`
+    /// is the empty-vector safe default — preserving every literal-constructor
+    /// caller's bit-identical legacy behaviour.
+    #[test]
+    fn pv_stage_f_aggregate_spec_default_input_has_validity_is_empty() {
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("v", DataType::Int64, true),
+            ]),
+        };
+        let agg = LogicalPlan::Aggregate {
+            input: Box::new(scan),
+            group_by: vec![Expr::Column("k".into())],
+            aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+        };
+        let phys = lower(&agg).expect("lower must succeed");
+        match phys {
+            PhysicalPlan::Aggregate { aggregate, .. } => {
+                assert!(
+                    aggregate.input_has_validity.is_empty(),
+                    "default (pre-populate_input_validity) must be empty Vec — \
+                     legacy code path"
+                );
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
         }
     }
 }

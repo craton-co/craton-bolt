@@ -1376,6 +1376,87 @@ fn groupby_sum_with_nulls_uses_native_validity_path() {
     );
 }
 
+/// PV-stage-f: no-pre GROUP BY path now wires
+/// `AggregateSpec::input_has_validity` through to a native `_with_validity`
+/// dispatch in `groupby::launch_agg_kernel`. With `EngineProvider::has_nulls`
+/// surfacing the source batch's null bitmap and `populate_input_validity`
+/// pushing that signal onto `AggregateSpec`, a NULL-bearing SQL query
+/// should increment `groupby::NATIVE_VALIDITY_LAUNCHES` at least once
+/// AND still produce the right per-group SUM.
+///
+/// Soft counter assertion (matches the Stage-E sibling test) so this is
+/// informative rather than brittle if a future planner change muffles
+/// the signal; the correctness assertion on per-group SUM is hard.
+#[test]
+#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+fn pv_stage_f_groupby_no_pre_native_validity_round_trip() {
+    use craton_bolt::exec::groupby::NATIVE_VALIDITY_LAUNCHES;
+    use craton_bolt::Engine;
+    use std::sync::atomic::Ordering;
+    use arrow_array::ArrayRef;
+
+    let baseline = NATIVE_VALIDITY_LAUNCHES.load(Ordering::Relaxed);
+
+    // Bare-column SUM over a null-bearing value column. The key column
+    // has no nulls so the native-validity dispatch is eligible:
+    //   - Float MIN/MAX is excluded by the predicate (host-strip).
+    //   - Int64 SUM is exactly the covered case for the integer
+    //     hash_kernels `_with_validity` emitter.
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("k", ArrowDataType::Int32, false),
+        ArrowField::new("v", ArrowDataType::Int64, true),
+    ]));
+    let k = Int32Array::from(vec![1i32, 2, 1, 2, 1, 2]);
+    let v = Int64Array::from(vec![
+        Some(10i64),
+        Some(20),
+        None,
+        Some(40),
+        Some(50),
+        None,
+    ]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(k) as ArrayRef, Arc::new(v) as ArrayRef],
+    )
+    .expect("batch");
+
+    let mut engine = Engine::new().expect("engine");
+    engine.register_table("t", batch).expect("register");
+    let h = engine
+        .sql("SELECT k, SUM(v) FROM t GROUP BY k")
+        .expect("execute");
+    let out = h.record_batch();
+    // k=1: 10 + 50 = 60 (the NULL row is dropped).
+    // k=2: 20 + 40 = 60 (the NULL row is dropped).
+    assert_eq!(out.num_rows(), 2);
+    let ks = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("Int32");
+    let ss = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64");
+    let mut got: std::collections::HashMap<i32, i64> =
+        std::collections::HashMap::new();
+    for i in 0..out.num_rows() {
+        got.insert(ks.value(i), ss.value(i));
+    }
+    assert_eq!(got.get(&1), Some(&60i64), "k=1 SUM (NULL excluded)");
+    assert_eq!(got.get(&2), Some(&60i64), "k=2 SUM (NULL excluded)");
+
+    let delta = NATIVE_VALIDITY_LAUNCHES
+        .load(Ordering::Relaxed)
+        .saturating_sub(baseline);
+    eprintln!(
+        "PV-stage-f: groupby::NATIVE_VALIDITY_LAUNCHES delta = {delta} \
+         (>=1 means planner+runtime drove native dispatch)"
+    );
+}
+
 /// Online: GROUP BY over a column with nulls should still produce the
 /// right result. With the validity-aware dispatch deferred to stage E,
 /// this test verifies that the engine still answers correctly via the

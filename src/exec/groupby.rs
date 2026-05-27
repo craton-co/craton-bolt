@@ -98,8 +98,9 @@ use crate::jit::agg_kernels::ReduceOp;
 // native GPU validity path is a performance follow-up — the host-strip
 // remains correct.
 use crate::jit::hash_kernels::{
-    compile_groupby_agg_kernel, compile_groupby_keys_kernel, groupby_block_size,
-    AGG_KERNEL_ENTRY, KEYS_KERNEL_ENTRY,
+    compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
+    compile_groupby_keys_kernel, groupby_block_size, AGG_KERNEL_ENTRY,
+    KEYS_KERNEL_ENTRY,
 };
 use crate::jit::CudaModule;
 use crate::plan::logical_plan::{
@@ -128,26 +129,21 @@ const EMPTY_KEY: i64 = i64::MIN;
 pub static NATIVE_VALIDITY_LAUNCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// PV-stage-e: runtime predicate — should this column's agg launch route
+/// PV-stage-f: runtime predicate — should this column's agg launch route
 /// through the native `_with_validity` kernel?
 ///
-/// Today the executor's host-strip pattern (see `pack_keys` and the
-/// per-aggregate `column_null_mask` calls) drops NULL rows before any GPU
-/// work, so the classic kernel never sees a NULL contribution. This
-/// predicate is the seed for Stage E's native-dispatch path: when a
-/// column has any null AND the `(op, dtype)` combination has a
-/// `_with_validity` emitter in `hash_kernels`, we'd prefer to upload the
-/// packed bitmap + raw values and let the GPU skip NULL rows. The
-/// host-strip remains the correctness fallback.
+/// Conditions checked here:
+/// 1. The Arrow array's `null_count() > 0` (no NULLs => classic kernel
+///    is already correct without any extra bitmap traffic).
+/// 2. The `(op, dtype)` combination has a `_with_validity` emitter in
+///    [`crate::jit::hash_kernels`]. Integer SUM/MIN/MAX and float SUM
+///    are covered; float MIN/MAX goes through `float_atomics` and has
+///    no companion yet — host-strip remains the fallback there.
 ///
-/// At this checkpoint the executor's plumbing for the bitmap upload +
-/// alternate launch is staged in `groupby_with_pre`; this helper exists
-/// so the gating logic is reviewable + testable here. Wiring it to the
-/// actual launch site is a Stage F follow-up (it requires expanding
-/// `launch_agg_kernel`'s ABI to optionally consume a validity buffer,
-/// mirroring the `groupby_with_pre::launch_agg_kernel_with_validity`
-/// path).
-#[allow(dead_code)]
+/// The caller in `run_typed_agg` additionally gates on the planner's
+/// `AggregateSpec::input_has_validity` signal so the runtime cost of
+/// inspecting `null_count()` is only paid when the planner believes the
+/// underlying table actually carries validity.
 fn column_should_use_native_validity(
     arr: &dyn arrow_array::Array,
     op: ReduceOp,
@@ -450,6 +446,16 @@ pub fn execute_groupby(
     // For each aggregate, prepare its accumulator and launch the agg kernel.
     // We collect (input_dtype_for_acc, downloaded acc vector as a typed enum)
     // per aggregate so that the host-side post-processing knows what to read.
+    //
+    // PV-stage-f: read the planner-time validity signal off the
+    // `AggregateSpec`. If ANY agg-input column was flagged by
+    // `populate_aggregate_spec`, the per-aggregate dispatch below uses this
+    // together with the runtime per-column null check to decide between the
+    // native `_with_validity` kernel and the host-strip fallback. An empty
+    // flag vector (legacy default) collapses to `false` so existing
+    // construction sites remain bit-identical.
+    let any_input_has_validity: bool =
+        aggregate.input_has_validity.iter().any(|&v| v);
     let mut acc_results: Vec<AccDownload> = Vec::with_capacity(aggregate.aggregates.len());
     for agg in &aggregate.aggregates {
         let acc = run_one_aggregate(
@@ -463,6 +469,7 @@ pub fn execute_groupby(
             k_u32,
             &stream,
             key_valid.as_deref(),
+            any_input_has_validity,
         )?;
         acc_results.push(acc);
     }
@@ -949,6 +956,22 @@ fn launch_keys_kernel(
 
 /// Launch one aggregate-update kernel for a (typed) input column and a
 /// (typed) accumulator buffer.
+///
+/// PV-stage-f: when `validity_ptr` is `Some(_)`, route through the native
+/// `_with_validity` PTX emitter
+/// ([`compile_groupby_agg_kernel_with_validity`]) — the kernel reads the
+/// packed-bit validity bitmap and skips NULL rows on the device, leaving
+/// the classic 6-param ABI alone for the no-validity case. The pointer
+/// must reference a `Vec<u32>` packed via
+/// [`crate::exec::groupby_with_pre::pack_validity_bits`] (little-endian
+/// bit `tid % 32` of word `tid / 32` per the
+/// [`crate::jit::hash_kernels`] module-level docs).
+///
+/// Float MIN/MAX still routes to `float_atomics` even when validity is
+/// requested — that emitter has no `_with_validity` companion yet
+/// (Stage G follow-up); the caller's
+/// [`column_should_use_native_validity`] gate already drops that combo.
+#[allow(clippy::too_many_arguments)]
 fn launch_agg_kernel<T: Pod>(
     op: ReduceOp,
     input_dtype: DataType,
@@ -959,6 +982,7 @@ fn launch_agg_kernel<T: Pod>(
     n_rows: usize,
     k_u32: u32,
     stream: &CudaStream,
+    validity_ptr: Option<CUdeviceptr>,
 ) -> BoltResult<()> {
     if n_rows == 0 {
         return Ok(());
@@ -966,15 +990,31 @@ fn launch_agg_kernel<T: Pod>(
 
     // MIN/MAX over floats need a CAS loop (no native atom.min.fXX on sm_70);
     // route those to the float_atomics codegen. Everything else uses the
-    // standard integer-atomic agg kernel.
+    // standard integer-atomic agg kernel. The native-validity variant is
+    // only available for the integer-atomic kernel today — float MIN/MAX
+    // through `float_atomics` has no `_with_validity` companion, so a
+    // caller passing `validity_ptr = Some(_)` for that combo is a bug
+    // (the dispatch predicate filters it out).
+    let use_validity = validity_ptr.is_some();
     let ptx = match (op, input_dtype) {
         (ReduceOp::Min, DataType::Float32)
         | (ReduceOp::Max, DataType::Float32)
         | (ReduceOp::Min, DataType::Float64)
         | (ReduceOp::Max, DataType::Float64) => {
+            debug_assert!(
+                !use_validity,
+                "float MIN/MAX has no _with_validity emitter — \
+                 dispatch predicate should have rejected this combo"
+            );
             crate::jit::float_atomics::compile_groupby_float_atomic_kernel(op, input_dtype)?
         }
-        _ => compile_groupby_agg_kernel(op, input_dtype)?,
+        _ => {
+            if use_validity {
+                compile_groupby_agg_kernel_with_validity(op, input_dtype)?
+            } else {
+                compile_groupby_agg_kernel(op, input_dtype)?
+            }
+        }
     };
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(AGG_KERNEL_ENTRY)?;
@@ -986,32 +1026,62 @@ fn launch_agg_kernel<T: Pod>(
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
 
-    let mut params: [*mut c_void; 6] = [
-        &mut group_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut n_rows_u32 as *mut u32 as *mut c_void,
-        &mut k_param as *mut u32 as *mut c_void,
-    ];
-
     let block = groupby_block_size();
     let grid_x = grid_x_for(n_rows_u32, block);
 
-    unsafe {
-        cuda_sys::check(cuda_sys::cuLaunchKernel(
-            function.raw(),
-            grid_x,
-            1,
-            1,
-            block,
-            1,
-            1,
-            0,
-            stream.raw(),
-            params.as_mut_ptr(),
-            ptr::null_mut(),
-        ))?;
+    if let Some(vp) = validity_ptr {
+        // Account the native-dispatch launch for inline-test observability.
+        NATIVE_VALIDITY_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut vptr: CUdeviceptr = vp;
+        let mut params: [*mut c_void; 7] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+            &mut vptr as *mut CUdeviceptr as *mut c_void,
+        ];
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
+        let _ = vptr;
+    } else {
+        let mut params: [*mut c_void; 6] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+        ];
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
     }
     stream.synchronize()?;
     let _ = (group_ptr, keys_ptr, input_ptr, acc_ptr);
@@ -1060,6 +1130,7 @@ fn run_one_aggregate(
     k_u32: u32,
     stream: &CudaStream,
     key_valid: Option<&[bool]>,
+    any_input_has_validity: bool,
 ) -> BoltResult<AccDownload> {
     match agg {
         AggregateExpr::Sum(expr)
@@ -1070,7 +1141,7 @@ fn run_one_aggregate(
             let col_io = resolve_input(inputs, col_name)?;
             run_typed_agg(
                 op, col_io, group_col, keys_table, batch, n_rows, k, k_u32, stream,
-                key_valid,
+                key_valid, any_input_has_validity,
             )
         }
 
@@ -1105,6 +1176,7 @@ fn run_one_aggregate(
                 count_n_rows,
                 k_u32,
                 stream,
+                None,
             )?;
             Ok(AccDownload::I64(download_pinned_i64(&acc_table, stream)?))
         }
@@ -1147,6 +1219,7 @@ fn run_one_aggregate(
                 avg_n_rows,
                 k_u32,
                 stream,
+                None,
             )?;
             let sum_host = download_pinned_f64(&sum_acc, stream)?;
 
@@ -1165,6 +1238,7 @@ fn run_one_aggregate(
                 avg_n_rows,
                 k_u32,
                 stream,
+                None,
             )?;
             let count_host = download_pinned_i64(&count_acc, stream)?;
 
@@ -1286,6 +1360,7 @@ fn run_typed_agg(
     k_u32: u32,
     stream: &CudaStream,
     key_valid: Option<&[bool]>,
+    any_input_has_validity: bool,
 ) -> BoltResult<AccDownload> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
         BoltError::Plan(format!(
@@ -1303,6 +1378,42 @@ fn run_typed_agg(
     }
 
     let value_valid = column_null_mask(col_io, batch)?;
+
+    // PV-stage-f: native-validity dispatch. When the planner flagged this
+    // input AND the column actually carries nulls AND the (op, dtype)
+    // combination has a `_with_validity` emitter, route through the GPU
+    // bitmap path. Falls through to the legacy host-strip otherwise.
+    // Float MIN/MAX is explicitly excluded — `float_atomics` has no
+    // `_with_validity` companion yet.
+    if any_input_has_validity
+        && column_should_use_native_validity(arr.as_ref(), op, col_io.dtype)
+        && key_valid.is_none()
+    {
+        // `key_valid.is_none()`: the native kernel reads rows by index, so
+        // its parallel keys array must be the same length as the value
+        // column. When `pack_keys` already dropped NULL-key rows the
+        // `group_col` we receive is shorter than the source batch, breaking
+        // the index alignment. Fall back to the host-strip path in that
+        // case — Stage G can lift this once the kernel accepts a
+        // key-filtered companion.
+        let vv = value_valid.as_deref().expect(
+            "column_should_use_native_validity guarantees arr.null_count() > 0, \
+             so column_null_mask returned Some(_)",
+        );
+        return run_typed_agg_native_validity(
+            op,
+            col_io,
+            arr.as_ref(),
+            vv,
+            group_col,
+            keys_table,
+            n_rows,
+            k,
+            k_u32,
+            stream,
+        );
+    }
+
     let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref())?;
     let n = filtered.n_rows();
 
@@ -1345,6 +1456,7 @@ fn run_typed_agg(
                     n,
                     k_u32,
                     stream,
+                    None,
                 )?;
                 Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
             } else {
@@ -1363,6 +1475,7 @@ fn run_typed_agg(
                     n,
                     k_u32,
                     stream,
+                    None,
                 )?;
                 Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
             }
@@ -1387,6 +1500,7 @@ fn run_typed_agg(
                 n,
                 k_u32,
                 stream,
+                None,
             )?;
             Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
         }
@@ -1412,6 +1526,7 @@ fn run_typed_agg(
                 n,
                 k_u32,
                 stream,
+                None,
             )?;
             Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
         }
@@ -1437,11 +1552,181 @@ fn run_typed_agg(
                 n,
                 k_u32,
                 stream,
+                None,
             )?;
             Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
         DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
+            col_io.dtype, col_io.name
+        ))),
+    }
+}
+
+/// PV-stage-f: native-validity dispatch — upload the FULL value column +
+/// the packed validity bitmap and let the GPU skip NULL rows on the
+/// device, instead of host-stripping them before upload.
+///
+/// Preconditions (enforced at the call site in `run_typed_agg`):
+/// 1. `arr.null_count() > 0` — there's actually a null to skip.
+/// 2. `(op, col_io.dtype)` is one of the integer SUM/MIN/MAX or float SUM
+///    combinations handled by [`compile_groupby_agg_kernel_with_validity`].
+/// 3. The key column (`group_col`) is parallel to the source batch by row
+///    index (i.e. `pack_keys` did not drop NULL-key rows).
+///
+/// The launcher increments [`NATIVE_VALIDITY_LAUNCHES`] each time it
+/// actually consumes a validity pointer, which inline tests assert on.
+#[allow(clippy::too_many_arguments)]
+fn run_typed_agg_native_validity(
+    op: ReduceOp,
+    col_io: &ColumnIO,
+    arr: &dyn Array,
+    value_valid: &[bool],
+    group_col: &GpuVec<i64>,
+    keys_table: &GpuVec<i64>,
+    n_rows: usize,
+    k: usize,
+    k_u32: u32,
+    stream: &CudaStream,
+) -> BoltResult<AccDownload> {
+    debug_assert_eq!(value_valid.len(), n_rows);
+    // Pack the validity bitmap into the kernel's u32-word layout. Reuse
+    // the helper exposed by `groupby_with_pre` so all native-validity
+    // executors agree on the LE bit ordering documented in
+    // [`crate::jit::hash_kernels`].
+    let validity_bytes: Vec<u8> = value_valid
+        .iter()
+        .map(|&v| if v { 1u8 } else { 0u8 })
+        .collect();
+    let packed = crate::exec::groupby_with_pre::pack_validity_bits(&validity_bytes);
+    let validity_gpu = GpuVec::<u32>::from_slice_async(&packed, stream.raw())?;
+    let validity_ptr = Some(validity_gpu.device_ptr());
+
+    match col_io.dtype {
+        DataType::Int32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
+            // SUM(Int32) widens to i64 (same rule as the host-strip path).
+            let widened_dtype = sum_output_dtype(DataType::Int32);
+            if matches!(op, ReduceOp::Sum) && widened_dtype == DataType::Int64 {
+                let widened: Vec<i64> = pa.values().iter().map(|&v| v as i64).collect();
+                let input_gpu = GpuVec::<i64>::from_slice_async(&widened, stream.raw())?;
+                let init: Vec<i64> = vec![identity_i64(op); k];
+                let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
+                launch_agg_kernel::<i64>(
+                    op,
+                    DataType::Int64,
+                    group_col,
+                    keys_table,
+                    &input_gpu,
+                    &mut acc,
+                    n_rows,
+                    k_u32,
+                    stream,
+                    validity_ptr,
+                )?;
+                let _ = validity_gpu; // keep validity buffer alive across launch
+                Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
+            } else {
+                let host: Vec<i32> = pa.values().to_vec();
+                let input_gpu = GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
+                let init: Vec<i32> = vec![identity_i32(op); k];
+                let mut acc = GpuVec::<i32>::from_slice_async(&init, stream.raw())?;
+                launch_agg_kernel::<i32>(
+                    op,
+                    DataType::Int32,
+                    group_col,
+                    keys_table,
+                    &input_gpu,
+                    &mut acc,
+                    n_rows,
+                    k_u32,
+                    stream,
+                    validity_ptr,
+                )?;
+                let _ = validity_gpu;
+                Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
+            }
+        }
+        DataType::Int64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
+            let host: Vec<i64> = pa.values().to_vec();
+            let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
+            let init: Vec<i64> = vec![identity_i64(op); k];
+            let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
+            launch_agg_kernel::<i64>(
+                op,
+                DataType::Int64,
+                group_col,
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                n_rows,
+                k_u32,
+                stream,
+                validity_ptr,
+            )?;
+            let _ = validity_gpu;
+            Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
+        }
+        DataType::Float32 => {
+            // Predicate gates float MIN/MAX out; only SUM reaches here.
+            debug_assert!(matches!(op, ReduceOp::Sum));
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
+            let host: Vec<f32> = pa.values().to_vec();
+            let input_gpu = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
+            let init: Vec<f32> = vec![identity_f32(op); k];
+            let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
+            launch_agg_kernel::<f32>(
+                op,
+                DataType::Float32,
+                group_col,
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                n_rows,
+                k_u32,
+                stream,
+                validity_ptr,
+            )?;
+            let _ = validity_gpu;
+            Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
+        }
+        DataType::Float64 => {
+            debug_assert!(matches!(op, ReduceOp::Sum));
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
+            let host: Vec<f64> = pa.values().to_vec();
+            let input_gpu = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
+            let init: Vec<f64> = vec![identity_f64(op); k];
+            let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
+            launch_agg_kernel::<f64>(
+                op,
+                DataType::Float64,
+                group_col,
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                n_rows,
+                k_u32,
+                stream,
+                validity_ptr,
+            )?;
+            let _ = validity_gpu;
+            Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
+        }
+        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+            "native-validity dispatch reached unsupported dtype {:?} (column '{}')",
             col_io.dtype, col_io.name
         ))),
     }
@@ -1865,6 +2150,7 @@ mod tests {
             group_by,
             aggregates: vec![],
             output_schema: Schema::new(vec![]),
+            input_has_validity: Vec::new(),
         }
     }
 

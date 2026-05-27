@@ -192,6 +192,13 @@ pub fn try_execute(
         return None;
     }
 
+    // PV-stage-f: NULL handling — the partition_reduce_kernel_minmax_i64
+    // family has no `_with_validity` companion. Defer NULL-bearing
+    // batches back to the no-pre single-key paths. Stage G follow-up.
+    if k1.null_count() > 0 || k2.null_count() > 0 || val_col.null_count() > 0 {
+        return None;
+    }
+
     Some(execute_inner(plan, k1, k2, val_col, op, val_dtype))
 }
 
@@ -701,6 +708,7 @@ mod eligibility_tests {
                 group_by: vec![0, 1],
                 aggregates: vec![agg],
                 output_schema,
+                input_has_validity: Vec::new(),
             },
         }
     }
@@ -911,6 +919,7 @@ mod stage4_tests {
                     Field::new("k2", DataType::Int32, false),
                     Field::new("min_v", DataType::Int32, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![

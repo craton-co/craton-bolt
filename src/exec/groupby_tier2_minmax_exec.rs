@@ -766,6 +766,7 @@ mod stage4_tests {
                     Field::new("k", DataType::Int32, false),
                     Field::new("min_v", DataType::Int32, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![
