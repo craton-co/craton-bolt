@@ -1037,7 +1037,7 @@ pub fn execute_outer_join_indices_on_gpu(
     // because the collision probe kernel needs a real pointer (we pass
     // null only for INNER).
     let matched_words = n_build.div_ceil(32);
-    let mut matched_dev = GpuVec::<u32>::zeros(matched_words)?;
+    let matched_dev = GpuVec::<u32>::zeros(matched_words)?;
 
     // Output buffer sizing: 2x (n_build + n_probe). Generous for typical
     // outer joins; cartesian-explosion cases overflow the counter (kernel

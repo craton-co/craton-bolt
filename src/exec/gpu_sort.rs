@@ -121,6 +121,7 @@ fn pad_to_pow2<T: Copy>(values: &[T], n_pow2: usize, sentinel: T) -> Vec<T> {
 /// the corresponding permutation of the identity 0..n_pow2.
 ///
 /// The two device buffers must have exactly `n_pow2` elements each.
+#[allow(dead_code)] // reason: Stage-1 single-key bitonic kept for golden-test surface; multi-key driver now dispatches all sorts.
 fn run_bitonic_passes(
     keys_dev_ptr: CUdeviceptr,
     idx_dev_ptr: CUdeviceptr,
@@ -215,6 +216,7 @@ fn run_bitonic_passes(
 /// This is the heart of the GPU ORDER BY fast path. The four type parameters
 /// have explicit branches so the compiler can monomorphise the host-side
 /// upload/download — the actual sort kernel is dtype-aware on the device.
+#[allow(dead_code)] // reason: Stage-1 single-key entry kept for golden-test surface; sort_indices_on_gpu_multi now dispatches.
 pub fn sort_indices_on_gpu(
     column: &dyn Array,
     dtype: DataType,
@@ -399,6 +401,7 @@ pub fn sort_indices_on_gpu(
 /// is expected to have already validated the precondition gates (single key,
 /// supported dtype, n_rows threshold, no NULLs); this entry point just
 /// executes the sort and the gather.
+#[allow(dead_code)] // reason: Stage-1 single-key entry kept for golden-test surface; sort_record_batch_on_gpu_multi now dispatches.
 pub fn sort_record_batch_on_gpu(
     batch: &RecordBatch,
     key_idx: usize,
