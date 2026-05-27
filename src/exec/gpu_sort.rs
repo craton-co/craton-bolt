@@ -65,7 +65,9 @@ use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::jit_compiler::CudaModule;
 use crate::jit::sort_kernel::{
-    compile_sort_kernel, sort_kernel_entry, SortDirection, SORT_BLOCK_SIZE,
+    compile_sort_kernel, compile_sort_kernel_spec, sort_kernel_entry,
+    sort_kernel_entry_spec, KeyDesc, SortDirection, SortKernelSpec, SortLayout,
+    MAX_SORT_KEYS, SORT_BLOCK_SIZE,
 };
 use crate::plan::logical_plan::DataType;
 
@@ -431,6 +433,411 @@ pub fn arrow_dtype_to_internal(d: &arrow_schema::DataType) -> Option<DataType> {
         A::Float64 => Some(DataType::Float64),
         _ => None,
     }
+}
+
+// =============================================================================
+// Stage 2: multi-key + NULL-aware + shmem-variant host driver.
+// =============================================================================
+
+/// Build an Arrow-format packed-bit validity bitmap (1 byte per 8 elements,
+/// LSB-first) covering positions `0..n_pow2`. Positions in `0..n_rows` come
+/// from `arr.is_null(i)`; padded positions are marked NULL.
+///
+/// Marking the padding NULL keeps the comparator semantics consistent even
+/// when the sentinel key values would otherwise tie a real row — under
+/// NULLS LAST the padding sorts to the end, under NULLS FIRST the host
+/// truncates leading padded indices (the truncation step in
+/// `sort_indices_on_gpu_multi` already filters out indices `>= n_rows`).
+fn build_validity_padded(arr: &dyn Array, n_pow2: usize) -> Vec<u8> {
+    let n_rows = arr.len();
+    let bytes = (n_pow2 + 7) / 8;
+    let mut out = vec![0u8; bytes];
+    for i in 0..n_rows {
+        if !arr.is_null(i) {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    // Padded positions are left as 0 = NULL. This matches the
+    // "padding goes last" convention paired with NULLS LAST polarity.
+    out
+}
+
+/// Upload a typed key column into a padded device buffer. Sentinel choice
+/// follows the Stage-1 convention (`+INF` for ASC, `-INF` for DESC) so
+/// padded entries land past real data in the comparator's value sense; the
+/// validity-aware path additionally marks them NULL.
+fn upload_padded_key_for_dtype(
+    arr: &dyn Array,
+    dtype: DataType,
+    dir: SortDirection,
+    n_pow2: usize,
+) -> BoltResult<KeyDeviceBuf> {
+    Ok(match dtype {
+        DataType::Int32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: i32 downcast failed".into()))?;
+            let host: Vec<i32> = pa.values().as_ref().to_vec();
+            let sentinel = match dir {
+                SortDirection::Asc => i32::MAX,
+                SortDirection::Desc => i32::MIN,
+            };
+            let padded = pad_to_pow2(&host, n_pow2, sentinel);
+            KeyDeviceBuf::I32(GpuVec::<i32>::from_slice(&padded)?)
+        }
+        DataType::Int64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: i64 downcast failed".into()))?;
+            let host: Vec<i64> = pa.values().as_ref().to_vec();
+            let sentinel = match dir {
+                SortDirection::Asc => i64::MAX,
+                SortDirection::Desc => i64::MIN,
+            };
+            let padded = pad_to_pow2(&host, n_pow2, sentinel);
+            KeyDeviceBuf::I64(GpuVec::<i64>::from_slice(&padded)?)
+        }
+        DataType::Float32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: f32 downcast failed".into()))?;
+            let host: Vec<f32> = pa.values().as_ref().to_vec();
+            let sentinel = match dir {
+                SortDirection::Asc => f32::INFINITY,
+                SortDirection::Desc => f32::NEG_INFINITY,
+            };
+            let padded = pad_to_pow2(&host, n_pow2, sentinel);
+            KeyDeviceBuf::F32(GpuVec::<f32>::from_slice(&padded)?)
+        }
+        DataType::Float64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| BoltError::Other("gpu_sort: f64 downcast failed".into()))?;
+            let host: Vec<f64> = pa.values().as_ref().to_vec();
+            let sentinel = match dir {
+                SortDirection::Asc => f64::INFINITY,
+                SortDirection::Desc => f64::NEG_INFINITY,
+            };
+            let padded = pad_to_pow2(&host, n_pow2, sentinel);
+            KeyDeviceBuf::F64(GpuVec::<f64>::from_slice(&padded)?)
+        }
+        _ => {
+            return Err(BoltError::Other(format!(
+                "gpu_sort multi-key: dtype {:?} not supported",
+                dtype
+            )))
+        }
+    })
+}
+
+/// Type-erased wrapper around a GpuVec of the key dtype. Lets the multi-key
+/// driver hold heterogeneous key buffers in a single Vec without unsafe
+/// dyn-dispatch tricks.
+enum KeyDeviceBuf {
+    I32(GpuVec<i32>),
+    I64(GpuVec<i64>),
+    F32(GpuVec<f32>),
+    F64(GpuVec<f64>),
+}
+
+impl KeyDeviceBuf {
+    fn device_ptr(&self) -> CUdeviceptr {
+        match self {
+            KeyDeviceBuf::I32(v) => v.device_ptr(),
+            KeyDeviceBuf::I64(v) => v.device_ptr(),
+            KeyDeviceBuf::F32(v) => v.device_ptr(),
+            KeyDeviceBuf::F64(v) => v.device_ptr(),
+        }
+    }
+}
+
+/// One key column ready to feed the multi-key sort kernel.
+pub struct GpuSortKey<'a> {
+    /// Underlying Arrow column.
+    pub column: &'a dyn Array,
+    /// Engine-internal dtype (must be one of the GPU-sortable set).
+    pub dtype: DataType,
+    /// Per-key direction.
+    pub direction: SortDirection,
+    /// Per-key NULLS placement.
+    pub nulls_first: bool,
+}
+
+/// Threshold below which we emit the in-block shmem variant. Equal to
+/// `SORT_BLOCK_SIZE` because the shmem variant requires `n_pow2 <=
+/// block_size` (each thread owns one element). Anything bigger goes through
+/// the multi-launch loop.
+const SHMEM_VARIANT_MAX_NPOW2: u32 = SORT_BLOCK_SIZE;
+
+/// Sort `keys` (up to [`MAX_SORT_KEYS`]) lexicographically on the GPU and
+/// return the row permutation as a `UInt32Array` of length `n_rows`.
+///
+/// Picks between the multi-launch and shmem-variant kernels based on
+/// `n_pow2`. For `n_pow2 <= SORT_BLOCK_SIZE` the shmem variant runs as a
+/// single launch; above that we fall back to one launch per substage.
+///
+/// Returns the (taken_path, permutation) pair so callers/tests can verify
+/// the dispatch decision without observing it through a counter.
+pub fn sort_indices_on_gpu_multi<'a>(
+    keys: &[GpuSortKey<'a>],
+) -> BoltResult<(SortLayout, UInt32Array)> {
+    if keys.is_empty() {
+        return Err(BoltError::Other(
+            "gpu_sort: sort_indices_on_gpu_multi needs at least 1 key".into(),
+        ));
+    }
+    if keys.len() > MAX_SORT_KEYS {
+        return Err(BoltError::Other(format!(
+            "gpu_sort: too many keys ({}); max is {}",
+            keys.len(),
+            MAX_SORT_KEYS
+        )));
+    }
+
+    let n_rows = keys[0].column.len();
+    for k in keys {
+        if k.column.len() != n_rows {
+            return Err(BoltError::Other(format!(
+                "gpu_sort: key column length mismatch ({} vs {})",
+                k.column.len(),
+                n_rows
+            )));
+        }
+    }
+    if n_rows == 0 {
+        return Ok((SortLayout::MultiLaunch, UInt32Array::from(Vec::<u32>::new())));
+    }
+    let n_pow2 = next_pow2_u32(n_rows)?;
+    let n_pow2_usize = n_pow2 as usize;
+    let stream = CudaStream::null();
+
+    // Decide layout. Shmem variant when the whole padded sort fits in a
+    // single block's worth of shared memory.
+    let layout = if n_pow2 <= SHMEM_VARIANT_MAX_NPOW2 {
+        SortLayout::Shmem
+    } else {
+        SortLayout::MultiLaunch
+    };
+
+    // Build the spec.
+    let key_descs: Vec<KeyDesc> = keys
+        .iter()
+        .map(|k| KeyDesc {
+            dtype: k.dtype,
+            direction: k.direction,
+            nulls_first: k.nulls_first,
+            nullable: k.column.null_count() > 0,
+        })
+        .collect();
+    let spec = SortKernelSpec {
+        keys: key_descs.clone(),
+        layout,
+        shmem_n_pow2: if matches!(layout, SortLayout::Shmem) {
+            n_pow2
+        } else {
+            0
+        },
+    };
+
+    // Upload each key's padded values + (if nullable) its validity bitmap.
+    // Buffers live for the duration of the kernel launches.
+    let mut key_bufs: Vec<KeyDeviceBuf> = Vec::with_capacity(keys.len());
+    let mut validity_bufs: Vec<Option<GpuVec<u8>>> = Vec::with_capacity(keys.len());
+    for (k, kd) in keys.iter().zip(key_descs.iter()) {
+        let kb = upload_padded_key_for_dtype(k.column, k.dtype, k.direction, n_pow2_usize)?;
+        key_bufs.push(kb);
+        if kd.nullable {
+            let bm = build_validity_padded(k.column, n_pow2_usize);
+            validity_bufs.push(Some(GpuVec::<u8>::from_slice(&bm)?));
+        } else {
+            validity_bufs.push(None);
+        }
+    }
+    // Indices buffer (identity).
+    let idx_host: Vec<u32> = (0..n_pow2).collect();
+    let idx_dev = GpuVec::<u32>::from_slice(&idx_host)?;
+
+    // Compile + load the module.
+    let ptx = compile_sort_kernel_spec(&spec)?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let entry = sort_kernel_entry_spec(&spec)?;
+    let function = module.function(&entry)?;
+
+    // Build the param array. ABI is constant across MultiLaunch / Shmem
+    // except for the trailing stage/mask pair.
+    //
+    // Slots 0..2*MAX_SORT_KEYS : alternating (key_ptr, validity_ptr).
+    //   Used keys point to real buffers; unused slots point to null.
+    // Slot 2*MAX_SORT_KEYS     : indices_ptr.
+    // Slot 2*MAX_SORT_KEYS+1   : n_pow2 (u32).
+    // Slots .. + 2/+3          : stage / substage_mask (MultiLaunch only).
+    let null_ptr: CUdeviceptr = 0;
+    let mut key_ptrs: [CUdeviceptr; MAX_SORT_KEYS] = [null_ptr; MAX_SORT_KEYS];
+    let mut val_ptrs: [CUdeviceptr; MAX_SORT_KEYS] = [null_ptr; MAX_SORT_KEYS];
+    for (i, kb) in key_bufs.iter().enumerate() {
+        key_ptrs[i] = kb.device_ptr();
+        val_ptrs[i] = validity_bufs[i]
+            .as_ref()
+            .map(|v| v.device_ptr())
+            .unwrap_or(null_ptr);
+    }
+    let mut indices_ptr = idx_dev.device_ptr();
+    let mut p_n_pow2: u32 = n_pow2;
+
+    match layout {
+        SortLayout::Shmem => {
+            // Single launch. block_size = n_pow2 (one thread per element),
+            // grid = 1.
+            let block_size: u32 = n_pow2.max(1);
+            let grid_x: u32 = 1;
+
+            let mut kp = key_ptrs;
+            let mut vp = val_ptrs;
+            // Interleave (k0, v0, k1, v1, ..., kN, vN, indices, n_pow2).
+            let mut params: Vec<*mut c_void> = Vec::with_capacity(MAX_SORT_KEYS * 2 + 2);
+            for i in 0..MAX_SORT_KEYS {
+                params.push(&mut kp[i] as *mut CUdeviceptr as *mut c_void);
+                params.push(&mut vp[i] as *mut CUdeviceptr as *mut c_void);
+            }
+            params.push(&mut indices_ptr as *mut CUdeviceptr as *mut c_void);
+            params.push(&mut p_n_pow2 as *mut u32 as *mut c_void);
+
+            // SAFETY: every entry of `params` points at a stack local that
+            // outlives the launch+synchronize below.
+            unsafe {
+                cuda_sys::check(cuda_sys::cuLaunchKernel(
+                    function.raw(),
+                    grid_x,
+                    1,
+                    1,
+                    block_size,
+                    1,
+                    1,
+                    0,
+                    stream.raw(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ))?;
+            }
+            stream.synchronize()?;
+        }
+        SortLayout::MultiLaunch => {
+            let block_size: u32 = SORT_BLOCK_SIZE;
+            let grid_x: u32 = n_pow2.div_ceil(block_size);
+            let log2_n = log2_pow2(n_pow2);
+
+            for stage in 1..=log2_n {
+                let mut substage = stage;
+                loop {
+                    let substage_mask: u32 = 1u32 << (substage - 1);
+                    let mut kp = key_ptrs;
+                    let mut vp = val_ptrs;
+                    let mut p_stage: u32 = stage;
+                    let mut p_mask: u32 = substage_mask;
+                    let mut params: Vec<*mut c_void> =
+                        Vec::with_capacity(MAX_SORT_KEYS * 2 + 4);
+                    for i in 0..MAX_SORT_KEYS {
+                        params.push(&mut kp[i] as *mut CUdeviceptr as *mut c_void);
+                        params.push(&mut vp[i] as *mut CUdeviceptr as *mut c_void);
+                    }
+                    params.push(&mut indices_ptr as *mut CUdeviceptr as *mut c_void);
+                    params.push(&mut p_n_pow2 as *mut u32 as *mut c_void);
+                    params.push(&mut p_stage as *mut u32 as *mut c_void);
+                    params.push(&mut p_mask as *mut u32 as *mut c_void);
+
+                    // SAFETY: same as Shmem branch — every param points at
+                    // a stack local that outlives the synchronous launch.
+                    unsafe {
+                        cuda_sys::check(cuda_sys::cuLaunchKernel(
+                            function.raw(),
+                            grid_x,
+                            1,
+                            1,
+                            block_size,
+                            1,
+                            1,
+                            0,
+                            stream.raw(),
+                            params.as_mut_ptr(),
+                            ptr::null_mut(),
+                        ))?;
+                    }
+                    stream.synchronize()?;
+                    if substage == 1 {
+                        break;
+                    }
+                    substage -= 1;
+                }
+            }
+        }
+    }
+
+    // Download indices and truncate.
+    let idx_host_sorted: Vec<u32> = idx_dev.to_vec()?;
+    let n_rows_u32 = n_rows_to_u32(n_rows)?;
+    let mut out: Vec<u32> = Vec::with_capacity(n_rows);
+    for v in &idx_host_sorted {
+        if *v < n_rows_u32 {
+            out.push(*v);
+        }
+        if out.len() == n_rows {
+            break;
+        }
+    }
+    if out.len() != n_rows {
+        return Err(BoltError::Other(format!(
+            "gpu_sort multi-key: recovered only {} indices for {} real rows",
+            out.len(),
+            n_rows
+        )));
+    }
+
+    // Buffers (key + validity + idx_dev) drop here.
+    drop(key_bufs);
+    drop(validity_bufs);
+    drop(idx_dev);
+
+    Ok((layout, UInt32Array::from(out)))
+}
+
+/// Sort an entire `RecordBatch` by `keys` on the GPU, gather every column.
+pub fn sort_record_batch_on_gpu_multi(
+    batch: &RecordBatch,
+    keys: &[(usize, DataType, SortDirection, bool /*nulls_first*/)],
+) -> BoltResult<RecordBatch> {
+    let sort_keys: Vec<GpuSortKey> = keys
+        .iter()
+        .map(|(idx, dtype, dir, nf)| GpuSortKey {
+            column: batch.column(*idx).as_ref(),
+            dtype: *dtype,
+            direction: *dir,
+            nulls_first: *nf,
+        })
+        .collect();
+    let (_layout, perm) = sort_indices_on_gpu_multi(&sort_keys)?;
+    let new_cols: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|c| {
+            take(c.as_ref(), &perm, None).map_err(|e| {
+                BoltError::Other(format!("gpu_sort multi-key: arrow take failed: {e}"))
+            })
+        })
+        .collect::<BoltResult<Vec<_>>>()?;
+    RecordBatch::try_new(batch.schema(), new_cols)
+        .map_err(|e| BoltError::Other(format!("gpu_sort multi-key: RecordBatch build failed: {e}")))
+}
+
+/// Threshold (in n_pow2 terms) at which the multi-key driver switches to the
+/// shmem variant. Exposed for tests that want to verify the dispatch
+/// decision without running on a CUDA device.
+#[allow(dead_code)]
+pub fn shmem_variant_threshold_n_pow2() -> u32 {
+    SHMEM_VARIANT_MAX_NPOW2
 }
 
 #[cfg(test)]

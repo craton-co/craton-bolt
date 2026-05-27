@@ -253,6 +253,211 @@ fn e2e_order_by_keeps_payload_aligned() {
     }
 }
 
+// ============================================================================
+// Stage 2: multi-key, NULL-aware, shmem variant.
+// ============================================================================
+
+/// Build a nullable Int32 batch.
+fn int32_nullable_batch(name: &str, values: Vec<Option<i32>>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        name,
+        ArrowDataType::Int32,
+        true,
+    )]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap()
+}
+
+/// Build a two-column nullable+non-nullable Int32 batch with names `a, b`.
+fn two_int32_batch(a: Vec<i32>, b: Vec<i32>) -> RecordBatch {
+    assert_eq!(a.len(), b.len());
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", ArrowDataType::Int32, false),
+        ArrowField::new("b", ArrowDataType::Int32, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(a)), Arc::new(Int32Array::from(b))],
+    )
+    .unwrap()
+}
+
+/// `ORDER BY a ASC, b DESC` — multi-key lexicographic. Build inputs where
+/// the major key has ties so the minor key's polarity is observable.
+#[test]
+#[ignore = "requires CUDA device"]
+fn multi_key_int_int() {
+    let mut engine = Engine::new().expect("ctx");
+
+    // n = N_BIG so the GPU threshold is hit. a takes ~64 distinct values
+    // so b's DESC ordering inside each tie group is visible.
+    let n = N_BIG;
+    let a: Vec<i32> = (0..n as i32).map(|i| i % 64).collect();
+    let b: Vec<i32> = (0..n as i32).collect();
+    let batch = two_int32_batch(a.clone(), b.clone());
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT a, b FROM t ORDER BY a ASC, b DESC")
+        .expect("ORDER BY a ASC, b DESC");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), n);
+
+    let a_out = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let b_out = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    for i in 1..n {
+        let pa = a_out.value(i - 1);
+        let ca = a_out.value(i);
+        let pb = b_out.value(i - 1);
+        let cb = b_out.value(i);
+        assert!(pa <= ca, "ORDER BY a ASC violated at row {i}");
+        if pa == ca {
+            assert!(
+                pb >= cb,
+                "ORDER BY b DESC within a-tie violated at row {i}: {} < {}",
+                pb,
+                cb
+            );
+        }
+    }
+}
+
+/// `ORDER BY a NULLS FIRST` — NULL rows must precede every non-NULL row.
+#[test]
+#[ignore = "requires CUDA device"]
+fn null_first_int_with_nulls() {
+    let mut engine = Engine::new().expect("ctx");
+
+    let n = N_BIG;
+    // ~10% nulls, scattered deterministically.
+    let mut values: Vec<Option<i32>> = (0..n)
+        .map(|i| if i % 10 == 3 { None } else { Some(i as i32) })
+        .collect();
+    // shuffle to defeat any input-order assumptions
+    let mut rng_state: u64 = 0xc0ffee;
+    for i in (1..n).rev() {
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (rng_state as usize) % (i + 1);
+        values.swap(i, j);
+    }
+    let batch = int32_nullable_batch("v", values.clone());
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT v FROM t ORDER BY v NULLS FIRST")
+        .expect("ORDER BY NULLS FIRST");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), n);
+
+    let arr = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    // Find the boundary: count leading nulls.
+    let mut leading_nulls = 0usize;
+    while leading_nulls < n && arr.is_null(leading_nulls) {
+        leading_nulls += 1;
+    }
+    // The total NULL count should equal the leading-nulls run.
+    let expected_nulls = values.iter().filter(|v| v.is_none()).count();
+    assert_eq!(
+        leading_nulls, expected_nulls,
+        "NULLS FIRST: leading nulls must equal total null count"
+    );
+    // After the null prefix, the rest must be ASC.
+    for i in (leading_nulls + 1)..n {
+        assert!(
+            arr.value(i - 1) <= arr.value(i),
+            "ASC violated at row {i} after null prefix"
+        );
+    }
+}
+
+/// `ORDER BY a NULLS LAST` — NULLs trailing.
+#[test]
+#[ignore = "requires CUDA device"]
+fn null_last_int_with_nulls() {
+    let mut engine = Engine::new().expect("ctx");
+
+    let n = N_BIG;
+    let mut values: Vec<Option<i32>> = (0..n)
+        .map(|i| if i % 11 == 5 { None } else { Some(i as i32) })
+        .collect();
+    let mut rng_state: u64 = 0xfeed;
+    for i in (1..n).rev() {
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (rng_state as usize) % (i + 1);
+        values.swap(i, j);
+    }
+    let batch = int32_nullable_batch("v", values.clone());
+    engine.register_table("t", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT v FROM t ORDER BY v NULLS LAST")
+        .expect("ORDER BY NULLS LAST");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), n);
+
+    let arr = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    // Find the boundary: count leading non-nulls.
+    let mut leading_non_nulls = 0usize;
+    while leading_non_nulls < n && !arr.is_null(leading_non_nulls) {
+        leading_non_nulls += 1;
+    }
+    let expected_nulls = values.iter().filter(|v| v.is_none()).count();
+    let trailing_nulls = n - leading_non_nulls;
+    assert_eq!(
+        trailing_nulls, expected_nulls,
+        "NULLS LAST: trailing nulls must equal total null count"
+    );
+    // The leading non-null prefix must be ASC.
+    for i in 1..leading_non_nulls {
+        assert!(arr.value(i - 1) <= arr.value(i));
+    }
+    // The trailing nulls really are NULL.
+    for i in leading_non_nulls..n {
+        assert!(arr.is_null(i));
+    }
+}
+
+/// `n_rows = 128` exercises the shmem variant (n_pow2 = 128 <= block_size).
+/// Below the GPU_SORT_MIN_ROWS threshold (16384) the executor wouldn't take
+/// the GPU path normally, so we drive the shmem dispatcher directly via the
+/// public `sort_indices_on_gpu_multi` entry point.
+#[test]
+#[ignore = "requires CUDA device"]
+fn shmem_variant_small_input() {
+    use craton_bolt::__test_only_gpu_sort::{sort_indices_on_gpu_multi, GpuSortKey, SortLayout};
+    use craton_bolt::__test_only_sort_kernel::SortDirection;
+    use craton_bolt::__test_only_logical_plan::DataType;
+
+    let n = 128usize;
+    let mut values: Vec<i32> = (0..n as i32).collect();
+    let mut s: u64 = 0xdeafbeef;
+    for i in (1..n).rev() {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (s as usize) % (i + 1);
+        values.swap(i, j);
+    }
+    let arr = Int32Array::from(values.clone());
+
+    let keys = vec![GpuSortKey {
+        column: &arr,
+        dtype: DataType::Int32,
+        direction: SortDirection::Asc,
+        nulls_first: false,
+    }];
+    let (layout, perm) = sort_indices_on_gpu_multi(&keys).expect("shmem sort");
+    assert!(
+        matches!(layout, SortLayout::Shmem),
+        "n_pow2=128 must take the Shmem dispatch path; got {:?}",
+        layout
+    );
+    assert_eq!(perm.len(), n);
+
+    // Apply the permutation and check ASC order + permutation correctness.
+    let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
+    let mut expected = values.clone();
+    expected.sort();
+    assert_eq!(sorted, expected, "shmem-variant output must equal sorted(input)");
+}
+
 /// Below the GPU threshold the host path must still produce correct output.
 /// This test guards against an accidental gate inversion that would route
 /// small queries through the GPU and break on its preconditions.
