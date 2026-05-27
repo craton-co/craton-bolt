@@ -101,6 +101,17 @@ cudarc = ["dep:cudarc"]
 # toolchain installed (nightly + libNVVM + LLVM, see kernels/rust-toolchain.toml).
 # Default build remains hand-emit. See `docs/JIT_PIPELINE.md` for background.
 rust-cuda = ["dep:cuda_builder"]
+# `pool-sharded` (Stage-3 escape hatch): swaps the `DeviceMemPool::buckets`
+# field from a `DashMap<usize, Mutex<BucketEntry>>` to a fixed-size
+# `[Mutex<HashMap<usize, BucketEntry>>; 32]` array keyed by
+# `size_class % 32`. Same external API, different lock-granularity tradeoff.
+# Off by default. Turn on only if profiling shows the DashMap shard layer
+# is the bottleneck (see `bench_dashmap_baseline` in `mem_pool.rs`). The
+# fixed-N variant pays one mutex acquisition per access regardless of
+# bucket-existence, but the lock is held only across the inner HashMap op
+# and never contends across distinct shard indices — useful when many
+# size classes happen to collide on DashMap's `default_hasher`.
+pool-sharded = []
 
 [build-dependencies]
 # `cuda_builder` is the build-time entry point to rust-cuda's NVVM codegen
