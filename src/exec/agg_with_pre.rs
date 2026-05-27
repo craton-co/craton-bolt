@@ -592,7 +592,30 @@ enum PreCol {
 
 impl PreCol {
     /// Upload an Arrow array to the GPU, downcasting per `dtype`.
+    ///
+    /// **NULL handling**: rejects any input array with `null_count() > 0`.
+    /// The pre-stage GPU kernels operate on raw value buffers and do not
+    /// (yet) carry a validity bitmap, so a NULL would silently feed garbage
+    /// into multiplications / additions. The clean error is the safe
+    /// surgical fix; full propagation is tracked below.
+    ///
+    /// TODO(pre-stage-nulls): propagate `arr.nulls()` into a parallel
+    /// `valid_mask: GpuBuffer<u8>` per `PreCol`, then have the JIT kernel
+    /// emit `value if valid else identity` per op so NULL semantics survive
+    /// the pre-stage. Until then, planners that introduce a pre kernel
+    /// over a NULL-bearing source column must ensure either (a) the source
+    /// has been filtered upstream or (b) the column is unconditionally
+    /// non-null.
     fn upload(arr: &dyn Array, dtype: DataType) -> BoltResult<Self> {
+        if arr.null_count() > 0 {
+            return Err(BoltError::Type(format!(
+                "agg_with_pre: pre-stage kernels do not yet propagate NULL \
+                 validity; input column with dtype {:?} has {} NULL(s). \
+                 See TODO(pre-stage-nulls) in agg_with_pre.rs.",
+                dtype,
+                arr.null_count()
+            )));
+        }
         match dtype {
             DataType::Int32 => {
                 let pa = arr
@@ -1099,5 +1122,41 @@ mod tests {
             from_expr_host(utf8_col),
             Err(BoltError::Type(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod null_handling_tests {
+    //! Host-only tests for the `PreCol::upload` NULL-rejection gate added in
+    //! the pre-stage: Arrow arrays whose `null_count() > 0` are rejected
+    //! before any device allocation because the pre-stage GPU kernels do not
+    //! yet carry a validity bitmap and would otherwise multiply garbage at
+    //! NULL positions.
+    //!
+    //! No CUDA touched: the error path short-circuits before any device
+    //! allocation.
+    use super::*;
+
+    #[test]
+    fn pre_col_upload_rejects_null_bearing_input() {
+        // Arrow `Int32Array::from` with `Option`s carries a real validity
+        // bitmap, so `null_count()` returns > 0 and we should reject this
+        // before reaching CUDA.
+        let arr = Int32Array::from(vec![Some(1i32), None, Some(3i32)]);
+        assert!(arr.null_count() > 0, "arrow array should carry a NULL");
+        // `PreCol` doesn't implement `Debug`, so we match the Result manually
+        // rather than calling `expect_err`.
+        let msg = match PreCol::upload(&arr, DataType::Int32) {
+            Ok(_) => panic!("PreCol::upload should reject NULL-bearing input"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            msg.contains("NULL"),
+            "error should mention NULL validity, got: {msg}"
+        );
+        assert!(
+            msg.contains("pre-stage"),
+            "error should mention pre-stage, got: {msg}"
+        );
     }
 }
