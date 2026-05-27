@@ -51,21 +51,66 @@
 //! binary op, so this evaluator never has to invent a wider type that the
 //! GPU would not also pick.
 //!
-//! ## NULL propagation
+//! ## NULL propagation (precise contract)
 //!
-//! Every operand position carries `Option<T>`. A `None` on *either* side of
-//! a binary op produces a `None` result, regardless of operator. This is
-//! the SQL semantics that the device-side codegen targets (NULL is a
-//! "third value" that infects compute). The one wrinkle is integer
-//! division by zero: per SQL, that is also `None`. Float division by zero
-//! follows IEEE-754 — positive / 0.0 is `+inf`, 0.0 / 0.0 is `NaN`, and so
-//! on. (We chose IEEE for floats because the device path also relies on
-//! IEEE behaviour; tagging those as `None` would diverge from the GPU.)
+//! Every operand cell carries `Option<T>`. `None` means SQL `NULL`. This
+//! module implements SQL three-valued logic (3VL) at the binary-op level:
+//!
+//!   1. **Arithmetic** (`+ - * /`): If *either* operand is `None`, the
+//!      result is `None`. Two `Some` values produce `Some(op(x, y))`.
+//!      Integer overflow wraps (matches the device codegen). Integer
+//!      division by zero produces `None` per SQL. Float division by zero
+//!      follows IEEE-754 (`+inf` / `-inf` / `NaN`); we deliberately do
+//!      not promote those to `None` because the GPU path keeps the IEEE
+//!      bit pattern.
+//!
+//!   2. **Comparison** (`= <> < <= > >=`): If *either* operand is `None`,
+//!      the result is `None` (NOT `Some(false)`). In particular
+//!      `NULL = NULL` is `None`, not `Some(true)`. Two `Some` values
+//!      produce `Some(cmp)`.
+//!
+//!   3. **Logical** (`AND`, `OR`): SQL 3VL with short-circuit on the
+//!      "absorbing" value, so `None` does *not* always propagate:
+//!      - `AND`: `Some(false) AND _ = Some(false)` (either side);
+//!        `Some(true) AND Some(true) = Some(true)`; anything else
+//!        involving `None` is `None`. In particular,
+//!        `None AND Some(true) = None` and `None AND None = None`.
+//!      - `OR`: `Some(true) OR _ = Some(true)` (either side);
+//!        `Some(false) OR Some(false) = Some(false)`; anything else
+//!        involving `None` is `None`. In particular,
+//!        `None OR Some(false) = None` and `None OR None = None`.
+//!
+//!   4. **Casts**: `cast_column` is `None`-preserving: a `None` input cell
+//!      stays `None` in the output column regardless of target dtype.
+//!      `Literal::Null` lowers to an `I64` column of `None`s, which then
+//!      casts to a `None`-only column of the caller-chosen dtype.
+//!
+//! ### Consumer contract (important)
+//!
+//! `HostColumn` exposes its `None` cells to callers verbatim. **It is the
+//! caller's responsibility to filter `None`s before passing the column to
+//! any downstream reduction that does not itself accept `Option<T>`**.
+//! In particular, `agg_with_pre::from_expr_host` collapses `None → 0` so
+//! that the primitive reduction path can consume a flat `Vec<T>`; that is
+//! safe for `SUM` (identity 0) and the count-of-non-NULL semantics, but
+//! callers using this module's output for `MIN`/`MAX` over a column
+//! containing `None`s must filter those rows out first — leaving them in
+//! would make zero a candidate minimum/maximum, which is wrong. This is
+//! an out-of-scope concern for this module; we only guarantee the
+//! `Option<T>` contract above.
+//!
+//! ### Out of scope
+//!
+//! The AST has no `NOT`, no unary minus, no `IS NULL`, no `COALESCE`, no
+//! `CASE`, no `NULLIF`. If those are added to `Expr`, the corresponding
+//! 3VL rules belong here — see the test block at the bottom for the
+//! shape they should take.
 //!
 //! ## Tests
 //!
 //! Self-contained unit tests live in the `#[cfg(test)] mod tests` at the
 //! bottom of the file. They exercise the public API only; no GPU calls.
+//! The `null_3vl_*` tests pin the 3VL invariants above.
 
 use std::collections::HashMap;
 
@@ -1023,5 +1068,242 @@ mod tests {
         assert_eq!(try_bare_column(&col("a").alias("b")), Some("a"));
         assert_eq!(try_bare_column(&lit(1i64)), None);
         assert_eq!(try_bare_column(&col("a").add(col("b"))), None);
+    }
+
+    // -----------------------------------------------------------------
+    // SQL three-valued-logic (3VL) invariant tests.
+    //
+    // Each test below pins one row of the precise NULL-propagation
+    // contract documented at the top of the file. If any of these
+    // tests change behaviour, the doc contract MUST be updated to
+    // match — these are the load-bearing invariants other modules
+    // (especially the consumers in agg_with_pre / groupby_with_pre)
+    // rely on.
+    // -----------------------------------------------------------------
+
+    /// `eval(col + NULL_lit) = NULL` for every row. Exercises the
+    /// "right operand is None" arm of arithmetic.
+    #[test]
+    fn null_3vl_arith_a_plus_null_literal() {
+        let a = HostColumn::I32(vec![Some(1), Some(2), Some(3)]);
+        let env = env_of(&[("a", &a)]);
+        let expr = col("a").add(Expr::Literal(Literal::Null));
+        let out = eval_expr(&expr, &env, DataType::Int32, 3).unwrap();
+        match out {
+            HostColumn::I32(v) => assert_eq!(v, vec![None, None, None]),
+            other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `eval(NULL_lit + col) = NULL` for every row. Exercises the
+    /// "left operand is None" arm of arithmetic.
+    #[test]
+    fn null_3vl_arith_null_literal_plus_b() {
+        let b = HostColumn::I32(vec![Some(10), Some(20), Some(30)]);
+        let env = env_of(&[("b", &b)]);
+        let expr = Expr::Literal(Literal::Null).add(col("b"));
+        let out = eval_expr(&expr, &env, DataType::Int32, 3).unwrap();
+        match out {
+            HostColumn::I32(v) => assert_eq!(v, vec![None, None, None]),
+            other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Every arithmetic op propagates None symmetrically. We sweep
+    /// `+ - * /` against a single (Some, None) and (None, Some) pair.
+    #[test]
+    fn null_3vl_arith_all_ops_propagate_both_sides() {
+        for use_left_null in [false, true] {
+            let a = if use_left_null {
+                HostColumn::I64(vec![None])
+            } else {
+                HostColumn::I64(vec![Some(7)])
+            };
+            let b = if use_left_null {
+                HostColumn::I64(vec![Some(3)])
+            } else {
+                HostColumn::I64(vec![None])
+            };
+            let env = env_of(&[("a", &a), ("b", &b)]);
+            for expr in [
+                col("a").add(col("b")),
+                col("a").sub(col("b")),
+                col("a").mul(col("b")),
+                col("a").div(col("b")),
+            ] {
+                let out = eval_expr(&expr, &env, DataType::Int64, 1).unwrap();
+                match out {
+                    HostColumn::I64(v) => assert_eq!(
+                        v,
+                        vec![None],
+                        "expected None for op with use_left_null={use_left_null}"
+                    ),
+                    other => panic!("expected I64, got {:?}", other.dtype()),
+                }
+            }
+        }
+    }
+
+    /// `NULL = NULL` is `None`, NOT `Some(true)`. This is the most
+    /// commonly mis-implemented 3VL rule.
+    #[test]
+    fn null_3vl_cmp_null_eq_null_is_null() {
+        let a = HostColumn::I32(vec![None]);
+        let b = HostColumn::I32(vec![None]);
+        let env = env_of(&[("a", &a), ("b", &b)]);
+        let out = eval_expr(&col("a").eq(col("b")), &env, DataType::Bool, 1).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// All six comparison ops produce `None` whenever either side is `None`.
+    #[test]
+    fn null_3vl_cmp_all_ops_propagate() {
+        // Row 0: (NULL, 1)  Row 1: (1, NULL)  Row 2: (NULL, NULL)
+        let a = HostColumn::I32(vec![None, Some(1), None]);
+        let b = HostColumn::I32(vec![Some(1), None, None]);
+        let env = env_of(&[("a", &a), ("b", &b)]);
+        for expr in [
+            col("a").eq(col("b")),
+            col("a").neq(col("b")),
+            col("a").lt(col("b")),
+            col("a").lt_eq(col("b")),
+            col("a").gt(col("b")),
+            col("a").gt_eq(col("b")),
+        ] {
+            let out = eval_expr(&expr, &env, DataType::Bool, 3).unwrap();
+            match out {
+                HostColumn::Bool(v) => assert_eq!(v, vec![None, None, None]),
+                other => panic!("expected Bool, got {:?}", other.dtype()),
+            }
+        }
+    }
+
+    /// `NULL AND false = false`. The absorbing element wins, NULL does
+    /// not infect. This and the `NULL AND true = NULL` row below are
+    /// the two rules that distinguish 3VL from naive `Option<bool>`
+    /// propagation.
+    #[test]
+    fn null_3vl_logical_null_and_false_is_false() {
+        let a = HostColumn::Bool(vec![None]);
+        let b = HostColumn::Bool(vec![Some(false)]);
+        let env = env_of(&[("a", &a), ("b", &b)]);
+        // Both orderings: NULL AND false, false AND NULL.
+        let out_lr = eval_expr(&col("a").and(col("b")), &env, DataType::Bool, 1).unwrap();
+        let out_rl = eval_expr(&col("b").and(col("a")), &env, DataType::Bool, 1).unwrap();
+        match (out_lr, out_rl) {
+            (HostColumn::Bool(lr), HostColumn::Bool(rl)) => {
+                assert_eq!(lr, vec![Some(false)], "NULL AND false");
+                assert_eq!(rl, vec![Some(false)], "false AND NULL");
+            }
+            _ => panic!("expected Bool"),
+        }
+    }
+
+    /// `NULL AND true = NULL` (no absorbing element on the true side
+    /// for AND), and `NULL AND NULL = NULL`.
+    #[test]
+    fn null_3vl_logical_null_and_true_is_null() {
+        let a = HostColumn::Bool(vec![None, None]);
+        let b = HostColumn::Bool(vec![Some(true), None]);
+        let env = env_of(&[("a", &a), ("b", &b)]);
+        let out = eval_expr(&col("a").and(col("b")), &env, DataType::Bool, 2).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![None, None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+        // Symmetric: true AND NULL is also NULL.
+        let out_rev = eval_expr(&col("b").and(col("a")), &env, DataType::Bool, 2).unwrap();
+        match out_rev {
+            HostColumn::Bool(v) => assert_eq!(v, vec![None, None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `NULL OR true = true`. The absorbing element wins.
+    #[test]
+    fn null_3vl_logical_null_or_true_is_true() {
+        let a = HostColumn::Bool(vec![None]);
+        let b = HostColumn::Bool(vec![Some(true)]);
+        let env = env_of(&[("a", &a), ("b", &b)]);
+        let out_lr = eval_expr(&col("a").or(col("b")), &env, DataType::Bool, 1).unwrap();
+        let out_rl = eval_expr(&col("b").or(col("a")), &env, DataType::Bool, 1).unwrap();
+        match (out_lr, out_rl) {
+            (HostColumn::Bool(lr), HostColumn::Bool(rl)) => {
+                assert_eq!(lr, vec![Some(true)], "NULL OR true");
+                assert_eq!(rl, vec![Some(true)], "true OR NULL");
+            }
+            _ => panic!("expected Bool"),
+        }
+    }
+
+    /// `NULL OR false = NULL` (no absorbing element on the false side
+    /// for OR), and `NULL OR NULL = NULL`.
+    #[test]
+    fn null_3vl_logical_null_or_false_is_null() {
+        let a = HostColumn::Bool(vec![None, None]);
+        let b = HostColumn::Bool(vec![Some(false), None]);
+        let env = env_of(&[("a", &a), ("b", &b)]);
+        let out = eval_expr(&col("a").or(col("b")), &env, DataType::Bool, 2).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![None, None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+        let out_rev = eval_expr(&col("b").or(col("a")), &env, DataType::Bool, 2).unwrap();
+        match out_rev {
+            HostColumn::Bool(v) => assert_eq!(v, vec![None, None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `Literal::Null` cast to any numeric dtype is still all-None, and
+    /// participates correctly in arithmetic. This pins the
+    /// "casts preserve None" contract.
+    #[test]
+    fn null_3vl_cast_null_literal_preserves_none() {
+        // NULL_lit cast to Float64, then added to a Float64 column,
+        // should give all-None.
+        let a = HostColumn::F64(vec![Some(1.0), Some(2.0)]);
+        let env = env_of(&[("a", &a)]);
+        // Build NULL literal then add to a — natural type for NULL_lit
+        // is I64; unify_numeric(F64, I64) = F64, so the add operates in F64.
+        let expr = col("a").add(Expr::Literal(Literal::Null));
+        let out = eval_expr(&expr, &env, DataType::Float64, 2).unwrap();
+        match out {
+            HostColumn::F64(v) => assert_eq!(v, vec![None, None]),
+            other => panic!("expected F64, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Comparing a non-NULL Bool with a NULL Bool yields NULL, not
+    /// Some(false). Bool-vs-Bool comparison is a separate code path
+    /// from numeric-vs-numeric so we pin it explicitly.
+    #[test]
+    fn null_3vl_cmp_bool_with_null_is_null() {
+        let a = HostColumn::Bool(vec![Some(true), Some(false), None]);
+        let b = HostColumn::Bool(vec![None, None, Some(true)]);
+        let env = env_of(&[("a", &a), ("b", &b)]);
+        let out = eval_expr(&col("a").eq(col("b")), &env, DataType::Bool, 3).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![None, None, None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Comparing two Utf8 strings where either side is NULL yields NULL.
+    /// The string compare path is a separate function from the numeric
+    /// one, so it gets its own test.
+    #[test]
+    fn null_3vl_cmp_utf8_with_null_is_null() {
+        let a = HostColumn::Utf8(vec![Some("x".into()), None]);
+        let b = HostColumn::Utf8(vec![None, Some("y".into())]);
+        let env = env_of(&[("a", &a), ("b", &b)]);
+        let out = eval_expr(&col("a").eq(col("b")), &env, DataType::Bool, 2).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![None, None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
     }
 }
