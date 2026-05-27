@@ -67,6 +67,11 @@ duckdb = { version = "1.2", features = ["bundled"] }
 # SQL queries from a constrained grammar are fed through parser+lowerer and
 # we assert no panics + type-consistent plans on success.
 proptest = "1"
+# `insta` powers the PTX snapshot tests in `tests/ptx_golden_tests.rs`. We use
+# the default feature set (no YAML / JSON / RON — plain text snapshots are all
+# we need for normalized PTX). Snapshot files live under `tests/snapshots/` and
+# are reviewed via `cargo insta review` / `cargo insta accept`.
+insta = "1"
 
 [features]
 default = []

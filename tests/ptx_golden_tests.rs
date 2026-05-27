@@ -3,21 +3,28 @@
 // Golden snapshot tests for emitted PTX. Updates to these tests are intentional
 // codegen contract changes — review the PTX diff carefully before accepting.
 //
-// Strategy:
-//   We don't use `insta` (not a project dependency). Instead each test asserts
-//   a small set of *stable substrings* that should appear in the emitted
-//   module. Stable substrings catch real codegen regressions (instruction
-//   mnemonic changes, dropped widening casts, lost loop bounds, wrong shared
-//   memory size, etc.) while tolerating cosmetic churn (register numbering,
-//   whitespace, label names that aren't externally meaningful).
+// Strategy (two-layer):
 //
-// What's intentionally NOT byte-equality:
-//   The `%rN` / `%rdN` / `%pN` register numbers are issued by a counter inside
-//   `RegAlloc`, so any new compute op inserted upstream will shift every
-//   later name. A full string snapshot would flap on every codegen
-//   refactor. The substring assertions below pin the *behavioral contract*
-//   (which mnemonics, which dtypes, which structural markers) without
-//   pinning the allocator state.
+//   1. Substring assertions (`assert!(ptx.contains("…"))`) pin the *behavioral
+//      contract* — which mnemonics, which dtypes, which structural markers
+//      must be present. These catch "dropped mnemonic" regressions
+//      (e.g. C6: missing s32→s64 widening; C7: missing probe-loop bound) and
+//      are stable across cosmetic churn.
+//
+//   2. `insta` snapshot tests (`assert_snapshot!(normalize_ptx(&ptx))`) pin
+//      the *register flow* — they catch regressions where a refactor changes
+//      which register feeds which instruction, not just whether the mnemonic
+//      is present. We pipe the PTX through `normalize_ptx` first to rewrite
+//      `%rdN` / `%rN` / `%fN` / `%fdN` / `%pN` into stable `%rd{N}` /
+//      `%r{N}` / `%f{N}` / `%fd{N}` / `%p{N}` placeholders so allocator
+//      counter drift (every new upstream op shifts every later number) does
+//      not flap the snapshots. Labels are NOT normalized — they're load-
+//      bearing for jump correctness.
+//
+// Accepting snapshots:
+//   On first build (and after intentional codegen changes), run
+//   `cargo insta accept` (or `cargo insta review` for interactive review).
+//   Snapshot files live under `tests/snapshots/`.
 
 use craton_bolt::jit::agg_kernels::{compile_reduction_kernel, ReduceOp};
 use craton_bolt::jit::compile_ptx;
@@ -29,6 +36,146 @@ use craton_bolt::jit::prefix_scan::compile_prefix_scan_kernel;
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
 };
+
+// ---- PTX normalization (for `insta` snapshots) ------------------------------
+
+/// Normalize a PTX string for snapshot testing.
+///
+/// PTX register names (`%rdN`, `%rN`, `%fN`, `%fdN`, `%pN`) are issued by a
+/// monotonic counter inside `RegAlloc`. Any new upstream compute op shifts
+/// every later register number, which would flap a byte-equality snapshot on
+/// every codegen refactor. This pass rewrites those numbers per-class into
+/// stable `%rd{N}` / `%r{N}` / `%f{N}` / `%fd{N}` / `%p{N}` placeholders
+/// while preserving the *flow* (i.e. the relationship between defs and uses):
+/// the Nth distinct `%rdK` encountered in the input becomes `%rd{N}`, so a
+/// refactor that swaps which register feeds which instruction will still
+/// produce a snapshot diff. Across PTXAS / NVRTC version drift, however,
+/// pure numbering churn is absorbed.
+///
+/// We use `{N}` (curly braces) rather than the more natural-looking `<N>`
+/// because real PTX *already* uses the angle-bracket form for register-vector
+/// declarations like `.reg .b64 %rd<24>;` (the `<24>` is the vector size).
+/// Using a syntax that PTX itself never emits keeps placeholders visually
+/// unambiguous from declarations in the snapshot diff.
+///
+/// What we strip / normalize:
+///   * `%rd\d+` → `%rd{N}` (64-bit integer / pointer registers)
+///   * `%rl\d+` → `%rl{N}` (64-bit "long" integer regs, hash kernel use)
+///   * `%r\d+`  → `%r{N}`  (32-bit integer registers)
+///   * `%f\d+`  → `%f{N}`  (32-bit float registers)
+///   * `%fd\d+` → `%fd{N}` (64-bit float registers)
+///   * `%p\d+`  → `%p{N}`  (predicate registers)
+///   * `// inline asm 0x…` debug comments dropped
+///
+/// What we DO NOT touch:
+///   * `.reg` vector declarations like `%rd<24>;` (no digit suffix → never
+///     matches; left as-is so the snapshot still records register-count
+///     changes, which ARE a real codegen contract).
+///   * Labels (`PROBE_LOOP:`, `bra DONE`, …) — load-bearing for jump
+///     correctness. A label rename IS a real diff.
+///   * Instruction mnemonics, dtypes, immediates.
+///   * Whitespace (left as-is so snapshot diffs read naturally).
+fn normalize_ptx(ptx: &str) -> String {
+    // Per-class assignment table: first-seen original number → stable index.
+    // We track them separately so `%rd1` and `%r1` don't collide.
+    use std::collections::HashMap;
+    let mut rd: HashMap<u32, u32> = HashMap::new();
+    let mut rl: HashMap<u32, u32> = HashMap::new();
+    let mut r: HashMap<u32, u32> = HashMap::new();
+    let mut f: HashMap<u32, u32> = HashMap::new();
+    let mut fd: HashMap<u32, u32> = HashMap::new();
+    let mut p: HashMap<u32, u32> = HashMap::new();
+
+    let mut out = String::with_capacity(ptx.len());
+
+    // Skip `// inline asm 0x…` debug comments (per-build address noise).
+    for line in ptx.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("// inline asm 0x") {
+            continue;
+        }
+
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            // Look for `%` followed by a register-class prefix.
+            if bytes[i] == b'%' {
+                // Try the longest prefixes first so `%rd` wins over `%r`,
+                // `%fd` wins over `%f`.
+                let rest = &bytes[i + 1..];
+                let matched = if rest.starts_with(b"rd") {
+                    parse_reg_suffix(&rest[2..]).map(|(num, len)| (2 + len, "rd", num))
+                } else if rest.starts_with(b"rl") {
+                    parse_reg_suffix(&rest[2..]).map(|(num, len)| (2 + len, "rl", num))
+                } else if rest.starts_with(b"fd") {
+                    parse_reg_suffix(&rest[2..]).map(|(num, len)| (2 + len, "fd", num))
+                } else if rest.starts_with(b"r") {
+                    parse_reg_suffix(&rest[1..]).map(|(num, len)| (1 + len, "r", num))
+                } else if rest.starts_with(b"f") {
+                    parse_reg_suffix(&rest[1..]).map(|(num, len)| (1 + len, "f", num))
+                } else if rest.starts_with(b"p") {
+                    parse_reg_suffix(&rest[1..]).map(|(num, len)| (1 + len, "p", num))
+                } else {
+                    None
+                };
+
+                if let Some((consumed, class, num)) = matched {
+                    let table = match class {
+                        "rd" => &mut rd,
+                        "rl" => &mut rl,
+                        "r" => &mut r,
+                        "f" => &mut f,
+                        "fd" => &mut fd,
+                        "p" => &mut p,
+                        _ => unreachable!(),
+                    };
+                    let next_idx = table.len() as u32;
+                    let stable = *table.entry(num).or_insert(next_idx);
+                    out.push('%');
+                    out.push_str(class);
+                    out.push('{');
+                    // Use a 0-based stable index so the *first* register
+                    // seen in each class is `{0}`. This makes diffs read
+                    // top-to-bottom in declaration order.
+                    out.push_str(&stable.to_string());
+                    out.push('}');
+                    i += 1 + consumed;
+                    continue;
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Helper for `normalize_ptx`: parse the digit suffix of a register name.
+/// Returns `(parsed_number, digits_consumed)`, or `None` if no digits.
+/// Requires the digit run to be followed by a non-identifier byte so we
+/// don't accidentally truncate `%foo` into a register match.
+fn parse_reg_suffix(bytes: &[u8]) -> Option<(u32, usize)> {
+    let mut end = 0;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    // Reject if the next byte is an identifier continuation (letter / digit /
+    // underscore) — we already consumed all digits, so the only way this
+    // fires is `%r1foo`, which isn't a real PTX register.
+    if let Some(&next) = bytes.get(end) {
+        if next.is_ascii_alphabetic() || next == b'_' {
+            return None;
+        }
+    }
+    // Safe: digits only.
+    let num: u32 = std::str::from_utf8(&bytes[..end]).ok()?.parse().ok()?;
+    Some((num, end))
+}
 
 // ---- Fixture ----------------------------------------------------------------
 
@@ -411,3 +558,193 @@ fn golden_float_atomic_min_uses_cas_loop() {
         "MIN(f64) must use float < comparison\n{ptx}"
     );
 }
+
+// ---- Snapshot tests (insta) -------------------------------------------------
+//
+// Each test below mirrors a substring assertion test above, but pins the
+// *full normalized PTX* via `insta::assert_snapshot!`. The substring tests
+// catch dropped mnemonics; these snapshot tests catch register-flow
+// regressions where a refactor changes which register feeds which
+// instruction (the substring would still pass, but the wiring would be
+// silently wrong).
+//
+// First-run bootstrap (`#[ignore]`):
+//   These tests are `#[ignore]`'d so the default `cargo test` run on a
+//   fresh checkout does NOT fail just because the snapshot files don't
+//   exist yet. To populate / refresh the snapshots, run:
+//
+//     cargo insta test --accept -- --include-ignored
+//
+//   (or `cargo test --include-ignored` followed by `cargo insta accept`).
+//   Once the snapshot files exist under `tests/snapshots/` they can be
+//   checked into version control, and a future PR that changes the
+//   normalized PTX will produce a reviewable diff via `cargo insta review`.
+//
+//   We use `omit_expression => true` so each snapshot file is just the
+//   normalized PTX payload (no `expression: ...` header) — small, stable,
+//   and trivially diffable.
+
+/// Wrap `insta::assert_snapshot!` with our preferred settings. The
+/// `omit_expression` setting keeps the snapshot file contents to just the
+/// payload (no `expression: "normalize_ptx(&ptx)"` boilerplate) so the
+/// diffs read as pure PTX.
+macro_rules! assert_ptx_snapshot {
+    ($name:expr, $ptx:expr) => {{
+        ::insta::with_settings!({ omit_expression => true }, {
+            ::insta::assert_snapshot!($name, normalize_ptx(&$ptx));
+        });
+    }};
+}
+
+// The bootstrap-gate reason — repeated in every `#[ignore = "..."]` below
+// because Rust requires that attribute argument to be a string literal (it
+// cannot reference a const). To avoid drift, edit all sites together.
+//
+// Bootstrap: `cargo insta test --accept -- --include-ignored`
+
+#[test]
+#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+fn snapshot_scalar_projection_int32() {
+    let ptx = build_ptx_for("SELECT int_col + 1 FROM t");
+    assert_ptx_snapshot!("scalar_projection_int32", ptx);
+}
+
+#[test]
+#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+fn snapshot_scalar_projection_float64() {
+    let ptx = build_ptx_for("SELECT f64_col * 2.0 FROM t");
+    assert_ptx_snapshot!("scalar_projection_float64", ptx);
+}
+
+#[test]
+#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+fn snapshot_predicate_filter_int32() {
+    let ptx = build_ptx_for("SELECT int_col FROM t WHERE int_col = 5");
+    assert_ptx_snapshot!("predicate_filter_int32", ptx);
+}
+
+#[test]
+#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+fn snapshot_predicate_filter_and_or() {
+    let ptx = build_ptx_for("SELECT a FROM t WHERE a = 1 AND (b = 2 OR c = 3)");
+    assert_ptx_snapshot!("predicate_filter_and_or", ptx);
+}
+
+#[test]
+#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+fn snapshot_sum_int32_reduction_kernel() {
+    let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Int32).expect("compile");
+    assert_ptx_snapshot!("sum_int32_reduction_kernel", ptx);
+}
+
+#[test]
+#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+fn snapshot_groupby_keys_kernel() {
+    let ptx = compile_groupby_keys_kernel().expect("compile keys kernel");
+    assert_ptx_snapshot!("groupby_keys_kernel", ptx);
+}
+
+#[test]
+#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+fn snapshot_prefix_scan_kernel() {
+    let ptx = compile_prefix_scan_kernel().expect("compile prefix scan");
+    assert_ptx_snapshot!("prefix_scan_kernel", ptx);
+}
+
+#[test]
+#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+fn snapshot_float_atomic_min_kernel() {
+    let ptx = compile_groupby_float_atomic_kernel(ReduceOp::Min, DataType::Float64)
+        .expect("compile float atomic kernel");
+    assert_ptx_snapshot!("float_atomic_min_kernel", ptx);
+}
+
+// ---- Unit tests for the normalizer itself ----------------------------------
+
+#[test]
+fn normalize_ptx_assigns_stable_indices_per_class() {
+    let input = "
+        ld.global.s32 %r5, [%rd2];
+        ld.global.s32 %r7, [%rd2];
+        add.s32       %r9, %r5, %r7;
+        setp.eq.s32   %p3, %r9, 0;
+        @%p3 bra DONE;
+    ";
+    let out = normalize_ptx(input);
+    // First-seen `%rd2` → `%rd{0}`; first-seen `%r5` → `%r{0}`, then `%r7` →
+    // `%r{1}`, etc. Per-class numbering: `%p3` is the first predicate so it
+    // becomes `%p{0}`.
+    assert!(out.contains("[%rd{0}]"), "rd numbering broken: {out}");
+    assert!(out.contains("%r{0}"), "r numbering broken: {out}");
+    assert!(out.contains("%r{1}"), "r numbering broken: {out}");
+    assert!(out.contains("%r{2}"), "r numbering broken: {out}");
+    assert!(out.contains("%p{0}"), "p numbering broken: {out}");
+    // Original numbers must be gone.
+    assert!(!out.contains("%r5"), "raw %r5 leaked: {out}");
+    assert!(!out.contains("%rd2"), "raw %rd2 leaked: {out}");
+    assert!(!out.contains("%p3"), "raw %p3 leaked: {out}");
+    // Labels are NOT normalized.
+    assert!(out.contains("bra DONE"), "label dropped: {out}");
+}
+
+#[test]
+fn normalize_ptx_separates_classes() {
+    // `%r1` and `%rd1` and `%p1` must each become `%X{0}` (per-class), not
+    // collide on a single shared counter.
+    let out = normalize_ptx("mov %r1, %rd1; setp %p1, %r1, 0;");
+    assert!(out.contains("%r{0}"));
+    assert!(out.contains("%rd{0}"));
+    assert!(out.contains("%p{0}"));
+}
+
+#[test]
+fn normalize_ptx_strips_inline_asm_address_comments() {
+    let input = "
+        add.s64 %rd1, %rd2, %rd3;
+        // inline asm 0xabc123
+        st.global.s64 [%rd4], %rd1;
+    ";
+    let out = normalize_ptx(input);
+    assert!(
+        !out.contains("inline asm 0x"),
+        "address comment not stripped: {out}"
+    );
+    // Surrounding instructions survive.
+    assert!(out.contains("add.s64"));
+    assert!(out.contains("st.global.s64"));
+}
+
+#[test]
+fn normalize_ptx_preserves_float_classes() {
+    // Important: `%fd3` must be matched as the `%fd` (f64) class, NOT as
+    // `%f` with an identifier-suffix `d3`. The `parse_reg_suffix` helper
+    // rejects trailing letters precisely so the longest-prefix dispatch
+    // (`%fd` before `%f`) is the only way `%fd3` can match.
+    let input = "ld.global.f32 %f2, [%rd1]; mul.f64 %fd3, %fd4, %fd5;";
+    let out = normalize_ptx(input);
+    // `%f2` is the only 32-bit float register here → `%f{0}`.
+    assert!(out.contains("%f{0}"), "%f class broken: {out}");
+    // Three distinct `%fd` registers in declaration order.
+    assert!(out.contains("%fd{0}"), "%fd class broken: {out}");
+    assert!(out.contains("%fd{1}"));
+    assert!(out.contains("%fd{2}"));
+    // `%rd1` got its own class.
+    assert!(out.contains("%rd{0}"));
+}
+
+#[test]
+fn normalize_ptx_leaves_register_vector_declarations_alone() {
+    // `.reg .b64 %rd<24>;` declares a 24-element register vector. The `<24>`
+    // is a size, not a register reference — our normalizer must NOT touch it
+    // (`parse_reg_suffix` rejects non-digit follow-ups, and `<` is one). The
+    // declaration thus stays in the snapshot, where a register-count change
+    // is itself a real codegen contract diff worth catching.
+    let input = "\t.reg .pred  %p<8>;\n\t.reg .b64   %rd<24>;\n\tld.global.s64 %rd2, [%rd1];";
+    let out = normalize_ptx(input);
+    assert!(out.contains("%p<8>"), "vector decl mangled: {out}");
+    assert!(out.contains("%rd<24>"), "vector decl mangled: {out}");
+    // Usages still normalized.
+    assert!(out.contains("%rd{0}"), "usage not normalized: {out}");
+    assert!(out.contains("%rd{1}"), "usage not normalized: {out}");
+}
+
