@@ -667,6 +667,556 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 }
 
 // ---------------------------------------------------------------------------
+// PV-stage-d: validity-aware kernel companions.
+//
+// These mirror the sentinel-free keys / agg kernels above but add a packed-
+// bit validity input — Arrow-compatible LE layout (bit i of byte i/8 is the
+// validity flag for row i; 0 = NULL, 1 = present). The kernel skips work
+// for any row whose validity bit is 0 instead of relying on a host-side
+// strip pass to drop NULL rows before upload.
+//
+// ## Packed-bit layout
+//
+// ```text
+// validity: u8[ceil(n_rows / 8)]
+//   bit j of validity[i/8] is row i's validity flag (Arrow LE convention)
+// ```
+//
+// This matches `arrow_buffer::NullBuffer::buffer()`'s wire format exactly,
+// so the host can hand the Arrow null buffer straight to the GPU without
+// rebuilding it.
+//
+// ## ABI delta (vs `compile_keys_valid_kernel` / `compile_agg_valid_kernel`)
+//
+// One extra `.param .u64 validity_ptr` is appended to the parameter list
+// (just before the spill block). A new entry-point name is used so the
+// host launcher can dispatch via symbol lookup without disambiguating the
+// shape from outside.
+//
+// ## Entry-point names
+//
+// * Keys: `bolt_groupby_keys_valid_with_validity`
+// * Agg:  `bolt_groupby_agg_valid_with_validity`
+// ---------------------------------------------------------------------------
+
+/// Entry-point name of the keys kernel produced by
+/// [`compile_keys_valid_kernel_with_validity`].
+pub const VALID_KEYS_KERNEL_WITH_VALIDITY_ENTRY: &str =
+    "bolt_groupby_keys_valid_with_validity";
+
+/// Entry-point name of the aggregate-update kernel produced by
+/// [`compile_agg_valid_kernel_with_validity`].
+pub const VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY: &str =
+    "bolt_groupby_agg_valid_with_validity";
+
+/// Pack a per-row boolean validity vector into the Arrow-compatible
+/// little-endian packed-bit layout the `_with_validity` kernels expect.
+///
+/// Bit `i` of byte `i / 8` is the validity flag for row `i`:
+///   * `1` — value is present.
+///   * `0` — value is NULL.
+///
+/// The output length is `ceil(n_rows / 8)` bytes. Trailing bits past
+/// `validity.len()` in the last byte are zero (treated as "row not
+/// present" by the kernel — those rows are guarded by the `n_rows`
+/// bound anyway).
+///
+/// This is a host-side helper; the kernel only needs the produced `Vec<u8>`
+/// uploaded as a `GpuVec<u8>`. The implementation is bit-identical to
+/// `arrow_buffer::BooleanBuffer::from_iter`, so existing Arrow NullBuffer
+/// payloads can be reused directly if the caller already has one.
+pub fn pack_validity_bits(validity: &[bool]) -> Vec<u8> {
+    let n_bytes = (validity.len() + 7) / 8;
+    let mut out = vec![0u8; n_bytes];
+    for (i, &v) in validity.iter().enumerate() {
+        if v {
+            out[i / 8] |= 1u8 << (i % 8);
+        }
+    }
+    out
+}
+
+/// Generate PTX for the keys-building kernel with a packed-bit validity
+/// input.
+///
+/// ## ABI
+///
+/// ```text
+/// .visible .entry bolt_groupby_keys_valid_with_validity(
+///     .param .u64 group_col_ptr,      // i64 keys, length n_rows
+///     .param .u64 keys_table_ptr,     // i64, length k
+///     .param .u64 slot_valid_ptr,     // u32, length k, host-init 0
+///     .param .u32 n_rows,
+///     .param .u32 k,                  // power-of-two table size
+///     .param .u64 validity_ptr,       // u8, length ceil(n_rows/8), Arrow LE bits
+///     .param .u64 spill_keys_ptr,     // i64, length max_spill
+///     .param .u64 spill_counter_ptr,  // u32, length 1
+///     .param .u32 max_spill
+/// )
+/// ```
+///
+/// Validity check: the kernel computes `byte = validity[tid/8]` and tests
+/// `byte & (1 << (tid & 7))`. If zero, the thread returns immediately
+/// (no slot claim, no spill) — the row is NULL and contributes no group.
+///
+/// The rest of the kernel body is identical to
+/// [`compile_keys_valid_kernel`].
+pub fn compile_keys_valid_kernel_with_validity() -> BoltResult<String> {
+    let mut ptx = String::new();
+    let entry = VALID_KEYS_KERNEL_WITH_VALIDITY_ENTRY;
+
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_2,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_3,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_4,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_5,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_6,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_7,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_8").map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    // Same register decls as the no-validity variant.
+    writeln!(ptx, "\t.reg .pred  %p<16>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<48>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // tid = ctaid.x * ntid.x + tid.x; bail if tid >= n_rows.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // -------- Validity bit check.
+    //   byte_idx = tid >> 3
+    //   bit_idx  = tid & 7
+    //   byte     = ld.global.u8 [validity + byte_idx]
+    //   if ((byte >> bit_idx) & 1) == 0 -> DONE (this row is NULL).
+    //
+    // PTX has no `ld.global.u8` of a single bit, so we load a byte and
+    // mask. The same pattern is used by the agg kernel below.
+    writeln!(ptx, "\tld.param.u64 %rd30, [{entry}_param_5];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd30, %rd30;").map_err(write_err)?;
+    // byte_idx = tid / 8 -> %r30; bit_idx = tid & 7 -> %r31
+    writeln!(ptx, "\tshr.u32 %r30, %r3, 3;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r31, %r3, 7;").map_err(write_err)?;
+    // addr = validity + byte_idx
+    writeln!(ptx, "\tmul.wide.u32 %rd31, %r30, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd32, %rd30, %rd31;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u8 %r32, [%rd32];").map_err(write_err)?;
+    // mask = 1 << bit_idx ; test = byte & mask
+    writeln!(ptx, "\tshl.b32 %r33, 1, %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r34, %r32, %r33;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p7, %r34, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra DONE;").map_err(write_err)?;
+
+    // k and mask = k-1.
+    writeln!(ptx, "\tld.param.u32 %r5, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.lo.u32 %r20, %r5, {factor};",
+        factor = MAX_PROBE_FACTOR
+    )
+    .map_err(write_err)?;
+
+    // Load this thread's key.
+    writeln!(ptx, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+
+    // Hash.
+    writeln!(ptx, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
+    writeln!(ptx, "\tmul.lo.s64 %rl2, %rl0, %rl1;").map_err(write_err)?;
+    writeln!(ptx, "\tshr.u64 %rl3, %rl2, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
+
+    // Keys + valid base pointers.
+    writeln!(ptx, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd4, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd4, %rd4;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p4, %r21, %r20;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p4 bra SPILL;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd5, %r8, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd7, %r8, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd8, %rd4, %rd7;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.cas.b32 %r9, [%rd8], 0, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p1, %r9, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra CLAIM_SLOT;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u32 %r22, 0;").map_err(write_err)?;
+    writeln!(ptx, "SPIN:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r22, %r22, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.gt.u32 %p5, %r22, {limit};",
+        limit = SPIN_LIMIT
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r10, [%rd8];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 %p2, %r10, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s64 %p3, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
+
+    writeln!(ptx, "CLAIM_SLOT:").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.s64 [%rd6], %rl0;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.gl;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.exch.b32 %r11, [%rd8], 2;").map_err(write_err)?;
+    writeln!(ptx, "\tbra DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "SPILL:").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd20, [{entry}_param_7];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd20, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r23, [{entry}_param_8];").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r24, [%rd20], 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p6, %r24, %r23;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd21, [{entry}_param_6];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd21, %rd21;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd22, %r24, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd23, %rd21, %rd22;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.s64 [%rd23], %rl0;").map_err(write_err)?;
+    writeln!(ptx, "\tbra DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
+/// Generate PTX for the aggregate kernel with a packed-bit validity input.
+///
+/// ## ABI
+///
+/// ```text
+/// .visible .entry bolt_groupby_agg_valid_with_validity(
+///     .param .u64 group_col_ptr,        // i64 keys, length n_rows
+///     .param .u64 keys_table_ptr,       // i64, length k
+///     .param .u64 slot_valid_ptr,       // u32, length k
+///     .param .u64 input_col_ptr,        // T,   length n_rows
+///     .param .u64 acc_table_ptr,        // T,   length k
+///     .param .u32 n_rows,
+///     .param .u32 k,
+///     .param .u64 validity_ptr,         // u8,  length ceil(n_rows/8), Arrow LE
+///     .param .u64 spill_keys_ptr,
+///     .param .u64 spill_values_ptr,
+///     .param .u64 spill_counter_ptr,
+///     .param .u32 max_spill
+/// )
+/// ```
+///
+/// As with the keys variant, a NULL row (validity bit 0) returns at the
+/// top of the kernel before touching the accumulator. The remaining
+/// body matches [`compile_agg_valid_kernel`] one-for-one (with the
+/// param indices shifted by +1 to make room for `validity_ptr`).
+///
+/// Float MIN/MAX is delegated to `valid_flag_float` — same constraint
+/// as the no-validity variant.
+pub fn compile_agg_valid_kernel_with_validity(
+    op: ReduceOp,
+    input_dtype: DataType,
+) -> BoltResult<String> {
+    let atomic = atomic_for(op, input_dtype)?;
+    let (load_suffix, reg_class) = ptx_type_info(input_dtype)?;
+    let elem_bytes = input_dtype.byte_width().ok_or_else(|| {
+        BoltError::Other(format!(
+            "valid_flag_kernels: variable-width dtype {:?} not supported",
+            input_dtype
+        ))
+    })?;
+    let store_suffix = ptx_store_suffix(input_dtype)?;
+
+    let mut ptx = String::new();
+    let entry = VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY;
+
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_2,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_3,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_4,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_5,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_6,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_7,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_8,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_9,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_10,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_11").map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    writeln!(ptx, "\t.reg .pred  %p<16>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<48>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t.reg .{ty}   %{rc}<4>;",
+        ty = reg_decl_ty(input_dtype)?,
+        rc = reg_class
+    )
+    .map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // tid = ctaid.x * ntid.x + tid.x; bail if tid >= n_rows.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{entry}_param_5];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // Validity bit check — same shape as in the keys-with-validity kernel.
+    writeln!(ptx, "\tld.param.u64 %rd30, [{entry}_param_7];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd30, %rd30;").map_err(write_err)?;
+    writeln!(ptx, "\tshr.u32 %r30, %r3, 3;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r31, %r3, 7;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd31, %r30, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd32, %rd30, %rd31;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u8 %r32, [%rd32];").map_err(write_err)?;
+    writeln!(ptx, "\tshl.b32 %r33, 1, %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r34, %r32, %r33;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p7, %r34, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "\tld.param.u32 %r5, [{entry}_param_6];").map_err(write_err)?;
+    writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.lo.u32 %r20, %r5, {factor};",
+        factor = MAX_PROBE_FACTOR
+    )
+    .map_err(write_err)?;
+
+    writeln!(ptx, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
+    writeln!(ptx, "\tmul.lo.s64 %rl2, %rl0, %rl1;").map_err(write_err)?;
+    writeln!(ptx, "\tshr.u64 %rl3, %rl2, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
+
+    writeln!(ptx, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd4, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd4, %rd4;").map_err(write_err)?;
+
+    // Load input value early (so SPILL has it ready).
+    writeln!(ptx, "\tld.param.u64 %rd9, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd9, %rd9;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.s32 %rd10, %r3, {bytes};",
+        bytes = elem_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd11, %rd9, %rd10;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.global.{ld} %{rc}0, [%rd11];",
+        ld = load_suffix,
+        rc = reg_class
+    )
+    .map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p4, %r21, %r20;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p4 bra SPILL;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd5, %r8, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd7, %r8, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd8, %rd4, %rd7;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r22, 0;").map_err(write_err)?;
+    writeln!(ptx, "SPIN:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r22, %r22, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.gt.u32 %p5, %r22, {limit};",
+        limit = SPIN_LIMIT
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r9, [%rd8];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p1, %r9, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra ADVANCE;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 %p2, %r9, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s64 %p3, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra FOUND;").map_err(write_err)?;
+    writeln!(ptx, "ADVANCE:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
+    writeln!(ptx, "FOUND:").map_err(write_err)?;
+
+    writeln!(ptx, "\tld.param.u64 %rd12, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd12, %rd12;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd13, %r8, {bytes};",
+        bytes = elem_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd14, %rd12, %rd13;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t{atomic} %{rc}1, [%rd14], %{rc}0;",
+        atomic = atomic,
+        rc = reg_class
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "SPILL:").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd40, [{entry}_param_10];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd40, %rd40;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r23, [{entry}_param_11];").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r24, [%rd40], 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p6, %r24, %r23;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd41, [{entry}_param_8];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd41, %rd41;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd42, %r24, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd43, %rd41, %rd42;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.s64 [%rd43], %rl0;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd44, [{entry}_param_9];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd44, %rd44;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd45, %r24, {bytes};",
+        bytes = elem_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd46, %rd44, %rd45;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tst.global.{st} [%rd46], %{rc}0;",
+        st = store_suffix,
+        rc = reg_class
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
+#[cfg(test)]
+mod with_validity_tests {
+    use super::*;
+
+    /// `pack_validity_bits` should match the Arrow LE bit-packing convention.
+    #[test]
+    fn pack_validity_bits_arrow_le() {
+        // Eight rows, alternating present/null: present=1, null=0.
+        // Expected byte: bit 0 = 1, bit 1 = 0, bit 2 = 1, ... = 0b01010101 = 0x55.
+        let validity = vec![true, false, true, false, true, false, true, false];
+        let packed = pack_validity_bits(&validity);
+        assert_eq!(packed, vec![0x55u8]);
+
+        // A 17-row vector should produce ceil(17/8) = 3 bytes.
+        let validity = vec![true; 17];
+        let packed = pack_validity_bits(&validity);
+        assert_eq!(packed.len(), 3);
+        assert_eq!(packed[0], 0xFF);
+        assert_eq!(packed[1], 0xFF);
+        // Bit 0 of byte 2 = row 16, the only valid row in byte 2.
+        assert_eq!(packed[2], 0x01);
+
+        // Empty input -> empty output.
+        let packed = pack_validity_bits(&[]);
+        assert!(packed.is_empty());
+    }
+
+    /// The keys-with-validity kernel must export its entry name AND test
+    /// the validity bit before the slot-claim CAS.
+    #[test]
+    fn keys_with_validity_emits_bit_check() {
+        let ptx = compile_keys_valid_kernel_with_validity().expect("compile");
+        assert!(ptx.contains(VALID_KEYS_KERNEL_WITH_VALIDITY_ENTRY));
+        // Validity byte load + mask test.
+        assert!(
+            ptx.contains("ld.global.u8 %r32, [%rd32];"),
+            "missing validity byte load:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s32 %p7, %r34, 0;"),
+            "missing validity bit-test predicate:\n{ptx}"
+        );
+        // The classic CAS is still present (we kept the same probe shape).
+        assert!(ptx.contains("atom.global.cas.b32"));
+        assert!(ptx.contains("atom.global.exch.b32"));
+    }
+
+    /// The agg-with-validity kernel must declare 12 params (vs 11 for
+    /// the no-validity variant) and bit-test before the probe.
+    #[test]
+    fn agg_with_validity_param_count_and_bit_check() {
+        let ptx = compile_agg_valid_kernel_with_validity(ReduceOp::Sum, DataType::Int64)
+            .expect("compile");
+        assert!(ptx.contains(VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY));
+        // param_11 is the new max_spill slot (validity_ptr is param_7).
+        assert!(ptx.contains("_param_11"), "missing param_11:\n{ptx}");
+        // No `_param_12` — defensive that we didn't accidentally bump too far.
+        assert!(
+            !ptx.contains("_param_12"),
+            "kernel should declare exactly 12 params (0..11):\n{ptx}"
+        );
+        // The bit-test setp predicate %p7.
+        assert!(
+            ptx.contains("setp.eq.s32 %p7, %r34, 0;"),
+            "missing bit-test predicate:\n{ptx}"
+        );
+        // Sum, Int64 -> atom.global.add.u64.
+        assert!(ptx.contains("atom.global.add.u64"));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PTX-shape tests (host-only — no CUDA required).
 // ---------------------------------------------------------------------------
 #[cfg(test)]

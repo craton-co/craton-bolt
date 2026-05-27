@@ -20,33 +20,64 @@ use crate::plan::logical_plan::{
 
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
 ///
-/// # Validity-signal scope (Stage C)
+/// # PV-stage-d: per-column null-bearing signal
 ///
-/// The trait deliberately exposes ONLY the column schema — not the registered
-/// `RecordBatch` itself. This means the planner cannot inspect per-column
-/// `null_count()` at lower time, so the
-/// [`crate::plan::physical_plan::KernelSpec::input_has_validity`] flag is
-/// left empty (the historical default) by the lowering pipeline.
+/// The two extension hooks ([`has_nulls`](TableProvider::has_nulls) and
+/// [`null_count`](TableProvider::null_count)) let the planner emit
+/// validity-aware kernels for columns the provider knows carry a NULL
+/// bitmap, and the simpler null-free path for everything else. Both
+/// methods default to "safe-false" / `None`, so providers that haven't
+/// been updated continue to work — the executor's run-time host-strip
+/// fallback (see [`crate::exec::groupby_with_pre`],
+/// [`crate::exec::groupby_valid`]) still handles row filtering for
+/// columns that turn out to carry nulls at execution time.
 ///
-/// The flag is populated at **executor time** by the per-stage helpers that
-/// upload columns to the GPU:
+/// # Run-time fallback (executor-time validity)
 ///
-/// * [`crate::exec::agg_with_pre`] and [`crate::exec::groupby_with_pre`] —
-///   `PreCol::upload` inspects `arr.null_count()` and attaches a `valid_mask`
-///   to each input column; the launcher then sets `input_has_validity` from
-///   `PreCol::has_validity()` before calling [`crate::jit::ptx_gen::compile`].
-/// * GROUP BY aggregate kernels (Stage C) — when the registered Arrow batch
-///   for a GROUP BY value column carries nulls, the executor picks
-///   [`crate::jit::hash_kernels::compile_groupby_agg_kernel_with_validity`]
-///   over the classic variant.
-///
-/// If a future `TableProvider` extension exposes the registered batches at
-/// plan time (e.g. for cost-based planning), the lowering pipeline can begin
-/// populating `input_has_validity` here so the JIT cache key reflects
-/// per-column nullability and the executor skips its own runtime probe.
+/// Even when a provider does not override `has_nulls`, the per-stage
+/// upload helpers ([`crate::exec::agg_with_pre`],
+/// [`crate::exec::groupby_with_pre`]) inspect `arr.null_count()` on each
+/// input column at upload time and set
+/// [`crate::plan::physical_plan::KernelSpec::input_has_validity`] from
+/// `PreCol::has_validity()` before invoking
+/// [`crate::jit::ptx_gen::compile`]. GROUP BY aggregate kernels likewise
+/// dispatch to
+/// [`crate::jit::hash_kernels::compile_groupby_agg_kernel_with_validity`]
+/// when the registered Arrow batch carries nulls. The plan-time signal is
+/// preferred when available because it lets the JIT cache key reflect
+/// per-column nullability — but correctness does not depend on it.
 pub trait TableProvider {
     /// Return the schema for `name`, or a `Plan` error if the table is unknown.
     fn schema(&self, name: &str) -> BoltResult<Schema>;
+
+    /// Plan-time signal: does column `col_idx` of `table_name` carry a
+    /// NULL bitmap that downstream kernels must consume?
+    ///
+    /// The default returns `false` for every column (safe — the executor
+    /// still inspects `RecordBatch::null_count()` at run time and falls
+    /// back to host-side row stripping if a null is found). Providers
+    /// that already know their physical layout (e.g. backed by Arrow
+    /// arrays whose `null_count()` is cheap to read) should override
+    /// this so the planner can pick the native-validity kernel path.
+    ///
+    /// `col_idx` is the column ordinal in the schema returned by
+    /// [`Self::schema`]. Out-of-range indices return `false`.
+    fn has_nulls(&self, table_name: &str, col_idx: usize) -> bool {
+        let _ = (table_name, col_idx);
+        false
+    }
+
+    /// Optional richer signal: exact null count of column `col_idx`, or
+    /// `None` if the provider can't (or won't) compute it. Defaults to
+    /// `None`. Implementors that return `Some(_)` should keep
+    /// [`Self::has_nulls`] consistent — i.e. `has_nulls(_, _)` should
+    /// return `null_count(_, _).map_or(false, |n| n > 0)`. The split
+    /// exists so cheap "is it dense?" checks don't pay for a full
+    /// `null_count` materialisation.
+    fn null_count(&self, table_name: &str, col_idx: usize) -> Option<usize> {
+        let _ = (table_name, col_idx);
+        None
+    }
 }
 
 /// In-FROM-scope name resolver: maps `table.col` (and bare `col`) references in

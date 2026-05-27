@@ -736,6 +736,7 @@ mod tests {
             ops,
             predicate: Some(Reg(2)),
             register_count: 3,
+            // No validity bitmap in test fixtures.
             input_has_validity: vec![],
             output_has_validity: vec![],
         }

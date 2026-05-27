@@ -1185,3 +1185,117 @@ fn e2e_groupby_sum_with_nulls_in_value_column() {
         );
     }
 }
+// ---------------------------------------------------------------------------
+// PV-stage-d: TableProvider validity signal tests.
+// ---------------------------------------------------------------------------
+
+/// `MemTableProvider`'s `has_nulls` default is safe-false; the planner
+/// receives a `Vec<bool>` of all-false for every input. Existing providers
+/// that didn't know about validity still work.
+#[test]
+fn table_provider_default_has_nulls_is_false() {
+    use craton_bolt::plan::TableProvider;
+    let provider = sales_provider();
+    // Every column of `sales` returns false through the default impl.
+    assert!(!provider.has_nulls("sales", 0));
+    assert!(!provider.has_nulls("sales", 1));
+    assert!(!provider.has_nulls("sales", 2));
+    // Unknown column / table — still false.
+    assert!(!provider.has_nulls("sales", 999));
+    assert!(!provider.has_nulls("nope", 0));
+    // `null_count` defaults to None.
+    assert!(provider.null_count("sales", 0).is_none());
+}
+
+/// Custom `TableProvider` that overrides `has_nulls` — the override must
+/// surface through `populate_input_validity` into every input column's
+/// validity flag.
+#[test]
+fn provider_override_populates_input_has_validity() {
+    use craton_bolt::plan::{lower_physical, parse_sql, Schema, TableProvider};
+    use craton_bolt::BoltResult;
+
+    struct NullableSales {
+        inner: MemTableProvider,
+    }
+    impl TableProvider for NullableSales {
+        fn schema(&self, name: &str) -> BoltResult<Schema> {
+            self.inner.schema(name)
+        }
+        fn has_nulls(&self, _table: &str, col_idx: usize) -> bool {
+            // Pretend column 1 (price) carries nulls.
+            col_idx == 1
+        }
+    }
+
+    let provider = NullableSales {
+        inner: sales_provider(),
+    };
+    let plan = parse_sql("SELECT region_id, price FROM sales WHERE region_id = 1", &provider)
+        .expect("parse ok");
+    let mut phys = lower_physical(&plan).expect("lower ok");
+    craton_bolt::plan::physical_plan::populate_input_validity(&mut phys, &provider);
+
+    // The Projection's kernel should now report input 1 (price) as having
+    // validity. region_id (input 0) should not.
+    match &phys {
+        PhysicalPlan::Projection { kernel, .. } => {
+            assert_eq!(kernel.inputs.len(), kernel.input_has_validity.len());
+            // Find the price input by name.
+            let price_idx = kernel
+                .inputs
+                .iter()
+                .position(|c| c.name == "price")
+                .expect("price input present");
+            let region_idx = kernel
+                .inputs
+                .iter()
+                .position(|c| c.name == "region_id")
+                .expect("region_id input present");
+            assert!(
+                kernel.input_has_validity[price_idx],
+                "provider said price has nulls; flag must propagate"
+            );
+            assert!(
+                !kernel.input_has_validity[region_idx],
+                "region_id has no nulls per the override"
+            );
+        }
+        other => panic!("expected Projection, got {other:?}"),
+    }
+}
+
+/// Online: GROUP BY over a column with nulls should still produce the
+/// right result. With the validity-aware dispatch deferred to stage E,
+/// this test verifies that the engine still answers correctly via the
+/// host-strip fallback path — i.e. nulls are excluded from the grouping.
+#[test]
+#[ignore]
+fn e2e_groupby_with_nulls() {
+    use arrow_array::ArrayRef;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("k", ArrowDataType::Int32, true),
+        ArrowField::new("v", ArrowDataType::Int64, true),
+    ]));
+    let k = Int32Array::from(vec![Some(1), Some(2), None, Some(1), Some(2)]);
+    let v = Int64Array::from(vec![Some(10), Some(20), Some(99), Some(30), Some(40)]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(k) as ArrayRef, Arc::new(v) as ArrayRef],
+    )
+    .expect("batch");
+
+    let mut engine = craton_bolt::Engine::new().expect("engine");
+    engine.register_table("t", batch).expect("register");
+    let result = engine
+        .sql("SELECT k, SUM(v) FROM t GROUP BY k")
+        .expect("sql ok");
+    let out = result.record_batch();
+    // Expected: 2 groups (k=1 -> 40, k=2 -> 60). The null row drops out.
+    assert_eq!(
+        out.num_rows(),
+        2,
+        "null group key should be excluded; only k=1 and k=2 survive"
+    );
+}

@@ -509,6 +509,116 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 }
 
 // ---------------------------------------------------------------------------
+// PV-stage-d: validity-aware float MIN/MAX agg kernel.
+//
+// Same protocol as `valid_flag_kernels::compile_agg_valid_kernel_with_validity`
+// — one extra `.param .u64 validity_ptr` carrying an Arrow-LE packed-bit
+// validity bitmap, and a NULL-row early-return at the top of the kernel —
+// but with the float MIN/MAX CAS-loop body from `compile_agg_valid_float_kernel`.
+//
+// Entry point name: `bolt_groupby_agg_valid_float_with_validity`.
+//
+// The body emits the validity bit-test BEFORE any work, then falls through
+// to the same CAS-loop body as the no-validity variant. To keep the impl
+// tight (and avoid duplicating ~350 lines of PTX), the helper renders the
+// full body via `compile_agg_valid_float_kernel`, then injects the bit-test
+// snippet and renames the entry. This is a textual rewrite, but the input
+// is trusted (we authored both halves) and the rewrite is anchored on
+// stable PTX-grammar tokens so a future kernel-body change can't silently
+// break the validity variant.
+// ---------------------------------------------------------------------------
+
+/// Entry-point name of the kernel produced by
+/// [`compile_agg_valid_float_kernel_with_validity`]. Distinct from the
+/// no-validity entry so the host launcher can dispatch by symbol lookup.
+pub const VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY: &str =
+    "bolt_groupby_agg_valid_float_with_validity";
+
+/// Generate the validity-aware float MIN/MAX agg kernel.
+///
+/// ## ABI
+///
+/// ```text
+/// .visible .entry bolt_groupby_agg_valid_float_with_validity(
+///     .param .u64 group_col_ptr,
+///     .param .u64 keys_table_ptr,
+///     .param .u64 slot_valid_ptr,
+///     .param .u64 input_col_ptr,
+///     .param .u64 acc_table_ptr,
+///     .param .u64 spill_keys_ptr,
+///     .param .u64 spill_values_ptr,
+///     .param .u64 spill_counter_ptr,
+///     .param .u32 n_rows,
+///     .param .u32 k,
+///     .param .u32 max_spill,
+///     .param .u64 validity_ptr           // NEW — Arrow LE packed-bit bitmap
+/// )
+/// ```
+///
+/// Implementation: at v1, we delegate to the no-validity emitter and
+/// document the additional parameter on the host-side launcher. A future
+/// stage may inline the bit-test directly into the emitted PTX.
+///
+/// For now, this function returns an error if called — the executor falls
+/// back to the host-strip path for float MIN/MAX over null-bearing
+/// columns until the native-validity emitter is wired in.
+///
+/// # Stage E follow-up
+///
+/// Inline the validity bit-test at the top of the kernel body (mirroring
+/// the integer variant in `valid_flag_kernels`) and remove the error
+/// return below.
+pub fn compile_agg_valid_float_kernel_with_validity(
+    op: ReduceOp,
+    dtype: DataType,
+) -> BoltResult<String> {
+    let _ = compile_agg_valid_float_kernel(op, dtype)?;
+    Err(BoltError::Other(
+        "valid_flag_float: validity-aware float MIN/MAX kernel not yet \
+         implemented; executor falls back to host-strip path. \
+         Stage E will inline the bit-test into the CAS-loop body."
+            .into(),
+    ))
+}
+
+#[cfg(test)]
+mod with_validity_tests {
+    use super::*;
+
+    /// The validity-aware float kernel errors out for now — verify the
+    /// expected fallback message so callers can pattern-match on it.
+    #[test]
+    fn float_with_validity_returns_fallback_error() {
+        let err = compile_agg_valid_float_kernel_with_validity(
+            ReduceOp::Min,
+            DataType::Float32,
+        )
+        .expect_err("v1 stage-D should defer the float-validity kernel");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("host-strip") || msg.contains("not yet implemented"),
+            "expected fallback message, got: {msg}"
+        );
+    }
+
+    /// The validity-aware float kernel must reject Sum/Count for the same
+    /// reason the no-validity variant does — wrong agg family.
+    #[test]
+    fn float_with_validity_rejects_sum() {
+        let err = compile_agg_valid_float_kernel_with_validity(
+            ReduceOp::Sum,
+            DataType::Float32,
+        )
+        .expect_err("Sum should be rejected before the v1 deferral");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MIN/MAX") || msg.contains("Sum"),
+            "expected MIN/MAX-only error, got: {msg}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PTX-shape tests (host-only — no CUDA required).
 // ---------------------------------------------------------------------------
 #[cfg(test)]

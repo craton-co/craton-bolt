@@ -49,6 +49,29 @@
 //! kernel — negligible. The kernels write to the spill buffer only when
 //! the bounded PROBE or SPIN loop overflows; under the executor-enforced
 //! load factor of < 0.5 we expect zero spills in practice.
+//!
+//! # PV-stage-d: native-validity dispatch
+//!
+//! This executor is the natural home for the
+//! [`crate::jit::valid_flag_kernels::compile_keys_valid_kernel_with_validity`]
+//! /
+//! [`crate::jit::valid_flag_kernels::compile_agg_valid_kernel_with_validity`]
+//! companions. Once the dispatch logic upstream looks at
+//! `KernelSpec::input_has_validity` (or the plan-level signal from
+//! [`crate::plan::sql_frontend::TableProvider::has_nulls`]) we will:
+//!
+//! 1. Inspect the source `RecordBatch` for an Arrow null buffer on the
+//!    group-by column AND each aggregate input.
+//! 2. If any column has nulls, build the packed-bit validity vector via
+//!    [`crate::jit::valid_flag_kernels::pack_validity_bits`], upload as
+//!    a `GpuVec<u8>`, and dispatch to the `_with_validity` variant.
+//! 3. Otherwise fall through to the existing keys + agg launch (the
+//!    current code below).
+//!
+//! Until then, the host-side `null_count` check inside `pack_keys` (and
+//! its sibling helpers) implicitly rejects null-bearing inputs by
+//! treating them as "no batch found" — the safety net documented in
+//! `crate::exec::groupby`'s module header.
 
 use std::collections::HashMap;
 use std::collections::HashSet;

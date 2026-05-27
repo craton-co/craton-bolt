@@ -54,6 +54,26 @@
 //!
 //! The module is intentionally self-contained: helpers are duplicated from
 //! `agg_with_pre` and `groupby` rather than reaching across module privacy.
+//!
+//! ## PV-stage-d: host-strip fallback vs native-validity kernels
+//!
+//! The pre-stage host-strip path below (predicate-only kernel + host-side
+//! `mask`-driven `Vec::compact`) is **kept** as the fallback for cases the
+//! GPU native-validity kernels can't (yet) handle. Specifically, the
+//! pre-kernel itself doesn't yet consume a packed-bit validity bitmap —
+//! when stage E lands that, this executor will branch:
+//!
+//! * If `kernel.input_has_validity[i] == true` for any input AND the
+//!   kernel shape is one we have a native-validity emitter for, upload
+//!   `pack_validity_bits(...)` (see [`crate::jit::valid_flag_kernels`])
+//!   and dispatch to the `_with_validity` variant — no host strip.
+//! * Otherwise, fall back to the existing predicate + compact path
+//!   below. This handles validity-bearing wide keys, Utf8, and any
+//!   shape we haven't taught the codegen yet.
+//!
+//! The fallback is correctness-safe at the cost of an extra device-to-host
+//! roundtrip on the pre outputs; the per-aggregate hash-table launches
+//! still run on the GPU.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
