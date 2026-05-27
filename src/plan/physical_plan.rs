@@ -116,6 +116,19 @@ pub struct KernelSpec {
     pub predicate: Option<Reg>,
     /// Number of registers used by this kernel.
     pub register_count: u32,
+    /// Per-input flag: `true` iff the source column has a NULL bitmap that
+    /// the kernel must consume. Parallel to `inputs` by index.
+    ///
+    /// Populated at lowering time by the planner via
+    /// [`crate::plan::sql_frontend::TableProvider::has_nulls`]. The default —
+    /// safe-`false` for every input — preserves the legacy "no-validity"
+    /// path: an empty vector OR a vector of all-false means the kernel
+    /// emits validity-free PTX exactly as before.
+    ///
+    /// PV-stage-d wires this through `ptx_gen.rs`'s pre-stage emitter so
+    /// the per-output validity AND-tree references only the LoadColumn ops
+    /// flagged here (see `ptx_gen::output_input_dependencies`).
+    pub input_has_validity: Vec<bool>,
 }
 
 /// Description of an aggregation kernel.
@@ -436,6 +449,13 @@ impl<'a> Codegen<'a> {
     }
 
     /// Finalize into a `KernelSpec`.
+    ///
+    /// `input_has_validity` is left empty by default; callers that have
+    /// already consulted a [`crate::plan::sql_frontend::TableProvider`] for
+    /// the underlying table can populate the per-input flags afterwards via
+    /// [`KernelSpec::input_has_validity`]. An empty vector is treated as
+    /// "no input carries validity", preserving the pre-stage-D codegen
+    /// shape for callers that don't yet wire the provider through.
     fn finish(self, outputs: Vec<ColumnIO>, predicate: Option<Reg>) -> KernelSpec {
         KernelSpec {
             inputs: self.inputs,
@@ -443,6 +463,7 @@ impl<'a> Codegen<'a> {
             ops: self.ops,
             predicate,
             register_count: self.next_reg,
+            input_has_validity: Vec::new(),
         }
     }
 }
@@ -994,6 +1015,85 @@ fn project_is_identity(
         }
     }
     true
+}
+
+/// Populate `KernelSpec::input_has_validity` for every kernel inside `plan`
+/// by consulting `provider`'s `has_nulls(table, col_idx)` for each input
+/// column. Walks `Projection`, `Aggregate.pre`, and recursively into
+/// `Distinct` / `Limit` / `Sort` / `Project` / `Union` / `Join` wrappers.
+///
+/// This is the plan-time signal documented on
+/// [`crate::plan::sql_frontend::TableProvider::has_nulls`]: by populating
+/// the per-input flag here, downstream codegen ([`crate::jit::ptx_gen`])
+/// can emit per-output validity AND-trees referencing only the LoadColumn
+/// ops that feed each `Store` — without the executor having to inspect
+/// `RecordBatch::null_count()` at run time.
+///
+/// Safe-`false` semantics: any provider that doesn't override `has_nulls`
+/// leaves the per-input flag at `false`, preserving the legacy "no input
+/// carries validity" codegen path. So this pass is always sound — at
+/// worst it under-flags an input that actually has nulls, in which case
+/// the executor's run-time host-strip fallback (see
+/// `crate::exec::groupby_with_pre`, `groupby_valid`) handles the row
+/// filtering before any kernel sees the data.
+pub fn populate_input_validity(
+    plan: &mut PhysicalPlan,
+    provider: &dyn crate::plan::sql_frontend::TableProvider,
+) {
+    match plan {
+        PhysicalPlan::Projection { table, kernel, .. } => {
+            populate_one_kernel(kernel, table, provider);
+        }
+        PhysicalPlan::Aggregate { table, pre, .. } => {
+            if let Some(k) = pre.as_mut() {
+                populate_one_kernel(k, table, provider);
+            }
+        }
+        PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Project { input, .. } => {
+            populate_input_validity(input.as_mut(), provider);
+        }
+        PhysicalPlan::Union { inputs } => {
+            for branch in inputs {
+                populate_input_validity(branch, provider);
+            }
+        }
+        PhysicalPlan::Join { left, right, .. } => {
+            populate_input_validity(left.as_mut(), provider);
+            populate_input_validity(right.as_mut(), provider);
+        }
+    }
+}
+
+/// Populate one `KernelSpec`'s `input_has_validity` from the provider.
+///
+/// Scans `kernel.inputs` and asks the provider for each column's
+/// null-bearing status by name. Columns not found in the provider's
+/// schema (e.g. synthesised pre-aggregation columns whose names won't
+/// resolve there) inherit safe-`false`.
+fn populate_one_kernel(
+    kernel: &mut KernelSpec,
+    table: &str,
+    provider: &dyn crate::plan::sql_frontend::TableProvider,
+) {
+    // Resolve column indices against the provider's schema (by name).
+    let schema = match provider.schema(table) {
+        Ok(s) => s,
+        Err(_) => return, // table unknown to provider — leave safe-false.
+    };
+    let mut flags = Vec::with_capacity(kernel.inputs.len());
+    for io in &kernel.inputs {
+        let has = schema
+            .fields
+            .iter()
+            .position(|f| f.name == io.name)
+            .map(|idx| provider.has_nulls(table, idx))
+            .unwrap_or(false);
+        flags.push(has);
+    }
+    kernel.input_has_validity = flags;
 }
 
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {

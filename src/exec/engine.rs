@@ -290,7 +290,18 @@ impl Engine {
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding __idx_<col> i32 column.
         let plan = self.dict_registry.rewrite_plan(&plan)?;
-        let phys = crate::plan::lower_physical(&plan)?;
+        let mut phys = crate::plan::lower_physical(&plan)?;
+        // PV-stage-d: populate `KernelSpec::input_has_validity` for every
+        // input column by consulting the engine-backed provider, which
+        // looks straight at `RecordBatch::column(col).null_count()` for
+        // each registered table. This is the plan-time signal that lets
+        // the codegen emit native-validity kernels instead of leaning on
+        // the run-time host-strip fallback in `groupby_with_pre` etc.
+        let nb = EngineProvider {
+            base: &self.provider,
+            tables: &self.tables,
+        };
+        crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
         self.execute(&phys)
     }
 
@@ -986,4 +997,63 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// PV-stage-d: TableProvider adaptor that surfaces actual per-column null
+// counts from the engine's registered `RecordBatch`es.
+//
+// `MemTableProvider` only knows the schema (column names + dtypes); the
+// engine additionally holds the data, so the per-column `null_count()` is
+// cheap to read here. We wrap the schema provider so the planner gets:
+//   * Schema lookups via the underlying `MemTableProvider` (same as before).
+//   * `has_nulls` answered by scanning the registered batches' bitmaps.
+// ---------------------------------------------------------------------------
+
+/// `TableProvider` adapter wrapping the engine's [`MemTableProvider`] schema
+/// store and adding `has_nulls` / `null_count` answers backed by the actual
+/// registered `RecordBatch`es.
+struct EngineProvider<'a> {
+    base: &'a MemTableProvider,
+    tables: &'a HashMap<String, Vec<RecordBatch>>,
+}
+
+impl<'a> crate::plan::TableProvider for EngineProvider<'a> {
+    fn schema(&self, name: &str) -> BoltResult<Schema> {
+        self.base.schema(name)
+    }
+
+    fn has_nulls(&self, table_name: &str, col_idx: usize) -> bool {
+        // Sum null_count across every registered batch for the table.
+        // Safe-false on any miss — the executor's host-strip fallback still
+        // handles the row filtering, so an under-flag is correctness-safe.
+        let batches = match self.tables.get(table_name) {
+            Some(b) => b,
+            None => return false,
+        };
+        for batch in batches {
+            // Skip out-of-range column ordinals (e.g. dictionary-extended
+            // `__idx_<col>` columns the dict registry mints; those have
+            // their own null behaviour).
+            if col_idx >= batch.num_columns() {
+                continue;
+            }
+            if batch.column(col_idx).null_count() > 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn null_count(&self, table_name: &str, col_idx: usize) -> Option<usize> {
+        let batches = self.tables.get(table_name)?;
+        let mut total: usize = 0;
+        for batch in batches {
+            if col_idx >= batch.num_columns() {
+                continue;
+            }
+            total = total.saturating_add(batch.column(col_idx).null_count());
+        }
+        Some(total)
+    }
 }

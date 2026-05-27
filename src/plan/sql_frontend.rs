@@ -19,9 +19,50 @@ use crate::plan::logical_plan::{
 };
 
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
+///
+/// # PV-stage-d: per-column null-bearing signal
+///
+/// The two extension hooks ([`has_nulls`](TableProvider::has_nulls) and
+/// [`null_count`](TableProvider::null_count)) let the planner emit
+/// validity-aware kernels for columns the provider knows carry a NULL
+/// bitmap, and the simpler null-free path for everything else. Both
+/// methods default to "safe-false" / `None`, so providers that haven't
+/// been updated continue to work — the executor's run-time host-strip
+/// fallback (see [`crate::exec::groupby_with_pre`],
+/// [`crate::exec::groupby_valid`]) still handles row filtering for
+/// columns that turn out to carry nulls at execution time.
 pub trait TableProvider {
     /// Return the schema for `name`, or a `Plan` error if the table is unknown.
     fn schema(&self, name: &str) -> BoltResult<Schema>;
+
+    /// Plan-time signal: does column `col_idx` of `table_name` carry a
+    /// NULL bitmap that downstream kernels must consume?
+    ///
+    /// The default returns `false` for every column (safe — the executor
+    /// still inspects `RecordBatch::null_count()` at run time and falls
+    /// back to host-side row stripping if a null is found). Providers
+    /// that already know their physical layout (e.g. backed by Arrow
+    /// arrays whose `null_count()` is cheap to read) should override
+    /// this so the planner can pick the native-validity kernel path.
+    ///
+    /// `col_idx` is the column ordinal in the schema returned by
+    /// [`Self::schema`]. Out-of-range indices return `false`.
+    fn has_nulls(&self, table_name: &str, col_idx: usize) -> bool {
+        let _ = (table_name, col_idx);
+        false
+    }
+
+    /// Optional richer signal: exact null count of column `col_idx`, or
+    /// `None` if the provider can't (or won't) compute it. Defaults to
+    /// `None`. Implementors that return `Some(_)` should keep
+    /// [`Self::has_nulls`] consistent — i.e. `has_nulls(_, _)` should
+    /// return `null_count(_, _).map_or(false, |n| n > 0)`. The split
+    /// exists so cheap "is it dense?" checks don't pay for a full
+    /// `null_count` materialisation.
+    fn null_count(&self, table_name: &str, col_idx: usize) -> Option<usize> {
+        let _ = (table_name, col_idx);
+        None
+    }
 }
 
 /// In-memory `name → Schema` provider; useful in tests and as a default.

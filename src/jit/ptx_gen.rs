@@ -711,3 +711,325 @@ fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> BoltResult<()> {
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("ptx_gen: write failed: {}", e))
 }
+
+// ---------------------------------------------------------------------------
+// PV-stage-d: per-output validity dataflow analysis.
+//
+// The pre-stage emitter previously ANDed the validity of every flagged input
+// into every output column's validity bit. That over-approximated the true
+// dataflow: a `Store(col=2)` that only reads inputs 0 and 1 should not need
+// input 3's bitmap. This module exposes the corrected analysis so callers
+// (the pre kernel codegen, the predicate kernel codegen) can emit a
+// narrower AND-tree per output.
+// ---------------------------------------------------------------------------
+
+/// For each `Store` op in `spec.ops`, compute the set of `LoadColumn`
+/// `col_idx` values it transitively depends on. Returns a `Vec<Vec<usize>>`
+/// parallel to `spec.outputs` — `result[i]` is the (sorted, deduplicated)
+/// list of input column ordinals whose validity feeds output `i`'s
+/// validity bit.
+///
+/// The walk is a backward def-use sweep over `spec.ops` keyed by `Reg`:
+///
+/// 1. Build a `Reg -> Op` index from `spec.ops` (each register is
+///    written exactly once — SSA).
+/// 2. For each `Store { src, col_idx }`, do a DFS from `src` collecting
+///    every `LoadColumn::col_idx` reached.
+/// 3. The result is the input set the AND-tree should reference for
+///    output `col_idx`.
+///
+/// The result is sorted + deduplicated so downstream PTX emission
+/// produces deterministic output regardless of HashMap iteration order.
+///
+/// # Caller responsibilities
+///
+/// The caller must intersect this with `spec.input_has_validity` — an input
+/// dependency only contributes to the AND-tree if that input actually
+/// carries a NULL bitmap. Doing the intersection outside this function
+/// keeps the analysis purely structural (testable without a provider).
+///
+/// # Output ordering
+///
+/// `result[i]` corresponds to `spec.outputs[i]` (i.e. `Store { col_idx: i }`).
+/// If multiple `Store`s target the same `col_idx` (the IR doesn't currently
+/// emit that, but defensively): the result merges all of their dependencies.
+/// If no `Store` targets `col_idx`, the result is an empty Vec for that
+/// position (output has no validity dependencies — vacuously valid).
+pub fn output_input_dependencies(
+    spec: &crate::plan::physical_plan::KernelSpec,
+) -> Vec<Vec<usize>> {
+    use crate::plan::physical_plan::Op;
+
+    // (a) Map every produced Reg to the Op that produced it. Since the IR
+    // is SSA each Reg appears as `dst` exactly once.
+    let mut reg_to_op: HashMap<u32, &Op> = HashMap::with_capacity(spec.ops.len());
+    for op in &spec.ops {
+        match op {
+            Op::LoadColumn { dst, .. }
+            | Op::Const { dst, .. }
+            | Op::Cast { dst, .. }
+            | Op::Binary { dst, .. } => {
+                reg_to_op.insert(dst.id(), op);
+            }
+            Op::Store { .. } => { /* no dst */ }
+        }
+    }
+
+    // (b) Pre-allocate one Vec per output. `spec.outputs.len()` is the
+    // declared output count; in practice every output has a matching
+    // Store, but defaulting to empty preserves correctness if the IR
+    // is ever incomplete.
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); spec.outputs.len()];
+
+    for op in &spec.ops {
+        if let Op::Store { src, col_idx, .. } = op {
+            if *col_idx >= deps.len() {
+                // Defensive: a Store referencing an unknown output index
+                // is a planner bug — skip rather than panic so codegen
+                // can surface the real diagnostic elsewhere.
+                continue;
+            }
+            let mut found: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut stack: Vec<u32> = vec![src.id()];
+            let mut visited: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            while let Some(r) = stack.pop() {
+                if !visited.insert(r) {
+                    continue;
+                }
+                let producer = match reg_to_op.get(&r) {
+                    Some(o) => *o,
+                    None => continue, // dangling reg — IR bug, skip.
+                };
+                match producer {
+                    Op::LoadColumn { col_idx, .. } => {
+                        found.insert(*col_idx);
+                    }
+                    Op::Const { .. } => { /* leaf — no input dep */ }
+                    Op::Cast { src, .. } => {
+                        stack.push(src.id());
+                    }
+                    Op::Binary { lhs, rhs, .. } => {
+                        stack.push(lhs.id());
+                        stack.push(rhs.id());
+                    }
+                    Op::Store { .. } => {
+                        // Stores don't produce a Reg, so reg_to_op can't
+                        // return one. Unreachable in practice.
+                    }
+                }
+            }
+            // Merge into the per-output set (sorted + dedup at the end).
+            for c in found {
+                if !deps[*col_idx].contains(&c) {
+                    deps[*col_idx].push(c);
+                }
+            }
+        }
+    }
+
+    for v in &mut deps {
+        v.sort_unstable();
+    }
+    deps
+}
+
+#[cfg(test)]
+mod dataflow_tests {
+    use super::*;
+    use crate::plan::logical_plan::{BinaryOp, Literal};
+    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
+
+    /// `KernelSpec::ops = [Load(0), Load(1), Add(0,1) -> r2, Store(r2 -> 0)]`:
+    /// the single output's dependency set should be exactly `{0, 1}`,
+    /// not "every flagged input".
+    #[test]
+    fn output_deps_add_two_loads() {
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: DataType::Int32,
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: DataType::Int32,
+                },
+                ColumnIO {
+                    name: "c".into(),
+                    dtype: DataType::Int32,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "ab".into(),
+                dtype: DataType::Int32,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Int32,
+                },
+                Op::Binary {
+                    dst: Reg(2),
+                    op: BinaryOp::Add,
+                    lhs: Reg(0),
+                    rhs: Reg(1),
+                    dtype: DataType::Int32,
+                    result_dtype: DataType::Int32,
+                },
+                Op::Store {
+                    src: Reg(2),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+            ],
+            predicate: None,
+            register_count: 3,
+            // Every input flagged — still, the analysis should only
+            // include col 0 and col 1, NOT col 2.
+            input_has_validity: vec![true, true, true],
+        };
+        let deps = output_input_dependencies(&spec);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0], vec![0, 1], "output 0 should depend on inputs 0 and 1 only");
+    }
+
+    /// Two outputs touching disjoint inputs must produce disjoint dep sets.
+    #[test]
+    fn output_deps_two_disjoint_stores() {
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: DataType::Int32,
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: DataType::Int32,
+                },
+            ],
+            outputs: vec![
+                ColumnIO {
+                    name: "a_out".into(),
+                    dtype: DataType::Int32,
+                },
+                ColumnIO {
+                    name: "b_out".into(),
+                    dtype: DataType::Int32,
+                },
+            ],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Int32,
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Int32,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            input_has_validity: vec![true, true],
+        };
+        let deps = output_input_dependencies(&spec);
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0], vec![0], "output 0 should depend only on input 0");
+        assert_eq!(deps[1], vec![1], "output 1 should depend only on input 1");
+    }
+
+    /// A `Const` leaf has no input dependencies — output that only writes
+    /// a constant should have an empty dep set.
+    #[test]
+    fn output_deps_const_only() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "a".into(),
+                dtype: DataType::Int32,
+            }],
+            outputs: vec![ColumnIO {
+                name: "k".into(),
+                dtype: DataType::Int32,
+            }],
+            ops: vec![
+                Op::Const {
+                    dst: Reg(0),
+                    lit: Literal::Int32(42),
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+            ],
+            predicate: None,
+            register_count: 1,
+            input_has_validity: vec![true],
+        };
+        let deps = output_input_dependencies(&spec);
+        assert_eq!(deps.len(), 1);
+        assert!(
+            deps[0].is_empty(),
+            "constant-only output should have no input deps, got {:?}",
+            deps[0]
+        );
+    }
+
+    /// `Cast` is transparent for the analysis — depends on whatever its
+    /// `src` depends on.
+    #[test]
+    fn output_deps_walk_through_cast() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "x".into(),
+                dtype: DataType::Int32,
+            }],
+            outputs: vec![ColumnIO {
+                name: "y".into(),
+                dtype: DataType::Float64,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+                Op::Cast {
+                    dst: Reg(1),
+                    src: Reg(0),
+                    from: DataType::Int32,
+                    to: DataType::Float64,
+                },
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 0,
+                    dtype: DataType::Float64,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            input_has_validity: vec![true],
+        };
+        let deps = output_input_dependencies(&spec);
+        assert_eq!(deps[0], vec![0]);
+    }
+}

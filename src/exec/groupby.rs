@@ -52,6 +52,22 @@
 //!     `i64::MIN` is rejected. For multi-column packed keys, a packed value
 //!     of `0x8000_0000_0000_0000` is unlikely to clash with a real composite
 //!     tuple but CAN — accepted risk for v1; the same validation rejects it.
+//!
+//! ## PV-stage-d: validity handling
+//!
+//! Today this executor only enters when all aggregate inputs (and the
+//! group-by key) come from a `RecordBatch` with `null_count() == 0` — the
+//! orchestrator's dispatcher routes null-bearing batches to
+//! [`crate::exec::groupby_valid`] (sentinel-free) or, when the plan
+//! includes a pre-projection, to [`crate::exec::groupby_with_pre`] (host
+//! strip). The classic kernels in [`crate::jit::hash_kernels`] therefore
+//! never need to consume a validity bitmap — every row they see is valid
+//! by construction.
+//!
+//! Stage E may unify this with the native-validity kernels by letting
+//! `KernelSpec::input_has_validity` drive dispatch right here; for now
+//! the host-side null check at the top of this function (mirrored by
+//! `groupby_valid::execute_groupby_valid`) is the safety net.
 
 use std::collections::HashSet;
 use std::ffi::c_void;

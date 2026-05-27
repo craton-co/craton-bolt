@@ -1389,6 +1389,7 @@ mod tests {
                 ops: vec![],
                 predicate: None,
                 register_count: 0,
+                input_has_validity: Vec::new(),
             }),
             aggregate: AggregateSpec {
                 inputs,
