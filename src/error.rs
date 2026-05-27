@@ -5,11 +5,20 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum BoltError {
     /// Free-form CUDA-related error without a driver `CUresult` code.
-    /// Used for cudarc backend errors, PTX compilation issues, and other
-    /// CUDA-adjacent failures whose origin is not a `cuGetErrorString`-
-    /// translatable driver call. The legacy variant retained for
-    /// backwards compatibility with consumers that still match on the
-    /// formatted-string shape.
+    ///
+    /// Reserved for failures whose origin genuinely has no associated
+    /// `CUresult` integer — e.g. `CString::new` rejecting an interior
+    /// NUL byte in PTX source, or NVRTC compile diagnostics surfaced
+    /// as a free-form string. Stage 5 (M3L5) migrated every site that
+    /// did have a `CUresult` to use [`BoltError::CudaWithCode`] so
+    /// downstream pattern-matching code (e.g. `mem_pool::is_oom_error`)
+    /// can recognise the code directly.
+    ///
+    /// **New code SHOULD prefer [`BoltError::CudaWithCode`] whenever a
+    /// `CUresult` integer is available.** This variant is intentionally
+    /// not `#[deprecated]` — a handful of legitimate "no code"
+    /// callsites remain — but extending the legacy variant to a new
+    /// site that DOES have a code is a regression.
     #[error("CUDA driver error: {0}")]
     Cuda(String),
 

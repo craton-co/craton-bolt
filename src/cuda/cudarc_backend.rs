@@ -64,11 +64,10 @@ static GLOBAL_DEVICE: once_cell::sync::OnceCell<Arc<CudaDevice>> =
 pub(crate) fn ensure_device(ordinal: i32) -> BoltResult<()> {
     GLOBAL_DEVICE
         .get_or_try_init(|| {
-            CudaDevice::new(ordinal as usize).map_err(|e| {
-                BoltError::Cuda(format!(
-                    "cudarc CudaDevice::new({ordinal}) failed: {e:?}"
-                ))
-            })
+            CudaDevice::new(ordinal as usize).map_err(|e| cudarc_err(
+                &format!("cudarc CudaDevice::new({ordinal})"),
+                e,
+            ))
         })
         .map(|_| ())
 }
@@ -79,11 +78,29 @@ fn device() -> BoltResult<Arc<CudaDevice>> {
     // that go directly through this module's `mem_alloc` etc.
     GLOBAL_DEVICE
         .get_or_try_init(|| {
-            CudaDevice::new(0).map_err(|e| {
-                BoltError::Cuda(format!("cudarc CudaDevice::new failed: {e:?}"))
-            })
+            CudaDevice::new(0)
+                .map_err(|e| cudarc_err("cudarc CudaDevice::new", e))
         })
         .map(Arc::clone)
+}
+
+/// Stage 5 (M3L5): translate a cudarc `DriverError` into the typed
+/// [`BoltError::CudaWithCode`] variant so downstream code (notably
+/// `mem_pool::is_oom_error`) can pattern-match the raw `CUresult`
+/// integer instead of scraping a formatted string.
+///
+/// cudarc represents driver errors as `DriverError(pub sys::CUresult)`,
+/// where `sys::CUresult` is a `#[repr(u32)]` enum. Casting the inner
+/// value to `i32` yields the same integer that the hand-rolled FFI's
+/// `cuda_sys::check` would have produced for the equivalent driver
+/// error. The Debug rendering preserves the original `{e:?}` text so
+/// log output stays familiar.
+fn cudarc_err(context: &str, e: cudarc::driver::DriverError) -> BoltError {
+    let code = e.0 as i32;
+    BoltError::CudaWithCode {
+        code,
+        message: format!("{context}: {e:?}"),
+    }
 }
 
 /// Allocate `bytes` of device memory via cudarc's raw `malloc_sync`.
@@ -94,7 +111,7 @@ pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
     unsafe {
         result::malloc_sync(bytes)
             .map(|p| p as CUdeviceptr)
-            .map_err(|e| BoltError::Cuda(format!("cudarc malloc_sync: {e:?}")))
+            .map_err(|e| cudarc_err("cudarc malloc_sync", e))
     }
 }
 
@@ -105,7 +122,7 @@ pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
 /// `cuda_sys::mem_alloc` — both call into the same `cuMemAlloc_v2`).
 pub unsafe fn mem_free(ptr: CUdeviceptr) -> BoltResult<()> {
     result::free_sync(ptr as cudarc::driver::sys::CUdeviceptr)
-        .map_err(|e| BoltError::Cuda(format!("cudarc free_sync: {e:?}")))
+        .map_err(|e| cudarc_err("cudarc free_sync", e))
 }
 
 /// Copy `count` elements of `T` from host to device.
@@ -126,7 +143,7 @@ pub unsafe fn memcpy_h2d<T>(
     })?;
     let src_bytes = std::slice::from_raw_parts(src as *const u8, bytes);
     result::memcpy_htod_sync(dst as cudarc::driver::sys::CUdeviceptr, src_bytes)
-        .map_err(|e| BoltError::Cuda(format!("cudarc memcpy_htod_sync: {e:?}")))
+        .map_err(|e| cudarc_err("cudarc memcpy_htod_sync", e))
 }
 
 /// Copy `count` elements of `T` from device to host.
@@ -147,12 +164,37 @@ pub unsafe fn memcpy_d2h<T>(
     })?;
     let dst_bytes = std::slice::from_raw_parts_mut(dst as *mut u8, bytes);
     result::memcpy_dtoh_sync(dst_bytes, src as cudarc::driver::sys::CUdeviceptr)
-        .map_err(|e| BoltError::Cuda(format!("cudarc memcpy_dtoh_sync: {e:?}")))
+        .map_err(|e| cudarc_err("cudarc memcpy_dtoh_sync", e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage 5 (M3L5): every cudarc backend call site now surfaces driver
+    /// errors as [`BoltError::CudaWithCode`] with the raw `CUresult` integer
+    /// extracted from `DriverError(pub sys::CUresult)`. We don't have a way
+    /// to trigger a real driver error from a host-only test (the FFI is
+    /// stubbed under `cuda-stub` to `CUDA_ERROR_STUB`, which gets mapped to
+    /// `BoltError::Other` upstream), but we can directly invoke the
+    /// `cudarc_err` helper to assert its shape.
+    #[test]
+    fn cudarc_err_translates_to_cuda_with_code() {
+        // cudarc::driver::sys::CUresult is a `#[repr(u32)]` enum whose first
+        // non-success variant is `CUDA_ERROR_INVALID_VALUE = 1`. We build a
+        // `DriverError` for it through the public `result()` shim on
+        // `CUresult` so this test compiles against every cudarc-supported
+        // CUDA version.
+        let drv_err = cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE
+            .result()
+            .unwrap_err();
+        let translated = cudarc_err("test ctx", drv_err);
+        assert!(
+            matches!(translated, BoltError::CudaWithCode { code: 1, .. }),
+            "cudarc DriverError(CUDA_ERROR_INVALID_VALUE) must translate to \
+             CudaWithCode {{ code: 1, .. }}, got: {translated:?}"
+        );
+    }
 
     /// Smoke test that the cudarc context comes up at all. Gated on
     /// `BOLT_BENCH_GPU=1` for the same reason as the engine tests —
