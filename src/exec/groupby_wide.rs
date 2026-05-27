@@ -61,7 +61,7 @@ use arrow_schema::{
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
-use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
+use crate::plan::physical_plan::{AggregateSpec, PhysicalPlan};
 
 // ---------------------------------------------------------------------------
 // Public entry point.
@@ -1117,6 +1117,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::physical_plan::ColumnIO;
 
     /// Convenience: extract the I64 array at column `idx` of `rb`.
     fn col_i64(rb: &RecordBatch, idx: usize) -> Vec<i64> {

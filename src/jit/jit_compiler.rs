@@ -75,6 +75,7 @@ use crate::error::{BoltError, BoltResult};
 // Mirrored from <cuda.h> — declared here (rather than in cuda_sys.rs) per the
 // orchestrator's file-ownership boundary. Values are stable ABI.
 /// `CUjit_option` value type, as expected by `cuModuleLoadDataEx`.
+#[allow(non_camel_case_types)] // reason: must match the CUDA C ABI name verbatim
 pub type CUjit_option = i32;
 
 /// Pointer to a buffer in which to print any info log messages from PTXAS.

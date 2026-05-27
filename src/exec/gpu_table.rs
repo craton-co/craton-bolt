@@ -2,8 +2,6 @@
 
 //! GPU-resident table storage: columns uploaded once and queried in place.
 
-use std::sync::Arc;
-
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
     StringArray,

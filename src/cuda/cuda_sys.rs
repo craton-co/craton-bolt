@@ -26,6 +26,7 @@ pub type CUcontext = *mut c_void;
 /// Device pointer (always 64-bit in the v2 ABI).
 pub type CUdeviceptr = u64;
 /// Device attribute enum value.
+#[allow(non_camel_case_types)] // reason: must match the CUDA C ABI name verbatim
 pub type CUdevice_attribute = i32;
 /// Opaque module handle (loaded PTX/cubin).
 pub type CUmodule = *mut c_void;
@@ -777,6 +778,7 @@ pub(crate) unsafe fn memcpy_d2h_async<T: Pod>(
 /// Wire cudarc async path. cudarc 0.13's `driver` feature does not expose
 /// `cuMemsetD8Async` from the safe surface, so the `--features cudarc`
 /// branch falls back to the synchronous memset.
+#[allow(dead_code)] // reason: Stage 2 will wire executors to async memset
 pub(crate) fn memset_d8_async(
     ptr: CUdeviceptr,
     value: u8,

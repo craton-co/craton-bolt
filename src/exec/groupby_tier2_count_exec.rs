@@ -41,7 +41,7 @@ use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel, partition_reduce_kernel_count, scatter_kernel, CudaModule,
 };
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
@@ -359,7 +359,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::logical_plan::{Field, Literal};
+    use crate::plan::logical_plan::{Expr, Field, Literal};
     use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
 
     /// Build a minimal `Aggregate` plan for `SELECT key, COUNT(*) FROM t
