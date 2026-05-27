@@ -1,4 +1,4 @@
-﻿# FAQ
+# FAQ
 
 Frequently asked questions about Craton Bolt. For the supported SQL surface
 see [`SQL_REFERENCE.md`](SQL_REFERENCE.md); for planned work see
@@ -23,9 +23,9 @@ cannot run a kernel.
 ## Q3. Why no async memcpy yet?
 
 The FFI bindings for `cuMemcpyAsync` and pinned host allocation are in
-place in 0.1.x, but the executors still issue synchronous transfers.
+place in 0.3.0, but the executors still issue synchronous transfers.
 Threading async copies through the per-shape executors (and the matching
-stream-and-event accounting) is on the 0.2 list.
+stream-and-event accounting) is on the 0.4 list.
 
 ## Q4. Can I share a `GpuVec` between threads?
 
@@ -59,8 +59,7 @@ widening is applied consistently in the scalar and GROUP BY paths via
 
 Identifiers are case-sensitive and qualified column references are not
 yet supported — the SQL frontend only accepts bare unqualified names
-that match a registered column exactly. Both are pre-0.1 limitations
-tracked in [`../ROADMAP.md`](../ROADMAP.md).
+that match a registered column exactly. Both are pre-0.3.0 limitations tracked in [`../ROADMAP.md`](../ROADMAP.md).
 
 ## Q9. Why is the CHANGELOG / NOTICE attribution "Craton Software Company"?
 

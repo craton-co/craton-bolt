@@ -1,4 +1,4 @@
-﻿# Craton Bolt Benchmarks
+# Craton Bolt Benchmarks
 
 This document captures the first measured numbers for the Craton Bolt GPU SQL engine and explains how to reproduce them. The numbers below were captured on **2026-05-23** on a CPU-only host (no CUDA device available), so the full `engine_execute` GPU pipeline group was skipped. Everything that does not require a GPU — SQL parsing, logical planning, physical lowering, PTX codegen, the hand-written CPU reference loop, and the Polars head-to-head — was measured end-to-end.
 
@@ -508,9 +508,7 @@ medians; all measurements within ±5 % CI.
 Three queries got the projected algorithmic speedup; the q2 / q3 numbers
 are within bench-run variance of the baseline (no fast path engaged). The
 gap to DuckDB on q1 / q4 closed dramatically (q1: 44× → 7.5×, q4: 38× →
-5.5×). Craton Bolt now **beats DuckDB on q5** (460 ms vs 623 ms) and **q3**
-(977 ms vs DuckDB's 498 ms — wait, that's still a loss). Correction: q5
-Craton Bolt (460 ms) beats DuckDB (623 ms). For Polars, Craton Bolt still trails
+5.5×). Craton Bolt now **beats DuckDB on q5** (460 ms vs 623 ms). For Polars, Craton Bolt still trails
 on q3 / q5 — Polars' multi-threaded CPU partitioned-hash is highly tuned.
 
 ### What still falls through
@@ -534,25 +532,25 @@ on q3 / q5 — Polars' multi-threaded CPU partitioned-hash is highly tuned.
 
 ### What ships now
 
-| File | Author | LOC | Purpose |
-| --- | --- | --- | --- |
-| `src/jit/shmem_sum_kernel.rs` | first wave | 360 | Tier-1 single-SUM PTX |
-| `src/jit/shmem_multi_sum_kernel.rs` | T1A | 657 | Tier-1 multi-SUM PTX (1..=4 outputs) |
-| `src/jit/shmem_count_kernel.rs` | T1B | ~250 | Tier-1 COUNT PTX (for AVG) |
-| `src/jit/partition_kernel.rs` | T2A | 311 | Tier-2 pass-1 partition PTX |
-| `src/jit/scatter_kernel.rs` | T2B | 328 | Tier-2 pass-2 scatter PTX |
-| `src/exec/groupby_shmem_dispatch.rs` | first wave | ~150 | Tier-1 eligibility |
-| `src/exec/groupby_shmem_launch.rs` | first wave | ~200 | block/grid/shared-mem tuner |
-| `src/exec/groupby_shmem_exec.rs` | first wave | ~280 | Tier-1 single-SUM executor |
-| `src/exec/groupby_shmem_multi_exec.rs` | T1A | 375 | Tier-1 multi-SUM executor |
-| `src/exec/groupby_shmem_avg_exec.rs` | T1B | ~200 | Tier-1 AVG executor |
-| `src/exec/partition_offsets.rs` | T2C | 243 | Prefix-sum (host) + upload helper |
-| `src/exec/groupby_tier2_orchestrator.rs` | T2D | 423 | Tier-2 pass orchestration |
-| `src/exec/groupby_tier2_merge.rs` | T2E | 233 | Tier-2 result RecordBatch |
-| `src/exec/groupby_tier2_dispatch.rs` | T2F | 281 | Tier-2 eligibility |
-| `src/exec/groupby_tier2_exec.rs` | integrator | ~140 | Tier-2 entry shim |
-| `tests/shmem_groupby_e2e.rs` | first wave | ~300 | Tier-1 CPU reference + tests |
-| `tests/tier2_groupby_e2e.rs` | T2G | 358 | Tier-2 CPU reference + tests |
+| File | LOC | Purpose |
+| --- | --- | --- |
+| `src/jit/shmem_sum_kernel.rs` | 360 | Tier-1 single-SUM PTX |
+| `src/jit/shmem_multi_sum_kernel.rs` | 657 | Tier-1 multi-SUM PTX (1..=4 outputs) |
+| `src/jit/shmem_count_kernel.rs` | ~250 | Tier-1 COUNT PTX (for AVG) |
+| `src/jit/partition_kernel.rs` | 311 | Tier-2 pass-1 partition PTX |
+| `src/jit/scatter_kernel.rs` | 328 | Tier-2 pass-2 scatter PTX |
+| `src/exec/groupby_shmem_dispatch.rs` | ~150 | Tier-1 eligibility |
+| `src/exec/groupby_shmem_launch.rs` | ~200 | block/grid/shared-mem tuner |
+| `src/exec/groupby_shmem_exec.rs` | ~280 | Tier-1 single-SUM executor |
+| `src/exec/groupby_shmem_multi_exec.rs` | 375 | Tier-1 multi-SUM executor |
+| `src/exec/groupby_shmem_avg_exec.rs` | ~200 | Tier-1 AVG executor |
+| `src/exec/partition_offsets.rs` | 243 | Prefix-sum (host) + upload helper |
+| `src/exec/groupby_tier2_orchestrator.rs` | 423 | Tier-2 pass orchestration |
+| `src/exec/groupby_tier2_merge.rs` | 233 | Tier-2 result RecordBatch |
+| `src/exec/groupby_tier2_dispatch.rs` | 281 | Tier-2 eligibility |
+| `src/exec/groupby_tier2_exec.rs` | ~140 | Tier-2 entry shim |
+| `tests/shmem_groupby_e2e.rs` | ~300 | Tier-1 CPU reference + tests |
+| `tests/tier2_groupby_e2e.rs` | 358 | Tier-2 CPU reference + tests |
 
 **52 new unit tests, all passing.** `execute_groupby` gained four layered
 `try_execute` fast-path checks at the top, no other existing-code edits.

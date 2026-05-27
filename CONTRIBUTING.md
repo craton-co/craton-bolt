@@ -1,4 +1,4 @@
-﻿# Contributing to Craton Bolt
+# Contributing to Craton Bolt
 
 Thank you for considering a contribution. This file covers what you need to know to get a useful change into the tree.
 
@@ -88,8 +88,8 @@ license. See the [`DCO`](DCO) file at the repo root for the full text.
 
 ## What to work on
 
-See [`ROADMAP.md`](ROADMAP.md) for milestones planned for 0.2 and 1.0.
-Items in the "Known limitations" section under "0.1.x (current)" are
+See [`ROADMAP.md`](ROADMAP.md) for milestones planned for 0.4 and 1.0.
+Items in the "Known limitations" section under "0.3.0 (current)" are
 intentional gaps — flag in your PR if you want to tackle one.
 
 ## Licensing of contributions

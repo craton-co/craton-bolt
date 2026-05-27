@@ -1,8 +1,8 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to this project will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project tries to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it leaves `0.1.x`.
 
-## [Unreleased]
+## [0.3.0] - 2026-05-26
 
 ### Added
 - **`INNER JOIN ... ON <equi predicate>`** — host-side hash join.
@@ -183,8 +183,6 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [0.1.0] - 2026-05-23
 
-## [0.1.0] - 2026-05-23
-
 ### Added
 
 #### CUDA layer (`src/cuda/`)
@@ -249,5 +247,5 @@ Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --
 - Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
 - Polars head-to-head numbers are not yet published.
 
-[unreleased]: https://github.com/craton-co/craton-bolt/compare/v0.1.0...HEAD
+[0.3.0]: https://github.com/craton-co/craton-bolt/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/craton-co/craton-bolt/releases/tag/v0.1.0

@@ -1,4 +1,4 @@
-﻿# cudarc adoption design doc
+# cudarc adoption design doc
 
 ## TL;DR
 
@@ -191,16 +191,16 @@ Add to `Cargo.toml`:
 
 ```toml
 [features]
-default = ["cudarc"]                        # opt-in to cudarc by default
+default = []                                    # keep hand-rolled until we soak cudarc
 cudarc = ["dep:cudarc"]
-hand-rolled = []                            # the current path, kept for now
+cuda-stub = []                                  # unchanged — for non-CUDA hosts
 
 [dependencies]
-cudarc = { version = "0.13", optional = true, features = ["driver", "nvrtc"] }
+cudarc = { version = "0.13", optional = true, default-features = false, features = ["driver", "cuda-12060"] }
 ```
 
 `src/cuda/cuda_sys.rs` (and friends) get `#[cfg(feature = "cudarc")]`
-/ `#[cfg(feature = "hand-rolled")]` blocks during the transition.
+/ `#[cfg(not(feature = "cudarc"))]` blocks during the transition.
 After Stage 4 and one release cycle of "default = cudarc" with no
 regressions, delete the hand-rolled path entirely.
 
@@ -277,7 +277,7 @@ cuda-stub = []                  # unchanged — for non-CUDA hosts
 
 [dependencies]
 cudarc = { version = "0.13", optional = true, default-features = false,
-           features = ["driver"] }
+           features = ["driver", "cuda-12060"] }
 ```
 
 ### Migration sketch (`src/cuda/cuda_sys.rs`)

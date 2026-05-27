@@ -1,10 +1,10 @@
-﻿# Craton Bolt Roadmap
+# Craton Bolt Roadmap
 
-This document tracks intentional gaps in the 0.1 release and the milestones
-planned for 0.2+. For day-to-day progress, see `CHANGELOG.md`. For supported
+This document tracks intentional gaps in the 0.3.0 release and the milestones
+planned for 0.4+. For day-to-day progress, see `CHANGELOG.md`. For supported
 SQL today, see `docs/SQL_REFERENCE.md`.
 
-## 0.1.x (current — pre-production, API unstable)
+## 0.3.0 (current — pre-production, API unstable)
 
 ### What works
 
@@ -15,7 +15,7 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 - `INNER JOIN ... ON <equi predicate>` (host-side hash join: build the
   smaller side into a `HashMap`, probe the larger). One join per
   `SELECT`; LEFT/RIGHT/FULL/CROSS and non-equi predicates are out of
-  scope for 0.1.x.
+  scope for 0.3.0.
 - Borrow-checked GPU memory primitives (`GpuVec` / `GpuView` /
   `GpuViewMut`) — use-after-free, double-free, and mutable/shared
   aliasing across kernel boundaries are compile-time errors.
@@ -39,8 +39,8 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 
 ### Known limitations (not bugs)
 
-- Single batch per registered table. No streaming, no larger-than-VRAM
-  tables.
+- Multi-batch tables are supported, but no streaming (`register_table_stream`) or
+  larger-than-VRAM tables yet.
 - One CUDA context, one device per `Engine`. `Engine::new_with_device`
   exists, but multi-GPU means one engine per device.
 - JOIN: only `INNER JOIN ... ON <equi predicate>` with one join per
@@ -49,14 +49,15 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   probe), not GPU-backed.
 - No CTE, subqueries, window functions.
 - No `IS NULL` / `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, `CASE`,
-  `NULLIF`, `COALESCE`, `CAST`, or string concat (`||`).
+- `NULLIF`, `COALESCE`, `CAST`, or string concat (`||`).
 - No `NOT` (would need a unary op in the AST).
 - Identifiers are case-sensitive; no folding.
 - Qualified column references (`t.col`) are rejected even when
   unambiguous.
-- Validity bitmaps are not propagated through filter or primitive
-  aggregate kernels. `COUNT(expr)` over a primitive column counts every
-  row; only the Bool/Utf8 `extended_agg` path honours nulls.
+- Validity propagation through compact / gpu_compact selection masks is implemented,
+  but primitive aggregate kernels still do not propagate validity bitmaps.
+  `COUNT(expr)` over a primitive column counts every row; only the Bool/Utf8
+  `extended_agg` path honours nulls.
 - Aggregate aliasing (`SUM(price) AS total`) is rejected by the SQL
   frontend — aggregates carry plan-assigned names.
 - Post-aggregate expressions (`SUM(price) + 1`) are not yet supported.
@@ -64,28 +65,24 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   are reachable only via `src/exec/string_ops*`, not via SQL.
 - Date / time / timestamp / decimal / list / struct / map types are
   unimplemented.
-- Async memcpy: FFI is bound, integration is a 0.2 task; today every
+- Async memcpy: FFI is bound, integration is a 0.4 task; today every
   H2D / D2H is synchronous.
 
-## 0.2 — production-readiness target
+## 0.4 — production-readiness target
 
 ### Goals
 
 - Streaming / multi-batch tables behind a stable `register_table_stream`
   API.
-- Validity propagation through filter and primitive aggregate kernels
-  (currently only the projection round-trip honours `BoolArray` nulls).
-- Async memcpy + pinned host buffers (FFI is bound in 0.1.x; integration
-  in 0.2).
-- Warp-shuffle reduction for the last 5 strides of the agg-kernel tree
-  (a TODO marker already exists in `src/jit/agg_kernels.rs`).
+- Validity propagation through primitive aggregate kernels.
+- Async memcpy + pinned host buffers (FFI is bound in 0.3.0; integration
+  in 0.4).
 - `KernelSpec`-keyed cache that skips codegen as well as PTXAS (the
   current cache only skips PTXAS reassembly).
-- Standardised `cargo bench` baselines published per release.
 
 ### Stretch goals
 
-- GPU hash join (the 0.1.x INNER equi-join executor is host-side; a
+- GPU hash join (the 0.3.0 INNER equi-join executor is host-side; a
   GPU-resident probe path is the natural next step).
 - LEFT / RIGHT / FULL / CROSS joins; non-equi predicates via
   nested-loop.

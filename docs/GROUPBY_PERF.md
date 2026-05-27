@@ -1,4 +1,7 @@
-﻿# GROUP BY performance — analysis and proposed optimizations
+# GROUP BY performance — analysis and proposed optimizations
+
+> [!NOTE]
+> **Status: Implemented** (Tiers 1–2 landed; see [BENCHMARKS.md](./BENCHMARKS.md) for results)
 
 ## What the measurements say
 

@@ -1,4 +1,4 @@
-﻿# Competitive Benchmarking Guide
+# Competitive Benchmarking Guide
 
 How to compare Craton Bolt against other SQL engines without lying to yourself or
 your readers. This document is for engineers running an evaluation, contributors
@@ -10,7 +10,7 @@ that any future numbers should follow.
 
 ## TL;DR
 
-- Craton Bolt 0.1.x is a single-node, single-batch, in-memory GPU SQL engine. Pick
+- Craton Bolt 0.3.0 is a single-node, single-batch, in-memory GPU SQL engine. Pick
   competitors that occupy the same niche; treat cross-niche comparisons as
   illustrative, not damning.
 - Use **ClickBench** as your primary suite: it's single-table, aggregation-heavy,
@@ -26,7 +26,7 @@ that any future numbers should follow.
 
 ## 1. What category is Craton Bolt in?
 
-Be specific about the contest before you measure. Craton Bolt 0.1.x is:
+Be specific about the contest before you measure. Craton Bolt 0.3.0 is:
 
 - **Single-node** (one process, one GPU).
 - **Single-batch in-memory** (no streaming, no larger-than-VRAM tables, no
@@ -66,14 +66,14 @@ buying anything *on that workload*, full stop.
 
 ### 3.1 Standard suites, ranked by fit
 
-| Suite | Tables | Queries | Fits Craton Bolt 0.1.x?       | Comment |
+| Suite | Tables | Queries | Fits Craton Bolt 0.3.0?       | Comment |
 | ----- | ------ | ------- | ------------------------- | ------- |
 | **ClickBench**     | 1 (`hits`)   | 43 | Yes (most queries)     | Aggregation-heavy single-table. Ideal. |
-| **SSB** (denormalised flat) | 1 | 13 | Yes              | Star Schema Benchmark; "denorm" form fits 0.1.x. |
-| **SSB** (joined)   | 5            | 13 | Partial (needs INNER) | The 0.1.x INNER hash join handles SSB joins. |
+| **SSB** (denormalised flat) | 1 | 13 | Yes              | Star Schema Benchmark; "denorm" form fits 0.3.0. |
+| **SSB** (joined)   | 5            | 13 | Partial (needs INNER) | The 0.3.0 INNER hash join handles SSB joins. |
 | **TPC-H** SF1      | 8            | 22 | Partial (~6 queries)  | Many queries need LEFT JOIN, subqueries, CTEs. |
 | **TPC-H** SF10+    | 8            | 22 | No                     | Multi-batch / streaming needed. |
-| **TPC-DS**         | 24           | 99 | No                     | Out of scope until 0.3+.               |
+| **TPC-DS**         | 24           | 99 | No                     | Out of scope until 0.4+.               |
 | **YCSB**           | 1            | KV  | No                     | Wrong category (transactional).        |
 
 **Default recommendation: ClickBench**. It's the modern standard, it's
@@ -176,7 +176,7 @@ the values in your writeup.
 
 ## 6. What Craton Bolt will likely win and lose at
 
-Setting reader expectations honestly is part of the deliverable. As of 0.1.x:
+Setting reader expectations honestly is part of the deliverable. As of 0.3.0:
 
 **Likely wins**
 - Warm scalar arithmetic at ≥ 10M rows (GPU FLOPs + bandwidth ratio).
@@ -188,14 +188,14 @@ Setting reader expectations honestly is part of the deliverable. As of 0.1.x:
 - Cold-start queries: parse + JIT + first H2D often exceeds DuckDB's entire
   warm run on small data.
 - Sub-million-row workloads: launch + transfer overhead dominates.
-- Queries dominated by string operations: 0.1.x only does dictionary equality;
+- Queries dominated by string operations: 0.3.0 only does dictionary equality;
   `LIKE` / `SUBSTRING` / `CONCAT` aren't routed through SQL.
-- Multi-table joins beyond the single equi-INNER pattern: 0.1.x rejects them
+- Multi-table joins beyond the single equi-INNER pattern: 0.3.0 rejects them
   at the parser.
 - Anything that requires `IS NULL`, `IN`, `BETWEEN`, `CASE`, `NULLIF`,
   `COALESCE`, or `CAST` — these are unimplemented and will fail.
 
-**Likely losses (by design, until 0.2+)**
+**Likely losses (by design, until 0.4+)**
 - Streaming / multi-batch tables.
 - Larger-than-VRAM datasets.
 - Distributed queries.

@@ -1,4 +1,4 @@
-﻿# 0.4 Milestone Proposal — Kernel Parameterisation, Backend Convergence
+# 0.4 Milestone Proposal — Kernel Parameterisation, Backend Convergence
 
 **Milestone:** Consolidate the GPU backend decision; ship const-generic kernels
 **Target release:** 0.4
@@ -91,8 +91,10 @@ defers the kernel-language question to 0.5.
 - **Wave B2 — cudarc Stage 3.** Launch path: `KernelArgs<'a>` →
   cudarc's typed `LaunchAsync` tuple per `CUDARC_ADOPTION.md` Stage 3.
   Touches every executor listed in
-  [`docs/CUDA_OXIDE_SWEEP.md`](CUDA_OXIDE_SWEEP.md). The CUDA-Oxide
-  sweep finishes inside this wave — every `⏳ todo` row goes `✅`.
+  [`docs/CUDA_OXIDE_SWEEP.md`](CUDA_OXIDE_SWEEP.md). The safe memory safety
+  sweep (internally nicknamed the "CUDA-Oxide sweep", referring to our safe
+  memory wrapper layer `GpuVec`/`GpuView`/`GpuViewMut` and NOT the NVIDIA first-party compiler)
+  finishes inside this wave — every `⏳ todo` row goes `✅`.
 - **Wave B3 — cudarc Stage 4 + pool consolidation.** Memory pool
   migration. Reconcile or delete `src/cuda/mem_pool.rs`. After this
   wave `default = ["cudarc"]` flips on and the hand-rolled FFI lives
@@ -130,6 +132,9 @@ execution; multi-GPU is more speculative). The pivot target is named
 at the end of Wave C1 once the split is known.
 
 ## NVIDIA CUDA-Oxide vs `rust-cuda`
+
+> [!IMPORTANT]
+> **Naming Disambiguation:** In the Craton Bolt codebase, "CUDA-Oxide" is sometimes used as an informal nickname for our own borrow-checked GPU memory safety layer (`GpuVec`/`GpuView`/`GpuViewMut`, see `docs/CUDA_OXIDE_SWEEP.md`). In this section, however, **CUDA-Oxide** refers to **NVIDIA's official first-party Rust-to-PTX compiler** shipped on 2026-05-09.
 
 [`01_toolchain_audit.md`](rust_cuda/01_toolchain_audit.md) §5 notes
 that NVIDIA shipped **CUDA-Oxide 0.1 on 2026-05-09** — a separate

@@ -1,4 +1,4 @@
-﻿# Craton Bolt
+# Craton Bolt
 
 [![crates.io](https://img.shields.io/crates/v/craton-bolt.svg)](https://crates.io/crates/craton-bolt) [![docs.rs](https://docs.rs/craton-bolt/badge.svg)](https://docs.rs/craton-bolt) [![CI](https://github.com/craton-co/craton-bolt/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/craton-bolt/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![MSRV: 1.74](https://img.shields.io/badge/MSRV-1.74-orange.svg)](Cargo.toml)
 
@@ -13,7 +13,7 @@ The project's two distinguishing ideas:
 
 ## Status
 
-**Active development.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (incl. multi-column, float keys, sentinel-collision-safe), and join-free SQL are implemented, along with string predicates (=, !=, IN over dictionary-encoded literals) and a small set of host-callable string operations (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`) reachable only via the Rust `string_ops` API, not yet via SQL. Production use is **not** recommended — the public API is unstable and large swaths still want hardening, benchmarking, and battle-testing.
+**Active development — v0.3.0.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (multi-tier shared-memory + hash-partitioned), `INNER JOIN`, `DISTINCT`, `ORDER BY`, `LIMIT`, `HAVING`, and `UNION [ALL]` are implemented. String predicates (`=`, `!=`, `IN` over dictionary-encoded literals) and a small set of host-callable string operations (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`) are available; string functions are not yet reachable via SQL. Production use is **not** recommended — the public API is unstable pre-1.0.
 
 See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported subset.
 
@@ -46,7 +46,7 @@ See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported sub
 ### Build
 
 ```bash
-git clone <repo-url> craton-bolt
+git clone https://github.com/craton-co/craton-bolt
 cd craton-bolt
 cargo build --release
 ```
@@ -132,42 +132,40 @@ For the long form, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs
 
 ## Performance
 
-First measured run on a CPU-only host (no GPU available; `engine_execute`
-was skipped). All numbers are criterion's middle estimate over 100 samples
-of three queries against a 1,000,000-row synthetic dataset:
+All GPU numbers below were measured on an **NVIDIA GeForce RTX 2060**,
+CUDA 12.6, verified end-to-end equivalent against Polars 0.42 and DuckDB 1.2
+before timing. Full methodology and per-bench breakdown: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-| Stage              | proj        | arith       | filtered    |
-|--------------------|-------------|-------------|-------------|
-| `plan`             |   13.7 µs   |    9.4 µs   |   11.9 µs   |
-| `lower`            |  429.5 ns   |  563.2 ns   |  621.0 ns   |
-| `ptx_gen`          |    7.0 µs   |    9.5 µs   |   11.2 µs   |
-| **CPU overhead**   | **~21 µs**  | **~19 µs**  | **~23 µs**  |
-| `polars` (multi-threaded) | 6.5 µs † | 2.94 ms | 1.60 ms |
-| `cpu_reference` (single-threaded baseline) | — | 3.51 ms | — |
-| `engine_execute` (GPU) | skipped | skipped | skipped |
+**CPU-side overhead** (plan + lower + codegen, no GPU needed) is **sub-25 µs** per
+query regardless of dataset size — JIT-compiling every query has negligible cost.
 
-† Polars's `proj` is essentially a metadata clone of the existing column —
-not a fair compute comparison.
+### Heavy-arithmetic OLAP (50 M rows, fused multi-operator, RTX 2060)
 
-**Takeaways:**
+| Query | Polars (CPU MT) | Craton Bolt (GPU) | Speedup |
+|---|---|---|---|
+| 11-op arithmetic chain (50 M rows) | 4.05 s | **124.8 ms** | **32.4×** |
+| Filter + 4-op arithmetic (50 M rows) | 369 ms | **41.8 ms** | **8.8×** |
 
-- Parse + plan + codegen is **sub-25-µs** per query. JIT-compiling at every
-  query is not a meaningful overhead.
-- The CPU reference single-threaded loop on 1M float multiplies takes
-  ~3.5 ms; that's the floor a GPU implementation needs to beat at this
-  problem size. We expect GPU break-even somewhere around 100k rows for
-  arithmetic queries; below that the launch + h2d/d2h round-trip dominates.
-- Polars on `filtered` (1.6 ms, multi-threaded) is the CPU number to beat.
+### h2o.ai db-benchmark GROUP BY subset (10 M rows, RTX 2060)
 
-The bench file is `benches/query_benchmarks.rs`. Run with:
+| Query | DuckDB | Polars | Craton Bolt | Notes |
+|---|---|---|---|---|
+| q1 low-card SUM (100 groups) | 6.9 ms | 19.0 ms | **51.4 ms** | DuckDB wins |
+| q2 med-card 2-SUM (10 K groups) | 46.4 ms | 99.4 ms | 384 ms | DuckDB wins |
+| q3 two-key SUM (~1 M groups) | 498 ms | 385 ms | **219 ms** ⭐ | Craton Bolt fastest |
+| q4 low-card 3-AVG (100 groups) | 12.9 ms | 97.0 ms | **70.5 ms** | DuckDB wins |
+| q5 high-card SUM (1 M groups) | 623 ms | 358 ms | **237 ms** ⭐ | Craton Bolt fastest |
+
+Creton Bolt wins outright on the two highest-cardinality workloads (q3, q5) where
+GPU-parallel hash-partitioning outpaces CPU per-core hash tables. CPU-native engines
+win at low cardinality (q1, q4) where their per-thread L1-resident tables beat GPU
+atomic contention. See [`docs/BENCHMARKS.md §honest read`](docs/BENCHMARKS.md#the-honest-read)
+for the full analysis.
 
 ```bash
 cargo bench                              # CPU-only (plan, codegen, CPU ref, Polars)
-BOLT_BENCH_GPU=1 cargo bench          # add the GPU engine path
+BOLT_BENCH_GPU=1 cargo bench            # add the GPU engine path
 ```
-
-For the methodology and a full per-bench breakdown, see
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## Contributing
 
@@ -180,14 +178,24 @@ craton-bolt/
 ├── Cargo.toml
 ├── README.md
 ├── CONTRIBUTING.md
+├── RELEASING.md              # maintainer release checklist
 ├── CODE_OF_CONDUCT.md
 ├── SECURITY.md
 ├── CHANGELOG.md
+├── ROADMAP.md
 ├── docs/
 │   ├── ARCHITECTURE.md       # the layer cake and module map
 │   ├── JIT_PIPELINE.md       # SQL → PTX, step by step
 │   ├── SQL_REFERENCE.md      # what works, what doesn't
-│   └── DEVELOPMENT.md        # building, testing, benchmarking
+│   ├── DEVELOPMENT.md        # building, testing, benchmarking
+│   ├── FAQ.md                # frequently asked questions
+│   ├── BENCHMARKS.md         # measured numbers and methodology
+│   ├── COMPETITIVE_BENCHMARKING.md  # how to run fair comparisons
+│   ├── GROUPBY_PERF.md       # GROUP BY kernel design and analysis
+│   ├── CUDARC_ADOPTION.md    # cudarc migration plan
+│   ├── CUDA_OXIDE_SWEEP.md   # CUDA-Oxide refactor status
+│   ├── MILESTONE_0_4.md      # 0.4 milestone proposal
+│   └── PATH_TO_1.0.md        # detailed 1.0 milestone plan
 ├── src/
 │   ├── lib.rs                # crate root, public re-exports
 │   ├── error.rs              # BoltError + BoltResult
@@ -199,7 +207,8 @@ craton-bolt/
 │   ├── memory_tests.rs       # CUDA-Oxide compile-fail proofs
 │   └── e2e_tests.rs          # parser/plan/PTX-shape + ignored live-GPU
 └── benches/
-    └── query_benchmarks.rs   # criterion + Polars head-to-head
+    ├── query_benchmarks.rs   # criterion + Polars + CPU-ref (small dataset)
+    └── olap_benchmarks.rs    # h2o.ai groupby vs Polars vs DuckDB
 ```
 
 ## Security
