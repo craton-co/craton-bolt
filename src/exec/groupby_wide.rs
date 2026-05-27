@@ -128,6 +128,20 @@ pub fn execute_groupby_wide(
     // Reusable scratch buffer for the per-row tuple build.
     let mut buf_key: Vec<KeyValue> = Vec::with_capacity(key_cols.len());
     for row in 0..n_rows {
+        // TODO(h1): same NULL fix pattern needed here — `key_value_at` and
+        // `agg_input_at` both read via `pa.value(row)`, which returns the
+        // garbage bit pattern at the underlying values buffer when the
+        // Arrow array's validity bitmap marks `row` as NULL. We need to:
+        //   1. Skip the row entirely when ANY key column is NULL at `row`
+        //      (matches the `groupby.rs` H1 fix: NULL keys are dropped).
+        //   2. For each aggregate, skip its update when the value column
+        //      is NULL at `row` (so SUM/MIN/MAX exclude NULL inputs and
+        //      AVG's denominator reflects the non-NULL count).
+        // The fix is straightforward inline here because the loop already
+        // walks per-row — just `if kc.arr.is_null(row) { skip row }` and
+        // `if agg_in.arr.is_null(row) { continue }` at the right spots.
+        // See `groupby.rs::collect_filtered_primitive` and
+        // `groupby.rs::run_typed_agg` for the canonical pattern.
         // Build the tuple key for this row.
         buf_key.clear();
         for kc in &key_cols {

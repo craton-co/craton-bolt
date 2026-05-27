@@ -389,6 +389,19 @@ struct PackedKeys {
 
 /// Load one group-by column's bit pattern (zero-extended into u64) from
 /// `batch`.
+///
+/// TODO(h1): same NULL fix pattern needed here. The `pa.values()` calls
+/// below pick up garbage bytes at NULL-validity positions, which would form
+/// fake groups in the downstream hash table (since the sentinel-free
+/// `groupby_valid` path is itself the fallback when classic `groupby` hits
+/// a value collision with `i64::MIN`). The fix mirrors `groupby.rs`: have
+/// this function return `(Vec<u64>, Option<Vec<bool>>)` where the second
+/// element is a per-row keep mask whenever `arr.null_count() > 0`, then
+/// surface that through `PackedKeys` and filter `keys_i64` + value columns
+/// in lockstep before the keys / agg kernel launches. The aggregate paths
+/// in this file also need the same per-aggregate value-NULL filter that
+/// `groupby.rs::collect_filtered_primitive` and
+/// `groupby.rs::load_input_column_as_f64_filtered` apply.
 fn load_key_column_bits(
     key_io: &ColumnIO,
     batch: &RecordBatch,
