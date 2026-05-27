@@ -34,6 +34,29 @@ pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
 pub use plan::{DataFrame, LogicalPlan, PhysicalPlan, Expr};
 pub use exec::Engine;
 
+/// Stage 4 (pool telemetry): public re-exports for downstream
+/// observability. [`pool_stats`] returns a [`PoolStats`] snapshot of
+/// the process-wide device-memory pool — total pooled bytes, bucket
+/// count, OOM-recovery count, and proactive-eviction count.
+///
+/// Wire this into a Prometheus exporter, a periodic log line, or a
+/// custom dashboard. The fields are documented on [`PoolStats`]; new
+/// fields may be added (non-breaking) but existing ones keep their
+/// semantics across point releases.
+///
+/// ```ignore
+/// use craton_bolt::pool_stats;
+/// let s = pool_stats();
+/// println!(
+///     "pool: {} bytes across {} buckets ({} OOM rescues, {} proactive evictions)",
+///     s.total_pooled_bytes,
+///     s.bucket_count,
+///     s.oom_recovery_count,
+///     s.proactive_eviction_count
+/// );
+/// ```
+pub use cuda::mem_pool::{pool_stats, PoolStats};
+
 /// Test-only re-exports of the multi-key GPU sort entry points. NOT a stable
 /// API surface — exists so the E2E test in `tests/sort_e2e.rs` can drive the
 /// shmem-variant dispatch directly (the public SQL path has a 16k-row gate

@@ -112,6 +112,15 @@ rust-cuda = ["dep:cuda_builder"]
 # and never contends across distinct shard indices — useful when many
 # size classes happen to collide on DashMap's `default_hasher`.
 pool-sharded = []
+# `pool-watcher` (Stage-4 proactive eviction): spawns a background thread on
+# first pool touch that polls `cuMemGetInfo_v2` every N seconds (tunable
+# via `BOLT_POOL_WATCH_INTERVAL_SECS`, default 5) and triggers
+# `evict_above_high_water` when device free memory falls below a
+# threshold (default 10%, tunable via `BOLT_POOL_WATCH_LOW_WATER_FRAC`).
+# Off by default — CI / cuda-stub builds don't carry the cost of a
+# permanently-resident thread. Successful triggers bump
+# `proactive_eviction_count()` for telemetry. See `mem_pool.rs`.
+pool-watcher = []
 
 [build-dependencies]
 # `cuda_builder` is the build-time entry point to rust-cuda's NVVM codegen

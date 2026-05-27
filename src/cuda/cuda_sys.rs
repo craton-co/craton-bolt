@@ -113,6 +113,13 @@ extern "C" {
         kernel_params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> CUresult;
+    /// Report the device's currently free and total memory, in bytes,
+    /// in the active context. Stage 4 (pool watcher) calls this from a
+    /// background thread to drive proactive eviction before the driver
+    /// OOMs. The `_v2` suffix mirrors the rest of this block — the
+    /// driver exposes both `cuMemGetInfo` and `cuMemGetInfo_v2`;
+    /// the v2 form is the documented one on CUDA 12.x.
+    pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,12 +199,22 @@ mod stubs {
         _kernel_params: *mut *mut c_void,
         _extra: *mut *mut c_void,
     ) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemGetInfo_v2(_free: *mut usize, _total: *mut usize) -> CUresult { CUDA_ERROR_STUB }
 }
 
 #[cfg(feature = "cuda-stub")]
 pub use stubs::*;
 
 /// Convert a `CUresult` into a `BoltResult`, attaching the driver's message.
+///
+/// Stage 4 (pool): the error now carries the raw `CUresult` integer
+/// alongside the human-readable string. Downstream consumers
+/// (`mem_pool::is_oom_error`) pattern-match on
+/// `BoltError::CudaWithCode { code: 2, .. }` directly instead of
+/// scraping the formatted message — see `crate::error::BoltError` for
+/// the variant rationale. The Display impl of `CudaWithCode` reproduces
+/// the legacy `"CUDA driver error {code}: {message}"` shape, so any
+/// caller that still falls through to `.to_string()` keeps working.
 pub fn check(code: CUresult) -> BoltResult<()> {
     if code == CUDA_SUCCESS {
         return Ok(());
@@ -215,7 +232,10 @@ pub fn check(code: CUresult) -> BoltResult<()> {
             format!("unknown CUDA error {}", code)
         }
     };
-    Err(BoltError::Cuda(format!("CUDA driver error {}: {}", code, msg)))
+    Err(BoltError::CudaWithCode {
+        code,
+        message: msg,
+    })
 }
 
 /// Successful-init latch. Stores `true` exactly once when `cuInit(0)`
@@ -526,6 +546,23 @@ pub unsafe fn mem_free_host(p: *mut c_void) -> BoltResult<()> {
 /// `ptr` must point to a live device allocation of at least `count` bytes.
 pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> BoltResult<()> {
     check(cuMemsetD8_v2(ptr, value, count))
+}
+
+/// Query free and total device-memory bytes in the current context.
+///
+/// Returns `(free_bytes, total_bytes)`. Wraps `cuMemGetInfo_v2`.
+///
+/// Stage 4 (pool watcher): a background thread spawned by
+/// [`crate::cuda::mem_pool`] polls this and triggers
+/// `evict_above_high_water` when the free fraction drops below a
+/// threshold, getting ahead of driver OOMs. Requires a live CUDA
+/// context on the calling thread (same precondition as
+/// `cuMemAlloc_v2`).
+pub fn mem_get_info() -> BoltResult<(usize, usize)> {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    check(unsafe { cuMemGetInfo_v2(&mut free, &mut total) })?;
+    Ok((free, total))
 }
 
 #[cfg(test)]
