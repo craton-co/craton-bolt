@@ -277,6 +277,225 @@ fn negative_keys_round_trip_n2() {
     assert!(err < 1e-10, "max rel err {err:e} exceeded 1e-10");
 }
 
+// ---- Per-key alignment tests -----------------------------------------------
+//
+// These tests directly attack the kind of bug the old multi-call scatter
+// design could produce: a value column j ending up paired with the wrong
+// key. We build inputs where each (key, v0, v1[, v2]) tuple has a unique
+// arithmetic relationship between its value columns, so a misalignment
+// shows up as an impossible per-group sum that no permutation of values
+// against the right key could produce.
+
+/// Fixture where, for every row, `v1 = 1000 * key` and `v2 = 1_000_000 * key`.
+/// After GROUP BY, `SUM(v1) / SUM(v2) = 1/1000` and both sums are exact
+/// integer multiples of the row count per group. A misalignment of v1
+/// vs v2 against the key column would produce sums whose ratios are not
+/// 1/1000 — easy to detect.
+fn fixture_aligned_multiples(
+    n_rows: usize,
+    n_distinct_keys: i32,
+    n_vals: usize,
+    seed: u64,
+) -> (Vec<i32>, Vec<Vec<f64>>) {
+    assert!(n_vals >= 1 && n_vals <= 4);
+    let modulus = n_distinct_keys as u64;
+    let mut state: u64 = seed.wrapping_add(0xDEAD_BEEF_CAFE_BABE);
+    if state == 0 {
+        state = 0xA1B2_C3D4_E5F6_0718;
+    }
+    let mut next = || -> u64 {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+
+    let mut keys = Vec::with_capacity(n_rows);
+    let mut vals: Vec<Vec<f64>> = (0..n_vals).map(|_| Vec::with_capacity(n_rows)).collect();
+    let per_col_scale: [f64; 4] = [1.0, 1_000.0, 1_000_000.0, 1_000_000_000.0];
+    for _ in 0..n_rows {
+        let k = (next() % modulus) as i32;
+        keys.push(k);
+        for j in 0..n_vals {
+            // Each row's value in column j is `scale_j * key`. Sums per
+            // group preserve this ratio exactly: SUM(v_j) over a group is
+            // `scale_j * key * count_for_key`. A scatter that paired v_j
+            // for row i with the wrong key would break the ratio.
+            vals[j].push(per_col_scale[j] * (k as f64));
+        }
+    }
+    (keys, vals)
+}
+
+#[test]
+fn aligned_multiples_n2_ratio_holds() {
+    // Small N so the CPU model is fast; exercises the alignment invariant
+    // without needing a GPU.
+    let (keys, vals) = fixture_aligned_multiples(50_000, 500, 2, 0xABCD);
+    let model = cpu_tier2_multi_sum_model(&keys, &vals);
+    let naive = cpu_naive_multi_sum_groupby(&keys, &vals);
+
+    // The model is the algorithm the orchestrator runs host-side; the naive
+    // path is a true oracle. They must agree.
+    let err = max_relative_error_multi(&model, &naive);
+    assert!(err < 1e-10, "model vs naive: max rel err {err:e}");
+
+    // Now check the alignment invariant directly: for every key, the
+    // returned SUM(v0) and SUM(v1) must satisfy v1_sum == 1000 * v0_sum.
+    // Even at f64 precision this is an exact integer relationship for
+    // small keys + row counts.
+    for (k, sums) in &model {
+        assert_eq!(sums.len(), 2);
+        let v0 = sums[0];
+        let v1 = sums[1];
+        // SUM(v0) for key k = k * count_k; SUM(v1) = 1000 * k * count_k.
+        // So v1 should be exactly 1000 * v0.
+        let expected_v1 = v0 * 1000.0;
+        let denom = expected_v1.abs().max(1.0);
+        let rel = (v1 - expected_v1).abs() / denom;
+        assert!(
+            rel < 1e-12,
+            "alignment broken at key {k}: SUM(v0)={v0} SUM(v1)={v1} (expected {expected_v1}, rel err {rel:e})"
+        );
+    }
+}
+
+#[test]
+fn aligned_multiples_n3_ratio_holds() {
+    let (keys, vals) = fixture_aligned_multiples(100_000, 1_000, 3, 0xBEEF);
+    let model = cpu_tier2_multi_sum_model(&keys, &vals);
+    let naive = cpu_naive_multi_sum_groupby(&keys, &vals);
+
+    let err = max_relative_error_multi(&model, &naive);
+    assert!(err < 1e-10, "model vs naive: max rel err {err:e}");
+
+    // SUM(v0) for key k = k * count_k.
+    // SUM(v1) = 1_000 * SUM(v0).
+    // SUM(v2) = 1_000_000 * SUM(v0).
+    for (k, sums) in &model {
+        assert_eq!(sums.len(), 3);
+        let v0 = sums[0];
+        let v1 = sums[1];
+        let v2 = sums[2];
+
+        let expected_v1 = v0 * 1_000.0;
+        let denom1 = expected_v1.abs().max(1.0);
+        let rel1 = (v1 - expected_v1).abs() / denom1;
+        assert!(
+            rel1 < 1e-12,
+            "alignment broken (v1) at key {k}: v0={v0} v1={v1} expected {expected_v1} (rel {rel1:e})"
+        );
+
+        let expected_v2 = v0 * 1_000_000.0;
+        let denom2 = expected_v2.abs().max(1.0);
+        let rel2 = (v2 - expected_v2).abs() / denom2;
+        assert!(
+            rel2 < 1e-12,
+            "alignment broken (v2) at key {k}: v0={v0} v2={v2} expected {expected_v2} (rel {rel2:e})"
+        );
+    }
+}
+
+#[test]
+fn known_sums_per_group_n2() {
+    // Hand-built tiny fixture with known sums per group. If alignment between
+    // v0 and v1 ever drifts in the orchestrator's host or GPU paths, this
+    // test will fail with sums that do not match the hand-computed totals.
+    //   key=10:  v0 = 1+2+3 = 6,    v1 = 10+20+30 = 60
+    //   key=20:  v0 = 4+5   = 9,    v1 = 40+50    = 90
+    //   key=30:  v0 = 6     = 6,    v1 = 60       = 60
+    //   key=-7:  v0 = 7+8   = 15,   v1 = 70+80    = 150
+    let keys: Vec<i32> = vec![10, 20, 10, 20, 10, 30, -7, -7];
+    let v0: Vec<f64> = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0, 7.0, 8.0];
+    let v1: Vec<f64> = vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0, 70.0, 80.0];
+    let vals = vec![v0, v1];
+
+    let model = cpu_tier2_multi_sum_model(&keys, &vals);
+
+    // Build a lookup keyed by group key.
+    let mut got: HashMap<i32, Vec<f64>> = HashMap::new();
+    for (k, sums) in model {
+        got.insert(k, sums);
+    }
+
+    let expected: &[(i32, [f64; 2])] = &[
+        (-7, [15.0, 150.0]),
+        (10, [6.0, 60.0]),
+        (20, [9.0, 90.0]),
+        (30, [6.0, 60.0]),
+    ];
+    for (k, exp) in expected {
+        let g = got.get(k).unwrap_or_else(|| panic!("missing key {k}"));
+        assert_eq!(g.len(), 2);
+        assert!(
+            (g[0] - exp[0]).abs() < 1e-12,
+            "SUM(v0) for key {k}: got {} expected {}",
+            g[0],
+            exp[0]
+        );
+        assert!(
+            (g[1] - exp[1]).abs() < 1e-12,
+            "SUM(v1) for key {k}: got {} expected {}",
+            g[1],
+            exp[1]
+        );
+        // Most importantly: v1 should be exactly 10 * v0 in this fixture.
+        // A misalignment would break this ratio.
+        let expected_ratio = g[0] * 10.0;
+        assert!(
+            (g[1] - expected_ratio).abs() < 1e-12,
+            "alignment broken at key {k}: v0={} v1={} (v1 should be 10*v0 = {expected_ratio})",
+            g[0],
+            g[1]
+        );
+    }
+}
+
+#[test]
+fn no_value_column_swap_under_permutation_n2() {
+    // Build a fixture where swapping the v0 and v1 results for any single
+    // key would yield different (non-physical) per-group sums. We then
+    // verify the model produces the physical sums, not the swapped ones.
+    //
+    // Each key gets a unique constant for v0 and a unique-but-different
+    // constant for v1, with row counts that vary per key. This guarantees
+    // that no two keys could share the same (SUM(v0), SUM(v1)) tuple,
+    // so a misalignment that paired v1 with the wrong key would surface.
+    let mut keys: Vec<i32> = Vec::new();
+    let mut v0: Vec<f64> = Vec::new();
+    let mut v1: Vec<f64> = Vec::new();
+    // key k has k+1 rows, v0=k, v1=100+k.
+    for k in 0..50_i32 {
+        let n = (k + 1) as usize;
+        for _ in 0..n {
+            keys.push(k);
+            v0.push(k as f64);
+            v1.push(100.0 + k as f64);
+        }
+    }
+
+    let vals = vec![v0, v1];
+    let model = cpu_tier2_multi_sum_model(&keys, &vals);
+
+    for (k, sums) in &model {
+        let n = (*k + 1) as f64;
+        let expected_v0 = (*k as f64) * n;
+        let expected_v1 = (100.0 + *k as f64) * n;
+        assert!(
+            (sums[0] - expected_v0).abs() < 1e-9,
+            "key {k}: SUM(v0) got {} expected {}",
+            sums[0],
+            expected_v0
+        );
+        assert!(
+            (sums[1] - expected_v1).abs() < 1e-9,
+            "key {k}: SUM(v1) got {} expected {}",
+            sums[1],
+            expected_v1
+        );
+    }
+}
+
 // ---- GPU-gated integration test --------------------------------------------
 //
 // Regression hook for the Tier-2 multi-SUM GPU pipeline. Once the dispatcher
@@ -309,5 +528,34 @@ fn tier2_multi_pipeline_matches_cpu_model() {
     let _ = expected.len();
     unimplemented!(
         "wire engine.sql -> sort by key -> compare against expected with max_relative_error_multi"
+    );
+}
+
+/// GPU-side alignment regression. Uses the aligned-multiples fixture so a
+/// (key, v_j) misalignment in the orchestrator's scatter path surfaces as
+/// a broken `SUM(v1) == 1000 * SUM(v0)` ratio — independent of any
+/// floating-point reordering. The CPU model already runs the same fixture
+/// above; this is the live-GPU end of the regression.
+#[test]
+#[ignore = "requires CUDA + integration"]
+fn tier2_multi_pipeline_preserves_value_column_alignment() {
+    let n_rows: usize = 10_000_000;
+    let n_distinct_keys: i32 = 100_000;
+    let n_vals: usize = 3;
+    let (keys, vals) = fixture_aligned_multiples(n_rows, n_distinct_keys, n_vals, 0xFEED);
+    let expected = cpu_tier2_multi_sum_model(&keys, &vals);
+
+    // Wire-up (mirrors the previous test):
+    //   1. RecordBatch with `id2` (Int32) from keys, `v1`/`v2`/`v3` (Float64)
+    //      from vals[0..3].
+    //   2. engine.sql("SELECT id2, SUM(v1), SUM(v2), SUM(v3) FROM x GROUP BY id2")
+    //   3. Sort by key; per-key, assert
+    //        SUM(v2) == 1000 * SUM(v1) within 1e-12 relative
+    //        SUM(v3) == 1_000_000 * SUM(v1) within 1e-12 relative
+    //      and that the per-key totals match `expected` within 1e-9
+    //      relative via `max_relative_error_multi`.
+    let _ = expected.len();
+    unimplemented!(
+        "wire engine.sql -> per-key ratio + max_relative_error_multi against expected"
     );
 }

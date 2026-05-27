@@ -15,6 +15,8 @@ pub mod shmem_multi_sum_kernel;
 pub mod shmem_count_kernel;
 pub mod partition_kernel;
 pub mod scatter_kernel;
+pub mod scatter_with_dest_idx_kernel;
+pub mod scatter_values_by_dest_idx_kernel;
 pub mod partition_reduce_kernel;
 pub mod partition_reduce_kernel_i64;
 pub mod partition_reduce_kernel_multi;

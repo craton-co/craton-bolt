@@ -12,9 +12,12 @@
 //!
 //! 1. **Partition + scatter**: identical to `groupby_tier2_multi_
 //!    orchestrator`. One partition kernel produces (partition_ids,
-//!    counts); host-side prefix-sum gives the offsets; N+1 scatter passes
-//!    (N value columns, all sharing one i32 key column) produce contiguous
-//!    per-partition slices.
+//!    counts); host-side prefix-sum gives the offsets; ONE atomic-claim
+//!    pass writes the per-row `dest_idx` map + the scattered key column;
+//!    N atomic-free indexed-scatter passes scatter each value column to
+//!    the slots `dest_idx` specifies. This guarantees alignment between
+//!    the key column and every value column by construction — independent
+//!    of any `atomicAdd` ordering assumptions.
 //! 2. **Pass 2 — SUMs**: one launch of `partition_reduce_kernel_multi`
 //!    (n_vals = N) reduces each partition into N per-group SUMs.
 //! 3. **Pass 2 — COUNT**: one launch of `partition_reduce_kernel_count`
@@ -48,7 +51,7 @@ use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel, partition_reduce_kernel_count, partition_reduce_kernel_multi,
-    scatter_kernel, CudaModule,
+    scatter_values_by_dest_idx_kernel, scatter_with_dest_idx_kernel, CudaModule,
 };
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
@@ -184,43 +187,77 @@ fn execute_inner(
     let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
     let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
 
-    // ---- Scatter (keys shared + N value passes) --------------------------
+    // ---- Scatter (deterministic dest_idx + indexed value passes) ---------
+    //
+    // Correctness note: the previous design called the atomic-claim scatter
+    // kernel once per value column, relying on identical `atomicAdd`
+    // orderings across launches to keep `(key, v1, v2, …)` aligned. That
+    // ordering is NOT a CUDA contract, so a driver/scheduler change could
+    // silently misalign `SUM(v_j)` with the wrong key.
+    //
+    // We now run the atomic-claim pass exactly ONCE
+    // (`scatter_with_dest_idx_kernel`), capturing the per-row destination
+    // slot in `dest_idx[n_rows]`. Each subsequent value column is scattered
+    // by an atomic-free kernel that reads `dest_idx[i]` and writes
+    // `out_vals[dest_idx[i]] = vals[i]`. Alignment is guaranteed by
+    // construction. The COUNT reduce below also reads `scatter_keys` (the
+    // claim pass's output), so the SUM-side / COUNT-side slot-population
+    // agreement that the historical comment relied on is now a structural
+    // property of the pipeline rather than an unsubstantiated assumption.
     let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros(n_rows as usize)?;
     let mut scatter_vals: Vec<GpuVec<f64>> = Vec::with_capacity(n_vals);
     for _ in 0..n_vals {
         scatter_vals.push(GpuVec::<f64>::zeros(n_rows as usize)?);
     }
+    let mut dest_idx: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
 
+    // Atomic-claim pass.
     {
-        let ptx = scatter_kernel::compile_scatter_kernel()?;
+        let ptx =
+            scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel()?;
+        let module = CudaModule::from_ptx(&ptx)?;
+        let func = module.function(scatter_with_dest_idx_kernel::KERNEL_ENTRY)?;
+
+        let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
+        let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
+
+        let view_keys = keys_gpu.view();
+        let view_pids = partition_ids.view();
+        let view_offsets = offsets_gpu.view();
+        let mut view_cursors = cursors.view_mut();
+        let mut view_sk = scatter_keys.view_mut();
+        let mut view_di = dest_idx.view_mut();
+
+        let mut args = KernelArgs::empty();
+        args.push_input(&view_keys);
+        args.push_input(&view_pids);
+        args.push_input(&view_offsets);
+        args.push_output(&mut view_cursors);
+        args.push_output(&mut view_sk);
+        args.push_output(&mut view_di);
+        args.push_scalar_u32(n_rows);
+
+        let stream = CudaStream::null();
+        launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
+    }
+
+    // Indexed value scatter — one launch per value column, no atomics.
+    {
+        let ptx =
+            scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel()?;
         let module = CudaModule::from_ptx(&ptx)?;
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
 
         for j in 0..n_vals {
-            // Recompile/reload per iteration is wasteful, but we need a
-            // fresh `CudaFunction` per launch_with_geometry call because
-            // the function borrows the module. The module lives for the
-            // whole loop, so reuse it; obtain a new function handle each
-            // launch.
-            let func = module.function(scatter_kernel::KERNEL_ENTRY)?;
+            let func = module.function(scatter_values_by_dest_idx_kernel::KERNEL_ENTRY)?;
 
-            let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
-
-            let view_keys = keys_gpu.view();
             let view_vals = vals_gpu[j].view();
-            let view_pids = partition_ids.view();
-            let view_offsets = offsets_gpu.view();
-            let mut view_cursors = cursors.view_mut();
-            let mut view_sk = scatter_keys.view_mut();
+            let view_dest = dest_idx.view();
             let mut view_sv = scatter_vals[j].view_mut();
 
             let mut args = KernelArgs::empty();
-            args.push_input(&view_keys);
             args.push_input(&view_vals);
-            args.push_input(&view_pids);
-            args.push_input(&view_offsets);
-            args.push_output(&mut view_cursors);
-            args.push_output(&mut view_sk);
+            args.push_input(&view_dest);
             args.push_output(&mut view_sv);
             args.push_scalar_u32(n_rows);
 
@@ -318,13 +355,14 @@ fn execute_inner(
 
     // ---- Download everything --------------------------------------------
     //
-    // The SUM reduce and COUNT reduce hash the same key column with
-    // the same slot function, so for a given (partition, slot) both
-    // kernels write either both populated or both empty, and both
-    // populate with the same key — we use the SUM-side out_keys /
-    // out_set and the COUNT-side out_counts. (Strictly speaking the
-    // count_out_keys / count_out_set are redundant, but allocating
-    // them is cheaper than special-casing the kernel signature.)
+    // The SUM reduce and COUNT reduce both consume `scatter_keys` (written
+    // by the single atomic-claim pass above) and hash with the same slot
+    // function, so for a given (partition, slot) both kernels write either
+    // both populated or both empty, and both populate with the same key.
+    // We use the SUM-side out_keys / out_set and the COUNT-side
+    // out_counts. (Strictly speaking the count_out_keys / count_out_set
+    // are redundant, but allocating them is cheaper than special-casing
+    // the kernel signature.)
     let host_out_keys: Vec<i32> = out_keys_gpu.to_vec()?;
     let mut host_out_vals: Vec<Vec<f64>> = Vec::with_capacity(n_vals);
     for ov in &out_vals_gpu {
@@ -348,8 +386,12 @@ fn execute_inner(
             let c = host_out_counts[idx];
             if c == 0 {
                 // Defensive: set==1 but count==0 means the two kernels
-                // disagreed on slot population, which would be a bug.
-                // Skip to match SQL "no rows → no output" semantics.
+                // disagreed on slot population. With the deterministic
+                // dest_idx scatter both kernels consume the same
+                // scatter_keys buffer with the same slot function, so
+                // this branch should be unreachable; we keep it as a
+                // belt-and-suspenders skip rather than panicking, to
+                // match SQL "no rows → no output" semantics.
                 continue;
             }
             let cf = c as f64;

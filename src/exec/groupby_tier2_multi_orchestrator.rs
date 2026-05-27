@@ -11,75 +11,50 @@
 //! Target query: h2o.ai q2 (`SELECT id2, SUM(v1), SUM(v2) FROM x GROUP BY id2`)
 //! at medium-to-high cardinality (1k < n_groups <= 100M).
 //!
-//! ## Design choice: multi-call scatter vs multi-value kernel
+//! ## Design choice: deterministic dest_idx + indexed value scatter
 //!
-//! The existing single-value scatter kernel writes one `(key, val)` pair per
-//! row. For N value columns we have two options:
+//! For N value columns sharing one key column we need every column's row `i`
+//! to land in the **same** destination slot, so the per-key tuple
+//! `(key, v0, v1, …, v_{N-1})` stays aligned. The naive approach — call the
+//! atomic-claim scatter kernel N times with identical inputs — looks like it
+//! should produce identical placements, but ordering of concurrent
+//! `atomicAdd` calls is **not** part of the CUDA contract. Any driver
+//! release, warp-scheduler tweak, or block-count change can permute the
+//! order, silently misaligning value columns against the key. That is the
+//! kind of bug a regression test only catches by luck.
 //!
-//!   (a) Call the existing scatter kernel N times, once per value column,
-//!       producing one scattered-value buffer per aggregate. This adds
-//!       `(N-1) * (1 kernel launch + 1 D2H of an f64 column)` over the
-//!       single-SUM cost; at h2o.ai N=10M, n_vals=2, each f64 column is
-//!       ~80 MB so ~16 ms of D2H + 2 scatter launches. Total well under the
-//!       100 ms budget.
+//! We avoid the assumption entirely by making the destination slot
+//! deterministic by construction:
 //!
-//!   (b) Write a new multi-value scatter kernel that fans N values per row in
-//!       one pass. Saves N-1 launches but requires a new PTX emitter and
-//!       parameter-passing path for variable N — overkill for v0.
+//!   1. **One** atomic-claim pass ([`scatter_with_dest_idx_kernel`])
+//!      computes, for every input row, the destination slot
+//!      `dest_idx[i] = offsets[pid_i] + atomicAdd(cursors[pid_i], 1)` and
+//!      writes it to a `dest_idx[n_rows]` buffer. The same launch also
+//!      writes the key column to `scatter_keys[dest_idx[i]]`. The atomic
+//!      now happens exactly once per row, in exactly one kernel — there is
+//!      no opportunity for cross-launch divergence.
 //!
-//! We pick (a). The partition pass is run **once** (not N times) since
-//! `partition_ids[i]` depends only on `keys[i]`. Likewise the offsets are
-//! computed once. The scatter kernel itself uses the partition_cursors output
-//! to claim slots — and that's the subtle part: the *scatter order* across N
-//! calls must be identical, otherwise scattered-value column j and scattered-
-//! value column k would not be aligned to the same key for row i.
+//!   2. For each value column `j` we launch
+//!      [`scatter_values_by_dest_idx_kernel`]: a tiny, **atomic-free**
+//!      kernel that does `out_vals[dest_idx[i]] = vals[j][i]`. Because
+//!      `dest_idx` is read, not recomputed, every value column lands at
+//!      the slot the key already occupies. Alignment is now a property of
+//!      the data, not of the GPU's atomic scheduler.
 //!
-//! We achieve identical ordering by re-running the partition pass cursors
-//! fresh for each scatter call (zero-init `partition_cursors`) and feeding
-//! the **same** `partition_ids` + `offsets` inputs. As long as the scatter
-//! kernel resolves ties deterministically (which it does — it uses
-//! `atomicAdd` on `partition_cursors[pid]`, which under a fixed launch
-//! configuration produces a deterministic-per-kernel-invocation order on a
-//! given GPU — but we MUST scatter the keys alongside each value so we can
-//! verify the alignment is correct, OR re-key once and reuse the key
-//! buffer across all N scatter calls).
-//!
-//! The safest correctness-preserving approach: scatter the **keys** once
-//! along with `v0`. For `v1..v_{N-1}` we re-launch scatter, but we discard
-//! the key output (overwriting the same scatter_keys buffer each time) and
-//! **rely on the fact that calling scatter with identical `partition_ids`,
-//! identical `offsets`, and a zeroed `partition_cursors` yields the same
-//! per-row write slot every time** — because each row's destination index is
-//! `offsets[pid_i] + atomicAdd(&partition_cursors[pid_i], 1)`, and the
-//! atomicAdd order across threads is what determines the cursor value, and
-//! a fixed thread-block configuration on the same GPU produces deterministic
-//! order. This is documented behaviour for CUDA atomics under the same
-//! launch on the same hardware, NOT cross-device deterministic.
-//!
-//! To be paranoid about this — and to avoid relying on atomicAdd ordering at
-//! all — we instead **pre-compute the destination index for each row once**
-//! by running scatter for column 0 with a "key-only" output, then... no, the
-//! cleanest construction is: scatter ONCE for `keys + v0`, then for each
-//! additional `v_j` scatter again with the same `keys` input (we don't
-//! actually need the key output, but the kernel signature requires one — we
-//! pass a throwaway buffer). Because the scatter kernel does
-//! `out[offsets[pid] + atomicAdd(cursors[pid], 1)] = (keys[tid], vals[tid])`
-//! and all parameters except `vals` and the value-output are identical
-//! across calls, and CUDA atomic operations within a single kernel launch
-//! on the same launch configuration produce a stable per-invocation slot
-//! assignment **on a given device**, we get aligned outputs.
-//!
-//! This atomic-order assumption is the one piece of correctness-fragility in
-//! the design. Tier-2.1 (a real multi-value kernel) eliminates it. Until
-//! then, the host-side pass-2 loop walks aligned slices and any misalignment
-//! would surface as wrong sums in the regression tests.
+//! Cost relative to the old N-scatter design: identical launch count
+//! (1 atomic-claim + N indexed scatters ≈ N scatters), one extra
+//! `u32 * n_rows` buffer (`dest_idx`), and the indexed-scatter kernel is
+//! cheaper than the original (no atomics, no offsets table loads).
 
 // HashMap removed: pass-2 now runs on the GPU via partition_reduce_kernel_multi.
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::partition_offsets;
-use crate::jit::{partition_kernel, partition_reduce_kernel_multi, scatter_kernel, CudaModule};
+use crate::jit::{
+    partition_kernel, partition_reduce_kernel_multi, scatter_values_by_dest_idx_kernel,
+    scatter_with_dest_idx_kernel, CudaModule,
+};
 
 /// Tier-2 multi-SUM partial result: one `(keys, sums_per_value_column)` pair
 /// per partition.
@@ -191,73 +166,68 @@ pub fn execute_tier2_multi_sum(
     }
 
     // ----------------------------------------------------------------------
-    // Step 4. Allocate scatter outputs: one shared i32 key buffer + n_vals
-    // f64 value buffers. Each scatter call (re-)writes its dedicated value
-    // buffer and also writes the same key buffer (it's required by the
-    // scatter kernel signature; we keep only the first call's output).
+    // Step 4. Allocate scatter outputs.
     //
-    // Upload offsets once and reuse across all N scatter calls.
+    //   - `scatter_keys[n_rows]`  i32: keys placed at their final slot
+    //   - `scatter_vals[j][n_rows]` f64: values for column j placed at slot
+    //   - `dest_idx[n_rows]`       u32: the slot index each row claimed,
+    //                                   written by the atomic-claim pass and
+    //                                   read by every indexed value-scatter
+    //                                   pass. This is the load-bearing
+    //                                   correctness primitive — it captures
+    //                                   the atomic-claim ordering exactly
+    //                                   once so every value column lands in
+    //                                   lockstep with the key column.
+    //   - `partition_cursors[K]`   u32: zero-init; the atomic-claim pass
+    //                                   bumps it. Not reused after that.
+    //
+    // Upload offsets once.
     // ----------------------------------------------------------------------
     let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros(n_rows as usize)?;
     let mut scatter_vals: Vec<GpuVec<f64>> = Vec::with_capacity(n_vals);
     for _ in 0..n_vals {
         scatter_vals.push(GpuVec::<f64>::zeros(n_rows as usize)?);
     }
+    let mut dest_idx: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
+    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
 
     let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
 
     // ----------------------------------------------------------------------
-    // Step 5. JIT the scatter kernel (one PTX, reused across all N calls).
-    // ----------------------------------------------------------------------
-    let scatter_ptx = scatter_kernel::compile_scatter_kernel()?;
-    let scatter_module = CudaModule::from_ptx(&scatter_ptx)?;
-    let scatter_fn = scatter_module.function(scatter_kernel::KERNEL_ENTRY)?;
-
-    // ----------------------------------------------------------------------
-    // Step 6. Launch scatter N times, once per value column.
+    // Step 5. Atomic-claim pass — runs ONCE.
     //
-    // For each call we MUST re-zero `partition_cursors` so the per-partition
-    // slot allocation starts at 0 again — otherwise call j would write into
-    // slots [m_k, 2*m_k) of partition k, past the partition's valid range.
+    // Writes:
+    //   - dest_idx[i] = offsets[pid_i] + atomicAdd(cursors[pid_i], 1)
+    //   - scatter_keys[dest_idx[i]] = keys[i]
     //
-    // The scatter destination for row i in call j is
-    //   dst_j[i] = offsets[pid_i] + cursor_j_at_time_of_write_for_row_i
-    // and we assume across the N calls this resolves to identical dst across
-    // j — see module-level docs for the atomic-ordering reasoning.
+    // This is the only place an atomic-ordered slot assignment happens.
+    // After this kernel returns, `dest_idx` is the canonical row→slot map.
     // ----------------------------------------------------------------------
-    for j in 0..n_vals {
-        // Fresh partition_cursors per iteration: zeroed cursor state is
-        // required so each scatter call writes into slots [0..m_k) of each
-        // partition. Same semantics as the original code.
-        let mut partition_cursors: GpuVec<u32> =
-            GpuVec::<u32>::zeros(num_partitions as usize)?;
+    let claim_ptx =
+        scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel()?;
+    let claim_module = CudaModule::from_ptx(&claim_ptx)?;
+    let claim_fn = claim_module.function(scatter_with_dest_idx_kernel::KERNEL_ENTRY)?;
 
-        // Split-borrow on `scatter_vals` so we can hold `scatter_keys` mutably
-        // alongside `scatter_vals[j]` mutably in the same args list.
-        let (sv_j_slice, _) = scatter_vals.split_at_mut(j + 1);
-        let scatter_vals_j = &mut sv_j_slice[j];
-
+    {
         let view_keys = keys.view();
-        let view_vals = vals[j].view();
         let view_pid = partition_ids.view();
         let view_offsets = offsets_gpu.view();
         let mut view_cursors = partition_cursors.view_mut();
         let mut view_sk = scatter_keys.view_mut();
-        let mut view_sv = scatter_vals_j.view_mut();
+        let mut view_di = dest_idx.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_keys);
-        args.push_input(&view_vals);
         args.push_input(&view_pid);
         args.push_input(&view_offsets);
         args.push_output(&mut view_cursors);
         args.push_output(&mut view_sk);
-        args.push_output(&mut view_sv);
+        args.push_output(&mut view_di);
         args.push_scalar_u32(n_rows);
 
         let stream = CudaStream::null();
         launch_with_geometry(
-            scatter_fn,
+            claim_fn,
             grid_blocks,
             BLOCK_THREADS,
             0,
@@ -265,6 +235,53 @@ pub fn execute_tier2_multi_sum(
             &mut args,
         )?;
     }
+
+    // ----------------------------------------------------------------------
+    // Step 6. Indexed value scatter — runs N times, one per value column.
+    //
+    // Each launch reads dest_idx[i] (deterministic) and writes
+    //   scatter_vals[j][dest_idx[i]] = vals[j][i]
+    // with NO atomics. Because dest_idx is fixed at this point, every
+    // column's row i lands in the same slot as the key — alignment is
+    // guaranteed by construction.
+    // ----------------------------------------------------------------------
+    let val_scatter_ptx =
+        scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel()?;
+    let val_scatter_module = CudaModule::from_ptx(&val_scatter_ptx)?;
+
+    for j in 0..n_vals {
+        let val_scatter_fn =
+            val_scatter_module.function(scatter_values_by_dest_idx_kernel::KERNEL_ENTRY)?;
+
+        // Split-borrow on `scatter_vals` so we can hold `scatter_vals[j]`
+        // mutably alongside the immutable inputs in the same args list.
+        let (sv_j_slice, _) = scatter_vals.split_at_mut(j + 1);
+        let scatter_vals_j = &mut sv_j_slice[j];
+
+        let view_vals = vals[j].view();
+        let view_dest = dest_idx.view();
+        let mut view_sv = scatter_vals_j.view_mut();
+
+        let mut args = KernelArgs::empty();
+        args.push_input(&view_vals);
+        args.push_input(&view_dest);
+        args.push_output(&mut view_sv);
+        args.push_scalar_u32(n_rows);
+
+        let stream = CudaStream::null();
+        launch_with_geometry(
+            val_scatter_fn,
+            grid_blocks,
+            BLOCK_THREADS,
+            0,
+            &stream,
+            &mut args,
+        )?;
+    }
+
+    // Silence unused-mut on partition_cursors after the single atomic-claim
+    // launch (we don't read or reset it again).
+    let _ = &partition_cursors;
 
     // ----------------------------------------------------------------------
     // Step 7. Pass 2 — GPU per-partition dedup + N-way sum (Tier 2.1 multi).
