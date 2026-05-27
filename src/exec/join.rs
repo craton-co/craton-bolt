@@ -416,9 +416,27 @@ fn execute_cross_join(
         )));
     }
 
-    // Build paired indices: for each left row r_l, emit every right row
-    // r_r in 0..n_right. That gives left = [0;n_right]+[1;n_right]+...,
-    // right = (0..n_right).repeat(n_left).
+    // Stage-3 GPU CROSS fast path. Gates:
+    //   * Total cells in [CROSS_JOIN_GPU_MIN_CELLS, CROSS_JOIN_GPU_CELL_CAP).
+    //   * GPU available (errors fall through to host).
+    if total >= crate::exec::gpu_join::CROSS_JOIN_GPU_MIN_CELLS
+        && total < crate::exec::gpu_join::CROSS_JOIN_GPU_CELL_CAP
+    {
+        match crate::exec::gpu_join::execute_cross_join_on_gpu(
+            &lhs,
+            &rhs,
+            arrow_schema.clone(),
+        ) {
+            Ok(batch) => return Ok(QueryHandle::from_record_batch(batch)),
+            Err(e) => {
+                log::debug!(
+                    "gpu_join: CROSS GPU path declined ({e}); falling back to host"
+                );
+            }
+        }
+    }
+
+    // Host fallback: pair indices by row-major iteration.
     let total = total as usize;
     let mut left_pairs: Vec<u32> = Vec::with_capacity(total);
     let mut right_pairs: Vec<u32> = Vec::with_capacity(total);
@@ -832,15 +850,11 @@ fn try_gpu_inner_join(
         }
     }
 
-    // ---- Stage 2: multi-key + bool/float + duplicate build keys ----
+    // ---- Stage 2/3: multi-key + bool/float + duplicate build keys ----
     let shape = match gpu_key_shape_for(build_batch, build_idx) {
         Some(s) => s,
         None => return Ok(None),
     };
-    if !shape.is_exact_in_i64() {
-        // Lossy fold — host hash-join takes over to avoid false matches.
-        return Ok(None);
-    }
     // Both sides must have matching dtypes per column (sanity — the planner
     // already enforced this at the schema level).
     for (b, p) in build_idx.iter().zip(probe_idx.iter()) {
@@ -849,7 +863,28 @@ fn try_gpu_inner_join(
         }
     }
 
-    match crate::exec::gpu_join::execute_inner_join_on_gpu_with_shape(
+    // Stage-3 Utf8 path: single string key routes through the dedicated
+    // dict-interning entry point.
+    if matches!(shape, crate::jit::hash_join_kernel::KeyShape::SingleUtf8) {
+        match crate::exec::gpu_join::execute_utf8_inner_join_on_gpu(
+            lhs,
+            rhs,
+            build_is_left,
+            build_idx[0],
+            probe_idx[0],
+            arrow_schema.clone(),
+        ) {
+            Ok(batch) => return Ok(Some(batch)),
+            Err(e) => {
+                log::debug!("gpu_join: Utf8 path declined ({e}); falling back to host");
+                return Ok(None);
+            }
+        }
+    }
+
+    // Stage-2 exact + Stage-3 lossy-fold (post-verify) both go through the
+    // verify-aware entry point. For exact shapes the verify is a no-op.
+    match crate::exec::gpu_join::execute_inner_join_on_gpu_with_shape_and_verify(
         lhs,
         rhs,
         build_is_left,
@@ -860,7 +895,7 @@ fn try_gpu_inner_join(
     ) {
         Ok(batch) => Ok(Some(batch)),
         Err(e) => {
-            log::debug!("gpu_join: Stage-2 path declined ({e}); falling back to host");
+            log::debug!("gpu_join: Stage-2/3 path declined ({e}); falling back to host");
             Ok(None)
         }
     }
@@ -974,6 +1009,9 @@ fn gpu_key_shape_for(
             ArrowDataType::Boolean => Some(KeyShape::SingleBool),
             ArrowDataType::Float32 => Some(KeyShape::SingleF32),
             ArrowDataType::Float64 => Some(KeyShape::SingleF64),
+            // Stage-3: Utf8 keys go through string interning to i32 dict
+            // indices before reaching the kernel.
+            ArrowDataType::Utf8 => Some(KeyShape::SingleUtf8),
             _ => None,
         },
         2 => {
