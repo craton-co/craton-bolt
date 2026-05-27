@@ -236,11 +236,33 @@ fn cte_unsupported() {
 }
 
 #[test]
-fn qualified_column_unsupported() {
+fn qualified_column_resolves() {
+    // `table.col` references are now supported in the SELECT list (and WHERE,
+    // GROUP BY, HAVING) for both single-table queries and JOINs. This used to
+    // be rejected with "qualified column references (no table aliases yet)";
+    // the negative coverage moved to `qualified_column_unknown_table` and
+    // `qualified_column_unknown_field` below.
     let provider = fixture_table();
     let res = try_plan("SELECT sales.region_id FROM sales", &provider);
-    // Frontend says "qualified column references (no table aliases yet)".
-    assert_err_contains(res, "qualified");
+    assert!(res.is_ok(), "qualified column should resolve: {res:?}");
+}
+
+#[test]
+fn qualified_column_unknown_table_errors() {
+    // Qualifier must match the (only) FROM table. A stray qualifier produces a
+    // clean "unknown table qualifier" message rather than a downstream
+    // "unknown column" surprise.
+    let provider = fixture_table();
+    let res = try_plan("SELECT t3.region_id FROM sales", &provider);
+    assert_err_contains(res, "unknown table qualifier");
+}
+
+#[test]
+fn qualified_column_unknown_field_errors() {
+    // Qualifier is valid; column name isn't part of that table's schema.
+    let provider = fixture_table();
+    let res = try_plan("SELECT sales.nope FROM sales", &provider);
+    assert_err_contains(res, "unknown column 'nope'");
 }
 
 #[test]
@@ -278,4 +300,174 @@ fn aggregate_alias_rejected() {
     let provider = fixture_table();
     let res = try_plan("SELECT SUM(qty) AS total FROM sales", &provider);
     assert_err_contains(res, "alias");
+}
+
+// ---- INNER JOIN qualified-column resolution --------------------------------
+//
+// These cover the `SELECT t.col FROM t1 JOIN t2 ON ...` usability path that
+// was rejected before: the wildcard expansion emits `right.a` for the
+// colliding right-side column, but users couldn't *type* either qualifier.
+// The fixture `join_provider` deliberately uses different shapes so each
+// test exercises a distinct branch of `NameResolver`.
+
+/// Two tables with one shared join key `k` and one non-shared payload column
+/// each (`a` on `t1`, `b` on `t2`). Useful for the "no collision in SELECT
+/// list" path.
+fn join_provider() -> MemTableProvider {
+    let t1 = Schema::new(vec![
+        Field {
+            name: "k".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "a".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+    ]);
+    let t2 = Schema::new(vec![
+        Field {
+            name: "k".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "b".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+    ]);
+    MemTableProvider::new()
+        .with_table("t1", t1)
+        .with_table("t2", t2)
+}
+
+/// Two tables that both have an `a` column (besides the join key) — exercises
+/// the rename-on-collision path: `a` resolves to t1's column, `t2.a` must
+/// resolve to the renamed `right.a` output column.
+fn join_provider_collision() -> MemTableProvider {
+    let t1 = Schema::new(vec![
+        Field {
+            name: "k".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "a".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+    ]);
+    let t2 = Schema::new(vec![
+        Field {
+            name: "k".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "a".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+    ]);
+    MemTableProvider::new()
+        .with_table("t1", t1)
+        .with_table("t2", t2)
+}
+
+#[test]
+fn join_select_left_qualified() {
+    // `t1.a` resolves through the base-table scope: column `a` is unique to
+    // t1, so the resolver maps it to plain `a` (its output name in the join
+    // schema). This worked before the fix in the ON path, but not in SELECT.
+    let provider = join_provider();
+    let res = try_plan(
+        "SELECT t1.a FROM t1 INNER JOIN t2 ON t1.k = t2.k",
+        &provider,
+    );
+    assert!(res.is_ok(), "SELECT t1.a should work: {res:?}");
+}
+
+#[test]
+fn join_select_right_qualified_no_collision() {
+    // `t2.b` resolves through the joined-table scope. `b` is unique to t2
+    // so it keeps its bare name in the join schema. Pre-fix the frontend
+    // rejected this with "unsupported: qualified column references".
+    let provider = join_provider();
+    let res = try_plan(
+        "SELECT t2.b FROM t1 INNER JOIN t2 ON t1.k = t2.k",
+        &provider,
+    );
+    assert!(res.is_ok(), "SELECT t2.b should work: {res:?}");
+}
+
+#[test]
+fn join_select_both_sides_colliding_name() {
+    // Both tables expose an `a`. The SELECT list names both — t1.a maps to
+    // `a` (left wins the bare name), t2.a maps to `right.a` (the rename
+    // applied by `join_combined_schema`). The Project must produce two
+    // distinct columns, not collapse them.
+    let provider = join_provider_collision();
+    let res = try_plan(
+        "SELECT t1.a, t2.a FROM t1 INNER JOIN t2 ON t1.k = t2.k",
+        &provider,
+    );
+    assert!(
+        res.is_ok(),
+        "SELECT t1.a, t2.a on colliding-name JOIN should work: {res:?}"
+    );
+}
+
+#[test]
+fn join_select_bare_colliding_name_picks_left() {
+    // A bare `a` reference is unambiguous *post-rename*: only t1's column
+    // keeps the name `a` (t2's `a` was renamed to `right.a`). So bare `a`
+    // silently picks the left side — same as the pre-fix behaviour for
+    // `SELECT *` followed by `SELECT a`. Documented here as a positive test
+    // so a future "make bare collision an error" change has to consciously
+    // update this expectation.
+    let provider = join_provider_collision();
+    let res = try_plan(
+        "SELECT a FROM t1 INNER JOIN t2 ON t1.k = t2.k",
+        &provider,
+    );
+    assert!(res.is_ok(), "bare `a` should resolve to left side: {res:?}");
+}
+
+#[test]
+fn join_select_unknown_qualifier_errors() {
+    // `t3` is not in the FROM list at all — produce a clean "unknown table
+    // qualifier" error rather than a downstream "unknown column" surprise.
+    let provider = join_provider();
+    let res = try_plan(
+        "SELECT t3.x FROM t1 INNER JOIN t2 ON t1.k = t2.k",
+        &provider,
+    );
+    assert_err_contains(res, "unknown table qualifier");
+}
+
+#[test]
+fn join_select_unknown_column_in_known_table_errors() {
+    // Qualifier matches, but the column isn't in that table's schema. The
+    // message must name the column and the table so users can spot the
+    // typo immediately.
+    let provider = join_provider();
+    let res = try_plan(
+        "SELECT t2.zzz FROM t1 INNER JOIN t2 ON t1.k = t2.k",
+        &provider,
+    );
+    assert_err_contains(res, "unknown column 'zzz'");
+}
+
+#[test]
+fn join_where_uses_qualified_column() {
+    // Qualified refs in WHERE go through the same resolver as SELECT items.
+    // Pre-fix this would error at the WHERE clause.
+    let provider = join_provider();
+    let res = try_plan(
+        "SELECT t1.a FROM t1 INNER JOIN t2 ON t1.k = t2.k WHERE t2.b > 0",
+        &provider,
+    );
+    assert!(res.is_ok(), "WHERE with qualified column should work: {res:?}");
 }
