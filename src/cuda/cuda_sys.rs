@@ -59,6 +59,10 @@ extern "C" {
     pub fn cuCtxCreate_v2(pctx: *mut CUcontext, flags: c_uint, dev: CUdevice) -> CUresult;
     pub fn cuCtxDestroy_v2(ctx: CUcontext) -> CUresult;
     pub fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
+    // Stage-4 (GJ): query the device handle bound to the calling thread's
+    // current CUDA context. Needed by `gpu_join::resolve_byte_cap_from_driver`
+    // so multi-GPU rigs detect the right card's VRAM cap.
+    pub fn cuCtxGetDevice(device: *mut CUdevice) -> CUresult;
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
     pub fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> CUresult;
@@ -138,6 +142,8 @@ mod stubs {
     pub unsafe fn cuCtxCreate_v2(_pctx: *mut CUcontext, _flags: c_uint, _dev: CUdevice) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuCtxDestroy_v2(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuCtxSetCurrent(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
+    // Stage-4 (GJ): mirror of the production `cuCtxGetDevice` for stub builds.
+    pub unsafe fn cuCtxGetDevice(_device: *mut CUdevice) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemAlloc_v2(_dptr: *mut CUdeviceptr, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemFree_v2(_dptr: CUdeviceptr) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemAllocHost_v2(_pp: *mut *mut c_void, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
@@ -315,6 +321,27 @@ pub fn device_name(dev: CUdevice) -> BoltResult<String> {
     // Buffer is NUL-terminated by the driver; find the terminator ourselves to be safe.
     let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
     Ok(cstr.to_string_lossy().trim_end_matches('\0').to_string())
+}
+
+/// Stage-4 (GJ): return the device ordinal bound to the calling thread's
+/// current CUDA context. Thin safe wrapper over `cuCtxGetDevice`.
+///
+/// The driver pins a CUDA context to a specific device at creation time, and
+/// `cuCtxSetCurrent` binds a context to the calling thread. This wrapper is
+/// the cheap way to discover which physical device the engine is talking to
+/// without having to thread a `CUdevice` handle through every layer.
+///
+/// Used by `crate::exec::gpu_join::resolve_byte_cap_from_driver` so multi-GPU
+/// rigs detect the right card's VRAM cap (the Stage-2 placeholder hardcoded
+/// device 0, which was correct on single-GPU rigs but wrong when the engine
+/// is bound to ordinal 1+).
+///
+/// Returns `Err` when no context is current on the calling thread (driver
+/// error `CUDA_ERROR_INVALID_CONTEXT`).
+pub(crate) fn current_device() -> BoltResult<i32> {
+    let mut dev: CUdevice = 0;
+    check(unsafe { cuCtxGetDevice(&mut dev) })?;
+    Ok(dev as i32)
 }
 
 /// Owned CUDA context. Thread-pinned by the driver: `Send` but not `Sync`.
