@@ -27,7 +27,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -140,34 +140,54 @@ fn build_one_aggregate(
             let scalar = reduce_column_from_batch(op, col_io, table_batch, n_rows)?;
             scalar_to_array(scalar, out_field.dtype)
         }
-        AggregateExpr::Count(_) => {
-            // COUNT(*) / COUNT(expr) with no NULL handling: just the row count.
-            // Implement via a SUM over a synthesized all-ones Int64 column.
-            // Inefficient but correct; will become a real path once NULL
-            // handling lands.
-            let ones: Vec<i64> = vec![1i64; n_rows];
-            let scalar =
-                reduce_host_slice::<i64>(ReduceOp::Sum, DataType::Int64, &ones)?;
-            scalar_to_array(scalar, out_field.dtype)
+        AggregateExpr::Count(expr) => {
+            // COUNT(col) excludes NULL inputs; COUNT(*) (with a literal-ish
+            // expression that doesn't resolve to a column) returns the row
+            // count. We mirror the SQL standard: if the expression is a bare
+            // column reference, count non-null rows of that column; otherwise
+            // count every row.
+            let count: i64 = match bare_column_name(expr)
+                .ok()
+                .and_then(|name| resolve_input(inputs, name).ok())
+            {
+                Some(col_io) => non_null_count_for_input(col_io, table_batch)? as i64,
+                None => n_rows as i64,
+            };
+            scalar_to_array(Scalar::I64(count), out_field.dtype)
         }
         AggregateExpr::Avg(expr) => {
-            // AVG = SUM(expr) / COUNT(expr), both computed on the GPU then
-            // divided on the host. The output is always Float64.
+            // AVG = SUM(expr) / COUNT(expr) where COUNT is the non-NULL count
+            // of the input column (NOT the row count). Both computed on the
+            // GPU then divided on the host. The output is always Float64.
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
             let sum_scalar =
                 reduce_column_from_batch(ReduceOp::Sum, col_io, table_batch, n_rows)?;
             let sum_f64 = scalar_to_f64(sum_scalar)?;
 
-            let ones: Vec<i64> = vec![1i64; n_rows];
-            let count_scalar =
-                reduce_host_slice::<i64>(ReduceOp::Sum, DataType::Int64, &ones)?;
-            let count_f64 = scalar_to_f64(count_scalar)?;
+            // Denominator is the non-NULL row count of the input column.
+            let count_f64 = non_null_count_for_input(col_io, table_batch)? as f64;
 
             let avg = if count_f64 == 0.0 { 0.0 } else { sum_f64 / count_f64 };
             scalar_to_array(Scalar::F64(avg), out_field.dtype)
         }
     }
+}
+
+/// Count of non-NULL rows for `col_io` in `batch`. Used by COUNT(col) and as
+/// the AVG denominator so neither includes garbage at NULL positions.
+fn non_null_count_for_input(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+) -> BoltResult<usize> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "aggregate input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+    Ok(arr.len() - arr.null_count())
 }
 
 /// Borrow the inner expression of an `AggregateExpr`, regardless of variant.
@@ -234,22 +254,42 @@ fn reduce_column_from_batch(
         )));
     }
 
+    // NULL handling: when `null_count > 0` the raw `.values()` buffer carries
+    // garbage at NULL positions which would be silently included in
+    // SUM/MIN/MAX. We detect that case and filter to a host vector of just the
+    // non-null values before uploading; the GPU reduction then operates on a
+    // post-filter prefix matching the natural identity (0 for SUM, +inf for
+    // MIN, -inf for MAX) at the (zero) NULL positions. The fast path stays
+    // zero-copy via `primitive_to_gpu` when there are no nulls.
+    let has_nulls = arr.null_count() > 0;
+
     match col_io.dtype {
         DataType::Int32 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
-            let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
             // SUM(Int32) widens to Int64 (see
             // `crate::plan::logical_plan::sum_output_dtype`): the GPU kernel
             // sign-extends each value and accumulates in s64, so the partials
             // buffer and host-side finalization must also be i64. MIN/MAX
             // preserve the input dtype and use the i32 path.
-            if matches!(op, ReduceOp::Sum) {
-                reduce_gpu_vec_widened::<i32, i64>(op, col_io.dtype, &dev, n_rows)
+            if has_nulls {
+                let host: Vec<i32> = filter_primitive_to_vec(pa);
+                let len = host.len();
+                if matches!(op, ReduceOp::Sum) {
+                    let dev = GpuVec::<i32>::from_slice(&host)?;
+                    reduce_gpu_vec_widened::<i32, i64>(op, col_io.dtype, &dev, len)
+                } else {
+                    reduce_host_slice::<i32>(op, col_io.dtype, &host)
+                }
             } else {
-                reduce_gpu_vec::<i32>(op, col_io.dtype, &dev, n_rows)
+                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                if matches!(op, ReduceOp::Sum) {
+                    reduce_gpu_vec_widened::<i32, i64>(op, col_io.dtype, &dev, n_rows)
+                } else {
+                    reduce_gpu_vec::<i32>(op, col_io.dtype, &dev, n_rows)
+                }
             }
         }
         DataType::Int64 => {
@@ -257,30 +297,64 @@ fn reduce_column_from_batch(
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
-            let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
-            reduce_gpu_vec::<i64>(op, col_io.dtype, &dev, n_rows)
+            if has_nulls {
+                let host: Vec<i64> = filter_primitive_to_vec(pa);
+                reduce_host_slice::<i64>(op, col_io.dtype, &host)
+            } else {
+                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                reduce_gpu_vec::<i64>(op, col_io.dtype, &dev, n_rows)
+            }
         }
         DataType::Float32 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
-            let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
-            reduce_gpu_vec::<f32>(op, col_io.dtype, &dev, n_rows)
+            if has_nulls {
+                let host: Vec<f32> = filter_primitive_to_vec(pa);
+                reduce_host_slice::<f32>(op, col_io.dtype, &host)
+            } else {
+                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                reduce_gpu_vec::<f32>(op, col_io.dtype, &dev, n_rows)
+            }
         }
         DataType::Float64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
-            let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
-            reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows)
+            if has_nulls {
+                let host: Vec<f64> = filter_primitive_to_vec(pa);
+                reduce_host_slice::<f64>(op, col_io.dtype, &host)
+            } else {
+                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows)
+            }
         }
         DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
     }
+}
+
+/// Copy the non-NULL values of an Arrow primitive array into a fresh `Vec`.
+/// Used in the `null_count > 0` path so the GPU reduction never sees garbage
+/// at masked positions. Order is preserved.
+fn filter_primitive_to_vec<P>(pa: &arrow_array::PrimitiveArray<P>) -> Vec<P::Native>
+where
+    P: arrow_array::types::ArrowPrimitiveType,
+    P::Native: Copy,
+{
+    let n = pa.len();
+    let mut out: Vec<P::Native> = Vec::with_capacity(n - pa.null_count());
+    let vals = pa.values();
+    for i in 0..n {
+        if !pa.is_null(i) {
+            out.push(vals[i]);
+        }
+    }
+    out
 }
 
 /// Upload a host slice, then run the standard GPU reduction over it. Used by
@@ -618,4 +692,104 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Host-only tests for the NULL-handling helpers. The full
+// `execute_aggregate` path needs the GPU and is exercised by the integration
+// suite; what we pin here is exactly the NULL bookkeeping that landed with
+// the H1 fix: COUNT(col) excludes nulls, AVG denominator is the non-null
+// count, and the pre-GPU filter keeps the raw values buffer's garbage bytes
+// out of the reduction.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: minimal single-column batch.
+    fn batch_one(name: &str, arr: ArrayRef) -> RecordBatch {
+        let dt = arr.data_type().clone();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(name, dt, true)]));
+        RecordBatch::try_new(schema, vec![arr]).expect("batch")
+    }
+
+    /// `filter_primitive_to_vec` drops NULL positions and preserves order for
+    /// the surviving values. Garbage at NULL positions in the underlying
+    /// values buffer (which Arrow doesn't zero) must not appear in the output.
+    #[test]
+    fn filter_primitive_drops_null_positions_i32() {
+        // The underlying values buffer for a NULL position is arbitrary; here
+        // it's `i32::MAX`, a value that would visibly corrupt MIN/SUM if it
+        // leaked through.
+        let arr = Int32Array::from(vec![
+            Some(1i32),
+            None,
+            Some(2),
+            None,
+            Some(3),
+            None,
+        ]);
+        let host = filter_primitive_to_vec::<arrow_array::types::Int32Type>(&arr);
+        assert_eq!(host, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn filter_primitive_drops_null_positions_f64() {
+        let arr = Float64Array::from(vec![Some(1.5f64), None, Some(2.5), Some(-3.0)]);
+        let host = filter_primitive_to_vec::<arrow_array::types::Float64Type>(&arr);
+        assert_eq!(host, vec![1.5, 2.5, -3.0]);
+    }
+
+    #[test]
+    fn filter_primitive_no_nulls_returns_full_vec() {
+        let arr = Int64Array::from(vec![10i64, 20, 30]);
+        let host = filter_primitive_to_vec::<arrow_array::types::Int64Type>(&arr);
+        assert_eq!(host, vec![10, 20, 30]);
+    }
+
+    /// `non_null_count_for_input` returns the count of non-null cells. This
+    /// drives both COUNT(col) and the AVG denominator.
+    #[test]
+    fn non_null_count_for_input_counts_only_valid_rows() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+            None,
+            Some(5),
+        ]));
+        let batch = batch_one("v", arr);
+        let col_io = ColumnIO {
+            name: "v".to_string(),
+            dtype: DataType::Int32,
+        };
+        let c = non_null_count_for_input(&col_io, &batch).expect("count ok");
+        assert_eq!(c, 3);
+    }
+
+    #[test]
+    fn non_null_count_for_input_all_nulls_is_zero() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![
+            Option::<i64>::None,
+            None,
+            None,
+        ]));
+        let batch = batch_one("v", arr);
+        let col_io = ColumnIO {
+            name: "v".to_string(),
+            dtype: DataType::Int64,
+        };
+        assert_eq!(non_null_count_for_input(&col_io, &batch).unwrap(), 0);
+    }
+
+    #[test]
+    fn non_null_count_for_input_no_nulls_is_full() {
+        let arr: ArrayRef = Arc::new(Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]));
+        let batch = batch_one("v", arr);
+        let col_io = ColumnIO {
+            name: "v".to_string(),
+            dtype: DataType::Float32,
+        };
+        assert_eq!(non_null_count_for_input(&col_io, &batch).unwrap(), 4);
+    }
 }

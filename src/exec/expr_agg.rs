@@ -62,6 +62,17 @@
 //! on. (We chose IEEE for floats because the device path also relies on
 //! IEEE behaviour; tagging those as `None` would diverge from the GPU.)
 //!
+//! TODO(h1): this module correctly propagates NULL as `Option<T>` end-to-end,
+//! but its callers (`agg_with_pre::from_expr_host`, `groupby_with_pre::
+//! from_expr_host`) collapse `None` into the dtype zero before feeding the
+//! GPU reduction. Those collapse points were the original H1 bug source for
+//! the pre-projection paths. The fix landed there as part of the C2/C2b
+//! work: the NULL rows are now filtered upstream of `eval_expr` via the
+//! predicate mask, so by the time `from_expr_host` runs no `None` should
+//! ever remain. Callers that bypass the pre-stage (e.g. a future inline
+//! evaluator on top of the classic groupby path) must replicate the same
+//! filter-then-evaluate ordering or they will reintroduce the bug.
+//!
 //! ## Tests
 //!
 //! Self-contained unit tests live in the `#[cfg(test)] mod tests` at the
