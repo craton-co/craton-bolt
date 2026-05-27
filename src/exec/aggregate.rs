@@ -312,7 +312,12 @@ where
     let block = BLOCK_SIZE;
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
-    let partials = GpuVec::<T>::zeros(grid_x as usize)?;
+
+    // Stage 3: mint a per-call stream and async-zero the partials buffer
+    // on it. Kernel + D2H land on the same stream, so the memset/launch/
+    // download chain serializes correctly without an explicit barrier.
+    let stream = CudaStream::null_or_default();
+    let partials = GpuVec::<T>::zeros_async(grid_x as usize, stream.raw())?;
 
     // Compile + load the kernel.
     let ptx = compile_reduction_kernel(op, dtype)?;
@@ -329,7 +334,6 @@ where
         &mut n_rows_u32 as *mut u32 as *mut c_void,
     ];
 
-    let stream = CudaStream::null();
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
@@ -345,15 +349,20 @@ where
             ptr::null_mut(),
         ))?;
     }
-    stream.synchronize()?;
 
     // The `_` writes are immediately superseded; silence the lints by reading
     // them post-launch in case a future reordering relies on the values.
     let _ = input_ptr;
     let _ = output_ptr;
 
-    // Download the per-block partials and finish the reduction on the host.
-    let host_partials = partials.to_vec()?;
+    // Stage 3: async D2H into a pinned host buffer, sync once, then copy
+    // into a regular Vec for the host-side finalization. The pinned hop
+    // lets the driver DMA directly without staging through a bounce
+    // buffer.
+    let pinned = partials.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_partials: Vec<T> = pinned.as_slice().to_vec();
+    drop(pinned);
     drop(partials);
     T::finalize(op, dtype, &host_partials)
 }
@@ -391,8 +400,10 @@ where
     let block = BLOCK_SIZE;
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
-    // Partials buffer is sized in accumulator elements.
-    let partials = GpuVec::<TAcc>::zeros(grid_x as usize)?;
+
+    // Stage 3: per-call stream + async-zero the (accumulator-sized) partials.
+    let stream = CudaStream::null_or_default();
+    let partials = GpuVec::<TAcc>::zeros_async(grid_x as usize, stream.raw())?;
 
     // Compile + load the kernel. The kernel takes the *input* dtype; it
     // internally widens to the accumulator dtype.
@@ -409,7 +420,6 @@ where
         &mut n_rows_u32 as *mut u32 as *mut c_void,
     ];
 
-    let stream = CudaStream::null();
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
@@ -425,12 +435,16 @@ where
             ptr::null_mut(),
         ))?;
     }
-    stream.synchronize()?;
 
     let _ = input_ptr;
     let _ = output_ptr;
 
-    let host_partials = partials.to_vec()?;
+    // Stage 3 pinned D2H: download partials directly into pinned memory,
+    // sync, then copy into a host Vec for the widened finalize.
+    let pinned = partials.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_partials: Vec<TAcc> = pinned.as_slice().to_vec();
+    drop(pinned);
     drop(partials);
     // Finalize at the accumulator dtype.
     let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);
@@ -618,4 +632,74 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Stage-3 round-trip tests. Existing aggregate semantics are
+    //! covered by the integration suite in `tests/e2e_tests.rs`; these
+    //! tests confirm that the async memcpy + pinned D2H plumbing
+    //! produces bit-identical results to the sync path it replaced.
+    // `super::*` is imported eagerly so the `#[ignore]`d tests can
+    // reach private helpers in the parent module; the warning fires
+    // under `cuda-stub` because every test inside is gated off.
+    #[allow(unused_imports)]
+    use super::*;
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDt, Field as ArrowFd, Schema as ArrowSc};
+    use std::sync::Arc;
+
+    fn one_col_batch(values: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(ArrowSc::new(vec![ArrowFd::new("v", ArrowDt::Int64, false)]));
+        let col = Arc::new(Int64Array::from(values));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_sum_int64_matches_host_sum() {
+        // Round-trip: build a small table, run SUM through the engine
+        // (which uses the Stage-3 async-memcpy reduction path here), and
+        // compare against an iterator sum.
+        use crate::Engine;
+
+        let mut engine = Engine::new().expect("ctx");
+        let xs: Vec<i64> = (0..10_000i64).collect();
+        let expected: i64 = xs.iter().sum();
+        let batch = one_col_batch(xs);
+        engine.register_table("t", batch).unwrap();
+        let h = engine.sql("SELECT SUM(v) FROM t").expect("execute");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 1);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), expected);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn pinned_d2h_matches_sync_d2h() {
+        // Allocate identical GPU buffers via `GpuVec::from_slice`, then
+        // pull one through the legacy sync path (`to_vec`) and one
+        // through the Stage-3 pinned path (`to_pinned_async` + sync +
+        // copy). The byte-for-byte equality check guards against a
+        // future regression where the pinned path drops or reorders
+        // elements.
+        use crate::cuda::GpuVec;
+        use crate::exec::launch::CudaStream;
+
+        let stream = CudaStream::null_or_default();
+        let xs: Vec<i32> = (0..1024i32).map(|i| i * 3 - 7).collect();
+        let v = GpuVec::<i32>::from_slice(&xs).expect("upload");
+
+        let via_sync = v.to_vec().expect("sync d2h");
+        let pinned = v.to_pinned_async(stream.raw()).expect("async d2h");
+        stream.synchronize().expect("sync");
+        let via_pinned: Vec<i32> = pinned.as_slice().to_vec();
+
+        assert_eq!(via_sync, via_pinned);
+    }
 }

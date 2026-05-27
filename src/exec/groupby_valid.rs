@@ -96,6 +96,36 @@ const SPILL_CAPACITY: usize = 4096;
 /// many real entries there are; this placeholder is purely defensive.
 const SPILL_EMPTY_KEY: i64 = i64::MIN;
 
+// ---------------------------------------------------------------------------
+// Stage-3 pinned D2H helpers for the accumulator-download path.
+// Mirrors the helpers in `groupby.rs`. See that module's doc for the
+// rationale.
+// ---------------------------------------------------------------------------
+
+fn download_pinned_i32(v: &GpuVec<i32>, stream: &CudaStream) -> BoltResult<Vec<i32>> {
+    let pinned = v.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().to_vec())
+}
+
+fn download_pinned_i64(v: &GpuVec<i64>, stream: &CudaStream) -> BoltResult<Vec<i64>> {
+    let pinned = v.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().to_vec())
+}
+
+fn download_pinned_f32(v: &GpuVec<f32>, stream: &CudaStream) -> BoltResult<Vec<f32>> {
+    let pinned = v.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().to_vec())
+}
+
+fn download_pinned_f64(v: &GpuVec<f64>, stream: &CudaStream) -> BoltResult<Vec<f64>> {
+    let pinned = v.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().to_vec())
+}
+
 /// Execute a GROUP BY plan using the sentinel-free (slot-valid-flag)
 /// protocol.
 ///
@@ -148,20 +178,31 @@ pub fn execute_groupby_valid(
         ))
     })?;
 
+    // Stage-3: per-call stream up front so all subsequent H2D / kernels /
+    // D2H land on the same ordering domain.
+    let stream = CudaStream::null_or_default();
+
     // Allocate keys table (arbitrary contents — slot_valid drives occupancy)
     // and the slot_valid table (zero-initialised = all slots empty).
+    //
+    // Stage-3: async H2D for the keys + key-column uploads. slot_valid is
+    // a pure zero buffer, so we use `zeros_async` (skips the host
+    // allocation entirely).
     let keys_init: Vec<i64> = vec![0i64; k];
-    let mut keys_table = GpuVec::<i64>::from_slice(&keys_init)?;
-    let slot_valid_init: Vec<u32> = vec![0u32; k];
-    let mut slot_valid = GpuVec::<u32>::from_slice(&slot_valid_init)?;
-    let key_col_gpu = GpuVec::<i64>::from_slice(&host_keys)?;
+    let mut keys_table = GpuVec::<i64>::from_slice_async(&keys_init, stream.raw())?;
+    let mut slot_valid = GpuVec::<u32>::zeros_async(k, stream.raw())?;
+    let key_col_gpu = GpuVec::<i64>::from_slice_async(&host_keys, stream.raw())?;
 
     // Allocate the keys-kernel spill buffers. The kernel writes to these
     // only when its bounded probe / spin loops overflow (extremely rare
     // under load factor < 0.5).
+    //
+    // Spill init uses async H2D for the keys buffer and a `zeros_async`
+    // for the single-element counter (cheap and dependency-ordered).
+    let spill_init: Vec<i64> = vec![SPILL_EMPTY_KEY; SPILL_CAPACITY];
     let mut keys_spill_keys =
-        GpuVec::<i64>::from_slice(&vec![SPILL_EMPTY_KEY; SPILL_CAPACITY])?;
-    let mut keys_spill_counter = GpuVec::<u32>::from_slice(&[0u32])?;
+        GpuVec::<i64>::from_slice_async(&spill_init, stream.raw())?;
+    let mut keys_spill_counter = GpuVec::<u32>::zeros_async(1, stream.raw())?;
     let max_spill_u32 = u32::try_from(SPILL_CAPACITY).map_err(|_| {
         BoltError::Other(format!(
             "SPILL_CAPACITY {} exceeds u32::MAX",
@@ -170,7 +211,6 @@ pub fn execute_groupby_valid(
     })?;
 
     // Launch the keys-only kernel.
-    let stream = CudaStream::null();
     launch_keys_kernel(
         &key_col_gpu,
         &mut keys_table,
@@ -204,10 +244,20 @@ pub fn execute_groupby_valid(
         acc_results.push(acc);
     }
 
-    // Download the keys + slot_valid tables; the latter drives "which slots
-    // are real groups" without relying on a sentinel.
-    let host_keys_table: Vec<i64> = keys_table.to_vec()?;
-    let host_slot_valid: Vec<u32> = slot_valid.to_vec()?;
+    // Stage-3: download keys table + slot_valid through pinned host
+    // buffers. The keys kernel synchronized the stream before
+    // returning, so the underlying device memory is already settled;
+    // these D2Hs just want the directly-DMAable pinned path.
+    let host_keys_table: Vec<i64> = {
+        let pinned = keys_table.to_pinned_async(stream.raw())?;
+        stream.synchronize()?;
+        pinned.as_slice().to_vec()
+    };
+    let host_slot_valid: Vec<u32> = {
+        let pinned = slot_valid.to_pinned_async(stream.raw())?;
+        stream.synchronize()?;
+        pinned.as_slice().to_vec()
+    };
     drop(keys_table);
     drop(slot_valid);
     drop(key_col_gpu);
@@ -215,6 +265,10 @@ pub fn execute_groupby_valid(
     // Download the keys-kernel spill. Any entries here represent rows
     // whose key never made it into the committed `keys_table` — we must
     // add them as new groups on the host.
+    //
+    // Counter download stays sync (single u32, not worth the pinned
+    // hop). Spill keys go through the pinned path when the counter
+    // indicates non-zero entries.
     let keys_spill_count_raw = keys_spill_counter.to_vec()?[0] as usize;
     if keys_spill_count_raw > SPILL_CAPACITY {
         return Err(BoltError::Other(format!(
@@ -225,8 +279,9 @@ pub fn execute_groupby_valid(
     }
     let keys_spill_count = keys_spill_count_raw.min(SPILL_CAPACITY);
     let host_keys_spill: Vec<i64> = if keys_spill_count > 0 {
-        let v = keys_spill_keys.to_vec()?;
-        v[..keys_spill_count].to_vec()
+        let pinned = keys_spill_keys.to_pinned_async(stream.raw())?;
+        stream.synchronize()?;
+        pinned.as_slice()[..keys_spill_count].to_vec()
     } else {
         Vec::new()
     };
@@ -943,10 +998,12 @@ fn run_one_aggregate(
 
         AggregateExpr::Count(_) => {
             // COUNT(*) over groups: synthesize an all-ones i64 input column.
+            // Stage-3: async H2D for the input + identity init; pinned
+            // D2H for the accumulator download below.
             let ones: Vec<i64> = vec![1i64; n_rows];
-            let input_gpu = GpuVec::<i64>::from_slice(&ones)?;
+            let input_gpu = GpuVec::<i64>::from_slice_async(&ones, stream.raw())?;
             let identity_init: Vec<i64> = vec![0i64; k];
-            let mut acc_table = GpuVec::<i64>::from_slice(&identity_init)?;
+            let mut acc_table = GpuVec::<i64>::from_slice_async(&identity_init, stream.raw())?;
             let (mut spill_keys, mut spill_values, mut spill_counter) =
                 alloc_agg_spill::<i64>()?;
             launch_agg_kernel::<i64>(
@@ -965,7 +1022,7 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
             )?;
-            let gpu_acc = acc_table.to_vec()?;
+            let gpu_acc = download_pinned_i64(&acc_table, stream)?;
             let spill = download_agg_spill(
                 spill_keys,
                 spill_values,
@@ -979,11 +1036,12 @@ fn run_one_aggregate(
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
 
-            // SUM(expr) cast to f64.
+            // SUM(expr) cast to f64. Stage-3: async H2D for inputs and
+            // identities; pinned D2H for the accumulator.
             let sum_input: Vec<f64> = load_input_column_as_f64(col_io, batch)?;
-            let input_gpu = GpuVec::<f64>::from_slice(&sum_input)?;
+            let input_gpu = GpuVec::<f64>::from_slice_async(&sum_input, stream.raw())?;
             let sum_init: Vec<f64> = vec![0.0f64; k];
-            let mut sum_acc = GpuVec::<f64>::from_slice(&sum_init)?;
+            let mut sum_acc = GpuVec::<f64>::from_slice_async(&sum_init, stream.raw())?;
             let (mut sum_spill_keys, mut sum_spill_values, mut sum_spill_counter) =
                 alloc_agg_spill::<f64>()?;
             launch_agg_kernel::<f64>(
@@ -1002,7 +1060,7 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
             )?;
-            let sum_host = sum_acc.to_vec()?;
+            let sum_host = download_pinned_f64(&sum_acc, stream)?;
             let sum_spill = download_agg_spill(
                 sum_spill_keys,
                 sum_spill_values,
@@ -1012,9 +1070,9 @@ fn run_one_aggregate(
 
             // COUNT(*) per group.
             let ones: Vec<i64> = vec![1i64; n_rows];
-            let count_input = GpuVec::<i64>::from_slice(&ones)?;
+            let count_input = GpuVec::<i64>::from_slice_async(&ones, stream.raw())?;
             let count_init: Vec<i64> = vec![0i64; k];
-            let mut count_acc = GpuVec::<i64>::from_slice(&count_init)?;
+            let mut count_acc = GpuVec::<i64>::from_slice_async(&count_init, stream.raw())?;
             let (mut cnt_spill_keys, mut cnt_spill_values, mut cnt_spill_counter) =
                 alloc_agg_spill::<i64>()?;
             launch_agg_kernel::<i64>(
@@ -1033,7 +1091,7 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
             )?;
-            let count_host = count_acc.to_vec()?;
+            let count_host = download_pinned_i64(&count_acc, stream)?;
             let count_spill = download_agg_spill(
                 cnt_spill_keys,
                 cnt_spill_values,
@@ -1099,9 +1157,9 @@ fn run_typed_agg(
             // input dtype and keep the narrow i32 path.
             if matches!(op, ReduceOp::Sum) {
                 let host: Vec<i64> = pa.values().iter().map(|&v| v as i64).collect();
-                let input_gpu = GpuVec::<i64>::from_slice(&host)?;
+                let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
-                let mut acc = GpuVec::<i64>::from_slice(&init)?;
+                let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
                 let (mut spill_keys, mut spill_values, mut spill_counter) =
                     alloc_agg_spill::<i64>()?;
                 launch_agg_kernel::<i64>(
@@ -1120,7 +1178,7 @@ fn run_typed_agg(
                     k_u32,
                     stream,
                 )?;
-                let gpu_acc = acc.to_vec()?;
+                let gpu_acc = download_pinned_i64(&acc, stream)?;
                 let spill = download_agg_spill(
                     spill_keys,
                     spill_values,
@@ -1130,9 +1188,9 @@ fn run_typed_agg(
                 Ok(AccDownload::I64 { gpu_acc, spill })
             } else {
                 let host: Vec<i32> = pa.values().to_vec();
-                let input_gpu = GpuVec::<i32>::from_slice(&host)?;
+                let input_gpu = GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
                 let init: Vec<i32> = vec![identity_i32(op); k];
-                let mut acc = GpuVec::<i32>::from_slice(&init)?;
+                let mut acc = GpuVec::<i32>::from_slice_async(&init, stream.raw())?;
                 let (mut spill_keys, mut spill_values, mut spill_counter) =
                     alloc_agg_spill::<i32>()?;
                 launch_agg_kernel::<i32>(
@@ -1151,7 +1209,7 @@ fn run_typed_agg(
                     k_u32,
                     stream,
                 )?;
-                let gpu_acc = acc.to_vec()?;
+                let gpu_acc = download_pinned_i32(&acc, stream)?;
                 let spill = download_agg_spill(
                     spill_keys,
                     spill_values,
@@ -1167,9 +1225,9 @@ fn run_typed_agg(
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
             let host: Vec<i64> = pa.values().to_vec();
-            let input_gpu = GpuVec::<i64>::from_slice(&host)?;
+            let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
-            let mut acc = GpuVec::<i64>::from_slice(&init)?;
+            let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
             let (mut spill_keys, mut spill_values, mut spill_counter) =
                 alloc_agg_spill::<i64>()?;
             launch_agg_kernel::<i64>(
@@ -1188,7 +1246,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
             )?;
-            let gpu_acc = acc.to_vec()?;
+            let gpu_acc = download_pinned_i64(&acc, stream)?;
             let spill = download_agg_spill(
                 spill_keys,
                 spill_values,
@@ -1203,9 +1261,9 @@ fn run_typed_agg(
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
             let host: Vec<f32> = pa.values().to_vec();
-            let input_gpu = GpuVec::<f32>::from_slice(&host)?;
+            let input_gpu = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
             let init: Vec<f32> = vec![identity_f32(op); k];
-            let mut acc = GpuVec::<f32>::from_slice(&init)?;
+            let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
             let (mut spill_keys, mut spill_values, mut spill_counter) =
                 alloc_agg_spill::<f32>()?;
             launch_agg_kernel::<f32>(
@@ -1224,7 +1282,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
             )?;
-            let gpu_acc = acc.to_vec()?;
+            let gpu_acc = download_pinned_f32(&acc, stream)?;
             let spill = download_agg_spill(
                 spill_keys,
                 spill_values,
@@ -1239,9 +1297,9 @@ fn run_typed_agg(
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
             let host: Vec<f64> = pa.values().to_vec();
-            let input_gpu = GpuVec::<f64>::from_slice(&host)?;
+            let input_gpu = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<f64> = vec![identity_f64(op); k];
-            let mut acc = GpuVec::<f64>::from_slice(&init)?;
+            let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
             let (mut spill_keys, mut spill_values, mut spill_counter) =
                 alloc_agg_spill::<f64>()?;
             launch_agg_kernel::<f64>(
@@ -1260,7 +1318,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
             )?;
-            let gpu_acc = acc.to_vec()?;
+            let gpu_acc = download_pinned_f64(&acc, stream)?;
             let spill = download_agg_spill(
                 spill_keys,
                 spill_values,

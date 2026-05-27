@@ -31,6 +31,28 @@ impl CudaStream {
         }
     }
 
+    /// Mint a per-call stream when possible, otherwise fall back to the
+    /// NULL stream.
+    ///
+    /// Stage-3 helper: every executor entry point that issues async
+    /// memcpys benefits from its own stream so its H2D upload, kernel,
+    /// and D2H can overlap with work the engine has queued on the NULL
+    /// stream. If stream creation fails (e.g. driver out of resources)
+    /// we degrade to the NULL stream rather than failing the whole
+    /// query — the executor is then strictly slower but functionally
+    /// identical, since async operations on the NULL stream serialize
+    /// with everything else.
+    ///
+    /// The caller still owns the stream and must `synchronize()` at the
+    /// end of the executor before returning device results back to
+    /// host-visible code.
+    pub fn null_or_default() -> Self {
+        match Self::new() {
+            Ok(s) => s,
+            Err(_) => Self::null(),
+        }
+    }
+
     /// Create a new non-blocking stream.
     pub fn new() -> BoltResult<Self> {
         let mut s: CUstream = ptr::null_mut();

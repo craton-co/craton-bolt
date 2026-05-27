@@ -387,3 +387,87 @@ pub unsafe fn mem_free_host(p: *mut c_void) -> BoltResult<()> {
 pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> BoltResult<()> {
     check(cuMemsetD8_v2(ptr, value, count))
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3: safe wrappers for async memcpy and async memset.
+//
+// These mirror the synchronous counterparts above but enqueue the operation
+// on `stream` and return immediately. The caller is responsible for
+// synchronizing the stream before reading device-side results or before
+// releasing the host buffer backing an H2D transfer.
+//
+// For unpaged ("pageable") host memory the driver still has to stage through
+// a pinned bounce buffer internally — the call therefore acts like a
+// synchronous copy for the host even though the device-side work proceeds
+// asynchronously. For pinned host memory (see [`mem_alloc_host`] /
+// `PinnedHostBuffer`), the driver enqueues a true DMA on `stream` and
+// returns without blocking — which is the configuration this Stage-3
+// plumbing is designed for. See the wave doc in
+// `docs/D-series/async_memcpy.md` for the overlap analysis.
+// ---------------------------------------------------------------------------
+
+/// Async H2D copy: enqueue `count` `T`s from host pointer `src` to device
+/// pointer `dst` on `stream`.
+///
+/// # Safety
+/// * `dst` must point to a live device allocation of at least
+///   `count * size_of::<T>()` bytes.
+/// * `src` must be valid for reads of `count` `T`s for the duration of the
+///   transfer (i.e. until the stream is synchronized).
+/// * For overlap with kernel work the caller should pass *pinned* host
+///   memory; pageable memory still works but the driver will stage through
+///   a hidden bounce buffer and the call becomes effectively synchronous.
+pub unsafe fn memcpy_h2d_async<T>(
+    dst: CUdeviceptr,
+    src: *const T,
+    count: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "memcpy_h2d_async size overflow: {} * {}",
+            count,
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    check(cuMemcpyHtoDAsync_v2(dst, src as *const c_void, bytes, stream))
+}
+
+/// Async D2H copy: enqueue `count` `T`s from device pointer `src` to host
+/// pointer `dst` on `stream`.
+///
+/// # Safety
+/// * `src` must point to a live device allocation of at least
+///   `count * size_of::<T>()` bytes.
+/// * `dst` must be valid for writes of `count` `T`s for the duration of the
+///   transfer (i.e. until the stream is synchronized).
+/// * Same pinned-vs-pageable guidance as [`memcpy_h2d_async`].
+pub unsafe fn memcpy_d2h_async<T>(
+    dst: *mut T,
+    src: CUdeviceptr,
+    count: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "memcpy_d2h_async size overflow: {} * {}",
+            count,
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    check(cuMemcpyDtoHAsync_v2(dst as *mut c_void, src, bytes, stream))
+}
+
+/// Async memset: enqueue a byte-fill of `count` bytes at device pointer
+/// `ptr` with byte `value` on `stream`.
+///
+/// # Safety
+/// `ptr` must point to a live device allocation of at least `count` bytes.
+pub unsafe fn memset_d8_async(
+    ptr: CUdeviceptr,
+    value: u8,
+    count: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    check(cuMemsetD8Async(ptr, value, count, stream))
+}

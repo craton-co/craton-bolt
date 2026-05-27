@@ -12,7 +12,7 @@ use std::mem::size_of;
 
 use bytemuck::Pod;
 
-use crate::cuda::cuda_sys::{self, CUdeviceptr};
+use crate::cuda::cuda_sys::{self, CUdeviceptr, CUstream};
 use crate::error::{BoltError, BoltResult};
 
 /// Arrow's mandated minimum buffer alignment, in bytes.
@@ -168,6 +168,88 @@ impl<T: Pod> GpuBuffer<T> {
         Ok(out)
     }
 
+    /// Async H2D upload from `slice` into the existing buffer on `stream`.
+    ///
+    /// The buffer must already have `capacity() >= slice.len()`. Updates
+    /// `len` to `slice.len()`. Does NOT synchronize — the caller must
+    /// synchronize `stream` before dropping (or aliasing) `slice`.
+    ///
+    /// Stage-3 overlap path: pair this with a [`PinnedHostBuffer`] source
+    /// to get a true DMA transfer that overlaps with kernel work on the
+    /// same stream.
+    pub fn copy_from_async(&mut self, slice: &[T], stream: CUstream) -> BoltResult<()> {
+        if slice.len() > self.capacity {
+            return Err(BoltError::Memory(format!(
+                "GpuBuffer::copy_from_async: source length {} > capacity {}",
+                slice.len(),
+                self.capacity
+            )));
+        }
+        if !slice.is_empty() {
+            // SAFETY: `self.ptr` was allocated with capacity for `self.capacity`
+            // elements of `T` (>= slice.len() checked above), and `slice` is a
+            // valid read source for that many. The caller is responsible for
+            // keeping `slice` alive until `stream` is synchronized.
+            unsafe {
+                cuda_sys::memcpy_h2d_async::<T>(self.ptr, slice.as_ptr(), slice.len(), stream)?;
+            }
+        }
+        self.len = slice.len();
+        Ok(())
+    }
+
+    /// Async D2H download into `dst` on `stream`.
+    ///
+    /// Errors if `dst.len() != self.len`. Does NOT synchronize — the caller
+    /// must synchronize `stream` before reading `dst`. Pair with a
+    /// [`PinnedHostBuffer`] destination for a true DMA transfer.
+    pub fn copy_to_slice_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
+        if dst.len() != self.len {
+            return Err(BoltError::Memory(format!(
+                "GpuBuffer::copy_to_slice_async length mismatch: dst={}, buffer={}",
+                dst.len(),
+                self.len
+            )));
+        }
+        if self.len > 0 {
+            // SAFETY: `dst` is valid for writes of `self.len` elements (checked
+            // above), and `self.ptr` is a live device allocation of at least
+            // that many `T`s. Caller is responsible for keeping `dst` alive
+            // until `stream` is synchronized.
+            unsafe {
+                cuda_sys::memcpy_d2h_async::<T>(dst.as_mut_ptr(), self.ptr, self.len, stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Allocate `len` elements and zero them via `cuMemsetD8Async` on `stream`.
+    ///
+    /// Stage-3 counterpart to [`zeros`]. The memset is enqueued on `stream`
+    /// and the caller must synchronize before launching any kernel that
+    /// reads these bytes on a *different* stream. Kernels enqueued on the
+    /// same `stream` after this call see a fully-zeroed buffer without an
+    /// explicit sync.
+    pub fn zeros_async(len: usize, stream: CUstream) -> BoltResult<Self> {
+        let mut buf = Self::with_capacity(len)?;
+        if len > 0 {
+            let byte_len = len.checked_mul(size_of::<T>()).ok_or_else(|| {
+                BoltError::Memory(format!(
+                    "GpuBuffer::zeros_async size overflow: {} * {}",
+                    len,
+                    size_of::<T>()
+                ))
+            })?;
+            // SAFETY: `buf.ptr` was just allocated with at least `byte_len`
+            // bytes of capacity (rounded up to ARROW_ALIGNMENT).
+            unsafe {
+                cuda_sys::memset_d8_async(buf.ptr, 0, byte_len, stream)?;
+            }
+        }
+        buf.len = len;
+        Ok(buf)
+    }
+
     /// Copy the buffer's contents into `dst`. Errors if lengths differ.
     pub fn copy_to_slice(&self, dst: &mut [T]) -> BoltResult<()> {
         if dst.len() != self.len {
@@ -229,6 +311,165 @@ where
 {
     GpuBuffer::<P::Native>::from_slice(arr.values().as_ref())
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3: PinnedHostBuffer<T>
+//
+// Owns a page-locked (pinned) host allocation. Pinned memory is required to
+// get a *true* asynchronous DMA H2D/D2H — pageable host memory forces the
+// driver to stage through a hidden pinned bounce buffer, which serialises
+// the transfer with the launch.
+//
+// The driver-side allocation comes from `cuMemAllocHost_v2` / is freed by
+// `cuMemFreeHost`. Allocations are limited (the kernel's pinned-pool is
+// global), so use only for the *final* H2D upload sources and D2H download
+// targets — not for every intermediate buffer.
+// ---------------------------------------------------------------------------
+
+/// Page-locked (pinned) host buffer of `T`. Used as the host side of an
+/// async H2D / D2H so the driver can DMA directly without a bounce copy.
+///
+/// `len()` is the number of valid `T` elements (set by the caller via
+/// [`PinnedHostBuffer::set_len`] after an async D2H, or by
+/// [`PinnedHostBuffer::new`] which initialises it to the full capacity).
+///
+/// `Drop` returns the pinned pages to the driver. Do NOT call drop while
+/// an async copy that targets this buffer is still in flight — the caller
+/// must `stream.synchronize()` first.
+pub struct PinnedHostBuffer<T: Pod> {
+    /// Raw host pointer returned by `cuMemAllocHost_v2`.
+    ptr: *mut T,
+    /// Logical element count (`<= capacity`).
+    len: usize,
+    /// Allocated capacity in `T` elements.
+    capacity: usize,
+}
+
+impl<T: Pod> PinnedHostBuffer<T> {
+    /// Allocate `capacity` elements of pinned host memory. `len()` is
+    /// initialised to `capacity` — the buffer is treated as a fully-sized
+    /// slice the moment it's allocated (its contents are still uninitialised
+    /// bytes, but `T: Pod` makes that defined behaviour for read).
+    pub fn new(capacity: usize) -> BoltResult<Self> {
+        if capacity == 0 {
+            // Zero-element buffer: hand out a non-null but unique sentinel
+            // so `as_ptr` is well-defined. We round to one byte's worth so
+            // `cuMemFreeHost` has something real to release; the alternative
+            // (skipping the alloc) would force a special case in `Drop`.
+            let bytes = size_of::<T>().max(1);
+            // SAFETY: we forward a single, non-aliased allocation request
+            // to the driver and store the returned pointer in `self`.
+            // `Drop` is the unique releaser.
+            let raw = unsafe { cuda_sys::mem_alloc_host(bytes)? };
+            return Ok(Self {
+                ptr: raw as *mut T,
+                len: 0,
+                capacity: 0,
+            });
+        }
+        let bytes = capacity.checked_mul(size_of::<T>()).ok_or_else(|| {
+            BoltError::Memory(format!(
+                "PinnedHostBuffer::new size overflow: {} * {}",
+                capacity,
+                size_of::<T>()
+            ))
+        })?;
+        // SAFETY: same as above — we own this allocation outright.
+        let raw = unsafe { cuda_sys::mem_alloc_host(bytes)? };
+        Ok(Self {
+            ptr: raw as *mut T,
+            len: capacity,
+            capacity,
+        })
+    }
+
+    /// Number of valid `T` elements.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the buffer holds zero elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Allocated capacity in `T` elements.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Raw host pointer; valid for `len()` `T`s.
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr as *const T
+    }
+
+    /// Raw mutable host pointer; valid for `len()` `T`s.
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+
+    /// Borrow as a `&[T]` slice of `len()` elements.
+    pub fn as_slice(&self) -> &[T] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: `self.ptr` is a live pinned allocation of at least `len`
+        // elements; lifetime is tied to `&self`. `T: Pod` makes the bytes
+        // safely readable even if uninitialised.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) }
+    }
+
+    /// Borrow as a `&mut [T]` slice of `len()` elements.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        // SAFETY: see `as_slice`; the `&mut` borrow ensures no aliasing.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// Override the logical length — used after an async D2H that filled
+    /// fewer than `capacity()` elements.
+    ///
+    /// # Safety
+    /// `new_len` must be `<= capacity()` and the first `new_len` elements
+    /// must be initialised (e.g. by a completed async D2H).
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.capacity);
+        self.len = new_len;
+    }
+}
+
+impl<T: Pod> Drop for PinnedHostBuffer<T> {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        // SAFETY: `self.ptr` was returned by `cuMemAllocHost_v2` in `new()`
+        // and has not been freed since. The caller's API contract requires
+        // synchronising any in-flight async copy before dropping.
+        unsafe {
+            if let Err(e) = cuda_sys::mem_free_host(self.ptr as *mut libc::c_void) {
+                log::warn!(
+                    "craton-bolt: PinnedHostBuffer drop: cuMemFreeHost failed: {}",
+                    e
+                );
+            }
+        }
+    }
+}
+
+// SAFETY: a pinned host pointer is just a u64 worth of address; sending it
+// between threads is no more dangerous than sending a `Box<[u8]>`. The
+// driver does not require thread affinity on pinned memory.
+unsafe impl<T: Pod> Send for PinnedHostBuffer<T> {}
+// Intentionally NOT `Sync`: concurrent mutation through shared references
+// would race on host memory.
 
 /// Round `n` up to the next multiple of `align` (which must be a power of two).
 /// Returns `None` on overflow.
@@ -381,5 +622,83 @@ mod tests {
         for _ in 0..16 {
             let _b: GpuBuffer<u8> = GpuBuffer::empty();
         }
+    }
+
+    // -------- Stage-3 PinnedHostBuffer + async API ------------------------
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn pinned_host_buffer_round_trip_via_async() {
+        // End-to-end exercise of the Stage-3 path: pinned source ->
+        // async H2D -> async D2H -> pinned sink, with the same bytes
+        // surviving the round trip. Uses a fresh stream so the test
+        // doesn't accidentally lean on the default-stream serialization.
+        use crate::cuda::cuda_sys::{cuStreamCreate, cuStreamDestroy_v2, cuStreamSynchronize, CUstream, check, CUDA_SUCCESS};
+        crate::cuda::cuda_sys::init().expect("init cuda");
+        let _ctx = crate::cuda::cuda_sys::CudaContext::new(0).expect("ctx");
+
+        let mut stream: CUstream = std::ptr::null_mut();
+        unsafe {
+            check(cuStreamCreate(&mut stream, 0)).expect("stream create");
+        }
+
+        let n = 257usize; // odd size that isn't a clean alignment multiple
+        let mut src = PinnedHostBuffer::<i64>::new(n).expect("alloc src");
+        for (i, slot) in src.as_mut_slice().iter_mut().enumerate() {
+            *slot = (i as i64) * 3 - 7;
+        }
+
+        let mut dev = GpuBuffer::<i64>::with_capacity(n).expect("dev alloc");
+        dev.copy_from_async(src.as_slice(), stream).expect("h2d");
+
+        let mut dst = PinnedHostBuffer::<i64>::new(n).expect("alloc dst");
+        dev.copy_to_slice_async(dst.as_mut_slice(), stream).expect("d2h");
+
+        unsafe {
+            assert_eq!(cuStreamSynchronize(stream), CUDA_SUCCESS, "sync");
+        }
+
+        // The pinned destination should now exactly mirror the source.
+        for (i, (&a, &b)) in src.as_slice().iter().zip(dst.as_slice().iter()).enumerate() {
+            assert_eq!(a, b, "mismatch at index {}", i);
+        }
+
+        unsafe {
+            let _ = cuStreamDestroy_v2(stream);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn zeros_async_matches_zeros() {
+        // `zeros_async` on the NULL stream must produce the same all-zero
+        // contents as the synchronous `zeros`. We compare via `to_vec`
+        // (sync D2H) so the test exercises the Stage-3 alloc but not the
+        // Stage-3 D2H — that's covered separately above.
+        crate::cuda::cuda_sys::init().expect("init cuda");
+        let _ctx = crate::cuda::cuda_sys::CudaContext::new(0).expect("ctx");
+
+        let n = 128usize;
+        // NULL stream — the synchronize is implicit when we call to_vec
+        // (cuMemcpyDtoH_v2 on the NULL stream waits for all prior work).
+        let buf = GpuBuffer::<i32>::zeros_async(n, std::ptr::null_mut()).expect("async zeros");
+        let host = buf.to_vec().expect("d2h");
+        assert_eq!(host.len(), n);
+        assert!(host.iter().all(|&x| x == 0), "expected all-zero buffer");
+    }
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn pinned_host_buffer_set_len_round_trip() {
+        crate::cuda::cuda_sys::init().expect("init cuda");
+        let _ctx = crate::cuda::cuda_sys::CudaContext::new(0).expect("ctx");
+
+        let mut p = PinnedHostBuffer::<u32>::new(8).expect("alloc");
+        assert_eq!(p.len(), 8);
+        // SAFETY: shrinking; the bytes 0..4 are still valid (uninit u32 is
+        // safe for read because u32: Pod).
+        unsafe { p.set_len(4) };
+        assert_eq!(p.len(), 4);
+        assert_eq!(p.as_slice().len(), 4);
     }
 }

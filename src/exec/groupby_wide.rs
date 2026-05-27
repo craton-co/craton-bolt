@@ -77,6 +77,13 @@ use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 /// The narrow single-i64 path lives in [`crate::exec::groupby`]; this
 /// fallback handles inputs that path can't pack losslessly. It is also
 /// safe to call on narrow inputs — it just gives up GPU parallelism.
+// Stage 3 note: this executor is host-side only — no GPU launches, no
+// device buffers, no streams. The "GPU output collection" mentioned by
+// the Stage-3 spec doesn't apply because the entire reduction runs on
+// the host. When this path is replaced by a GPU-side wide-key hash
+// table (a 0.3 goal), the new implementation should pick up the same
+// async memcpy + pinned D2H pattern used in `groupby.rs` /
+// `groupby_valid.rs`. Until then there's nothing to async-ify.
 pub fn execute_groupby_wide(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,

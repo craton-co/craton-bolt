@@ -550,7 +550,14 @@ impl Engine {
         kernel_params.push(&mut n_rows_u32 as *mut u32 as *mut c_void);
 
         // 5. Launch with one thread per row, block size 256.
-        let stream = CudaStream::null();
+        //
+        // Stage-3 async memcpy: mint a per-call stream so the kernel
+        // launch, mask materialisation (if any), and the final D2H
+        // download can run on the same stream — letting the driver
+        // overlap them with concurrent work on the NULL stream. Falls
+        // back to the NULL stream if stream creation fails (see
+        // `CudaStream::null_or_default`).
+        let stream = CudaStream::null_or_default();
         let grid_x = ((n_rows_u32 + BLOCK_SIZE - 1) / BLOCK_SIZE).max(1);
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
@@ -600,9 +607,14 @@ impl Engine {
                 // Host-side fallback: download mask + outputs, then filter.
                 let host_mask =
                     crate::exec::compact::download_mask(mask.device_ptr(), n_rows)?;
+                // Stage-3: route every primitive output column through the
+                // pinned async D2H path. Each `download_pinned` call
+                // synchronizes the stream internally, so we don't need a
+                // separate barrier between the predicate kernel and these
+                // reads.
                 let mut full: Vec<ArrayRef> = Vec::with_capacity(output_cols.len());
                 for col in output_cols {
-                    full.push(col.download(n_rows)?);
+                    full.push(col.download_pinned(n_rows, &stream)?);
                 }
                 crate::exec::compact::compact_arrays(&full, &host_mask)?
             } else {
@@ -627,9 +639,13 @@ impl Engine {
                 out
             }
         } else {
+            // Stage-3 pinned downloads on the per-call stream. Each
+            // call synchronizes internally before reading, so the loop
+            // is correct even though `stream` was used for the kernel
+            // launch above.
             let mut full: Vec<ArrayRef> = Vec::with_capacity(output_cols.len());
             for col in output_cols {
-                full.push(col.download(n_rows)?);
+                full.push(col.download_pinned(n_rows, &stream)?);
             }
             full
         };
@@ -910,6 +926,97 @@ impl DeviceCol {
             )),
         }
     }
+
+    /// Stage-3 async download: enqueue D2H from every primitive variant
+    /// into pinned host buffers on `stream`, then synchronize ONCE and
+    /// build the Arrow arrays from the resulting `Vec`s. Behaves
+    /// identically to [`download`] for the Utf8 / Borrowed variants —
+    /// those don't currently have a pinned fast path.
+    ///
+    /// The caller is responsible for ensuring `stream` is the same one
+    /// the producing kernel was launched on (so the D2H sees committed
+    /// results), and the function performs the synchronize internally
+    /// before reading the pinned buffer.
+    fn download_pinned(
+        self,
+        n_rows: usize,
+        stream: &CudaStream,
+    ) -> BoltResult<ArrayRef> {
+        match self {
+            DeviceCol::I32(v) => {
+                let staged = StagedDownload::<i32>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                Ok(Arc::new(Int32Array::from(host)) as ArrayRef)
+            }
+            DeviceCol::I64(v) => {
+                let staged = StagedDownload::<i64>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                Ok(Arc::new(Int64Array::from(host)) as ArrayRef)
+            }
+            DeviceCol::F32(v) => {
+                let staged = StagedDownload::<f32>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                Ok(Arc::new(Float32Array::from(host)) as ArrayRef)
+            }
+            DeviceCol::F64(v) => {
+                let staged = StagedDownload::<f64>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                Ok(Arc::new(Float64Array::from(host)) as ArrayRef)
+            }
+            DeviceCol::Bool(v) => {
+                let staged = StagedDownload::<u8>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                let bools: Vec<bool> = host.into_iter().map(|b| b != 0).collect();
+                Ok(Arc::new(BooleanArray::from(bools)) as ArrayRef)
+            }
+            DeviceCol::BoolNullable { values, validity } => {
+                // Two D2Hs back-to-back on the same stream; one sync.
+                let staged_v = StagedDownload::<u8>::from_gpu(&values, stream.raw())?;
+                let staged_m = StagedDownload::<u8>::from_gpu(&validity, stream.raw())?;
+                stream.synchronize()?;
+                let host_values = staged_v.into_vec();
+                let host_validity = staged_m.into_vec();
+                check_len(host_values.len(), n_rows)?;
+                check_len(host_validity.len(), n_rows)?;
+                let arr: BooleanArray = host_values
+                    .into_iter()
+                    .zip(host_validity.into_iter())
+                    .map(|(v, m)| if m == 1 { Some(v == 1) } else { None })
+                    .collect();
+                Ok(Arc::new(arr) as ArrayRef)
+            }
+            DeviceCol::Utf8(_) | DeviceCol::Borrowed { .. } => {
+                // Utf8 / Borrowed don't (yet) have a pinned fast path —
+                // fall back to the sync download. The stream has
+                // already been synchronized above for the primitive
+                // siblings, so this is safe to invoke regardless.
+                self.download(n_rows)
+            }
+        }
+    }
+}
+
+/// Tiny invariant check used by the pinned-download path: every
+/// `DeviceCol` output buffer is sized at allocation time to `n_rows`, so
+/// a length mismatch on download is a bug, not a runtime condition.
+fn check_len(have: usize, want: usize) -> BoltResult<()> {
+    if have != want {
+        return Err(BoltError::Other(format!(
+            "internal: device buffer length {} did not match expected {}",
+            have, want
+        )));
+    }
+    Ok(())
 }
 
 /// Copy back a `GpuVec<T>` into a host `Vec<T>` of length `n_rows`.
@@ -929,6 +1036,51 @@ where
         )));
     }
     Ok(host)
+}
+
+/// Stage-3 D2H staging buffer: async-copies a `GpuVec<T>` into a
+/// page-locked host buffer on a caller-supplied stream, synchronises
+/// once, and produces a regular `Vec<T>` for Arrow consumption.
+///
+/// Why a separate type vs. an inline call? Arrow array constructors
+/// (`Int32Array::from(Vec<i32>)`) want owned `Vec`s with the standard
+/// allocator — they will NOT accept a `PinnedHostBuffer` as a
+/// zero-copy backing buffer (the lifecycle is incompatible: pinned
+/// memory must be released via `cuMemFreeHost`, while Arrow buffers
+/// release through the global allocator). So the pinned hop is purely
+/// to get a true DMA without staging through a kernel-managed bounce
+/// buffer; the final `.to_vec()` is the one host-host copy we keep.
+///
+/// Usage:
+///
+/// ```ignore
+/// let staged = StagedDownload::from_gpu(&gpu_vec, stream.raw())?;
+/// stream.synchronize()?;
+/// let arrow_vec: Vec<i32> = staged.into_vec();
+/// ```
+struct StagedDownload<T: bytemuck::Pod> {
+    pinned: crate::cuda::PinnedHostBuffer<T>,
+}
+
+impl<T: bytemuck::Pod> StagedDownload<T> {
+    /// Enqueue an async D2H from `v` into a fresh pinned host buffer on
+    /// `stream`. The caller MUST synchronize `stream` before calling
+    /// [`into_vec`] / borrowing the pinned slice.
+    fn from_gpu(v: &GpuVec<T>, stream: crate::cuda::CUstream) -> BoltResult<Self> {
+        let pinned = v.to_pinned_async(stream)?;
+        Ok(Self { pinned })
+    }
+
+    /// Consume the staged download and produce a regular host `Vec<T>`.
+    ///
+    /// Assumes the caller has synchronized the stream — there is no way
+    /// to detect "not yet synchronized" without an event, which we skip
+    /// in Stage 3. Calling this before sync produces uninitialised
+    /// bytes (defined behaviour for `T: Pod` but functionally
+    /// incorrect).
+    fn into_vec(self) -> Vec<T> {
+        self.pinned.as_slice().to_vec()
+    }
 }
 
 /// Build a `Type` error for an Arrow downcast failure.
@@ -986,4 +1138,68 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Stage-3 projection-path round-trip. The pinned-host `StagedDownload`
+    //! struct is exercised here through `Engine::sql`; the existing
+    //! e2e tests in `tests/e2e_tests.rs` already cover broader semantics.
+    use super::*;
+    use arrow_array::Int32Array;
+
+    fn make_int32_table() -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, false),
+            ArrowField::new("b", ArrowDataType::Int32, false),
+        ]));
+        let a = Arc::new(Int32Array::from((0..256i32).collect::<Vec<_>>()));
+        let b = Arc::new(Int32Array::from((0..256i32).map(|i| i * 7).collect::<Vec<_>>()));
+        RecordBatch::try_new(schema, vec![a, b]).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_projection_pinned_d2h_correctness() {
+        // Run a fused projection through the Stage-3 pinned-download
+        // path; compare every row to the expected closed-form value.
+        let mut engine = Engine::new().expect("ctx");
+        engine.register_table("t", make_int32_table()).unwrap();
+        let h = engine.sql("SELECT a + b FROM t").expect("execute");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 256);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..256 {
+            let expected = (i as i32) + (i as i32) * 7;
+            assert_eq!(col.value(i), expected, "row {i}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_projection_with_filter_pinned_d2h() {
+        // Filter path also goes through `download_pinned` (the
+        // GPU-compact branch). Sanity-check it produces the right
+        // surviving rows.
+        let mut engine = Engine::new().expect("ctx");
+        engine.register_table("t", make_int32_table()).unwrap();
+        let h = engine
+            .sql("SELECT a FROM t WHERE a > 100")
+            .expect("execute");
+        let out = h.record_batch();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        // Rows 101..256: 155 surviving values.
+        assert_eq!(col.len(), 155);
+        for i in 0..col.len() {
+            assert_eq!(col.value(i), 101 + i as i32);
+        }
+    }
 }
