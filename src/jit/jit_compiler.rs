@@ -21,23 +21,41 @@
 //! the loaded `CUmodule` is sound — two cache lookups that collide on the
 //! hash *and* the full string match represent literally the same program.
 //! Hash collisions on the 64-bit DefaultHasher key are astronomically
-//! unlikely for the cache sizes we use (cap = 256), and even on collision
+//! unlikely for the cache sizes we use (default cap = 256), and even on collision
 //! the worst case is a spurious cache miss on the second program: we only
 //! match the hash here, but every cached entry was inserted from a PTX
 //! string we ourselves produced, so reusing a colliding module would launch
 //! the wrong kernel. We therefore guard against that by *also* keying on the
-//! PTX string itself: the map's `value` retains an `Arc<CudaModuleInner>`
-//! and we additionally compare the stored PTX text on lookup. (See
-//! `CacheEntry` below.)
+//! PTX string itself: each cache entry retains the source PTX alongside the
+//! loaded module (wrapped in a `OnceCell`; see the Concurrency section
+//! below and `CacheEntry`), and we compare the stored PTX text on lookup.
 //!
-//! The cache is bounded at 256 entries with FIFO eviction — LRU is overkill
-//! for what is essentially a hot-set of recently-issued query shapes, and
-//! FIFO needs only a `VecDeque<u64>` companion to the `HashMap`. When an
+//! The cache is bounded (default 256 entries) with FIFO eviction — LRU is
+//! overkill for what is essentially a hot-set of recently-issued query shapes,
+//! and FIFO needs only a `VecDeque<u64>` companion to the `HashMap`. When an
 //! entry is evicted from the cache its `Arc` strong count drops; if no
 //! `CudaModule` clones are live the underlying `CudaModuleInner::Drop`
 //! runs and calls `cuModuleUnload`. If clones *are* live the module stays
 //! loaded until the last clone is dropped — exactly the lifetime users
 //! expect.
+//!
+//! The cap is overridable at process start via the environment variable
+//! **`CRATON_BOLT_PTX_CACHE_CAP`** — set it to any positive integer (parsed
+//! as `usize`). Unset, empty, zero, or unparseable values fall back to the
+//! built-in default of 256. The value is read exactly once on first cache
+//! access and frozen for the lifetime of the process.
+//!
+//! # Concurrency
+//!
+//! On a cache miss the actual PTX → SASS compile (`cuModuleLoadDataEx`,
+//! tens of ms) runs *outside* the cache lock. To make that race-free we
+//! store a `OnceCell` per key inside the map: the first thread to miss
+//! inserts an empty `OnceCell` under the lock, releases the lock, and then
+//! `get_or_try_init`s it. A second thread racing on the same PTX finds the
+//! same `OnceCell` under the lock, releases the lock, and blocks inside
+//! `get_or_try_init` until the first thread's compile completes — it then
+//! receives the same `Arc<CudaModuleInner>` without paying the compile
+//! cost. Compiles for *different* PTX keys run fully in parallel.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
@@ -47,6 +65,7 @@ use std::ptr;
 use std::sync::{Arc, OnceLock};
 
 use libc::c_void;
+use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 
 use crate::cuda::cuda_sys::{self, CUfunction, CUmodule};
@@ -69,9 +88,36 @@ pub const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: CUjit_option = 6;
 
 const JIT_LOG_BUF_SIZE: usize = 4096;
 
-/// Cap on the number of cached compiled modules. Eviction is FIFO once we
-/// exceed this many entries.
-const PTX_CACHE_CAP: usize = 256;
+/// Built-in default cap on the number of cached compiled modules. Override at
+/// process start via `CRATON_BOLT_PTX_CACHE_CAP` (see module docs). Eviction
+/// is FIFO once we exceed this many entries.
+const PTX_CACHE_CAP_DEFAULT: usize = 256;
+
+/// Environment variable that overrides the PTX cache capacity. Parsed as
+/// `usize`. Unset / empty / zero / unparseable → fall back to
+/// `PTX_CACHE_CAP_DEFAULT`. Read once on first cache access and memoized.
+const PTX_CACHE_CAP_ENV: &str = "CRATON_BOLT_PTX_CACHE_CAP";
+
+/// Parse a candidate cache-cap string (typically from `std::env::var`).
+/// `None`, empty strings, zero, and unparseable values map to `default`.
+/// Factored out so the policy is testable without touching the process
+/// environment or the memoized global cap.
+fn parse_cap(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// Resolve the effective cache cap. Reads the env var the first time it is
+/// called and freezes the result for the rest of the process lifetime — we
+/// do not want a runaway query to change the cap mid-execution.
+fn ptx_cache_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var(PTX_CACHE_CAP_ENV).ok();
+        parse_cap(raw.as_deref(), PTX_CACHE_CAP_DEFAULT)
+    })
+}
 
 /// Owns the raw `CUmodule` and is responsible for unloading on drop. Lives
 /// behind an `Arc` so identical PTX queries share a single loaded module.
@@ -104,12 +150,18 @@ impl Drop for CudaModuleInner {
 unsafe impl Send for CudaModuleInner {}
 unsafe impl Sync for CudaModuleInner {}
 
-/// One cache slot: the loaded module plus the PTX text that produced it.
-/// We retain the source text so a hash collision can be detected (see the
-/// module-level comment).
+/// One cache slot: a lazily-populated `OnceCell` holding the loaded module,
+/// plus the PTX text that produced it. We retain the source text so a hash
+/// collision can be detected (see the module-level comment).
+///
+/// The `Arc<OnceCell<…>>` lets us release the cache lock before doing the
+/// slow PTXAS compile: the first thread to miss inserts an empty cell and
+/// `get_or_try_init`s it; concurrent threads racing on the same PTX clone
+/// the same `Arc<OnceCell>`, block on `get_or_try_init`, and pick up the
+/// same compiled module without re-running the driver. (Bug H3.)
 struct CacheEntry {
     ptx: String,
-    module: Arc<CudaModuleInner>,
+    module: Arc<OnceCell<Arc<CudaModuleInner>>>,
 }
 
 /// Cache state: a `HashMap` for O(1) lookup plus a `VecDeque` of keys in
@@ -121,10 +173,42 @@ struct PtxCache {
 
 impl PtxCache {
     fn new() -> Self {
+        let cap = ptx_cache_cap();
         Self {
-            map: HashMap::with_capacity(PTX_CACHE_CAP),
-            order: VecDeque::with_capacity(PTX_CACHE_CAP),
+            map: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
         }
+    }
+
+    /// Insert a fresh (empty) cell for `key` / `ptx`, performing FIFO
+    /// eviction first if we are at or above `cap`. Returns the inserted
+    /// `Arc<OnceCell>`. The caller is responsible for ensuring `key` is
+    /// not already present in the map.
+    ///
+    /// Factored out so the eviction policy can be exercised in isolation
+    /// from the global cache, and so the single source of truth lives in
+    /// one place.
+    fn insert_empty(
+        &mut self,
+        key: u64,
+        ptx: String,
+        cap: usize,
+    ) -> Arc<OnceCell<Arc<CudaModuleInner>>> {
+        if self.map.len() >= cap {
+            if let Some(old_key) = self.order.pop_front() {
+                self.map.remove(&old_key);
+            }
+        }
+        let cell = Arc::new(OnceCell::new());
+        self.map.insert(
+            key,
+            CacheEntry {
+                ptx,
+                module: Arc::clone(&cell),
+            },
+        );
+        self.order.push_back(key);
+        cell
     }
 }
 
@@ -160,49 +244,65 @@ impl CudaModule {
     /// On failure the driver's PTXAS error log (which usually includes line
     /// numbers for malformed instructions) is appended to the returned error.
     pub fn from_ptx(ptx: &str) -> BoltResult<Self> {
-        // Fast path: look up by hash, confirm via full-text compare to defend
-        // against the (astronomically unlikely) 64-bit collision.
+        Self::from_ptx_with(ptx, Self::load_uncached)
+    }
+
+    /// Shared cache logic, parameterised over the loader. Production code
+    /// always supplies `Self::load_uncached`; tests inject a counting / stub
+    /// loader so they can assert on race behaviour without a real GPU.
+    fn from_ptx_with<L>(ptx: &str, loader: L) -> BoltResult<Self>
+    where
+        L: FnOnce(&str) -> BoltResult<Self>,
+    {
+        // Phase 1: under the lock, locate (or create) a `OnceCell` for this
+        // PTX. We do NOT run the compile here — the lock is released as soon
+        // as we have an `Arc<OnceCell>` so other threads (including ones
+        // working on a different key) are not blocked behind PTXAS.
+        //
+        // Classify the slot via a small owned enum so the immutable borrow
+        // of `cache.map` from the lookup ends before we (potentially) take
+        // a mutable borrow to evict and insert.
         let key = hash_ptx(ptx);
-        {
-            let cache = ptx_cache().lock();
-            if let Some(entry) = cache.map.get(&key) {
-                if entry.ptx == ptx {
-                    return Ok(Self {
-                        inner: Arc::clone(&entry.module),
-                    });
-                }
-                // Collision: fall through to recompile. We do not attempt to
-                // store a second entry under the same key — at FIFO cap 256
-                // and 64-bit hashes a collision is a once-in-the-lifetime
-                // event and an extra recompile per call is acceptable.
-            }
+        enum Slot {
+            Reuse(Arc<OnceCell<Arc<CudaModuleInner>>>),
+            Collision,
+            Miss,
         }
-
-        // Slow path: actually invoke the driver to assemble the PTX.
-        let module = Self::load_uncached(ptx)?;
-
-        // Insert into the cache, evicting the oldest entry if we're at cap.
-        // We do not check whether another thread raced us and inserted the
-        // same key concurrently: an overwrite is harmless (both `Arc`s point
-        // to functionally identical modules, and the loser is unloaded when
-        // its last clone drops).
-        {
+        let cell: Arc<OnceCell<Arc<CudaModuleInner>>> = {
             let mut cache = ptx_cache().lock();
-            if cache.map.len() >= PTX_CACHE_CAP && !cache.map.contains_key(&key) {
-                if let Some(old_key) = cache.order.pop_front() {
-                    cache.map.remove(&old_key);
+            let slot = match cache.map.get(&key) {
+                Some(entry) if entry.ptx == ptx => Slot::Reuse(Arc::clone(&entry.module)),
+                Some(_) => Slot::Collision,
+                None => Slot::Miss,
+            };
+            match slot {
+                Slot::Reuse(cell) => cell,
+                Slot::Collision => {
+                    // 64-bit hash collision against a different PTX string —
+                    // astronomically rare at our cache sizes. Drop the lock
+                    // and serve this caller from a one-shot uncached load.
+                    drop(cache);
+                    return loader(ptx);
+                }
+                Slot::Miss => {
+                    // Fresh miss: insert an empty cell, FIFO-evict if at cap.
+                    let cap = ptx_cache_cap();
+                    cache.insert_empty(key, ptx.to_owned(), cap)
                 }
             }
-            let entry = CacheEntry {
-                ptx: ptx.to_owned(),
-                module: Arc::clone(&module.inner),
-            };
-            if cache.map.insert(key, entry).is_none() {
-                cache.order.push_back(key);
-            }
-        }
+        };
 
-        Ok(module)
+        // Phase 2: initialise the cell outside the cache lock. The first
+        // thread to reach this point for a given cell runs `loader`; any
+        // other thread that holds the same `Arc<OnceCell>` blocks inside
+        // `get_or_try_init` until the first thread finishes, and then
+        // observes the cached module. If `loader` returns Err the cell
+        // stays empty, so subsequent calls retry the compile rather than
+        // permanently poisoning the cache slot.
+        let inner = cell
+            .get_or_try_init(|| loader(ptx).map(|m| m.inner))
+            .map(Arc::clone)?;
+        Ok(Self { inner })
     }
 
     /// Internal: drive `cuModuleLoadDataEx` and wrap the resulting handle in
@@ -336,4 +436,222 @@ fn inner_msg(e: &BoltError) -> String {
 fn decode_log(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// These tests cover the cache state machine in isolation — they do NOT invoke
+// the real CUDA driver. The "loader" indirection on `from_ptx_with` lets us
+// substitute a stub loader that returns a `CudaModule` whose inner handle is
+// `ptr::null_mut()`; `CudaModuleInner::Drop` short-circuits on null, so no
+// real GPU resource is ever allocated or freed.
+//
+// The tests share a process-wide `PTX_CACHE` static. To stay independent of
+// run order each test uses unique PTX strings (a unique tag suffix) so cache
+// entries from one test cannot satisfy a lookup in another.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+    use std::thread;
+
+    /// Build a stub `CudaModule` with a null inner handle. `CudaModuleInner::Drop`
+    /// short-circuits on null, so this is safe to drop without a CUDA context.
+    fn stub_module() -> CudaModule {
+        CudaModule {
+            inner: Arc::new(CudaModuleInner {
+                raw: ptr::null_mut(),
+            }),
+        }
+    }
+
+    // -- parse_cap (P3, env-var parsing in isolation) ----------------------
+
+    #[test]
+    fn parse_cap_unset_returns_default() {
+        assert_eq!(parse_cap(None, 256), 256);
+    }
+
+    #[test]
+    fn parse_cap_empty_returns_default() {
+        assert_eq!(parse_cap(Some(""), 256), 256);
+    }
+
+    #[test]
+    fn parse_cap_zero_returns_default() {
+        // Zero would disable the cache entirely; treat as misconfiguration.
+        assert_eq!(parse_cap(Some("0"), 256), 256);
+    }
+
+    #[test]
+    fn parse_cap_garbage_returns_default() {
+        assert_eq!(parse_cap(Some("not-a-number"), 256), 256);
+        assert_eq!(parse_cap(Some("-1"), 256), 256);
+        assert_eq!(parse_cap(Some("12.5"), 256), 256);
+    }
+
+    #[test]
+    fn parse_cap_valid_returns_parsed() {
+        assert_eq!(parse_cap(Some("1"), 256), 1);
+        assert_eq!(parse_cap(Some("8"), 256), 8);
+        assert_eq!(parse_cap(Some("4096"), 256), 4096);
+    }
+
+    /// End-to-end env-var hookup: `std::env::set_var` round-tripped through
+    /// `std::env::var().ok()` → `parse_cap` lands at the configured value.
+    /// We test against `parse_cap` rather than the global `ptx_cache_cap()`
+    /// because the latter is memoized via `OnceLock` for the process and so
+    /// cannot be re-tested with different env-var values inside one binary.
+    #[test]
+    fn parse_cap_picks_up_env_var() {
+        let key = "CRATON_BOLT_PTX_CACHE_CAP_TEST_ENV";
+        // SAFETY: set_var is safe on Windows; on Unix it's documented as
+        // unsound across threads, but cargo test runs each #[test] on a
+        // dedicated thread and we never read this var from another thread.
+        std::env::set_var(key, "8");
+        let raw = std::env::var(key).ok();
+        assert_eq!(parse_cap(raw.as_deref(), PTX_CACHE_CAP_DEFAULT), 8);
+        std::env::remove_var(key);
+    }
+
+    // -- PtxCache eviction (P3, FIFO at the configured cap) ----------------
+
+    /// With cap = 8, inserting 9 distinct keys evicts the *first* one
+    /// inserted, leaving the most-recent 8 in the map.
+    #[test]
+    fn ptx_cache_evicts_oldest_at_cap() {
+        let mut cache = PtxCache::new();
+        let cap = 8usize;
+
+        // Insert 8 entries — none should be evicted yet.
+        for i in 0..cap as u64 {
+            cache.insert_empty(i, format!("ptx-{}", i), cap);
+        }
+        assert_eq!(cache.map.len(), cap);
+        assert!(cache.map.contains_key(&0));
+
+        // The 9th insert must evict key 0 (the oldest) and seat key 8.
+        cache.insert_empty(cap as u64, format!("ptx-{}", cap), cap);
+        assert_eq!(cache.map.len(), cap);
+        assert!(
+            !cache.map.contains_key(&0),
+            "key 0 should have been FIFO-evicted at the 9th insert"
+        );
+        assert!(cache.map.contains_key(&(cap as u64)));
+        // The order deque also tracks the surviving keys 1..=8.
+        assert_eq!(cache.order.front().copied(), Some(1));
+        assert_eq!(cache.order.back().copied(), Some(cap as u64));
+    }
+
+    // -- from_ptx_with concurrency (H3, no redundant compile on miss) ------
+
+    /// Many threads racing on the *same* PTX must invoke the loader exactly
+    /// once — the `OnceCell` in the cache entry serialises the compile so
+    /// late-arriving threads block on the in-flight compile rather than
+    /// kicking off a second one. Before the H3 fix this counter would
+    /// typically reach `N` under contention.
+    #[test]
+    fn from_ptx_compiles_once_under_contention() {
+        // Unique PTX so this test isn't satisfied by any other test's entry.
+        let ptx = "// H3 contention test — unique tag a7c5e91b3f024d8e".to_string();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n_threads = 16;
+        let barrier = Arc::new(Barrier::new(n_threads));
+
+        let mut handles = Vec::with_capacity(n_threads);
+        for _ in 0..n_threads {
+            let ptx = ptx.clone();
+            let calls = Arc::clone(&calls);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                // Wait so all threads hit the cache lookup roughly together.
+                barrier.wait();
+                let calls = Arc::clone(&calls);
+                CudaModule::from_ptx_with(&ptx, move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Make the "compile" non-trivial so the race window is
+                    // wide enough to be meaningful on fast hardware.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    Ok(stub_module())
+                })
+                .expect("stub loader cannot fail")
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "loader must run exactly once across all racing threads"
+        );
+    }
+
+    /// After a successful load, subsequent lookups for the same PTX must
+    /// return the cached module without invoking the loader at all.
+    #[test]
+    fn from_ptx_hits_cache_on_repeat() {
+        let ptx = "// H3 cache-hit test — unique tag 3d92f8a17ce04b06".to_string();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // First call: cold miss, loader fires once.
+        {
+            let calls = Arc::clone(&calls);
+            CudaModule::from_ptx_with(&ptx, move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(stub_module())
+            })
+            .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Subsequent calls: warm hit, loader must NOT fire.
+        for _ in 0..5 {
+            let calls = Arc::clone(&calls);
+            CudaModule::from_ptx_with(&ptx, move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(stub_module())
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "warm-hit lookups must not re-invoke the loader"
+        );
+    }
+
+    /// A loader that fails leaves the cell empty rather than poisoning the
+    /// slot — the next caller retries the compile. Without this property a
+    /// transient driver hiccup would permanently break cached-key compiles.
+    #[test]
+    fn from_ptx_failed_compile_does_not_poison_cell() {
+        let ptx = "// H3 failure-retry test — unique tag 8e1a4f0b9d375c22".to_string();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // First call: loader returns Err, count = 1.
+        {
+            let calls = Arc::clone(&calls);
+            let res = CudaModule::from_ptx_with(&ptx, move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(BoltError::Cuda("simulated PTXAS failure".into()))
+            });
+            assert!(res.is_err());
+        }
+
+        // Second call: loader fires again (cell was not poisoned), count = 2.
+        {
+            let calls = Arc::clone(&calls);
+            CudaModule::from_ptx_with(&ptx, move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(stub_module())
+            })
+            .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }
