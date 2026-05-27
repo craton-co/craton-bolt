@@ -71,76 +71,81 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
 /// host path), or `Err(...)` only on a hard GPU error (out-of-memory, kernel
 /// launch failure, etc.).
 ///
-/// Stage 1 gates (every gate must hold):
-///   1. Exactly one sort key.
-///   2. Sort key is a bare column reference (no computed exprs).
-///   3. Column dtype is one of Int32 / Int64 / Float32 / Float64.
+/// ## Stage 1 + Stage 2 gates
+///
+///   1. Number of sort keys is in `1..=MAX_SORT_KEYS` (Stage 2 lifted the
+///      single-key restriction; Stage-3 may extend beyond 4).
+///   2. Each sort key is a bare column reference (no computed exprs).
+///   3. Each column dtype is one of Int32 / Int64 / Float32 / Float64.
 ///   4. `n_rows >= GPU_SORT_MIN_ROWS` — below this, h2d/d2h overhead wins.
 ///   5. `n_rows <= u32::MAX` (and tightened to `<= 2^31` inside `gpu_sort`
 ///      because the bitonic padding doubles).
-///   6. Column has `null_count() == 0`. NULLs are `TODO(s1-stage2)`.
+///
+/// NULLs are handled by Stage 2 via a per-key validity bitmap + nulls_first
+/// flag — they no longer disqualify the GPU path.
 ///
 /// On any miss we return `Ok(None)`; the host path handles the input
-/// correctly. We deliberately don't propagate gate misses as errors because
-/// the host path is a real, correct fallback.
+/// correctly.
 fn try_gpu_sort(
     batch: &RecordBatch,
     sort_exprs: &[SortExpr],
 ) -> BoltResult<Option<RecordBatch>> {
-    // Gate 1: single key only. Multi-key bitonic is TODO(s1-stage2).
-    if sort_exprs.len() != 1 {
+    use crate::jit::sort_kernel::{SortDirection, MAX_SORT_KEYS};
+
+    // Gate 1: 1..=MAX_SORT_KEYS keys.
+    if sort_exprs.is_empty() || sort_exprs.len() > MAX_SORT_KEYS {
         return Ok(None);
     }
-    let se = &sort_exprs[0];
 
-    // Gate 2: bare column reference (or Alias-of-Column). We reuse the same
-    // helper as the host path so behaviour stays consistent.
-    let col_name = match expr_to_column_name(&se.expr) {
-        Ok(name) => name,
-        // Computed exprs (the only other case) fall through to host path,
-        // which will produce the proper error message.
-        Err(_) => return Ok(None),
-    };
-
-    let col_idx = match batch.schema().index_of(&col_name) {
-        Ok(i) => i,
-        Err(_) => return Ok(None),
-    };
-    let column = batch.column(col_idx);
-
-    // Gate 3: supported dtype.
-    let dtype = match crate::exec::gpu_sort::arrow_dtype_to_internal(column.data_type()) {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-
-    // Gate 4: row count threshold.
     let n_rows = batch.num_rows();
+    // Gate 4: row count threshold.
     if n_rows < GPU_SORT_MIN_ROWS {
         return Ok(None);
     }
-
-    // Gate 5: fits the bitonic-padding bound. We check the upper bound here
-    // (gpu_sort enforces the stricter 2^31 bound internally) so any miss
-    // falls through to host without a hard error.
+    // Gate 5: fits the bitonic-padding bound.
     if n_rows > (u32::MAX as usize) {
         return Ok(None);
     }
 
-    // Gate 6: no NULLs in the key column. The bitonic comparator doesn't
-    // currently understand validity; TODO(s1-stage2) is to thread a parallel
-    // validity buffer through the kernel.
-    if column.null_count() > 0 {
-        return Ok(None);
+    // Resolve every key: bare column ref + supported dtype.
+    let mut resolved: Vec<(usize, crate::plan::logical_plan::DataType, SortDirection, bool)> =
+        Vec::with_capacity(sort_exprs.len());
+    for se in sort_exprs {
+        let col_name = match expr_to_column_name(&se.expr) {
+            Ok(n) => n,
+            Err(_) => return Ok(None), // Gate 2 miss
+        };
+        let col_idx = match batch.schema().index_of(&col_name) {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+        let column = batch.column(col_idx);
+        let dtype = match crate::exec::gpu_sort::arrow_dtype_to_internal(column.data_type()) {
+            Some(d) => d,
+            None => return Ok(None), // Gate 3 miss
+        };
+        let dir = if se.descending {
+            SortDirection::Desc
+        } else {
+            SortDirection::Asc
+        };
+        resolved.push((col_idx, dtype, dir, se.nulls_first));
     }
 
-    let dir = if se.descending {
-        crate::jit::sort_kernel::SortDirection::Desc
-    } else {
-        crate::jit::sort_kernel::SortDirection::Asc
-    };
+    // Single-key path stays on the Stage-1 entry for back-compat with the
+    // golden PTX assertions; multi-key + any NULL-bearing key uses the
+    // Stage-2 multi-key driver.
+    let any_nulls = resolved
+        .iter()
+        .any(|(idx, _, _, _)| batch.column(*idx).null_count() > 0);
+    if resolved.len() == 1 && !any_nulls {
+        let (col_idx, dtype, dir, _) = resolved[0];
+        let sorted = crate::exec::gpu_sort::sort_record_batch_on_gpu(batch, col_idx, dtype, dir)?;
+        return Ok(Some(sorted));
+    }
 
-    let sorted = crate::exec::gpu_sort::sort_record_batch_on_gpu(batch, col_idx, dtype, dir)?;
+    // Multi-key (or null-aware single-key) path.
+    let sorted = crate::exec::gpu_sort::sort_record_batch_on_gpu_multi(batch, &resolved)?;
     Ok(Some(sorted))
 }
 
