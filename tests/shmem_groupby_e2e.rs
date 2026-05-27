@@ -247,6 +247,11 @@ fn fixture_is_deterministic() {
 #[test]
 #[ignore = "requires CUDA device + tier-1 shared-mem kernel; enable once merge lands"]
 fn shmem_kernel_matches_cpu_model() {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
     // Build a 10M-row fixture with n_groups=100. Same seed as the CPU test
     // above so debugging mismatches is straightforward.
     let n_rows: usize = 10_000_000;
@@ -259,24 +264,65 @@ fn shmem_kernel_matches_cpu_model() {
     // launch tuner sibling lands different defaults, update both sides.
     let expected = cpu_shmem_sum_model(&keys, &vals, n_groups, BLOCK_THREADS, ROWS_PER_THREAD);
 
-    // The actual GPU path. The four blocks below are the only thing the
-    // follow-up agent needs to wire up:
-    //
-    //   1. Build a `RecordBatch` with two columns: `id1` (Int32) from `keys`
-    //      and `v1` (Float64) from `vals`.
-    //   2. `let mut engine = craton_bolt::Engine::new().unwrap();`
-    //      `engine.register_table("x", batch).unwrap();`
-    //   3. `let h = engine.sql("SELECT id1, SUM(v1) FROM x GROUP BY id1").unwrap();`
-    //      `let out = h.record_batch();`
-    //   4. Extract `id1` (Int32Array) + `SUM(v1)` (Float64Array), index
-    //      `expected[id1]` for each output row, and assert relative error
-    //      < 1e-9 per group.
-    //
-    // Until then we leave a touch on the oracle so it isn't dead code under
-    // `--ignored` builds, and `unimplemented!` so the test fails loudly
-    // (rather than silently passing) if someone removes `#[ignore]` early.
-    let _ = expected.len();
-    unimplemented!(
-        "fill in: register_table -> engine.sql(...) -> compare against `expected` per group"
+    // Build a RecordBatch with columns `id1` (Int32) and `v1` (Float64).
+    let id1: Int32Array = keys.iter().copied().collect();
+    let v1: Float64Array = vals.iter().copied().collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id1", ArrowDataType::Int32, false),
+        ArrowField::new("v1", ArrowDataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(id1), Arc::new(v1)])
+        .expect("build RecordBatch");
+
+    // Stand up the engine on the default CUDA device. Mirrors the convention
+    // in `tests/memory_tests.rs`: `.expect()` is fine because the test is
+    // `#[ignore]`'d, so it only runs when the operator explicitly opted in
+    // with `-- --ignored` on a GPU host.
+    let mut engine = craton_bolt::Engine::new().expect("CUDA engine");
+    engine
+        .register_table("x", batch)
+        .expect("register table");
+
+    let h = engine
+        .sql("SELECT id1, SUM(v1) FROM x GROUP BY id1")
+        .expect("execute groupby");
+    let out = h.record_batch();
+
+    // The output schema is SELECT-ordered: [id1, sum_v1].
+    let id_col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id1 must be Int32");
+    let sum_col = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("SUM(v1) must be Float64");
+
+    let n_out = out.num_rows();
+    assert_eq!(
+        n_out, n_groups as usize,
+        "expected {} output rows (one per group), got {}",
+        n_groups, n_out
     );
+
+    // For every output row, look up the corresponding expected sum by key
+    // and check relative error. Use the same 1e-9 contract as the CPU model
+    // tests above.
+    for i in 0..n_out {
+        let key = id_col.value(i);
+        assert!(
+            key >= 0 && (key as u32) < n_groups,
+            "row {i}: key {key} out of range [0, {n_groups})"
+        );
+        let got = sum_col.value(i);
+        let want = expected[key as usize];
+        let denom = got.abs().max(want.abs()).max(1.0);
+        let rel = (got - want).abs() / denom;
+        assert!(
+            rel < 1e-9,
+            "row {i} key={key}: got {got}, want {want}, rel err {rel:e} exceeded 1e-9"
+        );
+    }
 }

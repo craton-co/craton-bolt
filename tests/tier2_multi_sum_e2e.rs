@@ -286,6 +286,11 @@ fn negative_keys_round_trip_n2() {
 #[test]
 #[ignore = "requires CUDA + integration"]
 fn tier2_multi_pipeline_matches_cpu_model() {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
     // q2-style fixture: 10M rows over 1M distinct keys, n_vals=2.
     let n_rows: usize = 10_000_000;
     let n_distinct_keys: i32 = 1_000_000;
@@ -297,17 +302,65 @@ fn tier2_multi_pipeline_matches_cpu_model() {
     // single-pass groupby (which differs by ~1e-12 due to reordered adds).
     let expected = cpu_tier2_multi_sum_model(&keys, &vals);
 
-    // Wire-up:
-    //   1. Build a RecordBatch with columns: `id2` (Int32) from `keys`,
-    //      `v1` (Float64) from `vals[0]`, `v2` (Float64) from `vals[1]`.
-    //   2. let mut engine = craton_bolt::Engine::new().unwrap();
-    //      engine.register_table("x", batch).unwrap();
-    //   3. let h = engine.sql("SELECT id2, SUM(v1), SUM(v2) FROM x GROUP BY id2").unwrap();
-    //      let out = h.record_batch();
-    //   4. Extract (id2, sum_v1, sum_v2), sort by key, compare with
-    //      `max_relative_error_multi(..) < 1e-9`.
-    let _ = expected.len();
-    unimplemented!(
-        "wire engine.sql -> sort by key -> compare against expected with max_relative_error_multi"
+    // Build a RecordBatch with columns `id2` (Int32), `v1` (Float64), `v2` (Float64).
+    let id2: Int32Array = keys.iter().copied().collect();
+    let v1: Float64Array = vals[0].iter().copied().collect();
+    let v2: Float64Array = vals[1].iter().copied().collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id2", ArrowDataType::Int32, false),
+        ArrowField::new("v1", ArrowDataType::Float64, false),
+        ArrowField::new("v2", ArrowDataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(id2), Arc::new(v1), Arc::new(v2)],
+    )
+    .expect("build RecordBatch");
+
+    // Stand up the engine on the default CUDA device. Mirrors the convention
+    // in `tests/memory_tests.rs`: `.expect()` is fine because the test is
+    // `#[ignore]`'d, so it only runs on a GPU host.
+    let mut engine = craton_bolt::Engine::new().expect("CUDA engine");
+    engine
+        .register_table("x", batch)
+        .expect("register table");
+
+    let h = engine
+        .sql("SELECT id2, SUM(v1), SUM(v2) FROM x GROUP BY id2")
+        .expect("execute multi-sum groupby");
+    let out = h.record_batch();
+
+    // The output schema is SELECT-ordered: [id2, sum_v1, sum_v2].
+    let id_col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id2 must be Int32");
+    let sum_v1_col = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("SUM(v1) must be Float64");
+    let sum_v2_col = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("SUM(v2) must be Float64");
+
+    // Flatten into the (key, [sums]) shape the oracle uses and sort by key.
+    let mut actual: Vec<(i32, Vec<f64>)> = (0..out.num_rows())
+        .map(|i| {
+            (
+                id_col.value(i),
+                vec![sum_v1_col.value(i), sum_v2_col.value(i)],
+            )
+        })
+        .collect();
+    actual.sort_by_key(|(k, _)| *k);
+
+    let err = max_relative_error_multi(&actual, &expected);
+    assert!(
+        err < 1e-9,
+        "GPU multi-SUM pipeline vs CPU model: max rel err {err:e} exceeded 1e-9"
     );
 }

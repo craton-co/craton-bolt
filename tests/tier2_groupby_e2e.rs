@@ -326,6 +326,11 @@ fn partition_function_distributes_evenly() {
 #[test]
 #[ignore = "requires CUDA + Tier-2 pipeline; enable post-merge"]
 fn tier2_pipeline_matches_cpu_model() {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
     // Build a 10M-row fixture with 1M distinct keys — the q5-style stress
     // case Tier 2 was designed for. Same seed as the CPU test above so
     // mismatches can be debugged side-by-side.
@@ -336,23 +341,53 @@ fn tier2_pipeline_matches_cpu_model() {
     // Expected (key, sum) output, sorted by key ASC.
     let expected = cpu_tier2_sum_model(&keys, &vals);
 
-    // The actual GPU path. The four blocks below are the only thing the
-    // follow-up agent needs to wire up:
-    //
-    //   1. Build a `RecordBatch` with two columns: `id1` (Int32) from `keys`
-    //      and `v1` (Float64) from `vals`.
-    //   2. `let mut engine = craton_bolt::Engine::new().unwrap();`
-    //      `engine.register_table("x", batch).unwrap();`
-    //   3. `let h = engine.sql("SELECT id1, SUM(v1) FROM x GROUP BY id1").unwrap();`
-    //      `let out = h.record_batch();`
-    //   4. Extract `id1` (Int32Array) + `SUM(v1)` (Float64Array), sort by
-    //      key, and assert max relative error < 1e-9 against `expected`.
-    //
-    // Touch `expected` so it isn't flagged as dead under `--ignored` builds,
-    // and `unimplemented!` so the test fails loudly if someone removes
-    // `#[ignore]` prematurely.
-    let _ = expected.len();
-    unimplemented!(
-        "fill in: register_table -> engine.sql(...) -> sort by key -> compare against `expected`"
+    // Build a RecordBatch with columns `id1` (Int32) and `v1` (Float64).
+    let id1: Int32Array = keys.iter().copied().collect();
+    let v1: Float64Array = vals.iter().copied().collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id1", ArrowDataType::Int32, false),
+        ArrowField::new("v1", ArrowDataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(id1), Arc::new(v1)])
+        .expect("build RecordBatch");
+
+    // Stand up the engine on the default CUDA device. Mirrors the convention
+    // in `tests/memory_tests.rs`: `.expect()` is fine because the test is
+    // `#[ignore]`'d, so it only runs on a GPU host.
+    let mut engine = craton_bolt::Engine::new().expect("CUDA engine");
+    engine
+        .register_table("x", batch)
+        .expect("register table");
+
+    let h = engine
+        .sql("SELECT id1, SUM(v1) FROM x GROUP BY id1")
+        .expect("execute groupby");
+    let out = h.record_batch();
+
+    // The output schema is SELECT-ordered: [id1, sum_v1]. The dispatcher
+    // (and the Tier-2 pipeline once landed) emits rows in an
+    // implementation-defined order; sort by key for the oracle comparison.
+    let id_col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id1 must be Int32");
+    let sum_col = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("SUM(v1) must be Float64");
+
+    let mut actual: Vec<(i32, f64)> = (0..out.num_rows())
+        .map(|i| (id_col.value(i), sum_col.value(i)))
+        .collect();
+    actual.sort_by_key(|&(k, _)| k);
+
+    // Compare against the CPU oracle with the same tolerance as the CPU
+    // model-vs-naive tests above.
+    let err = max_relative_error(&actual, &expected);
+    assert!(
+        err < 1e-9,
+        "GPU pipeline vs CPU tier-2 model: max rel err {err:e} exceeded 1e-9"
     );
 }
