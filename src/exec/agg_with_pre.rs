@@ -404,26 +404,44 @@ fn to_expr_host(c: &HostCol) -> expr_agg::HostColumn {
 }
 
 /// Convert a materialised [`expr_agg::HostColumn`] back into the local
-/// primitive [`HostCol`] shape consumed by the reduction path. NULLs collapse
-/// to the dtype's zero, matching the zero-initialised slots that the pre
-/// kernel writes for masked-out rows (the reduction's identity is also zero
-/// for SUM/COUNT, so this preserves the existing semantics). Bool / Utf8
-/// materialisations are rejected — the reduction kernels only accept
-/// primitive numeric inputs.
+/// primitive [`HostCol`] shape consumed by the reduction path.
+///
+/// **NULL handling**: any residual `None` is a logic bug — we are post
+/// predicate-mask compaction at this point, and `PreCol::upload` already
+/// rejects NULL-bearing input columns (see TODO there about full validity
+/// propagation). If a `None` reaches us here it means a NULL slipped past
+/// both gates, so we surface it as an error rather than silently collapse
+/// it to the dtype's zero (which would re-introduce the C2/C2b silent
+/// wrong-answer bug for any future call site that lacks a NULL-stripping
+/// predicate).
+///
+/// Bool / Utf8 materialisations are rejected — the reduction kernels only
+/// accept primitive numeric inputs.
 fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
+    fn collapse<T: Copy>(label: &str, v: Vec<Option<T>>) -> BoltResult<Vec<T>> {
+        let mut out: Vec<T> = Vec::with_capacity(v.len());
+        for (i, x) in v.into_iter().enumerate() {
+            match x {
+                Some(val) => out.push(val),
+                None => {
+                    return Err(BoltError::Other(format!(
+                        "agg_with_pre: from_expr_host received a NULL at row {} \
+                         of {} column; pre-stage NULL propagation is not yet \
+                         implemented and predicate compaction did not strip \
+                         this row",
+                        i, label
+                    )));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     match c {
-        expr_agg::HostColumn::I32(v) => {
-            Ok(HostCol::I32(v.into_iter().map(|x| x.unwrap_or(0)).collect()))
-        }
-        expr_agg::HostColumn::I64(v) => {
-            Ok(HostCol::I64(v.into_iter().map(|x| x.unwrap_or(0)).collect()))
-        }
-        expr_agg::HostColumn::F32(v) => Ok(HostCol::F32(
-            v.into_iter().map(|x| x.unwrap_or(0.0)).collect(),
-        )),
-        expr_agg::HostColumn::F64(v) => Ok(HostCol::F64(
-            v.into_iter().map(|x| x.unwrap_or(0.0)).collect(),
-        )),
+        expr_agg::HostColumn::I32(v) => Ok(HostCol::I32(collapse("I32", v)?)),
+        expr_agg::HostColumn::I64(v) => Ok(HostCol::I64(collapse("I64", v)?)),
+        expr_agg::HostColumn::F32(v) => Ok(HostCol::F32(collapse("F32", v)?)),
+        expr_agg::HostColumn::F64(v) => Ok(HostCol::F64(collapse("F64", v)?)),
         expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => {
             Err(BoltError::Type(
                 "agg_with_pre: Bool/Utf8 aggregate inputs not supported by the \
@@ -528,7 +546,30 @@ enum PreCol {
 
 impl PreCol {
     /// Upload an Arrow array to the GPU, downcasting per `dtype`.
+    ///
+    /// **NULL handling**: rejects any input array with `null_count() > 0`.
+    /// The pre-stage GPU kernels operate on raw value buffers and do not
+    /// (yet) carry a validity bitmap, so a NULL would silently feed garbage
+    /// into multiplications / additions. The clean error is the safe
+    /// surgical fix; full propagation is tracked below.
+    ///
+    /// TODO(pre-stage-nulls): propagate `arr.nulls()` into a parallel
+    /// `valid_mask: GpuBuffer<u8>` per `PreCol`, then have the JIT kernel
+    /// emit `value if valid else identity` per op so NULL semantics survive
+    /// the pre-stage. Until then, planners that introduce a pre kernel
+    /// over a NULL-bearing source column must ensure either (a) the source
+    /// has been filtered upstream or (b) the column is unconditionally
+    /// non-null.
     fn upload(arr: &dyn Array, dtype: DataType) -> BoltResult<Self> {
+        if arr.null_count() > 0 {
+            return Err(BoltError::Type(format!(
+                "agg_with_pre: pre-stage kernels do not yet propagate NULL \
+                 validity; input column with dtype {:?} has {} NULL(s). \
+                 See TODO(pre-stage-nulls) in agg_with_pre.rs.",
+                dtype,
+                arr.null_count()
+            )));
+        }
         match dtype {
             DataType::Int32 => {
                 let pa = arr
@@ -843,4 +884,84 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+#[cfg(test)]
+mod null_handling_tests {
+    //! Host-only tests for the NULL-handling gates added in the pre-stage:
+    //!   1. `from_expr_host` errors on residual `None` (rather than silently
+    //!      collapsing to the dtype zero).
+    //!   2. `PreCol::upload` rejects Arrow arrays whose `null_count() > 0`
+    //!      (the pre-stage GPU kernels do not yet carry validity, so a NULL
+    //!      would multiply garbage).
+    //!
+    //! No CUDA touched: both error paths short-circuit before any device
+    //! allocation. A "no NULLs" positive-regression test would necessarily
+    //! reach `primitive_to_gpu` (which allocates on the device); that is
+    //! covered indirectly by the existing end-to-end tests that exercise
+    //! `execute_aggregate_with_pre` with NULL-free inputs.
+    use super::*;
+
+    #[test]
+    fn from_expr_host_errors_on_residual_none_i32() {
+        let col = expr_agg::HostColumn::I32(vec![Some(1), None, Some(3)]);
+        let err = from_expr_host(col).expect_err("expected NULL to be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("NULL"),
+            "error should mention NULL, got: {msg}"
+        );
+        assert!(
+            msg.contains("row 1"),
+            "error should point at the offending row, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_expr_host_errors_on_residual_none_f64() {
+        let col = expr_agg::HostColumn::F64(vec![Some(1.0), Some(2.0), None]);
+        let err = from_expr_host(col).expect_err("expected NULL to be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("row 2"), "error should point at row 2: {msg}");
+    }
+
+    #[test]
+    fn from_expr_host_passes_through_all_some_i64() {
+        let col = expr_agg::HostColumn::I64(vec![Some(10), Some(20), Some(30)]);
+        let out = from_expr_host(col).expect("all-Some input should pass through");
+        match out {
+            HostCol::I64(v) => assert_eq!(v, vec![10, 20, 30]),
+            other => panic!("expected HostCol::I64, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn from_expr_host_passes_through_all_some_f32() {
+        let col = expr_agg::HostColumn::F32(vec![Some(1.5f32), Some(2.5f32)]);
+        let out = from_expr_host(col).expect("all-Some input should pass through");
+        match out {
+            HostCol::F32(v) => assert_eq!(v, vec![1.5f32, 2.5f32]),
+            other => panic!("expected HostCol::F32, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn pre_col_upload_rejects_null_bearing_input() {
+        // Arrow `Int32Array::from` with `Option`s carries a real validity
+        // bitmap, so `null_count()` returns > 0 and we should reject this
+        // before reaching CUDA.
+        let arr = Int32Array::from(vec![Some(1i32), None, Some(3i32)]);
+        assert!(arr.null_count() > 0, "arrow array should carry a NULL");
+        let err = PreCol::upload(&arr, DataType::Int32)
+            .expect_err("PreCol::upload should reject NULL-bearing input");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("NULL"),
+            "error should mention NULL validity, got: {msg}"
+        );
+        assert!(
+            msg.contains("pre-stage"),
+            "error should mention pre-stage, got: {msg}"
+        );
+    }
 }
