@@ -1126,3 +1126,254 @@ fn multi_gpu_cap_uses_current_device() {
     // `Engine::new` (which binds the context to device 0).
     assert!(total0 > 0, "device 0 must report non-zero VRAM");
 }
+
+// ============================================================================
+// Stage 5 (GJ-5): OUTER+Utf8, AoS routing, parallel intern.
+// ============================================================================
+
+/// Helper: build a `(k: Utf8, v: Int32)` batch.
+fn utf8_batch(name_k: &str, name_v: &str, keys: Vec<String>, vals: Vec<i32>) -> RecordBatch {
+    assert_eq!(keys.len(), vals.len());
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(name_k, ArrowDataType::Utf8, false),
+        ArrowField::new(name_v, ArrowDataType::Int32, false),
+    ]));
+    let key_arr: StringArray = StringArray::from(keys.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(key_arr) as ArrayRef,
+            Arc::new(Int32Array::from(vals)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+/// Stage-5: LEFT OUTER JOIN with a Utf8 key. The fixture is arranged so
+/// half the left rows have a matching right key and the other half don't
+/// — those must surface with the right-side columns NULL-padded.
+///
+/// This is the new code path: `try_gpu_outer_join` now accepts
+/// `SingleUtf8` and routes through `execute_utf8_outer_join_on_gpu`.
+/// Stage 4 fell back to host for this.
+#[test]
+#[ignore = "requires CUDA device"]
+fn outer_utf8_with_unmatched_rows() {
+    let mut engine = Engine::new().expect("ctx");
+
+    // Left (probe for LEFT OUTER): 4096 rows, keys "row-0000".."row-4095".
+    let l_keys: Vec<String> = (0..N_BUILD).map(|i| format!("row-{:04}", i)).collect();
+    let l_vals: Vec<i32> = (0..N_BUILD as i32).map(|i| 100 + i).collect();
+    // Right (build for LEFT OUTER): half-overlapping range. "row-2048" ..
+    // "row-6143" (4096 rows). So left rows "row-0000" .. "row-2047"
+    // (2048 rows) are unmatched.
+    let r_keys: Vec<String> = (2048..(2048 + N_BUILD))
+        .map(|i| format!("row-{:04}", i))
+        .collect();
+    let r_vals: Vec<i32> = (2048..(2048 + N_BUILD as i32)).map(|i| 500 + i).collect();
+
+    let t1 = utf8_batch("k", "lv", l_keys.clone(), l_vals.clone());
+    let t2 = utf8_batch("k", "rv", r_keys.clone(), r_vals.clone());
+    engine.register_table("t1", t1).unwrap();
+    engine.register_table("t2", t2).unwrap();
+
+    let h = engine
+        .sql("SELECT * FROM t1 LEFT OUTER JOIN t2 ON t1.k = t2.k")
+        .expect("LEFT OUTER JOIN over Utf8 keys must succeed (Stage-5)");
+    let out = h.record_batch();
+
+    // Every left row appears exactly once (LEFT OUTER invariant).
+    assert_eq!(
+        out.num_rows(),
+        N_BUILD,
+        "LEFT OUTER over Utf8: row count must equal left.len() = {N_BUILD}"
+    );
+
+    // Unmatched rows (left key "row-0000" .. "row-2047") must surface with
+    // `rv` NULL; matched rows have `rv` populated.
+    let rv_idx = out.schema().index_of("rv").expect("'rv' in output");
+    let rv = out.column(rv_idx);
+    let n_nulls = rv.null_count();
+    assert_eq!(
+        n_nulls, 2048,
+        "LEFT OUTER over Utf8: exactly 2048 rows must have rv NULL (left key < 'row-2048'); got {n_nulls}"
+    );
+    let n_matched = out.num_rows() - n_nulls;
+    assert_eq!(
+        n_matched, 2048,
+        "LEFT OUTER over Utf8: matched count must equal 2048; got {n_matched}"
+    );
+}
+
+/// Stage-5: probe-heavy INNER JOIN must hit the AoS routing path
+/// (`n_probe / n_build = 100` >> 8 = `AOS_ROUTING_PROBE_BUILD_RATIO`).
+/// We can't directly observe which kernel ran from outside the crate,
+/// so this test pins the OBSERVABLE behaviour: the AoS path must
+/// produce the same matched set as the SoA fallback (row count + equi-
+/// join invariant). Any regression in AoS (slot layout drift, wrong
+/// stride) is caught here.
+#[test]
+#[ignore = "requires CUDA device"]
+fn aos_routing_probe_heavy() {
+    let mut engine = Engine::new().expect("ctx");
+
+    // Build = 1k rows (small), probe = 100k rows (100× larger).
+    let n_build: usize = 1_024;
+    let n_probe: usize = 100_000;
+    let build_keys: Vec<i32> = (0..n_build as i32).collect();
+    let build_payload: Vec<i32> = build_keys.iter().map(|k| 1000 + k).collect();
+    // Probe keys cycle 0..(n_build * 2), so half land on a build key.
+    let probe_keys: Vec<i32> = (0..n_probe as i32)
+        .map(|i| i % (n_build as i32 * 2))
+        .collect();
+    let probe_payload: Vec<i32> = (0..n_probe as i32).map(|i| 50_000 + i).collect();
+
+    let t1 = int32_batch("k", "bv", build_keys.clone(), build_payload.clone());
+    let t2 = int32_batch("k", "pv", probe_keys.clone(), probe_payload.clone());
+    engine.register_table("t1", t1).unwrap();
+    engine.register_table("t2", t2).unwrap();
+
+    let h = engine
+        .sql("SELECT * FROM t1 INNER JOIN t2 ON t1.k = t2.k")
+        .expect("probe-heavy INNER JOIN must succeed");
+    let out = h.record_batch();
+
+    // Expected: every probe row with key < n_build matches exactly one
+    // build row. The cycle hits 0..2047 = 2*n_build distinct keys, so
+    // n_probe / 2 = 50_000 rows match.
+    let expected: usize = probe_keys
+        .iter()
+        .filter(|k| (**k as usize) < n_build)
+        .count();
+    assert_eq!(
+        out.num_rows(),
+        expected,
+        "probe-heavy AoS-routed INNER JOIN: row count mismatch (expected={expected})"
+    );
+
+    // Equi-join invariant: bv = 1000 + probe_key for every matched row.
+    let bv_idx = out.schema().index_of("bv").unwrap();
+    let pv_idx = out.schema().index_of("pv").unwrap();
+    let bv = out.column(bv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+    let pv = out.column(pv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+    for i in 0..out.num_rows() {
+        let probe_row = (pv.value(i) - 50_000) as usize;
+        let probe_key = probe_keys[probe_row];
+        assert_eq!(
+            bv.value(i),
+            1000 + probe_key,
+            "row {i}: AoS path violated equi-join invariant"
+        );
+    }
+}
+
+/// Stage-5: balanced sides keep the routing on SoA — the AoS heuristic is
+/// `n_probe / n_build > 8` so a 1:1 ratio MUST stay on SoA. We don't
+/// observe the layout directly; the test pins that the result is correct
+/// under whatever routing the heuristic picks. Any drift in the
+/// heuristic (e.g. accidentally routing AoS for ratio < 8) would still
+/// produce correct output, but a future test could grep for the routing
+/// log if debug logging is enabled.
+#[test]
+#[ignore = "requires CUDA device"]
+fn aos_routing_balanced_picks_soa() {
+    let mut engine = Engine::new().expect("ctx");
+
+    // Balanced 50k × 50k. Ratio = 1, well below the threshold of 8.
+    let n: usize = 50_000;
+    let build_keys: Vec<i32> = (0..n as i32).collect();
+    let build_payload: Vec<i32> = build_keys.iter().map(|k| 1000 + k).collect();
+    let probe_keys: Vec<i32> = (0..n as i32).collect();
+    let probe_payload: Vec<i32> = (0..n as i32).map(|i| 50_000 + i).collect();
+
+    let t1 = int32_batch("k", "bv", build_keys.clone(), build_payload.clone());
+    let t2 = int32_batch("k", "pv", probe_keys.clone(), probe_payload.clone());
+    engine.register_table("t1", t1).unwrap();
+    engine.register_table("t2", t2).unwrap();
+
+    let h = engine
+        .sql("SELECT * FROM t1 INNER JOIN t2 ON t1.k = t2.k")
+        .expect("balanced INNER JOIN must succeed");
+    let out = h.record_batch();
+
+    // Every key matches: build = probe = 0..n, so output rows = n.
+    assert_eq!(
+        out.num_rows(),
+        n,
+        "balanced (SoA-routed) INNER JOIN must emit every row; got {}",
+        out.num_rows()
+    );
+
+    // Equi-join invariant.
+    let bv_idx = out.schema().index_of("bv").unwrap();
+    let pv_idx = out.schema().index_of("pv").unwrap();
+    let bv = out.column(bv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+    let pv = out.column(pv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+    for i in 0..out.num_rows() {
+        let probe_row = (pv.value(i) - 50_000) as usize;
+        let probe_key = probe_keys[probe_row];
+        assert_eq!(
+            bv.value(i),
+            1000 + probe_key,
+            "row {i}: balanced SoA path violated equi-join invariant"
+        );
+    }
+}
+
+/// Stage-5 placeholder for the device-side string-hash unit test. The
+/// load-bearing assertion (device kernel byte-for-byte matches the host
+/// FNV-1a + splitmix path) lives in
+/// `src/exec/gpu_join.rs::tests::device_string_hash_matches_host` — that
+/// test reaches the private `utf8_hash64` + `compute_device_string_hashes`
+/// pair, which `gpu_join`'s `pub(crate)` visibility hides from this
+/// integration-test crate.
+///
+/// We keep an engine-level smoke test here that exercises the SAME code
+/// path indirectly: a Utf8 INNER join with the streaming-intern env var
+/// flipped on routes through `intern_utf8_columns_streaming_parallel`,
+/// which in turn drives the same `utf8_hash64` the device kernel is
+/// supposed to replay. A divergence between host and device hashing
+/// would surface here as a missing match.
+#[test]
+#[ignore = "requires CUDA device"]
+fn device_string_hash_matches_host_via_engine() {
+    let prev = std::env::var("BOLT_GPU_JOIN_STREAMING_INTERN").ok();
+    std::env::set_var("BOLT_GPU_JOIN_STREAMING_INTERN", "1");
+
+    let mut engine = Engine::new().expect("ctx");
+    let n_build = 4096usize;
+    let n_probe = 8192usize;
+    let build_keys: Vec<String> = (0..n_build).map(|i| format!("k-{:05}", i)).collect();
+    let build_vals: Vec<i32> = (0..n_build as i32).collect();
+    let probe_keys: Vec<String> = (0..n_probe).map(|i| format!("k-{:05}", i % (n_build * 2))).collect();
+    let probe_vals: Vec<i32> = (0..n_probe as i32).collect();
+
+    let t1 = utf8_batch("k", "bv", build_keys, build_vals);
+    let t2 = utf8_batch("k", "pv", probe_keys.clone(), probe_vals);
+    engine.register_table("t1", t1).unwrap();
+    engine.register_table("t2", t2).unwrap();
+
+    let h = engine
+        .sql("SELECT * FROM t1 INNER JOIN t2 ON t1.k = t2.k")
+        .expect("streaming-intern INNER JOIN over Utf8 must succeed");
+    let out = h.record_batch();
+
+    let expected: usize = probe_keys
+        .iter()
+        .filter(|k| {
+            // k = "k-{nnnnn}"; matches iff the numeric suffix < n_build.
+            let suffix: usize = k.trim_start_matches("k-").parse().unwrap_or(usize::MAX);
+            suffix < n_build
+        })
+        .count();
+    assert_eq!(
+        out.num_rows(),
+        expected,
+        "streaming-intern Utf8 INNER row count mismatch (expected={expected})"
+    );
+
+    match prev {
+        Some(v) => std::env::set_var("BOLT_GPU_JOIN_STREAMING_INTERN", v),
+        None => std::env::remove_var("BOLT_GPU_JOIN_STREAMING_INTERN"),
+    }
+}

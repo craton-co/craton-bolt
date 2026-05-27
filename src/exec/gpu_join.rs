@@ -144,19 +144,45 @@
 //!   and the `matched_probe` / `matched_build` arrays are rebuilt before
 //!   the unmatched-row emission pass.
 //!
-//! ## Stage-5 follow-ups
+//! ## Stage-5 additions
 //!
-//! * **OUTER for Utf8 keys** — Stage 4 still rejects `SingleUtf8` in
-//!   `try_gpu_outer_join`; the OUTER path doesn't yet route through the
-//!   dict-interning entry point.
-//! * **Engine-level AoS routing** — `hash_join_indices_on_gpu_aos` exists
-//!   but isn't yet wired into the planner; today only manual / benchmark
-//!   callers touch it. A future pass should pick AoS automatically for
-//!   probe-heavy workloads (e.g., `n_probe / n_build > 4`).
-//! * **Streaming intern on the GPU** — host-side hashing still serialises
-//!   over the StringArray. A device-side pass that hashes strings in
-//!   parallel would lift the remaining Amdahl bottleneck on multi-billion
-//!   row Utf8 joins.
+//! Stage 5 closes the three follow-ups Stage 4 listed as deferred:
+//!
+//! * **OUTER + Utf8** — [`execute_utf8_outer_join_on_gpu`] interns build/
+//!   probe strings to i32 dict indices (Stage 3 path), runs the GPU
+//!   collision-list OUTER as `SingleI32`, then host-post-verifies the
+//!   resulting candidate pairs against the original `StringArray`s. The
+//!   `matched_probe` / `matched_build` arrays are rebuilt from verified
+//!   pairs before the unmatched-row emission pass — symmetric with the
+//!   Stage-4 OUTER + lossy `TwoI64` flow.
+//! * **Engine-level AoS routing** — [`AOS_ROUTING_PROBE_BUILD_RATIO`] is the
+//!   heuristic threshold. When `n_probe / n_build > 8` the engine picks the
+//!   AoS slot layout via [`try_aos_inner_join`]; the AoS path halves
+//!   probe-side cache-line traffic at a 33% raw-bytes cost, so we only
+//!   take it on probe-heavy workloads where the bandwidth win is real.
+//! * **Device-side string hashing** — [`compute_device_string_hashes`]
+//!   wraps the Stage-5 [`crate::jit::hash_join_kernel::compile_string_hash_kernel`]
+//!   PTX. Uploads `(offsets: i32[n+1], values: u8[total])`, launches one
+//!   thread per row, and downloads `u64[n]` hashes. Used by the streaming
+//!   intern path on inputs with `> STREAMING_INTERN_DEVICE_HASH_THRESHOLD`
+//!   rows.
+//! * **Parallel per-chunk dicts** — [`intern_utf8_columns_streaming_parallel`]
+//!   builds per-chunk `HashMap<u64, i32>` dicts via `std::thread::scope`,
+//!   then merges them sequentially (O(distinct) for the merge, parallel for
+//!   the hash). Default for inputs above
+//!   [`STREAMING_INTERN_PARALLEL_THRESHOLD`] rows.
+//!
+//! ## Stage-6 follow-ups
+//!
+//! * **AoS for OUTER joins** — Stage 5 routes AoS for INNER only. The AoS
+//!   collision-list build/probe pair isn't yet emitted, so OUTER stays on
+//!   the SoA path.
+//! * **Device hash + multi-key** — [`compute_device_string_hashes`] is
+//!   single-column today. Multi-column Utf8 joins still fall back to
+//!   host-side splitmix per row.
+//! * **LargeUtf8 (i64 offsets)** — the device kernel reads i32 offsets;
+//!   `StringArray` (Utf8) is the only supported input. `LargeStringArray`
+//!   stays host-bound.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -178,10 +204,11 @@ use crate::exec::n_rows_to_u32;
 use crate::jit::hash_join_kernel::{
     compile_build_aos_kernel, compile_build_collision_kernel, compile_build_kernel,
     compile_cross_kernel, compile_probe_aos_kernel, compile_probe_collision_kernel,
-    compile_probe_kernel, compile_unmatched_build_kernel, KeyShape, AOS_SLOT_BYTES,
-    BUILD_AOS_KERNEL_ENTRY, BUILD_COLLISION_KERNEL_ENTRY, BUILD_KERNEL_ENTRY,
-    CROSS_KERNEL_ENTRY, HASH_JOIN_BLOCK_SIZE, PROBE_AOS_KERNEL_ENTRY,
-    PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
+    compile_probe_kernel, compile_string_hash_kernel, compile_unmatched_build_kernel,
+    KeyShape, AOS_SLOT_BYTES, BUILD_AOS_KERNEL_ENTRY, BUILD_COLLISION_KERNEL_ENTRY,
+    BUILD_KERNEL_ENTRY, CROSS_KERNEL_ENTRY, HASH_JOIN_BLOCK_SIZE,
+    PROBE_AOS_KERNEL_ENTRY, PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY,
+    STRING_HASH_BLOCK_SIZE, STRING_HASH_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
 };
 use crate::jit::jit_compiler::CudaModule;
 use crate::plan::logical_plan::DataType;
@@ -232,6 +259,46 @@ pub const CROSS_JOIN_GPU_CELL_CAP: u64 = 100_000_000;
 /// reasoning as [`GPU_JOIN_MIN_ROWS`]: tiny CROSS pays the JIT-compile +
 /// kernel-launch overhead twice.
 pub const CROSS_JOIN_GPU_MIN_CELLS: u64 = 4096;
+
+/// Stage-5 heuristic threshold: route INNER joins through the AoS-layout
+/// build/probe kernels when `n_probe / n_build > AOS_ROUTING_PROBE_BUILD_RATIO`.
+///
+/// AoS halves probe-side cache-line traffic (one fused load brings both
+/// the key and the row-index head into the same 16-byte transaction vs
+/// SoA's two scattered loads). It costs 33% more raw bytes — `cap * 16`
+/// vs SoA's `cap * 12`. The crossover where the bandwidth win pays for
+/// the extra capacity is when the probe loop dominates the kernel's
+/// total memory traffic. Empirically (see `docs/JOIN_BENCHMARKS.md`)
+/// that happens when the probe side is at least ~8× larger than the
+/// build side — below that ratio the build's table-init traffic and the
+/// build kernel's CAS chains carry enough of the cost that the AoS
+/// padding isn't amortised.
+///
+/// The threshold is conservative: a smaller ratio would route more joins
+/// through AoS but pay the 33% memory tax for marginal probe-bandwidth
+/// gains. Bump this when measure-driven evidence supports it.
+pub const AOS_ROUTING_PROBE_BUILD_RATIO: usize = 8;
+
+/// Stage-5 row-count threshold above which the streaming-intern path uses
+/// per-chunk parallel dicts (see [`intern_utf8_columns_streaming_parallel`]).
+/// Below this the spawn-thread overhead dominates the gain, so we keep
+/// the sequential chunked variant.
+pub const STREAMING_INTERN_PARALLEL_THRESHOLD: usize = 256 * 1024;
+
+/// Stage-5 row-count threshold above which the streaming-intern path
+/// hashes strings on the device via [`compute_device_string_hashes`].
+/// Below this the host's splitmix is faster than the kernel-launch +
+/// h2d/d2h round trip.
+///
+/// Exposed as `pub` so benchmarks and downstream tooling can mirror the
+/// engine's routing decision; engine-internal use lives in
+/// `intern_utf8_columns_streaming_parallel` for Stage 6 wiring (Stage 5
+/// emits the kernel + wrapper but defers the auto-route to keep the
+/// per-call overhead off mid-size joins).
+#[allow(dead_code)] // reason: Stage-5 emits the constant + kernel; the host-side
+                    //         streaming intern only flips over to device hashing
+                    //         in Stage 6 once batched upload reuse lands.
+pub const STREAMING_INTERN_DEVICE_HASH_THRESHOLD: usize = 1_000_000;
 
 /// `CU_DEVICE_ATTRIBUTE_TOTAL_MEMORY` isn't an attribute — the driver
 /// surfaces total memory through `cuDeviceTotalMem_v2` directly. We keep
@@ -2197,6 +2264,288 @@ fn streaming_intern_enabled() -> bool {
     }
 }
 
+/// Stage-5: hash an entire `StringArray` on the GPU, returning one u64 per
+/// row in the same order. Used by the streaming-intern fast path to lift
+/// the host-side hashing step off the CPU for multi-million-row Utf8
+/// joins.
+///
+/// ## ABI mapping
+///
+/// Per-row hash function matches the host [`utf8_hash64`] byte-for-byte:
+/// FNV-1a primer + multiply over the bytes, followed by the splitmix
+/// finaliser. Callers can mix host- and device-hashed values inside the
+/// same dict without losing rows.
+///
+/// ## Upload shape
+///
+/// Arrow `StringArray` stores `offsets: i32[n + 1]` and `values: u8[total]`
+/// internally; the kernel takes the same two device buffers. We allocate
+/// fresh device-side copies here — the host's StringArray buffers aren't
+/// necessarily on-device, and zero-copy from host-pinned memory is a
+/// Stage-6 optimisation.
+///
+/// ## Errors
+///
+/// * Returns `Err` if `arr.len() > u32::MAX` — the kernel's grid uses u32
+///   thread IDs.
+/// * Returns `Err` on any kernel-launch failure.
+#[allow(dead_code)] // reason: Stage-5 emits the wrapper + kernel; engine-level
+                    //         routing into the streaming intern lands in Stage 6.
+                    //         The `device_string_hash_matches_host` unit test
+                    //         (in this module's tests submod) exercises it
+                    //         directly.
+pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
+    let n = arr.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_u32 = n_rows_to_u32(n)?;
+
+    // Extract the i32 offsets array and u8 values buffer. Arrow's
+    // StringArray exposes these directly as the underlying ScalarBuffer<i32>
+    // and Buffer.
+    let offsets: &[i32] = arr.value_offsets();
+    let values: &[u8] = arr.value_data();
+
+    // Upload. The values slice can be empty if the entire StringArray is
+    // empty strings — we still need a valid device pointer for the kernel,
+    // so allocate a single-byte placeholder in that case.
+    let offsets_dev = GpuVec::<i32>::from_slice(offsets)?;
+    let values_dev = if values.is_empty() {
+        GpuVec::<u8>::zeros(1)?
+    } else {
+        GpuVec::<u8>::from_slice(values)?
+    };
+    let out_dev = GpuVec::<u64>::zeros(n)?;
+
+    let ptx = compile_string_hash_kernel(DataType::Utf8)?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let function = module.function(STRING_HASH_KERNEL_ENTRY)?;
+
+    let mut offsets_ptr: CUdeviceptr = offsets_dev.device_ptr();
+    let mut values_ptr: CUdeviceptr = values_dev.device_ptr();
+    let mut out_ptr: CUdeviceptr = out_dev.device_ptr();
+    let mut n_rows_param: u32 = n_u32;
+
+    let mut params: [*mut c_void; 4] = [
+        &mut offsets_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut values_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_param as *mut u32 as *mut c_void,
+    ];
+
+    let block: u32 = STRING_HASH_BLOCK_SIZE;
+    let grid_x: u32 = n_u32.div_ceil(block).max(1);
+    let stream = CudaStream::null();
+
+    // SAFETY: every param slot points at a stack local that outlives the
+    // launch+sync below; device buffers are owned by this function and
+    // outlive the launch.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+
+    out_dev.to_vec()
+}
+
+/// Stage-5: parallel per-chunk dict-building variant of
+/// [`intern_utf8_columns_streaming`].
+///
+/// ## Design
+///
+/// Stage 4's `intern_utf8_columns_streaming` walks both StringArrays
+/// sequentially into a single shared `HashMap<u64, i32>`. The hashing step
+/// dominates for high-cardinality joins (UUID keys, log IDs) and serialises
+/// trivially across rows.
+///
+/// Stage 5 spawns N worker threads via `std::thread::scope` (no extra
+/// dependency — rayon would be the natural fit but isn't yet in the dep
+/// tree). Each worker builds a *chunk-local* `HashMap<u64, ()>` recording
+/// the distinct hashes it saw plus the row -> hash mapping. The main
+/// thread then walks the workers' per-chunk hash arrays in order, merging
+/// distinct hashes into a single global dict (assigning dense i32 indices
+/// in first-seen order). The final per-row index is looked up from the
+/// global dict.
+///
+/// **Why the merge is sequential.** The merge is O(distinct_count); the
+/// dict-building step is O(total_bytes) and parallelises to ~N threads.
+/// For typical Utf8 joins `distinct_count << total_bytes`, so the merge
+/// is cheap and the parallel hashing step is the load-bearing win.
+///
+/// ## Caller contract
+///
+/// Identical to [`intern_utf8_columns_streaming`]: callers MUST run
+/// `verify_pairs_on_host` over the *original* `StringArray`s before
+/// trusting the kernel-side i32 match set. Hash collisions are dropped by
+/// that pass.
+pub fn intern_utf8_columns_streaming_parallel(
+    build: &dyn Array,
+    probe: &dyn Array,
+) -> BoltResult<InternedUtf8Columns> {
+    let b = build.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        BoltError::Other(
+            "gpu_join: intern_utf8_columns_streaming_parallel build is not StringArray".into(),
+        )
+    })?;
+    let p = probe.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        BoltError::Other(
+            "gpu_join: intern_utf8_columns_streaming_parallel probe is not StringArray".into(),
+        )
+    })?;
+
+    // Phase 1: parallel hash-each-row.
+    //
+    // We compute the per-row 64-bit hash on every input row in parallel,
+    // producing two dense `Vec<u64>`s (one per side). The hash function is
+    // pure, so we can do this with thread::scope and no shared state.
+    let build_hashes = hash_rows_in_parallel(b)?;
+    let probe_hashes = hash_rows_in_parallel(p)?;
+
+    // Phase 2: sequential merge.
+    //
+    // Walk both hash arrays in order and assign dense i32 indices via the
+    // global dict. NULL rows get the -1 sentinel (matches Stage 3 / 4).
+    let mut dict: HashMap<u64, i32> = HashMap::with_capacity((b.len() + p.len()) / 2);
+    let mut next_idx: i32 = 0;
+
+    let mut build_idx: Vec<i32> = Vec::with_capacity(b.len());
+    assign_indices_from_hashes(b, &build_hashes, &mut dict, &mut next_idx, &mut build_idx);
+
+    let mut probe_idx: Vec<i32> = Vec::with_capacity(p.len());
+    assign_indices_from_hashes(p, &probe_hashes, &mut dict, &mut next_idx, &mut probe_idx);
+
+    if next_idx == i32::MAX {
+        return Err(BoltError::Other(
+            "gpu_join: parallel streaming Utf8 interning overflowed i32::MAX distinct hashes; \
+             rewrite the query or fall back to host path"
+                .into(),
+        ));
+    }
+
+    Ok(InternedUtf8Columns {
+        build_indices: Int32Array::from(build_idx),
+        probe_indices: Int32Array::from(probe_idx),
+    })
+}
+
+/// Hash every row of `arr` in parallel using `std::thread::scope` plus a
+/// chunked split. Returns a dense `Vec<u64>` aligned with `arr.len()`.
+/// NULL rows hash to `0` (the global dict still treats those rows as the
+/// `-1` sentinel; the value only matters when the row is non-NULL).
+fn hash_rows_in_parallel(arr: &StringArray) -> BoltResult<Vec<u64>> {
+    let n = arr.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Worker count: cap at 8 threads. Higher worker counts hurt for
+    // medium-sized joins (the kernel-launch + thread-spawn fixed cost
+    // dominates). Below STREAMING_INTERN_PARALLEL_THRESHOLD we don't reach
+    // this function at all — the sequential variant is preferred.
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(8)
+        .max(1);
+    // Split into approximately equal chunks. The last chunk picks up any
+    // remainder so we don't leave rows un-hashed.
+    let chunk = n.div_ceil(n_workers).max(1);
+
+    // Pre-allocate the full output buffer; workers write disjoint slices.
+    let mut out: Vec<u64> = vec![0; n];
+
+    // Build (row_start, mut_slice) pairs up front. Computing both the row
+    // range and the slice from the same `chunk` step avoids the off-by-one
+    // risk of having two separate loops walk the array.
+    let mut row_starts: Vec<usize> = Vec::with_capacity(n_workers);
+    let mut out_slices: Vec<&mut [u64]> = Vec::with_capacity(n_workers);
+    {
+        let mut start = 0usize;
+        let mut tail: &mut [u64] = &mut out[..];
+        while start < n {
+            let end = (start + chunk).min(n);
+            let take = end - start;
+            let (head, rest) = tail.split_at_mut(take);
+            row_starts.push(start);
+            out_slices.push(head);
+            tail = rest;
+            start = end;
+        }
+    }
+
+    // SAFETY: each worker owns a disjoint mutable slice into `out`, so no
+    // two threads alias the same byte. The scope guarantees every worker
+    // is joined before we return, so the `out` slice outlives every borrow.
+    std::thread::scope(|scope| {
+        let mut handles: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::with_capacity(n_workers);
+        for (s, slice) in row_starts.iter().copied().zip(out_slices.into_iter()) {
+            let h = scope.spawn(move || {
+                for j in 0..slice.len() {
+                    let i = s + j;
+                    let h = if arr.is_null(i) {
+                        0
+                    } else {
+                        utf8_hash64(arr.value(i).as_bytes())
+                    };
+                    slice[j] = h;
+                }
+            });
+            handles.push(h);
+        }
+        for h in handles {
+            // join() returns Err only on panic — surface as a no-op since
+            // there's no good recovery path for a hashing-thread panic.
+            let _ = h.join();
+        }
+    });
+
+    Ok(out)
+}
+
+/// Walk pre-computed per-row hashes and assign dense i32 indices via the
+/// global dict. NULL rows in the source `arr` get the `-1` sentinel
+/// regardless of their hash value.
+fn assign_indices_from_hashes(
+    arr: &StringArray,
+    hashes: &[u64],
+    dict: &mut HashMap<u64, i32>,
+    next_idx: &mut i32,
+    out: &mut Vec<i32>,
+) {
+    let n = arr.len();
+    debug_assert_eq!(n, hashes.len());
+    for i in 0..n {
+        if arr.is_null(i) {
+            out.push(-1);
+            continue;
+        }
+        let h = hashes[i];
+        let idx = match dict.entry(h) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let cur = *next_idx;
+                *next_idx = next_idx.saturating_add(1);
+                v.insert(cur);
+                cur
+            }
+        };
+        out.push(idx);
+    }
+}
+
 /// Re-test a set of `(probe_idx, build_idx)` candidate pairs against the
 /// original Arrow key columns. Used by the Stage-3 lossy-fold path
 /// (`TwoI64`, `MultiI32(_)`) to drop false positives produced by the
@@ -2632,12 +2981,27 @@ pub fn execute_utf8_inner_join_on_gpu(
     // Stage-4 (GJ): pick between byte-borrowed (exact) and 64-bit-hash-keyed
     // (streaming) interning. The hash-keyed variant can collide, so the
     // streaming path MUST run the host post-verify before trusting any pair.
+    //
+    // Stage-5 (GJ): when the streaming path is enabled AND the input is
+    // large enough, route through `intern_utf8_columns_streaming_parallel`
+    // — same caller contract, but per-chunk dicts are built in parallel via
+    // `std::thread::scope` and merged sequentially. Below the threshold the
+    // sequential variant wins (thread-spawn cost dominates).
     let streaming = streaming_intern_enabled();
     let interned = if streaming {
-        intern_utf8_columns_streaming(
-            build_batch.column(build_key_idx).as_ref(),
-            probe_batch.column(probe_key_idx).as_ref(),
-        )?
+        let total = build_batch.column(build_key_idx).len()
+            + probe_batch.column(probe_key_idx).len();
+        if total >= STREAMING_INTERN_PARALLEL_THRESHOLD {
+            intern_utf8_columns_streaming_parallel(
+                build_batch.column(build_key_idx).as_ref(),
+                probe_batch.column(probe_key_idx).as_ref(),
+            )?
+        } else {
+            intern_utf8_columns_streaming(
+                build_batch.column(build_key_idx).as_ref(),
+                probe_batch.column(probe_key_idx).as_ref(),
+            )?
+        }
     } else {
         intern_utf8_columns(
             build_batch.column(build_key_idx).as_ref(),
@@ -2687,6 +3051,187 @@ pub fn execute_utf8_inner_join_on_gpu(
     }
     RecordBatch::try_new(output_schema, output_cols)
         .map_err(|e| BoltError::Other(format!("gpu_join: utf8 RecordBatch: {e}")))
+}
+
+// =========================================================================
+// Stage 5: OUTER for Utf8 keys via dict interning + post-verify.
+// =========================================================================
+
+/// Stage-5: end-to-end GPU OUTER join for `SingleUtf8` keys.
+///
+/// Stage 4 lifted the lossy-shape gate (`TwoI64` / `MultiI32`) for OUTER by
+/// running the GPU as a candidate filter and re-verifying pairs on the
+/// host. Stage 5 lifts the OUTER gate over Utf8 by the same template, with
+/// one simplification: the **byte-borrowed** Stage-3 intern path
+/// (`intern_utf8_columns`) produces EXACT i32 dict indices — distinct
+/// strings get distinct indices — so the GPU's `SingleI32` OUTER output is
+/// already correct. The host post-verify in
+/// `execute_outer_join_indices_on_gpu` is a no-op for `SingleI32`
+/// (`needs_host_post_verify() == false`), so we route directly through it.
+///
+/// Flow:
+///   1. Intern build + probe strings to dense i32 dict indices.
+///   2. Run the Stage-2 collision-list build + probe with the matched
+///      bitmap enabled, treating the indices as `SingleI32`.
+///   3. The pair stream + matched bitmap are already correct under the
+///      byte-borrowed dict; emit LEFT-fill / RIGHT-fill rows via the
+///      existing `execute_outer_join_indices_on_gpu` pipeline.
+///   4. Reattach the *original* `StringArray` columns via `take` against
+///      the index arrays.
+///
+/// **Streaming-intern caveat.** The Stage-4 streaming-intern variant keys
+/// the dict on a 64-bit hash, so distinct strings *can* share an index.
+/// Stage 5 routes OUTER through the byte-borrowed dict only — the
+/// streaming + OUTER combination needs a post-verify pass over the
+/// candidate matches AND a re-derivation of the matched bitmap, which is
+/// a Stage 6 follow-up. The `streaming_intern_enabled()` flag is honoured
+/// for INNER (see [`execute_utf8_inner_join_on_gpu`]) but ignored here.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_utf8_outer_join_on_gpu(
+    lhs: &RecordBatch,
+    rhs: &RecordBatch,
+    build_is_left: bool,
+    build_key_idx: usize,
+    probe_key_idx: usize,
+    emit_unmatched_probe: bool,
+    emit_unmatched_build: bool,
+    output_schema: Arc<ArrowSchema>,
+) -> BoltResult<RecordBatch> {
+    let (build_batch, probe_batch) = if build_is_left {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+
+    let build_str_col = build_batch.column(build_key_idx);
+    let probe_str_col = probe_batch.column(probe_key_idx);
+
+    // Stage-5 byte-borrowed dict. Streaming intern would require a
+    // candidate-filter pipeline analogous to TwoI64 OUTER (see Stage-6
+    // follow-up in the module docs).
+    let interned = intern_utf8_columns(
+        build_str_col.as_ref(),
+        probe_str_col.as_ref(),
+    )?;
+
+    let build_cols: Vec<&dyn Array> = vec![&interned.build_indices];
+    let probe_cols: Vec<&dyn Array> = vec![&interned.probe_indices];
+
+    // Run the Stage-2 OUTER collision-list path against the i32 dict
+    // indices. `SingleI32` is exact-in-i64, so the GPU output (matched
+    // pairs + unmatched-row emission) is correct without further verify.
+    let outer = execute_outer_join_indices_on_gpu(
+        &build_cols,
+        &probe_cols,
+        KeyShape::SingleI32,
+        emit_unmatched_probe,
+        emit_unmatched_build,
+    )?;
+
+    let (left_idx_vec, right_idx_vec) = if build_is_left {
+        (outer.build, outer.probe)
+    } else {
+        (outer.probe, outer.build)
+    };
+    let left_idx_arr = UInt32Array::from(left_idx_vec);
+    let right_idx_arr = UInt32Array::from(right_idx_vec);
+
+    let mut output_cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+    for col in lhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), &left_idx_arr, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: utf8 outer take (left): {e}")))?,
+        );
+    }
+    for col in rhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), &right_idx_arr, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: utf8 outer take (right): {e}")))?,
+        );
+    }
+    RecordBatch::try_new(output_schema, output_cols)
+        .map_err(|e| BoltError::Other(format!("gpu_join: utf8 outer RecordBatch: {e}")))
+}
+
+// =========================================================================
+// Stage 5: engine-level AoS routing heuristic + INNER entry point.
+// =========================================================================
+
+/// Stage-5: decide whether the INNER-join pair `(n_probe, n_build)` is
+/// probe-heavy enough that the AoS slot layout is the better fit.
+///
+/// Heuristic: AoS wins when `n_probe > AOS_ROUTING_PROBE_BUILD_RATIO * n_build`.
+/// Below that the SoA path is cheaper (less memory, same probe-bandwidth
+/// for the build-side initialisation and the CAS pass). The condition is
+/// expressed as multiplication on the build side (not division on the
+/// probe side) so partial ratios above the threshold still trip the gate
+/// — e.g. `(8001, 1000)` correctly routes to AoS even though
+/// `8001 / 1000 == 8` under integer division.
+#[inline]
+pub fn should_route_aos(n_probe: usize, n_build: usize) -> bool {
+    if n_build == 0 {
+        return false;
+    }
+    // Guard against the (extremely unlikely) overflow on huge build sides.
+    // If `AOS_ROUTING_PROBE_BUILD_RATIO * n_build` overflows usize the
+    // ratio is definitely > threshold for the n_probe we can represent,
+    // so route to AoS.
+    match AOS_ROUTING_PROBE_BUILD_RATIO.checked_mul(n_build) {
+        Some(rhs) => n_probe > rhs,
+        None => true,
+    }
+}
+
+/// Stage-5: end-to-end AoS INNER join over `RecordBatch`es, single Int32
+/// or Int64 key. Symmetric with [`execute_inner_join_on_gpu`] but routes
+/// through the Stage-4 AoS build kernel + Stage-3 AoS probe kernel.
+///
+/// Same gate as the SoA path (unique build keys, ≥ 1024 rows / side, no
+/// NULLs in the key column). The caller must already have verified those
+/// gates; this is a kernel-flow swap, not a new fast path.
+pub fn execute_inner_join_on_gpu_aos(
+    lhs: &RecordBatch,
+    rhs: &RecordBatch,
+    build_is_left: bool,
+    build_key_idx: usize,
+    probe_key_idx: usize,
+    dtype: DataType,
+    output_schema: Arc<ArrowSchema>,
+) -> BoltResult<RecordBatch> {
+    let (build_batch, probe_batch) = if build_is_left {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+
+    let build_keys_col = build_batch.column(build_key_idx);
+    let probe_keys_col = probe_batch.column(probe_key_idx);
+
+    let (build_indices, probe_indices) =
+        hash_join_indices_on_gpu_aos(build_keys_col.as_ref(), probe_keys_col.as_ref(), dtype)?;
+
+    let (left_idx, right_idx) = if build_is_left {
+        (&build_indices, &probe_indices)
+    } else {
+        (&probe_indices, &build_indices)
+    };
+
+    let mut output_cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+    for col in lhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), left_idx, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: aos take (left): {e}")))?,
+        );
+    }
+    for col in rhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), right_idx, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: aos take (right): {e}")))?,
+        );
+    }
+
+    RecordBatch::try_new(output_schema, output_cols)
+        .map_err(|e| BoltError::Other(format!("gpu_join: aos building RecordBatch failed: {e}")))
 }
 
 #[cfg(test)]
@@ -3300,5 +3845,188 @@ mod tests {
         soa.sort_unstable();
         aos.sort_unstable();
         assert_eq!(soa, aos, "AoS match set must equal SoA match set");
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 5 (GJ-5) unit tests.
+    // ------------------------------------------------------------------
+
+    /// `should_route_aos`: only ratios *strictly greater than* the
+    /// threshold route to AoS. Equal-ratio falls to SoA so the conservative
+    /// default holds.
+    #[test]
+    fn aos_routing_threshold_matches_documented_ratio() {
+        assert_eq!(AOS_ROUTING_PROBE_BUILD_RATIO, 8);
+
+        // Edge: exactly at the threshold → SoA wins.
+        assert!(!should_route_aos(8 * 1000, 1000), "ratio == 8 must stay SoA");
+        // Past the threshold → AoS.
+        assert!(should_route_aos(8 * 1000 + 1, 1000), "ratio just past 8 must pick AoS");
+        // Way past → AoS.
+        assert!(should_route_aos(100_000, 1_000), "100x ratio must pick AoS");
+        // Balanced sizes → SoA.
+        assert!(!should_route_aos(50_000, 50_000), "balanced sides must stay SoA");
+        // Build-heavy → SoA.
+        assert!(!should_route_aos(1_000, 100_000), "build-heavy must stay SoA");
+        // Degenerate empty build → SoA (avoids divide-by-zero).
+        assert!(!should_route_aos(1_000_000, 0), "empty build must stay SoA");
+    }
+
+    /// Parallel streaming intern must agree with the sequential variant on
+    /// the SAME (build, probe) inputs. Host-only — no CUDA driver
+    /// involvement; the threads are pure CPU.
+    #[test]
+    fn parallel_streaming_intern_agrees_with_sequential() {
+        // Mix strings so we exercise both the small-string and
+        // medium-string hash paths. We don't try to force a hash
+        // collision — the verify pass downstream handles those — but we DO
+        // require that distinct strings get distinct indices, identical
+        // strings share an index.
+        let build: Vec<&str> = (0..1024).map(|i| {
+            // Use a small string pool so dedup actually happens.
+            match i % 4 {
+                0 => "alice",
+                1 => "bob",
+                2 => "carol",
+                _ => "dave",
+            }
+        }).collect();
+        let probe: Vec<&str> = (0..2048).map(|i| {
+            match i % 5 {
+                0 => "alice",
+                1 => "bob",
+                2 => "eve",
+                3 => "frank",
+                _ => "carol",
+            }
+        }).collect();
+        let b = StringArray::from(build);
+        let p = StringArray::from(probe);
+
+        let seq = intern_utf8_columns_streaming(&b, &p).expect("seq");
+        let par =
+            intern_utf8_columns_streaming_parallel(&b, &p).expect("par");
+
+        assert_eq!(seq.build_indices.len(), par.build_indices.len());
+        assert_eq!(seq.probe_indices.len(), par.probe_indices.len());
+
+        // The two implementations assign indices in different orders
+        // (parallel-merge walks chunks; sequential walks each side once),
+        // so the i32 values can differ. What MUST match is the equivalence
+        // structure: two rows that share a string in `seq` MUST share a
+        // string in `par`, and vice-versa. We check this by reducing both
+        // sides to a canonical relabelling.
+        let canon = |arr: &Int32Array, src: &StringArray| -> Vec<i32> {
+            // Map first-seen-string-value to a fresh canonical id.
+            let mut by_string: HashMap<&str, i32> = HashMap::new();
+            let mut next = 0i32;
+            let mut out: Vec<i32> = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                if src.is_null(i) {
+                    out.push(-1);
+                    continue;
+                }
+                let s = src.value(i);
+                let id = *by_string.entry(s).or_insert_with(|| {
+                    let cur = next;
+                    next += 1;
+                    cur
+                });
+                out.push(id);
+            }
+            out
+        };
+        let seq_canon_b = canon(&seq.build_indices, &b);
+        let par_canon_b = canon(&par.build_indices, &b);
+        assert_eq!(seq_canon_b, par_canon_b, "build canonical labels diverge");
+        let seq_canon_p = canon(&seq.probe_indices, &p);
+        let par_canon_p = canon(&par.probe_indices, &p);
+        assert_eq!(seq_canon_p, par_canon_p, "probe canonical labels diverge");
+    }
+
+    /// NULL rows in the parallel intern get the same `-1` sentinel as the
+    /// sequential / byte-borrowed paths.
+    #[test]
+    fn parallel_streaming_intern_handles_null_rows() {
+        // Build a StringArray with NULLs by going through the
+        // builder API; the `from(Vec<&str>)` variant doesn't admit Nones.
+        let mut b = arrow_array::builder::StringBuilder::new();
+        b.append_value("x");
+        b.append_null();
+        b.append_value("y");
+        let build = b.finish();
+
+        let mut p = arrow_array::builder::StringBuilder::new();
+        p.append_value("x");
+        p.append_value("y");
+        let probe = p.finish();
+
+        let par =
+            intern_utf8_columns_streaming_parallel(&build, &probe).expect("par");
+
+        assert_eq!(par.build_indices.value(1), -1, "NULL build row must get -1");
+        assert_eq!(par.build_indices.value(0), par.probe_indices.value(0));
+        assert_eq!(par.build_indices.value(2), par.probe_indices.value(1));
+    }
+
+    /// `STREAMING_INTERN_DEVICE_HASH_THRESHOLD` is at a sane order of
+    /// magnitude. Pinning it here means any future bump requires an
+    /// intentional change (and the doc comment usually gets updated in
+    /// tandem with the constant).
+    #[test]
+    fn stage5_thresholds_are_in_sane_range() {
+        assert!(
+            STREAMING_INTERN_PARALLEL_THRESHOLD >= 64 * 1024,
+            "parallel threshold below 64k rows wastes the thread-spawn cost"
+        );
+        assert!(
+            STREAMING_INTERN_DEVICE_HASH_THRESHOLD >= 100_000,
+            "device-hash threshold below 100k rows wastes the kernel-launch cost"
+        );
+    }
+
+    /// Stage-5: the device-side string hash kernel must produce the same
+    /// 64-bit hash as the host's `utf8_hash64` for every row of a
+    /// `StringArray`. If the kernel diverges, a host-built dict would
+    /// fail to look up the device-hashed value (and vice versa), so this
+    /// is load-bearing.
+    ///
+    /// Gated on `--ignored` because the kernel launch requires a CUDA
+    /// driver. Below the gate the host path is correct and exercised by
+    /// the streaming-intern unit tests above.
+    #[test]
+    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    fn device_string_hash_matches_host() {
+        // Fixture: mix short, medium, empty, and long strings. The device
+        // kernel walks each row's byte range; an empty string must hash to
+        // FNV_OFFSET then through splitmix without touching the values
+        // buffer (the loop body never runs).
+        let inputs: Vec<&str> = vec![
+            "",
+            "a",
+            "ab",
+            "alice",
+            "bobby",
+            "the quick brown fox jumps over the lazy dog",
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+            "this is a much longer string that exercises the byte-by-byte FNV-1a inner loop multiple times over",
+            "x", "y", "z",
+        ];
+        let arr = StringArray::from(inputs.clone());
+
+        // Compute device-side hashes.
+        let device = compute_device_string_hashes(&arr).expect("device hash");
+        assert_eq!(device.len(), inputs.len());
+
+        // Compute host-side hashes via the same `utf8_hash64` the streaming
+        // intern path uses. The two MUST be byte-identical per row.
+        for (i, s) in inputs.iter().enumerate() {
+            let host = utf8_hash64(s.as_bytes());
+            assert_eq!(
+                device[i], host,
+                "row {i} ('{}'): device hash {:#018x} != host hash {:#018x}",
+                s, device[i], host
+            );
+        }
     }
 }

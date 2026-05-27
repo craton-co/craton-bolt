@@ -882,6 +882,51 @@ fn try_gpu_inner_join(
         }
     }
 
+    // Stage-5 AoS routing: only the single-int-key exact INNER path
+    // currently has an AoS build kernel. We pick AoS when the probe side
+    // dwarfs the build side (>8×) — see `AOS_ROUTING_PROBE_BUILD_RATIO`
+    // for the rationale. Multi-key + lossy shapes stay on SoA.
+    let stage1_single_int = matches!(
+        shape,
+        crate::jit::hash_join_kernel::KeyShape::SingleI32
+            | crate::jit::hash_join_kernel::KeyShape::SingleI64
+    );
+    if stage1_single_int
+        && crate::exec::gpu_join::should_route_aos(n_probe, n_build)
+        && build_idx.len() == 1
+    {
+        let b_key_idx = build_idx[0];
+        let p_key_idx = probe_idx[0];
+        let dtype = match build_batch.column(b_key_idx).data_type() {
+            ArrowDataType::Int32 => crate::plan::logical_plan::DataType::Int32,
+            ArrowDataType::Int64 => crate::plan::logical_plan::DataType::Int64,
+            // Unreachable per `stage1_single_int` guard above.
+            _ => return Ok(None),
+        };
+        // The AoS build kernel still requires unique build keys (CAS-only,
+        // no collision chain on AoS yet). Honour the same gate as the
+        // Stage-1 SoA fast path.
+        if build_keys_are_unique(build_batch.column(b_key_idx), dtype) {
+            match crate::exec::gpu_join::execute_inner_join_on_gpu_aos(
+                lhs,
+                rhs,
+                build_is_left,
+                b_key_idx,
+                p_key_idx,
+                dtype,
+                arrow_schema.clone(),
+            ) {
+                Ok(batch) => return Ok(Some(batch)),
+                Err(e) => {
+                    log::debug!(
+                        "gpu_join: AoS routing declined ({e}); trying SoA verify-aware path"
+                    );
+                    // Fall through to SoA.
+                }
+            }
+        }
+    }
+
     // Stage-2 exact + Stage-3 lossy-fold (post-verify) both go through the
     // verify-aware entry point. For exact shapes the verify is a no-op.
     match crate::exec::gpu_join::execute_inner_join_on_gpu_with_shape_and_verify(
@@ -965,15 +1010,6 @@ fn try_gpu_outer_join(
         Some(s) => s,
         None => return Ok(None),
     };
-    // Stage-4 (GJ): lossy shapes (TwoI64, MultiI32) are now admitted for
-    // OUTER joins via the host post-verify pipeline inside
-    // `execute_outer_join_indices_on_gpu`. Stage-3 wholesale-rejected them
-    // here; the only remaining shape we don't yet handle for OUTER is
-    // SingleUtf8 (the outer-join path doesn't go through the dict-interning
-    // entry point yet — that lands in Stage 5).
-    if matches!(shape, crate::jit::hash_join_kernel::KeyShape::SingleUtf8) {
-        return Ok(None);
-    }
 
     // Translate join_type into emit flags. preserve_probe = LEFT/RIGHT/FULL
     // (probe is always the preserved side per build_is_left choice).
@@ -983,6 +1019,30 @@ fn try_gpu_outer_join(
         JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
     );
     let emit_unmatched_build = matches!(join_type, JoinType::FullOuter);
+
+    // Stage-5 (GJ): SingleUtf8 OUTER now routes through the dedicated
+    // dict-interning entry point. The Stage-4 byte-borrowed dict produces
+    // exact i32 indices, so the GPU's `SingleI32` OUTER output is correct
+    // without further host post-verify (streaming-intern + OUTER is a
+    // Stage-6 follow-up).
+    if matches!(shape, crate::jit::hash_join_kernel::KeyShape::SingleUtf8) {
+        return match crate::exec::gpu_join::execute_utf8_outer_join_on_gpu(
+            lhs,
+            rhs,
+            build_is_left,
+            build_idx[0],
+            probe_idx[0],
+            emit_unmatched_probe,
+            emit_unmatched_build,
+            arrow_schema,
+        ) {
+            Ok(batch) => Ok(Some(batch)),
+            Err(e) => {
+                log::debug!("gpu_join: Utf8 outer-join path declined ({e}); falling back to host");
+                Ok(None)
+            }
+        };
+    }
 
     match crate::exec::gpu_join::execute_outer_join_on_gpu(
         lhs,

@@ -199,6 +199,27 @@ pub const PROBE_AOS_KERNEL_ENTRY: &str = "bolt_hash_join_probe_aos";
 /// load.
 pub const BUILD_AOS_KERNEL_ENTRY: &str = "bolt_hash_join_build_aos";
 
+/// Entry-point name of the Stage-5 device-side string-hash kernel — one
+/// thread per Arrow row; walks the row's byte range via the offsets array
+/// and folds bytes into a 64-bit splitmix-FNV hash, written to
+/// `out_hashes[tid]`. Pairs with [`compile_string_hash_kernel`].
+///
+/// Used by the streaming-intern fast path to lift the host-side hashing
+/// step (which dominates multi-billion-row Utf8 joins) onto the GPU.
+pub const STRING_HASH_KERNEL_ENTRY: &str = "bolt_string_hash";
+
+/// Threads per block for the Stage-5 string-hash kernel. Same default as
+/// the rest of the hash-join kernels — picked for occupancy uniformity, not
+/// for any string-specific tuning.
+pub const STRING_HASH_BLOCK_SIZE: u32 = 256;
+
+/// FNV-1a 64-bit primer + prime, replayed on-device. These literals MUST
+/// match the host-side `utf8_hash64` in `crate::exec::gpu_join` so that a
+/// stream-intern caller can swap host hashing for device hashing without
+/// changing the dictionary indices the kernel-side join sees.
+const FNV_OFFSET_LITERAL: &str = "-3750763034362895579"; // 0xcbf29ce484222325 as i64
+const FNV_PRIME_LITERAL: &str = "1099511628211";          // 0x100000001b3
+
 /// AoS slot footprint in bytes: `i64 key (8) + u32 head (4) + u32 _pad (4)
 /// = 16`. The pad keeps each slot 16-byte aligned for the `ld.global.v4.u32`
 /// fused load the AoS probe issues. Memory cost vs. SoA is 16/12 = 1.33× —
@@ -1419,6 +1440,160 @@ pub fn compile_build_aos_kernel() -> BoltResult<String> {
     Ok(p)
 }
 
+/// Compile the Stage-5 device-side string-hash kernel.
+///
+/// Hashes every row of an Arrow `StringArray` in parallel — one CUDA
+/// thread walks one string's byte range and folds it into a 64-bit hash
+/// using the same FNV-1a-plus-splitmix-finaliser the host's
+/// `crate::exec::gpu_join::utf8_hash64` uses. The output is a dense
+/// `u64[n_rows]` array suitable as a per-row hash key for the streaming
+/// intern path.
+///
+/// ## ABI
+///
+/// ```text
+/// .visible .entry bolt_string_hash(
+///     .param .u64 offsets_ptr,   // i32[n_rows + 1] Arrow Utf8 offsets
+///     .param .u64 values_ptr,    // u8[<total bytes>] Arrow Utf8 values
+///     .param .u64 out_hashes_ptr,// u64[n_rows] output buffer
+///     .param .u32 n_rows
+/// )
+/// ```
+///
+/// Grid: 1D, one thread per row, block size [`STRING_HASH_BLOCK_SIZE`].
+///
+/// `dtype` is currently unused — the kernel's hash function is
+/// dtype-agnostic — but is plumbed through so a future Int32 / Int64
+/// offsets-of-binary extension can pick a wider offsets dtype without
+/// changing the public signature.
+///
+/// ## Hash function
+///
+/// Per row `tid`:
+///   1. `start = offsets[tid]`, `end = offsets[tid + 1]`.
+///   2. `h = FNV_OFFSET`. For each byte `b` in `values[start..end]`:
+///      `h = (h ^ b) * FNV_PRIME` (FNV-1a, wrapping u64 arithmetic).
+///   3. Apply the splitmix finaliser (xor-shift + multiply, three rounds).
+///   4. Store the result to `out_hashes[tid]`.
+///
+/// **Byte-for-byte parity with the host.** The host-side `utf8_hash64`
+/// uses the same FNV-1a + splitmix sequence; any divergence here would
+/// mean a host-built dict can't be used to look up device-hashed keys and
+/// vice-versa.
+pub fn compile_string_hash_kernel(_dtype: DataType) -> BoltResult<String> {
+    let mut p = String::new();
+    writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
+    writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
+    writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    let entry = STRING_HASH_KERNEL_ENTRY;
+    writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_2,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_3").map_err(write_err)?;
+    writeln!(p, ")").map_err(write_err)?;
+    writeln!(p, "{{").map_err(write_err)?;
+
+    // Register file. b32: tid math, offset words, byte values. b64: device-
+    // pointer scratch + hash accumulator. The hash accumulator lives in
+    // `%rh<n>` for clarity; the splitmix finaliser keeps its scratch in
+    // `%rl<n>` so the byte-loop register set is small enough to stay
+    // resident.
+    writeln!(p, "\t.reg .pred  %p<8>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32   %r<24>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rd<24>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rh<8>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rl<8>;").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    // tid = ctaid.x * ntid.x + tid.x ; bail if tid >= n_rows.
+    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // Load offsets[tid] and offsets[tid + 1]. Offsets are i32 in Arrow's
+    // Utf8 layout (not i64) — that's the LargeUtf8 case, which we don't
+    // yet route through this kernel.
+    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(p, "\tld.global.s32 %r5, [%rd2];").map_err(write_err)?;       // start
+    writeln!(p, "\tld.global.s32 %r6, [%rd2 + 4];").map_err(write_err)?;   // end
+
+    // Values base pointer.
+    writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+
+    // Initialise hash accumulator + load FNV_PRIME into a register.
+    writeln!(p, "\tmov.s64 %rh0, {FNV_OFFSET_LITERAL};").map_err(write_err)?;
+    writeln!(p, "\tmov.s64 %rh1, {FNV_PRIME_LITERAL};").map_err(write_err)?;
+
+    // Loop: cursor (%r7) = start, end (%r6) — copy start so the increment
+    // doesn't trample the original offset.
+    writeln!(p, "\tmov.u32 %r7, %r5;").map_err(write_err)?;
+
+    writeln!(p, "BYTE_LOOP:").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.s32 %p1, %r7, %r6;").map_err(write_err)?;
+    writeln!(p, "\t@%p1 bra FINALIZE;").map_err(write_err)?;
+
+    // Load one byte: addr = values + cursor, value = ld.global.u8.
+    writeln!(p, "\tmul.wide.s32 %rd4, %r7, 1;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u8 %r8, [%rd5];").map_err(write_err)?;
+    // Widen to b64 with high bits zero so the xor doesn't smear sign.
+    writeln!(p, "\tcvt.u64.u32 %rh2, %r8;").map_err(write_err)?;
+
+    // h = h xor b
+    writeln!(p, "\txor.b64 %rh0, %rh0, %rh2;").map_err(write_err)?;
+    // h = h * FNV_PRIME (wrapping u64). PTX `mul.lo.s64` discards the high
+    // half, matching `wrapping_mul` on host.
+    writeln!(p, "\tmul.lo.s64 %rh0, %rh0, %rh1;").map_err(write_err)?;
+
+    writeln!(p, "\tadd.s32 %r7, %r7, 1;").map_err(write_err)?;
+    writeln!(p, "\tbra BYTE_LOOP;").map_err(write_err)?;
+
+    // Splitmix-style finaliser — three xor-shifts + two multiplies. Matches
+    // the host `host_splitmix` byte-for-byte.
+    //   h ^= h >> 33; h = h.wrapping_mul(HOST_FX_MUL);
+    //   h ^= h >> 29; h = h.wrapping_mul(HOST_FX_MUL);
+    //   h ^= h >> 32;
+    writeln!(p, "FINALIZE:").map_err(write_err)?;
+    writeln!(p, "\tmov.s64 %rl0, {FX_MUL};").map_err(write_err)?;
+    // h ^= h >> 33
+    writeln!(p, "\tshr.u64 %rl1, %rh0, 33;").map_err(write_err)?;
+    writeln!(p, "\txor.b64 %rh0, %rh0, %rl1;").map_err(write_err)?;
+    // h *= FX_MUL
+    writeln!(p, "\tmul.lo.s64 %rh0, %rh0, %rl0;").map_err(write_err)?;
+    // h ^= h >> 29
+    writeln!(p, "\tshr.u64 %rl1, %rh0, 29;").map_err(write_err)?;
+    writeln!(p, "\txor.b64 %rh0, %rh0, %rl1;").map_err(write_err)?;
+    // h *= FX_MUL
+    writeln!(p, "\tmul.lo.s64 %rh0, %rh0, %rl0;").map_err(write_err)?;
+    // h ^= h >> 32
+    writeln!(p, "\tshr.u64 %rl1, %rh0, 32;").map_err(write_err)?;
+    writeln!(p, "\txor.b64 %rh0, %rh0, %rl1;").map_err(write_err)?;
+
+    // out_hashes[tid] = h
+    writeln!(p, "\tld.param.u64 %rd6, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd6, %rd6;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.s32 %rd7, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd8, %rd6, %rd7;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u64 [%rd8], %rh0;").map_err(write_err)?;
+
+    writeln!(p, "DONE:").map_err(write_err)?;
+    writeln!(p, "\tret;").map_err(write_err)?;
+    writeln!(p, "}}").map_err(write_err)?;
+
+    Ok(p)
+}
+
 /// Adapt a `std::fmt::Error` into a `BoltError`.
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("hash_join_kernel: write failed: {}", e))
@@ -1931,5 +2106,86 @@ mod tests {
         assert_eq!(AOS_SLOT_BYTES, 16);
         // 8 (key) + 4 (head) + 4 (pad) = 16.
         assert_eq!(8 + 4 + 4, AOS_SLOT_BYTES);
+    }
+
+    // ----- Stage 5 PTX-shape goldens (string-hash kernel) -----------------
+
+    /// Stage-5 entry-point name is stable — host wrappers resolve by string.
+    #[test]
+    fn stage5_string_hash_entry_name_is_stable() {
+        assert_eq!(STRING_HASH_KERNEL_ENTRY, "bolt_string_hash");
+    }
+
+    /// String-hash kernel signature: four params (offsets, values, out, n).
+    #[test]
+    fn string_hash_ptx_has_four_params() {
+        let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
+        for i in 0..4 {
+            let needle = format!("bolt_string_hash_param_{i}");
+            assert!(ptx.contains(&needle), "string hash missing param {i}\n{ptx}");
+        }
+        assert!(!ptx.contains("bolt_string_hash_param_4"));
+    }
+
+    /// String-hash kernel emits a per-byte u8 load (the FNV-1a inner loop).
+    /// Dropping it would mean the kernel doesn't actually walk the string.
+    #[test]
+    fn string_hash_ptx_reads_bytes_with_u8_load() {
+        let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
+        assert!(
+            ptx.contains("ld.global.u8"),
+            "string hash kernel must use ld.global.u8 to read string bytes\n{ptx}"
+        );
+    }
+
+    /// String-hash kernel emits the FNV constants the host shares. Catches
+    /// any silent divergence from `utf8_hash64`.
+    #[test]
+    fn string_hash_ptx_uses_fnv_constants() {
+        let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
+        assert!(
+            ptx.contains(FNV_OFFSET_LITERAL),
+            "string hash kernel must materialise FNV_OFFSET; got:\n{ptx}"
+        );
+        assert!(
+            ptx.contains(FNV_PRIME_LITERAL),
+            "string hash kernel must materialise FNV_PRIME; got:\n{ptx}"
+        );
+    }
+
+    /// String-hash kernel must finish with the splitmix finaliser — three
+    /// xor-shifts (33, 29, 32). Without those the dict-side hash quality
+    /// drops and dict collisions explode.
+    #[test]
+    fn string_hash_ptx_has_splitmix_finalizer() {
+        let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
+        assert!(ptx.contains("shr.u64 %rl1, %rh0, 33;"));
+        assert!(ptx.contains("shr.u64 %rl1, %rh0, 29;"));
+        assert!(ptx.contains("shr.u64 %rl1, %rh0, 32;"));
+        // Splitmix multiplies by FX_MUL — must materialise that literal too.
+        let mul_literal = format!("mov.s64 %rl0, {FX_MUL};");
+        assert!(
+            ptx.contains(&mul_literal),
+            "string hash kernel must materialise FX_MUL for the splitmix finaliser; got:\n{ptx}"
+        );
+    }
+
+    /// String-hash kernel writes exactly one u64 per row.
+    #[test]
+    fn string_hash_ptx_writes_one_u64_store() {
+        let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
+        let n_st = ptx.matches("st.global.u64").count();
+        assert_eq!(
+            n_st, 1,
+            "string hash kernel must write exactly one u64 per row; saw {n_st}\n{ptx}"
+        );
+    }
+
+    /// String-hash kernel has the OOB guard against `n_rows`.
+    #[test]
+    fn string_hash_ptx_has_oob_guard() {
+        let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
+        assert!(ptx.contains("setp.ge.s32 %p0, %r3, %r4;"));
+        assert!(ptx.contains("DONE:"));
     }
 }
