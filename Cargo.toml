@@ -47,6 +47,12 @@ sqlparser = "0.52"
 thiserror = "1"
 parking_lot = "0.12"
 once_cell = "1"
+# `dashmap` powers `DeviceMemPool`'s per-bucket lock split (L-5). Each bucket
+# (rounded-up size class) gets its own `Mutex<VecDeque<PooledBlock>>` so
+# concurrent frees into distinct size classes do not serialise on a single
+# global mutex. Stage-2 LRU re-introduction will need a cross-bucket index;
+# until then we sacrifice global LRU for per-bucket FIFO. See `mem_pool.rs`.
+dashmap = "5"
 bytemuck = { version = "1", features = ["derive"] }
 libc = "0.2"
 log = "0.4"

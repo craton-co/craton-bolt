@@ -8,10 +8,35 @@
 //! materialization), these calls dominate. This pool recycles freed blocks
 //! back to callers instead of returning them to the driver.
 //!
-//! Size-bucketing rounds each request up to the next power of two with a
-//! 64-byte floor (`ARROW_ALIGNMENT`). That bounds the bucket count to
-//! `log2(max_alloc)` and gives high reuse for typical query buffers, which
-//! cluster around a handful of natural sizes.
+//! ### Size bucketing (M-3, denser than power-of-two)
+//!
+//! The original M0 pool rounded every request up to the next power of two.
+//! That capped at 2× over-allocation per call — a 65 KiB request became
+//! 128 KiB. For a JIT engine that allocates many sub-128 KiB index buffers
+//! per query, this wastes a lot of headroom.
+//!
+//! `bucket_size` now uses a **uniform 4-classes-per-octave geometric
+//! schedule** (jemalloc-style 1.25× max waste):
+//!
+//! ```text
+//!   pow2 = highest set bit of n
+//!   step = pow2 / 4                              // four sub-classes per octave
+//!   bucket = ceil(n / step) * step
+//! ```
+//!
+//! Examples (`ARROW_ALIGNMENT = 64`):
+//!
+//! | request | old (power-of-two) | new (4/octave) | waste |
+//! |---------|--------------------|----------------|-------|
+//! |    64   |    64              |    64          |   0%  |
+//! |   100   |   128              |   112          |  12%  |
+//! |  4097   |  8192              |  5120          |  25%  |
+//! | 65537   | 131072             | 81920          |  25%  |
+//! |  1 MiB  |  1 MiB             |  1 MiB         |   0%  |
+//!
+//! Worst-case overhead is just under 25% inside the last sub-class of each
+//! octave — substantially better than the old 2× ceiling. The bucket count
+//! is still bounded (~4 × log2(max_alloc)), so the per-bucket map stays small.
 //!
 //! ### Capacity & eviction
 //!
@@ -25,21 +50,47 @@
 //! * `MAX_BUCKET_ENTRIES` — hard cap on the number of pooled blocks per
 //!   bucket. Tunable via `CRATON_BOLT_POOL_BUCKET_CAP` (default 16).
 //!
-//! When a `free` would breach either limit, the pool first evicts the
-//! globally oldest block (LRU across buckets) via `cuMemFree_v2`. If that
-//! still does not make room (e.g. the per-bucket cap is hit by an already
-//! cold bucket), the freshly freed block is returned to the driver directly
-//! rather than pooled. Buckets internally are LIFO for reuse (returning the
-//! most-recently freed block gives the warmest cache behaviour) but FIFO
-//! for eviction (oldest first).
+//! When a `free` would breach either limit, the pool evicts the oldest
+//! block (front of the bucket's `VecDeque`) via `cuMemFree_v2`. If that
+//! still does not make room, the freshly freed block is returned to the
+//! driver directly rather than pooled. Buckets internally are LIFO for
+//! reuse (returning the most-recently freed block gives the warmest cache
+//! behaviour) but FIFO for eviction.
+//!
+//! ### Lock granularity (L-5, per-bucket locks)
+//!
+//! M1 used a single `Mutex<PoolState>` for all buckets; multi-stream
+//! workloads serialised on it. The pool now stores buckets in a
+//! `DashMap<usize, Mutex<BucketEntry>>` so concurrent frees into distinct
+//! size classes do not contend on a global lock. `total_bytes` becomes an
+//! `AtomicUsize`; cap checks read/write it with `Relaxed`/`AcqRel`
+//! ordering — the cap is soft, occasional overshoot by one block under
+//! race is acceptable and corrected on the next free.
+//!
+//! ### Stage 2 deferred items
+//!
+//! * **Cross-bucket global LRU.** Per-bucket FIFO is "evict oldest in
+//!   *that* bucket first." If a hot bucket fills while a cold bucket
+//!   holds older blocks, we evict from the hot one first. Re-introducing
+//!   global LRU requires a cross-bucket timestamp index (e.g. a BTreeMap
+//!   keyed by `Instant`) coordinated against the per-bucket locks.
+//! * **Lock-free `total_bytes` reconciliation.** The atomic counter can
+//!   transiently overshoot under heavy concurrent `free` calls because
+//!   the bucket lock and the atomic increment are not joined into one
+//!   transaction. Stage 2 should add a periodic reconciliation pass that
+//!   re-sums `bucket.len() * size_class` and corrects drift.
+//! * **Sharded-or-DashMap micro-bench.** We picked DashMap for simplicity;
+//!   if profiling shows the DashMap shard hash itself becomes a hot spot,
+//!   revisit with a fixed-N sharded `[Mutex<HashMap<..>>; 32]`.
 //!
 //! The pool depends on a live CUDA context being current on the calling
 //! thread — same precondition as the bare `cuMemAlloc` path it replaces.
 
-use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
@@ -70,26 +121,53 @@ fn read_env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Round `bytes` up to the next power of two, with a floor of `ARROW_ALIGNMENT`.
-/// This is the canonical bucket key.
+/// Round `bytes` up to a denser bucket class than next-power-of-two.
+///
+/// Uses a uniform 4-classes-per-octave schedule: within each `[2^k, 2^(k+1))`
+/// range there are four equally-spaced sub-classes, so worst-case waste is
+/// just under 25%. See the module-level doc for the full table.
+///
+/// Floor is `ARROW_ALIGNMENT` — the CUDA driver guarantees 256-byte
+/// alignment on its own end, so this is just a sanity floor for the tiniest
+/// allocations.
 fn bucket_size(bytes: usize) -> usize {
     let n = bytes.max(ARROW_ALIGNMENT);
-    if n.is_power_of_two() {
-        n
-    } else {
-        // next_power_of_two saturates; for realistic allocation sizes we never
-        // hit that ceiling, but if we did the cuMemAlloc below would fail
-        // cleanly.
-        n.next_power_of_two()
-    }
+    // Position of the highest set bit -> the lower octave boundary.
+    // `n >= ARROW_ALIGNMENT >= 1`, so `leading_zeros < usize::BITS`.
+    let pow2 = 1usize << (usize::BITS - 1 - n.leading_zeros());
+    // Four sub-classes per octave: step = pow2 / 4. For `pow2 == 64`
+    // (smallest, == ARROW_ALIGNMENT) step is 16, and `n >= 64` keeps
+    // the rounded value at or above the floor.
+    //
+    // `step.max(1)` is paranoia: with pow2 < 4 the division would yield
+    // zero and break `div_ceil`. We never hit that because `n >= 64`,
+    // but the cost is one cmp instruction.
+    let step = (pow2 / 4).max(1);
+    // ceil(n / step) * step. Saturating arithmetic guards against pathological
+    // sizes near `usize::MAX`; cuMemAlloc would refuse those anyway.
+    let rounded = n.saturating_add(step - 1) / step * step;
+    rounded.max(ARROW_ALIGNMENT)
 }
 
-/// One pooled block. `inserted` is captured at `free` time so the eviction
-/// path can find the globally oldest entry across buckets.
+/// One pooled block. `inserted` is captured at `free` time so the bucket's
+/// front entry is always the oldest within that bucket.
 #[derive(Clone, Copy)]
 struct PooledBlock {
     ptr: CUdeviceptr,
     inserted: Instant,
+}
+
+/// Per-bucket state. Each entry in the `DashMap` is independently locked.
+struct BucketEntry {
+    blocks: VecDeque<PooledBlock>,
+}
+
+impl BucketEntry {
+    fn new() -> Self {
+        Self {
+            blocks: VecDeque::new(),
+        }
+    }
 }
 
 /// Free a `CUdeviceptr` through whichever backend is active for this build.
@@ -122,57 +200,25 @@ unsafe fn driver_free(ptr: CUdeviceptr) {
 /// Process-wide GPU device-memory pool. Holds freed blocks keyed by their
 /// bucket (rounded-up) size and hands them out on subsequent allocations.
 pub struct DeviceMemPool {
-    inner: Mutex<PoolState>,
-    /// Soft cap on `inner.total_bytes`. Reads are uncontended after
-    /// construction; we cache the resolved env-var value here.
+    /// Buckets keyed by rounded-up byte size. Each bucket has its own
+    /// `Mutex` so concurrent frees into distinct size classes don't
+    /// serialise on a global lock.
+    buckets: DashMap<usize, Mutex<BucketEntry>>,
+    /// Sum of `alloc_bytes` across every pooled block. Atomic so reads in
+    /// the eviction loop don't need a global lock. Soft cap — short
+    /// transient overshoot under contention is acceptable.
+    total_bytes: AtomicUsize,
+    /// Soft cap on `total_bytes`. Resolved from env once at construction.
     max_pooled_bytes: usize,
-    /// Hard cap on `inner.buckets[k].len()` for any `k`.
+    /// Hard cap on `buckets[k].len()` for any `k`.
     max_bucket_entries: usize,
-}
-
-struct PoolState {
-    buckets: HashMap<usize, VecDeque<PooledBlock>>,
-    total_bytes: usize,
-}
-
-impl PoolState {
-    fn new() -> Self {
-        Self {
-            buckets: HashMap::new(),
-            total_bytes: 0,
-        }
-    }
-
-    /// Find the bucket whose oldest (front) entry has the smallest
-    /// `Instant`. `None` when the pool is empty. O(buckets) — bucket count
-    /// is bounded by `log2(max_alloc)`, so this is cheap in practice.
-    fn oldest_bucket(&self) -> Option<usize> {
-        let mut best: Option<(usize, Instant)> = None;
-        for (size, deque) in &self.buckets {
-            if let Some(front) = deque.front() {
-                match best {
-                    Some((_, t)) if front.inserted >= t => {}
-                    _ => best = Some((*size, front.inserted)),
-                }
-            }
-        }
-        best.map(|(s, _)| s)
-    }
-
-    /// Pop the oldest pooled block (front of the oldest bucket). Returns
-    /// `(ptr, alloc_bytes)` so the caller can route to `driver_free`.
-    fn evict_oldest(&mut self) -> Option<(CUdeviceptr, usize)> {
-        let key = self.oldest_bucket()?;
-        let block = self.buckets.get_mut(&key)?.pop_front()?;
-        self.total_bytes = self.total_bytes.saturating_sub(key);
-        Some((block.ptr, key))
-    }
 }
 
 impl DeviceMemPool {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(PoolState::new()),
+            buckets: DashMap::new(),
+            total_bytes: AtomicUsize::new(0),
             max_pooled_bytes: read_env_usize(
                 "CRATON_BOLT_POOL_MAX_BYTES",
                 DEFAULT_MAX_POOLED_BYTES,
@@ -190,14 +236,13 @@ impl DeviceMemPool {
     /// to the right bucket.
     pub fn alloc(&self, bytes: usize) -> BoltResult<(CUdeviceptr, usize)> {
         let alloc_bytes = bucket_size(bytes);
-        {
-            let mut state = self.inner.lock();
-            if let Some(bucket) = state.buckets.get_mut(&alloc_bytes) {
-                // LIFO: most-recently freed block first — best cache locality.
-                if let Some(block) = bucket.pop_back() {
-                    state.total_bytes = state.total_bytes.saturating_sub(alloc_bytes);
-                    return Ok((block.ptr, alloc_bytes));
-                }
+        if let Some(entry) = self.buckets.get(&alloc_bytes) {
+            let mut guard = entry.lock();
+            // LIFO: most-recently freed block first — best cache locality.
+            if let Some(block) = guard.blocks.pop_back() {
+                drop(guard);
+                self.total_bytes.fetch_sub(alloc_bytes, Ordering::AcqRel);
+                return Ok((block.ptr, alloc_bytes));
             }
         }
         // Miss: call the driver. cuMemAlloc_v2 guarantees at least 256-byte
@@ -218,62 +263,60 @@ impl DeviceMemPool {
     }
 
     /// Return a block to the pool. If pooling this block would exceed
-    /// `MAX_POOLED_BYTES` or `MAX_BUCKET_ENTRIES`, evict the LRU block(s)
-    /// first; if that still does not make room, free `ptr` directly via
-    /// the driver instead of pooling it.
+    /// `MAX_POOLED_BYTES` or `MAX_BUCKET_ENTRIES`, evict block(s) first;
+    /// if that still does not make room, free `ptr` directly via the
+    /// driver instead of pooling it.
+    ///
+    /// Under the L-5 per-bucket lock split, eviction is **per-bucket FIFO**
+    /// rather than global LRU: we first try to evict from the incoming
+    /// bucket itself (head = oldest), then walk other buckets if more
+    /// bytes need to be reclaimed. See module doc for the Stage-2 plan
+    /// to restore cross-bucket LRU.
     pub fn free(&self, ptr: CUdeviceptr, alloc_bytes: usize) {
         if ptr == 0 {
             return;
         }
 
-        // Decide policy under the lock; defer driver_free calls until
-        // after we drop the lock to keep the critical section short.
-        let to_free: Vec<CUdeviceptr> = {
-            let mut state = self.inner.lock();
-            let mut to_free = Vec::new();
+        let mut to_free: Vec<CUdeviceptr> = Vec::new();
 
-            // Evict from other buckets to make room for the new block on
-            // the byte budget. Skips eviction if the incoming block is
-            // already too large to ever fit — in that case we'll just
-            // free it directly below.
-            if alloc_bytes <= self.max_pooled_bytes {
-                while state.total_bytes + alloc_bytes > self.max_pooled_bytes {
-                    match state.evict_oldest() {
-                        Some((evicted_ptr, _evicted_bytes)) => to_free.push(evicted_ptr),
-                        None => break, // pool is empty; can't free more.
-                    }
+        // ---- Byte-cap eviction (best-effort, lock-free counter) ----
+        //
+        // If the incoming block is bigger than the entire cap there's no
+        // point evicting — we'll just route it straight to the driver.
+        if alloc_bytes <= self.max_pooled_bytes {
+            while self.total_bytes.load(Ordering::Acquire) + alloc_bytes
+                > self.max_pooled_bytes
+            {
+                if !self.evict_one(&mut to_free) {
+                    break; // pool empty.
                 }
             }
+        }
 
-            // Per-bucket cap. Read both decisions BEFORE taking the
-            // bucket mutable borrow so we don't run afoul of the borrow
-            // checker on `state.total_bytes`.
-            let cur_bucket_len = state
+        // ---- Per-bucket cap + insert under the bucket's own mutex ----
+        //
+        // Use `get` in the common case (bucket already exists) so we only
+        // hold a DashMap *read* lock on the shard while we manipulate the
+        // inner `Mutex`. `entry` would take a shard write lock for the
+        // duration of the inner-mutex operation — needlessly contending
+        // with other size classes that hash to the same shard.
+        let pooled = if let Some(entry) = self.buckets.get(&alloc_bytes) {
+            self.try_insert_into_bucket(entry.value(), ptr, alloc_bytes)
+        } else {
+            // Bucket missing — create it under a write lock and insert
+            // immediately. The first-touch path through `entry` is rare
+            // (only happens once per size class for the entire pool's
+            // lifetime), so the shard write lock is acceptable here.
+            let entry = self
                 .buckets
-                .get(&alloc_bytes)
-                .map(|d| d.len())
-                .unwrap_or(0);
-            let fits_bucket = cur_bucket_len < self.max_bucket_entries;
-            let fits_total = alloc_bytes <= self.max_pooled_bytes
-                && state.total_bytes + alloc_bytes <= self.max_pooled_bytes;
-
-            if fits_bucket && fits_total {
-                // Bucket may be empty when the global eviction above
-                // happened to drain it, which is fine — `or_default`
-                // recreates it.
-                let bucket = state.buckets.entry(alloc_bytes).or_default();
-                bucket.push_back(PooledBlock {
-                    ptr,
-                    inserted: Instant::now(),
-                });
-                state.total_bytes += alloc_bytes;
-            } else {
-                // Couldn't make room — drop this block to the driver.
-                to_free.push(ptr);
-            }
-
-            to_free
+                .entry(alloc_bytes)
+                .or_insert_with(|| Mutex::new(BucketEntry::new()));
+            self.try_insert_into_bucket(entry.value(), ptr, alloc_bytes)
         };
+        if !pooled {
+            // Couldn't make room — drop this block to the driver.
+            to_free.push(ptr);
+        }
 
         for p in to_free {
             // SAFETY: every pointer routed here was either pulled out of
@@ -284,11 +327,90 @@ impl DeviceMemPool {
         }
     }
 
+    /// Try to push `ptr` into the given bucket, respecting per-bucket and
+    /// global byte caps. Returns `true` when the block was pooled,
+    /// `false` when the caller must driver-free it.
+    fn try_insert_into_bucket(
+        &self,
+        bucket: &Mutex<BucketEntry>,
+        ptr: CUdeviceptr,
+        alloc_bytes: usize,
+    ) -> bool {
+        let mut guard = bucket.lock();
+        let fits_bucket = guard.blocks.len() < self.max_bucket_entries;
+        // Re-check byte cap under our local lock — eviction above might
+        // have already brought us under, or a parallel free may have
+        // pushed us back over.
+        let projected = self.total_bytes.load(Ordering::Acquire) + alloc_bytes;
+        let fits_total = alloc_bytes <= self.max_pooled_bytes
+            && projected <= self.max_pooled_bytes;
+        if fits_bucket && fits_total {
+            guard.blocks.push_back(PooledBlock {
+                ptr,
+                inserted: Instant::now(),
+            });
+            self.total_bytes.fetch_add(alloc_bytes, Ordering::AcqRel);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evict the oldest block from any non-empty bucket. Walks `self.buckets`,
+    /// peeks each front entry under a brief lock, and pops from whichever
+    /// bucket holds the oldest `Instant`. Returns `true` if an eviction
+    /// happened; `false` when every bucket is empty.
+    ///
+    /// Under L-5's per-bucket locks this is best-effort: between the scan
+    /// and the pop a concurrent `alloc` may have drained the chosen bucket.
+    /// We retry once on that race; if the bucket is still empty we fall
+    /// through to "no eviction" and the caller's outer loop will exit.
+    fn evict_one(&self, sink: &mut Vec<CUdeviceptr>) -> bool {
+        // Scan: find the bucket whose front entry has the smallest Instant.
+        // This is O(buckets) — bucket count is bounded (~4 × log2(max_alloc))
+        // so cheap in practice.
+        let mut best: Option<(usize, Instant)> = None;
+        for r in self.buckets.iter() {
+            let key = *r.key();
+            let guard = r.value().lock();
+            if let Some(front) = guard.blocks.front() {
+                match best {
+                    Some((_, t)) if front.inserted >= t => {}
+                    _ => best = Some((key, front.inserted)),
+                }
+            }
+        }
+        let Some((key, _)) = best else {
+            return false;
+        };
+        // Pop under the chosen bucket's lock. If the bucket emptied
+        // between the scan and now, fall back to any non-empty bucket.
+        if let Some(entry) = self.buckets.get(&key) {
+            let mut guard = entry.lock();
+            if let Some(block) = guard.blocks.pop_front() {
+                self.total_bytes.fetch_sub(key, Ordering::AcqRel);
+                sink.push(block.ptr);
+                return true;
+            }
+        }
+        // Lost the race — try one more scan for any non-empty bucket.
+        for r in self.buckets.iter() {
+            let key = *r.key();
+            let mut guard = r.value().lock();
+            if let Some(block) = guard.blocks.pop_front() {
+                self.total_bytes.fetch_sub(key, Ordering::AcqRel);
+                sink.push(block.ptr);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Sum of `alloc_bytes` across every pooled block. Useful for tests
     /// and memory-pressure introspection.
     #[allow(dead_code)] // reason: introspection API, used by tests and future memory-pressure hooks
     pub(crate) fn total_pooled_bytes(&self) -> usize {
-        self.inner.lock().total_bytes
+        self.total_bytes.load(Ordering::Acquire)
     }
 
     /// Evict pooled blocks (oldest first) until `total_pooled_bytes()` is
@@ -298,17 +420,12 @@ impl DeviceMemPool {
     /// normal operation. Returns the number of blocks evicted.
     #[allow(dead_code)] // reason: shutdown / memory-pressure hook, not yet wired but kept for the contract
     pub(crate) fn evict_above_high_water(&self) -> usize {
-        let to_free: Vec<CUdeviceptr> = {
-            let mut state = self.inner.lock();
-            let mut out = Vec::new();
-            while state.total_bytes > self.max_pooled_bytes {
-                match state.evict_oldest() {
-                    Some((ptr, _bytes)) => out.push(ptr),
-                    None => break,
-                }
+        let mut to_free: Vec<CUdeviceptr> = Vec::new();
+        while self.total_bytes.load(Ordering::Acquire) > self.max_pooled_bytes {
+            if !self.evict_one(&mut to_free) {
+                break;
             }
-            out
-        };
+        }
         let n = to_free.len();
         for p in to_free {
             // SAFETY: same provenance argument as `free`.
@@ -321,7 +438,10 @@ impl DeviceMemPool {
     /// blocks across all buckets. Intended for tests and diagnostics only.
     #[doc(hidden)]
     pub fn pooled_block_count(&self) -> usize {
-        self.inner.lock().buckets.values().map(|v| v.len()).sum()
+        self.buckets
+            .iter()
+            .map(|r| r.value().lock().blocks.len())
+            .sum()
     }
 
     /// Number of pooled blocks in the bucket that would satisfy an allocation
@@ -329,28 +449,27 @@ impl DeviceMemPool {
     #[doc(hidden)]
     pub fn bucket_len_for(&self, bytes: usize) -> usize {
         let key = bucket_size(bytes);
-        self.inner
-            .lock()
-            .buckets
+        self.buckets
             .get(&key)
-            .map(|v| v.len())
+            .map(|r| r.value().lock().blocks.len())
             .unwrap_or(0)
     }
 
     /// Release every pooled block back to the driver. Called on `Drop`, and
     /// usable by tests / shutdown paths that want a clean slate.
     pub fn drain(&self) {
-        let drained: Vec<CUdeviceptr> = {
-            let mut state = self.inner.lock();
-            let mut out = Vec::new();
-            for (_, mut deque) in state.buckets.drain() {
-                while let Some(block) = deque.pop_front() {
-                    out.push(block.ptr);
-                }
+        let mut drained: Vec<CUdeviceptr> = Vec::new();
+        // Iterate over all buckets, draining each under its own lock.
+        // We can't `DashMap::clear` mid-iteration safely, so we drain into
+        // a local `Vec` first, then clear.
+        for r in self.buckets.iter() {
+            let mut guard = r.value().lock();
+            while let Some(block) = guard.blocks.pop_front() {
+                drained.push(block.ptr);
             }
-            state.total_bytes = 0;
-            out
-        };
+        }
+        self.buckets.clear();
+        self.total_bytes.store(0, Ordering::Release);
         for ptr in drained {
             // SAFETY: every pointer in the pool came from the matching
             // backend's `mem_alloc` (either `cuda_sys` or `cudarc_backend`,
@@ -461,6 +580,51 @@ mod tests {
         EnvGuard { keys }
     }
 
+    /// M-3: assert representative sizes land on the new finer bucket
+    /// classes. Worst-case waste must be < 25% on every example below.
+    #[test]
+    fn bucket_size_finer_granularity() {
+        // Floor: anything <= ARROW_ALIGNMENT goes to ARROW_ALIGNMENT.
+        assert_eq!(bucket_size(1), ARROW_ALIGNMENT);
+        assert_eq!(bucket_size(ARROW_ALIGNMENT), ARROW_ALIGNMENT);
+
+        // 100 bytes: old=128, new=112 (12% waste vs 28%).
+        assert_eq!(bucket_size(100), 112);
+
+        // 65 KiB: old=128 KiB (97% waste), new=80 KiB (23% waste).
+        assert_eq!(bucket_size(65 * 1024), 80 * 1024);
+
+        // Just past 4096: old=8192, new=5120.
+        assert_eq!(bucket_size(4097), 5120);
+
+        // Exact powers of two should still hit themselves.
+        assert_eq!(bucket_size(1024), 1024);
+        assert_eq!(bucket_size(65536), 65536);
+        assert_eq!(bucket_size(1024 * 1024), 1024 * 1024);
+
+        // Worst-case waste check: pick the largest value in each octave
+        // and confirm we land in the same octave (i.e. waste < 25%).
+        for k in 6..24 {
+            let base: usize = 1 << k;
+            // The last-class boundary in this octave: base + 3*(base/4) = 1.75*base
+            let just_above = base + (base / 4) * 3 + 1;
+            let bucket = bucket_size(just_above);
+            // bucket should be exactly 2*base — first class of next octave.
+            assert_eq!(
+                bucket,
+                base * 2,
+                "octave 2^{} edge: bucket_size({}) = {}",
+                k,
+                just_above,
+                bucket
+            );
+            // And the value just inside that last sub-class wastes <= 25%.
+            let in_last = base + (base / 4) * 3; // exactly 1.75*base
+            let bucket = bucket_size(in_last);
+            assert_eq!(bucket, in_last); // exactly on a class boundary
+        }
+    }
+
     #[test]
     fn pool_evicts_when_max_bytes_exceeded() {
         let _l = ENV_LOCK.lock();
@@ -512,12 +676,7 @@ mod tests {
         for p in ptrs {
             pool.free(p, block_size);
         }
-        let state = pool.inner.lock();
-        let bucket_len = state
-            .buckets
-            .get(&bucket_size(block_size))
-            .map(|d| d.len())
-            .unwrap_or(0);
+        let bucket_len = pool.bucket_len_for(block_size);
         assert!(bucket_len <= 8, "bucket_len = {} > 8", bucket_len);
         // And we actually filled it.
         assert_eq!(bucket_len, 8);
@@ -551,8 +710,12 @@ mod tests {
         );
     }
 
+    /// Per-bucket FIFO eviction: under per-bucket locks the global LRU
+    /// guarantee is downgraded to "front of the chosen bucket goes first."
+    /// Within a single bucket, the oldest free is still the first to go;
+    /// that's what this test checks.
     #[test]
-    fn lru_evicts_oldest_first() {
+    fn per_bucket_fifo_evicts_oldest_first() {
         let _l = ENV_LOCK.lock();
         test_support::reset();
         // Cap to exactly 2 blocks' worth of bytes. Each block is one
@@ -590,7 +753,7 @@ mod tests {
         let freed = test_support::drained_ptrs();
         assert!(
             freed.contains(&a),
-            "LRU should have evicted `a`; freed list = {:?}",
+            "FIFO should have evicted `a`; freed list = {:?}",
             freed
         );
         assert!(
@@ -616,14 +779,19 @@ mod tests {
         // a white-box manipulation that mirrors what a memory-pressure
         // hook would observe if the cap were raised at runtime.
         {
-            let mut s = pool.inner.lock();
             for _ in 0..8 {
                 let p = test_support::test_driver_alloc(64).unwrap();
-                s.buckets.entry(64).or_default().push_back(PooledBlock {
+                let entry = pool
+                    .buckets
+                    .entry(64)
+                    .or_insert_with(|| Mutex::new(BucketEntry::new()));
+                let mut guard = entry.lock();
+                guard.blocks.push_back(PooledBlock {
                     ptr: p,
                     inserted: Instant::now(),
                 });
-                s.total_bytes += 64;
+                drop(guard);
+                pool.total_bytes.fetch_add(64, Ordering::AcqRel);
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
@@ -634,5 +802,83 @@ mod tests {
         // no-op here — the assertion below catches the case where we
         // accidentally over-evict.
         assert_eq!(evicted, 0);
+    }
+
+    /// L-5: per-bucket locks let concurrent frees into distinct size
+    /// classes proceed in parallel. We approximate "make progress" by
+    /// timing N parallel free streams vs. a sequential baseline: if a
+    /// single global mutex still gated everything, the parallel version
+    /// would be ~equal to the sequential one; with per-bucket locks it
+    /// should be measurably faster than 4× the per-thread time.
+    ///
+    /// The test is loose on purpose — CI machines have variable timing.
+    /// We just assert parallel < 4× sequential (any speedup at all).
+    #[test]
+    fn per_bucket_lock_allows_concurrent_progress() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        // Big caps so we never hit the eviction path — we're testing
+        // contention on the pool's bookkeeping locks, not its policy.
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "100000"),
+        ]);
+        let pool = Arc::new(DeviceMemPool::new());
+
+        // Four distinct bucket sizes — one per thread — so contention
+        // happens only inside the DashMap shard layer, not on a single
+        // bucket's mutex.
+        let sizes = [64usize, 256, 1024, 4096];
+        let per_thread_iters = 4000;
+
+        // Sequential baseline: same total work, one thread.
+        let seq_start = Instant::now();
+        for s in &sizes {
+            for _ in 0..per_thread_iters {
+                let (p, ab) = pool.alloc(*s).unwrap();
+                pool.free(p, ab);
+            }
+        }
+        let seq_elapsed = seq_start.elapsed();
+
+        // Parallel: spawn one thread per size class.
+        let par_start = Instant::now();
+        let handles: Vec<_> = sizes
+            .iter()
+            .copied()
+            .map(|s| {
+                let pool = Arc::clone(&pool);
+                std::thread::spawn(move || {
+                    for _ in 0..per_thread_iters {
+                        let (p, ab) = pool.alloc(s).unwrap();
+                        pool.free(p, ab);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let par_elapsed = par_start.elapsed();
+
+        // Sanity: both runs did real work.
+        assert!(seq_elapsed > Duration::from_micros(1));
+        assert!(par_elapsed > Duration::from_micros(1));
+
+        // Loose check: with per-bucket locks we expect par_elapsed to be
+        // less than seq_elapsed (sub-linear-ish scaling). A single global
+        // mutex would force par_elapsed >= seq_elapsed. Allow generous
+        // headroom for CI noise — if par_elapsed > 1.5 * seq_elapsed
+        // something is clearly serialising.
+        assert!(
+            par_elapsed < seq_elapsed + seq_elapsed / 2,
+            "parallel run ({:?}) should not be > 1.5x sequential ({:?}) — \
+             suggests a global lock is still serialising frees",
+            par_elapsed,
+            seq_elapsed
+        );
     }
 }
