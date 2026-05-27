@@ -1446,6 +1446,7 @@ fn launch_unmatched_build_kernel(
 /// the collision-list kernels rather than the Stage-1 unique-key fast path,
 /// so duplicate build keys produce correct (multiple) matches.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // reason: superseded by execute_inner_join_on_gpu_with_shape_and_verify (GJ-stage3 host post-verify); kept as the canonical no-verify variant for callers that have already validated key shapes.
 pub fn execute_inner_join_on_gpu_with_shape(
     lhs: &RecordBatch,
     rhs: &RecordBatch,
@@ -1628,7 +1629,7 @@ pub fn intern_utf8_columns(
             continue;
         }
         let s = b.value(i);
-        let &idx = dict.entry(s).or_insert_with(|| {
+        let idx = *dict.entry(s).or_insert_with(|| {
             let cur = next_idx;
             next_idx = next_idx.saturating_add(1);
             cur
@@ -1643,7 +1644,7 @@ pub fn intern_utf8_columns(
             continue;
         }
         let s = p.value(i);
-        let &idx = dict.entry(s).or_insert_with(|| {
+        let idx = *dict.entry(s).or_insert_with(|| {
             let cur = next_idx;
             next_idx = next_idx.saturating_add(1);
             cur
@@ -2009,8 +2010,8 @@ pub fn execute_cross_join_on_gpu(
     let n_build_u32 = n_rows_to_u32(n_right)?; // "build" = right side here
 
     // Output buffers.
-    let mut out_probe_idx_dev = GpuVec::<u32>::zeros(total_usize)?;
-    let mut out_build_idx_dev = GpuVec::<u32>::zeros(total_usize)?;
+    let out_probe_idx_dev = GpuVec::<u32>::zeros(total_usize)?;
+    let out_build_idx_dev = GpuVec::<u32>::zeros(total_usize)?;
     let stream = CudaStream::null();
 
     // Launch.
