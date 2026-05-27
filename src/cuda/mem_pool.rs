@@ -244,15 +244,23 @@ impl DeviceMemPool {
                 }
             }
 
-            // Per-bucket cap. Bucket may be empty when the global eviction
-            // above happened to drain it, which is fine — `or_default`
-            // recreates it.
-            let bucket = state.buckets.entry(alloc_bytes).or_default();
-            let fits_bucket = bucket.len() < self.max_bucket_entries;
+            // Per-bucket cap. Read both decisions BEFORE taking the
+            // bucket mutable borrow so we don't run afoul of the borrow
+            // checker on `state.total_bytes`.
+            let cur_bucket_len = state
+                .buckets
+                .get(&alloc_bytes)
+                .map(|d| d.len())
+                .unwrap_or(0);
+            let fits_bucket = cur_bucket_len < self.max_bucket_entries;
             let fits_total = alloc_bytes <= self.max_pooled_bytes
                 && state.total_bytes + alloc_bytes <= self.max_pooled_bytes;
 
             if fits_bucket && fits_total {
+                // Bucket may be empty when the global eviction above
+                // happened to drain it, which is fine — `or_default`
+                // recreates it.
+                let bucket = state.buckets.entry(alloc_bytes).or_default();
                 bucket.push_back(PooledBlock {
                     ptr,
                     inserted: Instant::now(),
@@ -310,7 +318,7 @@ impl DeviceMemPool {
     /// blocks across all buckets. Intended for tests and diagnostics only.
     #[doc(hidden)]
     pub fn pooled_block_count(&self) -> usize {
-        self.buckets.lock().values().map(|v| v.len()).sum()
+        self.inner.lock().buckets.values().map(|v| v.len()).sum()
     }
 
     /// Number of pooled blocks in the bucket that would satisfy an allocation
@@ -318,7 +326,12 @@ impl DeviceMemPool {
     #[doc(hidden)]
     pub fn bucket_len_for(&self, bytes: usize) -> usize {
         let key = bucket_size(bytes);
-        self.buckets.lock().get(&key).map(|v| v.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .buckets
+            .get(&key)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// Release every pooled block back to the driver. Called on `Drop`, and
