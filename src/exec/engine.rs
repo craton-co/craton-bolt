@@ -35,7 +35,7 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::{CudaContext, GpuVec};
 use crate::error::{BoltError, BoltResult};
-use crate::exec::launch::CudaStream;
+use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::n_rows_to_u32;
 use crate::jit::{compile_ptx, CudaModule};
 use crate::plan::{
@@ -551,7 +551,7 @@ impl Engine {
 
         // 5. Launch with one thread per row, block size 256.
         let stream = CudaStream::null();
-        let grid_x = ((n_rows_u32 + BLOCK_SIZE - 1) / BLOCK_SIZE).max(1);
+        let grid_x = grid_x_for(n_rows_u32, BLOCK_SIZE);
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
                 function.raw(),

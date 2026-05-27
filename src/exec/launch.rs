@@ -16,6 +16,40 @@ use crate::jit::CudaFunction;
 /// Threads per block for the 1D launch (one thread per row).
 const DEFAULT_BLOCK_SIZE: u32 = 256;
 
+/// Ceiling-divide a `u32` row count by a `u32` block size, returning the
+/// number of blocks needed to cover every row (with a floor of `1` so a
+/// zero-row launch still produces a valid `grid_x`).
+///
+/// The naive `(n_rows + block - 1) / block` form silently overflows in
+/// release builds when `n_rows > u32::MAX - block`, which is reachable
+/// because `n_rows_to_u32` accepts the full `u32` range. This helper does
+/// the addition in `usize` (so the `+block-1` cannot wrap) and only casts
+/// back to `u32` at the end — safe because `div_ceil(n, b) <= n <=
+/// u32::MAX` for any `b >= 1`, so the result is always representable.
+///
+/// # Panics
+///
+/// Panics in debug if `block == 0`. In release, the underlying integer
+/// division would itself panic, so this `debug_assert!` is purely for an
+/// earlier, clearer failure during development.
+pub(crate) fn grid_x_for(n_rows: u32, block: u32) -> u32 {
+    debug_assert!(block != 0, "grid_x_for: block size must be non-zero");
+    let n = n_rows as usize;
+    let b = block as usize;
+    // div_ceil in usize cannot overflow: n <= u32::MAX, b >= 1, so
+    // (n + b - 1) <= u32::MAX + (u32::MAX) which is well within usize
+    // on any platform we support (32-bit pointers still give 4 GiB-1
+    // headroom, and we only ever reach this with b <= ~1024).
+    let g = n.div_ceil(b);
+    // Floor of 1 matches the historical `.max(1)` behaviour of every
+    // call site: a zero-row launch still produces a valid (though
+    // wasted) `grid_x` of 1.
+    let g = g.max(1);
+    // SAFETY: g = max(div_ceil(n, b), 1) <= max(n, 1) <= u32::MAX,
+    // so the `as u32` cannot truncate.
+    g as u32
+}
+
 /// CUDA stream wrapper. NULL stream by default; create explicit ones for overlap.
 pub struct CudaStream {
     raw: CUstream,
@@ -201,7 +235,7 @@ pub fn launch_1d(
     stream: &CudaStream,
     args: &mut KernelArgs<'_>,
 ) -> BoltResult<()> {
-    let grid_x = ((args.n_rows + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE).max(1);
+    let grid_x = grid_x_for(args.n_rows, DEFAULT_BLOCK_SIZE);
 
     // Build the kernel-parameter pointer array. Each entry is a *mut c_void
     // pointing at the storage of one kernel argument (a CUdeviceptr or n_rows).
@@ -229,4 +263,47 @@ pub fn launch_1d(
 
     stream.synchronize()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grid_x_for;
+
+    /// `u32::MAX` rows / 256 threads-per-block must round up *without*
+    /// overflowing the addition that the old `(n + b - 1) / b` form
+    /// performed in `u32`. Expected value is the mathematical
+    /// ceiling-divide: ceil((2^32 - 1) / 256) == 16_777_216.
+    #[test]
+    fn grid_x_for_u32_max_no_overflow() {
+        // The +1 over 2^24 - 1 comes from the trailing 255 rows in the
+        // final partial block: 256 * 16_777_215 = u32::MAX - 255, so we
+        // need one more block to cover the residue.
+        assert_eq!(grid_x_for(u32::MAX, 256), 16_777_216);
+    }
+
+    /// Zero rows still produces `grid_x = 1`: a wasted launch is
+    /// preferable to a `grid_x = 0`, which CUDA rejects. Matches the
+    /// historical `.max(1)` floor at every call site.
+    #[test]
+    fn grid_x_for_zero_rows_is_one() {
+        assert_eq!(grid_x_for(0, 256), 1);
+    }
+
+    /// Just under one full block still needs a block: ceil(255/256) = 1.
+    #[test]
+    fn grid_x_for_just_under_block() {
+        assert_eq!(grid_x_for(255, 256), 1);
+    }
+
+    /// Exactly one full block: ceil(256/256) = 1.
+    #[test]
+    fn grid_x_for_exactly_one_block() {
+        assert_eq!(grid_x_for(256, 256), 1);
+    }
+
+    /// One row over a block needs a second block: ceil(257/256) = 2.
+    #[test]
+    fn grid_x_for_one_over_block() {
+        assert_eq!(grid_x_for(257, 256), 2);
+    }
 }

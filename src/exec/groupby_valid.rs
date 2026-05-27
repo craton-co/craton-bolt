@@ -67,7 +67,7 @@ use bytemuck::Pod;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
-use crate::exec::launch::CudaStream;
+use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::valid_flag_kernels::{
@@ -652,7 +652,7 @@ fn launch_keys_kernel(
     ];
 
     let block = valid_block_size();
-    let grid_x = ((n_rows_to_u32(n_rows)? + block - 1) / block).max(1);
+    let grid_x = grid_x_for(n_rows_to_u32(n_rows)?, block);
 
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
@@ -743,7 +743,7 @@ fn launch_agg_kernel<T: Pod>(
     // 7-param ABI is the integer kernel's 11-param ABI with the four
     // spill-related trailing params dropped — same prefix.
     let block = valid_block_size();
-    let grid_x = ((n_rows_to_u32(n_rows)? + block - 1) / block).max(1);
+    let grid_x = grid_x_for(n_rows_to_u32(n_rows)?, block);
 
     if is_float_min_max {
         let mut params: [*mut c_void; 7] = [

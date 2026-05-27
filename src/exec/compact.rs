@@ -27,7 +27,7 @@ use arrow_array::{ArrayRef, BooleanArray};
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
-use crate::exec::launch::CudaStream;
+use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::jit::CudaFunction;
 
 /// Default 1D block size for the predicate-eval launch. Matches the
@@ -163,7 +163,7 @@ pub fn launch_predicate_kernel(
     }
     kernel_params.push(&mut n_rows_local as *mut u32 as *mut std::ffi::c_void);
 
-    let grid_x = ((n_rows + PREDICATE_BLOCK_SIZE - 1) / PREDICATE_BLOCK_SIZE).max(1);
+    let grid_x = grid_x_for(n_rows, PREDICATE_BLOCK_SIZE);
 
     // SAFETY: `function` is borrowed from a live `CudaModule`; every entry of
     // `kernel_params` points into `device_ptrs` or `n_rows_local`, both of
