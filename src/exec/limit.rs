@@ -11,6 +11,10 @@ use crate::exec::QueryHandle;
 /// Apply LIMIT (and optional OFFSET) to the input. `offset == 0` skips the
 /// offset step; `limit` is interpreted as an upper bound on the result row
 /// count (the returned batch has `min(limit, n_rows - offset)` rows).
+///
+/// Stage 3 note: host-side only, no async opportunity here. LIMIT is a
+/// constant-time zero-copy slice on top of an already-materialised
+/// `RecordBatch` — there is no GPU work to overlap.
 pub fn execute_limit(input: QueryHandle, limit: usize, offset: usize) -> BoltResult<QueryHandle> {
     let batch = input.into_record_batch();
     let n_rows = batch.num_rows();

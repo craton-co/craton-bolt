@@ -180,10 +180,6 @@ impl<T: Pod> GpuBuffer<T> {
     /// a staging copy and the call effectively serializes.
     ///
     /// Errors if `src.len()` exceeds the buffer's allocated capacity.
-    ///
-    /// # Stage 1 status
-    /// This is a Stage 1 wrapper — no executor calls it yet. Stage 2 will
-    /// wire executors onto explicit streams.
     pub fn copy_from_async(&mut self, src: &[T], stream: CUstream) -> BoltResult<()> {
         if src.len() > self.capacity {
             return Err(BoltError::Memory(format!(
@@ -214,9 +210,6 @@ impl<T: Pod> GpuBuffer<T> {
     ///
     /// For real D2H / kernel overlap, pass a [`PinnedHostBuffer`]-backed
     /// slice. The caller must `cuStreamSynchronize` before reading `dst`.
-    ///
-    /// # Stage 1 status
-    /// Wrapper only — see [`copy_from_async`](Self::copy_from_async).
     pub fn copy_to_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
         if dst.len() != self.len {
             return Err(BoltError::Memory(format!(
@@ -235,6 +228,41 @@ impl<T: Pod> GpuBuffer<T> {
             }
         }
         Ok(())
+    }
+
+    /// Alias for [`copy_to_async`](Self::copy_to_async). Stage-3 callers
+    /// use this name to make the pinned-host pairing intent explicit at
+    /// the call site.
+    pub fn copy_to_slice_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
+        self.copy_to_async(dst, stream)
+    }
+
+    /// Allocate `len` elements and zero them via `cuMemsetD8Async` on `stream`.
+    ///
+    /// Stage-3 counterpart to [`zeros`]. The memset is enqueued on `stream`
+    /// and the caller must synchronize before launching any kernel that
+    /// reads these bytes on a *different* stream. Kernels enqueued on the
+    /// same `stream` after this call see a fully-zeroed buffer without an
+    /// explicit sync.
+    pub fn zeros_async(len: usize, stream: CUstream) -> BoltResult<Self> {
+        let mut buf = Self::with_capacity(len)?;
+        if len > 0 {
+            let byte_len = len.checked_mul(size_of::<T>()).ok_or_else(|| {
+                BoltError::Memory(format!(
+                    "GpuBuffer::zeros_async size overflow: {} * {}",
+                    len,
+                    size_of::<T>()
+                ))
+            })?;
+            // `memset_d8_async` is a safe wrapper; its safety contract is
+            // documented on the wrapper itself (caller must keep the range
+            // live and uncontended until the stream is synchronized).
+            // `buf.ptr` was just allocated with at least `byte_len` bytes
+            // of capacity (rounded up to ARROW_ALIGNMENT).
+            cuda_sys::memset_d8_async(buf.ptr, 0, byte_len, stream)?;
+        }
+        buf.len = len;
+        Ok(buf)
     }
 
     /// Copy the buffer's contents into `dst`. Errors if lengths differ.
@@ -300,7 +328,6 @@ where
     GpuBuffer::<P::Native>::from_slice(arr.values().as_ref())
 }
 
-// ---------------------------------------------------------------------------
 // PinnedHostBuffer<T>
 //
 // Page-locked host allocation, RAII'd over `cuMemAllocHost_v2` /
@@ -308,10 +335,10 @@ where
 // destination the driver can DMA directly out of, rather than the
 // staging-copy fall-back the driver synthesizes for pageable memory.
 //
-// Stage 1 ships this as a typed host buffer with `as_slice` / `as_mut_slice`
-// access. It is **not** plumbed into the executors — see the Stage 2 TODO
-// in cuda_sys.rs. Once executors are async, IngestBatch / aggregate scratch
-// buffers and the final result D2H will land in PinnedHostBuffer<T>s.
+// Allocations are limited (the kernel's pinned-pool is global), so use only
+// for the *final* H2D upload sources and D2H download targets — not for
+// every intermediate buffer.
+// ---------------------------------------------------------------------------
 
 /// Owned page-locked (pinned) host buffer. Backed by `cuMemAllocHost_v2`.
 ///
@@ -329,8 +356,7 @@ where
 pub struct PinnedHostBuffer<T: Pod> {
     /// Pinned host pointer (valid host VA, page-locked).
     ptr: *mut T,
-    /// Number of T elements (logical and physical — pinned buffers don't
-    /// grow, so capacity is unnecessary).
+    /// Logical element count.
     len: usize,
     /// Number of bytes the driver returned to us. Cached so `Drop` doesn't
     /// have to recompute (and so a future power-of-two-bucketed pool can
@@ -367,7 +393,6 @@ impl<T: Pod> PinnedHostBuffer<T> {
         // not expose `cuMemAllocHost_v2`. That's fine — the pointer is
         // bit-compatible with the driver, just like our other shared FFI
         // boundary points.
-        // TODO(stage2): wire cudarc pinned-host path if/when cudarc adds it.
         let raw = unsafe { cuda_sys::mem_alloc_host(byte_len)? };
         Ok(Self {
             ptr: raw as *mut T,
@@ -435,6 +460,17 @@ impl<T: Pod> PinnedHostBuffer<T> {
         // SAFETY: same as `as_slice`, plus the `&mut self` receiver
         // statically prevents aliasing.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// Override the logical length — used after an async D2H that filled
+    /// fewer than the buffer's allocated length.
+    ///
+    /// # Safety
+    /// `new_len` must be `<= len()` at allocation time and the first
+    /// `new_len` elements must be initialised (e.g. by a completed async D2H).
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len * size_of::<T>() <= self.byte_len);
+        self.len = new_len;
     }
 }
 

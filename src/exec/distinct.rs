@@ -82,6 +82,12 @@ type RowKey = Vec<RowKeyValue>;
 ///
 /// Host-side implementation. For wide schemas or large row counts this
 /// is the slow path; the 0.2 release will add a GPU sort-based variant.
+///
+/// Stage 3 note: host-side only, no async opportunity here. The upstream
+/// executor that produced `input` has already done its own pinned/async
+/// D2H, so the `RecordBatch` we receive is already settled in host
+/// memory. When the GPU-side DISTINCT lands it should pick up the same
+/// async memcpy + pinned D2H pattern as the projection / aggregate paths.
 pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
     let batch = input.into_record_batch();
     let n_rows = batch.num_rows();

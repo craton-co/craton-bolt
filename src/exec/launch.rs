@@ -65,6 +65,28 @@ impl CudaStream {
         }
     }
 
+    /// Mint a per-call stream when possible, otherwise fall back to the
+    /// NULL stream.
+    ///
+    /// Stage-3 helper: every executor entry point that issues async
+    /// memcpys benefits from its own stream so its H2D upload, kernel,
+    /// and D2H can overlap with work the engine has queued on the NULL
+    /// stream. If stream creation fails (e.g. driver out of resources)
+    /// we degrade to the NULL stream rather than failing the whole
+    /// query — the executor is then strictly slower but functionally
+    /// identical, since async operations on the NULL stream serialize
+    /// with everything else.
+    ///
+    /// The caller still owns the stream and must `synchronize()` at the
+    /// end of the executor before returning device results back to
+    /// host-visible code.
+    pub fn null_or_default() -> Self {
+        match Self::new() {
+            Ok(s) => s,
+            Err(_) => Self::null(),
+        }
+    }
+
     /// Create a new non-blocking stream.
     pub fn new() -> BoltResult<Self> {
         let mut s: CUstream = ptr::null_mut();
@@ -75,21 +97,6 @@ impl CudaStream {
             raw: s,
             owned: true,
         })
-    }
-
-    /// Create a non-blocking stream, falling back to the NULL stream if the
-    /// driver call fails (e.g. when the engine is being driven through the
-    /// `cuda-stub` feature or on a host with no device).
-    ///
-    /// Used by the Stage 2 async-memcpy wiring: per-query streams are a pure
-    /// perf optimisation, so a creation failure must not break the executor
-    /// — it just degrades to the legacy single-stream behaviour, which is
-    /// what we had before Stage 1.
-    pub fn null_or_default() -> Self {
-        match Self::new() {
-            Ok(s) => s,
-            Err(_) => Self::null(),
-        }
     }
 
     /// Raw handle accessor for the driver FFI.

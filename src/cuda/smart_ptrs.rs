@@ -28,7 +28,7 @@ use std::marker::PhantomData;
 
 use bytemuck::Pod;
 
-use crate::cuda::buffer::GpuBuffer;
+use crate::cuda::buffer::{GpuBuffer, PinnedHostBuffer};
 use crate::cuda::cuda_sys::{CUdeviceptr, CUstream};
 use crate::error::BoltResult;
 
@@ -121,11 +121,21 @@ impl<T: Pod> GpuVec<T> {
         self.buffer.to_vec()
     }
 
-    // ----- Stage 2 async memcpy entry points ------------------------------
+    // ----- Stage 2 / Stage 3 async memcpy entry points --------------------
+
+    /// Allocate `len` elements and async-zero them on `stream`. Kernels
+    /// enqueued on the same stream after this call observe a zeroed
+    /// buffer without an explicit synchronize.
+    pub fn zeros_async(len: usize, stream: CUstream) -> BoltResult<Self> {
+        Ok(Self {
+            buffer: GpuBuffer::<T>::zeros_async(len, stream)?,
+        })
+    }
 
     /// Allocate a device vec and enqueue an async H2D from `slice` on `stream`.
     /// Returns immediately; the device contents are not valid until `stream`
     /// is synchronized. `slice` must remain live and unmodified until then.
+    /// Pair with a [`PinnedHostBuffer`] source for a true DMA transfer.
     pub fn from_slice_async(slice: &[T], stream: CUstream) -> BoltResult<Self> {
         let mut buffer = GpuBuffer::<T>::with_capacity(slice.len())?;
         buffer.copy_from_async(slice, stream)?;
@@ -137,6 +147,21 @@ impl<T: Pod> GpuVec<T> {
     /// stream has been synchronized.
     pub fn copy_to_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
         self.buffer.copy_to_async(dst, stream)
+    }
+
+    /// Async D2H into a freshly-allocated [`PinnedHostBuffer<T>`] of
+    /// `self.len()` elements. The caller MUST call
+    /// `stream.synchronize()` before reading the pinned buffer.
+    ///
+    /// Use when you intend to feed the downloaded data straight into an
+    /// Arrow `Vec<T>` — the DMA lands in pinned memory, then the host
+    /// copies it into a regular `Vec` once. That is still strictly
+    /// faster than the synchronous `to_vec()` path when paired with
+    /// concurrent kernel work on the same stream.
+    pub fn to_pinned_async(&self, stream: CUstream) -> BoltResult<PinnedHostBuffer<T>> {
+        let mut pinned = PinnedHostBuffer::<T>::new(self.len())?;
+        self.buffer.copy_to_slice_async(pinned.as_mut_slice(), stream)?;
+        Ok(pinned)
     }
 }
 

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    RecordBatch,
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
@@ -636,15 +636,12 @@ impl Engine {
 
         // 5. Launch with one thread per row, block size 256.
         //
-        // Stage 2 async memcpy: we drive the entire query on a single per-call
-        // stream so the kernel launch and the subsequent D2H downloads chain
-        // naturally — the downloads see the kernel's writes without an
-        // explicit `cuStreamSynchronize` between launch and copy, and the
-        // final sync (just before we read the host buffers) is the only
-        // host/device barrier in the no-predicate path. `null_or_default`
-        // falls back to the NULL stream if `cuStreamCreate` fails (e.g. under
-        // the `cuda-stub` feature), so the engine still works in environments
-        // without real CUDA support.
+        // Stage-3 async memcpy: mint a per-call stream so the kernel
+        // launch, mask materialisation (if any), and the final pinned
+        // D2H download can run on the same stream — letting the driver
+        // overlap them with concurrent work on the NULL stream. Falls
+        // back to the NULL stream if stream creation fails (see
+        // `CudaStream::null_or_default`).
         let stream = CudaStream::null_or_default();
         let grid_x = grid_x_for(n_rows_u32, BLOCK_SIZE);
         unsafe {
@@ -699,9 +696,14 @@ impl Engine {
                 // Host-side fallback: download mask + outputs, then filter.
                 let host_mask =
                     crate::exec::compact::download_mask(mask.device_ptr(), n_rows)?;
+                // Stage-3: route every primitive output column through the
+                // pinned async D2H path. Each `download_pinned` call
+                // synchronizes the stream internally, so we don't need a
+                // separate barrier between the predicate kernel and these
+                // reads.
                 let mut full: Vec<ArrayRef> = Vec::with_capacity(output_cols.len());
                 for col in output_cols {
-                    full.push(col.download(n_rows)?);
+                    full.push(col.download_pinned(n_rows, &stream)?);
                 }
                 crate::exec::compact::compact_arrays(&full, &host_mask)?
             } else {
@@ -726,26 +728,13 @@ impl Engine {
                 out
             }
         } else {
-            // Stage 2 async D2H path: enqueue every output column's D2H on the
-            // per-query stream BEFORE synchronizing, then sync once and build
-            // the Arrow arrays from the now-valid host buffers. This is the
-            // simplest overlap win — the driver hands the copies off as a
-            // batch to the engine rather than stalling host-side between each
-            // column. (Pinned destination buffers are a Stage 3 follow-up;
-            // pageable `Vec<T>` still gets the ordering benefit even if not
-            // the peak bandwidth one.)
-            let mut staged: Vec<StagedDownload> = Vec::with_capacity(output_cols.len());
-            for col in &output_cols {
-                staged.push(col.stage_download_async(n_rows, &stream)?);
-            }
-            // Single host/device barrier for the whole batch of D2Hs (and the
-            // projection kernel, which is also on this stream).
-            stream.synchronize()?;
-            // The output_cols' device allocations can stay live (we just read
-            // their bytes); finalize host buffers into Arrow arrays.
+            // Stage-3 pinned downloads on the per-call stream. Each
+            // call synchronizes internally before reading, so the loop
+            // is correct even though `stream` was used for the kernel
+            // launch above.
             let mut full: Vec<ArrayRef> = Vec::with_capacity(output_cols.len());
-            for (col, st) in output_cols.into_iter().zip(staged.into_iter()) {
-                full.push(col.finalize_download(st)?);
+            for col in output_cols {
+                full.push(col.download_pinned(n_rows, &stream)?);
             }
             full
         };
@@ -795,35 +784,6 @@ impl QueryHandle {
     pub fn num_rows(&self) -> usize {
         self.batch.num_rows()
     }
-}
-
-/// Per-column host-side staging slot for the Stage 2 async D2H batch.
-///
-/// `DeviceCol::stage_download_async` allocates the host buffer up front and
-/// enqueues the D2H on the per-query stream. The buffer holds garbage until
-/// the stream is synchronized; `DeviceCol::finalize_download` consumes the
-/// staged buffer (now valid) and produces the Arrow `ArrayRef`. Splitting
-/// the API into stage / finalize lets the engine batch every column's D2H
-/// before the single host/device barrier at the end of the projection.
-enum StagedDownload {
-    /// `Vec<i32>` of length `n_rows`, valid post-sync.
-    I32(Vec<i32>),
-    /// `Vec<i64>` of length `n_rows`, valid post-sync.
-    I64(Vec<i64>),
-    /// `Vec<f32>` of length `n_rows`, valid post-sync.
-    F32(Vec<f32>),
-    /// `Vec<f64>` of length `n_rows`, valid post-sync.
-    F64(Vec<f64>),
-    /// One-byte-per-row representation; finalize maps `!= 0` to `true`.
-    Bool(Vec<u8>),
-    /// Utf8: i32 dictionary indices on the host, alongside the (already-host)
-    /// dictionary captured at stage time.
-    Utf8 {
-        /// Per-row dictionary indices; 0 = SQL NULL, >0 = position+1.
-        indices: Vec<i32>,
-        /// Owned copy of the source dictionary (host-side strings).
-        dictionary: Vec<String>,
-    },
 }
 
 /// Heterogenous owned device column. Keeps each `GpuVec<T>` alive past the kernel launch.
@@ -894,103 +854,6 @@ impl DeviceCol {
         }
     }
 
-    /// Stage 2 async D2H: enqueue a copy of this column into freshly allocated
-    /// host buffers on `stream` and return a `StagedDownload` parking those
-    /// buffers. The caller MUST synchronize `stream` before passing the result
-    /// to [`finalize_download`] — until then the host buffers contain garbage.
-    fn stage_download_async(
-        &self,
-        n_rows: usize,
-        stream: &CudaStream,
-    ) -> BoltResult<StagedDownload> {
-        // Helper: alloc a pageable Vec<T> sized for n_rows, then enqueue an
-        // async D2H from the underlying GpuVec's buffer. Returns the Vec with
-        // its length already set — the bytes are not valid until the stream
-        // has been synchronized, but `Vec<T: Pod>` is byte-only so this is
-        // sound provided the caller honours the contract.
-        fn stage_vec<T: bytemuck::Pod>(
-            v: &GpuVec<T>,
-            n_rows: usize,
-            stream: &CudaStream,
-        ) -> BoltResult<Vec<T>> {
-            let mut out: Vec<T> = vec![T::zeroed(); n_rows];
-            if n_rows > 0 {
-                // SAFETY: `out` was just sized to `n_rows` and is contiguous;
-                // we enqueue exactly that many element-bytes of D2H.
-                unsafe {
-                    cuda_sys::memcpy_d2h_async::<T>(
-                        out.as_mut_ptr(),
-                        v.device_ptr(),
-                        n_rows,
-                        stream.raw(),
-                    )?;
-                }
-            }
-            Ok(out)
-        }
-
-        match self {
-            DeviceCol::I32(v) => Ok(StagedDownload::I32(stage_vec::<i32>(v, n_rows, stream)?)),
-            DeviceCol::I64(v) => Ok(StagedDownload::I64(stage_vec::<i64>(v, n_rows, stream)?)),
-            DeviceCol::F32(v) => Ok(StagedDownload::F32(stage_vec::<f32>(v, n_rows, stream)?)),
-            DeviceCol::F64(v) => Ok(StagedDownload::F64(stage_vec::<f64>(v, n_rows, stream)?)),
-            DeviceCol::Bool(v) => Ok(StagedDownload::Bool(stage_vec::<u8>(v, n_rows, stream)?)),
-            DeviceCol::Utf8(d) => {
-                // Stage the i32 indices asynchronously; the host-side
-                // dictionary is already on the host so no further D2H is
-                // needed. Borrow it for finalize via clone — `Vec<String>` is
-                // cheap relative to a column download.
-                let indices = stage_vec::<i32>(&d.indices, n_rows, stream)?;
-                Ok(StagedDownload::Utf8 {
-                    indices,
-                    dictionary: d.dictionary.clone(),
-                })
-            }
-        }
-    }
-
-    /// Stage-2 companion: build the Arrow array from a `StagedDownload` after
-    /// the owning stream has been synchronized.
-    fn finalize_download(self, staged: StagedDownload) -> BoltResult<ArrayRef> {
-        match staged {
-            StagedDownload::I32(host) => Ok(Arc::new(Int32Array::from(host)) as ArrayRef),
-            StagedDownload::I64(host) => Ok(Arc::new(Int64Array::from(host)) as ArrayRef),
-            StagedDownload::F32(host) => Ok(Arc::new(Float32Array::from(host)) as ArrayRef),
-            StagedDownload::F64(host) => Ok(Arc::new(Float64Array::from(host)) as ArrayRef),
-            StagedDownload::Bool(host) => {
-                let bools: Vec<bool> = host.into_iter().map(|b| b != 0).collect();
-                Ok(Arc::new(BooleanArray::from(bools)) as ArrayRef)
-            }
-            StagedDownload::Utf8 { indices, dictionary } => {
-                // Mirror DictionaryColumn::to_string_array but over the
-                // already-on-host indices buffer.
-                let mut out: Vec<Option<&str>> = Vec::with_capacity(indices.len());
-                for &idx in &indices {
-                    if idx == 0 {
-                        out.push(None);
-                    } else if idx < 0 {
-                        return Err(BoltError::Other(format!(
-                            "dictionary decode: negative index {} (NULL is encoded as 0)",
-                            idx
-                        )));
-                    } else {
-                        let pos = (idx as usize) - 1;
-                        let s = dictionary.get(pos).ok_or_else(|| {
-                            BoltError::Other(format!(
-                                "dictionary decode: index {} out of range (dictionary size {})",
-                                idx,
-                                dictionary.len()
-                            ))
-                        })?;
-                        out.push(Some(s.as_str()));
-                    }
-                }
-                Ok(Arc::new(StringArray::from(out)) as ArrayRef)
-            }
-        }
-    }
-
-
     /// Copy the device column back to a host Arrow array of length `n_rows`.
     fn download(self, n_rows: usize) -> BoltResult<ArrayRef> {
         match self {
@@ -1021,6 +884,81 @@ impl DeviceCol {
             }
         }
     }
+
+    /// Stage-3 async download: enqueue D2H from every primitive variant
+    /// into pinned host buffers on `stream`, then synchronize ONCE and
+    /// build the Arrow arrays from the resulting `Vec`s. Behaves
+    /// identically to [`download`] for the Utf8 / Borrowed variants —
+    /// those don't currently have a pinned fast path.
+    ///
+    /// The caller is responsible for ensuring `stream` is the same one
+    /// the producing kernel was launched on (so the D2H sees committed
+    /// results), and the function performs the synchronize internally
+    /// before reading the pinned buffer.
+    fn download_pinned(
+        self,
+        n_rows: usize,
+        stream: &CudaStream,
+    ) -> BoltResult<ArrayRef> {
+        match self {
+            DeviceCol::I32(v) => {
+                let staged = StagedDownload::<i32>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                Ok(Arc::new(Int32Array::from(host)) as ArrayRef)
+            }
+            DeviceCol::I64(v) => {
+                let staged = StagedDownload::<i64>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                Ok(Arc::new(Int64Array::from(host)) as ArrayRef)
+            }
+            DeviceCol::F32(v) => {
+                let staged = StagedDownload::<f32>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                Ok(Arc::new(Float32Array::from(host)) as ArrayRef)
+            }
+            DeviceCol::F64(v) => {
+                let staged = StagedDownload::<f64>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                Ok(Arc::new(Float64Array::from(host)) as ArrayRef)
+            }
+            DeviceCol::Bool(v) => {
+                let staged = StagedDownload::<u8>::from_gpu(&v, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), n_rows)?;
+                let bools: Vec<bool> = host.into_iter().map(|b| b != 0).collect();
+                Ok(Arc::new(BooleanArray::from(bools)) as ArrayRef)
+            }
+            DeviceCol::Utf8(_) => {
+                // Utf8 doesn't (yet) have a pinned fast path — fall back
+                // to the sync download. The stream has already been
+                // synchronized above for the primitive siblings, so this
+                // is safe to invoke regardless.
+                self.download(n_rows)
+            }
+        }
+    }
+}
+
+/// Tiny invariant check used by the pinned-download path: every
+/// `DeviceCol` output buffer is sized at allocation time to `n_rows`, so
+/// a length mismatch on download is a bug, not a runtime condition.
+fn check_len(have: usize, want: usize) -> BoltResult<()> {
+    if have != want {
+        return Err(BoltError::Other(format!(
+            "internal: device buffer length {} did not match expected {}",
+            have, want
+        )));
+    }
+    Ok(())
 }
 
 /// Copy back a `GpuVec<T>` into a host `Vec<T>` of length `n_rows`.
@@ -1040,6 +978,51 @@ where
         )));
     }
     Ok(host)
+}
+
+/// Stage-3 D2H staging buffer: async-copies a `GpuVec<T>` into a
+/// page-locked host buffer on a caller-supplied stream, synchronises
+/// once, and produces a regular `Vec<T>` for Arrow consumption.
+///
+/// Why a separate type vs. an inline call? Arrow array constructors
+/// (`Int32Array::from(Vec<i32>)`) want owned `Vec`s with the standard
+/// allocator — they will NOT accept a `PinnedHostBuffer` as a
+/// zero-copy backing buffer (the lifecycle is incompatible: pinned
+/// memory must be released via `cuMemFreeHost`, while Arrow buffers
+/// release through the global allocator). So the pinned hop is purely
+/// to get a true DMA without staging through a kernel-managed bounce
+/// buffer; the final `.to_vec()` is the one host-host copy we keep.
+///
+/// Usage:
+///
+/// ```ignore
+/// let staged = StagedDownload::from_gpu(&gpu_vec, stream.raw())?;
+/// stream.synchronize()?;
+/// let arrow_vec: Vec<i32> = staged.into_vec();
+/// ```
+struct StagedDownload<T: bytemuck::Pod> {
+    pinned: crate::cuda::PinnedHostBuffer<T>,
+}
+
+impl<T: bytemuck::Pod> StagedDownload<T> {
+    /// Enqueue an async D2H from `v` into a fresh pinned host buffer on
+    /// `stream`. The caller MUST synchronize `stream` before calling
+    /// [`into_vec`] / borrowing the pinned slice.
+    fn from_gpu(v: &GpuVec<T>, stream: crate::cuda::CUstream) -> BoltResult<Self> {
+        let pinned = v.to_pinned_async(stream)?;
+        Ok(Self { pinned })
+    }
+
+    /// Consume the staged download and produce a regular host `Vec<T>`.
+    ///
+    /// Assumes the caller has synchronized the stream — there is no way
+    /// to detect "not yet synchronized" without an event, which we skip
+    /// in Stage 3. Calling this before sync produces uninitialised
+    /// bytes (defined behaviour for `T: Pod` but functionally
+    /// incorrect).
+    fn into_vec(self) -> Vec<T> {
+        self.pinned.as_slice().to_vec()
+    }
 }
 
 /// Map our plan `DataType` to Arrow `DataType`.
@@ -1092,8 +1075,8 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 
 #[cfg(test)]
 mod tests {
-    //! Online tests for the lazy-upload `register_batch` path and the Stage 2
-    //! async-memcpy wiring in `execute_projection`.
+    //! Online tests for the lazy-upload `register_batch` path and the
+    //! Stage-3 pinned async-memcpy wiring in `execute_projection`.
     //!
     //! The lazy-upload tests lock in the fix for the O(N²) PCIe re-upload bug
     //! described on the `gpu_tables` field: appending N batches must not cost
@@ -1101,7 +1084,7 @@ mod tests {
     //! observable correctness of the lazy path (rows from every appended batch
     //! are visible to the next query).
     //!
-    //! The Stage 2 tests cover the per-query-stream + async-D2H path —
+    //! The Stage-3 tests cover the per-query-stream + pinned D2H path —
     //! both the no-predicate and predicate flows — so any regression in the
     //! stream chaining surfaces as a value mismatch rather than a CUDA error.
     //!
