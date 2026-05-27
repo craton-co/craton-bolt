@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **Two-key MIN / MAX at Tier 2.1** — high-cardinality executor for
 //! `SELECT a, b, {MIN,MAX}(v) FROM x GROUP BY a, b` over **integer** value
@@ -19,14 +19,14 @@
 //!
 //! 1. Pack `(k1, k2)` → `i64` host-side.
 //! 2. Run `partition_kernel_i64` over the packed keys.
-//! 3. Round-trip the integer value column through `f64` (the scatter
-//!    kernel only takes f64 values; same hack as the single-key int
-//!    MIN/MAX exec — `Int32→f64→Int32` is exact for all i32, Int64
-//!    is lossy above 2^53 and documented as such).
-//! 4. Run `scatter_kernel_i64` (packed i64 keys + dummy f64 vals).
-//! 5. Re-upload the integer vals.
-//! 6. Run `partition_reduce_kernel_minmax_i64` with the integer vals.
-//! 7. Walk slots, unpack `(key_hi, key_lo)`, sort by packed-i64 ASC,
+//! 3. Scatter pass — dtype-specialised:
+//!    * Int32 vals: round-trip through `f64` via `scatter_kernel_i64`
+//!      (`Int32 -> f64 -> Int32` is bit-exact for every i32).
+//!    * Int64 vals: stay in 64-bit integer registers end-to-end via
+//!      `scatter_kernel_i64_to_i64`, so values >2^53 round-trip
+//!      losslessly — no narrowing.
+//! 4. Run `partition_reduce_kernel_minmax_i64` with the integer vals.
+//! 5. Walk slots, unpack `(key_hi, key_lo)`, sort by packed-i64 ASC,
 //!    build the output RecordBatch.
 //!
 //! ## Scope (v0)
@@ -63,6 +63,11 @@ const BLOCK_THREADS: u32 = 256;
 // ---------------------------------------------------------------------------
 // Per-executor module cache. Mirror of `groupby_tier2_minmax_exec.rs` over
 // the i64-key kernel variants.
+//
+// Scatter has two variants: the f64-val sibling (`KernelSpec::ScatterI64`,
+// used by the Int32 path — `i32 -> f64 -> i32` is bit-exact) and the
+// typed i64-key + i64-val variant (`KernelSpec::ScatterI64ToI64`, used by
+// the Int64 path so values >2^53 round-trip losslessly).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
@@ -97,6 +102,7 @@ impl ReduceKey {
 enum KernelSpec {
     PartitionI64,
     ScatterI64,
+    ScatterI64ToI64,
     ReduceMinMaxI64(ReduceKey),
 }
 
@@ -113,6 +119,7 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     let ptx = match spec {
         KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
         KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
+        KernelSpec::ScatterI64ToI64 => scatter_kernel_i64::compile_scatter_kernel_i64_to_i64()?,
         KernelSpec::ReduceMinMaxI64(rk) => {
             let (op, dt) = rk.into_pair();
             compile_partition_reduce_kernel_minmax_i64(op, dt)?
@@ -185,25 +192,6 @@ pub fn try_execute(
         return None;
     }
 
-    // Int64 correctness gate: the scatter pipeline routes the value
-    // column through `f64`, which only represents `i64` losslessly for
-    // `|v| <= 2^53`. Decline when any value would lose precision so the
-    // caller falls through to a non-lossy (slower) executor — wrong
-    // MIN/MAX is far worse than slow MIN/MAX. Shared with the single-key
-    // exec so the gate is defined in exactly one place.
-    //
-    // TODO(c4): wire a typed i64 scatter+reduce path so this guard can
-    // be removed. The two scatter kernels in `crate::jit::scatter_kernel*`
-    // both take `f64` value columns today; a sibling that takes `i64`
-    // value columns (or a generic typed scatter) would let us keep the
-    // fast lane for the full Int64 range.
-    if val_dtype == MinMaxDtype::Int64 {
-        let a = val_col.as_any().downcast_ref::<Int64Array>()?;
-        if crate::exec::groupby_tier2_minmax_exec::i64_values_exceed_f64_mantissa(a.values()) {
-            return None;
-        }
-    }
-
     Some(execute_inner(plan, k1, k2, val_col, op, val_dtype))
 }
 
@@ -226,31 +214,6 @@ fn execute_inner(
         .map(|(&a, &b)| ((a as u32 as u64) << 32 | (b as u32 as u64)) as i64)
         .collect();
     let keys_gpu: GpuVec<i64> = GpuVec::<i64>::from_slice(&packed)?;
-
-    // Round-trip ints through f64 for the scatter (same as single-key int
-    // MIN/MAX exec). Exact for Int32; for Int64 the round-trip is only
-    // sound for `|v| <= 2^53` — `try_execute` declines the batch
-    // otherwise (see the `i64_values_exceed_f64_mantissa` gate there).
-    // TODO(c4): remove the f64 hop once a typed i64 scatter lands.
-    let host_vals_f64: Vec<f64> = match val_dtype {
-        MinMaxDtype::Int32 => val_col
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .ok_or_else(|| BoltError::Other("expected Int32Array".into()))?
-            .values()
-            .iter()
-            .map(|&v| v as f64)
-            .collect(),
-        MinMaxDtype::Int64 => val_col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| BoltError::Other("expected Int64Array".into()))?
-            .values()
-            .iter()
-            .map(|&v| v as f64)
-            .collect(),
-    };
-    let vals_in_gpu: GpuVec<f64> = GpuVec::<f64>::from_slice(&host_vals_f64)?;
 
     let num_partitions = partition_kernel_i64::NUM_PARTITIONS;
 
@@ -279,55 +242,141 @@ fn execute_inner(
     let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
     let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
 
-    // ---- Scatter (i64 keys + f64 vals; we discard the scattered f64 vals) ----
-    let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros(n_rows as usize)?;
-    let mut scatter_vals_f64: GpuVec<f64> = GpuVec::<f64>::zeros(n_rows as usize)?;
-    let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
-    {
-        let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
-        let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
-
-        let view_keys = keys_gpu.view();
-        let view_vals = vals_in_gpu.view();
-        let view_pids = partition_ids.view();
-        let view_offsets = offsets_gpu.view();
-        let mut view_cursors = cursors.view_mut();
-        let mut view_sk = scatter_keys.view_mut();
-        let mut view_sv = scatter_vals_f64.view_mut();
-
-        let mut args = KernelArgs::empty();
-        args.push_input(&view_keys);
-        args.push_input(&view_vals);
-        args.push_input(&view_pids);
-        args.push_input(&view_offsets);
-        args.push_output(&mut view_cursors);
-        args.push_output(&mut view_sk);
-        args.push_output(&mut view_sv);
-        args.push_scalar_u32(n_rows);
-
-        let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
-        let stream = CudaStream::null();
-        launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
-    }
-
-    // Convert scattered f64 vals back to the integer dtype for the reduce.
-    let scattered_f64: Vec<f64> = scatter_vals_f64.to_vec()?;
-
+    // ---- Scatter pass — dtype-specialised ----
+    //
+    // Int32 vals route through the f64-val scatter (round-trip is exact
+    // for every i32). Int64 vals route through the typed
+    // `bolt_scatter_i64_to_i64` kernel — vals stay in 64-bit integer
+    // registers end-to-end, so values >2^53 round-trip losslessly. The
+    // previous f64 round-trip narrowed Int64 above the f64 mantissa
+    // boundary; the typed path is exact for the full i64 range.
     match val_dtype {
         MinMaxDtype::Int32 => {
+            let arr = val_col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| BoltError::Other("expected Int32Array".into()))?;
+            let host_vals_f64: Vec<f64> = arr.values().iter().map(|&v| v as f64).collect();
+            let vals_in_gpu: GpuVec<f64> = GpuVec::<f64>::from_slice(&host_vals_f64)?;
+
+            let (scatter_keys, scattered_f64) = run_scatter_f64(
+                &keys_gpu,
+                &vals_in_gpu,
+                &partition_ids,
+                &offsets_gpu,
+                n_rows,
+                num_partitions,
+            )?;
             let v: Vec<i32> = scattered_f64.iter().map(|&x| x as i32).collect();
             let vals_typed_gpu = GpuVec::<i32>::from_slice(&v)?;
-            // Keep these alive past the launch.
-            let _ = (vals_in_gpu, scatter_vals_f64);
             run_reduce_phase_i32(plan, op, vals_typed_gpu, scatter_keys, offsets, num_partitions)
         }
         MinMaxDtype::Int64 => {
-            let v: Vec<i64> = scattered_f64.iter().map(|&x| x as i64).collect();
-            let vals_typed_gpu = GpuVec::<i64>::from_slice(&v)?;
-            let _ = (vals_in_gpu, scatter_vals_f64);
-            run_reduce_phase_i64(plan, op, vals_typed_gpu, scatter_keys, offsets, num_partitions)
+            let arr = val_col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| BoltError::Other("expected Int64Array".into()))?;
+            let vals_in_gpu: GpuVec<i64> = GpuVec::<i64>::from_slice(arr.values())?;
+
+            let (scatter_keys, scatter_vals_i64) = run_scatter_i64_to_i64(
+                &keys_gpu,
+                &vals_in_gpu,
+                &partition_ids,
+                &offsets_gpu,
+                n_rows,
+                num_partitions,
+            )?;
+            run_reduce_phase_i64(plan, op, scatter_vals_i64, scatter_keys, offsets, num_partitions)
         }
     }
+}
+
+/// Scatter via the f64-val sibling. Returns the scattered i64 keys plus
+/// a host-side copy of the scattered f64 vals so the caller can re-cast
+/// to the integer dtype before the reduce. Module is fetched from the
+/// per-executor cache.
+fn run_scatter_f64(
+    keys_gpu: &GpuVec<i64>,
+    vals_in_gpu: &GpuVec<f64>,
+    partition_ids: &GpuVec<u32>,
+    offsets_gpu: &GpuVec<u32>,
+    n_rows: u32,
+    num_partitions: u32,
+) -> BoltResult<(GpuVec<i64>, Vec<f64>)> {
+    let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros(n_rows as usize)?;
+    let mut scatter_vals_f64: GpuVec<f64> = GpuVec::<f64>::zeros(n_rows as usize)?;
+
+    let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
+    let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
+    let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
+
+    let view_keys = keys_gpu.view();
+    let view_vals = vals_in_gpu.view();
+    let view_pids = partition_ids.view();
+    let view_offsets = offsets_gpu.view();
+    let mut view_cursors = cursors.view_mut();
+    let mut view_sk = scatter_keys.view_mut();
+    let mut view_sv = scatter_vals_f64.view_mut();
+
+    let mut args = KernelArgs::empty();
+    args.push_input(&view_keys);
+    args.push_input(&view_vals);
+    args.push_input(&view_pids);
+    args.push_input(&view_offsets);
+    args.push_output(&mut view_cursors);
+    args.push_output(&mut view_sk);
+    args.push_output(&mut view_sv);
+    args.push_scalar_u32(n_rows);
+
+    let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
+    let stream = CudaStream::null();
+    launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
+
+    let scattered_f64: Vec<f64> = scatter_vals_f64.to_vec()?;
+    Ok((scatter_keys, scattered_f64))
+}
+
+/// Typed i64-key + i64-val scatter. Returns scattered i64 keys and the
+/// scattered i64 vals (on device). No f64 round-trip; values >2^53 are
+/// preserved exactly. Module is fetched from the per-executor cache.
+fn run_scatter_i64_to_i64(
+    keys_gpu: &GpuVec<i64>,
+    vals_in_gpu: &GpuVec<i64>,
+    partition_ids: &GpuVec<u32>,
+    offsets_gpu: &GpuVec<u32>,
+    n_rows: u32,
+    num_partitions: u32,
+) -> BoltResult<(GpuVec<i64>, GpuVec<i64>)> {
+    let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros(n_rows as usize)?;
+    let mut scatter_vals_i64: GpuVec<i64> = GpuVec::<i64>::zeros(n_rows as usize)?;
+
+    let scatter_module = get_or_build_module(&KernelSpec::ScatterI64ToI64)?;
+    let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY_I64_TO_I64)?;
+    let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
+
+    let view_keys = keys_gpu.view();
+    let view_vals = vals_in_gpu.view();
+    let view_pids = partition_ids.view();
+    let view_offsets = offsets_gpu.view();
+    let mut view_cursors = cursors.view_mut();
+    let mut view_sk = scatter_keys.view_mut();
+    let mut view_sv = scatter_vals_i64.view_mut();
+
+    let mut args = KernelArgs::empty();
+    args.push_input(&view_keys);
+    args.push_input(&view_vals);
+    args.push_input(&view_pids);
+    args.push_input(&view_offsets);
+    args.push_output(&mut view_cursors);
+    args.push_output(&mut view_sk);
+    args.push_output(&mut view_sv);
+    args.push_scalar_u32(n_rows);
+
+    let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
+    let stream = CudaStream::null();
+    launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
+
+    Ok((scatter_keys, scatter_vals_i64))
 }
 
 /// Reduce phase for Int32 value dtype (i64-key).
@@ -529,54 +578,59 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 }
 
 // ---------------------------------------------------------------------------
-// Correctness-guard tests for the two-key Int64-value path.
+// Host-only wiring tests. End-to-end CUDA correctness lives in the
+// integration suite. These tests guard the JIT call sites so a regression
+// that re-routes Int64 through the lossy f64 sibling is caught early.
 //
-// We re-export the same predicate the single-key exec uses
-// (`groupby_tier2_minmax_exec::i64_values_exceed_f64_mantissa`), so the
-// behaviour we care about — "any value > 2^53 declines the fast path" —
-// is exercised here in the context of the two-key GROUP BY. No GPU
-// required.
+// The earlier f64-mantissa decline guard (and its inline tests) is deleted:
+// the typed `ScatterI64ToI64` kernel is exact across the full i64 range,
+// so the guard is no longer load-bearing.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    use crate::exec::groupby_tier2_minmax_exec::i64_values_exceed_f64_mantissa;
+    use crate::jit::scatter_kernel_i64;
 
-    const F64_EXACT_I64_LIMIT: i64 = 1_i64 << 53;
-
-    /// Two-key `MIN(int64_col)` with a value column containing
-    /// `2^53 + 1` must decline the fast path. Without the guard the
-    /// executor would silently downcast through f64 and return the
-    /// wrong number for one of the (k1, k2) groups.
+    /// The Int64 two-key path MUST be wired to the typed i64-val
+    /// scatter — the kernel PTX must contain no `.f64` references.
     #[test]
-    fn twokey_min_over_pow2_53_plus_one_is_rejected() {
-        let big = F64_EXACT_I64_LIMIT + 1;
-        // Sanity: confirm f64 round-trip really is lossy here.
-        assert_ne!(big as f64 as i64, big);
-        let vals = vec![1_i64, 2, big, 4, 5];
+    fn int64_twokey_scatter_kernel_has_no_f64() {
+        let ptx = scatter_kernel_i64::compile_scatter_kernel_i64_to_i64()
+            .expect("typed kernel compiles");
         assert!(
-            i64_values_exceed_f64_mantissa(&vals),
-            "two-key MIN must trip the guard on a column containing 2^53 + 1"
+            !ptx.contains(".f64") && !ptx.contains("%fd"),
+            "Int64 two-key fast path must avoid f64:\n{ptx}"
+        );
+        // Two .s64 loads (one for key, one for val).
+        assert!(
+            ptx.matches("ld.global.s64").count() >= 2,
+            "typed kernel must load both key and val via ld.global.s64:\n{ptx}"
+        );
+        // Two .u64 stores (one for key, one for val).
+        assert!(
+            ptx.matches("st.global.u64").count() >= 2,
+            "typed kernel must store both key and val via st.global.u64:\n{ptx}"
         );
     }
 
-    /// Two-key `MAX(int64_col)` — same property. The guard fires
-    /// regardless of which aggregation op is requested.
+    /// The Int32 two-key path still uses the f64-val sibling — round-trip
+    /// is bit-exact for i32.
     #[test]
-    fn twokey_max_over_pow2_53_plus_one_is_rejected() {
-        let big = F64_EXACT_I64_LIMIT + 1;
-        let vals = vec![big, 10, 20, 30];
-        assert!(i64_values_exceed_f64_mantissa(&vals));
+    fn int32_twokey_scatter_kernel_remains_f64() {
+        let ptx =
+            scatter_kernel_i64::compile_scatter_kernel_i64().expect("kernel compiles");
+        assert!(
+            ptx.contains("st.global.f64"),
+            "Int32 two-key path still uses the f64-val scatter:\n{ptx}"
+        );
     }
 
-    /// Two-key path with an in-range Int64 column must keep using the
-    /// fast lane. This is the no-regression test: typical workloads
-    /// (small IDs, modest counters) stay on the GPU.
+    /// Sanity: the typed kernel's entry symbol matches the literal the
+    /// executor passes to `module.function(...)`.
     #[test]
-    fn twokey_in_range_int64_keeps_fast_path() {
-        let vals: Vec<i64> = (0..512).map(|i| i * 1024).collect();
-        assert!(
-            !i64_values_exceed_f64_mantissa(&vals),
-            "in-range Int64 two-key MIN/MAX must NOT decline"
+    fn typed_twokey_kernel_entry_symbol_matches() {
+        assert_eq!(
+            scatter_kernel_i64::KERNEL_ENTRY_I64_TO_I64,
+            "bolt_scatter_i64_to_i64"
         );
     }
 }
@@ -585,10 +639,7 @@ mod tests {
 // Host-only eligibility-gate tests for the two-key integer MIN/MAX exec.
 //
 // Pure host tests; the actual MIN/MAX numerical correctness lives in the
-// e2e suite where a real CUDA context is available. The Int64-precision
-// (f64-roundtrip) guard is covered separately in the single-key exec's
-// inline tests once that fix lands on the branch — the twokey path will
-// inherit the predicate from there.
+// e2e suite where a real CUDA context is available.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod eligibility_tests {
@@ -782,5 +833,27 @@ mod cache_tests {
         let _ = get_or_build_module(&KernelSpec::ReduceMinMaxI64(ReduceKey::MaxI64))
             .expect("max-i64 hit");
         assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
+    }
+
+    /// The typed i64-key + i64-val scatter has its own cache slot,
+    /// distinct from the f64-val scatter. Verify both can co-exist and
+    /// neither recompiles on a repeat lookup.
+    #[test]
+    fn typed_i64_to_i64_scatter_is_distinct_cache_key() {
+        let _ = match get_or_build_module(&KernelSpec::ScatterI64) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = get_or_build_module(&KernelSpec::ScatterI64ToI64)
+            .expect("typed i64-to-i64 scatter build");
+        let baseline = LOAD_COUNT.load(Ordering::SeqCst);
+        let _ = get_or_build_module(&KernelSpec::ScatterI64).expect("f64 scatter hit");
+        let _ = get_or_build_module(&KernelSpec::ScatterI64ToI64)
+            .expect("typed i64-to-i64 scatter hit");
+        assert_eq!(
+            LOAD_COUNT.load(Ordering::SeqCst),
+            baseline,
+            "the two scatter variants must occupy distinct cache slots"
+        );
     }
 }
