@@ -171,6 +171,15 @@ impl Engine {
                  additional batches to an existing table"
             )));
         }
+        // Stage 4: flatten Dictionary(_, Utf8) columns to plain `StringArray`
+        // before they hit the dictionary registry / GpuTable upload. The
+        // planner sees these as Utf8 (via `arrow_dtype_to_plan`), so every
+        // downstream stage already reasons about them as plain strings; we
+        // just have to materialise the underlying values once at registration
+        // time. The engine's own dictionary registry then re-builds its own
+        // dict from the (now-plain) StringArray, keeping the existing GROUP
+        // BY / projection / ORDER BY paths working unchanged.
+        let batch = flatten_dictionary_utf8_columns(batch)?;
         // Build Utf8 dictionaries first (may fail — surface before we mutate
         // tables/provider).
         self.dict_registry.register_table(name.clone(), &batch)?;
@@ -206,6 +215,10 @@ impl Engine {
         batch: RecordBatch,
     ) -> BoltResult<()> {
         let name = name.into();
+        // Stage 4: same flatten as `register_table`. See the helper for the
+        // rationale (one materialisation here keeps every downstream Utf8
+        // consumer on `StringArray`).
+        let batch = flatten_dictionary_utf8_columns(batch)?;
         // Build the new GPU table FIRST so an upload failure can't leave the
         // engine half-replaced (we have not yet touched any existing entry).
         let new_gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
@@ -254,6 +267,12 @@ impl Engine {
         name: &str,
         batch: RecordBatch,
     ) -> BoltResult<()> {
+        // Stage 4: flatten any Dictionary(_, Utf8) columns into plain
+        // StringArrays so the schema-equality check below (against batch 0
+        // of the existing table) compares like-for-like. Without this the
+        // schema check could spuriously fail when batch 0 was stored as
+        // Utf8 (post-flatten) but the new batch arrives as Dictionary.
+        let batch = flatten_dictionary_utf8_columns(batch)?;
         if let Some(existing) = self.tables.get_mut(name) {
             // Schema-check against batch 0 — concat_batches would fail at query
             // time anyway, but surface it eagerly at registration time.
@@ -1049,6 +1068,15 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
 }
 
 /// Map Arrow `DataType` to our plan `DataType`. Errors on unsupported types.
+///
+/// **Stage 4** — `Dictionary(_, Utf8)` is accepted as a register-table type
+/// and exposed to the planner as `DataType::Utf8`. The fact that the column
+/// is dictionary-encoded is a *storage* detail: query planning, projection,
+/// filtering, ORDER BY all reason about it as a Utf8 column. The storage
+/// layer (and `gpu_sort`'s `host_values_for_key` adapter) reads the
+/// dictionary when it needs to. This is what makes `SELECT … ORDER BY s`
+/// reach the GPU dictionary adapter when the table is registered with a
+/// `DictionaryArray<Int32|Int64, Utf8>` column.
 fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
@@ -1057,11 +1085,146 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
+        // Stage 4: dictionary-encoded Utf8. Only string-valued dicts map to
+        // `Utf8`; numeric-valued dicts are intentionally rejected because the
+        // caller should hand the inner numeric column directly through the
+        // normal path (the dict-index roundtrip would be pure overhead).
+        ArrowDataType::Dictionary(_key, value)
+            if matches!(value.as_ref(), ArrowDataType::Utf8) =>
+        {
+            Ok(DataType::Utf8)
+        }
         other => Err(BoltError::Type(format!(
             "unsupported Arrow dtype {:?}",
             other
         ))),
     }
+}
+
+/// Stage 4 — rewrite every `Dictionary(_, Utf8)` column in `batch` into a
+/// plain `StringArray`, leaving non-dictionary columns untouched. Returns
+/// the rewritten `RecordBatch` (cheap if no dict columns: just reuses the
+/// original arrays via `Arc`).
+///
+/// Why flatten at registration time rather than carrying the dict through?
+/// The GPU storage (`GpuTable`) already manages its own dictionary for Utf8
+/// columns (see `GpuColumnData::Utf8`), so re-using the input dict would
+/// require teaching every consumer (GpuTable upload, projection, gather,
+/// expression evaluator, ORDER BY's host-side `take`) to read both dict
+/// variants. Materialising once at registration is O(n) per dict column —
+/// the same cost the engine's own dictionary builder pays — and keeps every
+/// downstream stage's Utf8 handling unified on `StringArray`.
+fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<RecordBatch> {
+    use arrow_array::{Array, DictionaryArray, StringArray};
+    use arrow_array::types::{Int32Type, Int64Type};
+
+    let schema = batch.schema();
+    let mut changed = false;
+    let mut new_fields: Vec<ArrowField> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(idx);
+        match field.data_type() {
+            ArrowDataType::Dictionary(key_ty, value_ty)
+                if matches!(value_ty.as_ref(), ArrowDataType::Utf8) =>
+            {
+                // Decode (key_idx, value_idx) -> StringArray entries.
+                // Supports Int32 and Int64 key types (matches `arrow_dtype_to_plan`).
+                let n = col.len();
+                let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+                let decode_into = |out: &mut Vec<Option<String>>,
+                                   value_idx: usize,
+                                   sa: &StringArray| {
+                    if sa.is_null(value_idx) {
+                        out.push(None);
+                    } else {
+                        out.push(Some(sa.value(value_idx).to_string()));
+                    }
+                };
+                match key_ty.as_ref() {
+                    ArrowDataType::Int32 => {
+                        let da = col
+                            .as_any()
+                            .downcast_ref::<DictionaryArray<Int32Type>>()
+                            .ok_or_else(|| {
+                                BoltError::Type(
+                                    "register_table: dict<i32,utf8> downcast failed".into(),
+                                )
+                            })?;
+                        let sa = da
+                            .values()
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| {
+                                BoltError::Type(
+                                    "register_table: dict values are not StringArray".into(),
+                                )
+                            })?;
+                        let keys = da.keys();
+                        for i in 0..n {
+                            if keys.is_null(i) {
+                                out.push(None);
+                            } else {
+                                decode_into(&mut out, keys.value(i) as usize, sa);
+                            }
+                        }
+                    }
+                    ArrowDataType::Int64 => {
+                        let da = col
+                            .as_any()
+                            .downcast_ref::<DictionaryArray<Int64Type>>()
+                            .ok_or_else(|| {
+                                BoltError::Type(
+                                    "register_table: dict<i64,utf8> downcast failed".into(),
+                                )
+                            })?;
+                        let sa = da
+                            .values()
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| {
+                                BoltError::Type(
+                                    "register_table: dict values are not StringArray".into(),
+                                )
+                            })?;
+                        let keys = da.keys();
+                        for i in 0..n {
+                            if keys.is_null(i) {
+                                out.push(None);
+                            } else {
+                                decode_into(&mut out, keys.value(i) as usize, sa);
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(BoltError::Type(format!(
+                            "register_table: dict key type {:?} not supported \
+                             (expected Int32 or Int64 with Utf8 values)",
+                            other
+                        )));
+                    }
+                }
+                let sa = StringArray::from(out);
+                new_fields.push(ArrowField::new(
+                    field.name().clone(),
+                    ArrowDataType::Utf8,
+                    field.is_nullable(),
+                ));
+                new_cols.push(Arc::new(sa) as ArrayRef);
+                changed = true;
+            }
+            _ => {
+                new_fields.push(field.as_ref().clone());
+                new_cols.push(col.clone());
+            }
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    let new_schema = Arc::new(ArrowSchema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_cols)
+        .map_err(|e| BoltError::Type(format!("register_table: rebuild after dict flatten failed: {e}")))
 }
 
 /// Convert an `arrow_schema::Schema` into our plan `Schema`.

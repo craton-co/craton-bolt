@@ -71,16 +71,18 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
 /// host path), or `Err(...)` only on a hard GPU error (out-of-memory, kernel
 /// launch failure, etc.).
 ///
-/// ## Stage 1 / 2 / 3 gates
+/// ## Stage 1 / 2 / 3 / 4 gates
 ///
 ///   1. Number of sort keys is in `1..=MAX_SORT_KEYS` (Stage 3 raised the
 ///      ceiling from 4 to 12; the real ceiling is the per-spec sm_70
 ///      register budget, validated by `compile_sort_kernel_spec`).
 ///   2. Each sort key is a bare column reference (no computed exprs).
 ///   3. Each column dtype is one of Int32 / Int64 / Float32 / Float64 /
-///      Bool / Dictionary(Int32|Int64, Utf8) — Stage 3 added Bool and
+///      Bool / Utf8 / Dictionary(Int32|Int64, Utf8). Stage 3 added Bool and
 ///      dictionary-encoded Utf8 (the latter sorts on the dictionary's
-///      index column). Plain Utf8 still falls through to the host path.
+///      index column); **Stage 4** added plain Utf8, which now flows
+///      through an inline dictionary builder inside `gpu_sort::host_values_for_key`
+///      and ends up driving the i32 numeric kernel like any other column.
 ///   4. `n_rows >= GPU_SORT_MIN_ROWS` — below this, h2d/d2h overhead wins.
 ///   5. `n_rows <= u32::MAX` (tightened to `<= 2^31` inside `gpu_sort`
 ///      because the bitonic padding doubles).
@@ -143,10 +145,12 @@ fn try_gpu_sort(
     // row-drop bug — a legitimate `i32::MAX` value (or any other value
     // colliding with the dtype's sentinel) used to be silently dropped by
     // the single-key Stage-1 path; the multi-key driver routes padded rows
-    // explicitly, preserving real ties. The single-key Stage-1 entry point
-    // and its PTX module are kept for the golden-test surface (they still
-    // exercise the dtype-mnemonic round-trip) but are no longer reached
-    // from the executor.
+    // explicitly, preserving real ties.
+    //
+    // Stage 4: the single-key Stage-1 PTX entry was retired. The driver
+    // here is the only path on the way to the GPU. Single-key sorts are
+    // expressed as a `SortKernelSpec` with one entry in `keys`; the PTX-
+    // shape golden tests were migrated to that form.
     let sorted = crate::exec::gpu_sort::sort_record_batch_on_gpu_multi(batch, &resolved)?;
     Ok(Some(sorted))
 }
