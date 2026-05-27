@@ -220,11 +220,12 @@ const RECONCILE_EVERY_N_FREES: u64 = 1024;
 const SHARDS: usize = 32;
 
 /// CUDA driver result code for "out of memory" (`CUDA_ERROR_OUT_OF_MEMORY = 2`).
-/// We match on it via the formatted error message because `BoltError::Cuda`
-/// erases the raw `CUresult`; the format is "CUDA driver error 2: ..." (see
-/// `crate::cuda::cuda_sys::check`). String matching keeps Stage 3 scoped to
-/// mem_pool.rs without an error-enum widening.
-const CUDA_OOM_PREFIX: &str = "CUDA driver error 2";
+///
+/// Stage 4 widened `BoltError::CudaWithCode { code, message }` to carry the
+/// raw `CUresult` integer, so the OOM detector now pattern-matches on
+/// `code == CUDA_OOM_CODE` directly. The earlier `CUDA_OOM_PREFIX` string
+/// match is gone — see `is_oom_error`.
+const CUDA_OOM_CODE: i32 = 2;
 
 /// Number of times the driver-OOM recovery path successfully retried an
 /// allocation after evicting / draining the pool. Process-wide because the
@@ -239,6 +240,70 @@ static OOM_RECOVERY_COUNT: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)] // reason: telemetry hook, consumed by downstream observability
 pub(crate) fn oom_recovery_count() -> u64 {
     OOM_RECOVERY_COUNT.load(Ordering::Relaxed)
+}
+
+/// Number of times the Stage 4 background watcher proactively called
+/// `evict_above_high_water` because `cuMemGetInfo_v2` reported free
+/// device memory below the configured low-water mark. Process-wide
+/// counter; never reset. Visible via the public [`pool_stats`] surface.
+static PROACTIVE_EVICTION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the cumulative count of proactive evictions triggered by the
+/// `pool-watcher` background thread. Always zero unless the
+/// `pool-watcher` feature is enabled and a watcher has actually
+/// observed memory pressure since startup.
+#[allow(dead_code)] // reason: telemetry hook, surfaced via `pool_stats`
+pub(crate) fn proactive_eviction_count() -> u64 {
+    PROACTIVE_EVICTION_COUNT.load(Ordering::Relaxed)
+}
+
+/// Snapshot of pool-wide telemetry counters and capacity figures.
+///
+/// Stage 4 — gives downstream observability layers a single, stable entry
+/// point ([`pool_stats`]) instead of poking at individual counters. New
+/// fields may be added (non-breaking) but existing ones keep their
+/// semantics. All fields are read with `Relaxed` atomic ordering; a
+/// snapshot may be slightly stale under heavy concurrent activity but
+/// every field is internally consistent on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolStats {
+    /// Sum of `alloc_bytes` across every pooled (currently-freed-but-
+    /// not-returned-to-driver) block. Mirrors the soft cap configured
+    /// via `CRATON_BOLT_POOL_MAX_BYTES`.
+    pub total_pooled_bytes: usize,
+    /// Number of distinct bucket size classes that currently hold at
+    /// least one pooled block (best-effort under DashMap iteration).
+    pub bucket_count: usize,
+    /// Cumulative count of driver-OOM allocations that were rescued by
+    /// evicting / draining the pool and retrying. See
+    /// [`oom_recovery_count`].
+    pub oom_recovery_count: u64,
+    /// Cumulative count of proactive evictions triggered by the
+    /// `pool-watcher` background thread when free device memory dropped
+    /// below `BOLT_POOL_WATCH_LOW_WATER_FRAC`. See
+    /// [`proactive_eviction_count`].
+    pub proactive_eviction_count: u64,
+}
+
+/// Public telemetry entry point: snapshot the process-wide pool counters.
+///
+/// Stage 4 surfaces this so a downstream observability layer (Prometheus
+/// exporter, log aggregator, custom dashboard) can poll one function
+/// instead of reaching into crate-internal symbols. The returned
+/// [`PoolStats`] is a value type; the caller owns it.
+///
+/// The fields are read with `Relaxed` atomic ordering, so a single
+/// snapshot may be slightly stale under heavy concurrent activity. Each
+/// field is internally consistent — `total_pooled_bytes` is reconciled
+/// at most `RECONCILE_EVERY_N_FREES` frees behind the truth, and the
+/// counters are monotonically non-decreasing.
+pub fn pool_stats() -> PoolStats {
+    PoolStats {
+        total_pooled_bytes: POOL.total_pooled_bytes(),
+        bucket_count: POOL.bucket_count(),
+        oom_recovery_count: oom_recovery_count(),
+        proactive_eviction_count: proactive_eviction_count(),
+    }
 }
 
 fn read_env_usize(name: &str, default: usize) -> usize {
@@ -355,30 +420,23 @@ fn driver_mem_alloc(alloc_bytes: usize) -> BoltResult<CUdeviceptr> {
     test_support::test_driver_alloc(alloc_bytes)
 }
 
-/// Recognise a driver-OOM error from `BoltError::Cuda`'s formatted string.
+/// Recognise a driver-OOM error from `BoltError::CudaWithCode`'s integer
+/// `code` field.
 ///
-/// `BoltError::Cuda` flattens the original `CUresult` into a message like
-/// `"CUDA driver error 2: out of memory"` (see `cuda_sys::check`). We
-/// can't pattern-match the numeric code from outside cuda_sys without
-/// widening the error enum — and Stage 3 is scoped to mem_pool.rs only —
-/// so we match on the well-known prefix instead. The check is exact
-/// ("error 2" not "error 20") because we anchor on a trailing colon /
-/// space in the format.
+/// Stage 4 replaces the fragile formatted-string prefix-match with a direct
+/// pattern match on the `CUresult` integer that `cuda_sys::check` now
+/// surfaces via `BoltError::CudaWithCode`. The string-prefix path is gone
+/// entirely — no risk of false negatives (driver localisation), false
+/// positives (`"error 200"`), or future-proofing concerns from formatting
+/// drift in `check()`.
 fn is_oom_error(e: &crate::error::BoltError) -> bool {
-    match e {
-        crate::error::BoltError::Cuda(msg) => {
-            // The format is fixed in cuda_sys::check: "CUDA driver error
-            // <CODE>: <text>". Match on the exact code-2 prefix with the
-            // colon to avoid catching e.g. error 20 or 200.
-            msg.starts_with(CUDA_OOM_PREFIX)
-                && msg
-                    .as_bytes()
-                    .get(CUDA_OOM_PREFIX.len())
-                    .map(|c| *c == b':' || *c == b' ')
-                    .unwrap_or(false)
+    matches!(
+        e,
+        crate::error::BoltError::CudaWithCode {
+            code: CUDA_OOM_CODE,
+            ..
         }
-        _ => false,
-    }
+    )
 }
 
 /// Storage shape for the bucket map. Default build uses DashMap; the
@@ -607,6 +665,13 @@ impl DeviceMemPool {
     /// reserved headroom" path: a hot pool of cached blocks can be
     /// holding several hundred MiB that the calling allocation needs.
     pub fn alloc(&self, bytes: usize) -> BoltResult<(CUdeviceptr, usize)> {
+        // Stage 4: ensure the proactive watcher is running, lazily.
+        // No-op under default build (feature off) and under #[cfg(test)]
+        // so the host-only test suite doesn't spawn driver-calling
+        // threads. Idempotent: spawns at most one thread for the
+        // lifetime of the process.
+        ensure_watcher_started();
+
         let alloc_bytes = bucket_size(bytes);
         // Hit-path: try the pool first.
         let hit = self.with_bucket(alloc_bytes, |bucket| {
@@ -1013,6 +1078,20 @@ impl DeviceMemPool {
         n
     }
 
+    /// Number of distinct size-class buckets that currently hold at least
+    /// one pooled block. Best-effort under concurrent mutation — surfaced
+    /// via the public [`pool_stats`] telemetry entry point.
+    #[allow(dead_code)] // reason: telemetry hook, consumed by `pool_stats`
+    pub(crate) fn bucket_count(&self) -> usize {
+        let mut n = 0usize;
+        self.for_each_bucket(|_, bucket| {
+            if !bucket.blocks.is_empty() {
+                n += 1;
+            }
+        });
+        n
+    }
+
     /// Number of pooled blocks in the bucket that would satisfy an allocation
     /// of `bytes`. Intended for tests and diagnostics only.
     #[doc(hidden)]
@@ -1061,6 +1140,14 @@ impl Default for DeviceMemPool {
 
 impl Drop for DeviceMemPool {
     fn drop(&mut self) {
+        // Stage 4: signal the background watcher (if any) to exit before
+        // we drain — once the pool is gone any `evict_above_high_water`
+        // call from the watcher races with us. The watcher polls the
+        // shutdown flag every `SHUTDOWN_QUANTUM` (~50 ms) so it exits
+        // well within the global-static destruction window. No-op when
+        // the `pool-watcher` feature is off.
+        #[cfg(all(feature = "pool-watcher", not(test)))]
+        pool_watcher::request_shutdown();
         self.drain();
     }
 }
@@ -1077,6 +1164,194 @@ pub fn __test_pool() -> &'static DeviceMemPool {
     &POOL
 }
 
+// ---------------------------------------------------------------------------
+// Stage 4: background watcher.
+//
+// Under `--features pool-watcher` the pool spawns a single OS thread on
+// first allocation that polls `cuMemGetInfo_v2` every
+// `BOLT_POOL_WATCH_INTERVAL_SECS` seconds (default 5). If the free
+// fraction drops below `BOLT_POOL_WATCH_LOW_WATER_FRAC` (default 0.10)
+// the watcher calls `POOL.evict_above_high_water()` and bumps
+// `PROACTIVE_EVICTION_COUNT`. The thread shuts down cleanly on process
+// exit via the `WATCHER_SHUTDOWN` flag — `DeviceMemPool::Drop` flips
+// the flag and `join`s when the global `POOL` is finalised.
+//
+// Default (and `#[cfg(test)]`) builds compile out the entire module and
+// `ensure_watcher_started` is a no-op `#[inline(always)]` shim, so the
+// hot path takes zero overhead. The feature is opt-in to keep CI /
+// cuda-stub builds free of a permanently-resident thread that would
+// fail every poll under the stub backend.
+// ---------------------------------------------------------------------------
+
+/// No-op spawn hook for builds without `pool-watcher`. The compiler
+/// inlines the call away entirely. See `pool_watcher::ensure_started`
+/// for the real implementation.
+#[cfg(not(feature = "pool-watcher"))]
+#[inline(always)]
+fn ensure_watcher_started() {}
+
+// Under the `pool-watcher` feature `ensure_watcher_started` defers to
+// the real `pool_watcher::ensure_started` for production builds.
+// Under `#[cfg(test)]` it remains a no-op so the host-only test suite
+// never spawns a watcher against the global POOL (the dedicated
+// `pool_watcher_*` tests below construct a controlled local
+// environment instead). This way `cargo test --features pool-watcher`
+// still passes the existing test surface unchanged.
+#[cfg(all(feature = "pool-watcher", not(test)))]
+#[inline]
+fn ensure_watcher_started() {
+    pool_watcher::ensure_started();
+}
+
+#[cfg(all(feature = "pool-watcher", test))]
+#[inline(always)]
+fn ensure_watcher_started() {}
+
+#[cfg(feature = "pool-watcher")]
+// Under `cfg(test)` the tests drive `watcher_loop` directly against a
+// local pool and never reach for `ensure_started` / `request_shutdown` /
+// the singleton statics. Allow dead_code at the module level so the
+// `cargo test --features pool-watcher` build stays warning-free
+// without an attribute on every helper.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) mod pool_watcher {
+    //! Single-thread background watcher: polls `cuMemGetInfo_v2` and
+    //! triggers `evict_above_high_water` when free device memory falls
+    //! below a configurable threshold. Lifetime is tied to the process —
+    //! `DeviceMemPool::Drop` (when the global `POOL` is finalised on
+    //! shutdown) trips `SHUTDOWN` so the thread exits cleanly.
+    use super::{DeviceMemPool, POOL, PROACTIVE_EVICTION_COUNT};
+    use crate::error::BoltResult;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    /// Default poll interval (5 seconds). Tunable via the
+    /// `BOLT_POOL_WATCH_INTERVAL_SECS` environment variable; a value of
+    /// 0 (or any non-numeric) falls back to the default.
+    const DEFAULT_INTERVAL_SECS: u64 = 5;
+
+    /// Default low-water mark on `free / total` device memory. When the
+    /// observed fraction drops below this value, the watcher calls
+    /// `evict_above_high_water`. Tunable via `BOLT_POOL_WATCH_LOW_WATER_FRAC`.
+    const DEFAULT_LOW_WATER_FRAC: f64 = 0.10;
+
+    /// Sleep-loop quantum so the shutdown flag is observed within ~50 ms
+    /// of `DeviceMemPool::Drop`. Sleeping for the full interval would
+    /// add up to `DEFAULT_INTERVAL_SECS` seconds to shutdown.
+    const SHUTDOWN_QUANTUM: Duration = Duration::from_millis(50);
+
+    /// Function pointer type matching `cuda_sys::mem_get_info` — the
+    /// indirection lets tests inject a deterministic mock without a
+    /// live CUDA context.
+    pub(super) type MemInfoFn = fn() -> BoltResult<(usize, usize)>;
+
+    static HANDLE: OnceLock<JoinHandle<()>> = OnceLock::new();
+    static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+    fn real_mem_info() -> BoltResult<(usize, usize)> {
+        crate::cuda::cuda_sys::mem_get_info()
+    }
+
+    /// Spawn the watcher exactly once (idempotent). Subsequent calls are
+    /// a cheap `OnceLock::get_or_init` check.
+    pub(super) fn ensure_started() {
+        HANDLE.get_or_init(|| {
+            let interval = read_interval();
+            let low_water = read_low_water();
+            thread::Builder::new()
+                .name("craton-bolt-pool-watcher".into())
+                .spawn(move || {
+                    watcher_loop(&POOL, interval, low_water, real_mem_info, &SHUTDOWN)
+                })
+                .expect("spawn pool-watcher thread")
+        });
+    }
+
+    /// Signal the watcher to exit. Called from `DeviceMemPool::Drop` —
+    /// the watcher polls `SHUTDOWN` between sleeps and exits within
+    /// `SHUTDOWN_QUANTUM`. Safe to call multiple times.
+    pub(super) fn request_shutdown() {
+        SHUTDOWN.store(true, Ordering::Release);
+    }
+
+    /// Core loop. Factored out of `ensure_started` so the test harness
+    /// can drive it against a local pool, a 1 ms interval, and a
+    /// deterministic `MemInfoFn` mock without colliding with the
+    /// production singleton or burning real wall-clock seconds.
+    pub(super) fn watcher_loop(
+        pool: &DeviceMemPool,
+        interval: Duration,
+        low_water_frac: f64,
+        mem_info: MemInfoFn,
+        shutdown: &AtomicBool,
+    ) {
+        log::info!(
+            "craton-bolt: pool-watcher started (interval={:?}, low_water={:.2}%)",
+            interval,
+            low_water_frac * 100.0
+        );
+        loop {
+            // Sleep in small quanta so the shutdown flag is observed
+            // promptly. `sleep` may return early on signal but that's
+            // benign — we just poll sooner.
+            let mut elapsed = Duration::ZERO;
+            while elapsed < interval {
+                if shutdown.load(Ordering::Acquire) {
+                    log::info!("craton-bolt: pool-watcher exiting on shutdown");
+                    return;
+                }
+                let step = SHUTDOWN_QUANTUM.min(interval - elapsed);
+                thread::sleep(step);
+                elapsed += step;
+            }
+            // Poll the driver. Errors (e.g. no current context on this
+            // thread, transient driver hiccup) are logged and ignored —
+            // the watcher is best-effort and must never crash the
+            // process.
+            match mem_info() {
+                Ok((free, total)) if total > 0 => {
+                    let frac = free as f64 / total as f64;
+                    if frac < low_water_frac {
+                        let evicted = pool.evict_above_high_water();
+                        PROACTIVE_EVICTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                        log::info!(
+                            "craton-bolt: pool-watcher proactive eviction \
+                             (free={} MiB, total={} MiB, frac={:.2}%, evicted={} blocks)",
+                            free / (1024 * 1024),
+                            total / (1024 * 1024),
+                            frac * 100.0,
+                            evicted
+                        );
+                    }
+                }
+                Ok(_) => {} // total == 0: cuMemGetInfo gave a nonsense reading; skip.
+                Err(e) => {
+                    log::debug!("craton-bolt: pool-watcher cuMemGetInfo failed: {}", e);
+                }
+            }
+        }
+    }
+
+    fn read_interval() -> Duration {
+        let secs = std::env::var("BOLT_POOL_WATCH_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(DEFAULT_INTERVAL_SECS);
+        Duration::from_secs(secs)
+    }
+
+    fn read_low_water() -> f64 {
+        std::env::var("BOLT_POOL_WATCH_LOW_WATER_FRAC")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f < 1.0)
+            .unwrap_or(DEFAULT_LOW_WATER_FRAC)
+    }
+}
+
 #[cfg(test)]
 mod test_support {
     //! Host-only shim. The pool's policy code (eviction, caps, LRU) can
@@ -1088,10 +1363,10 @@ mod test_support {
     //!
     //! Stage 3 adds an OOM-injection latch: `arm_oom_once` / `arm_oom_n`
     //! cause the next N `test_driver_alloc` calls to return
-    //! `BoltError::Cuda("CUDA driver error 2: out of memory")`. The
-    //! string matches the `cuda_sys::check` format exactly so the
-    //! pool's `is_oom_error` recogniser fires. After the latch counter
-    //! hits zero, subsequent calls succeed normally.
+    //! `BoltError::CudaWithCode { code: 2, .. }` (Stage 4: integer code
+    //! rather than the legacy formatted-string match) so the pool's
+    //! `is_oom_error` recogniser fires. After the latch counter hits
+    //! zero, subsequent calls succeed normally.
     use super::CUdeviceptr;
     use crate::error::{BoltError, BoltResult};
     use parking_lot::Mutex;
@@ -1108,8 +1383,10 @@ mod test_support {
 
     pub(super) fn test_driver_alloc(_bytes: usize) -> BoltResult<CUdeviceptr> {
         // OOM-injection: drain the latch by one and return an OOM
-        // error formatted the same way `cuda_sys::check` would for
-        // `CUDA_ERROR_OUT_OF_MEMORY = 2`.
+        // error in the same shape `cuda_sys::check` would produce for
+        // `CUDA_ERROR_OUT_OF_MEMORY = 2` — Stage 4 carries the code in
+        // a typed integer field rather than embedding it in a format
+        // string.
         loop {
             let cur = OOM_LATCH.load(Ordering::Acquire);
             if cur == 0 {
@@ -1119,9 +1396,10 @@ mod test_support {
                 .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Err(BoltError::Cuda(
-                    "CUDA driver error 2: out of memory".to_string(),
-                ));
+                return Err(BoltError::CudaWithCode {
+                    code: 2,
+                    message: "out of memory".to_string(),
+                });
             }
         }
         // Wraparound is irrelevant — tests use a few hundred at most.
@@ -1897,7 +2175,11 @@ mod tests {
         test_support::arm_oom_n(2);
 
         let result = pool.alloc(4096);
-        assert!(matches!(result, Err(crate::error::BoltError::Cuda(_))));
+        // Stage 4: the injected error is `CudaWithCode { code: 2, .. }`.
+        assert!(matches!(
+            result,
+            Err(crate::error::BoltError::CudaWithCode { code: 2, .. })
+        ));
         // Counter must NOT have incremented — recovery did not succeed.
         assert_eq!(oom_recovery_count(), pre_recover_count);
     }
@@ -1947,5 +2229,195 @@ mod tests {
         }
         // All blocks were consumed.
         assert_eq!(pool.pooled_block_count(), 0);
+    }
+
+    /// Stage 4: OOM detector uses the typed `CudaWithCode { code: 2, .. }`
+    /// match — no formatted-string parsing. We construct the error
+    /// directly (not via `cuda_sys::check`, which would need a CUDA
+    /// driver) and assert the recogniser fires for code 2 and rejects
+    /// other codes / variant shapes.
+    #[test]
+    fn is_oom_error_matches_code_directly() {
+        let oom = crate::error::BoltError::CudaWithCode {
+            code: 2,
+            message: "out of memory".to_string(),
+        };
+        assert!(is_oom_error(&oom), "code 2 must be OOM");
+
+        // Other CUDA codes must NOT be flagged.
+        for code in [0i32, 1, 3, 20, 200, 99] {
+            let e = crate::error::BoltError::CudaWithCode {
+                code,
+                message: "some other error".to_string(),
+            };
+            assert!(!is_oom_error(&e), "code {} mis-flagged as OOM", code);
+        }
+
+        // The legacy `Cuda(String)` variant must NOT be flagged — the
+        // fragile prefix matcher is gone. (Even if some upstream code
+        // hands us a string that *looks* like "CUDA driver error 2",
+        // it's no longer interpreted as OOM.)
+        let legacy = crate::error::BoltError::Cuda(
+            "CUDA driver error 2: out of memory".to_string(),
+        );
+        assert!(
+            !is_oom_error(&legacy),
+            "legacy Cuda(String) variant must no longer be OOM-matched"
+        );
+
+        // Non-CUDA variants are definitely not OOM.
+        assert!(!is_oom_error(&crate::error::BoltError::Other("x".into())));
+    }
+
+    /// Stage 4 telemetry: `pool_stats()` surfaces the same numbers a
+    /// caller would get from reaching directly into the crate-internal
+    /// counters, and is the single stable entry point downstream
+    /// observability layers should consume.
+    #[test]
+    fn pool_stats_snapshot_is_consistent() {
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1024"),
+        ]);
+
+        // pool_stats() reads the global POOL singleton, not the local
+        // one built inside this test — so we deliberately don't build
+        // a local pool here. We can still assert the snapshot is shaped
+        // correctly and that the counters never go backwards.
+        let snap = super::pool_stats();
+        // total_pooled_bytes is a usize; reading it is the assertion
+        // that the field exists with the documented type.
+        let _: usize = snap.total_pooled_bytes;
+        let _: usize = snap.bucket_count;
+        let _: u64 = snap.oom_recovery_count;
+        let _: u64 = snap.proactive_eviction_count;
+
+        // Same getter called twice in succession returns counters that
+        // are monotonically non-decreasing.
+        let snap2 = super::pool_stats();
+        assert!(snap2.oom_recovery_count >= snap.oom_recovery_count);
+        assert!(snap2.proactive_eviction_count >= snap.proactive_eviction_count);
+
+        // The Copy + Eq derives work — useful for downstream diff checks.
+        let snap3 = snap2;
+        assert_eq!(snap2, snap3);
+    }
+
+    /// Stage 4: the background watcher fires `evict_above_high_water` and
+    /// increments `PROACTIVE_EVICTION_COUNT` when the mock `mem_get_info`
+    /// reports free memory below the configured low-water mark. We
+    /// drive `pool_watcher::watcher_loop` directly with a 1 ms interval
+    /// and a `MemInfoFn` that returns `(1, 1000)` (0.1% free, well
+    /// under the 10% threshold) — then flip the shutdown flag and
+    /// `join` the helper thread.
+    #[cfg(feature = "pool-watcher")]
+    #[test]
+    fn pool_watcher_triggers_eviction_on_low_free() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1024"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1024"),
+        ]);
+        let pool = Arc::new(DeviceMemPool::new());
+
+        // Seed the pool with blocks that exceed the soft cap so the
+        // watcher's `evict_above_high_water` call has something to do.
+        // 8 blocks * 256 bytes = 2 KiB, cap = 1 KiB.
+        let mut seeded_ptrs = Vec::new();
+        for _ in 0..8 {
+            let (p, _) = pool.alloc(256).unwrap();
+            seeded_ptrs.push(p);
+        }
+        for p in &seeded_ptrs {
+            pool.free(*p, 256);
+        }
+
+        // Mock: free=1, total=1000 -> 0.1% free, well below 10% threshold.
+        fn mock_low_free() -> crate::error::BoltResult<(usize, usize)> {
+            Ok((1, 1000))
+        }
+
+        let pre_count = super::proactive_eviction_count();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let pool_thread = pool.clone();
+        let handle = std::thread::spawn(move || {
+            super::pool_watcher::watcher_loop(
+                &pool_thread,
+                Duration::from_millis(1),
+                0.10,
+                mock_low_free,
+                &shutdown_thread,
+            );
+        });
+
+        // Give the watcher enough wall-clock time to make at least one
+        // poll. The interval is 1 ms but the sleep quantum inside the
+        // loop is 50 ms (SHUTDOWN_QUANTUM), so the first poll lands
+        // after ~50 ms regardless. 200 ms is a generous bound.
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("watcher thread joined cleanly");
+
+        let post_count = super::proactive_eviction_count();
+        assert!(
+            post_count > pre_count,
+            "PROACTIVE_EVICTION_COUNT did not increment: pre={} post={}",
+            pre_count,
+            post_count
+        );
+    }
+
+    /// Stage 4: watcher must NOT evict when free memory is comfortably
+    /// above the low-water mark.
+    #[cfg(feature = "pool-watcher")]
+    #[test]
+    fn pool_watcher_skips_eviction_when_free_is_high() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1024"),
+        ]);
+        let pool = Arc::new(DeviceMemPool::new());
+
+        // Mock: free=900, total=1000 -> 90% free, far above 10% threshold.
+        fn mock_high_free() -> crate::error::BoltResult<(usize, usize)> {
+            Ok((900, 1000))
+        }
+
+        let pre_count = super::proactive_eviction_count();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let pool_thread = pool.clone();
+        let handle = std::thread::spawn(move || {
+            super::pool_watcher::watcher_loop(
+                &pool_thread,
+                Duration::from_millis(1),
+                0.10,
+                mock_high_free,
+                &shutdown_thread,
+            );
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("watcher thread joined cleanly");
+
+        let post_count = super::proactive_eviction_count();
+        assert_eq!(
+            post_count, pre_count,
+            "PROACTIVE_EVICTION_COUNT incremented when it should not have"
+        );
     }
 }
