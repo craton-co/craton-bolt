@@ -94,13 +94,41 @@
 //!   (=~ 44.7 M slots, ~22.4 M build rows under the 50% load factor).
 //!   The cap stays at 64 MiB on smaller cards.
 //!
-//! ## Stage-3 follow-ups
+//! ## Stage-3 additions
 //!
-//! * Per-pair host-side verification so lossy-fold shapes (`MultiI32(n)`,
-//!   `TwoI64`) can take the GPU path as a candidate filter.
-//! * Utf8 keys (string interning + offsets array).
-//! * Plumb runtime-tunable cap (`BOLT_GPU_JOIN_TABLE_CAP_MB`).
+//! Stage 3 closes the last surface gaps without disturbing the byte-stable
+//! Stage-1/Stage-2 fast paths:
+//!
+//! * **Per-pair host verification** for lossy fold shapes (`TwoI64`,
+//!   `MultiI32(n)`) — the GPU path emits candidate pairs from the i64-folded
+//!   hash; the host then re-tests each pair against the *original* Arrow
+//!   columns and drops false positives. See [`verify_pairs_on_host`].
+//! * **Utf8 keys via string interning** — [`KeyShape::SingleUtf8`] dispatches
+//!   through [`intern_utf8_columns`], which builds a `HashMap<&str, u32>` over
+//!   the union of build + probe values and re-encodes the keys as i32
+//!   dictionary indices. The kernels never see Utf8.
+//! * **AoS hash-table slot layout** for the probe-heavy path —
+//!   [`crate::jit::hash_join_kernel::compile_probe_aos_kernel`] reads each
+//!   slot as a single 16-byte tuple, halving probe-side DRAM traffic. Behind
+//!   the [`KeyShape::is_exact_in_i64`] gate today (host post-verify path
+//!   doesn't yet use it).
+//! * **Env-var-tunable cap** (`BOLT_GPU_JOIN_TABLE_CAP_MB`) — clamps to
+//!   `[64, 4096]` MiB and overrides the driver-detected cap.
+//! * **CROSS JOIN on GPU** — pure cartesian product via
+//!   [`execute_cross_join_on_gpu`]; one kernel thread per output pair.
+//!   Gated on `n_probe * n_build < CROSS_JOIN_GPU_CELL_CAP`.
+//!
+//! ## Stage-4 follow-ups
+//!
+//! * Multi-GPU plumbing — [`resolve_byte_cap_from_driver`] still queries
+//!   device 0. Add `cuda_sys::current_device` and route through it.
+//! * Streaming string interning so the dict build is incremental (avoids
+//!   the O(n_build + n_probe) host pass on high-cardinality Utf8 joins).
+//! * AoS layout for the BUILD kernel too (CAS at slot offset 0 still works;
+//!   we just haven't wired it yet to avoid disturbing the byte-stable
+//!   Stage-1 build emitter).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -108,7 +136,7 @@ use std::sync::OnceLock;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, UInt32Array,
+    RecordBatch, StringArray, UInt32Array,
 };
 use arrow_schema::Schema as ArrowSchema;
 
@@ -118,9 +146,10 @@ use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::hash_join_kernel::{
-    compile_build_collision_kernel, compile_build_kernel, compile_probe_collision_kernel,
-    compile_probe_kernel, compile_unmatched_build_kernel, KeyShape, BUILD_COLLISION_KERNEL_ENTRY,
-    BUILD_KERNEL_ENTRY, HASH_JOIN_BLOCK_SIZE, PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY,
+    compile_build_collision_kernel, compile_build_kernel, compile_cross_kernel,
+    compile_probe_collision_kernel, compile_probe_kernel, compile_unmatched_build_kernel,
+    KeyShape, BUILD_COLLISION_KERNEL_ENTRY, BUILD_KERNEL_ENTRY, CROSS_KERNEL_ENTRY,
+    HASH_JOIN_BLOCK_SIZE, PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY,
     UNMATCHED_BUILD_KERNEL_ENTRY,
 };
 use crate::jit::jit_compiler::CudaModule;
@@ -148,6 +177,31 @@ const HASH_TABLE_BYTE_CAP_LARGE: usize = 512 * 1024 * 1024; // 512 MiB
 /// [`HASH_TABLE_BYTE_CAP_LARGE`] instead of [`HASH_TABLE_BYTE_CAP_DEFAULT`].
 const LARGE_VRAM_THRESHOLD: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
 
+/// Env-var name for the Stage-3 user-tunable hash-table byte cap (MiB).
+/// Set this to override the driver-detected cap. Values are clamped to
+/// `[CAP_ENV_MIN_MIB, CAP_ENV_MAX_MIB]`.
+pub const CAP_ENV_VAR: &str = "BOLT_GPU_JOIN_TABLE_CAP_MB";
+
+/// Lower clamp on `BOLT_GPU_JOIN_TABLE_CAP_MB`. Below this the table is too
+/// small to hold even a single bucket's worth of state for typical workloads.
+const CAP_ENV_MIN_MIB: usize = 64;
+
+/// Upper clamp on `BOLT_GPU_JOIN_TABLE_CAP_MB`. 4 GiB is the largest hash
+/// table the engine will allocate from one tunable knob — beyond that the
+/// caller should split the build into multiple GPU joins.
+const CAP_ENV_MAX_MIB: usize = 4096;
+
+/// Hard cap on cartesian-product cell count for the GPU CROSS JOIN kernel.
+/// Beyond this the output buffer + per-thread launch shape are bigger than the
+/// host wants to allocate / serialise, and the host orchestrator wins.
+/// 100M pairs ≈ 800 MiB of u32 output indices, comfortable on 8 GiB cards.
+pub const CROSS_JOIN_GPU_CELL_CAP: u64 = 100_000_000;
+
+/// Minimum cartesian-product cell count below which the host wins. Same
+/// reasoning as [`GPU_JOIN_MIN_ROWS`]: tiny CROSS pays the JIT-compile +
+/// kernel-launch overhead twice.
+pub const CROSS_JOIN_GPU_MIN_CELLS: u64 = 4096;
+
 /// `CU_DEVICE_ATTRIBUTE_TOTAL_MEMORY` isn't an attribute — the driver
 /// surfaces total memory through `cuDeviceTotalMem_v2` directly. We keep
 /// the name for documentation symmetry with the task spec.
@@ -158,16 +212,30 @@ const LARGE_VRAM_THRESHOLD: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
 static HASH_TABLE_BYTE_CAP_CACHE: OnceLock<usize> = OnceLock::new();
 
 /// Resolve the per-process hash-table byte cap. First call performs the
-/// driver query; subsequent calls hit the latch.
+/// env-var lookup + driver query; subsequent calls hit the latch.
 ///
-/// Selection rule: total VRAM ≥ 8 GiB ⇒ 512 MiB cap; else 64 MiB cap.
-/// On any FFI error we fall back to the 64 MiB default and emit a
-/// debug-level log line — the GPU path stays correct, just smaller.
+/// Stage-3 selection rule, applied in order:
+///   1. `BOLT_GPU_JOIN_TABLE_CAP_MB` env var (clamped to `[64, 4096]` MiB) —
+///      if set to anything parseable, wins outright.
+///   2. Driver: total VRAM ≥ 8 GiB ⇒ 512 MiB cap; else 64 MiB cap.
+///   3. On any FFI error: 64 MiB default.
+///
+/// On any path we emit a one-time `log::info!` so operators can see what cap
+/// the executor settled on (without having to know whether the env var or the
+/// driver query won).
 fn hash_table_byte_cap() -> usize {
     *HASH_TABLE_BYTE_CAP_CACHE.get_or_init(|| {
-        // We deliberately swallow any error from the query: this is a
-        // tuning knob, not a correctness gate. On any failure (cuda-stub
-        // mode, driver glitch, …) fall back to the conservative default.
+        // 1. User override via env var. Parse + clamp; on any parse failure
+        //    (non-numeric, empty, weird unit suffix) we silently fall through
+        //    to the driver-detected cap, so the env var only takes effect
+        //    when set to a valid integer.
+        if let Some(cap) = parse_env_cap() {
+            log::info!(
+                "gpu_join: hash-table byte cap set via {CAP_ENV_VAR} = {cap} bytes"
+            );
+            return cap;
+        }
+        // 2. Driver-detected cap.
         let cap = match resolve_byte_cap_from_driver() {
             Ok(cap) => cap,
             Err(e) => {
@@ -178,17 +246,53 @@ fn hash_table_byte_cap() -> usize {
                 HASH_TABLE_BYTE_CAP_DEFAULT
             }
         };
-        log::debug!("gpu_join: hash-table byte cap resolved to {cap} bytes");
+        log::info!("gpu_join: hash-table byte cap resolved to {cap} bytes (driver-detected)");
         cap
     })
 }
 
+/// Parse `BOLT_GPU_JOIN_TABLE_CAP_MB`. Returns `Some(cap_bytes)` if the env
+/// var is set to a valid integer; clamps to `[CAP_ENV_MIN_MIB, CAP_ENV_MAX_MIB]`.
+/// Returns `None` on any parse failure or unset env var.
+fn parse_env_cap() -> Option<usize> {
+    let raw = std::env::var(CAP_ENV_VAR).ok()?;
+    let raw_trim = raw.trim();
+    if raw_trim.is_empty() {
+        return None;
+    }
+    let mib: usize = match raw_trim.parse::<usize>() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "gpu_join: {CAP_ENV_VAR}='{raw_trim}' is not a valid integer ({e}); \
+                 ignoring and using driver-detected cap"
+            );
+            return None;
+        }
+    };
+    let clamped = mib.clamp(CAP_ENV_MIN_MIB, CAP_ENV_MAX_MIB);
+    if clamped != mib {
+        log::warn!(
+            "gpu_join: {CAP_ENV_VAR}={mib} MiB out of range [{CAP_ENV_MIN_MIB}, {CAP_ENV_MAX_MIB}]; \
+             clamped to {clamped} MiB"
+        );
+    }
+    Some(clamped * 1024 * 1024)
+}
+
 /// Pure-driver path for [`hash_table_byte_cap`]. Extracted so unit tests can
 /// reason about it independent of the OnceLock latch.
+///
+/// TODO(stage4-multi-gpu): `cuda_sys` doesn't yet expose `cuCtxGetDevice`
+/// (current device handle for the active context). Once that helper lands as
+/// `cuda_sys::current_device()`, replace the hardcoded `device_get(0)` below
+/// with that call so multi-GPU setups query the device the engine is
+/// actually bound to. Until then, single-GPU rigs (the common case) still
+/// resolve correctly because the active context's device IS ordinal 0.
 fn resolve_byte_cap_from_driver() -> BoltResult<usize> {
     cuda_sys::init()?;
-    // Single-GPU only. Multi-GPU plumbing is a separate workstream — when
-    // it lands, this should query the engine's bound device.
+    // TODO(stage4-multi-gpu): switch to cuda_sys::current_device() when
+    // available. See the function-level doc for rationale.
     let dev = cuda_sys::device_get(0)?;
     let total = cuda_sys::device_total_mem(dev)?;
     Ok(if total >= LARGE_VRAM_THRESHOLD {
@@ -199,6 +303,10 @@ fn resolve_byte_cap_from_driver() -> BoltResult<usize> {
 }
 
 /// Hash-table slot cap given the active byte cap. `12 = sizeof(i64) + sizeof(u32)`.
+///
+/// Note: when the AoS layout is selected the per-slot footprint is 16 bytes
+/// instead of 12 (see `AOS_SLOT_BYTES`); callers using AoS should divide by
+/// 16 instead. The SoA path is the default everywhere today.
 fn hash_table_slot_cap() -> usize {
     hash_table_byte_cap() / 12
 }
@@ -464,14 +572,21 @@ pub fn encode_keys_for_shape(
                 out.push(packed);
             }
         }
+        KeyShape::SingleUtf8 => {
+            // Utf8 encoding goes through intern_utf8_columns + this branch
+            // never sees a raw StringArray — `encode_keys_for_shape` is the
+            // bytes-out layer, callers must intern before reaching here.
+            return Err(BoltError::Other(
+                "gpu_join: SingleUtf8 must be interned to i32 dict indices before encoding; \
+                 see intern_utf8_columns".into(),
+            ));
+        }
         KeyShape::TwoI64 | KeyShape::MultiI32(_) => {
-            // Lossy fold path. The host-side splitmix can collide; the
-            // executor gates this off the GPU path until per-pair host-side
-            // verification lands. Encoding is implemented because the
-            // hash_join_indices_on_gpu_with_shape entry point still takes
-            // a KeyShape and we want a single encoder rather than a forked
-            // path. Callers must NOT take the GPU fast path with these
-            // shapes today (see KeyShape::is_exact_in_i64).
+            // Stage-3 candidate-filter path. The host-side splitmix can
+            // collide, so the GPU join emits *candidate* pairs that the
+            // caller MUST re-verify against the original Arrow columns via
+            // `verify_pairs_on_host`. The encoder still produces an i64
+            // value per row; correctness depends on the post-verification.
             for i in 0..n {
                 let mut h: u64 = 0;
                 for col in columns {
@@ -1450,6 +1565,560 @@ pub fn execute_outer_join_on_gpu(
         .map_err(|e| BoltError::Other(format!("gpu_join: building RecordBatch failed: {e}")))
 }
 
+// =========================================================================
+// Stage 3: per-pair host verification, Utf8 interning, CROSS JOIN.
+// =========================================================================
+
+/// Result of [`intern_utf8_columns`]: the build- and probe-side dictionary-
+/// index columns suitable for upload to the kernel-side i64 path. Indices
+/// are i32 because we cap the union-cardinality of the join inputs at
+/// `i32::MAX` (`take` is u32-indexed downstream anyway).
+pub struct InternedUtf8Columns {
+    /// Build-side keys re-encoded as i32 dict indices.
+    pub build_indices: Int32Array,
+    /// Probe-side keys re-encoded as i32 dict indices. Probe-side strings
+    /// that never appear in the build are still given a dict index (so the
+    /// kernel-side compare is just an i32 equality) but they obviously
+    /// won't find a slot — the kernel returns "no match" naturally.
+    pub probe_indices: Int32Array,
+}
+
+/// Build a per-string dictionary over the union of `build` and `probe`'s
+/// Utf8 values and re-encode both as i32 dict indices. The Stage-3 Utf8
+/// path then uploads the i32 arrays through the existing `SingleI32`
+/// kernel-side code, and the output's Utf8 columns are re-attached via
+/// `arrow::compute::take` against the original `StringArray`s.
+///
+/// ## Cost note
+///
+/// O(n_build + n_probe) host work, with O(unique_strings) hash-map memory.
+/// For high-cardinality joins where most strings appear once on each side
+/// (e.g. random UUID keys) this can dominate. Stage 4 should add a
+/// streaming-interning path: hash each string to a 64-bit value on the host,
+/// upload that as the key, and run the candidate-filter path with
+/// post-verification (same model as `TwoI64`). That avoids the dict-build
+/// pass at the cost of a host comparison per match.
+pub fn intern_utf8_columns(
+    build: &dyn Array,
+    probe: &dyn Array,
+) -> BoltResult<InternedUtf8Columns> {
+    let b = build.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        BoltError::Other("gpu_join: intern_utf8_columns build is not StringArray".into())
+    })?;
+    let p = probe.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        BoltError::Other("gpu_join: intern_utf8_columns probe is not StringArray".into())
+    })?;
+
+    // Single-pass union dict build. Keys borrow into the StringArray's
+    // backing buffer, so the HashMap holds no extra heap copies of the
+    // string data.
+    let mut dict: HashMap<&str, i32> = HashMap::with_capacity(b.len() + p.len());
+    let mut next_idx: i32 = 0;
+
+    let mut build_idx: Vec<i32> = Vec::with_capacity(b.len());
+    for i in 0..b.len() {
+        if b.is_null(i) {
+            // NULL keys never match in the equi-join contract; we emit a
+            // sentinel index that no other row can map to so the kernel
+            // sees a unique key. -1 is safe because next_idx starts at 0.
+            // The host gate already rejects NULL-key columns for the GPU
+            // path, so this branch should be unreachable; we encode for
+            // safety.
+            build_idx.push(-1);
+            continue;
+        }
+        let s = b.value(i);
+        let &idx = dict.entry(s).or_insert_with(|| {
+            let cur = next_idx;
+            next_idx = next_idx.saturating_add(1);
+            cur
+        });
+        build_idx.push(idx);
+    }
+
+    let mut probe_idx: Vec<i32> = Vec::with_capacity(p.len());
+    for i in 0..p.len() {
+        if p.is_null(i) {
+            probe_idx.push(-1);
+            continue;
+        }
+        let s = p.value(i);
+        let &idx = dict.entry(s).or_insert_with(|| {
+            let cur = next_idx;
+            next_idx = next_idx.saturating_add(1);
+            cur
+        });
+        probe_idx.push(idx);
+    }
+
+    // i32::MAX is the cap — if we ever overflow, surface a clear error
+    // instead of pointing the kernel at a degenerate key column.
+    if next_idx == i32::MAX {
+        return Err(BoltError::Other(
+            "gpu_join: Utf8 interning overflowed i32::MAX distinct values; \
+             rewrite the query or fall back to host path".into(),
+        ));
+    }
+
+    Ok(InternedUtf8Columns {
+        build_indices: Int32Array::from(build_idx),
+        probe_indices: Int32Array::from(probe_idx),
+    })
+}
+
+/// Re-test a set of `(probe_idx, build_idx)` candidate pairs against the
+/// original Arrow key columns. Used by the Stage-3 lossy-fold path
+/// (`TwoI64`, `MultiI32(_)`) to drop false positives produced by the
+/// 64-bit splitmix collapse.
+///
+/// `build_cols` and `probe_cols` are slices of the original Arrow key
+/// columns (one per join column). For each pair we walk every column, pull
+/// the build- and probe-side values at the indexed rows, and require all
+/// columns to be equal. Any mismatch drops the pair.
+///
+/// Returns the filtered `(build, probe)` index pair, in the same relative
+/// order as the input.
+fn verify_pairs_on_host(
+    build_cols: &[&dyn Array],
+    probe_cols: &[&dyn Array],
+    build_indices: &UInt32Array,
+    probe_indices: &UInt32Array,
+) -> BoltResult<(UInt32Array, UInt32Array)> {
+    debug_assert_eq!(build_cols.len(), probe_cols.len());
+    debug_assert_eq!(build_indices.len(), probe_indices.len());
+
+    let mut kept_build: Vec<u32> = Vec::with_capacity(build_indices.len());
+    let mut kept_probe: Vec<u32> = Vec::with_capacity(probe_indices.len());
+
+    for k in 0..build_indices.len() {
+        let bi = build_indices.value(k);
+        let pi = probe_indices.value(k);
+        let mut all_eq = true;
+        for (b, p) in build_cols.iter().zip(probe_cols.iter()) {
+            if !arrow_row_eq(*b, bi as usize, *p, pi as usize)? {
+                all_eq = false;
+                break;
+            }
+        }
+        if all_eq {
+            kept_build.push(bi);
+            kept_probe.push(pi);
+        }
+    }
+
+    Ok((UInt32Array::from(kept_build), UInt32Array::from(kept_probe)))
+}
+
+/// Row-level equality on Arrow scalars. Returns true iff both values are
+/// non-NULL and bit-equal. Used by [`verify_pairs_on_host`] — equi-join
+/// semantics treats NULL = NULL as UNKNOWN (drops the pair).
+fn arrow_row_eq(
+    a: &dyn Array,
+    ai: usize,
+    b: &dyn Array,
+    bi: usize,
+) -> BoltResult<bool> {
+    if a.is_null(ai) || b.is_null(bi) {
+        return Ok(false);
+    }
+    if a.data_type() != b.data_type() {
+        return Err(BoltError::Other(format!(
+            "gpu_join: verify_pairs_on_host dtype mismatch ({:?} vs {:?})",
+            a.data_type(),
+            b.data_type()
+        )));
+    }
+    let eq = match a.data_type() {
+        arrow_schema::DataType::Int32 => {
+            let av = a.as_any().downcast_ref::<Int32Array>().unwrap().value(ai);
+            let bv = b.as_any().downcast_ref::<Int32Array>().unwrap().value(bi);
+            av == bv
+        }
+        arrow_schema::DataType::Int64 => {
+            let av = a.as_any().downcast_ref::<Int64Array>().unwrap().value(ai);
+            let bv = b.as_any().downcast_ref::<Int64Array>().unwrap().value(bi);
+            av == bv
+        }
+        arrow_schema::DataType::Float32 => {
+            // Bit-equal (engine convention: NaN == NaN if same bit pattern).
+            let av = a
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(ai)
+                .to_bits();
+            let bv = b
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(bi)
+                .to_bits();
+            av == bv
+        }
+        arrow_schema::DataType::Float64 => {
+            let av = a
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(ai)
+                .to_bits();
+            let bv = b
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(bi)
+                .to_bits();
+            av == bv
+        }
+        arrow_schema::DataType::Boolean => {
+            let av = a.as_any().downcast_ref::<BooleanArray>().unwrap().value(ai);
+            let bv = b.as_any().downcast_ref::<BooleanArray>().unwrap().value(bi);
+            av == bv
+        }
+        arrow_schema::DataType::Utf8 => {
+            let av = a.as_any().downcast_ref::<StringArray>().unwrap().value(ai);
+            let bv = b.as_any().downcast_ref::<StringArray>().unwrap().value(bi);
+            av == bv
+        }
+        other => {
+            return Err(BoltError::Other(format!(
+                "gpu_join: verify_pairs_on_host unsupported dtype {other:?}"
+            )));
+        }
+    };
+    Ok(eq)
+}
+
+/// Stage-3 INNER join entry point with optional host-side per-pair
+/// verification.
+///
+/// Same contract as [`execute_inner_join_on_gpu_with_shape`] but additionally
+/// supports lossy-fold shapes (`TwoI64`, `MultiI32(_)`) by running the GPU
+/// join as a candidate filter and re-testing every emitted pair on the host
+/// against the original Arrow columns. For exact shapes the verify step is
+/// skipped (no false positives are possible).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_inner_join_on_gpu_with_shape_and_verify(
+    lhs: &RecordBatch,
+    rhs: &RecordBatch,
+    build_is_left: bool,
+    build_key_idxs: &[usize],
+    probe_key_idxs: &[usize],
+    shape: KeyShape,
+    output_schema: Arc<ArrowSchema>,
+) -> BoltResult<RecordBatch> {
+    let (build_batch, probe_batch) = if build_is_left {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+    let build_cols: Vec<&dyn Array> = build_key_idxs
+        .iter()
+        .map(|&i| build_batch.column(i).as_ref())
+        .collect();
+    let probe_cols: Vec<&dyn Array> = probe_key_idxs
+        .iter()
+        .map(|&i| probe_batch.column(i).as_ref())
+        .collect();
+
+    let idx = hash_join_indices_on_gpu_with_shape_unverified(&build_cols, &probe_cols, shape)?;
+
+    // Stage-3: lossy shapes get per-pair host re-test. For exact shapes
+    // (every path that's_exact_in_i64) the verify is skipped — the kernel
+    // already emits exact matches.
+    let (build_verified, probe_verified) = if shape.needs_host_post_verify() {
+        verify_pairs_on_host(&build_cols, &probe_cols, &idx.build, &idx.probe)?
+    } else {
+        (idx.build, idx.probe)
+    };
+
+    let (left_idx, right_idx) = if build_is_left {
+        (&build_verified, &probe_verified)
+    } else {
+        (&probe_verified, &build_verified)
+    };
+
+    let mut output_cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+    for col in lhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), left_idx, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: arrow take (left): {e}")))?,
+        );
+    }
+    for col in rhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), right_idx, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: arrow take (right): {e}")))?,
+        );
+    }
+    RecordBatch::try_new(output_schema, output_cols)
+        .map_err(|e| BoltError::Other(format!("gpu_join: building RecordBatch failed: {e}")))
+}
+
+/// Like [`hash_join_indices_on_gpu_with_shape`] but does NOT reject lossy
+/// shapes — the caller is expected to apply [`verify_pairs_on_host`] before
+/// trusting the emitted pairs. Stage-1/2 callers go through the verifying
+/// `hash_join_indices_on_gpu_with_shape` wrapper.
+fn hash_join_indices_on_gpu_with_shape_unverified(
+    build_key_columns: &[&dyn Array],
+    probe_key_columns: &[&dyn Array],
+    shape: KeyShape,
+) -> BoltResult<GpuJoinIndices> {
+    // Re-route exact shapes through the existing verified entry point so
+    // we don't fork the kernel-launch logic.
+    if !shape.needs_host_post_verify() {
+        return hash_join_indices_on_gpu_with_shape(build_key_columns, probe_key_columns, shape);
+    }
+
+    // Lossy-fold path. We bypass the `is_exact_in_i64()` gate in the verified
+    // helper by inlining the launch sequence here. Encoding still goes
+    // through `encode_keys_for_shape` (which now accepts lossy shapes for
+    // the unverified entry).
+    let n_build = build_key_columns[0].len();
+    let n_probe = probe_key_columns[0].len();
+
+    if n_build == 0 || n_probe == 0 {
+        return Ok(GpuJoinIndices {
+            build: UInt32Array::from(Vec::<u32>::new()),
+            probe: UInt32Array::from(Vec::<u32>::new()),
+        });
+    }
+
+    let n_build_u32 = n_rows_to_u32(n_build)?;
+    let n_probe_u32 = n_rows_to_u32(n_probe)?;
+    let cap = compute_capacity(n_build)?;
+    let cap_u32 = u32::try_from(cap)
+        .map_err(|_| BoltError::Other(format!("gpu_join: cap {cap} doesn't fit in u32")))?;
+
+    let build_keys_host = encode_keys_for_shape(build_key_columns, shape)?;
+    let probe_keys_host = encode_keys_for_shape(probe_key_columns, shape)?;
+
+    let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
+    let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
+
+    let keys_init: Vec<i64> = vec![i64::MIN; cap];
+    let row_idx_init: Vec<u32> = vec![u32::MAX; cap];
+    let head_init: Vec<u32> = vec![COLLISION_LIST_SENTINEL; cap];
+    let next_idx_init: Vec<u32> = vec![COLLISION_LIST_SENTINEL; n_build];
+
+    let mut keys_table_dev = GpuVec::<i64>::from_slice(&keys_init)?;
+    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(&row_idx_init)?;
+    let mut head_dev = GpuVec::<u32>::from_slice(&head_init)?;
+    let mut next_idx_dev = GpuVec::<u32>::from_slice(&next_idx_init)?;
+
+    let out_capacity_usize = n_build
+        .checked_add(n_probe)
+        .and_then(|x| x.checked_mul(2))
+        .ok_or_else(|| BoltError::Other("gpu_join: output buffer size overflow".into()))?;
+    let out_capacity_u32 = u32::try_from(out_capacity_usize).map_err(|_| {
+        BoltError::Other(format!(
+            "gpu_join: out_capacity {out_capacity_usize} doesn't fit in u32"
+        ))
+    })?;
+
+    let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
+    let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
+    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
+    let stream = CudaStream::null();
+
+    launch_build_collision_kernel(
+        &build_keys_dev,
+        &mut keys_table_dev,
+        &mut row_idx_table_dev,
+        &mut head_dev,
+        &mut next_idx_dev,
+        n_build_u32,
+        cap_u32,
+        &stream,
+    )?;
+    let n_matches_raw = launch_probe_collision_kernel(
+        &probe_keys_dev,
+        &keys_table_dev,
+        &head_dev,
+        &next_idx_dev,
+        &mut out_probe_idx_dev,
+        &mut out_build_idx_dev,
+        &mut out_counter_dev,
+        None,
+        n_probe_u32,
+        n_build_u32,
+        cap_u32,
+        out_capacity_u32,
+        &stream,
+    )?;
+    if n_matches_raw > out_capacity_u32 {
+        return Err(BoltError::Other(format!(
+            "gpu_join: lossy-shape candidate filter claimed {n_matches_raw} > capacity {out_capacity_u32}"
+        )));
+    }
+    let n_matches = n_matches_raw as usize;
+    let probe_idx_full = out_probe_idx_dev.to_vec()?;
+    let build_idx_full = out_build_idx_dev.to_vec()?;
+    let probe_idx: Vec<u32> = probe_idx_full.into_iter().take(n_matches).collect();
+    let build_idx: Vec<u32> = build_idx_full.into_iter().take(n_matches).collect();
+    Ok(GpuJoinIndices {
+        build: UInt32Array::from(build_idx),
+        probe: UInt32Array::from(probe_idx),
+    })
+}
+
+/// End-to-end GPU CROSS JOIN. Pure cartesian product — every left row paired
+/// with every right row, in `(left_idx, right_idx)` row-major order.
+///
+/// Gates:
+/// * `n_left * n_right` is in `[CROSS_JOIN_GPU_MIN_CELLS, CROSS_JOIN_GPU_CELL_CAP]`.
+///   Below the min, host wins; above the cap, the host orchestrator must
+///   reject the query entirely (the index arrays don't fit in u32 anyway).
+/// * Neither side is empty (caller short-circuits that case).
+///
+/// Returns a fully-materialised `RecordBatch` over `output_schema = left ++
+/// right`. Output row ordering is deterministic: `(left_idx, right_idx)`
+/// pairs are emitted in row-major order, i.e. left-row 0 paired with every
+/// right-row, then left-row 1, etc. Matches the host CROSS path.
+pub fn execute_cross_join_on_gpu(
+    lhs: &RecordBatch,
+    rhs: &RecordBatch,
+    output_schema: Arc<ArrowSchema>,
+) -> BoltResult<RecordBatch> {
+    let n_left = lhs.num_rows();
+    let n_right = rhs.num_rows();
+    if n_left == 0 || n_right == 0 {
+        return Err(BoltError::Other(
+            "gpu_join: execute_cross_join_on_gpu called with empty side; \
+             caller must short-circuit before reaching the GPU path"
+                .into(),
+        ));
+    }
+
+    let total = (n_left as u64).checked_mul(n_right as u64).ok_or_else(|| {
+        BoltError::Other(format!(
+            "gpu_join: CROSS overflow ({n_left} × {n_right})"
+        ))
+    })?;
+    if total >= CROSS_JOIN_GPU_CELL_CAP {
+        return Err(BoltError::Other(format!(
+            "gpu_join: CROSS product {total} ≥ cap {CROSS_JOIN_GPU_CELL_CAP}; fall back to host"
+        )));
+    }
+    let total_usize = total as usize;
+    let total_u32 = u32::try_from(total).map_err(|_| {
+        BoltError::Other(format!(
+            "gpu_join: CROSS total {total} doesn't fit in u32"
+        ))
+    })?;
+    let n_build_u32 = n_rows_to_u32(n_right)?; // "build" = right side here
+
+    // Output buffers.
+    let mut out_probe_idx_dev = GpuVec::<u32>::zeros(total_usize)?;
+    let mut out_build_idx_dev = GpuVec::<u32>::zeros(total_usize)?;
+    let stream = CudaStream::null();
+
+    // Launch.
+    let ptx = compile_cross_kernel()?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let function = module.function(CROSS_KERNEL_ENTRY)?;
+
+    let mut out_probe_idx_ptr: CUdeviceptr = out_probe_idx_dev.device_ptr();
+    let mut out_build_idx_ptr: CUdeviceptr = out_build_idx_dev.device_ptr();
+    let mut n_build_param: u32 = n_build_u32;
+    let mut total_param: u32 = total_u32;
+    let mut params: [*mut c_void; 4] = [
+        &mut out_probe_idx_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut out_build_idx_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_build_param as *mut u32 as *mut c_void,
+        &mut total_param as *mut u32 as *mut c_void,
+    ];
+
+    let block: u32 = HASH_JOIN_BLOCK_SIZE;
+    let grid_x: u32 = total_u32.div_ceil(block).max(1);
+    // SAFETY: every param slot points at a stack local that outlives the
+    // launch+sync below; the device buffers outlive the launch.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x, 1, 1,
+            block, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+
+    let probe_idx_host: Vec<u32> = out_probe_idx_dev.to_vec()?;
+    let build_idx_host: Vec<u32> = out_build_idx_dev.to_vec()?;
+
+    let left_idx_arr = UInt32Array::from(probe_idx_host);
+    let right_idx_arr = UInt32Array::from(build_idx_host);
+
+    let mut output_cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+    for col in lhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), &left_idx_arr, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: cross take (left): {e}")))?,
+        );
+    }
+    for col in rhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), &right_idx_arr, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: cross take (right): {e}")))?,
+        );
+    }
+    RecordBatch::try_new(output_schema, output_cols)
+        .map_err(|e| BoltError::Other(format!("gpu_join: building CROSS RecordBatch: {e}")))
+}
+
+/// End-to-end GPU INNER join for Utf8 keys. Host-side string interning
+/// produces i32 dictionary indices that the kernel-side `SingleI32` path
+/// handles natively. The output reattaches the *original* StringArray
+/// columns from `lhs` / `rhs` via `arrow::compute::take`.
+pub fn execute_utf8_inner_join_on_gpu(
+    lhs: &RecordBatch,
+    rhs: &RecordBatch,
+    build_is_left: bool,
+    build_key_idx: usize,
+    probe_key_idx: usize,
+    output_schema: Arc<ArrowSchema>,
+) -> BoltResult<RecordBatch> {
+    let (build_batch, probe_batch) = if build_is_left {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+    let interned = intern_utf8_columns(
+        build_batch.column(build_key_idx).as_ref(),
+        probe_batch.column(probe_key_idx).as_ref(),
+    )?;
+
+    let (build_indices, probe_indices) = hash_join_indices_on_gpu(
+        &interned.build_indices,
+        &interned.probe_indices,
+        DataType::Int32,
+    )?;
+
+    let (left_idx, right_idx) = if build_is_left {
+        (&build_indices, &probe_indices)
+    } else {
+        (&probe_indices, &build_indices)
+    };
+    let mut output_cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+    for col in lhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), left_idx, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: utf8 take (left): {e}")))?,
+        );
+    }
+    for col in rhs.columns() {
+        output_cols.push(
+            arrow::compute::take(col.as_ref(), right_idx, None)
+                .map_err(|e| BoltError::Other(format!("gpu_join: utf8 take (right): {e}")))?,
+        );
+    }
+    RecordBatch::try_new(output_schema, output_cols)
+        .map_err(|e| BoltError::Other(format!("gpu_join: utf8 RecordBatch: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,5 +2474,121 @@ mod tests {
             differing >= 16,
             "splitmix should differ in at least 16 bits across nearby inputs; got {differing}"
         );
+    }
+
+    // ===== Stage 3 host-side helpers =====
+
+    /// Utf8 interning must give the same dict index to repeated strings and
+    /// distinct indices to distinct strings. The "union over both sides"
+    /// shape is important: a probe string not appearing in the build still
+    /// gets a fresh index (it just won't find a slot in the kernel).
+    #[test]
+    fn intern_utf8_columns_dedups_and_assigns_distinct_indices() {
+        let build = StringArray::from(vec!["alice", "bob", "alice", "carol"]);
+        let probe = StringArray::from(vec!["bob", "alice", "dave"]);
+        let interned = intern_utf8_columns(&build, &probe).unwrap();
+
+        // Build: alice=0, bob=1, alice=0, carol=2.
+        assert_eq!(interned.build_indices.value(0), 0);
+        assert_eq!(interned.build_indices.value(1), 1);
+        assert_eq!(interned.build_indices.value(2), 0);
+        assert_eq!(interned.build_indices.value(3), 2);
+        // Probe: bob=1, alice=0, dave=3 (new).
+        assert_eq!(interned.probe_indices.value(0), 1);
+        assert_eq!(interned.probe_indices.value(1), 0);
+        assert_eq!(interned.probe_indices.value(2), 3);
+    }
+
+    /// Per-pair host verification keeps exact matches and drops false
+    /// positives. Build/probe key columns each have a single Int64 column;
+    /// candidate pairs include one true match (build[0]==probe[0]) and one
+    /// false match (build[1]!=probe[1]).
+    #[test]
+    fn verify_pairs_on_host_drops_false_positives() {
+        let b = Int64Array::from(vec![100i64, 200, 300]);
+        let p = Int64Array::from(vec![100i64, 999, 300]);
+        let build_cols: Vec<&dyn Array> = vec![&b];
+        let probe_cols: Vec<&dyn Array> = vec![&p];
+        // Candidate pairs: (b0,p0) true, (b1,p1) FALSE, (b2,p2) true.
+        let cb = UInt32Array::from(vec![0u32, 1, 2]);
+        let cp = UInt32Array::from(vec![0u32, 1, 2]);
+        let (kept_b, kept_p) = verify_pairs_on_host(&build_cols, &probe_cols, &cb, &cp).unwrap();
+        assert_eq!(kept_b.len(), 2);
+        assert_eq!(kept_p.len(), 2);
+        assert_eq!(kept_b.value(0), 0);
+        assert_eq!(kept_b.value(1), 2);
+        assert_eq!(kept_p.value(0), 0);
+        assert_eq!(kept_p.value(1), 2);
+    }
+
+    /// Per-pair host verification with a two-column key: a candidate pair
+    /// is kept only if EVERY column agrees. Catches the bug where the
+    /// verifier short-circuits on the first column without checking the
+    /// rest.
+    #[test]
+    fn verify_pairs_on_host_requires_all_columns_to_agree() {
+        let b1 = Int32Array::from(vec![1i32, 1, 2]);
+        let b2 = Int64Array::from(vec![10i64, 20, 10]);
+        let p1 = Int32Array::from(vec![1i32, 1, 2]);
+        let p2 = Int64Array::from(vec![10i64, 999, 10]); // p2[1] disagrees
+        let build_cols: Vec<&dyn Array> = vec![&b1, &b2];
+        let probe_cols: Vec<&dyn Array> = vec![&p1, &p2];
+        let cb = UInt32Array::from(vec![0u32, 1, 2]);
+        let cp = UInt32Array::from(vec![0u32, 1, 2]);
+        let (kept_b, _) = verify_pairs_on_host(&build_cols, &probe_cols, &cb, &cp).unwrap();
+        assert_eq!(kept_b.len(), 2, "pair (b1,p1) must be dropped on col-2 mismatch");
+        assert_eq!(kept_b.value(0), 0);
+        assert_eq!(kept_b.value(1), 2);
+    }
+
+    /// Env-var cap: a valid integer is parsed and clamped. The OnceLock
+    /// latches on the FIRST call, so we test the parser directly.
+    #[test]
+    fn parse_env_cap_clamps_to_range() {
+        // Save / restore the env var so tests don't bleed into each other.
+        let prev = std::env::var(CAP_ENV_VAR).ok();
+        std::env::set_var(CAP_ENV_VAR, "128");
+        let cap = parse_env_cap().expect("128 MiB must parse");
+        assert_eq!(cap, 128 * 1024 * 1024);
+
+        // Below min → clamped up to 64 MiB.
+        std::env::set_var(CAP_ENV_VAR, "1");
+        let cap = parse_env_cap().expect("1 MiB must parse");
+        assert_eq!(cap, CAP_ENV_MIN_MIB * 1024 * 1024);
+
+        // Above max → clamped down to 4 GiB.
+        std::env::set_var(CAP_ENV_VAR, "999999");
+        let cap = parse_env_cap().expect("999999 MiB must parse");
+        assert_eq!(cap, CAP_ENV_MAX_MIB * 1024 * 1024);
+
+        // Garbage → ignored.
+        std::env::set_var(CAP_ENV_VAR, "not-a-number");
+        assert!(parse_env_cap().is_none(), "garbage env value must be ignored");
+
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var(CAP_ENV_VAR, v),
+            None => std::env::remove_var(CAP_ENV_VAR),
+        }
+    }
+
+    /// Stage-3 KeyShape: `SingleUtf8` claims to be exact. The Utf8 path is
+    /// expected to use the dedicated interning entry point — direct
+    /// encoding via encode_keys_for_shape returns a clear error.
+    #[test]
+    fn single_utf8_encode_steers_to_interning_path() {
+        let s = StringArray::from(vec!["hello"]);
+        let err = encode_keys_for_shape(&[&s as &dyn Array], KeyShape::SingleUtf8);
+        assert!(
+            err.is_err(),
+            "SingleUtf8 must not be encoded directly — caller should use intern_utf8_columns"
+        );
+    }
+
+    /// CROSS cap is a fixed compile-time bound; pinning it here means a
+    /// future change requires an intentional update.
+    #[test]
+    fn cross_join_cell_cap_is_100m() {
+        assert_eq!(CROSS_JOIN_GPU_CELL_CAP, 100_000_000);
     }
 }

@@ -179,6 +179,23 @@ pub const PROBE_COLLISION_KERNEL_ENTRY: &str = "bolt_hash_join_probe_collision";
 /// build-row index of every build row whose `matched[tid]` byte is still 0.
 pub const UNMATCHED_BUILD_KERNEL_ENTRY: &str = "bolt_hash_join_emit_unmatched_build";
 
+/// Entry-point name of the Stage-3 CROSS JOIN kernel — one thread per output
+/// pair `(probe_idx, build_idx)`. No hash table involved.
+pub const CROSS_KERNEL_ENTRY: &str = "bolt_cross_join";
+
+/// Entry-point name of the Stage-3 AoS-layout probe kernel — same semantics
+/// as [`PROBE_KERNEL_ENTRY`] but reads each hash-table slot as a single
+/// 16-byte tuple `[key:u64, head:u32, _pad:u32]`. Halves probe-side memory
+/// traffic on workloads where the probe loop is DRAM-bound.
+pub const PROBE_AOS_KERNEL_ENTRY: &str = "bolt_hash_join_probe_aos";
+
+/// AoS slot footprint in bytes: `i64 key (8) + u32 head (4) + u32 _pad (4)
+/// = 16`. The pad keeps each slot 16-byte aligned for the `ld.global.v4.u32`
+/// fused load the AoS probe issues. Memory cost vs. SoA is 16/12 = 1.33× —
+/// the extra padding buys one fused load per slot read instead of two
+/// scattered loads against parallel arrays.
+pub const AOS_SLOT_BYTES: u32 = 16;
+
 /// Shape of the join key, as seen by the host-side encoder. The kernels
 /// themselves never branch on this — every shape is folded into a single
 /// i64 on the host before upload — but the value carries the host-side
@@ -192,12 +209,17 @@ pub const UNMATCHED_BUILD_KERNEL_ENTRY: &str = "bolt_hash_join_emit_unmatched_bu
 /// * [`TwoI32`] — two Int32 columns packed as `(hi as u32 as u64) << 32
 ///   | (lo as u32 as u64)`. Matches `groupby::pack_keys` exactly.
 /// * [`TwoI64`] — two Int64 columns folded into a 64-bit splitmix hash
-///   on the host. Equality on the *host* still uses the full tuple (the
-///   GPU path is one-sided: if the host can't guarantee no false matches
-///   it doesn't take this shape).
-/// * [`MultiI32(n)`] — three or more Int32 columns; host folds to a 64-bit
-///   splitmix hash. Host falls back if it can't prove the fold is
-///   collision-free for this batch.
+///   on the host. Stage 3 admits this as a *candidate filter*: the GPU
+///   emits a superset of true matches; host post-verification re-tests
+///   each pair against the full tuple and drops false positives.
+/// * [`MultiI32(n)`] — three or more Int32 columns; same candidate-filter
+///   model as `TwoI64`. Host falls back wholesale only when interning /
+///   re-encoding the candidate set is more expensive than the host join.
+/// * [`SingleUtf8`] — Single string key. Host interns via
+///   `gpu_join::intern_utf8_columns` to produce a dictionary index per row,
+///   then routes through the kernel-side i64 path (the kernel never sees
+///   Utf8). Output reattaches the original `StringArray` columns via
+///   `take`.
 ///
 /// [`SingleI32`]: KeyShape::SingleI32
 /// [`SingleI64`]: KeyShape::SingleI64
@@ -207,6 +229,7 @@ pub const UNMATCHED_BUILD_KERNEL_ENTRY: &str = "bolt_hash_join_emit_unmatched_bu
 /// [`TwoI32`]: KeyShape::TwoI32
 /// [`TwoI64`]: KeyShape::TwoI64
 /// [`MultiI32(n)`]: KeyShape::MultiI32
+/// [`SingleUtf8`]: KeyShape::SingleUtf8
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyShape {
     /// Single Int32 key, sign-extended to i64 on the host.
@@ -219,12 +242,16 @@ pub enum KeyShape {
     SingleF32,
     /// Single Float64 key — bit-pattern after NaN canonicalisation.
     SingleF64,
+    /// Single Utf8 key — interned to i32 dict indices on the host before
+    /// upload. Stage-3.
+    SingleUtf8,
     /// Two Int32 columns packed `(hi << 32) | lo`.
     TwoI32,
     /// Two Int64 columns folded into one i64 by the host via splitmix.
+    /// Stage-3 admits this with mandatory host post-verification.
     TwoI64,
     /// `n` Int32 columns folded into one i64 by the host via splitmix.
-    /// `n >= 3`.
+    /// `n >= 3`. Same candidate-filter contract as `TwoI64`.
     MultiI32(u8),
 }
 
@@ -247,7 +274,21 @@ impl KeyShape {
                 | KeyShape::SingleF32
                 | KeyShape::SingleF64
                 | KeyShape::TwoI32
+                // SingleUtf8 is exact in i64 once the host has interned the
+                // strings to dictionary indices — the kernels see only
+                // i32-as-i64 keys at that point, with no collision risk.
+                | KeyShape::SingleUtf8
         )
+    }
+
+    /// True if this shape needs per-pair host-side verification after the
+    /// GPU emits candidate matches. Stage-3 routes `TwoI64` and
+    /// `MultiI32(n)` through the GPU as a fast pre-filter; the host then
+    /// re-tests each `(probe_idx, build_idx)` pair against the original
+    /// Arrow columns and drops false positives produced by the lossy
+    /// 64-bit fold. Other shapes are exact and return `false`.
+    pub fn needs_host_post_verify(self) -> bool {
+        matches!(self, KeyShape::TwoI64 | KeyShape::MultiI32(_))
     }
 }
 
@@ -256,7 +297,8 @@ impl KeyShape {
 /// Stage 1 handled `Int32` / `Int64`. Stage 2 widens to `Bool`, `Float32`
 /// and `Float64` — every shape still ends up as an i64 on the GPU after
 /// host-side encoding, so the kernel itself only knows about i64.
-/// `Utf8` remains host-only.
+/// Stage 3 adds `Utf8` via host-side string interning (the kernel still
+/// only sees i32 dict indices).
 pub fn is_supported_key_dtype(dtype: DataType) -> bool {
     matches!(
         dtype,
@@ -265,6 +307,7 @@ pub fn is_supported_key_dtype(dtype: DataType) -> bool {
             | DataType::Bool
             | DataType::Float32
             | DataType::Float64
+            | DataType::Utf8
     )
 }
 
@@ -978,6 +1021,228 @@ pub fn compile_unmatched_build_kernel() -> BoltResult<String> {
     Ok(p)
 }
 
+/// Compile the Stage-3 CROSS JOIN kernel. Pure cartesian product — one
+/// thread per output pair, no hash table. The kernel writes
+/// `out_probe_idx[tid] = tid / n_build` and `out_build_idx[tid] = tid %
+/// n_build`. The host guarantees `n_probe * n_build < u32::MAX` before
+/// launch (see [`crate::exec::gpu_join::CROSS_JOIN_GPU_CELL_CAP`]).
+///
+/// ```text
+/// .visible .entry bolt_cross_join(
+///     .param .u64 out_probe_idx_ptr,  // u32, length total
+///     .param .u64 out_build_idx_ptr,  // u32, length total
+///     .param .u32 n_build,
+///     .param .u32 total              // n_probe * n_build, fits u32
+/// )
+/// ```
+pub fn compile_cross_kernel() -> BoltResult<String> {
+    let mut p = String::new();
+    writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
+    writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
+    writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    let entry = CROSS_KERNEL_ENTRY;
+    writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_2,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_3").map_err(write_err)?;
+    writeln!(p, ")").map_err(write_err)?;
+    writeln!(p, "{{").map_err(write_err)?;
+
+    writeln!(p, "\t.reg .pred  %p<4>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32   %r<24>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rd<16>;").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    // tid = ctaid * ntid + tid_x ; bail if tid >= total.
+    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_3];").map_err(write_err)?; // total
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // n_build
+    writeln!(p, "\tld.param.u32 %r5, [{entry}_param_2];").map_err(write_err)?;
+    // probe_idx = tid / n_build  ; build_idx = tid % n_build.
+    writeln!(p, "\tdiv.u32 %r6, %r3, %r5;").map_err(write_err)?;
+    writeln!(p, "\trem.u32 %r7, %r3, %r5;").map_err(write_err)?;
+
+    // out_probe_idx[tid] = probe_idx.
+    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd2], %r6;").map_err(write_err)?;
+
+    // out_build_idx[tid] = build_idx.
+    writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd4, %rd3, %rd1;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd4], %r7;").map_err(write_err)?;
+
+    writeln!(p, "DONE:").map_err(write_err)?;
+    writeln!(p, "\tret;").map_err(write_err)?;
+    writeln!(p, "}}").map_err(write_err)?;
+    Ok(p)
+}
+
+/// Compile the Stage-3 AoS-layout probe kernel.
+///
+/// Reads each hash-table slot as a single 16-byte tuple `[key:u64,
+/// head:u32, _pad:u32]` via one fused load. Compared with the Stage-2 SoA
+/// probe (separate `keys_table` and `row_idx_table` loads per slot), AoS
+/// halves the DRAM bytes pulled per probe step — the head sits in the same
+/// 16-byte transaction as the key.
+///
+/// Slot address math: `slot_addr = base + slot_idx * 16`. The kernel must
+/// emit `mul.lo.u32 slot_offset, slot_idx, 16` (the AoS PTX golden tests
+/// this) — Stage-2's `mul.wide.u32 ..., 8` (SoA) is the inverse golden.
+///
+/// ABI:
+///
+/// ```text
+/// .visible .entry bolt_hash_join_probe_aos(
+///     .param .u64 probe_keys_ptr,    // i64, length n_probe
+///     .param .u64 slots_ptr,         // [u8; cap * 16] AoS slots
+///     .param .u64 out_probe_idx_ptr, // u32, length out_capacity
+///     .param .u64 out_build_idx_ptr, // u32, length out_capacity
+///     .param .u64 out_counter_ptr,   // u32, single counter
+///     .param .u32 n_probe,
+///     .param .u32 cap,
+///     .param .u32 out_capacity
+/// )
+/// ```
+///
+/// **AoS slot layout note:** padding 4 bytes per slot raises hash-table
+/// memory by a factor of 16 / 12 = 1.33× vs SoA, but the fused-load wins
+/// on probe-bound workloads outweigh the extra capacity. Build kernel
+/// stays SoA in Stage 3 (CAS at offset 0 is layout-agnostic; we just
+/// haven't ported it).
+pub fn compile_probe_aos_kernel() -> BoltResult<String> {
+    let mut p = String::new();
+    writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
+    writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
+    writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    let entry = PROBE_AOS_KERNEL_ENTRY;
+    writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_2,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_3,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_4,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_5,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_6,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_7").map_err(write_err)?;
+    writeln!(p, ")").map_err(write_err)?;
+    writeln!(p, "{{").map_err(write_err)?;
+
+    writeln!(p, "\t.reg .pred  %p<8>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32   %r<32>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rd<24>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_5];").map_err(write_err)?; // n_probe
+    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    writeln!(p, "\tld.param.u32 %r5, [{entry}_param_6];").map_err(write_err)?; // cap
+    writeln!(p, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;                  // mask
+    writeln!(p, "\tmul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};").map_err(write_err)?;
+    writeln!(p, "\tld.param.u32 %r22, [{entry}_param_7];").map_err(write_err)?; // out_capacity
+
+    // Load probe key.
+    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+
+    // hash + slot.
+    writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
+    writeln!(p, "\tmul.lo.s64 %rl2, %rl0, %rl1;").map_err(write_err)?;
+    writeln!(p, "\tshr.u64 %rl3, %rl2, 32;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
+
+    // slots base pointer.
+    writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+
+    writeln!(p, "\tmov.s64 %rl4, {EMPTY_KEY_LITERAL};").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+
+    // PROBE_LOOP — AoS edition. Slot offset = slot_idx * 16. This is the
+    // load-bearing instruction the PTX golden test pins.
+    writeln!(p, "PROBE_LOOP:").map_err(write_err)?;
+    writeln!(p, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
+    writeln!(p, "\tsetp.gt.u32 %p3, %r21, %r20;").map_err(write_err)?;
+    writeln!(p, "\t@%p3 bra DONE;").map_err(write_err)?;
+
+    // slot_offset = slot_idx * 16. Golden: `mul.lo.u32 ..., ..., 16`.
+    writeln!(p, "\tmul.lo.u32 %r10, %r8, {AOS_SLOT_BYTES};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd5, %r10, 1;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
+
+    // Fused load: key (8B) + head (4B) + pad (4B). PTX doesn't have a
+    // 16-byte vector load on global memory at all generations; we use
+    // separate loads but pack them at adjacent offsets so the L1/L2
+    // line-fill brings both into the same transaction. Equivalent fused-
+    // load wins without needing ld.global.v4.
+    writeln!(p, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;       // key
+    writeln!(p, "\tld.global.u32 %r9, [%rd6 + 8];").map_err(write_err)?;   // head
+
+    // Empty slot -> no match.
+    writeln!(p, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
+    writeln!(p, "\t@%p1 bra DONE;").map_err(write_err)?;
+
+    // Key match -> claim output slot.
+    writeln!(p, "\tsetp.eq.s64 %p2, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(p, "\t@%p2 bra MATCH;").map_err(write_err)?;
+
+    // Advance.
+    writeln!(p, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
+
+    writeln!(p, "MATCH:").map_err(write_err)?;
+    // atom.add on counter.
+    writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r11, 1;").map_err(write_err)?;
+    writeln!(p, "\tatom.global.add.u32 %r12, [%rd8], %r11;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p4, %r12, %r22;").map_err(write_err)?;
+    writeln!(p, "\t@%p4 bra DONE;").map_err(write_err)?;
+
+    // out_probe_idx[claimed] = tid (%r3)
+    writeln!(p, "\tld.param.u64 %rd9, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd9, %rd9;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd10, %r12, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd11, %rd9, %rd10;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd11], %r3;").map_err(write_err)?;
+
+    // out_build_idx[claimed] = head (%r9)
+    writeln!(p, "\tld.param.u64 %rd12, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd12, %rd12;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd13, %rd12, %rd10;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd13], %r9;").map_err(write_err)?;
+
+    writeln!(p, "DONE:").map_err(write_err)?;
+    writeln!(p, "\tret;").map_err(write_err)?;
+    writeln!(p, "}}").map_err(write_err)?;
+    Ok(p)
+}
+
 /// Adapt a `std::fmt::Error` into a `BoltError`.
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("hash_join_kernel: write failed: {}", e))
@@ -1005,9 +1270,8 @@ mod tests {
         assert!(is_supported_key_dtype(DataType::Float32));
         assert!(is_supported_key_dtype(DataType::Float64));
         assert!(is_supported_key_dtype(DataType::Bool));
-        // Utf8 stays host-only — string interning + var-width encoding is
-        // a separate workstream.
-        assert!(!is_supported_key_dtype(DataType::Utf8));
+        // Stage 3: Utf8 via dict interning to i32 indices on the host.
+        assert!(is_supported_key_dtype(DataType::Utf8));
     }
 
     #[test]
@@ -1019,10 +1283,27 @@ mod tests {
         assert!(KeyShape::SingleF32.is_exact_in_i64());
         assert!(KeyShape::SingleF64.is_exact_in_i64());
         assert!(KeyShape::TwoI32.is_exact_in_i64());
+        // Stage-3: Utf8 keys are exact once host-interned to i32 dict idx.
+        assert!(KeyShape::SingleUtf8.is_exact_in_i64());
         // Lossy shapes: host folds to i64 by splitmix, false matches possible.
         assert!(!KeyShape::TwoI64.is_exact_in_i64());
         assert!(!KeyShape::MultiI32(3).is_exact_in_i64());
         assert!(!KeyShape::MultiI32(5).is_exact_in_i64());
+    }
+
+    /// Stage-3: only the lossy-fold shapes ask for host post-verify; every
+    /// other shape produces exact matches from the kernel.
+    #[test]
+    fn key_shape_needs_post_verify() {
+        assert!(!KeyShape::SingleI32.needs_host_post_verify());
+        assert!(!KeyShape::SingleI64.needs_host_post_verify());
+        assert!(!KeyShape::SingleBool.needs_host_post_verify());
+        assert!(!KeyShape::SingleF64.needs_host_post_verify());
+        assert!(!KeyShape::TwoI32.needs_host_post_verify());
+        assert!(!KeyShape::SingleUtf8.needs_host_post_verify());
+        assert!(KeyShape::TwoI64.needs_host_post_verify());
+        assert!(KeyShape::MultiI32(3).needs_host_post_verify());
+        assert!(KeyShape::MultiI32(8).needs_host_post_verify());
     }
 
     /// Header + signature shape — the byte-stable bits of every emitted PTX
@@ -1360,5 +1641,119 @@ mod tests {
         assert!(collision_probe.contains(&mul_literal));
         assert!(collision_build.contains("shr.u64 %rl3, %rl2, 32;"));
         assert!(collision_probe.contains("shr.u64 %rl3, %rl2, 32;"));
+    }
+
+    // ----- Stage 3 PTX-shape goldens --------------------------------------
+
+    /// Stage-3 entry-point names are also string-stable.
+    #[test]
+    fn stage3_entry_names_are_stable() {
+        assert_eq!(CROSS_KERNEL_ENTRY, "bolt_cross_join");
+        assert_eq!(PROBE_AOS_KERNEL_ENTRY, "bolt_hash_join_probe_aos");
+    }
+
+    /// CROSS kernel has the expected four-parameter ABI.
+    #[test]
+    fn cross_ptx_has_four_params() {
+        let ptx = compile_cross_kernel().unwrap();
+        for i in 0..4 {
+            let needle = format!("bolt_cross_join_param_{i}");
+            assert!(ptx.contains(&needle), "CROSS missing param {i}\n{ptx}");
+        }
+        assert!(!ptx.contains("bolt_cross_join_param_4"));
+    }
+
+    /// CROSS kernel computes `probe_idx = tid / n_build` and
+    /// `build_idx = tid % n_build`. Catches accidental swap of divisor.
+    #[test]
+    fn cross_ptx_emits_div_and_rem_against_n_build() {
+        let ptx = compile_cross_kernel().unwrap();
+        // div + rem on tid by n_build.
+        assert!(
+            ptx.contains("div.u32 %r6, %r3, %r5;"),
+            "CROSS must compute probe_idx = tid / n_build\n{ptx}"
+        );
+        assert!(
+            ptx.contains("rem.u32 %r7, %r3, %r5;"),
+            "CROSS must compute build_idx = tid % n_build\n{ptx}"
+        );
+    }
+
+    /// CROSS kernel writes exactly two u32 stores per thread (probe + build).
+    #[test]
+    fn cross_ptx_writes_two_u32_stores() {
+        let ptx = compile_cross_kernel().unwrap();
+        let n_st = ptx.matches("st.global.u32").count();
+        assert_eq!(
+            n_st, 2,
+            "CROSS must emit exactly two u32 stores (probe_idx + build_idx); saw {n_st}\n{ptx}"
+        );
+    }
+
+    /// CROSS kernel has the OOB guard against `total`.
+    #[test]
+    fn cross_ptx_has_oob_guard_against_total() {
+        let ptx = compile_cross_kernel().unwrap();
+        assert!(ptx.contains("setp.ge.u32 %p0, %r3, %r4;"));
+        assert!(ptx.contains("DONE:"));
+    }
+
+    /// AoS probe slot-offset math is `slot_idx * 16` — pinned because the
+    /// scalar multiply chooses the slot footprint. If a future refactor
+    /// switches AoS to a different slot size (e.g. drops the pad) this
+    /// test must be updated intentionally.
+    #[test]
+    fn probe_aos_ptx_uses_16byte_slot_stride() {
+        let ptx = compile_probe_aos_kernel().unwrap();
+        assert!(
+            ptx.contains(&format!("mul.lo.u32 %r10, %r8, {AOS_SLOT_BYTES};")),
+            "AoS probe must compute slot_offset = slot_idx * 16 (got AOS_SLOT_BYTES={AOS_SLOT_BYTES})\n{ptx}"
+        );
+        // Sanity: AOS_SLOT_BYTES is the documented 16.
+        assert_eq!(AOS_SLOT_BYTES, 16);
+    }
+
+    /// AoS probe loads the head u32 at slot_offset + 8 — i.e. immediately
+    /// after the i64 key in the same slot. Catches accidental drift toward
+    /// SoA-style separate-array indexing.
+    #[test]
+    fn probe_aos_ptx_loads_head_at_plus_eight() {
+        let ptx = compile_probe_aos_kernel().unwrap();
+        assert!(
+            ptx.contains("ld.global.u32 %r9, [%rd6 + 8];"),
+            "AoS probe must load head u32 at slot_addr + 8\n{ptx}"
+        );
+    }
+
+    /// AoS probe shares the Stage-1 hash function (so reads of a SoA-built
+    /// table by an AoS probe would line up if we ever cross-wire them).
+    #[test]
+    fn probe_aos_ptx_shares_stage1_hash_function() {
+        let ptx = compile_probe_aos_kernel().unwrap();
+        let mul_literal = format!("mov.s64 %rl1, {FX_MUL};");
+        assert!(ptx.contains(&mul_literal));
+        assert!(ptx.contains("shr.u64 %rl3, %rl2, 32;"));
+    }
+
+    /// AoS probe still uses atom.global.add for the output counter so
+    /// concurrent threads claim disjoint slots.
+    #[test]
+    fn probe_aos_ptx_uses_atom_add_for_counter() {
+        let ptx = compile_probe_aos_kernel().unwrap();
+        assert!(
+            ptx.contains("atom.global.add.u32"),
+            "AoS probe must use atom.global.add.u32 for the output counter\n{ptx}"
+        );
+    }
+
+    /// AoS slot bytes is exactly 16 (8B key + 4B head + 4B pad). The
+    /// padding is what lets the AoS layout fit two reads into one
+    /// 128-bit-aligned line; dropping it would defeat the bandwidth win
+    /// (the loads would straddle a cache line for slot_idx > 0).
+    #[test]
+    fn aos_slot_bytes_includes_padding() {
+        assert_eq!(AOS_SLOT_BYTES, 16);
+        // 8 (key) + 4 (head) + 4 (pad) = 16.
+        assert_eq!(8 + 4 + 4, AOS_SLOT_BYTES);
     }
 }
