@@ -256,6 +256,7 @@ impl<T: Pod> GpuBuffer<T> {
         }
         Ok(())
     }
+
 }
 
 impl GpuBuffer<u8> {

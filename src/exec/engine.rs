@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
@@ -635,7 +635,17 @@ impl Engine {
         kernel_params.push(&mut n_rows_u32 as *mut u32 as *mut c_void);
 
         // 5. Launch with one thread per row, block size 256.
-        let stream = CudaStream::null();
+        //
+        // Stage 2 async memcpy: we drive the entire query on a single per-call
+        // stream so the kernel launch and the subsequent D2H downloads chain
+        // naturally — the downloads see the kernel's writes without an
+        // explicit `cuStreamSynchronize` between launch and copy, and the
+        // final sync (just before we read the host buffers) is the only
+        // host/device barrier in the no-predicate path. `null_or_default`
+        // falls back to the NULL stream if `cuStreamCreate` fails (e.g. under
+        // the `cuda-stub` feature), so the engine still works in environments
+        // without real CUDA support.
+        let stream = CudaStream::null_or_default();
         let grid_x = grid_x_for(n_rows_u32, BLOCK_SIZE);
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
@@ -655,7 +665,11 @@ impl Engine {
         // Debug-only synchronize: pin any in-kernel fault to THIS launch
         // rather than letting it surface at the next CUDA API call.
         debug_sync_check()?;
-        stream.synchronize()?;
+        // NOTE: no `stream.synchronize()` here — the predicate / gather path
+        // and the async-D2H path below both run on the same stream and so are
+        // serialized after the kernel automatically. The single sync happens
+        // at the bottom of this function (or inside `gpu_compact` for the
+        // predicate path, which manages its own stream barriers).
 
         // 6. If the kernel has a predicate, run a separate predicate-only
         //    kernel to materialise a u8 mask. We default to GPU-side compaction
@@ -712,9 +726,26 @@ impl Engine {
                 out
             }
         } else {
+            // Stage 2 async D2H path: enqueue every output column's D2H on the
+            // per-query stream BEFORE synchronizing, then sync once and build
+            // the Arrow arrays from the now-valid host buffers. This is the
+            // simplest overlap win — the driver hands the copies off as a
+            // batch to the engine rather than stalling host-side between each
+            // column. (Pinned destination buffers are a Stage 3 follow-up;
+            // pageable `Vec<T>` still gets the ordering benefit even if not
+            // the peak bandwidth one.)
+            let mut staged: Vec<StagedDownload> = Vec::with_capacity(output_cols.len());
+            for col in &output_cols {
+                staged.push(col.stage_download_async(n_rows, &stream)?);
+            }
+            // Single host/device barrier for the whole batch of D2Hs (and the
+            // projection kernel, which is also on this stream).
+            stream.synchronize()?;
+            // The output_cols' device allocations can stay live (we just read
+            // their bytes); finalize host buffers into Arrow arrays.
             let mut full: Vec<ArrayRef> = Vec::with_capacity(output_cols.len());
-            for col in output_cols {
-                full.push(col.download(n_rows)?);
+            for (col, st) in output_cols.into_iter().zip(staged.into_iter()) {
+                full.push(col.finalize_download(st)?);
             }
             full
         };
@@ -764,6 +795,35 @@ impl QueryHandle {
     pub fn num_rows(&self) -> usize {
         self.batch.num_rows()
     }
+}
+
+/// Per-column host-side staging slot for the Stage 2 async D2H batch.
+///
+/// `DeviceCol::stage_download_async` allocates the host buffer up front and
+/// enqueues the D2H on the per-query stream. The buffer holds garbage until
+/// the stream is synchronized; `DeviceCol::finalize_download` consumes the
+/// staged buffer (now valid) and produces the Arrow `ArrayRef`. Splitting
+/// the API into stage / finalize lets the engine batch every column's D2H
+/// before the single host/device barrier at the end of the projection.
+enum StagedDownload {
+    /// `Vec<i32>` of length `n_rows`, valid post-sync.
+    I32(Vec<i32>),
+    /// `Vec<i64>` of length `n_rows`, valid post-sync.
+    I64(Vec<i64>),
+    /// `Vec<f32>` of length `n_rows`, valid post-sync.
+    F32(Vec<f32>),
+    /// `Vec<f64>` of length `n_rows`, valid post-sync.
+    F64(Vec<f64>),
+    /// One-byte-per-row representation; finalize maps `!= 0` to `true`.
+    Bool(Vec<u8>),
+    /// Utf8: i32 dictionary indices on the host, alongside the (already-host)
+    /// dictionary captured at stage time.
+    Utf8 {
+        /// Per-row dictionary indices; 0 = SQL NULL, >0 = position+1.
+        indices: Vec<i32>,
+        /// Owned copy of the source dictionary (host-side strings).
+        dictionary: Vec<String>,
+    },
 }
 
 /// Heterogenous owned device column. Keeps each `GpuVec<T>` alive past the kernel launch.
@@ -833,6 +893,103 @@ impl DeviceCol {
             d.dictionary = dict;
         }
     }
+
+    /// Stage 2 async D2H: enqueue a copy of this column into freshly allocated
+    /// host buffers on `stream` and return a `StagedDownload` parking those
+    /// buffers. The caller MUST synchronize `stream` before passing the result
+    /// to [`finalize_download`] — until then the host buffers contain garbage.
+    fn stage_download_async(
+        &self,
+        n_rows: usize,
+        stream: &CudaStream,
+    ) -> BoltResult<StagedDownload> {
+        // Helper: alloc a pageable Vec<T> sized for n_rows, then enqueue an
+        // async D2H from the underlying GpuVec's buffer. Returns the Vec with
+        // its length already set — the bytes are not valid until the stream
+        // has been synchronized, but `Vec<T: Pod>` is byte-only so this is
+        // sound provided the caller honours the contract.
+        fn stage_vec<T: bytemuck::Pod>(
+            v: &GpuVec<T>,
+            n_rows: usize,
+            stream: &CudaStream,
+        ) -> BoltResult<Vec<T>> {
+            let mut out: Vec<T> = vec![T::zeroed(); n_rows];
+            if n_rows > 0 {
+                // SAFETY: `out` was just sized to `n_rows` and is contiguous;
+                // we enqueue exactly that many element-bytes of D2H.
+                unsafe {
+                    cuda_sys::memcpy_d2h_async::<T>(
+                        out.as_mut_ptr(),
+                        v.device_ptr(),
+                        n_rows,
+                        stream.raw(),
+                    )?;
+                }
+            }
+            Ok(out)
+        }
+
+        match self {
+            DeviceCol::I32(v) => Ok(StagedDownload::I32(stage_vec::<i32>(v, n_rows, stream)?)),
+            DeviceCol::I64(v) => Ok(StagedDownload::I64(stage_vec::<i64>(v, n_rows, stream)?)),
+            DeviceCol::F32(v) => Ok(StagedDownload::F32(stage_vec::<f32>(v, n_rows, stream)?)),
+            DeviceCol::F64(v) => Ok(StagedDownload::F64(stage_vec::<f64>(v, n_rows, stream)?)),
+            DeviceCol::Bool(v) => Ok(StagedDownload::Bool(stage_vec::<u8>(v, n_rows, stream)?)),
+            DeviceCol::Utf8(d) => {
+                // Stage the i32 indices asynchronously; the host-side
+                // dictionary is already on the host so no further D2H is
+                // needed. Borrow it for finalize via clone — `Vec<String>` is
+                // cheap relative to a column download.
+                let indices = stage_vec::<i32>(&d.indices, n_rows, stream)?;
+                Ok(StagedDownload::Utf8 {
+                    indices,
+                    dictionary: d.dictionary.clone(),
+                })
+            }
+        }
+    }
+
+    /// Stage-2 companion: build the Arrow array from a `StagedDownload` after
+    /// the owning stream has been synchronized.
+    fn finalize_download(self, staged: StagedDownload) -> BoltResult<ArrayRef> {
+        match staged {
+            StagedDownload::I32(host) => Ok(Arc::new(Int32Array::from(host)) as ArrayRef),
+            StagedDownload::I64(host) => Ok(Arc::new(Int64Array::from(host)) as ArrayRef),
+            StagedDownload::F32(host) => Ok(Arc::new(Float32Array::from(host)) as ArrayRef),
+            StagedDownload::F64(host) => Ok(Arc::new(Float64Array::from(host)) as ArrayRef),
+            StagedDownload::Bool(host) => {
+                let bools: Vec<bool> = host.into_iter().map(|b| b != 0).collect();
+                Ok(Arc::new(BooleanArray::from(bools)) as ArrayRef)
+            }
+            StagedDownload::Utf8 { indices, dictionary } => {
+                // Mirror DictionaryColumn::to_string_array but over the
+                // already-on-host indices buffer.
+                let mut out: Vec<Option<&str>> = Vec::with_capacity(indices.len());
+                for &idx in &indices {
+                    if idx == 0 {
+                        out.push(None);
+                    } else if idx < 0 {
+                        return Err(BoltError::Other(format!(
+                            "dictionary decode: negative index {} (NULL is encoded as 0)",
+                            idx
+                        )));
+                    } else {
+                        let pos = (idx as usize) - 1;
+                        let s = dictionary.get(pos).ok_or_else(|| {
+                            BoltError::Other(format!(
+                                "dictionary decode: index {} out of range (dictionary size {})",
+                                idx,
+                                dictionary.len()
+                            ))
+                        })?;
+                        out.push(Some(s.as_str()));
+                    }
+                }
+                Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+            }
+        }
+    }
+
 
     /// Copy the device column back to a host Arrow array of length `n_rows`.
     fn download(self, n_rows: usize) -> BoltResult<ArrayRef> {
@@ -935,16 +1092,23 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 
 #[cfg(test)]
 mod tests {
-    //! Online tests for the lazy-upload `register_batch` path.
+    //! Online tests for the lazy-upload `register_batch` path and the Stage 2
+    //! async-memcpy wiring in `execute_projection`.
     //!
-    //! These tests exist to lock in the fix for the O(N²) PCIe re-upload bug
+    //! The lazy-upload tests lock in the fix for the O(N²) PCIe re-upload bug
     //! described on the `gpu_tables` field: appending N batches must not cost
     //! `1+2+…+N` batches' worth of host→device traffic. They verify the
     //! observable correctness of the lazy path (rows from every appended batch
-    //! are visible to the next query). They're `#[ignore]`'d because they
-    //! launch real kernels — run with `cargo test -- --ignored` on a GPU host.
+    //! are visible to the next query).
+    //!
+    //! The Stage 2 tests cover the per-query-stream + async-D2H path —
+    //! both the no-predicate and predicate flows — so any regression in the
+    //! stream chaining surfaces as a value mismatch rather than a CUDA error.
+    //!
+    //! All tests are `#[ignore]`'d because they launch real kernels — run
+    //! with `cargo test -- --ignored` on a GPU host.
     use super::*;
-    use arrow_array::Int64Array;
+    use arrow_array::{Int32Array, Int64Array};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
 
@@ -1017,5 +1181,73 @@ mod tests {
         let sum: i64 = (0..actual.len()).map(|i| actual.value(i)).sum();
         let expected_sum: i64 = (0..total_rows as i64).sum();
         assert_eq!(sum, expected_sum, "sum of x column across all 10 batches");
+    }
+
+    /// Verify that a bare projection still returns the right rows after the
+    /// kernel launch and D2H downloads moved onto a per-query stream with
+    /// async copies. Mirrors what the synchronous path was previously
+    /// asserting — same input, same expected output — so any regression in
+    /// the stream-flow shows up as a value mismatch rather than a CUDA error.
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime — Stage 2 async D2H correctness"]
+    fn execute_projection_async_d2h_round_trip() {
+        let mut engine = Engine::new().expect("engine init");
+
+        // Single-column Int32 table: [1, 2, 3, 4, 5].
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1i32, 2, 3, 4, 5]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).expect("batch");
+        engine.register_table("t", batch).expect("register");
+
+        // Plain projection — no predicate, so the new async-D2H batch path
+        // is exercised end-to-end.
+        let handle = engine.sql("SELECT x FROM t").expect("query");
+        let out = handle.record_batch();
+
+        assert_eq!(out.num_rows(), 5);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32");
+        let got: Vec<i32> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Same shape, but with a WHERE clause so the predicate path is the one
+    /// exercised. The Stage 2 patch removed the explicit
+    /// `stream.synchronize()` after the projection kernel — the predicate
+    /// kernel's own internal sync (inside `launch_predicate_kernel`) now
+    /// covers both, and any regression in that chain surfaces here.
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime — Stage 2 stream chaining w/ predicate"]
+    fn execute_projection_with_predicate_under_async_stream() {
+        let mut engine = Engine::new().expect("engine init");
+
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1i32, 2, 3, 4, 5]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).expect("batch");
+        engine.register_table("t", batch).expect("register");
+
+        let handle = engine
+            .sql("SELECT x FROM t WHERE x > 2")
+            .expect("query");
+        let out = handle.record_batch();
+
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32");
+        let got: Vec<i32> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec![3, 4, 5]);
     }
 }

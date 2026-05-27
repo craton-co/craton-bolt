@@ -77,6 +77,21 @@ impl CudaStream {
         })
     }
 
+    /// Create a non-blocking stream, falling back to the NULL stream if the
+    /// driver call fails (e.g. when the engine is being driven through the
+    /// `cuda-stub` feature or on a host with no device).
+    ///
+    /// Used by the Stage 2 async-memcpy wiring: per-query streams are a pure
+    /// perf optimisation, so a creation failure must not break the executor
+    /// — it just degrades to the legacy single-stream behaviour, which is
+    /// what we had before Stage 1.
+    pub fn null_or_default() -> Self {
+        match Self::new() {
+            Ok(s) => s,
+            Err(_) => Self::null(),
+        }
+    }
+
     /// Raw handle accessor for the driver FFI.
     pub fn raw(&self) -> CUstream {
         self.raw

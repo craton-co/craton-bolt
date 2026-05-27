@@ -29,7 +29,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 
 use crate::cuda::buffer::GpuBuffer;
-use crate::cuda::cuda_sys::CUdeviceptr;
+use crate::cuda::cuda_sys::{CUdeviceptr, CUstream};
 use crate::error::BoltResult;
 
 /// Owned, typed handle to a column of `T` on the GPU.
@@ -119,6 +119,24 @@ impl<T: Pod> GpuVec<T> {
     /// Copy the vec back to a host `Vec<T>` (synchronous).
     pub fn to_vec(&self) -> BoltResult<Vec<T>> {
         self.buffer.to_vec()
+    }
+
+    // ----- Stage 2 async memcpy entry points ------------------------------
+
+    /// Allocate a device vec and enqueue an async H2D from `slice` on `stream`.
+    /// Returns immediately; the device contents are not valid until `stream`
+    /// is synchronized. `slice` must remain live and unmodified until then.
+    pub fn from_slice_async(slice: &[T], stream: CUstream) -> BoltResult<Self> {
+        let mut buffer = GpuBuffer::<T>::with_capacity(slice.len())?;
+        buffer.copy_from_async(slice, stream)?;
+        Ok(Self { buffer })
+    }
+
+    /// Enqueue an async D2H copy of this vec into `dst` on `stream`. `dst.len()`
+    /// must equal `self.len()`. The host slice is not safe to read until the
+    /// stream has been synchronized.
+    pub fn copy_to_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
+        self.buffer.copy_to_async(dst, stream)
     }
 }
 
