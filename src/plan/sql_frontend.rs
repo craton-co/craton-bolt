@@ -24,6 +24,147 @@ pub trait TableProvider {
     fn schema(&self, name: &str) -> BoltResult<Schema>;
 }
 
+/// In-FROM-scope name resolver: maps `table.col` (and bare `col`) references in
+/// the SELECT/WHERE clauses to the output column names produced by the
+/// FROM-tree (a base Scan, possibly extended by one or more INNER JOINs).
+///
+/// Built incrementally as the planner walks the FROM tree so its rename
+/// convention stays in lockstep with [`join_combined_schema`](crate::plan::logical_plan::join_combined_schema):
+/// the leftmost table whose column name appears wins the bare name; every
+/// later collision is renamed to `right.{col}` (with `__N` suffixes if even
+/// that collides).
+///
+/// The resolver intentionally borrows nothing from the FROM-tree plan — it
+/// owns its own (table_name, output_col) mapping so it remains valid after
+/// the planner moves the plan into `LogicalPlan::Join` boxes.
+#[derive(Debug, Default)]
+struct NameResolver {
+    /// One scope per table in FROM order (base first, then joined tables).
+    tables: Vec<TableScope>,
+}
+
+/// One table's contribution to a [`NameResolver`].
+#[derive(Debug)]
+struct TableScope {
+    /// Table name as it appears in FROM (no aliases — we don't support those yet).
+    name: String,
+    /// For each column of the table's original schema, the *output* column name
+    /// it produces in the FROM-tree's combined schema. Indices align with the
+    /// original [`Schema::fields`] order.
+    cols: Vec<TableCol>,
+}
+
+/// One column in a [`TableScope`]: the user-typeable name (as it appeared in
+/// the table's schema) plus the name that name maps to after JOIN renaming.
+#[derive(Debug)]
+struct TableCol {
+    /// The original (qualifier-local) column name — what `table.col` matches.
+    original: String,
+    /// The output column name in the FROM-tree's combined schema.
+    output: String,
+}
+
+impl NameResolver {
+    /// Empty resolver (no tables in scope). Used by `lower_order_by`, where
+    /// expressions run *after* projection so the FROM-tree's table qualifiers
+    /// are no longer meaningful. With no tables, `Identifier` still lowers to
+    /// a column ref (downstream type-checking validates the name), but
+    /// `CompoundIdentifier` is rejected because no qualifier can match.
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Push the base table scope. Each column maps to its own original name —
+    /// the base table is always the leftmost contributor, so nothing is
+    /// renamed yet.
+    fn push_base(&mut self, name: String, schema: &Schema) {
+        let cols = schema
+            .fields
+            .iter()
+            .map(|f| TableCol {
+                original: f.name.clone(),
+                output: f.name.clone(),
+            })
+            .collect();
+        self.tables.push(TableScope { name, cols });
+    }
+
+    /// Push a joined table scope. Applies the same rename rule as
+    /// [`join_combined_schema`]: a right-side column whose name already
+    /// appears in the accumulated taken-set is renamed to `right.{col}`,
+    /// with `__2`, `__3`, … suffixes appended as a last resort if even the
+    /// qualified form clashes. Keeping this rule in lockstep with that
+    /// function is the whole point of routing through both call sites.
+    fn push_join(&mut self, name: String, schema: &Schema) {
+        // Build the snapshot of names already taken across all previous
+        // scopes' *output* names. This mirrors `join_combined_schema`'s
+        // pass-by-pass accumulation: each new right side sees everything
+        // produced so far on its left, not just the immediately preceding
+        // table.
+        let mut taken: std::collections::HashSet<String> = self
+            .tables
+            .iter()
+            .flat_map(|t| t.cols.iter().map(|c| c.output.clone()))
+            .collect();
+        let mut cols = Vec::with_capacity(schema.fields.len());
+        for f in &schema.fields {
+            let mut out_name = if taken.contains(&f.name) {
+                format!("right.{}", f.name)
+            } else {
+                f.name.clone()
+            };
+            // Final-resort uniqueness suffix; only triggers if even the
+            // qualified form collides (e.g. an actual `right.x` column on
+            // the left side).
+            if taken.contains(&out_name) {
+                let base = out_name.clone();
+                let mut i = 2usize;
+                loop {
+                    let candidate = format!("{base}__{i}");
+                    if !taken.contains(&candidate) {
+                        out_name = candidate;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            taken.insert(out_name.clone());
+            cols.push(TableCol {
+                original: f.name.clone(),
+                output: out_name,
+            });
+        }
+        self.tables.push(TableScope { name, cols });
+    }
+
+    /// Resolve `qualifier.col` to its output column name in the FROM-tree's
+    /// combined schema.
+    ///
+    /// Errors with a clear message if the qualifier matches no in-scope table
+    /// or the column doesn't exist in the qualified table's schema.
+    fn resolve_compound(&self, qualifier: &str, col: &str) -> BoltResult<String> {
+        let scope = self
+            .tables
+            .iter()
+            .find(|t| t.name == qualifier)
+            .ok_or_else(|| {
+                BoltError::Sql(format!(
+                    "unknown table qualifier '{qualifier}' in column reference '{qualifier}.{col}'"
+                ))
+            })?;
+        let resolved = scope
+            .cols
+            .iter()
+            .find(|c| c.original == col)
+            .ok_or_else(|| {
+                BoltError::Sql(format!(
+                    "unknown column '{col}' in table '{qualifier}'"
+                ))
+            })?;
+        Ok(resolved.output.clone())
+    }
+}
+
 /// In-memory `name → Schema` provider; useful in tests and as a default.
 #[derive(Debug, Default, Clone)]
 pub struct MemTableProvider {
@@ -242,6 +383,12 @@ fn collect_union_branches(
 /// direction is ASC; the default NULL placement follows SQL convention
 /// (NULLS FIRST for ASC, NULLS LAST for DESC) when the user omits it.
 fn lower_order_by(exprs: &[OrderByExpr]) -> BoltResult<Vec<SortExpr>> {
+    // ORDER BY runs outside the FROM-tree (after projection), so no table
+    // qualifiers are in scope. We pass an empty resolver; bare identifiers
+    // still lower as column refs against the post-projection schema, and
+    // any stray `table.col` ref will fall through to a clean "unknown
+    // table qualifier" error.
+    let resolver = NameResolver::empty();
     let mut out = Vec::with_capacity(exprs.len());
     for OrderByExpr {
         expr,
@@ -265,7 +412,7 @@ fn lower_order_by(exprs: &[OrderByExpr]) -> BoltResult<Vec<SortExpr>> {
             None => !descending,
         };
         out.push(SortExpr {
-            expr: lower_expr(expr)?,
+            expr: lower_expr(expr, &resolver)?,
             descending,
             nulls_first,
         });
@@ -315,6 +462,11 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     // Build the base Scan from the first table reference.
     let (table_name, scan_schema) = lower_table_factor(&twj.relation, provider)?;
     let schema = scan_schema.clone();
+    // The name resolver tracks the FROM-tree's `table.col` namespace so we
+    // can resolve qualified references in WHERE / SELECT / GROUP BY / HAVING
+    // (the ON-clause lowerer keeps its own simpler path — see `lower_join_side`).
+    let mut resolver = NameResolver::empty();
+    resolver.push_base(table_name.clone(), &scan_schema);
     let mut plan = LogicalPlan::Scan {
         table: table_name,
         projection: None,
@@ -357,6 +509,10 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
             }
         };
         let (rhs_table, rhs_schema) = lower_table_factor(&join.relation, provider)?;
+        // Extend the resolver before we move `rhs_table` / `rhs_schema` into
+        // the right-side Scan, so it sees the same rename rule as
+        // `join_combined_schema` applies to the actual plan output.
+        resolver.push_join(rhs_table.clone(), &rhs_schema);
         let right_plan = LogicalPlan::Scan {
             table: rhs_table,
             projection: None,
@@ -383,7 +539,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
 
     // WHERE
     if let Some(filter_sql) = &select.selection {
-        let predicate = lower_expr(filter_sql)?;
+        let predicate = lower_expr(filter_sql, &resolver)?;
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate,
@@ -427,7 +583,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
 
     let has_agg_in_select = items
         .iter()
-        .map(|(e, _)| try_aggregate(e))
+        .map(|(e, _)| try_aggregate(e, &resolver))
         .collect::<BoltResult<Vec<_>>>()?
         .iter()
         .any(|o| o.is_some());
@@ -438,7 +594,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         // post-aggregate scalar work (e.g. `SUM(a) + 1`) is rejected up front.
         let group_by: Vec<Expr> = group_by_sql
             .iter()
-            .map(|e| lower_expr(e))
+            .map(|e| lower_expr(e, &resolver))
             .collect::<BoltResult<_>>()?;
 
         let mut aggregates: Vec<AggregateExpr> = Vec::new();
@@ -455,7 +611,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         let mut select_sources: Vec<SelectSource> = Vec::new();
 
         for (sql_expr, alias) in &items {
-            if let Some(agg) = try_aggregate(sql_expr)? {
+            if let Some(agg) = try_aggregate(sql_expr, &resolver)? {
                 if alias.is_some() {
                     return Err(BoltError::Sql(
                         "unsupported: alias on aggregate expression".into(),
@@ -467,12 +623,12 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
                 continue;
             }
             // Non-aggregate: must contain no nested aggregate (no post-aggregate exprs).
-            if contains_aggregate(sql_expr)? {
+            if contains_aggregate(sql_expr, &resolver)? {
                 return Err(BoltError::Sql(
                     "post-aggregate expressions not yet supported".into(),
                 ));
             }
-            let lowered = lower_expr(sql_expr)?;
+            let lowered = lower_expr(sql_expr, &resolver)?;
             // Must match some declared GROUP BY key by structural equality of the lowered form.
             if !group_by.iter().any(|g| expr_eq(g, &lowered)) {
                 return Err(BoltError::Sql(
@@ -548,7 +704,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         }
         let mut exprs = Vec::with_capacity(items.len());
         for (sql_expr, alias) in items {
-            let lowered = lower_expr(&sql_expr)?;
+            let lowered = lower_expr(&sql_expr, &resolver)?;
             let lowered = match alias {
                 Some(name) => lowered.alias(name),
                 None => lowered,
@@ -573,7 +729,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     // it. Non-aggregate sub-expressions go through the regular
     // `lower_expr`, which also handles bare group-key columns.
     if let Some(having_sql) = &select.having {
-        let predicate = lower_expr_in_having(having_sql)?;
+        let predicate = lower_expr_in_having(having_sql, &resolver)?;
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate,
@@ -754,7 +910,7 @@ fn single_ident_from_object_name(name: &ObjectName) -> BoltResult<String> {
 }
 
 /// Recognize a top-level aggregate function call. Returns `Ok(None)` for non-aggregates.
-fn try_aggregate(e: &SqlExpr) -> BoltResult<Option<AggregateExpr>> {
+fn try_aggregate(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Option<AggregateExpr>> {
     let func = match e {
         SqlExpr::Function(f) => f,
         _ => return Ok(None),
@@ -837,7 +993,7 @@ fn try_aggregate(e: &SqlExpr) -> BoltResult<Option<AggregateExpr>> {
     };
 
     let inner = match arg_expr {
-        Some(e) => lower_expr(e)?,
+        Some(e) => lower_expr(e, resolver)?,
         None => {
             if kind != "COUNT" {
                 return Err(BoltError::Sql(format!("{kind}(*) is not supported")));
@@ -858,16 +1014,16 @@ fn try_aggregate(e: &SqlExpr) -> BoltResult<Option<AggregateExpr>> {
 }
 
 /// True if `e` contains any aggregate function call (anywhere in the tree).
-fn contains_aggregate(e: &SqlExpr) -> BoltResult<bool> {
-    if try_aggregate(e)?.is_some() {
+fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<bool> {
+    if try_aggregate(e, resolver)?.is_some() {
         return Ok(true);
     }
     match e {
         SqlExpr::BinaryOp { left, right, .. } => {
-            Ok(contains_aggregate(left)? || contains_aggregate(right)?)
+            Ok(contains_aggregate(left, resolver)? || contains_aggregate(right, resolver)?)
         }
-        SqlExpr::UnaryOp { expr, .. } => contains_aggregate(expr),
-        SqlExpr::Nested(inner) => contains_aggregate(inner),
+        SqlExpr::UnaryOp { expr, .. } => contains_aggregate(expr, resolver),
+        SqlExpr::Nested(inner) => contains_aggregate(inner, resolver),
         _ => Ok(false),
     }
 }
@@ -878,16 +1034,16 @@ fn contains_aggregate(e: &SqlExpr) -> BoltResult<bool> {
 /// aggregate (per `aggregate_output_name`). Everything else delegates to
 /// `lower_expr`, which keeps the usual rules — bare columns become column
 /// refs, non-aggregate function calls are still rejected, etc.
-fn lower_expr_in_having(e: &SqlExpr) -> BoltResult<Expr> {
-    if let Some(agg) = try_aggregate(e)? {
+fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
+    if let Some(agg) = try_aggregate(e, resolver)? {
         return Ok(Expr::Column(aggregate_output_name(&agg)));
     }
     match e {
-        SqlExpr::Nested(inner) => lower_expr_in_having(inner),
+        SqlExpr::Nested(inner) => lower_expr_in_having(inner, resolver),
         SqlExpr::BinaryOp { left, op, right } => {
             let lop = lower_binary_op(op)?;
-            let l = lower_expr_in_having(left)?;
-            let r = lower_expr_in_having(right)?;
+            let l = lower_expr_in_having(left, resolver)?;
+            let r = lower_expr_in_having(right, resolver)?;
             Ok(Expr::Binary {
                 op: lop,
                 left: Box::new(l),
@@ -895,13 +1051,13 @@ fn lower_expr_in_having(e: &SqlExpr) -> BoltResult<Expr> {
             })
         }
         SqlExpr::UnaryOp { op, expr } => match op {
-            UnaryOperator::Plus => lower_expr_in_having(expr),
+            UnaryOperator::Plus => lower_expr_in_having(expr, resolver),
             UnaryOperator::Minus => {
                 // Re-use the aggregate-aware lowerer for the operand, then
                 // negate by hand (we can't fall through to `negate_expr`
                 // because it would route through `lower_expr` and reject
                 // any aggregate call nested under the unary minus).
-                let inner = lower_expr_in_having(expr)?;
+                let inner = lower_expr_in_having(expr, resolver)?;
                 Ok(Expr::Binary {
                     op: BinaryOp::Sub,
                     left: Box::new(Expr::Literal(Literal::Int64(0))),
@@ -915,24 +1071,47 @@ fn lower_expr_in_having(e: &SqlExpr) -> BoltResult<Expr> {
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
         // still rejects bare non-aggregate Function calls).
-        _ => lower_expr(e),
+        _ => lower_expr(e, resolver),
     }
 }
 
 /// Lower a scalar SQL expression into our `Expr`. Aggregates are rejected here —
 /// callers must split them off via `try_aggregate` first.
-fn lower_expr(e: &SqlExpr) -> BoltResult<Expr> {
+///
+/// Qualified column references (`table.col`) are resolved against `resolver`
+/// to the output column name produced by the FROM-tree's combined schema;
+/// see [`NameResolver`] for the rule. Bare `col` references pass through as
+/// `Expr::Column(col)` — downstream type-checking validates that the name
+/// exists in scope and (for JOINs) follows the leftmost-wins convention
+/// enforced by [`join_combined_schema`](crate::plan::logical_plan::join_combined_schema).
+fn lower_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
     match e {
         SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
-        SqlExpr::CompoundIdentifier(_) => Err(BoltError::Sql(
-            "unsupported: qualified column references (no table aliases yet)".into(),
-        )),
+        SqlExpr::CompoundIdentifier(parts) => {
+            // We currently only support a single `table.column` qualifier
+            // (no schema-qualified or struct-field forms). The frontend has
+            // no schema/database concept, so anything deeper is meaningless.
+            if parts.len() != 2 {
+                return Err(BoltError::Sql(format!(
+                    "unsupported: deeply qualified column reference '{}'",
+                    parts
+                        .iter()
+                        .map(|p| p.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                )));
+            }
+            let qualifier = &parts[0].value;
+            let col = &parts[1].value;
+            let resolved = resolver.resolve_compound(qualifier, col)?;
+            Ok(Expr::Column(resolved))
+        }
         SqlExpr::Value(v) => lower_value(v),
-        SqlExpr::Nested(inner) => lower_expr(inner),
+        SqlExpr::Nested(inner) => lower_expr(inner, resolver),
         SqlExpr::BinaryOp { left, op, right } => {
             let lop = lower_binary_op(op)?;
-            let l = lower_expr(left)?;
-            let r = lower_expr(right)?;
+            let l = lower_expr(left, resolver)?;
+            let r = lower_expr(right, resolver)?;
             Ok(Expr::Binary {
                 op: lop,
                 left: Box::new(l),
@@ -940,8 +1119,8 @@ fn lower_expr(e: &SqlExpr) -> BoltResult<Expr> {
             })
         }
         SqlExpr::UnaryOp { op, expr } => match op {
-            UnaryOperator::Plus => lower_expr(expr),
-            UnaryOperator::Minus => negate_expr(expr),
+            UnaryOperator::Plus => lower_expr(expr, resolver),
+            UnaryOperator::Minus => negate_expr(expr, resolver),
             other => Err(BoltError::Sql(format!(
                 "unsupported unary operator: {other:?}"
             ))),
@@ -995,7 +1174,7 @@ fn parse_number(n: &str) -> BoltResult<Expr> {
 /// The asymmetric `i64` range (`MIN = -2^63`, `MAX = 2^63 - 1`) is handled by
 /// trying `i64::from_str` on the *negated* string, which succeeds at `i64::MIN`
 /// even though `2^63` does not fit in a positive `i64`.
-fn negate_expr(e: &SqlExpr) -> BoltResult<Expr> {
+fn negate_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
     if let SqlExpr::Value(Value::Number(n, _)) = e {
         // Common case: positive literal fits in i64; just negate.
         if let Ok(i) = n.parse::<i64>() {
@@ -1019,7 +1198,7 @@ fn negate_expr(e: &SqlExpr) -> BoltResult<Expr> {
         }
         return Err(BoltError::Sql(format!("invalid number literal '{n}'")));
     }
-    let inner = lower_expr(e)?;
+    let inner = lower_expr(e, resolver)?;
     Ok(Expr::Binary {
         op: BinaryOp::Sub,
         left: Box::new(Expr::Literal(Literal::Int64(0))),
@@ -1362,6 +1541,50 @@ mod wave7_tests {
         assert!(
             matches!(phys, PhysicalPlan::Join { .. }),
             "expected PhysicalPlan::Join, got {phys:?}"
+        );
+    }
+
+    #[test]
+    fn join_select_qualified_columns_resolve_with_rename() {
+        // `t1` and `t2` both have a column named `a`; per
+        // `join_combined_schema`, the right-side `a` is renamed to
+        // `right.a` in the join's output. The resolver must mirror that
+        // rule so `t2.a` lowers to `Column("right.a")` (matching the
+        // wildcard-expansion convention) while `t1.a` stays as
+        // `Column("a")`.
+        let plan = lp("SELECT t1.a, t2.a FROM t1 INNER JOIN t2 ON t1.a = t2.a");
+        match plan {
+            LogicalPlan::Project { exprs, .. } => {
+                assert_eq!(exprs.len(), 2, "expected two columns, got {exprs:?}");
+                match (&exprs[0], &exprs[1]) {
+                    (Expr::Column(left), Expr::Column(right)) => {
+                        assert_eq!(left, "a", "t1.a should keep bare name");
+                        assert_eq!(
+                            right, "right.a",
+                            "t2.a should resolve to the post-rename `right.a`"
+                        );
+                    }
+                    other => panic!("expected two Column refs, got {other:?}"),
+                }
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_select_unknown_qualifier_errors() {
+        // `t3` isn't in FROM at all. The resolver must produce a clear
+        // "unknown table qualifier" message; pre-fix the entire
+        // CompoundIdentifier path errored generically.
+        let err = parse(
+            "SELECT t3.a FROM t1 INNER JOIN t2 ON t1.a = t2.a",
+            &provider(),
+        )
+        .expect_err("unknown qualifier must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown table qualifier"),
+            "expected 'unknown table qualifier', got: {msg}"
         );
     }
 }
