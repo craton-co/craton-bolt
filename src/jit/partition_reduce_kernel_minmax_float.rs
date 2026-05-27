@@ -282,6 +282,11 @@ pub fn compile_partition_reduce_kernel_minmax_float(
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
+    // MATCH path: fence between the set CAS and the key load — PTX
+    // sm_70 has no inter-address ordering, so without membar.cta a
+    // racing thread can read a still-zeroed key under set==1 and
+    // false-match key 0.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -294,9 +299,10 @@ pub fn compile_partition_reduce_kernel_minmax_float(
     .map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: publish key, then enter the CAS-loop to set the val.
+    // CLAIM: publish key, fence, then enter the CAS-loop to set the val.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     emit_cas_loop(&mut ptx, op, dtype, "CLAIM_CAS", val_reg)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 

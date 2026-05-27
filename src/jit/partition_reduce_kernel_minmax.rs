@@ -306,7 +306,11 @@ pub fn compile_partition_reduce_kernel_minmax(
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // Else: slot occupied. Compare keys.
+    // Else: slot occupied. membar.cta orders the CAS (block_set) against
+    // the upcoming key load (block_keys, a different address) — without
+    // this PTX sm_70 lets a racing thread see set==1 yet read a still-
+    // zeroed key, false-matching key 0.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -320,9 +324,10 @@ pub fn compile_partition_reduce_kernel_minmax(
     .map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: publish key, then atom.<op> the val.
+    // CLAIM: publish key, fence, then atom.<op> the val.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     let scratch_reg = if dtype == MinMaxDtype::Int64 { "%rd42" } else { "%r42" };
     writeln!(ptx, "\t{atom_op} {scratch_reg}, [%rd38], {val_reg};").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;

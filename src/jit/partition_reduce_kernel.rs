@@ -89,6 +89,14 @@
 //!   = 16 KiB per block, comfortably under the 48 KiB sm_70 static budget.
 //! * `atom.shared.cas.b32` is sm_60+. `atom.shared.add.f64` is sm_60+. We
 //!   target sm_70 (matching the rest of `jit/`).
+//! * The CAS on `block_set[slot]` and the subsequent st/ld on
+//!   `block_keys[slot]` touch DIFFERENT addresses, so PTX gives no
+//!   inter-address ordering on sm_70 without an explicit `membar.cta`.
+//!   The CLAIM path emits `membar.cta` between the key store and the val
+//!   atomic; the MATCH path emits `membar.cta` between observing set==1
+//!   and loading the key. Without these fences, a racing thread could
+//!   observe set==1 yet read a still-zeroed `block_keys[slot]` and
+//!   false-match key 0 — corrupting the sum.
 //! * Probe wrap (`(slot + 1) & mask`) uses `add.u32` + `and.b32` rather
 //!   than modulo, since BLOCK_GROUPS is a power of two.
 
@@ -346,14 +354,14 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // Else: slot was occupied. Load the existing key and compare. The
-    // claim path writes the key BEFORE issuing the val atomic, but on
-    // sm_70+ we still need the key store to be visible to other warps
-    // before they read it — atom.shared.cas is a sequentially-consistent
-    // fence inside shared memory, so any thread that observes set==1
-    // here is guaranteed to subsequently observe the key store via
-    // ld.shared. (The shared-memory model is sequentially-consistent
-    // for the same address within a CTA.)
+    // Else: slot was occupied. PTX gives no inter-address ordering between
+    // the CAS on block_set[slot] and the publishing thread's subsequent
+    // st.shared.u32 on block_keys[slot] — those touch different addresses.
+    // Insert a membar.cta here so this thread, having observed set==1 via
+    // its own CAS, sees the winner's key store (which is ordered before
+    // its own membar.cta on the CLAIM path). Without this fence a racing
+    // thread can read a still-zeroed key and false-match key 0.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -367,11 +375,12 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     .map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: this thread won the slot. Publish the key, then issue the
-    // val atomic. Key store before val atomic gives later readers a
-    // committed view via the same address ordering.
+    // CLAIM: this thread won the slot. Publish the key, then fence so
+    // racing MATCH-path readers (which insert their own membar.cta after
+    // observing set==1) can never see a zeroed key under set==1.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tatom.shared.add.f64 %fd1, [%rd38], %fd0;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
@@ -510,6 +519,40 @@ mod tests {
         assert!(
             ptx.contains("atom.shared.cas.b32"),
             "PTX must issue atom.shared.cas.b32 to claim a slot:\n{ptx}"
+        );
+    }
+
+    /// Inter-address ordering fix: the CAS on `block_set[slot]` and the
+    /// store/load on `block_keys[slot]` touch DIFFERENT addresses, so PTX
+    /// gives no ordering on sm_70 without an explicit `membar.cta`. Both
+    /// the CLAIM path (after publishing the key) and the MATCH path
+    /// (before loading the key) must emit it. Without these fences a
+    /// racing thread can read a zeroed key under set==1 and false-match
+    /// key 0 — the bug this fence pair guards against.
+    #[test]
+    fn membar_cta_on_claim_and_match_paths() {
+        let ptx = compile_partition_reduce_kernel().expect("kernel compiles");
+        let count = ptx.matches("membar.cta").count();
+        assert!(
+            count >= 2,
+            "expected >=2 membar.cta (CLAIM publish + MATCH read), saw {count}:\n{ptx}"
+        );
+        // The MATCH-path fence must live between the CAS and the key
+        // load. We locate the CAS and assert the next `membar.cta`
+        // appears before the `ld.shared.s32 %r35` (the key load).
+        let cas_pos = ptx
+            .find("atom.shared.cas.b32")
+            .expect("CAS must be present");
+        let after_cas = &ptx[cas_pos..];
+        let mb_pos = after_cas
+            .find("membar.cta")
+            .expect("membar.cta missing after CAS");
+        let ld_pos = after_cas
+            .find("ld.shared.s32 %r35")
+            .expect("MATCH-path key load missing");
+        assert!(
+            mb_pos < ld_pos,
+            "membar.cta must appear between CAS and key load on MATCH path:\n{ptx}"
         );
     }
 

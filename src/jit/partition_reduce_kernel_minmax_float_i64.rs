@@ -255,7 +255,10 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // Else: slot occupied. Compare keys (i64).
+    // Else: slot occupied. membar.cta orders the set CAS against the
+    // i64 key load (different addresses) — without this PTX sm_70 lets
+    // a racing thread observe set==1 with a zero key and false-match.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s64 %rd61, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p4, %rd61, %rd60;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -268,9 +271,10 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     .map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: publish key (i64), then CAS-loop the val.
+    // CLAIM: publish key (i64), fence, then CAS-loop the val.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     emit_cas_loop(&mut ptx, op, dtype, "CLAIM_CAS", val_reg)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 

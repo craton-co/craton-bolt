@@ -327,7 +327,11 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // Else: slot occupied — compare keys.
+    // Else: slot occupied — membar.cta orders the CAS (block_set)
+    // against the key load (block_keys, different address). PTX sm_70
+    // requires this fence; without it a racing thread can read a zero
+    // key under set==1 and false-match key 0.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd94];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -341,9 +345,11 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     .map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: this thread won the slot. Write the key, then sum N vals.
+    // CLAIM: this thread won the slot. Write the key, fence, then sum
+    // N vals.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd94], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     for j in 0..n_vals {
         let rd_v = 1 + j;
         let fd_v = j;

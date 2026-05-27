@@ -271,6 +271,77 @@ fn golden_prefix_scan_block_size_is_256() {
     );
 }
 
+// ---- Tests: partition-reduce kernel fences the set/key publish race --------
+
+#[test]
+fn golden_partition_reduce_fences_set_key_race() {
+    // CRITICAL CORRECTNESS REGRESSION GUARD.
+    //
+    // The per-partition reduce kernel claims a slot with
+    // `atom.shared.cas.b32` on `block_set[slot]`, then publishes the key
+    // with `st.shared.u32` on `block_keys[slot]`. Those two operations
+    // touch DIFFERENT shared addresses, so PTX on sm_70 gives no
+    // inter-address ordering between them. Without an explicit
+    // `membar.cta`:
+    //
+    //   * On the CLAIM path the key store can be reordered after the
+    //     val atomic — racing readers see set==1 with a stale key.
+    //   * On the MATCH path the key load can be hoisted before the
+    //     racing winner's key store becomes visible — racing readers
+    //     see a still-zeroed key and false-match key 0.
+    //
+    // Both lead to silent wrong-sum output when any user key happens to
+    // be 0. The fix emits `membar.cta`:
+    //   * Between the key store and the val atomic on CLAIM.
+    //   * Between the set-CAS and the key load on MATCH.
+    //
+    // This test pins the contract: regressing it reopens the
+    // correctness bug.
+    use craton_bolt::jit::partition_reduce_kernel::compile_partition_reduce_kernel;
+    let ptx = compile_partition_reduce_kernel().expect("kernel compiles");
+    let mb_count = ptx.matches("membar.cta").count();
+    assert!(
+        mb_count >= 2,
+        "partition-reduce kernel must emit >=2 membar.cta (CLAIM + MATCH \
+         paths); saw {mb_count}:\n{ptx}"
+    );
+    // Ordering: the MATCH-path membar must sit between the CAS and the
+    // key load. Search anchored at the CAS to dodge false hits in
+    // comments at the top of the file.
+    let cas_pos = ptx
+        .find("atom.shared.cas.b32")
+        .expect("partition-reduce kernel must issue atom.shared.cas.b32");
+    let tail = &ptx[cas_pos..];
+    let mb_after_cas = tail
+        .find("membar.cta")
+        .expect("missing MATCH-path membar.cta after CAS");
+    let key_load = tail
+        .find("ld.shared.s32 %r35")
+        .expect("missing MATCH-path key load");
+    assert!(
+        mb_after_cas < key_load,
+        "membar.cta must precede the MATCH-path key load:\n{ptx}"
+    );
+    // Ordering: the CLAIM-path membar must sit between the key store
+    // and the f64 val atomic. CLAIM-path key store is the
+    // `st.shared.u32 [%rd36], %r31;` line.
+    let claim_label = ptx.find("CLAIM:").expect("missing CLAIM: label");
+    let claim_tail = &ptx[claim_label..];
+    let key_store = claim_tail
+        .find("st.shared.u32")
+        .expect("missing CLAIM-path key store");
+    let mb_after_store = claim_tail[key_store..]
+        .find("membar.cta")
+        .expect("missing CLAIM-path membar.cta after key store");
+    let val_atomic = claim_tail[key_store..]
+        .find("atom.shared.add.f64")
+        .expect("missing CLAIM-path val atomic");
+    assert!(
+        mb_after_store < val_atomic,
+        "membar.cta must precede the CLAIM-path val atomic:\n{ptx}"
+    );
+}
+
 // ---- Tests: float MIN uses CAS loop ----------------------------------------
 
 #[test]

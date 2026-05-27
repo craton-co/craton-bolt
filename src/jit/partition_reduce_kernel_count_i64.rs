@@ -178,6 +178,11 @@ pub fn compile_partition_reduce_kernel_count_i64() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
+    // MATCH path: membar.cta to order the CAS (on block_set) against
+    // the subsequent key load (on block_keys). Different addresses, so
+    // PTX sm_70 requires an explicit fence — without it a racing thread
+    // can read a zero key under set==1 and false-match key 0.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s64 %rd61, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p4, %rd61, %rd60;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -192,6 +197,7 @@ pub fn compile_partition_reduce_kernel_count_i64() -> BoltResult<String> {
 
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tatom.shared.add.u64 %rd40, [%rd38], 1;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 

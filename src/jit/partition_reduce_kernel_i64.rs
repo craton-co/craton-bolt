@@ -274,7 +274,12 @@ pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // Else: slot occupied. Compare stored key (i64) to ours.
+    // Else: slot occupied. PTX gives no inter-address ordering between
+    // the CAS (block_set) and the key store (block_keys) — different
+    // addresses. Insert membar.cta before the key load so a racing
+    // thread that observes set==1 can never read a still-zeroed i64 key
+    // and false-match key 0.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s64 %rd61, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p4, %rd61, %rd60;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -290,6 +295,7 @@ pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
 
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tatom.shared.add.f64 %fd1, [%rd38], %fd0;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 

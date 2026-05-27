@@ -232,7 +232,11 @@ pub fn compile_partition_reduce_kernel_multi_i64(n_vals: u32) -> BoltResult<Stri
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // Slot occupied — compare i64 keys.
+    // Slot occupied — membar.cta orders the set CAS against the i64
+    // key load (different addresses). PTX sm_70 has no inter-address
+    // ordering; without this fence a racing thread can see set==1 with
+    // a zero key and false-match.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s64 %rd61, [%rd94];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p4, %rd61, %rd60;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -247,6 +251,7 @@ pub fn compile_partition_reduce_kernel_multi_i64(n_vals: u32) -> BoltResult<Stri
 
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u64 [%rd94], %rd60;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     for j in 0..n_vals {
         let rd_v = 1 + j;
         let fd_v = j;

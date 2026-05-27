@@ -224,6 +224,12 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
+    // MATCH path: fence between observing set==1 (via CAS) and loading
+    // the key. CAS and the key store touch different shared addresses,
+    // so PTX on sm_70 requires an explicit membar.cta to order them
+    // across threads. Without this, a racing thread could read a still-
+    // zeroed key and false-match key 0.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -236,9 +242,11 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     .map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: publish the key, then atomically add 1 to the count.
+    // CLAIM: publish the key, fence so racing readers see it, then
+    // atomically add 1 to the count.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tatom.shared.add.u64 %rd40, [%rd38], 1;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
