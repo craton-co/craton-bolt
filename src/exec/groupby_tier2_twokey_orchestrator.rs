@@ -37,6 +37,11 @@
 //! Pass-2-on-GPU is sibling agent (c)'s work and lands in a separate file
 //! at integration time; we do NOT depend on it here.
 
+use std::collections::HashMap;
+
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
@@ -45,6 +50,42 @@ use crate::jit::partition_kernel_i64;
 use crate::jit::partition_reduce_kernel_i64;
 use crate::jit::scatter_kernel_i64;
 use crate::jit::CudaModule;
+
+// ---------------------------------------------------------------------------
+// Per-orchestrator module cache. Mirror of `groupby_tier2_orchestrator`'s
+// cache but over the i64-key kernel variants.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum KernelSpec {
+    PartitionI64,
+    ScatterI64,
+    ReduceSumI64,
+}
+
+static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
+    if let Some(m) = MODULE_CACHE.lock().get(spec) {
+        return Ok(m.clone());
+    }
+    let ptx = match spec {
+        KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
+        KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
+        KernelSpec::ReduceSumI64 => {
+            partition_reduce_kernel_i64::compile_partition_reduce_kernel_i64()?
+        }
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    #[cfg(test)]
+    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut cache = MODULE_CACHE.lock();
+    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -105,8 +146,7 @@ pub fn execute_tier2_twokey_sum(
     //   .param .u64 counts            (out, u32* len K, zeroed)
     //   .param .u32 n_rows
     // ----------------------------------------------------------------------
-    let partition_ptx = partition_kernel_i64::compile_partition_kernel_i64()?;
-    let partition_module = CudaModule::from_ptx(&partition_ptx)?;
+    let partition_module = get_or_build_module(&KernelSpec::PartitionI64)?;
     let partition_fn = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
 
     const BLOCK_THREADS: u32 = 256;
@@ -164,8 +204,7 @@ pub fn execute_tier2_twokey_sum(
     // ----------------------------------------------------------------------
     // Step 5. JIT + launch the i64 scatter kernel.
     // ----------------------------------------------------------------------
-    let scatter_ptx = scatter_kernel_i64::compile_scatter_kernel_i64()?;
-    let scatter_module = CudaModule::from_ptx(&scatter_ptx)?;
+    let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
     let scatter_fn = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
 
     {
@@ -227,8 +266,7 @@ pub fn execute_tier2_twokey_sum(
     let mut out_vals_gpu: GpuVec<f64> = GpuVec::<f64>::zeros(n_out_slots)?;
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
 
-    let reduce_ptx = partition_reduce_kernel_i64::compile_partition_reduce_kernel_i64()?;
-    let reduce_module = CudaModule::from_ptx(&reduce_ptx)?;
+    let reduce_module = get_or_build_module(&KernelSpec::ReduceSumI64)?;
     let reduce_fn = reduce_module.function(partition_reduce_kernel_i64::KERNEL_ENTRY)?;
 
     {
@@ -336,5 +374,34 @@ mod tests {
                 "empty input must yield empty partitions"
             );
         }
+    }
+
+    // --- Module-cache mechanics tests. Skip on CPU-only hosts. -------------
+
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn cache_repeat_same_spec_is_hit() {
+        let m1 = match get_or_build_module(&KernelSpec::PartitionI64) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let after_first = LOAD_COUNT.load(Ordering::SeqCst);
+        let m2 = get_or_build_module(&KernelSpec::PartitionI64).expect("hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), after_first);
+        assert_eq!(m1.raw(), m2.raw());
+    }
+
+    #[test]
+    fn cache_different_specs_independent() {
+        let _ = match get_or_build_module(&KernelSpec::ScatterI64) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = get_or_build_module(&KernelSpec::ReduceSumI64).expect("reduce build");
+        let baseline = LOAD_COUNT.load(Ordering::SeqCst);
+        let _ = get_or_build_module(&KernelSpec::ScatterI64).expect("scatter hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceSumI64).expect("reduce hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
     }
 }

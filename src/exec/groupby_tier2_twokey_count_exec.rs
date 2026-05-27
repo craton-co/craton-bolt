@@ -32,12 +32,15 @@
 //!   conservatively use `n_rows` as an upper bound on n_groups (the
 //!   true cardinality is at most n_rows).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
@@ -51,6 +54,43 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
+
+// ---------------------------------------------------------------------------
+// Per-executor module cache. See `groupby_tier2_count_exec.rs` for the
+// motivation and concurrency notes — the design is identical, just over the
+// i64-key kernel variants.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum KernelSpec {
+    PartitionI64,
+    ScatterI64,
+    ReduceCountI64,
+}
+
+static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
+    if let Some(m) = MODULE_CACHE.lock().get(spec) {
+        return Ok(m.clone());
+    }
+    let ptx = match spec {
+        KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
+        KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
+        KernelSpec::ReduceCountI64 => {
+            partition_reduce_kernel_count_i64::compile_partition_reduce_kernel_count_i64()?
+        }
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    #[cfg(test)]
+    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut cache = MODULE_CACHE.lock();
+    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+}
 
 /// Try the two-key Tier-2.1 COUNT(*) fast path. `None` on any precondition
 /// miss so the caller falls through to the next strategy.
@@ -132,10 +172,9 @@ fn execute_inner(
     let partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
 
     // -------- Partition pass (i64) --------
+    let partition_module = get_or_build_module(&KernelSpec::PartitionI64)?;
     {
-        let ptx = partition_kernel_i64::compile_partition_kernel_i64()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_kernel_i64::KERNEL_ENTRY)?;
+        let func = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
         let mut keys_ptr = keys_gpu.device_ptr();
         let mut pids_ptr = partition_ids.device_ptr();
         let mut counts_ptr = counts.device_ptr();
@@ -179,10 +218,9 @@ fn execute_inner(
     let scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros(n_rows as usize)?;
     let dummy_vals_in: GpuVec<f64> = GpuVec::<f64>::zeros(n_rows as usize)?;
     let scatter_vals: GpuVec<f64> = GpuVec::<f64>::zeros(n_rows as usize)?;
+    let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
     {
-        let ptx = scatter_kernel_i64::compile_scatter_kernel_i64()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
+        let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
         let cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
         let mut keys_ptr = keys_gpu.device_ptr();
         let mut vals_ptr = dummy_vals_in.device_ptr();
@@ -230,10 +268,9 @@ fn execute_inner(
     let out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros(n_out_slots)?;
     let out_counts_gpu: GpuVec<u64> = GpuVec::<u64>::zeros(n_out_slots)?;
     let out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
+    let reduce_module = get_or_build_module(&KernelSpec::ReduceCountI64)?;
     {
-        let ptx = partition_reduce_kernel_count_i64::compile_partition_reduce_kernel_count_i64()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_reduce_kernel_count_i64::KERNEL_ENTRY)?;
+        let func = reduce_module.function(partition_reduce_kernel_count_i64::KERNEL_ENTRY)?;
         let mut keys_ptr = scatter_keys.device_ptr();
         let mut offsets_ptr = offsets_kp1_gpu.device_ptr();
         let mut ok_ptr = out_keys_gpu.device_ptr();
@@ -471,5 +508,39 @@ mod tests {
         }
         let batch = twokey_int32_batch(300_000);
         assert!(try_execute(&plan, &batch).is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module-cache mechanics tests. Skip on CPU-only hosts.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn second_call_same_spec_is_cache_hit() {
+        let m1 = match get_or_build_module(&KernelSpec::PartitionI64) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let after_first = LOAD_COUNT.load(Ordering::SeqCst);
+        let m2 = get_or_build_module(&KernelSpec::PartitionI64).expect("hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), after_first);
+        assert_eq!(m1.raw(), m2.raw());
+    }
+
+    #[test]
+    fn different_specs_miss_then_hit_independently() {
+        let _ = match get_or_build_module(&KernelSpec::ScatterI64) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = get_or_build_module(&KernelSpec::ReduceCountI64).expect("reduce build");
+        let baseline = LOAD_COUNT.load(Ordering::SeqCst);
+        let _ = get_or_build_module(&KernelSpec::ScatterI64).expect("scatter hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceCountI64).expect("reduce hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
     }
 }

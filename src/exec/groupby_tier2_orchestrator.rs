@@ -54,6 +54,11 @@
 //! actual call to an unimplemented stub would `unimplemented!()` at runtime.
 //! Wiring is the merger's job, not mine.
 
+use std::collections::HashMap;
+
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
@@ -78,6 +83,49 @@ use crate::jit::scatter_kernel as stub_scatter_kernel;
 use crate::exec::partition_offsets as stub_partition_offsets;
 // This file (Tier 2.1) owns:
 use crate::jit::partition_reduce_kernel;
+
+// ---------------------------------------------------------------------------
+// Per-orchestrator module cache.
+//
+// The SUM pipeline runs three kernel launches (partition + scatter + reduce)
+// per call. Each one used to rebuild a kilobyte-scale PTX string and feed it
+// to `CudaModule::from_ptx` only to hit the in-driver PTX cache anyway. We
+// cache the loaded `CudaModule` directly here, keyed by an enum of the three
+// kernel shapes — none are parameterised, so a unit-like variant per kernel
+// suffices.
+//
+// `CudaModule` is `Clone` over an internal `Arc<CudaModuleInner>`; storing
+// owned modules in the map and handing callers clones is cheap.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum KernelSpec {
+    Partition,
+    Scatter,
+    ReduceSum,
+}
+
+static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
+    if let Some(m) = MODULE_CACHE.lock().get(spec) {
+        return Ok(m.clone());
+    }
+    let ptx = match spec {
+        KernelSpec::Partition => stub_partition_kernel::compile_partition_kernel()?,
+        KernelSpec::Scatter => stub_scatter_kernel::compile_scatter_kernel()?,
+        KernelSpec::ReduceSum => partition_reduce_kernel::compile_partition_reduce_kernel()?,
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    #[cfg(test)]
+    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut cache = MODULE_CACHE.lock();
+    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -144,8 +192,7 @@ pub fn execute_tier2_sum(
     // a grid-stride loop internally so the exact block count is not
     // performance-critical, but matching it to n_rows minimises idle warps.
     // ----------------------------------------------------------------------
-    let partition_ptx = stub_partition_kernel::compile_partition_kernel()?;
-    let partition_module = CudaModule::from_ptx(&partition_ptx)?;
+    let partition_module = get_or_build_module(&KernelSpec::Partition)?;
     let partition_fn = partition_module.function(stub_partition_kernel::KERNEL_ENTRY)?;
 
     const BLOCK_THREADS: u32 = 256;
@@ -224,8 +271,7 @@ pub fn execute_tier2_sum(
     //   .param .u64 scatter_vals      (out, f64* len n_rows)
     //   .param .u32 n_rows
     // ----------------------------------------------------------------------
-    let scatter_ptx = stub_scatter_kernel::compile_scatter_kernel()?;
-    let scatter_module = CudaModule::from_ptx(&scatter_ptx)?;
+    let scatter_module = get_or_build_module(&KernelSpec::Scatter)?;
     let scatter_fn = scatter_module.function(stub_scatter_kernel::KERNEL_ENTRY)?;
 
     {
@@ -303,8 +349,7 @@ pub fn execute_tier2_sum(
 
     // JIT + launch the per-partition reduce kernel. Grid = NUM_PARTITIONS
     // blocks (one per partition); blockIdx.x IS the partition id.
-    let reduce_ptx = partition_reduce_kernel::compile_partition_reduce_kernel()?;
-    let reduce_module = CudaModule::from_ptx(&reduce_ptx)?;
+    let reduce_module = get_or_build_module(&KernelSpec::ReduceSum)?;
     let reduce_fn = reduce_module.function(partition_reduce_kernel::KERNEL_ENTRY)?;
 
     {
@@ -435,5 +480,37 @@ mod tests {
         for (k, v) in &result.per_partition {
             assert!(k.is_empty() && v.is_empty(), "empty input yields empty partitions");
         }
+    }
+
+    // --- Module-cache mechanics tests ---------------------------------------
+    //
+    // Skip on CPU-only hosts (no CUDA context).
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn cache_repeat_same_spec_is_hit() {
+        let m1 = match get_or_build_module(&KernelSpec::Partition) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let after_first = LOAD_COUNT.load(Ordering::SeqCst);
+        let m2 = get_or_build_module(&KernelSpec::Partition).expect("hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), after_first);
+        assert_eq!(m1.raw(), m2.raw());
+    }
+
+    #[test]
+    fn cache_different_specs_independent() {
+        let _ = match get_or_build_module(&KernelSpec::Scatter) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = get_or_build_module(&KernelSpec::ReduceSum).expect("reduce build");
+        let baseline = LOAD_COUNT.load(Ordering::SeqCst);
+        let _ = get_or_build_module(&KernelSpec::Scatter).expect("scatter hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceSum).expect("reduce hit");
+        assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
     }
 }

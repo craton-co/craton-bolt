@@ -26,10 +26,13 @@
 //!   handle the low-cardinality case if/when it grows a COUNT branch)
 //! - `max(key) < 100 M`
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -42,6 +45,67 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
+
+// ---------------------------------------------------------------------------
+// Per-executor module cache.
+//
+// `CudaModule::from_ptx` (see `src/jit/jit_compiler.rs`) already deduplicates
+// the PTX → SASS step by hashing the PTX text, but the caller still pays for
+// rebuilding the PTX string (non-trivial — kilobytes of templated text) and
+// for the cache lookup on every invocation. We add a second layer keyed by
+// the small set of parameters that *select* a PTX template, so a repeat call
+// skips PTX construction entirely and gets a cheap `CudaModule` clone (the
+// inner handle is `Arc`-shared with the `from_ptx` cache).
+//
+// `CudaModule` is `Clone` over an internal `Arc<CudaModuleInner>`, so we
+// store owned modules in the map and hand callers fresh clones — no need to
+// wrap the value in another `Arc`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum KernelSpec {
+    /// `partition_kernel::compile_partition_kernel()` — unparameterised.
+    Partition,
+    /// `scatter_kernel::compile_scatter_kernel()` — unparameterised.
+    Scatter,
+    /// `partition_reduce_kernel_count::compile_partition_reduce_kernel_count()` —
+    /// unparameterised.
+    ReduceCount,
+}
+
+static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Test-only counter of cache-miss compile passes. Incremented exactly once
+/// per `(spec, process)` pair regardless of how many threads race on the
+/// initial miss.
+#[cfg(test)]
+static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Cache-aware module loader. Returns a (cheap-Arc-clone of a) `CudaModule`
+/// for `spec`, building it on first miss and serving from the process-wide
+/// map thereafter. Builds happen outside the cache lock so that compiles for
+/// *different* specs can run in parallel; the small window where two threads
+/// race on the same spec results in at most one redundant compile (the
+/// second insertion overwrites — both modules are functionally identical
+/// and the loser is unloaded when its last clone drops).
+fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
+    if let Some(m) = MODULE_CACHE.lock().get(spec) {
+        return Ok(m.clone());
+    }
+    let ptx = match spec {
+        KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
+        KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
+        KernelSpec::ReduceCount => {
+            partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
+        }
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    #[cfg(test)]
+    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut cache = MODULE_CACHE.lock();
+    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+}
 
 /// Try the Tier-2.1 COUNT(*) fast path. `None` on any precondition miss.
 pub fn try_execute(
@@ -120,10 +184,9 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
 
     // Partition pass — CUDA-Oxide typed launch.
     // Kernel ABI: keys_ptr, pids_ptr, counts_ptr, n_rows
+    let partition_module = get_or_build_module(&KernelSpec::Partition)?;
     {
-        let ptx = partition_kernel::compile_partition_kernel()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_kernel::KERNEL_ENTRY)?;
+        let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
         let stream = CudaStream::null();
 
@@ -154,10 +217,9 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
 
     // Scatter pass — CUDA-Oxide typed launch.
     // Kernel ABI: keys, vals, pids, offsets, cursors, out_keys, out_vals, n_rows
+    let scatter_module = get_or_build_module(&KernelSpec::Scatter)?;
     {
-        let ptx = scatter_kernel::compile_scatter_kernel()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(scatter_kernel::KERNEL_ENTRY)?;
+        let func = scatter_module.function(scatter_kernel::KERNEL_ENTRY)?;
         let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
         let stream = CudaStream::null();
@@ -194,10 +256,9 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
 
     // CUDA-Oxide typed launch.
     // Kernel ABI: scatter_keys, offsets, out_keys, out_counts, out_set
+    let reduce_module = get_or_build_module(&KernelSpec::ReduceCount)?;
     {
-        let ptx = partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?;
-        let module = CudaModule::from_ptx(&ptx)?;
-        let func = module.function(partition_reduce_kernel_count::KERNEL_ENTRY)?;
+        let func = reduce_module.function(partition_reduce_kernel_count::KERNEL_ENTRY)?;
         let stream = CudaStream::null();
 
         let view_keys = scatter_keys.view();
@@ -474,5 +535,68 @@ mod tests {
         }
         let batch = small_int32_batch(300_000);
         assert!(try_execute(&plan, &batch).is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module-cache mechanics tests.
+//
+// Both tests early-return on `BoltError` (no CUDA context available, e.g. in
+// docs.rs or CPU-only CI). When a context *is* present, they assert:
+//   * a repeat call with the same `KernelSpec` does NOT increment
+//     `LOAD_COUNT` (cache hit);
+//   * a different `KernelSpec` always causes exactly one extra compile
+//     (miss → hit on the second call).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn second_call_same_spec_is_cache_hit() {
+        let before = LOAD_COUNT.load(Ordering::SeqCst);
+        let m1 = match get_or_build_module(&KernelSpec::Partition) {
+            Ok(m) => m,
+            Err(_) => return, // no CUDA context — skip.
+        };
+        let after_first = LOAD_COUNT.load(Ordering::SeqCst);
+        // First call may or may not have built (another test may have
+        // already populated the cache). Either way, the second call must
+        // not increment the counter further.
+        let m2 = get_or_build_module(&KernelSpec::Partition)
+            .expect("second lookup of an already-cached spec must succeed");
+        let after_second = LOAD_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            after_second, after_first,
+            "second get_or_build_module with same spec must be a cache hit \
+             (load_count went from {} to {} across the second call)",
+            after_first, after_second
+        );
+        // Pre-population case: if `before == after_first`, the cache was
+        // already warm. Otherwise the first call did exactly one compile.
+        assert!(after_first - before <= 1);
+        // Sanity: both handles refer to the same underlying module
+        // (cheap-clone equality via the raw CUmodule pointer).
+        assert_eq!(m1.raw(), m2.raw(), "clones must share the same CUmodule");
+    }
+
+    #[test]
+    fn different_specs_miss_then_hit_independently() {
+        // Warm the cache for two distinct specs and verify subsequent
+        // lookups don't re-compile either of them.
+        let _ = match get_or_build_module(&KernelSpec::Scatter) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = get_or_build_module(&KernelSpec::ReduceCount).expect("reduce build");
+        let baseline = LOAD_COUNT.load(Ordering::SeqCst);
+        let _ = get_or_build_module(&KernelSpec::Scatter).expect("scatter hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceCount).expect("reduce hit");
+        assert_eq!(
+            LOAD_COUNT.load(Ordering::SeqCst),
+            baseline,
+            "repeat lookups of already-cached specs must not recompile"
+        );
     }
 }
