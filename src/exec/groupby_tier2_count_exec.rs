@@ -287,3 +287,192 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
+
+// ---------------------------------------------------------------------------
+// Host-only eligibility-gate tests for the Tier-2.1 COUNT(*) executor.
+//
+// We exercise `try_execute`'s plan-shape / row-shape gating; none of these
+// reach the GPU. Anything that would require a CUDA context is left to the
+// dedicated e2e test files (see `tests/tier2_*_e2e.rs`).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::logical_plan::{Field, Literal};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    /// Build a minimal `Aggregate` plan for `SELECT key, COUNT(*) FROM t
+    /// GROUP BY key`. `key_dtype` parametrises the rejection tests below.
+    fn build_count_plan(key_dtype: DataType) -> PhysicalPlan {
+        let inputs = vec![ColumnIO {
+            name: "k".into(),
+            dtype: key_dtype,
+        }];
+        let output_schema = Schema::new(vec![
+            Field::new("k", key_dtype, false),
+            Field::new("count_star", DataType::Int64, true),
+        ]);
+        PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs,
+                group_by: vec![0],
+                aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Null))],
+                output_schema,
+            },
+        }
+    }
+
+    fn small_int32_batch(n: usize) -> RecordBatch {
+        let keys: Vec<i32> = (0..n as i32).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "k",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef],
+        )
+        .unwrap()
+    }
+
+    /// Non-Aggregate plans are not our business.
+    #[test]
+    fn rejects_non_aggregate_plan() {
+        let plan = PhysicalPlan::Union { inputs: vec![] };
+        let batch = small_int32_batch(0);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Two group-by keys go through the two-key sibling, not this exec.
+    #[test]
+    fn rejects_two_group_keys() {
+        let mut plan = build_count_plan(DataType::Int32);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.inputs.push(ColumnIO {
+                name: "k2".into(),
+                dtype: DataType::Int32,
+            });
+            aggregate.group_by = vec![0, 1];
+        }
+        // n_rows huge so we'd pass the row threshold if shape were right.
+        let n = 300_000;
+        let mut keys = vec![0i32; n];
+        for (i, k) in keys.iter_mut().enumerate() {
+            *k = (i % 1024) as i32;
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys.clone())) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(keys)),
+            ],
+        )
+        .unwrap();
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Non-Int32 key dtype must defer.
+    #[test]
+    fn rejects_int64_key() {
+        let plan = build_count_plan(DataType::Int64);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "k",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let n = 300_000;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())) as arrow_array::ArrayRef],
+        )
+        .unwrap();
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Any aggregate other than COUNT — even one — must defer.
+    #[test]
+    fn rejects_sum_aggregate() {
+        let mut plan = build_count_plan(DataType::Int32);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.aggregates = vec![AggregateExpr::Sum(Expr::Column("k".into()))];
+        }
+        let batch = small_int32_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Row count below 256 K trips the row-threshold gate — let smaller
+    /// fast paths handle it.
+    #[test]
+    fn rejects_below_row_threshold() {
+        let plan = build_count_plan(DataType::Int32);
+        let batch = small_int32_batch(1_024);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Negative keys break the dense-bucket invariant — must decline so a
+    /// safer path can take over.
+    #[test]
+    fn rejects_negative_key() {
+        let plan = build_count_plan(DataType::Int32);
+        let n = 300_000;
+        let mut keys: Vec<i32> = (0..n as i32).collect();
+        keys[42] = -1;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "k",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef],
+        )
+        .unwrap();
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// `max(key)` <= BLOCK_GROUPS means Tier-1 territory; defer.
+    #[test]
+    fn rejects_low_cardinality_estimate() {
+        let plan = build_count_plan(DataType::Int32);
+        let n = 300_000;
+        // All keys are 0..127 — n_groups estimator returns 128, well below
+        // BLOCK_GROUPS (which is >= 1024 in every variant).
+        let keys: Vec<i32> = (0..n).map(|i| (i % 128) as i32).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "k",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef],
+        )
+        .unwrap();
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// `pre` kernel present (compound plan) — defer to the with-pre path.
+    #[test]
+    fn rejects_plan_with_pre_kernel() {
+        use crate::plan::physical_plan::KernelSpec;
+        let mut plan = build_count_plan(DataType::Int32);
+        if let PhysicalPlan::Aggregate { pre, .. } = &mut plan {
+            *pre = Some(KernelSpec {
+                inputs: vec![],
+                outputs: vec![],
+                ops: vec![],
+                predicate: None,
+                register_count: 0,
+            });
+        }
+        let batch = small_int32_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+}

@@ -198,4 +198,124 @@ mod tests {
         let p_ba = pack_two_i32(&[2], &[1]);
         assert_ne!(p_ab, p_ba, "(1,2) and (2,1) must not collide");
     }
+
+    // ---- try_execute eligibility gate ----
+    //
+    // The next block exercises the plan-shape / row-shape rejection paths
+    // that `try_execute` runs before it commits to a GPU launch. None of
+    // these tests reach the device.
+
+    use crate::plan::logical_plan::{Field, Schema};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    fn build_twokey_sum_plan() -> PhysicalPlan {
+        let inputs = vec![
+            ColumnIO {
+                name: "k1".into(),
+                dtype: DataType::Int32,
+            },
+            ColumnIO {
+                name: "k2".into(),
+                dtype: DataType::Int32,
+            },
+            ColumnIO {
+                name: "v".into(),
+                dtype: DataType::Float64,
+            },
+        ];
+        let output_schema = Schema::new(vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Int32, false),
+            Field::new("sum_v", DataType::Float64, true),
+        ]);
+        PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs,
+                group_by: vec![0, 1],
+                aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+                output_schema,
+            },
+        }
+    }
+
+    fn twokey_sum_batch(n: usize) -> RecordBatch {
+        let k1: Vec<i32> = (0..n as i32).collect();
+        let k2: Vec<i32> = (0..n as i32).map(|i| i + 1).collect();
+        let v: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int32Array::from(k1)) as arrow_array::ArrayRef,
+                Arc::new(arrow_array::Int32Array::from(k2)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Non-Aggregate plan: reject.
+    #[test]
+    fn rejects_non_aggregate_plan() {
+        let plan = PhysicalPlan::Union { inputs: vec![] };
+        let batch = twokey_sum_batch(0);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Below-threshold rows fall through to a smaller path.
+    #[test]
+    fn rejects_below_row_threshold() {
+        let plan = build_twokey_sum_plan();
+        let batch = twokey_sum_batch(1_024);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// COUNT-shaped agg → wrong shim.
+    #[test]
+    fn rejects_count_aggregate() {
+        use crate::plan::logical_plan::Literal;
+        let mut plan = build_twokey_sum_plan();
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.aggregates =
+                vec![AggregateExpr::Count(Expr::Literal(Literal::Null))];
+        }
+        let batch = twokey_sum_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Three group keys → not our shape.
+    #[test]
+    fn rejects_three_keys() {
+        let mut plan = build_twokey_sum_plan();
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.inputs.push(ColumnIO {
+                name: "k3".into(),
+                dtype: DataType::Int32,
+            });
+            aggregate.group_by = vec![0, 1, 2];
+        }
+        let batch = twokey_sum_batch(300_000);
+        // Even though the batch lacks `k3`, the group_by.len() check fires
+        // first and returns None.
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+
+    /// Int64 key → reject (packing convention is (i32, i32)).
+    #[test]
+    fn rejects_int64_first_key() {
+        let mut plan = build_twokey_sum_plan();
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
+            aggregate.inputs[0].dtype = DataType::Int64;
+        }
+        let batch = twokey_sum_batch(300_000);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
 }
