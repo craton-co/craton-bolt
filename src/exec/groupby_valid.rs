@@ -57,7 +57,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -133,8 +133,24 @@ pub fn execute_groupby_valid(
     // to distinct i64s. The KEY DIFFERENCE versus `execute_groupby` is that
     // we do NOT validate-out the `i64::MIN` value — any i64 is legal here.
     let packed = pack_keys(aggregate, table_batch)?;
-    let host_keys = packed.keys_i64;
     let key_components = packed.components;
+    let key_valid = packed.key_valid;
+
+    // NULL keys: SQL standard semantics are implementation-defined for whether
+    // a NULL key forms its own group. For v1 we drop rows whose key is NULL,
+    // matching the classic path's behaviour (see `groupby::execute_groupby`).
+    // This is also what prevents the garbage bit pattern in the NULL slots of
+    // the values buffer from reaching the GPU keys kernel and forming a fake
+    // group (H1 fix).
+    let host_keys: Vec<i64> = match &key_valid {
+        Some(mask) => packed
+            .keys_i64
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(k, &keep)| if keep { Some(*k) } else { None })
+            .collect(),
+        None => packed.keys_i64,
+    };
     let n_rows = host_keys.len();
 
     // Estimate K from the unique-key count (host scan). Same heuristic as
@@ -200,6 +216,7 @@ pub fn execute_groupby_valid(
             k_u32,
             max_spill_u32,
             &stream,
+            key_valid.as_deref(),
         )?;
         acc_results.push(acc);
     }
@@ -379,31 +396,38 @@ struct KeyComponent {
 /// Output of [`pack_keys`]: encoded i64 column + per-component metadata.
 #[derive(Debug)]
 struct PackedKeys {
-    /// i64-encoded keys ready to upload, one entry per input row.
+    /// i64-encoded keys ready to upload, one entry per input row. NULL-key
+    /// rows (per `key_valid`) carry an undefined bit pattern at their slot
+    /// because the per-column loader propagates garbage values from the
+    /// Arrow values buffer at NULL positions; callers MUST filter via
+    /// `key_valid` before forwarding to the GPU.
     keys_i64: Vec<i64>,
     /// Per-column dtype + position, in pack order.
     components: Vec<KeyComponent>,
+    /// Per-row keep mask: `true` iff every GROUP BY key column is non-null
+    /// at that row. `None` means "all key columns have zero nulls" — the
+    /// fast path where no filtering is required. See `load_key_column_bits`.
+    key_valid: Option<Vec<bool>>,
 }
 
 /// Load one group-by column's bit pattern (zero-extended into u64) from
-/// `batch`.
+/// `batch`, plus an optional per-row validity mask (`Some(false)` at NULL
+/// positions).
 ///
-/// TODO(h1): same NULL fix pattern needed here. The `pa.values()` calls
-/// below pick up garbage bytes at NULL-validity positions, which would form
-/// fake groups in the downstream hash table (since the sentinel-free
-/// `groupby_valid` path is itself the fallback when classic `groupby` hits
-/// a value collision with `i64::MIN`). The fix mirrors `groupby.rs`: have
-/// this function return `(Vec<u64>, Option<Vec<bool>>)` where the second
-/// element is a per-row keep mask whenever `arr.null_count() > 0`, then
-/// surface that through `PackedKeys` and filter `keys_i64` + value columns
-/// in lockstep before the keys / agg kernel launches. The aggregate paths
-/// in this file also need the same per-aggregate value-NULL filter that
-/// `groupby.rs::collect_filtered_primitive` and
-/// `groupby.rs::load_input_column_as_f64_filtered` apply.
+/// H1 NULL-mask fix mirrored from `crate::exec::groupby::load_key_column_bits`.
+/// When the input array has no NULLs the returned mask is `None` (saves a
+/// per-row allocation in the common path). Callers must treat `None` as
+/// "all valid". For NULL positions the raw u64 bit pattern is whatever
+/// happens to live in the Arrow values buffer — callers MUST drop those
+/// rows before they reach the GPU keys kernel, otherwise garbage bytes
+/// from the NULL slots will form a fake group. This is doubly important
+/// for the sentinel-free path: the orchestrator dispatches here precisely
+/// when keys may collide with `i64::MIN`, so we cannot rely on the classic
+/// path's "sentinel-equals-empty" reject either.
 fn load_key_column_bits(
     key_io: &ColumnIO,
     batch: &RecordBatch,
-) -> BoltResult<Vec<u64>> {
+) -> BoltResult<(Vec<u64>, Option<Vec<bool>>)> {
     let idx = batch.schema().index_of(&key_io.name).map_err(|e| {
         BoltError::Plan(format!(
             "GROUP BY key '{}' not present in table batch: {}",
@@ -420,40 +444,49 @@ fn load_key_column_bits(
         )));
     }
 
-    match key_io.dtype {
+    let null_mask: Option<Vec<bool>> = if arr.null_count() == 0 {
+        None
+    } else {
+        Some((0..arr.len()).map(|i| !arr.is_null(i)).collect())
+    };
+
+    let bits = match key_io.dtype {
         DataType::Int32 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Int32"))?;
-            Ok(pa.values().iter().map(|&v| v as u32 as u64).collect())
+            pa.values().iter().map(|&v| v as u32 as u64).collect()
         }
         DataType::Int64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Int64"))?;
-            Ok(pa.values().iter().map(|&v| v as u64).collect())
+            pa.values().iter().map(|&v| v as u64).collect()
         }
         DataType::Float32 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Float32"))?;
-            Ok(pa.values().iter().map(|&v| v.to_bits() as u64).collect())
+            pa.values().iter().map(|&v| v.to_bits() as u64).collect()
         }
         DataType::Float64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Float64"))?;
-            Ok(pa.values().iter().map(|&v| v.to_bits()).collect())
+            pa.values().iter().map(|&v| v.to_bits()).collect()
         }
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
-            "GROUP BY key dtype {:?} not supported in v1",
-            key_io.dtype
-        ))),
-    }
+        DataType::Bool | DataType::Utf8 => {
+            return Err(BoltError::Type(format!(
+                "GROUP BY key dtype {:?} not supported in v1",
+                key_io.dtype
+            )))
+        }
+    };
+    Ok((bits, null_mask))
 }
 
 /// Encode each group-by column into a single i64 key per row. Mirrors the
@@ -503,19 +536,27 @@ fn pack_keys(
     let mut bit_streams: Vec<Vec<u64>> =
         Vec::with_capacity(aggregate.group_by.len());
 
+    // Accumulate per-key-column null masks into a single combined `key_valid`
+    // vector. If every key column has zero nulls we keep `combined_mask` as
+    // `None` (the common fast path).
+    let mut combined_mask: Option<Vec<bool>> = None;
+
     if aggregate.group_by.len() == 1 {
         let io = col_ios[0];
-        let bits = load_key_column_bits(io, batch)?;
+        let (bits, mask) = load_key_column_bits(io, batch)?;
         components.push(KeyComponent {
             original_dtype: io.dtype,
             bit_offset: 0,
         });
+        if let Some(m) = mask {
+            combined_mask = Some(m);
+        }
         bit_streams.push(bits);
     } else {
         let io_hi = col_ios[0];
         let io_lo = col_ios[1];
-        let bits_hi = load_key_column_bits(io_hi, batch)?;
-        let bits_lo = load_key_column_bits(io_lo, batch)?;
+        let (bits_hi, mask_hi) = load_key_column_bits(io_hi, batch)?;
+        let (bits_lo, mask_lo) = load_key_column_bits(io_lo, batch)?;
         if bits_hi.len() != bits_lo.len() {
             return Err(BoltError::Other(format!(
                 "pack_keys: group-by columns '{}' and '{}' have different row \
@@ -536,6 +577,8 @@ fn pack_keys(
         });
         bit_streams.push(bits_hi);
         bit_streams.push(bits_lo);
+        // Combine: a row is valid iff every key column is non-null at that row.
+        combined_mask = and_masks(mask_hi, mask_lo);
     }
 
     let n_rows = bit_streams[0].len();
@@ -551,7 +594,21 @@ fn pack_keys(
     Ok(PackedKeys {
         keys_i64,
         components,
+        key_valid: combined_mask,
     })
+}
+
+/// Logical AND of two optional masks. `None` denotes "all-true" (no nulls
+/// from that side). Returns `None` only when both inputs are `None`.
+fn and_masks(a: Option<Vec<bool>>, b: Option<Vec<bool>>) -> Option<Vec<bool>> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(ma), Some(mb)) => {
+            debug_assert_eq!(ma.len(), mb.len(), "and_masks: length mismatch");
+            Some(ma.iter().zip(mb.iter()).map(|(x, y)| *x && *y).collect())
+        }
+    }
 }
 
 /// Reverse of `pack_keys` for a single packed i64 key.
@@ -922,6 +979,14 @@ fn download_agg_spill<T: Pod>(
 /// Compile + launch one aggregate kernel (or two, for AVG), download its
 /// accumulator table(s), and return the result alongside any spilled
 /// rows the kernel had to defer to host-side folding.
+///
+/// `key_valid` is the per-row keep mask produced by `pack_keys` over the
+/// ORIGINAL (pre-filter) row indices — `None` means no key column has
+/// nulls. When the value column itself has NULLs we logically AND the
+/// masks and upload a fresh, per-aggregate filtered key column so that
+/// the GPU sees only (non-NULL key, non-NULL value) pairs. `n_rows` is
+/// the post-key-filter row count: it equals `group_col`'s length when we
+/// reuse the shared key column.
 #[allow(clippy::too_many_arguments)]
 fn run_one_aggregate(
     agg: &AggregateExpr,
@@ -935,6 +1000,7 @@ fn run_one_aggregate(
     k_u32: u32,
     max_spill: u32,
     stream: &CudaStream,
+    key_valid: Option<&[bool]>,
 ) -> BoltResult<AccDownload> {
     match agg {
         AggregateExpr::Sum(expr)
@@ -945,13 +1011,29 @@ fn run_one_aggregate(
             let col_io = resolve_input(inputs, col_name)?;
             run_typed_agg(
                 op, col_io, group_col, keys_table, slot_valid, batch, n_rows, k,
-                k_u32, max_spill, stream,
+                k_u32, max_spill, stream, key_valid,
             )
         }
 
-        AggregateExpr::Count(_) => {
-            // COUNT(*) over groups: synthesize an all-ones i64 input column.
-            let ones: Vec<i64> = vec![1i64; n_rows];
+        AggregateExpr::Count(expr) => {
+            // COUNT(col) excludes NULL inputs; COUNT(*) (an expression that
+            // doesn't resolve to a column) counts surviving (post-key-filter)
+            // rows. We synthesise an all-ones column over the (key AND value)
+            // filtered rows; the only difference is whether the value-NULL
+            // mask is applied.
+            let value_valid: Option<Vec<bool>> = match bare_column_name(expr)
+                .ok()
+                .and_then(|name| resolve_input(inputs, name).ok())
+            {
+                Some(col_io) => column_null_mask(col_io, batch)?,
+                None => None,
+            };
+
+            let filtered =
+                prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref())?;
+            let count_n_rows = filtered.n_rows();
+
+            let ones: Vec<i64> = vec![1i64; count_n_rows];
             let input_gpu = GpuVec::<i64>::from_slice(&ones)?;
             let identity_init: Vec<i64> = vec![0i64; k];
             let mut acc_table = GpuVec::<i64>::from_slice(&identity_init)?;
@@ -960,7 +1042,7 @@ fn run_one_aggregate(
             launch_agg_kernel::<i64>(
                 ReduceOp::Sum,
                 DataType::Int64,
-                group_col,
+                filtered.col(),
                 keys_table,
                 slot_valid,
                 &input_gpu,
@@ -969,7 +1051,7 @@ fn run_one_aggregate(
                 &mut spill_values,
                 &mut spill_counter,
                 max_spill,
-                n_rows,
+                count_n_rows,
                 k_u32,
                 stream,
             )?;
@@ -984,11 +1066,27 @@ fn run_one_aggregate(
         }
 
         AggregateExpr::Avg(expr) => {
+            // AVG = SUM(expr) / COUNT(expr), where COUNT is the non-NULL row
+            // count of the value column within each group. SUM in f64; COUNT
+            // in i64. Both kernels share the (key_valid ∧ value_valid) filter
+            // so every contribution to the SUM increments the matching COUNT.
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
 
-            // SUM(expr) cast to f64.
-            let sum_input: Vec<f64> = load_input_column_as_f64(col_io, batch)?;
+            let value_valid = column_null_mask(col_io, batch)?;
+            let filtered =
+                prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref())?;
+            let avg_n_rows = filtered.n_rows();
+
+            // --- SUM(expr) cast to f64. Upcast host-side, drop NULL positions
+            //     in the same step. ---
+            let sum_input: Vec<f64> = load_input_column_as_f64_filtered(
+                col_io,
+                batch,
+                key_valid,
+                value_valid.as_deref(),
+            )?;
+            debug_assert_eq!(sum_input.len(), avg_n_rows);
             let input_gpu = GpuVec::<f64>::from_slice(&sum_input)?;
             let sum_init: Vec<f64> = vec![0.0f64; k];
             let mut sum_acc = GpuVec::<f64>::from_slice(&sum_init)?;
@@ -997,7 +1095,7 @@ fn run_one_aggregate(
             launch_agg_kernel::<f64>(
                 ReduceOp::Sum,
                 DataType::Float64,
-                group_col,
+                filtered.col(),
                 keys_table,
                 slot_valid,
                 &input_gpu,
@@ -1006,7 +1104,7 @@ fn run_one_aggregate(
                 &mut sum_spill_values,
                 &mut sum_spill_counter,
                 max_spill,
-                n_rows,
+                avg_n_rows,
                 k_u32,
                 stream,
             )?;
@@ -1018,8 +1116,8 @@ fn run_one_aggregate(
                 "AVG.SUM agg kernel",
             )?;
 
-            // COUNT(*) per group.
-            let ones: Vec<i64> = vec![1i64; n_rows];
+            // --- COUNT(non-null) per group. ---
+            let ones: Vec<i64> = vec![1i64; avg_n_rows];
             let count_input = GpuVec::<i64>::from_slice(&ones)?;
             let count_init: Vec<i64> = vec![0i64; k];
             let mut count_acc = GpuVec::<i64>::from_slice(&count_init)?;
@@ -1028,7 +1126,7 @@ fn run_one_aggregate(
             launch_agg_kernel::<i64>(
                 ReduceOp::Sum,
                 DataType::Int64,
-                group_col,
+                filtered.col(),
                 keys_table,
                 slot_valid,
                 &count_input,
@@ -1037,7 +1135,7 @@ fn run_one_aggregate(
                 &mut cnt_spill_values,
                 &mut cnt_spill_counter,
                 max_spill,
-                n_rows,
+                avg_n_rows,
                 k_u32,
                 stream,
             )?;
@@ -1059,7 +1157,107 @@ fn run_one_aggregate(
     }
 }
 
+/// Return the per-row validity mask for `col_io` in `batch`, or `None` if
+/// the column has no nulls (saves the per-row allocation in the hot path).
+fn column_null_mask(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+) -> BoltResult<Option<Vec<bool>>> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "aggregate input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+    if arr.null_count() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((0..arr.len()).map(|i| !arr.is_null(i)).collect()))
+    }
+}
+
+/// A filtered key column for a single aggregate launch: either a borrowed
+/// view of the shared `group_col` (the common fast path: no value-NULLs
+/// shrunk the row set further) or a freshly-uploaded smaller column for
+/// the (key_valid AND value_valid) joint mask. The variants paper over
+/// Rust's borrow-checker constraints around returning `&GpuVec<i64>`
+/// whose lifetime might come from local storage.
+enum FilteredKeys<'a> {
+    /// Reuse the shared post-key-filter key column.
+    Borrowed { group_col: &'a GpuVec<i64>, n_rows: usize },
+    /// Freshly-uploaded smaller column applying a value-NULL filter on top
+    /// of `key_valid`. The owned vec must live across the kernel launch.
+    Owned { group_col: GpuVec<i64>, n_rows: usize },
+}
+
+impl<'a> FilteredKeys<'a> {
+    fn col(&self) -> &GpuVec<i64> {
+        match self {
+            FilteredKeys::Borrowed { group_col, .. } => *group_col,
+            FilteredKeys::Owned { group_col, .. } => group_col,
+        }
+    }
+    fn n_rows(&self) -> usize {
+        match self {
+            FilteredKeys::Borrowed { n_rows, .. }
+            | FilteredKeys::Owned { n_rows, .. } => *n_rows,
+        }
+    }
+}
+
+/// Decide whether to reuse the shared `group_col` (when no value-NULL
+/// filter shrinks the row set further) or upload a freshly-filtered key
+/// column for this aggregate. The shared `group_col` was built from a
+/// `host_keys` that already had the `key_valid` rows kept; if
+/// `value_valid` is `None` we can reuse it directly. Otherwise we
+/// re-download once and refilter against the joint mask, then upload a
+/// fresh i64 column.
+fn prepare_filtered_keys<'a>(
+    group_col: &'a GpuVec<i64>,
+    n_rows: usize,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+) -> BoltResult<FilteredKeys<'a>> {
+    if value_valid.is_none() {
+        return Ok(FilteredKeys::Borrowed { group_col, n_rows });
+    }
+
+    // Project `value_valid` (indexed by ORIGINAL row position) through the
+    // key filter to align with the post-key-filter `host_keys` list.
+    let value_valid_unwrapped = value_valid.expect("checked above");
+    let value_valid_filtered: Vec<bool> = match key_valid {
+        Some(kv) => kv
+            .iter()
+            .zip(value_valid_unwrapped.iter())
+            .filter_map(|(&k, &v)| if k { Some(v) } else { None })
+            .collect(),
+        None => value_valid_unwrapped.to_vec(),
+    };
+    debug_assert_eq!(value_valid_filtered.len(), n_rows);
+
+    let host_keys: Vec<i64> = group_col.to_vec()?;
+    debug_assert_eq!(host_keys.len(), n_rows);
+    let filtered: Vec<i64> = host_keys
+        .iter()
+        .zip(value_valid_filtered.iter())
+        .filter_map(|(&k, &v)| if v { Some(k) } else { None })
+        .collect();
+    let filtered_n = filtered.len();
+    let owned = GpuVec::<i64>::from_slice(&filtered)?;
+    Ok(FilteredKeys::Owned {
+        group_col: owned,
+        n_rows: filtered_n,
+    })
+}
+
 /// Common path for SUM/MIN/MAX.
+///
+/// `key_valid` (from `pack_keys`) and the value column's own validity
+/// mask are AND'd together: rows where EITHER is NULL are dropped before
+/// upload. This matches standard SQL semantics — NULL inputs are skipped
+/// by SUM/MIN/MAX rather than coerced to 0 / dtype-min / dtype-max (which
+/// is what reading the raw `.values()` buffer at NULL positions would do).
 #[allow(clippy::too_many_arguments)]
 fn run_typed_agg(
     op: ReduceOp,
@@ -1073,6 +1271,7 @@ fn run_typed_agg(
     k_u32: u32,
     max_spill: u32,
     stream: &CudaStream,
+    key_valid: Option<&[bool]>,
 ) -> BoltResult<AccDownload> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
         BoltError::Plan(format!(
@@ -1088,6 +1287,11 @@ fn run_typed_agg(
             col_io.name, col_io.dtype, arr_dtype
         )));
     }
+
+    let value_valid = column_null_mask(col_io, batch)?;
+    let filtered =
+        prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref())?;
+    let n = filtered.n_rows();
 
     match col_io.dtype {
         DataType::Int32 => {
@@ -1106,7 +1310,15 @@ fn run_typed_agg(
             // `AccDownload::I64`) all agree at i64. MIN/MAX preserve the
             // input dtype and keep the narrow i32 path.
             if matches!(op, ReduceOp::Sum) {
-                let host: Vec<i64> = pa.values().iter().map(|&v| v as i64).collect();
+                let host: Vec<i64> = collect_filtered_primitive(
+                    pa,
+                    key_valid,
+                    value_valid.as_deref(),
+                )
+                .into_iter()
+                .map(|v| v as i64)
+                .collect();
+                debug_assert_eq!(host.len(), n);
                 let input_gpu = GpuVec::<i64>::from_slice(&host)?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
                 let mut acc = GpuVec::<i64>::from_slice(&init)?;
@@ -1115,7 +1327,7 @@ fn run_typed_agg(
                 launch_agg_kernel::<i64>(
                     op,
                     DataType::Int64,
-                    group_col,
+                    filtered.col(),
                     keys_table,
                     slot_valid,
                     &input_gpu,
@@ -1124,7 +1336,7 @@ fn run_typed_agg(
                     &mut spill_values,
                     &mut spill_counter,
                     max_spill,
-                    n_rows,
+                    n,
                     k_u32,
                     stream,
                 )?;
@@ -1137,7 +1349,12 @@ fn run_typed_agg(
                 )?;
                 Ok(AccDownload::I64 { gpu_acc, spill })
             } else {
-                let host: Vec<i32> = pa.values().to_vec();
+                let host: Vec<i32> = collect_filtered_primitive(
+                    pa,
+                    key_valid,
+                    value_valid.as_deref(),
+                );
+                debug_assert_eq!(host.len(), n);
                 let input_gpu = GpuVec::<i32>::from_slice(&host)?;
                 let init: Vec<i32> = vec![identity_i32(op); k];
                 let mut acc = GpuVec::<i32>::from_slice(&init)?;
@@ -1146,7 +1363,7 @@ fn run_typed_agg(
                 launch_agg_kernel::<i32>(
                     op,
                     DataType::Int32,
-                    group_col,
+                    filtered.col(),
                     keys_table,
                     slot_valid,
                     &input_gpu,
@@ -1155,7 +1372,7 @@ fn run_typed_agg(
                     &mut spill_values,
                     &mut spill_counter,
                     max_spill,
-                    n_rows,
+                    n,
                     k_u32,
                     stream,
                 )?;
@@ -1174,7 +1391,9 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
-            let host: Vec<i64> = pa.values().to_vec();
+            let host: Vec<i64> =
+                collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+            debug_assert_eq!(host.len(), n);
             let input_gpu = GpuVec::<i64>::from_slice(&host)?;
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice(&init)?;
@@ -1183,7 +1402,7 @@ fn run_typed_agg(
             launch_agg_kernel::<i64>(
                 op,
                 DataType::Int64,
-                group_col,
+                filtered.col(),
                 keys_table,
                 slot_valid,
                 &input_gpu,
@@ -1192,7 +1411,7 @@ fn run_typed_agg(
                 &mut spill_values,
                 &mut spill_counter,
                 max_spill,
-                n_rows,
+                n,
                 k_u32,
                 stream,
             )?;
@@ -1210,7 +1429,9 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
-            let host: Vec<f32> = pa.values().to_vec();
+            let host: Vec<f32> =
+                collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+            debug_assert_eq!(host.len(), n);
             let input_gpu = GpuVec::<f32>::from_slice(&host)?;
             let init: Vec<f32> = vec![identity_f32(op); k];
             let mut acc = GpuVec::<f32>::from_slice(&init)?;
@@ -1219,7 +1440,7 @@ fn run_typed_agg(
             launch_agg_kernel::<f32>(
                 op,
                 DataType::Float32,
-                group_col,
+                filtered.col(),
                 keys_table,
                 slot_valid,
                 &input_gpu,
@@ -1228,7 +1449,7 @@ fn run_typed_agg(
                 &mut spill_values,
                 &mut spill_counter,
                 max_spill,
-                n_rows,
+                n,
                 k_u32,
                 stream,
             )?;
@@ -1246,7 +1467,9 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
-            let host: Vec<f64> = pa.values().to_vec();
+            let host: Vec<f64> =
+                collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+            debug_assert_eq!(host.len(), n);
             let input_gpu = GpuVec::<f64>::from_slice(&host)?;
             let init: Vec<f64> = vec![identity_f64(op); k];
             let mut acc = GpuVec::<f64>::from_slice(&init)?;
@@ -1255,7 +1478,7 @@ fn run_typed_agg(
             launch_agg_kernel::<f64>(
                 op,
                 DataType::Float64,
-                group_col,
+                filtered.col(),
                 keys_table,
                 slot_valid,
                 &input_gpu,
@@ -1264,7 +1487,7 @@ fn run_typed_agg(
                 &mut spill_values,
                 &mut spill_counter,
                 max_spill,
-                n_rows,
+                n,
                 k_u32,
                 stream,
             )?;
@@ -1284,10 +1507,42 @@ fn run_typed_agg(
     }
 }
 
-/// Pull a numeric input column out of `batch` and upcast to f64 (for AVG).
-fn load_input_column_as_f64(
+/// Collect a primitive Arrow array's values into a fresh `Vec`, filtering
+/// out positions where (key_valid AND value_valid) is false. Either mask
+/// being `None` means "all true" for that side. The output length equals
+/// the post-filter row count.
+fn collect_filtered_primitive<P>(
+    pa: &arrow_array::PrimitiveArray<P>,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+) -> Vec<P::Native>
+where
+    P: arrow_array::types::ArrowPrimitiveType,
+    P::Native: Copy,
+{
+    let n = pa.len();
+    let vals = pa.values();
+    let mut out: Vec<P::Native> = Vec::with_capacity(n);
+    for i in 0..n {
+        let kv = key_valid.map(|m| m[i]).unwrap_or(true);
+        let vv = value_valid.map(|m| m[i]).unwrap_or(true);
+        if kv && vv {
+            out.push(vals[i]);
+        }
+    }
+    out
+}
+
+/// Pull a numeric input column out of `batch`, upcast each element to
+/// f64, and drop positions where (key_valid AND value_valid) is false.
+/// Either mask being `None` means "all true" for that side. Used by AVG
+/// so the numerator and denominator stay aligned with the (key-NULL,
+/// value-NULL) filter applied to the rest of the launch.
+fn load_input_column_as_f64_filtered(
     col_io: &ColumnIO,
     batch: &RecordBatch,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
 ) -> BoltResult<Vec<f64>> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
         BoltError::Plan(format!(
@@ -1302,34 +1557,61 @@ fn load_input_column_as_f64(
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
-            Ok(pa.values().iter().map(|&v| v as f64).collect())
+            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
         }
         DataType::Int64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
-            Ok(pa.values().iter().map(|&v| v as f64).collect())
+            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
         }
         DataType::Float32 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
-            Ok(pa.values().iter().map(|&v| v as f64).collect())
+            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
         }
         DataType::Float64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
-            Ok(pa.values().to_vec())
+            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v))
         }
         DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "AVG input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
     }
+}
+
+/// Helper for `load_input_column_as_f64_filtered`: walks a primitive
+/// Arrow array, applies the joint key/value validity mask, and casts each
+/// surviving element via `f`.
+fn filter_iter_to_f64<P, F>(
+    pa: &arrow_array::PrimitiveArray<P>,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+    f: F,
+) -> Vec<f64>
+where
+    P: arrow_array::types::ArrowPrimitiveType,
+    P::Native: Copy,
+    F: Fn(P::Native) -> f64,
+{
+    let n = pa.len();
+    let vals = pa.values();
+    let mut out: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let kv = key_valid.map(|m| m[i]).unwrap_or(true);
+        let vv = value_valid.map(|m| m[i]).unwrap_or(true);
+        if kv && vv {
+            out.push(f(vals[i]));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1907,4 +2189,290 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Tests (H1 NULL-mask propagation in the sentinel-free GROUP BY path).
+//
+// These mirror the host-side tests in `crate::exec::groupby::tests` — they
+// verify that:
+//   * `load_key_column_bits` returns `(bits, Some(mask))` when the key
+//     column has nulls and `(bits, None)` when it doesn't.
+//   * `pack_keys` propagates the combined mask through `PackedKeys`.
+//   * The host-side filtering helpers used by SUM/MIN/MAX/COUNT/AVG drop
+//     positions in lockstep on `key_valid ∧ value_valid`.
+//
+// GPU end-to-end behaviour for the sentinel-free path needs a live CUDA
+// device and is out of scope for this unit-test module (the host-only
+// helpers below cover the data-shape contract end-to-end).
+//
+// Sentinel-collision coverage: the `-0.0` Float64 case — whose
+// `to_bits()` is `i64::MIN` — is the entire reason this module exists.
+// The `pack_keys_float64_neg_zero_with_null_surfaces_mask` test below
+// checks that a NULL row in the same batch as a `-0.0` row produces the
+// correct (post-mask) key vector with the `-0.0` row preserved.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `AggregateSpec` for the pack_keys tests. We only
+    /// need `inputs` + `group_by`; the `aggregates` and `output_schema`
+    /// aren't touched by `pack_keys`.
+    fn spec(inputs: Vec<(&str, DataType)>, group_by: Vec<usize>) -> AggregateSpec {
+        AggregateSpec {
+            inputs: inputs
+                .into_iter()
+                .map(|(n, d)| ColumnIO {
+                    name: n.to_string(),
+                    dtype: d,
+                })
+                .collect(),
+            group_by,
+            aggregates: vec![],
+            output_schema: Schema::new(vec![]),
+        }
+    }
+
+    /// Build a single-column RecordBatch from a typed Arrow array. The
+    /// field is marked nullable so callers can pass arrays with NULL
+    /// validity bitmaps.
+    fn one_col_batch(name: &str, arr: ArrayRef) -> RecordBatch {
+        let dt = arr.data_type().clone();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            name, dt, true,
+        )]));
+        RecordBatch::try_new(schema, vec![arr]).expect("one-col batch")
+    }
+
+    fn two_col_batch(
+        n1: &str,
+        a1: ArrayRef,
+        n2: &str,
+        a2: ArrayRef,
+    ) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(n1, a1.data_type().clone(), true),
+            ArrowField::new(n2, a2.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(schema, vec![a1, a2]).expect("two-col batch")
+    }
+
+    // -----------------------------------------------------------------
+    // pack_keys / load_key_column_bits — surface the NULL mask.
+    // -----------------------------------------------------------------
+
+    /// `pack_keys` surfaces `key_valid = None` when no key column has nulls.
+    #[test]
+    fn pack_keys_no_nulls_omits_mask() {
+        let agg = spec(vec![("k", DataType::Int32)], vec![0]);
+        let batch = one_col_batch(
+            "k",
+            Arc::new(Int32Array::from(vec![1i32, 2, 3])) as ArrayRef,
+        );
+        let packed = pack_keys(&agg, &batch).expect("pack ok");
+        assert!(
+            packed.key_valid.is_none(),
+            "expected None mask for null-free input"
+        );
+    }
+
+    /// `pack_keys` surfaces a per-row `key_valid` mask when the key column
+    /// has NULLs. Downstream the executor drops those rows.
+    #[test]
+    fn pack_keys_int32_with_nulls_surfaces_mask() {
+        let agg = spec(vec![("k", DataType::Int32)], vec![0]);
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1i32),
+            None,
+            Some(3),
+            None,
+            Some(5),
+        ]));
+        let batch = one_col_batch("k", arr);
+        let packed = pack_keys(&agg, &batch).expect("pack ok");
+        let mask = packed.key_valid.expect("expected mask");
+        assert_eq!(mask, vec![true, false, true, false, true]);
+    }
+
+    /// Two-column GROUP BY merges per-column null masks via logical AND.
+    #[test]
+    fn pack_keys_two_col_null_mask_is_and() {
+        let agg = spec(
+            vec![("a", DataType::Int32), ("b", DataType::Int32)],
+            vec![0, 1],
+        );
+        let a: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)]));
+        let b: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40)]));
+        let batch = two_col_batch("a", a, "b", b);
+        let packed = pack_keys(&agg, &batch).expect("pack ok");
+        let mask = packed.key_valid.expect("expected mask");
+        assert_eq!(mask, vec![true, false, false, true]);
+    }
+
+    /// `and_masks` honours `None` as all-true.
+    #[test]
+    fn and_masks_combinators() {
+        assert_eq!(and_masks(None, None), None);
+        assert_eq!(
+            and_masks(Some(vec![true, false]), None),
+            Some(vec![true, false])
+        );
+        assert_eq!(
+            and_masks(None, Some(vec![false, true])),
+            Some(vec![false, true])
+        );
+        assert_eq!(
+            and_masks(
+                Some(vec![true, true, false]),
+                Some(vec![true, false, true])
+            ),
+            Some(vec![true, false, false])
+        );
+    }
+
+    /// Sentinel-collision row coverage: the whole reason this module
+    /// exists. A Float64 `-0.0` packs to `i64::MIN`. With a NULL row in
+    /// the same batch, the mask MUST flag the NULL row and the `-0.0`
+    /// row must survive the post-mask filter — proving the NULL fix
+    /// doesn't accidentally drop a sentinel-colliding value.
+    #[test]
+    fn pack_keys_float64_neg_zero_with_null_surfaces_mask() {
+        let agg = spec(vec![("k", DataType::Float64)], vec![0]);
+        let arr: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(-0.0f64),
+            None,
+            Some(1.5),
+            Some(-0.0f64),
+        ]));
+        let batch = one_col_batch("k", arr);
+        let packed = pack_keys(&agg, &batch).expect("pack ok");
+        let mask = packed.key_valid.expect("expected mask");
+        assert_eq!(mask, vec![true, false, true, true]);
+
+        // Apply the mask just like `execute_groupby_valid` does: the two
+        // -0.0 rows survive (both equal to i64::MIN as i64), the NULL row
+        // is dropped, the 1.5 row survives.
+        let filtered: Vec<i64> = packed
+            .keys_i64
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(k, &keep)| if keep { Some(*k) } else { None })
+            .collect();
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0], i64::MIN);
+        assert_eq!(filtered[2], i64::MIN);
+        // 1.5_f64.to_bits() is non-i64::MIN.
+        assert_ne!(filtered[1], i64::MIN);
+        assert_eq!(filtered[1], 1.5f64.to_bits() as i64);
+    }
+
+    // -----------------------------------------------------------------
+    // column_null_mask + collect_filtered_primitive + filter_iter_to_f64
+    //
+    // These are the host-side helpers the agg launches call to drop
+    // (key, value) tuples in lockstep on the joint mask.
+    // -----------------------------------------------------------------
+
+    /// `column_null_mask` returns `None` when the column has no nulls and
+    /// a per-row mask when it does.
+    #[test]
+    fn column_null_mask_basic() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+        let batch = one_col_batch("v", arr);
+        let io = ColumnIO {
+            name: "v".to_string(),
+            dtype: DataType::Int64,
+        };
+        assert!(column_null_mask(&io, &batch).unwrap().is_none());
+
+        let arr2: ArrayRef =
+            Arc::new(Int64Array::from(vec![Some(1i64), None, Some(3)]));
+        let batch2 = one_col_batch("v", arr2);
+        let mask = column_null_mask(&io, &batch2).unwrap().expect("mask");
+        assert_eq!(mask, vec![true, false, true]);
+    }
+
+    /// `collect_filtered_primitive` drops positions where EITHER mask is
+    /// false. SUM/MIN/MAX/COUNT(col) all use this to skip value-NULL rows.
+    ///
+    /// Value-NULL only: MIN/MAX/AVG/COUNT(col) ignores garbage at NULL.
+    #[test]
+    fn collect_filtered_primitive_drops_value_null_rows() {
+        let arr = Int32Array::from(vec![Some(1i32), None, Some(3), Some(4)]);
+        let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
+        let out = collect_filtered_primitive::<arrow_array::types::Int32Type>(
+            &arr,
+            None,
+            Some(&vv),
+        );
+        assert_eq!(out, vec![1, 3, 4]);
+    }
+
+    /// Key-NULL only: MIN/MAX/AVG/COUNT(col) on a key column with NULLs.
+    /// Rows where the key is NULL must be dropped from the value stream.
+    #[test]
+    fn collect_filtered_primitive_drops_key_null_rows() {
+        let arr = Int32Array::from(vec![10i32, 20, 30, 40]);
+        // Simulate "row 0 and row 2 had a NULL key" — all values are
+        // present in the value column, but key-NULLs disqualify those rows.
+        let kv = vec![false, true, false, true];
+        let out = collect_filtered_primitive::<arrow_array::types::Int32Type>(
+            &arr,
+            Some(&kv),
+            None,
+        );
+        assert_eq!(out, vec![20, 40]);
+    }
+
+    /// Joint NULL — row dropped from BOTH input arrays when EITHER mask
+    /// is false. This is the contract the agg paths rely on so that the
+    /// filtered key column and the filtered value column have the same
+    /// length and stay aligned row-for-row.
+    #[test]
+    fn collect_filtered_primitive_joint_mask() {
+        let arr = Int32Array::from(vec![Some(1i32), None, Some(3), Some(4)]);
+        let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
+        // key_valid: drop row 0 too.
+        let kv = vec![false, true, true, true];
+        let out = collect_filtered_primitive::<arrow_array::types::Int32Type>(
+            &arr,
+            Some(&kv),
+            Some(&vv),
+        );
+        // Survivors: row 2 (kv=T, vv=T) and row 3 (kv=T, vv=T).
+        // Row 0: kv=F. Row 1: vv=F. Both dropped.
+        assert_eq!(out, vec![3, 4]);
+    }
+
+    /// `filter_iter_to_f64` (AVG helper) drops NULLs on both sides and
+    /// upcasts in one pass. This is what keeps SUM and COUNT aligned for
+    /// AVG: every contribution to the f64 numerator increments the i64
+    /// denominator exactly once.
+    #[test]
+    fn filter_iter_to_f64_drops_and_casts() {
+        let arr = Int32Array::from(vec![Some(2i32), None, Some(4), Some(6)]);
+        let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
+        let out = filter_iter_to_f64::<arrow_array::types::Int32Type, _>(
+            &arr,
+            None,
+            Some(&vv),
+            |v| v as f64,
+        );
+        assert_eq!(out, vec![2.0f64, 4.0, 6.0]);
+
+        // Joint mask: also drop row 2 via key_valid. Survivors: rows 0
+        // (kv=T, vv=T → 2.0) and 3 (kv=T, vv=T → 6.0). Row 1: vv=F.
+        // Row 2: kv=F.
+        let kv = vec![true, true, false, true];
+        let out2 = filter_iter_to_f64::<arrow_array::types::Int32Type, _>(
+            &arr,
+            Some(&kv),
+            Some(&vv),
+            |v| v as f64,
+        );
+        assert_eq!(out2, vec![2.0f64, 6.0]);
+    }
 }
