@@ -12,7 +12,7 @@ pub mod mem_pool;
 #[cfg(feature = "cudarc")]
 pub mod cudarc_backend;
 
-pub use buffer::{primitive_to_gpu, GpuBuffer};
+pub use buffer::{primitive_to_gpu, GpuBuffer, PinnedHostBuffer};
 pub use cuda_sys::{CudaContext, CUdevice, CUdeviceptr, CUfunction, CUmodule, CUresult, CUstream};
 pub use smart_ptrs::{GpuVec, GpuView, GpuViewMut};
 

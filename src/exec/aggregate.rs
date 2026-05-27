@@ -33,7 +33,6 @@ use arrow_schema::{
 };
 use bytemuck::Pod;
 
-use crate::cuda::buffer::primitive_to_gpu;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -234,22 +233,29 @@ fn reduce_column_from_batch(
         )));
     }
 
+    // Stage 2 async memcpy: build a per-call stream and chain H2D-upload →
+    // kernel-launch → D2H-partials on it, syncing exactly once at the end.
+    // `null_or_default` falls back to the NULL stream under `cuda-stub`.
+    let stream = CudaStream::null_or_default();
     match col_io.dtype {
         DataType::Int32 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
-            let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+            // Async H2D — keep `pa` borrowed for the entire call so the host
+            // memory backing `pa.values()` stays live until `stream` is
+            // synchronized inside `reduce_gpu_vec(_widened)`.
+            let dev = GpuVec::<i32>::from_slice_async(pa.values().as_ref(), stream.raw())?;
             // SUM(Int32) widens to Int64 (see
             // `crate::plan::logical_plan::sum_output_dtype`): the GPU kernel
             // sign-extends each value and accumulates in s64, so the partials
             // buffer and host-side finalization must also be i64. MIN/MAX
             // preserve the input dtype and use the i32 path.
             if matches!(op, ReduceOp::Sum) {
-                reduce_gpu_vec_widened::<i32, i64>(op, col_io.dtype, &dev, n_rows)
+                reduce_gpu_vec_widened::<i32, i64>(op, col_io.dtype, &dev, n_rows, &stream)
             } else {
-                reduce_gpu_vec::<i32>(op, col_io.dtype, &dev, n_rows)
+                reduce_gpu_vec::<i32>(op, col_io.dtype, &dev, n_rows, &stream)
             }
         }
         DataType::Int64 => {
@@ -257,24 +263,24 @@ fn reduce_column_from_batch(
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
-            let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
-            reduce_gpu_vec::<i64>(op, col_io.dtype, &dev, n_rows)
+            let dev = GpuVec::<i64>::from_slice_async(pa.values().as_ref(), stream.raw())?;
+            reduce_gpu_vec::<i64>(op, col_io.dtype, &dev, n_rows, &stream)
         }
         DataType::Float32 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
-            let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
-            reduce_gpu_vec::<f32>(op, col_io.dtype, &dev, n_rows)
+            let dev = GpuVec::<f32>::from_slice_async(pa.values().as_ref(), stream.raw())?;
+            reduce_gpu_vec::<f32>(op, col_io.dtype, &dev, n_rows, &stream)
         }
         DataType::Float64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
-            let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
-            reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows)
+            let dev = GpuVec::<f64>::from_slice_async(pa.values().as_ref(), stream.raw())?;
+            reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows, &stream)
         }
         DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
@@ -285,27 +291,39 @@ fn reduce_column_from_batch(
 
 /// Upload a host slice, then run the standard GPU reduction over it. Used by
 /// COUNT (which synthesizes an all-ones column on the host).
+///
+/// Stage 2: drives the upload + reduction on a per-call stream so the H2D and
+/// the partials D2H overlap with the kernel where the driver allows it.
 fn reduce_host_slice<T>(op: ReduceOp, dtype: DataType, host: &[T]) -> BoltResult<Scalar>
 where
     T: Pod + ReduceScalar,
 {
-    let dev = GpuVec::<T>::from_slice(host)?;
-    reduce_gpu_vec::<T>(op, dtype, &dev, host.len())
+    let stream = CudaStream::null_or_default();
+    let dev = GpuVec::<T>::from_slice_async(host, stream.raw())?;
+    reduce_gpu_vec::<T>(op, dtype, &dev, host.len(), &stream)
 }
 
 /// Launch the per-block reduction kernel against `input` and finish the
 /// reduction on the host. Returns the final scalar as a `Scalar`.
+///
+/// Stage 2 async memcpy: the caller provides the `stream` already carrying
+/// the input column's H2D upload — we enqueue the kernel and the partials
+/// D2H on the same stream and synchronize exactly once at the end.
 fn reduce_gpu_vec<T>(
     op: ReduceOp,
     dtype: DataType,
     input: &GpuVec<T>,
     n_rows: usize,
+    stream: &CudaStream,
 ) -> BoltResult<Scalar>
 where
     T: Pod + ReduceScalar,
 {
     // 0-row degenerate case: skip the launch entirely and return the identity.
+    // The stream may still have a pending (empty) H2D queued — synchronize so
+    // the next user of the default-device stream doesn't observe stale work.
     if n_rows == 0 {
+        stream.synchronize()?;
         return T::identity_scalar(op, dtype);
     }
 
@@ -329,7 +347,6 @@ where
         &mut n_rows_u32 as *mut u32 as *mut c_void,
     ];
 
-    let stream = CudaStream::null();
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
@@ -345,15 +362,18 @@ where
             ptr::null_mut(),
         ))?;
     }
-    stream.synchronize()?;
 
     // The `_` writes are immediately superseded; silence the lints by reading
     // them post-launch in case a future reordering relies on the values.
     let _ = input_ptr;
     let _ = output_ptr;
 
-    // Download the per-block partials and finish the reduction on the host.
-    let host_partials = partials.to_vec()?;
+    // Async D2H of partials on the same stream — chained after the kernel
+    // automatically — then sync once. Pageable Vec destination is fine for
+    // Stage 2; Stage 3 will swap in a pinned host buffer for the partials.
+    let mut host_partials: Vec<T> = vec![T::zeroed(); grid_x as usize];
+    partials.copy_to_async(&mut host_partials, stream.raw())?;
+    stream.synchronize()?;
     drop(partials);
     T::finalize(op, dtype, &host_partials)
 }
@@ -374,6 +394,7 @@ fn reduce_gpu_vec_widened<TIn, TAcc>(
     dtype: DataType,
     input: &GpuVec<TIn>,
     n_rows: usize,
+    stream: &CudaStream,
 ) -> BoltResult<Scalar>
 where
     TIn: Pod,
@@ -385,6 +406,7 @@ where
         // The accumulator dtype is what the output array expects, which is
         // the kernel-internal widened dtype. Look it up explicitly.
         let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);
+        stream.synchronize()?;
         return TAcc::identity_scalar(op, acc_dtype);
     }
 
@@ -409,7 +431,6 @@ where
         &mut n_rows_u32 as *mut u32 as *mut c_void,
     ];
 
-    let stream = CudaStream::null();
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
@@ -425,12 +446,14 @@ where
             ptr::null_mut(),
         ))?;
     }
-    stream.synchronize()?;
 
     let _ = input_ptr;
     let _ = output_ptr;
 
-    let host_partials = partials.to_vec()?;
+    // Async D2H of partials on the same stream; sync once afterwards.
+    let mut host_partials: Vec<TAcc> = vec![TAcc::zeroed(); grid_x as usize];
+    partials.copy_to_async(&mut host_partials, stream.raw())?;
+    stream.synchronize()?;
     drop(partials);
     // Finalize at the accumulator dtype.
     let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);

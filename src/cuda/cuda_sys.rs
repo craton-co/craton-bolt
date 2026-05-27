@@ -387,3 +387,82 @@ pub unsafe fn mem_free_host(p: *mut c_void) -> BoltResult<()> {
 pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> BoltResult<()> {
     check(cuMemsetD8_v2(ptr, value, count))
 }
+
+// ---------------------------------------------------------------------------
+// Async memcpy / memset wrappers (Stage 1 / 2).
+//
+// These submit the copy onto the supplied `stream` and return without
+// blocking — the caller is responsible for synchronising the stream (or
+// recording an event on it) before reading the destination. They are `pub`
+// because executors live outside the `cuda` module and need to drive
+// stream-scoped copies; the safety contract is identical to the synchronous
+// variants above, with the added requirement that the source/destination
+// buffers stay alive until the stream has been synchronized.
+// ---------------------------------------------------------------------------
+
+/// Asynchronously copy `count` elements of `T` from host `src` to device `dst`,
+/// enqueued on `stream`. Returns immediately; the copy is not visible until
+/// the stream is synchronized.
+///
+/// # Safety
+/// `src` must remain live and unmodified for reads of `count * size_of::<T>()`
+/// bytes until `stream` is synchronized. `dst` must point to a device
+/// allocation of at least the same size. Best performance requires `src` to
+/// be page-locked (pinned) host memory — see [`PinnedHostBuffer`]; pageable
+/// `src` still works but the driver internally stages through a bounce
+/// buffer.
+pub unsafe fn memcpy_h2d_async<T>(
+    dst: CUdeviceptr,
+    src: *const T,
+    count: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "memcpy_h2d_async size overflow: {} * {}",
+            count,
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    check(cuMemcpyHtoDAsync_v2(dst, src as *const c_void, bytes, stream))
+}
+
+/// Asynchronously copy `count` elements of `T` from device `src` to host `dst`,
+/// enqueued on `stream`. Returns immediately; the host buffer is not safe to
+/// read until the stream is synchronized.
+///
+/// # Safety
+/// `dst` must remain live for writes of `count * size_of::<T>()` bytes until
+/// `stream` is synchronized. `src` must point to a live device allocation of
+/// at least the same size. As with H2D, pinned `dst` memory is required for
+/// true overlap; pageable `dst` still works.
+pub unsafe fn memcpy_d2h_async<T>(
+    dst: *mut T,
+    src: CUdeviceptr,
+    count: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "memcpy_d2h_async size overflow: {} * {}",
+            count,
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    check(cuMemcpyDtoHAsync_v2(dst as *mut c_void, src, bytes, stream))
+}
+
+/// Asynchronously set `count` bytes at `ptr` to the byte `value`, enqueued on
+/// `stream`. Returns immediately.
+///
+/// # Safety
+/// `ptr` must point to a live device allocation of at least `count` bytes;
+/// the allocation must outlive the stream synchronization.
+pub unsafe fn memset_d8_async(
+    ptr: CUdeviceptr,
+    value: u8,
+    count: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    check(cuMemsetD8Async(ptr, value, count, stream))
+}
