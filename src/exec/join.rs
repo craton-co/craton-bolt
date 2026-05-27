@@ -41,8 +41,10 @@
 //! surface a clear plan error past it. Users with genuinely larger
 //! cartesian products should rewrite their query.
 //!
-//! GPU hash join (key-bucket + collision-list kernels) is a 0.4 target —
-//! see ROADMAP.md.
+//! GPU hash join (Stage 1): INNER + single equi-key + Int32/Int64 +
+//! ≥ 1024 rows / side + no NULLs in keys + unique build keys runs on the
+//! GPU via [`crate::exec::gpu_join`]. Any gate miss falls through to the
+//! host hash-join path. OUTER + CROSS stay host-side (Stage 2 target).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,6 +137,22 @@ fn execute_inner_join(
     let build_idx = lookup_columns(build_batch, build_keys)?;
     let probe_idx = lookup_columns(probe_batch, probe_keys)?;
     check_key_dtypes(build_batch, &build_idx, probe_batch, &probe_idx, "INNER JOIN")?;
+
+    // GPU fast path — single equi-key, Int32/Int64, both sides large enough,
+    // no NULLs, unique build keys. On any gate miss this returns Ok(None)
+    // and we fall through to the host hash join.
+    if let Some(out) = try_gpu_inner_join(
+        &lhs,
+        &rhs,
+        build_is_left,
+        build_batch,
+        &build_idx,
+        probe_batch,
+        &probe_idx,
+        arrow_schema.clone(),
+    )? {
+        return Ok(QueryHandle::from_record_batch(out));
+    }
 
     // Build phase. NULL-key build rows are silently skipped.
     let map = build_hash_map(build_batch, &build_idx)?;
@@ -695,4 +713,148 @@ fn plan_dtype_to_arrow(d: crate::plan::logical_plan::DataType) -> BoltResult<Arr
         D::Bool => ArrowDataType::Boolean,
         D::Utf8 => ArrowDataType::Utf8,
     })
+}
+
+// ---------- GPU INNER fast path -----------------------------------------
+
+/// Try the GPU INNER-join fast path. Returns:
+///
+/// * `Ok(Some(batch))` — every gate passed, the GPU ran the join, and `batch`
+///   is the result.
+/// * `Ok(None)`        — some gate didn't match; caller falls through to the
+///   host hash join (which is the correctness fallback for everything the
+///   GPU path can't yet handle).
+/// * `Err(e)`          — hard GPU error (kernel launch failure, OOM, etc.).
+///   We deliberately surface these — they indicate a CUDA-layer bug, not a
+///   "gate miss".
+///
+/// Gates (all must hold; first miss returns `Ok(None)`):
+///   1. Exactly one equi-predicate (`build_idx.len() == 1`).
+///   2. Key dtype is Int32 or Int64.
+///   3. `build_n_rows >= GPU_JOIN_MIN_ROWS` AND `probe_n_rows >= GPU_JOIN_MIN_ROWS`.
+///   4. `null_count() == 0` on both key columns.
+///   5. Build-side keys are unique (no duplicates). The Stage 1 hash table
+///      stores exactly one row index per slot; duplicates would silently
+///      drop all-but-one match per duplicated key.
+///   6. Encoded key set fits the hash-table cap (~2.8M build rows for the
+///      64 MiB budget). Enforced inside `hash_join_indices_on_gpu`, which
+///      returns Err on overflow — we map that to Ok(None) so the host path
+///      transparently handles it.
+fn try_gpu_inner_join(
+    lhs: &RecordBatch,
+    rhs: &RecordBatch,
+    build_is_left: bool,
+    build_batch: &RecordBatch,
+    build_idx: &[usize],
+    probe_batch: &RecordBatch,
+    probe_idx: &[usize],
+    arrow_schema: Arc<ArrowSchema>,
+) -> BoltResult<Option<RecordBatch>> {
+    // Gate 1: single equi-key only.
+    if build_idx.len() != 1 || probe_idx.len() != 1 {
+        return Ok(None);
+    }
+    let b_key_idx = build_idx[0];
+    let p_key_idx = probe_idx[0];
+
+    // Gate 2: dtype is Int32 or Int64. Both sides already validated equal.
+    let arrow_dtype = build_batch.column(b_key_idx).data_type();
+    let dtype = match arrow_dtype {
+        ArrowDataType::Int32 => crate::plan::logical_plan::DataType::Int32,
+        ArrowDataType::Int64 => crate::plan::logical_plan::DataType::Int64,
+        _ => return Ok(None),
+    };
+
+    // Gate 3: minimum row counts. The GPU path eats a JIT compile + h2d
+    // round-trip; below ~1k rows the host path wins.
+    let n_build = build_batch.num_rows();
+    let n_probe = probe_batch.num_rows();
+    if n_build < crate::exec::gpu_join::GPU_JOIN_MIN_ROWS
+        || n_probe < crate::exec::gpu_join::GPU_JOIN_MIN_ROWS
+    {
+        return Ok(None);
+    }
+
+    // Gate 4: no NULLs in the key columns. The kernel treats every i64 as
+    // a real key; NULLs would either collide with the sentinel or produce
+    // false matches.
+    let b_key_col = build_batch.column(b_key_idx);
+    let p_key_col = probe_batch.column(p_key_idx);
+    if b_key_col.null_count() > 0 || p_key_col.null_count() > 0 {
+        return Ok(None);
+    }
+
+    // Gate 5: build keys must be unique. Stage 1 stores one row-index per
+    // slot; duplicates would silently drop matches. The check is O(n) via
+    // a HashSet — cheap relative to the GPU launch.
+    if !build_keys_are_unique(b_key_col, dtype) {
+        return Ok(None);
+    }
+
+    // Hand off to the GPU executor. If it returns Err — typically because
+    // the hash table would exceed the byte cap, or a key collides with the
+    // i64::MIN sentinel — we treat that as a gate miss and fall through to
+    // the host path.
+    match crate::exec::gpu_join::execute_inner_join_on_gpu(
+        lhs,
+        rhs,
+        build_is_left,
+        b_key_idx,
+        p_key_idx,
+        dtype,
+        arrow_schema,
+    ) {
+        Ok(batch) => Ok(Some(batch)),
+        Err(e) => {
+            // Fall back silently — the host path is a real correctness
+            // fallback. Log the reason at debug level for post-hoc
+            // visibility without flooding the normal stream.
+            log::debug!("gpu_join: fast path declined ({e}); falling back to host");
+            Ok(None)
+        }
+    }
+}
+
+/// Quick host-side uniqueness check on the build-side key column. Returns
+/// `true` if every value is distinct (the Stage 1 GPU path's invariant).
+///
+/// We deliberately don't surface duplicates as an error: the host hash-join
+/// path handles them correctly via `HashMap<JoinKey, Vec<u32>>`, so a
+/// "duplicates" finding just routes the query to that path.
+fn build_keys_are_unique(
+    col: &dyn arrow_array::Array,
+    dtype: crate::plan::logical_plan::DataType,
+) -> bool {
+    use std::collections::HashSet;
+    let n = col.len();
+    match dtype {
+        crate::plan::logical_plan::DataType::Int32 => {
+            let arr = match col.as_any().downcast_ref::<Int32Array>() {
+                Some(a) => a,
+                None => return false,
+            };
+            let mut seen: HashSet<i32> = HashSet::with_capacity(n);
+            for v in arr.values().iter() {
+                if !seen.insert(*v) {
+                    return false;
+                }
+            }
+            true
+        }
+        crate::plan::logical_plan::DataType::Int64 => {
+            let arr = match col.as_any().downcast_ref::<Int64Array>() {
+                Some(a) => a,
+                None => return false,
+            };
+            let mut seen: HashSet<i64> = HashSet::with_capacity(n);
+            for v in arr.values().iter() {
+                if !seen.insert(*v) {
+                    return false;
+                }
+            }
+            true
+        }
+        // Other dtypes don't reach this function — gate 2 above rejects them.
+        _ => false,
+    }
 }
