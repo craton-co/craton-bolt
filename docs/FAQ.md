@@ -59,7 +59,7 @@ widening is applied consistently in the scalar and GROUP BY paths via
 
 Identifiers are case-sensitive and qualified column references are not
 yet supported — the SQL frontend only accepts bare unqualified names
-that match a registered column exactly. Both are pre-0.3.0 limitations tracked in [`../ROADMAP.md`](../ROADMAP.md).
+that match a registered column exactly. Both are current 0.3.0 limitations tracked in [`../ROADMAP.md`](../ROADMAP.md).
 
 ## Q9. Why is the CHANGELOG / NOTICE attribution "Craton Software Company"?
 

@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project tries to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it leaves `0.1.x`.
 
+## Note on version 0.2.0
+
+There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) directly to `0.3.0` (2026-05-26) — a three-day span in which the scope grew well past what a single minor bump could honestly carry (multi-batch tables, INNER JOIN, DISTINCT / LIMIT / ORDER BY / HAVING / UNION, real `cuda-stub`, PTX cache, CI). Tagging an intermediate `0.2.0` would have been a paper milestone, so the version number was reserved and skipped.
+
 ## [0.3.0] - 2026-05-26
 
 ### Added

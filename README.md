@@ -156,7 +156,7 @@ query regardless of dataset size — JIT-compiling every query has negligible co
 | q4 low-card 3-AVG (100 groups) | 12.9 ms | 97.0 ms | **70.5 ms** | DuckDB wins |
 | q5 high-card SUM (1 M groups) | 623 ms | 358 ms | **237 ms** ⭐ | Craton Bolt fastest |
 
-Creton Bolt wins outright on the two highest-cardinality workloads (q3, q5) where
+Craton Bolt wins outright on the two highest-cardinality workloads (q3, q5) where
 GPU-parallel hash-partitioning outpaces CPU per-core hash tables. CPU-native engines
 win at low cardinality (q1, q4) where their per-thread L1-resident tables beat GPU
 atomic contention. See [`docs/BENCHMARKS.md §honest read`](docs/BENCHMARKS.md#the-honest-read)
