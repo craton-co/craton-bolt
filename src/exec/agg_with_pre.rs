@@ -296,21 +296,34 @@ fn build_one_aggregate(
             let scalar = reduce_host_col(op, resolved.as_ref())?;
             scalar_to_array(scalar, out_field.dtype)
         }
-        AggregateExpr::Count(_) => {
-            // COUNT with no NULL handling: the number of surviving rows.
-            let count = compacted.n_rows() as i64;
+        AggregateExpr::Count(expr) => {
+            // SQL COUNT(col) counts non-NULL rows; COUNT(*) (planner-emitted
+            // as `Count(Literal(1))`) counts every surviving row. The
+            // distinction falls out naturally: `resolve_agg_input_col`
+            // returns a column whose `non_null_count` already excludes
+            // NULLs from expression evaluation, and a literal can never
+            // produce NULLs so it matches the full row count.
+            //
+            // We materialise at Int64 since that's the COUNT result dtype.
+            let resolved =
+                resolve_agg_input_col(expr, pre_spec, compacted, DataType::Int64)?;
+            let count = resolved.non_null_count() as i64;
             scalar_to_array(Scalar::I64(count), out_field.dtype)
         }
         AggregateExpr::Avg(expr) => {
-            // AVG = SUM(expr) / COUNT(expr). SUM is computed on the GPU; COUNT
-            // is the post-mask row count. The output is always Float64.
-            // For AVG the natural materialisation dtype is Float64 (the
-            // reduction's accumulator + the final division both work in f64).
+            // AVG = SUM(expr) / COUNT(expr) — SQL semantics, NULLs ignored
+            // in both numerator and denominator. The output is always
+            // Float64. For AVG the natural materialisation dtype is Float64
+            // (the reduction's accumulator + the final division both work
+            // in f64). NULL inputs are filtered out by `from_expr_host`
+            // before the reduction, and the denominator below uses the
+            // resolved column's `non_null_count` so the average reflects
+            // only the rows that contributed to the sum.
             let resolved =
                 resolve_agg_input_col(expr, pre_spec, compacted, DataType::Float64)?;
             let sum_scalar = reduce_host_col(ReduceOp::Sum, resolved.as_ref())?;
             let sum_f64 = scalar_to_f64(sum_scalar)?;
-            let count_f64 = compacted.n_rows() as f64;
+            let count_f64 = resolved.non_null_count() as f64;
             let avg = if count_f64 == 0.0 { 0.0 } else { sum_f64 / count_f64 };
             scalar_to_array(Scalar::F64(avg), out_field.dtype)
         }
@@ -326,9 +339,14 @@ fn build_one_aggregate(
 /// Slow path: when `expr` is anything else (e.g. `Sum(price * tax)` where the
 /// planner didn't pre-materialise the product), build a [`expr_agg::ColumnEnv`]
 /// over the already-compacted pre outputs and use [`expr_agg::eval_expr`] to
-/// materialise the value column. The result is owned. `expected_dtype` is the
-/// caller-chosen materialisation dtype: for SUM/MIN/MAX use `out_field.dtype`;
-/// for AVG use `Float64` (the reduction accumulator).
+/// materialise the value column. NULL rows produced by the host-side
+/// evaluator are filtered out of the returned column so the GPU reduction
+/// sees only valid values; the count of surviving rows is reported via
+/// [`ResolvedHostCol::non_null_count`] (used by AVG and COUNT(col)). The
+/// result is owned. `expected_dtype` is the caller-chosen materialisation
+/// dtype: SUM/MIN/MAX use `out_field.dtype`, AVG uses `Float64` (the
+/// reduction accumulator), and COUNT uses `Int64` (only the non-NULL count
+/// is consumed, not the values).
 fn resolve_agg_input_col<'a>(
     expr: &Expr,
     pre_spec: &KernelSpec,
@@ -353,13 +371,19 @@ fn resolve_agg_input_col<'a>(
                 compacted.cols.len()
             )));
         }
-        return Ok(ResolvedHostCol::Borrowed(&compacted.cols[idx]));
+        let col = &compacted.cols[idx];
+        // Fast path: the pre kernel output has no NULL bitmap, so every
+        // row is a "non-NULL" row for aggregate purposes.
+        let n = col.len();
+        return Ok(ResolvedHostCol::Borrowed { col, non_null: n });
     }
 
     // Slow path: materialise via the host-side evaluator over the compacted
     // pre outputs. Each compacted column is wrapped lazily (lifting to
     // `Option`, which never carries a None on this path) so the evaluator can
-    // run unchanged.
+    // run unchanged. The evaluator itself can introduce NULLs (e.g. integer
+    // division by zero, or any operand of a binary op being NULL), which we
+    // then filter out below so the reduction sees only valid rows.
     let n_rows = compacted.n_rows();
     let wrapped: Vec<(String, expr_agg::HostColumn)> = pre_spec
         .outputs
@@ -369,23 +393,46 @@ fn resolve_agg_input_col<'a>(
         .collect();
     let env: expr_agg::ColumnEnv<'_> = wrapped.iter().map(|(n, c)| (n.clone(), c)).collect();
     let materialised = expr_agg::eval_expr(expr, &env, expected_dtype, n_rows)?;
-    Ok(ResolvedHostCol::Owned(from_expr_host(materialised)?))
+    let (filtered, non_null) = from_expr_host(materialised)?;
+    Ok(ResolvedHostCol::Owned {
+        col: filtered,
+        non_null,
+    })
 }
 
 /// Borrowed or owned host column. Lets the fast path return `&HostCol` from
 /// the compacted store while the slow path returns a freshly-materialised
 /// value from `expr_agg`, with a single `as_ref()` method to feed either into
 /// `reduce_host_col`.
+///
+/// `non_null` is the number of rows that were not SQL NULL in the source
+/// column (after pre-filtering and expression evaluation). SQL aggregate
+/// semantics — `SUM`, `MIN`, `MAX`, `AVG`, `COUNT(col)` — all ignore NULL
+/// rows, so the executor exposes this count to callers that need it for
+/// the AVG denominator and the COUNT result.
 enum ResolvedHostCol<'a> {
-    Borrowed(&'a HostCol),
-    Owned(HostCol),
+    /// Borrowed view of a pre-stage output (no NULLs possible here).
+    Borrowed { col: &'a HostCol, non_null: usize },
+    /// Freshly materialised + NULL-filtered slow-path column.
+    Owned { col: HostCol, non_null: usize },
 }
 
 impl<'a> ResolvedHostCol<'a> {
     fn as_ref(&self) -> &HostCol {
         match self {
-            ResolvedHostCol::Borrowed(c) => *c,
-            ResolvedHostCol::Owned(c) => c,
+            ResolvedHostCol::Borrowed { col, .. } => *col,
+            ResolvedHostCol::Owned { col, .. } => col,
+        }
+    }
+
+    /// Number of non-NULL rows in the original (pre-filter) input. Used by
+    /// AVG (denominator) and COUNT(col) (result). For the fast path this
+    /// equals the column length; for the slow path it equals the length
+    /// of the filtered column (since NULL rows have been dropped).
+    fn non_null_count(&self) -> usize {
+        match self {
+            ResolvedHostCol::Borrowed { non_null, .. } => *non_null,
+            ResolvedHostCol::Owned { non_null, .. } => *non_null,
         }
     }
 }
@@ -404,26 +451,43 @@ fn to_expr_host(c: &HostCol) -> expr_agg::HostColumn {
 }
 
 /// Convert a materialised [`expr_agg::HostColumn`] back into the local
-/// primitive [`HostCol`] shape consumed by the reduction path. NULLs collapse
-/// to the dtype's zero, matching the zero-initialised slots that the pre
-/// kernel writes for masked-out rows (the reduction's identity is also zero
-/// for SUM/COUNT, so this preserves the existing semantics). Bool / Utf8
-/// materialisations are rejected — the reduction kernels only accept
-/// primitive numeric inputs.
-fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
+/// primitive [`HostCol`] shape consumed by the reduction path.
+///
+/// **NULL handling**: SQL aggregate semantics require `SUM`/`MIN`/`MAX`/`AVG`/
+/// `COUNT(col)` to ignore NULL rows. This function drops every `None` entry
+/// from the input column and returns the filtered values plus the count of
+/// surviving (non-NULL) rows. Callers use that count as the AVG denominator
+/// and the COUNT(col) result.
+///
+/// A previous version of this function coerced NULLs to zero, which was a
+/// correctness bug: `MIN([NULL, 5])` returned `0` instead of `5`,
+/// `MAX([NULL, -3])` returned `0` instead of `-3`, and `AVG([NULL, 4])`
+/// returned `2.0` (4/2) instead of `4.0` (4/1).
+///
+/// Bool / Utf8 materialisations are still rejected — the reduction kernels
+/// only accept primitive numeric inputs.
+fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<(HostCol, usize)> {
     match c {
         expr_agg::HostColumn::I32(v) => {
-            Ok(HostCol::I32(v.into_iter().map(|x| x.unwrap_or(0)).collect()))
+            let filtered: Vec<i32> = v.into_iter().flatten().collect();
+            let n = filtered.len();
+            Ok((HostCol::I32(filtered), n))
         }
         expr_agg::HostColumn::I64(v) => {
-            Ok(HostCol::I64(v.into_iter().map(|x| x.unwrap_or(0)).collect()))
+            let filtered: Vec<i64> = v.into_iter().flatten().collect();
+            let n = filtered.len();
+            Ok((HostCol::I64(filtered), n))
         }
-        expr_agg::HostColumn::F32(v) => Ok(HostCol::F32(
-            v.into_iter().map(|x| x.unwrap_or(0.0)).collect(),
-        )),
-        expr_agg::HostColumn::F64(v) => Ok(HostCol::F64(
-            v.into_iter().map(|x| x.unwrap_or(0.0)).collect(),
-        )),
+        expr_agg::HostColumn::F32(v) => {
+            let filtered: Vec<f32> = v.into_iter().flatten().collect();
+            let n = filtered.len();
+            Ok((HostCol::F32(filtered), n))
+        }
+        expr_agg::HostColumn::F64(v) => {
+            let filtered: Vec<f64> = v.into_iter().flatten().collect();
+            let n = filtered.len();
+            Ok((HostCol::F64(filtered), n))
+        }
         expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => {
             Err(BoltError::Type(
                 "agg_with_pre: Bool/Utf8 aggregate inputs not supported by the \
@@ -843,4 +907,197 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// These tests cover the host-only NULL-filtering contract of
+// `from_expr_host`, which is the patch point for a correctness bug: NULLs in
+// aggregate inputs used to be coerced to dtype-zero, which broke
+// `MIN`/`MAX`/`AVG`/`COUNT(col)`. The tests cannot exercise the GPU
+// reduction path directly (it requires CUDA), so they verify that
+// `from_expr_host` drops NULL entries and reports the surviving count, then
+// emulate what each GPU aggregate kernel would compute on the filtered
+// values to assert the end-to-end answer matches SQL semantics.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Emulate the host-side finalization that `reduce_host_slice` would
+    /// perform after the GPU returns its per-block partials. Lets us assert
+    /// the end-to-end SQL semantics without a CUDA context.
+    fn host_reduce_i32(op: ReduceOp, vs: &[i32]) -> i32 {
+        match op {
+            ReduceOp::Sum | ReduceOp::Count => vs.iter().copied().fold(0, i32::wrapping_add),
+            ReduceOp::Min => vs.iter().copied().fold(i32::MAX, i32::min),
+            ReduceOp::Max => vs.iter().copied().fold(i32::MIN, i32::max),
+        }
+    }
+
+    fn host_reduce_f64(op: ReduceOp, vs: &[f64]) -> f64 {
+        match op {
+            ReduceOp::Sum | ReduceOp::Count => vs.iter().copied().fold(0.0, |a, b| a + b),
+            ReduceOp::Min => vs.iter().copied().fold(f64::INFINITY, f64::min),
+            ReduceOp::Max => vs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        }
+    }
+
+    /// `from_expr_host` drops NULL entries and reports the count of
+    /// non-NULL values for an `I32` column. Covers the I32 arm of the bug
+    /// fix.
+    #[test]
+    fn from_expr_host_filters_i32_nulls() {
+        let col = expr_agg::HostColumn::I32(vec![None, Some(5), None, Some(7), Some(-3)]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 3);
+        match host {
+            HostCol::I32(v) => assert_eq!(v, vec![5, 7, -3]),
+            _ => panic!("expected I32 variant"),
+        }
+    }
+
+    /// Same as above for `I64`.
+    #[test]
+    fn from_expr_host_filters_i64_nulls() {
+        let col = expr_agg::HostColumn::I64(vec![Some(10), None, Some(20)]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 2);
+        match host {
+            HostCol::I64(v) => assert_eq!(v, vec![10, 20]),
+            _ => panic!("expected I64"),
+        }
+    }
+
+    /// Same as above for `F32`.
+    #[test]
+    fn from_expr_host_filters_f32_nulls() {
+        let col = expr_agg::HostColumn::F32(vec![None, Some(1.5), Some(2.5), None]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 2);
+        match host {
+            HostCol::F32(v) => assert_eq!(v, vec![1.5, 2.5]),
+            _ => panic!("expected F32"),
+        }
+    }
+
+    /// Same as above for `F64`.
+    #[test]
+    fn from_expr_host_filters_f64_nulls() {
+        let col = expr_agg::HostColumn::F64(vec![Some(4.0), None]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 1);
+        match host {
+            HostCol::F64(v) => assert_eq!(v, vec![4.0]),
+            _ => panic!("expected F64"),
+        }
+    }
+
+    /// `MIN` over a column with NULLs and one non-NULL must return that
+    /// non-NULL value, not the dtype's zero. Pre-fix this returned 0.
+    #[test]
+    fn min_ignores_nulls() {
+        let col = expr_agg::HostColumn::I32(vec![None, Some(5)]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 1);
+        let values = match host {
+            HostCol::I32(v) => v,
+            _ => panic!("expected I32"),
+        };
+        assert_eq!(host_reduce_i32(ReduceOp::Min, &values), 5);
+    }
+
+    /// `MAX([NULL, -3])` must be `-3`, not `0`. Pre-fix it was `0` because
+    /// NULL coerced to zero and `max(0, -3) == 0`.
+    #[test]
+    fn max_ignores_nulls() {
+        let col = expr_agg::HostColumn::I32(vec![None, Some(-3)]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 1);
+        let values = match host {
+            HostCol::I32(v) => v,
+            _ => panic!("expected I32"),
+        };
+        assert_eq!(host_reduce_i32(ReduceOp::Max, &values), -3);
+    }
+
+    /// `AVG([NULL, 4])` must be `4.0` (sum=4, count=1), not `2.0`
+    /// (sum=4 with NULL-as-zero, count=2 with NULL included). The
+    /// denominator comes from `non_null`, not the original row count.
+    #[test]
+    fn avg_ignores_nulls_in_numerator_and_denominator() {
+        // The slow path materialises AVG inputs at Float64.
+        let col = expr_agg::HostColumn::F64(vec![None, Some(4.0)]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 1);
+        let values = match host {
+            HostCol::F64(v) => v,
+            _ => panic!("expected F64"),
+        };
+        let sum = host_reduce_f64(ReduceOp::Sum, &values);
+        let avg = sum / (non_null as f64);
+        assert!((avg - 4.0).abs() < 1e-12, "avg was {avg}, expected 4.0");
+    }
+
+    /// `SUM` was previously "accidentally correct" because 0 is the SUM
+    /// identity. Verify it stays correct under the new filter-then-reduce
+    /// pipeline.
+    #[test]
+    fn sum_matches_non_null_sum() {
+        let col = expr_agg::HostColumn::I32(vec![None, Some(5), None, Some(7)]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 2);
+        let values = match host {
+            HostCol::I32(v) => v,
+            _ => panic!("expected I32"),
+        };
+        assert_eq!(host_reduce_i32(ReduceOp::Sum, &values), 12);
+    }
+
+    /// `COUNT(col)` excludes NULLs: a column with two NULLs and two
+    /// non-NULLs has count 2. Pre-fix `build_one_aggregate` used the
+    /// pre-stage row count (4 here), which double-counted the NULLs.
+    #[test]
+    fn count_col_excludes_nulls() {
+        let col = expr_agg::HostColumn::I32(vec![None, Some(5), None, Some(7)]);
+        let (_host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 2);
+    }
+
+    /// All-NULL input: `from_expr_host` returns an empty column and
+    /// `non_null == 0`. Downstream, `reduce_host_slice` short-circuits
+    /// the GPU launch (see `reduce_gpu_vec`'s `n_rows == 0` guard) and
+    /// returns the reduction's identity. SQL would say MIN/MAX/SUM/AVG
+    /// over an all-NULL column should be NULL, but the existing
+    /// non-nullable scalar output path cannot express that — out of
+    /// scope for this fix. `COUNT(col)` correctly yields 0.
+    #[test]
+    fn all_null_yields_empty_and_zero_count() {
+        let col = expr_agg::HostColumn::I32(vec![None, None, None]);
+        let (host, non_null) = from_expr_host(col).expect("ok");
+        assert_eq!(non_null, 0);
+        match host {
+            HostCol::I32(v) => assert!(v.is_empty(), "expected empty vec, got {v:?}"),
+            _ => panic!("expected I32"),
+        }
+    }
+
+    /// Bool / Utf8 are still rejected — the slow-path reduction kernels
+    /// only accept primitive numeric inputs.
+    #[test]
+    fn from_expr_host_rejects_bool_and_utf8() {
+        let bool_col = expr_agg::HostColumn::Bool(vec![Some(true)]);
+        assert!(matches!(
+            from_expr_host(bool_col),
+            Err(BoltError::Type(_))
+        ));
+
+        let utf8_col = expr_agg::HostColumn::Utf8(vec![Some("x".to_string())]);
+        assert!(matches!(
+            from_expr_host(utf8_col),
+            Err(BoltError::Type(_))
+        ));
+    }
 }

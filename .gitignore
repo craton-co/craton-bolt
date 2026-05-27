@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Claude Code worktrees and session state
+.claude/
+
 # Editor / IDE
 .idea
 .vscode/
