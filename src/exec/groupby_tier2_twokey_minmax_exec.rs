@@ -117,6 +117,25 @@ pub fn try_execute(
         return None;
     }
 
+    // Int64 correctness gate: the scatter pipeline routes the value
+    // column through `f64`, which only represents `i64` losslessly for
+    // `|v| <= 2^53`. Decline when any value would lose precision so the
+    // caller falls through to a non-lossy (slower) executor — wrong
+    // MIN/MAX is far worse than slow MIN/MAX. Shared with the single-key
+    // exec so the gate is defined in exactly one place.
+    //
+    // TODO(c4): wire a typed i64 scatter+reduce path so this guard can
+    // be removed. The two scatter kernels in `crate::jit::scatter_kernel*`
+    // both take `f64` value columns today; a sibling that takes `i64`
+    // value columns (or a generic typed scatter) would let us keep the
+    // fast lane for the full Int64 range.
+    if val_dtype == MinMaxDtype::Int64 {
+        let a = val_col.as_any().downcast_ref::<Int64Array>()?;
+        if crate::exec::groupby_tier2_minmax_exec::i64_values_exceed_f64_mantissa(a.values()) {
+            return None;
+        }
+    }
+
     Some(execute_inner(plan, k1, k2, val_col, op, val_dtype))
 }
 
@@ -141,7 +160,10 @@ fn execute_inner(
     let keys_gpu: GpuVec<i64> = GpuVec::<i64>::from_slice(&packed)?;
 
     // Round-trip ints through f64 for the scatter (same as single-key int
-    // MIN/MAX exec). Exact for Int32; lossy above 2^53 for Int64.
+    // MIN/MAX exec). Exact for Int32; for Int64 the round-trip is only
+    // sound for `|v| <= 2^53` — `try_execute` declines the batch
+    // otherwise (see the `i64_values_exceed_f64_mantissa` gate there).
+    // TODO(c4): remove the f64 hop once a typed i64 scatter lands.
     let host_vals_f64: Vec<f64> = match val_dtype {
         MinMaxDtype::Int32 => val_col
             .as_any()
@@ -436,4 +458,57 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Correctness-guard tests for the two-key Int64-value path.
+//
+// We re-export the same predicate the single-key exec uses
+// (`groupby_tier2_minmax_exec::i64_values_exceed_f64_mantissa`), so the
+// behaviour we care about — "any value > 2^53 declines the fast path" —
+// is exercised here in the context of the two-key GROUP BY. No GPU
+// required.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use crate::exec::groupby_tier2_minmax_exec::i64_values_exceed_f64_mantissa;
+
+    const F64_EXACT_I64_LIMIT: i64 = 1_i64 << 53;
+
+    /// Two-key `MIN(int64_col)` with a value column containing
+    /// `2^53 + 1` must decline the fast path. Without the guard the
+    /// executor would silently downcast through f64 and return the
+    /// wrong number for one of the (k1, k2) groups.
+    #[test]
+    fn twokey_min_over_pow2_53_plus_one_is_rejected() {
+        let big = F64_EXACT_I64_LIMIT + 1;
+        // Sanity: confirm f64 round-trip really is lossy here.
+        assert_ne!(big as f64 as i64, big);
+        let vals = vec![1_i64, 2, big, 4, 5];
+        assert!(
+            i64_values_exceed_f64_mantissa(&vals),
+            "two-key MIN must trip the guard on a column containing 2^53 + 1"
+        );
+    }
+
+    /// Two-key `MAX(int64_col)` — same property. The guard fires
+    /// regardless of which aggregation op is requested.
+    #[test]
+    fn twokey_max_over_pow2_53_plus_one_is_rejected() {
+        let big = F64_EXACT_I64_LIMIT + 1;
+        let vals = vec![big, 10, 20, 30];
+        assert!(i64_values_exceed_f64_mantissa(&vals));
+    }
+
+    /// Two-key path with an in-range Int64 column must keep using the
+    /// fast lane. This is the no-regression test: typical workloads
+    /// (small IDs, modest counters) stay on the GPU.
+    #[test]
+    fn twokey_in_range_int64_keeps_fast_path() {
+        let vals: Vec<i64> = (0..512).map(|i| i * 1024).collect();
+        assert!(
+            !i64_values_exceed_f64_mantissa(&vals),
+            "in-range Int64 two-key MIN/MAX must NOT decline"
+        );
+    }
 }

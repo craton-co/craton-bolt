@@ -82,6 +82,27 @@ pub fn try_execute(
         return None;
     }
 
+    // Int64 correctness gate: the current scatter pipeline routes the
+    // value column through `f64`, which has a 53-bit mantissa. Values
+    // with `|v| > 2^53` (e.g. modern unix-nanosecond timestamps, large
+    // monotonic IDs, hash-derived counters) survive the round-trip
+    // `i64 → f64 → i64` as a wrong number, producing a silently
+    // incorrect MIN/MAX. Decline this batch so the caller falls through
+    // to the slower-but-correct global-atomic / host baseline.
+    //
+    // TODO(c4): wire a typed i64 scatter+reduce path so we can keep the
+    // fast lane for full-range Int64 values. The scatter kernel today
+    // only accepts an f64 value column (see
+    // `crate::jit::scatter_kernel::compile_scatter_kernel` /
+    // `scatter_kernel_i64`). A sibling `scatter_kernel_i64_val` (or a
+    // generic typed scatter) would let us remove this guard entirely.
+    if val_dtype == MinMaxDtype::Int64 {
+        let a = val_col.as_any().downcast_ref::<Int64Array>()?;
+        if i64_values_exceed_f64_mantissa(a.values()) {
+            return None;
+        }
+    }
+
     // Range check + Tier-1-already-covers check.
     let mut max_key: i32 = -1;
     for &k in key_arr.values() {
@@ -191,7 +212,12 @@ fn execute_inner(
     // typed scatter then.
     //
     // For Int32: round-trip Int32→f64→Int32 is exact for all i32. ✓
-    // For Int64: lossy above 2^53. Documented limitation.
+    // For Int64: only sound when `|v| <= 2^53`. `try_execute` guards
+    // this with `i64_values_exceed_f64_mantissa` and declines the batch
+    // otherwise, so by the time we reach this point any Int64 column
+    // is in-range.
+    // TODO(c4): drop the host scan + decline once a typed i64 scatter
+    // path lands (see TODO in `try_execute`).
     let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros(n_rows as usize)?;
     let mut scatter_vals_f64: GpuVec<f64> = GpuVec::<f64>::zeros(n_rows as usize)?;
 
@@ -447,6 +473,27 @@ fn run_reduce_phase_i64(
     })
 }
 
+/// Largest absolute integer that survives the `i64 -> f64 -> i64`
+/// round-trip exactly. `f64` has a 53-bit significand, so any value with
+/// `|v| <= 2^53` is representable losslessly; above that the conversion
+/// quantises to the nearest representable double.
+const F64_EXACT_I64_LIMIT: i64 = 1_i64 << 53;
+
+/// Returns `true` if any value in `vals` has `|v| > 2^53`. Used as a
+/// correctness guard before routing an Int64 value column through the
+/// f64 scatter kernel — if the buffer contains values outside the safe
+/// range the host MUST decline this fast path and fall through to a
+/// non-lossy executor (host-side / global-atomic baseline).
+///
+/// O(n_rows) but a single tight scan over a primitive buffer; cheaper
+/// than the wrong answer it prevents. The check is conservative: it
+/// rejects on a single oversize value even if the surviving values
+/// would have produced the same MIN/MAX. We can tighten this later if
+/// it ever bites a real workload.
+pub(crate) fn i64_values_exceed_f64_mantissa(vals: &[i64]) -> bool {
+    vals.iter().any(|&v| v > F64_EXACT_I64_LIMIT || v < -F64_EXACT_I64_LIMIT)
+}
+
 fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
     match d {
         DataType::Int32 => Ok(ArrowDataType::Int32),
@@ -465,4 +512,102 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Correctness-guard tests for the `Int64 → f64` scatter round-trip.
+//
+// These exercise the host-side decline predicate
+// `i64_values_exceed_f64_mantissa`. They DO NOT require a GPU; they verify
+// only that the executor refuses to silently produce wrong answers when an
+// Int64 value column contains values beyond `±2^53`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The boundary value `2^53` itself is exactly representable in f64.
+    /// The first unsafe value is `2^53 + 1`. Our guard is conservative:
+    /// it rejects on `> 2^53` (strictly above the limit) so the limit
+    /// value alone is allowed but `2^53 + 1` must trip the guard.
+    #[test]
+    fn limit_value_is_safe() {
+        let vals = vec![0_i64, F64_EXACT_I64_LIMIT, -F64_EXACT_I64_LIMIT, 42];
+        assert!(
+            !i64_values_exceed_f64_mantissa(&vals),
+            "|v| == 2^53 must survive the f64 round-trip"
+        );
+    }
+
+    /// `MIN(int64_col)` over a column that contains `2^53 + 1` must NOT
+    /// hit the f64 path — the guard must trip so the caller falls
+    /// through to a correct executor.
+    #[test]
+    fn min_over_pow2_53_plus_one_is_rejected() {
+        let big = F64_EXACT_I64_LIMIT + 1; // 9_007_199_254_740_993
+        // Sanity check the value really is lossy through f64.
+        assert_ne!(
+            big as f64 as i64, big,
+            "2^53 + 1 must lose precision through f64 — if this stops being \
+             true on the host the guard is no longer load-bearing"
+        );
+        let vals = vec![100_i64, 200, big, 50];
+        assert!(
+            i64_values_exceed_f64_mantissa(&vals),
+            "MIN over a column containing 2^53 + 1 must trip the guard"
+        );
+    }
+
+    /// `MAX(int64_col)` over the same column has the same constraint —
+    /// the guard does not depend on the aggregation op, only on whether
+    /// any element would survive the f64 round-trip.
+    #[test]
+    fn max_over_pow2_53_plus_one_is_rejected() {
+        let big = F64_EXACT_I64_LIMIT + 1;
+        let vals = vec![big, 1, 2, 3];
+        assert!(
+            i64_values_exceed_f64_mantissa(&vals),
+            "MAX over a column containing 2^53 + 1 must trip the guard"
+        );
+    }
+
+    /// The negative-magnitude side of the mantissa is handled too — a
+    /// large negative value like `-(2^53 + 1)` is just as lossy.
+    #[test]
+    fn large_negative_is_rejected() {
+        let huge_neg = -(F64_EXACT_I64_LIMIT + 1);
+        let vals = vec![huge_neg, 0, 1, 2];
+        assert!(
+            i64_values_exceed_f64_mantissa(&vals),
+            "Large negative values must trip the guard too"
+        );
+    }
+
+    /// `i64::MAX` / `i64::MIN` are obviously out of range; sanity-check
+    /// the extreme corners.
+    #[test]
+    fn i64_extremes_are_rejected() {
+        assert!(i64_values_exceed_f64_mantissa(&[i64::MAX]));
+        assert!(i64_values_exceed_f64_mantissa(&[i64::MIN]));
+    }
+
+    /// All-zero / small-positive batches must NOT trip the guard, so
+    /// the existing fast path keeps working for typical Int64 workloads
+    /// (counters, small IDs).
+    #[test]
+    fn typical_small_int64_passes() {
+        let vals: Vec<i64> = (0..1024).collect();
+        assert!(
+            !i64_values_exceed_f64_mantissa(&vals),
+            "Small-integer Int64 columns must continue to use the fast path"
+        );
+    }
+
+    /// Empty input is trivially safe (vacuously true: no value is out of
+    /// range). Important so the guard does not accidentally decline a
+    /// zero-row batch.
+    #[test]
+    fn empty_input_passes() {
+        assert!(!i64_values_exceed_f64_mantissa(&[]));
+    }
 }
