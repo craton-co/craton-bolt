@@ -45,26 +45,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo fmt --all -- --check
 
-      - name: clippy (warnings allowed for now)
+      - name: clippy
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
-        # NOTE: 4 known warnings during fix cycle — do not fail the build yet.
-        # Re-enable `-D warnings` once the backlog is cleared.
         run: cargo clippy --lib --tests --features cuda-stub --no-default-features
-        env:
-          RUSTFLAGS: ""
 
       - name: cargo check
         run: cargo check --lib --features cuda-stub --no-default-features
-        env:
-          RUSTFLAGS: ""
 
       - name: cargo test (lib + integration)
         run: cargo test --lib --tests --features cuda-stub --no-default-features
-        env:
-          RUSTFLAGS: ""
 
       - name: cargo test (doctests)
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo test --doc --features cuda-stub --no-default-features
-        env:
-          RUSTFLAGS: ""
