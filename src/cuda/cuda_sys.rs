@@ -12,6 +12,7 @@
 
 use std::ffi::CStr;
 
+use bytemuck::Pod;
 use libc::{c_char, c_int, c_uint, c_void};
 
 use crate::error::{BoltError, BoltResult};
@@ -614,5 +615,275 @@ mod init_cache_tests {
             3,
             "driver was called after success latched"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1 async memcpy / memset wrappers.
+//
+// These are the safe-ish parents of `cuMemcpyHtoDAsync_v2`,
+// `cuMemcpyDtoHAsync_v2`, and `cuMemsetD8Async`. They issue the operation
+// on the supplied stream and return *immediately* — synchronization is the
+// caller's responsibility (typically a `CudaStream::synchronize` later in
+// the same phase).
+//
+// Stage 1 ships wrappers only: executors still use the existing synchronous
+// `from_slice` / `to_vec` paths and are unaffected. Stage 2 will wire these
+// into the per-shape executors together with pinned-host buffer plumbing.
+//
+// Backend split:
+//   - Default build: routes straight into the hand-rolled `extern "C"`
+//     async FFI.
+//   - `--features cudarc`: cudarc 0.13's scoped `driver` feature set does
+//     not expose async memcpy from the safe surface. To keep this Stage 1
+//     PR small we delegate to the synchronous path on this branch — the
+//     behaviour is identical to today, the wrappers just compile and link
+//     cleanly. Stage 2 will replace this with a real async path either by
+//     calling cudarc's `sys::*Async_v2` raw symbols or by enabling the
+//     wider cudarc feature flag.
+//
+// All three wrappers are `pub(crate)` rather than `pub`: Stage 1 deliberately
+// keeps the async surface internal until executors are wired in Stage 2.
+
+/// Asynchronously copy `n` elements of `T` from host `src` to device `dst`
+/// on `stream`. Returns once the copy is *issued* — call
+/// `cuStreamSynchronize` (or use
+/// [`crate::exec::launch::CudaStream::synchronize`]) before reading the
+/// destination.
+///
+/// For correct overlap with kernel work, `src` should point at pinned host
+/// memory ([`crate::cuda::buffer::PinnedHostBuffer`]). Pageable host memory
+/// still works but the driver synthesizes a staging copy that serializes
+/// against the calling thread.
+///
+/// # Safety
+/// - `src` must be valid for reads of `n * size_of::<T>()` bytes for the
+///   entire duration of the async copy (until the stream is synchronized).
+/// - `dst` must point to a live device allocation of at least the same
+///   size in the currently-bound context.
+/// - The caller must not mutate or free `src` until the copy completes.
+///
+/// # TODO(stage2)
+/// Wire cudarc async path — the cudarc 0.13 `driver` feature set does not
+/// expose `cuMemcpyHtoDAsync_v2` from the safe surface, so the
+/// `--features cudarc` branch currently falls back to the synchronous
+/// memcpy. Replace once the surface is widened or once we drop into
+/// `cudarc::driver::sys::*Async_v2` directly.
+pub(crate) unsafe fn memcpy_h2d_async<T: Pod>(
+    dst: CUdeviceptr,
+    src: *const T,
+    n: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let bytes = n.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "memcpy_h2d_async size overflow: {} * {}",
+            n,
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    if bytes == 0 {
+        return Ok(());
+    }
+
+    #[cfg(feature = "cudarc")]
+    {
+        // TODO(stage2): wire cudarc async path.
+        let _ = stream;
+        return crate::cuda::cudarc_backend::memcpy_h2d::<T>(dst, src, n);
+    }
+
+    #[cfg(not(feature = "cudarc"))]
+    {
+        check(cuMemcpyHtoDAsync_v2(
+            dst,
+            src as *const c_void,
+            bytes,
+            stream,
+        ))
+    }
+}
+
+/// Asynchronously copy `n` elements of `T` from device `src` to host `dst`
+/// on `stream`. Returns once the copy is *issued* — call
+/// `cuStreamSynchronize` (or use
+/// [`crate::exec::launch::CudaStream::synchronize`]) before reading the
+/// destination.
+///
+/// For correct overlap with kernel work, `dst` should point at pinned host
+/// memory ([`crate::cuda::buffer::PinnedHostBuffer`]).
+///
+/// # Safety
+/// - `dst` must be valid for writes of `n * size_of::<T>()` bytes for the
+///   entire duration of the async copy (until the stream is synchronized).
+/// - `src` must point to a live device allocation of at least the same size
+///   in the currently-bound context.
+/// - The caller must not read `dst` until the copy completes.
+///
+/// # TODO(stage2)
+/// Wire cudarc async path — same constraint as
+/// [`memcpy_h2d_async`].
+pub(crate) unsafe fn memcpy_d2h_async<T: Pod>(
+    dst: *mut T,
+    src: CUdeviceptr,
+    n: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let bytes = n.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "memcpy_d2h_async size overflow: {} * {}",
+            n,
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    if bytes == 0 {
+        return Ok(());
+    }
+
+    #[cfg(feature = "cudarc")]
+    {
+        // TODO(stage2): wire cudarc async path.
+        let _ = stream;
+        return crate::cuda::cudarc_backend::memcpy_d2h::<T>(dst, src, n);
+    }
+
+    #[cfg(not(feature = "cudarc"))]
+    {
+        check(cuMemcpyDtoHAsync_v2(
+            dst as *mut c_void,
+            src,
+            bytes,
+            stream,
+        ))
+    }
+}
+
+/// Asynchronously fill `n_bytes` at device pointer `ptr` with the byte
+/// `value`, on `stream`.
+///
+/// Unlike the typed memcpy wrappers this one does not need a `T` because
+/// `cuMemsetD8Async` operates on raw bytes.
+///
+/// # Safety contract
+/// `ptr` must point to a live device allocation of at least `n_bytes`
+/// bytes in the currently-bound context; the memory must not be freed or
+/// concurrently mutated until the stream is synchronized.
+///
+/// This wrapper itself does not deref the pointer, so it does not need to
+/// be `unsafe fn` — the unsafety is moved into the caller's obligation to
+/// uphold the contract above.
+///
+/// # TODO(stage2)
+/// Wire cudarc async path. cudarc 0.13's `driver` feature does not expose
+/// `cuMemsetD8Async` from the safe surface, so the `--features cudarc`
+/// branch falls back to the synchronous memset.
+pub(crate) fn memset_d8_async(
+    ptr: CUdeviceptr,
+    value: u8,
+    n_bytes: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    if n_bytes == 0 {
+        return Ok(());
+    }
+
+    #[cfg(feature = "cudarc")]
+    {
+        // TODO(stage2): wire cudarc async path. cudarc has no public
+        // memset_d8 helper, but the synchronous fall-back path below
+        // matches today's Stage 1 spike behaviour.
+        let _ = stream;
+        // SAFETY: precondition documented on the function — caller
+        // guarantees the device range is live and not in use.
+        return unsafe { memset_d8(ptr, value, n_bytes) };
+    }
+
+    #[cfg(not(feature = "cudarc"))]
+    {
+        // SAFETY: precondition documented on the function.
+        unsafe { check(cuMemsetD8Async(ptr, value, n_bytes, stream)) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Stage 1 sanity tests for the new async wrappers and pinned host
+    //! buffer. The GPU-touching test is `#[ignore]`-gated under the same
+    //! `BOLT_BENCH_GPU=1 + --ignored` convention as the rest of the crate;
+    //! the compile-only test runs everywhere (including `cuda-stub`).
+    use super::*;
+
+    /// Type-only check: the new async APIs exist with the documented
+    /// signatures and accept a `CUstream`. Runs under every feature
+    /// configuration including `cuda-stub` and `cudarc` because it never
+    /// calls the functions — it only takes their address through a
+    /// matching `fn` pointer.
+    #[test]
+    fn async_copy_apis_compile_under_cuda_stub() {
+        // Bind each wrapper to a function pointer of the expected shape.
+        // Any signature drift becomes a compile error here rather than
+        // silently breaking Stage 2 wiring.
+        let _h2d: unsafe fn(CUdeviceptr, *const u32, usize, CUstream) -> BoltResult<()> =
+            memcpy_h2d_async::<u32>;
+        let _d2h: unsafe fn(*mut u32, CUdeviceptr, usize, CUstream) -> BoltResult<()> =
+            memcpy_d2h_async::<u32>;
+        let _set: fn(CUdeviceptr, u8, usize, CUstream) -> BoltResult<()> = memset_d8_async;
+
+        // Also check that zero-length calls are infallible without needing
+        // a live CUDA context (the wrappers short-circuit before the FFI).
+        // Use a NULL stream so the call is self-contained.
+        let null_stream: CUstream = std::ptr::null_mut();
+        unsafe {
+            memcpy_h2d_async::<u32>(0, std::ptr::null(), 0, null_stream)
+                .expect("zero-length h2d must be Ok");
+            memcpy_d2h_async::<u32>(std::ptr::null_mut(), 0, 0, null_stream)
+                .expect("zero-length d2h must be Ok");
+        }
+        memset_d8_async(0, 0, 0, null_stream).expect("zero-length memset must be Ok");
+    }
+
+    /// End-to-end round-trip: pinned host -> device (async) -> pinned host
+    /// (async), with a stream sync in between. Verifies that the async
+    /// memcpy wrappers actually move bytes and that `PinnedHostBuffer`
+    /// hands out a valid host buffer.
+    #[test]
+    #[ignore = "requires CUDA device (set BOLT_BENCH_GPU=1 + run with --ignored)"]
+    fn pinned_host_buffer_roundtrip() {
+        use crate::cuda::buffer::{GpuBuffer, PinnedHostBuffer};
+        use crate::exec::launch::CudaStream;
+
+        // Bring up a context on device 0. `CudaContext::new` calls
+        // `cuInit(0)` for us, so this test does not depend on test
+        // ordering.
+        let ctx = CudaContext::new(0).expect("create CUDA context");
+        ctx.set_current().expect("set context current");
+
+        let n = 4096usize;
+        let mut host_in: PinnedHostBuffer<u32> =
+            PinnedHostBuffer::new(n).expect("alloc pinned host (in)");
+        let mut host_out: PinnedHostBuffer<u32> =
+            PinnedHostBuffer::new(n).expect("alloc pinned host (out)");
+
+        for (i, slot) in host_in.as_mut_slice().iter_mut().enumerate() {
+            *slot = (i as u32).wrapping_mul(0x9E37_79B1);
+        }
+        for slot in host_out.as_mut_slice().iter_mut() {
+            *slot = 0;
+        }
+
+        let stream = CudaStream::new().expect("create stream");
+        let mut dev: GpuBuffer<u32> = GpuBuffer::with_capacity(n).expect("alloc device");
+
+        dev.copy_from_async(host_in.as_slice(), stream.raw())
+            .expect("async H2D");
+        // Synchronize once so the kernel-less round-trip is self-contained
+        // and we can issue the D2H against a known-good device buffer.
+        stream.synchronize().expect("sync after H2D");
+
+        dev.copy_to_async(host_out.as_mut_slice(), stream.raw())
+            .expect("async D2H");
+        stream.synchronize().expect("sync after D2H");
+
+        assert_eq!(host_in.as_slice(), host_out.as_slice());
     }
 }

@@ -22,10 +22,14 @@ cannot run a kernel.
 
 ## Q3. Why no async memcpy yet?
 
-The FFI bindings for `cuMemcpyAsync` and pinned host allocation are in
-place in 0.3.0, but the executors still issue synchronous transfers.
-Threading async copies through the per-shape executors (and the matching
-stream-and-event accounting) is on the 0.4 list.
+The FFI bindings for `cuMemcpyAsync` and pinned host allocation landed
+in 0.3.0. **Stage 1** (safe wrappers — `memcpy_h2d_async`,
+`memcpy_d2h_async`, `memset_d8_async`, `PinnedHostBuffer<T>`,
+`GpuBuffer::copy_{from,to}_async`) is in place on the path to 0.4, but
+the executors still call the synchronous `from_slice` / `to_vec`
+helpers. Threading the new async surface through the per-shape
+executors (and the matching stream-and-event accounting) is the
+remaining 0.4 task — see `docs/JIT_PIPELINE.md` for the staging plan.
 
 ## Q4. Can I share a `GpuVec` between threads?
 
