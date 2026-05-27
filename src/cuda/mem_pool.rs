@@ -50,6 +50,7 @@ use crate::cuda::cuda_sys::CUdeviceptr;
 // instead, so the import is feature-gated to keep both builds warning-
 // free.
 #[cfg(not(feature = "cudarc"))]
+#[cfg(not(test))]
 use crate::cuda::cuda_sys;
 use crate::error::BoltResult;
 
@@ -285,6 +286,7 @@ impl DeviceMemPool {
 
     /// Sum of `alloc_bytes` across every pooled block. Useful for tests
     /// and memory-pressure introspection.
+    #[allow(dead_code)] // reason: introspection API, used by tests and future memory-pressure hooks
     pub(crate) fn total_pooled_bytes(&self) -> usize {
         self.inner.lock().total_bytes
     }
@@ -294,6 +296,7 @@ impl DeviceMemPool {
     /// paths and `CudaContext::Drop`-adjacent shutdown hooks; the steady-
     /// state `free` path already enforces the cap, so this is a no-op in
     /// normal operation. Returns the number of blocks evicted.
+    #[allow(dead_code)] // reason: shutdown / memory-pressure hook, not yet wired but kept for the contract
     pub(crate) fn evict_above_high_water(&self) -> usize {
         let to_free: Vec<CUdeviceptr> = {
             let mut state = self.inner.lock();
