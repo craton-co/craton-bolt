@@ -484,12 +484,44 @@ pub struct SortExpr {
     pub nulls_first: bool,
 }
 
-/// Join kind. Wave 7 ships INNER only; other kinds are reserved.
+/// Join kind. 0.3.0 ships INNER only; LEFT/RIGHT/FULL/CROSS land in 0.3.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
     /// SQL INNER JOIN.
     Inner,
-    // Left, Right, Full, etc. — out of scope for 0.1.x.
+    /// SQL LEFT [OUTER] JOIN: every left row appears, NULL-padded on the
+    /// right when no match is found.
+    LeftOuter,
+    /// SQL RIGHT [OUTER] JOIN: every right row appears, NULL-padded on the
+    /// left when no match is found.
+    RightOuter,
+    /// SQL FULL [OUTER] JOIN: union of LEFT + RIGHT semantics — every
+    /// unmatched row from either side emits with the opposite side NULL.
+    FullOuter,
+    /// SQL CROSS JOIN: cartesian product, no ON predicate.
+    Cross,
+}
+
+impl JoinType {
+    /// True if the left side is preserved (every left row emits at least
+    /// once). Holds for INNER (matched only), LEFT, FULL, and CROSS;
+    /// false for RIGHT (left rows may be dropped if unmatched on the
+    /// right).
+    pub fn left_preserved(self) -> bool {
+        matches!(
+            self,
+            JoinType::LeftOuter | JoinType::FullOuter | JoinType::Cross
+        )
+    }
+
+    /// True if the right side is preserved (every right row emits at least
+    /// once). Holds for RIGHT, FULL, and CROSS; false for INNER and LEFT.
+    pub fn right_preserved(self) -> bool {
+        matches!(
+            self,
+            JoinType::RightOuter | JoinType::FullOuter | JoinType::Cross
+        )
+    }
 }
 
 /// Relational logical plan node.
@@ -557,16 +589,19 @@ pub enum LogicalPlan {
         inputs: Vec<LogicalPlan>,
     },
     /// SQL JOIN: combine `left` and `right` rows that satisfy `on`.
-    /// For 0.1.x the executor only supports `JoinType::Inner` with at least
-    /// one equi-join predicate; everything else errors at execution time.
+    /// Supports `JoinType::Inner`, `LeftOuter`, `RightOuter`, `FullOuter`,
+    /// and `Cross`. INNER and the OUTER variants require at least one
+    /// equi-join predicate (`on` non-empty); CROSS requires `on` to be
+    /// empty (it has no ON clause).
     Join {
         /// Left input.
         left: Box<LogicalPlan>,
         /// Right input.
         right: Box<LogicalPlan>,
-        /// Join kind (INNER only in this version).
+        /// Join kind.
         join_type: JoinType,
-        /// Equi-join predicate pairs `(left_expr, right_expr)`; conjunctive.
+        /// Equi-join predicate pairs `(left_expr, right_expr)`;
+        /// conjunctive. Empty for `Cross`.
         on: Vec<(Expr, Expr)>,
     },
 }
@@ -673,21 +708,30 @@ impl LogicalPlan {
                 }
                 Ok(first)
             }
-            LogicalPlan::Join { left, right, .. } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
                 // Concatenate left and right schemas, disambiguating right-
                 // side columns whose names collide with anything on the left.
-                // See `join_combined_schema` for the canonical rule (also used
-                // by `PhysicalPlan::Join::output_schema()`); duplicating it
-                // here would risk drift if either copy is edited.
+                // For OUTER joins, the columns coming from the side that
+                // may be NULL-padded are marked `nullable = true` (a row
+                // from the preserved side may have no match on the other).
+                // See `join_combined_schema` for the canonical rule (also
+                // used by `PhysicalPlan::Join::output_schema()`);
+                // duplicating it here would risk drift if either copy is
+                // edited.
                 let l = left.schema()?;
                 let r = right.schema()?;
-                Ok(join_combined_schema(&l, &r))
+                Ok(join_combined_schema(&l, &r, *join_type))
             }
         }
     }
 }
 
-/// Build the output schema of an INNER JOIN over `left` and `right`.
+/// Build the output schema of a JOIN over `left` and `right`.
 ///
 /// Concatenates the two schemas in order, but disambiguates any right-side
 /// field whose name already appears on the left by prefixing it with
@@ -700,14 +744,32 @@ impl LogicalPlan {
 ///     itself collides (rare — only if the left side has a literal
 ///     `"right.<name>"` column), append `__2`, `__3`, ... until unique.
 ///
+/// Nullability of output fields is widened for OUTER joins. For a
+/// `LEFT [OUTER]` join, every right-side column becomes nullable
+/// (preserved-left rows with no match emit NULL-padded right columns).
+/// `RIGHT [OUTER]` is symmetric; `FULL [OUTER]` widens both sides;
+/// `CROSS` and `INNER` leave nullability untouched.
+///
 /// This is the single source of truth for join output schemas, called by
 /// both [`LogicalPlan::Join::schema`](LogicalPlan#method.schema)
 /// and [`PhysicalPlan::Join::output_schema`](crate::plan::physical_plan::PhysicalPlan::output_schema)
 /// so the logical and physical layers can never disagree on what a join
 /// produces.
-pub fn join_combined_schema(left: &Schema, right: &Schema) -> Schema {
+pub fn join_combined_schema(left: &Schema, right: &Schema, join_type: JoinType) -> Schema {
+    // Outer joins NULL-pad the *non-preserved* side: LEFT preserves the
+    // left side and may NULL-pad the right; RIGHT is symmetric; FULL may
+    // NULL-pad either side. CROSS and INNER never NULL-pad here.
+    let left_may_null = matches!(join_type, JoinType::RightOuter | JoinType::FullOuter);
+    let right_may_null = matches!(join_type, JoinType::LeftOuter | JoinType::FullOuter);
+
     let mut fields: Vec<Field> = Vec::with_capacity(left.fields.len() + right.fields.len());
-    fields.extend(left.fields.iter().cloned());
+    for lf in &left.fields {
+        fields.push(Field {
+            name: lf.name.clone(),
+            dtype: lf.dtype,
+            nullable: lf.nullable || left_may_null,
+        });
+    }
     // Snapshot the names already taken by the left side so collision lookup
     // doesn't depend on later right-side insertions.
     let mut taken: std::collections::HashSet<String> =
@@ -736,7 +798,7 @@ pub fn join_combined_schema(left: &Schema, right: &Schema) -> Schema {
         fields.push(Field {
             name,
             dtype: rf.dtype,
-            nullable: rf.nullable,
+            nullable: rf.nullable || right_may_null,
         });
     }
     Schema { fields }

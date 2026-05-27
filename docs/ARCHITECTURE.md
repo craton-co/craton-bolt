@@ -201,7 +201,7 @@ Float MIN/MAX over `Float32` / `Float64` has no native `atom.global.min/max.f*` 
 - **No process model.** Everything runs in a single Rust process.
 - **No multi-GPU.** One context, one device, one stream (by default). Multiple streams are a future change.
 - **No persistent dictionary or query cache.** Every query JITs fresh. A PTX cache keyed on `KernelSpec` is an obvious next optimization.
-- **No optimiser passes beyond the lowering.** No predicate pushdown, no constant folding (beyond what's already in `LogicalPlan::schema` type-checking), no join reordering (because there are no joins). The flat pipeline is the optimisation budget today.
+- **No optimiser passes beyond the lowering.** No predicate pushdown, no constant folding (beyond what's already in `LogicalPlan::schema` type-checking), no join reordering. JOIN executors are host-side (build smaller side into a HashMap, probe the larger; CROSS is a host-side cartesian product) — a GPU hash join is a 0.4 target. The flat pipeline is the optimisation budget today.
 - **No streaming / multi-batch.** One `RecordBatch` per query. Larger-than-VRAM tables would need a batched executor.
 
 Each of these is a deliberate scope choice for the v0.1 release, not a fundamental limitation.

@@ -15,8 +15,8 @@ SELECT <select_list>
 
 **Hard restrictions** (everything else returns a `BoltError`):
 
-- One `SELECT` per query. No UNION, INTERSECT, EXCEPT, CTE, subquery in FROM, subquery in WHERE.
-- Exactly one table in `FROM`. No JOIN. No schema-qualified names.
+- One `SELECT` per query. No INTERSECT, EXCEPT, CTE, subquery in FROM, subquery in WHERE. `UNION [ALL]` is supported.
+- `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS` joins are supported (one or more joins per `SELECT`, executed host-side). The ON predicate must be a conjunction of `<left.col> = <right.col>` equalities; `CROSS JOIN` has no ON clause. Non-equi predicates, USING, NATURAL, and computed join keys remain rejected. No schema-qualified table names.
 - No `DISTINCT`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, `LOCK`, `INTO`, `WINDOW`, `QUALIFY`, lateral, table-valued functions, `PREWHERE` (clickhouse-ism), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`.
 - No `GROUP BY ALL`, `ROLLUP`, `CUBE`, `TOTALS`.
 
@@ -156,11 +156,29 @@ SELECT COUNT(*) FROM sales WHERE region = 'US';
 SELECT MIN(temp), MAX(temp) FROM weather GROUP BY station; -- Float MIN/MAX via CAS
 ```
 
+## JOIN
+
+```
+SELECT ... FROM <table>
+  [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table> ON <equi_predicate>]
+  [CROSS JOIN <table>]
+  ...
+```
+
+- The ON predicate is a conjunction of `left.col = right.col` equalities. Non-equi predicates and non-conjunctive shapes are rejected.
+- `CROSS JOIN` has no ON clause. The output row count is `|left| × |right|`; rewrite your query if it would exceed the engine's `u32::MAX`-row materialisation limit (an explicit `BoltError::Plan` surfaces at execute time when it would).
+- For `LEFT` / `RIGHT` / `FULL [OUTER]`, columns coming from the *non-preserved* side are marked nullable in the output schema. Unmatched preserved-side rows emit with NULLs in those columns.
+- Right-side column names that collide with a left-side name are prefixed with `right.` (e.g. left `id` and right `id` → output has `id` and `right.id`).
+- Both sides of an equi-join key must have the same dtype; cross-dtype equi-joins (e.g. `Int32 = Int64`) are rejected.
+- SQL NULL semantics on keys: `NULL = NULL` is `UNKNOWN`, so NULL-keyed rows never match. For OUTER joins they still emit on the preserved side with the opposite side NULL-padded.
+- The executor is host-side (build smaller side into a HashMap, probe larger; for CROSS, a host-side cartesian product). GPU hash join is a 0.4 target.
+
 ## What's NOT supported
 
 These produce explicit errors:
 
-- JOIN of any kind.
+- Non-equi join predicates (`a > b`, range joins).
+- `JOIN ... USING (col)` / `NATURAL JOIN` (rewrite as `ON`).
 - Subqueries.
 - Window functions.
 - `CASE ... WHEN`, `NULLIF`, `COALESCE`, `IFNULL`, `IIF`.

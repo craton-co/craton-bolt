@@ -47,7 +47,7 @@ Source: `src/plan/sql_frontend.rs`.
 
 Uses [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) as the lexer/parser. We don't accept the full SQL grammar — `parse_sql` walks the parser's AST and only accepts shapes Craton Bolt can execute:
 
-- `SELECT` with optional `WHERE`, `GROUP BY`. No UNION, no CTE, no subqueries, no JOIN, no ORDER BY, no LIMIT, no HAVING.
+- `SELECT` with optional `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT [OFFSET]`, `DISTINCT`, `UNION [ALL]`, and JOIN (INNER / LEFT / RIGHT / FULL / CROSS, host-side executor). No CTE, no subqueries.
 - A single table in `FROM`. No schema-qualified names.
 - Scalar expressions: column references, integer / float / string / bool / null literals, binary arithmetic (`+ - * /`), comparison (`= <> < <= > >=`), logical (`AND OR`), parenthesised sub-expressions, unary minus on literals (folded), unary plus (no-op).
 - Aggregate functions in SELECT: `COUNT(*)`, `COUNT(expr)`, `SUM`, `MIN`, `MAX`, `AVG`.
@@ -270,7 +270,7 @@ For non-bare aggregate inputs that aren't covered by the pre kernel's outputs (r
 
 - **NULL handling.** The current reduction kernels don't read a validity bitmap. `COUNT(expr)` counts every row, not just non-null rows. The host-side `extended_agg` path (Bool, Utf8) does honour nulls.
 - **Variable-width string outputs.** CONCAT producing genuinely new strings works via host-side dictionary cross-product (`src/exec/string_ops_extended.rs`), not on the GPU.
-- **Joins.** No join algorithm yet.
+- **Joins.** INNER / LEFT / RIGHT / FULL / CROSS joins run host-side (build smaller side into a HashMap, probe the larger; CROSS is a host-side cartesian product). A GPU-resident hash-join path is a 0.4 target.
 - **Window functions.** Not yet.
 - **CASE / NULLIF / CAST / unary ops beyond folded minus.** The expression evaluator covers the standard binary set; the AST doesn't model these.
 

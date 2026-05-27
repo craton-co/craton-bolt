@@ -321,38 +321,32 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         schema,
     };
 
-    // JOIN handling. We support a single INNER JOIN with an equi-conjunction
-    // ON predicate; the join's right side must itself be a bare table.
-    // The wave-7 executor scaffold rejects anything more elaborate.
+    // JOIN handling. Supports INNER / LEFT / RIGHT / FULL with an equi-
+    // conjunction ON predicate, plus CROSS (no ON clause). The join's
+    // right side must itself be a bare table. Conjunctions of
+    // `left.col = right.col` equalities; non-equi predicates remain
+    // rejected. The host-side executor in `src/exec/join.rs` handles all
+    // five join kinds.
     for join in &twj.joins {
         if join.global {
             return Err(BoltError::Sql(
                 "unsupported: GLOBAL JOIN (ClickHouse extension)".into(),
             ));
         }
-        let on_expr = match &join.join_operator {
-            JoinOperator::Inner(JoinConstraint::On(e)) => e,
-            JoinOperator::Inner(JoinConstraint::Using(_)) => {
-                return Err(BoltError::Sql(
-                    "unsupported: JOIN ... USING; rewrite as ON".into(),
-                ));
+        // Pick out the (join_type, optional ON expr) pair. CROSS JOIN
+        // has no ON clause — sqlparser models it with its own variant.
+        let (join_type, on_expr) = match &join.join_operator {
+            JoinOperator::Inner(c) => (JoinType::Inner, lower_join_constraint(c, "INNER")?),
+            JoinOperator::LeftOuter(c) => (JoinType::LeftOuter, lower_join_constraint(c, "LEFT")?),
+            JoinOperator::RightOuter(c) => {
+                (JoinType::RightOuter, lower_join_constraint(c, "RIGHT")?)
             }
-            JoinOperator::Inner(JoinConstraint::Natural) => {
-                return Err(BoltError::Sql("unsupported: NATURAL JOIN".into()));
-            }
-            JoinOperator::Inner(JoinConstraint::None) => {
-                return Err(BoltError::Sql(
-                    "INNER JOIN requires an ON clause".into(),
-                ));
-            }
-            JoinOperator::CrossJoin => {
-                return Err(BoltError::Sql(
-                    "unsupported: CROSS JOIN; rewrite with explicit ON".into(),
-                ));
-            }
+            JoinOperator::FullOuter(c) => (JoinType::FullOuter, lower_join_constraint(c, "FULL")?),
+            JoinOperator::CrossJoin => (JoinType::Cross, None),
             other => {
                 return Err(BoltError::Sql(format!(
-                    "unsupported join kind: {other:?}; only INNER JOIN is supported"
+                    "unsupported join kind: {other:?}; \
+                     supported: INNER, LEFT, RIGHT, FULL OUTER, CROSS"
                 )));
             }
         };
@@ -362,11 +356,17 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
             projection: None,
             schema: rhs_schema,
         };
-        let on_pairs = lower_join_on(on_expr)?;
+        // CROSS has no ON predicate; everything else does. `lower_join_on`
+        // is reused for the rest so non-equi forms keep a single
+        // rejection path.
+        let on_pairs = match on_expr {
+            Some(e) => lower_join_on(e)?,
+            None => Vec::new(),
+        };
         plan = LogicalPlan::Join {
             left: Box::new(plan),
             right: Box::new(right_plan),
-            join_type: JoinType::Inner,
+            join_type,
             on: on_pairs,
         };
     }
@@ -631,6 +631,28 @@ fn lower_table_factor(
         _ => Err(BoltError::Sql(
             "unsupported: only bare table references are allowed in FROM".into(),
         )),
+    }
+}
+
+/// Pull the ON expression out of a `JoinConstraint` for non-CROSS joins.
+/// USING / NATURAL get explicit rejections; an absent constraint is an
+/// error for INNER/LEFT/RIGHT/FULL (all four require ON). CROSS doesn't
+/// flow through this helper — the caller handles its `None` arm directly.
+fn lower_join_constraint<'a>(
+    c: &'a JoinConstraint,
+    kind: &'static str,
+) -> BoltResult<Option<&'a SqlExpr>> {
+    match c {
+        JoinConstraint::On(e) => Ok(Some(e)),
+        JoinConstraint::Using(_) => Err(BoltError::Sql(format!(
+            "unsupported: {kind} JOIN ... USING; rewrite as ON"
+        ))),
+        JoinConstraint::Natural => Err(BoltError::Sql(format!(
+            "unsupported: NATURAL {kind} JOIN"
+        ))),
+        JoinConstraint::None => Err(BoltError::Sql(format!(
+            "{kind} JOIN requires an ON clause"
+        ))),
     }
 }
 
@@ -1348,6 +1370,98 @@ mod wave7_tests {
             msg.contains("non-equi JOIN not yet supported"),
             "error message should mention non-equi JOIN, got: {msg}"
         );
+    }
+
+    #[test]
+    fn left_join_parses_with_nullable_right_schema() {
+        // `LEFT JOIN` preserves the left side; right-side columns become
+        // nullable (a left row with no match emits NULL right columns).
+        let plan = lp("SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a");
+        // Walk past the outer Project (wildcard expansion) to the Join.
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        let (join_type, schema) = match join_plan {
+            LogicalPlan::Join {
+                join_type, ..
+            } => (*join_type, join_plan.schema().unwrap()),
+            other => panic!("expected Join, got {other:?}"),
+        };
+        assert_eq!(join_type, JoinType::LeftOuter);
+        // t1 fields are first (a, b); t2 fields (a, c) follow with collision
+        // disambiguation. Left fields keep their original nullability;
+        // right fields are now nullable.
+        assert_eq!(schema.fields.len(), 4);
+        assert_eq!(schema.fields[0].name, "a");
+        assert!(!schema.fields[0].nullable, "left 'a' keeps nullable=false");
+        assert_eq!(schema.fields[1].name, "b");
+        assert_eq!(schema.fields[2].name, "right.a");
+        assert!(schema.fields[2].nullable, "LEFT JOIN: right 'a' is nullable");
+        assert_eq!(schema.fields[3].name, "c");
+        assert!(schema.fields[3].nullable, "LEFT JOIN: right 'c' is nullable");
+    }
+
+    #[test]
+    fn right_join_parses_with_nullable_left_schema() {
+        let plan = lp("SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.a");
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        let (join_type, schema) = match join_plan {
+            LogicalPlan::Join { join_type, .. } => {
+                (*join_type, join_plan.schema().unwrap())
+            }
+            other => panic!("expected Join, got {other:?}"),
+        };
+        assert_eq!(join_type, JoinType::RightOuter);
+        // Left fields become nullable; right fields keep their original.
+        assert!(schema.fields[0].nullable, "RIGHT JOIN: left 'a' is nullable");
+        assert!(schema.fields[1].nullable, "RIGHT JOIN: left 'b' is nullable");
+        assert!(
+            !schema.fields[2].nullable,
+            "RIGHT JOIN: right 'a' keeps original nullable=false"
+        );
+    }
+
+    #[test]
+    fn full_outer_join_parses_with_both_sides_nullable() {
+        let plan = lp("SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.a");
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        let (join_type, schema) = match join_plan {
+            LogicalPlan::Join { join_type, .. } => {
+                (*join_type, join_plan.schema().unwrap())
+            }
+            other => panic!("expected Join, got {other:?}"),
+        };
+        assert_eq!(join_type, JoinType::FullOuter);
+        for (i, f) in schema.fields.iter().enumerate() {
+            assert!(
+                f.nullable,
+                "FULL OUTER JOIN: field {i} '{}' must be nullable",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn cross_join_parses_with_no_on_predicate() {
+        let plan = lp("SELECT * FROM t1 CROSS JOIN t2");
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        match join_plan {
+            LogicalPlan::Join { join_type, on, .. } => {
+                assert_eq!(*join_type, JoinType::Cross);
+                assert!(on.is_empty(), "CROSS JOIN has no ON predicate");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
     }
 
     #[test]
