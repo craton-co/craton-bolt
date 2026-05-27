@@ -131,6 +131,72 @@ const SPILL_CAPACITY: usize = 4096;
 /// many real entries there are; this placeholder is purely defensive.
 const SPILL_EMPTY_KEY: i64 = i64::MIN;
 
+/// PV-stage-e: observability counter — increments once per agg launch this
+/// sentinel-free executor routes through the native `_with_validity`
+/// kernel path (i.e.
+/// [`crate::jit::valid_flag_kernels::compile_agg_valid_kernel_with_validity`]
+/// or
+/// [`crate::jit::valid_flag_float::compile_agg_valid_float_kernel_with_validity`]).
+///
+/// `execute_groupby_valid` does not have a `pre` KernelSpec, so the
+/// planner-time `input_has_validity` signal is unavailable; the runtime
+/// gate is the source `RecordBatch`'s per-column `null_count()` — see
+/// [`column_should_use_native_validity`]. Stage F will plumb the planner
+/// signal end-to-end so this executor's dispatch matches the
+/// `groupby_with_pre` plan-time path exactly.
+///
+/// Used by inline `#[cfg(test)]` tests; production code does not read it.
+#[doc(hidden)]
+pub static NATIVE_VALIDITY_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// PV-stage-e: runtime predicate — should this column's agg launch route
+/// through the native `_with_validity` kernel (instead of host-stripping
+/// before upload)?
+///
+/// `compile_agg_valid_kernel_with_validity` (integer SUM/MIN/MAX + float
+/// SUM) and `compile_agg_valid_float_kernel_with_validity` (float
+/// MIN/MAX, finished in Stage E) together cover the full agg matrix for
+/// the sentinel-free path — so unlike `groupby.rs`, all (op, dtype)
+/// combinations with at least one NULL row are eligible here. The
+/// host-strip remains the correctness fallback for shapes outside this
+/// set (Utf8, Bool, etc., which the kernels reject anyway).
+///
+/// Wiring this into the actual launch site requires routing the validity
+/// pointer through [`launch_agg_kernel`]'s ABI — Stage F follow-up; the
+/// decision logic + counter exist here so the test surface is in place.
+#[allow(dead_code)]
+fn column_should_use_native_validity(
+    arr: &dyn arrow_array::Array,
+    op: ReduceOp,
+    dtype: DataType,
+) -> bool {
+    if arr.null_count() == 0 {
+        return false;
+    }
+    // Full coverage now that `valid_flag_float::compile_agg_valid_float_kernel_with_validity`
+    // is implemented (PV-stage-e). The sentinel-free integer kernel
+    // (`valid_flag_kernels::compile_agg_valid_kernel_with_validity`)
+    // covers SUM/MIN/MAX over Int32/Int64 and SUM over Float32/Float64;
+    // the float kernel covers MIN/MAX over Float32/Float64. Bool/Utf8
+    // are rejected by the kernels, so they don't dispatch here.
+    matches!(
+        (op, dtype),
+        (ReduceOp::Sum, DataType::Int32)
+            | (ReduceOp::Sum, DataType::Int64)
+            | (ReduceOp::Sum, DataType::Float32)
+            | (ReduceOp::Sum, DataType::Float64)
+            | (ReduceOp::Min, DataType::Int32)
+            | (ReduceOp::Max, DataType::Int32)
+            | (ReduceOp::Min, DataType::Int64)
+            | (ReduceOp::Max, DataType::Int64)
+            | (ReduceOp::Min, DataType::Float32)
+            | (ReduceOp::Max, DataType::Float32)
+            | (ReduceOp::Min, DataType::Float64)
+            | (ReduceOp::Max, DataType::Float64)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Stage-3 pinned D2H helpers for the accumulator-download path.
 // Mirrors the helpers in `groupby.rs`. See that module's doc for the
@@ -2564,5 +2630,64 @@ mod tests {
             |v| v as f64,
         );
         assert_eq!(out2, vec![2.0f64, 6.0]);
+    }
+
+    // ---- PV-stage-e: runtime native-validity dispatch decision ----
+
+    /// Columns with no NULLs must keep the classic kernel — the sentinel-
+    /// free path's classic kernel already handles every row correctly and
+    /// the `_with_validity` variant costs an extra bitmap upload.
+    #[test]
+    fn pv_stage_e_no_nulls_skips_native_validity() {
+        let arr = Int64Array::from(vec![1i64, 2, 3, 4, 5]);
+        assert_eq!(arr.null_count(), 0);
+        assert!(
+            !column_should_use_native_validity(&arr, ReduceOp::Sum, DataType::Int64),
+            "no NULLs in column -> classic kernel"
+        );
+    }
+
+    /// Integer SUM with NULLs is the canonical case: the
+    /// `valid_flag_kernels::compile_agg_valid_kernel_with_validity`
+    /// emitter covers it natively.
+    #[test]
+    fn pv_stage_e_int64_sum_with_nulls_dispatches_native() {
+        let arr = Int64Array::from(vec![Some(1i64), None, Some(3), None, Some(5)]);
+        assert!(arr.null_count() > 0);
+        assert!(
+            column_should_use_native_validity(&arr, ReduceOp::Sum, DataType::Int64),
+            "Int64 SUM with NULLs should dispatch native validity"
+        );
+    }
+
+    /// PV-stage-e completed the float MIN/MAX `_with_validity` emitter
+    /// (`compile_agg_valid_float_kernel_with_validity`), so this executor
+    /// dispatches natively for float MIN/MAX too — unlike
+    /// `crate::exec::groupby::column_should_use_native_validity`, which
+    /// still falls through to host-strip for that case (no companion in
+    /// `float_atomics`).
+    #[test]
+    fn pv_stage_e_float_minmax_with_nulls_dispatches_native() {
+        let arr = Float64Array::from(vec![Some(1.0f64), None, Some(3.0)]);
+        assert!(arr.null_count() > 0);
+        for op in [ReduceOp::Min, ReduceOp::Max] {
+            assert!(
+                column_should_use_native_validity(&arr, op, DataType::Float64),
+                "Float64 {:?} now has a _with_validity emitter; expected native dispatch",
+                op
+            );
+        }
+    }
+
+    /// Float SUM with NULLs follows the same coverage rule — the integer
+    /// agg kernel handles `atom.global.add.f{32,64}` natively.
+    #[test]
+    fn pv_stage_e_float_sum_with_nulls_dispatches_native() {
+        let arr = Float32Array::from(vec![Some(1.0f32), None, Some(2.5)]);
+        assert!(arr.null_count() > 0);
+        assert!(
+            column_should_use_native_validity(&arr, ReduceOp::Sum, DataType::Float32),
+            "Float32 SUM with NULLs should dispatch native validity"
+        );
     }
 }
