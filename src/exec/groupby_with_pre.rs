@@ -77,8 +77,10 @@ use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::hash_kernels::{
-    compile_groupby_agg_kernel, compile_groupby_keys_kernel, groupby_block_size,
-    AGG_KERNEL_ENTRY, KEYS_KERNEL_ENTRY,
+    compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
+    compile_groupby_keys_kernel, compile_groupby_keys_kernel_with_validity,
+    groupby_block_size, packed_validity_word_count, AGG_KERNEL_ENTRY,
+    KEYS_KERNEL_ENTRY,
 };
 use crate::jit::{compile_ptx, CudaModule};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
@@ -242,7 +244,19 @@ pub fn execute_groupby_with_pre(
     let key_col_gpu = GpuVec::<i64>::from_slice(&host_keys)?;
 
     let stream = CudaStream::null();
-    launch_keys_kernel(&key_col_gpu, &mut keys_table, n_compacted, k_u32, &stream)?;
+    // Key column already had its NULL rows rejected upstream (see the
+    // Stage-B key-validity gate above), so we pass `None` here — the
+    // classic 4-param keys kernel is sufficient. Stage C lifting for
+    // NULL keys (per-row, on the device) is a follow-up; today the
+    // host-side reject keeps semantics correct.
+    launch_keys_kernel(
+        &key_col_gpu,
+        &mut keys_table,
+        None,
+        n_compacted,
+        k_u32,
+        &stream,
+    )?;
 
     // -- 7. For each aggregate, prepare its accumulator and launch. The
     //       per-aggregate input column is at position `group_by.len() + i` in
@@ -532,10 +546,14 @@ fn build_pre_output_index(pre_spec: &KernelSpec) -> BoltResult<HashMap<String, u
     Ok(map)
 }
 
-/// Launch the keys-only kernel.
+/// Launch the keys-only kernel. When `key_validity` is `Some(_)` the
+/// Stage C validity-aware kernel variant is used: NULL-keyed rows skip
+/// the insert on the device side, matching SQL semantics (NULL keys form
+/// no group). When `None` the classic 4-param kernel is used.
 fn launch_keys_kernel(
     group_col: &GpuVec<i64>,
     keys_table: &mut GpuVec<i64>,
+    key_validity: Option<&GpuVec<u32>>,
     n_rows: usize,
     k_u32: u32,
     stream: &CudaStream,
@@ -545,7 +563,11 @@ fn launch_keys_kernel(
         return Ok(());
     }
 
-    let ptx = compile_groupby_keys_kernel()?;
+    let ptx = if key_validity.is_some() {
+        compile_groupby_keys_kernel_with_validity()?
+    } else {
+        compile_groupby_keys_kernel()?
+    };
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(KEYS_KERNEL_ENTRY)?;
 
@@ -554,32 +576,58 @@ fn launch_keys_kernel(
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
 
-    let mut params: [*mut c_void; 4] = [
-        &mut group_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut n_rows_u32 as *mut u32 as *mut c_void,
-        &mut k_param as *mut u32 as *mut c_void,
-    ];
-
     let block = groupby_block_size();
     let grid_x = grid_x_for(n_rows_u32, block);
 
     // SAFETY: `function` is borrowed from a live `CudaModule`; every entry of
     // `params` points to a stack local that outlives the synchronize.
-    unsafe {
-        cuda_sys::check(cuda_sys::cuLaunchKernel(
-            function.raw(),
-            grid_x,
-            1,
-            1,
-            block,
-            1,
-            1,
-            0,
-            stream.raw(),
-            params.as_mut_ptr(),
-            ptr::null_mut(),
-        ))?;
+    if let Some(vp) = key_validity {
+        let mut validity_ptr: CUdeviceptr = vp.device_ptr();
+        let mut params: [*mut c_void; 5] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+            &mut validity_ptr as *mut CUdeviceptr as *mut c_void,
+        ];
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
+        let _ = validity_ptr;
+    } else {
+        let mut params: [*mut c_void; 4] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+        ];
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
     }
     stream.synchronize()?;
     let _ = (group_ptr, keys_ptr);
@@ -598,11 +646,70 @@ fn launch_agg_kernel<T: Pod>(
     k_u32: u32,
     stream: &CudaStream,
 ) -> BoltResult<()> {
+    launch_agg_kernel_inner(
+        op, input_dtype, group_col, keys_table, input_col, acc_table, None, n_rows,
+        k_u32, stream,
+    )
+}
+
+/// Stage C: launch the validity-aware variant of the agg kernel. `value_validity`
+/// is a packed-bit `*u32` device pointer; rows whose bit is `0` are skipped
+/// on the device (no atomic update issued). Length must equal
+/// [`packed_validity_word_count`]`(n_rows)`.
+///
+/// Currently unused — the production path keeps the host-strip-in-lockstep
+/// fallback (see `run_typed_agg`). The wrapper exists so future
+/// performance work can flip individual call sites to the native GPU
+/// path without re-deriving the kernel-launch boilerplate.
+#[allow(dead_code)]
+fn launch_agg_kernel_with_validity<T: Pod>(
+    op: ReduceOp,
+    input_dtype: DataType,
+    group_col: &GpuVec<i64>,
+    keys_table: &GpuVec<i64>,
+    input_col: &GpuVec<T>,
+    acc_table: &mut GpuVec<T>,
+    value_validity: &GpuVec<u32>,
+    n_rows: usize,
+    k_u32: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    launch_agg_kernel_inner(
+        op,
+        input_dtype,
+        group_col,
+        keys_table,
+        input_col,
+        acc_table,
+        Some(value_validity),
+        n_rows,
+        k_u32,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_agg_kernel_inner<T: Pod>(
+    op: ReduceOp,
+    input_dtype: DataType,
+    group_col: &GpuVec<i64>,
+    keys_table: &GpuVec<i64>,
+    input_col: &GpuVec<T>,
+    acc_table: &mut GpuVec<T>,
+    value_validity: Option<&GpuVec<u32>>,
+    n_rows: usize,
+    k_u32: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
     if n_rows == 0 {
         return Ok(());
     }
 
-    let ptx = compile_groupby_agg_kernel(op, input_dtype)?;
+    let ptx = if value_validity.is_some() {
+        compile_groupby_agg_kernel_with_validity(op, input_dtype)?
+    } else {
+        compile_groupby_agg_kernel(op, input_dtype)?
+    };
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(AGG_KERNEL_ENTRY)?;
 
@@ -613,37 +720,98 @@ fn launch_agg_kernel<T: Pod>(
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
 
-    let mut params: [*mut c_void; 6] = [
-        &mut group_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut n_rows_u32 as *mut u32 as *mut c_void,
-        &mut k_param as *mut u32 as *mut c_void,
-    ];
+    // The classic ABI is 6 params (group, keys, input, acc, n_rows, k); the
+    // Stage C validity ABI adds a 7th trailing `*u64` packed-bit pointer.
+    let validity_ptr_opt: Option<CUdeviceptr> = value_validity.map(|v| v.device_ptr());
 
     let block = groupby_block_size();
     let grid_x = grid_x_for(n_rows_u32, block);
 
-    // SAFETY: see `launch_keys_kernel`.
-    unsafe {
-        cuda_sys::check(cuda_sys::cuLaunchKernel(
-            function.raw(),
-            grid_x,
-            1,
-            1,
-            block,
-            1,
-            1,
-            0,
-            stream.raw(),
-            params.as_mut_ptr(),
-            ptr::null_mut(),
-        ))?;
+    if let Some(mut validity_ptr) = validity_ptr_opt {
+        let mut params: [*mut c_void; 7] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+            &mut validity_ptr as *mut CUdeviceptr as *mut c_void,
+        ];
+        // SAFETY: see `launch_keys_kernel`.
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
+        let _ = validity_ptr;
+    } else {
+        let mut params: [*mut c_void; 6] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+        ];
+        // SAFETY: see `launch_keys_kernel`.
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
     }
     stream.synchronize()?;
     let _ = (group_ptr, keys_ptr, input_ptr, acc_ptr);
     Ok(())
+}
+
+/// Stage C: pack a `Vec<u8>` validity stream (`1` = valid, `0` = null,
+/// one byte per row, Arrow-style row-major) into a packed-bit `Vec<u32>`
+/// suitable for upload to the GPU. The layout matches the kernel's
+/// expectations (see [`crate::jit::hash_kernels`] module-level docs):
+/// bit `tid % 32` of word `tid / 32` describes row `tid`, with
+/// little-endian bit order inside each word (bit 0 = first row of the
+/// chunk).
+///
+/// The output length is [`packed_validity_word_count`]`(n_rows)`. Bits
+/// past `n_rows` are zero-padded; the kernel never reads them because
+/// `tid >= n_rows` short-circuits earlier.
+///
+/// Currently unused by the production path (the host-strip fallback
+/// avoids the per-row pack); exposed for when the native-validity
+/// kernel variant becomes the default.
+#[allow(dead_code)]
+pub(crate) fn pack_validity_bits(bytes: &[u8]) -> Vec<u32> {
+    let n_words = packed_validity_word_count(bytes.len());
+    let mut out: Vec<u32> = vec![0u32; n_words];
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != 0 {
+            let word = i / 32;
+            let bit = (i % 32) as u32;
+            out[word] |= 1u32 << bit;
+        }
+    }
+    out
 }
 
 /// Downloaded accumulator table for a single aggregate. The dtype variant
@@ -893,23 +1061,17 @@ fn run_typed_agg(
     let eff_group_col: &GpuVec<i64> = filtered_keys_gpu.as_ref().unwrap_or(group_col);
     let validity = resolved.validity();
 
-    // Option-A safety net for GROUP BY (Stage B partial): the GPU
-    // group-by-agg kernel (`crate::jit::hash_kernels::compile_groupby_agg_kernel`)
-    // does NOT yet consume validity, and stripping NULL rows here without
-    // also stripping them from the group-key column would mis-align
-    // accumulators. So when validity reaches this point — i.e. the
-    // pre-stage successfully propagated NULLs through the kernel — we
-    // reject rather than risk a silent wrong-answer accumulating into the
-    // wrong group. A Stage C follow-up should wire validity into the keys
-    // column upload (or into the agg kernel itself) to lift this gate.
-    if host_col.validity.is_some() {
-        return Err(BoltError::Other(format!(
-            "groupby_with_pre: aggregate input '{}' carries a NULL validity bitmap, \
-             but the GPU group-by agg kernel does not yet consume validity. \
-             NULL propagation through GROUP BY is a Stage C follow-up to Option B.",
-            col_io.name
-        )));
-    }
+    // Stage C: the Stage-B reject error is lifted. NULL value rows are
+    // dropped in lockstep with the GROUP BY key column via
+    // `filter_keys_if_needed` (above) + `filter_by_validity` (per
+    // dtype, below). Both filters consume the same `validity` mask so
+    // (keys, values) stay parallel at the kernel call site, and the
+    // GPU agg kernel never sees a NULL contribution. A follow-up can
+    // switch to the native-validity kernel variant
+    // (`compile_groupby_agg_kernel_with_validity` +
+    // `launch_agg_kernel_with_validity`, both already wired up) to
+    // avoid the host-side strip on hot paths; for correctness the
+    // host strip is sufficient and matches SQL aggregate semantics.
 
     match (col_io.dtype, &host_col.values) {
         (DataType::Int32, HostColValues::I32(host)) => {
@@ -965,7 +1127,13 @@ fn run_typed_agg(
             Ok(AccDownload::I32(acc.to_vec()?))
         }
         (DataType::Int64, HostColValues::I64(host)) => {
-            let input_gpu = GpuVec::<i64>::from_slice(host)?;
+            // Stage C: filter NULL rows in lockstep with the key column.
+            // Previously this branch uploaded the raw values buffer
+            // verbatim (would have summed NULL slots as 0); the
+            // Stage-B reject guarded against that. Now that the gate
+            // is lifted we must apply the validity mask explicitly.
+            let filtered: Vec<i64> = filter_by_validity(host, validity);
+            let input_gpu = GpuVec::<i64>::from_slice(&filtered)?;
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice(&init)?;
             launch_agg_kernel::<i64>(
@@ -1943,5 +2111,54 @@ mod null_propagation_tests {
             .map(|i| if arr.is_null(i) { 0 } else { 1 })
             .collect();
         assert_eq!(bytes, vec![1, 0, 1, 0, 1]);
+    }
+
+    // ---- Stage C: packed-bit validity conversion --------------------------
+
+    /// Small byte-stream packs into a single u32 with little-endian bit order
+    /// (bit 0 = first row). This matches Arrow's null-buffer convention and
+    /// the kernel's `bfe.u32` extraction.
+    #[test]
+    fn pack_validity_bits_small_little_endian() {
+        // 5 rows: 1, 0, 1, 0, 1 → bits 0, 2, 4 set → 0b10101 = 0x15
+        let bytes = vec![1u8, 0, 1, 0, 1];
+        let packed = pack_validity_bits(&bytes);
+        assert_eq!(packed.len(), 1, "5 rows fit in one u32 word");
+        assert_eq!(packed[0], 0b10101, "bit 0 = row 0; bit 4 = row 4");
+    }
+
+    /// 32-row boundary: word 0 holds rows 0..32, word 1 holds rows 32..
+    #[test]
+    fn pack_validity_bits_crosses_word_boundary() {
+        // Row 0..32 are all valid (word 0 = 0xFFFF_FFFF); row 32 is valid,
+        // row 33 is null, row 34 is valid (word 1 = 0b101 = 0x5).
+        let mut bytes = vec![1u8; 35];
+        bytes[33] = 0;
+        let packed = pack_validity_bits(&bytes);
+        assert_eq!(packed.len(), 2);
+        assert_eq!(packed[0], 0xFFFF_FFFFu32);
+        assert_eq!(packed[1], 0b101);
+    }
+
+    /// Round-trip: pack then unpack via the same bit-arithmetic the kernel
+    /// uses on the device. Catches off-by-one and endianness regressions.
+    #[test]
+    fn pack_validity_bits_round_trip() {
+        let bytes: Vec<u8> = (0..100u8).map(|i| if i % 3 == 0 { 1 } else { 0 }).collect();
+        let packed = pack_validity_bits(&bytes);
+        for (i, &expected) in bytes.iter().enumerate() {
+            let word = packed[i / 32];
+            let bit = ((word >> (i % 32)) & 1) as u8;
+            assert_eq!(bit, expected, "row {i} round-trip mismatch");
+        }
+    }
+
+    /// Empty input still produces one word of padding so the kernel can
+    /// load word 0 unconditionally (its `tid >= n_rows` guard ensures the
+    /// bit is never observed).
+    #[test]
+    fn pack_validity_bits_empty_pads_to_one_word() {
+        let packed = pack_validity_bits(&[]);
+        assert_eq!(packed, vec![0u32]);
     }
 }

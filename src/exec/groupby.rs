@@ -72,6 +72,15 @@ use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
+// Stage C: the `_with_validity` variants in `crate::jit::hash_kernels`
+// (`compile_groupby_agg_kernel_with_validity`,
+// `compile_groupby_keys_kernel_with_validity`) are wired up and available;
+// today this executor keeps the H1 host-strip-at-call-site pattern, which
+// is correct for NULL keys (via `key_valid` from `groupby_valid::pack_keys`)
+// and for NULL values (the source path here reads a `RecordBatch` and the
+// classic groupby rejects EMPTY_KEY collisions early). Switching to the
+// native GPU validity path is a performance follow-up — the host-strip
+// remains correct.
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_keys_kernel, groupby_block_size,
     AGG_KERNEL_ENTRY, KEYS_KERNEL_ENTRY,

@@ -23,7 +23,7 @@
 //!
 //! ## ABIs
 //!
-//! Keys kernel:
+//! Keys kernel (`with_validity = false`, classic):
 //! ```text
 //! .visible .entry bolt_groupby_keys(
 //!     .param .u64 group_col_ptr,   // i64 group keys, length n_rows
@@ -33,7 +33,23 @@
 //! )
 //! ```
 //!
-//! Agg kernel (input dtype `T` parameterises the load + atomic instruction):
+//! Keys kernel (`with_validity = true`, Stage C extension):
+//! ```text
+//! .visible .entry bolt_groupby_keys(
+//!     .param .u64 group_col_ptr,
+//!     .param .u64 keys_table_ptr,
+//!     .param .u32 n_rows,
+//!     .param .u32 k,
+//!     .param .u64 key_validity_ptr, // packed-bit *u32 (ceil(n_rows/32) words)
+//! )
+//! ```
+//! When the validity bit for this row is `0` the thread bails out
+//! before issuing any `atom.cas` — NULL keys are dropped, matching SQL
+//! semantics where NULL is not equal to itself and therefore does not
+//! group.
+//!
+//! Agg kernel (`with_validity = false`, classic — input dtype `T`
+//! parameterises the load + atomic instruction):
 //! ```text
 //! .visible .entry bolt_groupby_agg(
 //!     .param .u64 group_col_ptr,   // i64 group keys, length n_rows
@@ -44,6 +60,37 @@
 //!     .param .u32 k
 //! )
 //! ```
+//!
+//! Agg kernel (`with_validity = true`, Stage C extension):
+//! ```text
+//! .visible .entry bolt_groupby_agg(
+//!     .param .u64 group_col_ptr,
+//!     .param .u64 keys_table_ptr,
+//!     .param .u64 input_col_ptr,
+//!     .param .u64 acc_table_ptr,
+//!     .param .u32 n_rows,
+//!     .param .u32 k,
+//!     .param .u64 value_validity_ptr, // packed-bit *u32
+//! )
+//! ```
+//! When the value-validity bit for this row is `0` the thread does NOT
+//! issue its atomic — the NULL contribution is dropped per SQL aggregate
+//! semantics.
+//!
+//! ## Packed-bit validity layout (Stage C)
+//!
+//! Validity is **1 bit per row**, packed 32 rows per `u32` word, with
+//! little-endian bit order inside each word: bit `0` describes the first
+//! row of that 32-row chunk. This matches Arrow's standard null-buffer
+//! convention.
+//!
+//! The kernel computes `word_idx = tid >> 5`, loads
+//! `word = validity_ptr[word_idx]`, then extracts bit `tid & 31` with PTX
+//! `bfe.u32 dst, word, off, 1` (returns 0 or 1). A nonzero result means
+//! "row is valid".
+//!
+//! See [`packed_validity_word_count`] for the host-side word-count
+//! helper used to size the `Vec<u32>`.
 //!
 //! ## Sentinel
 //!
@@ -98,8 +145,22 @@ const EMPTY_KEY_LITERAL: &str = "-9223372036854775808";
 /// `MAX_PROBE_FACTOR` constant in [`crate::jit::valid_flag_kernels`].
 const MAX_PROBE_FACTOR: u32 = 2;
 
+/// Number of `u32` words required to pack a `n_rows`-row validity bitmap
+/// (1 bit per row, 32 rows per word). At least one word is allocated even
+/// for `n_rows == 0` so kernels can safely read word 0 unconditionally —
+/// in practice the kernel's `tid >= n_rows` bail-out short-circuits before
+/// touching the bitmap.
+pub fn packed_validity_word_count(n_rows: usize) -> usize {
+    n_rows.div_ceil(32).max(1)
+}
+
 /// Generate PTX for the keys-building kernel. The kernel writes only to the
 /// keys table; the accumulator tables are untouched.
+///
+/// `with_key_validity = false` is the historical entry point (`KEYS_KERNEL_ENTRY`,
+/// 4 params). When `true` the kernel takes an extra trailing `*u64` pointing
+/// at a packed-bit validity bitmap; rows whose validity bit is `0` skip
+/// the insert entirely (matches SQL semantics: NULL keys form no group).
 ///
 /// # Encoding contract
 ///
@@ -120,6 +181,17 @@ const MAX_PROBE_FACTOR: u32 = 2;
 /// Because every supported encoding is LOSSLESS (distinct tuples ↦ distinct
 /// i64), this kernel needs no awareness of the per-row column count.
 pub fn compile_groupby_keys_kernel() -> BoltResult<String> {
+    compile_groupby_keys_kernel_inner(false)
+}
+
+/// Stage C: variant of [`compile_groupby_keys_kernel`] that consumes a
+/// per-row validity bitmap. Rows whose validity bit is `0` skip the insert.
+/// See the module-level ABI documentation for the parameter list.
+pub fn compile_groupby_keys_kernel_with_validity() -> BoltResult<String> {
+    compile_groupby_keys_kernel_inner(true)
+}
+
+fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<String> {
     let mut ptx = String::new();
 
     writeln!(ptx, ".version 7.5").map_err(write_err)?;
@@ -131,7 +203,12 @@ pub fn compile_groupby_keys_kernel() -> BoltResult<String> {
     writeln!(ptx, "\t.param .u64 {}_param_0,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {}_param_1,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u32 {}_param_2,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
-    writeln!(ptx, "\t.param .u32 {}_param_3", KEYS_KERNEL_ENTRY).map_err(write_err)?;
+    if with_key_validity {
+        writeln!(ptx, "\t.param .u32 {}_param_3,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
+        writeln!(ptx, "\t.param .u64 {}_param_4", KEYS_KERNEL_ENTRY).map_err(write_err)?;
+    } else {
+        writeln!(ptx, "\t.param .u32 {}_param_3", KEYS_KERNEL_ENTRY).map_err(write_err)?;
+    }
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -155,6 +232,31 @@ pub fn compile_groupby_keys_kernel() -> BoltResult<String> {
     .map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // Stage C: optional packed-bit key-validity gate. Skip the insert
+    // entirely for rows whose validity bit is 0 (NULL keys are dropped
+    // per SQL semantics).
+    if with_key_validity {
+        // word_idx = tid >> 5 ; bit_off = tid & 31
+        writeln!(ptx, "\tshr.u32 %r10, %r3, 5;").map_err(write_err)?;
+        writeln!(ptx, "\tand.b32 %r11, %r3, 31;").map_err(write_err)?;
+        // base = key_validity_ptr (param_4)
+        writeln!(
+            ptx,
+            "\tld.param.u64 %rd10, [{}_param_4];",
+            KEYS_KERNEL_ENTRY
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd10, %rd10;").map_err(write_err)?;
+        // addr = base + word_idx * 4
+        writeln!(ptx, "\tmul.wide.u32 %rd11, %r10, 4;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd12, %rd10, %rd11;").map_err(write_err)?;
+        writeln!(ptx, "\tld.global.u32 %r12, [%rd12];").map_err(write_err)?;
+        // bit = (word >> bit_off) & 1  via bfe.u32
+        writeln!(ptx, "\tbfe.u32 %r13, %r12, %r11, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tsetp.eq.s32 %p4, %r13, 0;").map_err(write_err)?;
+        writeln!(ptx, "\t@%p4 bra DONE;").map_err(write_err)?;
+    }
 
     // Load k and compute k-1 (mask).
     writeln!(
@@ -290,6 +392,25 @@ pub fn compile_groupby_agg_kernel(
     op: ReduceOp,
     input_dtype: DataType,
 ) -> BoltResult<String> {
+    compile_groupby_agg_kernel_inner(op, input_dtype, false)
+}
+
+/// Stage C: variant of [`compile_groupby_agg_kernel`] that consumes a per-row
+/// value-validity bitmap (packed-bit, `u32` words). Rows whose bit is `0`
+/// skip the atomic — matches SQL semantics where NULL input rows do not
+/// contribute to the aggregate.
+pub fn compile_groupby_agg_kernel_with_validity(
+    op: ReduceOp,
+    input_dtype: DataType,
+) -> BoltResult<String> {
+    compile_groupby_agg_kernel_inner(op, input_dtype, true)
+}
+
+fn compile_groupby_agg_kernel_inner(
+    op: ReduceOp,
+    input_dtype: DataType,
+    with_value_validity: bool,
+) -> BoltResult<String> {
     // Reject unsupported (op, dtype) combinations up front with explicit errors.
     let atomic = atomic_for(op, input_dtype)?;
 
@@ -314,7 +435,12 @@ pub fn compile_groupby_agg_kernel(
     writeln!(ptx, "\t.param .u64 {}_param_2,", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {}_param_3,", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u32 {}_param_4,", AGG_KERNEL_ENTRY).map_err(write_err)?;
-    writeln!(ptx, "\t.param .u32 {}_param_5", AGG_KERNEL_ENTRY).map_err(write_err)?;
+    if with_value_validity {
+        writeln!(ptx, "\t.param .u32 {}_param_5,", AGG_KERNEL_ENTRY).map_err(write_err)?;
+        writeln!(ptx, "\t.param .u64 {}_param_6", AGG_KERNEL_ENTRY).map_err(write_err)?;
+    } else {
+        writeln!(ptx, "\t.param .u32 {}_param_5", AGG_KERNEL_ENTRY).map_err(write_err)?;
+    }
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -347,6 +473,29 @@ pub fn compile_groupby_agg_kernel(
     .map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // Stage C: optional packed-bit value-validity gate. Skip the atomic
+    // update for this row when the validity bit is 0 (SQL: NULL inputs
+    // do not contribute to SUM / MIN / MAX / COUNT(col) / AVG).
+    if with_value_validity {
+        // word_idx = tid >> 5 ; bit_off = tid & 31
+        writeln!(ptx, "\tshr.u32 %r14, %r3, 5;").map_err(write_err)?;
+        writeln!(ptx, "\tand.b32 %r15, %r3, 31;").map_err(write_err)?;
+        // base = value_validity_ptr (param_6)
+        writeln!(
+            ptx,
+            "\tld.param.u64 %rd16, [{}_param_6];",
+            AGG_KERNEL_ENTRY
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd16, %rd16;").map_err(write_err)?;
+        writeln!(ptx, "\tmul.wide.u32 %rd17, %r14, 4;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd18, %rd16, %rd17;").map_err(write_err)?;
+        writeln!(ptx, "\tld.global.u32 %r16, [%rd18];").map_err(write_err)?;
+        writeln!(ptx, "\tbfe.u32 %r17, %r16, %r15, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tsetp.eq.s32 %p4, %r17, 0;").map_err(write_err)?;
+        writeln!(ptx, "\t@%p4 bra DONE;").map_err(write_err)?;
+    }
 
     // k and mask = k - 1.
     writeln!(
@@ -564,4 +713,87 @@ fn reg_decl_ty(dtype: DataType) -> BoltResult<&'static str> {
 /// Adapt a `std::fmt::Error` into a `BoltError`.
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("hash_kernels: write failed: {}", e))
+}
+
+// ---------------------------------------------------------------------------
+// PTX-shape golden tests for the Stage C validity wiring. These are host-only
+// (no CUDA) — they assert that the emitted PTX text grows the expected param
+// + `bfe.u32` + skip-on-null shape, not that it runs correctly. End-to-end
+// numeric correctness is exercised by the GPU tests in `tests/e2e_tests.rs`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod ptx_shape_tests {
+    use super::*;
+
+    /// The classic (no-validity) keys kernel keeps its historical 4-param ABI
+    /// and emits no `bfe.u32` extraction.
+    #[test]
+    fn keys_kernel_classic_has_4_params_and_no_bfe() {
+        let ptx = compile_groupby_keys_kernel().expect("classic keys ptx");
+        // 4 params: 0..=3
+        assert!(ptx.contains("bolt_groupby_keys_param_3"));
+        assert!(!ptx.contains("bolt_groupby_keys_param_4"));
+        assert!(!ptx.contains("bfe.u32"));
+    }
+
+    /// The Stage C keys kernel adds a 5th param and emits the packed-bit
+    /// extract + branch-to-DONE shape.
+    #[test]
+    fn keys_kernel_with_validity_adds_param_and_bfe() {
+        let ptx = compile_groupby_keys_kernel_with_validity()
+            .expect("validity keys ptx");
+        // 5 params: 0..=4
+        assert!(ptx.contains("bolt_groupby_keys_param_4"));
+        // word_idx = tid >> 5
+        assert!(ptx.contains("shr.u32 %r10, %r3, 5;"));
+        // bit_off = tid & 31
+        assert!(ptx.contains("and.b32 %r11, %r3, 31;"));
+        // bfe extracts the single bit
+        assert!(ptx.contains("bfe.u32 %r13, %r12, %r11, 1;"));
+        // setp + branch on zero
+        assert!(ptx.contains("setp.eq.s32 %p4, %r13, 0;"));
+        assert!(ptx.contains("@%p4 bra DONE;"));
+    }
+
+    /// The classic agg kernel keeps its historical 6-param ABI.
+    #[test]
+    fn agg_kernel_classic_has_6_params_and_no_bfe() {
+        let ptx = compile_groupby_agg_kernel(ReduceOp::Sum, DataType::Int64)
+            .expect("classic agg ptx");
+        assert!(ptx.contains("bolt_groupby_agg_param_5"));
+        assert!(!ptx.contains("bolt_groupby_agg_param_6"));
+        assert!(!ptx.contains("bfe.u32"));
+    }
+
+    /// The Stage C agg kernel adds a 7th param (value validity) and emits
+    /// the bit-extract + skip-on-null gate.
+    #[test]
+    fn agg_kernel_with_validity_adds_param_and_bfe() {
+        let ptx = compile_groupby_agg_kernel_with_validity(
+            ReduceOp::Sum,
+            DataType::Int64,
+        )
+        .expect("validity agg ptx");
+        assert!(ptx.contains("bolt_groupby_agg_param_6"));
+        assert!(ptx.contains("shr.u32 %r14, %r3, 5;"));
+        assert!(ptx.contains("and.b32 %r15, %r3, 31;"));
+        assert!(ptx.contains("bfe.u32 %r17, %r16, %r15, 1;"));
+        assert!(ptx.contains("setp.eq.s32 %p4, %r17, 0;"));
+        assert!(ptx.contains("@%p4 bra DONE;"));
+        // The atom.add must still be present after the gate.
+        assert!(ptx.contains("atom.global.add.u64"));
+    }
+
+    /// Packed-bit word count rounds up.
+    #[test]
+    fn packed_validity_word_count_rounds_up() {
+        assert_eq!(packed_validity_word_count(0), 1);
+        assert_eq!(packed_validity_word_count(1), 1);
+        assert_eq!(packed_validity_word_count(31), 1);
+        assert_eq!(packed_validity_word_count(32), 1);
+        assert_eq!(packed_validity_word_count(33), 2);
+        assert_eq!(packed_validity_word_count(64), 2);
+        assert_eq!(packed_validity_word_count(65), 3);
+        assert_eq!(packed_validity_word_count(1_000_000), 31_250);
+    }
 }

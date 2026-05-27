@@ -1106,3 +1106,82 @@ fn e2e_sum_price_times_tax_with_nulls_in_price() {
          (10/100 NULL rows in price)"
     );
 }
+
+/// Stage C: `SELECT region_id, SUM(price * tax) FROM sales GROUP BY region_id`
+/// where `price` has NULL rows. Per SQL semantics, NULL rows must not
+/// contribute to ANY group's accumulator. This exercises the
+/// validity-bearing aggregate input path through
+/// `crate::exec::groupby_with_pre::run_typed_agg` — Stage B used to
+/// reject with a clear error; Stage C lifts that gate by stripping
+/// NULL rows in lockstep with the GROUP BY key column on the host
+/// before upload.
+#[test]
+#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+fn e2e_groupby_sum_with_nulls_in_value_column() {
+    use craton_bolt::Engine;
+
+    let n = 100usize;
+    let n_null = 10usize;
+    let batch = sales_batch_with_nulls(n, n_null);
+
+    // Compute the per-group expected SUM on the host using SQL semantics
+    // (NULL rows excluded from the running sum). region_id = i % 4 so we
+    // have 4 groups; price = (i+1) where non-NULL, otherwise NULL.
+    let region = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let price = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let tax = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let mut expected: std::collections::HashMap<i32, f64> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        if !price.is_null(i) {
+            *expected.entry(region.value(i)).or_insert(0.0) +=
+                price.value(i) * tax.value(i);
+        }
+    }
+
+    let mut engine = Engine::new().expect("ctx");
+    engine.register_table("sales", batch).unwrap();
+
+    let h = engine
+        .sql(
+            "SELECT region_id, SUM(price * tax) FROM sales \
+             GROUP BY region_id ORDER BY region_id",
+        )
+        .expect("execute");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), expected.len());
+
+    let out_region = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let out_sum = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    for i in 0..out.num_rows() {
+        let r = out_region.value(i);
+        let want = *expected
+            .get(&r)
+            .unwrap_or_else(|| panic!("region {r} missing from expected"));
+        let got = out_sum.value(i);
+        assert!(
+            (got - want).abs() < 1e-6,
+            "Stage C GROUP BY NULL handling: region {r}: got SUM={got}, want {want}"
+        );
+    }
+}

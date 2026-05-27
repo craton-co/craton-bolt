@@ -74,6 +74,18 @@ use crate::jit::valid_flag_kernels::{
     compile_agg_valid_kernel, compile_keys_valid_kernel, valid_block_size,
     VALID_AGG_KERNEL_ENTRY, VALID_KEYS_KERNEL_ENTRY,
 };
+// Stage C note: the sentinel-free path keeps host-side
+// filter-at-call-site (via `prepare_filtered_keys` /
+// `collect_filtered_primitive`) which already implements the
+// (key_valid ∧ value_valid) semantics correctly. The native validity
+// variants in `crate::jit::hash_kernels`
+// (`compile_groupby_keys_kernel_with_validity` /
+// `compile_groupby_agg_kernel_with_validity`) target the sentinel-based
+// path in `crate::exec::groupby_with_pre`; reusing them here would
+// require a parallel `_with_validity` flavour of `valid_flag_kernels`
+// (the sentinel-free kernels already carry their own slot-valid
+// occupancy table). That's a Stage C follow-up — host-strip remains
+// correct in the meantime.
 use crate::jit::CudaModule;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
