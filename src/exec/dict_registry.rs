@@ -35,7 +35,8 @@
 
 use std::collections::HashMap;
 
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::types::Int32Type as ArrowInt32Type;
+use arrow_array::{Array, DictionaryArray, RecordBatch, StringArray};
 use arrow_schema::DataType as ArrowDataType;
 
 use crate::cuda::dictionary::DictionaryColumn;
@@ -86,27 +87,83 @@ impl DictRegistry {
 
         let schema = batch.schema();
         for (idx, field) in schema.fields().iter().enumerate() {
-            if field.data_type() != &ArrowDataType::Utf8 {
-                continue;
-            }
             let arr = batch.column(idx);
-            let sa = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    BoltError::Type(format!(
-                        "column '{}' in table '{}' declared Utf8 but did not downcast to StringArray (got {:?})",
-                        field.name(),
-                        table,
-                        arr.data_type()
-                    ))
-                })?;
-            let dict = DictionaryColumnAny::from_string_array(sa)?;
-            cols.insert(field.name().clone(), dict);
+            match field.data_type() {
+                ArrowDataType::Utf8 => {
+                    let sa = arr
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            BoltError::Type(format!(
+                                "column '{}' in table '{}' declared Utf8 but did not downcast to StringArray (got {:?})",
+                                field.name(),
+                                table,
+                                arr.data_type()
+                            ))
+                        })?;
+                    let dict = DictionaryColumnAny::from_string_array(sa)?;
+                    cols.insert(field.name().clone(), dict);
+                }
+                // Stage 6: native ingest for Arrow `DictionaryArray<Int32, Utf8>`.
+                // Previously this required `flatten_dictionary_utf8_columns` to
+                // first materialise a `StringArray` — the registry now reads
+                // the Arrow dictionary in-place instead, saving a full
+                // host-side rematerialisation.
+                ArrowDataType::Dictionary(key_t, val_t)
+                    if key_t.as_ref() == &ArrowDataType::Int32
+                        && val_t.as_ref() == &ArrowDataType::Utf8 =>
+                {
+                    let da = arr
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<ArrowInt32Type>>()
+                        .ok_or_else(|| {
+                            BoltError::Type(format!(
+                                "column '{}' in table '{}' declared Dictionary<Int32, Utf8> but \
+                                 did not downcast to DictionaryArray<Int32Type>",
+                                field.name(),
+                                table,
+                            ))
+                        })?;
+                    let dict = dictionary_any_from_arrow_dict(da)?;
+                    cols.insert(field.name().clone(), dict);
+                }
+                _ => {
+                    // Numeric / boolean columns are uploaded directly by the
+                    // engine's per-query path and don't need a dictionary.
+                }
+            }
         }
 
         // Replace-not-merge: matches the engine's `register_table` contract.
         self.by_table.insert(table, cols);
+        Ok(())
+    }
+
+    /// Register a pre-built Arrow dictionary for `(table, column)` directly,
+    /// re-using the Arrow `DictionaryArray`'s values verbatim instead of
+    /// rebuilding the dictionary from a `StringArray`.
+    ///
+    /// Stage 6 entry point: when the engine ingests a column that already
+    /// arrived as `DictionaryArray<Int32, Utf8>` (Arrow IPC, Parquet, etc.),
+    /// this method lets the registry skip the flatten-then-rebuild round trip.
+    /// The resulting [`DictionaryColumnAny`] is always the `I32` variant —
+    /// matching the source key width.
+    ///
+    /// Idempotency mirrors `register_table`: any prior dictionary for
+    /// `(table, column)` is overwritten.
+    pub fn register_dictionary_column(
+        &mut self,
+        table: impl Into<String>,
+        column: impl Into<String>,
+        dict_arr: &DictionaryArray<ArrowInt32Type>,
+    ) -> BoltResult<()> {
+        let table = table.into();
+        let column = column.into();
+        let dict = dictionary_any_from_arrow_dict(dict_arr)?;
+        self.by_table
+            .entry(table)
+            .or_default()
+            .insert(column, dict);
         Ok(())
     }
 
@@ -240,6 +297,81 @@ impl DictRegistry {
     ) -> Option<DataType> {
         self.dictionary(table, original_col).map(|d| d.index_dtype())
     }
+}
+
+/// Build a [`DictionaryColumnAny`] from an Arrow `DictionaryArray<Int32, Utf8>`
+/// without going through a `StringArray` rematerialisation.
+///
+/// Strategy: the Arrow dictionary's values already encode the deduplicated
+/// strings in slot order, so we can clone them straight into the
+/// `DictionaryColumn::dictionary` field. The keys array is shifted by `+1`
+/// per row (slot 0 is reserved for SQL NULL across the in-tree dictionary
+/// representations — see `crate::cuda::dictionary` doc), and nulls collapse
+/// to index 0.
+///
+/// This always emits the i32 variant: the source is i32-keyed by definition,
+/// and widening to i64 would only be wasteful here. If callers ever need an
+/// i64 variant for a dictionary that overflows i32, they can fall back to
+/// the `StringArray` path via `DictionaryColumnAny::from_string_array`.
+fn dictionary_any_from_arrow_dict(
+    arr: &DictionaryArray<ArrowInt32Type>,
+) -> BoltResult<DictionaryColumnAny> {
+    use arrow_array::Int32Array;
+
+    let dict_vals = arr
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            BoltError::Type(format!(
+                "DictionaryArray has non-Utf8 value type {:?}",
+                arr.values().data_type()
+            ))
+        })?;
+    // Copy the Arrow dictionary values into an owned `Vec<String>`. Nulls in
+    // the dictionary itself (rare) become empty strings — row-level NULLs go
+    // through the keys path below.
+    let mut dictionary: Vec<String> = Vec::with_capacity(dict_vals.len());
+    for i in 0..dict_vals.len() {
+        if dict_vals.is_null(i) {
+            dictionary.push(String::new());
+        } else {
+            dictionary.push(dict_vals.value(i).to_string());
+        }
+    }
+    // i32 ceiling guard mirrors `DictionaryColumn::from_string_array`.
+    if dictionary.len().saturating_add(1) > i32::MAX as usize {
+        return Err(BoltError::Other(format!(
+            "dictionary overflow: more than {} unique strings (i32 index space)",
+            i32::MAX
+        )));
+    }
+
+    // Shift keys by +1 so slot 0 stays reserved for NULL; nulls land at 0.
+    let keys_arr: &Int32Array = arr.keys();
+    let n_rows = keys_arr.len();
+    let mut indices: Vec<i32> = Vec::with_capacity(n_rows);
+    for i in 0..n_rows {
+        if keys_arr.is_null(i) {
+            indices.push(0);
+        } else {
+            let k = keys_arr.value(i);
+            if k < 0 {
+                return Err(BoltError::Other(format!(
+                    "negative dictionary key {k} at row {i} — Arrow DictionaryArray invariants \
+                     forbid negative keys"
+                )));
+            }
+            indices.push(k + 1);
+        }
+    }
+    let device_indices = crate::cuda::GpuVec::<i32>::from_slice(&indices)?;
+    let inner = DictionaryColumn {
+        dictionary,
+        indices: device_indices,
+        n_rows,
+    };
+    Ok(DictionaryColumnAny::I32(inner))
 }
 
 /// Walk a `LogicalPlan` and collect every `Scan`'s table name in plan order.
@@ -498,5 +630,87 @@ mod tests {
         let twice = reg.extended_schema("orders", &extended);
         let names_twice: Vec<&str> = twice.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names_twice, vec!["region", "price", "__idx_region"]);
+    }
+
+    /// Stage 6: register a column from an Arrow `DictionaryArray<Int32, Utf8>`
+    /// natively (no flatten step). Verifies that the registered dictionary
+    /// values match the Arrow input slot-for-slot, modulo the `+1` NULL
+    /// reservation on the *index* side.
+    #[test]
+    #[ignore = "requires CUDA device"]
+    fn register_dictionary_column_reuses_arrow_dict() {
+        use arrow_array::builder::StringDictionaryBuilder;
+
+        let mut b: StringDictionaryBuilder<ArrowInt32Type> = StringDictionaryBuilder::new();
+        b.append_value("US");
+        b.append_value("EU");
+        b.append_value("US");
+        b.append_null();
+        b.append_value("JP");
+        let arr = b.finish();
+
+        let mut reg = DictRegistry::new();
+        reg.register_dictionary_column("orders", "region", &arr)
+            .expect("register dict");
+
+        let d = reg
+            .dictionary("orders", "region")
+            .expect("region dictionary should exist");
+        // i32 variant — keys are i32 by definition for this constructor.
+        assert!(d.is_i32(), "Arrow Int32 keys should stay i32");
+        // Dictionary mirrors the Arrow dictionary's values 1:1.
+        let dict: Vec<&str> = d.dictionary().iter().map(|s| s.as_str()).collect();
+        assert_eq!(dict, vec!["US", "EU", "JP"]);
+        // Lookups against the in-memory dictionary still work; widened to i64.
+        assert_eq!(d.index_of_any("US"), Some(1));
+        assert_eq!(d.index_of_any("JP"), Some(3));
+        assert_eq!(d.index_of_any("missing"), None);
+    }
+
+    /// Round-trip: `register_dictionary_column` then `rewrite_plan` folds a
+    /// `col = 'US'` predicate into `__idx_col = 1` just like the
+    /// StringArray-based path.
+    #[test]
+    #[ignore = "requires CUDA device"]
+    fn register_dictionary_column_drives_rewrite() {
+        use arrow_array::builder::StringDictionaryBuilder;
+
+        use crate::plan::logical_plan::{BinaryOp, Literal};
+
+        let mut b: StringDictionaryBuilder<ArrowInt32Type> = StringDictionaryBuilder::new();
+        b.append_value("US");
+        b.append_value("EU");
+        let arr = b.finish();
+
+        let mut reg = DictRegistry::new();
+        reg.register_dictionary_column("orders", "region", &arr)
+            .expect("register dict");
+
+        let scan = LogicalPlan::Scan {
+            table: "orders".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("region", DataType::Utf8, false)]),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: col("region").eq(lit("US")),
+        };
+        let rewritten = reg.rewrite_plan(&plan).expect("rewrite");
+        let LogicalPlan::Filter { predicate, .. } = rewritten else {
+            panic!("expected Filter at root");
+        };
+        match predicate {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Eq);
+                match (*left, *right) {
+                    (Expr::Column(name), Expr::Literal(Literal::Int32(idx))) => {
+                        assert_eq!(name, "__idx_region");
+                        assert_eq!(idx, 1);
+                    }
+                    other => panic!("unexpected operands: {other:?}"),
+                }
+            }
+            other => panic!("expected Binary: {other:?}"),
+        }
     }
 }

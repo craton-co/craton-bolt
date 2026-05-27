@@ -166,6 +166,12 @@ impl Engine {
         let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
         let extended = self.dict_registry.extended_schema(&name, &base_schema);
         self.provider.register(name.clone(), extended);
+        // Stage 6: surface per-column runtime nullability so the engine's
+        // null-aware paths can short-circuit the validity bitmap upload
+        // when a column is provably null-free. For `DictionaryArray`
+        // columns the answer comes from `keys().null_count()` — *not* the
+        // dictionary values.
+        propagate_column_nullability(&mut self.provider, &name, &batch);
         // Build a GPU-resident copy so execution can query in place.
         let gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
         self.gpu_tables.insert(name.clone(), gpu_table);
@@ -210,6 +216,9 @@ impl Engine {
         // `MemTableProvider::register` already overwrites — no separate `replace`
         // entry point needed.
         self.provider.register(name.clone(), extended);
+        // Mirror `register_table`: re-surface per-column nullability so a
+        // replace doesn't leave stale claims behind.
+        propagate_column_nullability(&mut self.provider, &name, &batch);
         self.gpu_tables.insert(name.clone(), new_gpu_table);
         self.tables.insert(name, vec![batch]);
         Ok(())
@@ -247,6 +256,10 @@ impl Engine {
             existing.push(batch);
             // Re-materialize the concatenated batch to update the GPU table
             let concatenated = self.materialize_table(name)?;
+            // Stage 6: re-evaluate per-column nullability against the *concatenated*
+            // view — a previously null-free column may have just gained a null
+            // in the appended batch.
+            propagate_column_nullability(&mut self.provider, name, &concatenated);
             let gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&concatenated)?;
             self.gpu_tables.insert(name.to_string(), gpu_table);
             Ok(())
@@ -953,6 +966,12 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
 }
 
 /// Map Arrow `DataType` to our plan `DataType`. Errors on unsupported types.
+///
+/// Stage 6 addition: `Dictionary<Int32, Utf8>` is now accepted and reported
+/// as plan-level `Utf8` — the dict layout is a storage detail, not a logical
+/// type, so SQL frontends see it identically to a flat `StringArray` column.
+/// The native ingest path (no flatten) is wired in `GpuTable::from_record_batch`
+/// and `DictRegistry::register_table`.
 fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
@@ -961,11 +980,70 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
+        ArrowDataType::Dictionary(key_t, val_t)
+            if key_t.as_ref() == &ArrowDataType::Int32
+                && val_t.as_ref() == &ArrowDataType::Utf8 =>
+        {
+            Ok(DataType::Utf8)
+        }
         other => Err(BoltError::Type(format!(
             "unsupported Arrow dtype {:?}",
             other
         ))),
     }
+}
+
+/// Walk `batch` and inform `provider` of each column's actual runtime
+/// nullability — i.e. whether the source array had any nulls. For
+/// `DictionaryArray<_, Utf8>` columns the per-row nullability lives on the
+/// keys buffer, not the dictionary values; this helper consults
+/// `keys().null_count()` to get the right answer.
+fn propagate_column_nullability(
+    provider: &mut MemTableProvider,
+    table: &str,
+    batch: &RecordBatch,
+) {
+    let schema = batch.schema();
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let arr = batch.column(idx);
+        let has_nulls = match field.data_type() {
+            ArrowDataType::Dictionary(key_t, _)
+                if key_t.as_ref() == &ArrowDataType::Int32 =>
+            {
+                // Dict keys carry the per-row validity. Downcast and ask the
+                // keys array directly; fall back to the array's own
+                // `null_count()` if the downcast fails (shouldn't happen for
+                // Int32 keys but defensive).
+                match arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int32Type>>(
+                    ) {
+                    Some(da) => da.keys().null_count() > 0,
+                    None => arr.null_count() > 0,
+                }
+            }
+            _ => arr.null_count() > 0,
+        };
+        provider.set_column_nullability(table.to_string(), field.name().clone(), has_nulls);
+    }
+}
+
+/// Stage 6 — DEPRECATED: this helper used to materialise a `StringArray` from
+/// every `DictionaryArray<Int32, Utf8>` column in a batch so the registry and
+/// the GPU table could ingest it. The ingest paths now consume the dictionary
+/// natively (`DictRegistry::register_table` matches the dict variant directly,
+/// and `GpuTable::from_record_batch` routes through `upload_dict_utf8`), so
+/// callers no longer need this rematerialisation step.
+///
+/// Kept as a `#[deprecated]` no-op for one release to avoid breaking out-of-tree
+/// callers that imported it; will be removed in the wave after Stage 7.
+#[deprecated(
+    note = "DictionaryArray<Int32, Utf8> is now ingested natively by DictRegistry \
+            and GpuTable; this flatten step is a no-op and will be removed."
+)]
+#[allow(dead_code)]
+pub(crate) fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<RecordBatch> {
+    Ok(batch)
 }
 
 /// Convert an `arrow_schema::Schema` into our plan `Schema`.
