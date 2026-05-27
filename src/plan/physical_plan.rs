@@ -126,6 +126,16 @@ pub struct KernelSpec {
     /// validity" and the existing PTX layout is emitted verbatim — every
     /// existing caller (e.g. the projection path in `engine.rs`) continues
     /// to work bit-for-bit. When non-empty, must be parallel to `inputs`.
+    ///
+    /// # Planner visibility (Stage C)
+    ///
+    /// The lowering pipeline cannot see per-column `null_count()` (the
+    /// `TableProvider` trait exposes only schemas). This field is populated
+    /// at executor time by the per-stage upload helpers (see
+    /// [`crate::plan::sql_frontend::TableProvider`] docs for the full
+    /// hand-off). The GROUP BY value-column validity path in
+    /// [`crate::jit::hash_kernels::compile_groupby_agg_kernel_with_validity`]
+    /// also consults the executor-time signal rather than this field.
     #[doc(hidden)]
     pub input_has_validity: Vec<bool>,
     /// Pre-stage NULL handling (Option B): one entry per output column.

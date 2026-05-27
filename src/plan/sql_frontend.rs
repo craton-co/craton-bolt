@@ -19,6 +19,31 @@ use crate::plan::logical_plan::{
 };
 
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
+///
+/// # Validity-signal scope (Stage C)
+///
+/// The trait deliberately exposes ONLY the column schema — not the registered
+/// `RecordBatch` itself. This means the planner cannot inspect per-column
+/// `null_count()` at lower time, so the
+/// [`crate::plan::physical_plan::KernelSpec::input_has_validity`] flag is
+/// left empty (the historical default) by the lowering pipeline.
+///
+/// The flag is populated at **executor time** by the per-stage helpers that
+/// upload columns to the GPU:
+///
+/// * [`crate::exec::agg_with_pre`] and [`crate::exec::groupby_with_pre`] —
+///   `PreCol::upload` inspects `arr.null_count()` and attaches a `valid_mask`
+///   to each input column; the launcher then sets `input_has_validity` from
+///   `PreCol::has_validity()` before calling [`crate::jit::ptx_gen::compile`].
+/// * GROUP BY aggregate kernels (Stage C) — when the registered Arrow batch
+///   for a GROUP BY value column carries nulls, the executor picks
+///   [`crate::jit::hash_kernels::compile_groupby_agg_kernel_with_validity`]
+///   over the classic variant.
+///
+/// If a future `TableProvider` extension exposes the registered batches at
+/// plan time (e.g. for cost-based planning), the lowering pipeline can begin
+/// populating `input_has_validity` here so the JIT cache key reflects
+/// per-column nullability and the executor skips its own runtime probe.
 pub trait TableProvider {
     /// Return the schema for `name`, or a `Plan` error if the table is unknown.
     fn schema(&self, name: &str) -> BoltResult<Schema>;
