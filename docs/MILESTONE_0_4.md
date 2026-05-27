@@ -4,35 +4,59 @@
 **Target release:** 0.4
 **Status:** Proposal (drafted before 0.3 closes; revisited at the 0.3 tag)
 
+> **Note on cross-references.** Earlier drafts of this milestone referenced
+> an internal `docs/rust_cuda/` scratch series (toolchain audit, kernel
+> inventory, risk assessment, the 0.3 milestone proposal). That series was
+> never published; the relevant content has been inlined here or redirected
+> to the public docs ([`CUDARC_ADOPTION.md`](CUDARC_ADOPTION.md),
+> [`JIT_PIPELINE.md`](JIT_PIPELINE.md),
+> [`CUDA_OXIDE_SWEEP.md`](CUDA_OXIDE_SWEEP.md)).
+
 ## Executive summary
 
-0.3 makes a bet on `rustc_codegen_nvvm` (see
-[`docs/rust_cuda/06_milestone_proposal.md`](rust_cuda/06_milestone_proposal.md)).
-The bet may win cleanly, fail outright, or land somewhere in the middle.
+0.3 makes a bet on `rustc_codegen_nvvm` — the community-led `rust-cuda`
+codegen path — as the eventual replacement for Craton Bolt's hand-emit
+PTX kernels. The bet may win cleanly, fail outright, or land somewhere
+in the middle.
 0.4 cannot wait for the answer to be uniform — it has to plan for all
 three. The headline of 0.4 is **backend convergence**: by the end of the
 cycle Craton Bolt ships exactly one device-side codegen story (rust-cuda,
 hand-emit PTX, or — speculatively — NVIDIA's CUDA-Oxide), the others are
 removed or feature-gated to history, and the cudarc host-side track from
-`docs/CUDARC_ADOPTION.md` is fully soaked. The secondary headline is
-**kernel parameterisation**: closing the dynamic-`n_vals` gap that
-[`07_risk_assessment.md`](rust_cuda/07_risk_assessment.md) R5 calls out
-as 0.3's structural debt.
+[`docs/CUDARC_ADOPTION.md`](CUDARC_ADOPTION.md) is fully soaked. The
+secondary headline is **kernel parameterisation**: closing the
+dynamic-`n_vals` gap (the structural debt that 0.3 incurs by emitting
+one PTX variant per `N` instead of monomorphising a single const-generic
+kernel — referred to below as Risk R5).
+
+## 0.3 risk legend (inline reference)
+
+Risk IDs referenced below summarise the 0.3 rust-cuda adoption risks:
+
+| ID | Risk |
+|----|------|
+| R1 | `rust-cuda` bus factor / maintainer attrition. |
+| R2 | High-velocity nightly-Rust toolchain dependency. |
+| R3 | `rustc_codegen_nvvm` codegen regressions vs hand-emit. |
+| R4 | Build-time / CI cost of the rust-cuda toolchain. |
+| R5 | No const-generic kernel story → one PTX-per-`N` emission. |
 
 ## Pre-0.4 state — three branching scenarios
 
 0.4 scope is keyed off which scenario obtains at the 0.3 tag. The
 post-0.3 status review names one of:
 
-- **Scenario A — clean 0.3.** All 18 PTX kernels enumerated in
-  [`02_kernel_inventory.md`](rust_cuda/02_kernel_inventory.md) are
-  rewritten as Rust source in the `kernels/` workspace member. Every
+- **Scenario A — clean 0.3.** All 18 PTX kernels currently emitted by
+  `src/jit/*_kernel*.rs` (the kernel inventory; see
+  [`docs/JIT_PIPELINE.md`](JIT_PIPELINE.md) for the executor-by-executor
+  rundown) are rewritten as Rust source in the `kernels/` workspace
+  member. Every
   bench in [`docs/BENCHMARKS.md`](BENCHMARKS.md) stays within ±5 % of
   the 0.2 baseline. `src/jit/*_kernel*.rs` is empty of emitter
   functions. `rust-cuda` is the source of truth; hand-emit lives only
   in the `v0.2-handemit` tag.
 - **Scenario B — Fallback B fired.** Wave A or a later wave hit
-  Risk R1 / R3 / R4 from `07_risk_assessment.md` hard enough to trigger
+  Risk R1 / R3 / R4 (see the risk legend above) hard enough to trigger
   the full revert documented as "Fallback B". The `kernels/` workspace
   member is shelved on a `rust-cuda-experiment` branch. Craton Bolt is
   back on hand-emit. The recovery window between the revert and 0.3
@@ -62,7 +86,7 @@ Rust-CUDA is the floor. 0.4 builds on top of it.
   Same for `shmem_multi_sum_kernel`. The variants-per-N macro from
   Wave E of 0.3 is deleted; the host-side dispatch picks the
   monomorphisation at launch time from a `KernelSpec` lookup. Resolves
-  R5 from `07_risk_assessment.md`.
+  R5 from the risk legend above.
 - **Wave A2 — host/device type sharing.** A `kernels-shared/` crate
   exposes `#[derive(DeviceCopy)]` structs that both the launcher and
   the kernel consume — currently impossible because the hand-emit path
@@ -99,9 +123,10 @@ defers the kernel-language question to 0.5.
   migration. Reconcile or delete `src/cuda/mem_pool.rs`. After this
   wave `default = ["cudarc"]` flips on and the hand-rolled FFI lives
   only behind `--features hand-rolled` for one cycle.
-- **Wave B4 — rust-cuda re-evaluation.** Re-run the
-  `01_toolchain_audit.md` audit against whatever rust-cuda HEAD looks
-  like at the start of Q3 2026. Two questions decide whether 0.5
+- **Wave B4 — rust-cuda re-evaluation.** Re-audit the rust-cuda
+  toolchain (nightly pin, `rustc_codegen_nvvm` release status, sm_70
+  support, CI cost) against whatever HEAD looks like at the start of
+  Q3 2026. Two questions decide whether 0.5
   retries the kernel-language migration: (i) is a tagged crates.io
   release of `rustc_codegen_nvvm` out? (ii) has NVIDIA's CUDA-Oxide
   shipped a 0.2 with PTX-text loading?
@@ -136,10 +161,9 @@ at the end of Wave C1 once the split is known.
 > [!IMPORTANT]
 > **Naming Disambiguation:** In the Craton Bolt codebase, "CUDA-Oxide" is sometimes used as an informal nickname for our own borrow-checked GPU memory safety layer (`GpuVec`/`GpuView`/`GpuViewMut`, see `docs/CUDA_OXIDE_SWEEP.md`). In this section, however, **CUDA-Oxide** refers to **NVIDIA's official first-party Rust-to-PTX compiler** shipped on 2026-05-09.
 
-[`01_toolchain_audit.md`](rust_cuda/01_toolchain_audit.md) §5 notes
-that NVIDIA shipped **CUDA-Oxide 0.1 on 2026-05-09** — a separate
-official Rust-to-PTX compiler. As of this writing it is pre-beta. 0.4
-has to take a position on it.
+NVIDIA shipped **CUDA-Oxide 0.1 on 2026-05-09** — a separate official
+Rust-to-PTX compiler, distinct from the community `rust-cuda` stack.
+As of this writing it is pre-beta. 0.4 has to take a position on it.
 
 ### What is NVIDIA CUDA-Oxide?
 
@@ -165,8 +189,7 @@ nvcc/PTX pipeline more directly), different release cadence (no tagged
   (libNVVM-IR). NVIDIA CUDA-Oxide's codegen path is not yet
   publicly documented in enough detail to compare; the 0.2 release
   is the moment to re-audit. Tracked in
-  [`docs/CUDA_OXIDE_SWEEP.md`](CUDA_OXIDE_SWEEP.md) and the future
-  `01_toolchain_audit.md` revision.
+  [`docs/CUDA_OXIDE_SWEEP.md`](CUDA_OXIDE_SWEEP.md).
 - **Ecosystem coupling.** rust-cuda pulls in `cust`, `cust_core`,
   `cust_raw`, `cuda_std`. NVIDIA CUDA-Oxide's transitive footprint is
   unknown.
@@ -187,9 +210,9 @@ the answers exist as of 2026-05-25.
    way. A CUDA-Oxide pivot is only cheap if its PTX output drops into
    that loader unchanged. *(Needs investigation.)*
 2. **Does CUDA-Oxide 0.2 support sm_70 (Volta) as a first-class
-   target?** sm_70 is Craton Bolt's published floor (see
-   `01_toolchain_audit.md` §2). If CUDA-Oxide 0.2 ships sm_75-only or
-   Blackwell-first, the pivot waits. *(Needs investigation.)*
+   target?** sm_70 is Craton Bolt's published floor. If CUDA-Oxide 0.2
+   ships sm_75-only or Blackwell-first, the pivot waits. *(Needs
+   investigation.)*
 3. **Can hand-emit PTX and CUDA-Oxide-emitted PTX coexist in one
    process?** A staged migration — like rust-cuda's Wave A through F
    — needs the answer to be yes. Two PTX sources, one loader, one
