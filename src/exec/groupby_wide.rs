@@ -127,21 +127,31 @@ pub fn execute_groupby_wide(
     let fresh_accs = make_initial_accumulators(&agg_plan)?;
     // Reusable scratch buffer for the per-row tuple build.
     let mut buf_key: Vec<KeyValue> = Vec::with_capacity(key_cols.len());
+    // H1 NULL handling: precompute "any key column has nulls?" and "any
+    // aggregate input has nulls?" once so the inner row loop stays
+    // branch-light when both are null-free (the common case). When either
+    // flag is set we fall back to per-row `is_null` probes on the relevant
+    // Arrow array via its validity bitmap.
+    //
+    // Lockstep semantics here:
+    //   - A row is DROPPED ENTIRELY when ANY group-by key column is NULL.
+    //     The narrow `groupby.rs` path does the same (`pack_keys`'s AND of
+    //     per-column key_valid masks); here we just short-circuit before
+    //     building the tuple key.
+    //   - Surviving rows feed each aggregate independently: an aggregate's
+    //     update is skipped only when that aggregate's own input is NULL.
+    //     This keeps SUM/MIN/MAX out of NULL slots, and makes
+    //     COUNT(col)/AVG denominator reflect the non-NULL count.
+    let any_key_nullable = key_cols.iter().any(|kc| kc.arr.null_count() > 0);
+    let any_agg_nullable = agg_plan.iter().any(|p| p.arr.null_count() > 0);
     for row in 0..n_rows {
-        // TODO(h1): same NULL fix pattern needed here — `key_value_at` and
-        // `agg_input_at` both read via `pa.value(row)`, which returns the
-        // garbage bit pattern at the underlying values buffer when the
-        // Arrow array's validity bitmap marks `row` as NULL. We need to:
-        //   1. Skip the row entirely when ANY key column is NULL at `row`
-        //      (matches the `groupby.rs` H1 fix: NULL keys are dropped).
-        //   2. For each aggregate, skip its update when the value column
-        //      is NULL at `row` (so SUM/MIN/MAX exclude NULL inputs and
-        //      AVG's denominator reflects the non-NULL count).
-        // The fix is straightforward inline here because the loop already
-        // walks per-row — just `if kc.arr.is_null(row) { skip row }` and
-        // `if agg_in.arr.is_null(row) { continue }` at the right spots.
-        // See `groupby.rs::collect_filtered_primitive` and
-        // `groupby.rs::run_typed_agg` for the canonical pattern.
+        // Drop the row entirely if ANY group-by column is NULL at this row.
+        // We probe `is_null` on the Arrow array directly — `key_value_at`
+        // would otherwise read garbage at NULL slots via `pa.value(row)`,
+        // which ignores the validity bitmap.
+        if any_key_nullable && key_cols.iter().any(|kc| kc.arr.is_null(row)) {
+            continue;
+        }
         // Build the tuple key for this row.
         buf_key.clear();
         for kc in &key_cols {
@@ -156,8 +166,19 @@ pub fn execute_groupby_wide(
             .entry(tuple)
             .or_insert_with(|| fresh_accs.clone());
 
-        // Feed each aggregate its row value.
+        // Feed each aggregate its row value, skipping per-aggregate inputs
+        // that are NULL at this row. Mirrors the call-site filter in
+        // `groupby.rs::run_typed_agg` (which drops NULL positions before
+        // GPU upload). Since the wide path is host-side per-row, we do the
+        // same thing inline:
+        //   - SUM/MIN/MAX: skip update so NULLs don't contribute.
+        //   - COUNT(col):  skip update so we report the non-NULL count.
+        //   - AVG:         skip update so the denominator is non-NULL count
+        //                  and the numerator excludes NULL contributions.
         for (i, agg_in) in agg_plan.iter().enumerate() {
+            if any_agg_nullable && agg_in.arr.is_null(row) {
+                continue;
+            }
             let value = agg_input_at(agg_in, row)?;
             accs[i].update(value)?;
         }
@@ -898,6 +919,27 @@ fn collect_sum_min_max(
     i: usize,
     out_dtype: DataType,
 ) -> BoltResult<ArrayRef> {
+    // Empty-group case (every row was dropped by the H1 NULL filter): emit
+    // an empty Arrow array of the plan-declared output dtype. Without this
+    // shortcut the `first.unwrap()` below would error on legitimate inputs
+    // whose entire batch is NULL-keyed.
+    if sorted.is_empty() {
+        return pack_typed_array(
+            out_dtype,
+            match out_dtype {
+                DataType::Int32 => TypedColumn::I32(Vec::new()),
+                DataType::Int64 => TypedColumn::I64(Vec::new()),
+                DataType::Float32 => TypedColumn::F32(Vec::new()),
+                DataType::Float64 => TypedColumn::F64(Vec::new()),
+                DataType::Bool | DataType::Utf8 => {
+                    return Err(BoltError::Type(format!(
+                        "wide GROUP BY: cannot emit empty {:?} aggregate column",
+                        out_dtype
+                    )))
+                }
+            },
+        );
+    }
     // Peek the first non-empty group to choose the natural collector type.
     let first = sorted
         .first()
@@ -1552,5 +1594,234 @@ mod tests {
         let s = col_i64(&out, 1);
         assert_eq!(a, vec![0, 1, 2]);
         assert_eq!(s, vec![30, 80, 40]);
+    }
+
+    // -----------------------------------------------------------------
+    // H1 NULL-handling tests for the wide-key path.
+    //
+    // The pre-fix per-row loop read every key column and aggregate input
+    // via `pa.value(row)`, which returns garbage bytes at NULL positions
+    // (Arrow's validity bitmap was ignored). The post-fix loop:
+    //   * drops a row when ANY key column is NULL at that row, and
+    //   * skips an aggregate's update when its own input is NULL.
+    // These tests pin both behaviours on a 2-key wide-input.
+    // -----------------------------------------------------------------
+
+    /// Build a 3-column (Int64?, Int64?, Int64?) NULLable batch.
+    /// `None` in any column produces a NULL at that row.
+    fn build_two_key_batch_nullable(
+        rows: &[(Option<i64>, Option<i64>, Option<i64>)],
+    ) -> RecordBatch {
+        let a: Vec<Option<i64>> = rows.iter().map(|r| r.0).collect();
+        let b: Vec<Option<i64>> = rows.iter().map(|r| r.1).collect();
+        let v: Vec<Option<i64>> = rows.iter().map(|r| r.2).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new("b", ArrowDataType::Int64, true),
+            ArrowField::new("v", ArrowDataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(a)) as ArrayRef,
+                Arc::new(Int64Array::from(b)) as ArrayRef,
+                Arc::new(Int64Array::from(v)) as ArrayRef,
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// H1: a row with a NULL in ANY key column is dropped from every group's
+    /// MIN/MAX/AVG/COUNT(col). The surviving rows must aggregate normally.
+    #[test]
+    fn null_key_row_excluded_from_min_max_avg_count() {
+        // Layout — note row 2 has b=NULL so it must be dropped entirely.
+        // (a=1, b=10): v ∈ {100, 200}                → min 100, max 200,
+        //                                              avg 150, count 2, sum 300
+        // (a=1, b=NULL, v=999)                       → DROPPED (NULL key)
+        // (a=2, b=10): v ∈ {7, 8, 9}                 → min 7,   max 9,
+        //                                              avg 8,   count 3, sum 24
+        let rows: Vec<(Option<i64>, Option<i64>, Option<i64>)> = vec![
+            (Some(1), Some(10), Some(100)),
+            (Some(2), Some(10), Some(7)),
+            (Some(1), None, Some(999)), // NULL key → must drop
+            (Some(1), Some(10), Some(200)),
+            (Some(2), Some(10), Some(8)),
+            (Some(2), Some(10), Some(9)),
+        ];
+        let batch = build_two_key_batch_nullable(&rows);
+
+        let inputs = vec![
+            ColumnIO {
+                name: "a".into(),
+                dtype: DataType::Int64,
+            },
+            ColumnIO {
+                name: "b".into(),
+                dtype: DataType::Int64,
+            },
+            ColumnIO {
+                name: "v".into(),
+                dtype: DataType::Int64,
+            },
+        ];
+        let output_schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("sum_v", DataType::Int64, true),
+            Field::new("min_v", DataType::Int64, true),
+            Field::new("max_v", DataType::Int64, true),
+            Field::new("count_v", DataType::Int64, true),
+            Field::new("avg_v", DataType::Float64, true),
+        ]);
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs,
+                group_by: vec![0, 1],
+                aggregates: vec![
+                    AggregateExpr::Sum(Expr::Column("v".into())),
+                    AggregateExpr::Min(Expr::Column("v".into())),
+                    AggregateExpr::Max(Expr::Column("v".into())),
+                    AggregateExpr::Count(Expr::Column("v".into())),
+                    AggregateExpr::Avg(Expr::Column("v".into())),
+                ],
+                output_schema,
+            },
+        };
+        let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");
+
+        // Only two groups must survive — the NULL-keyed row is gone.
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "NULL-key row leaked into output as its own group"
+        );
+        let a = col_i64(&out, 0);
+        let b = col_i64(&out, 1);
+        let s = col_i64(&out, 2);
+        let mn = col_i64(&out, 3);
+        let mx = col_i64(&out, 4);
+        let c = col_i64(&out, 5);
+        let avg = col_f64(&out, 6);
+        assert_eq!(a, vec![1, 2]);
+        assert_eq!(b, vec![10, 10]);
+        assert_eq!(s, vec![300, 24]);
+        assert_eq!(mn, vec![100, 7]);
+        assert_eq!(mx, vec![200, 9]);
+        assert_eq!(c, vec![2, 3]);
+        assert_eq!(avg, vec![150.0, 8.0]);
+    }
+
+    /// H1: SUM excludes NULL value inputs (lockstep filter on the value
+    /// column). Row keys are all non-null here; only the value column has
+    /// a NULL, which must be dropped from the group's running total.
+    #[test]
+    fn null_value_excluded_from_sum() {
+        // (a=1, b=10): v ∈ {100, NULL, 200}          → sum 300 (NULL excluded)
+        // (a=2, b=10): v ∈ {7, 8}                    → sum 15
+        let rows: Vec<(Option<i64>, Option<i64>, Option<i64>)> = vec![
+            (Some(1), Some(10), Some(100)),
+            (Some(2), Some(10), Some(7)),
+            (Some(1), Some(10), None), // NULL value: SUM must skip
+            (Some(1), Some(10), Some(200)),
+            (Some(2), Some(10), Some(8)),
+        ];
+        let batch = build_two_key_batch_nullable(&rows);
+
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO {
+                        name: "a".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColumnIO {
+                        name: "b".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Int64,
+                    },
+                ],
+                group_by: vec![0, 1],
+                aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+                output_schema: Schema::new(vec![
+                    Field::new("a", DataType::Int64, true),
+                    Field::new("b", DataType::Int64, true),
+                    Field::new("sum_v", DataType::Int64, true),
+                ]),
+            },
+        };
+        let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");
+        assert_eq!(out.num_rows(), 2);
+        let a = col_i64(&out, 0);
+        let b = col_i64(&out, 1);
+        let s = col_i64(&out, 2);
+        assert_eq!(a, vec![1, 2]);
+        assert_eq!(b, vec![10, 10]);
+        // Non-NULL sum: 100 + 200 = 300; 7 + 8 = 15.
+        assert_eq!(s, vec![300, 15]);
+    }
+
+    /// H1: when EVERY row is filtered out (here: every row has a NULL key),
+    /// we still produce a clean empty output rather than panicking on the
+    /// "no groups when finalising aggregate" branch.
+    #[test]
+    fn all_rows_filtered_yields_clean_empty_output() {
+        // All four rows have at least one NULL key → all four are dropped.
+        let rows: Vec<(Option<i64>, Option<i64>, Option<i64>)> = vec![
+            (None, Some(10), Some(1)),
+            (Some(1), None, Some(2)),
+            (None, None, Some(3)),
+            (None, Some(20), Some(4)),
+        ];
+        let batch = build_two_key_batch_nullable(&rows);
+
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO {
+                        name: "a".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColumnIO {
+                        name: "b".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Int64,
+                    },
+                ],
+                group_by: vec![0, 1],
+                aggregates: vec![
+                    AggregateExpr::Sum(Expr::Column("v".into())),
+                    AggregateExpr::Min(Expr::Column("v".into())),
+                    AggregateExpr::Max(Expr::Column("v".into())),
+                    AggregateExpr::Count(Expr::Column("v".into())),
+                    AggregateExpr::Avg(Expr::Column("v".into())),
+                ],
+                output_schema: Schema::new(vec![
+                    Field::new("a", DataType::Int64, true),
+                    Field::new("b", DataType::Int64, true),
+                    Field::new("sum_v", DataType::Int64, true),
+                    Field::new("min_v", DataType::Int64, true),
+                    Field::new("max_v", DataType::Int64, true),
+                    Field::new("count_v", DataType::Int64, true),
+                    Field::new("avg_v", DataType::Float64, true),
+                ]),
+            },
+        };
+        let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");
+        // Empty output, with the full output schema preserved.
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.num_columns(), 7);
     }
 }
