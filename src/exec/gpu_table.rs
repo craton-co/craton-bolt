@@ -66,16 +66,24 @@ pub enum GpuColumnData {
     /// [`GpuColumn::utf8_dictionary`] returns the dict for **both** variants
     /// — the `Utf8` `dictionary[i-1]` and `DictUtf8` `dict[i]` indexing
     /// conventions are different though (Utf8 reserves slot 0 for NULL).
+    ///
+    /// **Stage 6** — added `valid_mask`. NULL rows are represented by the
+    /// Arrow-LE packed validity bitmap (one `u8` per 8 rows, lsb-first),
+    /// matching the bitmap convention used by the PV validity path. The
+    /// `keys.value(i)` for a row whose validity bit is 0 is meaningless
+    /// (we zero them at upload time); callers MUST consult `valid_mask`
+    /// before dereferencing `dict[keys[i]]` for nullable inputs.
     DictUtf8 {
-        /// Per-row dictionary keys (the i32 indices into `dict`).
+        /// Per-row dictionary keys (the i32 indices into `dict`). NULL rows
+        /// are zeroed at upload time — `valid_mask` is the source of truth
+        /// for per-row validity.
         keys: GpuVec<i32>,
-        /// Host-side dictionary, `dict[i]` decodes key `i`. NULL rows are
-        /// represented by the Arrow keys array's null bit, not by a slot-0
-        /// convention — `keys.value(i)` is meaningless if the original
-        /// `keys.is_null(i)`. (Validity is currently not uploaded; callers
-        /// that need null handling must build a separate bitmap. Stage 6
-        /// follow-up.)
+        /// Host-side dictionary, `dict[i]` decodes key `i`. Mirrors the
+        /// Arrow dictionary's values 1:1 (no NULL offset).
         dict: Vec<String>,
+        /// Optional Arrow-LE packed validity bitmap on the device, one byte
+        /// per 8 rows. `None` when the upload source had no nulls.
+        valid_mask: Option<GpuVec<u8>>,
     },
 }
 
@@ -94,6 +102,39 @@ impl GpuColumnData {
             GpuColumnData::DictUtf8 { keys, .. } => keys.device_ptr(),
         }
     }
+
+    /// Device pointer to the validity bitmap, if any. Only `DictUtf8` carries
+    /// a separate bitmap today; all other variants either inline validity
+    /// (e.g. `BoolNullable`) or treat the data as non-nullable.
+    pub fn validity_ptr(&self) -> Option<CUdeviceptr> {
+        match self {
+            GpuColumnData::DictUtf8 {
+                valid_mask: Some(v),
+                ..
+            } => Some(v.device_ptr()),
+            GpuColumnData::BoolNullable { validity, .. } => Some(validity.device_ptr()),
+            _ => None,
+        }
+    }
+}
+
+/// Pack `n_rows` of host-side validity bits (one `bool` per row, `true` = valid)
+/// into an Arrow-LE packed bitmap, one `u8` per 8 rows, lsb-first.
+///
+/// This is the on-host counterpart to the PV-stage-c `pack_validity_bits`
+/// device kernel: it is used at upload time to translate an Arrow
+/// `NullBuffer`'s already-packed bits into our own owned `Vec<u8>` (the
+/// Arrow buffer's lifetime is tied to the source array; we want an owned
+/// copy to ship straight to the device).
+fn pack_validity_from_arrow(null_buffer: &arrow_buffer::NullBuffer, n_rows: usize) -> Vec<u8> {
+    let n_bytes = n_rows.div_ceil(8);
+    let mut out = vec![0u8; n_bytes];
+    for i in 0..n_rows {
+        if null_buffer.is_valid(i) {
+            out[i / 8] |= 1u8 << (i % 8);
+        }
+    }
+    out
 }
 
 impl GpuColumn {
@@ -291,9 +332,17 @@ impl GpuColumn {
                             }
                         };
                         let keys_gpu = GpuVec::<i32>::from_slice(&keys_i32)?;
+                        // Stage 6: this inline path is a fallback for direct
+                        // GpuColumn::upload callers (the engine's main ingest
+                        // route goes through `upload_dict_utf8` via
+                        // `GpuTable::from_record_batch`, which packs the
+                        // Arrow null buffer into a validity bitmap). We don't
+                        // re-derive validity here — `upload_dict_utf8` is the
+                        // null-aware ingress.
                         GpuColumnData::DictUtf8 {
                             keys: keys_gpu,
                             dict: dict_strings,
+                            valid_mask: None,
                         }
                     }
                     other => {
@@ -308,17 +357,87 @@ impl GpuColumn {
         Ok(Self { name, dtype, data })
     }
 
+    /// Upload an Arrow `DictionaryArray<Int32, Utf8>` to the GPU as a native
+    /// [`GpuColumnData::DictUtf8`] without going through `StringArray`
+    /// flattening. Used by the engine when it ingests dictionary-encoded
+    /// columns directly (Stage 6+).
+    pub fn upload_dict_utf8(
+        name: String,
+        arr: &DictionaryArray<Int32Type>,
+    ) -> BoltResult<Self> {
+        // Values must be Utf8.
+        let dict_vals = arr
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                BoltError::Type(format!(
+                    "DictionaryArray for column '{}' has non-Utf8 value type {:?}",
+                    name,
+                    arr.values().data_type()
+                ))
+            })?;
+        // Host-side dictionary: copy each value as an owned String.
+        let mut dict: Vec<String> = Vec::with_capacity(dict_vals.len());
+        for i in 0..dict_vals.len() {
+            // The dictionary itself is rarely nullable in practice; treat any
+            // null value as an empty string so the key->string lookup remains
+            // total. The validity for the row-level data still flows through
+            // the keys' null buffer.
+            if dict_vals.is_null(i) {
+                dict.push(String::new());
+            } else {
+                dict.push(dict_vals.value(i).to_string());
+            }
+        }
+
+        // Keys: upload the underlying i32 buffer to the device.
+        let keys_arr: &Int32Array = arr.keys();
+        let n_rows = keys_arr.len();
+        // Copy keys to an owned Vec — null keys are zeroed out so the device
+        // never reads garbage. Row-level validity lives in `valid_mask`.
+        let mut keys_host: Vec<i32> = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            if keys_arr.is_null(i) {
+                keys_host.push(0);
+            } else {
+                keys_host.push(keys_arr.value(i));
+            }
+        }
+        let keys = GpuVec::<i32>::from_slice(&keys_host)?;
+
+        // Optional validity: pack from the Arrow null buffer if present.
+        let valid_mask = if let Some(nb) = keys_arr.nulls() {
+            let bits = pack_validity_from_arrow(nb, n_rows);
+            Some(GpuVec::<u8>::from_slice(&bits)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            name,
+            dtype: DataType::Utf8,
+            data: GpuColumnData::DictUtf8 {
+                keys,
+                dict,
+                valid_mask,
+            },
+        })
+    }
+
     /// Device pointer for the column's primary buffer.
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.data.device_ptr()
     }
 
-    /// Host-side Utf8 dictionary, if this is a Utf8 column.
+    /// Host-side Utf8 dictionary, if this is a Utf8-backed column.
     ///
-    /// **Stage 5** — returns the dict for both the engine-managed `Utf8`
-    /// variant (with the slot-0-is-NULL convention) and the new `DictUtf8`
-    /// variant (input dict, no NULL reservation). Callers that need to know
-    /// the indexing convention should match on `data` directly.
+    /// **Stage 5 / Stage 6** — returns the dictionary for both the legacy
+    /// engine-managed `Utf8` variant (slot 0 reserved for NULL, real strings
+    /// at indices `1..`) and the `DictUtf8` variant (1:1 with the Arrow
+    /// dictionary; no NULL offset — NULL handling lives on the
+    /// `valid_mask` bitmap). Callers that care about the layout distinction
+    /// must match on `data` directly.
     pub fn utf8_dictionary(&self) -> Option<&[String]> {
         match &self.data {
             GpuColumnData::Utf8 { dictionary, .. } => Some(dictionary),
@@ -344,23 +463,46 @@ impl GpuTable {
         let mut columns: Vec<GpuColumn> = Vec::with_capacity(batch.num_columns());
         for (idx, field) in schema.fields().iter().enumerate() {
             let arr = batch.column(idx);
-            let dtype = match field.data_type() {
-                arrow_schema::DataType::Int32 => DataType::Int32,
-                arrow_schema::DataType::Int64 => DataType::Int64,
-                arrow_schema::DataType::Float32 => DataType::Float32,
-                arrow_schema::DataType::Float64 => DataType::Float64,
-                arrow_schema::DataType::Boolean => DataType::Bool,
-                arrow_schema::DataType::Utf8 => DataType::Utf8,
-                // Stage 5 — dict-encoded Utf8 maps to the engine's Utf8 dtype
-                // so the planner / consumers continue to reason about it as
-                // a string column. `GpuColumn::upload` then dispatches on
-                // the runtime Arrow type to pick the storage variant
-                // (`Utf8` for plain StringArray, `DictUtf8` for the dict
-                // input).
-                arrow_schema::DataType::Dictionary(_, value_ty)
-                    if matches!(value_ty.as_ref(), arrow_schema::DataType::Utf8) =>
+            let col = match field.data_type() {
+                arrow_schema::DataType::Int32 => {
+                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Int32)?
+                }
+                arrow_schema::DataType::Int64 => {
+                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Int64)?
+                }
+                arrow_schema::DataType::Float32 => {
+                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Float32)?
+                }
+                arrow_schema::DataType::Float64 => {
+                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Float64)?
+                }
+                arrow_schema::DataType::Boolean => {
+                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Bool)?
+                }
+                arrow_schema::DataType::Utf8 => {
+                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Utf8)?
+                }
+                // Stage 6: native ingest path for `DictionaryArray<Int32, Utf8>`.
+                // Stage 5 had this routed through `GpuColumn::upload` (which
+                // would build a `DictUtf8` variant without validity); Stage 6
+                // upgrades the path to `upload_dict_utf8`, which packs the
+                // Arrow null buffer into an on-device validity bitmap so
+                // downstream null-aware kernels see real per-row validity.
+                arrow_schema::DataType::Dictionary(key_t, val_t)
+                    if key_t.as_ref() == &arrow_schema::DataType::Int32
+                        && val_t.as_ref() == &arrow_schema::DataType::Utf8 =>
                 {
-                    DataType::Utf8
+                    let dict_arr = arr
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<Int32Type>>()
+                        .ok_or_else(|| {
+                            BoltError::Type(format!(
+                                "column '{}' declared Dictionary<Int32, Utf8> but did not \
+                                 downcast to DictionaryArray<Int32Type>",
+                                field.name()
+                            ))
+                        })?;
+                    GpuColumn::upload_dict_utf8(field.name().clone(), dict_arr)?
                 }
                 other => {
                     return Err(BoltError::Type(format!(
@@ -370,7 +512,6 @@ impl GpuTable {
                     )));
                 }
             };
-            let col = GpuColumn::upload(field.name().clone(), arr.as_ref(), dtype)?;
             columns.push(col);
         }
         Ok(Self { n_rows, columns })
@@ -399,9 +540,26 @@ fn type_mismatch_err(arr: &dyn Array, expected: &str) -> BoltError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::builder::StringDictionaryBuilder;
+    use arrow_array::types::Int32Type as ArrowInt32Type;
     use arrow_array::{DictionaryArray, Int32Array, StringArray};
+    use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
+
+    /// `pack_validity_from_arrow` round-trips an Arrow null buffer into the
+    /// PV-stage-c packed-bits layout (lsb-first per byte). This is a pure-host
+    /// test — no CUDA required.
+    #[test]
+    fn pack_validity_from_arrow_lsb_first() {
+        // Rows: [valid, null, valid, valid, null, null, valid, valid, valid]
+        //  bit:  [0=1,   1=0,  2=1,   3=1,   4=0,  5=0,  6=1,   7=1,   8=1]
+        // byte 0 = 0b1100_1101 = 0xCD ; byte 1 = 0b0000_0001 = 0x01
+        let bools = [true, false, true, true, false, false, true, true, true];
+        let nb = NullBuffer::new(BooleanBuffer::from_iter(bools.iter().copied()));
+        let packed = pack_validity_from_arrow(&nb, bools.len());
+        assert_eq!(packed, vec![0xCDu8, 0x01u8]);
+    }
 
     /// Stage 5 — registering a `DictionaryArray<i32, Utf8>` column produces
     /// the new `DictUtf8` GpuColumn variant rather than the engine-managed
@@ -485,5 +643,63 @@ mod tests {
         let col = table.column("name").expect("name column");
         assert!(matches!(col.dtype, DataType::Utf8));
         assert!(matches!(col.data, GpuColumnData::Utf8 { .. }));
+    }
+
+    /// Stage 6 — upload a `DictionaryArray<Int32, Utf8>` with NULLs and
+    /// verify the resulting `DictUtf8` variant carries a validity bitmap.
+    /// CUDA-dependent (uploads to the device).
+    #[test]
+    #[ignore = "requires CUDA device"]
+    fn dict_utf8_with_nulls_propagates_validity() {
+        let mut b: StringDictionaryBuilder<ArrowInt32Type> = StringDictionaryBuilder::new();
+        b.append_value("a");
+        b.append_null();
+        b.append_value("b");
+        b.append_value("a");
+        b.append_null();
+        let arr = b.finish();
+        assert_eq!(arr.keys().null_count(), 2);
+
+        let col = GpuColumn::upload_dict_utf8("c".into(), &arr).expect("upload");
+        match &col.data {
+            GpuColumnData::DictUtf8 {
+                keys,
+                dict,
+                valid_mask,
+            } => {
+                assert_eq!(keys.len(), 5);
+                assert_eq!(dict.as_slice(), &["a".to_string(), "b".to_string()]);
+                let mask = valid_mask
+                    .as_ref()
+                    .expect("validity bitmap should be present when source has nulls");
+                // 5 rows → 1 byte of bitmap.
+                assert_eq!(mask.len(), 1);
+            }
+            other => panic!("expected DictUtf8, got {:?}", std::mem::discriminant(other)),
+        }
+        // device_ptr / validity_ptr surface the correct buffers.
+        assert!(col.data.validity_ptr().is_some());
+    }
+
+    /// Stage 6 — a `DictionaryArray` with zero nulls uploads a `DictUtf8`
+    /// whose `valid_mask` is `None`.
+    #[test]
+    #[ignore = "requires CUDA device"]
+    fn dict_utf8_without_nulls_omits_validity() {
+        let mut b: StringDictionaryBuilder<ArrowInt32Type> = StringDictionaryBuilder::new();
+        b.append_value("x");
+        b.append_value("y");
+        b.append_value("x");
+        let arr = b.finish();
+        assert_eq!(arr.keys().null_count(), 0);
+
+        let col = GpuColumn::upload_dict_utf8("c".into(), &arr).expect("upload");
+        match &col.data {
+            GpuColumnData::DictUtf8 { valid_mask, .. } => {
+                assert!(valid_mask.is_none(), "no-nulls upload should omit validity");
+            }
+            _ => panic!("expected DictUtf8"),
+        }
+        assert!(col.data.validity_ptr().is_none());
     }
 }

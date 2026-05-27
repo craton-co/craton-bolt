@@ -222,10 +222,28 @@ impl NameResolver {
 }
 
 /// In-memory `name → Schema` provider; useful in tests and as a default.
+///
+/// Stage 6 addition: the provider also accepts a `nulls_by_column` side-table
+/// declaring which `(table, column)` pairs are known to admit nulls. The
+/// frontend doesn't otherwise care — nulls are a runtime concern — but the
+/// engine's null-aware sort / aggregation paths consult [`Self::has_nulls`]
+/// to skip the validity-bitmap upload when a column is provably null-free.
+///
+/// `Schema` already records nullability per [`Field`], so `has_nulls` first
+/// consults the field-level flag. The `nulls_by_column` override exists for
+/// cases where the schema is supplied externally with a pessimistic
+/// `nullable: true` but the ingest path (e.g. a `DictionaryArray` whose key
+/// buffer has `null_count() == 0`) has confirmed the column is null-free at
+/// runtime.
 #[derive(Debug, Default, Clone)]
 pub struct MemTableProvider {
     /// Registered tables, keyed by name.
     tables: HashMap<String, Schema>,
+    /// Per-`(table, column)` runtime nullability override.
+    /// `Some(true)`  → column is known to contain at least one NULL,
+    /// `Some(false)` → column is known to be free of NULLs,
+    /// `None` (absent) → fall back to the field's `nullable` flag.
+    nulls_by_column: HashMap<(String, String), bool>,
 }
 
 impl MemTableProvider {
@@ -242,7 +260,57 @@ impl MemTableProvider {
 
     /// Mutating register; overwrites any existing entry with the same name.
     pub fn register(&mut self, name: impl Into<String>, schema: Schema) {
-        self.tables.insert(name.into(), schema);
+        let name = name.into();
+        // Replace-not-merge: drop stale overrides for the prior schema of
+        // this table so a re-registered table doesn't inherit a stale
+        // nullability claim.
+        self.nulls_by_column.retain(|(t, _), _| t != &name);
+        self.tables.insert(name, schema);
+    }
+
+    /// Record runtime nullability for `(table, column)`. Used by the engine
+    /// after it ingests a batch and learns the actual `null_count()` of
+    /// each column — including `DictionaryArray` keys, where the
+    /// nullability question is answered by the keys' null buffer, not the
+    /// dictionary values.
+    pub fn set_column_nullability(
+        &mut self,
+        table: impl Into<String>,
+        column: impl Into<String>,
+        has_nulls: bool,
+    ) {
+        self.nulls_by_column
+            .insert((table.into(), column.into()), has_nulls);
+    }
+
+    /// True if `(table, column)` is known to admit nulls.
+    ///
+    /// Resolution order:
+    ///   1. Runtime override from [`Self::set_column_nullability`] (most precise).
+    ///   2. Field-level `nullable` flag on the registered `Schema`.
+    ///   3. `false` if the table or column is unknown.
+    ///
+    /// This is the entry point the engine's sort / aggregate paths consult
+    /// when deciding whether to ship a validity bitmap to the device. For
+    /// a `DictUtf8` column the answer comes from the keys array's
+    /// `null_count()`, surfaced here via `set_column_nullability` at
+    /// register-time — *not* from the dictionary values.
+    pub fn has_nulls(&self, table: &str, column: &str) -> bool {
+        if let Some(&v) = self
+            .nulls_by_column
+            .get(&(table.to_string(), column.to_string()))
+        {
+            return v;
+        }
+        match self.tables.get(table) {
+            Some(s) => s
+                .fields
+                .iter()
+                .find(|f| f.name == column)
+                .map(|f| f.nullable)
+                .unwrap_or(false),
+            None => false,
+        }
     }
 }
 

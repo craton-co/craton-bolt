@@ -1196,13 +1196,18 @@ fn e2e_groupby_sum_with_nulls_in_value_column() {
 fn table_provider_default_has_nulls_is_false() {
     use craton_bolt::plan::TableProvider;
     let provider = sales_provider();
+    // Stage 6: `MemTableProvider` grew an inherent `has_nulls(&str, &str)` that
+    // shadows the trait method when called via method syntax. Use UFCS to
+    // disambiguate to the trait's `(&str, usize)` signature — that's the
+    // shape this test exercises.
+    type Mem = craton_bolt::plan::MemTableProvider;
     // Every column of `sales` returns false through the default impl.
-    assert!(!provider.has_nulls("sales", 0));
-    assert!(!provider.has_nulls("sales", 1));
-    assert!(!provider.has_nulls("sales", 2));
+    assert!(!<Mem as TableProvider>::has_nulls(&provider, "sales", 0));
+    assert!(!<Mem as TableProvider>::has_nulls(&provider, "sales", 1));
+    assert!(!<Mem as TableProvider>::has_nulls(&provider, "sales", 2));
     // Unknown column / table — still false.
-    assert!(!provider.has_nulls("sales", 999));
-    assert!(!provider.has_nulls("nope", 0));
+    assert!(!<Mem as TableProvider>::has_nulls(&provider, "sales", 999));
+    assert!(!<Mem as TableProvider>::has_nulls(&provider, "nope", 0));
     // `null_count` defaults to None.
     assert!(provider.null_count("sales", 0).is_none());
 }

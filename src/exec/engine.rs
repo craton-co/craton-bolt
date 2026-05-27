@@ -208,21 +208,26 @@ impl Engine {
                  additional batches to an existing table"
             )));
         }
-        // Stage 4: flatten Dictionary(_, Utf8) columns to plain `StringArray`
-        // before they hit the dictionary registry / GpuTable upload. The
-        // planner sees these as Utf8 (via `arrow_dtype_to_plan`), so every
-        // downstream stage already reasons about them as plain strings; we
-        // just have to materialise the underlying values once at registration
-        // time. The engine's own dictionary registry then re-builds its own
-        // dict from the (now-plain) StringArray, keeping the existing GROUP
-        // BY / projection / ORDER BY paths working unchanged.
-        let batch = flatten_dictionary_utf8_columns(batch)?;
+        // Stage 6: the historical flatten step (`flatten_dictionary_utf8_columns`)
+        // is gone from the hot path. `DictRegistry::register_table` matches
+        // `DictionaryArray<Int32, Utf8>` directly and re-uses the input
+        // dictionary; `GpuTable::from_record_batch` routes the same Arrow
+        // variant through `upload_dict_utf8`, packing the keys' null buffer
+        // into an on-device validity bitmap. Stage 4's compat materialisation
+        // is preserved as a deprecated no-op for out-of-tree callers only.
+        //
         // Build Utf8 dictionaries first (may fail — surface before we mutate
         // tables/provider).
         self.dict_registry.register_table(name.clone(), &batch)?;
         let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
         let extended = self.dict_registry.extended_schema(&name, &base_schema);
         self.provider.register(name.clone(), extended);
+        // Stage 6: surface per-column runtime nullability so the engine's
+        // null-aware paths can short-circuit the validity bitmap upload
+        // when a column is provably null-free. For `DictionaryArray`
+        // columns the answer comes from `keys().null_count()` — *not* the
+        // dictionary values.
+        propagate_column_nullability(&mut self.provider, &name, &batch);
         // Build a GPU-resident copy so execution can query in place.
         let gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
         self.gpu_tables
@@ -252,10 +257,10 @@ impl Engine {
         batch: RecordBatch,
     ) -> BoltResult<()> {
         let name = name.into();
-        // Stage 4: same flatten as `register_table`. See the helper for the
-        // rationale (one materialisation here keeps every downstream Utf8
-        // consumer on `StringArray`).
-        let batch = flatten_dictionary_utf8_columns(batch)?;
+        // Stage 6: see `register_table` — the flatten step is gone from the
+        // hot path. Dict ingest is native through `DictRegistry::register_table`
+        // and `GpuTable::from_record_batch::upload_dict_utf8`.
+        //
         // Build the new GPU table FIRST so an upload failure can't leave the
         // engine half-replaced (we have not yet touched any existing entry).
         let new_gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
@@ -273,6 +278,9 @@ impl Engine {
         // `MemTableProvider::register` already overwrites — no separate `replace`
         // entry point needed.
         self.provider.register(name.clone(), extended);
+        // Stage 6: mirror `register_table` — re-surface per-column nullability
+        // so a replace doesn't leave stale claims behind.
+        propagate_column_nullability(&mut self.provider, &name, &batch);
         self.gpu_tables
             .borrow_mut()
             .insert(name.clone(), Some(new_gpu_table));
@@ -304,12 +312,10 @@ impl Engine {
         name: &str,
         batch: RecordBatch,
     ) -> BoltResult<()> {
-        // Stage 4: flatten any Dictionary(_, Utf8) columns into plain
-        // StringArrays so the schema-equality check below (against batch 0
-        // of the existing table) compares like-for-like. Without this the
-        // schema check could spuriously fail when batch 0 was stored as
-        // Utf8 (post-flatten) but the new batch arrives as Dictionary.
-        let batch = flatten_dictionary_utf8_columns(batch)?;
+        // Stage 6: dict-encoded columns are ingested natively now, so no
+        // flatten-to-StringArray is needed for the schema check below to
+        // line up — batch 0 and any appended batch both carry the Arrow
+        // `Dictionary<Int32, Utf8>` type verbatim.
         if let Some(existing) = self.tables.get_mut(name) {
             // Schema-check against batch 0 — concat_batches would fail at query
             // time anyway, but surface it eagerly at registration time.
@@ -324,6 +330,13 @@ impl Engine {
                 }
             }
             existing.push(batch);
+            // Stage 6: re-evaluate per-column nullability against the
+            // *concatenated* view — a previously null-free column may have
+            // just gained a null in the appended batch. We materialise here
+            // ONLY to read null counts; the GPU upload itself stays lazy
+            // (see below) so we don't pay the O(N²) PCIe upload cost.
+            let concatenated = self.materialize_table(name)?;
+            propagate_column_nullability(&mut self.provider, name, &concatenated);
             // Mark the GPU-resident copy dirty. The next query that hits this
             // table will rebuild it from the concatenated host batches. We
             // explicitly insert `None` (rather than `remove`) so the entry's
@@ -1145,14 +1158,18 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
 
 /// Map Arrow `DataType` to our plan `DataType`. Errors on unsupported types.
 ///
-/// **Stage 4** — `Dictionary(_, Utf8)` is accepted as a register-table type
-/// and exposed to the planner as `DataType::Utf8`. The fact that the column
+/// **Stage 4 / Stage 6** — `Dictionary(_, Utf8)` is accepted as a register-table
+/// type and exposed to the planner as `DataType::Utf8`. The fact that the column
 /// is dictionary-encoded is a *storage* detail: query planning, projection,
-/// filtering, ORDER BY all reason about it as a Utf8 column. The storage
-/// layer (and `gpu_sort`'s `host_values_for_key` adapter) reads the
-/// dictionary when it needs to. This is what makes `SELECT … ORDER BY s`
-/// reach the GPU dictionary adapter when the table is registered with a
-/// `DictionaryArray<Int32|Int64, Utf8>` column.
+/// filtering, ORDER BY all reason about it as a Utf8 column. SQL frontends
+/// see it identically to a flat `StringArray` column.
+///
+/// Stage 4 accepted any key width (Int32 *or* Int64) and routed through the
+/// flatten step. Stage 6 added a native ingest path for `Dictionary<Int32, Utf8>`
+/// in `GpuTable::from_record_batch` and `DictRegistry::register_table`, so the
+/// flatten in `flatten_dictionary_utf8_columns` is now a deprecated no-op (the
+/// dict layout reaches the GPU table directly). Int64-keyed dicts still take
+/// the legacy path through `GpuColumn::upload`.
 fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
@@ -1161,10 +1178,13 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        // Stage 4: dictionary-encoded Utf8. Only string-valued dicts map to
-        // `Utf8`; numeric-valued dicts are intentionally rejected because the
-        // caller should hand the inner numeric column directly through the
-        // normal path (the dict-index roundtrip would be pure overhead).
+        // Stage 4 / Stage 6: dictionary-encoded Utf8. Only string-valued
+        // dicts map to `Utf8`; numeric-valued dicts are intentionally
+        // rejected because the caller should hand the inner numeric column
+        // directly through the normal path. Both Int32 and Int64 keys are
+        // accepted: Int32 takes the Stage-6 native ingest in
+        // `GpuTable::from_record_batch`, Int64 falls through to the legacy
+        // `GpuColumn::upload` path (which still emits a `DictUtf8` variant).
         ArrowDataType::Dictionary(_key, value)
             if matches!(value.as_ref(), ArrowDataType::Utf8) =>
         {
@@ -1194,11 +1214,23 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 /// **Stage 5** added a native `GpuColumnData::DictUtf8` variant to
 /// `GpuTable` so callers that go directly through `GpuTable::from_record_batch`
 /// (skipping the engine's registry / `MemTableProvider`) can preserve the
-/// input dictionary instead of materialising it. The engine's SQL pipeline
-/// still flattens here because the `dict_registry` and `MemTableProvider`
-/// both work in terms of `StringArray`; teaching them to consume `DictUtf8`
-/// is the Stage-6 follow-up that finally retires this function.
-fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<RecordBatch> {
+/// input dictionary instead of materialising it.
+///
+/// **Stage 6** — DEPRECATED. The dict registry and `GpuTable` now ingest
+/// `DictionaryArray<Int32, Utf8>` natively (the registry matches the dict
+/// variant directly; `GpuTable::from_record_batch` routes through
+/// `upload_dict_utf8`). The engine no longer calls this helper from
+/// `register_table` / `replace_table` / `register_batch`, but the body is
+/// kept callable so any out-of-tree consumer that imported it still
+/// compiles. Will be removed in a wave following Stage 7.
+#[deprecated(
+    since = "0.3.0",
+    note = "DictionaryArray<Int32, Utf8> is now ingested natively by DictRegistry \
+            and GpuTable::from_record_batch; this flatten step is no longer \
+            invoked by the engine and will be removed in a future release."
+)]
+#[allow(dead_code)]
+pub(crate) fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<RecordBatch> {
     use arrow_array::{Array, DictionaryArray, StringArray};
     use arrow_array::types::{Int32Type, Int64Type};
 
@@ -1356,6 +1388,47 @@ fn should_emit_pool_stats(
         *last = Some(now);
     }
     should
+}
+
+/// Stage 6 — walk `batch` and inform `provider` of each column's actual
+/// runtime nullability (i.e. whether the source array had any nulls). For
+/// `DictionaryArray<_, Utf8>` columns the per-row nullability lives on the
+/// keys buffer, not the dictionary values; this helper consults
+/// `keys().null_count()` to get the right answer. Called from
+/// `register_table` / `replace_table` / `register_batch`, so the
+/// engine-backed `TableProvider` (`EngineProvider::has_nulls`) and the
+/// codegen-time `populate_input_validity` pass both see truthful claims.
+fn propagate_column_nullability(
+    provider: &mut MemTableProvider,
+    table: &str,
+    batch: &RecordBatch,
+) {
+    // `Array::null_count` is an inherent-trait method; pull the trait into
+    // scope locally so we can ask any `&dyn Array` for its null count.
+    use arrow_array::Array;
+    let schema = batch.schema();
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let arr = batch.column(idx);
+        let has_nulls = match field.data_type() {
+            ArrowDataType::Dictionary(key_t, _)
+                if key_t.as_ref() == &ArrowDataType::Int32 =>
+            {
+                // Dict keys carry the per-row validity. Downcast and ask the
+                // keys array directly; fall back to the array's own
+                // `null_count()` if the downcast fails (shouldn't happen for
+                // Int32 keys but defensive).
+                match arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int32Type>>()
+                {
+                    Some(da) => da.keys().null_count() > 0,
+                    None => arr.null_count() > 0,
+                }
+            }
+            _ => arr.null_count() > 0,
+        };
+        provider.set_column_nullability(table.to_string(), field.name().clone(), has_nulls);
+    }
 }
 
 /// Convert an `arrow_schema::Schema` into our plan `Schema`.

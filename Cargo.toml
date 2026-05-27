@@ -137,6 +137,15 @@ harness = false
 name = "olap_benchmarks"
 harness = false
 
+# Stage-6 microbench: throughput of `ORDER BY <utf8>` across a sweep of
+# cardinality ratios, used to calibrate `HIGH_CARDINALITY_THRESHOLD`.
+# Off by default — set `BOLT_BENCH_THRESHOLD=1` to actually exercise the
+# GPU path; otherwise the harness records a zero-work baseline so the
+# bench compiles and runs on machines without CUDA.
+[[bench]]
+name = "utf8_sort_bench"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
