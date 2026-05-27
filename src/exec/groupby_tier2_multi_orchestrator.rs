@@ -114,11 +114,15 @@ pub fn execute_tier2_multi_sum(
         });
     }
 
+    // Stage-4 (P1b): per-call stream so every device allocation, kernel
+    // launch, and the final D2H share one ordering domain.
+    let stream = CudaStream::null_or_default();
+
     // ----------------------------------------------------------------------
     // Step 1. Allocate the partition-pass outputs.
     // ----------------------------------------------------------------------
-    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
-    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
+    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
 
     // ----------------------------------------------------------------------
     // Step 2. JIT + launch the partition kernel (once — pid depends only on
@@ -142,7 +146,6 @@ pub fn execute_tier2_multi_sum(
         args.push_output(&mut view_counts);
         args.push_scalar_u32(n_rows);
 
-        let stream = CudaStream::null();
         launch_with_geometry(
             partition_fn,
             grid_blocks,
@@ -183,13 +186,13 @@ pub fn execute_tier2_multi_sum(
     //
     // Upload offsets once.
     // ----------------------------------------------------------------------
-    let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros(n_rows as usize)?;
+    let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_rows as usize, stream.raw())?;
     let mut scatter_vals: Vec<GpuVec<f64>> = Vec::with_capacity(n_vals);
     for _ in 0..n_vals {
-        scatter_vals.push(GpuVec::<f64>::zeros(n_rows as usize)?);
+        scatter_vals.push(GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?);
     }
-    let mut dest_idx: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
-    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
+    let mut dest_idx: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
 
@@ -225,7 +228,6 @@ pub fn execute_tier2_multi_sum(
         args.push_output(&mut view_di);
         args.push_scalar_u32(n_rows);
 
-        let stream = CudaStream::null();
         launch_with_geometry(
             claim_fn,
             grid_blocks,
@@ -268,7 +270,6 @@ pub fn execute_tier2_multi_sum(
         args.push_output(&mut view_sv);
         args.push_scalar_u32(n_rows);
 
-        let stream = CudaStream::null();
         launch_with_geometry(
             val_scatter_fn,
             grid_blocks,
@@ -304,16 +305,16 @@ pub fn execute_tier2_multi_sum(
     }
 
     // Reduce kernel needs the FULL K+1 offsets buffer on the device.
-    let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice(&offsets)?;
+    let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice_async(&offsets, stream.raw())?;
 
     let n_out_slots: usize =
         (num_partitions as usize) * (partition_reduce_kernel_multi::BLOCK_GROUPS as usize);
-    let mut out_keys_gpu: GpuVec<i32> = GpuVec::<i32>::zeros(n_out_slots)?;
+    let mut out_keys_gpu: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_vals_gpu: Vec<GpuVec<f64>> = Vec::with_capacity(n_vals);
     for _ in 0..n_vals {
-        out_vals_gpu.push(GpuVec::<f64>::zeros(n_out_slots)?);
+        out_vals_gpu.push(GpuVec::<f64>::zeros_async(n_out_slots, stream.raw())?);
     }
-    let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
+    let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
 
     // JIT + launch — kernel is cached per (n_vals) via the PTX cache.
     let reduce_ptx = partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(
@@ -350,7 +351,6 @@ pub fn execute_tier2_multi_sum(
         }
         args.push_output(&mut view_os);
 
-        let stream = CudaStream::null();
         launch_with_geometry(
             reduce_fn,
             num_partitions,
@@ -361,13 +361,22 @@ pub fn execute_tier2_multi_sum(
         )?;
     }
 
-    // Download the fixed-size outputs.
-    let host_out_keys: Vec<i32> = out_keys_gpu.to_vec()?;
-    let mut host_out_vals: Vec<Vec<f64>> = Vec::with_capacity(n_vals);
+    // Stage-4 (P1b): pinned D2H for the fixed-size outputs; sync once
+    // after all transfers are queued.
+    let pinned_keys = out_keys_gpu.to_pinned_async(stream.raw())?;
+    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> =
+        Vec::with_capacity(n_vals);
     for ov in &out_vals_gpu {
-        host_out_vals.push(ov.to_vec()?);
+        pinned_vals.push(ov.to_pinned_async(stream.raw())?);
     }
-    let host_out_set: Vec<u8> = out_set_gpu.to_vec()?;
+    let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_out_keys: Vec<i32> = pinned_keys.as_slice().to_vec();
+    let host_out_vals: Vec<Vec<f64>> = pinned_vals
+        .iter()
+        .map(|p| p.as_slice().to_vec())
+        .collect();
+    let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
 
     // Walk per-partition slot maps. For each populated slot push
     // (key, [sum_0, …, sum_{N-1}]) into the partition's result.

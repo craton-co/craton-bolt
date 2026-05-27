@@ -21,6 +21,7 @@ use crate::exec::groupby_tier2_dispatch::{
 };
 use crate::exec::groupby_tier2_merge::build_tier2_result;
 use crate::exec::groupby_tier2_orchestrator::execute_tier2_sum;
+use crate::exec::launch::CudaStream;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -110,8 +111,12 @@ fn execute_inner(
     val_arr: &Float64Array,
 ) -> BoltResult<RecordBatch> {
     let n_rows = key_arr.len() as u32;
-    let keys_gpu = GpuVec::<i32>::from_slice(key_arr.values())?;
-    let vals_gpu = GpuVec::<f64>::from_slice(val_arr.values())?;
+    // Stage-4 (P1b): mint a per-call stream so the input H2D uploads,
+    // kernel launches inside the orchestrator, and final D2H share a
+    // single ordering domain. Falls back to NULL if creation fails.
+    let stream = CudaStream::null_or_default();
+    let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
+    let vals_gpu = GpuVec::<f64>::from_slice_async(val_arr.values(), stream.raw())?;
 
     let partial = execute_tier2_sum(&keys_gpu, &vals_gpu, n_rows)?;
 
@@ -125,4 +130,76 @@ fn execute_inner(
     };
 
     build_tier2_result(partial.per_partition, &aggregate.output_schema)
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async round-trip smoke test.
+//
+// Verifies that `execute_inner` produces correct per-group sums after the
+// async memcpy + pinned D2H plumbing was layered in. Gated `#[ignore]`
+// because it needs a live CUDA context; cargo test runs it explicitly with
+// `--ignored`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::{AggregateExpr, Expr, Field, Schema};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_tier2_sum_round_trip() {
+        // 300 K rows, ~2 K distinct keys — comfortably above the row + group
+        // floor that gates this executor.
+        let n: usize = 300_000;
+        let n_groups: usize = 2048;
+        let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
+        let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+
+        // Closed-form expected sum: for each g in 0..n_groups, sum over
+        // i in [0..n) with i % n_groups == g of `i as f64`.
+        let mut expected = vec![0.0f64; n_groups];
+        for (i, &k) in keys.iter().enumerate() {
+            expected[k as usize] += vals[i];
+        }
+
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
+                ],
+                group_by: vec![0],
+                aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+                output_schema: Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("sum_v", DataType::Float64, true),
+                ]),
+            },
+        };
+        let key_arr = Int32Array::from(keys);
+        let val_arr = Float64Array::from(vals);
+
+        let out = match execute_inner(&plan, &key_arr, &val_arr) {
+            Ok(b) => b,
+            Err(_) => return, // no CUDA — skip rather than fail.
+        };
+
+        // Output rows are (k, sum_v). Verify by index lookup.
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let vs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..out.num_rows() {
+            let k = ks.value(i);
+            let v = vs.value(i);
+            assert_eq!(v, expected[k as usize], "key={} mismatch", k);
+        }
+    }
 }

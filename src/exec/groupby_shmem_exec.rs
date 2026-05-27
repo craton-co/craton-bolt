@@ -140,16 +140,19 @@ fn execute_inner(
 ) -> BoltResult<RecordBatch> {
     let n_rows = key_arr.len();
 
+    // Stage-4 (P1b): per-call stream shared across H2D, kernel, and D2H.
+    let stream = CudaStream::null_or_default();
+
     // --- Upload inputs ----------------------------------------------------
     // We don't go through GpuTable here because this fast-path is currently
     // invoked from `execute_groupby` which takes a host RecordBatch. A future
     // refactor can short-circuit to on-device inputs.
-    let keys_gpu = GpuVec::<i32>::from_slice(key_arr.values())?;
-    let vals_gpu = GpuVec::<f64>::from_slice(val_arr.values())?;
+    let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
+    let vals_gpu = GpuVec::<f64>::from_slice_async(val_arr.values(), stream.raw())?;
 
     // Output buffer sized to slot count (== n_groups since we already
     // gated on max_key < BLOCK_GROUPS, and slot index == key value).
-    let mut out_gpu = GpuVec::<f64>::zeros(n_groups as usize)?;
+    let mut out_gpu = GpuVec::<f64>::zeros_async(n_groups as usize, stream.raw())?;
 
     // --- JIT + load the kernel (PTX cache hits after first run) -----------
     let ptx = compile_shmem_sum_kernel()?;
@@ -206,7 +209,6 @@ fn execute_inner(
     // so we pass 0 here regardless of `params.shared_bytes`. The tuner's
     // `shared_bytes` becomes load-bearing only if we switch to dynamic
     // shared memory.
-    let stream = CudaStream::null();
     launch_with_geometry(
         function,
         params.grid_blocks,
@@ -216,8 +218,10 @@ fn execute_inner(
         &mut args,
     )?;
 
-    // --- Download + build the output RecordBatch -------------------------
-    let host_sums: Vec<f64> = out_gpu.to_vec()?;
+    // Stage-4 (P1b): pinned D2H; sync once.
+    let pinned = out_gpu.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_sums: Vec<f64> = pinned.as_slice().to_vec();
 
     // The fast path only filled slots [0, n_groups). Build a presence map
     // by host-scanning the keys (cheap on a single Int32 column); a slot
@@ -299,4 +303,64 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async round-trip smoke test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::{Field, Schema};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_shmem_sum_round_trip() {
+        let n: usize = 1024;
+        let n_groups: usize = 8;
+        let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
+        let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let mut expected = vec![0.0f64; n_groups];
+        for (i, &k) in keys.iter().enumerate() {
+            expected[k as usize] += vals[i];
+        }
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                ],
+                group_by: vec![0],
+                aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+                output_schema: Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("sum_v", DataType::Float64, true),
+                ]),
+            },
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(vals)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        let out = match try_execute(&plan, &batch) {
+            Some(Ok(b)) => b,
+            _ => return,
+        };
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let vs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..out.num_rows() {
+            assert_eq!(vs.value(i), expected[ks.value(i) as usize]);
+        }
+    }
 }

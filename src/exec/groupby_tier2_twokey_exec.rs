@@ -27,6 +27,7 @@ use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_tier2_twokey_merge::build_tier2_twokey_result;
 use crate::exec::groupby_tier2_twokey_orchestrator::execute_tier2_twokey_sum;
+use crate::exec::launch::CudaStream;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -130,11 +131,18 @@ fn execute_inner(
     // inline so this shim doesn't depend on private internals.
     let packed: Vec<i64> = pack_two_i32(k0_arr.values(), k1_arr.values());
 
+    // Stage-4 (P1b): per-call stream for the input H2D uploads. The
+    // orchestrator mints its own stream for its kernel + D2H phase;
+    // we synchronize here before handing off so the orchestrator's
+    // stream sees a fully-realised input buffer.
+    let stream = CudaStream::null_or_default();
+
     // Upload to device. Both vecs are exactly `n_rows` long — the
     // orchestrator's length invariant is the caller's responsibility per
     // its API contract.
-    let keys_gpu = GpuVec::<i64>::from_slice(&packed)?;
-    let vals_gpu = GpuVec::<f64>::from_slice(val_arr.values())?;
+    let keys_gpu = GpuVec::<i64>::from_slice_async(&packed, stream.raw())?;
+    let vals_gpu = GpuVec::<f64>::from_slice_async(val_arr.values(), stream.raw())?;
+    stream.synchronize()?;
 
     let n_rows_u32 = u32::try_from(n_rows).map_err(|_| {
         BoltError::Other(format!(
@@ -317,5 +325,75 @@ mod tests {
         }
         let batch = twokey_sum_batch(300_000);
         assert!(try_execute(&plan, &batch).is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async round-trip smoke test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::{Field, Schema};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_tier2_twokey_sum_round_trip() {
+        let n: usize = 300_000;
+        let g1: usize = 64;
+        let g2: usize = 64;
+        let k1: Vec<i32> = (0..n).map(|i| (i % g1) as i32).collect();
+        let k2: Vec<i32> = (0..n).map(|i| ((i / g1) % g2) as i32).collect();
+        let v: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let mut expected = std::collections::HashMap::<(i32, i32), f64>::new();
+        for i in 0..n {
+            *expected.entry((k1[i], k2[i])).or_default() += v[i];
+        }
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO { name: "k1".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "k2".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                ],
+                group_by: vec![0, 1],
+                aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+                output_schema: Schema::new(vec![
+                    Field::new("k1", DataType::Int32, false),
+                    Field::new("k2", DataType::Int32, false),
+                    Field::new("sum_v", DataType::Float64, true),
+                ]),
+            },
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int32Array::from(k1)) as arrow_array::ArrayRef,
+                Arc::new(arrow_array::Int32Array::from(k2)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        let out = match try_execute(&plan, &batch) {
+            Some(Ok(b)) => b,
+            _ => return,
+        };
+        let kc1 = out.column(0).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        let kc2 = out.column(1).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        let sv = out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..out.num_rows() {
+            let key = (kc1.value(i), kc2.value(i));
+            assert_eq!(sv.value(i), *expected.get(&key).unwrap());
+        }
     }
 }

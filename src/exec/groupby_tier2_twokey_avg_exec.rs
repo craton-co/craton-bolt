@@ -175,6 +175,10 @@ fn execute_inner(
 ) -> BoltResult<RecordBatch> {
     let n_rows = k1.len() as u32;
 
+    // Stage-4 (P1b): per-call stream shared across every H2D, kernel
+    // launch, and final D2H.
+    let stream = CudaStream::null_or_default();
+
     // ---- Host-side pack ------------------------------------------------
     // `(k1 << 32) | (k2 & 0xFFFF_FFFF)`. Matches `groupby.rs::pack_keys`
     // for the (Int32, Int32) shape.
@@ -184,18 +188,18 @@ fn execute_inner(
         .zip(k2.values().iter())
         .map(|(&a, &b)| ((a as u32 as u64) << 32 | (b as u32 as u64)) as i64)
         .collect();
-    let keys_gpu: GpuVec<i64> = GpuVec::<i64>::from_slice(&packed)?;
+    let keys_gpu: GpuVec<i64> = GpuVec::<i64>::from_slice_async(&packed, stream.raw())?;
 
     let mut vals_gpu: Vec<GpuVec<f64>> = Vec::with_capacity(n_vals);
     for arr in &val_arrs {
-        vals_gpu.push(GpuVec::<f64>::from_slice(arr.values())?);
+        vals_gpu.push(GpuVec::<f64>::from_slice_async(arr.values(), stream.raw())?);
     }
 
     let num_partitions = partition_kernel_i64::NUM_PARTITIONS;
 
     // ---- Partition pass (i64) ------------------------------------------
-    let counts: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
-    let partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros(n_rows as usize)?;
+    let counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
     let partition_module = get_or_build_module(&KernelSpec::PartitionI64)?;
     {
         let func = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
@@ -210,7 +214,6 @@ fn execute_inner(
             &mut n_rows_u32 as *mut u32 as *mut c_void,
         ];
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
-        let stream = CudaStream::null();
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
                 func.raw(),
@@ -234,10 +237,10 @@ fn execute_inner(
     let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
 
     // ---- Scatter (keys shared + N value passes) ------------------------
-    let scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros(n_rows as usize)?;
+    let scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
     let mut scatter_vals: Vec<GpuVec<f64>> = Vec::with_capacity(n_vals);
     for _ in 0..n_vals {
-        scatter_vals.push(GpuVec::<f64>::zeros(n_rows as usize)?);
+        scatter_vals.push(GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?);
     }
     {
         let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
@@ -245,7 +248,7 @@ fn execute_inner(
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
 
         for j in 0..n_vals {
-            let cursors: GpuVec<u32> = GpuVec::<u32>::zeros(num_partitions as usize)?;
+            let cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
             let mut keys_ptr = keys_gpu.device_ptr();
             let mut vals_ptr = vals_gpu[j].device_ptr();
             let mut pids_ptr = partition_ids.device_ptr();
@@ -264,7 +267,6 @@ fn execute_inner(
                 &mut sv_ptr as *mut CUdeviceptr as *mut c_void,
                 &mut n_rows_u32 as *mut u32 as *mut c_void,
             ];
-            let stream = CudaStream::null();
             unsafe {
                 cuda_sys::check(cuda_sys::cuLaunchKernel(
                     func.raw(),
@@ -285,25 +287,25 @@ fn execute_inner(
     }
 
     // Reduce kernels need the FULL K+1 offsets buffer.
-    let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice(&offsets)?;
+    let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice_async(&offsets, stream.raw())?;
 
     let block_groups = partition_reduce_kernel_multi_i64::BLOCK_GROUPS as usize;
     let n_out_slots = (num_partitions as usize) * block_groups;
 
-    let out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros(n_out_slots)?;
+    let out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_vals_gpu: Vec<GpuVec<f64>> = Vec::with_capacity(n_vals);
     for _ in 0..n_vals {
-        out_vals_gpu.push(GpuVec::<f64>::zeros(n_out_slots)?);
+        out_vals_gpu.push(GpuVec::<f64>::zeros_async(n_out_slots, stream.raw())?);
     }
-    let out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
-    let out_counts_gpu: GpuVec<u64> = GpuVec::<u64>::zeros(n_out_slots)?;
+    let out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    let out_counts_gpu: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_out_slots, stream.raw())?;
     // COUNT kernel writes its own out_keys / out_set buffers; we only
     // consume its out_counts. SUM-side out_keys/out_set are the canonical
     // dedup output. (Strictly speaking the count_out_keys/set are
     // redundant; allocating them is cheaper than special-casing the
     // kernel signature.)
-    let count_out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros(n_out_slots)?;
-    let count_out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros(n_out_slots)?;
+    let count_out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
+    let count_out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
 
     // ---- Multi-SUM reduce (i64-key) ------------------------------------
     let reduce_multi_module = get_or_build_module(&KernelSpec::ReduceMultiI64 {
@@ -329,7 +331,6 @@ fn execute_inner(
             .iter_mut()
             .map(|p| p as *mut CUdeviceptr as *mut c_void)
             .collect();
-        let stream = CudaStream::null();
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
                 func.raw(),
@@ -364,7 +365,6 @@ fn execute_inner(
             &mut oc_ptr as *mut CUdeviceptr as *mut c_void,
             &mut os_ptr as *mut CUdeviceptr as *mut c_void,
         ];
-        let stream = CudaStream::null();
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
                 func.raw(),
@@ -383,14 +383,23 @@ fn execute_inner(
         stream.synchronize()?;
     }
 
-    // ---- Download everything -------------------------------------------
-    let host_out_keys: Vec<i64> = out_keys_gpu.to_vec()?;
-    let mut host_out_vals: Vec<Vec<f64>> = Vec::with_capacity(n_vals);
+    // ---- Stage-4 (P1b): pinned D2H for every output buffer; sync once.
+    let pinned_keys = out_keys_gpu.to_pinned_async(stream.raw())?;
+    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> =
+        Vec::with_capacity(n_vals);
     for ov in &out_vals_gpu {
-        host_out_vals.push(ov.to_vec()?);
+        pinned_vals.push(ov.to_pinned_async(stream.raw())?);
     }
-    let host_out_set: Vec<u8> = out_set_gpu.to_vec()?;
-    let host_out_counts: Vec<u64> = out_counts_gpu.to_vec()?;
+    let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
+    let pinned_counts = out_counts_gpu.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
+    let host_out_vals: Vec<Vec<f64>> = pinned_vals
+        .iter()
+        .map(|p| p.as_slice().to_vec())
+        .collect();
+    let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
+    let host_out_counts: Vec<u64> = pinned_counts.as_slice().to_vec();
 
     // ---- Walk slots, divide host-side, sort by packed key --------------
     let mut rows: Vec<(i64, Vec<f64>)> = Vec::new();
@@ -674,5 +683,58 @@ mod cache_tests {
         let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 })
             .expect("n_vals=2 hit");
         assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async smoke test. Just confirms `try_execute` doesn't
+// panic and returns *some* output on a small-but-eligible input.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::Field;
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_tier2_twokey_avg_round_trip() {
+        let n: usize = 300_000;
+        let k1: Vec<i32> = (0..n as i32).map(|i| i % 64).collect();
+        let k2: Vec<i32> = (0..n as i32).map(|i| (i / 64) % 64).collect();
+        let v: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO { name: "k1".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "k2".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                ],
+                group_by: vec![0, 1],
+                aggregates: vec![AggregateExpr::Avg(Expr::Column("v".into()))],
+                output_schema: Schema::new(vec![
+                    Field::new("k1", DataType::Int32, false),
+                    Field::new("k2", DataType::Int32, false),
+                    Field::new("avg_v", DataType::Float64, true),
+                ]),
+            },
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, false),
+            ArrowField::new("k2", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k1)) as ArrayRef,
+                Arc::new(Int32Array::from(k2)) as ArrayRef,
+                Arc::new(Float64Array::from(v)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let _ = try_execute(&plan, &batch);
     }
 }
