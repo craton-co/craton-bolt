@@ -65,8 +65,12 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   are reachable only via `src/exec/string_ops*`, not via SQL.
 - Date / time / timestamp / decimal / list / struct / map types are
   unimplemented.
-- Async memcpy: FFI is bound, integration is a 0.4 task; today every
-  H2D / D2H is synchronous.
+- Async memcpy: FFI is bound and Stage 1 safe wrappers
+  (`memcpy_h2d_async`, `memcpy_d2h_async`, `memset_d8_async`,
+  `PinnedHostBuffer<T>`, `GpuBuffer::copy_{from,to}_async`) have landed,
+  but executors still call the synchronous `from_slice` / `to_vec`
+  paths. Stage 2 (wiring executors onto explicit streams + pinned host
+  buffers) is the 0.4 task.
 
 ## 0.4 — production-readiness target
 
@@ -75,8 +79,11 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 - Streaming / multi-batch tables behind a stable `register_table_stream`
   API.
 - Validity propagation through primitive aggregate kernels.
-- Async memcpy + pinned host buffers (FFI is bound in 0.3.0; integration
-  in 0.4).
+- Async memcpy + pinned host buffers. **Stage 1** (safe wrappers +
+  `PinnedHostBuffer<T>` + `GpuBuffer::copy_{from,to}_async`) has landed
+  on top of the 0.3.0 FFI bindings; **Stage 2** wires the per-shape
+  executors onto explicit streams and pinned host buffers and is the
+  remaining 0.4 task.
 - `KernelSpec`-keyed cache that skips codegen as well as PTXAS (the
   current cache only skips PTXAS reassembly).
 

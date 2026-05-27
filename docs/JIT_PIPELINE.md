@@ -238,6 +238,16 @@ Source: `src/exec/engine.rs::execute_projection` and the per-shape executors.
 
 Each output `GpuVec` is round-tripped to a host `Vec<T>` via `cuMemcpyDtoH`, wrapped in the matching Arrow primitive array (`Int32Array`, `Float64Array`, etc.) or decoded back through a `DictionaryColumn` for Utf8 outputs. The arrays plus the schema build a `RecordBatch`, which the engine wraps in a `QueryHandle` and returns to the caller.
 
+> **Async transfer status (Stage 1 → Stage 2).** The download path above is
+> still synchronous in 0.3.x. Stage 1 of the async-memcpy work has landed:
+> safe wrappers `memcpy_h2d_async` / `memcpy_d2h_async` / `memset_d8_async`
+> sit alongside a typed `PinnedHostBuffer<T>` and additive
+> `GpuBuffer::copy_from_async` / `copy_to_async` entry points. Executors
+> still call the synchronous `from_slice` / `to_vec` helpers — Stage 2
+> threads the new surface through the per-shape executors so that the
+> Ingest → kernel → Download pipeline overlaps on an explicit stream
+> rather than serializing on the NULL stream.
+
 ## Fusing aggregates with projections
 
 The hardest case the planner has to handle: `SELECT SUM(price * tax) FROM sales WHERE region_id = 1`.
