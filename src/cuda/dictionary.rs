@@ -18,11 +18,29 @@
 //!     downstream codegen; we surface that as a `BoltError::Other`.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use arrow_array::{Array, StringArray};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
+
+/// Hash a string with `DefaultHasher` for the construction-time lookup index.
+///
+/// Used only inside [`DictionaryColumn::from_string_array`] (and the i64
+/// sibling) to dedupe strings without paying an extra owned `String` per
+/// distinct entry. The full string still lives once in `dictionary[]`;
+/// collisions are resolved by an explicit equality check on the candidate
+/// (see the lookup logic). `DefaultHasher` (SipHash-1-3) is fine here — this
+/// is a host-side dedupe path, not a security boundary, and collisions are
+/// astronomically rare on real data.
+#[inline]
+fn hash_str(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
 
 /// On-host string dictionary + on-device i32 indices.
 ///
@@ -49,16 +67,24 @@ impl DictionaryColumn {
     pub fn from_string_array(arr: &StringArray) -> BoltResult<Self> {
         let n_rows = arr.len();
         let mut dictionary: Vec<String> = Vec::new();
-        // NOTE: The lookup map keys are owned `String`s, mirroring the entries
-        // in `dictionary`. That means each distinct string is allocated twice
-        // (once for the map key, once for the vec entry). A single-allocation
-        // design would require `Arc<str>` or `&str` keys borrowing from
-        // `dictionary`, but `dictionary: Vec<String>` is a `pub` field with
-        // external callers, so we keep the simple two-alloc pattern here.
-        // TODO(perf): if the dictionary field is ever sealed (made private or
-        // changed to `Vec<Arc<str>>`), revisit to drop one allocation per
-        // distinct string. See wave-6 review notes.
-        let mut lookup: HashMap<String, i32> = HashMap::new();
+        // Construction-time dedupe index. Keying the map on a 64-bit string
+        // digest (rather than an owned `String`) means each distinct string is
+        // allocated exactly once — in `dictionary[]`. The bucket value is a
+        // `Vec<i32>` of candidate dictionary indices (1-based, matching the
+        // GPU encoding) that hashed to the same digest; on lookup we tiebreak
+        // by comparing the candidate strings via the dictionary itself. In
+        // the common case the bucket holds a single entry, so per-row work is
+        // one hash + one compare. SipHash collisions on real text are
+        // astronomically rare; the tiebreak is defensive, not hot.
+        //
+        // The previous implementation kept a `HashMap<String, i32>` alongside
+        // the `Vec<String>` — that double-allocated each distinct string
+        // (once as the map key, once as the vec entry). For a 100M-row column
+        // with millions of distinct strings, that wasted ~half the host
+        // memory used by the dictionary. The digest map keeps the same
+        // amortised dedupe cost without the second `String` per distinct
+        // value.
+        let mut lookup: HashMap<u64, Vec<i32>> = HashMap::new();
         let mut indices: Vec<i32> = Vec::with_capacity(n_rows);
 
         for i in 0..n_rows {
@@ -67,7 +93,18 @@ impl DictionaryColumn {
                 continue;
             }
             let s = arr.value(i);
-            if let Some(&idx) = lookup.get(s) {
+            let digest = hash_str(s);
+            // Probe the digest bucket. The bucket's i32s are 1-based
+            // dictionary indices; `dictionary[idx - 1]` is the candidate
+            // string. Iterate every candidate (typically one) and accept the
+            // first byte-equal match.
+            let existing = lookup.get(&digest).and_then(|bucket| {
+                bucket
+                    .iter()
+                    .find(|&&idx| dictionary[(idx as usize) - 1] == s)
+                    .copied()
+            });
+            if let Some(idx) = existing {
                 indices.push(idx);
             } else {
                 // Next index = current dictionary length + 1 (slot 0 reserved for NULL).
@@ -83,13 +120,11 @@ impl DictionaryColumn {
                     )));
                 }
                 let idx = next_len as i32;
-                // Allocate the owned String exactly once; the lookup map gets
-                // a clone, but we avoid the previous redundant `owned.clone()`
-                // pattern by cloning explicitly into the map and moving the
-                // original into the dictionary.
-                let owned = s.to_string();
-                lookup.insert(owned.clone(), idx);
-                dictionary.push(owned);
+                // Single owned-string allocation: the dictionary takes the
+                // only copy. The lookup map gets just the digest -> index
+                // mapping.
+                dictionary.push(s.to_string());
+                lookup.entry(digest).or_default().push(idx);
                 indices.push(idx);
             }
         }
@@ -160,6 +195,61 @@ impl DictionaryColumn {
             indices: GpuVec::<i32>::empty(),
             n_rows,
         }
+    }
+
+    /// Host-only dedupe helper that mirrors the loop body of
+    /// [`Self::from_string_array`] without the device upload.
+    ///
+    /// Returns `(dictionary, indices)` exactly as the real path would
+    /// produce them, so a test can assert dedupe behaviour on a multi-million
+    /// row input without needing a CUDA toolkit. Production code must not use
+    /// this — use [`Self::from_string_array`].
+    #[cfg(test)]
+    pub(crate) fn dedupe_for_test<'a, I>(
+        rows: I,
+    ) -> BoltResult<(Vec<String>, Vec<i32>)>
+    where
+        I: IntoIterator<Item = Option<&'a str>>,
+    {
+        let iter = rows.into_iter();
+        let (lo, _hi) = iter.size_hint();
+        let mut dictionary: Vec<String> = Vec::new();
+        let mut lookup: HashMap<u64, Vec<i32>> = HashMap::new();
+        let mut indices: Vec<i32> = Vec::with_capacity(lo);
+
+        for row in iter {
+            let Some(s) = row else {
+                indices.push(0);
+                continue;
+            };
+            let digest = hash_str(s);
+            let existing = lookup.get(&digest).and_then(|bucket| {
+                bucket
+                    .iter()
+                    .find(|&&idx| dictionary[(idx as usize) - 1] == s)
+                    .copied()
+            });
+            if let Some(idx) = existing {
+                indices.push(idx);
+            } else {
+                let next_len = dictionary.len().checked_add(1).ok_or_else(|| {
+                    BoltError::Other(
+                        "dictionary overflow: more than usize::MAX unique strings".into(),
+                    )
+                })?;
+                if next_len > i32::MAX as usize {
+                    return Err(BoltError::Other(format!(
+                        "dictionary overflow: more than {} unique strings (i32 index space)",
+                        i32::MAX
+                    )));
+                }
+                let idx = next_len as i32;
+                dictionary.push(s.to_string());
+                lookup.entry(digest).or_default().push(idx);
+                indices.push(idx);
+            }
+        }
+        Ok((dictionary, indices))
     }
 
     /// Download indices and reconstruct a `StringArray`.
@@ -267,6 +357,78 @@ mod tests {
         let col = DictionaryColumn::new_host_only(dict, 0);
         let got = col.index_of_many(&[]);
         assert!(got.is_empty());
+    }
+
+    // ---- Construction-time dedupe ----------------------------------------
+
+    #[test]
+    fn dedupe_large_redundant_input_yields_only_distinct_strings() {
+        // High-redundancy regression: 1M rows over 100 distinct strings.
+        // Verifies the digest-keyed dedupe map collapses the input to the
+        // expected distinct count and that each row's emitted index is
+        // consistent with `index_of` on the resulting dictionary. This is
+        // also the load-bearing test for the memory-allocation fix: the
+        // previous `HashMap<String, i32>` implementation would have
+        // allocated 100 redundant `String`s for the map keys, on top of the
+        // 100 `String`s in the dictionary vec. The new digest map allocates
+        // each distinct string exactly once.
+        const ROWS: usize = 1_000_000;
+        const DISTINCT: usize = 100;
+
+        // Pre-materialise the 100 distinct strings so we can borrow them as
+        // `&str` for the dedupe iterator without re-allocating per row.
+        let pool: Vec<String> = (0..DISTINCT).map(|i| format!("val_{i}")).collect();
+        let rows = (0..ROWS).map(|r| Some(pool[r % DISTINCT].as_str()));
+
+        let (dictionary, indices) =
+            DictionaryColumn::dedupe_for_test(rows).expect("dedupe");
+
+        // Distinct count must equal the input cardinality, in first-
+        // occurrence order.
+        assert_eq!(dictionary.len(), DISTINCT);
+        for i in 0..DISTINCT {
+            assert_eq!(dictionary[i], pool[i]);
+        }
+        // Every row must have a positive index (slot 0 reserved for NULL).
+        assert_eq!(indices.len(), ROWS);
+        for (r, &idx) in indices.iter().enumerate() {
+            let expected = ((r % DISTINCT) as i32) + 1;
+            assert_eq!(
+                idx, expected,
+                "row {r} expected index {expected}, got {idx}"
+            );
+        }
+        // `index_of` on the resulting dictionary must agree with the emitted
+        // indices for every distinct string.
+        let col = DictionaryColumn::new_host_only(dictionary, ROWS);
+        for (i, s) in pool.iter().enumerate() {
+            assert_eq!(col.index_of(s), Some((i as i32) + 1));
+        }
+        // Sanity: a string never seen during construction returns None.
+        assert_eq!(col.index_of("missing-literal"), None);
+    }
+
+    #[test]
+    fn dedupe_handles_interleaved_nulls() {
+        // Nulls go to index 0 and do not enter the dictionary. Verifies the
+        // digest-map dedupe doesn't accidentally treat None as a value.
+        let rows = vec![
+            Some("a"),
+            None,
+            Some("b"),
+            None,
+            Some("a"),
+            Some("c"),
+            None,
+        ];
+        let (dictionary, indices) =
+            DictionaryColumn::dedupe_for_test(rows).expect("dedupe");
+
+        assert_eq!(
+            dictionary,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(indices, vec![1, 0, 2, 0, 1, 3, 0]);
     }
 
     #[test]

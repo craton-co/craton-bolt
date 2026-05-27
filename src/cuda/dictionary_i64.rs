@@ -18,12 +18,26 @@
 //! codegen path to accept i64 indices belongs to the orchestrator and is out
 //! of scope for this file.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use arrow_array::{Array, StringArray};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
+
+/// Hash a string with `DefaultHasher` for the construction-time lookup index.
+///
+/// Mirrors the i32 sibling's `hash_str` — kept private here to avoid an
+/// inter-module dependency just for a one-liner. See the i32 module for the
+/// rationale (host-side dedupe, collision-tolerant via tiebreak compare).
+#[inline]
+fn hash_str(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
 
 /// Threshold for picking i64 over i32 indices.
 ///
@@ -60,7 +74,14 @@ impl DictionaryColumnI64 {
     pub fn from_string_array(arr: &StringArray) -> BoltResult<Self> {
         let n_rows = arr.len();
         let mut dictionary: Vec<String> = Vec::new();
-        let mut lookup: HashMap<String, i64> = HashMap::new();
+        // Construction-time dedupe by 64-bit digest. See the i32 sibling for
+        // the full rationale: the previous `HashMap<String, i64>` design
+        // allocated each distinct string twice (once as map key, once as vec
+        // entry), wasting ~half the host memory used by the dictionary on
+        // wide-cardinality columns. Keying by digest with a per-bucket
+        // candidate list keeps the same dedupe cost without the second
+        // allocation.
+        let mut lookup: HashMap<u64, Vec<i64>> = HashMap::new();
         let mut indices: Vec<i64> = Vec::with_capacity(n_rows);
 
         for i in 0..n_rows {
@@ -69,7 +90,17 @@ impl DictionaryColumnI64 {
                 continue;
             }
             let s = arr.value(i);
-            if let Some(&idx) = lookup.get(s) {
+            let digest = hash_str(s);
+            // Tiebreak by candidate-string compare against the dictionary.
+            // Buckets typically hold a single entry; the linear scan is over
+            // collision candidates only.
+            let existing = lookup.get(&digest).and_then(|bucket| {
+                bucket
+                    .iter()
+                    .find(|&&idx| dictionary[(idx as usize) - 1] == s)
+                    .copied()
+            });
+            if let Some(idx) = existing {
                 indices.push(idx);
             } else {
                 // Next index = current dictionary length + 1 (slot 0 reserved for NULL).
@@ -85,9 +116,8 @@ impl DictionaryColumnI64 {
                     )));
                 }
                 let idx = next_len as i64;
-                let owned = s.to_string();
-                dictionary.push(owned.clone());
-                lookup.insert(owned, idx);
+                dictionary.push(s.to_string());
+                lookup.entry(digest).or_default().push(idx);
                 indices.push(idx);
             }
         }
@@ -112,6 +142,28 @@ impl DictionaryColumnI64 {
             .position(|d| d == s)
             // position is 0-based; real indices start at 1.
             .map(|p| (p as i64) + 1)
+    }
+
+    /// Batched variant of [`Self::index_of`].
+    ///
+    /// Mirrors [`crate::cuda::dictionary::DictionaryColumn::index_of_many`]:
+    /// builds a temporary `HashMap` once and resolves every query against it,
+    /// turning an `O(N * dict_len)` sequence of `index_of` calls into
+    /// `O(dict_len + N)`. Returns `None` in any slot whose literal is not in
+    /// the dictionary, matching the single-lookup convention. Useful for
+    /// `IN`-list predicates or any path that wants several literal indices at
+    /// once. The result is `Option<i64>` to match the underlying index width.
+    pub fn index_of_many(&self, queries: &[&str]) -> Vec<Option<i64>> {
+        // Lazy reverse map; callers on this path already know they have many
+        // queries, so the up-front cost pays for itself.
+        let lookup: HashMap<&str, i64> = self
+            .dictionary
+            .iter()
+            .enumerate()
+            // position is 0-based; real indices start at 1 (slot 0 = NULL).
+            .map(|(i, s)| (s.as_str(), (i as i64) + 1))
+            .collect();
+        queries.iter().map(|q| lookup.get(*q).copied()).collect()
     }
 
     /// Download indices and reconstruct a `StringArray`.
@@ -228,6 +280,57 @@ impl DictionaryColumnI64 {
             n_rows,
         })
     }
+
+    /// Host-only dedupe helper that mirrors the loop body of
+    /// [`Self::from_string_array`] without the device upload. See the i32
+    /// sibling's `dedupe_for_test` for rationale.
+    #[cfg(test)]
+    pub(crate) fn dedupe_for_test<'a, I>(
+        rows: I,
+    ) -> BoltResult<(Vec<String>, Vec<i64>)>
+    where
+        I: IntoIterator<Item = Option<&'a str>>,
+    {
+        let iter = rows.into_iter();
+        let (lo, _hi) = iter.size_hint();
+        let mut dictionary: Vec<String> = Vec::new();
+        let mut lookup: HashMap<u64, Vec<i64>> = HashMap::new();
+        let mut indices: Vec<i64> = Vec::with_capacity(lo);
+
+        for row in iter {
+            let Some(s) = row else {
+                indices.push(0);
+                continue;
+            };
+            let digest = hash_str(s);
+            let existing = lookup.get(&digest).and_then(|bucket| {
+                bucket
+                    .iter()
+                    .find(|&&idx| dictionary[(idx as usize) - 1] == s)
+                    .copied()
+            });
+            if let Some(idx) = existing {
+                indices.push(idx);
+            } else {
+                let next_len = dictionary.len().checked_add(1).ok_or_else(|| {
+                    BoltError::Other(
+                        "dictionary overflow: more than usize::MAX unique strings".into(),
+                    )
+                })?;
+                if (next_len as u128) > (i64::MAX as u128) {
+                    return Err(BoltError::Other(format!(
+                        "dictionary overflow: more than {} unique strings (i64 index space)",
+                        i64::MAX
+                    )));
+                }
+                let idx = next_len as i64;
+                dictionary.push(s.to_string());
+                lookup.entry(digest).or_default().push(idx);
+                indices.push(idx);
+            }
+        }
+        Ok((dictionary, indices))
+    }
 }
 
 /// Estimate the unique-string count of a `StringArray`.
@@ -280,6 +383,115 @@ mod tests {
         assert_eq!(col.index_of("gamma"), Some(3));
         // Absent literal → None (predicate trivially matches no rows).
         assert_eq!(col.index_of("delta"), None);
+    }
+
+    // ---- index_of_many symmetry with the i32 sibling ---------------------
+
+    #[test]
+    fn index_of_many_matches_single_lookup_semantics() {
+        // Mirrors the i32 sibling's test of the same name: the batched
+        // lookup must agree with N calls to `index_of`, including the
+        // `None` slots for unknown literals. Guards against the common
+        // refactor bug of returning 0 (NULL) for misses.
+        let dict = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let col = DictionaryColumnI64::new_host_only(dict, 0)
+            .expect("host-only constructor must not depend on CUDA");
+
+        let got = col.index_of_many(&["a", "missing", "c", "b", ""]);
+        assert_eq!(got, vec![Some(1), None, Some(3), Some(2), None]);
+    }
+
+    #[test]
+    fn index_of_many_agrees_with_i32_sibling_on_parallel_fixture() {
+        // Symmetry test: build the i32 and i64 wrappers from the *same*
+        // dictionary contents, run the *same* queries through their
+        // `index_of_many`, and assert the results agree slot-for-slot
+        // (modulo the index integer width). This pins the contract that the
+        // i64 sibling is a drop-in widening of the i32 path, not a
+        // separately-evolving implementation.
+        use crate::cuda::dictionary::DictionaryColumn;
+
+        let dict = vec![
+            "us".to_string(),
+            "uk".to_string(),
+            "fr".to_string(),
+            "jp".to_string(),
+        ];
+        let i32_col = DictionaryColumn::new_host_only(dict.clone(), 0);
+        let i64_col = DictionaryColumnI64::new_host_only(dict, 0)
+            .expect("host-only constructor");
+
+        let queries = ["jp", "missing", "us", "fr", "", "uk"];
+        let got_i32 = i32_col.index_of_many(&queries);
+        let got_i64 = i64_col.index_of_many(&queries);
+
+        // Same length, same None/Some pattern, same numeric values (widened).
+        assert_eq!(got_i32.len(), got_i64.len());
+        for (q_idx, (a, b)) in got_i32.iter().zip(got_i64.iter()).enumerate() {
+            match (a, b) {
+                (Some(a32), Some(b64)) => assert_eq!(
+                    *a32 as i64, *b64,
+                    "query {q_idx} ('{}'): i32={} but i64={}",
+                    queries[q_idx], a32, b64
+                ),
+                (None, None) => {}
+                _ => panic!(
+                    "query {q_idx} ('{}'): None/Some mismatch i32={:?} i64={:?}",
+                    queries[q_idx], a, b
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn index_of_many_on_empty_dictionary_is_all_none() {
+        let col = DictionaryColumnI64::new_host_only(Vec::new(), 0)
+            .expect("host-only constructor");
+        let got = col.index_of_many(&["x", "y"]);
+        assert_eq!(got, vec![None, None]);
+    }
+
+    #[test]
+    fn index_of_many_with_empty_query_is_empty() {
+        let dict = vec!["a".to_string()];
+        let col = DictionaryColumnI64::new_host_only(dict, 0)
+            .expect("host-only constructor");
+        let got = col.index_of_many(&[]);
+        assert!(got.is_empty());
+    }
+
+    // ---- Construction-time dedupe ----------------------------------------
+
+    #[test]
+    fn dedupe_large_redundant_input_yields_only_distinct_strings() {
+        // Same memory-fix regression as the i32 sibling: 1M rows over 100
+        // distinct strings, asserting the digest dedupe collapses to the
+        // expected cardinality with the right per-row indices.
+        const ROWS: usize = 1_000_000;
+        const DISTINCT: usize = 100;
+
+        let pool: Vec<String> = (0..DISTINCT).map(|i| format!("v_{i}")).collect();
+        let rows = (0..ROWS).map(|r| Some(pool[r % DISTINCT].as_str()));
+
+        let (dictionary, indices) =
+            DictionaryColumnI64::dedupe_for_test(rows).expect("dedupe");
+
+        assert_eq!(dictionary.len(), DISTINCT);
+        for i in 0..DISTINCT {
+            assert_eq!(dictionary[i], pool[i]);
+        }
+        assert_eq!(indices.len(), ROWS);
+        for (r, &idx) in indices.iter().enumerate() {
+            let expected = ((r % DISTINCT) as i64) + 1;
+            assert_eq!(idx, expected);
+        }
+
+        let col = DictionaryColumnI64::new_host_only(dictionary, ROWS)
+            .expect("host-only constructor");
+        for (i, s) in pool.iter().enumerate() {
+            assert_eq!(col.index_of(s), Some((i as i64) + 1));
+        }
+        assert_eq!(col.index_of("missing-literal"), None);
     }
 
     #[test]
