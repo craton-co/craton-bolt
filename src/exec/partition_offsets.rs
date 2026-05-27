@@ -98,11 +98,13 @@ fn lock_pinned_scratch() -> BoltResult<MutexGuard<'static, PinnedHostBuffer<u32>
         // slot. In practice this only fires under CUDA-stub or if the
         // driver refuses, in which case the parent query is already
         // doomed and will surface a clearer error from a later FFI call.
-        PinnedHostBuffer::<u32>::new(NUM_PARTITIONS as usize + 1)
-            .unwrap_or_else(|_| {
-                PinnedHostBuffer::<u32>::new(0)
-                    .expect("zero-length PinnedHostBuffer never fails")
-            })
+        Mutex::new(
+            PinnedHostBuffer::<u32>::new(NUM_PARTITIONS as usize + 1)
+                .unwrap_or_else(|_| {
+                    PinnedHostBuffer::<u32>::new(0)
+                        .expect("zero-length PinnedHostBuffer never fails")
+                }),
+        )
     });
     let guard = cell.lock().map_err(|e| {
         BoltError::Other(format!(
