@@ -301,8 +301,11 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
                 "add.s64 {}, {}, {};",
                 addr, vptr, off
             ))?;
+            // Input-validity bytes live in distinct param buffers (host side
+            // allocates them as fresh `GpuVec<u8>`). They're read-only here, so
+            // route the load through the read-only cache.
             b.emit(&format!(
-                "ld.global.u8 {}, [{}];",
+                "ld.global.nc.u8 {}, [{}];",
                 byte_reg, addr
             ))?;
             // AND combined with this validity byte. Both live in the b32
@@ -412,7 +415,14 @@ fn emit_op(
     }
 }
 
-/// Emit a `ld.global.<type>` of input column `col_idx` at row `tid` into a fresh register.
+/// Emit a `ld.global.nc.<type>` of input column `col_idx` at row `tid` into a fresh register.
+///
+/// Uses `ld.global.nc` (non-coherent / read-only cache) because every kernel-param
+/// pointer is declared `.ptr .global .restrict` (see `write_signature`): the planner
+/// guarantees that input column buffers never alias any output buffer of the same
+/// kernel. The read-only cache path takes L2 pressure off shared scalar loads on
+/// sm_70+. `ld.global.nc` returns the same bytes as `ld.global`; only the cache
+/// hierarchy differs.
 fn emit_load(
     b: &mut PtxBuilder,
     dst: Reg,
@@ -438,7 +448,7 @@ fn emit_load(
     ))?;
     let dst_name = b.alloc.assign(dst, dtype)?;
     let suffix = ld_st_suffix(dtype)?;
-    b.emit(&format!("ld.global.{} {}, [{}];", suffix, dst_name, addr))?;
+    b.emit(&format!("ld.global.nc.{} {}, [{}];", suffix, dst_name, addr))?;
     Ok(())
 }
 
@@ -931,8 +941,9 @@ mod validity_emission_tests {
     #[test]
     fn validity_emits_and_b32_and_u8_store() {
         // Contract:
-        //   1. Each flagged input contributes an `ld.global.u8` for its
-        //      per-row validity byte.
+        //   1. Each flagged input contributes an `ld.global.nc.u8` for its
+        //      per-row validity byte (read-only-cache hint — input
+        //      validity buffers are guaranteed non-aliasing).
         //   2. The bytes are AND-folded into a single combined register
         //      via `and.b32` (booleans live in the b32 register class).
         //   3. The combined byte is written via `st.global.u8` to every
@@ -943,11 +954,12 @@ mod validity_emission_tests {
         let spec = mul_with_validity_spec();
         let ptx = compile(&spec, "bolt_pre_kernel_validity").expect("compile");
 
-        // 2 u8 loads (one per flagged input).
-        let n_u8_loads = ptx.matches("ld.global.u8").count();
+        // 2 u8 loads (one per flagged input) — routed through the read-only
+        // cache via `ld.global.nc.u8`.
+        let n_u8_loads = ptx.matches("ld.global.nc.u8").count();
         assert!(
             n_u8_loads >= 2,
-            "expected >=2 ld.global.u8 for input validity, got {n_u8_loads}\n{ptx}"
+            "expected >=2 ld.global.nc.u8 for input validity, got {n_u8_loads}\n{ptx}"
         );
 
         // and.b32 for the combined-validity fold (Mul doesn't emit one).
@@ -990,8 +1002,8 @@ mod validity_emission_tests {
             "expected 3 .ptr params (2 inputs + 1 output, no validity), got {n_ptr_params}\n{ptx}"
         );
         assert!(
-            !ptx.contains("ld.global.u8"),
-            "expected NO ld.global.u8 in the no-validity path\n{ptx}"
+            !ptx.contains("ld.global.nc.u8"),
+            "expected NO ld.global.nc.u8 in the no-validity path\n{ptx}"
         );
         assert!(
             !ptx.contains("st.global.u8"),

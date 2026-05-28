@@ -265,7 +265,8 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
         // addr = base + word_idx * 4
         writeln!(ptx, "\tmul.wide.u32 %rd11, %r10, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd12, %rd10, %rd11;").map_err(write_err)?;
-        writeln!(ptx, "\tld.global.u32 %r12, [%rd12];").map_err(write_err)?;
+        // Validity bitmap is a read-only input — route through the read-only cache.
+        writeln!(ptx, "\tld.global.nc.u32 %r12, [%rd12];").map_err(write_err)?;
         // bit = (word >> bit_off) & 1  via bfe.u32
         writeln!(ptx, "\tbfe.u32 %r13, %r12, %r11, 1;").map_err(write_err)?;
         writeln!(ptx, "\tsetp.eq.s32 %p4, %r13, 0;").map_err(write_err)?;
@@ -292,7 +293,9 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     )
     .map_err(write_err)?;
 
-    // Load this thread's key value from group_col.
+    // Load this thread's key value from group_col. The group-by column is a
+    // read-only input (the host allocates it as a distinct GpuVec from the
+    // keys_table the kernel CASes into), so route through the read-only cache.
     writeln!(
         ptx,
         "\tld.param.u64 %rd0, [{}_param_0];",
@@ -302,7 +305,7 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // Hash: h = (key * FX_MUL) >> 32 ; then & (k-1).
     writeln!(ptx, "\tmov.s64 %rl1, {};", FX_MUL).map_err(write_err)?;
@@ -505,7 +508,8 @@ fn compile_groupby_agg_kernel_inner(
         writeln!(ptx, "\tcvta.to.global.u64 %rd16, %rd16;").map_err(write_err)?;
         writeln!(ptx, "\tmul.wide.u32 %rd17, %r14, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd18, %rd16, %rd17;").map_err(write_err)?;
-        writeln!(ptx, "\tld.global.u32 %r16, [%rd18];").map_err(write_err)?;
+        // value-validity bitmap is a read-only input — route through .nc.
+        writeln!(ptx, "\tld.global.nc.u32 %r16, [%rd18];").map_err(write_err)?;
         writeln!(ptx, "\tbfe.u32 %r17, %r16, %r15, 1;").map_err(write_err)?;
         writeln!(ptx, "\tsetp.eq.s32 %p4, %r17, 0;").map_err(write_err)?;
         writeln!(ptx, "\t@%p4 bra DONE;").map_err(write_err)?;
@@ -533,7 +537,7 @@ fn compile_groupby_agg_kernel_inner(
     )
     .map_err(write_err)?;
 
-    // Load the key for this row.
+    // Load the key for this row. Key column is a read-only input.
     writeln!(
         ptx,
         "\tld.param.u64 %rd0, [{}_param_0];",
@@ -543,7 +547,7 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // Hash.
     writeln!(ptx, "\tmov.s64 %rl1, {};", FX_MUL).map_err(write_err)?;
@@ -580,7 +584,10 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s64 %rl5, [%rd5];").map_err(write_err)?;
+    // The keys-table is non-mutating from this kernel's POV (it was populated
+    // by the preceding keys kernel and is only READ here — no atom.cas, no
+    // st.global to %rd3). Route through the read-only cache.
+    writeln!(ptx, "\tld.global.nc.s64 %rl5, [%rd5];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p1, %rl5, %rl0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra FOUND;").map_err(write_err)?;
     // Otherwise advance.
@@ -589,7 +596,7 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "\tbra PROBE_LOOP;").map_err(write_err)?;
     writeln!(ptx, "FOUND:").map_err(write_err)?;
 
-    // Load the input column value for this row.
+    // Load the input column value for this row (read-only input column).
     writeln!(
         ptx,
         "\tld.param.u64 %rd6, [{}_param_2];",
@@ -606,7 +613,7 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "\tadd.s64 %rd8, %rd6, %rd7;").map_err(write_err)?;
     writeln!(
         ptx,
-        "\tld.global.{ld} %{rc}0, [%rd8];",
+        "\tld.global.nc.{ld} %{rc}0, [%rd8];",
         ld = load_suffix,
         rc = reg_class
     )
@@ -861,12 +868,12 @@ pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String>
     )
     .map_err(write_err)?;
 
-    // Load the key for this row (param 0 = group_col_ptr).
+    // Load the key for this row (param 0 = group_col_ptr — read-only input).
     writeln!(ptx, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // Hash — computed exactly ONCE for the entire fused kernel. This is the
     // whole point: subsequent atomic updates reuse the resolved slot
@@ -892,7 +899,9 @@ pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String>
     writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s64 %rl5, [%rd5];").map_err(write_err)?;
+    // Keys-table probe is non-mutating here — populated by the prior keys
+    // kernel and READ from this multi-agg kernel. Route through .nc.
+    writeln!(ptx, "\tld.global.nc.s64 %rl5, [%rd5];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p1, %rl5, %rl0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra FOUND;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
@@ -947,9 +956,10 @@ pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String>
         writeln!(ptx, "\tadd.s64 %rd12, %rd10, %rd11;").map_err(write_err)?;
 
         let (val_idx, ret_idx) = take_two_slots(&mut class_slot_counter, p.reg_class);
+        // Per-spec input column is read-only (host upload-side guarantee).
         writeln!(
             ptx,
-            "\tld.global.{ld} %{rc}{vi}, [%rd12];",
+            "\tld.global.nc.{ld} %{rc}{vi}, [%rd12];",
             ld = p.load_suffix,
             rc = p.reg_class,
             vi = val_idx,

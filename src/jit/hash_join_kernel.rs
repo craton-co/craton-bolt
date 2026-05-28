@@ -468,12 +468,12 @@ pub fn compile_build_kernel() -> BoltResult<String> {
     // max_probes = cap * MAX_PROBE_FACTOR.
     writeln!(p, "\tmul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};").map_err(write_err)?;
 
-    // Load key for this row.
+    // Load key for this row (read-only input column).
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // hash = (key * FX_MUL) >> 32 ; slot = hash & mask.
     writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
@@ -482,7 +482,8 @@ pub fn compile_build_kernel() -> BoltResult<String> {
     writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
 
-    // keys_table base pointer.
+    // keys_table base pointer (THIS kernel mutates it via atom.cas — do NOT
+    // route reads through .nc).
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
     // row_idx_table base pointer.
@@ -640,12 +641,12 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     // out_capacity.
     writeln!(p, "\tld.param.u32 %r22, [{entry}_param_8];").map_err(write_err)?;
 
-    // Load probe key.
+    // Load probe key (read-only input).
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // hash + slot.
     writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
@@ -654,7 +655,9 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
 
-    // keys_table base + row_idx_table base.
+    // keys_table base + row_idx_table base. Both were populated by the prior
+    // build kernel and are READ-ONLY from this probe kernel's POV — see the
+    // "Probe loop — non-mutating walk" comment below.
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
     writeln!(p, "\tld.param.u64 %rd4, [{entry}_param_2];").map_err(write_err)?;
@@ -672,10 +675,11 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     writeln!(p, "\tsetp.gt.u32 %p3, %r21, %r20;").map_err(write_err)?;
     writeln!(p, "\t@%p3 bra DONE;").map_err(write_err)?;
 
-    // addr_keys = keys_table + slot * 8
+    // addr_keys = keys_table + slot * 8 — read-only-cache load (slot table
+    // is non-mutating from this kernel's POV).
     writeln!(p, "\tmul.wide.u32 %rd5, %r8, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.s64 %rl5, [%rd6];").map_err(write_err)?;
 
     // If slot is empty -> no match, done.
     writeln!(p, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
@@ -697,10 +701,10 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     // don't write past the buffer.
     writeln!(p, "MATCH:").map_err(write_err)?;
 
-    // Load build_idx = row_idx_table[slot].
+    // Load build_idx = row_idx_table[slot] (read-only-cache load).
     writeln!(p, "\tmul.wide.u32 %rd5, %r8, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd7, %rd4, %rd5;").map_err(write_err)?;
-    writeln!(p, "\tld.global.u32 %r9, [%rd7];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.u32 %r9, [%rd7];").map_err(write_err)?;
 
     // atom.add on counter: claim slot.
     writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_5];").map_err(write_err)?;
@@ -801,12 +805,12 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
     writeln!(p, "\tmul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};").map_err(write_err)?;
 
-    // Load this row's key.
+    // Load this row's key (read-only input column).
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // hash + slot.
     writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
@@ -815,7 +819,9 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
 
-    // base pointers.
+    // base pointers. THIS kernel mutates keys_table (atom.cas), row_idx_table
+    // (st), head (atom.exch), and next_idx (st) — so leave their reads as
+    // plain ld.global.
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?; // keys_table
     writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
     writeln!(p, "\tld.param.u64 %rd4, [{entry}_param_2];").map_err(write_err)?; // row_idx_table
@@ -948,12 +954,12 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tld.param.u32 %r23, [{entry}_param_10];").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r24, [{entry}_param_11];").map_err(write_err)?;
 
-    // Load probe key.
+    // Load probe key (read-only input).
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // hash + slot.
     writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
@@ -962,7 +968,8 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
 
-    // base pointers.
+    // base pointers. keys_table, head, next_idx were populated by the prior
+    // build kernel and are READ-ONLY from this probe's POV.
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?; // keys_table
     writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
     writeln!(p, "\tld.param.u64 %rd14, [{entry}_param_2];").map_err(write_err)?; // head
@@ -992,7 +999,8 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
 
     writeln!(p, "\tmul.wide.u32 %rd5, %r8, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
+    // keys_table is read-only here — route through .nc.
+    writeln!(p, "\tld.global.nc.s64 %rl5, [%rd6];").map_err(write_err)?;
 
     // Empty -> no match.
     writeln!(p, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
@@ -1008,11 +1016,11 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
 
     // Chain walk: cursor = head[slot]; while cursor != u32::MAX, emit and
-    // advance via next_idx[cursor].
+    // advance via next_idx[cursor]. Both head and next_idx are read-only here.
     writeln!(p, "WALK_CHAIN:").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd20, %r8, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd21, %rd14, %rd20;").map_err(write_err)?;
-    writeln!(p, "\tld.global.u32 %r25, [%rd21];").map_err(write_err)?; // cursor
+    writeln!(p, "\tld.global.nc.u32 %r25, [%rd21];").map_err(write_err)?; // cursor
 
     // CHAIN_LOOP — bail on cursor == u32::MAX (== -1 as i32) OR cursor >= build_n_rows.
     writeln!(p, "CHAIN_LOOP:").map_err(write_err)?;
@@ -1051,10 +1059,10 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tatom.global.or.b32 %r32, [%rd27], %r31;").map_err(write_err)?;
 
     writeln!(p, "ADVANCE:").map_err(write_err)?;
-    // cursor = next_idx[cursor]
+    // cursor = next_idx[cursor] (next_idx is read-only from this kernel's POV).
     writeln!(p, "\tmul.wide.u32 %rd28, %r25, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd29, %rd15, %rd28;").map_err(write_err)?;
-    writeln!(p, "\tld.global.u32 %r25, [%rd29];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.u32 %r25, [%rd29];").map_err(write_err)?;
     writeln!(p, "\tbra CHAIN_LOOP;").map_err(write_err)?;
 
     writeln!(p, "DONE:").map_err(write_err)?;
@@ -1109,13 +1117,15 @@ pub fn compile_unmatched_build_kernel() -> BoltResult<String> {
     writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
-    // Load matched-bitmap word for this row.
+    // Load matched-bitmap word for this row. The bitmap was populated by the
+    // probe kernel and is READ-ONLY from this unmatched-emission kernel — route
+    // through .nc.
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(p, "\tshr.u32 %r5, %r3, 5;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd1, %r5, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(p, "\tld.global.u32 %r6, [%rd2];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.u32 %r6, [%rd2];").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r7, %r3, 31;").map_err(write_err)?;
     writeln!(p, "\tshr.u32 %r8, %r6, %r7;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r9, %r8, 1;").map_err(write_err)?;
@@ -1284,12 +1294,12 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tmul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r22, [{entry}_param_7];").map_err(write_err)?; // out_capacity
 
-    // Load probe key.
+    // Load probe key (read-only input).
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // hash + slot.
     writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
@@ -1298,7 +1308,8 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
 
-    // slots base pointer.
+    // slots base pointer. The AoS slot table is read-only here (built by the
+    // preceding AoS build kernel); see the fused-load comment below.
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
 
@@ -1321,9 +1332,10 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     // 16-byte vector load on global memory at all generations; we use
     // separate loads but pack them at adjacent offsets so the L1/L2
     // line-fill brings both into the same transaction. Equivalent fused-
-    // load wins without needing ld.global.v4.
-    writeln!(p, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;       // key
-    writeln!(p, "\tld.global.u32 %r9, [%rd6 + 8];").map_err(write_err)?;   // head
+    // load wins without needing ld.global.v4. Slot table is read-only from
+    // this probe kernel — route both halves of the fused load through .nc.
+    writeln!(p, "\tld.global.nc.s64 %rl5, [%rd6];").map_err(write_err)?;       // key
+    writeln!(p, "\tld.global.nc.u32 %r9, [%rd6 + 8];").map_err(write_err)?;   // head
 
     // Empty slot -> no match.
     writeln!(p, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
@@ -1452,12 +1464,12 @@ pub fn compile_build_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
     writeln!(p, "\tmul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};").map_err(write_err)?;
 
-    // Load this row's key.
+    // Load this row's key (read-only input column).
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
 
     // hash + slot.
     writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
@@ -1466,7 +1478,8 @@ pub fn compile_build_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
 
-    // slots base pointer.
+    // slots base pointer. THIS kernel mutates slots (atom.cas + st), so keep
+    // any reads on plain ld.global.
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
 
@@ -1620,19 +1633,21 @@ pub fn compile_string_hash_kernel_with_offsets(
     // sane workload, even if the cumulative byte buffer exceeds 4 GiB).
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    // Offsets and values buffers are both read-only inputs to the hash kernel
+    // — route their loads through the read-only cache.
     match width {
         StringOffsetWidth::I32 => {
             writeln!(p, "\tmul.wide.u32 %rd1, %r3, 4;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-            writeln!(p, "\tld.global.s32 %r5, [%rd2];").map_err(write_err)?;     // start
-            writeln!(p, "\tld.global.s32 %r6, [%rd2 + 4];").map_err(write_err)?; // end
+            writeln!(p, "\tld.global.nc.s32 %r5, [%rd2];").map_err(write_err)?;     // start
+            writeln!(p, "\tld.global.nc.s32 %r6, [%rd2 + 4];").map_err(write_err)?; // end
         }
         StringOffsetWidth::I64 => {
             writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
             // i64 offsets — load into b64 scratch then narrow to b32 cursor.
-            writeln!(p, "\tld.global.s64 %rd9, [%rd2];").map_err(write_err)?;
-            writeln!(p, "\tld.global.s64 %rd10, [%rd2 + 8];").map_err(write_err)?;
+            writeln!(p, "\tld.global.nc.s64 %rd9, [%rd2];").map_err(write_err)?;
+            writeln!(p, "\tld.global.nc.s64 %rd10, [%rd2 + 8];").map_err(write_err)?;
             writeln!(p, "\tcvt.u32.u64 %r5, %rd9;").map_err(write_err)?;   // start
             writeln!(p, "\tcvt.u32.u64 %r6, %rd10;").map_err(write_err)?;  // end
         }
@@ -1654,10 +1669,11 @@ pub fn compile_string_hash_kernel_with_offsets(
     writeln!(p, "\tsetp.ge.s32 %p1, %r7, %r6;").map_err(write_err)?;
     writeln!(p, "\t@%p1 bra FINALIZE;").map_err(write_err)?;
 
-    // Load one byte: addr = values + cursor, value = ld.global.u8.
+    // Load one byte: addr = values + cursor, value = ld.global.nc.u8.
+    // The string-values buffer is a read-only input.
     writeln!(p, "\tmul.wide.s32 %rd4, %r7, 1;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
-    writeln!(p, "\tld.global.u8 %r8, [%rd5];").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.u8 %r8, [%rd5];").map_err(write_err)?;
     // Widen to b64 with high bits zero so the xor doesn't smear sign.
     writeln!(p, "\tcvt.u64.u32 %rh2, %r8;").map_err(write_err)?;
 
@@ -2020,13 +2036,15 @@ mod tests {
             ptx.contains("CHAIN_LOOP:"),
             "probe collision kernel must contain a chain loop;\n{ptx}"
         );
-        // The next-pointer load: `ld.global.u32 %r25, [%rd29];` — match
+        // The next-pointer load: `ld.global.nc.u32 %r25, [%rd29];` — match
         // shape, not register naming, by checking the second u32 load
-        // (head[slot] first, then next_idx[cursor]).
-        let n_u32_loads = ptx.matches("ld.global.u32").count();
+        // (head[slot] first, then next_idx[cursor]). Both go through the
+        // read-only cache since head and next_idx are populated by the build
+        // kernel before the probe runs.
+        let n_u32_loads = ptx.matches("ld.global.nc.u32").count();
         assert!(
             n_u32_loads >= 2,
-            "probe collision kernel must read head + next_idx as u32; saw {n_u32_loads}\n{ptx}"
+            "probe collision kernel must read head + next_idx as ld.global.nc.u32; saw {n_u32_loads}\n{ptx}"
         );
     }
 
@@ -2060,8 +2078,9 @@ mod tests {
     #[test]
     fn unmatched_build_ptx_tests_bit_and_stores_row_idx() {
         let ptx = compile_unmatched_build_kernel().unwrap();
-        // Reads the bitmap word and shifts down by (tid & 31).
-        assert!(ptx.contains("ld.global.u32"));
+        // Reads the bitmap word (read-only-cache load — bitmap was written
+        // by the probe kernel) and shifts down by (tid & 31).
+        assert!(ptx.contains("ld.global.nc.u32"));
         assert!(ptx.contains("shr.u32"));
         assert!(ptx.contains("and.b32"));
         // Branches around the store when matched != 0.
@@ -2182,8 +2201,8 @@ mod tests {
     fn probe_aos_ptx_loads_head_at_plus_eight() {
         let ptx = compile_probe_aos_kernel().unwrap();
         assert!(
-            ptx.contains("ld.global.u32 %r9, [%rd6 + 8];"),
-            "AoS probe must load head u32 at slot_addr + 8\n{ptx}"
+            ptx.contains("ld.global.nc.u32 %r9, [%rd6 + 8];"),
+            "AoS probe must load head u32 at slot_addr + 8 via the read-only cache\n{ptx}"
         );
     }
 
@@ -2240,12 +2259,13 @@ mod tests {
 
     /// String-hash kernel emits a per-byte u8 load (the FNV-1a inner loop).
     /// Dropping it would mean the kernel doesn't actually walk the string.
+    /// The values buffer is a read-only input, so the load is `ld.global.nc.u8`.
     #[test]
     fn string_hash_ptx_reads_bytes_with_u8_load() {
         let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
         assert!(
-            ptx.contains("ld.global.u8"),
-            "string hash kernel must use ld.global.u8 to read string bytes\n{ptx}"
+            ptx.contains("ld.global.nc.u8"),
+            "string hash kernel must use ld.global.nc.u8 to read string bytes\n{ptx}"
         );
     }
 

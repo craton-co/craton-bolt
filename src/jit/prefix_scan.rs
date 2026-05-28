@@ -163,7 +163,10 @@ pub fn compile_prefix_scan_kernel() -> BoltResult<String> {
     writeln!(ptx, "\t@%p0 bra AFTER_LOAD;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd3, %r3, 1;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd4, %rd0, %rd3;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u8 %rs0, [%rd4];").map_err(write_err)?;
+    // mask is a read-only input (the host side passes a distinct GpuVec<u8>;
+    // local_indices and block_sums in this kernel are write-only), so route
+    // the load through the read-only cache via `ld.global.nc`.
+    writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd4];").map_err(write_err)?;
     writeln!(ptx, "\tcvt.u32.u16 %r6, %rs0;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p1, %r6, 0;").map_err(write_err)?;
     writeln!(ptx, "\tselp.s32 %r5, 1, 0, %p1;").map_err(write_err)?;
@@ -366,10 +369,13 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     writeln!(ptx, "\tld.param.u64 %rd4, [{}_param_4];", entry).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd4, %rd4;").map_err(write_err)?;
 
-    // Load mask byte; bail if zero.
+    // Load mask byte; bail if zero. Mask, local_indices, block_bases and the
+    // input column are all read-only inputs (the host side allocates them as
+    // distinct GpuVec buffers and the planner never aliases them with the
+    // output), so route the loads through the read-only cache via `ld.global.nc`.
     writeln!(ptx, "\tmul.wide.u32 %rd5, %r3, 1;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd6, %rd0, %rd5;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u8 %rs0, [%rd6];").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd6];").map_err(write_err)?;
     writeln!(ptx, "\tcvt.u32.u16 %r5, %rs0;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p1, %r5, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra DONE;").map_err(write_err)?;
@@ -377,12 +383,12 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     // local_idx = local_indices[gid]
     writeln!(ptx, "\tmul.wide.u32 %rd7, %r3, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd8, %rd1, %rd7;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r6, [%rd8];").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.u32 %r6, [%rd8];").map_err(write_err)?;
 
     // block_base = block_bases[blockIdx.x]
     writeln!(ptx, "\tmul.wide.u32 %rd9, %r0, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd10, %rd2, %rd9;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r7, [%rd10];").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.u32 %r7, [%rd10];").map_err(write_err)?;
 
     // out_idx = block_base + local_idx
     writeln!(ptx, "\tadd.s32 %r8, %r6, %r7;").map_err(write_err)?;
@@ -408,7 +414,7 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     // value = *input_addr ; *output_addr = value
     writeln!(
         ptx,
-        "\tld.global.{ld} %{rc}0, [%rd12];",
+        "\tld.global.nc.{ld} %{rc}0, [%rd12];",
         ld = ld_suffix,
         rc = reg_class
     )
@@ -513,12 +519,13 @@ mod tests {
         }
         assert!(ptx.contains(".param .u32 bolt_gather_i32_param_5"));
 
-        // i32 load/store uses .s32.
-        assert!(ptx.contains("ld.global.s32"), "missing typed input load");
+        // i32 load/store uses .s32. Input load is routed through the read-only
+        // cache (`ld.global.nc`); output store stays as `st.global`.
+        assert!(ptx.contains("ld.global.nc.s32"), "missing typed input load");
         assert!(ptx.contains("st.global.s32"), "missing typed output store");
 
-        // Mask gate.
-        assert!(ptx.contains("ld.global.u8 %rs0,"));
+        // Mask gate (read-only-cache load).
+        assert!(ptx.contains("ld.global.nc.u8 %rs0,"));
         assert!(
             ptx.contains("setp.eq.s32 %p1, %r5, 0;"),
             "missing mask==0 short-circuit"
