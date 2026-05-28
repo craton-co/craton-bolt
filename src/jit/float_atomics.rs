@@ -80,6 +80,18 @@ const EMPTY_KEY_LITERAL: &str = "-9223372036854775808";
 /// single name regardless of which compiler produced the PTX.
 pub const FLOAT_ATOMIC_AGG_ENTRY: &str = "bolt_groupby_agg";
 
+/// Per-iteration `nanosleep.u32` operand for the slot-probe and CAS-retry
+/// loops. PTX `nanosleep.u32` (sm_70+) yields SM cycles so peer warps
+/// contending the same accumulator slot can make progress instead of all
+/// warps burning instruction-issue slots on hot CAS retries.
+///
+/// TODO(perf): exponential back-off (shift left by 1 per iteration, capped
+/// at 256). The exponential variant requires a register that survives the
+/// loop body across the back-edge, complicating the PTX. The fixed 32 ns
+/// constant captures the bulk of the occupancy win at a fraction of the
+/// codegen complexity.
+const SPIN_BACKOFF_NS: u32 = 32;
+
 /// Generate a PTX kernel for `GROUP BY MIN(float)` / `MAX(float)`.
 ///
 /// Performs the same hash + linear probe against `keys_table_ptr` as the
@@ -160,6 +172,13 @@ pub fn compile_groupby_float_atomic_kernel(
     writeln!(ptx, "\t.reg .b32   %r<24>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<24>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    // Operand register for the per-iteration `nanosleep.u32` back-off in
+    // the PROBE_LOOP (slot walk) and the CAS_LOOP (contention retry).
+    // PTX `nanosleep.u32` (sm_70+) suspends the warp for ~NS nanoseconds,
+    // yielding SM cycles to the warp scheduler so peer warps can make
+    // progress on the slot we're contending. Portable form is register
+    // operand; the immediate form is rejected by some toolchains.
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     // Bit-pattern registers used for the CAS itself. For f32 these are
     // `.b32 %vrN`; for f64 they are `.b64 %vrlN`. Distinct namespaces avoid
     // collisions with the `%r` / `%rl` registers above.
@@ -245,6 +264,18 @@ pub fn compile_groupby_float_atomic_kernel(
     writeln!(ptx, "\t@%p2 bra DONE;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
     writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    // Occupancy-friendly back-off on the probe-advance path. Reached only
+    // when the probed slot held the wrong key (collision) — yielding SM
+    // cycles here frees the warp scheduler to run peer warps that may be
+    // populating slots ahead of us. The FOUND and EMPTY-sentinel paths
+    // skip this via early branches above.
+    writeln!(
+        ptx,
+        "\tmov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_LOOP;").map_err(write_err)?;
     writeln!(ptx, "FOUND:").map_err(write_err)?;
 
@@ -362,6 +393,18 @@ pub fn compile_groupby_float_atomic_kernel(
         br = bits_reg
     )
     .map_err(write_err)?;
+    // Occupancy-friendly back-off on the CAS-loss retry path. When the
+    // CAS lost we know another warp updated the slot between our load
+    // and our CAS; yielding SM cycles here gives that warp room to drain
+    // its update instead of all warps storming the same cache line. The
+    // CAS-won path skips the back-off by branching past via @%p5.
+    writeln!(
+        ptx,
+        "\t@!%p5 mov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@!%p5 nanosleep.u32 %nstime;").map_err(write_err)?;
     // If we did NOT win the race, someone updated the slot since our load —
     // retry with their value as the new baseline.
     writeln!(ptx, "\t@!%p5 bra CAS_LOOP;").map_err(write_err)?;

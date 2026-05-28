@@ -129,6 +129,23 @@ const MAX_PROBE_FACTOR: u32 = 2;
 /// the writer.
 const SPIN_LIMIT: u32 = 1024;
 
+/// Per-iteration `nanosleep.u32` operand for the inner SPIN loop. PTX
+/// `nanosleep.u32` (sm_70+) yields SM cycles to the warp scheduler so
+/// peer warps holding the slot's writer can make progress instead of
+/// burning instruction-issue slots on a hot reload of `slot_valid`.
+///
+/// Value chosen empirically: ~32 ns per iteration is short enough that
+/// the SPIN remains responsive (worst-case bound stays well under a
+/// microsecond at SPIN_LIMIT=1024) but long enough that the GPU's idle
+/// scheduler actually swaps in another warp.
+///
+/// TODO(perf): exponential back-off (shift left by 1 each iteration,
+/// capped at 256). That requires a register that survives the loop body
+/// across the bound-check and back-edge, which complicates the PTX. The
+/// fixed-32ns variant captures most of the occupancy win at a fraction
+/// of the codegen complexity.
+const SPIN_BACKOFF_NS: u32 = 32;
+
 /// Block-size accessor for the host-side launcher.
 pub fn valid_block_size() -> u32 {
     BLOCK_SIZE
@@ -185,6 +202,10 @@ pub fn compile_keys_valid_kernel() -> BoltResult<String> {
     writeln!(ptx, "\t.reg .b32   %r<48>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    // Operand register for the per-SPIN `nanosleep.u32` back-off. PTX
+    // requires a register form for portability across toolchains; the
+    // immediate form is not universally accepted.
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     // tid = ctaid.x * ntid.x + tid.x; bail if tid >= n_rows.
@@ -266,6 +287,19 @@ pub fn compile_keys_valid_kernel() -> BoltResult<String> {
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u32 %r10, [%rd8];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r10, 2;").map_err(write_err)?;
+    // Occupancy-friendly back-off: when the slot is still un-published
+    // (`slot_valid != 2`), yield SM cycles before re-reading. PTX
+    // `nanosleep.u32` (sm_70+) suspends the warp for ~NS nanoseconds,
+    // letting the warp scheduler run other warps — notably the warp
+    // holding this slot's writer. The nanosleep is emitted only on
+    // the failed-read path; the committed path falls through.
+    writeln!(
+        ptx,
+        "\t@%p2 mov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 nanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     // Now safe to read the committed key.
     writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
@@ -383,6 +417,9 @@ pub fn compile_agg_valid_kernel(
     writeln!(ptx, "\t.reg .b32   %r<48>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    // Operand register for the per-SPIN `nanosleep.u32` back-off — see
+    // the keys kernel for full rationale.
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     // Typed value register class for the input column load + atomic update.
     writeln!(
         ptx,
@@ -495,6 +532,16 @@ pub fn compile_agg_valid_kernel(
     // the table).
     writeln!(ptx, "\t@%p1 bra ADVANCE;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r9, 2;").map_err(write_err)?;
+    // Occupancy-friendly back-off: yield SM cycles when slot is still
+    // un-published. See the keys kernel for the full rationale; the
+    // nanosleep is emitted only on the spin-back path.
+    writeln!(
+        ptx,
+        "\t@%p2 mov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 nanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     // valid==2 here: key is committed. Compare.
     writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
@@ -788,6 +835,9 @@ pub fn compile_keys_valid_kernel_with_validity() -> BoltResult<String> {
     writeln!(ptx, "\t.reg .b32   %r<48>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    // Operand register for the per-SPIN `nanosleep.u32` back-off — see
+    // the no-validity keys kernel for full rationale.
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     // tid = ctaid.x * ntid.x + tid.x; bail if tid >= n_rows.
@@ -877,6 +927,14 @@ pub fn compile_keys_valid_kernel_with_validity() -> BoltResult<String> {
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u32 %r10, [%rd8];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r10, 2;").map_err(write_err)?;
+    // Occupancy-friendly back-off — see no-validity keys kernel.
+    writeln!(
+        ptx,
+        "\t@%p2 mov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 nanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p3, %rl5, %rl0;").map_err(write_err)?;
@@ -982,6 +1040,9 @@ pub fn compile_agg_valid_kernel_with_validity(
     writeln!(ptx, "\t.reg .b32   %r<48>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    // Operand register for the per-SPIN `nanosleep.u32` back-off — see
+    // the no-validity keys kernel for full rationale.
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(
         ptx,
         "\t.reg .{ty}   %{rc}<4>;",
@@ -1080,6 +1141,14 @@ pub fn compile_agg_valid_kernel_with_validity(
     writeln!(ptx, "\tsetp.eq.s32 %p1, %r9, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra ADVANCE;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r9, 2;").map_err(write_err)?;
+    // Occupancy-friendly back-off — see no-validity keys kernel.
+    writeln!(
+        ptx,
+        "\t@%p2 mov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 nanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p3, %rl5, %rl0;").map_err(write_err)?;

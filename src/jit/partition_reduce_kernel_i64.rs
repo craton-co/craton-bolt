@@ -83,6 +83,11 @@ pub const KERNEL_ENTRY: &str = "bolt_partition_reduce_i64";
 /// Probe bound. Same as i32 sibling.
 const MAX_PROBES: u32 = BLOCK_GROUPS;
 
+/// Per-iteration `nanosleep.u32` operand for the collision-advance path.
+/// See `partition_reduce_kernel::SPIN_BACKOFF_NS` for full rationale.
+/// TODO(perf): exponential back-off.
+const SPIN_BACKOFF_NS: u32 = 32;
+
 /// Generate PTX for the i64-key per-partition reduce kernel.
 ///
 /// Kernel signature (PTX-level):
@@ -152,6 +157,9 @@ pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
     writeln!(ptx, "\t.reg .b32   %r<64>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<64>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .f64   %fd<8>;").map_err(write_err)?;
+    // Operand register for the per-collision `nanosleep.u32` back-off
+    // (sm_70+). See partition_reduce_kernel.rs for rationale.
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     // %r0 = blockIdx.x = partition id
@@ -291,6 +299,15 @@ pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
         mask = mask
     )
     .map_err(write_err)?;
+    // Occupancy-friendly back-off on the collision-advance path
+    // (sm_70+). See partition_reduce_kernel.rs for full rationale.
+    writeln!(
+        ptx,
+        "\tmov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
