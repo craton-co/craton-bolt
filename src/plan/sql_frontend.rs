@@ -1297,6 +1297,18 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     // WHERE
     if let Some(filter_sql) = &select.selection {
         let predicate = lower_expr(filter_sql, &resolver, 0)?;
+        // Trigger type-checking on the predicate. `Expr::dtype` recurses
+        // through the operand tree, so per-arm rules like the Utf8 check on
+        // `Expr::Like` fire here. Without this call the lower-level type
+        // rules are dormant during pure SQL parsing because nothing else
+        // walks the predicate's dtype tree before execution.
+        let input_schema = plan.schema()?;
+        let predicate_dtype = predicate.dtype(&input_schema)?;
+        if predicate_dtype != DataType::Bool {
+            return Err(BoltError::Type(format!(
+                "WHERE predicate must be Bool, got {predicate_dtype:?}"
+            )));
+        }
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate,
