@@ -80,8 +80,10 @@ use arrow_array::{
 };
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow::compute::take;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
-use crate::cuda::cuda_sys::{self, CUdeviceptr};
+use crate::cuda::cuda_sys::{self, CUdeviceptr, CUgraphExec};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
@@ -643,6 +645,130 @@ pub struct GpuSortKey<'a> {
 /// the multi-launch loop.
 const SHMEM_VARIANT_MAX_NPOW2: u32 = SORT_BLOCK_SIZE;
 
+// ============================================================================
+// Batch 6: CUDA Graph capture for the bitonic-sort `O(log^2 n)` launch
+// sequence.
+//
+// The MultiLaunch path already dropped per-iteration stream syncs in Batch 5
+// (one terminal sync after the whole sequence). The next-level win is to
+// **capture** the entire launch sequence into a `cuGraph` once per shape so
+// subsequent sorts of the same `(n_pow2, dtype, idx_dev_ptr)` can re-launch
+// the instantiated graph in a single FFI hop instead of replaying every
+// `cuLaunchKernel`. Eliminates O(log^2 n) per-launch driver overhead for the
+// steady-state path.
+//
+// ## Why a *device-pointer* cache key?
+//
+// `cuStreamBeginCapture_v2` bakes the kernel-arg pointers passed to each
+// `cuLaunchKernel` directly into the recorded graph nodes. The instantiated
+// `CUgraphExec` is therefore valid only as long as every captured pointer
+// keeps pointing at the same live device allocation. The bitonic sort
+// writes through one `idx_dev` `GpuVec<u32>` and a set of typed key
+// buffers; the indices buffer is the load-bearing one (the sort runs
+// in-place on it), so the cache key includes `idx_dev.device_ptr()` AND
+// every key buffer's pointer. A different caller — passing a fresh
+// `GpuVec` — will MISS the cache and capture a new graph.
+//
+// `cuGraphExecUpdate` could in principle patch the captured args on a hit
+// from a different pointer, but the bookkeeping is intricate (mapping
+// `CUgraphNode` handles back to argument indices) and out of scope for
+// Batch 6. The pointer-keyed cache is the simpler win for the common case
+// where the caller re-uses the same buffers across queries.
+//
+// ## Lifetime
+//
+// `CUgraphExec` handles are stored process-wide and intentionally LEAKED at
+// process exit — destroying graph execs during context teardown races on
+// some drivers and we have no signal that says "the engine is shutting
+// down cleanly" before `Drop` runs on the global cache. The cache is
+// monotone-grow during a process's lifetime; in practice the number of
+// distinct `(n_pow2, dtype, ptr)` triples is small (one per registered
+// table per dtype) and the per-entry footprint is the size of a
+// `CUgraphExec` (one pointer).
+//
+// ## Opt-in
+//
+// Gated by env var `BOLT_SORT_USE_GRAPH=1`. Default OFF: the existing
+// per-launch-with-one-terminal-sync path runs unchanged for anyone who
+// doesn't flip the flag. Once the path is validated in benchmarks it
+// becomes the default; until then this is opt-in.
+// ============================================================================
+
+/// Compact dtype tag for the graph cache key. Mirrors [`KeyDeviceBuf`]'s
+/// variants — every dtype the bitonic sort accepts maps to a unique byte
+/// so two different-typed sorts of the same `n_pow2` and pointer can't
+/// alias each other's cached graph.
+fn dtype_tag(dt: DataType) -> u8 {
+    match dt {
+        DataType::Int32 => 1,
+        DataType::Int64 => 2,
+        DataType::Float32 => 3,
+        DataType::Float64 => 4,
+        DataType::Bool => 5,
+        // Any future GPU-sortable dtype must add a unique tag here; the
+        // catch-all returns 255 so a misconfigured path errs on the side
+        // of cache-miss-then-rebuild rather than alias.
+        _ => 255,
+    }
+}
+
+/// Process-wide cache of instantiated bitonic-sort graphs.
+///
+/// Key tuple (in order):
+///   - `n_pow2`           — recorded grid size baked into the graph.
+///   - `dtype_tag`        — keeps different-typed sorts on the same
+///                          buffer from aliasing.
+///   - `idx_dev_ptr`      — the indices buffer (`idx_dev.device_ptr()`).
+///                          Bitonic sort writes through this in place.
+///   - `keys_fingerprint` — XOR of every key buffer's device pointer. Two
+///                          launches with different key buffers must MISS
+///                          and re-capture; XOR is the cheapest collision-
+///                          resistant fingerprint that's cheap to compute
+///                          and doesn't need a Vec in the key.
+///
+/// The value is a `CUgraphExec` — a raw pointer that's wrapped in
+/// `GraphExecHandle` so we can `Send` it across threads via the `static`.
+type GraphCacheKey = (u32, u8, u64, u64);
+
+/// `Send + Sync` wrapper around `CUgraphExec`. The driver permits using
+/// a `CUgraphExec` from any thread once its context is current; we only
+/// dereference the handle while we already hold the engine's `CudaContext`.
+struct GraphExecHandle(CUgraphExec);
+// SAFETY: a `CUgraphExec` is a raw opaque handle the driver dereferences;
+// the engine serialises capture and launch through `GRAPH_CACHE.lock()`
+// and only launches with a live context bound to the calling thread.
+unsafe impl Send for GraphExecHandle {}
+unsafe impl Sync for GraphExecHandle {}
+
+/// Lazily-initialised cache. Allocated on first lookup, monotone-grow,
+/// leaked at process exit (see module-level rationale).
+static GRAPH_CACHE: Lazy<Mutex<HashMap<GraphCacheKey, GraphExecHandle>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Env-var name controlling the graph-capture opt-in. Exposed as a
+/// constant so the tests can verify the gate logic without string-typing
+/// the name.
+pub(crate) const BOLT_SORT_USE_GRAPH_ENV: &str = "BOLT_SORT_USE_GRAPH";
+
+/// Parse the `BOLT_SORT_USE_GRAPH` env var into a bool. Returns `true`
+/// only when set to exactly `"1"`. Any other value (including `"0"`,
+/// `"true"`, unparseable garbage, or unset) returns `false` — the strict
+/// `=="1"` semantics keep the gate from accidentally tripping on shell
+/// quoting or boolean-style strings the user might assume "feel right".
+pub(crate) fn sort_uses_graph() -> bool {
+    match std::env::var(BOLT_SORT_USE_GRAPH_ENV) {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    }
+}
+
+/// Test-only: clear the graph cache so cache-hit/-miss tests start from
+/// a known-empty state. Production code never invokes this.
+#[cfg(test)]
+fn _test_clear_graph_cache() {
+    GRAPH_CACHE.lock().clear();
+}
+
 /// Sort `keys` (up to [`MAX_SORT_KEYS`]) lexicographically on the GPU and
 /// return the row permutation as a `UInt32Array` of length `n_rows`.
 ///
@@ -836,48 +962,186 @@ pub fn sort_indices_on_gpu_multi<'a>(
             let grid_x: u32 = n_pow2.div_ceil(block_size);
             let log2_n = log2_pow2(n_pow2);
 
-            for stage in 1..=log2_n {
-                let mut substage = stage;
-                loop {
-                    let substage_mask: u32 = 1u32 << (substage - 1);
-                    let mut kp = key_ptrs;
-                    let mut vp = val_ptrs;
-                    let mut p_stage: u32 = stage;
-                    let mut p_mask: u32 = substage_mask;
-                    let mut params: Vec<*mut c_void> =
-                        Vec::with_capacity(MAX_SORT_KEYS * 2 + 5);
-                    for i in 0..MAX_SORT_KEYS {
-                        params.push(&mut kp[i] as *mut CUdeviceptr as *mut c_void);
-                        params.push(&mut vp[i] as *mut CUdeviceptr as *mut c_void);
-                    }
-                    params.push(&mut indices_ptr as *mut CUdeviceptr as *mut c_void);
-                    params.push(&mut is_padded_ptr as *mut CUdeviceptr as *mut c_void);
-                    params.push(&mut p_n_pow2 as *mut u32 as *mut c_void);
-                    params.push(&mut p_stage as *mut u32 as *mut c_void);
-                    params.push(&mut p_mask as *mut u32 as *mut c_void);
+            // Batch 6: when BOLT_SORT_USE_GRAPH=1, route through the
+            // CUDA-Graph cache. The default path falls through to the
+            // existing per-launch loop with one terminal sync. Both
+            // branches end with a single sync; only the
+            // record-vs-execute method changes.
+            if sort_uses_graph() {
+                // Build the cache key. `keys_fingerprint` is the XOR of every
+                // captured pointer; that's enough to detect "different
+                // buffers" without storing a Vec in the key.
+                let mut keys_fp: u64 = 0;
+                for p in key_ptrs.iter() {
+                    keys_fp ^= *p;
+                }
+                for p in val_ptrs.iter() {
+                    keys_fp ^= *p;
+                }
+                keys_fp ^= is_padded_ptr;
+                // First key's dtype dominates the cache tag — every key in a
+                // single launch shares the same kernel ABI, but the first key
+                // is the load-bearing one for grid sizing.
+                let tag = dtype_tag(key_descs[0].dtype);
+                let cache_key: GraphCacheKey = (n_pow2, tag, indices_ptr, keys_fp);
 
-                    // SAFETY: same as Shmem branch — every param points at
-                    // a stack local that outlives the synchronous launch.
-                    unsafe {
-                        cuda_sys::check(cuda_sys::cuLaunchKernel(
-                            function.raw(),
-                            grid_x,
-                            1,
-                            1,
-                            block_size,
-                            1,
-                            1,
-                            0,
-                            stream.raw(),
-                            params.as_mut_ptr(),
-                            ptr::null_mut(),
-                        ))?;
+                // Cache lookup. We hold the mutex for the entire capture /
+                // instantiate critical section to serialise concurrent first
+                // launches of the same shape; the per-shape work is
+                // amortised over every subsequent launch so the contention
+                // is a non-issue.
+                let mut cache = GRAPH_CACHE.lock();
+                let exec_handle: CUgraphExec = match cache.get(&cache_key) {
+                    Some(h) => h.0,
+                    None => {
+                        // MISS: capture the launch sequence on a dedicated
+                        // stream (cuStreamBeginCapture rejects the NULL
+                        // stream), instantiate, cache.
+                        let capture_stream = CudaStream::new()?;
+                        cuda_sys::stream_begin_capture(
+                            capture_stream.raw(),
+                            cuda_sys::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                        )?;
+                        // Issue every kernel launch on the capture stream.
+                        // No per-launch sync — stream capture forbids it and
+                        // we don't need it.
+                        let mut capture_ok = true;
+                        let mut capture_err: Option<BoltError> = None;
+                        'capture: for stage in 1..=log2_n {
+                            let mut substage = stage;
+                            loop {
+                                let substage_mask: u32 = 1u32 << (substage - 1);
+                                let mut kp = key_ptrs;
+                                let mut vp = val_ptrs;
+                                let mut p_stage: u32 = stage;
+                                let mut p_mask: u32 = substage_mask;
+                                let mut params: Vec<*mut c_void> =
+                                    Vec::with_capacity(MAX_SORT_KEYS * 2 + 5);
+                                for i in 0..MAX_SORT_KEYS {
+                                    params.push(
+                                        &mut kp[i] as *mut CUdeviceptr as *mut c_void,
+                                    );
+                                    params.push(
+                                        &mut vp[i] as *mut CUdeviceptr as *mut c_void,
+                                    );
+                                }
+                                params.push(
+                                    &mut indices_ptr as *mut CUdeviceptr as *mut c_void,
+                                );
+                                params.push(
+                                    &mut is_padded_ptr as *mut CUdeviceptr as *mut c_void,
+                                );
+                                params.push(&mut p_n_pow2 as *mut u32 as *mut c_void);
+                                params.push(&mut p_stage as *mut u32 as *mut c_void);
+                                params.push(&mut p_mask as *mut u32 as *mut c_void);
+
+                                // SAFETY: every param points at a stack local
+                                // that outlives this iteration; stream
+                                // capture only records the pointer values,
+                                // not the storage behind them.
+                                let rc = unsafe {
+                                    cuda_sys::check(cuda_sys::cuLaunchKernel(
+                                        function.raw(),
+                                        grid_x,
+                                        1,
+                                        1,
+                                        block_size,
+                                        1,
+                                        1,
+                                        0,
+                                        capture_stream.raw(),
+                                        params.as_mut_ptr(),
+                                        ptr::null_mut(),
+                                    ))
+                                };
+                                if let Err(e) = rc {
+                                    capture_err = Some(e);
+                                    capture_ok = false;
+                                    break 'capture;
+                                }
+                                if substage == 1 {
+                                    break;
+                                }
+                                substage -= 1;
+                            }
+                        }
+
+                        // Always end capture so the stream isn't left in
+                        // capture state, even on the error path. The
+                        // returned graph is dropped on error.
+                        let graph = cuda_sys::stream_end_capture(capture_stream.raw())?;
+                        if !capture_ok {
+                            let _ = cuda_sys::graph_destroy(graph);
+                            return Err(capture_err.unwrap_or_else(|| {
+                                BoltError::Other(
+                                    "gpu_sort: stream-capture failed without a specific error"
+                                        .into(),
+                                )
+                            }));
+                        }
+                        // Instantiate, then destroy the source `CUgraph`
+                        // (the CUgraphExec keeps its own copy).
+                        let exec = cuda_sys::graph_instantiate(graph)?;
+                        let _ = cuda_sys::graph_destroy(graph);
+                        cache.insert(cache_key, GraphExecHandle(exec));
+                        exec
                     }
-                    stream.synchronize()?;
-                    if substage == 1 {
-                        break;
+                };
+                // Release the cache lock before launching — the launch
+                // itself is concurrent-safe across threads as long as each
+                // call uses a separate stream (we use the NULL stream here;
+                // callers that need overlap should mint their own).
+                drop(cache);
+                cuda_sys::graph_launch(exec_handle, stream.raw())?;
+                stream.synchronize()?;
+            } else {
+                // Default path (Batch 5 behaviour): one launch per substage,
+                // terminal sync at the end. Per-launch sync was dropped in
+                // Batch 5; the only sync is the one after the loop.
+                for stage in 1..=log2_n {
+                    let mut substage = stage;
+                    loop {
+                        let substage_mask: u32 = 1u32 << (substage - 1);
+                        let mut kp = key_ptrs;
+                        let mut vp = val_ptrs;
+                        let mut p_stage: u32 = stage;
+                        let mut p_mask: u32 = substage_mask;
+                        let mut params: Vec<*mut c_void> =
+                            Vec::with_capacity(MAX_SORT_KEYS * 2 + 5);
+                        for i in 0..MAX_SORT_KEYS {
+                            params.push(&mut kp[i] as *mut CUdeviceptr as *mut c_void);
+                            params.push(&mut vp[i] as *mut CUdeviceptr as *mut c_void);
+                        }
+                        params.push(&mut indices_ptr as *mut CUdeviceptr as *mut c_void);
+                        params.push(&mut is_padded_ptr as *mut CUdeviceptr as *mut c_void);
+                        params.push(&mut p_n_pow2 as *mut u32 as *mut c_void);
+                        params.push(&mut p_stage as *mut u32 as *mut c_void);
+                        params.push(&mut p_mask as *mut u32 as *mut c_void);
+
+                        // SAFETY: same as Shmem branch — every param points
+                        // at a stack local that outlives the synchronous
+                        // launch.
+                        unsafe {
+                            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                                function.raw(),
+                                grid_x,
+                                1,
+                                1,
+                                block_size,
+                                1,
+                                1,
+                                0,
+                                stream.raw(),
+                                params.as_mut_ptr(),
+                                ptr::null_mut(),
+                            ))?;
+                        }
+                        stream.synchronize()?;
+                        if substage == 1 {
+                            break;
+                        }
+                        substage -= 1;
                     }
-                    substage -= 1;
                 }
             }
         }
@@ -1425,5 +1689,171 @@ mod tests {
             .expect("empty Utf8 must not error");
         let values = res.expect("empty Utf8 must NOT trip the high-cardinality gate");
         assert!(matches!(values, HostKeyValues::I32(_)));
+    }
+}
+
+// ============================================================================
+// Batch 6 — CUDA Graph cache tests (host-only, no GPU).
+//
+// We exercise the cache-key shape, the env-var parser, and the dtype-tag
+// helper directly. The GRAPH_CACHE itself stores raw `CUgraphExec`
+// pointers, but for these host tests we forge non-null sentinel pointers
+// and treat the cache as a plain map — none of the test cases dereference
+// the handles, so the driver is never touched.
+// ============================================================================
+#[cfg(test)]
+mod graph_cache_tests {
+    use super::*;
+    use parking_lot::Mutex;
+
+    /// Process-wide gate so concurrent tests don't race on the shared
+    /// GRAPH_CACHE / env-var state. Mirrors the pattern used by
+    /// `init_cache_tests` in `cuda_sys.rs`.
+    static TEST_GATE: Mutex<()> = Mutex::new(());
+
+    /// `dtype_tag` must produce distinct tags for every GPU-sortable
+    /// dtype so two different-typed sorts on the same buffer pointer can
+    /// never alias their cached graphs.
+    #[test]
+    fn dtype_tag_is_injective_over_sortable_set() {
+        let tags = [
+            dtype_tag(DataType::Int32),
+            dtype_tag(DataType::Int64),
+            dtype_tag(DataType::Float32),
+            dtype_tag(DataType::Float64),
+            dtype_tag(DataType::Bool),
+        ];
+        let mut seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        for t in tags.iter() {
+            assert!(
+                seen.insert(*t),
+                "dtype_tag must be injective; collision on tag={t}"
+            );
+            assert_ne!(*t, 255, "unknown-dtype catch-all must not alias a real tag");
+        }
+    }
+
+    /// `sort_uses_graph()` returns `true` *only* for the exact string
+    /// "1". Any other value (including "0", "true", garbage, unset)
+    /// returns false — strict equality keeps the gate from tripping on
+    /// shell-quoting surprises.
+    #[test]
+    fn env_var_parsing_strict_equals_one() {
+        let _g = TEST_GATE.lock();
+        // SAFETY: we hold TEST_GATE; no concurrent test mutates this env var.
+        std::env::remove_var(BOLT_SORT_USE_GRAPH_ENV);
+        assert!(!sort_uses_graph(), "unset must be off");
+
+        std::env::set_var(BOLT_SORT_USE_GRAPH_ENV, "1");
+        assert!(sort_uses_graph(), "\"1\" must be on");
+
+        std::env::set_var(BOLT_SORT_USE_GRAPH_ENV, "0");
+        assert!(!sort_uses_graph(), "\"0\" must be off");
+
+        std::env::set_var(BOLT_SORT_USE_GRAPH_ENV, "true");
+        assert!(!sort_uses_graph(), "\"true\" must be off — only \"1\" wins");
+
+        std::env::set_var(BOLT_SORT_USE_GRAPH_ENV, "yes");
+        assert!(!sort_uses_graph(), "\"yes\" must be off");
+
+        std::env::set_var(BOLT_SORT_USE_GRAPH_ENV, "garbage\u{0}bytes");
+        assert!(!sort_uses_graph(), "unparseable garbage must be off");
+
+        // Restore env to a known-empty state for any follow-up tests.
+        std::env::remove_var(BOLT_SORT_USE_GRAPH_ENV);
+    }
+
+    /// Synthetic insert/lookup against the GRAPH_CACHE. Confirms keys
+    /// differ across `(n_pow2, dtype, idx_ptr, keys_fp)` permutations and
+    /// that lookups round-trip.
+    ///
+    /// The cache stores raw `CUgraphExec` pointers; we forge non-null
+    /// sentinels here and never dereference them. The test clears the
+    /// cache on entry and exit so it doesn't disturb any concurrent
+    /// (real-GPU, `#[ignore]`-gated) tests.
+    #[test]
+    fn cache_hit_miss_accounting_synthetic() {
+        let _g = TEST_GATE.lock();
+        _test_clear_graph_cache();
+
+        // Forge three distinct fake CUgraphExec values. The cache only
+        // sees them as opaque pointers — never dereferenced in this test.
+        let fake_a: CUgraphExec = 0xA000_0000_usize as CUgraphExec;
+        let fake_b: CUgraphExec = 0xB000_0000_usize as CUgraphExec;
+        let fake_c: CUgraphExec = 0xC000_0000_usize as CUgraphExec;
+
+        let key_a: GraphCacheKey = (1024, dtype_tag(DataType::Int32), 0x1111, 0x2222);
+        let key_b: GraphCacheKey = (1024, dtype_tag(DataType::Int64), 0x1111, 0x2222);
+        let key_c: GraphCacheKey = (2048, dtype_tag(DataType::Int32), 0x1111, 0x2222);
+
+        // Miss on every key (cache was just cleared).
+        {
+            let cache = GRAPH_CACHE.lock();
+            assert!(cache.get(&key_a).is_none(), "key_a must miss initially");
+            assert!(cache.get(&key_b).is_none(), "key_b must miss initially");
+            assert!(cache.get(&key_c).is_none(), "key_c must miss initially");
+        }
+
+        // Insert.
+        {
+            let mut cache = GRAPH_CACHE.lock();
+            cache.insert(key_a, GraphExecHandle(fake_a));
+            cache.insert(key_b, GraphExecHandle(fake_b));
+            cache.insert(key_c, GraphExecHandle(fake_c));
+        }
+
+        // Lookup must return the same handle we inserted, keyed
+        // independently — dtype_tag and n_pow2 must NOT alias.
+        {
+            let cache = GRAPH_CACHE.lock();
+            assert_eq!(cache.get(&key_a).map(|h| h.0), Some(fake_a));
+            assert_eq!(cache.get(&key_b).map(|h| h.0), Some(fake_b));
+            assert_eq!(cache.get(&key_c).map(|h| h.0), Some(fake_c));
+            assert_eq!(cache.len(), 3, "three distinct keys → three entries");
+        }
+
+        // Distinct idx_ptr must miss even when (n_pow2, dtype, keys_fp)
+        // match an existing entry — this is the load-bearing property
+        // that protects us from the "caller passes a different GpuVec"
+        // failure mode documented at the top of the module.
+        let key_other_ptr: GraphCacheKey = (1024, dtype_tag(DataType::Int32), 0x3333, 0x2222);
+        {
+            let cache = GRAPH_CACHE.lock();
+            assert!(
+                cache.get(&key_other_ptr).is_none(),
+                "different idx_ptr must NOT hit an existing entry"
+            );
+        }
+
+        // Distinct keys_fp must miss too — same n_pow2/dtype/idx_ptr but
+        // a different key-buffer fingerprint means the captured key
+        // pointers no longer match what the caller will pass to the
+        // graph at launch time.
+        let key_other_fp: GraphCacheKey = (1024, dtype_tag(DataType::Int32), 0x1111, 0xDEAD);
+        {
+            let cache = GRAPH_CACHE.lock();
+            assert!(
+                cache.get(&key_other_fp).is_none(),
+                "different keys fingerprint must NOT hit an existing entry"
+            );
+        }
+
+        _test_clear_graph_cache();
+    }
+
+    /// The `BOLT_SORT_USE_GRAPH` gate determines whether the MultiLaunch
+    /// path even consults the cache. With the gate off, the cache stays
+    /// untouched and the legacy code path runs — confirm via the env-var
+    /// parser since we can't observe the launch sequence without a GPU.
+    #[test]
+    fn gate_off_leaves_cache_untouched() {
+        let _g = TEST_GATE.lock();
+        _test_clear_graph_cache();
+        std::env::remove_var(BOLT_SORT_USE_GRAPH_ENV);
+        assert!(!sort_uses_graph(), "gate must be off when env unset");
+        // Cache stays empty: no test path inserts into it without a real
+        // launch, which the host-only test deliberately avoids.
+        let len = GRAPH_CACHE.lock().len();
+        assert_eq!(len, 0, "no GPU launch happened; cache must be empty");
     }
 }

@@ -34,6 +34,22 @@ pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 /// Opaque stream handle (NULL == default/legacy stream).
 pub type CUstream = *mut c_void;
+/// Batch 6: opaque CUDA graph handle (a recorded sequence of operations,
+/// before instantiation).
+pub type CUgraph = *mut c_void;
+/// Batch 6: opaque executable graph handle (instantiated form of a `CUgraph`,
+/// the thing actually launched on a stream).
+pub type CUgraphExec = *mut c_void;
+
+/// `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`: capture mode that scopes its
+/// "did anything race?" detection to operations issued from the calling
+/// thread. The other two valid modes are `_GLOBAL` (0) and `_RELAXED` (1);
+/// thread-local is the right default for the bitonic-sort capture because
+/// every kernel launch in the capture sequence happens on the same thread
+/// (the executor that called `sort_indices_on_gpu_multi`). `GLOBAL` would
+/// erroneously flag concurrent unrelated CUDA work from other engine
+/// threads as a capture violation.
+pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: u32 = 2;
 
 /// Driver "no error" sentinel.
 pub const CUDA_SUCCESS: CUresult = 0;
@@ -134,6 +150,31 @@ extern "C" {
     /// driver exposes both `cuMemGetInfo` and `cuMemGetInfo_v2`;
     /// the v2 form is the documented one on CUDA 12.x.
     pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
+
+    // ---------------------------------------------------------------------
+    // Batch 6: CUDA Graph stream-capture API.
+    //
+    // Used by `crate::exec::gpu_sort` to capture the bitonic-sort
+    // `O(log^2 n)` launch sequence into a `CUgraph` once per shape, then
+    // re-launch the instantiated `CUgraphExec` on every subsequent sort
+    // of the same `(n_pow2, dtype)` — eliminates per-launch driver
+    // overhead for the steady-state path.
+    //
+    // All entries are gated behind the `BOLT_SORT_USE_GRAPH=1` env var
+    // in `gpu_sort.rs`; the default code path is unchanged.
+    // ---------------------------------------------------------------------
+    pub fn cuStreamBeginCapture_v2(stream: CUstream, mode: c_uint) -> CUresult;
+    pub fn cuStreamEndCapture(stream: CUstream, graph_out: *mut CUgraph) -> CUresult;
+    pub fn cuGraphInstantiate_v2(
+        graph_exec_out: *mut CUgraphExec,
+        graph: CUgraph,
+        error_node: *mut c_void,
+        log_buffer: *mut c_char,
+        buffer_size: usize,
+    ) -> CUresult;
+    pub fn cuGraphLaunch(graph_exec: CUgraphExec, stream: CUstream) -> CUresult;
+    pub fn cuGraphExecDestroy(graph_exec: CUgraphExec) -> CUresult;
+    pub fn cuGraphDestroy(graph: CUgraph) -> CUresult;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +262,21 @@ mod stubs {
         _extra: *mut *mut c_void,
     ) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemGetInfo_v2(_free: *mut usize, _total: *mut usize) -> CUresult { CUDA_ERROR_STUB }
+
+    // Batch 6: cuGraph stub mirrors. Returning the stub sentinel so
+    // `check()` maps every call to `BoltError::Other("cuda-stub mode")`.
+    pub unsafe fn cuStreamBeginCapture_v2(_stream: CUstream, _mode: c_uint) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuStreamEndCapture(_stream: CUstream, _graph_out: *mut CUgraph) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuGraphInstantiate_v2(
+        _graph_exec_out: *mut CUgraphExec,
+        _graph: CUgraph,
+        _error_node: *mut c_void,
+        _log_buffer: *mut c_char,
+        _buffer_size: usize,
+    ) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuGraphLaunch(_graph_exec: CUgraphExec, _stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuGraphExecDestroy(_graph_exec: CUgraphExec) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuGraphDestroy(_graph: CUgraph) -> CUresult { CUDA_ERROR_STUB }
 }
 
 #[cfg(feature = "cuda-stub")]
@@ -972,6 +1028,117 @@ pub(crate) fn memset_d8_async(
         // SAFETY: precondition documented on the function.
         unsafe { check(cuMemsetD8Async(ptr, value, n_bytes, stream)) }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: CUDA Graph wrappers.
+//
+// Safe-ish parents of the `cuStreamBeginCapture_v2` / `cuStreamEndCapture` /
+// `cuGraphInstantiate_v2` / `cuGraphLaunch` / `cuGraph*Destroy` FFI calls.
+//
+// The bitonic-sort capture in `crate::exec::gpu_sort` is the only consumer
+// today; these wrappers stay `pub(crate)` because the lifetimes / ownership
+// of the returned handles are subtle (a `CUgraphExec` bakes in every
+// kernel-arg pointer at instantiation time — see `gpu_sort.rs` for the
+// cache-key discussion).
+//
+// Every wrapper short-circuits to `BoltError::Other("cuda-stub …")` under
+// `--features cuda-stub` because the underlying FFI shim returns
+// `CUDA_ERROR_STUB`. Callers that want to opt out of the graph path on
+// stub builds should check the env var BEFORE calling these wrappers
+// (see `gpu_sort::sort_uses_graph()` for the gate).
+// ---------------------------------------------------------------------------
+
+/// Start stream-capture on `stream`. Every subsequent kernel launch /
+/// async memcpy on this stream is *recorded* into a graph instead of
+/// executed; capture stops with [`stream_end_capture`].
+///
+/// `mode` should be [`CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`] (=2) unless the
+/// caller knows it wants the laxer GLOBAL/RELAXED semantics; thread-local
+/// is the safer default because it scopes the driver's "did anything race
+/// with capture?" detection to the calling thread (other engine threads
+/// can keep issuing CUDA work without tripping the capture).
+///
+/// # Safety contract (callers)
+/// - `stream` must NOT be the NULL stream — stream capture rejects it
+///   (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`). The caller must mint a
+///   real `CudaStream` first.
+/// - The caller must pair this with exactly one [`stream_end_capture`]
+///   call on the same stream. Leaving a stream in capture state leaks
+///   any operations submitted on it.
+pub(crate) fn stream_begin_capture(stream: CUstream, mode: u32) -> BoltResult<()> {
+    check(unsafe { cuStreamBeginCapture_v2(stream, mode as c_uint) })
+}
+
+/// End stream-capture and return the recorded `CUgraph`. Pairs with
+/// [`stream_begin_capture`].
+///
+/// The returned handle is owned by the caller; release it with
+/// [`graph_destroy`] when the graph is no longer needed. Typically the
+/// caller `cuGraphInstantiate`s it once, then destroys the `CUgraph`
+/// immediately (the instantiated `CUgraphExec` holds its own copy).
+pub(crate) fn stream_end_capture(stream: CUstream) -> BoltResult<CUgraph> {
+    let mut g: CUgraph = std::ptr::null_mut();
+    check(unsafe { cuStreamEndCapture(stream, &mut g) })?;
+    Ok(g)
+}
+
+/// Instantiate `graph` into an executable form. The returned
+/// `CUgraphExec` is what gets re-launched on every subsequent sort of
+/// matching shape.
+///
+/// The `error_node` and log-buffer outputs are not surfaced — passing
+/// nulls / zeros is fine for the bitonic-sort use case because we know
+/// the captured graph has no host-side data dependencies and every node
+/// is a pure kernel launch. If a future caller needs the diagnostic
+/// info, this signature can grow accessors without breaking
+/// `gpu_sort.rs`.
+pub(crate) fn graph_instantiate(graph: CUgraph) -> BoltResult<CUgraphExec> {
+    let mut exec: CUgraphExec = std::ptr::null_mut();
+    check(unsafe {
+        cuGraphInstantiate_v2(
+            &mut exec,
+            graph,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    })?;
+    Ok(exec)
+}
+
+/// Launch a previously-instantiated `CUgraphExec` on `stream`. Returns
+/// immediately; the caller is responsible for the `cuStreamSynchronize`
+/// (or equivalent) before reading device outputs.
+///
+/// # Safety contract
+/// `graph_exec` must have been returned by [`graph_instantiate`] in the
+/// current process AND every kernel argument captured at instantiation
+/// time must still point at a live device allocation. The bitonic-sort
+/// path enforces this by keying its graph cache on the input device
+/// pointer — see `gpu_sort::GRAPH_CACHE`.
+pub(crate) fn graph_launch(graph_exec: CUgraphExec, stream: CUstream) -> BoltResult<()> {
+    check(unsafe { cuGraphLaunch(graph_exec, stream) })
+}
+
+/// Destroy a `CUgraphExec` returned by [`graph_instantiate`].
+///
+/// # Safety
+/// `graph_exec` must not be in flight on any stream. The bitonic-sort
+/// cache deliberately *leaks* its entries at process exit rather than
+/// running this in `Drop` — destroying graph execs during teardown
+/// races against the context-destroy path on some drivers.
+#[allow(dead_code)] // reason: kept for symmetry; the cache leaks intentionally
+pub(crate) unsafe fn graph_exec_destroy(graph_exec: CUgraphExec) -> BoltResult<()> {
+    check(cuGraphExecDestroy(graph_exec))
+}
+
+/// Destroy a `CUgraph` returned by [`stream_end_capture`]. Safe to call
+/// immediately after instantiation: the resulting `CUgraphExec` keeps its
+/// own copy of the recorded operations, so the source graph can be
+/// released right away.
+pub(crate) fn graph_destroy(graph: CUgraph) -> BoltResult<()> {
+    check(unsafe { cuGraphDestroy(graph) })
 }
 
 #[cfg(test)]
