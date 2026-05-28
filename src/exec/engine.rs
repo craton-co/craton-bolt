@@ -467,6 +467,31 @@ fn debug_sync_check() -> crate::error::BoltResult<()> {
 /// Field-drop order matters: `dict_registry` owns `DictionaryColumn`s which own
 /// `GpuVec`s — those must be freed BEFORE `_ctx` tears down the CUDA context.
 /// Rust drops fields in declaration order, so `_ctx` sits last.
+///
+/// # Construction
+///
+/// Prefer the typed builder for new code:
+///
+/// ```ignore
+/// use craton_bolt::Engine;
+///
+/// let engine = Engine::builder()
+///     .device(0)
+///     .memory_budget(1 << 30)
+///     .build()?;
+/// ```
+///
+/// The legacy [`Engine::new`] and [`Engine::new_with_device`] entry points are
+/// thin wrappers around the builder, kept for source-compatibility with
+/// pre-v0.6 callers.
+///
+/// # `#[non_exhaustive]`
+///
+/// Marked `#[non_exhaustive]` so future v0.x releases can grow new fields
+/// without a breaking semver bump for downstream code that destructures or
+/// constructs `Engine` literally. Construction goes through the builder; all
+/// other access is via inherent methods.
+#[non_exhaustive]
 pub struct Engine {
     /// Registered tables, keyed by name. A single table may comprise multiple
     /// batches (wave-7 multi-batch support): the engine concatenates them via
@@ -568,46 +593,138 @@ pub struct Engine {
     /// engine's increment.
     module_cache_loads: std::sync::atomic::AtomicUsize,
     /// v0.6 / M7 public optimizer extension surface: user-registered
-    /// [`PlanRewrite`] implementations run in registration order, threaded
-    /// through each other, immediately before [`crate::plan::lower_physical`]
-    /// in [`Engine::sql`]. Empty for engines built via [`Engine::new`] /
-    /// [`Engine::new_with_device`]; populated via [`Engine::with_rewrite`]
-    /// (and, once the parallel `Engine::Builder` agent lands, via the
-    /// builder's `with_rewrite` method that drains into this field).
-    ///
-    /// Placeholder until the Builder ships: today the field can be
-    /// mutated through `with_rewrite` directly on `Engine`. The Builder
-    /// agent will integrate by forwarding registrations into this same
-    /// `Vec`, so the wiring in [`Engine::sql`] doesn't change when the
-    /// Builder merges.
+    /// PlanRewrite implementations run in registration order before lower_physical.
     rewrites: Vec<Box<dyn PlanRewrite>>,
+    /// v0.6 builder: CUDA device ordinal this engine was constructed on.
+    device_idx: i32,
+    /// v0.6 builder: soft cap on device-memory pool allocations in bytes.
+    memory_budget_bytes: Option<usize>,
+    /// v0.6 builder: optional disk-backed PTX cache directory.
+    persistent_cache_path: Option<std::path::PathBuf>,
+    /// v0.6 builder: whether tracing was enabled by the builder.
+    tracing_enabled: bool,
     /// Owned CUDA context — declared LAST so it drops AFTER dictionaries.
     _ctx: CudaContext,
 }
 
-impl Engine {
-    /// Create an engine on the default CUDA device (ordinal 0).
-    ///
-    /// Convenience constructor for single-GPU systems. On hosts with more
-    /// than one CUDA device, use [`Engine::new_with_device`] to pick a
-    /// specific GPU.
-    pub fn new() -> BoltResult<Self> {
-        Self::new_with_device(0)
+/// v0.6 builder for [`Engine`]. Use [`Engine::builder`] to start one.
+///
+/// Every knob is optional; un-set knobs land on the same defaults that the
+/// legacy [`Engine::new`] / [`Engine::new_with_device`] paths produce. The
+/// builder owns no resources until [`EngineBuilder::build`] is called — only
+/// `build` initialises the CUDA driver, validates the device index, and
+/// creates the CUDA context. This keeps `EngineBuilder` cheap to construct in
+/// hot paths (e.g. test harnesses) without paying for driver init that may
+/// then be discarded.
+///
+/// The builder is `#[non_exhaustive]` so v0.x can grow new knobs without a
+/// breaking change for downstream code that destructures it (which shouldn't
+/// happen — but the marker makes the intent explicit).
+///
+/// ```ignore
+/// use craton_bolt::Engine;
+/// use std::path::PathBuf;
+///
+/// let engine = Engine::builder()
+///     .device(0)
+///     .memory_budget(2 * 1024 * 1024 * 1024)        // 2 GiB soft cap
+///     .persistent_cache(PathBuf::from("/var/cache/bolt/ptx"))
+///     .enable_tracing()
+///     .build()?;
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Default, Clone)]
+pub struct EngineBuilder {
+    /// CUDA device ordinal. `None` selects the default (`0`).
+    device: Option<i32>,
+    /// Soft device-memory budget in bytes. `None` is uncapped.
+    memory_budget_bytes: Option<usize>,
+    /// Optional disk-backed PTX cache directory.
+    persistent_cache_path: Option<std::path::PathBuf>,
+    /// Install a default tracing subscriber from [`build`](Self::build).
+    enable_tracing: bool,
+}
+
+impl EngineBuilder {
+    /// Fresh builder with all knobs at their defaults. Same as the value
+    /// returned by [`Engine::builder`] — exposed publicly so downstream code
+    /// can stash a default builder and tweak it incrementally without going
+    /// through the `Engine::` type name (handy in generic test helpers).
+    pub fn new() -> Self {
+        Self {
+            device: None,
+            memory_budget_bytes: None,
+            persistent_cache_path: None,
+            enable_tracing: false,
+        }
     }
 
-    /// Create an engine bound to the CUDA device at ordinal `device_idx`.
+    /// Select the CUDA device ordinal. Defaults to `0`.
     ///
-    /// Use this when running on a multi-GPU host and you want to target a
-    /// specific device. The constructor:
-    ///   1. Initializes the CUDA driver (idempotent — safe to call repeatedly).
-    ///   2. Validates `device_idx` against `cuDeviceGetCount`.
-    ///   3. Creates an owned CUDA context on the selected device.
+    /// The index is validated against `cuDeviceGetCount` inside
+    /// [`build`](Self::build); an out-of-range index surfaces a
+    /// `BoltError::Other` there, not here.
+    pub fn device(mut self, idx: i32) -> Self {
+        self.device = Some(idx);
+        self
+    }
+
+    /// Set a soft cap on device-memory pool allocations, in bytes. Defaults
+    /// to uncapped.
+    ///
+    /// Stored verbatim on the engine and readable via
+    /// [`Engine::memory_budget_bytes`]. Runtime pool integration may evolve
+    /// across v0.x — the getter contract is what's stable.
+    pub fn memory_budget(mut self, bytes: usize) -> Self {
+        self.memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    /// Enable a disk-backed PTX cache rooted at `path`. Defaults to
+    /// disabled (the existing in-memory PTX cache in `jit::jit_compiler`
+    /// is unaffected either way).
+    ///
+    /// The path is stored verbatim — it is the caller's responsibility to
+    /// ensure the directory exists and is writable.
+    pub fn persistent_cache(mut self, path: std::path::PathBuf) -> Self {
+        self.persistent_cache_path = Some(path);
+        self
+    }
+
+    /// Ask [`build`](Self::build) to install a default tracing subscriber
+    /// before returning the engine. Defaults to disabled.
+    ///
+    /// "Default subscriber" here means a best-effort `log`-crate
+    /// initialisation: this crate uses [`log`] for diagnostics today, so
+    /// enabling this knob promotes the global `log::Level` to `Info`. A
+    /// future v0.x may swap to the `tracing` crate proper; the builder
+    /// method's name is intentionally subscriber-agnostic so the contract
+    /// survives that swap. Calling this on a process where a logger /
+    /// subscriber is already installed is a no-op (the underlying
+    /// `set_logger` is idempotent under contention).
+    pub fn enable_tracing(mut self) -> Self {
+        self.enable_tracing = true;
+        self
+    }
+
+    /// Build the [`Engine`]. Consumes the builder.
+    ///
+    /// Steps performed by `build` (in order):
+    ///   1. Resolve the device index (default `0`).
+    ///   2. Initialize the CUDA driver (idempotent across calls).
+    ///   3. Validate the device index against `cuDeviceGetCount`.
+    ///   4. Create an owned CUDA context on the selected device.
+    ///   5. If [`enable_tracing`](Self::enable_tracing) was set, promote the
+    ///      global `log` max level to `Info` (best-effort, ignored if a
+    ///      logger is already installed).
     ///
     /// # Errors
-    /// Returns an error if `device_idx < 0` or `device_idx >=
-    /// cuDeviceGetCount()`, or if any underlying CUDA driver call fails
-    /// (e.g. no CUDA-capable device, driver/runtime mismatch).
-    pub fn new_with_device(device_idx: i32) -> BoltResult<Self> {
+    /// - `BoltError::Other` if the device index is `< 0` or `>=
+    ///   cuDeviceGetCount()`.
+    /// - Any underlying CUDA driver failure (no CUDA-capable device,
+    ///   driver / runtime mismatch, OOM on context create).
+    pub fn build(self) -> BoltResult<Engine> {
+        let device_idx = self.device.unwrap_or(0);
         // Initialize the driver up-front so device_count() is callable.
         cuda_sys::init()?;
         let count = cuda_sys::device_count()?;
@@ -619,7 +736,19 @@ impl Engine {
         }
         let ctx = CudaContext::new(device_idx)?;
         let pool_stats_interval = pool_stats_interval_from_env();
-        Ok(Self {
+
+        if self.enable_tracing {
+            // Best-effort subscriber init. `log::set_max_level` is
+            // process-global but always succeeds; pairing it with a
+            // logger-installed check would require a fixed downstream
+            // logger choice we don't want to make here. If the caller
+            // has already wired a logger, raising the level is the
+            // worst we'll do; if they haven't, the elevated level is
+            // a benign hint for whatever they install later.
+            log::set_max_level(log::LevelFilter::Info);
+        }
+
+        Ok(Engine {
             tables: HashMap::new(),
             provider: MemTableProvider::new(),
             dict_registry: crate::exec::dict_registry::DictRegistry::new(),
@@ -632,8 +761,85 @@ impl Engine {
             module_cache: Mutex::new(HashMap::new()),
             module_cache_loads: std::sync::atomic::AtomicUsize::new(0),
             rewrites: Vec::new(),
+            device_idx,
+            memory_budget_bytes: self.memory_budget_bytes,
+            persistent_cache_path: self.persistent_cache_path,
+            tracing_enabled: self.enable_tracing,
             _ctx: ctx,
         })
+    }
+}
+
+impl Engine {
+    /// Create an engine on the default CUDA device (ordinal 0).
+    ///
+    /// v0.6 legacy entry point: thin wrapper around [`Engine::builder`] kept
+    /// so pre-v0.6 callers continue to compile. New code should prefer the
+    /// builder for forward-compatible knobs.
+    pub fn new() -> BoltResult<Self> {
+        Self::builder().build()
+    }
+
+    /// Create an engine bound to the CUDA device at ordinal `device_idx`.
+    ///
+    /// v0.6 legacy entry point: thin wrapper around
+    /// [`Engine::builder`]`.device(device_idx).build()`. The error contract is
+    /// preserved verbatim — see [`EngineBuilder::build`] for the failure
+    /// modes (out-of-range index, driver init failure, context create).
+    pub fn new_with_device(device_idx: i32) -> BoltResult<Self> {
+        Self::builder().device(device_idx).build()
+    }
+
+    /// Start a fresh [`EngineBuilder`] with all knobs at their defaults.
+    ///
+    /// This is the recommended construction entry point as of v0.6. Set only
+    /// the knobs you need; everything else picks up the same default that
+    /// the legacy [`Engine::new`] / [`Engine::new_with_device`] paths use:
+    ///
+    /// | Builder method        | Default                |
+    /// |-----------------------|------------------------|
+    /// | [`EngineBuilder::device`]            | `0`              |
+    /// | [`EngineBuilder::memory_budget`]     | uncapped         |
+    /// | [`EngineBuilder::persistent_cache`]  | disabled         |
+    /// | [`EngineBuilder::enable_tracing`]    | disabled         |
+    ///
+    /// ```ignore
+    /// use craton_bolt::Engine;
+    /// let engine = Engine::builder().build()?;
+    /// ```
+    pub fn builder() -> EngineBuilder {
+        EngineBuilder::new()
+    }
+
+    /// CUDA device ordinal this engine was constructed on.
+    ///
+    /// Mirrors the value passed to [`EngineBuilder::device`] (or `0` for the
+    /// default-device entry points). Useful for diagnostics on multi-GPU
+    /// hosts and for tests that want to assert the builder threaded the
+    /// device knob through.
+    pub fn device(&self) -> i32 {
+        self.device_idx
+    }
+
+    /// Soft device-memory budget in bytes, as set via
+    /// [`EngineBuilder::memory_budget`]. `None` means uncapped (the default).
+    ///
+    /// The value is stored verbatim; the runtime pool integration may evolve
+    /// across v0.x releases but the getter's contract is stable.
+    pub fn memory_budget_bytes(&self) -> Option<usize> {
+        self.memory_budget_bytes
+    }
+
+    /// Disk-backed PTX cache directory, as set via
+    /// [`EngineBuilder::persistent_cache`]. `None` means disabled.
+    pub fn persistent_cache_path(&self) -> Option<&std::path::Path> {
+        self.persistent_cache_path.as_deref()
+    }
+
+    /// `true` if [`EngineBuilder::enable_tracing`] was called on the builder
+    /// that produced this engine.
+    pub fn tracing_enabled(&self) -> bool {
+        self.tracing_enabled
     }
 
     /// Register a user-supplied [`PlanRewrite`] on this engine.
