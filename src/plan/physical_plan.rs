@@ -628,8 +628,23 @@ fn resolve_source<'a>(
     // The outermost Project defines the chain's effective output schema; any
     // Filters above it preserve the schema and just AND into the predicate.
     let mut outermost_project_idx: Option<usize> = None;
+    // The walk is iterative, so we can't blow the stack here — but an
+    // attacker-controlled deeply nested Filter/Project chain would still
+    // force us to allocate one `Layer` per node before the eventual error,
+    // and the substitution loop below would then take O(depth^2) time.
+    // Cap the chain length at MAX_RECURSION_DEPTH so we surface a clear
+    // error long before either pathology shows up. The cap is generous —
+    // realistic plan chains land in single digits.
+    let mut steps = 0usize;
 
     let (table, scan_schema) = loop {
+        if steps > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+            return Err(BoltError::Plan(format!(
+                "plan nesting exceeds depth limit ({})",
+                crate::plan::sql_frontend::MAX_RECURSION_DEPTH
+            )));
+        }
+        steps += 1;
         match cur {
             LogicalPlan::Scan { table, schema, .. } => {
                 break (table.as_str(), schema);
@@ -730,7 +745,35 @@ fn resolve_source<'a>(
 
 /// Substitute `Column(name)` references in `expr` using `map`; leave unknown
 /// columns alone (they pass through to a deeper layer or to the scan).
+///
+/// Thin wrapper that starts the depth counter at zero; the real recursion
+/// lives in [`substitute_one_depth`], which enforces
+/// [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`] as a defense-in-depth
+/// guard against deeply nested attacker-controlled expressions reaching the
+/// substitution pass.
 fn substitute_one(expr: &Expr, map: &HashMap<String, Expr>) -> Expr {
+    substitute_one_depth(expr, map, 0)
+}
+
+/// Inner recursion for [`substitute_one`]. `depth` is the current recursion
+/// depth; when it exceeds [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`]
+/// we stop recursing and return the sub-expression unchanged. The public
+/// `substitute_one` does not return a `Result`, so we cannot surface the
+/// overflow — but in practice the input `Expr` is itself produced by the
+/// depth-bounded `lower_expr`, so the ceiling is only hit for inputs
+/// constructed programmatically (DataFrame builder, tests, malicious calls
+/// through public APIs we don't yet bound). Leaving the sub-tree
+/// unsubstituted is sound: any unmatched `Column(name)` simply resolves
+/// against the scan namespace, which is the existing fallback for unknown
+/// columns.
+fn substitute_one_depth(
+    expr: &Expr,
+    map: &HashMap<String, Expr>,
+    depth: usize,
+) -> Expr {
+    if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+        return expr.clone();
+    }
     match expr {
         Expr::Column(name) => match map.get(name) {
             Some(replacement) => replacement.clone(),
@@ -739,12 +782,13 @@ fn substitute_one(expr: &Expr, map: &HashMap<String, Expr>) -> Expr {
         Expr::Literal(_) => expr.clone(),
         Expr::Binary { op, left, right } => Expr::Binary {
             op: *op,
-            left: Box::new(substitute_one(left, map)),
-            right: Box::new(substitute_one(right, map)),
+            left: Box::new(substitute_one_depth(left, map, depth + 1)),
+            right: Box::new(substitute_one_depth(right, map, depth + 1)),
         },
-        Expr::Alias(inner, name) => {
-            Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
-        }
+        Expr::Alias(inner, name) => Expr::Alias(
+            Box::new(substitute_one_depth(inner, map, depth + 1)),
+            name.clone(),
+        ),
     }
 }
 
@@ -1229,6 +1273,20 @@ fn populate_aggregate_spec(
 }
 
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
+    lower_depth(plan, 0)
+}
+
+/// Inner recursion for [`lower`]. `depth` is the current recursion depth;
+/// returns Err if [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`] is
+/// exceeded — guarding against attacker-controlled deeply nested plans
+/// that would otherwise overflow the host thread stack.
+fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
+    if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+        return Err(BoltError::Plan(format!(
+            "plan nesting exceeds depth limit ({})",
+            crate::plan::sql_frontend::MAX_RECURSION_DEPTH
+        )));
+    }
     match plan {
         LogicalPlan::Project { input, exprs } => {
             // Scan/Filter/Project chain → single fused kernel via `lower_projection`.
@@ -1243,7 +1301,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
             } else {
-                let inner = lower(input)?;
+                let inner = lower_depth(input, depth + 1)?;
                 let output_schema = plan.schema()?;
                 if project_is_identity(exprs, inner.output_schema(), &output_schema) {
                     Ok(inner)
@@ -1270,7 +1328,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
                 // rows that don't satisfy it. The inner plan's output is
                 // typically tiny (one row per group for HAVING), so a
                 // host-side pass is fine for 0.3.
-                let inner = lower(input)?;
+                let inner = lower_depth(input, depth + 1)?;
                 Ok(PhysicalPlan::Filter {
                     input: Box::new(inner),
                     predicate: predicate.clone(),
@@ -1284,7 +1342,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             aggregates,
         } => lower_aggregate(plan, input, group_by, aggregates),
         LogicalPlan::Distinct { input } => {
-            let inner = lower(input)?;
+            let inner = lower_depth(input, depth + 1)?;
             Ok(PhysicalPlan::Distinct {
                 input: Box::new(inner),
             })
@@ -1294,7 +1352,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             limit,
             offset,
         } => {
-            let inner = lower(input)?;
+            let inner = lower_depth(input, depth + 1)?;
             Ok(PhysicalPlan::Limit {
                 input: Box::new(inner),
                 limit: *limit,
@@ -1302,7 +1360,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             })
         }
         LogicalPlan::Sort { input, sort_exprs } => {
-            let inner = lower(input)?;
+            let inner = lower_depth(input, depth + 1)?;
             Ok(PhysicalPlan::Sort {
                 input: Box::new(inner),
                 sort_exprs: sort_exprs.clone(),
@@ -1316,7 +1374,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             }
             let mut lowered: Vec<PhysicalPlan> = Vec::with_capacity(inputs.len());
             for branch in inputs {
-                lowered.push(lower(branch)?);
+                lowered.push(lower_depth(branch, depth + 1)?);
             }
             // Schema integrity (matching shapes across branches) was
             // already enforced by `LogicalPlan::schema()`; trust that.
@@ -1328,8 +1386,8 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             join_type,
             on,
         } => {
-            let l = lower(left)?;
-            let r = lower(right)?;
+            let l = lower_depth(left, depth + 1)?;
+            let r = lower_depth(right, depth + 1)?;
             // Build the combined schema *from the physical inputs*: the
             // logical sides may have been folded / projected differently
             // than their physical counterparts, but for the operators

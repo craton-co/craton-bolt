@@ -18,6 +18,19 @@ use crate::plan::logical_plan::{
     AggregateExpr, BinaryOp, Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr,
 };
 
+/// Maximum recursion depth allowed when walking attacker-controlled SQL
+/// AST / `LogicalPlan` trees. Pathological inputs (e.g. `SELECT
+/// (((((... 1 ...))))) FROM t` with 10^5 nested parens) would otherwise
+/// overflow the host thread stack and abort the process; this bound
+/// surfaces a `BoltError::Sql` long before that happens.
+///
+/// 256 is comfortably deeper than any realistic query (the largest hand-
+/// written nesting in our test corpus tops out around 12 levels) but
+/// shallow enough that no platform's default thread stack — including
+/// Windows' 1 MiB default — comes close to its overflow point even with
+/// large per-frame locals on the lowering call path.
+pub(crate) const MAX_RECURSION_DEPTH: usize = 256;
+
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
 ///
 /// # PV-stage-d: per-column null-bearing signal
@@ -343,13 +356,24 @@ pub fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan>
             )));
         }
     };
-    plan_query(&query, provider)
+    plan_query(&query, provider, 0)
 }
 
 /// Lower a top-level `Query`. Supports SELECT, UNION [ALL], ORDER BY, LIMIT,
 /// and OFFSET. Rejects CTEs, FETCH, locks, EXCEPT/INTERSECT, and dialect
 /// extensions outside our subset.
-fn plan_query(query: &Query, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn plan_query(
+    query: &Query,
+    provider: &dyn TableProvider,
+    depth: usize,
+) -> BoltResult<LogicalPlan> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     if query.with.is_some() {
         return Err(BoltError::Sql("unsupported: WITH / CTEs".into()));
     }
@@ -375,7 +399,7 @@ fn plan_query(query: &Query, provider: &dyn TableProvider) -> BoltResult<Logical
     // Lower the body into a base plan; UNION/UNION ALL builds a `Union` (and
     // optionally a `Distinct` wrapper) here, so the ORDER BY / LIMIT layers
     // below apply to the *combined* result, matching SQL semantics.
-    let mut plan = lower_set_expr(query.body.as_ref(), provider)?;
+    let mut plan = lower_set_expr(query.body.as_ref(), provider, depth + 1)?;
 
     // ORDER BY: appended *outside* the body so it sees the final schema.
     if let Some(order_by) = &query.order_by {
@@ -414,10 +438,21 @@ fn plan_query(query: &Query, provider: &dyn TableProvider) -> BoltResult<Logical
 /// Lower a `SetExpr` (SELECT body or UNION/EXCEPT/INTERSECT node) into a
 /// `LogicalPlan`. UNION ALL becomes `Union { inputs }`; plain UNION becomes
 /// `Distinct(Union { inputs })`. EXCEPT/INTERSECT are rejected.
-fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn lower_set_expr(
+    expr: &SetExpr,
+    provider: &dyn TableProvider,
+    depth: usize,
+) -> BoltResult<LogicalPlan> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     match expr {
         SetExpr::Select(s) => plan_select(s.as_ref(), provider),
-        SetExpr::Query(q) => plan_query(q.as_ref(), provider),
+        SetExpr::Query(q) => plan_query(q.as_ref(), provider, depth + 1),
         SetExpr::SetOperation {
             op,
             set_quantifier,
@@ -446,8 +481,8 @@ fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> BoltResult<Lo
             // than a nested binary tree. UNION (dedup) does NOT flatten across
             // UNION ALL boundaries: their semantics differ.
             let mut inputs: Vec<LogicalPlan> = Vec::new();
-            collect_union_branches(left, provider, dedup, &mut inputs)?;
-            collect_union_branches(right, provider, dedup, &mut inputs)?;
+            collect_union_branches(left, provider, dedup, &mut inputs, depth + 1)?;
+            collect_union_branches(right, provider, dedup, &mut inputs, depth + 1)?;
             let union = LogicalPlan::Union { inputs };
             Ok(if dedup {
                 LogicalPlan::Distinct {
@@ -469,12 +504,20 @@ fn lower_set_expr(expr: &SetExpr, provider: &dyn TableProvider) -> BoltResult<Lo
 /// recurse to collect its operands directly into `out`; otherwise lower it
 /// as a single branch. `parent_dedup` indicates whether the enclosing UNION
 /// is a dedup variant (so we only flatten matching-quantifier children).
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
 fn collect_union_branches(
     expr: &SetExpr,
     provider: &dyn TableProvider,
     parent_dedup: bool,
     out: &mut Vec<LogicalPlan>,
+    depth: usize,
 ) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     if let SetExpr::SetOperation {
         op: SetOperator::Union,
         set_quantifier,
@@ -489,17 +532,17 @@ fn collect_union_branches(
             SetQuantifier::ByName
             | SetQuantifier::AllByName
             | SetQuantifier::DistinctByName => {
-                out.push(lower_set_expr(expr, provider)?);
+                out.push(lower_set_expr(expr, provider, depth + 1)?);
                 return Ok(());
             }
         };
         if child_dedup == parent_dedup {
-            collect_union_branches(left, provider, parent_dedup, out)?;
-            collect_union_branches(right, provider, parent_dedup, out)?;
+            collect_union_branches(left, provider, parent_dedup, out, depth + 1)?;
+            collect_union_branches(right, provider, parent_dedup, out, depth + 1)?;
             return Ok(());
         }
     }
-    out.push(lower_set_expr(expr, provider)?);
+    out.push(lower_set_expr(expr, provider, depth + 1)?);
     Ok(())
 }
 
@@ -536,7 +579,7 @@ fn lower_order_by(exprs: &[OrderByExpr]) -> BoltResult<Vec<SortExpr>> {
             None => !descending,
         };
         out.push(SortExpr {
-            expr: lower_expr(expr, &resolver)?,
+            expr: lower_expr(expr, &resolver, 0)?,
             descending,
             nulls_first,
         });
@@ -663,7 +706,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
 
     // WHERE
     if let Some(filter_sql) = &select.selection {
-        let predicate = lower_expr(filter_sql, &resolver)?;
+        let predicate = lower_expr(filter_sql, &resolver, 0)?;
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate,
@@ -707,7 +750,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
 
     let has_agg_in_select = items
         .iter()
-        .map(|(e, _)| try_aggregate(e, &resolver))
+        .map(|(e, _)| try_aggregate(e, &resolver, 0))
         .collect::<BoltResult<Vec<_>>>()?
         .iter()
         .any(|o| o.is_some());
@@ -718,7 +761,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         // post-aggregate scalar work (e.g. `SUM(a) + 1`) is rejected up front.
         let group_by: Vec<Expr> = group_by_sql
             .iter()
-            .map(|e| lower_expr(e, &resolver))
+            .map(|e| lower_expr(e, &resolver, 0))
             .collect::<BoltResult<_>>()?;
 
         let mut aggregates: Vec<AggregateExpr> = Vec::new();
@@ -735,7 +778,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         let mut select_sources: Vec<SelectSource> = Vec::new();
 
         for (sql_expr, alias) in &items {
-            if let Some(agg) = try_aggregate(sql_expr, &resolver)? {
+            if let Some(agg) = try_aggregate(sql_expr, &resolver, 0)? {
                 if alias.is_some() {
                     return Err(BoltError::Sql(
                         "unsupported: alias on aggregate expression".into(),
@@ -747,12 +790,12 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
                 continue;
             }
             // Non-aggregate: must contain no nested aggregate (no post-aggregate exprs).
-            if contains_aggregate(sql_expr, &resolver)? {
+            if contains_aggregate(sql_expr, &resolver, 0)? {
                 return Err(BoltError::Sql(
                     "post-aggregate expressions not yet supported".into(),
                 ));
             }
-            let lowered = lower_expr(sql_expr, &resolver)?;
+            let lowered = lower_expr(sql_expr, &resolver, 0)?;
             // Must match some declared GROUP BY key by structural equality of the lowered form.
             if !group_by.iter().any(|g| expr_eq(g, &lowered)) {
                 return Err(BoltError::Sql(
@@ -828,7 +871,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         }
         let mut exprs = Vec::with_capacity(items.len());
         for (sql_expr, alias) in items {
-            let lowered = lower_expr(&sql_expr, &resolver)?;
+            let lowered = lower_expr(&sql_expr, &resolver, 0)?;
             let lowered = match alias {
                 Some(name) => lowered.alias(name),
                 None => lowered,
@@ -853,7 +896,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     // it. Non-aggregate sub-expressions go through the regular
     // `lower_expr`, which also handles bare group-key columns.
     if let Some(having_sql) = &select.having {
-        let predicate = lower_expr_in_having(having_sql, &resolver)?;
+        let predicate = lower_expr_in_having(having_sql, &resolver, 0)?;
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate,
@@ -941,7 +984,7 @@ fn lower_join_constraint<'a>(
 /// message; the executor scaffold only handles equi joins.
 fn lower_join_on(e: &SqlExpr) -> BoltResult<Vec<(Expr, Expr)>> {
     let mut out = Vec::new();
-    collect_join_eq(e, &mut out)?;
+    collect_join_eq(e, &mut out, 0)?;
     if out.is_empty() {
         return Err(BoltError::Sql(
             "JOIN ON clause must contain at least one equality predicate".into(),
@@ -951,16 +994,23 @@ fn lower_join_on(e: &SqlExpr) -> BoltResult<Vec<(Expr, Expr)>> {
 }
 
 /// Walk `e` flattening `AND` nodes; each leaf must be `<expr> = <expr>`.
-fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>) -> BoltResult<()> {
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>, depth: usize) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     match e {
-        SqlExpr::Nested(inner) => collect_join_eq(inner, out),
+        SqlExpr::Nested(inner) => collect_join_eq(inner, out, depth + 1),
         SqlExpr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
         } => {
-            collect_join_eq(left, out)?;
-            collect_join_eq(right, out)
+            collect_join_eq(left, out, depth + 1)?;
+            collect_join_eq(right, out, depth + 1)
         }
         SqlExpr::BinaryOp {
             left,
@@ -1056,7 +1106,18 @@ fn single_ident_from_object_name(name: &ObjectName) -> BoltResult<String> {
 }
 
 /// Recognize a top-level aggregate function call. Returns `Ok(None)` for non-aggregates.
-fn try_aggregate(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Option<AggregateExpr>> {
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn try_aggregate(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Option<AggregateExpr>> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     let func = match e {
         SqlExpr::Function(f) => f,
         _ => return Ok(None),
@@ -1139,7 +1200,7 @@ fn try_aggregate(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Option<Aggr
     };
 
     let inner = match arg_expr {
-        Some(e) => lower_expr(e, resolver)?,
+        Some(e) => lower_expr(e, resolver, depth + 1)?,
         None => {
             if kind != "COUNT" {
                 return Err(BoltError::Sql(format!("{kind}(*) is not supported")));
@@ -1160,16 +1221,24 @@ fn try_aggregate(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Option<Aggr
 }
 
 /// True if `e` contains any aggregate function call (anywhere in the tree).
-fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<bool> {
-    if try_aggregate(e, resolver)?.is_some() {
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<bool> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if try_aggregate(e, resolver, depth + 1)?.is_some() {
         return Ok(true);
     }
     match e {
-        SqlExpr::BinaryOp { left, right, .. } => {
-            Ok(contains_aggregate(left, resolver)? || contains_aggregate(right, resolver)?)
-        }
-        SqlExpr::UnaryOp { expr, .. } => contains_aggregate(expr, resolver),
-        SqlExpr::Nested(inner) => contains_aggregate(inner, resolver),
+        SqlExpr::BinaryOp { left, right, .. } => Ok(
+            contains_aggregate(left, resolver, depth + 1)?
+                || contains_aggregate(right, resolver, depth + 1)?,
+        ),
+        SqlExpr::UnaryOp { expr, .. } => contains_aggregate(expr, resolver, depth + 1),
+        SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
         _ => Ok(false),
     }
 }
@@ -1180,16 +1249,22 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<bool> 
 /// aggregate (per `aggregate_output_name`). Everything else delegates to
 /// `lower_expr`, which keeps the usual rules — bare columns become column
 /// refs, non-aggregate function calls are still rejected, etc.
-fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
-    if let Some(agg) = try_aggregate(e, resolver)? {
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if let Some(agg) = try_aggregate(e, resolver, depth + 1)? {
         return Ok(Expr::Column(aggregate_output_name(&agg)));
     }
     match e {
-        SqlExpr::Nested(inner) => lower_expr_in_having(inner, resolver),
+        SqlExpr::Nested(inner) => lower_expr_in_having(inner, resolver, depth + 1),
         SqlExpr::BinaryOp { left, op, right } => {
             let lop = lower_binary_op(op)?;
-            let l = lower_expr_in_having(left, resolver)?;
-            let r = lower_expr_in_having(right, resolver)?;
+            let l = lower_expr_in_having(left, resolver, depth + 1)?;
+            let r = lower_expr_in_having(right, resolver, depth + 1)?;
             Ok(Expr::Binary {
                 op: lop,
                 left: Box::new(l),
@@ -1197,13 +1272,13 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr
             })
         }
         SqlExpr::UnaryOp { op, expr } => match op {
-            UnaryOperator::Plus => lower_expr_in_having(expr, resolver),
+            UnaryOperator::Plus => lower_expr_in_having(expr, resolver, depth + 1),
             UnaryOperator::Minus => {
                 // Re-use the aggregate-aware lowerer for the operand, then
                 // negate by hand (we can't fall through to `negate_expr`
                 // because it would route through `lower_expr` and reject
                 // any aggregate call nested under the unary minus).
-                let inner = lower_expr_in_having(expr, resolver)?;
+                let inner = lower_expr_in_having(expr, resolver, depth + 1)?;
                 Ok(Expr::Binary {
                     op: BinaryOp::Sub,
                     left: Box::new(Expr::Literal(Literal::Int64(0))),
@@ -1217,7 +1292,7 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
         // still rejects bare non-aggregate Function calls).
-        _ => lower_expr(e, resolver),
+        _ => lower_expr(e, resolver, depth + 1),
     }
 }
 
@@ -1230,7 +1305,14 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr
 /// `Expr::Column(col)` — downstream type-checking validates that the name
 /// exists in scope and (for JOINs) follows the leftmost-wins convention
 /// enforced by [`join_combined_schema`](crate::plan::logical_plan::join_combined_schema).
-fn lower_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     match e {
         SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
         SqlExpr::CompoundIdentifier(parts) => {
@@ -1253,11 +1335,11 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
             Ok(Expr::Column(resolved))
         }
         SqlExpr::Value(v) => lower_value(v),
-        SqlExpr::Nested(inner) => lower_expr(inner, resolver),
+        SqlExpr::Nested(inner) => lower_expr(inner, resolver, depth + 1),
         SqlExpr::BinaryOp { left, op, right } => {
             let lop = lower_binary_op(op)?;
-            let l = lower_expr(left, resolver)?;
-            let r = lower_expr(right, resolver)?;
+            let l = lower_expr(left, resolver, depth + 1)?;
+            let r = lower_expr(right, resolver, depth + 1)?;
             Ok(Expr::Binary {
                 op: lop,
                 left: Box::new(l),
@@ -1265,8 +1347,8 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
             })
         }
         SqlExpr::UnaryOp { op, expr } => match op {
-            UnaryOperator::Plus => lower_expr(expr, resolver),
-            UnaryOperator::Minus => negate_expr(expr, resolver),
+            UnaryOperator::Plus => lower_expr(expr, resolver, depth + 1),
+            UnaryOperator::Minus => negate_expr(expr, resolver, depth + 1),
             other => Err(BoltError::Sql(format!(
                 "unsupported unary operator: {other:?}"
             ))),
@@ -1320,7 +1402,14 @@ fn parse_number(n: &str) -> BoltResult<Expr> {
 /// The asymmetric `i64` range (`MIN = -2^63`, `MAX = 2^63 - 1`) is handled by
 /// trying `i64::from_str` on the *negated* string, which succeeds at `i64::MIN`
 /// even though `2^63` does not fit in a positive `i64`.
-fn negate_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn negate_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     if let SqlExpr::Value(Value::Number(n, _)) = e {
         // Common case: positive literal fits in i64; just negate.
         if let Ok(i) = n.parse::<i64>() {
@@ -1344,7 +1433,7 @@ fn negate_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
         }
         return Err(BoltError::Sql(format!("invalid number literal '{n}'")));
     }
-    let inner = lower_expr(e, resolver)?;
+    let inner = lower_expr(e, resolver, depth + 1)?;
     Ok(Expr::Binary {
         op: BinaryOp::Sub,
         left: Box::new(Expr::Literal(Literal::Int64(0))),

@@ -331,14 +331,28 @@ impl Expr {
 
     /// Resolve the static type of this expression against `schema`.
     pub fn dtype(&self, schema: &Schema) -> BoltResult<DataType> {
+        self.dtype_depth(schema, 0)
+    }
+
+    /// Inner recursion for [`Expr::dtype`]. `depth` is the current recursion
+    /// depth; returns Err if [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`]
+    /// is exceeded — guards against attacker-controlled deeply nested
+    /// expressions reaching type-checking after construction.
+    fn dtype_depth(&self, schema: &Schema, depth: usize) -> BoltResult<DataType> {
+        if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+            return Err(BoltError::Type(format!(
+                "expression nesting exceeds depth limit ({})",
+                crate::plan::sql_frontend::MAX_RECURSION_DEPTH
+            )));
+        }
         match self {
             Expr::Column(name) => Ok(schema.field(name)?.dtype),
             Expr::Literal(lit) => lit
                 .dtype()
                 .ok_or_else(|| BoltError::Type("untyped NULL literal".into())),
             Expr::Binary { op, left, right } => {
-                let l = left.dtype(schema)?;
-                let r = right.dtype(schema)?;
+                let l = left.dtype_depth(schema, depth + 1)?;
+                let r = right.dtype_depth(schema, depth + 1)?;
                 if op.is_arithmetic() {
                     if !l.is_numeric() || !r.is_numeric() {
                         return Err(BoltError::Type(format!(
@@ -370,7 +384,7 @@ impl Expr {
                     Err(BoltError::Type(format!("unsupported operator {op:?}")))
                 }
             }
-            Expr::Alias(inner, _) => inner.dtype(schema),
+            Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
         }
     }
 }
@@ -609,6 +623,22 @@ pub enum LogicalPlan {
 impl LogicalPlan {
     /// Type-check the plan and return its output schema.
     pub fn schema(&self) -> BoltResult<Schema> {
+        self.schema_depth(0)
+    }
+
+    /// Inner recursion for [`LogicalPlan::schema`]. `depth` is the current
+    /// recursion depth; returns Err if
+    /// [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`] is exceeded —
+    /// guards against attacker-controlled deeply nested plans reaching
+    /// type-checking after construction (which would otherwise overflow
+    /// the host thread stack).
+    fn schema_depth(&self, depth: usize) -> BoltResult<Schema> {
+        if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+            return Err(BoltError::Plan(format!(
+                "plan nesting exceeds depth limit ({})",
+                crate::plan::sql_frontend::MAX_RECURSION_DEPTH
+            )));
+        }
         match self {
             LogicalPlan::Scan {
                 projection, schema, ..
@@ -623,7 +653,7 @@ impl LogicalPlan {
                 }
             },
             LogicalPlan::Filter { input, predicate } => {
-                let s = input.schema()?;
+                let s = input.schema_depth(depth + 1)?;
                 let pt = predicate.dtype(&s)?;
                 if pt != DataType::Bool {
                     return Err(BoltError::Type(format!(
@@ -633,7 +663,7 @@ impl LogicalPlan {
                 Ok(s)
             }
             LogicalPlan::Project { input, exprs } => {
-                let s = input.schema()?;
+                let s = input.schema_depth(depth + 1)?;
                 let mut fields = Vec::with_capacity(exprs.len());
                 for (i, e) in exprs.iter().enumerate() {
                     let dtype = e.dtype(&s)?;
@@ -651,7 +681,7 @@ impl LogicalPlan {
                 group_by,
                 aggregates,
             } => {
-                let s = input.schema()?;
+                let s = input.schema_depth(depth + 1)?;
                 let mut fields = Vec::with_capacity(group_by.len() + aggregates.len());
                 for (i, g) in group_by.iter().enumerate() {
                     let dtype = g.dtype(&s)?;
@@ -675,7 +705,7 @@ impl LogicalPlan {
                 // For Sort we additionally type-check the sort keys against
                 // the input schema so misnamed columns surface here rather
                 // than at execution time.
-                let s = input.schema()?;
+                let s = input.schema_depth(depth + 1)?;
                 if let LogicalPlan::Sort { sort_exprs, .. } = self {
                     for se in sort_exprs {
                         // We don't constrain the key dtype (any orderable
@@ -692,9 +722,9 @@ impl LogicalPlan {
                         "UNION requires at least one input".into(),
                     ));
                 }
-                let first = inputs[0].schema()?;
+                let first = inputs[0].schema_depth(depth + 1)?;
                 for (i, branch) in inputs.iter().enumerate().skip(1) {
-                    let other = branch.schema()?;
+                    let other = branch.schema_depth(depth + 1)?;
                     if !schemas_compatible(&first, &other) {
                         return Err(BoltError::Plan(format!(
                             "UNION branch {i} schema does not match branch 0: \
@@ -723,8 +753,8 @@ impl LogicalPlan {
                 // used by `PhysicalPlan::Join::output_schema()`);
                 // duplicating it here would risk drift if either copy is
                 // edited.
-                let l = left.schema()?;
-                let r = right.schema()?;
+                let l = left.schema_depth(depth + 1)?;
+                let r = right.schema_depth(depth + 1)?;
                 Ok(join_combined_schema(&l, &r, *join_type))
             }
         }
