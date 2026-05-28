@@ -1896,14 +1896,17 @@ fn plan_contains_case_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<bool
                 return Ok(true);
             }
             for agg in aggregates {
-                let inner = match agg {
+                let has_case = match agg {
                     AggregateExpr::Count(e)
                     | AggregateExpr::Sum(e)
                     | AggregateExpr::Min(e)
                     | AggregateExpr::Max(e)
-                    | AggregateExpr::Avg(e) => e,
+                    | AggregateExpr::Avg(e) => expr_contains_case(e),
+                    AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => {
+                        expr_contains_case(e.as_ref())
+                    }
                 };
-                if expr_contains_case(inner) {
+                if has_case {
                     return Ok(true);
                 }
             }
