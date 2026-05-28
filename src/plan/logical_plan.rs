@@ -241,6 +241,50 @@ pub enum UnaryOp {
     IsNotNull,
 }
 
+/// Scalar string functions surfaced through the SQL frontend.
+///
+/// v0.5 MVP scope: parser + type-check only. The physical-plan boundary
+/// rejects every variant cleanly with a `BoltError::Plan` so the planner
+/// can accept the syntax without misleading the user about kernel support.
+/// Execution wiring (host-side fallback or GPU codegen) is a follow-up.
+///
+/// Type-check rules (enforced in [`Expr::dtype_depth`]):
+///
+/// * `Upper(s)` / `Lower(s)`: requires a single `Utf8` argument; returns
+///   `Utf8`.
+/// * `Length(s)`: requires a single `Utf8` argument; returns `Int64`.
+/// * `Substring(s, start)` or `Substring(s, start, length)`:
+///   first argument `Utf8`, remaining arguments `Int64`; returns `Utf8`.
+///   `length` is optional (2 or 3 args).
+/// * `Concat(s1, s2, ...)`: at least two `Utf8` arguments; returns `Utf8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarFnKind {
+    /// `UPPER(s)` — uppercase the input string.
+    Upper,
+    /// `LOWER(s)` — lowercase the input string.
+    Lower,
+    /// `LENGTH(s)` — character length of the input string, as `Int64`.
+    Length,
+    /// `SUBSTRING(s, start [, length])` — extract a substring.
+    Substring,
+    /// `CONCAT(s1, s2, ...)` — concatenate two or more strings.
+    Concat,
+}
+
+impl ScalarFnKind {
+    /// Canonical uppercase function name as it appears in SQL (for error
+    /// messages).
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            ScalarFnKind::Upper => "UPPER",
+            ScalarFnKind::Lower => "LOWER",
+            ScalarFnKind::Length => "LENGTH",
+            ScalarFnKind::Substring => "SUBSTRING",
+            ScalarFnKind::Concat => "CONCAT",
+        }
+    }
+}
+
 /// Scalar expression tree.
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -268,6 +312,17 @@ pub enum Expr {
         op: UnaryOp,
         /// The single operand.
         operand: Box<Expr>,
+    },
+    /// Scalar string function call (UPPER / LOWER / LENGTH / SUBSTRING /
+    /// CONCAT). v0.5 MVP scope: parser + type-check only — the physical
+    /// planner rejects every variant at `lower()` with a clear "string
+    /// scalar functions are not yet lowered to GPU" error. See
+    /// [`ScalarFnKind`] for the per-kind type-check contract.
+    ScalarFn {
+        /// Which scalar function this is.
+        kind: ScalarFnKind,
+        /// Arguments, evaluated left-to-right.
+        args: Vec<Expr>,
     },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
@@ -449,7 +504,105 @@ impl Expr {
                     Ok(DataType::Bool)
                 }
             },
+            Expr::ScalarFn { kind, args } => scalar_fn_dtype(*kind, args, schema, depth + 1),
             Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
+        }
+    }
+}
+
+/// Type-check a scalar string function call against `schema` and return
+/// its output dtype. Centralised here so the rule lives in one place; the
+/// SQL frontend builds `Expr::ScalarFn` without inspecting argument types
+/// itself and lets this helper surface the type error.
+///
+/// `depth` is the current recursion depth at which the arguments will be
+/// resolved (the caller has already incremented for entering the ScalarFn
+/// node itself). Errors surface as `BoltError::Type`.
+fn scalar_fn_dtype(
+    kind: ScalarFnKind,
+    args: &[Expr],
+    schema: &Schema,
+    depth: usize,
+) -> BoltResult<DataType> {
+    // Resolve every argument's dtype up front so column-typo errors fire
+    // before we apply per-kind shape checks.
+    let mut arg_types: Vec<DataType> = Vec::with_capacity(args.len());
+    for a in args {
+        arg_types.push(a.dtype_depth(schema, depth)?);
+    }
+    let name = kind.sql_name();
+    match kind {
+        ScalarFnKind::Upper | ScalarFnKind::Lower => {
+            if arg_types.len() != 1 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects exactly 1 argument, got {}",
+                    arg_types.len()
+                )));
+            }
+            if arg_types[0] != DataType::Utf8 {
+                return Err(BoltError::Type(format!(
+                    "{name} requires a Utf8 argument, got {:?}",
+                    arg_types[0]
+                )));
+            }
+            Ok(DataType::Utf8)
+        }
+        ScalarFnKind::Length => {
+            if arg_types.len() != 1 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects exactly 1 argument, got {}",
+                    arg_types.len()
+                )));
+            }
+            if arg_types[0] != DataType::Utf8 {
+                return Err(BoltError::Type(format!(
+                    "{name} requires a Utf8 argument, got {:?}",
+                    arg_types[0]
+                )));
+            }
+            Ok(DataType::Int64)
+        }
+        ScalarFnKind::Substring => {
+            if arg_types.len() != 2 && arg_types.len() != 3 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects 2 or 3 arguments (string, start [, length]), got {}",
+                    arg_types.len()
+                )));
+            }
+            if arg_types[0] != DataType::Utf8 {
+                return Err(BoltError::Type(format!(
+                    "{name} first argument must be Utf8, got {:?}",
+                    arg_types[0]
+                )));
+            }
+            for (i, t) in arg_types.iter().enumerate().skip(1) {
+                if *t != DataType::Int64 {
+                    return Err(BoltError::Type(format!(
+                        "{name} argument {} must be Int64, got {:?}",
+                        i + 1,
+                        t
+                    )));
+                }
+            }
+            Ok(DataType::Utf8)
+        }
+        ScalarFnKind::Concat => {
+            if arg_types.len() < 2 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects at least 2 arguments, got {}",
+                    arg_types.len()
+                )));
+            }
+            for (i, t) in arg_types.iter().enumerate() {
+                if *t != DataType::Utf8 {
+                    return Err(BoltError::Type(format!(
+                        "{name} argument {} must be Utf8, got {:?}",
+                        i + 1,
+                        t
+                    )));
+                }
+            }
+            Ok(DataType::Utf8)
         }
     }
 }
@@ -993,6 +1146,140 @@ pub(crate) fn join_rename(name: &str, taken: &mut std::collections::HashSet<Stri
     }
     taken.insert(out_name.clone());
     out_name
+}
+
+#[cfg(test)]
+mod scalar_fn_typecheck_tests {
+    //! Direct type-check coverage for `Expr::ScalarFn` at the logical-plan
+    //! layer. The SQL frontend has its own integration coverage in
+    //! `tests/string_fns_sql_test.rs`; the tests here pin the per-kind
+    //! contract documented on [`ScalarFnKind`].
+    use super::*;
+
+    fn s_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("n", DataType::Int32, false),
+        ])
+    }
+
+    #[test]
+    fn upper_lower_utf8_to_utf8() {
+        let schema = s_schema();
+        for kind in [ScalarFnKind::Upper, ScalarFnKind::Lower] {
+            let e = Expr::ScalarFn {
+                kind,
+                args: vec![Expr::Column("s".into())],
+            };
+            assert_eq!(e.dtype(&schema).unwrap(), DataType::Utf8);
+        }
+    }
+
+    #[test]
+    fn length_utf8_to_int64() {
+        let schema = s_schema();
+        let e = Expr::ScalarFn {
+            kind: ScalarFnKind::Length,
+            args: vec![Expr::Column("s".into())],
+        };
+        assert_eq!(e.dtype(&schema).unwrap(), DataType::Int64);
+    }
+
+    #[test]
+    fn substring_two_or_three_int64_args_returns_utf8() {
+        let schema = s_schema();
+        let two = Expr::ScalarFn {
+            kind: ScalarFnKind::Substring,
+            args: vec![
+                Expr::Column("s".into()),
+                Expr::Literal(Literal::Int64(1)),
+            ],
+        };
+        assert_eq!(two.dtype(&schema).unwrap(), DataType::Utf8);
+
+        let three = Expr::ScalarFn {
+            kind: ScalarFnKind::Substring,
+            args: vec![
+                Expr::Column("s".into()),
+                Expr::Literal(Literal::Int64(1)),
+                Expr::Literal(Literal::Int64(3)),
+            ],
+        };
+        assert_eq!(three.dtype(&schema).unwrap(), DataType::Utf8);
+    }
+
+    #[test]
+    fn concat_requires_two_or_more_utf8() {
+        let schema = s_schema();
+        // 2 args OK.
+        let e2 = Expr::ScalarFn {
+            kind: ScalarFnKind::Concat,
+            args: vec![
+                Expr::Column("s".into()),
+                Expr::Literal(Literal::Utf8("x".into())),
+            ],
+        };
+        assert_eq!(e2.dtype(&schema).unwrap(), DataType::Utf8);
+        // 3 args OK (variadic).
+        let e3 = Expr::ScalarFn {
+            kind: ScalarFnKind::Concat,
+            args: vec![
+                Expr::Column("s".into()),
+                Expr::Literal(Literal::Utf8("x".into())),
+                Expr::Column("s".into()),
+            ],
+        };
+        assert_eq!(e3.dtype(&schema).unwrap(), DataType::Utf8);
+        // 1 arg: error.
+        let e1 = Expr::ScalarFn {
+            kind: ScalarFnKind::Concat,
+            args: vec![Expr::Column("s".into())],
+        };
+        assert!(e1.dtype(&schema).is_err());
+    }
+
+    #[test]
+    fn upper_rejects_non_utf8() {
+        let schema = s_schema();
+        let e = Expr::ScalarFn {
+            kind: ScalarFnKind::Upper,
+            args: vec![Expr::Column("n".into())],
+        };
+        assert!(e.dtype(&schema).is_err());
+    }
+
+    #[test]
+    fn substring_rejects_non_int64_start() {
+        let schema = s_schema();
+        let e = Expr::ScalarFn {
+            kind: ScalarFnKind::Substring,
+            args: vec![
+                Expr::Column("s".into()),
+                Expr::Column("n".into()), // Int32 not Int64
+            ],
+        };
+        assert!(e.dtype(&schema).is_err());
+    }
+
+    #[test]
+    fn substring_rejects_zero_args() {
+        let schema = s_schema();
+        let e = Expr::ScalarFn {
+            kind: ScalarFnKind::Substring,
+            args: vec![],
+        };
+        assert!(e.dtype(&schema).is_err());
+    }
+
+    #[test]
+    fn length_rejects_non_utf8() {
+        let schema = s_schema();
+        let e = Expr::ScalarFn {
+            kind: ScalarFnKind::Length,
+            args: vec![Expr::Column("n".into())],
+        };
+        assert!(e.dtype(&schema).is_err());
+    }
 }
 
 #[cfg(test)]

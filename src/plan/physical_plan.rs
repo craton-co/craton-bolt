@@ -463,6 +463,13 @@ impl<'a> Codegen<'a> {
             Expr::Literal(lit) => self.emit_literal(lit),
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
             Expr::Unary { op, operand } => self.emit_unary(*op, operand),
+            // v0.5: parser + type-check land, execution wiring is a
+            // follow-up. Reject cleanly so callers see a useful message
+            // rather than the kernel emitter producing nonsense PTX.
+            Expr::ScalarFn { kind, .. } => Err(BoltError::Plan(format!(
+                "string scalar function {} is not yet lowered to GPU; coming in a follow-up",
+                kind.sql_name()
+            ))),
             Expr::Alias(inner, _) => self.emit_expr(inner),
         }
     }
@@ -1006,6 +1013,17 @@ fn substitute_one_depth(
             op: *op,
             operand: Box::new(substitute_one(operand, map)),
         },
+        // Recurse into every argument so chain-projection substitution
+        // propagates column renames into string-function arguments. The
+        // physical-plan emitter still rejects ScalarFn at `lower()`, but
+        // substitution must be structure-preserving regardless.
+        Expr::ScalarFn { kind, args } => Expr::ScalarFn {
+            kind: *kind,
+            args: args
+                .iter()
+                .map(|a| substitute_one_depth(a, map, depth + 1))
+                .collect(),
+        },
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
         }
@@ -1359,6 +1377,12 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
             predicate_contains_unary(left) || predicate_contains_unary(right)
         }
         Expr::Alias(inner, _) => predicate_contains_unary(inner),
+        // ScalarFn predicates are rejected at `lower()` outright (no
+        // host-fallback path yet), so the unary-detection routing decision
+        // is moot here. Recurse into the args for completeness — if a
+        // future host-fallback wires ScalarFn through Filter, this keeps
+        // the routing correct.
+        Expr::ScalarFn { args, .. } => args.iter().any(predicate_contains_unary),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1603,6 +1627,9 @@ fn expr_contains_div_or_mod(e: &Expr) -> bool {
         }
         Expr::Alias(inner, _) => expr_contains_div_or_mod(inner),
         Expr::Unary { operand, .. } => expr_contains_div_or_mod(operand),
+        // String scalar functions can't contain Div/Mod themselves, but
+        // their arguments are arbitrary scalar expressions, so recurse.
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_div_or_mod),
     }
 }
 
@@ -1625,6 +1652,10 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
         }
         Expr::Alias(inner, _) => expr_has_unsafe_eager_shortcircuit(inner),
         Expr::Unary { operand, .. } => expr_has_unsafe_eager_shortcircuit(operand),
+        // No And/Or wrapper inside a ScalarFn can short-circuit a sibling
+        // operand of the *function call*, but the arguments themselves
+        // might contain the unsafe pattern, so recurse.
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_has_unsafe_eager_shortcircuit),
     }
 }
 

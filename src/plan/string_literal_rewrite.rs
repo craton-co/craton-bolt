@@ -370,6 +370,22 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 operand: Box::new(new_operand),
             })
         }
+        Expr::ScalarFn { kind, args } => {
+            // String scalar functions don't get folded by the dictionary
+            // rewriter (their output isn't a registered Utf8 column), but
+            // we still walk every argument so any nested `col = 'lit'`
+            // shapes inside them are normalised before they reach the
+            // physical-plan boundary (which currently rejects ScalarFn
+            // outright, but the rewrite is structurally consistent).
+            let mut new_args = Vec::with_capacity(args.len());
+            for a in args {
+                new_args.push(rewrite_expr_with(a, r, depth + 1)?);
+            }
+            Ok(Expr::ScalarFn {
+                kind: *kind,
+                args: new_args,
+            })
+        }
     }
 }
 

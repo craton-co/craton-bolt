@@ -310,6 +310,17 @@ fn eval_inner(
         Expr::Alias(inner, _) => eval_inner(inner, env, n_rows),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, n_rows),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, n_rows),
+        // v0.5: parser + type-check land, host-side execution wiring is a
+        // follow-up. The physical-plan boundary should have rejected this
+        // already; reaching here means a future caller built a Filter
+        // whose predicate contains a ScalarFn without going through
+        // `lower()`. Surface a clear `Plan` error rather than silently
+        // producing wrong output.
+        Expr::ScalarFn { kind, .. } => Err(BoltError::Plan(format!(
+            "expr_agg: string scalar function {} is not yet evaluated host-side; \
+             coming in a follow-up",
+            kind.sql_name()
+        ))),
     }
 }
 
