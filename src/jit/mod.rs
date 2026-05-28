@@ -19,6 +19,7 @@ pub mod scatter_with_dest_idx_kernel;
 pub mod scatter_values_by_dest_idx_kernel;
 pub mod partition_reduce_kernel;
 pub mod partition_reduce_kernel_i64;
+pub(crate) mod partition_reduce_kernel_spill_common;
 pub mod partition_reduce_kernel_multi;
 pub mod partition_reduce_kernel_count;
 pub mod partition_reduce_kernel_minmax;
