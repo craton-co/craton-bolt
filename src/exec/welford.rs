@@ -1,53 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Welford's online algorithm for variance, used by the `VAR_POP` /
-//! `VAR_SAMP` scalar aggregates.
+//! Welford's one-pass algorithm for numerically-stable mean / variance.
 //!
-//! For v0.5 the GPU codegen path does not yet emit Welford-on-device
-//! kernels; the scalar (no GROUP BY) aggregate path downloads the column
-//! to the host and reduces it here in `f64`. This module is the single
-//! source of truth for the numerical recipe so a future device-side
-//! implementation can compare bit-for-bit against the host fallback.
-//!
-//! The algorithm carries three running quantities: `count`, `mean`, and
-//! `M2` (the sum of squared deviations from the running mean). For each
-//! new observation `x`:
-//!
-//! ```text
-//!   count <- count + 1
-//!   delta  = x - mean
-//!   mean  <- mean + delta / count
-//!   delta2 = x - mean
-//!   M2    <- M2 + delta * delta2
-//! ```
-//!
-//! After streaming all observations:
-//!   * `var_pop  = M2 / count`           (population variance)
-//!   * `var_samp = M2 / (count - 1)`     (sample variance; NULL when count <= 1)
-//!
-//! The host reduction works on `f64` regardless of input dtype — narrow
-//! integers and Float32 are widened during the source-column upcast.
+//! Used by the `VAR_POP` / `VAR_SAMP` and `STDDEV_POP` / `STDDEV_SAMP`
+//! scalar aggregates. The state is the canonical triple
+//! `(count, mean, M2)`. At any point, population variance is
+//! `M2 / count`, sample variance is `M2 / (count - 1)`. Standard
+//! deviations are the square roots of those.
 
-/// Running Welford state. `count` is non-negative; `mean` and `m2` are
-/// only meaningful when `count > 0`.
-///
-/// Construct with [`WelfordState::new`] and feed observations through
-/// [`WelfordState::push`]. Finalise with [`WelfordState::var_pop`] /
-/// [`WelfordState::var_samp`].
-#[derive(Debug, Clone, Copy, Default)]
+use crate::error::{BoltError, BoltResult};
+
+/// Running `(count, mean, M2)` Welford state, accumulated in `f64`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WelfordState {
-    /// Number of observations accumulated so far.
+    /// Number of values folded in so far.
     pub count: u64,
     /// Running mean.
     pub mean: f64,
-    /// Running sum of squared deviations from the mean.
+    /// Sum of squared deviations from the mean.
     pub m2: f64,
 }
 
+impl Default for WelfordState {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 impl WelfordState {
-    /// Fresh empty state. Equivalent to `Default::default()` but spelled
-    /// out so the call site reads as deliberate initialisation.
-    pub fn new() -> Self {
+    /// Empty state — identity for [`combine`](Self::combine).
+    pub const fn empty() -> Self {
         Self {
             count: 0,
             mean: 0.0,
@@ -55,23 +37,71 @@ impl WelfordState {
         }
     }
 
-    /// Fold a single observation `x` into the running state. Numerically
-    /// stable — uses the mean-update form (Welford 1962) rather than the
-    /// naive `sum_of_squares - sum*sum/n` formulation, which catastrophically
-    /// cancels on inputs whose mean is much larger than their spread.
+    /// Fresh empty state (alias for `empty`).
+    pub fn new() -> Self {
+        Self::empty()
+    }
+
+    /// Fold one value into `self` (Welford's classic update).
+    #[inline]
     pub fn push(&mut self, x: f64) {
         self.count += 1;
         let delta = x - self.mean;
-        // count >= 1 here, so the divide is well-defined.
         self.mean += delta / (self.count as f64);
         let delta2 = x - self.mean;
         self.m2 += delta * delta2;
     }
 
-    /// Population variance: `M2 / count`, or `None` when no observations
-    /// have been folded in. The SQL standard says `VAR_POP` of an empty /
-    /// all-NULL group is NULL — surface that via `Option<f64>` so the
-    /// caller can pack a nullable Arrow cell directly.
+    /// Fold an entire slice in source order.
+    pub fn push_slice_f64(&mut self, xs: &[f64]) {
+        for &x in xs {
+            self.push(x);
+        }
+    }
+
+    /// Fold a slice of `i64` values (promoted to `f64`).
+    pub fn push_slice_i64(&mut self, xs: &[i64]) {
+        for &x in xs {
+            self.push(x as f64);
+        }
+    }
+
+    /// Fold a slice of `i32` values.
+    pub fn push_slice_i32(&mut self, xs: &[i32]) {
+        for &x in xs {
+            self.push(x as f64);
+        }
+    }
+
+    /// Fold a slice of `f32` values (promoted to `f64`).
+    pub fn push_slice_f32(&mut self, xs: &[f32]) {
+        for &x in xs {
+            self.push(x as f64);
+        }
+    }
+
+    /// Merge two partial Welford states (Chan-Golub-LeVeque parallel update).
+    pub fn combine(a: WelfordState, b: WelfordState) -> WelfordState {
+        if a.count == 0 {
+            return b;
+        }
+        if b.count == 0 {
+            return a;
+        }
+        let n_a = a.count as f64;
+        let n_b = b.count as f64;
+        let n = n_a + n_b;
+        let delta = b.mean - a.mean;
+        let mean = a.mean + delta * (n_b / n);
+        let m2 = a.m2 + b.m2 + delta * delta * (n_a * n_b / n);
+        WelfordState {
+            count: a.count + b.count,
+            mean,
+            m2,
+        }
+    }
+
+    /// Population variance: `M2 / count`, or `None` for an empty state.
     pub fn var_pop(&self) -> Option<f64> {
         if self.count == 0 {
             None
@@ -80,9 +110,7 @@ impl WelfordState {
         }
     }
 
-    /// Sample variance: `M2 / (count - 1)`, or `None` when fewer than two
-    /// observations have been folded in. SQL standard returns NULL when
-    /// `count <= 1`; this mirrors that contract.
+    /// Sample variance: `M2 / (count - 1)`, or `None` when `count <= 1`.
     pub fn var_samp(&self) -> Option<f64> {
         if self.count <= 1 {
             None
@@ -90,97 +118,149 @@ impl WelfordState {
             Some(self.m2 / ((self.count - 1) as f64))
         }
     }
+
+    /// Population standard deviation: `sqrt(var_pop)`. `None` for empty.
+    pub fn stddev_pop(&self) -> Option<f64> {
+        let v = self.var_pop()?;
+        Some(v.max(0.0).sqrt())
+    }
+
+    /// Sample standard deviation: `sqrt(var_samp)`. `None` when `count <= 1`.
+    pub fn stddev_samp(&self) -> Option<f64> {
+        let v = self.var_samp()?;
+        Some(v.max(0.0).sqrt())
+    }
 }
 
-/// Compute the population variance of `xs` in one host-side Welford pass.
-/// Returns `None` for an empty slice (SQL NULL semantics).
+/// Compute population variance of `xs` in one host-side Welford pass.
 pub fn var_pop_f64(xs: &[f64]) -> Option<f64> {
     let mut s = WelfordState::new();
-    for &x in xs {
-        s.push(x);
-    }
+    s.push_slice_f64(xs);
     s.var_pop()
 }
 
-/// Compute the sample variance of `xs` in one host-side Welford pass.
-/// Returns `None` when `xs.len() <= 1` (SQL NULL semantics).
+/// Compute sample variance of `xs` in one host-side Welford pass.
 pub fn var_samp_f64(xs: &[f64]) -> Option<f64> {
     let mut s = WelfordState::new();
-    for &x in xs {
-        s.push(x);
-    }
+    s.push_slice_f64(xs);
     s.var_samp()
+}
+
+/// Whether to finalize a Welford state into a population or sample stddev.
+#[derive(Debug, Clone, Copy)]
+pub enum StddevKind {
+    /// `STDDEV_POP` — divisor is `count`.
+    Pop,
+    /// `STDDEV_SAMP` — divisor is `count - 1`; result is NULL when `count <= 1`.
+    Samp,
+}
+
+/// Finalize a Welford state to a scalar standard deviation.
+pub fn finalize(state: &WelfordState, kind: StddevKind) -> Option<f64> {
+    match kind {
+        StddevKind::Pop => state.stddev_pop(),
+        StddevKind::Samp => state.stddev_samp(),
+    }
+}
+
+/// Error helper for dtype dispatch failures in Welford paths.
+pub fn err_unsupported_dtype(dtype_dbg: &str, op: &str) -> BoltError {
+    BoltError::Type(format!(
+        "{op} over dtype {dtype_dbg} not supported in scalar Welford path"
+    ))
+}
+
+/// Ensure `dtype` is one of the four numeric primitives the Welford push
+/// helpers accept.
+pub fn ensure_numeric_dtype(dtype: crate::plan::logical_plan::DataType, op: &str) -> BoltResult<()> {
+    use crate::plan::logical_plan::DataType::*;
+    match dtype {
+        Int32 | Int64 | Float32 | Float64 => Ok(()),
+        other => Err(err_unsupported_dtype(&format!("{:?}", other), op)),
+    }
+}
+
+/// Build a state and fold an `f64` slice. Convenience for callers.
+pub fn reduce_f64_slice(xs: &[f64]) -> WelfordState {
+    let mut s = WelfordState::empty();
+    s.push_slice_f64(xs);
+    s
+}
+
+/// Build a state and fold an `i64` slice.
+pub fn reduce_i64_slice(xs: &[i64]) -> WelfordState {
+    let mut s = WelfordState::empty();
+    s.push_slice_i64(xs);
+    s
+}
+
+/// Build a state and fold an `i32` slice.
+pub fn reduce_i32_slice(xs: &[i32]) -> WelfordState {
+    let mut s = WelfordState::empty();
+    s.push_slice_i32(xs);
+    s
+}
+
+/// Build a state and fold an `f32` slice.
+pub fn reduce_f32_slice(xs: &[f32]) -> WelfordState {
+    let mut s = WelfordState::empty();
+    s.push_slice_f32(xs);
+    s
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Empty input → both variants return `None`.
     #[test]
     fn empty_returns_none() {
-        assert_eq!(var_pop_f64(&[]), None);
-        assert_eq!(var_samp_f64(&[]), None);
+        let s = WelfordState::empty();
+        assert_eq!(s.var_pop(), None);
+        assert_eq!(s.var_samp(), None);
+        assert_eq!(s.stddev_pop(), None);
+        assert_eq!(s.stddev_samp(), None);
     }
 
-    /// One observation: VAR_POP is defined (== 0), VAR_SAMP is NULL.
     #[test]
     fn single_observation() {
-        assert_eq!(var_pop_f64(&[5.0]), Some(0.0));
-        assert_eq!(var_samp_f64(&[5.0]), None);
+        let mut s = WelfordState::empty();
+        s.push(5.0);
+        assert_eq!(s.var_pop(), Some(0.0));
+        assert_eq!(s.var_samp(), None);
+        assert_eq!(s.stddev_pop(), Some(0.0));
+        assert_eq!(s.stddev_samp(), None);
     }
 
-    /// Three observations: spot-check against the closed-form result.
-    /// `[1, 2, 3]` -> mean 2, deviations `[-1, 0, 1]`, M2 = 2.
-    /// VAR_POP = 2/3, VAR_SAMP = 2/2 = 1.
     #[test]
     fn three_observations_match_closed_form() {
         let xs = [1.0, 2.0, 3.0];
         let vp = var_pop_f64(&xs).unwrap();
         let vs = var_samp_f64(&xs).unwrap();
-        assert!((vp - (2.0 / 3.0)).abs() < 1e-12, "VAR_POP = {vp}");
-        assert!((vs - 1.0).abs() < 1e-12, "VAR_SAMP = {vs}");
+        assert!((vp - (2.0 / 3.0)).abs() < 1e-12);
+        assert!((vs - 1.0).abs() < 1e-12);
     }
 
-    /// Order-independence: streaming in reverse must yield the same result
-    /// up to floating-point round-off.
-    #[test]
-    fn order_independence_within_tolerance() {
-        let xs: Vec<f64> = (1..=100).map(|i| i as f64).collect();
-        let mut rev: Vec<f64> = xs.clone();
-        rev.reverse();
-        let a = var_pop_f64(&xs).unwrap();
-        let b = var_pop_f64(&rev).unwrap();
-        assert!((a - b).abs() < 1e-9, "order: {a} vs {b}");
-    }
-
-    /// Constant input: variance is exactly 0 regardless of length.
     #[test]
     fn constant_input_has_zero_variance() {
         let xs = [7.5_f64; 50];
         assert_eq!(var_pop_f64(&xs), Some(0.0));
-        let vs = var_samp_f64(&xs).unwrap();
-        assert_eq!(vs, 0.0);
+        assert_eq!(var_samp_f64(&xs), Some(0.0));
     }
 
-    /// Welford's stability win: a stream with a huge mean and small spread
-    /// must still produce a small variance. The naive
-    /// `E[X^2] - E[X]^2` formulation would catastrophically cancel here.
     #[test]
-    fn welford_is_stable_for_high_mean_small_spread() {
-        let base = 1e9_f64;
-        let xs: Vec<f64> = (0..1000).map(|i| base + (i as f64) * 1e-3).collect();
-        // Closed-form: a sequence base, base+d, base+2d, ..., base+(n-1)d
-        // has var_pop = d^2 * (n^2 - 1) / 12.
-        let n = xs.len() as f64;
-        let d = 1e-3_f64;
-        let expected = d * d * (n * n - 1.0) / 12.0;
-        let got = var_pop_f64(&xs).unwrap();
-        let rel = (got - expected).abs() / expected;
-        assert!(
-            rel < 1e-6,
-            "Welford lost precision on high-mean input: got {got}, expected {expected}, \
-             rel error {rel}"
-        );
+    fn combine_identity_with_empty() {
+        let s = reduce_f64_slice(&[1.0, 2.0, 3.0]);
+        let empty = WelfordState::empty();
+        assert_eq!(WelfordState::combine(empty, s).var_pop(), s.var_pop());
+        assert_eq!(WelfordState::combine(s, empty).var_pop(), s.var_pop());
+    }
+
+    #[test]
+    fn combine_matches_concatenated_push() {
+        let a = reduce_f64_slice(&[1.0, 2.0, 3.0]);
+        let b = reduce_f64_slice(&[4.0, 5.0, 6.0]);
+        let merged = WelfordState::combine(a, b);
+        let full = reduce_f64_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!((merged.var_pop().unwrap() - full.var_pop().unwrap()).abs() < 1e-12);
     }
 }

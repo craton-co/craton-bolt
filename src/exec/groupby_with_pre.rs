@@ -1081,6 +1081,17 @@ fn run_one_aggregate(
                     .into(),
             ))
         }
+        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+            // v0.5 cut: STDDEV is only supported in the scalar-aggregate
+            // path. The pre-aggregated GROUP BY route shares the same
+            // rejection (see `groupby.rs::run_one_aggregate`).
+            Err(BoltError::Other(
+                "STDDEV_POP / STDDEV_SAMP are not yet supported with GROUP BY \
+                 (v0.5: scalar aggregate only)"
+                    .into(),
+            ))
+        }
+
         AggregateExpr::Avg(_) => {
             // AVG = SUM(expr) / COUNT(expr), both grouped, SQL semantics:
             // NULL rows are excluded from both numerator and denominator.
@@ -1677,6 +1688,14 @@ fn inner_expr_of(agg: &AggregateExpr) -> &Expr {
         | AggregateExpr::Avg(e)
         | AggregateExpr::Count(e) => e,
         AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e.as_ref(),
+        // STDDEV variants store their operand boxed; deref to the inner
+        // `Expr` so this helper's downstream column-resolution logic
+        // still composes. The GROUP-BY-with-pre path then rejects the
+        // STDDEV op proper at `run_one_aggregate` — but the helper still
+        // needs to return *some* operand reference so the per-aggregate
+        // expression-feed collection (used by the pre kernel) doesn't
+        // panic on an exhaustive-match miss before that rejection fires.
+        AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => e.as_ref(),
     }
 }
 
@@ -1869,6 +1888,16 @@ fn build_agg_array(
                 }
             };
             pack_array(out_field.dtype, scalars)
+        }
+        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => {
+            // Unreachable: STDDEV variants are rejected at
+            // `run_one_aggregate` for GROUP BY mode before any accumulator
+            // is allocated. Arm exists for exhaustive-match coverage only.
+            Err(BoltError::Other(
+                "internal: STDDEV reached GROUP-BY-with-pre array-builder \
+                 path (should have been rejected at run_one_aggregate)"
+                    .into(),
+            ))
         }
         (_, _) => Err(BoltError::Other(
             "internal: aggregate / accumulator-variant mismatch".into(),

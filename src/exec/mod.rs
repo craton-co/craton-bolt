@@ -25,6 +25,9 @@ pub mod expr_agg;
 /// Welford's online algorithm for variance, shared by the `VAR_POP` /
 /// `VAR_SAMP` scalar-aggregate path. The GROUP BY path is intentionally
 /// rejected by the executors below in v0.5.
+/// Welford's one-pass algorithm for numerically-stable mean / variance.
+/// Shared between STDDEV_* (this crate's v0.5 surface) and the upcoming
+/// VAR_* aggregates.
 pub mod welford;
 pub mod groupby_valid;
 pub mod gpu_table;

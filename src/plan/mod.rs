@@ -12,7 +12,10 @@ pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema, UnaryOp,
     col, lit,
 };
-pub use dataframe::{DataFrame, GroupedDataFrame, avg, count, max, min, sum, var_pop, var_samp};
+pub use dataframe::{
+    DataFrame, GroupedDataFrame, avg, count, max, min, stddev_pop, stddev_samp, sum, var_pop,
+    var_samp,
+};
 pub use sql_frontend::{parse as parse_sql, MemTableProvider, TableProvider};
 pub use physical_plan::{
     lower as lower_physical, ColumnIO, KernelSpec, Op, PhysicalPlan, Reg, Value,

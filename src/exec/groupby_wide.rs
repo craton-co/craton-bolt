@@ -454,19 +454,26 @@ impl AggKind {
     /// host-side accumulator variant for them yet (rejected at engine
     /// dispatch in v0.5).
     fn from_expr(e: &AggregateExpr) -> BoltResult<Self> {
-        Ok(match e {
-            AggregateExpr::Sum(_) => AggKind::Sum,
-            AggregateExpr::Min(_) => AggKind::Min,
-            AggregateExpr::Max(_) => AggKind::Max,
-            AggregateExpr::Count(_) => AggKind::Count,
-            AggregateExpr::Avg(_) => AggKind::Avg,
+        match e {
+            AggregateExpr::Sum(_) => Ok(AggKind::Sum),
+            AggregateExpr::Min(_) => Ok(AggKind::Min),
+            AggregateExpr::Max(_) => Ok(AggKind::Max),
+            AggregateExpr::Count(_) => Ok(AggKind::Count),
+            AggregateExpr::Avg(_) => Ok(AggKind::Avg),
             AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => {
-                return Err(BoltError::Other(
+                Err(BoltError::Other(
                     "wide GROUP BY: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
                         .into(),
                 ))
             }
-        })
+            AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+                Err(BoltError::Other(
+                    "wide GROUP BY: STDDEV_POP / STDDEV_SAMP not yet \
+                     supported (v0.5: scalar aggregate only)"
+                        .into(),
+                ))
+            }
+        }
     }
 }
 
@@ -485,6 +492,12 @@ fn resolve_aggregates<'a>(
             | AggregateExpr::Count(e)
             | AggregateExpr::Avg(e) => e,
             AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e.as_ref(),
+            // STDDEV variants box their operand. The wide-GROUP-BY path is
+            // gated by `AggKind::from_expr` to reject STDDEV up front, but
+            // this match needs an exhaustive arm to compile — deref so the
+            // borrow shape matches if it ever does reach here through a
+            // future code path.
+            AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => e.as_ref(),
         };
         let col_name = bare_column_name(expr)?;
         let io = aggregate
@@ -952,6 +965,16 @@ fn finalize_agg_column(
             "wide GROUP BY: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
                 .into(),
         )),
+        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+            // Unreachable: `AggKind::from_expr` rejects STDDEV variants
+            // before any accumulator is allocated. Arm exists to keep the
+            // match exhaustive.
+            Err(BoltError::Other(
+                "wide GROUP BY: internal — STDDEV reached finalize \
+                 (should have been rejected at AggKind::from_expr)"
+                    .into(),
+            ))
+        }
     }
 }
 

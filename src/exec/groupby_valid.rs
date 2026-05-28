@@ -1382,6 +1382,17 @@ fn run_one_aggregate(
                     .into(),
             ))
         }
+        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+            // v0.5 cut: STDDEV is only supported in the scalar-aggregate
+            // path. The GROUP BY path is out of scope for this milestone
+            // — see the matching gate in `groupby.rs::run_one_aggregate`.
+            Err(BoltError::Other(
+                "STDDEV_POP / STDDEV_SAMP are not yet supported with GROUP BY \
+                 (v0.5: scalar aggregate only)"
+                    .into(),
+            ))
+        }
+
         AggregateExpr::Avg(expr) => {
             // AVG = SUM(expr) / COUNT(expr), where COUNT is the non-NULL row
             // count of the value column within each group. SUM in f64; COUNT
@@ -2298,6 +2309,13 @@ fn build_agg_array_from_per_group(
                     .into(),
             ))
         }
+        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => {
+            Err(BoltError::Other(
+                "internal: STDDEV reached GROUP BY (valid-flag) array-builder \
+                 path (should have been rejected at run_one_aggregate)"
+                    .into(),
+            ))
+        }
         (AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_), other) => {
             // NOTE on SQL NULL-group semantics: per docs/SQL_REFERENCE.md,
             // SUM/MIN/MAX over an all-NULL group should return NULL. In this
@@ -2354,6 +2372,13 @@ fn aggregate_to_op(agg: &AggregateExpr) -> ReduceOp {
         // accounting stays defined while still surfacing the issue
         // upstream (the run match returns an error).
         AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => ReduceOp::Sum,
+        // STDDEV doesn't decompose into a single ReduceOp — it uses the
+        // Welford state instead. The GROUP BY path rejects STDDEV ops
+        // long before this helper is consulted (see `run_one_aggregate`),
+        // so the choice here is purely "what spill-fold op would be safe
+        // if it ever leaked through". `ReduceOp::Sum` is the additive
+        // identity — folding zero contributions changes nothing.
+        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => ReduceOp::Sum,
     }
 }
 

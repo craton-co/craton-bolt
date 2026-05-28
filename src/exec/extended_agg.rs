@@ -64,6 +64,10 @@ pub fn handles(op: &AggregateExpr, input_dtype: DataType) -> bool {
         // Bool / Utf8 outright so the caller routes through the numeric
         // scalar-aggregate path and surfaces a clean type error there.
         (AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_), _) => false,
+        // STDDEV over Bool / Utf8 isn't defined (already gated at the
+        // logical-plan dtype check); falling through here lets the caller
+        // surface its own type error on the standard dispatch path.
+        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => false,
 
         // SUM/AVG over Utf8 is intentionally rejected here so the caller
         // raises its own type error on the standard dispatch path.
@@ -255,6 +259,9 @@ fn aggregate_inner(expr: &AggregateExpr) -> &Expr {
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e) => e,
         AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e.as_ref(),
+        // STDDEV variants store the operand boxed; deref so the helper's
+        // borrow shape matches the other arms.
+        AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => e.as_ref(),
     }
 }
 
@@ -318,6 +325,11 @@ fn validate_output_dtype(
                  scalar-aggregate path, not the Bool/Utf8 extended path"
                     .into(),
             ))
+        }
+        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => {
+            return Err(BoltError::Type(
+                "STDDEV is not defined for Bool / Utf8 inputs".into(),
+            ));
         }
         (_, dt) => {
             return Err(BoltError::Other(format!(

@@ -1371,6 +1371,20 @@ fn run_one_aggregate(
                     .into(),
             ))
         }
+        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+            // v0.5 cut: STDDEV is only supported in the scalar-aggregate
+            // path (no GROUP BY). The shared Welford state extends cleanly
+            // to per-group accumulation but the integration with the GPU
+            // group-by reduction kernels is a v0.6 follow-up — gate here
+            // with a clear error so users get a useful message rather than
+            // the executor silently falling through to a different path.
+            Err(BoltError::Other(
+                "STDDEV_POP / STDDEV_SAMP are not yet supported with GROUP BY \
+                 (v0.5: scalar aggregate only)"
+                    .into(),
+            ))
+        }
+
         AggregateExpr::Avg(expr) => {
             // AVG = SUM(expr) / COUNT(expr), where COUNT is the non-NULL row
             // count of the value column within each group. SUM in f64 (so we
@@ -2159,7 +2173,13 @@ fn build_agg_array(
         // get here. Surface a clear error if a future plan ever lands here.
         (AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_), _) => {
             Err(BoltError::Other(
-                "groupby: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                "groupby: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5".into(),
+            ))
+        }
+        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => {
+            Err(BoltError::Other(
+                "internal: STDDEV reached GROUP BY array-builder path \
+                 (should have been rejected at run_one_aggregate)"
                     .into(),
             ))
         }

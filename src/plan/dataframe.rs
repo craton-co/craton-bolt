@@ -259,6 +259,9 @@ fn agg_inner_expr(a: &AggregateExpr) -> &Expr {
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e) => e,
         AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e,
+        // STDDEV variants store their operand boxed; deref so the inner
+        // `Expr` borrow shape matches the other arms.
+        AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => e.as_ref(),
     }
 }
 
@@ -392,4 +395,16 @@ pub fn var_pop(e: Expr) -> AggregateExpr {
 /// were aggregated.
 pub fn var_samp(e: Expr) -> AggregateExpr {
     AggregateExpr::VarSamp(Box::new(e))
+}
+
+/// `STDDEV_POP(expr)` aggregate — population standard deviation.
+pub fn stddev_pop(e: Expr) -> AggregateExpr {
+    AggregateExpr::StddevPop(Box::new(e))
+}
+
+/// `STDDEV_SAMP(expr)` aggregate — sample standard deviation. Returns
+/// SQL NULL when the input has 0 or 1 non-NULL rows (the divisor
+/// `count - 1` is then undefined per the SQL standard).
+pub fn stddev_samp(e: Expr) -> AggregateExpr {
+    AggregateExpr::StddevSamp(Box::new(e))
 }

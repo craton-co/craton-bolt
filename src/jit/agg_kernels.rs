@@ -104,6 +104,10 @@ impl ReduceOp {
                  the scalar-aggregate executor must dispatch to crate::exec::welford"
                     .into(),
             )),
+            AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => Err(BoltError::Other(
+                "agg_kernels: STDDEV_POP / STDDEV_SAMP do not lower to a \
+                 single ReduceOp; handled via the Welford state path".into(),
+            )),
         }
     }
 

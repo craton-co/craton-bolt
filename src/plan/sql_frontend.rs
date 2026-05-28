@@ -1645,12 +1645,18 @@ fn try_aggregate(
         return Ok(None);
     }
     let fname = func.name.0[0].value.to_ascii_uppercase();
+    // Plain `STDDEV(x)` is treated as `STDDEV_SAMP(x)` per the SQL standard
+    // (the same convention DuckDB, Postgres, and Snowflake follow). Lower it
+    // to the canonical `STDDEV_SAMP` spelling before the variant match below
+    // so there is exactly one downstream representation per aggregate.
     let kind = match fname.as_str() {
         // `VARIANCE` is the SQL-standard synonym for `VAR_SAMP`; normalise
         // it here so the lowering match below only has to know about the
         // two canonical forms.
         "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "VAR_POP" | "VAR_SAMP" => fname,
         "VARIANCE" => "VAR_SAMP".to_string(),
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "STDDEV_POP" | "STDDEV_SAMP" => fname,
+        "STDDEV" => "STDDEV_SAMP".to_string(),
         _ => return Ok(None),
     };
 
@@ -1741,6 +1747,8 @@ fn try_aggregate(
         "AVG" => AggregateExpr::Avg(inner),
         "VAR_POP" => AggregateExpr::VarPop(Box::new(inner)),
         "VAR_SAMP" => AggregateExpr::VarSamp(Box::new(inner)),
+        "STDDEV_POP" => AggregateExpr::StddevPop(Box::new(inner)),
+        "STDDEV_SAMP" => AggregateExpr::StddevSamp(Box::new(inner)),
         _ => unreachable!("kind already filtered above"),
     }))
 }

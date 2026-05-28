@@ -188,6 +188,29 @@ fn build_one_aggregate(
             let scalar = reduce_column_from_batch(op, col_io, table_batch, n_rows)?;
             scalar_to_array(scalar, out_field.dtype)
         }
+        AggregateExpr::StddevPop(expr) | AggregateExpr::StddevSamp(expr) => {
+            // Welford one-pass reduction on the host. The scalar-aggregate
+            // path's GPU offload is a v0.6 stretch goal — for v0.5 we
+            // download (or already have) the values as a host slice and
+            // fold them via `WelfordState::push`. The output dtype is
+            // always Float64; STDDEV_SAMP packs SQL NULL when count <= 1
+            // (so the output field's `nullable = true` is load-bearing for
+            // that path). See `crate::exec::welford` for the canonical
+            // numerics.
+            //
+            // `expr` is `&Box<Expr>` (the enum variant's payload is
+            // `Box<Expr>`); explicitly deref through `.as_ref()` so the
+            // borrowed-`&Expr` shape matches `bare_column_name`'s signature.
+            let col_name = bare_column_name(expr.as_ref())?;
+            let col_io = resolve_input(inputs, col_name)?;
+            let state = welford_state_from_batch(col_io, table_batch)?;
+            let kind = match agg {
+                AggregateExpr::StddevPop(_) => crate::exec::welford::StddevKind::Pop,
+                AggregateExpr::StddevSamp(_) => crate::exec::welford::StddevKind::Samp,
+                _ => unreachable!("matched above"),
+            };
+            stddev_to_array(crate::exec::welford::finalize(&state, kind), agg, out_field)
+        }
         AggregateExpr::Count(expr) => {
             // COUNT(col) excludes NULL inputs; COUNT(*) (with a literal-ish
             // expression that doesn't resolve to a column) returns the row
@@ -373,6 +396,8 @@ fn agg_inner_expr(agg: &AggregateExpr) -> Option<&Expr> {
         | AggregateExpr::Avg(e)
         | AggregateExpr::Count(e) => Some(e),
         AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => Some(e),
+        // STDDEV_* hold their operand boxed; deref to expose the inner Expr.
+        AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => Some(e.as_ref()),
     }
 }
 
@@ -725,6 +750,138 @@ where
     drop(block_counts);
 
     Ok((total_sum, total_count))
+}
+
+/// Build a Welford `(count, mean, M2)` state by folding the non-NULL values
+/// of `col_io` from `batch` in source order. Used by the scalar
+/// `STDDEV_POP` / `STDDEV_SAMP` aggregates; the host-side fold is
+/// acceptable for v0.5 (see `crate::exec::welford` module docs on host vs
+/// device). All numeric input dtypes promote to `f64` at the push site so
+/// the accumulator stays in double precision regardless of input width.
+fn welford_state_from_batch(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+) -> BoltResult<crate::exec::welford::WelfordState> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "STDDEV input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+    let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
+    if arr_dtype != col_io.dtype {
+        return Err(BoltError::Type(format!(
+            "STDDEV input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
+            col_io.name, col_io.dtype, arr_dtype
+        )));
+    }
+
+    let mut state = crate::exec::welford::WelfordState::empty();
+    match col_io.dtype {
+        DataType::Int32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
+            for i in 0..pa.len() {
+                if !pa.is_null(i) {
+                    state.push(pa.value(i) as f64);
+                }
+            }
+        }
+        DataType::Int64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
+            for i in 0..pa.len() {
+                if !pa.is_null(i) {
+                    state.push(pa.value(i) as f64);
+                }
+            }
+        }
+        DataType::Float32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
+            for i in 0..pa.len() {
+                if !pa.is_null(i) {
+                    state.push(pa.value(i) as f64);
+                }
+            }
+        }
+        DataType::Float64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
+            for i in 0..pa.len() {
+                if !pa.is_null(i) {
+                    state.push(pa.value(i));
+                }
+            }
+        }
+        DataType::Bool | DataType::Utf8 => {
+            return Err(BoltError::Type(format!(
+                "STDDEV over dtype {:?} not supported (column '{}')",
+                col_io.dtype, col_io.name
+            )));
+        }
+    }
+    Ok(state)
+}
+
+/// Pack a finalized stddev (`Some(σ)` or `None`) into a one-row Arrow
+/// `Float64Array`.
+///
+/// * `STDDEV_POP` returns `0.0` on an empty input — mirrors the existing
+///   AVG convention so the output schema field can stay non-nullable in
+///   downstream consumers that don't yet handle the SQL NULL case.
+/// * `STDDEV_SAMP` returns SQL NULL when `count <= 1` (the divisor is zero
+///   or negative — undefined per the SQL standard); the output field is
+///   nullable per `LogicalPlan::Aggregate` schema-construction.
+///
+/// `out_field.dtype` must be `Float64` (validated against the planner's
+/// declared output schema); we surface a Type error otherwise so a
+/// future plan that picks the wrong dtype fails loudly rather than
+/// silently truncating.
+fn stddev_to_array(
+    value: Option<f64>,
+    agg: &AggregateExpr,
+    out_field: &Field,
+) -> BoltResult<ArrayRef> {
+    if out_field.dtype != DataType::Float64 {
+        return Err(BoltError::Type(format!(
+            "STDDEV output dtype must be Float64, got {:?}",
+            out_field.dtype
+        )));
+    }
+    match (agg, value) {
+        (AggregateExpr::StddevPop(_), Some(v)) => {
+            Ok(Arc::new(Float64Array::from(vec![v])) as ArrayRef)
+        }
+        (AggregateExpr::StddevPop(_), None) => {
+            // Empty input: match the AVG-on-empty convention (return 0.0
+            // rather than NULL) so the output column stays packed when the
+            // SELECT-list re-projection consumes it. Documented in the
+            // public stddev semantics on `welford::WelfordState`.
+            Ok(Arc::new(Float64Array::from(vec![0.0_f64])) as ArrayRef)
+        }
+        (AggregateExpr::StddevSamp(_), Some(v)) => {
+            Ok(Arc::new(Float64Array::from(vec![v])) as ArrayRef)
+        }
+        (AggregateExpr::StddevSamp(_), None) => {
+            // count <= 1 → SQL NULL. The output field is nullable in the
+            // logical plan's Aggregate schema (every aggregate output is),
+            // so a single-element nullable Float64Array packs cleanly here.
+            Ok(Arc::new(Float64Array::from(vec![None::<f64>])) as ArrayRef)
+        }
+        _ => Err(BoltError::Other(
+            "stddev_to_array called with non-STDDEV aggregate".into(),
+        )),
+    }
 }
 
 /// Copy the non-NULL values of an Arrow primitive array into a fresh `Vec`.

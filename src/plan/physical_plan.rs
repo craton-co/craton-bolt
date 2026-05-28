@@ -1257,6 +1257,11 @@ fn lower_aggregate(
             // unbox a clone so it threads through the same `feed` list as
             // the other aggregates.
             AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => (**e).clone(),
+            // STDDEV variants box their operand; clone the contents so the
+            // collected feed list shape matches the other arms (a Vec<Expr>,
+            // not Vec<Box<Expr>>). The physical-plan lowerer treats the
+            // feed-collection step uniformly across aggregate variants.
+            AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => (**e).clone(),
         };
         agg_input_exprs.push(e);
     }
@@ -1358,10 +1363,16 @@ fn lower_aggregate(
                 AggregateExpr::Max(e) => AggregateExpr::Max(substitute_one(e, m)),
                 AggregateExpr::Avg(e) => AggregateExpr::Avg(substitute_one(e, m)),
                 AggregateExpr::VarPop(e) => {
-                    AggregateExpr::VarPop(Box::new(substitute_one(e, m)))
+                    AggregateExpr::VarPop(Box::new(substitute_one(e.as_ref(), m)))
                 }
                 AggregateExpr::VarSamp(e) => {
-                    AggregateExpr::VarSamp(Box::new(substitute_one(e, m)))
+                    AggregateExpr::VarSamp(Box::new(substitute_one(e.as_ref(), m)))
+                }
+                AggregateExpr::StddevPop(e) => {
+                    AggregateExpr::StddevPop(Box::new(substitute_one(e.as_ref(), m)))
+                }
+                AggregateExpr::StddevSamp(e) => {
+                    AggregateExpr::StddevSamp(Box::new(substitute_one(e.as_ref(), m)))
                 }
             },
         })
@@ -1930,6 +1941,9 @@ fn plan_contains_case_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<bool
                     | AggregateExpr::Max(e)
                     | AggregateExpr::Avg(e) => expr_contains_case(e),
                     AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => {
+                        expr_contains_case(e.as_ref())
+                    }
+                    AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => {
                         expr_contains_case(e.as_ref())
                     }
                 };
