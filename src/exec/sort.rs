@@ -36,6 +36,23 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
         return Ok(QueryHandle::from_record_batch(batch));
     }
 
+    // v0.7 fast path: GPU radix sort for the single-key, Int32/Int64,
+    // ASC-only, no-NULL, env-gated case. Lighter and asymptotically
+    // faster than the bitonic path for the common large-int ORDER BY.
+    // Returns the row permutation as a `UInt32Array`; the take loop
+    // below gathers each column to produce the sorted batch — same
+    // reorder machinery the host-fallback path uses, so the executor
+    // surface stays narrow.
+    if let Some(perm) = try_gpu_sort_radix(&batch, sort_exprs)? {
+        let new_cols: Vec<Arc<dyn Array>> = batch
+            .columns()
+            .iter()
+            .map(|c| take(c.as_ref(), &perm, None).map_err(arrow_err))
+            .collect::<BoltResult<Vec<_>>>()?;
+        let out = RecordBatch::try_new(batch.schema(), new_cols).map_err(arrow_err)?;
+        return Ok(QueryHandle::from_record_batch(out));
+    }
+
     // Fast path: GPU bitonic sort for the single-key, fixed-dtype, no-NULL,
     // large-input case. On any precondition miss, fall through to the
     // existing host path.
@@ -64,6 +81,107 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
         .collect::<BoltResult<Vec<_>>>()?;
     let out = RecordBatch::try_new(batch.schema(), new_cols).map_err(arrow_err)?;
     Ok(QueryHandle::from_record_batch(out))
+}
+
+/// Try the GPU radix sort fast path.
+///
+/// Returns `Ok(Some(perm))` with the row permutation when every gate is
+/// satisfied. The caller is responsible for feeding `perm` through
+/// `arrow::compute::take` to produce the sorted batch — keeping the
+/// permutation as the return value (not the sorted batch) means the take
+/// loop in `execute_sort` is the single reorder machinery for both this
+/// path and the existing host fallback.
+///
+/// ## Gates (all must hold)
+///   1. **Env opt-in.** `BOLT_GPU_SORT=1`. Default OFF; we keep the
+///      historical bitonic / host paths as the steady-state behaviour
+///      until the radix path is bake-tested in production.
+///   2. **Single key.** `sort_exprs.len() == 1`. Multi-key lex ordering
+///      needs a stable per-pass sort + outer key loop — punted to v0.8.
+///   3. **Bare column reference.** No computed sort keys; matches the
+///      bitonic path's gate 2.
+///   4. **ASC direction.** DESC would need a second post-pass reversal
+///      step or a flipped XOR constant; easy to add but no need today.
+///   5. **`nulls_first == false`.** Pinned for clarity — radix has no
+///      validity-bitmap routing.
+///   6. **Int32 / Int64 dtype.** Float radix needs the IEEE-monotonic
+///      transform (deferred); Bool / Utf8 fall through.
+///   7. **No NULLs in the key column.** Radix sort has no validity
+///      routing — checked inside [`radix_dispatch_predicate`].
+///   8. **`n_rows >= GPU_SORT_MIN_ROWS`.** Same threshold as the bitonic
+///      path — h2d/d2h overhead dominates below ~16k.
+///
+/// On any miss we return `Ok(None)` and the caller falls through to the
+/// bitonic path (which has its own gates) and then to the host path.
+fn try_gpu_sort_radix(
+    batch: &RecordBatch,
+    sort_exprs: &[SortExpr],
+) -> BoltResult<Option<UInt32Array>> {
+    use crate::jit::sort_kernel::SortDirection;
+    use crate::jit::sort_kernel_radix::gpu_sort_env_enabled;
+
+    // Gate 1: env opt-in.
+    if !gpu_sort_env_enabled() {
+        return Ok(None);
+    }
+    // Gate 2: single key.
+    if sort_exprs.len() != 1 {
+        return Ok(None);
+    }
+    let se = &sort_exprs[0];
+    // Gate 3: bare column reference.
+    let col_name = match expr_to_column_name(&se.expr) {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    // Gate 4: ASC.
+    if se.descending {
+        return Ok(None);
+    }
+    // Gate 5: nulls_first off — pinned for clarity (the column is
+    // null-free by the gate-7 check inside the predicate anyway).
+    if se.nulls_first {
+        return Ok(None);
+    }
+
+    let col_idx = match batch.schema().index_of(&col_name) {
+        Ok(i) => i,
+        Err(_) => return Ok(None),
+    };
+    let column = batch.column(col_idx);
+
+    // Gate 6: dtype. `arrow_dtype_to_internal` maps the Arrow dtype to the
+    // engine's internal dtype; the radix predicate then gates Int32/Int64.
+    let dtype = match crate::exec::gpu_sort::arrow_dtype_to_internal(column.data_type()) {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    let n_rows = batch.num_rows();
+    // Gate 8: row count threshold.
+    if n_rows < GPU_SORT_MIN_ROWS {
+        return Ok(None);
+    }
+
+    // Gates 6 + 7 + "fits u32" are checked inside `radix_dispatch_predicate`.
+    // Calling it here lets `sort_indices_on_gpu_radix` re-check the same
+    // predicate (it does) without duplicating the gate ladder.
+    if !crate::exec::gpu_sort::radix_dispatch_predicate(
+        column.as_ref(),
+        dtype,
+        SortDirection::Asc,
+        se.nulls_first,
+    ) {
+        return Ok(None);
+    }
+
+    // All gates passed — hand off to the GPU driver.
+    crate::exec::gpu_sort::sort_indices_on_gpu_radix(
+        column.as_ref(),
+        dtype,
+        SortDirection::Asc,
+        se.nulls_first,
+    )
 }
 
 /// Try the GPU sort fast path. Returns `Ok(Some(sorted_batch))` on success,
@@ -315,5 +433,175 @@ mod tests {
         let out = execute_sort(handle, &[aliased]).unwrap();
         let result = out.into_record_batch();
         assert_eq!(as_i32(&result, 0), vec![Some(1), Some(2)]);
+    }
+
+    // ----- v0.7 radix-sort dispatch tests -----
+    //
+    // These verify the pure host-side gates in `try_gpu_sort_radix` /
+    // `gpu_sort::radix_dispatch_predicate` without ever touching a CUDA
+    // device. They run unconditionally — including under
+    // `--features cuda-stub` on GPU-less CI — because the predicate
+    // returns before any FFI call.
+    //
+    // The end-to-end "actually run the radix kernel" tests live in
+    // `gpu_sort.rs` and are gated by `#[ignore = "gpu:sort_radix"]` so
+    // CI skips them but a developer with a real device can opt in via
+    // `cargo test -- --ignored gpu:sort_radix`.
+
+    use crate::exec::gpu_sort::{radix_dispatch_predicate, RADIX_DISPATCH_COUNT};
+    use crate::jit::sort_kernel::SortDirection;
+    use crate::plan::logical_plan::DataType as PlanDataType;
+    use std::sync::atomic::Ordering;
+
+    /// Build an Int32 batch with the given non-null values and the
+    /// minimum row count needed to pass the `GPU_SORT_MIN_ROWS` gate.
+    /// Pads with `0` (sentinel value irrelevant — the gate only checks
+    /// `n_rows`, not the contents).
+    fn padded_int_batch(name: &str, head: Vec<i32>) -> RecordBatch {
+        let mut all = head;
+        while all.len() < GPU_SORT_MIN_ROWS {
+            all.push(0);
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        let arr = Int32Array::from(all);
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    /// The pure predicate accepts Int32 ASC with no nulls and rejects
+    /// every variation that should fall through to the bitonic / host
+    /// path. Single test, multiple assertions — each line documents the
+    /// branch it pins.
+    #[test]
+    fn radix_predicate_gates() {
+        let arr = Int32Array::from(vec![3, 1, 2, 5, 4]);
+        // Happy path — Int32 ASC no-nulls.
+        assert!(radix_dispatch_predicate(
+            &arr,
+            PlanDataType::Int32,
+            SortDirection::Asc,
+            false,
+        ));
+        // DESC rejected (gate 4).
+        assert!(!radix_dispatch_predicate(
+            &arr,
+            PlanDataType::Int32,
+            SortDirection::Desc,
+            false,
+        ));
+        // Float dtype rejected (gate 6 — radix_supports_dtype gate).
+        assert!(!radix_dispatch_predicate(
+            &arr,
+            PlanDataType::Float32,
+            SortDirection::Asc,
+            false,
+        ));
+        // Nullable column with at least one NULL rejected (gate 7).
+        let null_arr = Int32Array::from(vec![Some(3), None, Some(1)]);
+        assert!(!radix_dispatch_predicate(
+            &null_arr,
+            PlanDataType::Int32,
+            SortDirection::Asc,
+            false,
+        ));
+    }
+
+    /// `try_gpu_sort_radix` engages the radix path when every gate
+    /// holds: env var set, single-key, ASC, Int32 no-null, large input.
+    ///
+    /// Observability: we read `RADIX_DISPATCH_COUNT` before and after
+    /// the dispatch decision and assert it increments by exactly 1.
+    /// `sort_indices_on_gpu_radix` bumps the counter the moment it
+    /// commits to the radix path, and *before* any kernel launch — so
+    /// even under `cuda-stub` (where the subsequent GPU work would
+    /// fail) the counter delta is observable. We swallow the GPU error
+    /// because that's the expected outcome on a stub build; the test
+    /// is about predicate engagement, not kernel execution.
+    #[test]
+    #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
+    fn radix_dispatch_engages_on_int32_asc() {
+        // Save and restore env state around the test. Tests in
+        // `cargo test` share a process; another concurrent test could
+        // see `BOLT_GPU_SORT=1` if we didn't restore — but the gate is
+        // strict ("1"), and any concurrent test of unsorted-input
+        // semantics is robust to either gate state because the predicate
+        // is a function of the inputs.
+        let prev = std::env::var("BOLT_GPU_SORT").ok();
+        // SAFETY: set_var is unsafe on edition-2024 nightly but stable in
+        // current edition; the test harness is single-threaded enough
+        // that the env mutation here doesn't cross any other gate read
+        // — only `gpu_sort_env_enabled` consults it.
+        std::env::set_var("BOLT_GPU_SORT", "1");
+
+        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+
+        let batch = padded_int_batch("a", vec![5, 3, 1, 4, 2]);
+        // Run dispatch; we don't care whether the actual kernel
+        // succeeds (it can't on cuda-stub) — only that the predicate
+        // committed.
+        let _ = try_gpu_sort_radix(&batch, &[col("a", false, false)]);
+
+        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+        assert!(
+            after >= before + 1,
+            "radix dispatch counter did not increment ({} -> {})",
+            before,
+            after
+        );
+
+        // Restore env state.
+        match prev {
+            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
+            None => std::env::remove_var("BOLT_GPU_SORT"),
+        }
+    }
+
+    /// Sanity check the other side of the gate: with the env var
+    /// **unset**, `try_gpu_sort_radix` returns `Ok(None)` without
+    /// bumping the dispatch counter. This is the default production
+    /// behaviour — the radix path is opt-in until benched in.
+    #[test]
+    fn radix_dispatch_skipped_when_env_off() {
+        let prev = std::env::var("BOLT_GPU_SORT").ok();
+        std::env::remove_var("BOLT_GPU_SORT");
+
+        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+
+        let batch = padded_int_batch("a", vec![5, 3, 1, 4, 2]);
+        let res = try_gpu_sort_radix(&batch, &[col("a", false, false)]);
+        assert!(matches!(res, Ok(None)));
+
+        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            before, after,
+            "counter must not bump when env gate is off"
+        );
+
+        if let Some(v) = prev {
+            std::env::set_var("BOLT_GPU_SORT", v);
+        }
+    }
+
+    /// The dispatch also rejects when row count is below the threshold,
+    /// even with env on and all other gates green — small inputs amortize
+    /// kernel launch worse than the host sort.
+    #[test]
+    fn radix_dispatch_skipped_when_too_small() {
+        let prev = std::env::var("BOLT_GPU_SORT").ok();
+        std::env::set_var("BOLT_GPU_SORT", "1");
+
+        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+
+        // Only 5 rows — well below GPU_SORT_MIN_ROWS.
+        let batch = int_batch("a", vec![Some(3), Some(1), Some(2), Some(5), Some(4)]);
+        let res = try_gpu_sort_radix(&batch, &[col("a", false, false)]);
+        assert!(matches!(res, Ok(None)));
+
+        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+        assert_eq!(before, after, "small-input gate must short-circuit");
+
+        match prev {
+            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
+            None => std::env::remove_var("BOLT_GPU_SORT"),
+        }
     }
 }

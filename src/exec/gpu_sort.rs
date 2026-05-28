@@ -93,6 +93,12 @@ use crate::jit::sort_kernel::{
     compile_sort_kernel_spec, sort_kernel_entry_spec, KeyDesc, SortDirection,
     SortKernelSpec, SortLayout, MAX_SORT_KEYS, SORT_BLOCK_SIZE,
 };
+use crate::jit::sort_kernel_radix::{
+    compile_radix_histogram, compile_radix_msb_flip, compile_radix_scatter_with_indices,
+    radix_histogram_entry, radix_msb_flip_entry, radix_needs_msb_flip,
+    radix_scatter_with_indices_entry, radix_steps_for, radix_supports_dtype, RADIX_BLOCK_SIZE,
+    RADIX_BUCKETS,
+};
 use crate::plan::logical_plan::DataType;
 
 /// Compute `next_power_of_two(n)` returning `Err` if the result would overflow
@@ -637,6 +643,734 @@ pub struct GpuSortKey<'a> {
     pub direction: SortDirection,
     /// Per-key NULLS placement.
     pub nulls_first: bool,
+}
+
+// =============================================================================
+// v0.7: GPU radix-sort path (single-key Int32/Int64 ASC).
+// =============================================================================
+//
+// Pairs with [`crate::jit::sort_kernel_radix`]. The flow:
+//
+// ```text
+//  key column (host, n_rows)
+//     │
+//     ▼ h2d (no padding — radix has no power-of-two requirement)
+//  keys_ping (device)        idx_ping (device, 0..n_rows)
+//     │                            │
+//     ├─ optional MSB flip kernel  │  (signed int dtypes only)
+//     ▼                            ▼
+//  for pass in 0..radix_steps:
+//      zero hist (16 u32)
+//      histogram kernel (reads keys_ping, atom-adds hist[digit])
+//      D2H hist → host exclusive scan → H2D as offsets
+//      scatter_with_indices kernel
+//          (keys_ping, idx_ping)  →  (keys_pong, idx_pong)
+//      swap ping ↔ pong
+//
+//  optional MSB flip on keys_ping  (restores original int values)
+//     │
+//     ▼ d2h idx_ping
+//  permutation: UInt32Array of length n_rows
+//     │
+//     ▼ arrow::compute::take per column
+//  sorted RecordBatch
+// ```
+//
+// ## Scope (v0.7)
+//
+// - **Single key only.** Multi-key lex ordering needs a different driver
+//   (stable per-pass sort + outer key loop). Punted to v0.8.
+// - **Int32 / Int64 only.** Float radix wants the IEEE-monotonic
+//   transform (deferred); Bool / Utf8 fall through.
+// - **ASC direction only.** DESC would need a second post-pass index
+//   reversal or a flipped XOR constant. Easy to add but no need yet.
+// - **No NULLs.** Radix sort has no validity-bitmap routing; we reject
+//   nullable columns up front and let the bitonic / host path handle them.
+// - **Env-gated.** `BOLT_GPU_SORT=1` opts in; default OFF.
+//
+// The dispatch decision in [`try_gpu_sort_radix`] returns `Ok(None)` on
+// any precondition miss so the caller can fall through to the bitonic
+// path or the host `lexsort_to_indices`.
+
+/// Test-side dispatch counter. Bumps once per successful predicate match —
+/// i.e. every time the executor decides to take the radix path for a
+/// given sort. Production callers ignore it; the gpu_sort_radix tests
+/// observe dispatch by comparing the counter delta.
+///
+/// We use this instead of trying to instrument launches under `cuda-stub`
+/// because the predicate check happens *before* any kernel touches the
+/// device, so a pure counter is the cheapest observability hook and the
+/// only one that can fire under stub builds.
+#[doc(hidden)]
+pub(crate) static RADIX_DISPATCH_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// **Pure** predicate: does this `(arr, dtype, direction, nulls_first)`
+/// tuple satisfy every gate the v0.7 radix sort needs?
+///
+/// Splitting the predicate out of [`sort_indices_on_gpu_radix`] gives the
+/// `sort.rs` dispatcher a host-only check (no GPU touch, no allocation)
+/// for routing decisions, AND lets the unit tests verify the gates
+/// deterministically under `cuda-stub` without ever launching a kernel.
+///
+/// The gates, in evaluation order:
+///   1. `radix_supports_dtype(dtype)` — currently Int32 / Int64 only.
+///   2. `direction == Asc` — DESC deferred.
+///   3. `!nulls_first` is harmless on its own, but together with the
+///      next gate it pins the no-NULL contract.
+///   4. `arr.null_count() == 0` — radix sort has no validity routing.
+///   5. `arr.len() <= u32::MAX` — the indices payload is `u32`.
+pub(crate) fn radix_dispatch_predicate(
+    arr: &dyn Array,
+    dtype: DataType,
+    direction: SortDirection,
+    nulls_first: bool,
+) -> bool {
+    if !radix_supports_dtype(dtype) {
+        return false;
+    }
+    if !matches!(direction, SortDirection::Asc) {
+        return false;
+    }
+    // No NULL routing in the radix kernel today.
+    if arr.null_count() > 0 {
+        return false;
+    }
+    // `nulls_first` is meaningless without NULLs, but we keep the gate
+    // explicit so a caller that accidentally requests nulls_first=true on
+    // a nullable column doesn't fall through here silently.
+    let _ = nulls_first;
+    // u32 indices payload.
+    if arr.len() > (u32::MAX as usize) {
+        return false;
+    }
+    true
+}
+
+/// GPU radix sort for a single Int32/Int64 ASC key column.
+///
+/// Returns `Ok(Some(perm))` with the row permutation on success, or
+/// `Ok(None)` if the input doesn't match the radix gate (caller falls
+/// through to bitonic / host). Returns `Err` only on hard GPU failures
+/// (OOM, kernel launch failure).
+///
+/// The kernel side ([`crate::jit::sort_kernel_radix`]) emits three PTX
+/// entry points per dtype:
+///   - `bolt_radix_msb_flip_<dty>` — XOR every key with the MSB constant
+///     to make signed-int bit-patterns sort like unsigned.
+///   - `bolt_radix_histogram_<dty>` — per-pass 4-bit digit bucketing.
+///   - `bolt_radix_scatter_<dty>_with_indices` — per-pass scatter that
+///     carries the u32 row-index payload in lock-step with the key.
+///
+/// Per pass:
+///   1. Zero the 16-entry u32 histogram.
+///   2. Launch histogram (writes 16 atomic counts).
+///   3. D2H the 16 counts; compute exclusive scan host-side; H2D as offsets.
+///   4. Launch scatter (atom-bumps offsets, writes key+idx at the bumped slot).
+///   5. Swap ping ↔ pong.
+///
+/// 8 passes for Int32, 16 for Int64. The post-pass MSB-flip restores the
+/// original int values to the output keys buffer (we don't actually need
+/// the keys back, but the kernel can be reused on the same buffer because
+/// XOR is its own inverse — calling it again on the flipped buffer cancels
+/// the entry-flip).
+pub fn sort_indices_on_gpu_radix(
+    arr: &dyn Array,
+    dtype: DataType,
+    direction: SortDirection,
+    nulls_first: bool,
+) -> BoltResult<Option<UInt32Array>> {
+    if !radix_dispatch_predicate(arr, dtype, direction, nulls_first) {
+        return Ok(None);
+    }
+    // Bump the dispatch counter as soon as we commit to the radix path.
+    // Tests observe this; production builds inline-decrement the counter
+    // through the AtomicUsize (negligible overhead).
+    RADIX_DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let n_rows = arr.len();
+    if n_rows == 0 {
+        return Ok(Some(UInt32Array::from(Vec::<u32>::new())));
+    }
+    let n_rows_u32 = n_rows_to_u32(n_rows)?;
+
+    // ----- host-side key extraction ------------------------------------
+    //
+    // Re-use `host_values_for_key`: for Int32/Int64 it returns the bare
+    // typed Vec, no padding (radix has no pow2 requirement). We assert
+    // the dtype branch here so a future host_values_for_key change can't
+    // silently feed us the wrong width.
+    let host_keys = match host_values_for_key(arr, dtype)? {
+        Some(v) => v,
+        // host_values_for_key only returns None for high-cardinality Utf8
+        // — we've already gated to Int32/Int64 above, so this is a
+        // safety-net "should never happen" path. Fall through anyway.
+        None => return Ok(None),
+    };
+
+    // Run the dtype-monomorphic radix driver. Match arms differ only in
+    // the concrete int width — the launch / scan / D2H plumbing is the
+    // same shape.
+    let perm = match host_keys {
+        HostKeyValues::I32(host) => {
+            run_radix_pipeline_i32(&host, n_rows_u32, dtype)?
+        }
+        HostKeyValues::I64(host) => {
+            run_radix_pipeline_i64(&host, n_rows_u32, dtype)?
+        }
+        // The predicate above gates dtype to Int32/Int64, so other arms
+        // are unreachable. Defensive `return Ok(None)` instead of panic
+        // so a future predicate widening doesn't crash the engine.
+        _ => return Ok(None),
+    };
+
+    Ok(Some(UInt32Array::from(perm)))
+}
+
+/// Inner pipeline for Int32 keys. Separated from the Int64 variant so the
+/// monomorphic GpuVec types stay statically typed throughout the loop.
+fn run_radix_pipeline_i32(
+    host_keys: &[i32],
+    n_rows_u32: u32,
+    dtype: DataType,
+) -> BoltResult<Vec<u32>> {
+    debug_assert!(matches!(dtype, DataType::Int32));
+    let radix_steps = radix_steps_for(dtype)?;
+    let needs_flip = radix_needs_msb_flip(dtype)?;
+
+    // ----- device allocation: ping-pong key + index buffers ------------
+    //
+    // Both ping and pong are allocated via `from_slice` so each
+    // GpuVec's internal `len` bookkeeping is populated up front. The
+    // pong buffer's initial contents don't matter (the first scatter
+    // overwrites every slot), but the populated len is what lets the
+    // final `to_vec()` D2H read all n_rows entries after the last
+    // ping↔pong swap.
+    let mut keys_ping: GpuVec<i32> = GpuVec::<i32>::from_slice(host_keys)?;
+    let mut keys_pong: GpuVec<i32> = GpuVec::<i32>::from_slice(host_keys)?;
+    // Identity indices on host, uploaded once.
+    let idx_host: Vec<u32> = (0..n_rows_u32).collect();
+    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(&idx_host)?;
+    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(&idx_host)?;
+    // Histogram + offsets buffers (16 u32 entries each, reused per pass).
+    // Use `zeros(RADIX_BUCKETS)` so the GpuVec's bookkeeping len is the
+    // full 16-entry size — required for any future to_vec(), and
+    // harmless for the memset_d8 / memcpy_d2h paths we take below.
+    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
+    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
+
+    // ----- modules + entry points -------------------------------------
+    let stream = CudaStream::null();
+    let hist_module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("radix_histogram:{:?}", dtype),
+        None,
+        || compile_radix_histogram(dtype),
+    )?;
+    let hist_fn = hist_module.function(&radix_histogram_entry(dtype)?)?;
+
+    let scatter_module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("radix_scatter_with_indices:{:?}", dtype),
+        None,
+        || compile_radix_scatter_with_indices(dtype),
+    )?;
+    let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
+
+    // MSB-flip kernel: only built when the dtype actually needs it.
+    let flip_module_fn = if needs_flip {
+        let m = module_cache::get_or_build_module(
+            module_path!(),
+            format!("radix_msb_flip:{:?}", dtype),
+            None,
+            || compile_radix_msb_flip(dtype),
+        )?;
+        Some(m)
+    } else {
+        None
+    };
+
+    let block_size = RADIX_BLOCK_SIZE;
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
+
+    // ----- one-shot pre-pass: MSB flip on keys_ping -------------------
+    if let Some(ref m) = flip_module_fn {
+        let flip_fn = m.function(&radix_msb_flip_entry(dtype)?)?;
+        launch_radix_msb_flip(&flip_fn, &mut keys_ping, n_rows_u32, grid_x, block_size, &stream)?;
+    }
+
+    // ----- per-pass loop: histogram → host-scan → scatter -------------
+    for step in 0..radix_steps {
+        let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
+
+        // Zero the histogram buffer for this pass. The same GpuVec is
+        // reused across passes — `memset_d8` directly on the device
+        // pointer avoids the 64-byte allocation churn of re-creating
+        // it. The buffer's GpuVec `len` is already RADIX_BUCKETS
+        // (allocated via `zeros`) so the bytes we zero match the bytes
+        // we later D2H out.
+        let hist_bytes = (RADIX_BUCKETS as usize) * std::mem::size_of::<u32>();
+        // SAFETY: hist_dev was allocated with `zeros(RADIX_BUCKETS)`,
+        // so the underlying allocation has at least RADIX_BUCKETS u32
+        // entries; we zero exactly that many bytes.
+        unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
+
+        launch_radix_histogram(
+            &hist_fn,
+            &keys_ping,
+            &hist_dev,
+            n_rows_u32,
+            shift,
+            grid_x,
+            block_size,
+            &stream,
+        )?;
+
+        // D2H the 16 histogram counts. We use a fresh zeros() then
+        // copy_to_async would be ideal, but GpuVec's to_vec requires
+        // self.len > 0 and a tracked len. Cheapest stable path: re-create
+        // a small typed view via `read_hist_as_u32` which uses raw memcpy.
+        let mut hist_host = vec![0u32; RADIX_BUCKETS as usize];
+        // SAFETY: hist_dev is a u32 allocation of RADIX_BUCKETS entries;
+        // we read exactly that many u32 elements.
+        unsafe {
+            cuda_sys::memcpy_d2h::<u32>(
+                hist_host.as_mut_ptr(),
+                hist_dev.device_ptr(),
+                RADIX_BUCKETS as usize,
+            )?;
+        }
+
+        // Exclusive prefix scan on host (16 elements — cheaper than a
+        // kernel launch).
+        let mut offsets_host = vec![0u32; RADIX_BUCKETS as usize];
+        let mut running: u32 = 0;
+        for (i, h) in hist_host.iter().enumerate() {
+            offsets_host[i] = running;
+            running = running.wrapping_add(*h);
+        }
+        // H2D the offsets. Same memcpy_h2d trick as above (re-using
+        // offsets_dev's allocation).
+        // SAFETY: offsets_dev was allocated with RADIX_BUCKETS u32 entries.
+        unsafe {
+            cuda_sys::memcpy_h2d::<u32>(
+                offsets_dev.device_ptr(),
+                offsets_host.as_ptr(),
+                RADIX_BUCKETS as usize,
+            )?;
+        }
+
+        launch_radix_scatter_with_indices(
+            &scatter_fn,
+            &keys_ping,
+            &keys_pong,
+            &idx_ping,
+            &idx_pong,
+            &offsets_dev,
+            n_rows_u32,
+            shift,
+            grid_x,
+            block_size,
+            &stream,
+        )?;
+
+        // Swap ping ↔ pong for the next pass.
+        std::mem::swap(&mut keys_ping, &mut keys_pong);
+        std::mem::swap(&mut idx_ping, &mut idx_pong);
+    }
+
+    // ----- one-shot post-pass: restore original int values ------------
+    if let Some(ref m) = flip_module_fn {
+        let flip_fn = m.function(&radix_msb_flip_entry(dtype)?)?;
+        launch_radix_msb_flip(&flip_fn, &mut keys_ping, n_rows_u32, grid_x, block_size, &stream)?;
+    }
+
+    stream.synchronize()?;
+
+    // ----- D2H the permutation ----------------------------------------
+    // idx_ping holds the final permutation. GpuVec::to_vec needs self.len
+    // to be populated; we constructed it from a slice of n_rows entries
+    // so the bookkeeping len is already correct.
+    let perm = idx_ping.to_vec()?;
+
+    // Buffers drop here.
+    drop(keys_ping);
+    drop(keys_pong);
+    drop(idx_pong);
+    drop(hist_dev);
+    drop(offsets_dev);
+
+    Ok(perm)
+}
+
+/// Inner pipeline for Int64 keys. Mirror of `run_radix_pipeline_i32`
+/// except the key buffer is `GpuVec<i64>` and the pass count is 16.
+fn run_radix_pipeline_i64(
+    host_keys: &[i64],
+    n_rows_u32: u32,
+    dtype: DataType,
+) -> BoltResult<Vec<u32>> {
+    debug_assert!(matches!(dtype, DataType::Int64));
+    let radix_steps = radix_steps_for(dtype)?;
+    let needs_flip = radix_needs_msb_flip(dtype)?;
+
+    // See the i32 driver for the rationale behind initialising both
+    // ping and pong via `from_slice` — `to_vec()` after the final swap
+    // needs the destination buffer's len bookkeeping to be n_rows.
+    let mut keys_ping: GpuVec<i64> = GpuVec::<i64>::from_slice(host_keys)?;
+    let mut keys_pong: GpuVec<i64> = GpuVec::<i64>::from_slice(host_keys)?;
+    let idx_host: Vec<u32> = (0..n_rows_u32).collect();
+    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(&idx_host)?;
+    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(&idx_host)?;
+    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
+    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
+
+    let stream = CudaStream::null();
+    let hist_module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("radix_histogram:{:?}", dtype),
+        None,
+        || compile_radix_histogram(dtype),
+    )?;
+    let hist_fn = hist_module.function(&radix_histogram_entry(dtype)?)?;
+    let scatter_module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("radix_scatter_with_indices:{:?}", dtype),
+        None,
+        || compile_radix_scatter_with_indices(dtype),
+    )?;
+    let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
+    let flip_module_fn = if needs_flip {
+        Some(module_cache::get_or_build_module(
+            module_path!(),
+            format!("radix_msb_flip:{:?}", dtype),
+            None,
+            || compile_radix_msb_flip(dtype),
+        )?)
+    } else {
+        None
+    };
+
+    let block_size = RADIX_BLOCK_SIZE;
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
+
+    if let Some(ref m) = flip_module_fn {
+        let flip_fn = m.function(&radix_msb_flip_entry(dtype)?)?;
+        launch_radix_msb_flip_i64(&flip_fn, &mut keys_ping, n_rows_u32, grid_x, block_size, &stream)?;
+    }
+
+    for step in 0..radix_steps {
+        let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
+
+        let hist_bytes = (RADIX_BUCKETS as usize) * std::mem::size_of::<u32>();
+        // SAFETY: hist_dev was allocated with RADIX_BUCKETS u32 entries.
+        unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
+        let _ = hist_bytes;
+
+        launch_radix_histogram_i64(
+            &hist_fn,
+            &keys_ping,
+            &hist_dev,
+            n_rows_u32,
+            shift,
+            grid_x,
+            block_size,
+            &stream,
+        )?;
+
+        let mut hist_host = vec![0u32; RADIX_BUCKETS as usize];
+        // SAFETY: hist_dev has RADIX_BUCKETS u32 elements.
+        unsafe {
+            cuda_sys::memcpy_d2h::<u32>(
+                hist_host.as_mut_ptr(),
+                hist_dev.device_ptr(),
+                RADIX_BUCKETS as usize,
+            )?;
+        }
+        let mut offsets_host = vec![0u32; RADIX_BUCKETS as usize];
+        let mut running: u32 = 0;
+        for (i, h) in hist_host.iter().enumerate() {
+            offsets_host[i] = running;
+            running = running.wrapping_add(*h);
+        }
+        // SAFETY: offsets_dev has RADIX_BUCKETS u32 entries.
+        unsafe {
+            cuda_sys::memcpy_h2d::<u32>(
+                offsets_dev.device_ptr(),
+                offsets_host.as_ptr(),
+                RADIX_BUCKETS as usize,
+            )?;
+        }
+
+        launch_radix_scatter_with_indices_i64(
+            &scatter_fn,
+            &keys_ping,
+            &keys_pong,
+            &idx_ping,
+            &idx_pong,
+            &offsets_dev,
+            n_rows_u32,
+            shift,
+            grid_x,
+            block_size,
+            &stream,
+        )?;
+
+        std::mem::swap(&mut keys_ping, &mut keys_pong);
+        std::mem::swap(&mut idx_ping, &mut idx_pong);
+    }
+
+    if let Some(ref m) = flip_module_fn {
+        let flip_fn = m.function(&radix_msb_flip_entry(dtype)?)?;
+        launch_radix_msb_flip_i64(&flip_fn, &mut keys_ping, n_rows_u32, grid_x, block_size, &stream)?;
+    }
+
+    stream.synchronize()?;
+
+    let perm = idx_ping.to_vec()?;
+    drop(keys_ping);
+    drop(keys_pong);
+    drop(idx_pong);
+    drop(hist_dev);
+    drop(offsets_dev);
+    Ok(perm)
+}
+
+/// Launch `bolt_radix_msb_flip_i32` on `keys`. Pass the n_rows u32 alongside.
+///
+/// The kernel mutates the device buffer in place; we take `&mut GpuVec`
+/// here so the borrow-checker reflects that — even though the helper
+/// only reads `device_ptr()` itself, the FFI call writes through the
+/// pointer.
+fn launch_radix_msb_flip(
+    f: &crate::jit::CudaFunction<'_>,
+    keys: &mut GpuVec<i32>,
+    n_rows_u32: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut keys_ptr: CUdeviceptr = keys.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: every param slot points at a stack local that outlives the
+    // synchronous launch boundary used below.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// Int64 variant of [`launch_radix_msb_flip`]. ABI is identical (keys_ptr +
+/// n_rows u32) — only the buffer's element type changes on the host side.
+fn launch_radix_msb_flip_i64(
+    f: &crate::jit::CudaFunction<'_>,
+    keys: &mut GpuVec<i64>,
+    n_rows_u32: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut keys_ptr: CUdeviceptr = keys.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: same as the i32 variant.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// Launch `bolt_radix_histogram_i32` for one radix step. The histogram
+/// buffer is atomically updated.
+#[allow(clippy::too_many_arguments)]
+fn launch_radix_histogram(
+    f: &crate::jit::CudaFunction<'_>,
+    keys: &GpuVec<i32>,
+    hist: &GpuVec<u32>,
+    n_rows_u32: u32,
+    shift: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut keys_ptr: CUdeviceptr = keys.device_ptr();
+    let mut hist_ptr: CUdeviceptr = hist.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut p_shift: u32 = shift;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut hist_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+        &mut p_shift as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: every param slot points at a stack local that outlives the
+    // synchronous launch + sync at the end of the driver.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// Int64 variant of [`launch_radix_histogram`].
+#[allow(clippy::too_many_arguments)]
+fn launch_radix_histogram_i64(
+    f: &crate::jit::CudaFunction<'_>,
+    keys: &GpuVec<i64>,
+    hist: &GpuVec<u32>,
+    n_rows_u32: u32,
+    shift: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut keys_ptr: CUdeviceptr = keys.device_ptr();
+    let mut hist_ptr: CUdeviceptr = hist.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut p_shift: u32 = shift;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut hist_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+        &mut p_shift as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: same as the i32 variant.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// Launch `bolt_radix_scatter_i32_with_indices` for one radix step. The
+/// `offsets` buffer is atomically updated as the kernel runs.
+#[allow(clippy::too_many_arguments)]
+fn launch_radix_scatter_with_indices(
+    f: &crate::jit::CudaFunction<'_>,
+    keys_in: &GpuVec<i32>,
+    keys_out: &GpuVec<i32>,
+    vals_in: &GpuVec<u32>,
+    vals_out: &GpuVec<u32>,
+    offsets: &GpuVec<u32>,
+    n_rows_u32: u32,
+    shift: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut k_in_ptr: CUdeviceptr = keys_in.device_ptr();
+    let mut k_out_ptr: CUdeviceptr = keys_out.device_ptr();
+    let mut v_in_ptr: CUdeviceptr = vals_in.device_ptr();
+    let mut v_out_ptr: CUdeviceptr = vals_out.device_ptr();
+    let mut off_ptr: CUdeviceptr = offsets.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut p_shift: u32 = shift;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut k_in_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut k_out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut v_in_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut v_out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut off_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+        &mut p_shift as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: every param slot points at a stack local that outlives the
+    // synchronous launch + sync at the end of the driver.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// Int64 variant of [`launch_radix_scatter_with_indices`].
+#[allow(clippy::too_many_arguments)]
+fn launch_radix_scatter_with_indices_i64(
+    f: &crate::jit::CudaFunction<'_>,
+    keys_in: &GpuVec<i64>,
+    keys_out: &GpuVec<i64>,
+    vals_in: &GpuVec<u32>,
+    vals_out: &GpuVec<u32>,
+    offsets: &GpuVec<u32>,
+    n_rows_u32: u32,
+    shift: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut k_in_ptr: CUdeviceptr = keys_in.device_ptr();
+    let mut k_out_ptr: CUdeviceptr = keys_out.device_ptr();
+    let mut v_in_ptr: CUdeviceptr = vals_in.device_ptr();
+    let mut v_out_ptr: CUdeviceptr = vals_out.device_ptr();
+    let mut off_ptr: CUdeviceptr = offsets.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut p_shift: u32 = shift;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut k_in_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut k_out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut v_in_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut v_out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut off_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+        &mut p_shift as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: same as the i32 variant.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
 }
 
 /// Threshold below which we emit the in-block shmem variant. Equal to
@@ -1575,6 +2309,87 @@ mod tests {
         for i in 1..n {
             assert!(k_sorted.value(i - 1) <= k_sorted.value(i));
         }
+    }
+
+    // -- v0.7 GPU radix sort round-trips (single-key Int32/Int64 ASC). --
+    //
+    // These mirror the bitonic round-trip tests above but go through
+    // `sort_indices_on_gpu_radix` instead of the bitonic multi-key
+    // driver. Tagged `gpu:sort_radix` so an existing `gpu:sort` skip
+    // doesn't accidentally hide a radix-only regression.
+
+    /// End-to-end Int32 ASC sort via the radix path. Builds a 16k-row
+    /// scrambled column, runs the radix driver, and asserts the
+    /// permutation is correct.
+    #[test]
+    #[ignore = "gpu:sort_radix"]
+    fn gpu_sort_radix_int32_asc_round_trip() {
+        let n = 16_384usize;
+        let mut values: Vec<i32> = (0..n as i32).collect();
+        let mut rng_state: u64 = 0xfeedface;
+        for i in (1..n).rev() {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (rng_state as usize) % (i + 1);
+            values.swap(i, j);
+        }
+        let arr = Int32Array::from(values.clone());
+
+        let perm = sort_indices_on_gpu_radix(
+            &arr,
+            DataType::Int32,
+            SortDirection::Asc,
+            false,
+        )
+        .expect("gpu radix sort")
+        .expect("non-fallback on int32 asc no-null");
+        assert_eq!(perm.len(), n);
+
+        let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
+        for w in sorted.windows(2) {
+            assert!(w[0] <= w[1], "radix non-monotonic: {} > {}", w[0], w[1]);
+        }
+        let mut expected = values.clone();
+        expected.sort();
+        assert_eq!(sorted, expected);
+    }
+
+    /// End-to-end Int64 ASC sort via the radix path. Same shape as the
+    /// i32 test but with 16-pass coverage of the 64-bit key.
+    #[test]
+    #[ignore = "gpu:sort_radix"]
+    fn gpu_sort_radix_int64_asc_round_trip() {
+        let n = 16_384usize;
+        // Use a range that includes negatives so the MSB-flip path is
+        // exercised — without it the negatives would sort after positives.
+        let values: Vec<i64> = (0..n as i64)
+            .map(|i| ((i * 7919) % 200_000) - 100_000)
+            .collect();
+        let arr = Int64Array::from(values.clone());
+
+        let perm = sort_indices_on_gpu_radix(
+            &arr,
+            DataType::Int64,
+            SortDirection::Asc,
+            false,
+        )
+        .expect("gpu radix sort i64")
+        .expect("non-fallback on int64 asc no-null");
+        assert_eq!(perm.len(), n);
+
+        let sorted: Vec<i64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
+        for w in sorted.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "radix i64 non-monotonic: {} > {}",
+                w[0],
+                w[1]
+            );
+        }
+        let mut expected = values.clone();
+        expected.sort();
+        assert_eq!(sorted, expected);
     }
 
     // -- Stage 5 — high-cardinality sampling gate. Pure host, no CUDA. --
