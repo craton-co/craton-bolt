@@ -269,6 +269,32 @@ pub enum Expr {
         /// The single operand.
         operand: Box<Expr>,
     },
+    /// SQL `expr LIKE 'pattern'` / `expr NOT LIKE 'pattern'`.
+    ///
+    /// v0.5 minimum: the pattern must be a string literal constant captured
+    /// here as `pattern: String`. Variable / column-valued patterns are
+    /// rejected by the SQL frontend with a clear error so the executor never
+    /// sees them. Wildcards: `%` matches zero-or-more characters; `_` matches
+    /// exactly one character. The `escape` slot is reserved for future use —
+    /// `ESCAPE '<char>'` is rejected at the frontend until kernel codegen
+    /// catches up (see follow-up note in [`crate::plan::sql_frontend`]).
+    ///
+    /// Type-check rule: `expr` must resolve to `Utf8`. The whole expression
+    /// resolves to `Bool`. Lowering for v0.5 lives entirely on the host
+    /// side; see [`crate::exec::like::host_like`] for the executor.
+    Like {
+        /// Operand: must be a `Utf8`-typed expression.
+        expr: Box<Expr>,
+        /// Literal pattern (`%` = wildcard any, `_` = wildcard one).
+        pattern: String,
+        /// Optional ESCAPE character. Currently always `None` — the SQL
+        /// frontend rejects `ESCAPE '<char>'` for v0.5 and the executor
+        /// has no escape semantics. Kept on the variant so the eventual
+        /// implementation does not change the variant shape.
+        escape: Option<char>,
+        /// `true` for `NOT LIKE`, `false` for `LIKE`.
+        negated: bool,
+    },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
 }
@@ -449,6 +475,17 @@ impl Expr {
                     Ok(DataType::Bool)
                 }
             },
+            Expr::Like { expr, .. } => {
+                // Operand must be Utf8. The pattern is a constant captured on
+                // the variant so it doesn't participate in type-checking.
+                let t = expr.dtype_depth(schema, depth + 1)?;
+                if t != DataType::Utf8 {
+                    return Err(BoltError::Type(format!(
+                        "LIKE requires a Utf8 operand, got {t:?}"
+                    )));
+                }
+                Ok(DataType::Bool)
+            }
             Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
         }
     }
@@ -1063,6 +1100,37 @@ mod null_handling_tests {
             };
             assert_eq!(on_null.dtype(&schema).unwrap(), DataType::Bool);
         }
+    }
+
+    /// `expr LIKE 'pat'` resolves to Bool when the operand is Utf8, and
+    /// errors with a type message otherwise (e.g. LIKE on an Int32
+    /// column).
+    #[test]
+    fn like_typechecks_to_bool_on_utf8() {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("v", DataType::Int32, false),
+        ]);
+        let ok = Expr::Like {
+            expr: Box::new(Expr::Column("s".into())),
+            pattern: "foo%".into(),
+            escape: None,
+            negated: false,
+        };
+        assert_eq!(ok.dtype(&schema).unwrap(), DataType::Bool);
+
+        let bad = Expr::Like {
+            expr: Box::new(Expr::Column("v".into())),
+            pattern: "foo%".into(),
+            escape: None,
+            negated: false,
+        };
+        let err = bad.dtype(&schema).expect_err("LIKE on Int32 must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LIKE requires a Utf8 operand"),
+            "expected Utf8 type error, got: {msg}"
+        );
     }
 
     /// Arithmetic peer-typing: `x + NULL` with `x: Int64` resolves to

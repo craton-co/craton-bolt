@@ -357,17 +357,24 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 right: Box::new(new_right),
             })
         }
-        Expr::Unary { op, operand } => {
-            // `IS [NOT] NULL` does not interact with the string-literal
-            // rewriter: the rewriter folds `col = 'lit'` shapes into
-            // integer-index comparisons against a registered dictionary,
-            // and a unary validity test has no literal to resolve. We
-            // still walk the operand so any rewritable sub-expression
-            // (e.g. `(col = 'a') IS NULL`, however unusual) is normalised.
-            let new_operand = rewrite_expr_with(operand, r, depth + 1)?;
-            Ok(Expr::Unary {
-                op: *op,
-                operand: Box::new(new_operand),
+        Expr::Like {
+            expr: like_expr,
+            pattern,
+            escape,
+            negated,
+        } => {
+            // LIKE on a registered Utf8 column does not currently dispatch
+            // through the dictionary rewriter: the host-side LIKE evaluator
+            // ([`crate::exec::like::host_like`]) works on the raw Utf8
+            // string array, not on the integer index column. Walk the
+            // operand so any nested string-literal comparisons inside it
+            // are still normalised, but leave the LIKE itself intact.
+            let new_inner = rewrite_expr_with(like_expr, r, depth + 1)?;
+            Ok(Expr::Like {
+                expr: Box::new(new_inner),
+                pattern: pattern.clone(),
+                escape: *escape,
+                negated: *negated,
             })
         }
     }

@@ -310,7 +310,65 @@ fn eval_inner(
         Expr::Alias(inner, _) => eval_inner(inner, env, n_rows),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, n_rows),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, n_rows),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => eval_like(expr, pattern, *escape, *negated, env, n_rows),
     }
+}
+
+/// Evaluate `expr LIKE 'pattern'` / `expr NOT LIKE 'pattern'` on the host.
+///
+/// `expr` must produce a `Utf8` (or `Utf8`-castable) column. `pattern`'s
+/// `%` matches zero-or-more characters and `_` matches exactly one. Rows
+/// where the operand is `NULL` produce `None` in the output (SQL 3VL —
+/// `NULL LIKE 'x'` is NULL, not false). For non-NULL rows the result is
+/// `Some(true)` / `Some(false)`. `negated` inverts the per-row Bool but
+/// preserves the `None` cells.
+///
+/// `escape` is currently always `None` — the SQL frontend rejects
+/// `ESCAPE '<char>'` for v0.5. We still accept the parameter so the
+/// follow-up that wires escape support doesn't need to change this
+/// signature.
+fn eval_like(
+    expr: &Expr,
+    pattern: &str,
+    escape: Option<char>,
+    negated: bool,
+    env: &ColumnEnv<'_>,
+    n_rows: usize,
+) -> BoltResult<HostColumn> {
+    let raw = eval_inner(expr, env, n_rows)?;
+    let utf8 = match raw {
+        HostColumn::Utf8(v) => v,
+        other => {
+            return Err(BoltError::Type(format!(
+                "expr_agg: LIKE requires a Utf8 operand, got {:?}",
+                other.dtype()
+            )));
+        }
+    };
+    if utf8.len() != n_rows {
+        return Err(BoltError::Other(format!(
+            "expr_agg: LIKE operand produced {} rows, expected {}",
+            utf8.len(),
+            n_rows
+        )));
+    }
+    let matcher = crate::exec::like::PatternMatcher::compile(pattern, escape)?;
+    let out: Vec<Option<bool>> = utf8
+        .iter()
+        .map(|cell| match cell {
+            None => None,
+            Some(s) => {
+                let m = matcher.matches(s);
+                Some(if negated { !m } else { m })
+            }
+        })
+        .collect();
+    Ok(HostColumn::Bool(out))
 }
 
 /// Look up `name` in `env` and clone the referenced column. Validates the

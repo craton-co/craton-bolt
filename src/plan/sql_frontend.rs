@@ -1711,6 +1711,11 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
         SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
             contains_aggregate(inner, resolver, depth + 1)
         }
+        // `expr LIKE 'pattern'` — descend into the operand (the pattern is a
+        // constant, but a future SUM(s) LIKE '%foo' inside HAVING should be
+        // detected here so we don't silently mis-classify the predicate as
+        // non-aggregate).
+        SqlExpr::Like { expr, .. } => contains_aggregate(expr, resolver, depth + 1),
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
         _ => Ok(false),
     }
@@ -1824,6 +1829,7 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
             }
             Expr::Alias(inner, _) => stack.push(inner),
             Expr::Unary { operand, .. } => stack.push(operand),
+            Expr::Like { expr, .. } => stack.push(expr),
         }
     }
     Ok(())
@@ -1913,6 +1919,55 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
             Ok(Expr::Unary {
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(operand),
+            })
+        }
+        // `<expr> [NOT] LIKE 'pattern' [ESCAPE 'c']`. v0.5 contract:
+        //   - `pattern` MUST be a single-quoted string literal — variable
+        //     / column-valued patterns are rejected with a clear error.
+        //   - `ESCAPE '<char>'` is rejected for v0.5 (deferred); the only
+        //     wildcards recognised are `%` (zero-or-more) and `_` (exactly
+        //     one). Follow-up: implement ESCAPE once the generic char-class
+        //     matcher learns the escape rule.
+        //   - `any: true` (Snowflake LIKE ANY) is rejected — it does not
+        //     map to a single-pattern semantics.
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(BoltError::Sql(
+                    "unsupported: LIKE ANY (...)".into(),
+                ));
+            }
+            // ESCAPE is a v0.5 follow-up — reject so the user gets a clear
+            // message rather than silently-wrong results.
+            if escape_char.is_some() {
+                return Err(BoltError::Sql(
+                    "unsupported: LIKE ... ESCAPE '<char>' (v0.5 follow-up)".into(),
+                ));
+            }
+            // Pattern must be a string literal. Anything else (a column
+            // ref, a function call, a numeric literal) is rejected with a
+            // message that names the offending shape so the user knows why
+            // their query was blocked.
+            let pattern_str = match pattern.as_ref() {
+                SqlExpr::Value(Value::SingleQuotedString(s)) => s.clone(),
+                other => {
+                    return Err(BoltError::Sql(format!(
+                        "LIKE pattern must be a string literal constant, got: {other}"
+                    )));
+                }
+            };
+            let operand = lower_expr(expr, resolver, depth + 1)?;
+            Ok(Expr::Like {
+                expr: Box::new(operand),
+                pattern: pattern_str,
+                // ESCAPE rejected above; reserved for the follow-up.
+                escape: None,
+                negated: *negated,
             })
         }
         SqlExpr::Function(_) => Err(BoltError::Sql(
@@ -2873,6 +2928,7 @@ mod wave7_tests {
                         }
                         Expr::Alias(inner, _) => stack.push(inner),
                         Expr::Unary { operand, .. } => stack.push(operand),
+                        Expr::Like { expr, .. } => stack.push(expr),
                         Expr::Literal(_) => {}
                     }
                 }
@@ -2987,6 +3043,150 @@ mod wave7_tests {
         assert!(
             msg.contains("both sides reference the same table"),
             "expected same-side message, got: {msg}"
+        );
+    }
+}
+
+/// v0.5 LIKE parse-shape tests. Lock the SQL frontend surface for
+/// `expr LIKE 'pat'` and `expr NOT LIKE 'pat'`: pattern must be a string
+/// literal, ESCAPE is rejected as a follow-up, the typed Expr::Like
+/// captures pattern verbatim. Execution is covered by
+/// `tests/like_test.rs` against the host evaluator.
+#[cfg(test)]
+mod like_tests {
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    /// `s` is a Utf8 column for LIKE tests; `v` is an unrelated Int64 so
+    /// we can also assert LIKE on a non-Utf8 column rejects cleanly.
+    fn s_provider() -> MemTableProvider {
+        let t = Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]);
+        MemTableProvider::new().with_table("t", t)
+    }
+
+    /// Pull the Filter predicate out of a top-level
+    /// `Project { input: Filter { .. } }` plan.
+    fn predicate(plan: &LogicalPlan) -> &Expr {
+        match plan {
+            LogicalPlan::Project { input, .. } => match input.as_ref() {
+                LogicalPlan::Filter { predicate, .. } => predicate,
+                other => panic!("expected Filter under Project, got {other:?}"),
+            },
+            LogicalPlan::Filter { predicate, .. } => predicate,
+            other => panic!("expected Project or Filter at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_like_exact_pattern() {
+        let plan = parse("SELECT s FROM t WHERE s LIKE 'foo'", &s_provider())
+            .expect("LIKE 'foo' must parse");
+        match predicate(&plan) {
+            Expr::Like {
+                pattern,
+                negated,
+                escape,
+                ..
+            } => {
+                assert_eq!(pattern, "foo");
+                assert!(!negated);
+                assert!(escape.is_none());
+            }
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_like_prefix_pattern() {
+        let plan = parse("SELECT s FROM t WHERE s LIKE 'foo%'", &s_provider())
+            .expect("LIKE 'foo%' must parse");
+        match predicate(&plan) {
+            Expr::Like { pattern, .. } => assert_eq!(pattern, "foo%"),
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_like_suffix_pattern() {
+        let plan = parse("SELECT s FROM t WHERE s LIKE '%foo'", &s_provider()).unwrap();
+        match predicate(&plan) {
+            Expr::Like { pattern, .. } => assert_eq!(pattern, "%foo"),
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_like_contains_pattern() {
+        let plan = parse("SELECT s FROM t WHERE s LIKE '%foo%'", &s_provider()).unwrap();
+        match predicate(&plan) {
+            Expr::Like { pattern, .. } => assert_eq!(pattern, "%foo%"),
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_not_like_sets_negated_flag() {
+        let plan = parse(
+            "SELECT s FROM t WHERE s NOT LIKE 'foo%'",
+            &s_provider(),
+        )
+        .unwrap();
+        match predicate(&plan) {
+            Expr::Like {
+                pattern, negated, ..
+            } => {
+                assert_eq!(pattern, "foo%");
+                assert!(*negated, "NOT LIKE must set negated=true");
+            }
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_like_on_non_utf8_column_typeerrs() {
+        // `v` is Int64; LIKE must require Utf8.
+        let err = parse("SELECT v FROM t WHERE v LIKE 'foo'", &s_provider())
+            .expect_err("LIKE on Int64 must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LIKE requires a Utf8 operand"),
+            "expected Utf8 type error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_like_with_variable_pattern_rejected() {
+        // Pattern must be a string literal — a column ref is not allowed.
+        let err = parse(
+            "SELECT s FROM t WHERE s LIKE s",
+            &s_provider(),
+        )
+        .expect_err("variable LIKE pattern must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LIKE pattern must be a string literal constant"),
+            "expected constant-pattern message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_like_with_escape_rejected_for_v05() {
+        let err = parse(
+            r"SELECT s FROM t WHERE s LIKE 'a\_b' ESCAPE '\'",
+            &s_provider(),
+        )
+        .expect_err("ESCAPE must be rejected for v0.5");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ESCAPE"),
+            "expected ESCAPE-rejection message, got: {msg}"
+        );
+        assert!(
+            msg.contains("follow-up") || msg.contains("v0.5"),
+            "error message should mark this as a follow-up, got: {msg}"
         );
     }
 }

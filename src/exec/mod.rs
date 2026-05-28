@@ -68,6 +68,10 @@ pub mod join;
 pub(crate) mod gpu_join;
 #[doc(hidden)]
 pub mod filter;
+// v0.5: host-side SQL `LIKE` evaluator (`Expr::Like` lowering target).
+// Exposed `pub` so the host filter executor and the expression evaluator
+// both reach the `PatternMatcher` API through one source-of-truth module.
+pub mod like;
 
 #[doc(hidden)]
 pub use launch::{launch_1d, CudaStream, KernelArgs};
