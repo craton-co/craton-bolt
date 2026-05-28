@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! PTX codegen for a **single-pass 4-bit-radix sort** kernel (keys-only).
+//! PTX codegen for a **single-pass 4-bit-radix sort** kernel.
 //!
 //! ## Why a radix sort?
 //!
@@ -11,10 +11,24 @@
 //! sort (where `k` is the key bit-width and `r` the radix bit-width) wins.
 //!
 //! This kernel is **gated behind the `BOLT_GPU_SORT=1` environment variable**
-//! and is **not** wired into [`crate::exec::sort`] yet — see [`try_gpu_radix_sort`]
-//! for the hook point. Integration with the executor (allocating scratch
-//! buffers, launching one kernel per radix step, writing the permutation back
-//! into the row indices) is a follow-up.
+//! — see [`try_gpu_radix_sort`] for the hook point.
+//!
+//! ## Two ABI flavours: keys-only vs keys+indices
+//!
+//! The codegen surface emits **two** scatter variants per dtype:
+//!
+//! - **Keys-only** ([`compile_radix_scatter`]) — retained for the ORDER BY
+//!   single-key shortcut where the executor never needs to project unrelated
+//!   columns. The sorted key buffer *is* the result.
+//! - **Keys + indices** ([`compile_radix_scatter_with_indices`]) — the
+//!   standard path for multi-column ORDER BY. The kernel carries a parallel
+//!   `u32` row-index payload through every scatter step, so the final
+//!   `vals_out` buffer is the row permutation. The executor then feeds that
+//!   permutation to `arrow::compute::take` to materialise every projected
+//!   column in the sorted order.
+//!
+//! Both variants share the same histogram kernel — the histogram only counts
+//! digits in the keys, so it doesn't need the index payload.
 //!
 //! ## Algorithm — standard histogram / scan / scatter
 //!
@@ -45,13 +59,23 @@
 //!
 //! This file scaffolds **the codegen surface** for the radix sort. The full
 //! "histogram / scan / scatter" loop is multi-kernel and multi-launch — this
-//! module emits the per-step PTX that the executor will drive. For the v0.6
-//! scaffold we emit two single entry-points per dtype:
+//! module emits the per-step PTX that the executor will drive. Per dtype:
 //!
 //! - `bolt_radix_histogram_<dty>` — read each key, bump its 4-bit digit bucket
 //!   in a global 16-counter histogram. Used at the start of every radix step.
-//! - `bolt_radix_scatter_<dty>` — read each key, look up its digit's running
-//!   offset (atomic-bumped), and write the key into the output buffer.
+//!   Keys-only and keys+indices variants share this kernel.
+//! - `bolt_radix_scatter_<dty>` — keys-only scatter: read each key, look up
+//!   its digit's running offset (atomic-bumped), and write the key into the
+//!   output buffer. Kept for the ORDER BY single-key shortcut.
+//! - `bolt_radix_scatter_<dty>_with_indices` — keys+indices scatter: read
+//!   each `(key, val)` pair from `(keys_in, vals_in)`, atomic-bump the
+//!   digit's offset to claim a single output slot, then write both `key` and
+//!   `val` at that slot in `(keys_out, vals_out)`. `val` is a `u32`
+//!   row-index; this is the standard path for multi-column ORDER BY.
+//! - `bolt_radix_msb_flip_<dty>` — signed-key fixup: XOR every key with the
+//!   MSB constant. Run once on the input before pass 0 and once on the final
+//!   output after the last pass. See [`compile_radix_msb_flip`] for the
+//!   rationale.
 //!
 //! The host-side scan over 16 buckets is trivial enough to run on the CPU or
 //! to reuse the engine's existing prefix-scan kernel — we don't emit a
@@ -73,6 +97,21 @@
 //!     .param .u64 offsets_ptr,    // 16-entry u32 running offsets (atomic-bumped)
 //!     .param .u32 n_rows,
 //!     .param .u32 shift
+//! )
+//!
+//! .visible .entry bolt_radix_scatter_<dty>_with_indices(
+//!     .param .u64 keys_in_ptr,    // input keys
+//!     .param .u64 keys_out_ptr,   // output keys (sorted by current radix step)
+//!     .param .u64 vals_in_ptr,    // input row-index payload (u32 per row)
+//!     .param .u64 vals_out_ptr,   // output row-index payload (lock-step with keys)
+//!     .param .u64 offsets_ptr,    // 16-entry u32 running offsets (atomic-bumped)
+//!     .param .u32 n_rows,
+//!     .param .u32 shift
+//! )
+//!
+//! .visible .entry bolt_radix_msb_flip_<dty>(
+//!     .param .u64 keys_ptr,       // in-place XOR with the MSB constant
+//!     .param .u32 n_rows
 //! )
 //! ```
 //!
@@ -248,6 +287,29 @@ pub fn radix_scatter_entry(dtype: DataType) -> BoltResult<String> {
     Ok(format!("bolt_radix_scatter_{}", tag))
 }
 
+/// Build the entry-point name for the keys+indices scatter kernel of a given
+/// dtype.
+///
+/// This is the standard path for multi-column ORDER BY: the kernel carries a
+/// parallel `u32` row-index payload through every scatter step, so the final
+/// `vals_out` buffer is the row permutation the executor feeds to
+/// `arrow::compute::take`.
+pub fn radix_scatter_with_indices_entry(dtype: DataType) -> BoltResult<String> {
+    let tag = dtype_tag(dtype)?;
+    Ok(format!("bolt_radix_scatter_{}_with_indices", tag))
+}
+
+/// Build the entry-point name for the MSB-flip kernel of a given dtype.
+///
+/// The MSB-flip is a one-shot in-place XOR over the keys buffer: it is run
+/// once on the input before pass 0 and once on the final output after the
+/// last pass, so the per-pass histogram / scatter kernels can treat the
+/// keys as plain unsigned bit-blobs.
+pub fn radix_msb_flip_entry(dtype: DataType) -> BoltResult<String> {
+    let tag = dtype_tag(dtype)?;
+    Ok(format!("bolt_radix_msb_flip_{}", tag))
+}
+
 /// Map a supported dtype to its short tag used in entry-point names.
 fn dtype_tag(dtype: DataType) -> BoltResult<&'static str> {
     // We deliberately use `i32` / `i64` (the source-language spelling) rather
@@ -282,10 +344,10 @@ fn dtype_tag(dtype: DataType) -> BoltResult<&'static str> {
 /// ```
 ///
 /// The MSB-flip transform is **not** done inside this kernel — the executor
-/// pre-flips the keys buffer once before pass 0 and post-flips it once after
-/// the last pass. Keeping the per-step kernel transform-free means the
-/// scatter kernel can ride the same already-flipped buffer without doing
-/// per-step work that would cancel itself.
+/// runs the dedicated [`compile_radix_msb_flip`] kernel once before pass 0
+/// and once after the last pass. Keeping the per-step kernel transform-free
+/// means the scatter kernel can ride the same already-flipped buffer without
+/// doing per-step work that would cancel itself.
 pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     let entry = radix_histogram_entry(dtype)?;
@@ -468,6 +530,253 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     Ok(p)
 }
 
+/// Emit the PTX for the radix-sort **keys+indices scatter** kernel for `dtype`.
+///
+/// This is the standard path for multi-column ORDER BY: the kernel carries a
+/// parallel `u32` row-index payload through every scatter step, so after the
+/// last pass `vals_out` is the row permutation. The executor wraps that
+/// permutation in a `UInt32Array` and feeds it to `arrow::compute::take` to
+/// materialise every projected column in sorted order.
+///
+/// Per-thread logic:
+///
+/// ```text
+///   tid = blockIdx.x * blockDim.x + threadIdx.x
+///   if tid >= n_rows: return
+///   key = keys_in[tid]
+///   val = vals_in[tid]                    // u32 row-index payload
+///   digit = (key >> shift) & 0xF
+///   out_idx = atomicAdd(&offsets[digit], 1u32)
+///   keys_out[out_idx] = key
+///   vals_out[out_idx] = val               // lock-step with key at same slot
+/// ```
+///
+/// The single `atomicAdd` is critical: keys and values must land at the
+/// **same** slot, so we capture `out_idx` once and reuse it for both stores.
+/// Two `atomicAdd`s would race and break the pairing.
+///
+/// Like the keys-only scatter this is not stable — for ORDER BY semantics
+/// that's fine (SQL ORDER BY is not required to be stable, and adding stable
+/// row-index breaks ties in the natural per-thread order anyway because the
+/// kernel processes rows in `tid` order within each digit bucket modulo
+/// scheduling jitter).
+pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String> {
+    let flavour = RadixFlavour::for_dtype(dtype)?;
+    let entry = radix_scatter_with_indices_entry(dtype)?;
+
+    let mut p = String::new();
+    writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
+    writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
+    writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    // -- Signature ----------------------------------------------------
+    writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?; // keys_in
+    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?; // keys_out
+    writeln!(p, "\t.param .u64 {entry}_param_2,").map_err(write_err)?; // vals_in
+    writeln!(p, "\t.param .u64 {entry}_param_3,").map_err(write_err)?; // vals_out
+    writeln!(p, "\t.param .u64 {entry}_param_4,").map_err(write_err)?; // offsets
+    writeln!(p, "\t.param .u32 {entry}_param_5,").map_err(write_err)?; // n_rows
+    writeln!(p, "\t.param .u32 {entry}_param_6").map_err(write_err)?; // shift
+    writeln!(p, ")").map_err(write_err)?;
+    writeln!(p, "{{").map_err(write_err)?;
+
+    // -- Register declarations ---------------------------------------
+    // %r10 holds the u32 row-index payload; reserve a larger b32 pool.
+    writeln!(p, "\t.reg .pred %p<2>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %r<20>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %rd<24>;").map_err(write_err)?;
+
+    // tid
+    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+
+    // bail if tid >= n_rows
+    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_5];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // load shift
+    writeln!(p, "\tld.param.u32 %r5, [{entry}_param_6];").map_err(write_err)?;
+
+    // keys_in_ptr -> %rd0; load key from keys_in + tid * key_w
+    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    let key_w = flavour.byte_width as i64;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+
+    if flavour.byte_width == 4 {
+        writeln!(p, "\tld.global.{} %r6, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
+        writeln!(p, "\tshr.u32 %r7, %r6, %r5;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
+    } else {
+        writeln!(p, "\tld.global.{} %rd3, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
+        writeln!(p, "\tshr.u64 %rd4, %rd3, %r5;").map_err(write_err)?;
+        writeln!(p, "\tcvt.u32.u64 %r7, %rd4;").map_err(write_err)?;
+        writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
+    }
+
+    // vals_in_ptr -> %rd11; addr = vals_in_ptr + tid * 4 (u32 payload).
+    // Load the row-index now, before we claim the output slot, so the load
+    // and the store are independent.
+    writeln!(p, "\tld.param.u64 %rd11, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd11, %rd11;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd12, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd13, %rd11, %rd12;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u32 %r10, [%rd13];").map_err(write_err)?;
+
+    // offsets_ptr -> %rd5; atomic-add 1 to offsets[digit], capturing the
+    // *pre*-increment value as the output slot. The single atomic guarantees
+    // keys and vals land at the same slot.
+    writeln!(p, "\tld.param.u64 %rd5, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd5, %rd5;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd6, %r8, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd7, %rd5, %rd6;").map_err(write_err)?;
+    writeln!(p, "\tatom.global.add.u32 %r9, [%rd7], 1;").map_err(write_err)?;
+
+    // keys_out_ptr -> %rd8; out_addr = keys_out_ptr + out_idx * key_w
+    writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd9, %r9, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd10, %rd8, %rd9;").map_err(write_err)?;
+
+    if flavour.byte_width == 4 {
+        writeln!(p, "\tst.global.{} [%rd10], %r6;", flavour.ld_st_suffix).map_err(write_err)?;
+    } else {
+        writeln!(p, "\tst.global.{} [%rd10], %rd3;", flavour.ld_st_suffix).map_err(write_err)?;
+    }
+
+    // vals_out_ptr -> %rd14; vout_addr = vals_out_ptr + out_idx * 4
+    writeln!(p, "\tld.param.u64 %rd14, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd14, %rd14;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd15, %r9, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd16, %rd14, %rd15;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd16], %r10;").map_err(write_err)?;
+
+    writeln!(p, "DONE:").map_err(write_err)?;
+    writeln!(p, "\tret;").map_err(write_err)?;
+    writeln!(p, "}}").map_err(write_err)?;
+
+    Ok(p)
+}
+
+/// Emit the PTX for the **MSB-flip** kernel for a signed `dtype`.
+///
+/// Why we need this: a signed integer's bits sort wrong as unsigned because
+/// the sign bit is the most-significant bit and is inverted (negative values
+/// have the sign bit set, but should sort *before* positive values that have
+/// it cleared). The standard trick — used in Thrust's radix sort and CUB —
+/// is to XOR the key with the MSB constant on entry, run the unsigned radix
+/// sort over the transformed bits, then XOR again on exit to restore the
+/// original values. After the round-trip XOR the visible output is identical
+/// to the input *value*, but the intermediate per-pass histogram / scatter
+/// kernels see a clean unsigned bit-pattern that sorts correctly.
+///
+/// The MSB constants:
+/// - Int32: `0x8000_0000`
+/// - Int64: `0x8000_0000_0000_0000`
+///
+/// Per-thread logic:
+///
+/// ```text
+///   tid = blockIdx.x * blockDim.x + threadIdx.x
+///   if tid >= n_rows: return
+///   keys[tid] ^= MSB
+/// ```
+///
+/// Run once before pass 0 over the input buffer, then once after the last
+/// pass over the final output buffer. The transform is its own inverse
+/// (XOR is involutive), so the same kernel does entry-flip and exit-flip.
+///
+/// We separate this from the per-pass kernels so the scatter kernel can ride
+/// already-flipped keys without doing per-step work that would cancel itself.
+/// Returns an error for dtypes that don't require the flip (today: none of
+/// the supported set, since `Float32`/`Float64` need the IEEE-monotonic
+/// transform instead and `Bool`/`Utf8` aren't supported at all). Callers
+/// can also gate via [`radix_needs_msb_flip`].
+pub fn compile_radix_msb_flip(dtype: DataType) -> BoltResult<String> {
+    let flavour = RadixFlavour::for_dtype(dtype)?;
+    if !flavour.signed_msb_flip {
+        return Err(BoltError::Other(format!(
+            "sort_kernel_radix: dtype {:?} does not require an MSB flip; \
+             callers should gate via radix_needs_msb_flip first",
+            dtype
+        )));
+    }
+    let entry = radix_msb_flip_entry(dtype)?;
+
+    let mut p = String::new();
+    writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
+    writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
+    writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    // -- Signature ----------------------------------------------------
+    writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?; // keys
+    writeln!(p, "\t.param .u32 {entry}_param_1").map_err(write_err)?; // n_rows
+    writeln!(p, ")").map_err(write_err)?;
+    writeln!(p, "{{").map_err(write_err)?;
+
+    // -- Register declarations ---------------------------------------
+    writeln!(p, "\t.reg .pred %p<2>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %r<10>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %rd<10>;").map_err(write_err)?;
+
+    // tid
+    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+
+    // bail if tid >= n_rows
+    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // keys_ptr -> %rd0; addr = keys_ptr + tid * byte_width
+    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    let key_w = flavour.byte_width as i64;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+
+    // load key, XOR with the MSB constant, store back. Round-tripping
+    // via the same address (involutive XOR) makes the kernel its own inverse.
+    if flavour.byte_width == 4 {
+        writeln!(p, "\tld.global.{} %r5, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
+        writeln!(p, "\txor.b32 %r6, %r5, 2147483648;").map_err(write_err)?; // 0x8000_0000
+        writeln!(p, "\tst.global.{} [%rd2], %r6;", flavour.ld_st_suffix).map_err(write_err)?;
+    } else {
+        writeln!(p, "\tld.global.{} %rd3, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
+        // 0x8000_0000_0000_0000 as a literal; PTX accepts unsigned 64-bit
+        // immediates for xor.b64.
+        writeln!(p, "\txor.b64 %rd4, %rd3, 9223372036854775808;").map_err(write_err)?;
+        writeln!(p, "\tst.global.{} [%rd2], %rd4;", flavour.ld_st_suffix).map_err(write_err)?;
+    }
+
+    writeln!(p, "DONE:").map_err(write_err)?;
+    writeln!(p, "\tret;").map_err(write_err)?;
+    writeln!(p, "}}").map_err(write_err)?;
+
+    Ok(p)
+}
+
+/// Public: does this dtype need a one-shot MSB flip on entry and exit?
+///
+/// Returns `true` for signed integer dtypes (Int32, Int64) where the sign
+/// bit's inverted order would otherwise break the unsigned bit-pattern
+/// compare used by the per-pass histogram / scatter kernels. Returns `false`
+/// for unsigned-natured dtypes once they're added. Errors if the dtype isn't
+/// supported at all (same set as [`radix_supports_dtype`]).
+pub fn radix_needs_msb_flip(dtype: DataType) -> BoltResult<bool> {
+    Ok(RadixFlavour::for_dtype(dtype)?.signed_msb_flip)
+}
+
 /// Hook point for the executor: decide whether the GPU radix sort should run
 /// for an ORDER BY with `dtype` keys.
 ///
@@ -549,10 +858,49 @@ mod tests {
             );
             assert!(radix_histogram_entry(dty).is_err());
             assert!(radix_scatter_entry(dty).is_err());
+            assert!(radix_scatter_with_indices_entry(dty).is_err());
+            assert!(radix_msb_flip_entry(dty).is_err());
             assert!(compile_radix_histogram(dty).is_err());
             assert!(compile_radix_scatter(dty).is_err());
+            assert!(compile_radix_scatter_with_indices(dty).is_err());
+            assert!(compile_radix_msb_flip(dty).is_err());
             assert!(radix_steps_for(dty).is_err());
+            assert!(radix_needs_msb_flip(dty).is_err());
         }
+    }
+
+    /// The new keys+indices entry names pin to the documented shape — both
+    /// the executor wiring and the PTX module cache rely on this string.
+    #[test]
+    fn scatter_with_indices_entry_names_pin() {
+        assert_eq!(
+            radix_scatter_with_indices_entry(DataType::Int32).unwrap(),
+            "bolt_radix_scatter_i32_with_indices"
+        );
+        assert_eq!(
+            radix_scatter_with_indices_entry(DataType::Int64).unwrap(),
+            "bolt_radix_scatter_i64_with_indices"
+        );
+    }
+
+    /// MSB-flip entry names pin to the documented shape.
+    #[test]
+    fn msb_flip_entry_names_pin() {
+        assert_eq!(
+            radix_msb_flip_entry(DataType::Int32).unwrap(),
+            "bolt_radix_msb_flip_i32"
+        );
+        assert_eq!(
+            radix_msb_flip_entry(DataType::Int64).unwrap(),
+            "bolt_radix_msb_flip_i64"
+        );
+    }
+
+    /// Both signed integer dtypes need the MSB flip.
+    #[test]
+    fn signed_dtypes_need_msb_flip() {
+        assert!(radix_needs_msb_flip(DataType::Int32).unwrap());
+        assert!(radix_needs_msb_flip(DataType::Int64).unwrap());
     }
 
     /// The histogram PTX module includes the right entry name, the atomic
@@ -594,6 +942,109 @@ mod tests {
         assert!(ptx.contains("atom.global.add.u32"));
         assert!(ptx.contains("st.global.b32"));
         assert!(ptx.contains("ld.global.b32"));
+    }
+
+    /// Keys+indices scatter PTX shape for `i32`:
+    ///   1. The entry name and signature carry the documented seven `.param`s.
+    ///   2. The key load (`ld.global.b32`) and key store (`st.global.b32`)
+    ///      survive intact — same shape as the keys-only scatter.
+    ///   3. A single atomic-add bumps the offset; both stores reuse its result
+    ///      (we don't see a second `atom.global.add.u32` for the index).
+    ///   4. The new `vals_in` u32 load and `vals_out` u32 store appear —
+    ///      these are the new ABI surface the executor depends on.
+    #[test]
+    fn scatter_with_indices_ptx_shape_i32() {
+        let ptx = compile_radix_scatter_with_indices(DataType::Int32).unwrap();
+        assert!(ptx.contains(".visible .entry bolt_radix_scatter_i32_with_indices("));
+        // Seven params: keys_in, keys_out, vals_in, vals_out, offsets, n_rows, shift.
+        for i in 0..=6 {
+            assert!(
+                ptx.contains(&format!("_param_{i}")),
+                "missing _param_{i} in keys+indices scatter PTX",
+            );
+        }
+        // Existing key-side ABI preserved.
+        assert!(ptx.contains("ld.global.b32"));
+        assert!(ptx.contains("st.global.b32"));
+        // Single atomic bump — paired key+val writes share its result.
+        assert_eq!(
+            ptx.matches("atom.global.add.u32").count(),
+            1,
+            "keys+indices scatter must use exactly one atomicAdd per thread \
+             so keys and vals land at the same slot",
+        );
+        // The new vals payload: u32 load from vals_in and u32 store to vals_out.
+        assert!(
+            ptx.contains("ld.global.u32"),
+            "expected `ld.global.u32` for the vals_in row-index payload load",
+        );
+        assert!(
+            ptx.contains("st.global.u32"),
+            "expected `st.global.u32` for the vals_out row-index payload store",
+        );
+        assert!(ptx.contains("DONE:"));
+        assert!(ptx.contains("ret;"));
+    }
+
+    /// Keys+indices scatter PTX shape for `i64`:
+    ///   1. Entry name carries the i64 tag.
+    ///   2. Key load/store use the `b64` suffix (the 64-bit-key path).
+    ///   3. The vals payload remains u32 — row indices don't grow with key
+    ///      width — so we still see `ld.global.u32` / `st.global.u32`.
+    ///   4. A single `atomicAdd` couples the key and val writes.
+    #[test]
+    fn scatter_with_indices_ptx_shape_i64() {
+        let ptx = compile_radix_scatter_with_indices(DataType::Int64).unwrap();
+        assert!(ptx.contains(".visible .entry bolt_radix_scatter_i64_with_indices("));
+        assert!(ptx.contains("ld.global.b64"));
+        assert!(ptx.contains("st.global.b64"));
+        // Row-index payload is still u32 even for 64-bit keys.
+        assert!(ptx.contains("ld.global.u32"));
+        assert!(ptx.contains("st.global.u32"));
+        assert_eq!(
+            ptx.matches("atom.global.add.u32").count(),
+            1,
+            "keys+indices scatter (i64) must use exactly one atomicAdd per thread",
+        );
+    }
+
+    /// MSB-flip PTX shape for `i32`: XOR with `0x8000_0000` (decimal
+    /// `2147483648`) in-place over the keys buffer.
+    #[test]
+    fn msb_flip_ptx_shape_i32() {
+        let ptx = compile_radix_msb_flip(DataType::Int32).unwrap();
+        assert!(ptx.contains(".visible .entry bolt_radix_msb_flip_i32("));
+        assert!(ptx.contains("xor.b32"));
+        assert!(ptx.contains("2147483648")); // 0x8000_0000
+        assert!(ptx.contains("ld.global.b32"));
+        assert!(ptx.contains("st.global.b32"));
+        assert!(ptx.contains("DONE:"));
+        assert!(ptx.contains("ret;"));
+    }
+
+    /// MSB-flip PTX shape for `i64`: XOR with `0x8000_0000_0000_0000`
+    /// (decimal `9223372036854775808`) using `xor.b64`.
+    #[test]
+    fn msb_flip_ptx_shape_i64() {
+        let ptx = compile_radix_msb_flip(DataType::Int64).unwrap();
+        assert!(ptx.contains(".visible .entry bolt_radix_msb_flip_i64("));
+        assert!(ptx.contains("xor.b64"));
+        assert!(ptx.contains("9223372036854775808")); // 0x8000_0000_0000_0000
+        assert!(ptx.contains("ld.global.b64"));
+        assert!(ptx.contains("st.global.b64"));
+    }
+
+    /// The keys-only scatter must remain unchanged in shape — neither the
+    /// keys+indices variant nor the MSB-flip helper should leak into it.
+    /// This guards against accidental shared-emission regressions.
+    #[test]
+    fn keys_only_scatter_does_not_carry_vals() {
+        for dty in [DataType::Int32, DataType::Int64] {
+            let ptx = compile_radix_scatter(dty).unwrap();
+            assert!(!ptx.contains("_with_indices"));
+            assert!(!ptx.contains("xor.b32"));
+            assert!(!ptx.contains("xor.b64"));
+        }
     }
 
     /// Radix-step count: 32-bit keys need 8 passes at 4 bits per pass;
