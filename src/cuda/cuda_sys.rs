@@ -79,6 +79,12 @@ extern "C" {
     pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
+    /// Synchronous device-to-device copy. Added for the incremental
+    /// `GpuTable` cache: when `register_batch` appends rows, the engine
+    /// allocates a fresh GpuVec sized for old+new rows, DtoD-copies the
+    /// unchanged prefix, and HtoD-uploads only the new tail — replacing
+    /// the previous full re-upload.
+    pub fn cuMemcpyDtoD_v2(dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> CUresult;
     pub fn cuMemcpyHtoDAsync_v2(
         dst: CUdeviceptr,
         src: *const c_void,
@@ -172,6 +178,7 @@ mod stubs {
     pub unsafe fn cuMemFreeHost(_p: *mut c_void) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemcpyHtoD_v2(_dst: CUdeviceptr, _src: *const c_void, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemcpyDtoH_v2(_dst: *mut c_void, _src: CUdeviceptr, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemcpyDtoD_v2(_dst: CUdeviceptr, _src: CUdeviceptr, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemcpyHtoDAsync_v2(
         _dst: CUdeviceptr,
         _src: *const c_void,
@@ -563,6 +570,34 @@ pub unsafe fn memcpy_d2h<T>(dst: *mut T, src: CUdeviceptr, count: usize) -> Bolt
         ))
     })?;
     check(cuMemcpyDtoH_v2(dst as *mut c_void, src, bytes))
+}
+
+/// Synchronously device-to-device copy `count` elements of `T` from `src`
+/// to `dst`. The two device allocations may belong to the same or different
+/// pool buckets; the driver does not require any specific alignment relation
+/// between them (beyond each being a valid device pointer).
+///
+/// Used by the incremental `GpuTable` cache: when `register_batch` appends
+/// rows to a table, the engine allocates a fresh GpuVec sized for the new
+/// total, DtoD-copies the previously-uploaded prefix into the leading rows,
+/// and HtoD-uploads only the tail. The DtoD copy stays on the device — no
+/// host bounce, no PCIe traffic.
+///
+/// # Safety
+/// Both `dst` and `src` must point to live device allocations of at least
+/// `count * size_of::<T>()` bytes. `dst` and `src` may NOT overlap.
+pub unsafe fn memcpy_d2d<T>(dst: CUdeviceptr, src: CUdeviceptr, count: usize) -> BoltResult<()> {
+    let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "memcpy_d2d size overflow: {} * {}",
+            count,
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    if bytes == 0 {
+        return Ok(());
+    }
+    check(cuMemcpyDtoD_v2(dst, src, bytes))
 }
 
 /// Allocate `bytes` of page-locked (pinned) host memory via `cuMemAllocHost_v2`.

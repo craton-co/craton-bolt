@@ -140,6 +140,66 @@ impl<T: Pod> GpuBuffer<T> {
         Ok(buf)
     }
 
+    /// Allocate a new buffer of `total_len` `T`s, DtoD-copy `prefix_len`
+    /// elements from `prefix_src` into the leading rows, then HtoD-upload
+    /// `tail` into the trailing rows. Used by the incremental `GpuTable`
+    /// cache (batch 5): when `register_batch` appends rows to a table,
+    /// the unchanged prefix never re-crosses PCIe — only the new tail does.
+    ///
+    /// `prefix_len + tail.len()` must equal `total_len`.
+    ///
+    /// # Safety
+    /// `prefix_src` must point to a live device allocation of at least
+    /// `prefix_len * size_of::<T>()` bytes. The caller must guarantee
+    /// that `prefix_src` is distinct from the (not-yet-existing) new
+    /// buffer's pointer.
+    pub unsafe fn from_prefix_and_tail(
+        total_len: usize,
+        prefix_src: crate::cuda::cuda_sys::CUdeviceptr,
+        prefix_len: usize,
+        tail: &[T],
+    ) -> BoltResult<Self> {
+        if prefix_len.checked_add(tail.len()) != Some(total_len) {
+            return Err(BoltError::Memory(format!(
+                "GpuBuffer::from_prefix_and_tail: prefix_len ({}) + tail.len ({}) != total_len ({})",
+                prefix_len,
+                tail.len(),
+                total_len
+            )));
+        }
+        let mut buf = Self::with_capacity(total_len)?;
+        // 1. Device-to-device copy of the prefix.
+        if prefix_len > 0 {
+            // SAFETY: `buf.ptr` was just allocated with capacity for
+            // `total_len >= prefix_len` elements; `prefix_src` is a live
+            // allocation of at least `prefix_len` `T`s per the caller's
+            // contract; the two allocations are distinct (just allocated
+            // vs. caller-supplied) so the non-overlap requirement of
+            // `cuMemcpyDtoD_v2` holds.
+            cuda_sys::memcpy_d2d::<T>(buf.ptr, prefix_src, prefix_len)?;
+        }
+        // 2. Host-to-device copy of the tail directly into the offset
+        //    `prefix_len * size_of::<T>()` bytes.
+        if !tail.is_empty() {
+            let byte_offset = prefix_len
+                .checked_mul(size_of::<T>())
+                .ok_or_else(|| {
+                    BoltError::Memory(format!(
+                        "GpuBuffer::from_prefix_and_tail: offset overflow: {} * {}",
+                        prefix_len,
+                        size_of::<T>()
+                    ))
+                })?;
+            let tail_dst: cuda_sys::CUdeviceptr = buf.ptr.wrapping_add(byte_offset as u64);
+            // SAFETY: `tail_dst` is `buf.ptr + prefix_len` elements in; the
+            // buffer has room for `total_len = prefix_len + tail.len()`
+            // elements; `tail` is a host slice of `tail.len()` `T`s.
+            cuda_sys::memcpy_h2d::<T>(tail_dst, tail.as_ptr(), tail.len())?;
+        }
+        buf.len = total_len;
+        Ok(buf)
+    }
+
     /// Number of valid `T` elements currently in the buffer.
     pub fn len(&self) -> usize {
         self.len
