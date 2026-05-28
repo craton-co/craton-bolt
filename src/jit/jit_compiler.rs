@@ -97,13 +97,23 @@ const PTX_CACHE_CAP_DEFAULT: usize = 256;
 /// Environment variable that overrides the PTX cache capacity. Parsed as
 /// `usize`. Unset / empty / zero / unparseable → fall back to
 /// `PTX_CACHE_CAP_DEFAULT`. Read once on first cache access and memoized.
-const PTX_CACHE_CAP_ENV: &str = "CRATON_BOLT_PTX_CACHE_CAP";
+///
+/// `pub(crate)` so the integration test `tests/env_var_smoke.rs` can
+/// reference the canonical name from one place. The in-module test
+/// `parse_cap_picks_up_env_var` already drives `parse_cap` against
+/// a *different* env var to side-step the OnceLock memoisation; the
+/// integration test does the same against the live name.
+pub(crate) const PTX_CACHE_CAP_ENV: &str = "CRATON_BOLT_PTX_CACHE_CAP";
 
 /// Parse a candidate cache-cap string (typically from `std::env::var`).
 /// `None`, empty strings, zero, and unparseable values map to `default`.
 /// Factored out so the policy is testable without touching the process
 /// environment or the memoized global cap.
-fn parse_cap(raw: Option<&str>, default: usize) -> usize {
+///
+/// `pub(crate)` so `tests/env_var_smoke.rs` can drive the policy with
+/// borrowed `&str` inputs (mirroring the in-module unit tests) without
+/// depending on the memoised `ptx_cache_cap` global.
+pub(crate) fn parse_cap(raw: Option<&str>, default: usize) -> usize {
     raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(default)

@@ -200,3 +200,29 @@ pub const REL_TOL_TEST: f64 = 1e-9;
 pub mod __test_only_partition_offsets {
     pub use crate::exec::partition_offsets::NUM_PARTITIONS;
 }
+
+/// Test-only re-exports of opt-in env-var parser helpers.
+///
+/// The integration test `tests/env_var_smoke.rs` round-trips each of the
+/// engine's opt-in env vars through its parser (or dispatch-flag) helper
+/// to lock the toggle semantics in place — empty / "0" / "false" / unset
+/// must all keep the default path active, and a positive parse must land
+/// on the configured value.
+///
+/// Marked `#[doc(hidden)]` to signal that the names are an internal
+/// test surface, not part of the public API. Cannot be `#[cfg(test)]`-
+/// gated because integration tests under `tests/` link against the
+/// non-test build of the library — the gate would hide the module
+/// from exactly the consumers that need it. (Unit tests inside `src/`
+/// reach the underlying helpers directly via `super::`.)
+#[doc(hidden)]
+pub mod __test_only_env_vars {
+    pub use crate::exec::engine::pool_stats_interval_from_env;
+    pub use crate::exec::engine::POOL_STATS_ENV;
+    pub use crate::exec::gpu_join::parse_env_cap;
+    pub use crate::exec::gpu_join::streaming_intern_enabled;
+    pub use crate::exec::gpu_join::CAP_ENV_VAR;
+    pub use crate::exec::gpu_join::STREAMING_INTERN_ENV_VAR;
+    pub use crate::jit::jit_compiler::parse_cap as parse_ptx_cache_cap;
+    pub use crate::jit::jit_compiler::PTX_CACHE_CAP_ENV;
+}

@@ -352,7 +352,12 @@ fn hash_table_byte_cap() -> usize {
 /// Parse `BOLT_GPU_JOIN_TABLE_CAP_MB`. Returns `Some(cap_bytes)` if the env
 /// var is set to a valid integer; clamps to `[CAP_ENV_MIN_MIB, CAP_ENV_MAX_MIB]`.
 /// Returns `None` on any parse failure or unset env var.
-fn parse_env_cap() -> Option<usize> {
+///
+/// `pub(crate)` so the integration test `tests/env_var_smoke.rs` can
+/// round-trip the parser against the live env var. The clamp policy is
+/// a per-process latch in `HASH_TABLE_BYTE_CAP_CACHE`, so the public
+/// surface here intentionally stays the unmemoised inner parser.
+pub(crate) fn parse_env_cap() -> Option<usize> {
     let raw = std::env::var(CAP_ENV_VAR).ok()?;
     let raw_trim = raw.trim();
     if raw_trim.is_empty() {
@@ -2289,7 +2294,12 @@ fn utf8_hash64(bytes: &[u8]) -> u64 {
 /// Read the streaming-intern env var. Returns `true` when the variable is
 /// set to a non-empty value other than `"0"` / `"false"`. Anything else
 /// (unset, empty, `"0"`, `"false"`) keeps the Stage-3 path active.
-fn streaming_intern_enabled() -> bool {
+///
+/// `pub(crate)` so the integration test `tests/env_var_smoke.rs` can
+/// pin the toggle semantics — the truthy/falsy parsing rule is the
+/// observable contract that downstream tooling tunes against, and
+/// drifting it silently has bitten us before.
+pub(crate) fn streaming_intern_enabled() -> bool {
     match std::env::var(STREAMING_INTERN_ENV_VAR) {
         Ok(v) => {
             let s = v.trim();
