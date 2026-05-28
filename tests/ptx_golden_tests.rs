@@ -267,8 +267,9 @@ fn golden_scalar_projection_int32_smoke() {
         "wrong entry name\n{ptx}"
     );
     // `int_col + 1` widens to s64 (int literals are Int64 by parse default),
-    // so the load is s32 but the arithmetic and store run at s64.
-    assert!(ptx.contains("ld.global.s32"), "missing s32 load\n{ptx}");
+    // so the load is s32 but the arithmetic and store run at s64. The input
+    // column is read-only, so the load goes through the read-only cache.
+    assert!(ptx.contains("ld.global.nc.s32"), "missing s32 read-only-cache load\n{ptx}");
     assert!(
         ptx.contains("cvt.s64.s32"),
         "missing s32->s64 widening for literal-1 add\n{ptx}"
@@ -282,7 +283,7 @@ fn golden_scalar_projection_float64_smoke() {
     let ptx = build_ptx_for("SELECT f64_col * 2.0 FROM t");
     assert!(ptx.contains(".version 7.5"));
     assert!(ptx.contains(".target sm_70"));
-    assert!(ptx.contains("ld.global.f64"), "missing f64 load\n{ptx}");
+    assert!(ptx.contains("ld.global.nc.f64"), "missing f64 read-only-cache load\n{ptx}");
     assert!(ptx.contains("mul.f64"), "missing f64 multiply\n{ptx}");
     assert!(ptx.contains("st.global.f64"), "missing f64 store\n{ptx}");
 }
@@ -926,21 +927,22 @@ fn golden_agg_kernel_sum_int64_smoke() {
     let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Int64).expect("compile");
     assert!(ptx.contains(".visible .entry bolt_reduce"), "{ptx}");
     assert!(ptx.contains("add.s64"), "{ptx}");
-    assert!(ptx.contains("ld.global.s64"), "{ptx}");
+    // Source-column load routed through the read-only cache.
+    assert!(ptx.contains("ld.global.nc.s64"), "{ptx}");
 }
 
 #[test]
 fn golden_agg_kernel_sum_float32_smoke() {
     let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Float32).expect("compile");
     assert!(ptx.contains("add.f32"), "{ptx}");
-    assert!(ptx.contains("ld.global.f32"), "{ptx}");
+    assert!(ptx.contains("ld.global.nc.f32"), "{ptx}");
 }
 
 #[test]
 fn golden_agg_kernel_sum_float64_smoke() {
     let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Float64).expect("compile");
     assert!(ptx.contains("add.f64"), "{ptx}");
-    assert!(ptx.contains("ld.global.f64"), "{ptx}");
+    assert!(ptx.contains("ld.global.nc.f64"), "{ptx}");
 }
 
 #[test]

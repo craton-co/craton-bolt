@@ -275,9 +275,11 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
         // sign-extend into the accumulator-class register. The acc class is
         // always wider (currently only s64 from s32), so `cvt.<acc>.<in>`
         // is the right widening cvt mnemonic.
+        //
+        // The source column is a read-only input — route through .nc.
         writeln!(
             ptx,
-            "\tld.global.{} %{}0, [%rd2];",
+            "\tld.global.nc.{} %{}0, [%rd2];",
             input_load_suffix, input_reg_class
         )
         .map_err(write_err)?;
@@ -291,9 +293,10 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
         )
         .map_err(write_err)?;
     } else {
+        // Same-width load from a read-only input — use .nc.
         writeln!(
             ptx,
-            "\tld.global.{} %{}0, [%rd2];",
+            "\tld.global.nc.{} %{}0, [%rd2];",
             acc_load_suffix, acc_reg_class
         )
         .map_err(write_err)?;

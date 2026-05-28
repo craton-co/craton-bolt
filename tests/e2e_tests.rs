@@ -185,8 +185,9 @@ fn ptx_for_trivial_select_contains_required_directives() {
     // a trailing `ld.param.u32` (row count) — this is the order cuLaunchKernel sees.
     assert!(ptx.contains("ld.param.u64"), "expected ld.param.u64 for column ptrs");
     assert!(ptx.contains("ld.param.u32"), "expected ld.param.u32 for n_rows");
-    // f64 load + store, since `price` is Float64.
-    assert!(ptx.contains("ld.global.f64"), "missing f64 load");
+    // f64 load + store, since `price` is Float64. Input loads route through
+    // the read-only cache (`ld.global.nc`) — output stores remain plain.
+    assert!(ptx.contains("ld.global.nc.f64"), "missing f64 read-only-cache load");
     assert!(ptx.contains("st.global.f64"), "missing f64 store");
     assert!(ptx.contains("DONE:"), "missing DONE label");
     assert!(ptx.contains("ret;"), "missing ret;");
@@ -234,7 +235,7 @@ fn ptx_int32_dtype_load_store_suffixes() {
         panic!("expected Projection");
     };
     let ptx = compile_ptx(kernel, "bolt_kernel").unwrap();
-    assert!(ptx.contains("ld.global.s32"), "expected s32 load");
+    assert!(ptx.contains("ld.global.nc.s32"), "expected s32 read-only-cache load");
     assert!(ptx.contains("st.global.s32"), "expected s32 store");
 }
 
@@ -252,7 +253,7 @@ fn ptx_int64_dtype_load_store_suffixes() {
         panic!("expected Projection");
     };
     let ptx = compile_ptx(kernel, "bolt_kernel").unwrap();
-    assert!(ptx.contains("ld.global.s64"), "expected s64 load");
+    assert!(ptx.contains("ld.global.nc.s64"), "expected s64 read-only-cache load");
     assert!(ptx.contains("st.global.s64"), "expected s64 store");
 }
 
