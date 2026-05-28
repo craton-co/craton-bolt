@@ -15,7 +15,8 @@ use sqlparser::parser::Parser;
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr,
+    aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, Expr,
+    JoinType, Literal, LogicalPlan, Schema, SortExpr,
 };
 
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
@@ -146,17 +147,23 @@ impl NameResolver {
     }
 
     /// Push a joined table scope. Applies the same rename rule as
-    /// [`join_combined_schema`]: a right-side column whose name already
-    /// appears in the accumulated taken-set is renamed to `right.{col}`,
-    /// with `__2`, `__3`, … suffixes appended as a last resort if even the
-    /// qualified form clashes. Keeping this rule in lockstep with that
-    /// function is the whole point of routing through both call sites.
+    /// [`join_combined_schema`](crate::plan::logical_plan::join_combined_schema):
+    /// a right-side column whose name already appears in the accumulated
+    /// taken-set is renamed to `right.{col}`, with `__2`, `__3`, …
+    /// suffixes appended as a last resort if even the qualified form
+    /// clashes.
+    ///
+    /// The rule itself lives in
+    /// [`join_rename`](crate::plan::logical_plan::join_rename) so this
+    /// call site and `join_combined_schema` cannot drift apart; do not
+    /// duplicate the mangling logic here.
     fn push_join(&mut self, name: String, schema: &Schema) {
         // Build the snapshot of names already taken across all previous
         // scopes' *output* names. This mirrors `join_combined_schema`'s
         // pass-by-pass accumulation: each new right side sees everything
         // produced so far on its left, not just the immediately preceding
-        // table.
+        // table. `join_rename` then mutates this set so each subsequent
+        // right-side column sees the names produced by its predecessors.
         let mut taken: std::collections::HashSet<String> = self
             .tables
             .iter()
@@ -164,27 +171,7 @@ impl NameResolver {
             .collect();
         let mut cols = Vec::with_capacity(schema.fields.len());
         for f in &schema.fields {
-            let mut out_name = if taken.contains(&f.name) {
-                format!("right.{}", f.name)
-            } else {
-                f.name.clone()
-            };
-            // Final-resort uniqueness suffix; only triggers if even the
-            // qualified form collides (e.g. an actual `right.x` column on
-            // the left side).
-            if taken.contains(&out_name) {
-                let base = out_name.clone();
-                let mut i = 2usize;
-                loop {
-                    let candidate = format!("{base}__{i}");
-                    if !taken.contains(&candidate) {
-                        out_name = candidate;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            taken.insert(out_name.clone());
+            let out_name = join_rename(&f.name, &mut taken);
             cols.push(TableCol {
                 original: f.name.clone(),
                 output: out_name,
@@ -789,11 +776,12 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         // (Aggregate::schema places keys first, aggregates second — independent
         // of the user's SELECT order, which would silently swap columns).
         //
-        // Aggregate output names follow `AggregateExpr::output_name()` in
-        // `logical_plan.rs` (e.g. SUM(x) -> "sum_x", COUNT(*) -> "count"). That
-        // method is private, so we mirror the same convention here in
-        // `aggregate_output_name`. Group-key names mirror the rule in
-        // `LogicalPlan::schema()` for the Aggregate arm.
+        // Aggregate output names follow `aggregate_output_name` (a thin wrapper
+        // over the `pub(crate)` `AggregateExpr::output_name` in
+        // `logical_plan.rs`, e.g. SUM(x) -> "sum_x", COUNT(*) -> "count").
+        // Group-key names follow `group_key_output_name`. Both live in
+        // `logical_plan.rs` as the single source of truth; do not duplicate
+        // the rule here.
         let aggregates_out: &[AggregateExpr] = match &aggregate_plan {
             LogicalPlan::Aggregate { aggregates, .. } => aggregates,
             _ => unreachable!("just constructed an Aggregate"),
@@ -843,8 +831,9 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
 
     // HAVING: wrap the (SELECT-ordered) projection with a Filter. The
     // predicate references aggregate output column names by the names
-    // generated in `AggregateExpr::output_name` (mirrored in
-    // `aggregate_output_name` above), or group-key column names.
+    // produced by `aggregate_output_name` (the canonical helper in
+    // `logical_plan.rs`), or group-key column names from
+    // `group_key_output_name`.
     //
     // SQL allows aggregate function *calls* inside HAVING (e.g.
     // `HAVING SUM(price) > 100`) — the GROUP BY has already established an
@@ -1350,36 +1339,6 @@ fn negate_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
         left: Box::new(Expr::Literal(Literal::Int64(0))),
         right: Box::new(inner),
     })
-}
-
-/// Mirror of the (private) `AggregateExpr::output_name` rule in
-/// `logical_plan.rs`. Kept in sync by inspection — if that rule changes, this
-/// must change with it. Used to re-project aggregate results in SELECT order.
-fn aggregate_output_name(agg: &AggregateExpr) -> String {
-    fn suffix(e: &Expr) -> String {
-        match e {
-            Expr::Column(n) => format!("_{n}"),
-            Expr::Alias(_, n) => format!("_{n}"),
-            _ => String::new(),
-        }
-    }
-    match agg {
-        AggregateExpr::Count(e) => format!("count{}", suffix(e)),
-        AggregateExpr::Sum(e) => format!("sum{}", suffix(e)),
-        AggregateExpr::Min(e) => format!("min{}", suffix(e)),
-        AggregateExpr::Max(e) => format!("max{}", suffix(e)),
-        AggregateExpr::Avg(e) => format!("avg{}", suffix(e)),
-    }
-}
-
-/// Mirror of the group-key naming rule inside `LogicalPlan::schema()` for the
-/// `Aggregate` arm in `logical_plan.rs`. Kept in sync by inspection.
-fn group_key_output_name(key: &Expr, idx: usize) -> String {
-    match key {
-        Expr::Column(n) => n.clone(),
-        Expr::Alias(_, n) => n.clone(),
-        _ => format!("__group_{idx}"),
-    }
 }
 
 /// Map a `sqlparser` `BinaryOperator` onto our small `BinaryOp` set; reject anything else.

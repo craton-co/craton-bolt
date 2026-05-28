@@ -410,7 +410,15 @@ pub enum AggregateExpr {
 
 impl AggregateExpr {
     /// Default output column name.
-    fn output_name(&self) -> String {
+    ///
+    /// Authoritative naming rule for aggregate output columns. Called from
+    /// `LogicalPlan::schema()` (this file) and re-exported via the
+    /// free function [`aggregate_output_name`] which is consumed by
+    /// `sql_frontend.rs::plan_select` (SELECT-list re-projection) and
+    /// `sql_frontend.rs::lower_expr_in_having` (HAVING rewriter). Do not
+    /// duplicate the rule at the call sites; route through this method
+    /// (or the free function) instead.
+    pub(crate) fn output_name(&self) -> String {
         match self {
             AggregateExpr::Count(e) => format!("count{}", suffix(e)),
             AggregateExpr::Sum(e) => format!("sum{}", suffix(e)),
@@ -655,11 +663,13 @@ impl LogicalPlan {
                 let mut fields = Vec::with_capacity(group_by.len() + aggregates.len());
                 for (i, g) in group_by.iter().enumerate() {
                     let dtype = g.dtype(&s)?;
-                    let name = match g {
-                        Expr::Column(n) => n.clone(),
-                        Expr::Alias(_, n) => n.clone(),
-                        _ => format!("__group_{i}"),
-                    };
+                    // Route through the authoritative helper so the rule
+                    // (Column/Alias keep their name, anything else gets a
+                    // positional `__group_{i}` placeholder) lives in one
+                    // place. `sql_frontend.rs` calls the same helper to
+                    // recover these names when re-projecting the
+                    // Aggregate's output into SELECT-list order.
+                    let name = group_key_output_name(g, i);
                     fields.push(Field::new(name, dtype, false));
                 }
                 for agg in aggregates {
@@ -771,30 +781,13 @@ pub fn join_combined_schema(left: &Schema, right: &Schema, join_type: JoinType) 
         });
     }
     // Snapshot the names already taken by the left side so collision lookup
-    // doesn't depend on later right-side insertions.
+    // doesn't depend on later right-side insertions. `join_rename` mutates
+    // this set so each rename also sees the names produced for prior
+    // right-side columns.
     let mut taken: std::collections::HashSet<String> =
         left.fields.iter().map(|f| f.name.clone()).collect();
     for rf in &right.fields {
-        let mut name = if taken.contains(&rf.name) {
-            format!("right.{}", rf.name)
-        } else {
-            rf.name.clone()
-        };
-        // Final-resort uniqueness suffix; only triggers if the qualified
-        // name itself collides with an existing left-side column.
-        if taken.contains(&name) {
-            let base = name.clone();
-            let mut i = 2usize;
-            loop {
-                let candidate = format!("{base}__{i}");
-                if !taken.contains(&candidate) {
-                    name = candidate;
-                    break;
-                }
-                i += 1;
-            }
-        }
-        taken.insert(name.clone());
+        let name = join_rename(&rf.name, &mut taken);
         fields.push(Field {
             name,
             dtype: rf.dtype,
@@ -824,4 +817,202 @@ fn schema_summary(s: &Schema) -> String {
         .map(|f| format!("{}: {:?}", f.name, f.dtype))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Authoritative naming rule for aggregate output columns.
+///
+/// Thin free-function wrapper around [`AggregateExpr::output_name`] for use
+/// from outside this module (the method itself is `pub(crate)`, but a free
+/// function keeps the call sites in `sql_frontend.rs` clear of method-syntax
+/// borrows). Called from `sql_frontend.rs::plan_select` (SELECT-list
+/// re-projection over an `Aggregate` plan) and
+/// `sql_frontend.rs::lower_expr_in_having` (HAVING rewriter); do not
+/// duplicate the rule at the call sites.
+pub(crate) fn aggregate_output_name(agg: &AggregateExpr) -> String {
+    agg.output_name()
+}
+
+/// Authoritative naming rule for GROUP BY output columns inside an
+/// `Aggregate` plan's output schema: a bare `Column` or top-level `Alias`
+/// keeps its name; anything else gets a positional `__group_{idx}`
+/// placeholder.
+///
+/// Called from [`LogicalPlan::schema`] (this file, in the `Aggregate` arm)
+/// and from `sql_frontend.rs::plan_select` (the SELECT-list re-projection,
+/// which needs to recover these names to wire group keys through to the
+/// user-visible projection). Do not duplicate the rule at either call site.
+pub(crate) fn group_key_output_name(key: &Expr, idx: usize) -> String {
+    match key {
+        Expr::Column(n) => n.clone(),
+        Expr::Alias(_, n) => n.clone(),
+        _ => format!("__group_{idx}"),
+    }
+}
+
+/// Authoritative naming rule for a single right-side JOIN column when
+/// disambiguating against an accumulated set of already-taken names.
+///
+/// Given an unqualified `name` and a mutable `taken` set of names already
+/// produced on the left of the join (and by any prior right-side columns
+/// in the same join expression), returns the renamed output name and
+/// inserts it into `taken`. The rule:
+///
+/// * if `name` is not in `taken`, the output is `name` as-is;
+/// * else the output is `"right.{name}"`;
+/// * else (rare — only if the left side already has a literal
+///   `"right.<name>"` column) the output is `"right.{name}__2"`,
+///   `"right.{name}__3"`, ... until unique.
+///
+/// Used by [`join_combined_schema`] (this file, to build the JOIN output
+/// schema for both `LogicalPlan` and `PhysicalPlan`) and by
+/// `sql_frontend.rs::NameResolver::push_join` (to track the original ->
+/// output mapping for SQL qualifier resolution). Do not duplicate the
+/// rule at either call site.
+pub(crate) fn join_rename(name: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let mut out_name = if taken.contains(name) {
+        format!("right.{name}")
+    } else {
+        name.to_string()
+    };
+    // Final-resort uniqueness suffix; only triggers if even the qualified
+    // form collides (e.g. an actual `right.x` column on the left side).
+    if taken.contains(&out_name) {
+        let base = out_name.clone();
+        let mut i = 2usize;
+        loop {
+            let candidate = format!("{base}__{i}");
+            if !taken.contains(&candidate) {
+                out_name = candidate;
+                break;
+            }
+            i += 1;
+        }
+    }
+    taken.insert(out_name.clone());
+    out_name
+}
+
+#[cfg(test)]
+mod naming_consistency_tests {
+    //! Lock the authoritative naming rules in place. These tests guard the
+    //! consolidation in this module against regressions: if anyone changes
+    //! the rule here, downstream `sql_frontend.rs` must observe the same
+    //! change because both sites route through these helpers.
+    use super::*;
+
+    #[test]
+    fn aggregate_output_name_is_stable_for_representative_exprs() {
+        // Bare Column: `_colname` suffix.
+        let agg = AggregateExpr::Sum(Expr::Column("price".to_string()));
+        assert_eq!(aggregate_output_name(&agg), "sum_price");
+        assert_eq!(agg.output_name(), "sum_price");
+
+        let agg = AggregateExpr::Avg(Expr::Column("qty".to_string()));
+        assert_eq!(aggregate_output_name(&agg), "avg_qty");
+
+        let agg = AggregateExpr::Min(Expr::Column("ts".to_string()));
+        assert_eq!(aggregate_output_name(&agg), "min_ts");
+
+        let agg = AggregateExpr::Max(Expr::Column("ts".to_string()));
+        assert_eq!(aggregate_output_name(&agg), "max_ts");
+
+        // Alias: take the alias name as the suffix.
+        let aliased = Expr::Alias(Box::new(Expr::Column("c".to_string())), "renamed".to_string());
+        let agg = AggregateExpr::Count(aliased);
+        assert_eq!(aggregate_output_name(&agg), "count_renamed");
+
+        // Non-column / non-alias inner expr: no suffix.
+        let lit = Expr::Literal(Literal::Int64(1));
+        let agg = AggregateExpr::Count(lit);
+        assert_eq!(aggregate_output_name(&agg), "count");
+    }
+
+    #[test]
+    fn group_key_output_name_is_stable_for_representative_exprs() {
+        // Bare column keeps its name.
+        assert_eq!(
+            group_key_output_name(&Expr::Column("region".to_string()), 0),
+            "region"
+        );
+        // Alias keeps its alias name regardless of index.
+        let aliased = Expr::Alias(Box::new(Expr::Column("c".to_string())), "r".to_string());
+        assert_eq!(group_key_output_name(&aliased, 3), "r");
+        // Anything else falls back to a positional placeholder.
+        let lit = Expr::Literal(Literal::Int64(7));
+        assert_eq!(group_key_output_name(&lit, 0), "__group_0");
+        assert_eq!(group_key_output_name(&lit, 2), "__group_2");
+    }
+
+    #[test]
+    fn join_combined_schema_renames_colliding_right_side_to_right_dot_prefix() {
+        // Both sides have a column named `a`; the right one should be
+        // renamed to `right.a`. The left one stays as `a`.
+        let left = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let right = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let out = join_combined_schema(&left, &right, JoinType::Inner);
+        let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "right.a"]);
+    }
+
+    #[test]
+    fn join_combined_schema_passes_through_non_colliding_names() {
+        // No collision — both sides keep their original names.
+        let left = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let right = Schema::new(vec![Field::new("b", DataType::Int32, false)]);
+        let out = join_combined_schema(&left, &right, JoinType::Inner);
+        let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn join_combined_schema_falls_back_to_numeric_suffix_on_qualified_collision() {
+        // Pathological case: the left side already has a column literally
+        // named `right.a`, so the right-side `a` cannot be renamed to
+        // `right.a` and must fall through to the `__2` suffix.
+        let left = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("right.a", DataType::Int32, false),
+        ]);
+        let right = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let out = join_combined_schema(&left, &right, JoinType::Inner);
+        let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "right.a", "right.a__2"]);
+    }
+
+    #[test]
+    fn join_rename_matches_join_combined_schema_for_simple_collision() {
+        // The standalone helper must produce the same rename sequence the
+        // full schema-building function produces; this is the contract
+        // `sql_frontend.rs::NameResolver::push_join` relies on.
+        let mut taken: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        let renamed = join_rename("a", &mut taken);
+        assert_eq!(renamed, "right.a");
+        assert!(taken.contains("right.a"));
+        assert!(taken.contains("a"));
+    }
+
+    #[test]
+    fn join_combined_schema_widens_nullability_for_outer_joins() {
+        // LEFT OUTER: right-side columns become nullable.
+        let left = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let right = Schema::new(vec![Field::new("b", DataType::Int32, false)]);
+        let out = join_combined_schema(&left, &right, JoinType::LeftOuter);
+        assert!(!out.fields[0].nullable, "left side stays non-null on LEFT");
+        assert!(out.fields[1].nullable, "right side widens on LEFT");
+
+        // RIGHT OUTER: left-side columns become nullable.
+        let out = join_combined_schema(&left, &right, JoinType::RightOuter);
+        assert!(out.fields[0].nullable, "left side widens on RIGHT");
+        assert!(!out.fields[1].nullable, "right side stays non-null on RIGHT");
+
+        // FULL OUTER: both sides become nullable.
+        let out = join_combined_schema(&left, &right, JoinType::FullOuter);
+        assert!(out.fields[0].nullable);
+        assert!(out.fields[1].nullable);
+
+        // INNER / CROSS: nullability untouched.
+        let out = join_combined_schema(&left, &right, JoinType::Inner);
+        assert!(!out.fields[0].nullable);
+        assert!(!out.fields[1].nullable);
+    }
 }
