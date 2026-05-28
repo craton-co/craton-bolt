@@ -246,6 +246,8 @@ pub fn prefix_scan_mask(
             n_rows: 0,
         });
     }
+    // Single-pass dispatch limit: ensures `running` fits in u32. Multipass at
+    // multipass.rs handles n_rows above this.
     let max_rows = (u32::MAX as usize) / (BLOCK_SIZE as usize);
     if n_rows > max_rows {
         // Single-pass topped out; delegate to the recursive multi-pass path.
@@ -307,10 +309,16 @@ pub fn prefix_scan_mask(
     for s in &sums_host {
         // u64 accumulator is overkill (we already bounded n_rows <= u32::MAX),
         // but it's cheap and makes the bound obvious.
-        bases_host.push(running as u32);
-        running += *s as u64;
+        bases_host.push(u32::try_from(running).map_err(|_| BoltError::Other(format!(
+            "gpu_compact: per-block base {running} exceeds u32::MAX; this is a kernel-contract violation"
+        )))?);
+        running = running.checked_add(*s as u64).ok_or_else(|| BoltError::Other(
+            "gpu_compact: accumulator overflowed u64; this should be impossible for any legal input".to_string()
+        ))?;
     }
-    let total_count = running as usize;
+    let total_count = usize::try_from(running).map_err(|_| BoltError::Other(format!(
+        "gpu_compact: total_count {running} exceeds usize::MAX on this host"
+    )))?;
 
     let block_bases = GpuVec::<u32>::from_slice(&bases_host)?;
 

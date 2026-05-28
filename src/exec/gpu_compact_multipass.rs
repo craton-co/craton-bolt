@@ -51,7 +51,7 @@ use std::ptr;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
-use crate::error::BoltResult;
+use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::jit_compiler::CudaModule;
@@ -86,6 +86,16 @@ pub fn prefix_scan_mask_multipass(
             mask_ptr,
             n_rows: 0,
         });
+    }
+
+    // Fail fast on inputs that would exceed the documented depth bound,
+    // rather than blowing the recursion stack mid-launch.
+    let depth = recursion_depth(n_rows);
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Other(format!(
+            "gpu_compact_multipass: n_rows={n_rows} would require recursion depth {depth}, \
+             exceeding the documented max of {MAX_RECURSION_DEPTH}"
+        )));
     }
 
     let block_size = BLOCK_SIZE as usize;
@@ -128,7 +138,7 @@ fn scan_block_sums(
 ) -> BoltResult<(GpuVec<u32>, usize)> {
     if should_host_scan(vals.len()) {
         let host = vals.to_vec()?;
-        let (bases, total) = host_exclusive_scan(&host);
+        let (bases, total) = host_exclusive_scan(&host)?;
         let bases_dev = GpuVec::<u32>::from_slice(&bases)?;
         // `vals` (the device block_sums buffer) drops here: nothing
         // downstream needs it after we've turned it into bases.
@@ -350,16 +360,27 @@ fn run_add_block_bases(
 ///
 /// The accumulator is `u64` so callers never need to worry about an
 /// intermediate overflow even when the scanned array runs the full width of
-/// the recursion stack. The returned `total` is `usize` (`running` cast),
-/// matching `ScanResult::total_count`.
-pub(crate) fn host_exclusive_scan(sums: &[u32]) -> (Vec<u32>, usize) {
+/// the recursion stack. The returned `total` is `usize` (checked-narrowed
+/// from `running`), matching `ScanResult::total_count`. Returns
+/// `BoltError::Other` if any per-block base exceeds `u32::MAX`, if the
+/// accumulator would overflow `u64`, or if the total would exceed
+/// `usize::MAX` on the host — every such case is a contract violation by
+/// the upstream kernel rather than a legal input.
+pub(crate) fn host_exclusive_scan(sums: &[u32]) -> BoltResult<(Vec<u32>, usize)> {
     let mut bases = Vec::with_capacity(sums.len());
     let mut running: u64 = 0;
     for s in sums {
-        bases.push(running as u32);
-        running += *s as u64;
+        bases.push(u32::try_from(running).map_err(|_| BoltError::Other(format!(
+            "gpu_compact: per-block base {running} exceeds u32::MAX; this is a kernel-contract violation"
+        )))?);
+        running = running.checked_add(*s as u64).ok_or_else(|| BoltError::Other(
+            "gpu_compact: accumulator overflowed u64; this should be impossible for any legal input".to_string()
+        ))?;
     }
-    (bases, running as usize)
+    let total = usize::try_from(running).map_err(|_| BoltError::Other(format!(
+        "gpu_compact: total_count {running} exceeds usize::MAX on this host"
+    )))?;
+    Ok((bases, total))
 }
 
 /// Compute the recursion depth needed to scan `n_rows` rows with the
@@ -367,8 +388,12 @@ pub(crate) fn host_exclusive_scan(sums: &[u32]) -> (Vec<u32>, usize) {
 /// a regression check on the doc-stated depth bounds.
 ///
 /// Returns 0 for `n_rows == 0` (the early-return path takes no levels).
-#[cfg(test)]
-fn recursion_depth(n_rows: usize) -> usize {
+///
+/// Now a runtime helper (not `#[cfg(test)]`): `prefix_scan_mask_multipass`
+/// calls it before launching to fail fast if the input would exceed
+/// [`MAX_RECURSION_DEPTH`], rather than blowing the stack or producing
+/// silently-wrong results.
+pub(crate) fn recursion_depth(n_rows: usize) -> usize {
     if n_rows == 0 {
         return 0;
     }
@@ -385,20 +410,28 @@ fn recursion_depth(n_rows: usize) -> usize {
     depth + 1
 }
 
+/// Documented maximum recursion depth for the multipass strategy. At
+/// `BLOCK_SIZE = 256`, even `n_rows = u32::MAX` only needs 4 levels (3
+/// device scans + 1 host scan). Anything beyond this would mean either
+/// `BLOCK_SIZE` shrank or `n_rows` blew past `u32::MAX`; either way the
+/// caller is out of contract and we surface a structured error rather
+/// than recursing further.
+pub(crate) const MAX_RECURSION_DEPTH: usize = 4;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn host_exclusive_scan_empty() {
-        let (bases, total) = host_exclusive_scan(&[]);
+        let (bases, total) = host_exclusive_scan(&[]).expect("scan empty");
         assert!(bases.is_empty());
         assert_eq!(total, 0);
     }
 
     #[test]
     fn host_exclusive_scan_single() {
-        let (bases, total) = host_exclusive_scan(&[42]);
+        let (bases, total) = host_exclusive_scan(&[42]).expect("scan single");
         assert_eq!(bases, vec![0]);
         assert_eq!(total, 42);
     }
@@ -407,7 +440,7 @@ mod tests {
     fn host_exclusive_scan_multi() {
         // Hand-checked: bases are exclusive prefix sums; total is the full sum.
         let sums = vec![3u32, 0, 5, 256, 1, 9, 9];
-        let (bases, total) = host_exclusive_scan(&sums);
+        let (bases, total) = host_exclusive_scan(&sums).expect("scan multi");
         assert_eq!(bases, vec![0, 3, 3, 8, 264, 265, 274]);
         assert_eq!(total, 283);
         assert_eq!(total as u32, sums.iter().sum::<u32>());
@@ -419,7 +452,7 @@ mod tests {
         // total is 5 * 255 = 1275, well within u32. The point is that the
         // u64 accumulator absorbs the intermediate values without surprise.
         let sums = vec![255u32; 5];
-        let (bases, total) = host_exclusive_scan(&sums);
+        let (bases, total) = host_exclusive_scan(&sums).expect("scan wide");
         assert_eq!(bases, vec![0, 255, 510, 765, 1020]);
         assert_eq!(total, 1275);
     }
