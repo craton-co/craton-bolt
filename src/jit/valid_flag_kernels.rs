@@ -264,7 +264,12 @@ pub fn compile_keys_valid_kernel() -> BoltResult<String> {
     )
     .map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r10, [%rd8];").map_err(write_err)?;
+    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
+    // read-of-published-value contract explicit (sm_70+). Replaces the
+    // plain `ld.<space>.<ty>` which relied on the publisher's release +
+    // SASS-level implicit acquire — sound in practice but not promised
+    // by PTX semantics.
+    writeln!(ptx, "\tld.acquire.gpu.u32 %r10, [%rd8];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r10, 2;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     // Now safe to read the committed key.
@@ -485,7 +490,12 @@ pub fn compile_agg_valid_kernel(
     )
     .map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r9, [%rd8];").map_err(write_err)?;
+    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
+    // read-of-published-value contract explicit (sm_70+). Replaces the
+    // plain `ld.<space>.<ty>` which relied on the publisher's release +
+    // SASS-level implicit acquire — sound in practice but not promised
+    // by PTX semantics.
+    writeln!(ptx, "\tld.acquire.gpu.u32 %r9, [%rd8];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p1, %r9, 0;").map_err(write_err)?;
     // valid==0 means this row has no matching group slot — impossible after
     // a successful keys kernel UNLESS the keys kernel itself spilled this
@@ -875,7 +885,12 @@ pub fn compile_keys_valid_kernel_with_validity() -> BoltResult<String> {
     )
     .map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r10, [%rd8];").map_err(write_err)?;
+    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
+    // read-of-published-value contract explicit (sm_70+). Replaces the
+    // plain `ld.<space>.<ty>` which relied on the publisher's release +
+    // SASS-level implicit acquire — sound in practice but not promised
+    // by PTX semantics.
+    writeln!(ptx, "\tld.acquire.gpu.u32 %r10, [%rd8];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r10, 2;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
@@ -1076,7 +1091,12 @@ pub fn compile_agg_valid_kernel_with_validity(
     )
     .map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r9, [%rd8];").map_err(write_err)?;
+    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
+    // read-of-published-value contract explicit (sm_70+). Replaces the
+    // plain `ld.<space>.<ty>` which relied on the publisher's release +
+    // SASS-level implicit acquire — sound in practice but not promised
+    // by PTX semantics.
+    writeln!(ptx, "\tld.acquire.gpu.u32 %r9, [%rd8];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p1, %r9, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra ADVANCE;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r9, 2;").map_err(write_err)?;
@@ -1251,13 +1271,17 @@ mod tests {
     }
 
     /// The agg kernel must read the slot-valid flag before reading the key.
+    /// The read uses `ld.acquire.gpu.u32` (sm_70+) so the publisher's
+    /// `atom.global.exch.b32` + reader-acquire pair gives explicit PTX-level
+    /// ordering rather than relying on SASS-level implicit acquire.
     #[test]
     fn agg_valid_kernel_reads_valid_flag() {
         let ptx = compile_agg_valid_kernel(ReduceOp::Sum, DataType::Int64)
             .expect("agg kernel compiles");
         assert!(
-            ptx.contains("ld.global.u32"),
-            "agg kernel must issue ld.global.u32 to inspect slot_valid:\n{ptx}"
+            ptx.contains("ld.acquire.gpu.u32"),
+            "agg kernel must issue ld.acquire.gpu.u32 to inspect slot_valid \
+             (acquire pairs with the keys-kernel publish):\n{ptx}"
         );
         assert!(
             ptx.contains(VALID_AGG_KERNEL_ENTRY),

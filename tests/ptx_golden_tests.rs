@@ -569,9 +569,14 @@ fn golden_partition_reduce_fences_set_key_race() {
     let mb_after_cas = tail
         .find("membar.cta")
         .expect("missing MATCH-path membar.cta after CAS");
+    // MATCH-path key load is `ld.acquire.cta.s32 %r35` — the acquire
+    // variant pairs with the publisher's atomic store to make the
+    // read-of-published-value contract explicit at the PTX level (the
+    // membar.cta still precedes it; acquire is in ADDITION, not
+    // replacement).
     let key_load = tail
-        .find("ld.shared.s32 %r35")
-        .expect("missing MATCH-path key load");
+        .find("ld.acquire.cta.s32 %r35")
+        .expect("missing MATCH-path acquire key load");
     assert!(
         mb_after_cas < key_load,
         "membar.cta must precede the MATCH-path key load:\n{ptx}"

@@ -332,17 +332,12 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     // requires this fence; without it a racing thread can read a zero
     // key under set==1 and false-match key 0.
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    // CAS-LOSER ACQUIRE: the ld.shared.s32 below races against the
-    // publishing thread's st.shared.u32 + membar.cta + atom.shared.cas.b32.
-    // PTX does NOT guarantee acquire on plain ld.shared; the publishing
-    // chain's membar.cta sequenced before atom.cas carries release-acquire
-    // on Volta+. TODO: ld.acquire.cta when sm_60 is dropped.
-    writeln!(
-        ptx,
-        "\t// CAS-LOSER ACQUIRE: see partition_reduce_kernel_multi.rs"
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r35, [%rd94];").map_err(write_err)?;
+    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
+    // read-of-published-value contract explicit (sm_70+). Replaces the
+    // plain `ld.<space>.<ty>` which relied on the publisher's release +
+    // SASS-level implicit acquire — sound in practice but not promised
+    // by PTX semantics.
+    writeln!(ptx, "\tld.acquire.cta.s32 %r35, [%rd94];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
     // Collision: advance.
