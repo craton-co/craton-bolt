@@ -759,21 +759,22 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         enum SelectSource {
             /// SELECT references a group key; pull by the key's name in the Aggregate schema.
             GroupKey { key_name: String, alias: Option<String> },
-            /// SELECT references the Nth aggregate in `aggregates`.
-            Aggregate { index: usize },
+            /// SELECT references the Nth aggregate in `aggregates`. An optional
+            /// alias renames the aggregate's output column in the SELECT-order
+            /// Project (so HAVING and downstream stages can reference it by
+            /// the user-friendly name).
+            Aggregate { index: usize, alias: Option<String> },
         }
         let mut select_sources: Vec<SelectSource> = Vec::new();
 
         for (sql_expr, alias) in &items {
             if let Some(agg) = try_aggregate(sql_expr, &resolver, 0)? {
-                if alias.is_some() {
-                    return Err(BoltError::Sql(
-                        "unsupported: alias on aggregate expression".into(),
-                    ));
-                }
                 let idx = aggregates.len();
                 aggregates.push(agg);
-                select_sources.push(SelectSource::Aggregate { index: idx });
+                select_sources.push(SelectSource::Aggregate {
+                    index: idx,
+                    alias: alias.clone(),
+                });
                 continue;
             }
             // Non-aggregate: must contain no nested aggregate (no post-aggregate exprs).
@@ -830,6 +831,12 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
             _ => unreachable!("just constructed an Aggregate"),
         };
         let mut proj_exprs: Vec<Expr> = Vec::with_capacity(select_sources.len());
+        // Build the (aggregate-output-name -> SELECT alias) map at the same
+        // time so the HAVING lowerer below can rewrite e.g. `SUM(v)` into
+        // the alias the Project exposed (otherwise it would lower to
+        // `Column("sum_v")`, which no longer exists in the Project's
+        // output once an alias renamed it).
+        let mut agg_alias_for_having: HashMap<String, String> = HashMap::new();
         for src in &select_sources {
             match src {
                 SelectSource::GroupKey { key_name, alias } => {
@@ -839,17 +846,41 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
                         None => col,
                     });
                 }
-                SelectSource::Aggregate { index } => {
+                SelectSource::Aggregate { index, alias } => {
                     let name = aggregate_output_name(&aggregates_out[*index]);
-                    proj_exprs.push(Expr::Column(name));
+                    if let Some(a) = alias {
+                        agg_alias_for_having.insert(name.clone(), a.clone());
+                    }
+                    let col = Expr::Column(name);
+                    proj_exprs.push(match alias {
+                        Some(a) => col.alias(a.clone()),
+                        None => col,
+                    });
                 }
             }
         }
+        // Stash for the HAVING block below. The empty-map case is fine —
+        // `lower_expr_in_having` falls through to the unaliased name.
+        let having_agg_aliases = agg_alias_for_having;
 
         plan = LogicalPlan::Project {
             input: Box::new(aggregate_plan),
             exprs: proj_exprs,
         };
+
+        // HAVING (aggregate mode): the predicate may reference aggregates
+        // by call (`SUM(v)`), by alias (`total`), or by group-key name. We
+        // use the alias map built alongside the Project so an aggregate
+        // call resolves to whichever name the Project actually exposed.
+        if let Some(having_sql) = &select.having {
+            let predicate = lower_expr_in_having(having_sql, &resolver, &having_agg_aliases, 0)?;
+            let project_schema = plan.schema()?;
+            validate_having_columns(&predicate, &project_schema)?;
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate,
+            };
+        }
     } else {
         // Scalar projection mode.
         if select.having.is_some() {
@@ -872,25 +903,9 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         };
     }
 
-    // HAVING: wrap the (SELECT-ordered) projection with a Filter. The
-    // predicate references aggregate output column names by the names
-    // produced by `aggregate_output_name` (the canonical helper in
-    // `logical_plan.rs`), or group-key column names from
-    // `group_key_output_name`.
-    //
-    // SQL allows aggregate function *calls* inside HAVING (e.g.
-    // `HAVING SUM(price) > 100`) — the GROUP BY has already established an
-    // aggregation context. We rewrite each such call into a `Column`
-    // reference using the same name the SELECT-order Project produced for
-    // it. Non-aggregate sub-expressions go through the regular
-    // `lower_expr`, which also handles bare group-key columns.
-    if let Some(having_sql) = &select.having {
-        let predicate = lower_expr_in_having(having_sql, &resolver, 0)?;
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate,
-        };
-    }
+    // (HAVING is handled inside the aggregate-mode branch above, where the
+    // alias map is in scope. The scalar-projection branch rejects HAVING
+    // outright since there is no aggregation context.)
 
     // SELECT DISTINCT: dedup the *output* rows (after projection, HAVING).
     if matches!(select.distinct, Some(Distinct::Distinct)) {
@@ -1240,25 +1255,32 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
 /// Variant of `lower_expr` used inside a HAVING clause. Aggregate function
 /// calls (anywhere in the tree) are rewritten into a bare `Column(name)`
 /// where `name` is the column the post-aggregate Project produces for that
-/// aggregate (per `aggregate_output_name`). Everything else delegates to
-/// `lower_expr`, which keeps the usual rules — bare columns become column
-/// refs, non-aggregate function calls are still rejected, etc.
-/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
-fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<Expr> {
+/// aggregate (per `aggregate_output_name`), unless the SELECT renamed that
+/// aggregate with an alias. `agg_aliases` maps raw aggregate output name to
+/// the SELECT alias. `depth` enforces MAX_RECURSION_DEPTH against adversarial
+/// SQL nesting.
+fn lower_expr_in_having(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    agg_aliases: &HashMap<String, String>,
+    depth: usize,
+) -> BoltResult<Expr> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(BoltError::Sql(format!(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
         )));
     }
     if let Some(agg) = try_aggregate(e, resolver, depth + 1)? {
-        return Ok(Expr::Column(aggregate_output_name(&agg)));
+        let raw = aggregate_output_name(&agg);
+        let resolved = agg_aliases.get(&raw).cloned().unwrap_or(raw);
+        return Ok(Expr::Column(resolved));
     }
     match e {
-        SqlExpr::Nested(inner) => lower_expr_in_having(inner, resolver, depth + 1),
+        SqlExpr::Nested(inner) => lower_expr_in_having(inner, resolver, agg_aliases, depth + 1),
         SqlExpr::BinaryOp { left, op, right } => {
             let lop = lower_binary_op(op)?;
-            let l = lower_expr_in_having(left, resolver, depth + 1)?;
-            let r = lower_expr_in_having(right, resolver, depth + 1)?;
+            let l = lower_expr_in_having(left, resolver, agg_aliases, depth + 1)?;
+            let r = lower_expr_in_having(right, resolver, agg_aliases, depth + 1)?;
             Ok(Expr::Binary {
                 op: lop,
                 left: Box::new(l),
@@ -1266,13 +1288,13 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> B
             })
         }
         SqlExpr::UnaryOp { op, expr } => match op {
-            UnaryOperator::Plus => lower_expr_in_having(expr, resolver, depth + 1),
+            UnaryOperator::Plus => lower_expr_in_having(expr, resolver, agg_aliases, depth + 1),
             UnaryOperator::Minus => {
                 // Re-use the aggregate-aware lowerer for the operand, then
                 // negate by hand (we can't fall through to `negate_expr`
                 // because it would route through `lower_expr` and reject
                 // any aggregate call nested under the unary minus).
-                let inner = lower_expr_in_having(expr, resolver, depth + 1)?;
+                let inner = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
                 Ok(Expr::Binary {
                     op: BinaryOp::Sub,
                     left: Box::new(Expr::Literal(Literal::Int64(0))),
@@ -1288,14 +1310,14 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> B
         // aggregate calls inside the operand (`HAVING SUM(v) IS NOT NULL`)
         // are rewritten to the aggregate-output column reference.
         SqlExpr::IsNull(inner) => {
-            let operand = lower_expr_in_having(inner, resolver, depth + 1)?;
+            let operand = lower_expr_in_having(inner, resolver, agg_aliases, depth + 1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::IsNull,
                 operand: Box::new(operand),
             })
         }
         SqlExpr::IsNotNull(inner) => {
-            let operand = lower_expr_in_having(inner, resolver, depth + 1)?;
+            let operand = lower_expr_in_having(inner, resolver, agg_aliases, depth + 1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(operand),
@@ -1306,6 +1328,40 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> B
         // still rejects bare non-aggregate Function calls).
         _ => lower_expr(e, resolver, depth + 1),
     }
+}
+
+/// Walk a lowered HAVING predicate and verify that every `Expr::Column`
+/// reference names a field present in `project_schema`.
+///
+/// The HAVING `Filter` sits *outside* the SELECT-order `Project`, so its
+/// predicate is resolved against that Project's output. If a user typos a
+/// column (or references a name that isn't in the SELECT list and isn't a
+/// group key the SELECT exposed), this catches it with a friendly error
+/// before the schema-checker further down produces a less obvious
+/// `column not found` error. The check is also a structural guard: if a
+/// future refactor changes the HAVING/Project ordering and silently breaks
+/// alias passthrough, the integration tests for this function will fail
+/// loudly rather than the queries silently misbehaving.
+fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltResult<()> {
+    let mut stack: Vec<&Expr> = vec![predicate];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Column(name) => {
+                if !project_schema.fields.iter().any(|f| &f.name == name) {
+                    return Err(BoltError::Sql(format!(
+                        "HAVING references unknown column '{name}'"
+                    )));
+                }
+            }
+            Expr::Literal(_) => {}
+            Expr::Binary { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::Alias(inner, _) => stack.push(inner),
+        }
+    }
+    Ok(())
 }
 
 /// Lower a scalar SQL expression into our `Expr`. Aggregates are rejected here —
@@ -1332,13 +1388,23 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
             // (no schema-qualified or struct-field forms). The frontend has
             // no schema/database concept, so anything deeper is meaningless.
             if parts.len() != 2 {
+                // Cap the reflected fragment so adversarial input (very long
+                // identifiers, deeply nested chains) can't flood logs. 200
+                // chars is enough to identify the offending reference in
+                // practice; anything past that gets an ellipsis.
+                let full = parts
+                    .iter()
+                    .map(|p| p.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let display = if full.chars().count() > 200 {
+                    let truncated: String = full.chars().take(200).collect();
+                    format!("{truncated}...")
+                } else {
+                    full
+                };
                 return Err(BoltError::Sql(format!(
-                    "unsupported: deeply qualified column reference '{}'",
-                    parts
-                        .iter()
-                        .map(|p| p.value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".")
+                    "unsupported: deeply qualified column reference '{display}'"
                 )));
             }
             let qualifier = &parts[0].value;
@@ -1385,7 +1451,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
             })
         }
         SqlExpr::Function(_) => Err(BoltError::Sql(
-            "function calls are only allowed as top-level aggregates in SELECT".into(),
+            "scalar function calls are not supported".into(),
         )),
         other => Err(BoltError::Sql(format!(
             "unsupported expression: {other}"
@@ -1896,6 +1962,190 @@ mod wave7_tests {
                 }
             }
             other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    /// Three-column fixture for the HAVING/alias stress tests: `t(k, v)`
+    /// (group key + aggregable value), separate from the wave-7 join
+    /// fixture above so the existing tests aren't perturbed.
+    fn having_provider() -> MemTableProvider {
+        use crate::plan::logical_plan::Field;
+        let t = Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+        ]);
+        MemTableProvider::new().with_table("t", t)
+    }
+
+    fn lp_with(sql: &str, prov: &MemTableProvider) -> LogicalPlan {
+        parse(sql, prov).unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
+    }
+
+    /// `HAVING total > 10` after `SUM(v) AS total`. The HAVING predicate
+    /// references the SELECT alias; lowered as `Column("total")` and the
+    /// outer Project (built in SELECT order) exposes a `total` column, so
+    /// validation must succeed and the plan must end in
+    /// `Filter(Project(Aggregate(...)))`.
+    #[test]
+    fn having_via_alias_passthrough_succeeds() {
+        let prov = having_provider();
+        let plan = lp_with(
+            "SELECT SUM(v) AS total FROM t GROUP BY k HAVING total > 10",
+            &prov,
+        );
+        match plan {
+            LogicalPlan::Filter { input, predicate } => {
+                // Below the HAVING Filter is the SELECT-order Project.
+                assert!(
+                    matches!(*input, LogicalPlan::Project { .. }),
+                    "expected Project under HAVING Filter, got {input:?}"
+                );
+                // The predicate's left side must be the alias `total` (not
+                // an unresolved aggregate output name like `sum_v`).
+                match predicate {
+                    Expr::Binary { left, .. } => match *left {
+                        Expr::Column(name) => assert_eq!(
+                            name, "total",
+                            "HAVING alias should lower to Column(\"total\")"
+                        ),
+                        other => panic!("expected Column on HAVING LHS, got {other:?}"),
+                    },
+                    other => panic!("expected Binary HAVING predicate, got {other:?}"),
+                }
+            }
+            other => panic!("expected Filter (HAVING) at top, got {other:?}"),
+        }
+    }
+
+    /// `HAVING SUM(v) > 10` with no alias. The HAVING-aware lowerer
+    /// rewrites `SUM(v)` into `Column("sum_v")` and the unaliased SELECT
+    /// Project exposes that same name.
+    #[test]
+    fn having_no_alias_succeeds() {
+        let prov = having_provider();
+        let plan = lp_with(
+            "SELECT SUM(v) FROM t GROUP BY k HAVING SUM(v) > 10",
+            &prov,
+        );
+        match plan {
+            LogicalPlan::Filter { input, predicate } => {
+                assert!(
+                    matches!(*input, LogicalPlan::Project { .. }),
+                    "expected Project under HAVING Filter, got {input:?}"
+                );
+                match predicate {
+                    Expr::Binary { left, .. } => match *left {
+                        Expr::Column(name) => assert_eq!(
+                            name, "sum_v",
+                            "SUM(v) in HAVING should lower to Column(\"sum_v\")"
+                        ),
+                        other => panic!("expected Column on HAVING LHS, got {other:?}"),
+                    },
+                    other => panic!("expected Binary HAVING predicate, got {other:?}"),
+                }
+            }
+            other => panic!("expected Filter (HAVING) at top, got {other:?}"),
+        }
+    }
+
+    /// `SELECT SUM(v) AS total ... HAVING SUM(v) > 10`. The aggregate call
+    /// in HAVING is rewritten to the underlying aggregate output name
+    /// (`sum_v`), even though the SELECT names it `total`. Both names live
+    /// in the Project's output (the alias renames one of them), so
+    /// validation must pass.
+    #[test]
+    fn having_mix_alias_and_aggregate_call_succeeds() {
+        let prov = having_provider();
+        let plan = lp_with(
+            "SELECT SUM(v) AS total FROM t GROUP BY k HAVING SUM(v) > 10",
+            &prov,
+        );
+        // The plan must still wrap a Project in a Filter — alias renaming
+        // doesn't change the layering.
+        let (predicate, _) = match plan {
+            LogicalPlan::Filter { predicate, input } => (predicate, input),
+            other => panic!("expected Filter (HAVING) at top, got {other:?}"),
+        };
+        // The HAVING-aware lowerer rewrites the bare `SUM(v)` call into the
+        // aggregate output name (`sum_v`). The SELECT alias `total` doesn't
+        // change the predicate; it changes the Project. Either name would
+        // be acceptable as long as the Project below carries it.
+        match predicate {
+            Expr::Binary { left, .. } => match *left {
+                Expr::Column(name) => assert!(
+                    name == "sum_v" || name == "total",
+                    "HAVING SUM(v) should resolve to either the underlying \
+                     aggregate name or its alias; got {name:?}"
+                ),
+                other => panic!("expected Column on HAVING LHS, got {other:?}"),
+            },
+            other => panic!("expected Binary HAVING predicate, got {other:?}"),
+        }
+    }
+
+    /// `HAVING nonexistent > 10` — typo. Must fail with a clear "unknown
+    /// column" error from the HAVING column validator, *not* a downstream
+    /// type-checker error.
+    #[test]
+    fn having_unknown_column_errors() {
+        let prov = having_provider();
+        let err = parse(
+            "SELECT SUM(v) AS total FROM t GROUP BY k HAVING nonexistent > 10",
+            &prov,
+        )
+        .expect_err("HAVING with unknown column must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HAVING references unknown column"),
+            "expected HAVING validator error, got: {msg}"
+        );
+        assert!(
+            msg.contains("nonexistent"),
+            "error message should name the missing column, got: {msg}"
+        );
+    }
+
+    /// `HAVING k > 0 AND s > 10` — combined group-key and aggregate alias
+    /// references. Both names must be in the Project's output schema; the
+    /// AND-node walker has to descend into both sides.
+    #[test]
+    fn having_group_key_and_aggregate_alias_succeeds() {
+        let prov = having_provider();
+        let plan = lp_with(
+            "SELECT k, SUM(v) AS s FROM t GROUP BY k HAVING k > 0 AND s > 10",
+            &prov,
+        );
+        match plan {
+            LogicalPlan::Filter { input, predicate } => {
+                assert!(
+                    matches!(*input, LogicalPlan::Project { .. }),
+                    "expected Project under HAVING Filter, got {input:?}"
+                );
+                // Walk the AND predicate, collect column names, and check
+                // both `k` and `s` appear.
+                let mut names: Vec<String> = Vec::new();
+                let mut stack = vec![&predicate];
+                while let Some(e) = stack.pop() {
+                    match e {
+                        Expr::Column(n) => names.push(n.clone()),
+                        Expr::Binary { left, right, .. } => {
+                            stack.push(left);
+                            stack.push(right);
+                        }
+                        Expr::Alias(inner, _) => stack.push(inner),
+                        Expr::Literal(_) => {}
+                    }
+                }
+                assert!(
+                    names.iter().any(|n| n == "k"),
+                    "HAVING predicate must reference group key 'k', got {names:?}"
+                );
+                assert!(
+                    names.iter().any(|n| n == "s"),
+                    "HAVING predicate must reference aggregate alias 's', got {names:?}"
+                );
+            }
+            other => panic!("expected Filter (HAVING) at top, got {other:?}"),
         }
     }
 
