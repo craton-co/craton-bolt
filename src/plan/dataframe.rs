@@ -18,17 +18,16 @@
 //!
 //! # Handing the plan to the engine
 //!
-//! Call [`DataFrame::into_plan`] to consume the builder and obtain the
-//! underlying [`LogicalPlan`]; pass that to `Engine::sql` (or the lower-level
-//! planner entry points) to execute.
+//! Two terminals are offered:
 //!
-//! ## `collect()` is a 0.1 tombstone
-//!
-//! [`DataFrame::collect`] is a `#[doc(hidden)]` deprecated alias for
-//! `into_plan()`, kept only so older internal call sites compile. The name
-//! `collect` is reserved for a future materializing API (Polars-style) in
-//! 1.0; today it does not materialize anything. New code should call
-//! `into_plan()` directly.
+//! - [`DataFrame::collect`] consumes the builder, runs the plan against the
+//!   supplied [`Engine`], and returns the materialised [`RecordBatch`]. This
+//!   is the Polars-style "kick the query off and give me the rows" entry
+//!   point.
+//! - [`DataFrame::into_plan`] consumes the builder and returns the underlying
+//!   [`LogicalPlan`] without executing — useful for tests, plan inspection,
+//!   or callers that want to lower / execute through the lower-level planner
+//!   entry points themselves.
 //!
 //! # Builder-time validation
 //!
@@ -40,7 +39,10 @@
 //! the current 0.1 signature constraints (terminal `into_plan()` returns a
 //! bare `LogicalPlan`, so propagation is necessarily limited).
 
+use arrow_array::RecordBatch;
+
 use crate::error::{BoltError, BoltResult};
+use crate::exec::Engine;
 use crate::plan::logical_plan::{AggregateExpr, Expr, LogicalPlan, Schema};
 
 /// Lazy DataFrame — wraps a `LogicalPlan` and offers a builder API.
@@ -184,7 +186,13 @@ impl DataFrame {
         self.first_error.as_deref()
     }
 
-    /// Hand the plan off to the engine.
+    /// Hand the plan off without executing.
+    ///
+    /// Returns the underlying [`LogicalPlan`] for callers that want to
+    /// inspect or lower the plan manually (tests, plan-shape assertions,
+    /// custom executor paths). Most application code should prefer
+    /// [`DataFrame::collect`], which runs the plan and materialises a
+    /// [`RecordBatch`].
     ///
     /// Note: if a builder-time validation error was recorded (see
     /// [`DataFrame::validation_error`]) it is *not* returned here — the 0.1
@@ -192,10 +200,6 @@ impl DataFrame {
     /// when the plan is type-checked downstream (e.g. during lowering or
     /// via [`DataFrame::schema`]). Callers wanting fail-fast behavior
     /// should check `validation_error()` first.
-    // TODO(1.0): introduce a real `collect()` that materializes the plan to
-    // a `RecordBatch` via `Engine`. The current `collect` alias below is a
-    // doc-hidden tombstone kept only so older internal call sites compile;
-    // it should be removed once that materializing API lands.
     // TODO(post-0.1): change this to `BoltResult<LogicalPlan>` so the
     // stored `first_error` can be surfaced here instead of via the separate
     // `validation_error()` accessor.
@@ -203,14 +207,28 @@ impl DataFrame {
         self.plan
     }
 
-    /// Deprecated alias for [`DataFrame::into_plan`]. Hidden from rustdoc
-    /// because the name `collect` is reserved for a future materializing
-    /// API (Polars-style) in 1.0; today this is a no-op rename kept so
-    /// older internal call sites continue to compile.
-    #[doc(hidden)]
-    #[deprecated(since = "0.1.0", note = "use into_plan() instead")]
-    pub fn collect(self) -> LogicalPlan {
-        self.into_plan()
+    /// Execute the plan against `engine` and return the materialised
+    /// [`RecordBatch`].
+    ///
+    /// This is the Polars-style terminal that consumes the lazy builder,
+    /// runs it through the full rewrite → lower → execute pipeline (the
+    /// same one [`Engine::sql`] uses), and downloads the result rows. Any
+    /// builder-time validation error captured in
+    /// [`DataFrame::validation_error`] is surfaced here rather than being
+    /// silently swallowed — callers no longer need a separate
+    /// `validation_error()` check before kicking the query off.
+    ///
+    /// `&mut Engine` is taken because execution may touch engine state
+    /// (the pool-stats throttle, the GPU-table cache) that is logically
+    /// mutable even though the SQL path's `&self` signature hides the
+    /// interior mutability. Future executors that wire in materialised
+    /// intermediate tables will need the exclusive borrow.
+    pub fn collect(self, engine: &mut Engine) -> BoltResult<RecordBatch> {
+        if let Some(e) = self.first_error {
+            return Err(BoltError::Plan(e));
+        }
+        let handle = engine.run_logical_plan(&self.plan)?;
+        Ok(handle.into_record_batch())
     }
 }
 

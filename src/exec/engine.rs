@@ -1706,6 +1706,38 @@ impl Engine {
         result
     }
 
+    /// Execute an already-built [`LogicalPlan`] and return a [`QueryHandle`].
+    ///
+    /// This is the post-parse half of [`Engine::sql`]: it skips SQL parsing
+    /// (so the input plan can come from the [`DataFrame`](crate::DataFrame)
+    /// builder, a test fixture, etc.) but still runs the full
+    /// rewrite → lower → validity-propagate → execute pipeline so the
+    /// physical plan reaching the kernels is shaped identically to the SQL
+    /// path. The pool-stats periodic emit is performed here too, mirroring
+    /// `sql()`'s book-keeping.
+    ///
+    /// `&mut self` matches the [`DataFrame::collect`](crate::DataFrame::collect)
+    /// signature; the engine state mutated here is bounded to the
+    /// pool-stats throttle and the (interior-mutable) GpuTable cache
+    /// already touched by `sql()`.
+    pub fn run_logical_plan(&mut self, plan: &LogicalPlan) -> BoltResult<QueryHandle> {
+        crate::cuda::mem_pool::pool_watcher_retry_context_capture();
+        // String-literal predicates against Utf8 columns are folded into
+        // integer equality against the corresponding __idx_<col> i32 column —
+        // mirrors `sql()`.
+        let plan = self.dict_registry.rewrite_plan(plan)?;
+        let mut phys = crate::plan::lower_physical(&plan)?;
+        // PV-stage-d: thread per-column null-bearing into the kernel specs.
+        let nb = EngineProvider {
+            base: &self.provider,
+            tables: &self.tables,
+        };
+        crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
+        let result = self.execute(&phys);
+        self.maybe_emit_pool_stats(Instant::now());
+        result
+    }
+
     /// Emit a periodic pool-stats log line + observer notification if
     /// the configured interval has elapsed since the last emit.
     ///
