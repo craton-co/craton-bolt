@@ -7,6 +7,7 @@ pub mod dataframe;
 pub mod sql_frontend;
 pub mod physical_plan;
 pub mod string_literal_rewrite;
+pub mod rewrite;
 
 pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema, UnaryOp,
@@ -17,3 +18,4 @@ pub use sql_frontend::{parse as parse_sql, MemTableProvider, TableProvider};
 pub use physical_plan::{
     lower as lower_physical, ColumnIO, KernelSpec, Op, PhysicalPlan, Reg, Value,
 };
+pub use rewrite::PlanRewrite;

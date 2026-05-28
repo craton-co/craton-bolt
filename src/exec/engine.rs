@@ -41,7 +41,8 @@ use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::n_rows_to_u32;
 use crate::jit::{compile_ptx, CudaModule};
 use crate::plan::{
-    parse_sql, DataType, Field, KernelSpec, LogicalPlan, MemTableProvider, PhysicalPlan, Schema,
+    parse_sql, DataType, Field, KernelSpec, LogicalPlan, MemTableProvider, PhysicalPlan,
+    PlanRewrite, Schema,
 };
 
 /// PTX entry-point name; matches the symbol `ptx_gen` emits.
@@ -566,6 +567,20 @@ pub struct Engine {
     /// `SeqCst` so the test's load/store interleaves cleanly with the
     /// engine's increment.
     module_cache_loads: std::sync::atomic::AtomicUsize,
+    /// v0.6 / M7 public optimizer extension surface: user-registered
+    /// [`PlanRewrite`] implementations run in registration order, threaded
+    /// through each other, immediately before [`crate::plan::lower_physical`]
+    /// in [`Engine::sql`]. Empty for engines built via [`Engine::new`] /
+    /// [`Engine::new_with_device`]; populated via [`Engine::with_rewrite`]
+    /// (and, once the parallel `Engine::Builder` agent lands, via the
+    /// builder's `with_rewrite` method that drains into this field).
+    ///
+    /// Placeholder until the Builder ships: today the field can be
+    /// mutated through `with_rewrite` directly on `Engine`. The Builder
+    /// agent will integrate by forwarding registrations into this same
+    /// `Vec`, so the wiring in [`Engine::sql`] doesn't change when the
+    /// Builder merges.
+    rewrites: Vec<Box<dyn PlanRewrite>>,
     /// Owned CUDA context — declared LAST so it drops AFTER dictionaries.
     _ctx: CudaContext,
 }
@@ -616,8 +631,35 @@ impl Engine {
             pool_stats_interval,
             module_cache: Mutex::new(HashMap::new()),
             module_cache_loads: std::sync::atomic::AtomicUsize::new(0),
+            rewrites: Vec::new(),
             _ctx: ctx,
         })
+    }
+
+    /// Register a user-supplied [`PlanRewrite`] on this engine.
+    ///
+    /// Rewrites run in registration order, threading each rewriter's
+    /// output into the next, immediately **before**
+    /// [`crate::plan::lower_physical`] in [`Engine::sql`]. See the
+    /// [`PlanRewrite`](crate::plan::PlanRewrite) trait docs for the
+    /// contract implementations must uphold.
+    ///
+    /// This `with_rewrite` is the engine-direct entry point; the
+    /// forthcoming `Engine::Builder` (parallel agent) exposes the same
+    /// signature on the builder. Both ultimately push into the same
+    /// `rewrites` field, so the builder integration is a drop-in.
+    ///
+    /// Takes `self` by value and returns it so the call can chain with
+    /// the constructor: `Engine::new()?.with_rewrite(Box::new(MyRewrite))`.
+    pub fn with_rewrite(mut self, r: Box<dyn PlanRewrite>) -> Self {
+        self.rewrites.push(r);
+        self
+    }
+
+    /// Number of registered [`PlanRewrite`]s on this engine. Exposed for
+    /// tests and for `EXPLAIN`-style introspection.
+    pub fn rewrite_count(&self) -> usize {
+        self.rewrites.len()
     }
 
     /// Review-H2: look up the cached `CudaModule` for `(spec, entry)`, or
@@ -1247,6 +1289,17 @@ impl Engine {
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding __idx_<col> i32 column.
         let plan = self.dict_registry.rewrite_plan(&plan)?;
+        // v0.6 / M7: run user-registered PlanRewrite implementations in
+        // registration order, threading each rewriter's output into the
+        // next. This runs AFTER the internal dict-rewrite (so user
+        // rewrites see the engine's normalised form with `__idx_<col>`
+        // refs already in place) and BEFORE `lower_physical` (so users
+        // can still target logical-plan structure). See
+        // `crate::plan::rewrite` for the contract.
+        let plan = self
+            .rewrites
+            .iter()
+            .try_fold(plan, |p, r| r.rewrite(p))?;
         let mut phys = crate::plan::lower_physical(&plan)?;
         // PV-stage-d: populate `KernelSpec::input_has_validity` for every
         // input column by consulting the engine-backed provider, which
