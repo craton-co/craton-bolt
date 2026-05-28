@@ -2108,11 +2108,25 @@ pub fn intern_utf8_columns(
             continue;
         }
         let s = b.value(i);
-        let idx = *dict.entry(s).or_insert_with(|| {
-            let cur = next_idx;
-            next_idx = next_idx.saturating_add(1);
-            cur
-        });
+        // Bound check FIRST: compute the next index via `checked_add` BEFORE
+        // we hand `cur` to the dictionary entry. If the increment would
+        // overflow `i32::MAX` we bubble the error up here, so no corrupt
+        // index ever gets written into `dict` or pushed into `build_idx`.
+        let idx = match dict.entry(s) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let cur = next_idx;
+                next_idx = next_idx.checked_add(1).ok_or_else(|| {
+                    BoltError::Other(
+                        "gpu_join: Utf8 interning overflowed i32::MAX distinct values; \
+                         rewrite the query or fall back to host path"
+                            .to_string(),
+                    )
+                })?;
+                v.insert(cur);
+                cur
+            }
+        };
         build_idx.push(idx);
     }
 
@@ -2123,22 +2137,28 @@ pub fn intern_utf8_columns(
             continue;
         }
         let s = p.value(i);
-        let idx = *dict.entry(s).or_insert_with(|| {
-            let cur = next_idx;
-            next_idx = next_idx.saturating_add(1);
-            cur
-        });
+        let idx = match dict.entry(s) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let cur = next_idx;
+                next_idx = next_idx.checked_add(1).ok_or_else(|| {
+                    BoltError::Other(
+                        "gpu_join: Utf8 interning overflowed i32::MAX distinct values; \
+                         rewrite the query or fall back to host path"
+                            .to_string(),
+                    )
+                })?;
+                v.insert(cur);
+                cur
+            }
+        };
         probe_idx.push(idx);
     }
 
-    // i32::MAX is the cap — if we ever overflow, surface a clear error
-    // instead of pointing the kernel at a degenerate key column.
-    if next_idx == i32::MAX {
-        return Err(BoltError::Other(
-            "gpu_join: Utf8 interning overflowed i32::MAX distinct values; \
-             rewrite the query or fall back to host path".into(),
-        ));
-    }
+    // The bound check above is now load-bearing: if any row would have
+    // pushed `next_idx` past `i32::MAX` we already returned. This
+    // `debug_assert!` is paranoia for the invariant.
+    debug_assert!(next_idx < i32::MAX);
 
     Ok(InternedUtf8Columns {
         build_indices: Int32Array::from(build_idx),
@@ -2256,9 +2276,17 @@ pub fn intern_utf8_columns_streaming(
                     std::collections::hash_map::Entry::Occupied(e) => *e.get(),
                     std::collections::hash_map::Entry::Vacant(v) => {
                         let cur = *next_idx;
-                        // Saturating-add catches the i32::MAX overflow case;
-                        // we surface a clear error below.
-                        *next_idx = next_idx.saturating_add(1);
+                        // Bound check BEFORE the dict write so we never
+                        // intern a row under a saturated/aliased index.
+                        // `checked_add` returns None on overflow; we bubble
+                        // out via `?` immediately.
+                        *next_idx = next_idx.checked_add(1).ok_or_else(|| {
+                            BoltError::Other(
+                                "gpu_join: streaming Utf8 interning overflowed i32::MAX \
+                                 distinct hashes; rewrite the query or fall back to host path"
+                                    .to_string(),
+                            )
+                        })?;
                         v.insert(cur);
                         cur
                     }
@@ -2276,13 +2304,10 @@ pub fn intern_utf8_columns_streaming(
     let mut probe_idx: Vec<i32> = Vec::with_capacity(p.len());
     intern_chunked(p, &mut dict, &mut next_idx, &mut probe_idx)?;
 
-    if next_idx == i32::MAX {
-        return Err(BoltError::Other(
-            "gpu_join: streaming Utf8 interning overflowed i32::MAX distinct hashes; \
-             rewrite the query or fall back to host path"
-                .into(),
-        ));
-    }
+    // The bound check inside `intern_chunked` is load-bearing: any row that
+    // would have overflowed `i32::MAX` already returned with the error
+    // above. This `debug_assert!` is paranoia for the invariant.
+    debug_assert!(next_idx < i32::MAX);
 
     Ok(InternedUtf8Columns {
         build_indices: Int32Array::from(build_idx),
@@ -2566,18 +2591,15 @@ pub fn intern_utf8_columns_streaming_parallel(
     let mut next_idx: i32 = 0;
 
     let mut build_idx: Vec<i32> = Vec::with_capacity(b.len());
-    assign_indices_from_hashes(b, &build_hashes, &mut dict, &mut next_idx, &mut build_idx);
+    assign_indices_from_hashes(b, &build_hashes, &mut dict, &mut next_idx, &mut build_idx)?;
 
     let mut probe_idx: Vec<i32> = Vec::with_capacity(p.len());
-    assign_indices_from_hashes(p, &probe_hashes, &mut dict, &mut next_idx, &mut probe_idx);
+    assign_indices_from_hashes(p, &probe_hashes, &mut dict, &mut next_idx, &mut probe_idx)?;
 
-    if next_idx == i32::MAX {
-        return Err(BoltError::Other(
-            "gpu_join: parallel streaming Utf8 interning overflowed i32::MAX distinct hashes; \
-             rewrite the query or fall back to host path"
-                .into(),
-        ));
-    }
+    // `assign_indices_from_hashes` already errors on the first row that
+    // would push `next_idx` past `i32::MAX`, so this is paranoia for the
+    // post-condition.
+    debug_assert!(next_idx < i32::MAX);
 
     Ok(InternedUtf8Columns {
         build_indices: Int32Array::from(build_idx),
@@ -2686,13 +2708,20 @@ fn hash_rows_in_parallel(arr: &StringArray) -> BoltResult<Vec<u64>> {
 /// Walk pre-computed per-row hashes and assign dense i32 indices via the
 /// global dict. NULL rows in the source `arr` get the `-1` sentinel
 /// regardless of their hash value.
+///
+/// Errors out the moment incrementing `next_idx` would overflow `i32::MAX`,
+/// BEFORE the would-be corrupt index is inserted into `dict` or pushed into
+/// `out`. This is called sequentially from the main thread of
+/// [`intern_utf8_columns_streaming_parallel`] (Phase 2 merge), so a plain
+/// `BoltResult<()>` is sufficient — no cross-thread error propagation
+/// required.
 fn assign_indices_from_hashes(
     arr: &StringArray,
     hashes: &[u64],
     dict: &mut HashMap<u64, i32>,
     next_idx: &mut i32,
     out: &mut Vec<i32>,
-) {
+) -> BoltResult<()> {
     let n = arr.len();
     debug_assert_eq!(n, hashes.len());
     for i in 0..n {
@@ -2705,13 +2734,22 @@ fn assign_indices_from_hashes(
             std::collections::hash_map::Entry::Occupied(e) => *e.get(),
             std::collections::hash_map::Entry::Vacant(v) => {
                 let cur = *next_idx;
-                *next_idx = next_idx.saturating_add(1);
+                // Bound check FIRST so we never write a saturated/aliased
+                // index into the dict or the output Vec.
+                *next_idx = next_idx.checked_add(1).ok_or_else(|| {
+                    BoltError::Other(
+                        "gpu_join: parallel streaming Utf8 interning overflowed i32::MAX \
+                         distinct hashes; rewrite the query or fall back to host path"
+                            .to_string(),
+                    )
+                })?;
                 v.insert(cur);
                 cur
             }
         };
         out.push(idx);
     }
+    Ok(())
 }
 
 /// Re-test a set of `(probe_idx, build_idx)` candidate pairs against the
