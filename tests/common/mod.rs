@@ -26,6 +26,9 @@
 /// the test + bench suite. Floating-point arithmetic is non-associative
 /// and chunking / SIMD / fast-math can introduce per-batch drift of
 /// ~1e-12; 1e-9 is conservative for f64 sums up to ~1e6.
+// Each tests/*.rs is its own integration-test crate that only imports the
+// helpers it needs, so per-binary dead_code warnings here are spurious.
+#[allow(dead_code)]
 pub const REL_TOL: f64 = 1e-9;
 
 /// Deterministic xorshift64* PRNG used by the integration test fixtures.
@@ -37,10 +40,14 @@ pub const REL_TOL: f64 = 1e-9;
 ///
 /// Output quality is far more than adequate for fixture generation; do not
 /// use it for anything security-sensitive.
+// Each tests/*.rs is its own integration-test crate that only imports the
+// helpers it needs, so per-binary dead_code warnings here are spurious.
+#[allow(dead_code)]
 pub struct Xorshift64Star {
     state: u64,
 }
 
+#[allow(dead_code)]
 impl Xorshift64Star {
     /// Construct from an arbitrary `u64` seed. The seed is mixed with the
     /// golden-ratio constant (so adjacent integer seeds produce
@@ -89,6 +96,9 @@ impl Xorshift64Star {
 /// This is a distinct PRNG from [`Xorshift64Star`] — kept separate because
 /// existing sort fixtures hash-coded the LCG output across many tests and
 /// changing the PRNG would shift every expected value.
+// Each tests/*.rs is its own integration-test crate that only imports the
+// helpers it needs, so per-binary dead_code warnings here are spurious.
+#[allow(dead_code)]
 pub fn shuffle_deterministic<T: Copy>(xs: &mut [T], seed: u64) {
     let mut s = seed;
     for i in (1..xs.len()).rev() {
