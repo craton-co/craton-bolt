@@ -329,9 +329,16 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
         }
     }
 
-    // Emit all compute ops (loads, consts, casts, binaries).
+    // Emit all compute ops (loads, consts, casts, binaries, null-checks).
     for op in compute_ops {
-        emit_op(&mut b, op, &input_ptrs, &output_ptrs, &tid)?;
+        emit_op(
+            &mut b,
+            op,
+            &input_ptrs,
+            &output_ptrs,
+            &input_validity_ptrs,
+            &tid,
+        )?;
     }
 
     // Predicate gate (single branch skips every store) if requested.
@@ -344,7 +351,14 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
 
     // Emit all stores.
     for op in store_ops {
-        emit_op(&mut b, op, &input_ptrs, &output_ptrs, &tid)?;
+        emit_op(
+            &mut b,
+            op,
+            &input_ptrs,
+            &output_ptrs,
+            &input_validity_ptrs,
+            &tid,
+        )?;
     }
 
     // -------- (Option B) Per-output validity stores. Each flagged output
@@ -397,6 +411,7 @@ fn emit_op(
     op: &Op,
     input_ptrs: &[String],
     output_ptrs: &[String],
+    input_validity_ptrs: &[Option<String>],
     tid: &str,
 ) -> BoltResult<()> {
     match op {
@@ -412,7 +427,88 @@ fn emit_op(
             result_dtype,
         } => emit_binary(b, *dst, *op, *lhs, *rhs, *dtype, *result_dtype),
         Op::Store { src, col_idx, dtype } => emit_store(b, *src, *col_idx, *dtype, output_ptrs, tid),
+        Op::IsNullCheck {
+            dst,
+            validity_input,
+            want_null,
+        } => emit_is_null_check(b, *dst, *validity_input, *want_null, input_validity_ptrs, tid),
     }
+}
+
+/// Emit PTX for `Op::IsNullCheck`: load the validity byte for the current
+/// row from `input_validity_ptrs[validity_input]` and produce a Bool (0/1)
+/// in `dst` reflecting the IS [NOT] NULL outcome.
+///
+/// Wire shape:
+///
+/// ```text
+///   cvt.s64.s32 %off,  %tid                 // widen row index to b64
+///   add.s64     %addr, %vptr, %off          // &validity[tid]
+///   ld.global.nc.u8 %byte, [%addr]          // 0=null, 1=non-null
+///   setp.eq.u32 %p,    %byte, 0             // (or setp.ne for IS NOT NULL)
+///   selp.s32    %dst,  1, 0, %p             // 0/1 Bool result
+/// ```
+///
+/// For `want_null == true` (`IS NULL`) we emit `setp.eq.u32` so the
+/// predicate fires when the byte is 0. For `want_null == false`
+/// (`IS NOT NULL`) we emit `setp.ne.u32` so the predicate fires when
+/// the byte is non-zero. The `ld.global.nc.u8` form matches the
+/// read-only-cache hint used by the rest of the pre-kernel loads.
+///
+/// # Errors
+///
+/// Returns `BoltError::Other` if `validity_input` is out of range for
+/// `input_validity_ptrs`, or if the slot is `None` (the kernel was built
+/// without `KernelSpec::input_has_validity` set for this column — a
+/// planner bug; the codegen in `physical_plan::Codegen::emit_unary`
+/// flips the flag whenever it emits this op).
+fn emit_is_null_check(
+    b: &mut PtxBuilder,
+    dst: Reg,
+    validity_input: usize,
+    want_null: bool,
+    input_validity_ptrs: &[Option<String>],
+    tid: &str,
+) -> BoltResult<()> {
+    if validity_input >= input_validity_ptrs.len() {
+        return Err(BoltError::Other(format!(
+            "ptx_gen: IsNullCheck validity_input {} out of range (have {} input validity slots)",
+            validity_input,
+            input_validity_ptrs.len()
+        )));
+    }
+    let vptr = match &input_validity_ptrs[validity_input] {
+        Some(p) => p.clone(),
+        None => {
+            return Err(BoltError::Other(format!(
+                "ptx_gen: IsNullCheck on input {} but KernelSpec::input_has_validity \
+                 has no validity pointer wired through — planner bug \
+                 (Codegen::emit_unary must flip input_has_validity[{}] = true)",
+                validity_input, validity_input
+            )));
+        }
+    };
+
+    // Address arithmetic: validity bitmap is a parallel `*u8` of length
+    // n_rows where byte `tid` carries 0 = NULL, 1 = non-null (matching
+    // the Option-B convention used by the AND-of-inputs fold above).
+    let off = b.alloc.alloc("rd");
+    let addr = b.alloc.alloc("rd");
+    let byte_reg = b.alloc.alloc("r");
+    b.emit(&format!("cvt.s64.s32 {}, {};", off, tid))?;
+    b.emit(&format!("add.s64 {}, {}, {};", addr, vptr, off))?;
+    b.emit(&format!("ld.global.nc.u8 {}, [{}];", byte_reg, addr))?;
+
+    // Predicate + Bool result. `setp.{eq,ne}.u32` is the right typed
+    // comparator for the b32 byte_reg above (zero-extended from the u8
+    // load). `selp.s32` materialises the 0/1 Bool in the b32 class to
+    // match the existing Bool ABI (see `RegAlloc::class_for(Bool)`).
+    let dst_name = b.alloc.assign(dst, DataType::Bool)?;
+    let pred = b.alloc.alloc("p");
+    let cmp = if want_null { "setp.eq.u32" } else { "setp.ne.u32" };
+    b.emit(&format!("{} {}, {}, 0;", cmp, pred, byte_reg))?;
+    b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, pred))?;
+    Ok(())
 }
 
 /// Emit a `ld.global.nc.<type>` of input column `col_idx` at row `tid` into a fresh register.
@@ -1086,6 +1182,191 @@ mod validity_emission_tests {
             "error should mention validity, got: {msg}"
         );
     }
+
+    /// PTX-shape coverage for the new `Op::IsNullCheck` op (Batch 5).
+    ///
+    /// Builds a hand-crafted spec that selects an Int32 column and writes
+    /// the `IS NULL` result for a flagged-nullable input as a Bool output.
+    /// The PTX must:
+    ///
+    ///   1. Carry one extra `.param .u64 .ptr` for the input's validity
+    ///      buffer (no output validity, no AND-fold).
+    ///   2. Issue an `ld.global.nc.u8` for the validity byte at row `tid`.
+    ///   3. Compare the byte to zero with `setp.eq.u32` (IS NULL — fire
+    ///      when validity = 0).
+    ///   4. Materialise the 0/1 result with `selp.s32 ..., 1, 0, ...`.
+    ///
+    /// Mirrors the contract documented on `Op::IsNullCheck` in
+    /// `physical_plan.rs`.
+    #[test]
+    fn is_null_check_emits_validity_load_and_setp() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "x".into(),
+                dtype: DataType::Int32,
+            }],
+            outputs: vec![ColumnIO {
+                name: "x_is_null".into(),
+                dtype: DataType::Bool,
+            }],
+            ops: vec![
+                // The codegen always emits a LoadColumn for the bare-column
+                // operand (cache miss path); mirror that so the IR shape is
+                // realistic. The loaded value register is unused — the
+                // IsNullCheck reads validity, not value.
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+                Op::IsNullCheck {
+                    dst: Reg(1),
+                    validity_input: 0,
+                    want_null: true,
+                },
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            // The codegen sets this when emitting IsNullCheck; we mirror
+            // it manually here so the kernel param list grows by one for
+            // the validity pointer.
+            input_has_validity: vec![true],
+            output_has_validity: vec![],
+        };
+
+        let ptx = compile(&spec, "bolt_is_null_check").expect("compile");
+
+        // One extra .ptr param for the input validity pointer:
+        // 1 input value + 1 output value + 1 input validity = 3.
+        let n_ptr_params = ptx.matches(".param .u64 .ptr").count();
+        assert_eq!(
+            n_ptr_params, 3,
+            "expected 3 .ptr params (1 input + 1 output + 1 validity), got {n_ptr_params}\n{ptx}"
+        );
+
+        // The body must contain the read-only-cache validity load.
+        assert!(
+            ptx.contains("ld.global.nc.u8"),
+            "expected ld.global.nc.u8 for validity byte load\n{ptx}"
+        );
+
+        // The IS NULL predicate is `byte == 0`.
+        assert!(
+            ptx.contains("setp.eq.u32"),
+            "expected setp.eq.u32 for IS NULL (validity == 0)\n{ptx}"
+        );
+
+        // 0/1 materialisation.
+        assert!(
+            ptx.contains("selp.s32"),
+            "expected selp.s32 to materialise the Bool 0/1 result\n{ptx}"
+        );
+    }
+
+    /// `IS NOT NULL` should swap `setp.eq.u32` for `setp.ne.u32` —
+    /// otherwise the PTX shape is identical to the IS NULL case.
+    #[test]
+    fn is_not_null_check_uses_setp_ne() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "x".into(),
+                dtype: DataType::Int32,
+            }],
+            outputs: vec![ColumnIO {
+                name: "x_is_not_null".into(),
+                dtype: DataType::Bool,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+                Op::IsNullCheck {
+                    dst: Reg(1),
+                    validity_input: 0,
+                    want_null: false,
+                },
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            input_has_validity: vec![true],
+            output_has_validity: vec![],
+        };
+
+        let ptx = compile(&spec, "bolt_is_not_null_check").expect("compile");
+
+        assert!(
+            ptx.contains("ld.global.nc.u8"),
+            "expected ld.global.nc.u8 for validity byte load\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.ne.u32"),
+            "IS NOT NULL must use setp.ne.u32 (fire when validity != 0)\n{ptx}"
+        );
+        // The IS NULL form must NOT appear — otherwise the want_null=false
+        // branch silently degraded to want_null=true.
+        assert!(
+            !ptx.contains("setp.eq.u32"),
+            "IS NOT NULL must NOT contain setp.eq.u32 (would invert semantics)\n{ptx}"
+        );
+    }
+
+    /// Planner-bug guard: an `IsNullCheck` referring to a `validity_input`
+    /// slot that wasn't flagged in `KernelSpec::input_has_validity` must
+    /// surface as an error from `compile`, not silently produce bad PTX.
+    #[test]
+    fn is_null_check_without_validity_flag_is_error() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "x".into(),
+                dtype: DataType::Int32,
+            }],
+            outputs: vec![ColumnIO {
+                name: "x_is_null".into(),
+                dtype: DataType::Bool,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+                Op::IsNullCheck {
+                    dst: Reg(1),
+                    validity_input: 0,
+                    want_null: true,
+                },
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            // Forget to flag input 0 — the kernel won't have a validity
+            // pointer for it, so the IsNullCheck has nothing to read.
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let err = compile(&spec, "bolt_is_null_unflagged").expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("IsNullCheck") || msg.contains("validity"),
+            "error should mention validity wiring, got: {msg}"
+        );
+    }
 }
 
 
@@ -1145,7 +1426,8 @@ pub fn output_input_dependencies(
             Op::LoadColumn { dst, .. }
             | Op::Const { dst, .. }
             | Op::Cast { dst, .. }
-            | Op::Binary { dst, .. } => {
+            | Op::Binary { dst, .. }
+            | Op::IsNullCheck { dst, .. } => {
                 reg_to_op.insert(dst.id(), op);
             }
             Op::Store { .. } => { /* no dst */ }
@@ -1190,6 +1472,17 @@ pub fn output_input_dependencies(
                     Op::Binary { lhs, rhs, .. } => {
                         stack.push(lhs.id());
                         stack.push(rhs.id());
+                    }
+                    Op::IsNullCheck { .. } => {
+                        // IS NULL / IS NOT NULL is itself never-null: it
+                        // turns a (value, validity) pair into a Bool
+                        // {0,1} that already encodes the NULL outcome.
+                        // From a per-output validity AND-tree standpoint
+                        // it acts as a leaf with no upstream input-VALUE
+                        // dependency — even though the op reads its
+                        // input's validity bitmap, that read does NOT
+                        // need to be folded into a downstream output's
+                        // validity bit.
                     }
                     Op::Store { .. } => {
                         // Stores don't produce a Reg, so reg_to_op can't

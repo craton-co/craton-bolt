@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     join_combined_schema, AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal,
-    LogicalPlan, Schema, SortExpr,
+    LogicalPlan, Schema, SortExpr, UnaryOp,
 };
 
 /// SSA register handle. Just an index into the IR's value table.
@@ -89,6 +89,36 @@ pub enum Op {
         col_idx: usize,
         /// Dtype of the stored value.
         dtype: DataType,
+    },
+    /// Per-row null test against an input column's validity bitmap.
+    ///
+    /// Emits PTX that loads the validity byte for the current row from the
+    /// per-input validity pointer (`input_validity_ptrs[validity_input]`,
+    /// passed as a kernel parameter when
+    /// [`KernelSpec::input_has_validity`]`[validity_input]` is `true`) and
+    /// produces a Bool (0/1) result in `dst`:
+    ///
+    /// * `want_null == true`  → result is 1 iff the byte is 0 (the row IS NULL).
+    /// * `want_null == false` → result is 1 iff the byte is non-zero (the row
+    ///   IS NOT NULL).
+    ///
+    /// The codegen ([`Codegen::emit_unary`]) only emits this op when the
+    /// operand is a bare column reference whose schema marks it nullable;
+    /// non-nullable operands collapse to a constant Bool at plan time.
+    /// Compound unary operands (e.g. `(x + y) IS NULL`) take the host
+    /// fallback in [`predicate_contains_unary`].
+    IsNullCheck {
+        /// Destination register (Bool predicate).
+        dst: Reg,
+        /// Ordinal of the source column in `KernelSpec::inputs`. The
+        /// emitter indexes the kernel's validity-pointer table by this slot;
+        /// for it to resolve to a real pointer,
+        /// `KernelSpec::input_has_validity[validity_input]` must be `true`.
+        validity_input: usize,
+        /// `true` if this is `IS NULL` (result 1 when validity byte is 0);
+        /// `false` for `IS NOT NULL` (result 1 when validity byte is
+        /// non-zero).
+        want_null: bool,
     },
 }
 
@@ -392,6 +422,18 @@ struct Codegen<'a> {
     inputs: Vec<ColumnIO>,
     /// Cache of already-loaded columns: name -> (input ordinal, Value).
     column_cache: HashMap<String, (usize, Value)>,
+    /// Parallel to `inputs`: `true` if any emitted op (today only
+    /// [`Op::IsNullCheck`]) needs the kernel to consume that column's
+    /// validity bitmap at runtime. Propagated into
+    /// [`KernelSpec::input_has_validity`] by [`Codegen::finish`].
+    ///
+    /// Plan-time validity tracking is OR-combined with the provider-side
+    /// signal populated by [`populate_input_validity`]: a column that the
+    /// codegen flags here stays flagged even if the provider returns
+    /// `has_nulls == false`, since we still need the validity pointer
+    /// wired through to satisfy the `IsNullCheck` op. See
+    /// [`populate_one_kernel`] for the merge semantics.
+    input_needs_validity: Vec<bool>,
 }
 
 impl<'a> Codegen<'a> {
@@ -403,6 +445,7 @@ impl<'a> Codegen<'a> {
             next_reg: 0,
             inputs: Vec::new(),
             column_cache: HashMap::new(),
+            input_needs_validity: Vec::new(),
         }
     }
 
@@ -419,28 +462,105 @@ impl<'a> Codegen<'a> {
             Expr::Column(name) => self.emit_column(name),
             Expr::Literal(lit) => self.emit_literal(lit),
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
-            Expr::Unary { op, .. } => Err(BoltError::Plan(format!(
-                "{op:?} not yet supported by GPU executor; use host fallback"
-            ))),
+            Expr::Unary { op, operand } => self.emit_unary(*op, operand),
             Expr::Alias(inner, _) => self.emit_expr(inner),
-            // GPU codegen for IS [NOT] NULL is deferred: validity-propagating
-            // PTX needs an Op::IsNull / Op::IsNotNull pair that round-trips
-            // the validity bitmap through the register file. The plan-time
-            // `lower()` peels any Filter whose predicate contains Expr::Unary
-            // off the scan-kernel chain and routes it through the host-side
-            // `PhysicalPlan::Filter` instead (see `predicate_contains_unary`
-            // below), so this arm should be unreachable in practice — the
-            // explicit error message exists to localise any future regression
-            // (e.g. a Unary slipping into a Project's expression list).
-            //
-            // TODO(perf): emit `Op::IsNull` / `Op::IsNotNull` to push this onto
-            // the GPU once the IR + PTX emitter support reading validity bits.
-            Expr::Unary { op, .. } => Err(BoltError::Plan(format!(
-                "GPU codegen for unary {:?} not yet supported; \
-                 expected lower() to route this through PhysicalPlan::Filter",
-                op
-            ))),
         }
+    }
+
+    /// Emit a unary op.
+    ///
+    /// Today this only covers `IS NULL` / `IS NOT NULL`, and only when the
+    /// operand is a bare column reference (optionally wrapped in `Alias`).
+    /// Compound operands (e.g. `(x + y) IS NULL`) are surfaced as a
+    /// `Plan` error so the caller routes the predicate through the host
+    /// fallback — see [`predicate_contains_unary`] for the routing
+    /// invariant.
+    ///
+    /// The emitted IR shape:
+    /// * Non-nullable input schema → `Op::Const { Bool(false_or_true) }`,
+    ///   since the column can never be NULL at runtime. `IS NULL` collapses
+    ///   to `false`, `IS NOT NULL` to `true`.
+    /// * Nullable input schema → `Op::IsNullCheck` referencing the input
+    ///   slot's validity bitmap. The codegen also flips
+    ///   [`Codegen::input_needs_validity`] for that slot so the lowered
+    ///   `KernelSpec::input_has_validity` will request the validity
+    ///   pointer at kernel-launch time.
+    fn emit_unary(&mut self, op: UnaryOp, operand: &Expr) -> BoltResult<Value> {
+        // Peel through any `Alias` wrappers so `x AS y IS NULL` lowers the
+        // same as `x IS NULL`.
+        let mut bare = operand;
+        loop {
+            match bare {
+                Expr::Alias(inner, _) => bare = inner.as_ref(),
+                _ => break,
+            }
+        }
+        let col_name = match bare {
+            Expr::Column(n) => n.as_str(),
+            // Compound operand — caller must have routed through the host
+            // fallback. Return a Plan error so the planner regression
+            // surfaces clearly if the route is ever miswired.
+            _ => {
+                return Err(BoltError::Plan(format!(
+                    "GPU codegen: {:?} on non-column operand requires host fallback",
+                    op
+                )));
+            }
+        };
+
+        // Resolve the column in the scan schema. Unknown columns surface
+        // as `BoltError::Schema` — same as `emit_column`.
+        let field = self.scan_schema.field(col_name)?;
+        let nullable = field.nullable;
+        let want_null = matches!(op, UnaryOp::IsNull);
+
+        if !nullable {
+            // Non-nullable column: the answer is a constant. IS NULL → false,
+            // IS NOT NULL → true. No validity pointer needed, no IsNullCheck.
+            let lit = Literal::Bool(!want_null);
+            let dst = self.fresh();
+            self.ops.push(Op::Const { dst, lit });
+            return Ok(Value {
+                reg: dst,
+                dtype: DataType::Bool,
+            });
+        }
+
+        // Nullable column: route through the value-load path so the input
+        // slot exists, then flip its validity flag. We reuse `emit_column`
+        // (which is idempotent via `column_cache`) so a query that touches
+        // the same column for both value and null-check ends up with a
+        // single input slot.
+        let value = self.emit_column(col_name)?;
+        let col_idx = self
+            .column_cache
+            .get(col_name)
+            .map(|(idx, _)| *idx)
+            .ok_or_else(|| {
+                BoltError::Other(format!(
+                    "physical_plan: column '{}' missing from cache after emit_column",
+                    col_name
+                ))
+            })?;
+        let _ = value; // value reg unused — IsNullCheck only reads validity.
+
+        // Flag this input as needing its validity pointer wired through.
+        // `input_needs_validity` is parallel to `inputs`; `emit_column`
+        // already extended both vectors (via the cache miss path).
+        if col_idx < self.input_needs_validity.len() {
+            self.input_needs_validity[col_idx] = true;
+        }
+
+        let dst = self.fresh();
+        self.ops.push(Op::IsNullCheck {
+            dst,
+            validity_input: col_idx,
+            want_null,
+        });
+        Ok(Value {
+            reg: dst,
+            dtype: DataType::Bool,
+        })
     }
 
     /// Emit (or reuse) a column load.
@@ -455,6 +575,10 @@ impl<'a> Codegen<'a> {
             name: name.to_string(),
             dtype,
         });
+        // Keep `input_needs_validity` parallel to `inputs`. Default is
+        // `false` — `emit_unary` flips the slot to `true` if any
+        // `Op::IsNullCheck` reads this column's validity bitmap.
+        self.input_needs_validity.push(false);
         let dst = self.fresh();
         self.ops.push(Op::LoadColumn { dst, col_idx, dtype });
         let value = Value { reg: dst, dtype };
@@ -609,6 +733,26 @@ impl<'a> Codegen<'a> {
     /// "no input carries validity", preserving the pre-stage-D codegen
     /// shape for callers that don't yet wire the provider through.
     fn finish(self, outputs: Vec<ColumnIO>, predicate: Option<Reg>) -> KernelSpec {
+        // PV-stage-g: surface plan-time validity needs.
+        //
+        // If any `Op::IsNullCheck` was emitted, `input_needs_validity` has
+        // at least one `true` entry parallel to `inputs`. Propagate the
+        // whole vector into `KernelSpec::input_has_validity` so the
+        // launch-time wiring knows to pass through the matching `*u8`
+        // validity pointer. Otherwise (no IsNullCheck anywhere) keep the
+        // legacy empty-vector shape — every existing caller / PTX golden
+        // test continues to see the historical no-validity layout.
+        //
+        // The provider-side signal populated by
+        // [`populate_input_validity`] is OR-merged into this vector
+        // afterwards (see [`populate_one_kernel`]), so a column that the
+        // codegen flags here stays flagged even if the provider returns
+        // `has_nulls == false`.
+        let input_has_validity = if self.input_needs_validity.iter().any(|b| *b) {
+            self.input_needs_validity
+        } else {
+            Vec::new()
+        };
         KernelSpec {
             inputs: self.inputs,
             outputs,
@@ -619,7 +763,7 @@ impl<'a> Codegen<'a> {
             // these via `populate_input_validity` or per-stage upload
             // helpers. The default codegen path emits the historical PTX
             // shape unchanged.
-            input_has_validity: Vec::new(),
+            input_has_validity,
             output_has_validity: Vec::new(),
         }
     }
@@ -1172,17 +1316,45 @@ fn lower_aggregate(
 }
 
 /// True if `plan` is a Scan/Filter/Project chain that bottoms out in a Scan —
-/// Recursively test whether `expr` contains any `Expr::Unary` node.
+/// Recursively test whether `expr` contains an `Expr::Unary` node that
+/// the GPU codegen cannot lower — i.e. one whose operand is something
+/// other than a bare column reference (with any number of transparent
+/// `Alias` wrappers around it).
 ///
-/// Used by `lower()` to gate Filter predicates: anything with a unary
-/// op (today: `IS [NOT] NULL`) must take the host-side Filter detour
-/// because the GPU codegen doesn't yet emit validity-bitmap reads.
+/// Used by `lower()` to gate Filter predicates. Today the GPU codegen
+/// emits `Op::IsNullCheck` for `column IS [NOT] NULL` and
+/// `column-alias IS [NOT] NULL`; anything more elaborate (a binary
+/// expression or literal underneath the unary, e.g. `(x + y) IS NULL`)
+/// still has to fall back to the host-side `expr_agg::eval_unary` path
+/// because the codegen has no register-level NULL propagation for
+/// arbitrary subexpressions.
 ///
 /// Aliases are transparent — we look through them and into their inner
 /// expression.
+///
+/// # Naming
+///
+/// This used to return `true` for *any* `Expr::Unary`, since the IR had
+/// no `IsNullCheck` op. Now that bare-column unary lowers cleanly to
+/// the GPU, the function returns `true` ONLY for the cases that still
+/// need the host fallback. The function name stays the same so the
+/// existing call sites (Filter / Project gating in `lower()`) read
+/// naturally — "does the predicate contain a Unary we can't handle?".
 fn predicate_contains_unary(expr: &Expr) -> bool {
     match expr {
-        Expr::Unary { .. } => true,
+        Expr::Unary { operand, .. } => {
+            // Peel through any Alias wrappers — `x AS y IS NULL` is
+            // still a bare-column unary that the codegen can lower.
+            let mut bare = operand.as_ref();
+            loop {
+                match bare {
+                    Expr::Alias(inner, _) => bare = inner.as_ref(),
+                    _ => break,
+                }
+            }
+            // Bare column → GPU path; anything else → host path.
+            !matches!(bare, Expr::Column(_))
+        }
         Expr::Binary { left, right, .. } => {
             predicate_contains_unary(left) || predicate_contains_unary(right)
         }
@@ -1341,6 +1513,15 @@ pub fn populate_input_validity(
 /// null-bearing status by name. Columns not found in the provider's
 /// schema (e.g. synthesised pre-aggregation columns whose names won't
 /// resolve there) inherit safe-`false`.
+///
+/// OR-merge semantics: any `true` flag already present in
+/// `kernel.input_has_validity` (e.g. set by [`Codegen::emit_unary`] for
+/// an `IS NULL` check) is preserved. A provider that reports
+/// `has_nulls == false` cannot *clear* a codegen-set flag, because the
+/// `Op::IsNullCheck` instruction still needs the validity pointer wired
+/// through even when no row will actually be null. The provider can
+/// only ADD more `true` flags (e.g. for columns the codegen merely
+/// loaded as values).
 fn populate_one_kernel(
     kernel: &mut KernelSpec,
     table: &str,
@@ -1352,14 +1533,22 @@ fn populate_one_kernel(
         Err(_) => return, // table unknown to provider — leave safe-false.
     };
     let mut flags = Vec::with_capacity(kernel.inputs.len());
-    for io in &kernel.inputs {
-        let has = schema
+    for (i, io) in kernel.inputs.iter().enumerate() {
+        let provider_says = schema
             .fields
             .iter()
             .position(|f| f.name == io.name)
             .map(|idx| provider.has_nulls(table, idx))
             .unwrap_or(false);
-        flags.push(has);
+        // OR with any pre-existing codegen-set flag. If the kernel was
+        // built with an empty `input_has_validity` (legacy path) this
+        // simplifies to just `provider_says`.
+        let existing = kernel
+            .input_has_validity
+            .get(i)
+            .copied()
+            .unwrap_or(false);
+        flags.push(existing || provider_says);
     }
     kernel.input_has_validity = flags;
 }
@@ -1543,17 +1732,23 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             // same order as the lowered inner plan), drop it so downstream
             // pattern-matchers (and tests) see the bare inner plan.
             //
-            // Pre-flight: if any Filter in the underlying scan chain carries
-            // an `Expr::Unary` predicate, the predicate cannot survive the
-            // GPU codegen path (see `Codegen::emit_expr` and the Filter arm
-            // below). Force the SQL's `WHERE … IS [NOT] NULL` shape onto the
+            // Pre-flight: if any Filter in the underlying scan chain
+            // carries an `Expr::Unary` over a NON-bare-column operand
+            // (e.g. `(x + y) IS NULL`), the predicate cannot survive the
+            // GPU codegen path — `Op::IsNullCheck` only reads validity
+            // bitmaps for input columns, not for arbitrary subexpressions.
+            // Force the SQL's `WHERE … IS [NOT] NULL` shape onto the
             // host fallback by lowering the inner plan as-is and wrapping
             // the SELECT-list Project on top. Each layer keeps its
             // host-side semantics; the Project layer evaluates simple
             // bare-column renames against the host RecordBatch produced by
             // the Filter (see `engine.rs` PhysicalPlan::Project arm).
             //
-            // TODO(perf): drop this branch when Op::IsNull lands.
+            // Bare-column unary (`x IS NULL`, `x IS NOT NULL`) falls
+            // through to the GPU codegen path below — `Codegen::emit_unary`
+            // emits `Op::IsNullCheck` and `predicate_contains_unary`
+            // returns `false` for that shape, so this branch does NOT
+            // fire.
             if is_scan_chain(input) && scan_chain_has_unary_filter(input) {
                 log::debug!(
                     "physical_plan: Expr::Unary in scan-chain Filter; \
@@ -1588,19 +1783,13 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             }
         }
         LogicalPlan::Filter { input, predicate } => {
-            // GPU codegen does not (yet) support `IS [NOT] NULL`: emitting
-            // the right PTX requires reading the input column's validity
-            // bitmap into a register, and the IR/codegen are still
-            // value-only. Detect Expr::Unary anywhere in the predicate and
-            // detour the whole Filter through the host-side
-            // `PhysicalPlan::Filter` executor (`crate::exec::filter::
-            // execute_filter`), which already understands the full
-            // host evaluator including Unary IsNull/IsNotNull.
-            //
-            // TODO(perf): once Op::IsNull lands and `Codegen::emit_expr`
-            // can lower Expr::Unary, drop this branch so simple
-            // IS-NULL predicates over a Scan fold back into the fused
-            // projection kernel.
+            // GPU codegen handles `column IS [NOT] NULL` natively via
+            // `Op::IsNullCheck` — see `Codegen::emit_unary`. The host
+            // fallback is only required for compound Unary operands
+            // (e.g. `(x + y) IS NULL`), which `predicate_contains_unary`
+            // still flags. The host-side `PhysicalPlan::Filter` executor
+            // (`crate::exec::filter::execute_filter`) drives the full
+            // `expr_agg::eval_unary` path for those cases.
             if predicate_contains_unary(predicate) {
                 log::debug!(
                     "physical_plan: Expr::Unary in Filter predicate; \
