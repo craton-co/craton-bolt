@@ -181,8 +181,8 @@ for (uint32_t k = 0; k < K; ++k) {
 memcpy_concat(out_final, out_partial, K);
 ```
 
-**Why it works.** For q5 (1 M groups) and K = 1024 partitions, each
-partition holds ~1000 keys — comfortably under `BLOCK_GROUPS = 1024`. The
+**Why it works.** For q5 (1 M groups) and K = 4096 partitions, each
+partition holds ~250 keys — comfortably under `BLOCK_GROUPS = 1024`. The
 scatter is one DRAM read + one DRAM write per row, totally coalesced.
 Pass 2 then runs at Tier-1 speed.
 
@@ -197,7 +197,7 @@ Pass 2 then runs at Tier-1 speed.
 - Adds two device-side scratch buffers sized to the input (16 + 80 MB at
   N = 10 M). The memory pool absorbs this gracefully.
 - The partition kernel itself uses `atomicAdd` on the per-partition counter
-  vector — but counters are only K = 1024 slots, so it's strictly cheaper
+  vector — but counters are only K = 4096 slots, so it's strictly cheaper
   than the current bottleneck. Putting the counters in shared memory makes
   it cheaper still.
 - Scatter pattern is write-coalesced within a partition but

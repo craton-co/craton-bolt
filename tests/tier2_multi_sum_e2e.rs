@@ -15,8 +15,12 @@
 use std::collections::HashMap;
 
 // ---- Tier-2 constants (mirror the kernel) ----------------------------------
+//
+// `NUM_PARTITIONS` is imported from the crate's `__test_only_partition_offsets`
+// re-export so the oracle cannot drift away from the GPU kernel constant
+// (review C1).
+use craton_bolt::__test_only_partition_offsets::NUM_PARTITIONS;
 
-const NUM_PARTITIONS: u32 = 1024;
 const HASH_MULTIPLIER: u32 = 0x9E37_79B1;
 
 #[inline]

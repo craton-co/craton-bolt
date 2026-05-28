@@ -9,14 +9,14 @@
 //!
 //! ## Why we do this on the host
 //!
-//! `NUM_PARTITIONS = 1024`, so the counts vector is exactly 4 KiB. The
+//! `NUM_PARTITIONS = 4096`, so the counts vector is exactly 16 KiB. The
 //! cost breakdown for a host-side scan is:
 //!
-//! - DtoH copy of 4 KiB:   ~10 µs (a single PCIe round-trip)
-//! - 1024-element sum:     ~1 µs on any modern CPU
-//! - HtoD copy of 4 KiB:   ~10 µs
+//! - DtoH copy of 16 KiB:  ~10 µs (a single PCIe round-trip)
+//! - 4096-element sum:     ~1 µs on any modern CPU
+//! - HtoD copy of 16 KiB:  ~10 µs
 //!
-//! That's ~25 µs end-to-end. A GPU prefix-scan over 1024 elements would
+//! That's ~25 µs end-to-end. A GPU prefix-scan over 4096 elements would
 //! pay roughly the same in launch overhead alone, plus we'd have to ship
 //! and maintain another kernel. Tier 2 only kicks in for queries whose
 //! end-to-end runtime is measured in milliseconds, so this overhead is
@@ -24,7 +24,7 @@
 //! justified at this scale.
 //!
 //! If the partition count ever grows past ~16 K we should revisit, but
-//! 1024 is the right choice for q5-class workloads (~1 M groups, ~1 K
+//! 4096 is the right choice for q5-class workloads (~1 M groups, ~250
 //! groups per partition) and there's no plausible path to making it
 //! larger without also blowing up the per-partition hashtable budget.
 
@@ -48,7 +48,7 @@ pub const NUM_PARTITIONS: u32 = 4096;
 /// `offsets[NUM_PARTITIONS]` equals the total row count and is used as
 /// the scatter buffer length.
 ///
-/// Mechanism: downloads the 1024 `u32`s (4 KiB) over PCIe, prefix-sums
+/// Mechanism: downloads the 4096 `u32`s (16 KiB) over PCIe, prefix-sums
 /// on the host with one tight loop, returns. See the module docs for
 /// the cost rationale.
 pub fn compute_partition_offsets(counts: &GpuVec<u32>) -> BoltResult<Vec<u32>> {

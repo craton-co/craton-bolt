@@ -15,20 +15,21 @@
 //! in 16 KiB of shared memory, walks its partition's scatter slice with a
 //! grid-stride loop, and emits one slot's worth of `(key, val, set)` per
 //! shared-table position. The host then walks the (now fixed-size,
-//! `NUM_PARTITIONS * BLOCK_GROUPS * 13 B = 13 MiB`) output to collect the
-//! populated slots into the per-partition result vectors.
+//! `NUM_PARTITIONS * BLOCK_GROUPS * 13 B = 4096 * 1024 * 13 B = 52 MiB`)
+//! output to collect the populated slots into the per-partition result
+//! vectors.
 //!
 //! Net cost change:
-//!   * D2H: ~150 ms (n_rows-sized buffers) → ~13 ms (fixed 13 MiB output)
+//!   * D2H: ~150 ms (n_rows-sized buffers) → ~50 ms (fixed 52 MiB output)
 //!   * Host pass: ~100 ms of HashMap → ~5 ms of trivial scan
 //!   * GPU pass: +10–30 ms for the new kernel
-//! Net: ~150 ms saved, projected ~6× speedup on q5 per
+//! Net: ~120 ms saved, projected ~5× speedup on q5 per
 //! `docs/GROUPBY_PERF.md`.
 //!
 //! ## Pipeline
 //!
 //! 1. **Partition pass.** Hash every input row's key into one of
-//!    `NUM_PARTITIONS = 1024` buckets, count rows per bucket, and remember
+//!    `NUM_PARTITIONS = 4096` buckets, count rows per bucket, and remember
 //!    the per-row bucket assignment. (`partition_kernel`, sibling agent.)
 //! 2. **Prefix sum.** Exclusive prefix sum over the bucket counts gives the
 //!    write offset for each partition in the scattered output.
@@ -206,9 +207,9 @@ pub fn execute_tier2_sum(
     // Upload only the NUM_PARTITIONS bases (not the [K] sentinel) — the
     // scatter kernel indexes `offsets[pid]` for pid in [0, K).
     let offsets_gpu: GpuVec<u32> =
-        // upload_offsets takes the full 1025-element vec and slices off the
-        // trailing total internally; passing &offsets[..1024] would trip its
-        // length invariant.
+        // upload_offsets takes the full (NUM_PARTITIONS + 1)-element vec
+        // and slices off the trailing total internally; passing
+        // `&offsets[..NUM_PARTITIONS]` would trip its length invariant.
         stub_partition_offsets::upload_offsets(&offsets)?;
 
     // ----------------------------------------------------------------------
@@ -294,7 +295,7 @@ pub fn execute_tier2_sum(
 
     // Output buffers. NUM_PARTITIONS × BLOCK_GROUPS slots; one entry per
     // shared-table slot per partition. Total fixed cost regardless of
-    // n_rows: 1024 * 1024 * (4 + 8 + 1) = ~13 MiB.
+    // n_rows: 4096 * 1024 * (4 + 8 + 1) = ~52 MiB.
     let n_out_slots: usize =
         (num_partitions as usize) * (partition_reduce_kernel::BLOCK_GROUPS as usize);
     let mut out_keys: GpuVec<i32> = GpuVec::<i32>::zeros(n_out_slots)?;
@@ -334,7 +335,7 @@ pub fn execute_tier2_sum(
         )?;
     }
 
-    // Download the three fixed-size output buffers. Total ~13 MiB (vs.
+    // Download the three fixed-size output buffers. Total ~52 MiB (vs.
     // ~150 MiB the host path used to download at N=10 M).
     let host_out_keys: Vec<i32> = out_keys.to_vec()?;
     let host_out_vals: Vec<f64> = out_vals.to_vec()?;

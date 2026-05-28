@@ -22,3 +22,19 @@ pub use error::{BoltError, BoltResult};
 pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
 pub use plan::{DataFrame, LogicalPlan, PhysicalPlan, Expr};
 pub use exec::Engine;
+
+/// Test-only re-export of the live Tier-2 partition-count constant.
+///
+/// Integration tests under `tests/` need the same `NUM_PARTITIONS` value
+/// the GPU kernels use to build their host-side oracles (e.g. the
+/// `partition_of(key)` mirror in `tests/tier2_groupby_e2e.rs`). Without
+/// this re-export each test would hard-code the value and silently drift
+/// when the kernel constant changes — exactly the bug review C1 caught.
+///
+/// Importing through this module guarantees a drift now becomes a
+/// compile error (or a value mismatch) instead of silently miscomputing
+/// the partition oracle. Not part of the public API — `#[doc(hidden)]`.
+#[doc(hidden)]
+pub mod __test_only_partition_offsets {
+    pub use crate::exec::partition_offsets::NUM_PARTITIONS;
+}
