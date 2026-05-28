@@ -56,6 +56,14 @@
 //! `get_or_try_init` until the first thread's compile completes — it then
 //! receives the same `Arc<CudaModuleInner>` without paying the compile
 //! cost. Compiles for *different* PTX keys run fully in parallel.
+//!
+//! # Observability
+//!
+//! The cache tracks three monotonically-increasing counters — `hits`,
+//! `misses`, and `evictions` — accessible via the public
+//! [`ptx_cache_stats`] free function. The counters are snapshot under the
+//! cache lock, so callers always see a consistent triple. Suitable for
+//! Prometheus exporters, benchmark scoreboards, and test assertions.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
@@ -166,10 +174,26 @@ struct CacheEntry {
 }
 
 /// Cache state: a `HashMap` for O(1) lookup plus a `VecDeque` of keys in
-/// insertion order for FIFO eviction.
+/// insertion order for FIFO eviction. Tracks `hits`, `misses`, and
+/// `evictions` counters for the public [`ptx_cache_stats`] observability
+/// hook — counters are pure `usize` fields (no atomics) because every
+/// read/write happens while the surrounding `Mutex<PtxCache>` is held,
+/// giving us snapshot-consistent triples for free.
 struct PtxCache {
     map: HashMap<u64, CacheEntry>,
     order: VecDeque<u64>,
+    /// Number of successful lookups (key present *and* PTX text matched).
+    /// Updated under the cache lock in the `from_ptx_with` classify step.
+    hits: usize,
+    /// Number of unsuccessful lookups — both fresh misses (no key) and
+    /// 64-bit hash collisions against a different PTX string. Updated
+    /// under the cache lock alongside `hits`.
+    misses: usize,
+    /// Number of FIFO evictions performed by `insert_empty` when the
+    /// cache was at or above its capacity. Saturating at `usize::MAX` is
+    /// unreachable for any realistic process lifetime, but we use a
+    /// plain `+=` for cheap counter updates under the lock.
+    evictions: usize,
 }
 
 impl PtxCache {
@@ -178,6 +202,9 @@ impl PtxCache {
         Self {
             map: HashMap::with_capacity(cap),
             order: VecDeque::with_capacity(cap),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
         }
     }
 
@@ -188,7 +215,10 @@ impl PtxCache {
     ///
     /// Factored out so the eviction policy can be exercised in isolation
     /// from the global cache, and so the single source of truth lives in
-    /// one place.
+    /// one place. Bumps `self.evictions` whenever a FIFO eviction occurs
+    /// — this is the *only* place the eviction counter is updated, so
+    /// `ptx_cache_stats` reflects a precise eviction count even under
+    /// concurrent inserts.
     fn insert_empty(
         &mut self,
         key: u64,
@@ -198,6 +228,7 @@ impl PtxCache {
         if self.map.len() >= cap {
             if let Some(old_key) = self.order.pop_front() {
                 self.map.remove(&old_key);
+                self.evictions += 1;
             }
         }
         let cell = Arc::new(OnceCell::new());
@@ -218,6 +249,25 @@ static PTX_CACHE: OnceLock<Mutex<PtxCache>> = OnceLock::new();
 
 fn ptx_cache() -> &'static Mutex<PtxCache> {
     PTX_CACHE.get_or_init(|| Mutex::new(PtxCache::new()))
+}
+
+/// Returns `(hits, misses, evictions)` from the process-wide PTX cache.
+///
+/// Observability hook — useful for benchmarking, dashboards, and tests.
+/// All counters are saturating-atomic / lock-snapshot reads and are
+/// safe to call from any thread. The triple is taken under the cache
+/// `Mutex`, so the three values are mutually consistent (no torn reads
+/// across counters), at the cost of brief lock contention with an
+/// in-flight cache classify step. Compile work itself runs *outside*
+/// the lock, so calling this from a metrics-scrape loop will not stall
+/// a parallel PTXAS assembly.
+///
+/// Counters are monotonically non-decreasing for the life of the
+/// process; they have no reset semantics in the public API. Callers
+/// that want a per-window delta should subtract two snapshots.
+pub fn ptx_cache_stats() -> (usize, usize, usize) {
+    let cache = ptx_cache().lock();
+    (cache.hits, cache.misses, cache.evictions)
 }
 
 /// 64-bit hash of the PTX source. We use the std default hasher; it is not
@@ -276,9 +326,18 @@ impl CudaModule {
                 Some(_) => Slot::Collision,
                 None => Slot::Miss,
             };
+            // Counter updates live inside the same critical section as the
+            // classification above so a concurrent reader of
+            // `ptx_cache_stats` cannot observe a half-updated triple. A
+            // collision still counts as a miss for stats purposes — the
+            // caller pays the full compile cost on this path.
             match slot {
-                Slot::Reuse(cell) => cell,
+                Slot::Reuse(cell) => {
+                    cache.hits += 1;
+                    cell
+                }
                 Slot::Collision => {
+                    cache.misses += 1;
                     // 64-bit hash collision against a different PTX string —
                     // astronomically rare at our cache sizes. Drop the lock
                     // and serve this caller from a one-shot uncached load.
@@ -286,6 +345,7 @@ impl CudaModule {
                     return loader(ptx);
                 }
                 Slot::Miss => {
+                    cache.misses += 1;
                     // Fresh miss: insert an empty cell, FIFO-evict if at cap.
                     let cap = ptx_cache_cap();
                     cache.insert_empty(key, ptx.to_owned(), cap)
@@ -710,6 +770,108 @@ mod tests {
 
         let other = BoltError::Other("misc".to_string());
         assert_eq!(inner_code(&other), None);
+    }
+
+    // -- ptx_cache_stats observability hook --------------------------------
+
+    /// `ptx_cache_stats` returns a `(hits, misses, evictions)` triple
+    /// reflecting the process-wide cache counters. Because the cache is
+    /// shared across tests *and* cargo runs tests concurrently, the test
+    /// works in *lower-bound deltas* from a snapshot taken at the top:
+    /// each of our operations must bump its counter by *at least* its
+    /// contribution. Other concurrent tests can only push the absolute
+    /// values higher, never lower — counters are monotonic — so a
+    /// lower-bound assertion is robust to parallel test execution.
+    ///
+    /// Scenario:
+    /// 1. Insert one fresh entry via stub loader → `misses` advances by
+    ///    >= 1.
+    /// 2. Look up the same PTX again → `hits` advances by >= 1, and the
+    ///    loader does NOT fire (verified via a sentinel counter, which
+    ///    is unaffected by other tests).
+    /// 3. Insert `cap + 1` further unique entries → `evictions` advances
+    ///    by >= 1 and `misses` by >= `cap + 1`.
+    #[test]
+    fn ptx_cache_stats_reports_hits_misses_evictions() {
+        let (h0, m0, e0) = ptx_cache_stats();
+
+        // Step 1: cold miss on a unique key.
+        let ptx_a = "// ptx_cache_stats test A — unique tag 41c6b7d92f8e0a13".to_string();
+        CudaModule::from_ptx_with(&ptx_a, |_| Ok(stub_module())).unwrap();
+        let (h1, m1, e1) = ptx_cache_stats();
+        assert!(
+            m1 >= m0 + 1,
+            "fresh miss must advance misses by >= 1 (m0={}, m1={})",
+            m0,
+            m1
+        );
+        assert!(h1 >= h0, "hits counter must be monotonic");
+        assert!(e1 >= e0, "evictions counter must be monotonic");
+
+        // Step 2: warm hit on the same key. The sentinel `fired` is
+        // private to this test (closure-local AtomicUsize), so it is
+        // unaffected by any concurrent test running on the global cache —
+        // this gives us an authoritative "did the loader actually run"
+        // signal independent of the global counters.
+        let fired = Arc::new(AtomicUsize::new(0));
+        {
+            let fired = Arc::clone(&fired);
+            CudaModule::from_ptx_with(&ptx_a, move |_| {
+                fired.fetch_add(1, Ordering::SeqCst);
+                Ok(stub_module())
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "warm hit must not invoke the loader"
+        );
+        let (h2, m2, e2) = ptx_cache_stats();
+        assert!(
+            h2 >= h1 + 1,
+            "warm hit must advance hits by >= 1 (h1={}, h2={})",
+            h1,
+            h2
+        );
+        assert!(m2 >= m1, "misses counter must be monotonic");
+        assert!(e2 >= e1, "evictions counter must be monotonic");
+
+        // Step 3: force at least one eviction by inserting `cap + 1` more
+        // unique entries. The cap is process-frozen via OnceLock so this
+        // matches the cap the cache itself is using. We assert lower
+        // bounds (not equality) because pre-existing entries from other
+        // tests and concurrent test threads may both push the actual
+        // delta higher than our contribution alone.
+        let cap = ptx_cache_cap();
+        let burst = cap + 1;
+        for i in 0..burst {
+            let ptx = format!(
+                "// ptx_cache_stats test eviction burst {} — unique tag bd7e54f08a2c91{:04x}",
+                i, i
+            );
+            CudaModule::from_ptx_with(&ptx, |_| Ok(stub_module())).unwrap();
+        }
+        let (h3, m3, e3) = ptx_cache_stats();
+        assert!(
+            m3 >= m2 + burst,
+            "burst of {} unique keys must advance misses by >= {} \
+             (m2={}, m3={})",
+            burst,
+            burst,
+            m2,
+            m3,
+        );
+        assert!(
+            e3 >= e2 + 1,
+            "inserting cap+1 fresh entries into a cache already at \
+             least at cap (we just inserted `cap+1` plus prior step's \
+             entry) must produce >= 1 eviction (e2={}, e3={}, cap={})",
+            e2,
+            e3,
+            cap,
+        );
+        assert!(h3 >= h2, "hits counter must be monotonic");
     }
 
     /// A loader that fails leaves the cell empty rather than poisoning the
