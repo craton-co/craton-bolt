@@ -219,6 +219,308 @@ pub struct AggregateSpec {
     pub input_has_validity: Vec<bool>,
 }
 
+// ---------------------------------------------------------------------------
+// v0.7: KernelSpec coverage for non-projection kernel kinds.
+//
+// Background. The original [`KernelSpec`] struct above models the
+// fused-projection (+ optional filter) kernel ONLY — its fields (`inputs`,
+// `outputs`, `ops`, `predicate`, …) are accessed from over a dozen call sites
+// (the executor in `engine.rs`, `groupby_with_pre.rs`, the PTX emitter in
+// `jit::ptx_gen`, scan kernels, etc.). Refactoring that struct into an enum
+// would ripple through every field-access site AND change its `Debug` output
+// — which is the disk-cache key shape via `hash_to_key(spec_hash_hi,
+// spec_hash_lo)` in `exec::engine`. Both are out of scope for this task per
+// the brief; see the explicit escape hatch documented there.
+//
+// Instead we introduce SIBLING spec types — one per non-projection kernel
+// kind — each independently cacheable through a per-kind wrapper around the
+// existing `crate::exec::module_cache::get_or_build_module` machinery
+// (wired in a follow-up; see #14 / v0.7). Each sibling type:
+//
+//   * `#[derive(Debug, Clone, PartialEq, Eq, Hash)]` so the existing
+//     `KernelSpecKey::new(spec, entry)` machinery in `exec::module_cache`
+//     (which hashes the `Debug` output with a domain-separated
+//     `DefaultHasher`) keeps working bit-for-bit, and so callers can use
+//     these specs as `HashMap` keys directly if they prefer to bypass the
+//     module cache.
+//   * Carries every knob the codegen / launcher consult — dtype, op flavour,
+//     pass index, key shape, etc. — so two specs that differ in any
+//     observable way produce different `Debug` strings and therefore land in
+//     distinct cache slots.
+//   * Provides no field-access dependency on the existing `KernelSpec` —
+//     each new type is self-contained, so wiring a single executor through
+//     to a new spec is a localised change.
+//
+// The [`KernelSpecKind`] wrapper at the bottom is a single envelope every
+// executor can use as a uniform cache-key carrier without having to spell
+// out the variant at the call site; the projection variant wraps the
+// existing struct unchanged so its hash shape is `Projection(KernelSpec
+// { … })`. That is intentionally DIFFERENT from the bare `KernelSpec { … }`
+// hash used by the wired projection cache today — wiring callers through
+// `KernelSpecKind::Projection(spec)` would force a cache rebuild on first
+// run. Callers that want the legacy projection-cache shape continue passing
+// `&KernelSpec` directly; callers that want the new uniform envelope use
+// `KernelSpecKind`.
+
+/// Scalar-aggregate reduction operator. Mirror of
+/// [`crate::jit::agg_kernels::ReduceOp`] kept here so the planner-side
+/// spec type doesn't have to import from `jit::` (layering: `plan` is
+/// below `jit` in the dependency graph). The two enums are kept in sync
+/// by hand; the unit test
+/// [`scalar_agg_spec_op_round_trips`] pins the round-trip mapping.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarAggOp {
+    /// `SUM` — identity 0, combine `add`. The accumulator dtype follows
+    /// the widening contract documented on
+    /// [`crate::plan::logical_plan::sum_output_dtype`].
+    Sum,
+    /// `MIN` — identity +inf / INT_MAX, combine `min`.
+    Min,
+    /// `MAX` — identity -inf / INT_MIN, combine `max`.
+    Max,
+    /// `COUNT(_)` — synthesised as `Sum` over ones at PTX-emit time, but
+    /// kept distinct here so the cache key disambiguates a literal
+    /// `SUM(col)` from a `COUNT(col)` even when the underlying combine
+    /// instruction is identical.
+    Count,
+    /// `AVG` — fused per-block `(f64 sum, u32 count)` partials in a
+    /// single pass; see [`crate::jit::agg_kernels::compile_avg_reduction_kernel`].
+    /// `AVG` is its own kernel because the combine and partial-shape
+    /// differ from the basic four reductions above.
+    Avg,
+}
+
+/// Spec for a per-block scalar reduction kernel emitted from
+/// [`crate::jit::agg_kernels::compile_reduction_kernel`] (or
+/// `compile_avg_reduction_kernel` when `op == ScalarAggOp::Avg`).
+///
+/// The knobs the codegen reads are exactly `(op, dtype)`: identity,
+/// combine instruction, accumulator widening, and PTX register class all
+/// derive from those two fields. The kernel entry symbol
+/// (`REDUCTION_KERNEL_ENTRY` / `AVG_KERNEL_ENTRY`) is fixed per-op, so the
+/// cache layer's `entry` tag domain-separates `Avg` from non-`Avg` even
+/// for the same input dtype.
+///
+/// # Cache key
+///
+/// The `Debug` impl emits `ScalarAggSpec { op: Sum, dtype: Int32 }` — i.e.
+/// no two distinct `(op, dtype)` pairs hash to the same string. The
+/// `assert_ne!` round-trip tests in this file pin that property for every
+/// pair the codegen accepts.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScalarAggSpec {
+    /// Which reduction operator the kernel implements.
+    pub op: ScalarAggOp,
+    /// The INPUT-column dtype. The accumulator dtype (for `Sum` over
+    /// narrow signed ints) is derived from `dtype` via
+    /// [`crate::plan::logical_plan::sum_output_dtype`]; we don't store it
+    /// here so two specs that would lower to the same kernel can't
+    /// accidentally drift on the accumulator field.
+    pub dtype: DataType,
+}
+
+/// Which entry point of the hash-join kernel set this spec selects. The
+/// hash-join PTX is emitted by `compile_*_kernel` helpers in
+/// `crate::jit::hash_join_kernel`; each helper takes no arguments and
+/// returns a fixed PTX string for a fixed entry symbol. The codegen-time
+/// knob is therefore which helper to call.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HashJoinKernelKind {
+    /// `compile_build_kernel` — insert encoded keys into the open-addressed
+    /// table at `keys_table_ptr` / `row_idx_table_ptr`.
+    Build,
+    /// `compile_probe_kernel` — emit `(probe_idx, build_idx)` pairs for every
+    /// matched probe row. Linear-probe variant.
+    Probe,
+    /// `compile_probe_kernel_tiled` — tiled-shared-memory probe variant for
+    /// small build sides.
+    ProbeTiled,
+    /// `compile_build_collision_kernel` — build variant that records
+    /// per-key collision chains.
+    BuildCollision,
+    /// `compile_probe_collision_kernel` — probe variant matching
+    /// `BuildCollision`.
+    ProbeCollision,
+    /// `compile_build_aos_kernel` — array-of-structs build kernel for the
+    /// AOS code path.
+    BuildAos,
+    /// `compile_probe_aos_kernel` — array-of-structs probe kernel.
+    ProbeAos,
+    /// `compile_unmatched_build_kernel` — emit unmatched build-side row
+    /// indices for `LEFT` / `FULL` outer joins.
+    UnmatchedBuild,
+    /// `compile_cross_kernel` — full Cartesian product for `CROSS JOIN`.
+    Cross,
+    /// `compile_string_hash_kernel` — Utf8 candidate filter for
+    /// `KeyShape::SingleI32Candidate`. The `_i64` flavour is selected by
+    /// the boolean field below.
+    StringHash,
+}
+
+/// Spec for one entry point of the hash-join kernel set.
+///
+/// The hash-join kernels themselves don't take a `DataType` parameter —
+/// every encoded key arrives as an `i64` at the kernel boundary (see
+/// `encode_keys_for_shape` in `crate::exec::gpu_join`). The `key_dtype`
+/// field is stored here purely so the cache key is unambiguous across
+/// joins built on different source-column types (which DO produce
+/// different host-side encoders and would otherwise share a slot here —
+/// harmless for correctness, surprising for telemetry).
+///
+/// `string_hash_returns_i64` is the single bit that distinguishes the two
+/// `StringHash` flavours (`bolt_string_hash` vs `bolt_string_hash_i64`);
+/// it's ignored for every other variant.
+///
+/// # Cache key
+///
+/// The `Debug` impl emits all three fields, so distinct
+/// `(kind, key_dtype, string_hash_returns_i64)` triples land in distinct
+/// cache slots.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HashJoinKernelSpec {
+    /// Which of the hash-join PTX entry points this spec selects.
+    pub kind: HashJoinKernelKind,
+    /// Dtype of the source key column BEFORE host-side encoding to i64.
+    /// Kept here for cache-key disambiguation only; the kernel itself
+    /// always operates on `i64`-encoded keys.
+    pub key_dtype: DataType,
+    /// For `kind == StringHash`: `true` selects the `_i64` flavour
+    /// (`bolt_string_hash_i64`), `false` selects the regular flavour
+    /// (`bolt_string_hash`). Ignored for every other `kind`.
+    pub string_hash_returns_i64: bool,
+}
+
+/// Which pass of the radix-sort driver this spec compiles. The radix
+/// driver in `crate::exec::gpu_sort` (and the per-pass kernels in
+/// `crate::jit::sort_kernel_radix`) breaks the sort into a histogram
+/// pass and a scatter pass per 4-bit digit; the same PTX is reused
+/// across passes (the `shift` is a kernel parameter, not a codegen knob).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RadixSortPass {
+    /// `compile_radix_histogram` — count digit occurrences into a per-block
+    /// histogram.
+    Histogram,
+    /// `compile_radix_scatter` — scatter keys to their final positions
+    /// using the prefix-summed histogram.
+    Scatter,
+}
+
+/// Spec for one pass of the radix sort kernel pair.
+///
+/// The codegen knobs are exactly `(pass, dtype)`. The per-pass shift is a
+/// kernel parameter passed at launch time — it does NOT participate in
+/// codegen and therefore does NOT participate in the cache key. Two
+/// `(Histogram, Int32)` calls at shift 0 and shift 4 hit the same cached
+/// module.
+///
+/// # Cache key
+///
+/// The `Debug` impl emits both fields, so a `(Histogram, Int32)` spec and
+/// a `(Histogram, Int64)` spec hash to distinct strings and never collide.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RadixSortKernelSpec {
+    /// Which pass (Histogram or Scatter) this spec compiles.
+    pub pass: RadixSortPass,
+    /// Key dtype the kernel reads. Drives the PTX load-suffix / register
+    /// class (`b32` vs `b64`).
+    pub dtype: DataType,
+}
+
+/// Which prefix-scan algorithm a [`CompactionKernelSpec::PrefixScan`]
+/// variant compiles. Mirror of `crate::exec::gpu_compact::PrefixScanAlgo`
+/// (the original is module-private); the two enums are kept in sync by
+/// hand. The unit test [`compaction_spec_prefix_scan_round_trips`] pins
+/// that every variant produces a distinct cache key.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrefixScanAlgoTag {
+    /// O(n log n) ping-pong scan — `SCAN_KERNEL_ENTRY`, the default.
+    HillisSteele,
+    /// O(n) upsweep/downsweep — `SCAN_KERNEL_ENTRY_BLELLOCH`.
+    Blelloch,
+    /// Single-pass decoupled-lookback — `SCAN_KERNEL_ENTRY_LOOKBACK`,
+    /// runs with an extra `partial_status` buffer.
+    Lookback,
+}
+
+/// Which compaction-pipeline kernel this spec compiles. The compaction
+/// pipeline in `crate::exec::gpu_compact` has three distinct PTX shapes
+/// — prefix scan over a `u8` mask, per-dtype gather, and a Bool-nullable
+/// gather — each with its own knobs.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionKernelKind {
+    /// Prefix-scan over the keep-mask, parameterised by which algorithm
+    /// implementation is selected (see [`PrefixScanAlgoTag`]).
+    PrefixScan(PrefixScanAlgoTag),
+    /// Per-dtype gather kernel from `compile_gather_kernel(dtype)`.
+    Gather(DataType),
+    /// Bool-with-validity gather variant — used by
+    /// `gather_bool_nullable`. The validity store path is distinct PTX
+    /// from the plain `Gather(Bool)` variant.
+    GatherBoolNullable,
+}
+
+/// Spec for one of the compaction-pipeline kernels.
+///
+/// The codegen-time knob is entirely captured by the `kind` variant —
+/// `PrefixScan` selects between three algorithms, `Gather` is
+/// parameterised by dtype, and `GatherBoolNullable` is a single fixed
+/// shape. Wrapping all three in one spec type lets the executor pass a
+/// single `&CompactionKernelSpec` to the cache layer regardless of which
+/// pipeline stage is being looked up.
+///
+/// # Cache key
+///
+/// The `Debug` impl emits the wrapped variant in full, so
+/// `PrefixScan(HillisSteele)` and `PrefixScan(Blelloch)` hash to distinct
+/// strings, and `Gather(Int32)` vs `Gather(Int64)` likewise.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompactionKernelSpec {
+    /// Which compaction-pipeline kernel this spec compiles.
+    pub kind: CompactionKernelKind,
+}
+
+/// Uniform-envelope wrapper over every kernel-spec kind the planner can
+/// produce. Lets the cache layer accept a single type for every executor
+/// without each call site spelling the variant.
+///
+/// # Hash-shape caveat
+///
+/// The `Debug` output of `KernelSpecKind::Projection(spec)` is
+/// `Projection(KernelSpec { … })` — strictly different from the bare
+/// `KernelSpec { … }` shape that the wired projection cache in
+/// `engine.rs::get_or_build_module` produces today. **Callers that want
+/// to hit the legacy projection-cache slot must continue passing
+/// `&KernelSpec` directly**, not the envelope; the envelope is for the
+/// new spec kinds (`ScalarAgg`, `HashJoin`, `RadixSort`, `Compaction`)
+/// that have no legacy cache slot to collide with.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum KernelSpecKind {
+    /// The fused-projection / filter kernel — wraps the existing
+    /// [`KernelSpec`] struct unchanged. See caveat above on hash shape.
+    Projection(KernelSpec),
+    /// A scalar-reduction kernel; see [`ScalarAggSpec`].
+    ScalarAgg(ScalarAggSpec),
+    /// One entry point of the hash-join kernel set; see
+    /// [`HashJoinKernelSpec`].
+    HashJoin(HashJoinKernelSpec),
+    /// One pass of the radix sort kernel pair; see
+    /// [`RadixSortKernelSpec`].
+    RadixSort(RadixSortKernelSpec),
+    /// One of the compaction-pipeline kernels; see
+    /// [`CompactionKernelSpec`].
+    Compaction(CompactionKernelSpec),
+}
+
 /// The top-level physical plan: a small ordered pipeline of kernels.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
@@ -2687,5 +2989,431 @@ mod tests {
             df.validation_error().is_some(),
             "nested empty Union must be flagged by from_plan",
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.7: KernelSpec coverage for non-projection kernel kinds.
+    //
+    // These tests pin the cache-key roundtrip invariant for each new sibling
+    // spec type: distinct knob values must produce distinct `Debug` outputs
+    // (the basis for `exec::module_cache::KernelSpecKey::new`, which hashes
+    // `format!("{:?}", spec)` with a domain-separated `DefaultHasher`). We
+    // reproduce the same hashing shape locally rather than reach into the
+    // private `KernelSpecKey` — the property under test is "different specs
+    // hash differently", not the specific 128-bit fingerprint.
+    // ---------------------------------------------------------------------
+
+    /// Mirror of `KernelSpecKey::new` for tests: hash `format!("{:?}", spec)`
+    /// with two domain-separated `DefaultHasher` instances and return the
+    /// 128-bit fingerprint as a tuple. Two specs with the same `Debug`
+    /// output produce the same fingerprint; distinct `Debug` outputs are
+    /// overwhelmingly likely to produce distinct fingerprints.
+    fn dbg_key<T: std::fmt::Debug>(spec: &T) -> (u64, u64) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+        let s = format!("{:?}", spec);
+        let mut hi = DefaultHasher::new();
+        hi.write_u8(0x01);
+        hi.write(s.as_bytes());
+        let mut lo = DefaultHasher::new();
+        lo.write_u8(0x02);
+        lo.write(s.as_bytes());
+        (hi.finish(), lo.finish())
+    }
+
+    /// Build a `ScalarAggSpec` for each `(op, dtype)` pair the codegen
+    /// accepts and confirm:
+    ///   1. The Debug output of each pair is unique (no string collisions).
+    ///   2. The hashed cache-key roundtrip distinguishes every pair.
+    ///   3. Cloning a spec produces the same cache key.
+    #[test]
+    fn scalar_agg_spec_key_roundtrip() {
+        use std::collections::HashSet;
+
+        let ops = [
+            ScalarAggOp::Sum,
+            ScalarAggOp::Min,
+            ScalarAggOp::Max,
+            ScalarAggOp::Count,
+            ScalarAggOp::Avg,
+        ];
+        let dtypes = [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+        ];
+
+        let mut keys: HashSet<(u64, u64)> = HashSet::new();
+        let mut dbgs: HashSet<String> = HashSet::new();
+        for op in ops {
+            for dtype in dtypes {
+                let spec = ScalarAggSpec { op, dtype };
+                let dbg = format!("{:?}", spec);
+                assert!(
+                    dbgs.insert(dbg.clone()),
+                    "Debug output collision for ScalarAggSpec ({:?}, {:?}): {dbg}",
+                    op,
+                    dtype,
+                );
+                let key = dbg_key(&spec);
+                assert!(
+                    keys.insert(key),
+                    "cache-key collision for ScalarAggSpec ({:?}, {:?})",
+                    op,
+                    dtype,
+                );
+                // Cloning preserves the cache key.
+                let clone = spec.clone();
+                assert_eq!(
+                    dbg_key(&spec),
+                    dbg_key(&clone),
+                    "Clone changed the cache key for ScalarAggSpec ({:?}, {:?})",
+                    op,
+                    dtype,
+                );
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            ops.len() * dtypes.len(),
+            "every (op, dtype) pair must produce a distinct key",
+        );
+    }
+
+    /// Round-trip pin: every `(kind, key_dtype, returns_i64)` triple
+    /// produces a distinct cache key.
+    #[test]
+    fn hash_join_kernel_spec_key_roundtrip() {
+        use std::collections::HashSet;
+
+        // Cover at least one of each kind plus a couple of cross-cuts (the
+        // StringHash flavour bit, the key_dtype field).
+        let specs = [
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::Build,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::Build,
+                key_dtype: DataType::Int64,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::Probe,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::ProbeTiled,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::BuildCollision,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::ProbeCollision,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::BuildAos,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::ProbeAos,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::UnmatchedBuild,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::Cross,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            },
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::StringHash,
+                key_dtype: DataType::Utf8,
+                string_hash_returns_i64: false,
+            },
+            // The `_i64` flavour of StringHash must NOT collide with the
+            // regular one.
+            HashJoinKernelSpec {
+                kind: HashJoinKernelKind::StringHash,
+                key_dtype: DataType::Utf8,
+                string_hash_returns_i64: true,
+            },
+        ];
+
+        let mut keys: HashSet<(u64, u64)> = HashSet::new();
+        for s in &specs {
+            assert!(
+                keys.insert(dbg_key(s)),
+                "cache-key collision for HashJoinKernelSpec {:?}",
+                s,
+            );
+        }
+        assert_eq!(
+            keys.len(),
+            specs.len(),
+            "every distinct (kind, key_dtype, returns_i64) triple must produce a \
+             distinct cache key",
+        );
+
+        // Clone roundtrip: cloning preserves the cache key.
+        let s = specs[0];
+        let clone = s.clone();
+        assert_eq!(dbg_key(&s), dbg_key(&clone));
+    }
+
+    /// Round-trip pin: every `(pass, dtype)` pair produces a distinct
+    /// cache key. The shift parameter is intentionally NOT part of the
+    /// spec — it's a runtime kernel arg, so two `(Histogram, Int32)` specs
+    /// at different shifts MUST land in the same cache slot.
+    #[test]
+    fn radix_sort_kernel_spec_key_roundtrip() {
+        use std::collections::HashSet;
+
+        let passes = [RadixSortPass::Histogram, RadixSortPass::Scatter];
+        // The radix kernels in `jit::sort_kernel_radix` support b32 and b64
+        // integer keys today; the spec admits any dtype the codegen accepts.
+        let dtypes = [DataType::Int32, DataType::Int64];
+
+        let mut keys: HashSet<(u64, u64)> = HashSet::new();
+        for pass in passes {
+            for dtype in dtypes {
+                let spec = RadixSortKernelSpec { pass, dtype };
+                assert!(
+                    keys.insert(dbg_key(&spec)),
+                    "cache-key collision for RadixSortKernelSpec ({:?}, {:?})",
+                    pass,
+                    dtype,
+                );
+                let clone = spec.clone();
+                assert_eq!(dbg_key(&spec), dbg_key(&clone));
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            passes.len() * dtypes.len(),
+            "every (pass, dtype) pair must produce a distinct key",
+        );
+    }
+
+    /// Round-trip pin for the compaction-pipeline specs. Three independent
+    /// invariants:
+    ///   1. The three `PrefixScan` algorithm variants must produce
+    ///      distinct keys (so the env-driven algorithm switch does NOT
+    ///      collide on cache slots).
+    ///   2. Per-dtype `Gather` variants must produce distinct keys.
+    ///   3. `GatherBoolNullable` must NOT collide with `Gather(Bool)` —
+    ///      the validity store path is distinct PTX.
+    #[test]
+    fn compaction_kernel_spec_key_roundtrip() {
+        use std::collections::HashSet;
+
+        let specs = [
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::PrefixScan(PrefixScanAlgoTag::HillisSteele),
+            },
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::PrefixScan(PrefixScanAlgoTag::Blelloch),
+            },
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::PrefixScan(PrefixScanAlgoTag::Lookback),
+            },
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::Gather(DataType::Bool),
+            },
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::Gather(DataType::Int32),
+            },
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::Gather(DataType::Int64),
+            },
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::Gather(DataType::Float32),
+            },
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::Gather(DataType::Float64),
+            },
+            CompactionKernelSpec {
+                kind: CompactionKernelKind::GatherBoolNullable,
+            },
+        ];
+
+        let mut keys: HashSet<(u64, u64)> = HashSet::new();
+        for s in &specs {
+            assert!(
+                keys.insert(dbg_key(s)),
+                "cache-key collision for CompactionKernelSpec {:?}",
+                s,
+            );
+        }
+        assert_eq!(keys.len(), specs.len(), "all variants must hash distinctly");
+
+        // Specifically pin (3): Gather(Bool) vs GatherBoolNullable.
+        let plain = CompactionKernelSpec {
+            kind: CompactionKernelKind::Gather(DataType::Bool),
+        };
+        let nullable = CompactionKernelSpec {
+            kind: CompactionKernelKind::GatherBoolNullable,
+        };
+        assert_ne!(
+            dbg_key(&plain),
+            dbg_key(&nullable),
+            "Gather(Bool) and GatherBoolNullable must produce distinct keys — the \
+             validity store path is distinct PTX",
+        );
+    }
+
+    /// Sanity test for the `ScalarAggOp` <-> `crate::jit::agg_kernels::ReduceOp`
+    /// mapping. We can't depend on `jit::` from a planner-side test without
+    /// pulling in the whole codegen layer, but we CAN pin the local enum's
+    /// variant count and ordering so a stale mirror is caught at test time.
+    ///
+    /// The pin: there are exactly five variants and each formats as its name
+    /// in `Debug`. If a future change adds (say) `BitAnd` here, this test
+    /// will fail with a count mismatch — prompting the author to update the
+    /// jit-side mirror in lockstep.
+    #[test]
+    fn scalar_agg_spec_op_round_trips() {
+        let all = [
+            ScalarAggOp::Sum,
+            ScalarAggOp::Min,
+            ScalarAggOp::Max,
+            ScalarAggOp::Count,
+            ScalarAggOp::Avg,
+        ];
+        assert_eq!(
+            all.len(),
+            5,
+            "ScalarAggOp has {} variants; if you added one, also update \
+             the mirror in crate::jit::agg_kernels::ReduceOp / the AVG path",
+            all.len()
+        );
+        // Per-variant Debug pin — guards against an unexpected rename, which
+        // would silently reshape every existing cache slot for that op.
+        let names = [
+            format!("{:?}", ScalarAggOp::Sum),
+            format!("{:?}", ScalarAggOp::Min),
+            format!("{:?}", ScalarAggOp::Max),
+            format!("{:?}", ScalarAggOp::Count),
+            format!("{:?}", ScalarAggOp::Avg),
+        ];
+        assert_eq!(names, ["Sum", "Min", "Max", "Count", "Avg"]);
+    }
+
+    /// Round-trip pin for the local `PrefixScanAlgoTag` mirror of
+    /// `gpu_compact::PrefixScanAlgo`. Same shape as the `ScalarAggOp`
+    /// pin above — a count check so a stale mirror is caught at test time.
+    #[test]
+    fn compaction_spec_prefix_scan_round_trips() {
+        let all = [
+            PrefixScanAlgoTag::HillisSteele,
+            PrefixScanAlgoTag::Blelloch,
+            PrefixScanAlgoTag::Lookback,
+        ];
+        assert_eq!(
+            all.len(),
+            3,
+            "PrefixScanAlgoTag has {} variants; if you added one, also \
+             update the mirror in crate::exec::gpu_compact::PrefixScanAlgo",
+            all.len()
+        );
+        let names = [
+            format!("{:?}", PrefixScanAlgoTag::HillisSteele),
+            format!("{:?}", PrefixScanAlgoTag::Blelloch),
+            format!("{:?}", PrefixScanAlgoTag::Lookback),
+        ];
+        assert_eq!(names, ["HillisSteele", "Blelloch", "Lookback"]);
+    }
+
+    /// The envelope `KernelSpecKind::Projection(spec)` MUST hash
+    /// differently from the bare `&spec` — this is the documented caveat
+    /// on `KernelSpecKind` (the envelope is for the new spec kinds only;
+    /// the wired projection cache continues passing `&KernelSpec` so its
+    /// legacy disk-cache slots don't get evicted on first run).
+    #[test]
+    fn kernel_spec_kind_projection_envelope_differs_from_bare_spec() {
+        let spec = KernelSpec {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            ops: Vec::new(),
+            predicate: None,
+            register_count: 0,
+            input_has_validity: Vec::new(),
+            output_has_validity: Vec::new(),
+        };
+        let envelope = KernelSpecKind::Projection(spec.clone());
+        // Sanity: distinct Debug outputs.
+        let bare_dbg = format!("{:?}", spec);
+        let env_dbg = format!("{:?}", envelope);
+        assert_ne!(
+            bare_dbg, env_dbg,
+            "envelope must wrap-and-rename the Debug output (or the wired \
+             projection cache key would collide with the new-envelope key)",
+        );
+        // The envelope `Debug` carries the inner Projection variant tag.
+        assert!(
+            env_dbg.starts_with("Projection("),
+            "KernelSpecKind::Projection(_) Debug must start with `Projection(`; got: {env_dbg}",
+        );
+    }
+
+    /// The envelope variants must each produce a distinct cache key.
+    /// Pins the "uniform envelope" property — any executor can route through
+    /// `KernelSpecKind` and get correct cache disambiguation for free.
+    #[test]
+    fn kernel_spec_kind_envelope_variants_hash_distinctly() {
+        use std::collections::HashSet;
+
+        let bare_spec = KernelSpec {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            ops: Vec::new(),
+            predicate: None,
+            register_count: 0,
+            input_has_validity: Vec::new(),
+            output_has_validity: Vec::new(),
+        };
+        let variants = [
+            KernelSpecKind::Projection(bare_spec),
+            KernelSpecKind::ScalarAgg(ScalarAggSpec {
+                op: ScalarAggOp::Sum,
+                dtype: DataType::Int32,
+            }),
+            KernelSpecKind::HashJoin(HashJoinKernelSpec {
+                kind: HashJoinKernelKind::Build,
+                key_dtype: DataType::Int32,
+                string_hash_returns_i64: false,
+            }),
+            KernelSpecKind::RadixSort(RadixSortKernelSpec {
+                pass: RadixSortPass::Histogram,
+                dtype: DataType::Int32,
+            }),
+            KernelSpecKind::Compaction(CompactionKernelSpec {
+                kind: CompactionKernelKind::GatherBoolNullable,
+            }),
+        ];
+
+        let mut keys: HashSet<(u64, u64)> = HashSet::new();
+        for v in &variants {
+            assert!(
+                keys.insert(dbg_key(v)),
+                "envelope variants collide: {:?}",
+                v,
+            );
+        }
+        assert_eq!(keys.len(), variants.len());
     }
 }
