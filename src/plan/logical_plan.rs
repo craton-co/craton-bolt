@@ -705,8 +705,18 @@ pub enum LogicalPlan {
     /// SQL JOIN: combine `left` and `right` rows that satisfy `on`.
     /// Supports `JoinType::Inner`, `LeftOuter`, `RightOuter`, `FullOuter`,
     /// and `Cross`. INNER and the OUTER variants require at least one
-    /// equi-join predicate (`on` non-empty); CROSS requires `on` to be
-    /// empty (it has no ON clause).
+    /// equi-join predicate (`on` non-empty) OR a non-equi `filter`;
+    /// CROSS requires both `on` and `filter` to be empty (no ON clause).
+    ///
+    /// # Non-equi join contract (v0.6)
+    ///
+    /// `on` carries pure equi pairs (`left.col = right.col`) for the
+    /// hash-join fast path. `filter` carries the residual non-equi predicate
+    /// — `<`, `>`, `BETWEEN`, etc. — that cannot be expressed as a hash
+    /// lookup, evaluated against the join's *combined* schema. When `filter`
+    /// is `Some`, the executor switches to a nested-loop fallback (see
+    /// [`crate::exec::join`]); the cap on the inner side is enforced at
+    /// runtime.
     Join {
         /// Left input.
         left: Box<LogicalPlan>,
@@ -715,8 +725,14 @@ pub enum LogicalPlan {
         /// Join kind.
         join_type: JoinType,
         /// Equi-join predicate pairs `(left_expr, right_expr)`;
-        /// conjunctive. Empty for `Cross`.
+        /// conjunctive. Empty for `Cross` and for pure non-equi joins.
         on: Vec<(Expr, Expr)>,
+        /// Optional residual non-equi predicate evaluated against the
+        /// combined left ++ right schema (with right-side rename rules of
+        /// [`join_combined_schema`] applied). `None` means a pure
+        /// equi/cross join; `Some(_)` routes through the nested-loop
+        /// executor.
+        filter: Option<Expr>,
     },
 }
 

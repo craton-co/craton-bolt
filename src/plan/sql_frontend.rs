@@ -984,12 +984,13 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         schema,
     };
 
-    // JOIN handling. Supports INNER / LEFT / RIGHT / FULL with an equi-
-    // conjunction ON predicate, plus CROSS (no ON clause). The join's
-    // right side must itself be a bare table. Conjunctions of
-    // `left.col = right.col` equalities; non-equi predicates remain
-    // rejected. The host-side executor in `src/exec/join.rs` handles all
-    // five join kinds.
+    // JOIN handling. Supports INNER / LEFT / RIGHT / FULL with an
+    // ON predicate, plus CROSS (no ON clause). The join's right side must
+    // itself be a bare table. Equi conjuncts (`left.col = right.col`)
+    // route to the hash-join fast path; non-equi conjuncts (`<`, `>`,
+    // `BETWEEN`, …) populate the residual `filter` slot and switch the
+    // executor to the nested-loop fallback (v0.6). See
+    // `crate::exec::join` for both paths.
     for join in &twj.joins {
         if join.global {
             return Err(BoltError::Sql(
@@ -1028,19 +1029,24 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
             schema: rhs_schema,
         };
         // CROSS has no ON predicate; everything else does. `lower_join_on`
-        // is reused for the rest so non-equi forms keep a single
-        // rejection path. The validator uses `resolver` + `rhs_table_for_on`
-        // to reject `t1.a = t1.a` style same-side equalities and references
-        // to tables not in scope (see `lower_join_on`).
-        let on_pairs = match on_expr {
-            Some(e) => lower_join_on(e, &resolver, &rhs_table_for_on)?,
-            None => Vec::new(),
+        // splits the ON clause into equi-join pairs (fast path) and an
+        // optional non-equi residual filter (nested-loop path). The
+        // validator uses `resolver` + `rhs_table_for_on` to reject
+        // `t1.a = t1.a` style same-side equalities and references to tables
+        // not in scope (see `lower_join_on`).
+        let (on_pairs, filter) = match on_expr {
+            Some(e) => {
+                let lowered = lower_join_on(e, &resolver, &rhs_table_for_on)?;
+                (lowered.equi_pairs, lowered.filter)
+            }
+            None => (Vec::new(), None),
         };
         plan = LogicalPlan::Join {
             left: Box::new(plan),
             right: Box::new(right_plan),
             join_type,
             on: on_pairs,
+            filter,
         };
     }
     // After a JOIN, the namespace for WHERE / SELECT items widens to the
@@ -1366,37 +1372,80 @@ enum JoinSide {
     Unknown,
 }
 
-/// Look up a join predicate expression as a conjunction of `left.col = right.col`
-/// equalities. Reject non-equi joins and non-conjunctive forms with a clear
-/// message; the executor scaffold only handles equi joins.
+/// Result of lowering an ON-clause: zero-or-more equi pairs plus an
+/// optional residual non-equi filter.
 ///
-/// Validation added by the MED fix for `t1.a = t1.a`-style same-side
-/// equalities: each conjunct is required to reference *different* sides of
-/// the join when both sides are `table.col` qualified. `resolver` carries
-/// every in-scope table so we can also reject `t3.a = t2.a` when `t3` is
-/// not part of FROM. `rhs_table` is the table just being joined — anything
-/// else in `resolver` is "left".
+/// * `equi_pairs` holds the `left.col = right.col` equalities suitable for
+///   the hash-join fast path.
+/// * `filter` is the conjunction of every non-equi leaf (`<`, `>`,
+///   `BETWEEN`, etc.) — `None` if the ON clause is purely equi. The filter
+///   is lowered against the combined left ++ right schema (the resolver
+///   already carries the renamed names), so the executor can evaluate it
+///   directly against the join's output via [`crate::exec::filter`].
+///
+/// v0.6 routing rule: if `filter` is `Some(_)`, the planner emits a
+/// `LogicalPlan::Join` with the residual carried in
+/// [`LogicalPlan::Join::filter`], and the executor switches to the
+/// nested-loop path (see [`crate::exec::join`]).
+struct JoinOnLowered {
+    equi_pairs: Vec<(Expr, Expr)>,
+    filter: Option<Expr>,
+}
+
+/// Lower a join ON-clause into the `(equi_pairs, filter)` split.
+///
+/// Conjunctive AND nodes are flattened; each leaf is classified as:
+///   * `left.col = right.col` (cross-table) → goes into `equi_pairs`.
+///   * Anything else (non-equi comparison, BETWEEN, mixed expressions) →
+///     lowered via [`lower_expr`] and AND-folded into `filter`.
+///
+/// The ON clause must produce at least one of the two (pure CROSS uses a
+/// different code path); a fully empty result is rejected. Same-side
+/// equalities like `t1.a = t1.b` are still rejected with a clear message
+/// (route through WHERE instead) when both sides are qualified.
 fn lower_join_on(
     e: &SqlExpr,
     resolver: &NameResolver,
     rhs_table: &str,
-) -> BoltResult<Vec<(Expr, Expr)>> {
-    let mut out = Vec::new();
+) -> BoltResult<JoinOnLowered> {
+    let mut out = JoinOnLowered {
+        equi_pairs: Vec::new(),
+        filter: None,
+    };
     collect_join_eq(e, &mut out, resolver, rhs_table, 0)?;
-    if out.is_empty() {
+    if out.equi_pairs.is_empty() && out.filter.is_none() {
         return Err(BoltError::Sql(
-            "JOIN ON clause must contain at least one equality predicate".into(),
+            "JOIN ON clause must contain at least one predicate".into(),
         ));
     }
     Ok(out)
 }
 
-/// Walk `e` flattening `AND` nodes; each leaf must be `<expr> = <expr>`.
+/// AND a new conjunct into the lowered ON-clause filter slot. The first
+/// non-equi conjunct populates `filter`; subsequent ones are folded with
+/// `AND` so the executor sees one composite predicate. Conjunctive
+/// flattening matches the SQL standard's left-associative AND semantics.
+fn and_into_filter(slot: &mut Option<Expr>, conjunct: Expr) {
+    match slot.take() {
+        None => *slot = Some(conjunct),
+        Some(prev) => {
+            *slot = Some(Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(prev),
+                right: Box::new(conjunct),
+            });
+        }
+    }
+}
+
+/// Walk `e` flattening `AND` nodes. Each leaf is either an equi-join
+/// equality (extracted into `out.equi_pairs`) or a non-equi conjunct
+/// (lowered via [`lower_expr`] and AND-folded into `out.filter`).
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
 fn collect_join_eq(
     e: &SqlExpr,
-    out: &mut Vec<(Expr, Expr)>,
+    out: &mut JoinOnLowered,
     resolver: &NameResolver,
     rhs_table: &str,
     depth: usize,
@@ -1421,25 +1470,107 @@ fn collect_join_eq(
             op: BinaryOperator::Eq,
             right,
         } => {
-            let (l, lside) = lower_join_side(left, resolver, rhs_table)?;
-            let (r, rside) = lower_join_side(right, resolver, rhs_table)?;
-            // Same-side equality rejection. We only flag when *both* sides
-            // are classifiable (compound-identifier-with-known-qualifier);
-            // a bare `Identifier(col)` leaves the side `Unknown` so the
-            // pair still passes — matching the pre-fix lenient behaviour
-            // for queries like `t1 JOIN t2 ON a = b` where the column name
-            // is unambiguous across the schemas.
-            if lside != JoinSide::Unknown && lside == rside {
-                return Err(BoltError::Sql(format!(
-                    "JOIN ON ... both sides reference the same table; \
-                     expected a cross-table equality (got {left} = {right})"
-                )));
+            // Try the equi-join fast-path classification first. Both sides
+            // must be simple column refs whose join-side is determinable.
+            // If either side is a computed expression (e.g. `t1.a + 1`) the
+            // equality falls through to the residual filter — but unknown
+            // qualifiers (`t3.a` when t3 isn't in FROM) MUST hard-error so
+            // typos surface immediately instead of being deferred to a
+            // confusing runtime "column not found".
+            let left_side = classify_join_side(left, resolver, rhs_table)?;
+            let right_side = classify_join_side(right, resolver, rhs_table)?;
+            match (left_side, right_side) {
+                (Some((l, lside)), Some((r, rside))) => {
+                    // Cross-table equi: same-side already rejected here for
+                    // clarity (same-side equality on a JOIN ON is almost
+                    // always a user typo and should be in WHERE). `Unknown`
+                    // (bare identifier) is treated as cross-table per the
+                    // lenient pre-v0.6 contract.
+                    if lside != JoinSide::Unknown && lside == rside {
+                        return Err(BoltError::Sql(format!(
+                            "JOIN ON ... both sides reference the same table; \
+                             expected a cross-table equality (got {left} = {right})"
+                        )));
+                    }
+                    out.equi_pairs.push((l, r));
+                    Ok(())
+                }
+                _ => {
+                    // At least one side is a computed expression — route
+                    // the whole equality into the residual filter so the
+                    // nested-loop executor evaluates it host-side.
+                    let lowered = lower_expr(e, resolver, depth + 1)?;
+                    and_into_filter(&mut out.filter, lowered);
+                    Ok(())
+                }
             }
-            out.push((l, r));
+        }
+        // Non-equi comparisons (<, <=, >, >=, <>) and the boolean operators
+        // OR / NOT — the executor's nested-loop fallback handles these via
+        // host-side predicate evaluation. We lower the whole leaf and push
+        // it into the filter slot.
+        SqlExpr::BinaryOp {
+            op:
+                BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Or,
+            ..
+        } => {
+            let lowered = lower_expr(e, resolver, depth + 1)?;
+            and_into_filter(&mut out.filter, lowered);
+            Ok(())
+        }
+        // `x BETWEEN low AND high` → lower as `low <= x AND x <= high` and
+        // route to the residual filter. `negated` flips to
+        // `x < low OR x > high`.
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let x = lower_expr(expr, resolver, depth + 1)?;
+            let lo = lower_expr(low, resolver, depth + 1)?;
+            let hi = lower_expr(high, resolver, depth + 1)?;
+            let lowered = if *negated {
+                // x < low OR x > high
+                Expr::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(Expr::Binary {
+                        op: BinaryOp::Lt,
+                        left: Box::new(x.clone()),
+                        right: Box::new(lo),
+                    }),
+                    right: Box::new(Expr::Binary {
+                        op: BinaryOp::Gt,
+                        left: Box::new(x),
+                        right: Box::new(hi),
+                    }),
+                }
+            } else {
+                // low <= x AND x <= high
+                Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(Expr::Binary {
+                        op: BinaryOp::LtEq,
+                        left: Box::new(lo),
+                        right: Box::new(x.clone()),
+                    }),
+                    right: Box::new(Expr::Binary {
+                        op: BinaryOp::LtEq,
+                        left: Box::new(x),
+                        right: Box::new(hi),
+                    }),
+                }
+            };
+            and_into_filter(&mut out.filter, lowered);
             Ok(())
         }
         other => Err(BoltError::Sql(format!(
-            "non-equi JOIN not yet supported (ON clause must be a conjunction of `a = b` predicates; got {other})"
+            "unsupported JOIN ON predicate shape: {other}"
         ))),
     }
 }
@@ -1512,9 +1643,50 @@ fn lower_join_side(
             };
             Ok((Expr::Column(col.clone()), side))
         }
+        // Computed expressions (binary ops, function calls, literals, …)
+        // are not valid sides for the equi-join fast path. The caller
+        // routes them through the residual filter via
+        // [`classify_join_side`]; this arm exists so a direct call still
+        // produces a clear message rather than panicking.
         other => Err(BoltError::Sql(format!(
-            "non-equi JOIN not yet supported (JOIN ON sides must be column references; got {other})"
+            "JOIN ON equi sides must be column references; got {other} (use the residual filter path for computed predicates)"
         ))),
+    }
+}
+
+/// 3-valued classifier used by [`collect_join_eq`] to decide whether an
+/// equality leaf can route through the equi-join fast path.
+///
+/// * `Ok(Some((expr, side)))` — `e` is a simple column reference and we
+///   know which side of the join it belongs to. Caller pushes the pair
+///   into `equi_pairs`.
+/// * `Ok(None)`               — `e` is a computed expression (e.g.
+///   `t1.a + 1`). Caller falls back to lowering the whole equality as a
+///   residual filter.
+/// * `Err(_)`                 — `e` is structurally malformed (deeply
+///   qualified, unknown table). Caller propagates immediately so user
+///   typos surface here rather than as a confusing runtime error.
+///
+/// This is a thin wrapper over [`lower_join_side`] that distinguishes
+/// "this isn't a column ref" (recoverable, route to filter) from
+/// "this is a column ref but it's broken" (hard error). The original
+/// `lower_join_side` shape conflated both with `Err`.
+fn classify_join_side(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    rhs_table: &str,
+) -> BoltResult<Option<(Expr, JoinSide)>> {
+    match e {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            // Column-ref shapes: defer to lower_join_side. Its Err here is
+            // load-bearing (unknown qualifier, deeply qualified ref) and
+            // must propagate so the user sees a clear plan error.
+            lower_join_side(e, resolver, rhs_table).map(Some)
+        }
+        // Anything else (BinaryOp, function call, literal, …) is a
+        // computed expression — not a candidate for the equi-join fast
+        // path. Route the caller to the residual-filter path.
+        _ => Ok(None),
     }
 }
 
@@ -2557,17 +2729,48 @@ mod wave7_tests {
     }
 
     #[test]
-    fn non_equi_join_rejected_with_clear_message() {
-        let err = parse(
+    fn non_equi_join_lowers_to_join_with_filter() {
+        // v0.6: non-equi predicates no longer error at the planner. They
+        // route through the residual `filter` slot on `LogicalPlan::Join`,
+        // and the executor switches to the nested-loop fallback.
+        let plan = parse(
             "SELECT * FROM t1 INNER JOIN t2 ON t1.a > t2.a",
             &provider(),
         )
-        .expect_err("non-equi JOIN must error");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("non-equi JOIN not yet supported"),
-            "error message should mention non-equi JOIN, got: {msg}"
-        );
+        .expect("non-equi JOIN must parse in v0.6");
+        // Walk past the outer wildcard Project to the Join.
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        match join_plan {
+            LogicalPlan::Join { on, filter, .. } => {
+                assert!(on.is_empty(), "pure non-equi ON yields no equi pairs");
+                assert!(filter.is_some(), "non-equi ON populates the filter slot");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn between_join_lowers_to_join_with_filter() {
+        // `BETWEEN` lowers to `low <= x AND x <= high` in the filter slot.
+        let plan = parse(
+            "SELECT * FROM t1 INNER JOIN t2 ON t1.a BETWEEN t2.a AND t2.c",
+            &provider(),
+        )
+        .expect("BETWEEN JOIN must parse in v0.6");
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        match join_plan {
+            LogicalPlan::Join { on, filter, .. } => {
+                assert!(on.is_empty(), "BETWEEN yields no equi pairs");
+                assert!(filter.is_some(), "BETWEEN populates the filter slot");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
     }
 
     #[test]

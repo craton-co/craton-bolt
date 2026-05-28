@@ -80,20 +80,41 @@ use crate::plan::physical_plan::PhysicalPlan;
 /// build time rather than overflow silently.
 const MAX_CROSS_ROWS: u64 = u32::MAX as u64;
 
+/// Hard cap on the inner-side row count of a non-equi (nested-loop) join.
+/// The nested-loop fallback walks the full cartesian product and applies
+/// a host-side predicate; cost is `O(outer × inner)`. We cap the *inner*
+/// side at 1024 rows to keep the host-side blow-up bounded and surface a
+/// clear "rewrite as equi if possible" hint past that.
+///
+/// Sized for the v0.6 stretch goal: small-side non-equi joins (e.g. a
+/// dimension table of buckets / ranges against a fact table) work cleanly,
+/// while accidental cartesian explosions are caught early. The cap is a
+/// `const` so it's easy to find and tune.
+pub(crate) const MAX_NESTED_LOOP_INNER_ROWS: usize = 1024;
+
 /// Execute a JOIN. Dispatches per `join_type` to one of:
 ///   * `execute_inner_join` — existing INNER path (smaller side builds).
 ///   * `execute_outer_join` — LEFT / RIGHT / FULL (build side is fixed
 ///      by the join kind so unmatched-row tracking is straightforward).
 ///   * `execute_cross_join` — cartesian product with a row-count cap.
+///   * `execute_nested_loop_join` — v0.6 non-equi fallback. Activated when
+///     `filter` is `Some(_)`: every (left, right) pair is materialised
+///     via CROSS and then the predicate is evaluated host-side via
+///     [`crate::exec::filter::execute_filter`]. The inner side is capped
+///     at [`MAX_NESTED_LOOP_INNER_ROWS`] to keep the explosion bounded.
 ///
 /// `output_schema` is the disambiguated combined schema produced by
 /// `join_combined_schema` and stored on `PhysicalPlan::Join`; the engine
 /// passes it through so this executor doesn't have to recompute it.
+///
+/// `filter` is the optional non-equi residual predicate carried on
+/// `PhysicalPlan::Join`. `None` is the equi/CROSS fast path.
 pub fn execute_join(
     left: &PhysicalPlan,
     right: &PhysicalPlan,
     join_type: &JoinType,
     on: &[(Expr, Expr)],
+    filter: Option<&Expr>,
     output_schema: &Schema,
     engine: &Engine,
 ) -> BoltResult<QueryHandle> {
@@ -103,6 +124,16 @@ pub fn execute_join(
     // path.
     let lhs = engine.execute(left)?.into_record_batch();
     let rhs = engine.execute(right)?.into_record_batch();
+
+    // Non-equi fast-bail: any filter present routes through the nested-loop
+    // executor regardless of join_type, since the existing equi-join
+    // executors can't honour the residual predicate. v0.6 supports the
+    // INNER and CROSS shapes for non-equi; LEFT/RIGHT/FULL with a non-equi
+    // predicate is a future extension (current behaviour: reject with a
+    // clear message rather than silently produce wrong results).
+    if let Some(pred) = filter {
+        return execute_nested_loop_join(lhs, rhs, *join_type, on, pred, output_schema);
+    }
 
     match join_type {
         JoinType::Inner => execute_inner_join(lhs, rhs, on, output_schema),
@@ -466,6 +497,125 @@ fn execute_cross_join(
         &Indices::Some(right_pairs),
         arrow_schema,
     )
+}
+
+// ---------- NESTED-LOOP (v0.6 non-equi fallback) -------------------------
+
+/// Nested-loop join with a host-side residual predicate.
+///
+/// Strategy:
+///   1. Cap the *inner* (smaller) side at [`MAX_NESTED_LOOP_INNER_ROWS`]
+///      and refuse the join past that limit with a clear hint that the
+///      user should rewrite as an equi-join if possible. The cap is on the
+///      smaller side because the cartesian explosion is `outer × inner`;
+///      capping the smaller side bounds the host-side work without
+///      arbitrarily limiting the larger fact-table side.
+///   2. Materialise the full cartesian product via `execute_cross_join`,
+///      which already produces a `RecordBatch` over the join's combined
+///      output schema (with right-side rename rules applied). The cross
+///      cap [`MAX_CROSS_ROWS`] still applies — `outer × inner` cannot
+///      exceed `u32::MAX` regardless.
+///   3. Apply `predicate` to that cartesian batch via
+///      [`crate::exec::filter::execute_filter`], which evaluates the
+///      expression against the combined-schema columns and drops rows
+///      where the predicate is `false` or NULL (standard SQL WHERE
+///      semantics — matches the v0.6 INNER-non-equi contract).
+///   4. For OUTER variants (LEFT/RIGHT/FULL), the nested-loop path with
+///      a non-equi predicate would need to track unmatched preserved-side
+///      rows and emit them NULL-padded. v0.6 ships the INNER-non-equi
+///      surface only; OUTER + non-equi rejects with a clear message
+///      pointing at the future extension.
+///
+/// `on` (equi pairs) can be non-empty alongside a `filter`: the SQL
+/// frontend's `lower_join_on` extracts equi conjuncts into `on` and routes
+/// the remaining non-equi conjuncts into `filter` (e.g.
+/// `t1.a = t2.a AND t1.b > t2.b` produces `on = [(a, a)]` and
+/// `filter = Some(b > right.b)`). For correctness this executor folds
+/// every equi pair into the residual predicate as a `left = right`
+/// conjunct via [`fold_equi_into_predicate`] before evaluating the whole
+/// thing host-side — that way both the equi and non-equi constraints are
+/// enforced in one pass. A future optimisation could run the equi join
+/// first (hash) and then post-filter, but the mixed shape is rare enough
+/// in v0.6 that the simpler approach is preferred.
+fn execute_nested_loop_join(
+    lhs: RecordBatch,
+    rhs: RecordBatch,
+    join_type: JoinType,
+    on: &[(Expr, Expr)],
+    predicate: &Expr,
+    output_schema: &Schema,
+) -> BoltResult<QueryHandle> {
+    // OUTER + non-equi is a planned follow-up; surface a clear message
+    // rather than silently dropping the preserved-side semantics.
+    if matches!(
+        join_type,
+        JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
+    ) {
+        return Err(BoltError::Plan(format!(
+            "{join_type:?} JOIN with a non-equi ON predicate is not yet supported \
+             in the nested-loop executor (v0.6 ships INNER non-equi only); \
+             rewrite the predicate as an equi-join or use INNER + WHERE"
+        )));
+    }
+
+    // Inner-side cap. We pick the *smaller* side as the inner (the side we
+    // walk per outer row); that's the side whose row count drives the
+    // host-side explosion. Pre-flight the cap before materialising the
+    // cross output so a bad shape fails fast.
+    let inner_rows = lhs.num_rows().min(rhs.num_rows());
+    if inner_rows > MAX_NESTED_LOOP_INNER_ROWS {
+        return Err(BoltError::Plan(format!(
+            "non-equi join inner side > {MAX_NESTED_LOOP_INNER_ROWS} rows; \
+             rewrite as equi if possible (got smaller-side row count = {inner_rows})"
+        )));
+    }
+
+    // Build the cartesian batch. `execute_cross_join` already handles the
+    // empty-side short-circuit, name disambiguation, and the
+    // `MAX_CROSS_ROWS` overflow cap; we reuse it verbatim.
+    let cross_handle = execute_cross_join(lhs, rhs, output_schema)?;
+
+    // If the SQL frontend extracted equi pairs alongside a residual filter,
+    // fold them into one composite predicate so they're enforced too. This
+    // arm isn't reachable from v0.6's `lower_join_on` (which puts the whole
+    // equality into the filter when any non-equi sibling is present), but
+    // future planner improvements (e.g. extracting equi pairs even when a
+    // non-equi sibling exists) need not change this executor.
+    let composite: Expr;
+    let pred_ref: &Expr = if on.is_empty() {
+        predicate
+    } else {
+        composite = fold_equi_into_predicate(on, predicate);
+        &composite
+    };
+
+    // Apply the residual predicate host-side. `execute_filter` uses
+    // `expr_agg::eval_expr` against the combined-schema columns, so the
+    // predicate is evaluated row-by-row in SQL three-valued logic
+    // (predicate result of NULL drops the row, matching WHERE semantics).
+    crate::exec::filter::execute_filter(cross_handle, pred_ref)
+}
+
+/// Conjunct every equi pair (lowered as `l = r`) into `predicate` with AND
+/// so the host-side filter can enforce both the equi pairs and the
+/// residual non-equi predicate in one pass. See the dispatch logic in
+/// [`execute_nested_loop_join`] for why this exists despite v0.6's planner
+/// never producing mixed shapes.
+fn fold_equi_into_predicate(on: &[(Expr, Expr)], predicate: &Expr) -> Expr {
+    let mut acc: Expr = predicate.clone();
+    for (l, r) in on.iter() {
+        let eq = Expr::Binary {
+            op: crate::plan::logical_plan::BinaryOp::Eq,
+            left: Box::new(l.clone()),
+            right: Box::new(r.clone()),
+        };
+        acc = Expr::Binary {
+            op: crate::plan::logical_plan::BinaryOp::And,
+            left: Box::new(eq),
+            right: Box::new(acc),
+        };
+    }
+    acc
 }
 
 // ---------- shared helpers ----------------------------------------------

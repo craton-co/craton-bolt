@@ -508,7 +508,7 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 .collect::<BoltResult<Vec<_>>>()?;
             Ok(LogicalPlan::Union { inputs: new_inputs })
         }
-        LogicalPlan::Join { left, right, join_type, on } => {
+        LogicalPlan::Join { left, right, join_type, on, filter } => {
             let new_left = rewrite_plan_with(left, r, depth + 1)?;
             let new_right = rewrite_plan_with(right, r, depth + 1)?;
             Ok(LogicalPlan::Join {
@@ -516,6 +516,7 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 right: Box::new(new_right),
                 join_type: *join_type,
                 on: on.clone(),
+                filter: filter.clone(),
             })
         }
     }
