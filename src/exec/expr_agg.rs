@@ -335,15 +335,17 @@ fn eval_inner(
              plan-time lowering should have rejected this expression"
                 .into(),
         )),
-        // v0.5: parser + type-check land, host-side execution wiring is a
-        // follow-up. The physical-plan boundary should have rejected this
-        // already; reaching here means a future caller built a Filter
-        // whose predicate contains a ScalarFn without going through
-        // `lower()`. Surface a clear `Plan` error rather than silently
-        // producing wrong output.
+        // v0.5/v0.7: parser + type-check land, host-side execution wiring
+        // is a follow-up. The physical-plan boundary (`lower_depth`) rejects
+        // any plan containing `Expr::ScalarFn` outright with a per-kind
+        // "not yet lowered to GPU: <blocker>" Plan error, so reaching this
+        // arm means a future caller built a Filter / Project whose tree
+        // contains a ScalarFn without going through `lower()`. Surface a
+        // clear `Plan` error mirroring the boundary message rather than
+        // silently producing wrong output.
         Expr::ScalarFn { kind, .. } => Err(BoltError::Plan(format!(
             "expr_agg: string scalar function {} is not yet evaluated host-side; \
-             coming in a follow-up",
+             the physical-plan boundary rejects it before lowering",
             kind.sql_name()
         ))),
     }

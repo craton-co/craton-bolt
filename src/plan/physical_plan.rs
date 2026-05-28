@@ -484,13 +484,61 @@ impl<'a> Codegen<'a> {
             Expr::Cast { .. } => Err(BoltError::Plan(
                 "CAST not yet lowered to GPU; coming in a follow-up".into(),
             )),
-            // v0.5: parser + type-check land, execution wiring is a
-            // follow-up. Reject cleanly so callers see a useful message
-            // rather than the kernel emitter producing nonsense PTX.
-            Expr::ScalarFn { kind, .. } => Err(BoltError::Plan(format!(
-                "string scalar function {} is not yet lowered to GPU; coming in a follow-up",
-                kind.sql_name()
-            ))),
+            // v0.5/v0.7 surface: parser + type-check land, GPU execution
+            // wiring is blocked at the substrate level.
+            //
+            // The fused-projection GPU codegen consumes one device pointer
+            // per `KernelSpec::inputs` slot (see `compile` in
+            // `crate::jit::ptx_gen` and the `ColumnIO` doc — Utf8 inputs are
+            // rejected eagerly). Strings on the device are dictionary-
+            // encoded (`GpuColumnData::DictUtf8` in
+            // `crate::exec::gpu_table`): only the integer index column ever
+            // crosses the kernel boundary, and the dictionary itself lives
+            // host-side. Every scalar string function in the v0.5 surface
+            // needs at least one of:
+            //
+            //   * UPPER / LOWER / SUBSTRING — a new output-string-buffer
+            //     allocation path (the kernel must produce a fresh
+            //     `(values, offsets)` pair, or build a fresh dictionary).
+            //     The IR has no Utf8 output op and the codegen has no way to
+            //     size or allocate variable-width output buffers at launch
+            //     time.
+            //   * LENGTH — a way to read per-row Utf8 input from the kernel.
+            //     With the dictionary-encoded layout this is a gather op
+            //     ("look up byte length at dict index N"), which would need
+            //     a sidecar lengths buffer threaded through `ColumnIO` plus
+            //     a new `Op::GatherInt32` in the IR. Neither exists today.
+            //
+            // Until that substrate lands every variant is rejected here with
+            // a per-kind message that names the concrete blocker, so users
+            // get an actionable hint instead of a generic "follow-up" string.
+            // Unlike CASE / CAST (which have early-reject walks at the top
+            // of `lower`), ScalarFn flows down through `lower_depth` →
+            // `lower_projection` → `build_projection_kernel` and surfaces
+            // here on the first call to `emit_expr` over the projected
+            // expression. The error then bubbles back up to the planner.
+            Expr::ScalarFn { kind, .. } => {
+                let blocker = match kind {
+                    crate::plan::logical_plan::ScalarFnKind::Upper
+                    | crate::plan::logical_plan::ScalarFnKind::Lower
+                    | crate::plan::logical_plan::ScalarFnKind::Substring => {
+                        "no GPU output-string-buffer allocation in the scalar emitter"
+                    }
+                    crate::plan::logical_plan::ScalarFnKind::Length => {
+                        "no GPU Utf8 input support — dictionary lengths sidecar / \
+                         Op::GatherInt32 not yet wired"
+                    }
+                    crate::plan::logical_plan::ScalarFnKind::Concat => {
+                        "GPU codegen has no Utf8 support (Concat routes through host fallback)"
+                    }
+                };
+                Err(BoltError::Plan(format!(
+                    "string scalar function {} is not yet lowered to GPU: {}; \
+                     coming in a follow-up",
+                    kind.sql_name(),
+                    blocker
+                )))
+            }
             Expr::Alias(inner, _) => self.emit_expr(inner),
             // CASE has no GPU IR yet: there is no value-selection-by-mask
             // op in the kernel codegen, so a CASE expression in a fused
