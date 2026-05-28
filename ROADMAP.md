@@ -60,8 +60,6 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   `COUNT(col)` excludes NULLs via the bitmap, and `SUM`/`MIN`/`MAX`/`AVG` host-strip
   NULL positions before the GPU reduction. The fast path (`null_count == 0`)
   remains a zero-copy `primitive_to_gpu` upload.
-- Aggregate aliasing (`SUM(price) AS total`) is rejected by the SQL
-  frontend — aggregates carry plan-assigned names.
 - Post-aggregate expressions (`SUM(price) + 1`) are not yet supported.
 - String functions (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING`)
   are reachable only via `src/exec/string_ops*`, not via SQL.

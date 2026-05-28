@@ -120,7 +120,7 @@ Aggregates over an all-NULL group (Bool/Utf8 inputs, which thread validity throu
 
 `SUM` widens narrow integer inputs to the corresponding 64-bit type to prevent silent overflow: `SUM(Int32) -> Int64`. `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The widening is applied consistently in both the scalar and GROUP BY paths via `crate::plan::logical_plan::sum_output_dtype`.
 
-`DISTINCT` inside an aggregate (`COUNT(DISTINCT col)`) is not supported. Aggregate aliasing (`SUM(price) AS total`) is rejected by the SQL frontend — the plan auto-names aggregates and the SQL frontend doesn't carry the alias through.
+`DISTINCT` inside an aggregate (`COUNT(DISTINCT col)`) is not supported. Aggregate aliasing (`SUM(price) AS total`) is supported in v0.5: the alias renames the aggregate's plan-assigned name (e.g. `sum_price`) in a post-Aggregate Project, and the alias is visible to `HAVING` and `ORDER BY`.
 
 ## GROUP BY
 
@@ -304,7 +304,6 @@ These produce explicit errors at parse / plan time:
 - String concatenation operator `||`.
 - Ordering comparisons on Utf8 columns (`WHERE name < 'M'`).
 - Schema- or multi-level qualified column references (`db.t.col`, struct-field access). Single-level `t.col` *is* supported — see "Hard restrictions" above.
-- Aggregate aliasing (`SUM(price) AS total`) — the SQL frontend rejects an alias on an aggregate SELECT item; the plan auto-names aggregates and the SQL frontend doesn't carry the user alias through (see `sql_frontend.rs` aggregate-alias check).
 - Post-aggregate expressions (`SUM(price) + 1`, `SUM(a) / SUM(b)`).
 - `COUNT(DISTINCT col)`.
 

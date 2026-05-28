@@ -9,6 +9,13 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
 ## [Unreleased]
 
 ### Added
+- **Aggregate aliasing** (`SELECT SUM(x) AS total FROM t`) — the SQL
+  frontend now carries the user alias through the post-Aggregate Project,
+  so the output column is named `total` (not the plan-assigned
+  `sum_x`). The alias is visible to `HAVING` (`HAVING total > 100`) and
+  `ORDER BY` (`ORDER BY total DESC`). The bare aggregate call form
+  (`HAVING SUM(x) > 100`) continues to resolve via the existing
+  HAVING-aware lowerer.
 
 ### Changed
 
