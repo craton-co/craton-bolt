@@ -34,6 +34,10 @@ pub const BLOCK_THREADS: u32 = 256;
 pub const NUM_PARTITIONS: u32 = 4096;
 const MAX_PROBES: u32 = BLOCK_GROUPS;
 
+/// Per-iteration `nanosleep.u32` operand for the collision-advance and
+/// CAS-retry paths (sm_70+). TODO(perf): exponential back-off.
+const SPIN_BACKOFF_NS: u32 = 32;
+
 /// Entry-point name for the (op, dtype) combination. Distinct from the
 /// i32-key sibling via the `_keyi64` suffix.
 pub fn kernel_entry(op: MinMaxOp, dtype: FloatDtype) -> String {
@@ -142,6 +146,9 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     writeln!(ptx, "\t.reg .b64   %rd<80>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .f32   %f<16>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .f64   %fd<16>;").map_err(write_err)?;
+    // Operand register for the per-collision / per-retry `nanosleep.u32`
+    // back-off (sm_70+).
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
@@ -274,6 +281,14 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
         mask = mask
     )
     .map_err(write_err)?;
+    // Occupancy-friendly back-off on the collision-advance path.
+    writeln!(
+        ptx,
+        "\tmov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     // CLAIM: publish key (i64), fence, then CAS-loop the val.
@@ -467,6 +482,21 @@ fn emit_cas_loop(
             .map_err(write_err)?;
         }
     }
+    // Occupancy-friendly back-off on the CAS-loss retry path. When CAS
+    // lost, another warp updated the slot between our load and our CAS;
+    // yielding SM cycles here gives that warp room to drain its update
+    // instead of all warps storming the same cache line.
+    writeln!(
+        ptx,
+        "\t@!{won_pred} mov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t@!{won_pred} nanosleep.u32 %nstime;"
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\t@!{won_pred} bra {lp}_LOAD;", lp = label_prefix).map_err(write_err)?;
     writeln!(ptx, "{lp}_DONE:", lp = label_prefix).map_err(write_err)?;
     Ok(())

@@ -166,6 +166,19 @@ pub const KERNEL_ENTRY_WITH_SPILL: &str = "bolt_partition_reduce_spill";
 /// docs for why this is acceptable for v0.
 const MAX_PROBES: u32 = BLOCK_GROUPS;
 
+/// Per-iteration `nanosleep.u32` operand for the collision-advance path
+/// of the slot-claim loop. PTX `nanosleep.u32` (sm_70+) suspends the
+/// warp for ~NS nanoseconds, yielding SM cycles to the warp scheduler so
+/// peer warps holding contested slots can finish their writes instead of
+/// every warp burning instruction-issue slots on hot probe walks.
+///
+/// TODO(perf): exponential back-off (shift left by 1 each iteration,
+/// capped at 256). That would require a register that survives the loop
+/// body across the back-edge, complicating the PTX. A fixed 32 ns
+/// constant captures the bulk of the occupancy win at a fraction of the
+/// codegen complexity.
+const SPIN_BACKOFF_NS: u32 = 32;
+
 /// Generate PTX for the per-partition reduce kernel.
 ///
 /// Kernel signature (PTX-level):
@@ -243,6 +256,9 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     writeln!(ptx, "\t.reg .b32   %r<64>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<64>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .f64   %fd<8>;").map_err(write_err)?;
+    // Operand register for the per-collision `nanosleep.u32` back-off.
+    // PTX requires the register form for portability across toolchains.
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     // --- thread coordinates -------------------------------------------------
@@ -413,6 +429,19 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
         mask = mask
     )
     .map_err(write_err)?;
+    // Occupancy-friendly back-off on the collision-advance path. Reached
+    // only when CAS observed set==1 AND the key mismatched (i.e. another
+    // group owns this slot). Yielding SM cycles here lets the warp
+    // scheduler run peer warps that may be claiming or publishing other
+    // slots, rather than hot-spinning probe walks across this block's
+    // shared table. CLAIM and MATCH paths skip this via early branches.
+    writeln!(
+        ptx,
+        "\tmov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     // CLAIM: this thread won the slot. Publish the key, then fence so

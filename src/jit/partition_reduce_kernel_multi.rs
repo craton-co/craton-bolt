@@ -77,6 +77,11 @@ pub const NUM_PARTITIONS: u32 = 4096;
 /// Probe-chain bound — same v0 policy as the single-value variant.
 const MAX_PROBES: u32 = BLOCK_GROUPS;
 
+/// Per-iteration `nanosleep.u32` operand for the collision-advance path
+/// (sm_70+). See `partition_reduce_kernel::SPIN_BACKOFF_NS` for full
+/// rationale. TODO(perf): exponential back-off.
+const SPIN_BACKOFF_NS: u32 = 32;
+
 /// Entry-point name for the emitted PTX. Includes `n_vals` so each variant
 /// is cache-distinct in the PTX cache.
 pub fn kernel_entry(n_vals: u32) -> String {
@@ -162,6 +167,8 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     writeln!(ptx, "\t.reg .b32   %r<96>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<128>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .f64   %fd<32>;").map_err(write_err)?;
+    // Operand register for the per-collision `nanosleep.u32` back-off.
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     // Thread coordinates.
@@ -348,6 +355,14 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
         mask = mask
     )
     .map_err(write_err)?;
+    // Occupancy-friendly back-off on the collision-advance path.
+    writeln!(
+        ptx,
+        "\tmov.u32 %nstime, {ns};",
+        ns = SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     // CLAIM: this thread won the slot. Write the key, fence, then sum
