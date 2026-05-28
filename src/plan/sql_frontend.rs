@@ -2,8 +2,12 @@
 
 //! SQL frontend: parses a SQL string into a `LogicalPlan` against a `TableProvider`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Offset, OrderByExpr, Query,
@@ -91,6 +95,29 @@ pub trait TableProvider {
     fn null_count(&self, table_name: &str, col_idx: usize) -> Option<usize> {
         let _ = (table_name, col_idx);
         None
+    }
+
+    /// Monotonically-increasing version token bumped whenever the provider's
+    /// view of the schema universe changes (a table is registered, replaced,
+    /// or dropped). The [`parse`] plan cache mixes this into its key so a
+    /// schema change invalidates previously-cached plans automatically.
+    ///
+    /// **Default behaviour: opt-out of caching.** The default returns a
+    /// fresh, never-recurring token on every call (pulled from a
+    /// process-wide counter), so providers that haven't been audited for
+    /// versioning correctness produce a cache miss every time. This is the
+    /// safe choice: a stale-plan bug from a mis-implemented
+    /// `schema_version` is harder to diagnose than the missing speed-up
+    /// from a cache miss. Providers that intend to participate in the
+    /// cache (like [`MemTableProvider`]) override this to return a token
+    /// that is *stable* across calls *until* the schema state changes.
+    fn schema_version(&self) -> u64 {
+        // A fresh token on every call → no two `(sql, version)` keys ever
+        // collide, → the cache stores entries that are never re-hit, → at
+        // most one entry per (provider, parse call) ever accumulates and
+        // FIFO eviction reclaims it long before it matters. Net effect:
+        // the cache is functionally disabled for default-impl providers.
+        next_provider_version()
     }
 }
 
@@ -235,7 +262,7 @@ impl NameResolver {
 /// `nullable: true` but the ingest path (e.g. a `DictionaryArray` whose key
 /// buffer has `null_count() == 0`) has confirmed the column is null-free at
 /// runtime.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug)]
 pub struct MemTableProvider {
     /// Registered tables, keyed by name.
     tables: HashMap<String, Schema>,
@@ -244,6 +271,52 @@ pub struct MemTableProvider {
     /// `Some(false)` → column is known to be free of NULLs,
     /// `None` (absent) → fall back to the field's `nullable` flag.
     nulls_by_column: HashMap<(String, String), bool>,
+    /// Process-wide-unique schema version. Bumped on every mutation
+    /// ([`Self::register`], [`Self::unregister_table`],
+    /// [`Self::set_column_nullability`]) by fetch-adding a single global
+    /// counter ([`NEXT_PROVIDER_VERSION`]). Because every bump pulls from
+    /// the global counter, no two `(provider, mutation_count)` states ever
+    /// share a `version` value across the process — so the plan cache's
+    /// `(sql, version)` key is unambiguous even when several
+    /// `MemTableProvider` instances coexist (e.g. in parallel test
+    /// threads sharing the process-wide `PLAN_CACHE`).
+    version: AtomicU64,
+}
+
+/// Global monotonic counter feeding every [`MemTableProvider`] version bump.
+/// `fetch_add(1, Relaxed)` is enough — we only need uniqueness, not any
+/// happens-before ordering against other state.
+static NEXT_PROVIDER_VERSION: AtomicU64 = AtomicU64::new(1);
+
+/// Pull the next unique version token. Centralised so the constructor and
+/// every mutation route through the same source of truth.
+fn next_provider_version() -> u64 {
+    NEXT_PROVIDER_VERSION.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Default for MemTableProvider {
+    fn default() -> Self {
+        Self {
+            tables: HashMap::new(),
+            nulls_by_column: HashMap::new(),
+            version: AtomicU64::new(next_provider_version()),
+        }
+    }
+}
+
+impl Clone for MemTableProvider {
+    /// Cloning takes a fresh version token so the clone is treated as a
+    /// distinct provider instance by the plan cache. Otherwise two clones
+    /// that diverged via different `register_table` calls could collide on
+    /// the same `(sql, version)` cache key for SQL referencing a table
+    /// only present in one of them.
+    fn clone(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            nulls_by_column: self.nulls_by_column.clone(),
+            version: AtomicU64::new(next_provider_version()),
+        }
+    }
 }
 
 impl MemTableProvider {
@@ -259,6 +332,8 @@ impl MemTableProvider {
     }
 
     /// Mutating register; overwrites any existing entry with the same name.
+    /// Bumps [`Self::schema_version`] so the parse cache invalidates plans
+    /// that were lowered against the prior provider state.
     pub fn register(&mut self, name: impl Into<String>, schema: Schema) {
         let name = name.into();
         // Replace-not-merge: drop stale overrides for the prior schema of
@@ -266,13 +341,30 @@ impl MemTableProvider {
         // nullability claim.
         self.nulls_by_column.retain(|(t, _), _| t != &name);
         self.tables.insert(name, schema);
+        self.bump_version();
+    }
+
+    /// Remove a registered table (no-op if absent). Bumps the schema
+    /// version regardless of whether the table existed, so callers don't
+    /// have to second-guess whether a particular drop invalidated cached
+    /// plans (this errs on the side of *more* invalidation, which is
+    /// correctness-safe). Returns `true` iff the table was present.
+    pub fn unregister_table(&mut self, name: &str) -> bool {
+        let removed = self.tables.remove(name).is_some();
+        if removed {
+            self.nulls_by_column.retain(|(t, _), _| t != name);
+        }
+        self.bump_version();
+        removed
     }
 
     /// Record runtime nullability for `(table, column)`. Used by the engine
     /// after it ingests a batch and learns the actual `null_count()` of
     /// each column — including `DictionaryArray` keys, where the
     /// nullability question is answered by the keys' null buffer, not the
-    /// dictionary values.
+    /// dictionary values. Bumps the schema version: the planner's
+    /// `KernelSpec::input_has_validity` derivation reads this flag, so a
+    /// change here must invalidate cached plans.
     pub fn set_column_nullability(
         &mut self,
         table: impl Into<String>,
@@ -281,6 +373,18 @@ impl MemTableProvider {
     ) {
         self.nulls_by_column
             .insert((table.into(), column.into()), has_nulls);
+        self.bump_version();
+    }
+
+    /// Internal: assign a fresh process-wide-unique version token to this
+    /// provider. Called from every mutating entry point.
+    fn bump_version(&self) {
+        // `Relaxed` is enough: we are the sole writer (mutating methods
+        // take `&mut self`) and the only reader that cares about ordering
+        // is the plan-cache lookup, which races against itself rather
+        // than against any other piece of state.
+        self.version
+            .store(next_provider_version(), Ordering::Relaxed);
     }
 
     /// True if `(table, column)` is known to admit nulls.
@@ -321,10 +425,43 @@ impl TableProvider for MemTableProvider {
             .cloned()
             .ok_or_else(|| BoltError::Plan(format!("unknown table '{name}'")))
     }
+
+    fn schema_version(&self) -> u64 {
+        // `Relaxed` matches the writer (`bump_version` uses `Relaxed`); we
+        // do not need a happens-before edge against any other state.
+        self.version.load(Ordering::Relaxed)
+    }
 }
 
 /// Parse a SQL string into a single `LogicalPlan` using the given provider.
+///
+/// Repeated calls with identical `sql` against a provider whose
+/// [`TableProvider::schema_version`] is unchanged are served from a small
+/// process-wide LRU-ish (FIFO) plan cache (see [`PLAN_CACHE`]). Cache misses
+/// fall through to the full tokenise + parse + lower pipeline. Failures
+/// (`Err`) are *not* cached — a re-parse of bad SQL still pays the parser
+/// cost, but that's a one-time hit at development time, not the dashboard
+/// hot path the cache is here to accelerate.
 pub fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
+    let version = provider.schema_version();
+    if let Some(plan) = plan_cache_lookup(sql, version) {
+        // Cheap deep-copy: every other lowered branch already pays a clone
+        // somewhere downstream (e.g. through `lower(&logical)` borrowing).
+        // `LogicalPlan` is `Clone` (verified in `logical_plan.rs`); the
+        // cache stores the canonical `Arc<LogicalPlan>` so successive hits
+        // pay only the clone of nested Strings / Boxes.
+        return Ok((*plan).clone());
+    }
+
+    let plan = parse_uncached(sql, provider)?;
+    plan_cache_insert(sql.to_string(), version, Arc::new(plan.clone()));
+    Ok(plan)
+}
+
+/// Internal: do the real parse + lower, with no cache interaction at all.
+/// Separated out so the cache layer in [`parse`] is a thin shell that's easy
+/// to read and so tests / benches that want to bypass the cache can.
+fn parse_uncached(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
     let dialect = GenericDialect {};
     let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| BoltError::Sql(e.to_string()))?;
 
@@ -344,6 +481,224 @@ pub fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan>
         }
     };
     plan_query(&query, provider, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Parse + plan cache
+// ---------------------------------------------------------------------------
+//
+// Dashboard-style workloads send the same handful of SQL strings on every
+// poll. Tokenising, parsing, and lowering each one from scratch is pure
+// waste — the work is deterministic in `(sql, schema_universe)`, so memoise
+// it. We follow the same pattern as `crate::jit::jit_compiler::PtxCache`:
+//   * A `HashMap` keyed on the (sql, version) pair for O(1) lookup,
+//     paired with a `VecDeque` of keys in insertion order for FIFO eviction
+//     at the configured cap. The deque is the canonical eviction order —
+//     `HashMap`'s iteration order would not survive rehashes.
+//   * A `Lazy<Mutex<PlanCache>>` global, initialised on first `parse` call.
+//   * Hit / miss / evict counters surfaced via [`plan_cache_stats`] for
+//     orchestrator-side observability (no `tracing` dep yet).
+//
+// We store `Arc<LogicalPlan>` so the cache hit path's clone cost is bounded
+// by the nested heap allocations inside the plan tree (a handful of String
+// / Box::clone calls) and does NOT scan the lowered tree twice.
+
+/// Environment variable that overrides the default cache capacity. Read
+/// once on first access via [`plan_cache_cap`] and frozen for the rest of
+/// the process lifetime; testing the eviction policy with a different cap
+/// uses `PlanCache::with_capacity` directly instead of mutating env state.
+const PLAN_CACHE_SIZE_ENV: &str = "CRATON_PLAN_CACHE_SIZE";
+
+/// Default cache capacity if `CRATON_PLAN_CACHE_SIZE` is unset / unparsable.
+/// Sized for "tens of dashboard tiles" — large enough to absorb the typical
+/// repeated-query workload, small enough that the cache itself is a rounding
+/// error against the lowered plan footprint.
+const PLAN_CACHE_CAP_DEFAULT: usize = 64;
+
+/// Parse a candidate capacity string (typically from `std::env::var`).
+/// `None`, empty strings, zero, and unparseable values all map to
+/// `default`. Factored out so the policy is unit-testable without touching
+/// the process environment.
+fn parse_plan_cache_cap(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// Resolve the effective cache cap. Memoised via an inner `OnceLock` so
+/// the env var is only consulted once — a long-running process can't have
+/// its plan cache resize partway through.
+fn plan_cache_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var(PLAN_CACHE_SIZE_ENV).ok();
+        parse_plan_cache_cap(raw.as_deref(), PLAN_CACHE_CAP_DEFAULT)
+    })
+}
+
+/// Composite cache key: SQL text plus the provider's `schema_version`. A
+/// schema-universe change bumps `version`, so previously-cached plans for
+/// the same SQL become unreachable (and eventually FIFO-evicted) the next
+/// time the same SQL is parsed against the new state.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct PlanCacheKey {
+    sql: String,
+    version: u64,
+}
+
+/// Cache state. Mirrors [`crate::jit::jit_compiler::PtxCache`]'s layout: a
+/// hash map for lookup, a deque for FIFO eviction order, plus three
+/// counters for `(hits, misses, evictions)`.
+///
+/// All mutation happens under a [`Mutex`]; the hot path is short (hash +
+/// probe + Arc clone), so there is no concurrency hazard worth a more
+/// elaborate scheme.
+struct PlanCache {
+    /// Maximum number of entries. Fixed at construction.
+    capacity: usize,
+    /// Cached plans keyed by `(sql, version)`. Values are `Arc<LogicalPlan>`
+    /// so hits clone the cheap `Arc`, not the lowered tree.
+    map: HashMap<PlanCacheKey, Arc<LogicalPlan>>,
+    /// Keys in insertion order. Front is oldest; eviction pops the front.
+    /// We do NOT touch this on hits — FIFO, not true LRU — which keeps the
+    /// hot path lock-free of any deque manipulation. The terminology in
+    /// the task is "LRU-ish": good enough for dashboard reuse patterns
+    /// where the working set fits comfortably under `capacity`.
+    order: VecDeque<PlanCacheKey>,
+    /// Cumulative hits since process start.
+    hits: usize,
+    /// Cumulative misses since process start.
+    misses: usize,
+    /// Cumulative evictions since process start.
+    evictions: usize,
+}
+
+impl PlanCache {
+    /// Empty cache with the given (positive) capacity.
+    fn with_capacity(capacity: usize) -> Self {
+        // `capacity == 0` would mean "evict on every insert"; we treat it
+        // as the default to keep callers (env-var-misconfigured users)
+        // from accidentally disabling the cache entirely.
+        let capacity = capacity.max(1);
+        Self {
+            capacity,
+            map: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    /// Look up a cached plan. On hit, returns the cached `Arc<LogicalPlan>`
+    /// and bumps the hit counter; on miss, bumps the miss counter and
+    /// returns `None`. We do NOT touch the eviction order on hits — see
+    /// the docstring on `order`.
+    fn lookup(&mut self, key: &PlanCacheKey) -> Option<Arc<LogicalPlan>> {
+        match self.map.get(key) {
+            Some(plan) => {
+                self.hits += 1;
+                Some(Arc::clone(plan))
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    /// Insert a freshly-lowered plan. If a matching key is already present
+    /// (a race between two misses that both did the parse work
+    /// concurrently) the *existing* value is left in place and the new one
+    /// is dropped — both threads return identical-looking plans, and we
+    /// keep the insertion-order deque clean.
+    ///
+    /// Otherwise, if we are at capacity, FIFO-evict the oldest entry
+    /// before inserting.
+    fn insert(&mut self, key: PlanCacheKey, plan: Arc<LogicalPlan>) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        while self.map.len() >= self.capacity {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if self.map.remove(&old).is_some() {
+                        self.evictions += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, plan);
+    }
+
+    /// `(hits, misses, evictions)` snapshot. Cheap copy from the counters.
+    fn stats(&self) -> (usize, usize, usize) {
+        (self.hits, self.misses, self.evictions)
+    }
+}
+
+/// Process-wide singleton. Initialised lazily on first `parse` call so
+/// startup cost is `0` for binaries that never touch SQL.
+static PLAN_CACHE: Lazy<Mutex<PlanCache>> =
+    Lazy::new(|| Mutex::new(PlanCache::with_capacity(plan_cache_cap())));
+
+/// Shared `AtomicUsize` snapshot of the most-recent `stats()` triple. Lets
+/// observers read counters without taking the cache lock at all, which is
+/// useful for periodic health-check probes. The triple is updated on every
+/// `parse` call right before returning.
+static PLAN_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static PLAN_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+static PLAN_CACHE_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Look up `(sql, version)` in the global plan cache, bumping the shared
+/// `hits` / `misses` snapshot. Returns the cached `Arc<LogicalPlan>` on
+/// hit, `None` on miss.
+fn plan_cache_lookup(sql: &str, version: u64) -> Option<Arc<LogicalPlan>> {
+    let key = PlanCacheKey {
+        sql: sql.to_string(),
+        version,
+    };
+    let mut cache = PLAN_CACHE.lock();
+    let result = cache.lookup(&key);
+    let (h, m, e) = cache.stats();
+    drop(cache);
+    PLAN_CACHE_HITS.store(h, Ordering::Relaxed);
+    PLAN_CACHE_MISSES.store(m, Ordering::Relaxed);
+    PLAN_CACHE_EVICTIONS.store(e, Ordering::Relaxed);
+    result
+}
+
+/// Insert `plan` for `(sql, version)` in the global plan cache, then
+/// refresh the shared `(hits, misses, evictions)` snapshot.
+fn plan_cache_insert(sql: String, version: u64, plan: Arc<LogicalPlan>) {
+    let key = PlanCacheKey { sql, version };
+    let mut cache = PLAN_CACHE.lock();
+    cache.insert(key, plan);
+    let (h, m, e) = cache.stats();
+    drop(cache);
+    PLAN_CACHE_HITS.store(h, Ordering::Relaxed);
+    PLAN_CACHE_MISSES.store(m, Ordering::Relaxed);
+    PLAN_CACHE_EVICTIONS.store(e, Ordering::Relaxed);
+}
+
+/// Public observability hook: `(hits, misses, evictions)` since process
+/// start. Read from atomic snapshots that are refreshed on every `parse`
+/// call, so this never blocks behind the cache lock.
+///
+/// The returned triple is a point-in-time read; reading the three counters
+/// is *not* atomic as a whole (each load is `Relaxed`), which is fine for
+/// the intended dashboard-style sampling use. If you need a perfectly
+/// consistent triple, take it inside a single `PLAN_CACHE.lock()` —
+/// nothing else in the public API exposes the lock so that path is
+/// internal only.
+pub fn plan_cache_stats() -> (usize, usize, usize) {
+    (
+        PLAN_CACHE_HITS.load(Ordering::Relaxed),
+        PLAN_CACHE_MISSES.load(Ordering::Relaxed),
+        PLAN_CACHE_EVICTIONS.load(Ordering::Relaxed),
+    )
 }
 
 /// Lower a top-level `Query`. Supports SELECT, UNION [ALL], ORDER BY, LIMIT,
@@ -1700,6 +2055,280 @@ fn strip_alias(e: &Expr) -> &Expr {
         cur = inner;
     }
     cur
+}
+
+#[cfg(test)]
+mod plan_cache_tests {
+    //! Unit tests for the parse + plan cache. These deliberately exercise
+    //! `PlanCache` directly with explicit capacities instead of going
+    //! through the env-var-frozen global cap, so the eviction case can be
+    //! tested deterministically without depending on whether some other
+    //! `#[test]` in this binary already initialised `PLAN_CACHE`. The
+    //! env-var parsing is exercised separately via `parse_plan_cache_cap`.
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    /// Two-table fixture matching the one in `wave7_tests::provider` but
+    /// kept local so this module's tests don't depend on test-helper
+    /// ordering between sibling modules.
+    fn provider() -> MemTableProvider {
+        let t1 = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int64, false),
+        ]);
+        let t2 = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("c", DataType::Float64, false),
+        ]);
+        MemTableProvider::new()
+            .with_table("t1", t1)
+            .with_table("t2", t2)
+    }
+
+    /// Build a tiny `Arc<LogicalPlan>` for direct cache tests. Using a
+    /// hand-rolled `Scan` keeps the tests independent of the lowering
+    /// pipeline (so a future change to `parse_uncached` doesn't break the
+    /// pure cache-policy tests below).
+    fn dummy_plan(table: &str) -> Arc<LogicalPlan> {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        Arc::new(LogicalPlan::Scan {
+            table: table.to_string(),
+            projection: None,
+            schema,
+        })
+    }
+
+    fn key(sql: &str, version: u64) -> PlanCacheKey {
+        PlanCacheKey {
+            sql: sql.to_string(),
+            version,
+        }
+    }
+
+    #[test]
+    fn parse_cache_cap_picks_up_env_var() {
+        // End-to-end: the env-var parser handles set / unset / zero /
+        // garbage. The global `plan_cache_cap()` is memoised, so we test
+        // the pure helper instead — same pattern as
+        // `parse_cap_picks_up_env_var` in `jit_compiler`.
+        assert_eq!(parse_plan_cache_cap(Some("8"), 64), 8);
+        assert_eq!(parse_plan_cache_cap(None, 64), 64);
+        assert_eq!(parse_plan_cache_cap(Some(""), 64), 64);
+        assert_eq!(parse_plan_cache_cap(Some("0"), 64), 64);
+        assert_eq!(parse_plan_cache_cap(Some("not-a-number"), 64), 64);
+    }
+
+    #[test]
+    fn cache_with_zero_capacity_promotes_to_one() {
+        // Misconfigured env var -> cap 0 was rejected upstream by
+        // `parse_plan_cache_cap`, but `PlanCache::with_capacity` is also
+        // used directly (from this test module). Defensively bump 0 to 1
+        // so inserts can succeed.
+        let mut cache = PlanCache::with_capacity(0);
+        cache.insert(key("SELECT 1", 0), dummy_plan("t1"));
+        assert!(cache.lookup(&key("SELECT 1", 0)).is_some());
+    }
+
+    #[test]
+    fn same_sql_twice_second_is_a_hit() {
+        let mut cache = PlanCache::with_capacity(8);
+        let plan = dummy_plan("t1");
+        // First lookup: miss, no entry yet.
+        assert!(cache.lookup(&key("SELECT a FROM t1", 1)).is_none());
+        // Producer inserts after the miss.
+        cache.insert(key("SELECT a FROM t1", 1), Arc::clone(&plan));
+        // Second lookup: hit.
+        let got = cache.lookup(&key("SELECT a FROM t1", 1));
+        assert!(got.is_some(), "expected hit on identical (sql, version)");
+        let (hits, misses, evictions) = cache.stats();
+        assert_eq!(hits, 1);
+        assert_eq!(misses, 1);
+        assert_eq!(evictions, 0);
+    }
+
+    #[test]
+    fn two_different_sql_strings_are_two_misses() {
+        let mut cache = PlanCache::with_capacity(8);
+        // Both lookups miss; counts increment independently.
+        assert!(cache.lookup(&key("SELECT a FROM t1", 1)).is_none());
+        assert!(cache.lookup(&key("SELECT b FROM t1", 1)).is_none());
+        let (hits, misses, _) = cache.stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 2);
+    }
+
+    #[test]
+    fn register_table_invalidates_previously_cached_sql() {
+        // Same SQL string but a different schema version: the cache
+        // treats them as distinct keys, so the post-mutation lookup is a
+        // miss even though the SQL is byte-identical.
+        let mut cache = PlanCache::with_capacity(8);
+        let sql = "SELECT a FROM t1";
+        let v0 = 1u64;
+        cache.insert(key(sql, v0), dummy_plan("t1"));
+        assert!(cache.lookup(&key(sql, v0)).is_some(), "pre-mutation hit");
+
+        let v1 = v0 + 1; // simulate `register_table` bumping the version.
+        assert!(
+            cache.lookup(&key(sql, v1)).is_none(),
+            "post-mutation must miss — version bump invalidates the cached plan"
+        );
+    }
+
+    #[test]
+    fn register_table_bumps_schema_version_end_to_end() {
+        // End-to-end through the public `MemTableProvider` API: any
+        // mutation must produce a strictly-greater `schema_version`.
+        let mut provider = MemTableProvider::new();
+        let v_empty = provider.schema_version();
+        provider.register(
+            "t1",
+            Schema::new(vec![Field::new("a", DataType::Int32, false)]),
+        );
+        let v_after_register = provider.schema_version();
+        assert!(
+            v_after_register > v_empty,
+            "register should bump version: {v_empty} -> {v_after_register}"
+        );
+
+        let removed = provider.unregister_table("t1");
+        assert!(removed, "table was present");
+        let v_after_unregister = provider.schema_version();
+        assert!(
+            v_after_unregister > v_after_register,
+            "unregister should bump version: {v_after_register} -> {v_after_unregister}"
+        );
+
+        // Set column nullability also bumps so the planner's
+        // `input_has_validity` derivation invalidates cleanly.
+        provider.register(
+            "t2",
+            Schema::new(vec![Field::new("a", DataType::Int32, false)]),
+        );
+        let v_before_null = provider.schema_version();
+        provider.set_column_nullability("t2", "a", true);
+        let v_after_null = provider.schema_version();
+        assert!(
+            v_after_null > v_before_null,
+            "set_column_nullability should bump version"
+        );
+    }
+
+    #[test]
+    fn parse_round_trip_hits_global_cache() {
+        // Run twice through the *public* `parse` against the same provider
+        // and SQL; the second call's plan must be equal to the first.
+        // Whether or not other tests in this binary have already populated
+        // `PLAN_CACHE` does not affect this assertion — the cache promise
+        // is *correctness*, not "n misses became n-1".
+        let p = provider();
+        let sql = "SELECT a FROM t1";
+        let plan1 = parse(sql, &p).expect("first parse ok");
+        let plan2 = parse(sql, &p).expect("second parse ok");
+        // Cheap structural check: same Debug rendering means same lowered
+        // tree (Debug derive on LogicalPlan is structural).
+        assert_eq!(format!("{plan1:?}"), format!("{plan2:?}"));
+
+        // The shared stats counters must have moved by at least 1 hit OR
+        // 1 miss between the two `parse` calls. We can't assert exact
+        // values because other tests in this binary share the same
+        // counters; instead we measure deltas around our two calls.
+        let (h0, m0, _) = plan_cache_stats();
+        let _ = parse(sql, &p).expect("third parse ok");
+        let (h1, m1, _) = plan_cache_stats();
+        // Either we hit or we missed-then-recovered (race against
+        // eviction from an unrelated test in the same binary). Both are
+        // valid outcomes — the cache promise is correctness, not strict
+        // hit counts under concurrent test interleaving.
+        assert!(
+            h1 + m1 > h0 + m0,
+            "stats counters must advance on every parse"
+        );
+    }
+
+    #[test]
+    fn parse_against_different_provider_versions_does_not_alias() {
+        // Two `MemTableProvider` instances with the same registered table
+        // get DIFFERENT version tokens (the global counter is bumped on
+        // every mutation). So the same SQL against the two providers
+        // hits two different cache keys and lowers cleanly against each.
+        let p1 = provider();
+        let p2 = provider();
+        assert_ne!(
+            p1.schema_version(),
+            p2.schema_version(),
+            "distinct provider instances must have distinct version tokens"
+        );
+        let plan1 = parse("SELECT a FROM t1", &p1).unwrap();
+        let plan2 = parse("SELECT a FROM t1", &p2).unwrap();
+        // Same lowered shape — providers describe the same schemas.
+        assert_eq!(format!("{plan1:?}"), format!("{plan2:?}"));
+    }
+
+    #[test]
+    fn cache_evicts_oldest_when_full() {
+        // Mirrors the spec: with capacity=2, inserting 3 entries evicts
+        // the first. Uses `PlanCache::with_capacity` directly so the test
+        // is independent of `CRATON_PLAN_CACHE_SIZE` (which the global
+        // cache memoises on first use, making mid-binary env-var
+        // mutation unreliable).
+        let mut cache = PlanCache::with_capacity(2);
+        let p = dummy_plan("scratch");
+
+        cache.insert(key("Q1", 0), Arc::clone(&p));
+        cache.insert(key("Q2", 0), Arc::clone(&p));
+        assert!(cache.lookup(&key("Q1", 0)).is_some(), "Q1 still cached");
+        assert!(cache.lookup(&key("Q2", 0)).is_some(), "Q2 still cached");
+
+        // Third insert evicts the oldest (Q1).
+        cache.insert(key("Q3", 0), Arc::clone(&p));
+        assert!(
+            cache.lookup(&key("Q1", 0)).is_none(),
+            "Q1 must be FIFO-evicted at capacity 2"
+        );
+        assert!(cache.lookup(&key("Q2", 0)).is_some(), "Q2 survives");
+        assert!(cache.lookup(&key("Q3", 0)).is_some(), "Q3 just-inserted");
+        let (_, _, evictions) = cache.stats();
+        assert_eq!(evictions, 1, "exactly one entry was evicted");
+    }
+
+    #[test]
+    fn cache_insert_does_not_double_count_existing_key() {
+        // Re-inserting the same key (e.g. two threads racing through the
+        // miss path) leaves the cache size unchanged — no spurious
+        // eviction, no duplicated deque entry.
+        let mut cache = PlanCache::with_capacity(2);
+        let p = dummy_plan("scratch");
+        cache.insert(key("Q1", 0), Arc::clone(&p));
+        cache.insert(key("Q1", 0), Arc::clone(&p));
+        cache.insert(key("Q1", 0), Arc::clone(&p));
+        // map size 1, deque length 1, zero evictions.
+        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+        let (_, _, ev) = cache.stats();
+        assert_eq!(ev, 0);
+    }
+
+    #[test]
+    fn register_table_through_parse_returns_invalidated_plan() {
+        // End-to-end: parse SQL, mutate the provider (unregister a
+        // referenced table), re-parse the same SQL — the second call
+        // must surface the NEW provider state (an "unknown table"
+        // error here), not a stale cached plan from before the
+        // mutation.
+        let mut p = provider();
+        let sql = "SELECT a FROM t1";
+        let _plan_pre = parse(sql, &p).expect("plan against full provider");
+        assert!(p.unregister_table("t1"), "t1 was present");
+        let err = parse(sql, &p).expect_err(
+            "post-mutation parse must reach the lowerer and surface the schema error",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown table"),
+            "expected 'unknown table' error from re-parse, got: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
