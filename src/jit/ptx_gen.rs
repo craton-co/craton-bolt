@@ -1437,6 +1437,279 @@ mod validity_emission_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scalar string functions: substrate-blocker coverage.
+//
+// v0.7: SQL `UPPER(s)`, `LOWER(s)`, `LENGTH(s)`, `SUBSTRING(s, start [, len])`
+// parse + type-check (see `crate::plan::logical_plan::ScalarFnKind`), but the
+// physical-plan boundary (`Codegen::emit_expr`) rejects every variant before
+// any `KernelSpec` is built. The per-kind rejection messages now name the
+// concrete substrate blocker:
+//
+//   * UPPER / LOWER / SUBSTRING → "no GPU output-string-buffer allocation in
+//     the scalar emitter" — the kernel IR has no variable-width output op,
+//     and `write_signature` has no way to size a Utf8 output buffer at
+//     launch time.
+//   * LENGTH → "no GPU Utf8 input support — dictionary lengths sidecar /
+//     Op::GatherInt32 not yet wired" — strings on the device are stored as
+//     `GpuColumnData::DictUtf8` (an integer index column plus a host-side
+//     dictionary), so even a "trivial" `LENGTH` would need a precomputed
+//     lengths-by-dict-index sidecar buffer threaded through `ColumnIO`, plus
+//     a new IR op to gather from it.
+//
+// The tests below directly attempt to build a `KernelSpec` that would hold a
+// Utf8 input or output and assert the codegen rejects it. This pins both
+// halves of the substrate gap so a future "wire LENGTH end-to-end" PR has to
+// update these tests deliberately rather than silently regressing the
+// rejection path.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod scalar_string_fn_substrate_tests {
+    use super::*;
+    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
+
+    /// `UPPER` / `LOWER` / `SUBSTRING` all produce a fresh Utf8 column.
+    /// A `KernelSpec` declaring a Utf8 output is rejected by `compile` at
+    /// the parameter-emission preflight (see `write_signature` and the
+    /// loop in `compile` over `spec.outputs`).
+    ///
+    /// This is the substrate blocker that keeps UPPER / LOWER / SUBSTRING
+    /// off the GPU: the IR has no op for variable-width output buffers
+    /// and the kernel-param layout has no slot for a `(values, offsets)`
+    /// pair. Until that lands, `Codegen::emit_expr` rejects every
+    /// `Expr::ScalarFn { Upper | Lower | Substring }` with a per-kind
+    /// "no GPU output-string-buffer allocation" message — see
+    /// `crate::plan::physical_plan` for the rejection arm.
+    #[test]
+    fn utf8_output_rejected_blocks_upper_lower_substring() {
+        // Hand-build a `KernelSpec` whose single output is Utf8. The
+        // body is intentionally trivial — we only care that the preflight
+        // refuses to emit kernel params for a Utf8 output buffer. The
+        // codegen check fires before any `Op` is lowered.
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "in0".into(),
+                dtype: DataType::Int32,
+            }],
+            outputs: vec![ColumnIO {
+                name: "out0".into(),
+                dtype: DataType::Utf8,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+                // Store is unreachable past the Utf8 output preflight; we
+                // include it so the spec is internally well-formed.
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+            ],
+            predicate: None,
+            register_count: 1,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+
+        let err = compile(&spec, "bolt_utf8_out_blocker").expect_err(
+            "compile must reject Utf8 output — substrate blocker for UPPER/LOWER/SUBSTRING",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Utf8"),
+            "rejection should mention Utf8 (got {msg})"
+        );
+    }
+
+    /// `LENGTH(s)` would consume a Utf8 column and produce Int32 — the
+    /// output dtype is friendly, but the *input* is the blocker. Strings
+    /// on the GPU are dictionary-encoded (only an Int32/Int64 key column
+    /// crosses the kernel boundary; the dictionary lives host-side) so the
+    /// IR has no way to "load the byte length at row tid" without a new
+    /// op + sidecar buffer.
+    ///
+    /// Until that substrate lands, `compile` rejects any `KernelSpec`
+    /// whose `inputs` carry a `Utf8` slot — even before any `Op`
+    /// references it. This pins the rejection so a future LENGTH wiring
+    /// has to update this test along with the substrate change.
+    #[test]
+    fn utf8_input_rejected_blocks_length() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "s".into(),
+                dtype: DataType::Utf8,
+            }],
+            outputs: vec![ColumnIO {
+                name: "len".into(),
+                dtype: DataType::Int32,
+            }],
+            // No ops — the Utf8 preflight rejects before lowering any IR.
+            ops: vec![],
+            predicate: None,
+            register_count: 0,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+
+        let err = compile(&spec, "bolt_utf8_in_blocker").expect_err(
+            "compile must reject Utf8 input — substrate blocker for LENGTH",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Utf8"),
+            "rejection should mention Utf8 (got {msg})"
+        );
+    }
+
+    /// Per-kind rejection: `Codegen::emit_expr` in `physical_plan.rs` now
+    /// emits a per-kind blocker message rather than a generic "not yet
+    /// lowered" string. We exercise the integration path end-to-end (SQL
+    /// → logical plan → `lower_physical`) to pin the message shape for
+    /// each of the four scalar string functions in scope.
+    ///
+    /// The check is intentionally permissive on the exact wording (we
+    /// assert the function name + "not yet lowered to GPU" appear) so
+    /// the message can evolve as the substrate gap narrows. The per-kind
+    /// blocker phrase (`output-string-buffer` for UPPER/LOWER/SUBSTRING,
+    /// `Utf8 input` for LENGTH) is asserted separately so a regression
+    /// that flattens every kind back to a generic string is caught.
+    #[test]
+    fn per_kind_rejection_messages_name_the_substrate_blocker() {
+        use crate::plan::logical_plan::{
+            DataType as PlanDt, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,
+        };
+        use crate::plan::physical_plan::lower;
+
+        // Minimal single-Utf8-column fixture; mirrors the SQL-frontend test
+        // fixture in `tests/string_fns_sql_test.rs`. We only need the Utf8
+        // column `s` — Substring's start / length literals are inline.
+        let schema = Schema::new(vec![Field {
+            name: "s".into(),
+            dtype: PlanDt::Utf8,
+            nullable: false,
+        }]);
+        let scan = LogicalPlan::Scan {
+            table: "txt".into(),
+            projection: None,
+            schema,
+        };
+
+        // Build `Project { ScalarFn }` plans directly so the test doesn't
+        // depend on the SQL frontend. Each variant uses the per-kind
+        // argument shape `ScalarFnKind`'s type-check contract documents.
+        let s_col = Expr::Column("s".into());
+
+        let cases: &[(ScalarFnKind, Expr, &str)] = &[
+            (
+                ScalarFnKind::Upper,
+                Expr::ScalarFn {
+                    kind: ScalarFnKind::Upper,
+                    args: vec![s_col.clone()],
+                },
+                "output-string-buffer",
+            ),
+            (
+                ScalarFnKind::Lower,
+                Expr::ScalarFn {
+                    kind: ScalarFnKind::Lower,
+                    args: vec![s_col.clone()],
+                },
+                "output-string-buffer",
+            ),
+            (
+                ScalarFnKind::Length,
+                Expr::ScalarFn {
+                    kind: ScalarFnKind::Length,
+                    args: vec![s_col.clone()],
+                },
+                "Utf8 input",
+            ),
+            (
+                ScalarFnKind::Substring,
+                Expr::ScalarFn {
+                    kind: ScalarFnKind::Substring,
+                    args: vec![
+                        s_col.clone(),
+                        Expr::Literal(Literal::Int64(1)),
+                        Expr::Literal(Literal::Int64(2)),
+                    ],
+                },
+                "output-string-buffer",
+            ),
+        ];
+
+        for (kind, expr, blocker_phrase) in cases {
+            let plan = LogicalPlan::Project {
+                input: Box::new(scan.clone()),
+                exprs: vec![expr.clone()],
+            };
+            let err =
+                lower(&plan).expect_err(&format!("{} must be rejected at GPU lowering", kind.sql_name()));
+            let msg = format!("{err}");
+
+            // The function's SQL name must be in the message — caller's
+            // SQL has a concrete `UPPER` / `LOWER` / etc. and a generic
+            // "scalar function" wouldn't be actionable.
+            assert!(
+                msg.contains(kind.sql_name()),
+                "rejection for {} should name the function in the error; got: {msg}",
+                kind.sql_name()
+            );
+            // Standard "follow-up" marker shared with the broader v0.5
+            // rejection family (CAST, CASE, Date/Timestamp, Decimal128).
+            // The `string_fns_sql_test.rs::upper_rejected_at_lower_with_followup_marker`
+            // test pins this; keep it stable here so a regression that
+            // drops the marker fails both tests.
+            assert!(
+                msg.to_ascii_lowercase().contains("not yet lowered to gpu")
+                    || msg.to_ascii_lowercase().contains("follow-up"),
+                "rejection for {} should be flagged as a follow-up; got: {msg}",
+                kind.sql_name()
+            );
+            // Per-kind blocker phrase: a regression that flattens every
+            // kind to the same generic message would drop this.
+            assert!(
+                msg.contains(blocker_phrase),
+                "rejection for {} should name the substrate blocker {:?}; got: {msg}",
+                kind.sql_name(),
+                blocker_phrase
+            );
+        }
+
+        // `ScalarFnKind::Concat` (SQL `CONCAT(a, b)`) is the fifth member
+        // of `ScalarFnKind` and shares the rejection arm. It's not in the
+        // task's wiring scope (UPPER / LOWER / LENGTH / SUBSTRING), so we
+        // only check the basics: the per-kind branch returns a Concat-
+        // specific blocker phrase rather than collapsing to a generic one.
+        // We don't exercise the full Project lowering here because the
+        // SQL `||` (`BinaryOp::Concat`) lives on a different code path
+        // (`expr_contains_concat`) and the host-fallback routing for that
+        // op is already covered by the broader Project tests; we just
+        // confirm the per-kind message survives in the function-call form.
+        let concat_plan = LogicalPlan::Project {
+            input: Box::new(scan.clone()),
+            exprs: vec![Expr::ScalarFn {
+                kind: ScalarFnKind::Concat,
+                args: vec![s_col.clone(), s_col.clone()],
+            }],
+        };
+        let err = lower(&concat_plan).expect_err("CONCAT must be rejected at GPU lowering");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CONCAT"),
+            "rejection for CONCAT should name the function; got: {msg}"
+        );
+        assert!(
+            msg.contains("Utf8"),
+            "rejection for CONCAT should name the Utf8 substrate blocker; got: {msg}"
+        );
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // PV-stage-d: per-output validity dataflow analysis.
