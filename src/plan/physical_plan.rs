@@ -568,6 +568,24 @@ pub enum RadixSortPass {
     /// `compile_radix_scatter` — scatter keys to their final positions
     /// using the prefix-summed histogram.
     Scatter,
+    /// `compile_radix_scatter_with_indices` — variant of `Scatter` that
+    /// carries a parallel `u32` row-index payload through the scatter step.
+    /// This is the standard path for multi-column ORDER BY (see
+    /// `gpu_sort::run_radix_pipeline_*`). It is a distinct codegen knob from
+    /// `Scatter` (different PTX entry point, different ABI) and therefore
+    /// must occupy its own cache slot.
+    ScatterWithIndices,
+    /// `compile_radix_msb_flip` — one-shot in-place XOR over the keys buffer
+    /// that flips the MSB so the per-pass histogram/scatter kernels can treat
+    /// signed keys as plain unsigned bit-blobs.
+    ///
+    /// In the current `gpu_sort` driver this kernel is **not invoked** — the
+    /// host-side pre-transform during gather subsumes both the signed-MSB
+    /// XOR and the per-key DESC bit-not in one pass (see the long comment
+    /// at `run_radix_pipeline_i32`). The variant is retained on the planner
+    /// IR so the kernel-side helper can be re-introduced (e.g. for an
+    /// in-place / no-gather code path) without churning the IR enum.
+    MsbFlip,
 }
 
 /// Spec for one pass of the radix sort kernel pair.
@@ -3848,7 +3866,12 @@ mod tests {
     fn radix_sort_kernel_spec_key_roundtrip() {
         use std::collections::HashSet;
 
-        let passes = [RadixSortPass::Histogram, RadixSortPass::Scatter];
+        let passes = [
+            RadixSortPass::Histogram,
+            RadixSortPass::Scatter,
+            RadixSortPass::ScatterWithIndices,
+            RadixSortPass::MsbFlip,
+        ];
         // The radix kernels in `jit::sort_kernel_radix` support b32 and b64
         // integer keys today; the spec admits any dtype the codegen accepts.
         let dtypes = [DataType::Int32, DataType::Int64];

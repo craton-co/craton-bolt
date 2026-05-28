@@ -99,6 +99,23 @@ use crate::jit::sort_kernel_radix::{
     radix_supports_dtype, RADIX_BLOCK_SIZE, RADIX_BUCKETS,
 };
 use crate::plan::logical_plan::DataType;
+use crate::plan::physical_plan::{RadixSortKernelSpec, RadixSortPass};
+
+// Entry-point name constants for the radix kernels we wire through the
+// `RadixSortKernelSpec` cache layer. They must match the strings emitted by
+// `radix_histogram_entry(dtype)` / `radix_scatter_with_indices_entry(dtype)`
+// in `crate::jit::sort_kernel_radix` — kept as `&'static str` consts here
+// so we can hand them to `get_or_build_module_for_radix_sort` (whose
+// `entry: &'static str` participates in the cache key). Splitting the
+// keys-only and with-indices scatter into separate constants pins the
+// "distinct cache slots" invariant for the two scatter ABIs at compile
+// time; if someone re-points one of these to the wrong PTX entry, the
+// `module.function(...)` lookup further down panics rather than silently
+// loading the wrong kernel.
+const RADIX_HISTOGRAM_I32_ENTRY: &str = "bolt_radix_histogram_i32";
+const RADIX_HISTOGRAM_I64_ENTRY: &str = "bolt_radix_histogram_i64";
+const RADIX_SCATTER_WI_I32_ENTRY: &str = "bolt_radix_scatter_i32_with_indices";
+const RADIX_SCATTER_WI_I64_ENTRY: &str = "bolt_radix_scatter_i64_with_indices";
 
 /// Compute `next_power_of_two(n)` returning `Err` if the result would overflow
 /// `u32` (i.e. `n > 2^31`). `n == 0` returns `1` — bitonic sort needs at least
@@ -1020,20 +1037,35 @@ fn run_radix_pipeline_i32(
     let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
 
     // ----- modules + entry points -------------------------------------
+    //
+    // Each radix kernel goes through the v0.7 `RadixSortKernelSpec`-keyed
+    // process-wide cache (see `module_cache::get_or_build_module_for_radix_sort`).
+    // On a warm hit the entire codegen + PTX-load round-trip is skipped —
+    // the cached `CudaModule` clone is returned in sub-microsecond time.
+    // The keys-only scatter and the with-indices scatter share the same
+    // `RadixSortPass::Scatter` / `ScatterWithIndices` variants but occupy
+    // distinct cache slots because the `entry` argument participates in
+    // the key.
     let stream = CudaStream::null();
-    let hist_module = module_cache::get_or_build_module(
-        module_path!(),
-        format!("radix_histogram:{:?}", dtype),
-        None,
-        || compile_radix_histogram(dtype),
+    let hist_spec = RadixSortKernelSpec {
+        pass: RadixSortPass::Histogram,
+        dtype,
+    };
+    let hist_module = module_cache::get_or_build_module_for_radix_sort(
+        &hist_spec,
+        RADIX_HISTOGRAM_I32_ENTRY,
+        |spec| compile_radix_histogram(spec.dtype),
     )?;
     let hist_fn = hist_module.function(&radix_histogram_entry(dtype)?)?;
 
-    let scatter_module = module_cache::get_or_build_module(
-        module_path!(),
-        format!("radix_scatter_with_indices:{:?}", dtype),
-        None,
-        || compile_radix_scatter_with_indices(dtype),
+    let scatter_spec = RadixSortKernelSpec {
+        pass: RadixSortPass::ScatterWithIndices,
+        dtype,
+    };
+    let scatter_module = module_cache::get_or_build_module_for_radix_sort(
+        &scatter_spec,
+        RADIX_SCATTER_WI_I32_ENTRY,
+        |spec| compile_radix_scatter_with_indices(spec.dtype),
     )?;
     let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
 
@@ -1180,18 +1212,26 @@ fn run_radix_pipeline_i64(
     let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
 
     let stream = CudaStream::null();
-    let hist_module = module_cache::get_or_build_module(
-        module_path!(),
-        format!("radix_histogram:{:?}", dtype),
-        None,
-        || compile_radix_histogram(dtype),
+    // See `run_radix_pipeline_i32` for the cache-layer rationale; this is
+    // the i64 mirror.
+    let hist_spec = RadixSortKernelSpec {
+        pass: RadixSortPass::Histogram,
+        dtype,
+    };
+    let hist_module = module_cache::get_or_build_module_for_radix_sort(
+        &hist_spec,
+        RADIX_HISTOGRAM_I64_ENTRY,
+        |spec| compile_radix_histogram(spec.dtype),
     )?;
     let hist_fn = hist_module.function(&radix_histogram_entry(dtype)?)?;
-    let scatter_module = module_cache::get_or_build_module(
-        module_path!(),
-        format!("radix_scatter_with_indices:{:?}", dtype),
-        None,
-        || compile_radix_scatter_with_indices(dtype),
+    let scatter_spec = RadixSortKernelSpec {
+        pass: RadixSortPass::ScatterWithIndices,
+        dtype,
+    };
+    let scatter_module = module_cache::get_or_build_module_for_radix_sort(
+        &scatter_spec,
+        RADIX_SCATTER_WI_I64_ENTRY,
+        |spec| compile_radix_scatter_with_indices(spec.dtype),
     )?;
     let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
 
