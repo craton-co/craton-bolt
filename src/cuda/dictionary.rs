@@ -26,6 +26,23 @@ use arrow_array::{Array, StringArray};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 
+// 32-bit host pointer-width note.
+//
+// `to_string_array` below performs `(idx as usize) - 1` after the `idx <= ...`
+// upper-bound check. On a 64-bit `usize` this is unambiguously lossless. On a
+// 32-bit `usize`, the cast is still lossless *because* we validate
+// `idx <= i32::MAX` (and reject `idx < 0`) before the cast, so the value fits
+// in `u32` and therefore in a 32-bit `usize`. The crate does not advertise
+// 32-bit support, but this const-context note flags the dependency between
+// the i32 bound and the pointer-width assumption: if the bound is ever
+// raised, this site needs revisiting before 32-bit builds remain safe.
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    // The dictionary code does `(idx as usize) - 1` after validating
+    // `idx <= i32::MAX`, which is lossless on 32-bit usize. Keep this
+    // const-context note so future bumps of the bound are flagged.
+};
+
 /// Hash a string with `DefaultHasher` for the construction-time lookup index.
 ///
 /// Used only inside [`DictionaryColumn::from_string_array`] (and the i64

@@ -7,16 +7,52 @@
 //! real strings start at index `1`, and `dictionary[k - 1]` decodes GPU index
 //! `k` — only the index width changes from `i32` to `i64`.
 //!
-//! The engine picks between the i32 and i64 variants at register-table time
-//! based on a distinct-string estimate. The threshold lives in
-//! [`I32_INDEX_THRESHOLD`]: any column whose unique-string count is at or above
-//! the threshold uses [`DictionaryColumnI64`]. The cap on this type is
-//! `i64::MAX`, which is effectively unbounded for any input that fits in host
-//! memory.
+//! The engine would pick between the i32 and i64 variants at register-table
+//! time based on a distinct-string estimate. The threshold lives in
+//! [`I32_INDEX_THRESHOLD`]: any column whose unique-string count is at or
+//! above the threshold would use [`DictionaryColumnI64`]. The cap on this
+//! type is `i64::MAX`, which is effectively unbounded for any input that
+//! fits in host memory.
 //!
-//! Deferred: downstream PTX kernels still consume i32 indices. Wiring the
-//! codegen path to accept i64 indices belongs to the orchestrator and is out
-//! of scope for this file.
+//! # State: deferred / runtime-guarded
+//!
+//! This module is **plumbed but not reachable** through the production
+//! `DictionaryColumnAny::from_string_array` dispatch.
+//! [`crate::cuda::dictionary_any::DictionaryColumnAny::from_string_array`]
+//! detects the wide-cardinality case (`distinct >= I32_INDEX_THRESHOLD`)
+//! and returns a `BoltError::Other("i64-indexed dictionary not yet wired
+//! through codegen; use i32 path")` instead of constructing a
+//! `DictionaryColumnI64`. The reason: downstream PTX kernels still consume
+//! `i32` indices. Wiring the codegen path to accept `i64` indices belongs
+//! to the orchestrator and is out of scope for this file.
+//!
+//! The host-side types ([`DictionaryColumnI64`], the
+//! [`crate::cuda::dictionary_any::DictionaryColumnAny::I64`] arm,
+//! `as_i64()`, `index_of_any` widening, the engine's `I64` arm in
+//! `engine.rs`, and the rewriter's `I64` arm in `string_literal_rewrite.rs`)
+//! remain in place so re-enabling the path is a localised change rather
+//! than a cross-cutting one. `#[allow(dead_code)]` lives on the struct and
+//! its methods because the constructor is currently only reached from
+//! tests — production callers exit through the runtime guard above.
+//!
+//! ## TODO: re-enabling conditions
+//!
+//! Remove the guard in
+//! [`crate::cuda::dictionary_any::DictionaryColumnAny::from_string_array`]
+//! when **all** of the following hold:
+//!   1. PTX codegen (`src/codegen`) emits kernels that accept `i64`
+//!      dictionary-index columns. The current kernels hard-code `i32`
+//!      loads for index inputs.
+//!   2. The kernel-arg dispatch in `src/exec/engine.rs` widens correctly
+//!      for the `DictionaryColumnAny::I64` arm — both for the pointer it
+//!      forwards and for the kernel signature it selects.
+//!   3. The literal rewriter in `src/plan/string_literal_rewrite.rs`
+//!      emits a typed `Int64` literal for the `I64` arm (it already does;
+//!      verify nothing downstream re-narrows it to `Int32`).
+//!   4. Round-trip tests cover the i64 path end-to-end. The current
+//!      `from_string_array_round_trip` test in this module is `#[ignore]`'d
+//!      for resource reasons; an integration-level test that exercises the
+//!      full engine path is required before the guard is removed.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -55,6 +91,15 @@ pub const I32_INDEX_THRESHOLD: usize = (i32::MAX as usize) - 1024;
 ///     occupies `dictionary[i - 1]`.
 ///   * Indices are `i64`. The cap is `i64::MAX` unique strings (effectively
 ///     unlimited for any host that fits the input column in memory).
+///
+/// **Kept for the future i64-index codegen path; see module docs.** The
+/// production dispatch in
+/// [`crate::cuda::dictionary_any::DictionaryColumnAny::from_string_array`]
+/// returns an error rather than constructing this type, so several of the
+/// methods below are not reached from non-test code today. The
+/// `#[allow(dead_code)]` on the struct silences the corresponding lints
+/// without deleting code we intend to revive.
+#[allow(dead_code)]
 pub struct DictionaryColumnI64 {
     /// Host-side dictionary: position `i` → the `(i + 1)`-th index's string.
     pub dictionary: Vec<String>,
@@ -64,6 +109,8 @@ pub struct DictionaryColumnI64 {
     pub n_rows: usize,
 }
 
+// kept for the future i64-index codegen path; see module docs
+#[allow(dead_code)]
 impl DictionaryColumnI64 {
     /// Encode an Arrow `StringArray` as an i64-indexed dictionary.
     ///
