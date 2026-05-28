@@ -1700,6 +1700,7 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
     }
 }
 
+#[tracing::instrument(name = "lower", level = "info", skip_all)]
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
     let phys = lower_depth(plan, 0)?;
     // Static-analysis safety net for the documented short-circuit divergence

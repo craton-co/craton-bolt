@@ -56,6 +56,11 @@ dashmap = "5"
 bytemuck = { version = "1", features = ["derive"] }
 libc = "0.2"
 log = "0.4"
+# `tracing` powers the per-query-phase span observability surface (v0.6 / M5
+# ergonomics). Spans are off by default — downstream users opt in by
+# installing a subscriber (`tracing_subscriber::fmt().init()` is the simplest
+# choice). See `src/observability.rs` for the span-name catalogue.
+tracing = "0.1"
 # cudarc: optional pure-Rust CUDA Driver API binding. Gated on the
 # `cudarc` feature. See docs/CUDARC_ADOPTION.md for the migration plan.
 # v0.13 supports CUDA 12.x with stable Rust. Default features off — we
@@ -78,6 +83,12 @@ proptest = "1"
 # we need for normalized PTX). Snapshot files live under `tests/snapshots/` and
 # are reviewed via `cargo insta review` / `cargo insta accept`.
 insta = "1"
+# `tracing-subscriber` is a dev-only dependency: the e2e test
+# `tests/tracing_test.rs` installs a custom subscriber to capture and assert
+# on the span names the engine emits across query phases. The library itself
+# does NOT depend on any specific subscriber — downstream users wire their
+# own (fmt, OTel, custom collector, ...).
+tracing-subscriber = "0.3"
 
 [features]
 default = []

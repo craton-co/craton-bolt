@@ -1246,7 +1246,8 @@ impl Engine {
         let plan: LogicalPlan = parse_sql(query, &self.provider)?;
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding __idx_<col> i32 column.
-        let plan = self.dict_registry.rewrite_plan(&plan)?;
+        let plan = tracing::info_span!("plan")
+            .in_scope(|| self.dict_registry.rewrite_plan(&plan))?;
         let mut phys = crate::plan::lower_physical(&plan)?;
         // PV-stage-d: populate `KernelSpec::input_has_validity` for every
         // input column by consulting the engine-backed provider, which
