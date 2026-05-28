@@ -648,6 +648,7 @@ fn run_pre_stage(
         Some(crate::exec::compact::download_mask(
             mask.device_ptr(),
             n_rows,
+            &stream,
         )?)
     } else {
         None
