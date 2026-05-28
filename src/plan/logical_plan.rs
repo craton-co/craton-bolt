@@ -269,6 +269,29 @@ pub enum Expr {
         /// The single operand.
         operand: Box<Expr>,
     },
+    /// SQL `CASE WHEN cond1 THEN val1 [WHEN cond2 THEN val2 ...] [ELSE
+    /// val_else] END`. Each `(cond, then)` branch is evaluated in order;
+    /// the first branch whose condition is `true` contributes the
+    /// expression's value. If no branch matches, the value is `else_branch`
+    /// when present and SQL `NULL` otherwise.
+    ///
+    /// Type-checks every WHEN condition to `Bool`, and unifies every THEN
+    /// value and the optional ELSE to a single dtype: numeric pairs go
+    /// through [`unify_numeric`]; non-numeric pairs must match exactly. If
+    /// the ELSE branch is absent the dtype is taken from the first THEN
+    /// value (and SQL NULL is implicit for unmatched rows).
+    ///
+    /// The physical planner does not yet lower this to a GPU kernel — the
+    /// codegen path in `physical_plan::emit_expr` rejects it with a clear
+    /// "CASE not yet lowered to GPU; coming in a follow-up" `Plan` error,
+    /// so callers using CASE in a fused projection / filter will see that
+    /// message rather than a misleading runtime failure.
+    Case {
+        /// One or more WHEN/THEN branches in source order.
+        branches: Vec<(Expr, Expr)>,
+        /// Optional ELSE value; SQL NULL when omitted.
+        else_branch: Option<Box<Expr>>,
+    },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
 }
@@ -374,7 +397,8 @@ impl Expr {
     }
 
     /// Resolve the static type of this expression against `schema`.
-    // TODO(nullable): add CASE/COALESCE/IS NULL/IS NOT NULL variants
+    // TODO(nullable): add COALESCE / NULLIF variants (CASE, IS NULL,
+    // IS NOT NULL all landed).
     pub fn dtype(&self, schema: &Schema) -> BoltResult<DataType> {
         self.dtype_depth(schema, 0)
     }
@@ -449,8 +473,115 @@ impl Expr {
                     Ok(DataType::Bool)
                 }
             },
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
+                if branches.is_empty() {
+                    return Err(BoltError::Type(
+                        "CASE expression requires at least one WHEN/THEN branch".into(),
+                    ));
+                }
+                // Every WHEN must type-check to Bool against the input
+                // schema. We accept the same NULL-peer-typing latitude as
+                // `Expr::Binary` (a bare `Literal::Null` condition would
+                // hard-error here; users hit this so rarely it isn't worth
+                // a special case — SQL CASE conditions are always real
+                // boolean expressions in practice).
+                for (i, (when, _)) in branches.iter().enumerate() {
+                    let wt = when.dtype_depth(schema, depth + 1)?;
+                    if wt != DataType::Bool {
+                        return Err(BoltError::Type(format!(
+                            "CASE WHEN condition {i} must be Bool, got {wt:?}"
+                        )));
+                    }
+                }
+                // Walk THEN values + optional ELSE and unify into a single
+                // dtype. NULL operands borrow their peer's dtype just like
+                // `peer_typed_dtype` does for binary ops, so a CASE arm of
+                // bare NULL doesn't hard-error when there's a typed peer.
+                //
+                // Collect (idx_label, dtype_option) so error messages can
+                // name the failing branch precisely. `None` means the arm
+                // is an untyped `Literal::Null`.
+                let mut arms: Vec<(String, Option<DataType>)> =
+                    Vec::with_capacity(branches.len() + 1);
+                for (i, (_, then)) in branches.iter().enumerate() {
+                    let t = case_arm_dtype(then, schema, depth + 1)?;
+                    arms.push((format!("THEN {i}"), t));
+                }
+                if let Some(e) = else_branch {
+                    let t = case_arm_dtype(e, schema, depth + 1)?;
+                    arms.push(("ELSE".to_string(), t));
+                }
+                // The unified dtype is the first typed arm's dtype, then
+                // pairwise-unified against every other typed arm. Untyped
+                // NULL arms borrow whatever the accumulator already has.
+                // If every arm is an untyped NULL we have nothing to anchor
+                // on — surface a clear error.
+                let mut acc: Option<DataType> = None;
+                for (label, t) in &arms {
+                    match t {
+                        Some(t) => match acc {
+                            None => acc = Some(*t),
+                            Some(prev) => {
+                                acc = Some(unify_case_dtypes(prev, *t).ok_or_else(|| {
+                                    BoltError::Type(format!(
+                                        "CASE {label} has incompatible dtype {t:?} \
+                                         with previous arms ({prev:?})"
+                                    ))
+                                })?);
+                            }
+                        },
+                        None => {
+                            // Untyped NULL arm — no dtype information; we
+                            // adopt whatever `acc` already has (which may
+                            // be `None` if every preceding arm was NULL).
+                        }
+                    }
+                }
+                acc.ok_or_else(|| {
+                    BoltError::Type(
+                        "CASE expression: every THEN/ELSE arm is an untyped NULL — \
+                         cannot infer a result dtype"
+                            .into(),
+                    )
+                })
+            }
             Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
         }
+    }
+}
+
+/// Resolve a single CASE arm's dtype against `schema`, returning `None` if
+/// the arm is an untyped `Literal::Null` (which carries no static type).
+/// Any other resolvable arm returns `Some(dtype)`; resolution errors bubble
+/// through verbatim (e.g. unknown column references).
+fn case_arm_dtype(
+    arm: &Expr,
+    schema: &Schema,
+    depth: usize,
+) -> BoltResult<Option<DataType>> {
+    if matches!(arm, Expr::Literal(Literal::Null)) {
+        return Ok(None);
+    }
+    Ok(Some(arm.dtype_depth(schema, depth)?))
+}
+
+/// Unify two CASE arm dtypes. Numeric pairs go through [`unify_numeric`];
+/// non-numeric arms must match exactly. Returns `None` on incompatibility
+/// so the caller can build a friendly per-arm error message.
+fn unify_case_dtypes(a: DataType, b: DataType) -> Option<DataType> {
+    if a == b {
+        return Some(a);
+    }
+    if a.is_numeric() && b.is_numeric() {
+        // `unify_numeric` mirrors the rules used by `Expr::Binary`, so a
+        // CASE that mixes (Int32, Float64) widens to Float64 just like
+        // `Int32 + Float64` would.
+        unify_numeric(a, b).ok()
+    } else {
+        None
     }
 }
 
@@ -1077,6 +1208,156 @@ mod null_handling_tests {
             right: Box::new(Expr::Literal(Literal::Null)),
         };
         assert_eq!(expr.dtype(&schema).unwrap(), DataType::Int64);
+    }
+
+    /// CASE with a single Bool WHEN and two Int64 arms (THEN + ELSE)
+    /// resolves to Int64 without widening.
+    #[test]
+    fn case_with_else_uniform_int_arms_typechecks_to_int64() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int64(0))),
+                },
+                Expr::Literal(Literal::Int64(1)),
+            )],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Int64(0)))),
+        };
+        assert_eq!(case.dtype(&schema).unwrap(), DataType::Int64);
+    }
+
+    /// CASE without ELSE: dtype is taken from the THEN arms alone.
+    #[test]
+    fn case_without_else_takes_then_dtype() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int64(0))),
+                },
+                Expr::Literal(Literal::Float64(1.0)),
+            )],
+            else_branch: None,
+        };
+        assert_eq!(case.dtype(&schema).unwrap(), DataType::Float64);
+    }
+
+    /// Mixed numeric arms widen pairwise: Int64 THEN + Float64 ELSE
+    /// resolves to Float64 via the same `unify_numeric` rule used for
+    /// arithmetic.
+    #[test]
+    fn case_with_mixed_numeric_arms_widens_to_float64() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int64(0))),
+                },
+                Expr::Literal(Literal::Int64(1)),
+            )],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Float64(0.5)))),
+        };
+        assert_eq!(case.dtype(&schema).unwrap(), DataType::Float64);
+    }
+
+    /// Non-Bool WHEN condition surfaces a Type error naming the offending
+    /// branch index and the dtype that broke it.
+    #[test]
+    fn case_rejects_non_bool_when_condition() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Column("x".into()),
+                Expr::Literal(Literal::Int64(1)),
+            )],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Int64(0)))),
+        };
+        let err = case.dtype(&schema).expect_err("non-Bool WHEN must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CASE WHEN condition") && msg.contains("Bool"),
+            "error should mention the failure, got: {msg}"
+        );
+    }
+
+    /// Incompatible non-numeric arms (Utf8 vs Bool) cannot unify; the
+    /// error message must mention the offending arm label.
+    #[test]
+    fn case_rejects_incompatible_non_numeric_arms() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int64(0))),
+                },
+                Expr::Literal(Literal::Utf8("yes".into())),
+            )],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(true)))),
+        };
+        let err = case
+            .dtype(&schema)
+            .expect_err("Utf8 + Bool arms must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CASE") && msg.contains("incompatible"),
+            "expected incompatibility message, got: {msg}"
+        );
+    }
+
+    /// Untyped-NULL THEN borrows the ELSE arm's dtype just like the
+    /// NULL-peer-typing rule for binary ops. THEN = NULL, ELSE = Int64
+    /// resolves to Int64.
+    #[test]
+    fn case_with_null_then_borrows_else_dtype() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int64(0))),
+                },
+                Expr::Literal(Literal::Null),
+            )],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Int64(0)))),
+        };
+        assert_eq!(case.dtype(&schema).unwrap(), DataType::Int64);
+    }
+
+    /// Every arm being an untyped NULL leaves the planner with nothing
+    /// to anchor on; surface a clear Type error rather than guessing a
+    /// default dtype.
+    #[test]
+    fn case_with_only_null_arms_errors() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int64(0))),
+                },
+                Expr::Literal(Literal::Null),
+            )],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Null))),
+        };
+        let err = case
+            .dtype(&schema)
+            .expect_err("all-NULL arms must error at type-check");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CASE") && msg.contains("untyped NULL"),
+            "expected all-NULL error, got: {msg}"
+        );
     }
 }
 

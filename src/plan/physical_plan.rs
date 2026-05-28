@@ -464,6 +464,16 @@ impl<'a> Codegen<'a> {
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
             Expr::Unary { op, operand } => self.emit_unary(*op, operand),
             Expr::Alias(inner, _) => self.emit_expr(inner),
+            // CASE has no GPU IR yet: there is no value-selection-by-mask
+            // op in the kernel codegen, so a CASE expression in a fused
+            // projection / filter kernel cannot be lowered. The lowering
+            // entry point (`lower_depth`) catches this earlier via
+            // `plan_contains_case` and surfaces the same message before
+            // we ever get here; reach this arm only on hand-built plans
+            // that bypass `lower_depth`.
+            Expr::Case { .. } => Err(BoltError::Plan(
+                "CASE not yet lowered to GPU; coming in a follow-up".into(),
+            )),
         }
     }
 
@@ -1006,6 +1016,23 @@ fn substitute_one_depth(
             op: *op,
             operand: Box::new(substitute_one(operand, map)),
         },
+        Expr::Case {
+            branches,
+            else_branch,
+        } => Expr::Case {
+            branches: branches
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        substitute_one_depth(w, map, depth + 1),
+                        substitute_one_depth(t, map, depth + 1),
+                    )
+                })
+                .collect(),
+            else_branch: else_branch
+                .as_deref()
+                .map(|e| Box::new(substitute_one_depth(e, map, depth + 1))),
+        },
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
         }
@@ -1359,6 +1386,15 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
             predicate_contains_unary(left) || predicate_contains_unary(right)
         }
         Expr::Alias(inner, _) => predicate_contains_unary(inner),
+        // CASE inside a predicate or projection cannot be lowered to the
+        // fused GPU kernel today (no value-selection-by-mask op). The
+        // lowering entry point already rejects the enclosing plan with a
+        // "CASE not yet lowered to GPU" Plan error via `plan_contains_case`;
+        // we conservatively return `true` here so any leftover code path
+        // (a host-side CASE in a Filter predicate, say, if a future
+        // refactor adds host CASE support without revisiting this
+        // gate) still routes away from the fused kernel.
+        Expr::Case { .. } => true,
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1603,6 +1639,16 @@ fn expr_contains_div_or_mod(e: &Expr) -> bool {
         }
         Expr::Alias(inner, _) => expr_contains_div_or_mod(inner),
         Expr::Unary { operand, .. } => expr_contains_div_or_mod(operand),
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            branches.iter().any(|(w, t)| {
+                expr_contains_div_or_mod(w) || expr_contains_div_or_mod(t)
+            }) || else_branch
+                .as_deref()
+                .is_some_and(expr_contains_div_or_mod)
+        }
     }
 }
 
@@ -1625,6 +1671,17 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
         }
         Expr::Alias(inner, _) => expr_has_unsafe_eager_shortcircuit(inner),
         Expr::Unary { operand, .. } => expr_has_unsafe_eager_shortcircuit(operand),
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            branches.iter().any(|(w, t)| {
+                expr_has_unsafe_eager_shortcircuit(w)
+                    || expr_has_unsafe_eager_shortcircuit(t)
+            }) || else_branch
+                .as_deref()
+                .is_some_and(expr_has_unsafe_eager_shortcircuit)
+        }
     }
 }
 
@@ -1701,12 +1758,128 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
 }
 
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
+    // Pre-flight: the GPU codegen path has no value-selection-by-mask op,
+    // so a SQL `CASE WHEN ... THEN ... END` expression anywhere in the
+    // plan cannot be lowered today. Surface a clear `Plan` error before
+    // we walk the plan so the user sees one consistent message — without
+    // this, the SELECT-list / WHERE codegen would surface the same error
+    // deep inside `Codegen::emit_expr`, with a less informative stack.
+    // Tracked for a follow-up that adds the predicated-store op.
+    if plan_contains_case(plan)? {
+        return Err(BoltError::Plan(
+            "CASE not yet lowered to GPU; coming in a follow-up".into(),
+        ));
+    }
     let phys = lower_depth(plan, 0)?;
     // Static-analysis safety net for the documented short-circuit divergence
     // (see the AND/OR arm in `emit_binary`). Runs once at the lowering
     // boundary; non-fatal warning only.
     warn_if_eager_shortcircuit_unsafe(&phys);
     Ok(phys)
+}
+
+/// True if any expression in `plan` (predicate, projection, aggregate
+/// input, group key, sort key, join key) is — or contains — an
+/// `Expr::Case` node. Used by [`lower`] as a single-pass gate that
+/// rejects CASE expressions cleanly before any kernel codegen runs.
+///
+/// The walker bounds its own recursion via
+/// [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`] so a pathologically
+/// nested plan can't overflow the host stack here.
+fn plan_contains_case(plan: &LogicalPlan) -> BoltResult<bool> {
+    plan_contains_case_depth(plan, 0)
+}
+
+fn plan_contains_case_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<bool> {
+    if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+        return Err(BoltError::Plan(format!(
+            "plan nesting exceeds depth limit ({})",
+            crate::plan::sql_frontend::MAX_RECURSION_DEPTH
+        )));
+    }
+    match plan {
+        LogicalPlan::Scan { .. } => Ok(false),
+        LogicalPlan::Filter { input, predicate } => {
+            if expr_contains_case(predicate) {
+                return Ok(true);
+            }
+            plan_contains_case_depth(input, depth + 1)
+        }
+        LogicalPlan::Project { input, exprs } => {
+            if exprs.iter().any(expr_contains_case) {
+                return Ok(true);
+            }
+            plan_contains_case_depth(input, depth + 1)
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            if group_by.iter().any(expr_contains_case) {
+                return Ok(true);
+            }
+            for agg in aggregates {
+                let inner = match agg {
+                    AggregateExpr::Count(e)
+                    | AggregateExpr::Sum(e)
+                    | AggregateExpr::Min(e)
+                    | AggregateExpr::Max(e)
+                    | AggregateExpr::Avg(e) => e,
+                };
+                if expr_contains_case(inner) {
+                    return Ok(true);
+                }
+            }
+            plan_contains_case_depth(input, depth + 1)
+        }
+        LogicalPlan::Distinct { input } | LogicalPlan::Limit { input, .. } => {
+            plan_contains_case_depth(input, depth + 1)
+        }
+        LogicalPlan::Sort { input, sort_exprs } => {
+            if sort_exprs.iter().any(|se| expr_contains_case(&se.expr)) {
+                return Ok(true);
+            }
+            plan_contains_case_depth(input, depth + 1)
+        }
+        LogicalPlan::Union { inputs } => {
+            for branch in inputs {
+                if plan_contains_case_depth(branch, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        LogicalPlan::Join {
+            left, right, on, ..
+        } => {
+            for (l, r) in on {
+                if expr_contains_case(l) || expr_contains_case(r) {
+                    return Ok(true);
+                }
+            }
+            if plan_contains_case_depth(left, depth + 1)? {
+                return Ok(true);
+            }
+            plan_contains_case_depth(right, depth + 1)
+        }
+    }
+}
+
+/// True if `e` (recursively) contains an `Expr::Case` node anywhere in its
+/// subtree. Used by [`plan_contains_case`] to scan every expression
+/// position in a logical plan; see that function for the full list of
+/// scanned positions.
+fn expr_contains_case(e: &Expr) -> bool {
+    match e {
+        Expr::Case { .. } => true,
+        Expr::Column(_) | Expr::Literal(_) => false,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_case(left) || expr_contains_case(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_case(operand),
+        Expr::Alias(inner, _) => expr_contains_case(inner),
+    }
 }
 
 /// Inner recursion for [`lower`]. `depth` is the current recursion depth;

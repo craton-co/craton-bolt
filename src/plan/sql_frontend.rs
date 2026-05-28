@@ -1712,6 +1712,36 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
             contains_aggregate(inner, resolver, depth + 1)
         }
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
+        // CASE: any nested subtree may contain an aggregate call (operand
+        // of a simple CASE, any WHEN condition, any THEN value, the ELSE).
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                if contains_aggregate(o, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            for c in conditions {
+                if contains_aggregate(c, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            for r in results {
+                if contains_aggregate(r, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            if let Some(e) = else_result {
+                if contains_aggregate(e, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         _ => Ok(false),
     }
 }
@@ -1787,6 +1817,63 @@ fn lower_expr_in_having(
                 operand: Box::new(operand),
             })
         }
+        // HAVING ... CASE: walk every subtree through the aggregate-aware
+        // lowerer so an aggregate call buried in a CASE arm
+        // (`HAVING CASE WHEN k > 0 THEN SUM(v) ELSE 0 END > 10`)
+        // resolves to the post-aggregate column reference. Simple-CASE
+        // operands are desugared the same way as in `lower_case`.
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            let lowered_operand = match operand {
+                Some(o) => Some(lower_expr_in_having(o, resolver, agg_aliases, depth + 1)?),
+                None => None,
+            };
+            if conditions.len() != results.len() {
+                return Err(BoltError::Sql(format!(
+                    "CASE expression has {} conditions and {} results; they must match",
+                    conditions.len(),
+                    results.len(),
+                )));
+            }
+            if conditions.is_empty() {
+                return Err(BoltError::Sql(
+                    "CASE expression requires at least one WHEN/THEN branch".into(),
+                ));
+            }
+            let mut branches: Vec<(Expr, Expr)> = Vec::with_capacity(conditions.len());
+            for (w, t) in conditions.iter().zip(results.iter()) {
+                let cond = match &lowered_operand {
+                    Some(op_expr) => {
+                        let v = lower_expr_in_having(w, resolver, agg_aliases, depth + 1)?;
+                        Expr::Binary {
+                            op: BinaryOp::Eq,
+                            left: Box::new(op_expr.clone()),
+                            right: Box::new(v),
+                        }
+                    }
+                    None => lower_expr_in_having(w, resolver, agg_aliases, depth + 1)?,
+                };
+                let then = lower_expr_in_having(t, resolver, agg_aliases, depth + 1)?;
+                branches.push((cond, then));
+            }
+            let else_expr = match else_result {
+                Some(e) => Some(Box::new(lower_expr_in_having(
+                    e,
+                    resolver,
+                    agg_aliases,
+                    depth + 1,
+                )?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                branches,
+                else_branch: else_expr,
+            })
+        }
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
         // still rejects bare non-aggregate Function calls).
@@ -1824,6 +1911,18 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
             }
             Expr::Alias(inner, _) => stack.push(inner),
             Expr::Unary { operand, .. } => stack.push(operand),
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
+                for (when, then) in branches {
+                    stack.push(when);
+                    stack.push(then);
+                }
+                if let Some(e) = else_branch {
+                    stack.push(e);
+                }
+            }
         }
     }
     Ok(())
@@ -1915,6 +2014,25 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                 operand: Box::new(operand),
             })
         }
+        // SQL `CASE` — both the plain (no operand) and the simple (with
+        // operand) forms. The simple form `CASE x WHEN v1 THEN ... WHEN v2
+        // THEN ... END` is rewritten branch-by-branch to `WHEN x = v1 THEN
+        // ... WHEN x = v2 THEN ...` so the lowered IR only carries the
+        // single plain shape. See `Expr::Case` for the type-checking
+        // contract.
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => lower_case(
+            operand.as_deref(),
+            conditions,
+            results,
+            else_result.as_deref(),
+            resolver,
+            depth + 1,
+        ),
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "scalar function calls are not supported".into(),
         )),
@@ -1922,6 +2040,79 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
             "unsupported expression: {other}"
         ))),
     }
+}
+
+/// Lower a SQL `CASE` expression — both the plain form (no operand) and
+/// the simple form (with operand). The simple form is desugared into the
+/// plain form by rewriting each WHEN `value` into `operand = value`, so
+/// the lowered IR only ever carries the plain shape.
+///
+/// Both `conditions` and `results` must have the same length, and there
+/// must be at least one branch (sqlparser already rejects `CASE END` at
+/// parse time, but we double-check defensively).
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn lower_case(
+    operand: Option<&SqlExpr>,
+    conditions: &[SqlExpr],
+    results: &[SqlExpr],
+    else_result: Option<&SqlExpr>,
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if conditions.len() != results.len() {
+        return Err(BoltError::Sql(format!(
+            "CASE expression has {} conditions and {} results; they must match",
+            conditions.len(),
+            results.len(),
+        )));
+    }
+    if conditions.is_empty() {
+        return Err(BoltError::Sql(
+            "CASE expression requires at least one WHEN/THEN branch".into(),
+        ));
+    }
+    // Pre-lower the operand once for the simple form so we don't repeat the
+    // work per branch. Each branch clones the lowered operand expression for
+    // its own `operand = condition` rewrite — the operand is typically a
+    // bare column or small expression so the clone is cheap.
+    let lowered_operand = match operand {
+        Some(e) => Some(lower_expr(e, resolver, depth + 1)?),
+        None => None,
+    };
+    let mut branches: Vec<(Expr, Expr)> = Vec::with_capacity(conditions.len());
+    for (when_sql, then_sql) in conditions.iter().zip(results.iter()) {
+        let cond_expr = match &lowered_operand {
+            Some(op_expr) => {
+                // Simple CASE: rewrite `CASE op WHEN v THEN ...` into
+                // `CASE WHEN op = v THEN ...`. Each branch gets a fresh
+                // clone of the lowered operand on the LHS of the equality.
+                let v = lower_expr(when_sql, resolver, depth + 1)?;
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(op_expr.clone()),
+                    right: Box::new(v),
+                }
+            }
+            // Plain CASE: the WHEN expression is the condition verbatim.
+            None => lower_expr(when_sql, resolver, depth + 1)?,
+        };
+        let then_expr = lower_expr(then_sql, resolver, depth + 1)?;
+        branches.push((cond_expr, then_expr));
+    }
+    let else_expr = match else_result {
+        Some(e) => Some(Box::new(lower_expr(e, resolver, depth + 1)?)),
+        None => None,
+    };
+    Ok(Expr::Case {
+        branches,
+        else_branch: else_expr,
+    })
 }
 
 /// Translate a SQL literal `Value` into our `Literal` expression.
@@ -2873,6 +3064,18 @@ mod wave7_tests {
                         }
                         Expr::Alias(inner, _) => stack.push(inner),
                         Expr::Unary { operand, .. } => stack.push(operand),
+                        Expr::Case {
+                            branches,
+                            else_branch,
+                        } => {
+                            for (w, t) in branches {
+                                stack.push(w);
+                                stack.push(t);
+                            }
+                            if let Some(e) = else_branch {
+                                stack.push(e);
+                            }
+                        }
                         Expr::Literal(_) => {}
                     }
                 }

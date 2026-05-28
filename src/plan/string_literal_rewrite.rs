@@ -357,17 +357,33 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 right: Box::new(new_right),
             })
         }
-        Expr::Unary { op, operand } => {
-            // `IS [NOT] NULL` does not interact with the string-literal
-            // rewriter: the rewriter folds `col = 'lit'` shapes into
-            // integer-index comparisons against a registered dictionary,
-            // and a unary validity test has no literal to resolve. We
-            // still walk the operand so any rewritable sub-expression
-            // (e.g. `(col = 'a') IS NULL`, however unusual) is normalised.
-            let new_operand = rewrite_expr_with(operand, r, depth + 1)?;
-            Ok(Expr::Unary {
-                op: *op,
-                operand: Box::new(new_operand),
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            // CASE WHEN ... THEN ... [ELSE ...] END: rewrite every WHEN /
+            // THEN / ELSE sub-expression so string-literal comparisons
+            // inside arms are normalised against the dictionary in the
+            // same way they would be at the top level. CASE itself has
+            // no `col = 'lit'` shape to fold against — the rewriter only
+            // matches direct binary comparisons — so we just recurse and
+            // rebuild.
+            let new_branches = branches
+                .iter()
+                .map(|(w, t)| {
+                    Ok::<_, BoltError>((
+                        rewrite_expr_with(w, r, depth + 1)?,
+                        rewrite_expr_with(t, r, depth + 1)?,
+                    ))
+                })
+                .collect::<BoltResult<Vec<_>>>()?;
+            let new_else = match else_branch {
+                Some(e) => Some(Box::new(rewrite_expr_with(e, r, depth + 1)?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                branches: new_branches,
+                else_branch: new_else,
             })
         }
     }
