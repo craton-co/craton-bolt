@@ -24,8 +24,9 @@ use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::MinMaxOp;
 use crate::jit::partition_reduce_kernel_minmax_float::{
-    compile_partition_reduce_kernel_minmax_float, kernel_entry as minmax_float_entry,
-    FloatDtype, BLOCK_GROUPS, BLOCK_THREADS as REDUCE_BLOCK_THREADS,
+    compile_partition_reduce_kernel_minmax_float_with_spill,
+    kernel_entry_with_spill as minmax_float_entry_with_spill, FloatDtype, BLOCK_GROUPS,
+    BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
 use crate::jit::{partition_kernel, scatter_kernel, CudaModule};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
@@ -255,12 +256,13 @@ fn execute_inner(
     let mut out_keys_gpu: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_vals_gpu: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMaxFloat(
         ReduceFloatKey::from_pair(op, float_dtype),
     ))?;
     {
-        let entry = minmax_float_entry(op, float_dtype);
+        let entry = minmax_float_entry_with_spill(op, float_dtype);
         let func = reduce_module.function(&entry)?;
 
         let view_pk = scatter_keys.view();
@@ -269,6 +271,7 @@ fn execute_inner(
         let mut view_ok = out_keys_gpu.view_mut();
         let mut view_ov = out_vals_gpu.view_mut();
         let mut view_os = out_set_gpu.view_mut();
+        let mut view_sp = spill.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_pk);
@@ -277,6 +280,7 @@ fn execute_inner(
         args.push_output(&mut view_ok);
         args.push_output(&mut view_ov);
         args.push_output(&mut view_os);
+        args.push_output(&mut view_sp);
 
         launch_with_geometry(
             func,
@@ -293,6 +297,13 @@ fn execute_inner(
     let pinned_vals = out_vals_gpu.to_pinned_async(stream.raw())?;
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
+    let spill_count = spill.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
     let host_out_keys: Vec<i32> = pinned_keys.as_slice().to_vec();
     let host_out_vals: Vec<f64> = pinned_vals.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();

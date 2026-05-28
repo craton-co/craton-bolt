@@ -49,8 +49,9 @@ use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::{MinMaxDtype, MinMaxOp};
 use crate::jit::partition_reduce_kernel_minmax_i64::{
-    compile_partition_reduce_kernel_minmax_i64, kernel_entry as minmax_i64_entry,
-    BLOCK_GROUPS, BLOCK_THREADS as REDUCE_BLOCK_THREADS,
+    compile_partition_reduce_kernel_minmax_i64_with_spill,
+    kernel_entry_with_spill as minmax_i64_entry, BLOCK_GROUPS,
+    BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
 use crate::jit::{partition_kernel_i64, scatter_kernel_i64, CudaModule};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
@@ -408,6 +409,7 @@ fn run_reduce_phase_i32(
     let mut out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_vals_gpu: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMaxI64(
         ReduceKey::from_pair(op, MinMaxDtype::Int32),
@@ -422,6 +424,7 @@ fn run_reduce_phase_i32(
         let mut view_ok = out_keys_gpu.view_mut();
         let mut view_ov = out_vals_gpu.view_mut();
         let mut view_os = out_set_gpu.view_mut();
+        let mut view_sp = spill.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_pk);
@@ -430,6 +433,7 @@ fn run_reduce_phase_i32(
         args.push_output(&mut view_ok);
         args.push_output(&mut view_ov);
         args.push_output(&mut view_os);
+        args.push_output(&mut view_sp);
 
         launch_with_geometry(func, num_partitions, REDUCE_BLOCK_THREADS, 0, stream, &mut args)?;
     }
@@ -439,6 +443,13 @@ fn run_reduce_phase_i32(
     let pinned_vals = out_vals_gpu.to_pinned_async(stream.raw())?;
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
+    let spill_count = spill.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
     let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
     let host_out_vals: Vec<i32> = pinned_vals.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
@@ -502,6 +513,7 @@ fn run_reduce_phase_i64(
     let mut out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_vals_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMaxI64(
         ReduceKey::from_pair(op, MinMaxDtype::Int64),
@@ -516,6 +528,7 @@ fn run_reduce_phase_i64(
         let mut view_ok = out_keys_gpu.view_mut();
         let mut view_ov = out_vals_gpu.view_mut();
         let mut view_os = out_set_gpu.view_mut();
+        let mut view_sp = spill.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_pk);
@@ -524,6 +537,7 @@ fn run_reduce_phase_i64(
         args.push_output(&mut view_ok);
         args.push_output(&mut view_ov);
         args.push_output(&mut view_os);
+        args.push_output(&mut view_sp);
 
         launch_with_geometry(func, num_partitions, REDUCE_BLOCK_THREADS, 0, stream, &mut args)?;
     }
@@ -533,6 +547,13 @@ fn run_reduce_phase_i64(
     let pinned_vals = out_vals_gpu.to_pinned_async(stream.raw())?;
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
+    let spill_count = spill.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
     let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
     let host_out_vals: Vec<i64> = pinned_vals.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();

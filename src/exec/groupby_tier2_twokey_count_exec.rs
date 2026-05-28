@@ -280,20 +280,24 @@ fn execute_inner(
     let out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
     let out_counts_gpu: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_out_slots, stream.raw())?;
     let out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    let spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
     let reduce_module = get_or_build_module(&KernelSpec::ReduceCountI64)?;
     {
-        let func = reduce_module.function(partition_reduce_kernel_count_i64::KERNEL_ENTRY)?;
+        let func = reduce_module
+            .function(partition_reduce_kernel_count_i64::KERNEL_ENTRY_WITH_SPILL)?;
         let mut keys_ptr = scatter_keys.device_ptr();
         let mut offsets_ptr = offsets_kp1_gpu.device_ptr();
         let mut ok_ptr = out_keys_gpu.device_ptr();
         let mut oc_ptr = out_counts_gpu.device_ptr();
         let mut os_ptr = out_set_gpu.device_ptr();
-        let mut params: [*mut c_void; 5] = [
+        let mut sp_ptr = spill.device_ptr();
+        let mut params: [*mut c_void; 6] = [
             &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
             &mut offsets_ptr as *mut CUdeviceptr as *mut c_void,
             &mut ok_ptr as *mut CUdeviceptr as *mut c_void,
             &mut oc_ptr as *mut CUdeviceptr as *mut c_void,
             &mut os_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut sp_ptr as *mut CUdeviceptr as *mut c_void,
         ];
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
@@ -318,6 +322,13 @@ fn execute_inner(
     let pinned_counts = out_counts_gpu.to_pinned_async(stream.raw())?;
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
+    let spill_count = spill.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
     let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
     let host_out_counts: Vec<u64> = pinned_counts.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();

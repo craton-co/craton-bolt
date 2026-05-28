@@ -344,12 +344,15 @@ fn execute_inner(
     // its out_counts. Output dedup keys / set come from the SUM reduce.
     let mut count_out_keys_gpu: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_out_slots, stream.raw())?;
     let mut count_out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    // Spill counter for the multi-SUM reduce. Non-zero after sync means
+    // some rows dropped on probe overflow and the result is incorrect.
+    let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     // ---- Multi-SUM reduce -----------------------------------------------
     let reduce_multi_module =
         get_or_build_module(&KernelSpec::ReduceMulti { n_vals: n_vals as u32 })?;
     {
-        let entry = partition_reduce_kernel_multi::kernel_entry(n_vals as u32);
+        let entry = partition_reduce_kernel_multi::kernel_entry_with_spill(n_vals as u32);
         let func = reduce_multi_module.function(&entry)?;
 
         let view_sk = scatter_keys.view();
@@ -358,6 +361,7 @@ fn execute_inner(
         let mut view_ok = out_keys_gpu.view_mut();
         let mut views_ov: Vec<_> = out_vals_gpu.iter_mut().map(|g| g.view_mut()).collect();
         let mut view_os = out_set_gpu.view_mut();
+        let mut view_sp = spill.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_sk);
@@ -370,6 +374,7 @@ fn execute_inner(
             args.push_output(v);
         }
         args.push_output(&mut view_os);
+        args.push_output(&mut view_sp);
 
         launch_with_geometry(
             func,
@@ -430,6 +435,13 @@ fn execute_inner(
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     let pinned_counts = out_counts_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
+    let spill_count = spill.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
     let host_out_keys: Vec<i32> = pinned_keys.as_slice().to_vec();
     let host_out_vals: Vec<Vec<f64>> = pinned_vals
         .iter()
