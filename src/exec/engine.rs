@@ -748,6 +748,25 @@ impl EngineBuilder {
             log::set_max_level(log::LevelFilter::Info);
         }
 
+        // v0.7: wire the builder-supplied `persistent_cache(path)` knob
+        // into the process-wide disk PTX cache (see `jit::disk_cache`).
+        // When `persistent_cache_path` is `Some`, install it as a
+        // builder override — `disk_cache::resolve_cache_dir` prefers an
+        // installed override over the `BOLT_PTX_CACHE_DIR` env var so
+        // the builder-explicit path wins (last-write-wins between this
+        // path and any prior `set_disk_ptx_cache_dir` call).
+        //
+        // When `persistent_cache_path` is `None` we intentionally do
+        // NOT clear the override here: an unset builder knob must not
+        // wipe out an env-var-driven cache that the surrounding
+        // process configured, and must not wipe out an override that
+        // another component installed before us. The env-var path
+        // therefore continues to work unchanged when the builder
+        // doesn't opt in.
+        if let Some(p) = self.persistent_cache_path.clone() {
+            crate::jit::set_disk_ptx_cache_dir(Some(p));
+        }
+
         Ok(Engine {
             tables: HashMap::new(),
             provider: MemTableProvider::new(),
@@ -3840,6 +3859,94 @@ mod tests {
             "clone of the same spec must produce the same cache key — \
              otherwise repeat queries would always JIT-compile from scratch"
         );
+    }
+
+    // ---- v0.7: `EngineBuilder::persistent_cache` wires into disk PTX cache ----
+
+    /// `EngineBuilder::persistent_cache(path).build()` must install
+    /// `path` as the process-wide disk PTX cache override, so a later
+    /// `crate::jit::disk_cache::disk_cache()` resolves to it instead of
+    /// (or in preference to) the `BOLT_PTX_CACHE_DIR` env var.
+    ///
+    /// Marked `#[ignore]` because `build()` initialises the CUDA driver
+    /// and that's not available on every CI host. The wiring under test
+    /// is, however, GPU-independent — it's a pure setter call inside
+    /// `build()` — so on a non-GPU host the env-var-only path
+    /// (`persistent_cache` not called) is exercised implicitly by every
+    /// other test that instantiates an Engine without calling this
+    /// knob, and the env-var contract continues to hold.
+    #[test]
+    #[ignore = "gpu:e2e — EngineBuilder::build initializes CUDA driver"]
+    fn builder_persistent_cache_wires_into_disk_ptx_cache() {
+        // Use a unique-per-run temp dir so this test can't observe
+        // leftover state from a previous run or interfere with a
+        // sibling test that also pokes the override slot.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "craton-bolt-builder-persistent-cache-{}-{}",
+            std::process::id(),
+            // Cheap unique suffix without a `rand` dep.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+
+        // Save + restore the process-wide override slot so this test
+        // doesn't leak state into siblings (the disk-cache module's
+        // own tests do the same dance with their own ENV_LOCK; we
+        // skip the lock here because the test is `#[ignore]` and not
+        // expected to interleave with disk_cache's tests under
+        // `cargo test`).
+        let prev = crate::jit::current_disk_ptx_cache_dir();
+
+        let _engine = Engine::builder()
+            .persistent_cache(path.clone())
+            .build()
+            .expect("builder + CUDA init");
+
+        // The setter must have run: the override slot now reflects
+        // the builder-supplied path.
+        assert_eq!(
+            crate::jit::current_disk_ptx_cache_dir(),
+            Some(path.clone()),
+            "EngineBuilder::persistent_cache must propagate into the \
+             process-wide disk PTX cache override"
+        );
+
+        // Restore prior state so we don't leak into sibling tests.
+        crate::jit::set_disk_ptx_cache_dir(prev);
+    }
+
+    /// When `persistent_cache` is NOT called on the builder, `build`
+    /// must NOT touch the disk-cache override slot — so a previously-
+    /// installed override (or the `BOLT_PTX_CACHE_DIR` env-var path)
+    /// continues to take effect unchanged.
+    #[test]
+    #[ignore = "gpu:e2e — EngineBuilder::build initializes CUDA driver"]
+    fn builder_without_persistent_cache_preserves_existing_override() {
+        let mut prior = std::env::temp_dir();
+        prior.push(format!(
+            "craton-bolt-builder-prior-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let prev = crate::jit::current_disk_ptx_cache_dir();
+        crate::jit::set_disk_ptx_cache_dir(Some(prior.clone()));
+
+        let _engine = Engine::builder().build().expect("builder + CUDA init");
+
+        assert_eq!(
+            crate::jit::current_disk_ptx_cache_dir(),
+            Some(prior),
+            "builder without persistent_cache must NOT clobber a \
+             pre-installed override (env-var path must keep working too)"
+        );
+
+        crate::jit::set_disk_ptx_cache_dir(prev);
     }
 
     /// End-to-end cache miss on a *different* projection: confirm the cache
