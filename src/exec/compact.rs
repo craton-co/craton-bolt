@@ -25,7 +25,7 @@ use arrow::compute::filter;
 use arrow_array::{ArrayRef, BooleanArray};
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
-use crate::cuda::GpuVec;
+use crate::cuda::{GpuVec, PinnedHostBuffer};
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::jit::CudaFunction;
@@ -40,17 +40,59 @@ const PREDICATE_BLOCK_SIZE: u32 = 256;
 /// byte per row, `1` for "keep" and `0` for "drop". Any non-zero byte is
 /// treated as `true` to be tolerant of mask kernels that emit other truthy
 /// values.
-pub fn download_mask(mask_device_ptr: CUdeviceptr, n_rows: usize) -> BoltResult<Vec<bool>> {
+///
+/// v0.7 async-D2H wiring: the copy runs through
+/// [`PinnedHostBuffer<u8>`] + `memcpy_d2h_async` on the caller's
+/// `stream`, then a single `stream.synchronize()` fences before the
+/// pinned buffer is converted to `Vec<bool>`. Routing the WHERE-filter
+/// mask through the same pinned-DMA path as the data columns lets the
+/// driver chain the predicate-kernel launch, the mask D2H, and the
+/// subsequent output-column D2Hs on the same stream — eliminating the
+/// implicit `cuCtxSynchronize` the legacy synchronous `memcpy_d2h`
+/// inserted right after the predicate launch.
+///
+/// The mask is held as a raw `CUdeviceptr` (sourced from
+/// `alloc_mask_buffer().device_ptr()` at every call site), so this
+/// function takes the raw-pointer + length pair directly rather than a
+/// `GpuVec<u8>`. The caller must keep the backing `GpuVec<u8>` alive
+/// until this function returns — which the existing call sites already
+/// do, since the mask allocation outlives the `download_mask` call by
+/// design.
+pub fn download_mask(
+    mask_device_ptr: CUdeviceptr,
+    n_rows: usize,
+    stream: &CudaStream,
+) -> BoltResult<Vec<bool>> {
     if n_rows == 0 {
         return Ok(Vec::new());
     }
-    let mut host = vec![0u8; n_rows];
-    // SAFETY: `host` is valid for `n_rows` byte writes; the caller asserts
-    // `mask_device_ptr` is a live device allocation of at least that size.
+    // Pinned destination so the driver DMAs straight into host-visible
+    // memory without a hidden staging copy. The pinned buffer owns its
+    // page-locked pages and `Drop` fences the last-recorded stream, so
+    // we only have to (a) tag the stream and (b) synchronize once below
+    // before reading.
+    let mut pinned = PinnedHostBuffer::<u8>::new(n_rows)?;
+    // SAFETY: `pinned.as_mut_ptr()` is valid for `n_rows` byte writes
+    // (just allocated); `mask_device_ptr` is asserted by the caller to
+    // be a live device allocation of at least that many bytes. The
+    // `stream.synchronize()` below fences before we read.
     unsafe {
-        cuda_sys::memcpy_d2h::<u8>(host.as_mut_ptr(), mask_device_ptr, n_rows)?;
+        cuda_sys::memcpy_d2h_async::<u8>(
+            pinned.as_mut_ptr(),
+            mask_device_ptr,
+            n_rows,
+            stream.raw(),
+        )?;
     }
-    Ok(host.into_iter().map(|b| b != 0).collect())
+    // Pair the in-flight DMA with the pinned buffer so `Drop` can sync
+    // before reclaiming the page-locked pages (review finding C13).
+    pinned.mark_stream_use(stream.raw());
+    stream.synchronize()?;
+    // Convert pinned `[u8]` -> `Vec<bool>`. We deliberately don't expose
+    // the pinned slice past this point — the host fan-out path expects
+    // an owned `Vec<bool>`, and the per-row decode is trivially cheap
+    // relative to the DMA itself.
+    Ok(pinned.as_slice().iter().map(|&b| b != 0).collect())
 }
 
 /// Apply `mask` to an Arrow array, returning a new array with only the kept
@@ -322,6 +364,41 @@ mod tests {
         assert!(
             msg.contains("length mismatch"),
             "expected length-mismatch error, got: {msg}"
+        );
+    }
+
+    /// `n_rows == 0` short-circuits before touching CUDA, so the function
+    /// must succeed and return an empty `Vec<bool>` even with a null
+    /// device pointer and the NULL stream. Exercises the early-exit path
+    /// on every backend (stub or real).
+    #[test]
+    fn download_mask_zero_rows_skips_cuda() {
+        let stream = CudaStream::null();
+        let out = download_mask(0 as CUdeviceptr, 0, &stream)
+            .expect("zero-row download must not error");
+        assert!(out.is_empty(), "expected empty Vec<bool>");
+    }
+
+    /// Under `--features cuda-stub` every async FFI call returns
+    /// `CUDA_ERROR_STUB`, which `check()` surfaces as a `BoltError`. The
+    /// async-D2H wiring must propagate that as an `Err` cleanly — *not*
+    /// panic — so the rest of the executor can degrade gracefully. The
+    /// non-stub backend hits real CUDA, which would require a live
+    /// context; that path is covered by the integration tests under
+    /// `tests/`, so we gate this stub-only check on the feature.
+    #[cfg(feature = "cuda-stub")]
+    #[test]
+    fn download_mask_stub_errors_without_panic() {
+        let stream = CudaStream::null();
+        // The stub backend errors on `PinnedHostBuffer::new` (which calls
+        // `cuMemAllocHost_v2`) for a non-zero length. Either that error
+        // or a downstream `memcpy_d2h_async` stub error must surface as
+        // a `BoltError`; what matters is that we return `Err`, not
+        // panic / abort.
+        let res = download_mask(0 as CUdeviceptr, 8, &stream);
+        assert!(
+            res.is_err(),
+            "stub backend must surface an Err from download_mask, got Ok"
         );
     }
 }

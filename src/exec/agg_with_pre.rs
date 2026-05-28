@@ -315,7 +315,11 @@ fn run_pre_stage(
             n_rows_to_u32(n_rows)?,
             &stream,
         )?;
-        Some(crate::exec::compact::download_mask(mask.device_ptr(), n_rows)?)
+        Some(crate::exec::compact::download_mask(
+            mask.device_ptr(),
+            n_rows,
+            &stream,
+        )?)
     } else {
         None
     };

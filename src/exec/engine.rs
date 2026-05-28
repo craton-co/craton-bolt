@@ -2336,7 +2336,7 @@ impl Engine {
             if has_utf8_output {
                 // Host-side fallback: download mask + outputs, then filter.
                 let host_mask =
-                    crate::exec::compact::download_mask(mask.device_ptr(), n_rows)?;
+                    crate::exec::compact::download_mask(mask.device_ptr(), n_rows, &stream)?;
                 // Stage-3: route every primitive output column through the
                 // pinned async D2H path. Each `download_pinned` call
                 // synchronizes the stream internally, so we don't need a
