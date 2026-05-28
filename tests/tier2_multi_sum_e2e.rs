@@ -13,7 +13,7 @@
 //! relative tolerance (1e-9), per the existing Tier-2 contract.
 
 mod common;
-use common::Xorshift64Star;
+use common::{Xorshift64Star, REL_TOL};
 
 use std::collections::HashMap;
 
@@ -193,7 +193,7 @@ fn model_agrees_with_naive_n2_medium() {
     let model = cpu_tier2_multi_sum_model(&keys, &vals);
     let naive = cpu_naive_multi_sum_groupby(&keys, &vals);
     let err = max_relative_error_multi(&model, &naive);
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn model_agrees_with_naive_n2_high_card() {
     let model = cpu_tier2_multi_sum_model(&keys, &vals);
     let naive = cpu_naive_multi_sum_groupby(&keys, &vals);
     let err = max_relative_error_multi(&model, &naive);
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn model_agrees_with_naive_n4_medium() {
     let model = cpu_tier2_multi_sum_model(&keys, &vals);
     let naive = cpu_naive_multi_sum_groupby(&keys, &vals);
     let err = max_relative_error_multi(&model, &naive);
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -478,13 +478,13 @@ fn no_value_column_swap_under_permutation_n2() {
         let expected_v0 = (*k as f64) * n;
         let expected_v1 = (100.0 + *k as f64) * n;
         assert!(
-            (sums[0] - expected_v0).abs() < 1e-9,
+            (sums[0] - expected_v0).abs() < REL_TOL,
             "key {k}: SUM(v0) got {} expected {}",
             sums[0],
             expected_v0
         );
         assert!(
-            (sums[1] - expected_v1).abs() < 1e-9,
+            (sums[1] - expected_v1).abs() < REL_TOL,
             "key {k}: SUM(v1) got {} expected {}",
             sums[1],
             expected_v1
@@ -575,8 +575,8 @@ fn tier2_multi_pipeline_matches_cpu_model() {
 
     let err = max_relative_error_multi(&actual, &expected);
     assert!(
-        err < 1e-9,
-        "GPU multi-SUM pipeline vs CPU model: max rel err {err:e} exceeded 1e-9"
+        err < REL_TOL,
+        "GPU multi-SUM pipeline vs CPU model: max rel err {err:e} exceeded {REL_TOL:e}"
     );
 }
 

@@ -170,6 +170,21 @@ pub mod __test_only_logical_plan {
     pub use crate::plan::logical_plan::DataType;
 }
 
+/// Default relative-tolerance constant for the test + bench harness.
+///
+/// Mirrored from `tests/common::REL_TOL`. Integration tests under `tests/`
+/// share that copy via `mod common;`; benches under `benches/` are compiled
+/// as their own crate and cannot reach into the test binary's modules, so
+/// they import this re-export instead. Keeping both definitions
+/// numerically identical is the whole point of centralising the constant —
+/// when you change one, change the other (and `git grep REL_TOL` will
+/// surface both).
+///
+/// Not a stable public API surface (`#[doc(hidden)]`); benches and dev-deps
+/// only.
+#[doc(hidden)]
+pub const REL_TOL_TEST: f64 = 1e-9;
+
 /// Test-only re-export of the live Tier-2 partition-count constant.
 ///
 /// Integration tests under `tests/` need the same `NUM_PARTITIONS` value

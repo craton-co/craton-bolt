@@ -12,8 +12,9 @@
 //!      [`craton_bolt::Engine::register_table`]).
 //!   3. Run the same SQL on both, decode each result row-by-row into a
 //!      normalised `Cell` representation, canonicalise the row order, and
-//!      assert numerical agreement (`REL_TOL = 1e-9` for floats; exact for
-//!      ints / bools / strings; null on one side must be null on the other).
+//!      assert numerical agreement (`common::REL_TOL = 1e-9` for floats;
+//!      exact for ints / bools / strings; null on one side must be null on
+//!      the other).
 //!   4. On mismatch, print BOTH result sets in full so the diff is obvious.
 //!
 //! The eight curated cases are chosen to instantly catch the three critical
@@ -44,16 +45,18 @@ use arrow_array::{
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
+mod common;
+use common::REL_TOL;
+
 // ---------------------------------------------------------------------------
 // Tolerances + cell representation
 // ---------------------------------------------------------------------------
-
-/// Relative tolerance for float comparisons. Matches
-/// `benches/olap_benchmarks.rs::REL_TOL` — SUMs reordered by a parallel
-/// engine accumulate up to ~10 ULPs of rounding noise, so 1e-9 relative
-/// is comfortably above that floor while still tight enough to catch a
-/// genuine arithmetic bug.
-const REL_TOL: f64 = 1e-9;
+//
+// `REL_TOL` is the shared test-suite-wide constant from `tests/common/mod.rs`
+// — SUMs reordered by a parallel engine accumulate up to ~10 ULPs of
+// rounding noise, so 1e-9 relative is comfortably above that floor while
+// still tight enough to catch a genuine arithmetic bug. The bench crate
+// uses `craton_bolt::REL_TOL_TEST` (same value, different binary).
 
 /// Normalised representation of a single result cell from either engine.
 ///
@@ -481,6 +484,52 @@ fn t_distinct(n: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(a), Arc::new(b)]).expect("t_distinct batch")
 }
 
+/// Single-table fixture `t(s: Utf8, v: i64)` for the Utf8/dictionary diff
+/// cases. The `s` column draws from a small vocabulary so the engine's
+/// dictionary registry sees a dense dict and the string-literal rewriter
+/// has the values it needs to fold `WHERE s = 'foo'` into integer
+/// equality on `__idx_s`. `v` carries enough numeric variety to exercise
+/// the compound-predicate test (`AND v > 10`).
+fn t_strings(n: usize) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", ArrowDataType::Utf8, false),
+        ArrowField::new("v", ArrowDataType::Int64, false),
+    ]));
+    // 4-way vocabulary, cycled deterministically. Includes "foo" so the
+    // value-present case has hits; "qux" is reserved for the absent test.
+    let vocab = ["foo", "bar", "baz", "abc"];
+    let s_vals: Vec<&str> = (0..n).map(|i| vocab[i % vocab.len()]).collect();
+    let s = StringArray::from(s_vals);
+    let v: Int64Array = (0..n as i64).map(|i| (i * 3) % 31).collect();
+    RecordBatch::try_new(schema, vec![Arc::new(s), Arc::new(v)])
+        .expect("t_strings batch")
+}
+
+/// Two-table Utf8 join fixture: `t1(s)` and `t2(s)` with overlapping
+/// vocabularies. The intersection (`foo`, `bar`) drives the inner-join
+/// hit rate; `only1` / `only2` ensure each side has rows that should
+/// NOT survive the join, so a degenerate "return everything" bug shows
+/// up as a row-count mismatch against DuckDB.
+fn t_strings_join_fixture(n: usize) -> (RecordBatch, RecordBatch) {
+    let s1_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let s2_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let vocab1 = ["foo", "bar", "only1", "foo"];
+    let vocab2 = ["foo", "only2", "bar", "bar"];
+    let s1: StringArray = (0..n).map(|i| vocab1[i % vocab1.len()]).collect();
+    let s2: StringArray = (0..n).map(|i| vocab2[i % vocab2.len()]).collect();
+    let t1 = RecordBatch::try_new(s1_schema, vec![Arc::new(s1)]).expect("t1 strings batch");
+    let t2 = RecordBatch::try_new(s2_schema, vec![Arc::new(s2)]).expect("t2 strings batch");
+    (t1, t2)
+}
+
 /// Build-the-join-fixture: two tables `t1(k, v)` and `t2(k, w)` with a
 /// medium-overlap key space.
 fn join_fixture(n: usize) -> (RecordBatch, RecordBatch) {
@@ -513,7 +562,7 @@ fn join_fixture(n: usize) -> (RecordBatch, RecordBatch) {
 /// Case 1 — basic filter pass-through. No aggregation, no grouping; sanity
 /// check that projection + WHERE agree across engines.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:e2e"]
 fn diff_filter_basic() {
     let batch = t_no_nulls(1024);
     diff_query(
@@ -532,7 +581,7 @@ fn diff_filter_basic() {
 /// Case 2 — single-key SUM. The most common groupby shape; if this fails,
 /// nothing harder will pass.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:e2e"]
 fn diff_groupby_basic_sum() {
     let batch = t_no_nulls(1024);
     diff_query(
@@ -553,7 +602,7 @@ fn diff_groupby_basic_sum() {
 /// groups; DuckDB returns only those whose `SUM(v) > 100`. The differential
 /// check trips on the row-count mismatch.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:e2e"]
 fn diff_groupby_having_sum() {
     // Use an all-positive value column so HAVING > 100 has a meaningful
     // signal (otherwise sin() can sum near zero per group and the filter
@@ -584,7 +633,7 @@ fn diff_groupby_having_sum() {
 /// negative-side, and shifts AVG. DuckDB applies the spec correctly; any
 /// drift from Bolt fires the assert with a clean per-cell diff.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:e2e"]
 fn diff_agg_nulls_min_max_avg_count() {
     let batch = t_with_nulls(1024);
     // Wrap in a single-row scalar-agg shape: no GROUP BY, so the result
@@ -612,7 +661,7 @@ fn diff_agg_nulls_min_max_avg_count() {
 /// with deliberately overlapping per-column value ranges. That still
 /// exercises the multi-column key path and would catch C3.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:e2e"]
 fn diff_distinct_high_volume() {
     let batch = t_distinct(16_384);
     diff_query(
@@ -631,7 +680,7 @@ fn diff_distinct_high_volume() {
 /// post-aggregation pipelines (sort + limit) are wired to the same
 /// rows + values DuckDB produces.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:e2e"]
 fn diff_groupby_order_limit() {
     let batch = t_no_nulls(2048);
     diff_query_ordered(
@@ -651,7 +700,7 @@ fn diff_groupby_order_limit() {
 /// two-table fixture loader and validates the join-output schema matches
 /// DuckDB column-for-column.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:e2e"]
 fn diff_inner_join() {
     let (t1, t2) = join_fixture(512);
     diff_query(
@@ -678,7 +727,7 @@ fn diff_inner_join() {
 /// canonical mapping. Any per-cell drift in a SUM(a) / SUM(b) / SUM(c)
 /// triplet trips this case.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:e2e"]
 fn diff_groupby_multi_sum() {
     let batch = t_no_nulls(2048);
     diff_query(
@@ -689,6 +738,151 @@ fn diff_groupby_multi_sum() {
             ddl_cols:
                 "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
                  a DOUBLE NOT NULL, b DOUBLE NOT NULL, c DOUBLE NOT NULL",
+            batch,
+        }],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Utf8 / dictionary differential cases (review H8)
+// ---------------------------------------------------------------------------
+//
+// The eight cases above cover only numeric + bool dtypes. Bolt's string
+// path — dictionary registry (`src/exec/dict_registry.rs`), Utf8 GPU
+// dictionaries (`src/cuda/dictionary*.rs`), and the string-literal
+// rewriter (`src/plan/string_literal_rewrite.rs`) — had ZERO end-to-end
+// coverage against DuckDB. The cases below close that gap for every
+// Utf8/dict SQL surface that's currently wired end-to-end in Bolt:
+//
+//   * `WHERE s = 'lit'` and the constant-folded "literal not in dict"
+//     short-circuit (the rewriter emits `Bool(false)`).
+//   * Inner JOIN on a Utf8 key (gpu_join's `SingleUtf8` shape).
+//   * DISTINCT on a Utf8 column (host-side dedup with `RowKeyValue::Utf8`).
+//   * Compound predicate that mixes string equality with a numeric range
+//     — exercises the rewriter recursing through `AND`.
+//
+// NOT covered here: `GROUP BY <Utf8 column>`. The executor currently
+// rejects with `"Utf8 GROUP BY keys not yet supported"` (see
+// `src/exec/groupby_with_pre.rs` and `src/exec/groupby.rs`), so a diff
+// test would panic on the Bolt side rather than exercise the comparison
+// path. Add it the moment that error lifts.
+//
+// Gating: `#[ignore = "gpu:string_diff"]` per the H8 review ask. Run on
+// a GPU host with:
+//
+//     cargo test --test diff_duckdb -- --ignored
+
+/// Case 9 — `WHERE s = 'lit'` against a literal that IS in the dictionary.
+/// Round-trips the rewriter's hot path: the predicate folds to
+/// `__idx_s = <dict_idx_of_foo>`, the GPU runs integer eq, and the host
+/// gathers exactly the `s = 'foo'` rows. Any drift from DuckDB here
+/// indicates either a dictionary-index bug (wrong index for "foo") or a
+/// gather-compaction bug.
+#[test]
+#[ignore = "gpu:string_diff"]
+fn diff_string_equality_value_present() {
+    let batch = t_strings(1024);
+    diff_query(
+        "diff_string_equality_value_present",
+        "SELECT s FROM t WHERE s = 'foo'",
+        &[TableSpec {
+            name: "t",
+            ddl_cols: "s VARCHAR NOT NULL, v BIGINT NOT NULL",
+            batch,
+        }],
+    );
+}
+
+/// Case 10 — `WHERE s = 'lit'` against a literal that is NOT in the
+/// dictionary. `string_literal_rewrite` constant-folds this to
+/// `Bool(false)`, so Bolt should return zero rows — matching DuckDB,
+/// which evaluates the equality and gets no hits. Catches a regression
+/// where the fold either fires too eagerly (returns 0 when matches
+/// exist) or fails to fire (returns garbage indices).
+#[test]
+#[ignore = "gpu:string_diff"]
+fn diff_string_equality_value_absent() {
+    // "qux" is not present in `t_strings`'s 4-word vocabulary, so the
+    // rewriter must fold the predicate to Bool(false) and surface zero
+    // rows on both engines.
+    let batch = t_strings(1024);
+    diff_query(
+        "diff_string_equality_value_absent",
+        "SELECT s FROM t WHERE s = 'qux'",
+        &[TableSpec {
+            name: "t",
+            ddl_cols: "s VARCHAR NOT NULL, v BIGINT NOT NULL",
+            batch,
+        }],
+    );
+}
+
+/// Case 11 — INNER JOIN on a Utf8 key. Exercises `KeyShape::SingleUtf8`
+/// in `src/exec/gpu_join.rs`: both sides string-intern their keys to
+/// i32 dictionary indices, the GPU joins on the indices, and the host
+/// re-materialises the original strings on the output side. A bug in
+/// the interner (e.g. independent dictionaries for the two sides) would
+/// produce false negatives — DuckDB's row count gives the canonical
+/// answer.
+#[test]
+#[ignore = "gpu:string_diff"]
+fn diff_string_join_inner() {
+    let (t1, t2) = t_strings_join_fixture(256);
+    diff_query(
+        "diff_string_join_inner",
+        "SELECT t1.s FROM t1 INNER JOIN t2 ON t1.s = t2.s",
+        &[
+            TableSpec {
+                name: "t1",
+                ddl_cols: "s VARCHAR NOT NULL",
+                batch: t1,
+            },
+            TableSpec {
+                name: "t2",
+                ddl_cols: "s VARCHAR NOT NULL",
+                batch: t2,
+            },
+        ],
+    );
+}
+
+/// Case 12 — `SELECT DISTINCT s FROM t ORDER BY s`. Exercises the
+/// host-side DISTINCT path's `RowKeyValue::Utf8` arm
+/// (`src/exec/distinct.rs`) plus the Utf8 ORDER BY (which goes through
+/// the GPU sort's inline-dictionary builder, see `src/exec/gpu_sort.rs`).
+/// Order is meaningful here — we route through `diff_query_ordered` so
+/// row positions are checked.
+#[test]
+#[ignore = "gpu:string_diff"]
+fn diff_string_distinct() {
+    let batch = t_strings(1024);
+    diff_query_ordered(
+        "diff_string_distinct",
+        "SELECT DISTINCT s FROM t ORDER BY s",
+        &[TableSpec {
+            name: "t",
+            ddl_cols: "s VARCHAR NOT NULL, v BIGINT NOT NULL",
+            batch,
+        }],
+    );
+}
+
+/// Case 13 — compound predicate mixing string equality and a numeric
+/// range. The rewriter walks post-order through the `AND` node and
+/// rewrites only the string-eq leg; the numeric leg passes through to
+/// the generic scan kernel. A bug that drops one half of the conjunct
+/// (e.g. the rewriter stomping over the other side) shows up as a row
+/// count or per-row value mismatch.
+#[test]
+#[ignore = "gpu:string_diff"]
+fn diff_string_compound_predicate() {
+    let batch = t_strings(1024);
+    diff_query(
+        "diff_string_compound_predicate",
+        "SELECT s, v FROM t WHERE s = 'foo' AND v > 10",
+        &[TableSpec {
+            name: "t",
+            ddl_cols: "s VARCHAR NOT NULL, v BIGINT NOT NULL",
             batch,
         }],
     );

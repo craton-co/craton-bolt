@@ -22,7 +22,7 @@
 //! Algorithm context: see `docs/GROUPBY_PERF.md` Tier 1.
 
 mod common;
-use common::Xorshift64Star;
+use common::{Xorshift64Star, REL_TOL};
 
 // ---- CPU references ---------------------------------------------------------
 
@@ -183,7 +183,7 @@ fn model_agrees_with_naive_low_card_10m() {
     let naive = cpu_naive_sum(&keys, &vals, 100);
     let err = max_relative_error(&model, &naive);
     // Empirical max relative error on the current fixture: ~2.5e-13.
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn model_agrees_with_naive_med_card() {
     let model = cpu_shmem_sum_model(&keys, &vals, 1000, BLOCK_THREADS, ROWS_PER_THREAD);
     let naive = cpu_naive_sum(&keys, &vals, 1000);
     let err = max_relative_error(&model, &naive);
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn model_agrees_with_naive_at_block_groups_limit() {
     let model = cpu_shmem_sum_model(&keys, &vals, 1024, BLOCK_THREADS, ROWS_PER_THREAD);
     let naive = cpu_naive_sum(&keys, &vals, 1024);
     let err = max_relative_error(&model, &naive);
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -295,8 +295,8 @@ fn shmem_kernel_matches_cpu_model() {
     );
 
     // For every output row, look up the corresponding expected sum by key
-    // and check relative error. Use the same 1e-9 contract as the CPU model
-    // tests above.
+    // and check relative error. Use the same REL_TOL contract as the CPU
+    // model tests above (shared `tests/common::REL_TOL`).
     for i in 0..n_out {
         let key = id_col.value(i);
         assert!(
@@ -308,8 +308,8 @@ fn shmem_kernel_matches_cpu_model() {
         let denom = got.abs().max(want.abs()).max(1.0);
         let rel = (got - want).abs() / denom;
         assert!(
-            rel < 1e-9,
-            "row {i} key={key}: got {got}, want {want}, rel err {rel:e} exceeded 1e-9"
+            rel < REL_TOL,
+            "row {i} key={key}: got {got}, want {want}, rel err {rel:e} exceeded {REL_TOL:e}"
         );
     }
 }

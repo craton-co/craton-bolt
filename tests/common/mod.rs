@@ -8,6 +8,12 @@
 //! sub-module pattern (the `mod.rs` suffix is recognised; `tests/common.rs`
 //! would itself be compiled as another test binary).
 
+/// Default relative-tolerance constant for numerical equality across
+/// the test + bench suite. Floating-point arithmetic is non-associative
+/// and chunking / SIMD / fast-math can introduce per-batch drift of
+/// ~1e-12; 1e-9 is conservative for f64 sums up to ~1e6.
+pub const REL_TOL: f64 = 1e-9;
+
 /// Deterministic xorshift64* PRNG used by the integration test fixtures.
 ///
 /// All call-sites must use the same seed-mixing convention for

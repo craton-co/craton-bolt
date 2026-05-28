@@ -33,7 +33,7 @@
 //! Algorithm context: see `docs/GROUPBY_PERF.md` Tier 2.
 
 mod common;
-use common::Xorshift64Star;
+use common::{Xorshift64Star, REL_TOL};
 
 use std::collections::HashMap;
 
@@ -198,7 +198,7 @@ fn model_agrees_with_naive_medium() {
     let model = cpu_tier2_sum_model(&keys, &vals);
     let naive = cpu_naive_sum_groupby(&keys, &vals);
     let err = max_relative_error(&model, &naive);
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -209,7 +209,7 @@ fn model_agrees_with_naive_high_card() {
     let model = cpu_tier2_sum_model(&keys, &vals);
     let naive = cpu_naive_sum_groupby(&keys, &vals);
     let err = max_relative_error(&model, &naive);
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn model_agrees_with_naive_super_high() {
     let model = cpu_tier2_sum_model(&keys, &vals);
     let naive = cpu_naive_sum_groupby(&keys, &vals);
     let err = max_relative_error(&model, &naive);
-    assert!(err < 1e-9, "max rel err {err:e} exceeded 1e-9");
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
 
 #[test]
@@ -379,7 +379,7 @@ fn tier2_pipeline_matches_cpu_model() {
     // model-vs-naive tests above.
     let err = max_relative_error(&actual, &expected);
     assert!(
-        err < 1e-9,
-        "GPU pipeline vs CPU tier-2 model: max rel err {err:e} exceeded 1e-9"
+        err < REL_TOL,
+        "GPU pipeline vs CPU tier-2 model: max rel err {err:e} exceeded {REL_TOL:e}"
     );
 }

@@ -39,6 +39,12 @@ use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
+// Shared cross-suite relative-tolerance constant. See the doc comment on
+// `craton_bolt::REL_TOL_TEST` in `src/lib.rs`; the same constant lives in
+// `tests/common::REL_TOL` for integration tests (which can't import bench
+// crates and vice-versa).
+use craton_bolt::REL_TOL_TEST as REL_TOL;
+
 // --- h2o.ai-style data spec ------------------------------------------------
 //
 // The original h2o.ai benchmark generates N rows with:
@@ -429,10 +435,13 @@ fn bolt_decode(h: &craton_bolt::exec::QueryHandle, q: &str) -> QueryResult {
 
 // --- Equivalence check ----------------------------------------------------
 
-/// Relative tolerance. SUMs over 10 M Float64 values accumulate up to ~10
-/// ULPs of rounding when summed in different orders — 1e-9 relative covers
-/// it with margin to spare.
-const REL_TOL: f64 = 1e-9;
+// Relative tolerance: SUMs over 10 M Float64 values accumulate up to ~10
+// ULPs of rounding when summed in different orders — 1e-9 relative covers
+// it with margin to spare. The actual constant `REL_TOL` is imported at
+// the top of the file from `craton_bolt::REL_TOL_TEST` (the doc-hidden
+// re-export of `tests/common::REL_TOL`); the bench crate can't reach
+// into the integration-test binary, so the shared constant lives on the
+// library side.
 
 fn close_enough(a: f64, b: f64) -> bool {
     let diff = (a - b).abs();

@@ -17,6 +17,9 @@ use craton_bolt::plan::{
     MemTableProvider, PhysicalPlan, Schema,
 };
 
+mod common;
+use common::REL_TOL;
+
 // ---- Fixtures ---------------------------------------------------------------
 
 fn sales_schema() -> Schema {
@@ -483,7 +486,7 @@ fn groupby_sum_int32_widens_to_i64() {
 // ---- Online (require CUDA device) ------------------------------------------
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:projection"]
 fn e2e_simple_projection() {
     use craton_bolt::Engine;
 
@@ -510,7 +513,7 @@ fn e2e_simple_projection() {
 }
 
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:projection"]
 fn e2e_arithmetic_projection() {
     use craton_bolt::Engine;
 
@@ -539,7 +542,7 @@ fn e2e_arithmetic_projection() {
     for i in 0..4096 {
         let want = price.value(i) * tax.value(i);
         let got = actual.value(i);
-        assert!((got - want).abs() < 1e-9, "row {i}: got {got}, want {want}");
+        assert!((got - want).abs() < REL_TOL, "row {i}: got {got}, want {want}");
     }
 }
 

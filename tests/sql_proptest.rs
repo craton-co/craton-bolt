@@ -27,21 +27,17 @@ use craton_bolt::plan::{
 };
 use proptest::prelude::*;
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Differential helpers (semantic property, gated behind `gpu:proptest-semantic`)
 // ---------------------------------------------------------------------------
 //
 // Rust integration tests are separate crates, so we can't `use` the helpers
-// from `tests/diff_duckdb.rs` directly. The minimum surface we need is:
-//
-//   * load the `sql_proptest` fixture into both engines,
-//   * run a single SQL string through each,
-//   * approx-compare the resulting rows.
-//
-// TODO(L2): consolidate into `tests/common/mod.rs` shared with
-// `tests/diff_duckdb.rs` (mirrors the standard `mod common; use common::*;`
-// pattern). Until then, this is a deliberately small copy of the pieces from
-// `tests/diff_duckdb.rs` strictly needed for the semantic property below.
+// from `tests/diff_duckdb.rs` directly — but we *can* share constants and
+// PRNGs through `tests/common/mod.rs` (review L2). The cell-equality types
+// below are still a small copy from `tests/diff_duckdb.rs`; what they need
+// from the shared module is just the `REL_TOL` tolerance.
 mod semantic_diff {
     use std::sync::Arc;
 
@@ -53,8 +49,7 @@ mod semantic_diff {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
 
-    /// Matches `diff_duckdb.rs::REL_TOL` — keep in sync if that file moves.
-    const REL_TOL: f64 = 1e-9;
+    use super::common::REL_TOL;
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum Cell {

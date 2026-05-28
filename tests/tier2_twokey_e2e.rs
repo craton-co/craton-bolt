@@ -29,6 +29,9 @@
 
 use std::collections::HashMap;
 
+mod common;
+use common::REL_TOL;
+
 /// Pack two `i32` columns into a single `i64` per row using the
 /// `src/exec/groupby.rs::pack_keys` convention:
 ///   high 32 bits = column 0
@@ -206,7 +209,7 @@ fn h2oai_q3_shape_one_million_groups() {
         .map(|t| t.2)
         .expect("(37, 91) group must exist");
     assert!(
-        (observed - expected).abs() < 1e-9,
+        (observed - expected).abs() < REL_TOL,
         "observed sum {observed} differs from expected {expected}"
     );
 }
