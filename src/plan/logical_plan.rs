@@ -330,6 +330,7 @@ impl Expr {
     }
 
     /// Resolve the static type of this expression against `schema`.
+    // TODO(nullable): add CASE/COALESCE/IS NULL/IS NOT NULL variants
     pub fn dtype(&self, schema: &Schema) -> BoltResult<DataType> {
         self.dtype_depth(schema, 0)
     }
@@ -498,7 +499,7 @@ pub struct SortExpr {
     pub nulls_first: bool,
 }
 
-/// Join kind. 0.3.0 ships INNER only; LEFT/RIGHT/FULL/CROSS land in 0.3.1.
+/// Join kind. INNER, LEFT, RIGHT, FULL, CROSS supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
     /// SQL INNER JOIN.
