@@ -38,10 +38,13 @@
 //!     Anything wider than 64 bits of key material (e.g. 2× Int64, 2× Float64,
 //!     3+ columns) returns a "not yet supported" error. The general fallback
 //!     (composite hash + host-side per-slot tuple verification) is deferred.
-//!   - Float keys: bitwise-equal floats group together. NaN bit patterns are
-//!     distinct keys (acceptable for v1; SQL standard NaN-grouping is
-//!     implementation-defined). `-0.0` and `+0.0` group SEPARATELY because
-//!     their bit patterns differ — documented v1 limitation.
+//!   - Float keys: bitwise-equal floats group together AFTER signed-zero
+//!     canonicalisation. `+0.0` and `-0.0` are mapped to the same key
+//!     (review C12) via a host-side pre-pass in `load_key_column_bits`,
+//!     matching SQL/IEEE semantics and the DISTINCT / JOIN executors.
+//!     The kernel itself is not changed — only the i64-encoded buffer
+//!     uploaded to the GPU. NaN bit patterns are LEFT AS-IS (NaN != NaN
+//!     per IEEE / SQL standard; DuckDB does the same).
 //!   - Aggregates: `SUM`, `MIN`, `MAX`, `COUNT(*)`, `AVG`. `MIN`/`MAX` over
 //!     float inputs are rejected (would need float-CAS loops on sm_70).
 //!   - Aggregate inputs must be bare column references (mirrors
@@ -742,14 +745,23 @@ fn load_key_column_bits(
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Float32"))?;
-            pa.values().iter().map(|&v| v.to_bits() as u64).collect()
+            // Review C12: canonicalise -0.0 -> +0.0 so signed-zero pairs hash
+            // into one group. NaN bit patterns preserved (x == 0.0 is false for NaN).
+            pa.values()
+                .iter()
+                .map(|&v| canonicalise_f32(v).to_bits() as u64)
+                .collect()
         }
         DataType::Float64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Float64"))?;
-            pa.values().iter().map(|&v| v.to_bits()).collect()
+            // Review C12: same signed-zero canonicalisation as Float32.
+            pa.values()
+                .iter()
+                .map(|&v| canonicalise_f64(v).to_bits())
+                .collect()
         }
         DataType::Bool | DataType::Utf8 => {
             return Err(BoltError::Type(format!(
@@ -759,6 +771,23 @@ fn load_key_column_bits(
         }
     };
     Ok((bits, null_mask))
+}
+
+/// Canonicalise `-0.0` to `+0.0` so that signed-zero pairs key the same
+/// group. Preserves every other bit pattern, including NaN payloads
+/// (`x == 0.0` is `false` for any NaN). Identical to the host-side
+/// canonicalisation in `distinct::canonicalise_f64` and `join::extract_key`
+/// — all three operators must agree on the float equivalence relation
+/// (review C12).
+#[inline]
+fn canonicalise_f64(x: f64) -> f64 {
+    if x == 0.0 { 0.0 } else { x }
+}
+
+/// `f32` analogue of [`canonicalise_f64`].
+#[inline]
+fn canonicalise_f32(x: f32) -> f32 {
+    if x == 0.0 { 0.0 } else { x }
 }
 
 /// Encode each group-by column (in `aggregate.group_by` order) into a single
@@ -2355,8 +2384,9 @@ mod tests {
         assert_eq!(dec_neg, vec![KeyValue::I32(-1), KeyValue::I32(-1)]);
     }
 
-    /// 3. Single Float32 key packs to `f32::to_bits() as i64` and round-trips
-    ///    via `decode_key` back to the same f32 bit pattern.
+    /// 3. Single Float32 key packs to `canonicalise_f32(f).to_bits() as i64`
+    ///    and round-trips via `decode_key` back to the canonicalised f32 bit
+    ///    pattern. Review C12: `-0.0` packs to the same key as `+0.0`.
     #[test]
     fn pack_keys_float32() {
         let agg = spec(vec![("f", DataType::Float32)], vec![0]);
@@ -2371,20 +2401,23 @@ mod tests {
         assert_eq!(packed.components[0].bit_offset, 0);
 
         for (i, v) in vals.iter().enumerate() {
-            let expected = (v.to_bits() as u64) as i64;
+            // The packed key must equal the CANONICALISED bit pattern,
+            // not the raw `v.to_bits()` — -0.0 collapses to +0.0.
+            let canon = if *v == 0.0f32 { 0.0f32 } else { *v };
+            let expected = (canon.to_bits() as u64) as i64;
             assert_eq!(packed.keys_i64[i], expected, "row {i}");
             let dec = decode_key(packed.keys_i64[i], &packed.components);
             assert_eq!(dec.len(), 1);
             match dec[0] {
-                KeyValue::F32(f) => assert_eq!(f.to_bits(), v.to_bits()),
+                KeyValue::F32(f) => assert_eq!(f.to_bits(), canon.to_bits()),
                 other => panic!("expected F32, got {:?}", other),
             }
         }
 
-        // Documented limitation: -0.0 and +0.0 have different bit patterns
-        // and therefore pack to different i64 keys (they would group
-        // separately). The test pins this behaviour.
-        assert_ne!(packed.keys_i64[2], packed.keys_i64[3]);
+        // Review C12: -0.0 and +0.0 are canonicalised to the same key so
+        // they group together (matches SQL/IEEE and DuckDB). The test
+        // pins this convention.
+        assert_eq!(packed.keys_i64[2], packed.keys_i64[3]);
     }
 
     /// 4. Three columns exceeds the v1 lossless packing budget.

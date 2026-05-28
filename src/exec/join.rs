@@ -45,6 +45,15 @@
 //! ≥ 1024 rows / side + no NULLs in keys + unique build keys runs on the
 //! GPU via [`crate::exec::gpu_join`]. Any gate miss falls through to the
 //! host hash-join path. OUTER + CROSS stay host-side (Stage 2 target).
+//!
+//! Float-key semantics (review C12): `+0.0` and `-0.0` compare equal per
+//! SQL/IEEE (`+0.0 == -0.0`), so this executor CANONICALISES `-0.0` to
+//! `+0.0` before building the key (see `canonicalise_f32`/`canonicalise_f64`
+//! and `extract_key`). NaN bit patterns are LEFT AS-IS (`NaN != NaN`;
+//! build-side NaN rows therefore never match a probe-side NaN row,
+//! matching DuckDB). The same canonicalisation is applied in `distinct.rs`
+//! and `groupby.rs` so DISTINCT / GROUP BY / JOIN agree on one
+//! equivalence relation for floats.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -581,9 +590,11 @@ fn empty_output(arrow_schema: Arc<ArrowSchema>) -> BoltResult<QueryHandle> {
 
 /// A hashable join-key value: one entry per join column. Variants cover
 /// every primitive dtype the engine produces. Float keys hash by their
-/// raw bit pattern (matches `distinct.rs`'s `hash_array_row`); equality
-/// of `NaN` is therefore bit-wise, which is the engine-wide convention
-/// for these primitive types.
+/// CANONICALISED bit pattern (see `canonicalise_f32`/`canonicalise_f64`
+/// below — `-0.0` is mapped to `+0.0` before `.to_bits()`). NaN bit
+/// patterns are preserved verbatim, so equality of NaN keys is bit-wise:
+/// two `NaN` join rows whose payloads differ never match each other,
+/// matching the SQL standard's `NaN != NaN` rule (and DuckDB).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum JoinKeyValue {
     I32(i32),
@@ -622,18 +633,27 @@ fn extract_key(
                 arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
             ),
             ArrowDataType::Float32 => JoinKeyValue::F32(
-                arr.as_any()
-                    .downcast_ref::<Float32Array>()
-                    .unwrap()
-                    .value(row)
-                    .to_bits(),
+                // Review C12: canonicalise -0.0 -> +0.0 so that signed-zero
+                // join keys match across sides (matches SQL/IEEE and
+                // DuckDB). NaN bit patterns are preserved as-is, so
+                // NaN-keyed rows never match (`NaN != NaN`).
+                canonicalise_f32(
+                    arr.as_any()
+                        .downcast_ref::<Float32Array>()
+                        .unwrap()
+                        .value(row),
+                )
+                .to_bits(),
             ),
             ArrowDataType::Float64 => JoinKeyValue::F64(
-                arr.as_any()
-                    .downcast_ref::<Float64Array>()
-                    .unwrap()
-                    .value(row)
-                    .to_bits(),
+                // Review C12: same signed-zero canonicalisation as Float32.
+                canonicalise_f64(
+                    arr.as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap()
+                        .value(row),
+                )
+                .to_bits(),
             ),
             ArrowDataType::Boolean => JoinKeyValue::Bool(
                 arr.as_any().downcast_ref::<BooleanArray>().unwrap().value(row),
@@ -654,6 +674,24 @@ fn extract_key(
         key.push(v);
     }
     Ok(Some(key))
+}
+
+/// Canonicalise `-0.0` to `+0.0` so signed-zero pairs key the same
+/// hash bucket. Preserves every other bit pattern, including NaN
+/// payloads (`x == 0.0` is `false` for any NaN, so NaN-keyed rows never
+/// match `NaN == NaN`). Mirrors the host-side canonicalisation in
+/// `distinct::canonicalise_f64` and `groupby::canonicalise_f64` so
+/// DISTINCT, GROUP BY, and JOIN share one float-equality relation
+/// (review C12).
+#[inline]
+fn canonicalise_f64(x: f64) -> f64 {
+    if x == 0.0 { 0.0 } else { x }
+}
+
+/// `f32` analogue of [`canonicalise_f64`].
+#[inline]
+fn canonicalise_f32(x: f32) -> f32 {
+    if x == 0.0 { 0.0 } else { x }
 }
 
 /// Look up every name in `names` in the batch's schema, returning the

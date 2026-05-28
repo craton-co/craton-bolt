@@ -342,7 +342,9 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> BoltResult<KeyValue> {
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&kc.name, "Float32"))?;
-            Ok(KeyValue::F32Bits(pa.value(row).to_bits()))
+            // Review C12: canonicalise -0.0 -> +0.0 so signed-zero pairs
+            // hash into one group. NaN bit patterns preserved.
+            Ok(KeyValue::F32Bits(canonicalise_f32(pa.value(row)).to_bits()))
         }
         DataType::Float64 => {
             let pa = kc
@@ -350,13 +352,30 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> BoltResult<KeyValue> {
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&kc.name, "Float64"))?;
-            Ok(KeyValue::F64Bits(pa.value(row).to_bits()))
+            // Review C12: same signed-zero canonicalisation as Float32.
+            Ok(KeyValue::F64Bits(canonicalise_f64(pa.value(row)).to_bits()))
         }
         DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "wide GROUP BY: key dtype {:?} not supported",
             kc.dtype
         ))),
     }
+}
+
+/// Canonicalise `-0.0` to `+0.0` so signed-zero pairs key the same
+/// group. Preserves every other bit pattern, including NaN payloads
+/// (`x == 0.0` is `false` for any NaN). Mirrors the expression used in
+/// `distinct.rs`, `groupby.rs`, `groupby_valid.rs`, and `join.rs` so
+/// every operator agrees on the float equivalence relation (review C12).
+#[inline]
+fn canonicalise_f64(x: f64) -> f64 {
+    if x == 0.0 { 0.0 } else { x }
+}
+
+/// `f32` analogue of [`canonicalise_f64`].
+#[inline]
+fn canonicalise_f32(x: f32) -> f32 {
+    if x == 0.0 { 0.0 } else { x }
 }
 
 /// Total ordering over `TupleKey` for deterministic output. We compare

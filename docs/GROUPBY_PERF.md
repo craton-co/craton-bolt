@@ -3,6 +3,8 @@
 > [!NOTE]
 > **Status: Implemented** (Tiers 1–2 landed; see [BENCHMARKS.md](./BENCHMARKS.md) for results)
 
+> **For current performance numbers see [docs/BENCHMARKS.md §1](BENCHMARKS.md).** This document covers algorithm and design rationale.
+
 ## What the measurements say
 
 From the h2o.ai db-benchmark groupby subset, three-engine table (10 M rows,
@@ -147,6 +149,13 @@ in `groupby_valid.rs`. ~2–3 days.
 ---
 
 ### Tier 2 — Hash-partitioned two-pass aggregation
+
+The canonical partition-count constant lives in
+[`src/exec/partition_offsets.rs::NUM_PARTITIONS`][1] (currently 4096).
+Anywhere this doc mentions a specific partition count, treat the source
+file as the source of truth.
+
+[1]: ../src/exec/partition_offsets.rs
 
 **Idea.** When the group count exceeds what fits in shared memory, partition
 input rows into K disjoint device buffers by `hash(key) % K`, then run a

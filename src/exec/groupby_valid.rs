@@ -9,9 +9,15 @@
 //! "empty slot" sentinel.
 //!
 //! The orchestrator in `groupby.rs` dispatches here for queries whose key
-//! encoding could collide with the classic sentinel — most notably Float64
-//! group-by columns containing `-0.0`, whose `f64::to_bits()` is exactly
-//! `0x8000_0000_0000_0000 == i64::MIN`.
+//! encoding could collide with the classic sentinel. Historically the
+//! flagship case was Float64 `-0.0` (whose `f64::to_bits()` is exactly
+//! `0x8000_0000_0000_0000 == i64::MIN`); review C12 added a host-side
+//! `-0.0 → +0.0` canonicalisation in `load_key_column_bits` so that case
+//! no longer reaches the kernel as `i64::MIN`. The sentinel-free path
+//! still earns its keep for any other key shape whose packed bits land
+//! on `i64::MIN` (e.g. a future two-column packing that happens to
+//! produce `0x8000_0000_0000_0000`), and stays the explicit opt-in for
+//! callers who want to avoid the sentinel pre-validation altogether.
 //!
 //! # Slot-state machine
 //!
@@ -227,8 +233,12 @@ fn download_pinned_f64(v: &GpuVec<f64>, stream: &CudaStream) -> BoltResult<Vec<f
 ///
 /// Mirrors `groupby::execute_groupby`'s public surface; the orchestrator
 /// dispatches to this path when the key encoding could collide with the
-/// classic kernel's `i64::MIN` sentinel (notably Float64 keys including
-/// `-0.0`) or when the user explicitly opts in.
+/// classic kernel's `i64::MIN` sentinel, or when the user explicitly
+/// opts in. Note: review C12 canonicalises `-0.0` to `+0.0` before
+/// upload, so the historical `-0.0 → i64::MIN` clash that originally
+/// motivated this module no longer arises for that case; the sentinel-
+/// free path is still the right home for any other shape whose packed
+/// bits happen to land on `i64::MIN`.
 pub fn execute_groupby_valid(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,
@@ -630,14 +640,23 @@ fn load_key_column_bits(
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Float32"))?;
-            pa.values().iter().map(|&v| v.to_bits() as u64).collect()
+            // Review C12: canonicalise -0.0 -> +0.0 so signed-zero pairs
+            // hash into one group. NaN bit patterns preserved.
+            pa.values()
+                .iter()
+                .map(|&v| canonicalise_f32(v).to_bits() as u64)
+                .collect()
         }
         DataType::Float64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Float64"))?;
-            pa.values().iter().map(|&v| v.to_bits()).collect()
+            // Review C12: same signed-zero canonicalisation as Float32.
+            pa.values()
+                .iter()
+                .map(|&v| canonicalise_f64(v).to_bits())
+                .collect()
         }
         DataType::Bool | DataType::Utf8 => {
             return Err(BoltError::Type(format!(
@@ -647,6 +666,22 @@ fn load_key_column_bits(
         }
     };
     Ok((bits, null_mask))
+}
+
+/// Canonicalise `-0.0` to `+0.0` so signed-zero pairs key the same
+/// group. Preserves every other bit pattern (NaN payloads stay verbatim
+/// — `x == 0.0` is false for any NaN). Mirrors the same expression in
+/// `distinct.rs` and `groupby.rs` so DISTINCT, GROUP BY, and JOIN share
+/// one float-equality relation (review C12).
+#[inline]
+fn canonicalise_f64(x: f64) -> f64 {
+    if x == 0.0 { 0.0 } else { x }
+}
+
+/// `f32` analogue of [`canonicalise_f64`].
+#[inline]
+fn canonicalise_f32(x: f32) -> f32 {
+    if x == 0.0 { 0.0 } else { x }
 }
 
 /// Encode each group-by column into a single i64 key per row. Mirrors the

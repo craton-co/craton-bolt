@@ -135,7 +135,7 @@ Supported key shapes:
   - `(Int32, Int32)`, `(Int32, Float32)`, `(Float32, Float32)`. Packed into one i64 host-side.
 - **Three or more columns**, or pairs wider than 64 bits (e.g. `(Int64, Int64)`): host-side reduction fallback. Correct but doesn't use the GPU hash table.
 
-Float keys: bitwise grouping (`f.to_bits() as i64`). Different NaN bit patterns group separately; `-0.0` and `+0.0` group separately. The classic GPU path rejects keys that encode to `i64::MIN` (notably `-0.0`); the engine falls back to the sentinel-free `groupby_valid` path which has no such restriction.
+Float keys: bitwise grouping AFTER signed-zero canonicalisation (`canonicalise(f).to_bits() as i64`, where `canonicalise(x) = if x == 0.0 { 0.0 } else { x }`). `-0.0` and `+0.0` collapse to ONE group (matches SQL/IEEE and DuckDB — review C12). DISTINCT and JOIN apply the same canonicalisation so the three operators agree on float equivalence. NaN bit patterns are LEFT AS-IS (`NaN != NaN` per IEEE/SQL standard; DuckDB does the same), so different NaN payloads still group separately. The classic GPU path rejects keys that encode to `i64::MIN`; after canonicalisation `-0.0` packs to `+0.0` (bits `0`), removing the historical sentinel collision for the headline case. The sentinel-free `groupby_valid` path remains the safety net for any other dtype where the encoded bits happen to collide with `i64::MIN`.
 
 Utf8 keys: not yet supported. Would need a dictionary-aware GROUP BY codegen path.
 
