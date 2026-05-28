@@ -1711,6 +1711,22 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
         SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
             contains_aggregate(inner, resolver, depth + 1)
         }
+        // `<probe> [NOT] IN (v1, ..., vN)` — the probe expression *or* any
+        // value in the list could itself be an aggregate call (e.g.
+        // `HAVING SUM(v) IN (10, 20)` or `HAVING x IN (COUNT(*) , 0)`).
+        // Recurse through both so the SELECT/HAVING classifier doesn't
+        // misroute aggregate-bearing IN-lists into the scalar arm.
+        SqlExpr::InList { expr, list, .. } => {
+            if contains_aggregate(expr, resolver, depth + 1)? {
+                return Ok(true);
+            }
+            for item in list {
+                if contains_aggregate(item, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
         _ => Ok(false),
     }
@@ -1786,6 +1802,56 @@ fn lower_expr_in_having(
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(operand),
             })
+        }
+        // HAVING `<probe> [NOT] IN (...)`: lower the probe and each list
+        // element via the aggregate-aware lowerer so aggregate calls
+        // anywhere in the operand or the list (e.g.
+        // `HAVING SUM(v) IN (10, 20)`) resolve to the aggregate-output
+        // column reference, then desugar to the same OR/AND chain shape
+        // as scalar `lower_in_list`. Capping and empty-list folding are
+        // shared with the scalar path; we re-derive them here so the
+        // HAVING surface is total without depending on the scalar entry
+        // point for aggregate rewriting.
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if list.len() > MAX_IN_LIST_VALUES {
+                return Err(BoltError::Sql(format!(
+                    "IN with > {MAX_IN_LIST_VALUES} values not yet supported; use a JOIN \
+                     against a derived table (got {} values)",
+                    list.len()
+                )));
+            }
+            if list.is_empty() {
+                return Ok(Expr::Literal(Literal::Bool(*negated)));
+            }
+            let lowered_expr = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
+            let (cmp_op, combine_op) = if *negated {
+                (BinaryOp::NotEq, BinaryOp::And)
+            } else {
+                (BinaryOp::Eq, BinaryOp::Or)
+            };
+            let mut acc: Option<Expr> = None;
+            for item in list {
+                let item_lowered =
+                    lower_expr_in_having(item, resolver, agg_aliases, depth + 1)?;
+                let cmp = Expr::Binary {
+                    op: cmp_op,
+                    left: Box::new(lowered_expr.clone()),
+                    right: Box::new(item_lowered),
+                };
+                acc = Some(match acc {
+                    None => cmp,
+                    Some(prev) => Expr::Binary {
+                        op: combine_op,
+                        left: Box::new(prev),
+                        right: Box::new(cmp),
+                    },
+                });
+            }
+            Ok(acc.expect("non-empty IN list guarantees at least one chain element"))
         }
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
@@ -1915,6 +1981,15 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                 operand: Box::new(operand),
             })
         }
+        // `<expr> [NOT] IN (v1, v2, ...)` — desugared into an OR/AND chain
+        // of element-wise equalities/inequalities so existing comparison and
+        // boolean codegen handles it without a new operator. See
+        // [`lower_in_list`] for the cap (`MAX_IN_LIST_VALUES`) and the empty-
+        // list constant-folding rule. A large-list hash-probe path is a
+        // separate follow-up.
+        SqlExpr::InList { expr, list, negated } => {
+            lower_in_list(expr, list, *negated, resolver, depth + 1)
+        }
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "scalar function calls are not supported".into(),
         )),
@@ -1922,6 +1997,102 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
             "unsupported expression: {other}"
         ))),
     }
+}
+
+/// Maximum number of values accepted on the right-hand side of a SQL
+/// `IN (...)` list operator. Lists at or under this bound are desugared
+/// to a balanced OR/AND chain of element-wise comparisons (see
+/// [`lower_in_list`]); anything larger is rejected with a clear error so
+/// the user is steered toward a JOIN against a derived table while the
+/// large-list hash-probe path is still on the v0.5 roadmap.
+///
+/// 64 was picked as a round power-of-two large enough to comfortably
+/// cover the typical "status code allowlist" / "small id set" use case
+/// (which empirically tops out in the low tens of values) and small
+/// enough that the resulting OR-chain still fits within a reasonable
+/// JIT instruction budget. Bumping this is a back-compat change (more
+/// queries succeed); shrinking it is not.
+const MAX_IN_LIST_VALUES: usize = 64;
+
+/// Desugar SQL `<expr> [NOT] IN (v1, v2, ..., vN)` into the equivalent
+/// chain of element-wise comparisons:
+///
+///   * `IN`     → `(expr = v1) OR  (expr = v2) OR  ... OR  (expr = vN)`
+///   * `NOT IN` → `(expr <> v1) AND (expr <> v2) AND ... AND (expr <> vN)`
+///
+/// `NOT IN` is lowered directly via De Morgan rather than wrapping the
+/// `IN` form in a logical NOT — the planner does not yet surface a NOT
+/// node, and the AND-of-`<>` form is more amenable to downstream short-
+/// circuiting anyway. Both forms reuse the existing `BinaryOp::{Eq,
+/// NotEq, And, Or}` so no new operator is required.
+///
+/// Empty-list semantics follow the SQL standard: `x IN ()` is always
+/// false, `x NOT IN ()` is always true (with the usual caveat that
+/// `GenericDialect` rejects literal `IN ()` at parse time — this branch
+/// is a safety net for dialects or future callers that do allow it).
+///
+/// Lists with more than [`MAX_IN_LIST_VALUES`] entries are rejected with
+/// a message pointing the user at a JOIN; the large-list hash-probe
+/// path is a separate v0.5 follow-up.
+fn lower_in_list(
+    expr: &SqlExpr,
+    list: &[SqlExpr],
+    negated: bool,
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if list.len() > MAX_IN_LIST_VALUES {
+        return Err(BoltError::Sql(format!(
+            "IN with > {MAX_IN_LIST_VALUES} values not yet supported; use a JOIN \
+             against a derived table (got {} values)",
+            list.len()
+        )));
+    }
+    // SQL-standard empty-list constants: `x IN ()` ≡ false, `x NOT IN ()` ≡ true.
+    // Note: `GenericDialect::supports_in_empty_list` defaults to false so the
+    // parser rejects literal `IN ()` before we ever get here; this arm exists
+    // so the lowerer remains total for any AST node carrying an empty list.
+    if list.is_empty() {
+        return Ok(Expr::Literal(Literal::Bool(negated)));
+    }
+
+    // Lower the probed expression once; the desugared chain reuses it via
+    // `Clone` for each element. Cloning is necessary because each branch of
+    // the OR/AND tree owns its own copy of the operand.
+    let lowered_expr = lower_expr(expr, resolver, depth + 1)?;
+
+    // Element-wise (op, combiner) pair: IN uses Eq + OR, NOT IN uses NotEq + AND.
+    let (cmp_op, combine_op) = if negated {
+        (BinaryOp::NotEq, BinaryOp::And)
+    } else {
+        (BinaryOp::Eq, BinaryOp::Or)
+    };
+
+    let mut acc: Option<Expr> = None;
+    for item in list {
+        let item_lowered = lower_expr(item, resolver, depth + 1)?;
+        let cmp = Expr::Binary {
+            op: cmp_op,
+            left: Box::new(lowered_expr.clone()),
+            right: Box::new(item_lowered),
+        };
+        acc = Some(match acc {
+            None => cmp,
+            Some(prev) => Expr::Binary {
+                op: combine_op,
+                left: Box::new(prev),
+                right: Box::new(cmp),
+            },
+        });
+    }
+    // `list.is_empty()` was handled above, so `acc` is always `Some` here;
+    // the `.expect` documents that invariant for future readers.
+    Ok(acc.expect("non-empty IN list guarantees at least one chain element"))
 }
 
 /// Translate a SQL literal `Value` into our `Literal` expression.
