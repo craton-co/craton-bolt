@@ -211,7 +211,6 @@ use crate::jit::hash_join_kernel::{
     PROBE_AOS_KERNEL_ENTRY, PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY,
     STRING_HASH_BLOCK_SIZE, STRING_HASH_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
 };
-use crate::jit::jit_compiler::CudaModule;
 use crate::plan::logical_plan::DataType;
 
 /// Minimum size threshold (per side) below which the host hash join wins. The

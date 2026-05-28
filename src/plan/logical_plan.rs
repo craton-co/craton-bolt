@@ -1061,6 +1061,9 @@ mod null_handling_tests {
             right: Box::new(Expr::Literal(Literal::Null)),
         };
         assert_eq!(expr.dtype(&schema).unwrap(), DataType::Int64);
+    }
+}
+
 #[cfg(test)]
 mod naming_consistency_tests {
     //! Lock the authoritative naming rules in place. These tests guard the
