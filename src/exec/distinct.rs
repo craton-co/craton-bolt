@@ -624,9 +624,11 @@ mod tests {
         // 5 distinct values, cap of 3 — must error after the 4th unique.
         let batch = int32_batch(vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
         let input = QueryHandle::from_record_batch(batch);
-        let err = execute_distinct_with_cap(input, 3).expect_err(
-            "expected DISTINCT bound to be exceeded with cap=3 and 5 distinct rows",
-        );
+        let result = execute_distinct_with_cap(input, 3);
+        let err = match result {
+            Ok(_) => panic!("expected DISTINCT bound to be exceeded with cap=3 and 5 distinct rows"),
+            Err(e) => e,
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("DISTINCT exceeded host bound"),

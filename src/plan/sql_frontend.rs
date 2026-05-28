@@ -1823,6 +1823,7 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
                 stack.push(right);
             }
             Expr::Alias(inner, _) => stack.push(inner),
+            Expr::Unary { operand, .. } => stack.push(operand),
         }
     }
     Ok(())
@@ -2871,6 +2872,7 @@ mod wave7_tests {
                             stack.push(right);
                         }
                         Expr::Alias(inner, _) => stack.push(inner),
+                        Expr::Unary { operand, .. } => stack.push(operand),
                         Expr::Literal(_) => {}
                     }
                 }
