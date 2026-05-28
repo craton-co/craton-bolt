@@ -1236,6 +1236,26 @@ enum AccDownload {
         sum_spill: Vec<(i64, f64)>,
         count_spill: Vec<(i64, i64)>,
     },
+    /// v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
+    /// Welford state. The full (count, mean, M2) update doesn't fit a
+    /// single atomic, so per-group accumulation runs host-side. Two
+    /// shapes:
+    ///   * Pre-fold: keyed by encoded i64 key (captures both
+    ///     GPU-committed and spilled keys uniformly — the host HashMap
+    ///     subsumes the kernel spill machinery).
+    ///   * Post-fold: a flat `Vec<WelfordState>` indexed by post-sort
+    ///     group position, ready for `build_agg_array_from_per_group`.
+    Welford(WelfordAcc),
+}
+
+/// Two-stage Welford accumulator. Run-one-aggregate produces the
+/// `ByKey` shape; `fold_acc_with_spill` consumes it into the
+/// `ByGroup` shape (one entry per output group in `groups` order).
+enum WelfordAcc {
+    /// Keyed by encoded i64 group key (pre-fold).
+    ByKey(std::collections::HashMap<i64, crate::exec::welford::WelfordState>),
+    /// Indexed by post-sort group position (post-fold).
+    ByGroup(Vec<crate::exec::welford::WelfordState>),
 }
 
 /// Allocate the (keys, values, counter) spill triple for a typed agg
@@ -1373,24 +1393,35 @@ fn run_one_aggregate(
             Ok(AccDownload::I64 { gpu_acc, spill })
         }
 
-        AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => {
-            // v0.5: rejected at engine dispatch. Defensive arm here so the
-            // match remains exhaustive against the new variants without
-            // accidentally treating them like another aggregate.
-            Err(BoltError::Other(
-                "groupby_valid: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
-                    .into(),
-            ))
-        }
-        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
-            // v0.5 cut: STDDEV is only supported in the scalar-aggregate
-            // path. The GROUP BY path is out of scope for this milestone
-            // — see the matching gate in `groupby.rs::run_one_aggregate`.
-            Err(BoltError::Other(
-                "STDDEV_POP / STDDEV_SAMP are not yet supported with GROUP BY \
-                 (v0.5: scalar aggregate only)"
-                    .into(),
-            ))
+        AggregateExpr::VarPop(expr)
+        | AggregateExpr::VarSamp(expr)
+        | AggregateExpr::StddevPop(expr)
+        | AggregateExpr::StddevSamp(expr) => {
+            // v0.7: per-group Welford. Mirrors the matching arm in
+            // `crate::exec::groupby::run_one_aggregate` — the GPU
+            // hash-aggregate kernel can only update one scalar slot at a
+            // time, but numerically-stable Welford needs the coupled
+            // `(count, mean, M2)` triple to evolve together. We do the
+            // per-group fold entirely on the host using the encoded i64
+            // key as the HashMap key, which sidesteps the GPU slot
+            // indirection AND the keys-kernel spill dedupe (a host
+            // HashMap can hold every distinct key the input contains,
+            // spill or not).
+            let col_name = bare_column_name(expr.as_ref())?;
+            let col_io = resolve_input(inputs, col_name)?;
+            // Suppress unused-arg warnings: this path doesn't currently
+            // touch the GPU kernel plumbing the other arms thread
+            // through, but keeping the parameter list uniform avoids
+            // diverging the dispatch signature.
+            let _ = (
+                keys_table,
+                slot_valid,
+                k,
+                k_u32,
+                max_spill,
+                any_input_has_validity,
+            );
+            run_welford_aggregate_valid(col_io, group_col, batch, n_rows, stream, key_valid)
         }
 
         AggregateExpr::Avg(expr) => {
@@ -1485,6 +1516,96 @@ fn run_one_aggregate(
             })
         }
     }
+}
+
+/// Per-group Welford (`count`, `mean`, `M2`) accumulation for VAR_POP /
+/// VAR_SAMP / STDDEV_POP / STDDEV_SAMP under the slot-valid GROUP BY
+/// path.
+///
+/// Mirrors `crate::exec::groupby::run_welford_aggregate` — see that
+/// function for the design rationale. The valid-flag variant differs in
+/// two ways:
+///   * The host can't pre-download `keys_table` to build a `key -> slot`
+///     mapping here, because at this point the slot-valid bitmap hasn't
+///     been examined and some keys may have ended up in the keys-kernel
+///     spill buffer. Instead the Welford state is keyed by the encoded
+///     i64 key directly (`HashMap<i64, WelfordState>`), so spilled keys
+///     and committed keys merge automatically.
+///   * No GPU spill plumbing is needed: every (key, value) pair updates
+///     the host HashMap directly. `fold_acc_with_spill` then becomes a
+///     no-op for the `Welford` variant.
+fn run_welford_aggregate_valid(
+    col_io: &ColumnIO,
+    group_col: &GpuVec<i64>,
+    batch: &RecordBatch,
+    n_rows: usize,
+    stream: &CudaStream,
+    key_valid: Option<&[bool]>,
+) -> BoltResult<AccDownload> {
+    // Pull the per-row encoded i64 keys back to the host (these were the
+    // input to the keys kernel, so this download mirrors the upload).
+    let host_keys: Vec<i64> = group_col.to_vec()?;
+    debug_assert_eq!(host_keys.len(), n_rows);
+    // Defensive sync: `to_vec` uses cuMemcpyDtoH which is implicitly
+    // ordered w.r.t. the NULL stream, but the per-call stream the
+    // executor minted may have queued copies that need to drain first.
+    stream.synchronize()?;
+
+    let value_valid = column_null_mask(col_io, batch)?;
+    let values_f64 = load_input_column_as_f64_filtered(
+        col_io,
+        batch,
+        key_valid,
+        value_valid.as_deref(),
+    )?;
+
+    // Re-project the value-valid mask through key_valid so its index
+    // axis aligns with host_keys (same shape as
+    // `crate::exec::groupby::prepare_filtered_keys`).
+    let value_valid_filtered: Option<Vec<bool>> = match value_valid.as_deref() {
+        None => None,
+        Some(v) => Some(match key_valid {
+            Some(kv) => kv
+                .iter()
+                .zip(v.iter())
+                .filter_map(|(&kk, &vv)| if kk { Some(vv) } else { None })
+                .collect(),
+            None => v.to_vec(),
+        }),
+    };
+
+    let mut states_by_key: std::collections::HashMap<
+        i64,
+        crate::exec::welford::WelfordState,
+    > = std::collections::HashMap::new();
+
+    let mut idx_vals: usize = 0;
+    match value_valid_filtered {
+        None => {
+            debug_assert_eq!(values_f64.len(), host_keys.len());
+            for (i, &key) in host_keys.iter().enumerate() {
+                let st = states_by_key
+                    .entry(key)
+                    .or_insert_with(crate::exec::welford::WelfordState::empty);
+                st.push(values_f64[i]);
+            }
+        }
+        Some(vv) => {
+            debug_assert_eq!(vv.len(), host_keys.len());
+            for (i, &key) in host_keys.iter().enumerate() {
+                if !vv[i] {
+                    continue;
+                }
+                let st = states_by_key
+                    .entry(key)
+                    .or_insert_with(crate::exec::welford::WelfordState::empty);
+                st.push(values_f64[idx_vals]);
+                idx_vals += 1;
+            }
+        }
+    }
+
+    Ok(AccDownload::Welford(WelfordAcc::ByKey(states_by_key)))
 }
 
 /// Return the per-row validity mask for `col_io` in `batch`, or `None` if
@@ -2301,21 +2422,36 @@ fn build_agg_array_from_per_group(
                 ))),
             }
         }
-        // v0.5 contract: GROUP BY VAR_POP/VAR_SAMP is rejected before reaching
-        // this assembly step. Defensive arm to keep the match exhaustive.
-        (AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_), _) => {
-            Err(BoltError::Other(
-                "groupby_valid: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
-                    .into(),
-            ))
+        // v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP from the
+        // per-group Welford state. By this point fold_acc_with_spill has
+        // re-indexed the accumulator from "by encoded i64 key" to "by
+        // group position", so we can walk `states` directly. Empty /
+        // single-observation groups produce SQL NULL via the matching
+        // [`crate::exec::welford::WelfordState`] finaliser, so the output
+        // array must be nullable Float64.
+        (AggregateExpr::VarPop(_), AccDownload::Welford(WelfordAcc::ByGroup(states))) => {
+            finalize_welford_array_valid(states, WelfordOutKind::VarPop, out_field, n_groups)
         }
-        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => {
-            Err(BoltError::Other(
-                "internal: STDDEV reached GROUP BY (valid-flag) array-builder \
-                 path (should have been rejected at run_one_aggregate)"
-                    .into(),
-            ))
+        (AggregateExpr::VarSamp(_), AccDownload::Welford(WelfordAcc::ByGroup(states))) => {
+            finalize_welford_array_valid(states, WelfordOutKind::VarSamp, out_field, n_groups)
         }
+        (AggregateExpr::StddevPop(_), AccDownload::Welford(WelfordAcc::ByGroup(states))) => {
+            finalize_welford_array_valid(states, WelfordOutKind::StddevPop, out_field, n_groups)
+        }
+        (AggregateExpr::StddevSamp(_), AccDownload::Welford(WelfordAcc::ByGroup(states))) => {
+            finalize_welford_array_valid(states, WelfordOutKind::StddevSamp, out_field, n_groups)
+        }
+        (
+            AggregateExpr::VarPop(_)
+            | AggregateExpr::VarSamp(_)
+            | AggregateExpr::StddevPop(_)
+            | AggregateExpr::StddevSamp(_),
+            _,
+        ) => Err(BoltError::Other(
+            "internal: VAR/STDDEV aggregate received a non-Welford / unfolded \
+             accumulator (valid-flag path)"
+                .into(),
+        )),
         (AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_), other) => {
             // NOTE on SQL NULL-group semantics: per docs/SQL_REFERENCE.md,
             // SUM/MIN/MAX over an all-NULL group should return NULL. In this
@@ -2346,6 +2482,13 @@ fn build_agg_array_from_per_group(
                             .into(),
                     ))
                 }
+                AccDownload::Welford(_) => {
+                    return Err(BoltError::Other(
+                        "internal: Welford accumulator passed to SUM/MIN/MAX aggregate \
+                         (valid-flag path)"
+                            .into(),
+                    ))
+                }
             };
             pack_array(out_field.dtype, scalars)
         }
@@ -2353,6 +2496,48 @@ fn build_agg_array_from_per_group(
             "internal: aggregate / accumulator-variant mismatch".into(),
         )),
     }
+}
+
+/// Tag for finalising a per-group [`crate::exec::welford::WelfordState`]
+/// in the valid-flag GROUP BY path. Mirrors `groupby::WelfordOutKind`.
+#[derive(Clone, Copy, Debug)]
+enum WelfordOutKind {
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
+}
+
+/// Build a nullable `Float64Array` from a per-group Welford state vector
+/// indexed by post-sort group position. Empty / single-observation groups
+/// produce SQL NULL via the matching
+/// [`crate::exec::welford::WelfordState`] finaliser (`var_pop` returns
+/// None when `count == 0`; `var_samp` / `stddev_samp` return None when
+/// `count <= 1`).
+fn finalize_welford_array_valid(
+    states: &[crate::exec::welford::WelfordState],
+    kind: WelfordOutKind,
+    out_field: &Field,
+    n_groups: usize,
+) -> BoltResult<ArrayRef> {
+    if out_field.dtype != DataType::Float64 {
+        return Err(BoltError::Type(format!(
+            "GROUP BY (valid-flag) VAR/STDDEV output dtype must be Float64, got {:?}",
+            out_field.dtype
+        )));
+    }
+    debug_assert_eq!(states.len(), n_groups);
+    let mut out: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+    for st in states {
+        let v = match kind {
+            WelfordOutKind::VarPop => st.var_pop(),
+            WelfordOutKind::VarSamp => st.var_samp(),
+            WelfordOutKind::StddevPop => st.stddev_pop(),
+            WelfordOutKind::StddevSamp => st.stddev_samp(),
+        };
+        out.push(v);
+    }
+    Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
 }
 
 /// Map a logical AggregateExpr to its reduce op. AVG decomposes into
@@ -2453,6 +2638,31 @@ fn fold_acc_with_spill(
                 sum_spill: Vec::new(),
                 count_spill: Vec::new(),
             })
+        }
+        AccDownload::Welford(WelfordAcc::ByKey(states_by_key)) => {
+            // Re-index the encoded-key HashMap into a per-group Vec in the
+            // same order as `groups` so the assembler can use the uniform
+            // `n_groups`-by-position contract. Empty / missing groups (a
+            // key with no rows folded in — shouldn't happen for inputs the
+            // GPU placed, but handle defensively for cosmic safety) get a
+            // fresh `WelfordState::empty()`, which finalises to SQL NULL.
+            let _ = (op, key_to_group);
+            let mut states: Vec<crate::exec::welford::WelfordState> =
+                Vec::with_capacity(groups.len());
+            for g in groups {
+                let st = states_by_key
+                    .get(&g.key)
+                    .copied()
+                    .unwrap_or_else(crate::exec::welford::WelfordState::empty);
+                states.push(st);
+            }
+            Ok(AccDownload::Welford(WelfordAcc::ByGroup(states)))
+        }
+        AccDownload::Welford(WelfordAcc::ByGroup(states)) => {
+            // Already folded — pass through. fold_acc_with_spill is only
+            // called once per aggregate today, but be idempotent.
+            let _ = (op, groups, key_to_group);
+            Ok(AccDownload::Welford(WelfordAcc::ByGroup(states)))
         }
     }
 }
