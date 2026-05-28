@@ -314,7 +314,7 @@ mod tests {
     /// `BOLT_BENCH_GPU=1` for the same reason as the engine tests —
     /// we can't acquire a context on a non-CUDA host.
     #[test]
-    #[ignore = "requires CUDA device (set BOLT_BENCH_GPU=1 + run with --ignored)"]
+    #[ignore = "gpu:mempool — set BOLT_BENCH_GPU=1 + run with --ignored"]
     fn cudarc_alloc_roundtrip() {
         let host_in: Vec<i32> = (0..1024).collect();
         let dev_ptr = mem_alloc(host_in.len() * 4).expect("alloc");

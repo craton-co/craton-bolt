@@ -1142,7 +1142,7 @@ mod tests {
     /// through `sort_indices_on_gpu_multi` (single-key spec), gathers, and
     /// asserts strictly ascending output.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:sort"]
     fn gpu_sort_int32_asc_round_trip() {
         // 16384 = 2^14, exact power of two: no padding required, exercises the
         // happy path without truncation noise.
@@ -1183,7 +1183,7 @@ mod tests {
     /// 16385-row non-power-of-two sort exercises the padding path: n_pow2 =
     /// 32768, with 16383 sentinel entries that must be truncated cleanly.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:sort"]
     fn gpu_sort_int64_desc_with_padding() {
         let n = 16_385usize;
         let values: Vec<i64> = (0..n as i64).map(|i| (i * 7919) % 1_000_000).collect();
@@ -1212,7 +1212,7 @@ mod tests {
 
     /// Float64 ASC round trip with a non-power-of-two size.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:sort"]
     fn gpu_sort_float64_asc_with_padding() {
         let n = 20_000usize;
         let values: Vec<f64> = (0..n).map(|i| ((i as f64) * 1.61803398875).sin()).collect();
@@ -1244,7 +1244,7 @@ mod tests {
     /// full-batch gather. Build a two-column batch (key + payload), sort by
     /// the key, and confirm the payload tracks.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:sort"]
     fn gpu_sort_record_batch_keeps_columns_in_sync() {
         let n = 16_384usize;
         // Key = scrambled 0..n; payload = 100 + key. After sorting by key,

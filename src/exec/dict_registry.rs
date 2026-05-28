@@ -440,7 +440,7 @@ mod tests {
     /// register it, then confirm the registry holds a dictionary for `region`
     /// (and no dictionary for `price`).
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn register_table_indexes_only_utf8_columns() {
         use std::sync::Arc;
 
@@ -474,7 +474,7 @@ mod tests {
     /// Round-trip a `Scan` plan through `rewrite_plan` and confirm the Utf8
     /// equality is folded into an Int32 equality against `__idx_region`.
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn rewrite_plan_folds_string_eq_into_index_eq() {
         use std::sync::Arc;
 
@@ -527,7 +527,7 @@ mod tests {
     /// registered Utf8 column and leaves non-Utf8 / unregistered columns
     /// alone.
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn extended_schema_appends_index_columns() {
         use std::sync::Arc;
 
@@ -568,7 +568,7 @@ mod tests {
     /// values match the Arrow input slot-for-slot, modulo the `+1` NULL
     /// reservation on the *index* side.
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn register_dictionary_column_reuses_arrow_dict() {
         use arrow_array::builder::StringDictionaryBuilder;
 
@@ -602,7 +602,7 @@ mod tests {
     /// `col = 'US'` predicate into `__idx_col = 1` just like the
     /// StringArray-based path.
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn register_dictionary_column_drives_rewrite() {
         use arrow_array::builder::StringDictionaryBuilder;
 

@@ -2238,7 +2238,7 @@ mod tests {
     /// median per_op_ns is reported so a single GC pause or background
     /// noise burst doesn't bias the result.
     #[test]
-    #[ignore = "micro-bench, run manually with --ignored --nocapture"]
+    #[ignore = "gpu:mempool — micro-bench, run manually with --ignored --nocapture"]
     fn bench_dashmap_baseline() {
         use std::sync::Arc;
 

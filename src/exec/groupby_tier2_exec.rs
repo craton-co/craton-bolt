@@ -147,7 +147,7 @@ mod stage4_tests {
     use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier2"]
     fn async_tier2_sum_round_trip() {
         // 300 K rows, ~2 K distinct keys — comfortably above the row + group
         // floor that gates this executor.

@@ -644,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime (zeros)"]
+    #[ignore = "gpu:projection — zeros"]
     fn gather_col_dispatch_matches_alloc() {
         // alloc_gathered must produce a variant whose len matches the request.
         let g = alloc_gathered(DataType::Int32, 4).expect("alloc i32");
@@ -715,7 +715,7 @@ mod tests {
     /// zip logic that would re-introduce the W5A2-pre regression
     /// (dropping validity during compaction).
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime (GpuVec::from_slice allocates on device)"]
+    #[ignore = "gpu:projection — GpuVec::from_slice allocates on device"]
     fn gathered_bool_nullable_download_preserves_validity() {
         // values:   [1, 0, 0, 1]
         // validity: [1, 0, 1, 0]
@@ -775,7 +775,7 @@ mod tests {
     ///   validity: [1, 0, 1, 0]
     /// which the download zip then turns into [Some(true), None, Some(true), None].
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:projection"]
     fn gpu_compact_bool_nullable_gathers_both_buffers() {
         let stream = CudaStream::null();
 

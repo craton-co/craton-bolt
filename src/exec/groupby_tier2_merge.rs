@@ -240,7 +240,7 @@ mod tests {
     // JIT + a live CUDA context.
     // ----------------------------------------------------------------------
     #[test]
-    #[ignore = "requires CUDA toolkit + JIT (executes Tier-2 SUM pipeline + merge)"]
+    #[ignore = "gpu:tier2 — executes Tier-2 SUM pipeline + merge"]
     fn stage6_orchestrator_plus_merge_smoke() {
         use std::collections::HashMap;
         use crate::cuda::GpuVec;

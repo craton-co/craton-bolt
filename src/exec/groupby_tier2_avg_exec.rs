@@ -587,7 +587,7 @@ mod stage4_tests {
     use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier2"]
     fn async_tier2_avg_round_trip() {
         let n: usize = 300_000;
         let n_groups: usize = 4096;

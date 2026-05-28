@@ -508,7 +508,7 @@ mod tests {
     // toolkit-less build machine pass.
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:string"]
     fn from_string_array_round_trip() {
         let input = StringArray::from(vec![Some("us"), None, Some("uk"), Some("us")]);
         let col = DictionaryColumnI64::from_string_array(&input)
@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:string"]
     fn try_into_i32_succeeds_for_small_dict() {
         let input = StringArray::from(vec![Some("us"), Some("uk"), Some("us")]);
         let wide = DictionaryColumnI64::from_string_array(&input).expect("encode");
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime — narrow path uploads the oversized vec"]
+    #[ignore = "gpu:string — narrow path uploads the oversized vec"]
     fn try_into_i32_fails_for_oversized_index() {
         // We can't realistically build a dictionary with > i32::MAX entries in
         // a unit test, so synthesize the failure by hand-uploading a single

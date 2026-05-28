@@ -1727,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+    #[ignore = "gpu:projection"]
     fn register_batch_two_batches_query_sees_both() {
         // Register two batches, then SELECT the only column. The lazy-upload
         // path must rebuild the GpuTable from BOTH batches at query time, so
@@ -1753,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+    #[ignore = "gpu:projection"]
     fn register_batch_ten_batches_combined_row_count() {
         // Append ten 100-row batches in a loop, then query. With the bug we
         // were fixing, this would upload 1+2+…+10 = 55 batches' worth of bytes
@@ -1790,7 +1790,7 @@ mod tests {
     /// asserting — same input, same expected output — so any regression in
     /// the stream-flow shows up as a value mismatch rather than a CUDA error.
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime — Stage 2 async D2H correctness"]
+    #[ignore = "gpu:projection — Stage 2 async D2H correctness"]
     fn execute_projection_async_d2h_round_trip() {
         let mut engine = Engine::new().expect("engine init");
 
@@ -1825,7 +1825,7 @@ mod tests {
     /// kernel's own internal sync (inside `launch_predicate_kernel`) now
     /// covers both, and any regression in that chain surfaces here.
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime — Stage 2 stream chaining w/ predicate"]
+    #[ignore = "gpu:projection — Stage 2 stream chaining w/ predicate"]
     fn execute_projection_with_predicate_under_async_stream() {
         let mut engine = Engine::new().expect("engine init");
 
@@ -1962,7 +1962,7 @@ mod tests {
     /// `AggregateSpec::input_has_validity`, defeating PV-stage-d / -f
     /// native-validity dispatch.
     #[test]
-    #[ignore = "requires CUDA device - Engine::new() initializes driver"]
+    #[ignore = "gpu:e2e — Engine::new() initializes driver"]
     fn pv_stage_f_engine_provider_has_nulls_true_for_null_bearing_batch() {
         use crate::plan::TableProvider;
 
@@ -2010,7 +2010,7 @@ mod tests {
     ///   * batch 1 has dict values ["a", "b", "c"]
     ///   * `WHERE s = 'c'` must return the rows from batch 1 whose `s = "c"`.
     #[test]
-    #[ignore = "requires CUDA device - dictionary construction uploads to GPU"]
+    #[ignore = "gpu:string — dictionary construction uploads to GPU"]
     fn c10_register_batch_unions_dictionaries_across_batches() {
         use arrow_array::StringArray;
 
@@ -2062,7 +2062,7 @@ mod tests {
     /// Mirror of the test above for a NULL-free column — provider must
     /// return false so PV stages keep the legacy host-strip path bit-identical.
     #[test]
-    #[ignore = "requires CUDA device - Engine::new() initializes driver"]
+    #[ignore = "gpu:e2e — Engine::new() initializes driver"]
     fn pv_stage_f_engine_provider_has_nulls_false_for_null_free_batch() {
         use crate::plan::TableProvider;
 
@@ -2194,7 +2194,7 @@ mod tests {
     /// observe exactly one cache miss against the projection entry. The
     /// second call must hit and produce identical results.
     #[test]
-    #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+    #[ignore = "gpu:projection — module cache hit"]
     fn module_cache_hits_on_repeat_projection() {
         use std::sync::atomic::Ordering;
 
@@ -2235,7 +2235,7 @@ mod tests {
     /// is keyed correctly (otherwise a second, distinct SELECT would
     /// erroneously hit and run the wrong kernel — silent-wrong-result).
     #[test]
-    #[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+    #[ignore = "gpu:projection — module cache miss"]
     fn module_cache_misses_on_different_projection() {
         use std::sync::atomic::Ordering;
 

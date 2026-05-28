@@ -3463,7 +3463,7 @@ mod tests {
     /// arbitrary-order output is reconciled by sorting both sides on
     /// (probe_idx, build_idx) before comparison.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:join"]
     fn gpu_hash_join_int32_round_trip() {
         // Build side: 2000 unique keys 0..2000, payload = key + 1000.
         // Probe side: 4000 keys, every other one matching a build key.
@@ -3530,7 +3530,7 @@ mod tests {
     /// End-to-end test through `execute_inner_join_on_gpu`: same fixture as
     /// above but exercises the full take + concat path.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:join"]
     fn gpu_inner_join_full_batch_round_trip() {
         let n_build = 2000usize;
         let n_probe = 4000usize;
@@ -3613,7 +3613,7 @@ mod tests {
 
     /// 0-row probe side: must produce an empty result without panicking.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:join"]
     fn gpu_hash_join_empty_probe() {
         let build_keys: Vec<i32> = (0..1024).collect();
         let probe_keys: Vec<i32> = Vec::new();
@@ -3631,7 +3631,7 @@ mod tests {
 
     /// Int64 keys, same shape as the Int32 round-trip.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:join"]
     fn gpu_hash_join_int64_round_trip() {
         let n_build = 1500usize;
         let n_probe = 3000usize;
@@ -3964,7 +3964,7 @@ mod tests {
     /// regression test that backs `tests/gpu_join_e2e.rs::aos_build_layout_no_regression`.
     /// Gated on `--ignored` for the same reason as the other GPU tests.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:join"]
     fn aos_matches_soa() {
         let n_build = 2_000usize;
         let n_probe = 4_000usize;
@@ -4144,7 +4144,7 @@ mod tests {
     /// driver. Below the gate the host path is correct and exercised by
     /// the streaming-intern unit tests above.
     #[test]
-    #[ignore = "requires CUDA toolkit + driver at runtime"]
+    #[ignore = "gpu:join"]
     fn device_string_hash_matches_host() {
         // Fixture: mix short, medium, empty, and long strings. The device
         // kernel walks each row's byte range; an empty string must hash to

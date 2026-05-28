@@ -305,7 +305,7 @@ mod tests {
     /// [`dispatch_i32_vs_i64_by_threshold`] below, which constructs the i64
     /// variant directly via [`DictionaryColumnI64::new_host_only`].
     #[test]
-    #[ignore = "would require allocating > 2 billion distinct strings"]
+    #[ignore = "resource — would require allocating > 2 billion distinct strings"]
     fn cardinality_above_threshold_picks_i64() {
         // Intentionally left empty — see the comment above.
     }

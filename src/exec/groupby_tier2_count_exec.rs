@@ -622,7 +622,7 @@ mod stage4_tests {
     use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier2"]
     fn async_tier2_count_round_trip() {
         // Needs >= 256 K rows AND max(key) > BLOCK_GROUPS so this path
         // takes the query instead of deferring.

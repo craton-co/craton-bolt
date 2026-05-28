@@ -222,7 +222,7 @@ mod stage4_tests {
     use std::sync::Arc;
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier1"]
     fn async_shmem_count_round_trip() {
         let n: usize = 1024;
         let n_groups: usize = 8;

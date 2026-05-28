@@ -1016,7 +1016,7 @@ mod tests {
     /// memcpy wrappers actually move bytes and that `PinnedHostBuffer`
     /// hands out a valid host buffer.
     #[test]
-    #[ignore = "requires CUDA device (set BOLT_BENCH_GPU=1 + run with --ignored)"]
+    #[ignore = "gpu:mempool — set BOLT_BENCH_GPU=1 + run with --ignored"]
     fn pinned_host_buffer_roundtrip() {
         use crate::cuda::buffer::{GpuBuffer, PinnedHostBuffer};
         use crate::exec::launch::CudaStream;

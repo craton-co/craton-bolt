@@ -2633,7 +2633,7 @@ mod tests {
     /// Stage-3 async memcpy + pinned D2H plumbing produces the same
     /// per-group sums as a host-side check.
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier1"]
     fn async_groupby_int32_sum_round_trip() {
         use crate::Engine;
         use arrow_array::Int64Array;

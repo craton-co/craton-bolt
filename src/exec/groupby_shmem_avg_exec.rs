@@ -472,7 +472,7 @@ mod stage4_tests {
     use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier1"]
     fn async_shmem_avg_round_trip() {
         let n: usize = 1024;
         let n_groups: usize = 8;
@@ -565,7 +565,7 @@ mod stage5_tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier1"]
     fn multi_avg_persisted_pinned() {
         // 64K rows (the fast-path floor), 16 groups, 4 AVGs — exactly the
         // shape MAX_AVG_AGGS targets. Each iteration's D2H now writes
@@ -658,7 +658,7 @@ mod stage5_tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier1"]
     fn single_avg_still_correct_after_persist_refactor() {
         // Regression guard for the N=1 path: the persisted-buffer code
         // must not have broken the most-common single-AVG case (it had

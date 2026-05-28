@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier1"]
     fn async_sum_int64_matches_host_sum() {
         // Round-trip: build a small table, run SUM through the engine
         // (which uses the Stage-3 async-memcpy reduction path here), and
@@ -874,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:tier1"]
     fn pinned_d2h_matches_sync_d2h() {
         // Allocate identical GPU buffers via `GpuVec::from_slice`, then
         // pull one through the legacy sync path (`to_vec`) and one

@@ -453,7 +453,7 @@ mod tests {
     // tests are.
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:string"]
     fn dict_basic_encoding() {
         // ["a", "b", "a", "c", "b"] => dictionary ["a", "b", "c"], indices
         // [1, 2, 1, 3, 2]. First-occurrence order, slot 0 reserved for NULL.
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:string"]
     fn dict_with_nulls() {
         // Nulls collapse to index 0 and never enter the dictionary.
         let input = StringArray::from(vec![Some("a"), None, Some("b"), None, Some("a")]);
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:string"]
     fn dict_empty_input() {
         // Edge case: zero rows. Dictionary and indices must both be empty,
         // and n_rows must agree.
@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:string"]
     fn dict_all_null() {
         // Every row is NULL: the dictionary stays empty (no non-null
         // strings to deduplicate), and every index is 0.
@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:string"]
     fn dict_index_of_lookup() {
         // After a real encode, `index_of` must report the same slots that
         // the indices vec already uses for those strings.
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA toolkit at runtime"]
+    #[ignore = "gpu:string"]
     fn dict_to_string_array_roundtrip() {
         // encode -> decode -> assert byte-equality (with NULL preservation).
         let input = StringArray::from(vec![

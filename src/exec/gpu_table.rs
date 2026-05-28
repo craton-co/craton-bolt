@@ -568,7 +568,7 @@ mod tests {
     /// Ignored: GpuVec uploads require a CUDA device, so this test must be
     /// run with `cargo test ... -- --ignored` on a GPU host.
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn dict_column_uploads_without_flattening() {
         // Make sure a CUDA context exists. Engine::new() initialises one.
         let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
@@ -623,7 +623,7 @@ mod tests {
     /// from `DictUtf8` (slot-0 NULL reservation, dictionary owned by
     /// `DictionaryColumn`).
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn plain_utf8_column_still_takes_utf8_variant() {
         let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
 
@@ -649,7 +649,7 @@ mod tests {
     /// verify the resulting `DictUtf8` variant carries a validity bitmap.
     /// CUDA-dependent (uploads to the device).
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn dict_utf8_with_nulls_propagates_validity() {
         let mut b: StringDictionaryBuilder<ArrowInt32Type> = StringDictionaryBuilder::new();
         b.append_value("a");
@@ -684,7 +684,7 @@ mod tests {
     /// Stage 6 — a `DictionaryArray` with zero nulls uploads a `DictUtf8`
     /// whose `valid_mask` is `None`.
     #[test]
-    #[ignore = "requires CUDA device"]
+    #[ignore = "gpu:string"]
     fn dict_utf8_without_nulls_omits_validity() {
         let mut b: StringDictionaryBuilder<ArrowInt32Type> = StringDictionaryBuilder::new();
         b.append_value("x");
