@@ -6,6 +6,18 @@
 //! a `HashSet<u64>` to identify duplicates, then use the dedup mask
 //! to construct a new `BooleanArray` and apply `arrow::compute::filter`.
 //!
+//! Float semantics (review C12 alignment):
+//!   * `+0.0` and `-0.0` are CANONICALISED to a single representation
+//!     (`+0.0`) before hashing, so they dedupe to one row. This matches
+//!     SQL/IEEE comparison semantics (`+0.0 == -0.0`) and what DuckDB
+//!     does, and lines up with the `groupby` and host-side `join`
+//!     executors which apply the same canonicalisation. See
+//!     `canonicalise_f32` / `canonicalise_f64` below.
+//!   * `NaN` bit patterns are LEFT AS-IS. The host-side canonicalisation
+//!     uses `if x == 0.0 { 0.0 } else { x }` which evaluates `false` for
+//!     every NaN (per IEEE) and therefore preserves NaN bit patterns
+//!     verbatim. Documented SQL semantics: `NaN != NaN` (also DuckDB).
+//!
 //! GPU-side DISTINCT (via a sort + run-length encoding kernel) is a
 //! 0.2 target — see ROADMAP.md.
 
@@ -68,20 +80,24 @@ fn hash_array_row(array: &dyn Array, row: usize, h: &mut impl Hasher) {
             h.write_i64(array.as_any().downcast_ref::<Int64Array>().unwrap().value(row))
         }
         DataType::Float32 => h.write_u32(
-            array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .value(row)
-                .to_bits(),
+            canonicalise_f32(
+                array
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .value(row),
+            )
+            .to_bits(),
         ),
         DataType::Float64 => h.write_u64(
-            array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(row)
-                .to_bits(),
+            canonicalise_f64(
+                array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row),
+            )
+            .to_bits(),
         ),
         DataType::Boolean => h.write_u8(
             array
@@ -105,6 +121,24 @@ fn hash_array_row(array: &dyn Array, row: usize, h: &mut impl Hasher) {
     }
 }
 
+/// Collapse `-0.0` to `+0.0` so that signed-zero pairs hash identically
+/// under DISTINCT. Preserves every other bit pattern, including the full
+/// space of `NaN` payloads (the predicate `x == 0.0` is `false` for any
+/// `NaN`). Mirrors the host-side canonicalisation applied in
+/// `groupby::load_key_column_bits` and `join::extract_key` so that
+/// DISTINCT, GROUP BY, and JOIN share one equivalence relation for
+/// floats.
+#[inline]
+pub(crate) fn canonicalise_f64(x: f64) -> f64 {
+    if x == 0.0 { 0.0 } else { x }
+}
+
+/// `f32` analogue of [`canonicalise_f64`]; same shape, same rationale.
+#[inline]
+pub(crate) fn canonicalise_f32(x: f32) -> f32 {
+    if x == 0.0 { 0.0 } else { x }
+}
+
 fn arrow_err(e: arrow::error::ArrowError) -> BoltError {
     BoltError::Other(format!("arrow: {}", e))
 }
@@ -112,7 +146,7 @@ fn arrow_err(e: arrow::error::ArrowError) -> BoltError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{Float64Array, Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     /// Build a one-column Int32 batch from the given values.
@@ -190,6 +224,41 @@ mod tests {
         let out_batch = out.into_record_batch();
         assert_eq!(out_batch.num_rows(), 3);
         assert_eq!(col_to_vec(&out_batch, 0), vec![None, Some(1), Some(2)]);
+    }
+
+    /// Review C12: `+0.0` and `-0.0` belong to the same equivalence
+    /// class for DISTINCT (matches SQL/IEEE and DuckDB). Two rows
+    /// holding signed-zero pairs must dedupe to one row.
+    #[test]
+    fn distinct_signed_zero_dedupes_to_one_row() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "f",
+            DataType::Float64,
+            false,
+        )]));
+        let arr: Arc<dyn Array> =
+            Arc::new(Float64Array::from(vec![0.0_f64, -0.0_f64, 0.0_f64]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
+        // {+0.0, -0.0, +0.0} all collapse to the canonical +0.0 key, so
+        // only the first row survives.
+        assert_eq!(out.into_record_batch().num_rows(), 1);
+    }
+
+    /// Review C12: `NaN` is left as-is — the canonicalisation only
+    /// touches signed zeros, so two `NaN`s with the SAME bit pattern
+    /// still hash equal (the row carries the raw bits) and dedupe, but
+    /// the canonicalisation does NOT collapse NaN-vs-not-NaN.
+    #[test]
+    fn distinct_nan_canonicalisation_is_noop() {
+        // canonicalise_f64 must preserve NaN bit-for-bit.
+        let nan_in = f64::from_bits(0x7ff8_0000_0000_0001); // a quiet NaN
+        let nan_out = canonicalise_f64(nan_in);
+        assert!(nan_out.is_nan());
+        assert_eq!(nan_in.to_bits(), nan_out.to_bits());
+        // Signed-zero canonicalisation does happen.
+        assert_eq!(canonicalise_f64(-0.0_f64).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(canonicalise_f32(-0.0_f32).to_bits(), 0.0_f32.to_bits());
     }
 
     #[test]
