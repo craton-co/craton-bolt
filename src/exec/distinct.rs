@@ -21,23 +21,6 @@
 //! well as the obvious correctness one. The fix carries the values in the
 //! set, so the only way two rows collapse is if they are genuinely equal.
 //!
-//! Float semantics: NaN/NaN and +0.0/-0.0 are compared **by bit pattern**
-//! via `f32::to_bits` / `f64::to_bits`. Consequences:
-//!   * Two `NaN`s with identical bit patterns dedupe to one row, even
-//!     though `NaN == NaN` is `false` under IEEE-754. This matches what
-//!     SQL's `DISTINCT` users intuitively expect — a single "NaN" should
-//!     appear once in the output, not once per input occurrence.
-//!     PostgreSQL and DuckDB take the same stance.
-//!   * `+0.0` and `-0.0` have **different** bit patterns and therefore
-//!     dedupe to two rows. This differs from PostgreSQL (which treats
-//!     them as equal). We pick bit-equality here because it is the only
-//!     equivalence relation that is consistent with the same-bits rule
-//!     for `NaN`, and it matches the join executor's existing behaviour
-//!     (`JoinKeyValue::F32`/`F64` also key on the raw bit pattern). If
-//!     this turns into a real-world pain point we can swap to a
-//!     canonicalising encoding later — the test `distinct_zero_signs`
-//!     locks in today's behaviour so any change is intentional.
-//!
 //! Float semantics (review C12 alignment):
 //!   * `+0.0` and `-0.0` are CANONICALISED to a single representation
 //!     (`+0.0`) before hashing, so they dedupe to one row. This matches
@@ -49,14 +32,37 @@
 //!     uses `if x == 0.0 { 0.0 } else { x }` which evaluates `false` for
 //!     every NaN (per IEEE) and therefore preserves NaN bit patterns
 //!     verbatim. Documented SQL semantics: `NaN != NaN` (also DuckDB).
+//!     Two `NaN`s with identical bit patterns DO dedupe to one row
+//!     because the row key carries the raw bits and `Eq` is bit-wise.
 //!
-//! GPU-side DISTINCT (via a sort + run-length encoding kernel) is a
-//! 0.2 target — see ROADMAP.md.
+//! Allocation strategy (review H9): the inner loop pre-downcasts each
+//! column ONCE into a typed `ColumnReader` enum (a struct-of-arrays view
+//! of the batch), then walks rows pulling values through the readers.
+//! This avoids the per-row `Array::as_any` + `downcast_ref` vtable
+//! shuffle that the old `extract_value(&dyn Array, row)` shape paid on
+//! every (row, column) pair — for an N-row × K-column batch that is N·K
+//! vtable lookups dropped to K. The `Vec<RowKeyValue>` per row is
+//! preallocated with `n_cols` capacity (no growth re-allocs); the freshly
+//! built key is moved into `HashSet::insert`, so on a miss it lives in
+//! the set and on a hit it is dropped — same allocation count as before
+//! but the per-row dtype dispatch is now branch-predictor friendly
+//! (constant variant per column) instead of an `Array::data_type()`
+//! match in the inner loop.
+//!
+//! Dispatch: a single host-side path. The 0.2 target (sort-based DISTINCT
+//! via `gpu_sort::sort_indices_on_gpu_multi`) is tracked in ROADMAP.md;
+//! it requires the input columns to already be uploaded as `GpuVec`s,
+//! which the distinct executor does not have hand — that restructure is
+//! deferred to the GPU-side rework.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray,
+};
+use arrow_schema::DataType;
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::QueryHandle;
@@ -74,8 +80,8 @@ enum RowKeyValue {
     I32(i32),
     I64(i64),
     /// `f32` reinterpreted via `to_bits`. NaN-vs-NaN equality is therefore
-    /// bit-wise; `+0.0` and `-0.0` have different bit patterns and do
-    /// **not** compare equal. See module doc-comment.
+    /// bit-wise; `+0.0` and `-0.0` are first canonicalised to `+0.0` via
+    /// [`canonicalise_f32`]. See module doc-comment.
     F32(u32),
     /// `f64` reinterpreted via `to_bits`. Same bit-wise semantics as `F32`.
     F64(u64),
@@ -84,10 +90,82 @@ enum RowKeyValue {
 }
 
 /// A row's full key — one `RowKeyValue` per column, in column order.
-/// Allocating a `Vec` per surviving row is the price of correctness over
-/// the previous hash-only shape; the 0.2 GPU port will eliminate the
-/// allocation entirely by switching to a sort-based DISTINCT.
 type RowKey = Vec<RowKeyValue>;
+
+/// Pre-downcast column reader: a typed, zero-cost view into one column of
+/// the input batch. Built once per column up-front so the inner row loop
+/// no longer pays `Array::as_any` + `downcast_ref` per (row, column).
+enum ColumnReader<'a> {
+    I32(&'a Int32Array),
+    I64(&'a Int64Array),
+    F32(&'a Float32Array),
+    F64(&'a Float64Array),
+    Bool(&'a BooleanArray),
+    Utf8(&'a StringArray),
+}
+
+impl<'a> ColumnReader<'a> {
+    fn new(array: &'a dyn Array) -> BoltResult<Self> {
+        Ok(match array.data_type() {
+            DataType::Int32 => ColumnReader::I32(array.as_any().downcast_ref().unwrap()),
+            DataType::Int64 => ColumnReader::I64(array.as_any().downcast_ref().unwrap()),
+            DataType::Float32 => ColumnReader::F32(array.as_any().downcast_ref().unwrap()),
+            DataType::Float64 => ColumnReader::F64(array.as_any().downcast_ref().unwrap()),
+            DataType::Boolean => ColumnReader::Bool(array.as_any().downcast_ref().unwrap()),
+            DataType::Utf8 => ColumnReader::Utf8(array.as_any().downcast_ref().unwrap()),
+            other => {
+                return Err(BoltError::Type(format!(
+                    "DISTINCT: unsupported dtype {other:?} — should have been caught by the planner"
+                )))
+            }
+        })
+    }
+
+    /// Pull the value at `row` out as an owned `RowKeyValue`. NULL handling
+    /// is uniform: any column variant returns `RowKeyValue::Null` for a
+    /// null row. The only path that allocates is `Utf8`, which clones the
+    /// underlying `&str` into a `String`.
+    #[inline]
+    fn value_at(&self, row: usize) -> RowKeyValue {
+        match self {
+            ColumnReader::I32(a) => {
+                if a.is_null(row) { RowKeyValue::Null } else { RowKeyValue::I32(a.value(row)) }
+            }
+            ColumnReader::I64(a) => {
+                if a.is_null(row) { RowKeyValue::Null } else { RowKeyValue::I64(a.value(row)) }
+            }
+            ColumnReader::F32(a) => {
+                if a.is_null(row) {
+                    RowKeyValue::Null
+                } else {
+                    // Canonicalise +0.0/-0.0 → +0.0 (review C12).
+                    RowKeyValue::F32(canonicalise_f32(a.value(row)).to_bits())
+                }
+            }
+            ColumnReader::F64(a) => {
+                if a.is_null(row) {
+                    RowKeyValue::Null
+                } else {
+                    // Canonicalise +0.0/-0.0 → +0.0 (review C12).
+                    RowKeyValue::F64(canonicalise_f64(a.value(row)).to_bits())
+                }
+            }
+            ColumnReader::Bool(a) => {
+                if a.is_null(row) { RowKeyValue::Null } else { RowKeyValue::Bool(a.value(row)) }
+            }
+            ColumnReader::Utf8(a) => {
+                if a.is_null(row) {
+                    RowKeyValue::Null
+                } else {
+                    // String allocation is unavoidable in the owned-key
+                    // shape; the win from H9 is that we no longer redo
+                    // the downcast per row, only the clone.
+                    RowKeyValue::Utf8(a.value(row).to_string())
+                }
+            }
+        }
+    }
+}
 
 /// Apply DISTINCT to the input handle, returning a new handle whose
 /// RecordBatch has duplicate rows removed (first-occurrence wins).
@@ -108,16 +186,27 @@ pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
         return Ok(QueryHandle::from_record_batch(batch));
     }
 
+    // Pre-downcast every column ONCE (review H9). For an N-row × K-column
+    // input this turns N·K vtable lookups into K.
+    let n_cols = batch.num_columns();
+    let readers: Vec<ColumnReader<'_>> = batch
+        .columns()
+        .iter()
+        .map(|c| ColumnReader::new(c.as_ref()))
+        .collect::<BoltResult<Vec<_>>>()?;
+
     // Build an owned, typed key per row and check membership against the
     // set of already-seen keys. `HashSet::insert` returns `true` iff the
     // key was not already present — i.e. iff the row is a first occurrence.
+    // The freshly-built `key` is *moved* into `insert`, so on a miss it
+    // lives in the set and on a hit it is dropped — exactly one
+    // `Vec<RowKeyValue>` allocation per input row.
     let mut seen: HashSet<RowKey> = HashSet::with_capacity(n_rows);
     let mut mask_bits: Vec<bool> = Vec::with_capacity(n_rows);
-    let n_cols = batch.num_columns();
     for row in 0..n_rows {
         let mut key: RowKey = Vec::with_capacity(n_cols);
-        for col in batch.columns() {
-            key.push(extract_value(col.as_ref(), row)?);
+        for reader in &readers {
+            key.push(reader.value_at(row));
         }
         mask_bits.push(seen.insert(key));
     }
@@ -130,68 +219,6 @@ pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
         .collect::<BoltResult<Vec<_>>>()?;
     let out = RecordBatch::try_new(batch.schema(), filtered_cols).map_err(arrow_err)?;
     Ok(QueryHandle::from_record_batch(out))
-}
-
-/// Pull the value at `(array, row)` out as an owned `RowKeyValue`.
-/// Handles every primitive Arrow type the engine produces; unsupported
-/// dtypes surface as a typed `BoltError` rather than a panic so the
-/// caller can return a clean SQL error to the user.
-fn extract_value(array: &dyn Array, row: usize) -> BoltResult<RowKeyValue> {
-    use arrow_array::*;
-    use arrow_schema::DataType;
-    if array.is_null(row) {
-        return Ok(RowKeyValue::Null);
-    }
-    Ok(match array.data_type() {
-        DataType::Int32 => RowKeyValue::I32(
-            array.as_any().downcast_ref::<Int32Array>().unwrap().value(row),
-        ),
-        DataType::Int64 => RowKeyValue::I64(
-            array.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
-        ),
-        DataType::Float32 => RowKeyValue::F32(
-            // Canonicalise +0.0/-0.0 → +0.0 to match join/groupby equivalence (review C12).
-            canonicalise_f32(
-                array
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .unwrap()
-                    .value(row),
-            )
-            .to_bits(),
-        ),
-        DataType::Float64 => RowKeyValue::F64(
-            // Canonicalise +0.0/-0.0 → +0.0 to match join/groupby equivalence (review C12).
-            canonicalise_f64(
-                array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .unwrap()
-                    .value(row),
-            )
-            .to_bits(),
-        ),
-        DataType::Boolean => RowKeyValue::Bool(
-            array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap()
-                .value(row),
-        ),
-        DataType::Utf8 => RowKeyValue::Utf8(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        ),
-        other => {
-            return Err(BoltError::Type(format!(
-                "DISTINCT: unsupported dtype {other:?} — should have been caught by the planner"
-            )))
-        }
-    })
 }
 
 /// Collapse `-0.0` to `+0.0` so that signed-zero pairs hash identically
