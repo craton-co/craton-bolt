@@ -960,10 +960,13 @@ fn radix_pre_transform_i32(val: i32, dir: SortDirection) -> i32 {
         // constant. `wrapping_neg` would also work for the magnitude but
         // XOR makes the bit-pattern intent explicit.
         SortDirection::Asc => val ^ i32::MIN,
-        // Bit-not is the all-ones XOR. For any fixed-width int, `a < b`
-        // iff `!a > !b` bit-pattern-wise — so unsigned ASC of `!val` is
-        // value-DESC of `val`.
-        SortDirection::Desc => !val,
+        // DESC = ASC-then-bitwise-NOT. Bit-NOT alone is wrong for signed
+        // ints because it doesn't normalise the MSB first — `!INT_MIN ==
+        // INT_MAX` would sort *below* `!0 == -1` under u32 order, which
+        // is value-ASC of the inputs, not value-DESC. The correct
+        // transform is `!(val ^ MIN)` so unsigned-ASC of the result =
+        // signed-DESC of `val`.
+        SortDirection::Desc => !(val ^ i32::MIN),
     }
 }
 
@@ -973,7 +976,7 @@ fn radix_pre_transform_i32(val: i32, dir: SortDirection) -> i32 {
 fn radix_pre_transform_i64(val: i64, dir: SortDirection) -> i64 {
     match dir {
         SortDirection::Asc => val ^ i64::MIN,
-        SortDirection::Desc => !val,
+        SortDirection::Desc => !(val ^ i64::MIN),
     }
 }
 
