@@ -28,13 +28,17 @@
 //! 3. Performs a bounded linear probe (`MAX_PROBE_FACTOR * cap` slots):
 //!    * `atom.global.cas.b64 prev, [keys_table[slot]], EMPTY_KEY, key`.
 //!    * `prev == EMPTY_KEY` ⇒ insertion succeeded; write `row_idx_table[slot] = tid`
-//!      and return.
+//!      *immediately* (before any further branching — see review C5) and
+//!      return.
 //!    * `prev == key` ⇒ another thread already inserted this key. We keep the
-//!      first-writer-wins behaviour by leaving `row_idx_table[slot]` alone.
-//!      However the host treats build-key collisions as a *fall-through* miss
-//!      (see Stage-2 note below) so duplicate build keys disable the GPU fast
-//!      path entirely; if execution reaches this kernel the host has already
-//!      asserted uniqueness.
+//!      first-writer-wins behaviour by leaving `row_idx_table[slot]` alone:
+//!      the first thread to win the CAS already stored its tid in the
+//!      CAS-success path above, so the slot is guaranteed to hold a valid
+//!      row index (not the u32::MAX sentinel) by the time the probe runs.
+//!      The host treats duplicate build keys as a *fall-through* miss and
+//!      routes them through `compile_build_collision_kernel` instead, so
+//!      this branch is only reached if the host's no-duplicates contract
+//!      is violated — defensive behaviour is to return the first-seen row.
 //!    * Otherwise advance `slot = (slot + 1) & (cap - 1)` and retry.
 //! 4. If the bounded probe exhausts without inserting, the thread silently
 //!    bails. The host enforces load factor < 0.5 so this never triggers in
@@ -504,14 +508,51 @@ pub fn compile_build_kernel() -> BoltResult<String> {
     // atom.cas: EMPTY -> key. Returns the previous value.
     writeln!(p, "\tatom.global.cas.b64 %rl5, [%rd6], %rl4, %rl0;").map_err(write_err)?;
 
-    // If prev == EMPTY -> we inserted; record row index and done.
+    // === Review C5 — Option A: write row_idx BEFORE the prev==key compare. ===
+    //
+    // Bug history: this kernel used to test `prev == EMPTY` and `prev == key`
+    // in sequence and *only* wrote row_idx_table[slot] on the EMPTY path,
+    // jumping straight to DONE on prev==key. The host contract is "no
+    // duplicate build keys on the fast path" (see `compile_build_collision_kernel`
+    // for the duplicates path), but the kernel itself never enforced it —
+    // so any host bug that let two threads hash the same key into the same
+    // slot left row_idx_table[slot] == u32::MAX while keys_table[slot] held
+    // the real key. The probe kernel then matched the key, loaded the
+    // sentinel row_idx, and wrote u32::MAX into the output (garbage rows
+    // downstream).
+    //
+    // The fix: on CAS success (prev == EMPTY) we write row_idx_table[slot]
+    // immediately, *before* doing anything else. The prev == key branch
+    // then becomes a clean "first-writer-wins" no-op: the *first* thread to
+    // claim the slot already stored its tid into row_idx_table[slot] (this
+    // very kernel, earlier in time), so duplicate threads can safely skip
+    // straight to DONE without leaving a sentinel behind.
+    //
+    // Correctness vs. the probe: the host issues `stream.synchronize()`
+    // between the build launch and the probe launch (see
+    // `gpu_join::launch_build_kernel`), so any row_idx store on the build
+    // side is globally visible before any probe thread reads it. The
+    // intra-build window (winning CAS thread hasn't stored row_idx yet,
+    // duplicate thread sees its prev==key and exits) is irrelevant because
+    // the probe doesn't run during that window.
+    //
+    // If prev == EMPTY -> CAS succeeded; write the row index right here,
+    // then fall through (the prev == key test below will be false because
+    // EMPTY != key).
     writeln!(p, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
-    writeln!(p, "\t@%p1 bra INSERTED;").map_err(write_err)?;
+    writeln!(p, "\t@!%p1 bra CHECK_DUP;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd5, %r8, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd7, %rd4, %rd5;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd7], %r3;").map_err(write_err)?;
+    writeln!(p, "\tbra DONE;").map_err(write_err)?;
 
-    // If prev == key -> someone else has this exact key already. The host
-    // forbids duplicate build keys at this point in Stage 1, so this branch
-    // is unreachable in practice; we still test for it so a future
-    // duplicate-aware path can clear out cleanly. Either way: don't advance.
+    // CHECK_DUP: prev != EMPTY. Distinguish duplicate (prev == key) from a
+    // genuine collision against a different key.
+    writeln!(p, "CHECK_DUP:").map_err(write_err)?;
+    // If prev == key -> another thread already inserted this exact key and
+    // (by the reorder above) has already written row_idx_table[slot] = its
+    // tid. We leave it untouched (first-writer-wins) — matches the documented
+    // host contract that duplicate build keys resolve to the first occurrence.
     writeln!(p, "\tsetp.eq.s64 %p2, %rl5, %rl0;").map_err(write_err)?;
     writeln!(p, "\t@%p2 bra DONE;").map_err(write_err)?;
 
@@ -519,14 +560,6 @@ pub fn compile_build_kernel() -> BoltResult<String> {
     writeln!(p, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
     writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
-
-    // INSERTED: write the row index. The slot is now exclusively ours
-    // (the cas above wrote a non-EMPTY value); no concurrent writer can win
-    // a later cas for the same slot.
-    writeln!(p, "INSERTED:").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.u32 %rd5, %r8, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd7, %rd4, %rd5;").map_err(write_err)?;
-    writeln!(p, "\tst.global.u32 [%rd7], %r3;").map_err(write_err)?;
 
     writeln!(p, "DONE:").map_err(write_err)?;
     writeln!(p, "\tret;").map_err(write_err)?;
