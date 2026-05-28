@@ -882,6 +882,30 @@ impl Engine {
     ///
     /// The closure-based loader keeps us from re-spelling the projection vs
     /// predicate compile path at every call site.
+    ///
+    /// # v0.7: process-wide KernelSpec cache layer
+    ///
+    /// Before consulting the per-`Engine` cache we now check the
+    /// process-wide KernelSpec-keyed cache in
+    /// [`crate::exec::module_cache::get_or_build_module_for_spec`]. The
+    /// global layer survives across `Engine` instances (test harnesses,
+    /// short-lived embedded engines, future multi-engine deployments) so
+    /// the second engine that requests the same `(spec, entry)` skips
+    /// both codegen *and* PTX-text-hash lookup — it's a flat Arc-clone of
+    /// the already-loaded module. The per-engine cache is retained as an
+    /// inner fast path so the on-engine `module_cache_loads` counter and
+    /// disk-cache write-through remain observable. The layering is:
+    ///
+    /// 1. **Global KernelSpec cache** — sub-µs Arc-clone on hit; on miss
+    ///    falls through to the per-engine path below via the closure.
+    /// 2. **Per-engine KernelSpec cache** — fast path for repeat calls on
+    ///    the same engine; bumps `module_cache_loads` on a miss.
+    /// 3. **Disk-backed PTX cache** (v0.6 / M6) — skips codegen if
+    ///    `BOLT_PTX_CACHE_DIR` or the builder's `persistent_cache` was
+    ///    set and the PTX text is on disk from a previous process.
+    /// 4. **`compile(spec)` + `CudaModule::from_ptx`** — the latter
+    ///    consults the PTX-text-hash cache in `jit::jit_compiler` so a
+    ///    cross-spec PTX collision still reuses the loaded driver module.
     fn get_or_build_module<F>(
         &self,
         spec: &KernelSpec,
@@ -891,8 +915,30 @@ impl Engine {
     where
         F: FnOnce(&KernelSpec) -> BoltResult<String>,
     {
+        // v0.7 layer 1: process-wide KernelSpec cache. On a hit this is a
+        // sub-µs Arc-clone that skips every layer below. On a miss the
+        // closure runs `compile` and routes the resulting PTX through
+        // `CudaModule::from_ptx` itself — so we must NOT call back into
+        // the per-engine path here (we'd double-codegen). Instead we
+        // re-implement the per-engine + disk + codegen fall-through
+        // *inside* the closure. The per-engine cache still services
+        // repeat calls within one engine: the `module_cache.lock().get`
+        // pre-check is the only difference from a flat global-only path,
+        // and it's load-bearing for the `module_cache_loads`-counter
+        // test below.
+        //
+        // Why not push the global cache check inside the per-engine
+        // miss branch? Because the *fast path* of `get_or_build_module_for_spec`
+        // is what we want — it never touches `self.module_cache.lock()`
+        // and so doesn't serialise on the per-engine mutex. The cost is
+        // that on a miss we do two lookups (global + per-engine); both
+        // are HashMap probes, fine.
         let key = ModuleCacheKey::new(spec, entry);
-        // Fast path: hit. Hold the lock only long enough to clone the Arc.
+        // Per-engine fast path: hit. Hold the lock only long enough to
+        // clone the Arc. This stays AHEAD of the global lookup so the
+        // existing `module_cache_loads` invariant ("second call must
+        // not bump the counter") is preserved bit-for-bit, and the
+        // single-engine hot path keeps its per-engine mutex affinity.
         if let Some(m) = self
             .module_cache
             .lock()
@@ -901,51 +947,68 @@ impl Engine {
         {
             return Ok(m.clone());
         }
-        // Miss in the in-process cache. Before paying the codegen cost,
-        // check the optional disk-backed cache (v0.6 / M6): if the user
-        // opted in via `BOLT_PTX_CACHE_DIR` or `Engine::Builder::
-        // persistent_cache`, the PTX text for this spec may already be
-        // on disk from a previous process invocation. The disk key is
-        // namespaced by entry-point name so the projection and
-        // predicate-only PTX shapes don't alias.
-        //
-        // We still pay the `cuModuleLoadDataEx` cost (no cubin cache
-        // yet in v0.6), but we skip the multi-millisecond PTX-text
-        // codegen step on a disk hit.
-        let disk = crate::jit::disk_cache::disk_cache();
-        let disk_key = disk.as_ref().map(|_| {
-            // Compose a disk key that domain-separates entry-point
-            // names: two kernels with identical KernelSpec content but
-            // different entry symbols (KERNEL_ENTRY vs
-            // PREDICATE_ENTRY) must NOT alias to the same .ptx file.
-            format!(
-                "{}-{}",
-                entry,
-                crate::jit::disk_cache::hash_to_key(key.spec_hash_hi, key.spec_hash_lo),
-            )
-        });
-        let ptx = match (&disk, &disk_key) {
-            (Some(cache), Some(k)) => match cache.lookup(k) {
-                Some(text) => text,
-                None => {
-                    let text = compile(spec)?;
-                    // Write-through to disk. Errors here are non-fatal:
-                    // a failed write just means future processes won't
-                    // benefit, but the current process still loads the
-                    // module successfully via the in-process cache.
-                    let _ = cache.store(k, &text);
-                    text
-                }
+        // Capture just the Copy hash components for the closure below;
+        // this lets us move `key` itself into `cache.entry(key)` after
+        // the closure has run without borrow-checker complications.
+        let spec_hash_hi = key.spec_hash_hi;
+        let spec_hash_lo = key.spec_hash_lo;
+        // Per-engine miss. Consult the process-wide KernelSpec cache; on
+        // a global hit we also seed the per-engine cache so subsequent
+        // calls on this engine take the per-engine fast path above and
+        // skip the global mutex altogether.
+        let module = crate::exec::module_cache::get_or_build_module_for_spec(
+            spec,
+            entry,
+            |spec| {
+                // Global miss path: this closure runs at most once per
+                // (spec, entry) per process. Inside it we still want
+                // the disk cache + codegen layers, so we open-code
+                // them here (mirrors the legacy per-engine miss path).
+                let disk = crate::jit::disk_cache::disk_cache();
+                let disk_key = disk.as_ref().map(|_| {
+                    // Compose a disk key that domain-separates
+                    // entry-point names: two kernels with identical
+                    // KernelSpec content but different entry symbols
+                    // (KERNEL_ENTRY vs PREDICATE_ENTRY) must NOT alias
+                    // to the same .ptx file.
+                    format!(
+                        "{}-{}",
+                        entry,
+                        crate::jit::disk_cache::hash_to_key(
+                            spec_hash_hi,
+                            spec_hash_lo,
+                        ),
+                    )
+                });
+                let ptx = match (&disk, &disk_key) {
+                    (Some(cache), Some(k)) => match cache.lookup(k) {
+                        Some(text) => text,
+                        None => {
+                            let text = compile(spec)?;
+                            // Write-through to disk. Errors here are
+                            // non-fatal: a failed write just means
+                            // future processes won't benefit, but the
+                            // current process still loads the module
+                            // successfully via the in-process caches.
+                            let _ = cache.store(k, &text);
+                            text
+                        }
+                    },
+                    _ => compile(spec)?,
+                };
+                Ok(ptx)
             },
-            _ => compile(spec)?,
-        };
-        let module = CudaModule::from_ptx(&ptx)?;
+        )?;
+        // Bump the per-engine miss counter. We treat any path that
+        // missed the per-engine cache as a "miss" for this counter —
+        // even if the global cache served us — because the counter's
+        // historical semantics are "did we have to look further than
+        // this engine's own table?". Tests pin this invariant.
         self.module_cache_loads
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Insert and hand back a clone. If a concurrent thread raced us to
-        // the same key, `or_insert` keeps the first winner — both threads
-        // observe the same `Arc<CudaModuleInner>`, just one of the two
-        // `CudaModule` wrappers we built gets dropped (cheap: an Arc dec).
+        // Seed the per-engine cache so subsequent calls on this
+        // engine take the per-engine fast path above and never reach
+        // the global lock.
         let mut cache = self
             .module_cache
             .lock()

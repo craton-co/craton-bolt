@@ -655,6 +655,33 @@ impl CudaModule {
     pub fn raw(&self) -> CUmodule {
         self.inner.raw
     }
+
+    /// Test-only stub: a `CudaModule` whose inner handle is null. The
+    /// `CudaModuleInner::Drop` impl short-circuits on a null handle, so this
+    /// is safe to drop without an active CUDA context.
+    ///
+    /// Cross-module tests (e.g. `exec::module_cache`) call this to inject a
+    /// fake module through the `loader` parameter of
+    /// `get_or_build_module_for_spec_with`, so they can exercise the cache
+    /// hit/miss paths end-to-end without paying for a real `cuModuleLoadDataEx`
+    /// — which would also require a live CUDA context the test runner doesn't
+    /// have. Mirrors the in-file `stub_module` helper used by the existing
+    /// `from_ptx_with` tests; lifted to `pub(crate)` so other test modules in
+    /// the crate can reuse the same shape without re-rolling the unsafe
+    /// `CudaModuleInner` constructor.
+    ///
+    /// NEVER call this from production code — handing the result to
+    /// `function()` or `raw()` will hit the null-deref guard at the driver
+    /// boundary and surface as a `BoltError`.
+    #[cfg(test)]
+    pub(crate) fn stub_for_tests() -> Self {
+        Self {
+            inner: Arc::new(CudaModuleInner {
+                raw: ptr::null_mut(),
+            }),
+            _not_sync: PhantomData,
+        }
+    }
 }
 
 // SAFETY: `CudaModule` is now just an `Arc<CudaModuleInner>`. The inner type
