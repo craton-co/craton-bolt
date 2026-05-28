@@ -246,6 +246,8 @@ pub fn prefix_scan_mask(
             n_rows: 0,
         });
     }
+    // Single-pass dispatch limit: ensures `running` fits in u32. Multipass at
+    // multipass.rs handles n_rows above this.
     let max_rows = (u32::MAX as usize) / (BLOCK_SIZE as usize);
     if n_rows > max_rows {
         // Single-pass topped out; delegate to the recursive multi-pass path.
@@ -316,13 +318,10 @@ pub fn prefix_scan_mask(
     let mut running: u64 = 0;
     let mut prev_base: u32 = 0;
     for (i, s) in sums_host.iter().enumerate() {
-        if running > u32::MAX as u64 {
-            return Err(BoltError::Other(format!(
-                "gpu_compact: prefix-sum overflowed u32 at block {i} \
-                 (running={running}, total exceeds u32::MAX)"
-            )));
-        }
-        let base_u32 = running as u32;
+        let base_u32 = u32::try_from(running).map_err(|_| BoltError::Other(format!(
+            "gpu_compact: per-block base {running} exceeds u32::MAX at block {i}; \
+             this is a kernel-contract violation"
+        )))?;
         // Monotonicity guard: bases must be non-decreasing. The u64 accumulator
         // can only ever grow (we add unsigned u32 values), so a decrease here
         // would be a host-arithmetic bug, not a GPU bug — surface it loudly.
@@ -339,12 +338,9 @@ pub fn prefix_scan_mask(
                 "gpu_compact: prefix-sum u64 overflow at block {i} (running={running}, +{s})"
             )))?;
     }
-    if running > usize::MAX as u64 {
-        return Err(BoltError::Other(format!(
-            "gpu_compact: total_count {running} exceeds usize::MAX"
-        )));
-    }
-    let total_count = running as usize;
+    let total_count = usize::try_from(running).map_err(|_| BoltError::Other(format!(
+        "gpu_compact: total_count {running} exceeds usize::MAX on this host"
+    )))?;
 
     let block_bases = GpuVec::<u32>::from_slice(&bases_host)?;
 
