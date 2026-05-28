@@ -55,14 +55,10 @@
 //! actual call to an unimplemented stub would `unimplemented!()` at runtime.
 //! Wiring is the merger's job, not mine.
 
-use std::collections::HashMap;
-
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::jit::CudaModule;
 
 // ---------------------------------------------------------------------------
@@ -86,17 +82,19 @@ use crate::exec::partition_offsets as stub_partition_offsets;
 use crate::jit::partition_reduce_kernel;
 
 // ---------------------------------------------------------------------------
-// Per-orchestrator module cache.
+// Module-cache wrapper.
 //
 // The SUM pipeline runs three kernel launches (partition + scatter + reduce)
 // per call. Each one used to rebuild a kilobyte-scale PTX string and feed it
 // to `CudaModule::from_ptx` only to hit the in-driver PTX cache anyway. We
-// cache the loaded `CudaModule` directly here, keyed by an enum of the three
-// kernel shapes — none are parameterised, so a unit-like variant per kernel
-// suffices.
+// route every lookup through the process-wide `exec::module_cache` so all
+// sibling executors share one consolidated table — see that module's docs
+// for the multi-GPU caveat and the per-Engine migration TODO.
 //
-// `CudaModule` is `Clone` over an internal `Arc<CudaModuleInner>`; storing
-// owned modules in the map and handing callers clones is cheap.
+// The local `enum KernelSpec` stays private (each executor's variants do not
+// fit the engine's projection-path `ModuleCacheKey`), and the namespace
+// argument to `get_or_build_module` (the `module_path!()`) keeps our slots
+// disjoint from siblings'.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -106,26 +104,21 @@ enum KernelSpec {
     ReduceSum,
 }
 
-static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
 #[cfg(test)]
-static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
-    if let Some(m) = MODULE_CACHE.lock().get(spec) {
-        return Ok(m.clone());
-    }
-    let ptx = match spec {
-        KernelSpec::Partition => stub_partition_kernel::compile_partition_kernel()?,
-        KernelSpec::Scatter => stub_scatter_kernel::compile_scatter_kernel()?,
-        KernelSpec::ReduceSum => partition_reduce_kernel::compile_partition_reduce_kernel()?,
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
-    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut cache = MODULE_CACHE.lock();
-    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+    let counter = Some(&LOAD_COUNT);
+    #[cfg(not(test))]
+    let counter = None;
+    module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
+        Ok(match spec {
+            KernelSpec::Partition => stub_partition_kernel::compile_partition_kernel()?,
+            KernelSpec::Scatter => stub_scatter_kernel::compile_scatter_kernel()?,
+            KernelSpec::ReduceSum => partition_reduce_kernel::compile_partition_reduce_kernel()?,
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------

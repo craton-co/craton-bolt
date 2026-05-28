@@ -85,8 +85,8 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
-use crate::jit::jit_compiler::CudaModule;
 use crate::jit::sort_kernel::{
     compile_sort_kernel_spec, sort_kernel_entry_spec, KeyDesc, SortDirection,
     SortKernelSpec, SortLayout, MAX_SORT_KEYS, SORT_BLOCK_SIZE,
@@ -765,9 +765,15 @@ pub fn sort_indices_on_gpu_multi<'a>(
     let is_padded_host = build_is_padded(n_rows, n_pow2_usize);
     let is_padded_dev = GpuVec::<u8>::from_slice(&is_padded_host)?;
 
-    // Compile + load the module.
-    let ptx = compile_sort_kernel_spec(&spec)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // Compile + load the module via the consolidated `exec::module_cache`.
+    // The sort PTX is a pure function of `spec`, so a Debug-formatted spec
+    // is a stable cache id.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("sort_kernel:{:?}", spec),
+        None,
+        || compile_sort_kernel_spec(&spec),
+    )?;
     let entry = sort_kernel_entry_spec(&spec)?;
     let function = module.function(&entry)?;
 

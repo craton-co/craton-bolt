@@ -40,17 +40,15 @@
 //! - `max(key) >= BLOCK_GROUPS` so Tier-1 AVG doesn't already win this
 //! - `max(key) < 100 M` (Tier-2 dispatcher cap)
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel, partition_reduce_kernel_count, partition_reduce_kernel_multi,
@@ -62,19 +60,18 @@ use crate::plan::physical_plan::PhysicalPlan;
 const BLOCK_THREADS: u32 = 256;
 
 // ---------------------------------------------------------------------------
-// Per-executor module cache.
+// Module-cache wrapper.
 //
 // `CudaModule::from_ptx` (in `src/jit/jit_compiler.rs`) already deduplicates
 // PTX → SASS by hashing the PTX text, but the AVG path issues *four* distinct
 // kernel launches per query (partition, scatter, multi-SUM-reduce, count-
 // reduce) and each one used to rebuild a kilobyte-scale PTX string only to
-// hit the cache. We add a second layer keyed by the small set of parameters
-// that *select* a PTX template, so a repeat call skips PTX construction
-// entirely and gets a cheap `CudaModule` clone (the inner CUmodule handle
-// is `Arc`-shared with the lower cache).
-//
-// `CudaModule` is `Clone` over an internal `Arc<CudaModuleInner>`, so we
-// hand callers fresh clones — no extra wrapping needed.
+// hit the cache. We route every lookup through the process-wide
+// `exec::module_cache` so all sibling executors share one consolidated table;
+// the local `enum KernelSpec` stays private (its variants don't fit the
+// engine's projection-path `ModuleCacheKey`) and the `module_path!()`
+// namespace keeps our cache slots disjoint from siblings'. See
+// `module_cache`'s docs for the multi-GPU caveat and the migration TODO.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -94,38 +91,33 @@ enum KernelSpec {
     ReduceCount,
 }
 
-static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-/// Test-only counter of cache-miss compile passes.
+/// Test-only counter of cache-miss compile passes serviced via THIS executor.
 #[cfg(test)]
-static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
 /// Cache-aware module loader. See module-cache comment above.
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
-    if let Some(m) = MODULE_CACHE.lock().get(spec) {
-        return Ok(m.clone());
-    }
-    let ptx = match spec {
-        KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
-        KernelSpec::ScatterWithDestIdx => {
-            scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel()?
-        }
-        KernelSpec::ScatterValuesByDestIdx => {
-            scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel()?
-        }
-        KernelSpec::ReduceMulti { n_vals } => {
-            partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(*n_vals)?
-        }
-        KernelSpec::ReduceCount => {
-            partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
-        }
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
-    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut cache = MODULE_CACHE.lock();
-    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+    let counter = Some(&LOAD_COUNT);
+    #[cfg(not(test))]
+    let counter = None;
+    module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
+        Ok(match spec {
+            KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
+            KernelSpec::ScatterWithDestIdx => {
+                scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel()?
+            }
+            KernelSpec::ScatterValuesByDestIdx => {
+                scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel()?
+            }
+            KernelSpec::ReduceMulti { n_vals } => {
+                partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(*n_vals)?
+            }
+            KernelSpec::ReduceCount => {
+                partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
+            }
+        })
+    })
 }
 
 /// Try to execute `plan` against `batch` via the Tier-2.1 AVG fast path.

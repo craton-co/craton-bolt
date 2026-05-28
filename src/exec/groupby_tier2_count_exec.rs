@@ -26,17 +26,15 @@
 //!   handle the low-cardinality case if/when it grows a COUNT branch)
 //! - `max(key) < 100 M`
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel, partition_reduce_kernel_count, scatter_kernel, CudaModule,
@@ -47,19 +45,8 @@ use crate::plan::physical_plan::PhysicalPlan;
 const BLOCK_THREADS: u32 = 256;
 
 // ---------------------------------------------------------------------------
-// Per-executor module cache.
-//
-// `CudaModule::from_ptx` (see `src/jit/jit_compiler.rs`) already deduplicates
-// the PTX → SASS step by hashing the PTX text, but the caller still pays for
-// rebuilding the PTX string (non-trivial — kilobytes of templated text) and
-// for the cache lookup on every invocation. We add a second layer keyed by
-// the small set of parameters that *select* a PTX template, so a repeat call
-// skips PTX construction entirely and gets a cheap `CudaModule` clone (the
-// inner handle is `Arc`-shared with the `from_ptx` cache).
-//
-// `CudaModule` is `Clone` over an internal `Arc<CudaModuleInner>`, so we
-// store owned modules in the map and hand callers fresh clones — no need to
-// wrap the value in another `Arc`.
+// Module-cache wrapper. See `exec::module_cache` for the consolidated
+// process-wide table; this executor namespaces its slots via `module_path!()`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -73,38 +60,25 @@ enum KernelSpec {
     ReduceCount,
 }
 
-static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-/// Test-only counter of cache-miss compile passes. Incremented exactly once
-/// per `(spec, process)` pair regardless of how many threads race on the
-/// initial miss.
+/// Test-only counter of cache-miss compile passes serviced via THIS executor.
 #[cfg(test)]
-static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
-/// Cache-aware module loader. Returns a (cheap-Arc-clone of a) `CudaModule`
-/// for `spec`, building it on first miss and serving from the process-wide
-/// map thereafter. Builds happen outside the cache lock so that compiles for
-/// *different* specs can run in parallel; the small window where two threads
-/// race on the same spec results in at most one redundant compile (the
-/// second insertion overwrites — both modules are functionally identical
-/// and the loser is unloaded when its last clone drops).
+/// Cache-aware module loader. See module-cache comment above.
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
-    if let Some(m) = MODULE_CACHE.lock().get(spec) {
-        return Ok(m.clone());
-    }
-    let ptx = match spec {
-        KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
-        KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
-        KernelSpec::ReduceCount => {
-            partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
-        }
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
-    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut cache = MODULE_CACHE.lock();
-    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+    let counter = Some(&LOAD_COUNT);
+    #[cfg(not(test))]
+    let counter = None;
+    module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
+        Ok(match spec {
+            KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
+            KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
+            KernelSpec::ReduceCount => {
+                partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
+            }
+        })
+    })
 }
 
 /// Try the Tier-2.1 COUNT(*) fast path. `None` on any precondition miss.

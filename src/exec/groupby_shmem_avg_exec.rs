@@ -58,13 +58,13 @@ use crate::cuda::{GpuVec, PinnedHostBuffer};
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::jit::shmem_count_kernel::{
     compile_shmem_count_kernel, KERNEL_ENTRY as COUNT_ENTRY,
 };
 use crate::jit::shmem_sum_kernel::{
     compile_shmem_sum_kernel, BLOCK_GROUPS, KERNEL_ENTRY as SUM_ENTRY,
 };
-use crate::jit::CudaModule;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -193,12 +193,24 @@ fn execute_inner(
     let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
 
     // --- JIT both kernels (PTX cache hits after first run) ---------------
-    let sum_ptx = compile_shmem_sum_kernel()?;
-    let sum_module = CudaModule::from_ptx(&sum_ptx)?;
+    // Routed through the consolidated `exec::module_cache` so repeated
+    // SUM/COUNT launches skip PTX generation entirely. Namespaced by SUM
+    // namespace (matches `groupby_shmem_exec`) for SUM and by our own
+    // module path for COUNT.
+    let sum_module = module_cache::get_or_build_module(
+        module_path!(),
+        "shmem_sum".to_string(),
+        None,
+        || compile_shmem_sum_kernel(),
+    )?;
     let sum_function = sum_module.function(SUM_ENTRY)?;
 
-    let count_ptx = compile_shmem_count_kernel()?;
-    let count_module = CudaModule::from_ptx(&count_ptx)?;
+    let count_module = module_cache::get_or_build_module(
+        module_path!(),
+        "shmem_count".to_string(),
+        None,
+        || compile_shmem_count_kernel(),
+    )?;
     let count_function = count_module.function(COUNT_ENTRY)?;
 
     // --- Launch params (shared between SUM and COUNT — same shape) -------

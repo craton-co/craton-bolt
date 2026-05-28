@@ -51,11 +51,12 @@ use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::expr_agg;
 use crate::exec::launch::CudaStream;
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
     compile_reduction_kernel, ReduceOp, BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
 };
-use crate::jit::{compile_ptx, CudaModule};
+use crate::jit::compile_ptx;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 use crate::plan::physical_plan::{AggregateSpec, KernelSpec, PhysicalPlan};
 
@@ -204,8 +205,15 @@ fn run_pre_stage(
         output_has_validity: output_has_validity.clone(),
         ..spec.clone()
     };
-    let ptx = compile_ptx(&pre_spec_for_ptx, PRE_KERNEL_ENTRY)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // Route through the consolidated `exec::module_cache`. The pre-kernel's
+    // PTX is a function of the (validity-aware) `KernelSpec` plus the
+    // PRE_KERNEL_ENTRY name, so the spec id Debug-hashes both.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("pre_kernel:{}:{:?}", PRE_KERNEL_ENTRY, pre_spec_for_ptx),
+        None,
+        || compile_ptx(&pre_spec_for_ptx, PRE_KERNEL_ENTRY),
+    )?;
     let function = module.function(PRE_KERNEL_ENTRY)?;
 
     // -- Assemble kernel parameters: inputs..., outputs...,
@@ -277,9 +285,12 @@ fn run_pre_stage(
 
     // -- Optional predicate kernel: builds a u8 keep-mask we download.
     let host_mask: Option<Vec<bool>> = if spec.predicate.is_some() {
-        let pred_ptx =
-            crate::jit::scan_kernel::compile_predicate_kernel(spec, PRE_PREDICATE_ENTRY)?;
-        let pred_module = CudaModule::from_ptx(&pred_ptx)?;
+        let pred_module = module_cache::get_or_build_module(
+            module_path!(),
+            format!("predicate_kernel:{}:{:?}", PRE_PREDICATE_ENTRY, spec),
+            None,
+            || crate::jit::scan_kernel::compile_predicate_kernel(spec, PRE_PREDICATE_ENTRY),
+        )?;
         let pred_function = pred_module.function(PRE_PREDICATE_ENTRY)?;
 
         let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
@@ -693,8 +704,12 @@ where
     let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
     let partials = GpuVec::<T>::zeros(grid_x as usize)?;
 
-    let ptx = compile_reduction_kernel(op, dtype)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("reduction:{:?}:{:?}", op, dtype),
+        None,
+        || compile_reduction_kernel(op, dtype),
+    )?;
     let function = module.function(REDUCTION_KERNEL_ENTRY)?;
 
     let mut input_ptr: CUdeviceptr = input.device_ptr();

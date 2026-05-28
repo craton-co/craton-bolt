@@ -17,11 +17,11 @@ use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::jit::partition_reduce_kernel_minmax::{MinMaxDtype, MinMaxOp};
 use crate::jit::shmem_minmax_kernel::{
     compile_shmem_minmax_kernel, kernel_entry, BLOCK_GROUPS,
 };
-use crate::jit::CudaModule;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -234,8 +234,12 @@ fn run_launch_i32(
     n_groups: u32,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    let ptx = compile_shmem_minmax_kernel(op, val_dtype)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("shmem_minmax:{:?}:{:?}", op, val_dtype),
+        None,
+        || compile_shmem_minmax_kernel(op, val_dtype),
+    )?;
     let entry = kernel_entry(op, val_dtype);
     let function = module.function(&entry)?;
 
@@ -281,8 +285,12 @@ fn run_launch_i64(
     n_groups: u32,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    let ptx = compile_shmem_minmax_kernel(op, val_dtype)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("shmem_minmax:{:?}:{:?}", op, val_dtype),
+        None,
+        || compile_shmem_minmax_kernel(op, val_dtype),
+    )?;
     let entry = kernel_entry(op, val_dtype);
     let function = module.function(&entry)?;
 

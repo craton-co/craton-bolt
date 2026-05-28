@@ -94,6 +94,7 @@ use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::expr_agg;
 use crate::exec::launch::{grid_x_for, CudaStream};
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::hash_kernels::{
@@ -102,7 +103,7 @@ use crate::jit::hash_kernels::{
     groupby_block_size, packed_validity_word_count, AGG_KERNEL_ENTRY,
     I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
 };
-use crate::jit::{compile_ptx, CudaModule};
+use crate::jit::compile_ptx;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, KernelSpec, PhysicalPlan};
 
@@ -529,8 +530,12 @@ fn run_pre_stage(
         output_has_validity: output_has_validity.clone(),
         ..spec.clone()
     };
-    let ptx = compile_ptx(&pre_spec_for_ptx, PRE_KERNEL_ENTRY)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("pre_kernel:{}:{:?}", PRE_KERNEL_ENTRY, pre_spec_for_ptx),
+        None,
+        || compile_ptx(&pre_spec_for_ptx, PRE_KERNEL_ENTRY),
+    )?;
     let function = module.function(PRE_KERNEL_ENTRY)?;
 
     // -- Assemble kernel parameters: inputs..., outputs...,
@@ -601,9 +606,12 @@ fn run_pre_stage(
 
     // -- Optional predicate kernel: builds a u8 keep-mask we download.
     let host_mask: Option<Vec<bool>> = if spec.predicate.is_some() {
-        let pred_ptx =
-            crate::jit::scan_kernel::compile_predicate_kernel(spec, PRE_PREDICATE_ENTRY)?;
-        let pred_module = CudaModule::from_ptx(&pred_ptx)?;
+        let pred_module = module_cache::get_or_build_module(
+            module_path!(),
+            format!("predicate_kernel:{}:{:?}", PRE_PREDICATE_ENTRY, spec),
+            None,
+            || crate::jit::scan_kernel::compile_predicate_kernel(spec, PRE_PREDICATE_ENTRY),
+        )?;
         let pred_function = pred_module.function(PRE_PREDICATE_ENTRY)?;
 
         let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
@@ -681,12 +689,19 @@ fn launch_keys_kernel(
         return Ok(());
     }
 
-    let ptx = if key_validity.is_some() {
-        compile_groupby_keys_kernel_with_validity()?
-    } else {
-        compile_groupby_keys_kernel()?
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
+    let key_validity_flag = key_validity.is_some();
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("groupby_keys:validity={}", key_validity_flag),
+        None,
+        || {
+            if key_validity_flag {
+                compile_groupby_keys_kernel_with_validity()
+            } else {
+                compile_groupby_keys_kernel()
+            }
+        },
+    )?;
     let function = module.function(KEYS_KERNEL_ENTRY)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
@@ -824,12 +839,19 @@ fn launch_agg_kernel_inner<T: Pod>(
         return Ok(());
     }
 
-    let ptx = if value_validity.is_some() {
-        compile_groupby_agg_kernel_with_validity(op, input_dtype)?
-    } else {
-        compile_groupby_agg_kernel(op, input_dtype)?
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
+    let value_validity_flag = value_validity.is_some();
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("groupby_agg:{:?}:{:?}:validity={}", op, input_dtype, value_validity_flag),
+        None,
+        || {
+            if value_validity_flag {
+                compile_groupby_agg_kernel_with_validity(op, input_dtype)
+            } else {
+                compile_groupby_agg_kernel(op, input_dtype)
+            }
+        },
+    )?;
     let function = module.function(AGG_KERNEL_ENTRY)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
