@@ -36,6 +36,36 @@ use crate::plan::logical_plan::{
 /// large per-frame locals on the lowering call path.
 pub(crate) const MAX_RECURSION_DEPTH: usize = 256;
 
+/// SQL-standard identifier folding (v0.5 / M2).
+///
+/// Unquoted SQL identifiers are case-insensitive in the standard. We
+/// implement the Postgres convention: unquoted identifiers fold to ASCII
+/// lowercase at parse time; quoted identifiers (`"MyCol"`) keep their
+/// case verbatim. The choice of *which* canonical case is somewhat
+/// arbitrary — the standard mandates uppercase, but Postgres uses lower
+/// and is by far the more common reference for application developers.
+///
+/// We pair this folding with a case-insensitive *fallback* in
+/// [`crate::plan::logical_plan::Schema::index_of`] (and likewise in
+/// [`MemTableProvider::schema`] below). The fallback means callers who
+/// programmatically constructed plans against a verbatim-cased schema
+/// continue to work unchanged; the new lowercase-by-default identifiers
+/// produced by SQL parsing match the verbatim schema via the fallback.
+///
+/// Locale note: SQL identifier folding is defined over ASCII, and a
+/// locale-aware lowercase would make lowered plans non-portable between
+/// machines that differ in their Unicode tables. Use
+/// `to_ascii_lowercase` everywhere.
+///
+/// Returns the canonical name to embed in the lowered IR for `ident`.
+fn ident_to_name(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_ascii_lowercase()
+    }
+}
+
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
 ///
 /// # PV-stage-d: per-column null-bearing signal
@@ -225,11 +255,30 @@ impl NameResolver {
     ///
     /// Errors with a clear message if the qualifier matches no in-scope table
     /// or the column doesn't exist in the qualified table's schema.
+    ///
+    /// # SQL-standard case folding (v0.5)
+    ///
+    /// Both the qualifier and the column lookup try an exact match first.
+    /// If that misses and the lookup name is all-ASCII-lowercase, falls
+    /// back to a case-insensitive search; mixed-case lookups (quoted
+    /// SQL identifiers) take the strict path. Mirrors the rule in
+    /// [`crate::plan::logical_plan::Schema::index_of`] so the resolver
+    /// and downstream schema lookup agree on what counts as "case-folded".
     fn resolve_compound(&self, qualifier: &str, col: &str) -> BoltResult<String> {
+        let qualifier_lc = !qualifier.chars().any(|c| c.is_ascii_uppercase());
+        let col_lc = !col.chars().any(|c| c.is_ascii_uppercase());
         let scope = self
             .tables
             .iter()
             .find(|t| t.name == qualifier)
+            .or_else(|| {
+                if !qualifier_lc {
+                    return None;
+                }
+                self.tables
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(qualifier))
+            })
             .ok_or_else(|| {
                 BoltError::Sql(format!(
                     "unknown table qualifier '{qualifier}' in column reference '{qualifier}.{col}'"
@@ -239,6 +288,15 @@ impl NameResolver {
             .cols
             .iter()
             .find(|c| c.original == col)
+            .or_else(|| {
+                if !col_lc {
+                    return None;
+                }
+                scope
+                    .cols
+                    .iter()
+                    .find(|c| c.original.eq_ignore_ascii_case(col))
+            })
             .ok_or_else(|| {
                 BoltError::Sql(format!(
                     "unknown column '{col}' in table '{qualifier}'"
@@ -419,11 +477,31 @@ impl MemTableProvider {
 }
 
 impl TableProvider for MemTableProvider {
+    /// Resolve a table name to its schema.
+    ///
+    /// # SQL-standard case folding (v0.5)
+    ///
+    /// Tries an exact match first. If that misses *and* `name` is
+    /// all-ASCII-lowercase, falls back to a case-insensitive scan.
+    /// Mixed-case lookup keys (verbatim programmatic calls, quoted SQL
+    /// identifiers) take the strict path. Same rule as
+    /// [`crate::plan::logical_plan::Schema::index_of`] — see that method
+    /// for the rationale.
     fn schema(&self, name: &str) -> BoltResult<Schema> {
-        self.tables
-            .get(name)
-            .cloned()
-            .ok_or_else(|| BoltError::Plan(format!("unknown table '{name}'")))
+        if let Some(s) = self.tables.get(name) {
+            return Ok(s.clone());
+        }
+        if name.chars().any(|c| c.is_ascii_uppercase()) {
+            return Err(BoltError::Plan(format!("unknown table '{name}'")));
+        }
+        if let Some((_, s)) = self
+            .tables
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            return Ok(s.clone());
+        }
+        Err(BoltError::Plan(format!("unknown table '{name}'")))
     }
 
     fn schema_version(&self) -> u64 {
@@ -1085,11 +1163,24 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         match item {
             SelectItem::UnnamedExpr(e) => items.push((e.clone(), None)),
             SelectItem::ExprWithAlias { expr, alias } => {
-                items.push((expr.clone(), Some(alias.value.clone())))
+                // Column alias: same fold rule as any other unquoted identifier
+                // (lowercase) — quoted aliases preserve case.
+                items.push((expr.clone(), Some(ident_to_name(alias))))
             }
             SelectItem::Wildcard(_) => {
+                // Expand `SELECT *` to the FROM-tree's registered field
+                // names verbatim. We synthesize *quoted* `Ident`s so the
+                // SQL-standard case folding ([`ident_to_name`]) preserves
+                // the registered casing — anything else would silently
+                // rename columns like `MyCol` to `mycol` in the lowered
+                // plan, which is wrong: the user's host program registered
+                // them with that casing and downstream code (executor,
+                // physical planner) refers to them by that exact name.
                 for f in &scan_schema_for_wildcard.fields {
-                    items.push((SqlExpr::Identifier(Ident::new(f.name.clone())), None));
+                    items.push((
+                        SqlExpr::Identifier(Ident::with_quote('"', f.name.clone())),
+                        None,
+                    ));
                 }
             }
             SelectItem::QualifiedWildcard(_, _) => {
@@ -1469,8 +1560,10 @@ fn lower_join_side(
         SqlExpr::Identifier(ident) => {
             // Bare column reference — no qualifier to verify. Leave the
             // side undetermined so the caller doesn't accidentally treat
-            // it as same-side.
-            Ok((Expr::Column(ident.value.clone()), JoinSide::Unknown))
+            // it as same-side. SQL-standard case folding (v0.5): the
+            // lowered column name is the folded form (lowercase unless
+            // the user quoted the identifier).
+            Ok((Expr::Column(ident_to_name(ident)), JoinSide::Unknown))
         }
         SqlExpr::CompoundIdentifier(parts) => {
             // `table.col` — keep only the trailing column name in the
@@ -1480,7 +1573,7 @@ fn lower_join_side(
                 let last = parts.last().ok_or_else(|| {
                     BoltError::Sql("empty compound identifier in JOIN ON".into())
                 })?;
-                return Ok((Expr::Column(last.value.clone()), JoinSide::Unknown));
+                return Ok((Expr::Column(ident_to_name(last)), JoinSide::Unknown));
             }
             if parts.len() > 2 {
                 return Err(BoltError::Sql(format!(
@@ -1492,20 +1585,27 @@ fn lower_join_side(
                         .join(".")
                 )));
             }
-            let qualifier = &parts[0].value;
-            let col = &parts[1].value;
+            // SQL-standard case folding (v0.5): qualifier and column are
+            // folded independently. The qualifier match against the
+            // resolver is ASCII case-insensitive so a folded `t1` still
+            // matches a table the host registered as `T1`.
+            let qualifier = ident_to_name(&parts[0]);
+            let col = ident_to_name(&parts[1]);
             // Verify the qualifier exists somewhere in the FROM-tree
             // (resolver already contains every in-scope table, including
             // the rhs we just pushed). This catches `t3.a` when only `t1`
             // and `t2` are joined.
-            let in_scope = resolver.tables.iter().any(|t| &t.name == qualifier);
+            let in_scope = resolver
+                .tables
+                .iter()
+                .any(|t| t.name == qualifier || t.name.eq_ignore_ascii_case(&qualifier));
             if !in_scope {
                 return Err(BoltError::Sql(format!(
                     "JOIN ON ... references unknown table '{qualifier}' \
                      in column reference '{qualifier}.{col}'"
                 )));
             }
-            let side = if qualifier == rhs_table {
+            let side = if qualifier == rhs_table || qualifier.eq_ignore_ascii_case(rhs_table) {
                 JoinSide::Right
             } else {
                 JoinSide::Left
@@ -1564,13 +1664,17 @@ fn reject_unsupported_select(select: &Select) -> BoltResult<()> {
 }
 
 /// Pull a single-part identifier out of an `ObjectName`, rejecting schema-qualified names.
+///
+/// SQL-standard case folding (v0.5): unquoted table names are folded to
+/// lowercase; quoted names (`"MyTable"`) keep their case verbatim. See
+/// [`ident_to_name`] for the rule.
 fn single_ident_from_object_name(name: &ObjectName) -> BoltResult<String> {
     if name.0.len() != 1 {
         return Err(BoltError::Sql(format!(
             "qualified table names not supported: {name}"
         )));
     }
-    Ok(name.0[0].value.clone())
+    Ok(ident_to_name(&name.0[0]))
 }
 
 /// Recognize a top-level aggregate function call. Returns `Ok(None)` for non-aggregates.
@@ -1847,7 +1951,14 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
         )));
     }
     match e {
-        SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
+        SqlExpr::Identifier(ident) => {
+            // SQL-standard case folding (v0.5): unquoted column refs fold to
+            // lowercase, quoted refs stay verbatim. The resolver and
+            // downstream `Schema::index_of` apply a case-insensitive fallback
+            // when the verbatim name is not present, so a folded `name`
+            // still matches a schema field registered as `Name`.
+            Ok(Expr::Column(ident_to_name(ident)))
+        }
         SqlExpr::CompoundIdentifier(parts) => {
             // We currently only support a single `table.column` qualifier
             // (no schema-qualified or struct-field forms). The frontend has
@@ -1872,9 +1983,12 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                     "unsupported: deeply qualified column reference '{display}'"
                 )));
             }
-            let qualifier = &parts[0].value;
-            let col = &parts[1].value;
-            let resolved = resolver.resolve_compound(qualifier, col)?;
+            // Per-part case folding: each segment of `table.col` is folded
+            // independently. `T1.Name` and `t1.name` resolve to the same
+            // column; `"T1"."Name"` (both quoted) is verbatim.
+            let qualifier = ident_to_name(&parts[0]);
+            let col = ident_to_name(&parts[1]);
+            let resolved = resolver.resolve_compound(&qualifier, &col)?;
             Ok(Expr::Column(resolved))
         }
         SqlExpr::Value(v) => lower_value(v),
