@@ -216,6 +216,7 @@ use crate::jit::hash_join_kernel::{
     STRING_HASH_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
 };
 use crate::plan::logical_plan::DataType;
+use crate::plan::physical_plan::{HashJoinKernelKind, HashJoinKernelSpec};
 
 // ---------------------------------------------------------------------------
 // Reusable host-side sentinel buffers
@@ -860,11 +861,20 @@ fn launch_build_kernel(
     // here, the kernel now degrades to first-writer-wins semantics rather
     // than emitting u32::MAX sentinel row indices — but the collision kernel
     // is still the correct dispatch for known-duplicate inputs.
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "build".to_string(),
-        None,
-        || compile_build_kernel(),
+    // Hash-join kernels operate on already-encoded i64 keys (see
+    // `encode_keys_for_shape`); the source-column dtype is not visible at
+    // this call site. Stamp the cache spec with `DataType::Int64` to
+    // describe the kernel-boundary type — matching the single-slot
+    // behaviour of the legacy string-keyed cache this replaces.
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::Build,
+        key_dtype: DataType::Int64,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        BUILD_KERNEL_ENTRY,
+        |_| compile_build_kernel(),
     )?;
     let function = module.function(BUILD_KERNEL_ENTRY)?;
 
@@ -976,16 +986,20 @@ fn launch_probe_kernel(
     // ABI. Route through the consolidated module cache so each variant is
     // cached separately by spec id.
     let tiled = probe_tiled_enabled();
-    let (spec_id, entry) = if tiled {
-        ("probe_tiled", PROBE_KERNEL_TILED_ENTRY)
+    let (kind, entry) = if tiled {
+        (HashJoinKernelKind::ProbeTiled, PROBE_KERNEL_TILED_ENTRY)
     } else {
-        ("probe", PROBE_KERNEL_ENTRY)
+        (HashJoinKernelKind::Probe, PROBE_KERNEL_ENTRY)
     };
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        spec_id.to_string(),
-        None,
-        || if tiled { compile_probe_kernel_tiled() } else { compile_probe_kernel() },
+    let spec = HashJoinKernelSpec {
+        kind,
+        key_dtype: DataType::Int64,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        entry,
+        |_| if tiled { compile_probe_kernel_tiled() } else { compile_probe_kernel() },
     )?;
     let function = module.function(entry)?;
     log::debug!(
@@ -1086,11 +1100,15 @@ fn launch_build_aos_kernel(
     if n_build_rows == 0 {
         return Ok(());
     }
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "build_aos".to_string(),
-        None,
-        || compile_build_aos_kernel(),
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::BuildAos,
+        key_dtype: DataType::Int64,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        BUILD_AOS_KERNEL_ENTRY,
+        |_| compile_build_aos_kernel(),
     )?;
     let function = module.function(BUILD_AOS_KERNEL_ENTRY)?;
 
@@ -1150,11 +1168,15 @@ fn launch_probe_aos_kernel(
     if n_probe_rows == 0 {
         return Ok(0);
     }
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "probe_aos".to_string(),
-        None,
-        || compile_probe_aos_kernel(),
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::ProbeAos,
+        key_dtype: DataType::Int64,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        PROBE_AOS_KERNEL_ENTRY,
+        |_| compile_probe_aos_kernel(),
     )?;
     let function = module.function(PROBE_AOS_KERNEL_ENTRY)?;
 
@@ -1993,11 +2015,15 @@ fn launch_build_collision_kernel(
     if n_build_rows == 0 {
         return Ok(());
     }
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "build_collision".to_string(),
-        None,
-        || compile_build_collision_kernel(),
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::BuildCollision,
+        key_dtype: DataType::Int64,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        BUILD_COLLISION_KERNEL_ENTRY,
+        |_| compile_build_collision_kernel(),
     )?;
     let function = module.function(BUILD_COLLISION_KERNEL_ENTRY)?;
 
@@ -2069,11 +2095,15 @@ fn launch_probe_collision_kernel(
             "probe-collision matched bitmap must be ceil(build_n_rows/32) u32 words"
         );
     }
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "probe_collision".to_string(),
-        None,
-        || compile_probe_collision_kernel(),
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::ProbeCollision,
+        key_dtype: DataType::Int64,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        PROBE_COLLISION_KERNEL_ENTRY,
+        |_| compile_probe_collision_kernel(),
     )?;
     let function = module.function(PROBE_COLLISION_KERNEL_ENTRY)?;
 
@@ -2152,11 +2182,15 @@ fn launch_unmatched_build_kernel(
         ((n_build_rows as usize) + 31) / 32,
         "unmatched-build matched bitmap must be ceil(build_n_rows/32) u32 words"
     );
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "unmatched_build".to_string(),
-        None,
-        || compile_unmatched_build_kernel(),
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::UnmatchedBuild,
+        key_dtype: DataType::Int64,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        UNMATCHED_BUILD_KERNEL_ENTRY,
+        |_| compile_unmatched_build_kernel(),
     )?;
     let function = module.function(UNMATCHED_BUILD_KERNEL_ENTRY)?;
 
@@ -2687,11 +2721,20 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
     };
     let out_dev = GpuVec::<u64>::zeros(n)?;
 
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "string_hash:Utf8".to_string(),
-        None,
-        || compile_string_hash_kernel(DataType::Utf8),
+    // Two string-hash flavours share `HashJoinKernelKind::StringHash`:
+    // the regular Utf8 (i32-offsets) variant emits Int64 hash values via
+    // the entry point `bolt_string_hash`. The companion LargeUtf8 (i64-offsets)
+    // variant below sets `string_hash_returns_i64 = true` to land in a
+    // distinct cache slot.
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::StringHash,
+        key_dtype: DataType::Utf8,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        STRING_HASH_KERNEL_ENTRY,
+        |_| compile_string_hash_kernel(DataType::Utf8),
     )?;
     let function = module.function(STRING_HASH_KERNEL_ENTRY)?;
 
@@ -2773,11 +2816,19 @@ pub fn compute_device_string_hashes_large(
     };
     let out_dev = GpuVec::<u64>::zeros(n)?;
 
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "string_hash_with_offsets:I64".to_string(),
-        None,
-        || {
+    // LargeUtf8 variant — i64 offsets at the kernel boundary. The
+    // `string_hash_returns_i64 = true` flag distinguishes this cache slot
+    // from the i32-offset Utf8 sibling above; both share the
+    // `HashJoinKernelKind::StringHash` kind and `DataType::Utf8` key dtype.
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::StringHash,
+        key_dtype: DataType::Utf8,
+        string_hash_returns_i64: true,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        crate::jit::hash_join_kernel::STRING_HASH_KERNEL_ENTRY_I64,
+        |_| {
             crate::jit::hash_join_kernel::compile_string_hash_kernel_with_offsets(
                 crate::jit::hash_join_kernel::StringOffsetWidth::I64,
             )
@@ -3421,12 +3472,19 @@ pub fn execute_cross_join_on_gpu(
     let out_build_idx_dev = GpuVec::<u32>::zeros(total_usize)?;
     let stream = CudaStream::null();
 
-    // Launch.
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "cross".to_string(),
-        None,
-        || compile_cross_kernel(),
+    // Launch. The CROSS kernel has no join key; the `HashJoinKernelSpec`
+    // shape requires SOME `key_dtype`, so we pass `DataType::Bool` as a
+    // sentinel. `string_hash_returns_i64` is ignored for this variant
+    // (only consulted for `StringHash`).
+    let spec = HashJoinKernelSpec {
+        kind: HashJoinKernelKind::Cross,
+        key_dtype: DataType::Bool,
+        string_hash_returns_i64: false,
+    };
+    let module = module_cache::get_or_build_module_for_hash_join(
+        &spec,
+        CROSS_KERNEL_ENTRY,
+        |_| compile_cross_kernel(),
     )?;
     let function = module.function(CROSS_KERNEL_ENTRY)?;
 

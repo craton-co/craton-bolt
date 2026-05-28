@@ -60,7 +60,7 @@ use parking_lot::Mutex;
 
 use crate::error::BoltResult;
 use crate::jit::CudaModule;
-use crate::plan::physical_plan::{KernelSpec, ScalarAggSpec};
+use crate::plan::physical_plan::{HashJoinKernelSpec, KernelSpec, ScalarAggSpec};
 
 /// Composite cache key: `(namespace, spec_id)`.
 ///
@@ -655,6 +655,232 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// v0.7: HashJoinKernelSpec-keyed cache layer.
+//
+// Mirrors the `ScalarAggSpec` layer above but keyed on the hash-join planner
+// IR (see [`crate::plan::physical_plan::HashJoinKernelSpec`]). Every
+// `compile_*_kernel` helper in `crate::jit::hash_join_kernel` takes no
+// arguments and returns a fixed PTX string for a fixed entry symbol; the
+// codegen-time knob is therefore which helper to call. The wrapper here
+// maps a `HashJoinKernelSpec` (kind + key_dtype + string_hash_returns_i64)
+// to the corresponding helper and routes the resulting PTX through the
+// existing [`CudaModule::from_ptx`] pipeline.
+//
+// As with `ScalarAggSpec`, we domain-separate the disk-cache key with a
+// `"hash_join::"` prefix so a hand inspection of the cache directory shows
+// immediately which family produced each entry, and we keep the in-memory
+// cache independent from `KERNELSPEC_CACHE` / `SCALARAGG_CACHE` so the FIFO
+// eviction policies of the three families don't compete.
+
+/// FIFO cap on the HashJoinKernelSpec→`CudaModule` cache. Matches the
+/// `SCALARAGG_CACHE_CAP` default.
+const HASHJOIN_CACHE_CAP: usize = 64;
+
+/// 128-bit content fingerprint of a `HashJoinKernelSpec` plus its
+/// entry-point tag. Built the same way `ScalarAggKey` is — two
+/// `DefaultHasher` instances domain-separated by a leading byte, packing
+/// into 128 bits total. We re-hash even though `HashJoinKernelSpec` itself
+/// implements `Hash`, so the fingerprint shape exactly matches the
+/// projection-side and scalar-agg caches (and so the `Debug` output drives
+/// the key in case `HashJoinKernelSpec` ever grows non-Hashable fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct HashJoinKey {
+    /// Upper 64 bits of the 128-bit content hash (domain byte `0x21`).
+    hi: u64,
+    /// Lower 64 bits of the 128-bit content hash (domain byte `0x22`).
+    lo: u64,
+    /// PTX entry-point name (e.g. `bolt_build` / `bolt_probe` / `bolt_string_hash`).
+    entry: &'static str,
+}
+
+impl HashJoinKey {
+    fn new(spec: &HashJoinKernelSpec, entry: &'static str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::fmt::Write as _;
+        use std::hash::Hasher;
+
+        // Domain-separating prefix bytes distinct from `KernelSpecKey`'s
+        // (`0x01` / `0x02`) and `ScalarAggKey`'s (`0x11` / `0x12`) so a
+        // hypothetical hash collision between the Debug shapes of the three
+        // spec types can't alias keys.
+        let mut hi = DefaultHasher::new();
+        hi.write_u8(0x21);
+        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
+
+        let mut lo = DefaultHasher::new();
+        lo.write_u8(0x22);
+        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
+
+        Self {
+            hi: hi.finish(),
+            lo: lo.finish(),
+            entry,
+        }
+    }
+}
+
+/// Cached payload for one HashJoinKernelSpec key. Mirrors `ScalarAggEntry`.
+#[derive(Clone)]
+struct HashJoinEntry {
+    /// Emitted PTX text. Retained for observability / future
+    /// hit-collision-detection. The production lookup path only needs
+    /// `module`.
+    #[allow(dead_code)]
+    ptx: String,
+    module: CudaModule,
+}
+
+/// State of the HashJoinKernelSpec-keyed cache. Same FIFO eviction shape as
+/// [`ScalarAggCache`]; see those docs for the invariants.
+struct HashJoinCache {
+    by_key: HashMap<HashJoinKey, HashJoinEntry>,
+    order: VecDeque<HashJoinKey>,
+    cap: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl HashJoinCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_key: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, key: &HashJoinKey) -> Option<HashJoinEntry> {
+        if let Some(entry) = self.by_key.get(key) {
+            self.hits = self.hits.saturating_add(1);
+            Some(entry.clone())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    fn insert(&mut self, key: HashJoinKey, entry: HashJoinEntry) {
+        if self.by_key.contains_key(&key) {
+            return;
+        }
+        while self.by_key.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_key.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.by_key.insert(key, entry);
+    }
+}
+
+/// Process-wide HashJoinKernelSpec→`CudaModule` cache. Initialised lazily.
+static HASHJOIN_CACHE: Lazy<Mutex<HashJoinCache>> =
+    Lazy::new(|| Mutex::new(HashJoinCache::new(HASHJOIN_CACHE_CAP)));
+
+/// Disk-cache key prefix for the hash-join PTX family. Stamped onto every
+/// disk-cache write/read so a directory listing shows immediately which
+/// kernel family produced each `.ptx` file, and so the projection /
+/// scalar-aggregate paths' key shapes can't ever collide with a hash-join
+/// entry.
+pub(crate) const HASH_JOIN_DISK_PREFIX: &str = "hash_join::";
+
+/// Test- and observability-facing snapshot of `(hits, misses)` for the
+/// HashJoinKernelSpec cache. Parallel to [`scalar_agg_cache_stats`].
+#[doc(hidden)]
+#[must_use]
+pub fn hash_join_cache_stats() -> (usize, usize) {
+    let c = HASHJOIN_CACHE.lock();
+    (c.hits as usize, c.misses as usize)
+}
+
+/// Look up (or compile-and-load) the `CudaModule` for `(spec, entry)`.
+///
+/// This is the hash-join analogue of [`get_or_build_module_for_scalar_agg`].
+/// On a **cache hit** we return the cached `CudaModule` clone immediately —
+/// no codegen, no PTX text generation, no `cuModuleLoadDataEx`. On a
+/// **cache miss** we run `compile(spec)` to get the PTX text and hand it to
+/// `CudaModule::from_ptx`. The resulting `(ptx, module)` pair is stored
+/// under the HashJoinKernelSpec key so subsequent calls with the same spec
+/// hit the fast path.
+///
+/// # Disk-cache integration
+///
+/// When the disk-backed PTX cache is enabled (env var `BOLT_PTX_CACHE_DIR`
+/// or builder override), a miss in the in-memory cache consults the disk
+/// cache *before* paying the codegen cost. The disk key is composed as
+/// `"{HASH_JOIN_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
+///   1. The `"hash_join::"` prefix domain-separates these entries from the
+///      projection-path and scalar-aggregate entries sharing the directory.
+///   2. The `entry` suffix distinguishes `bolt_build`, `bolt_probe`,
+///      `bolt_build_aos`, `bolt_string_hash`, etc.
+///   3. The 128-bit hex content hash makes the key collision-resistant
+///      against unrelated specs that happen to share the same kind +
+///      dtype tuple.
+///
+/// On a disk hit we skip codegen and feed the on-disk PTX straight to
+/// `CudaModule::from_ptx`.
+///
+/// # Concurrency
+///
+/// The cache lock is held only long enough to look up or insert; the slow
+/// `compile` + `from_ptx` work runs outside the lock. If two threads race
+/// on the same miss they will each compile once and the second insert is
+/// dropped by `insert`'s idempotence check.
+pub(crate) fn get_or_build_module_for_hash_join<F>(
+    spec: &HashJoinKernelSpec,
+    entry: &'static str,
+    compile: F,
+) -> BoltResult<CudaModule>
+where
+    F: FnOnce(&HashJoinKernelSpec) -> BoltResult<String>,
+{
+    let key = HashJoinKey::new(spec, entry);
+    // Fast path: in-memory hit. Hold the lock just long enough to clone.
+    if let Some(cached) = HASHJOIN_CACHE.lock().get(&key) {
+        return Ok(cached.module);
+    }
+    // In-memory miss: try the optional on-disk cache before paying for codegen.
+    let disk = crate::jit::disk_cache::disk_cache();
+    let disk_key = disk.as_ref().map(|_| {
+        format!(
+            "{}{}-{}",
+            HASH_JOIN_DISK_PREFIX,
+            entry,
+            crate::jit::disk_cache::hash_to_key(key.hi, key.lo),
+        )
+    });
+    let ptx = match (&disk, &disk_key) {
+        (Some(cache), Some(k)) => match cache.lookup(k) {
+            Some(text) => text,
+            None => {
+                let text = compile(spec)?;
+                // Write-through to disk. Errors here are non-fatal: a
+                // failed write just means future processes won't benefit,
+                // the current process still loads the module successfully.
+                let _ = cache.store(k, &text);
+                text
+            }
+        },
+        _ => compile(spec)?,
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    // Insert and hand back a clone. Concurrent winners are tolerated by
+    // `insert`'s idempotence check.
+    HASHJOIN_CACHE.lock().insert(
+        key,
+        HashJoinEntry {
+            ptx,
+            module: module.clone(),
+        },
+    );
+    Ok(module)
+}
+
+// ---------------------------------------------------------------------------
 // Tests for the KernelSpec-keyed cache.
 // ---------------------------------------------------------------------------
 
@@ -1162,6 +1388,255 @@ mod scalar_agg_cache_tests {
         assert_eq!(
             ScalarAggKey::new(&spec, "bolt_reduce"),
             ScalarAggKey::new(&copied, "bolt_reduce"),
+            "copying the spec must not change its cache key"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the HashJoinKernelSpec-keyed cache.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod hash_join_cache_tests {
+    use super::*;
+    use crate::plan::logical_plan::DataType;
+    use crate::plan::physical_plan::{HashJoinKernelKind, HashJoinKernelSpec};
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+    fn mk_spec(kind: HashJoinKernelKind, key_dtype: DataType) -> HashJoinKernelSpec {
+        HashJoinKernelSpec {
+            kind,
+            key_dtype,
+            string_hash_returns_i64: false,
+        }
+    }
+
+    /// Cold lookup against a fresh cache is a miss and `get` accounts for
+    /// it. Mirrors `scalar_agg_cache_cold_lookup_is_a_miss`.
+    #[test]
+    fn hash_join_cache_cold_lookup_is_a_miss() {
+        let mut cache = HashJoinCache::new(4);
+        let spec = mk_spec(HashJoinKernelKind::Build, DataType::Int64);
+        let key = HashJoinKey::new(&spec, "bolt_build");
+
+        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert_eq!(cache.misses, 1);
+        assert_eq!(cache.hits, 0);
+    }
+
+    /// State-machine pin of the hit path: a second call with the same spec
+    /// must NOT re-run the compile closure and must NOT re-run the loader.
+    /// We mock `CudaModule::from_ptx` with a stub closure since CUDA isn't
+    /// available in unit tests; the cache state machine is identical.
+    #[test]
+    fn hash_join_cache_compile_and_loader_run_once_per_unique_spec() {
+        // Mock module type — just a tag so we can confirm the same instance
+        // comes back on a hit.
+        #[derive(Clone)]
+        struct MockModule(&'static str);
+
+        struct MockCache {
+            by_key: HashMap<HashJoinKey, MockModule>,
+            order: VecDeque<HashJoinKey>,
+            cap: usize,
+        }
+
+        impl MockCache {
+            fn get_or_build(
+                &mut self,
+                spec: &HashJoinKernelSpec,
+                entry: &'static str,
+                compile_count: &AtomicUsize,
+                loader_count: &AtomicUsize,
+                tag: &'static str,
+            ) -> MockModule {
+                let key = HashJoinKey::new(spec, entry);
+                if let Some(m) = self.by_key.get(&key) {
+                    return m.clone();
+                }
+                // Miss: "compile" then "load".
+                compile_count.fetch_add(1, AOrdering::SeqCst);
+                loader_count.fetch_add(1, AOrdering::SeqCst);
+                let m = MockModule(tag);
+                while self.by_key.len() >= self.cap {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.by_key.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+                self.order.push_back(key);
+                self.by_key.insert(key, m.clone());
+                m
+            }
+        }
+
+        let spec_build_i64 = mk_spec(HashJoinKernelKind::Build, DataType::Int64);
+        let spec_probe_i64 = mk_spec(HashJoinKernelKind::Probe, DataType::Int64);
+
+        let compile_count = AtomicUsize::new(0);
+        let loader_count = AtomicUsize::new(0);
+        let mut cache = MockCache {
+            by_key: HashMap::new(),
+            order: VecDeque::new(),
+            cap: 64,
+        };
+
+        // First call with (Build, Int64): miss → compile + load each run once.
+        let m1 = cache.get_or_build(
+            &spec_build_i64,
+            "bolt_build",
+            &compile_count,
+            &loader_count,
+            "build-i64",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 1);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 1);
+        assert_eq!(m1.0, "build-i64");
+
+        // Second call with the SAME spec: HIT → neither closure runs again.
+        let m2 = cache.get_or_build(
+            &spec_build_i64,
+            "bolt_build",
+            &compile_count,
+            &loader_count,
+            "build-i64",
+        );
+        assert_eq!(
+            compile_count.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip codegen"
+        );
+        assert_eq!(
+            loader_count.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip module load"
+        );
+        assert_eq!(m2.0, "build-i64");
+
+        // A different kind (Probe): miss again.
+        let m3 = cache.get_or_build(
+            &spec_probe_i64,
+            "bolt_probe",
+            &compile_count,
+            &loader_count,
+            "probe-i64",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(m3.0, "probe-i64");
+
+        // And back to spec_build_i64: still a hit, neither closure runs.
+        let m4 = cache.get_or_build(
+            &spec_build_i64,
+            "bolt_build",
+            &compile_count,
+            &loader_count,
+            "build-i64",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(m4.0, "build-i64");
+
+        // string_hash_returns_i64 = true flavour vs false: must miss
+        // because the bool field participates in the cache key. This pins
+        // the routing that distinguishes the two string-hash kernel widths.
+        let string_hash_i32 = HashJoinKernelSpec {
+            kind: HashJoinKernelKind::StringHash,
+            key_dtype: DataType::Utf8,
+            string_hash_returns_i64: false,
+        };
+        let string_hash_i64 = HashJoinKernelSpec {
+            kind: HashJoinKernelKind::StringHash,
+            key_dtype: DataType::Utf8,
+            string_hash_returns_i64: true,
+        };
+        let _ = cache.get_or_build(
+            &string_hash_i32,
+            "bolt_string_hash",
+            &compile_count,
+            &loader_count,
+            "sh-i32",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 3);
+        let _ = cache.get_or_build(
+            &string_hash_i64,
+            "bolt_string_hash_i64",
+            &compile_count,
+            &loader_count,
+            "sh-i64",
+        );
+        assert_eq!(
+            compile_count.load(AOrdering::SeqCst),
+            4,
+            "string_hash_returns_i64 must participate in the key"
+        );
+    }
+
+    /// Key uniqueness: distinct kinds, dtypes, entry tags, and
+    /// `string_hash_returns_i64` flavours must each produce distinct keys.
+    #[test]
+    fn hash_join_cache_key_distinguishes_axes() {
+        let build_i64 = mk_spec(HashJoinKernelKind::Build, DataType::Int64);
+        let build_i32 = mk_spec(HashJoinKernelKind::Build, DataType::Int32);
+        let probe_i64 = mk_spec(HashJoinKernelKind::Probe, DataType::Int64);
+        let string_hash_i32 = HashJoinKernelSpec {
+            kind: HashJoinKernelKind::StringHash,
+            key_dtype: DataType::Utf8,
+            string_hash_returns_i64: false,
+        };
+        let string_hash_i64 = HashJoinKernelSpec {
+            kind: HashJoinKernelKind::StringHash,
+            key_dtype: DataType::Utf8,
+            string_hash_returns_i64: true,
+        };
+
+        let k_build_i64 = HashJoinKey::new(&build_i64, "bolt_build");
+        let k_build_i32 = HashJoinKey::new(&build_i32, "bolt_build");
+        let k_probe_i64 = HashJoinKey::new(&probe_i64, "bolt_probe");
+        let k_build_i64_alt = HashJoinKey::new(&build_i64, "bolt_build_aos");
+        let k_sh_i32 = HashJoinKey::new(&string_hash_i32, "bolt_string_hash");
+        let k_sh_i64 = HashJoinKey::new(&string_hash_i64, "bolt_string_hash_i64");
+
+        assert_ne!(k_build_i64, k_build_i32, "key_dtype must participate");
+        assert_ne!(k_build_i64, k_probe_i64, "kind must participate");
+        assert_ne!(k_build_i64, k_build_i64_alt, "entry tag must participate");
+        assert_ne!(
+            k_sh_i32, k_sh_i64,
+            "string_hash_returns_i64 must participate in the key"
+        );
+    }
+
+    /// The disk-cache key prefix must start with `"hash_join::"` so a
+    /// hand inspection of the cache directory distinguishes hash-join
+    /// entries from projection-path and scalar-agg entries. Pins the
+    /// prefix contract against accidental drift.
+    #[test]
+    fn hash_join_disk_prefix_is_visibly_namespaced() {
+        assert_eq!(HASH_JOIN_DISK_PREFIX, "hash_join::");
+        let composed = format!(
+            "{}{}-{}",
+            HASH_JOIN_DISK_PREFIX,
+            "bolt_build",
+            "deadbeefcafebabe1234567890abcdef",
+        );
+        assert!(
+            composed.starts_with("hash_join::"),
+            "composed disk key must carry the hash_join prefix: {composed}"
+        );
+    }
+
+    /// The key fingerprint is stable across `Copy` of the same spec.
+    /// Callers `Copy` the IR before handing it to the cache, so the
+    /// stability is load-bearing.
+    #[test]
+    fn hash_join_cache_key_stable_across_copy() {
+        let spec = mk_spec(HashJoinKernelKind::ProbeTiled, DataType::Int64);
+        let copied = spec;
+        assert_eq!(
+            HashJoinKey::new(&spec, "bolt_probe_tiled"),
+            HashJoinKey::new(&copied, "bolt_probe_tiled"),
             "copying the spec must not change its cache key"
         );
     }
