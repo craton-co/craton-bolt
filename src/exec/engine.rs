@@ -2393,11 +2393,20 @@ impl DeviceCol {
             DataType::Decimal128(_, _) => Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             )),
-            // v0.6 / M4: Date32 / Timestamp don't have a device column
-            // backing yet — physical-plan codegen rejects them before
-            // reaching this allocation.
+            // v0.7: PTX codegen for Date32 / Timestamp arithmetic is wired
+            // (see `crate::jit::ptx_gen`), but the device-side download
+            // path is dtype-blind — `DeviceCol::I32::download` always
+            // emits an `Int32Array`, which would silently downgrade a
+            // Date32 output to plain Int32. Keep the engine boundary
+            // rejecting these types until a follow-up wires the
+            // Date32Array / TimestampArray reconstruction. The
+            // physical-plan codegen still produces correct PTX for
+            // `Date32 - Date32` and `Timestamp - Timestamp`; the
+            // top-level engine routes any temporal column through the
+            // host path until then.
             DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
-                "Date/Timestamp not yet lowered to GPU: {:?}",
+                "Date/Timestamp output column lowering pending download-path \
+                 wiring (PTX codegen is done; got {:?})",
                 dtype
             ))),
         }

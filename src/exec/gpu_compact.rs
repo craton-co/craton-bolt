@@ -935,9 +935,19 @@ fn alloc_gathered(dtype: DataType, len: usize) -> BoltResult<GatheredCol> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
+        // v0.7: Date32 / Timestamp arithmetic (subtraction) is wired in the
+        // mainline projection codegen, but the gather/compact download path
+        // here still emits the underlying Int32 / Int64 Arrow array — there
+        // is no Date32Array / TimestampArray reconstruction yet. Reject at
+        // the compaction boundary so a filter+project over a temporal
+        // column lands on the host executor path (which handles the
+        // dtype round-trip correctly) rather than silently downgrading
+        // to plain integers.
         DataType::Date32 | DataType::Timestamp(_, _) => {
             return Err(BoltError::Other(
-                "Date/Timestamp not yet lowered to GPU".into(),
+                "Date/Timestamp not yet lowered through GPU gather; \
+                 filter+project over temporal columns falls back to the host executor"
+                    .into(),
             ))
         }
     })

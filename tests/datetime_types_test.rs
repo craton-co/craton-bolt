@@ -5,16 +5,16 @@
 //! These tests pin the **planner-side** contract: the new dtypes survive a
 //! register-table round trip, schemas reflect them correctly, the SQL
 //! `DATE 'YYYY-MM-DD'` / `TIMESTAMP 'YYYY-MM-DD HH:MM:SS'` literal surfaces
-//! parse into the right `Literal` variants, and the GPU codegen boundary
-//! rejects them with the documented "Date/Timestamp not yet lowered to GPU"
-//! message.
+//! parse into the right `Literal` variants, and the GPU codegen accepts a
+//! bare projection of Date32 / Timestamp columns (since v0.7 they lower to
+//! integer arithmetic on the underlying days / ticks).
 //!
 //! Nothing here touches the GPU — the goal is purely to confirm the dtype
-//! plumbing is in place so a follow-up wave can wire up host execution and
-//! GPU lowering. The companion changes live in
-//! `src/plan/logical_plan.rs` (variant definitions), `src/plan/sql_frontend.rs`
-//! (literal parsing), `src/plan/physical_plan.rs` (codegen rejection), and
-//! `src/exec/engine.rs` (Arrow conversion).
+//! plumbing is in place so a follow-up wave can wire up host execution.
+//! The companion changes live in `src/plan/logical_plan.rs` (variant
+//! definitions), `src/plan/sql_frontend.rs` (literal parsing), and
+//! `src/plan/physical_plan.rs` (codegen accept) and `src/exec/engine.rs`
+//! (Arrow conversion).
 
 use std::sync::Arc;
 
@@ -242,33 +242,24 @@ fn sql_timestamp_literal_parses_to_nanosecond_timestamp() {
     );
 }
 
-/// GPU codegen must reject a projection that references a Date32 / Timestamp
-/// column with the documented "Date/Timestamp not yet lowered to GPU"
-/// message. The physical-plan lowering is the single funnel through which
-/// every kernel emission flows, so a single rejection point covers all GPU
-/// paths.
+/// v0.7: Date32 and Timestamp columns now lower to GPU as their underlying
+/// integer types (i32 days / i64 ticks). A bare projection that just passes
+/// these columns through must succeed at `lower_physical` — the prior
+/// "Date/Timestamp not yet lowered to GPU" rejection was retired by the
+/// GPU lowering wiring that treats them as Int32 / Int64 at the PTX layer
+/// while preserving the temporal dtype on the IR.
 #[test]
-fn gpu_codegen_rejects_date32_column() {
+fn gpu_codegen_accepts_date32_column_projection() {
     let provider = MemTableProvider::new().with_table("events", datetime_schema());
     let plan = parse_sql("SELECT d FROM events", &provider).expect("parse");
-    let err = lower_physical(&plan).expect_err("GPU lowering must reject Date32");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("Date/Timestamp not yet lowered to GPU"),
-        "expected the documented rejection message, got: {msg}"
-    );
+    let _ = lower_physical(&plan).expect("Date32 column projection must lower in v0.7");
 }
 
 #[test]
-fn gpu_codegen_rejects_timestamp_column() {
+fn gpu_codegen_accepts_timestamp_column_projection() {
     let provider = MemTableProvider::new().with_table("events", datetime_schema());
     let plan = parse_sql("SELECT ts FROM events", &provider).expect("parse");
-    let err = lower_physical(&plan).expect_err("GPU lowering must reject Timestamp");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("Date/Timestamp not yet lowered to GPU"),
-        "expected the documented rejection message, got: {msg}"
-    );
+    let _ = lower_physical(&plan).expect("Timestamp column projection must lower in v0.7");
 }
 
 // ----- helpers --------------------------------------------------------------
