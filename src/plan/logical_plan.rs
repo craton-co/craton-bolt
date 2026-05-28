@@ -86,11 +86,22 @@ impl Schema {
     }
 
     /// Index of `name` in this schema, or a `Plan` error if absent.
+    ///
+    /// On miss the error message includes a "did you mean '<X>'?" suggestion
+    /// if any field name is within edit distance 2 of `name` (see
+    /// [`crate::plan::suggest`]). The suffix is appended verbatim — when no
+    /// close match exists, the original message is left unchanged.
     pub fn index_of(&self, name: &str) -> BoltResult<usize> {
         self.fields
             .iter()
             .position(|f| f.name == name)
-            .ok_or_else(|| BoltError::Plan(format!("column '{name}' not found in schema")))
+            .ok_or_else(|| {
+                let suffix = crate::plan::suggest::did_you_mean_suffix(
+                    name,
+                    self.fields.iter().map(|f| f.name.as_str()),
+                );
+                BoltError::Plan(format!("column '{name}' not found in schema{suffix}"))
+            })
     }
 
     /// Lookup a field by name, or a `Plan` error if absent.

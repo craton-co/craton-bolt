@@ -231,8 +231,13 @@ impl NameResolver {
             .iter()
             .find(|t| t.name == qualifier)
             .ok_or_else(|| {
+                // Suggest a close in-scope table qualifier if any.
+                let suffix = crate::plan::suggest::did_you_mean_suffix(
+                    qualifier,
+                    self.tables.iter().map(|t| t.name.as_str()),
+                );
                 BoltError::Sql(format!(
-                    "unknown table qualifier '{qualifier}' in column reference '{qualifier}.{col}'"
+                    "unknown table qualifier '{qualifier}' in column reference '{qualifier}.{col}'{suffix}"
                 ))
             })?;
         let resolved = scope
@@ -240,8 +245,12 @@ impl NameResolver {
             .iter()
             .find(|c| c.original == col)
             .ok_or_else(|| {
+                let suffix = crate::plan::suggest::did_you_mean_suffix(
+                    col,
+                    scope.cols.iter().map(|c| c.original.as_str()),
+                );
                 BoltError::Sql(format!(
-                    "unknown column '{col}' in table '{qualifier}'"
+                    "unknown column '{col}' in table '{qualifier}'{suffix}"
                 ))
             })?;
         Ok(resolved.output.clone())
@@ -1596,7 +1605,28 @@ fn try_aggregate(
     let fname = func.name.0[0].value.to_ascii_uppercase();
     let kind = match fname.as_str() {
         "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => fname,
-        _ => return Ok(None),
+        _ => {
+            // The name isn't one of our supported aggregates. If it's a
+            // near-miss for a known aggregate (e.g. `SU` or `COUTN`),
+            // surface a "did you mean...?" hint right here so the user
+            // gets a useful message instead of the generic
+            // "scalar function calls are not supported" downstream.
+            // Otherwise leave the decision to `lower_expr` (which may
+            // legitimately reject the call as an unsupported scalar
+            // function).
+            const KNOWN_AGGREGATES: &[&str] =
+                &["COUNT", "SUM", "MIN", "MAX", "AVG"];
+            if let Some(hint) = crate::plan::suggest::closest_match(
+                &fname,
+                KNOWN_AGGREGATES.iter().copied(),
+            ) {
+                let original = &func.name.0[0].value;
+                return Err(BoltError::Sql(format!(
+                    "unknown function '{original}' (did you mean '{hint}'?)"
+                )));
+            }
+            return Ok(None);
+        }
     };
 
     // Disallow OVER (window), FILTER, ORDER BY, WITHIN GROUP, parameters.
