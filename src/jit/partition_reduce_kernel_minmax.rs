@@ -311,6 +311,16 @@ pub fn compile_partition_reduce_kernel_minmax(
     // this PTX sm_70 lets a racing thread see set==1 yet read a still-
     // zeroed key, false-matching key 0.
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    // CAS-LOSER ACQUIRE: the ld.shared.s32 below races against the
+    // publishing thread's st.shared.u32 + membar.cta + atom.shared.cas.b32.
+    // PTX does NOT guarantee acquire on plain ld.shared; the publishing
+    // chain's membar.cta sequenced before atom.cas carries release-acquire
+    // on Volta+ (verified empirically). TODO: ld.acquire.cta when sm_60 dies.
+    writeln!(
+        ptx,
+        "\t// CAS-LOSER ACQUIRE: see partition_reduce_kernel_minmax.rs"
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;

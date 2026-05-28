@@ -237,6 +237,16 @@ pub fn compile_partition_reduce_kernel_multi_i64(n_vals: u32) -> BoltResult<Stri
     // ordering; without this fence a racing thread can see set==1 with
     // a zero key and false-match.
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    // CAS-LOSER ACQUIRE: the ld.shared.s64 below races against the
+    // publishing thread's st.shared.u64 + membar.cta + atom.shared.cas.b32.
+    // PTX does NOT guarantee acquire on plain ld.shared; the publishing
+    // chain's membar.cta sequenced before atom.cas carries release-acquire
+    // on Volta+. TODO: ld.acquire.cta when sm_60 is dropped.
+    writeln!(
+        ptx,
+        "\t// CAS-LOSER ACQUIRE: see partition_reduce_kernel_multi_i64.rs"
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s64 %rd61, [%rd94];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p4, %rd61, %rd60;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;

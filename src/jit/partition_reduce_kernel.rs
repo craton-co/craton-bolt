@@ -75,6 +75,35 @@
 //! ≥ 2 × partition row count, falling back to global atomics on overflow.
 //! See `docs/GROUPBY_PERF.md` Tier 2.1 follow-up section.
 //!
+//! ## Spill counter (v1)
+//!
+//! The base [`compile_partition_reduce_kernel`] preserves the v0 silent-drop
+//! semantics for callers that don't care (and for backward-compatible
+//! callsites that haven't been migrated). The companion
+//! [`compile_partition_reduce_kernel_with_spill`] emits the same kernel
+//! with one additional `.ptr .global .restrict .align 4 spill_counter_ptr`
+//! parameter at the end of the parameter list. When a row exhausts
+//! `MAX_PROBES` probes without finding a free or matching slot, the kernel
+//! atomically increments `*spill_counter_ptr` (via `atom.global.add.u32`)
+//! before taking the ADVANCE/exit path. The host must:
+//!
+//!  1. Allocate a `GpuVec<u32>::zeros(1)` for the counter at launch.
+//!  2. Pass its device pointer as the trailing parameter. **Passing 0
+//!     (null) is permitted** — the kernel gates the atomic on
+//!     `setp.eq.u64 %p, %rd_spill, 0` and skips the increment, leaving the
+//!     control flow otherwise identical to the original kernel. This lets
+//!     callers that don't care about spill detection share the same
+//!     emitted PTX.
+//!  3. After kernel sync, copy back the single `u32`. A non-zero value
+//!     means at least that many rows were silently dropped from the
+//!     reduction — the result is incorrect for those groups and the
+//!     executor should propagate an error rather than fold a partial sum.
+//!
+//! The spill counter does **not** capture the spilled keys (no per-row
+//! buffer). It is a count-only diagnostic; the executor's response is to
+//! abort the Tier-2 launch with `BoltError::Other` and let the
+//! orchestrator fall back to a higher-K configuration or to Tier-1.
+//!
 //! ## PTX-level notes
 //!
 //! * Shared variables are declared as raw byte arrays
@@ -362,6 +391,37 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     // its own membar.cta on the CLAIM path). Without this fence a racing
     // thread can read a still-zeroed key and false-match key 0.
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    // CAS-LOSER ACQUIRE: this ld.shared depends on the publishing thread's
+    // `st.shared.s32 [block_keys+slot], key` + `membar.cta` + `atom.shared.cas.b32`.
+    // PTX does not guarantee acquire semantics on plain `ld.shared`, but the
+    // publishing chain's membar.cta sequenced before atom.cas carries
+    // release-acquire on Volta+; verified empirically. TODO: switch to
+    // `ld.acquire.cta` when craton-bolt drops sm_60 support.
+    writeln!(
+        ptx,
+        "\t// CAS-LOSER ACQUIRE: ld.shared.s32 below is ordered by the membar.cta"
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t//   above + the publishing thread's membar.cta on the CLAIM path; this"
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t//   chain carries release-acquire on Volta+ via the atom.shared.cas.b32."
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t//   PTX does not guarantee acquire on plain ld.shared; TODO switch to"
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t//   ld.acquire.cta when craton-bolt drops sm_60 support."
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -461,6 +521,269 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
         bt = block_threads
     )
     .map_err(write_err)?;
+    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
+
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
+/// Entry-point name embedded in the spill-aware PTX variant emitted by
+/// [`compile_partition_reduce_kernel_with_spill`]. Distinct from
+/// [`KERNEL_ENTRY`] so the JIT module cache can hold both variants
+/// concurrently without symbol-name collisions.
+pub const KERNEL_ENTRY_WITH_SPILL: &str = "bolt_partition_reduce_with_spill";
+
+/// Variant of [`compile_partition_reduce_kernel`] that takes a trailing
+/// `spill_counter_ptr` parameter and, on probe overflow, atomically
+/// increments `*spill_counter_ptr` before taking the drop path.
+///
+/// ## ABI delta
+///
+/// One extra parameter is appended:
+///
+/// ```text
+/// .visible .entry bolt_partition_reduce_with_spill(
+///     ...,                            // same first six params as the base kernel
+///     .param .u64 spill_counter_ptr   // u32*; null (0) disables the increment
+/// )
+/// ```
+///
+/// On overflow the kernel does:
+///
+/// ```text
+///   setp.eq.u64 %p_null, %rd_spill, 0
+///   @%p_null bra LOOP_NEXT          // null pointer -> skip
+///   atom.global.add.u32 %r_old, [%rd_spill], 1
+///   bra LOOP_NEXT
+/// ```
+///
+/// so callers that don't care can pass `0` and get the same observable
+/// behaviour as the base kernel. Callers that DO care allocate a single
+/// `u32` initialised to 0, pass its device pointer, and after the launch
+/// copy it back: a non-zero value means at least that many rows were
+/// silently dropped and the result is incorrect.
+pub fn compile_partition_reduce_kernel_with_spill() -> BoltResult<String> {
+    let mut ptx = String::new();
+    let entry = KERNEL_ENTRY_WITH_SPILL;
+    let block_groups = BLOCK_GROUPS;
+    let mask = BLOCK_GROUPS - 1;
+    let block_threads = BLOCK_THREADS;
+    let keys_bytes = BLOCK_GROUPS * 4;
+    let vals_bytes = BLOCK_GROUPS * 8;
+    let set_bytes = BLOCK_GROUPS * 4;
+    let max_probes = MAX_PROBES;
+
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 block_keys_buf[{bytes}];",
+        bytes = keys_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align 8 .b8 block_vals_buf[{bytes}];",
+        bytes = vals_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 block_set_buf[{bytes}];",
+        bytes = set_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_2,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_3,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_4,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_5,").map_err(write_err)?;
+    // Trailing spill_counter_ptr. May be 0 (null) at the call site — the
+    // kernel gates the atomic increment behind a setp.eq.u64 null-check
+    // so the control flow is otherwise identical to the base kernel.
+    writeln!(ptx, "\t.param .u64 {entry}_param_6").map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    writeln!(ptx, "\t.reg .pred  %p<16>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<64>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<64>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .f64   %fd<8>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u64 %rd1, block_vals_buf;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u64 %rd2, block_set_buf;").map_err(write_err)?;
+
+    writeln!(ptx, "\tld.param.u64 %rd3, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd4, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd4, %rd4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd5, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd5, %rd5;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd6, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd6, %rd6;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd7, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd7, %rd7;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd8, [{entry}_param_5];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    // Spill counter pointer — loaded raw, NOT through cvta. We keep the
+    // generic-space value so we can null-check with setp.eq.u64 %p, %rd, 0
+    // (cvta.to.global on a null pointer is implementation-defined). When
+    // non-null, we issue atom.global.add.u32 — atomics accept generic
+    // pointers on sm_70+ and dispatch to the underlying space, so we don't
+    // need to materialise a global-space alias separately.
+    writeln!(ptx, "\tld.param.u64 %rd9, [{entry}_param_6];").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 1: zero shared arrays (identical to base kernel).
+    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r20, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd21], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u64 [%rd23], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r20, %r20, {bt};", bt = block_threads).map_err(write_err)?;
+    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 2: probe + sum.
+    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s32 %r31, [%rd31];").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd32, %r30, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd33, %rd4, %rd32;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.f64 %fd0, [%rd33];").map_err(write_err)?;
+
+    writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
+
+    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p2, %r33, {mp};", mp = max_probes).map_err(write_err)?;
+    // Branch to SPILL instead of LOOP_NEXT — SPILL atomically bumps the
+    // counter (if non-null) then jumps to LOOP_NEXT.
+    writeln!(ptx, "\t@%p2 bra SPILL;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd34;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?;
+
+    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t// CAS-LOSER ACQUIRE: ld.shared.s32 below is ordered by the membar.cta"
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t//   above + the publishing thread's membar.cta on the CLAIM path."
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r32, %r32, 0x{mask:X};", mask = mask).map_err(write_err)?;
+    writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
+
+    writeln!(ptx, "CLAIM:").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.shared.add.f64 %fd1, [%rd38], %fd0;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+
+    writeln!(ptx, "MATCH:").map_err(write_err)?;
+    writeln!(ptx, "\tatom.shared.add.f64 %fd2, [%rd38], %fd0;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+
+    // SPILL: probe overflow. If the host passed a non-null counter, bump
+    // it atomically; either way, fall through to LOOP_NEXT (the row IS
+    // dropped — the counter is purely diagnostic).
+    writeln!(ptx, "SPILL:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u64 %p7, %rd9, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra LOOP_NEXT;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r46, [%rd9], 1;").map_err(write_err)?;
+
+    writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r30, %r30, %r1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_TOP;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 3: export (identical to base kernel).
+    writeln!(ptx, "\tmul.lo.u32 %r40, %r0, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p5, %r41, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra EXPORT_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd40, %r41, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd41, %rd0, %rd40;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r43, [%rd41];").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd42, %r41, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd43, %rd1, %rd42;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.f64 %fd3, [%rd43];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd44, %rd2, %rd40;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.u32 %r44, [%rd44];").map_err(write_err)?;
+
+    writeln!(ptx, "\tsetp.ne.s32 %p6, %r44, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tselp.u32 %r45, 1, 0, %p6;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd45, %r42, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd46, %rd6, %rd45;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.s32 [%rd46], %r43;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd47, %r42, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd48, %rd7, %rd47;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.f64 [%rd48], %fd3;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u64.u32 %rd49, %r42;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd50, %rd8, %rd49;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u8 [%rd50], %r45;").map_err(write_err)?;
+
+    writeln!(ptx, "\tadd.u32 %r41, %r41, {bt};", bt = block_threads).map_err(write_err)?;
     writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
     writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
 
@@ -656,5 +979,53 @@ mod tests {
         let _fn = module
             .function(KERNEL_ENTRY)
             .expect("kernel entry point should be reachable");
+    }
+
+    /// The spill-aware variant compiles, exports the alternate entry point,
+    /// and contains the diagnostic atom.global.add.u32 on its overflow path.
+    #[test]
+    fn with_spill_variant_compiles_and_has_spill_atomic() {
+        let ptx = compile_partition_reduce_kernel_with_spill()
+            .expect("with_spill kernel compiles");
+        let needle = format!(".visible .entry {}(", KERNEL_ENTRY_WITH_SPILL);
+        assert!(
+            ptx.contains(&needle),
+            "PTX must declare the with_spill entry point:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("atom.global.add.u32"),
+            "PTX must emit atom.global.add.u32 on the SPILL path:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("SPILL:"),
+            "PTX must label the SPILL block:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.u64 %p7, %rd9, 0;"),
+            "PTX must null-check spill_counter_ptr before the atomic:\n{ptx}"
+        );
+    }
+
+    /// The spill-aware variant has one more .param .u64 than the base.
+    #[test]
+    fn with_spill_variant_has_seven_params() {
+        let ptx = compile_partition_reduce_kernel_with_spill()
+            .expect("with_spill kernel compiles");
+        // The .visible block lists exactly the kernel params (the
+        // `.shared` declarations live before the entry header so they
+        // don't share the `.param .u64` shape).
+        let n_params = ptx.matches(".param .u64 ").count();
+        assert_eq!(
+            n_params, 7,
+            "expected 7 .u64 params on the spill variant, got {n_params}\n{ptx}"
+        );
+    }
+
+    /// Spill-aware variant is deterministic — same input -> same output.
+    #[test]
+    fn with_spill_variant_is_deterministic() {
+        let a = compile_partition_reduce_kernel_with_spill().expect("compile a");
+        let b = compile_partition_reduce_kernel_with_spill().expect("compile b");
+        assert_eq!(a, b, "with_spill emitter must be deterministic");
     }
 }
