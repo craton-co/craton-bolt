@@ -58,6 +58,16 @@ jobs:
         env:
           RUSTFLAGS: ""
 
+      - name: cargo check --features cudarc
+        if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
+        run: cargo check --lib --features cudarc --no-default-features
+        env:
+          RUSTFLAGS: ""
+
+      # TODO(ci): --features rust-cuda requires nightly + libNVVM + LLVM
+      # toolchain — not feasible on github-hosted runners without a custom
+      # container. Track in https://github.com/craton-co/craton-bolt/issues/?
+
       - name: cargo test (lib + integration)
         run: cargo test --lib --tests --features cuda-stub --no-default-features
         env:
