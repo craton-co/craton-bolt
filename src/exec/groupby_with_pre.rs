@@ -1072,6 +1072,15 @@ fn run_one_aggregate(
             Ok(AccDownload::I64(acc_table.to_vec()?))
         }
 
+        AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => {
+            // v0.5: rejected at engine dispatch; defensive arm to keep
+            // the match exhaustive without committing to a GROUP BY
+            // semantics for the new variants.
+            Err(BoltError::Other(
+                "groupby_with_pre: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                    .into(),
+            ))
+        }
         AggregateExpr::Avg(_) => {
             // AVG = SUM(expr) / COUNT(expr), both grouped, SQL semantics:
             // NULL rows are excluded from both numerator and denominator.
@@ -1667,6 +1676,7 @@ fn inner_expr_of(agg: &AggregateExpr) -> &Expr {
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e)
         | AggregateExpr::Count(e) => e,
+        AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e.as_ref(),
     }
 }
 
@@ -1829,6 +1839,14 @@ fn build_agg_array(
                 out.push(v);
             }
             pack_array(out_field.dtype, Scalars::F64(out))
+        }
+        // v0.5: VAR_POP/VAR_SAMP with GROUP BY is rejected before reaching
+        // here. Defensive arm to keep the match exhaustive.
+        (AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_), _) => {
+            Err(BoltError::Other(
+                "groupby_with_pre: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                    .into(),
+            ))
         }
         (AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_), other) => {
             let scalars = match other {

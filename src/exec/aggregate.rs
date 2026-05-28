@@ -230,7 +230,120 @@ fn build_one_aggregate(
             };
             scalar_to_array(Scalar::F64(avg), out_field.dtype)
         }
+        AggregateExpr::VarPop(expr) | AggregateExpr::VarSamp(expr) => {
+            // v0.5 scalar-aggregate path: download the column to the host
+            // and run Welford's online algorithm in f64. The output is
+            // nullable Float64 — SQL says VAR_POP/VAR_SAMP over an empty
+            // (or all-NULL) input is NULL, and VAR_SAMP additionally
+            // requires count > 1. A future patch can lower this to a GPU
+            // kernel emitting per-block (count, mean, M2) partials that
+            // merge in `O(blocks)` on the host; the wire-format used here
+            // is the Welford state, so swapping the launcher is contract-
+            // preserving.
+            let col_name = bare_column_name(expr)?;
+            let col_io = resolve_input(inputs, col_name)?;
+            let values_f64 = column_as_f64_no_nulls(col_io, table_batch)?;
+            let is_pop = matches!(agg, AggregateExpr::VarPop(_));
+            let result: Option<f64> = if is_pop {
+                crate::exec::welford::var_pop_f64(&values_f64)
+            } else {
+                crate::exec::welford::var_samp_f64(&values_f64)
+            };
+            Ok(Arc::new(Float64Array::from(vec![result])) as ArrayRef)
+        }
     }
+}
+
+/// Pull `col_io` out of `batch` as an `f64` vector, dropping NULL rows.
+/// Used by the host-side Welford path; mirrors the NULL-filtering done
+/// by `reduce_column_from_batch` for SUM/MIN/MAX but always upcasts to
+/// the f64 accumulator dtype.
+fn column_as_f64_no_nulls(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+) -> BoltResult<Vec<f64>> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "aggregate input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+    let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
+    if arr_dtype != col_io.dtype {
+        return Err(BoltError::Type(format!(
+            "aggregate input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
+            col_io.name, col_io.dtype, arr_dtype
+        )));
+    }
+    match col_io.dtype {
+        DataType::Int32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
+            Ok(primitive_to_f64_dropping_nulls::<arrow_array::types::Int32Type>(
+                pa,
+                |v| v as f64,
+            ))
+        }
+        DataType::Int64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
+            Ok(primitive_to_f64_dropping_nulls::<arrow_array::types::Int64Type>(
+                pa,
+                |v| v as f64,
+            ))
+        }
+        DataType::Float32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
+            Ok(primitive_to_f64_dropping_nulls::<arrow_array::types::Float32Type>(
+                pa,
+                |v| v as f64,
+            ))
+        }
+        DataType::Float64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
+            Ok(primitive_to_f64_dropping_nulls::<arrow_array::types::Float64Type>(
+                pa,
+                |v| v,
+            ))
+        }
+        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+            "VAR_POP/VAR_SAMP over dtype {:?} not supported (column '{}')",
+            col_io.dtype, col_io.name
+        ))),
+    }
+}
+
+/// Copy a primitive Arrow array's non-NULL values into a fresh `Vec<f64>`,
+/// applying `cast` to widen each element. NULL positions are skipped so
+/// the resulting slice can be fed straight into Welford.
+fn primitive_to_f64_dropping_nulls<P>(
+    pa: &arrow_array::PrimitiveArray<P>,
+    cast: impl Fn(P::Native) -> f64,
+) -> Vec<f64>
+where
+    P: arrow_array::types::ArrowPrimitiveType,
+    P::Native: Copy,
+{
+    let n = pa.len();
+    let mut out: Vec<f64> = Vec::with_capacity(n - pa.null_count());
+    let vals = pa.values();
+    for i in 0..n {
+        if !pa.is_null(i) {
+            out.push(cast(vals[i]));
+        }
+    }
+    out
 }
 
 /// Count of non-NULL rows for `col_io` in `batch`. Used by COUNT(col) and as
@@ -259,6 +372,7 @@ fn agg_inner_expr(agg: &AggregateExpr) -> Option<&Expr> {
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e)
         | AggregateExpr::Count(e) => Some(e),
+        AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => Some(e),
     }
 }
 

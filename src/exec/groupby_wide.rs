@@ -449,14 +449,24 @@ enum AggKind {
 }
 
 impl AggKind {
-    fn from_expr(e: &AggregateExpr) -> Self {
-        match e {
+    /// Map an `AggregateExpr` to its `AggKind` discriminant. Returns an
+    /// error for VAR_POP/VAR_SAMP because the wide GROUP BY path has no
+    /// host-side accumulator variant for them yet (rejected at engine
+    /// dispatch in v0.5).
+    fn from_expr(e: &AggregateExpr) -> BoltResult<Self> {
+        Ok(match e {
             AggregateExpr::Sum(_) => AggKind::Sum,
             AggregateExpr::Min(_) => AggKind::Min,
             AggregateExpr::Max(_) => AggKind::Max,
             AggregateExpr::Count(_) => AggKind::Count,
             AggregateExpr::Avg(_) => AggKind::Avg,
-        }
+            AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => {
+                return Err(BoltError::Other(
+                    "wide GROUP BY: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                        .into(),
+                ))
+            }
+        })
     }
 }
 
@@ -474,6 +484,7 @@ fn resolve_aggregates<'a>(
             | AggregateExpr::Max(e)
             | AggregateExpr::Count(e)
             | AggregateExpr::Avg(e) => e,
+            AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e.as_ref(),
         };
         let col_name = bare_column_name(expr)?;
         let io = aggregate
@@ -511,7 +522,7 @@ fn resolve_aggregates<'a>(
             )));
         }
         out.push(AggInputPlan {
-            kind: AggKind::from_expr(agg),
+            kind: AggKind::from_expr(agg)?,
             name: io.name.clone(),
             dtype: io.dtype,
             arr,
@@ -934,6 +945,13 @@ fn finalize_agg_column(
             // the (possibly narrowing) cast to `pack_typed_array`.
             collect_sum_min_max(sorted, i, out_field.dtype)
         }
+        // v0.5: wide GROUP BY rejects VAR_POP/VAR_SAMP at the `resolve_aggregates`
+        // gate already (see `AggKind::from_expr`); this arm is unreachable in
+        // practice but keeps the match exhaustive.
+        AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => Err(BoltError::Other(
+            "wide GROUP BY: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                .into(),
+        )),
     }
 }
 

@@ -289,6 +289,7 @@ pub fn materialize_agg_input(
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e)
         | AggregateExpr::Count(e) => e,
+        AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e.as_ref(),
     };
     eval_expr(inner, env, expected_dtype, n_rows)
 }

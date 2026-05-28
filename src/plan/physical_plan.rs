@@ -1233,6 +1233,10 @@ fn lower_aggregate(
             | AggregateExpr::Min(e)
             | AggregateExpr::Max(e)
             | AggregateExpr::Avg(e) => e.clone(),
+            // VAR_POP/VAR_SAMP store their inner expression inside a Box;
+            // unbox a clone so it threads through the same `feed` list as
+            // the other aggregates.
+            AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => (**e).clone(),
         };
         agg_input_exprs.push(e);
     }
@@ -1333,6 +1337,12 @@ fn lower_aggregate(
                 AggregateExpr::Min(e) => AggregateExpr::Min(substitute_one(e, m)),
                 AggregateExpr::Max(e) => AggregateExpr::Max(substitute_one(e, m)),
                 AggregateExpr::Avg(e) => AggregateExpr::Avg(substitute_one(e, m)),
+                AggregateExpr::VarPop(e) => {
+                    AggregateExpr::VarPop(Box::new(substitute_one(e, m)))
+                }
+                AggregateExpr::VarSamp(e) => {
+                    AggregateExpr::VarSamp(Box::new(substitute_one(e, m)))
+                }
             },
         })
         .collect();
