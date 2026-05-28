@@ -32,7 +32,7 @@ pub use error::{BoltError, BoltResult};
 
 pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
 pub use plan::{DataFrame, LogicalPlan, PhysicalPlan, Expr};
-pub use exec::Engine;
+pub use exec::{Engine, EngineBuilder};
 
 /// Stage 4 (pool telemetry): public re-exports for downstream
 /// observability. [`pool_stats`] returns a [`PoolStats`] snapshot of

@@ -71,7 +71,7 @@ pub mod filter;
 
 #[doc(hidden)]
 pub use launch::{launch_1d, CudaStream, KernelArgs};
-pub use engine::{Engine, QueryHandle};
+pub use engine::{Engine, EngineBuilder, QueryHandle};
 
 /// Convert a host-side row count to the `u32` shape CUDA kernel launches require,
 /// returning a structured error if the count exceeds `u32::MAX`.
