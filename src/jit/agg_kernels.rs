@@ -551,3 +551,306 @@ fn ptx_type_info(
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("agg_kernels: write failed: {}", e))
 }
+
+// ---------------------------------------------------------------------------
+// Fused AVG kernel.
+// ---------------------------------------------------------------------------
+
+/// PTX entry-point name for the fused AVG reduction kernel.
+pub const AVG_KERNEL_ENTRY: &str = "bolt_avg_reduce";
+
+/// Per-block sum-of-squares output element type for the AVG kernel: always
+/// `f64` regardless of input dtype, so the sum doesn't lose precision as soon
+/// as the input is wider than the accumulator (e.g. SUM over a long Int64
+/// column with values whose partial sums no longer fit in `f32`).
+pub const AVG_SUM_ELEM_BYTES: usize = 8;
+
+/// Per-block count output element type for the AVG kernel: always `u32`. We
+/// can't overflow at `BLOCK_SIZE = 256` per block; the grand total fits in
+/// u64 at the host-side finalize.
+pub const AVG_COUNT_ELEM_BYTES: usize = 4;
+
+/// Generate PTX for the **fused** per-block AVG kernel. In a single pass over
+/// the input column each block computes:
+///   - `block_sums[blockIdx.x]` (`f64`): partial sum of the in-range elements.
+///   - `block_counts[blockIdx.x]` (`u32`): count of in-range elements (i.e.
+///     `min(n_rows - blockIdx.x * BLOCK_SIZE, BLOCK_SIZE)` — equivalent to the
+///     non-NULL count once the caller has stripped NULL rows on the host).
+///
+/// This replaces the previous "two separate kernel launches (SUM + COUNT) then
+/// divide on the host" sequence, which paid two PTX compilations, two kernel
+/// launches, and two D2H copies to compute a single float. The fused kernel
+/// keeps the reduction shape identical to `compile_reduction_kernel` (phase 1
+/// shared-memory tree + phase 2 warp shuffle) but tracks two accumulators in
+/// parallel: an `f64` sum and a `b32` count.
+///
+/// ABI:
+/// ```text
+/// .visible .entry bolt_avg_reduce(
+///     .param .u64 input_ptr,
+///     .param .u64 block_sums_ptr,
+///     .param .u64 block_counts_ptr,
+///     .param .u32 n_rows
+/// )
+/// ```
+///
+/// `dtype` is the *input* column dtype. The sum accumulator is always `f64`;
+/// the kernel cvts each loaded primitive into `f64` before the per-thread
+/// contribution. NULL rows are not handled by this kernel — the caller (host)
+/// is responsible for stripping them, exactly as it does for the SUM kernel.
+pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
+    let (input_load_suffix, _, input_reg_class, input_reg_ty, _input_imm_ty) =
+        ptx_type_info(dtype)?;
+    let input_elem_bytes = dtype.byte_width().ok_or_else(|| {
+        BoltError::Other(format!(
+            "agg_kernels: variable-width dtype {:?} not supported in AVG kernel",
+            dtype
+        ))
+    })?;
+
+    // Two shared-memory scratch pads: one for the f64 sum, one for the u32 count.
+    let sum_shared_bytes = BLOCK_SIZE as usize * AVG_SUM_ELEM_BYTES;
+    let count_shared_bytes = BLOCK_SIZE as usize * AVG_COUNT_ELEM_BYTES;
+
+    let mut ptx = String::new();
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        ".shared .align 8 .b8 sdata_sum[{n}];",
+        n = sum_shared_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 sdata_cnt[{n}];",
+        n = count_shared_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, ".visible .entry {}(", AVG_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_0,", AVG_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_1,", AVG_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_2,", AVG_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {}_param_3", AVG_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    // Generous register names — PTX allocates names, not registers.
+    writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<32>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<32>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .f64   %fd<16>;").map_err(write_err)?;
+    // If the input dtype isn't already f64, allocate the input-class register
+    // so we can `ld.global.<inp>` then `cvt.f64.<inp>` into the sum accumulator.
+    if dtype != DataType::Float64 {
+        writeln!(ptx, "\t.reg .{}   %{}<4>;", input_reg_ty, input_reg_class)
+            .map_err(write_err)?;
+    }
+    writeln!(ptx).map_err(write_err)?;
+
+    // gid = ctaid.x * ntid.x + tid.x
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_3];", AVG_KERNEL_ENTRY).map_err(write_err)?;
+
+    // Load input value as f64 (or +0.0 if past the end) and set the count
+    // contribution (1 if in range, 0 otherwise).
+    writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_0];", AVG_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra AVG_LOAD_IDENTITY;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd1, %r3, {bytes};",
+        bytes = input_elem_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    if dtype == DataType::Float64 {
+        writeln!(ptx, "\tld.global.f64 %fd0, [%rd2];").map_err(write_err)?;
+    } else {
+        writeln!(
+            ptx,
+            "\tld.global.{ld} %{rc}0, [%rd2];",
+            ld = input_load_suffix,
+            rc = input_reg_class
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tcvt.f64.{ld} %fd0, %{rc}0;",
+            ld = input_load_suffix,
+            rc = input_reg_class
+        )
+        .map_err(write_err)?;
+    }
+    // Count contribution: 1 for in-range threads.
+    writeln!(ptx, "\tmov.u32 %r5, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra AVG_AFTER_LOAD;").map_err(write_err)?;
+
+    writeln!(ptx, "AVG_LOAD_IDENTITY:").map_err(write_err)?;
+    // Sum identity is +0.0; count identity is 0.
+    writeln!(
+        ptx,
+        "\tmov.f64 %fd0, 0d{:016X};",
+        0f64.to_bits()
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r5, 0;").map_err(write_err)?;
+    writeln!(ptx, "AVG_AFTER_LOAD:").map_err(write_err)?;
+
+    // Stash sum and count into their shared-memory slots.
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd3, %r2, {bytes};",
+        bytes = AVG_SUM_ELEM_BYTES
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u64 %rd4, sdata_sum;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd5, %rd4, %rd3;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.f64 [%rd5], %fd0;").map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd6, %r2, {bytes};",
+        bytes = AVG_COUNT_ELEM_BYTES
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u64 %rd7, sdata_cnt;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd8, %rd7, %rd6;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.b32 [%rd8], %r5;").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+
+    // Phase 1: inter-warp shared-memory tree at strides 128, 64, 32 — exactly
+    // mirroring `compile_reduction_kernel`. We do both reductions in lockstep
+    // under a single `tid < stride` predicate so we share the barrier and the
+    // address arithmetic.
+    let phase1_strides: [i32; 3] = [128, 64, 32];
+    let mut step = 0usize;
+    for &stride in &phase1_strides {
+        let neighbor_pred = format!("%p{}", 1 + (step % 4));
+        let sum_stride_bytes = stride as usize * AVG_SUM_ELEM_BYTES;
+        let cnt_stride_bytes = stride as usize * AVG_COUNT_ELEM_BYTES;
+
+        writeln!(
+            ptx,
+            "\tsetp.lt.s32 {pred}, %r2, {stride};",
+            pred = neighbor_pred,
+            stride = stride
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\t@!{pred} bra AVG_SKIP_ADD_{step};",
+            pred = neighbor_pred,
+            step = step
+        )
+        .map_err(write_err)?;
+
+        // Sum: load own + neighbour, add, store back.
+        writeln!(
+            ptx,
+            "\tadd.s64 %rd10, %rd5, {offset};",
+            offset = sum_stride_bytes
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tld.shared.f64 %fd1, [%rd10];").map_err(write_err)?;
+        writeln!(ptx, "\tld.shared.f64 %fd2, [%rd5];").map_err(write_err)?;
+        writeln!(ptx, "\tadd.f64 %fd3, %fd2, %fd1;").map_err(write_err)?;
+        writeln!(ptx, "\tst.shared.f64 [%rd5], %fd3;").map_err(write_err)?;
+
+        // Count.
+        writeln!(
+            ptx,
+            "\tadd.s64 %rd11, %rd8, {offset};",
+            offset = cnt_stride_bytes
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tld.shared.b32 %r6, [%rd11];").map_err(write_err)?;
+        writeln!(ptx, "\tld.shared.b32 %r7, [%rd8];").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s32 %r8, %r7, %r6;").map_err(write_err)?;
+        writeln!(ptx, "\tst.shared.b32 [%rd8], %r8;").map_err(write_err)?;
+
+        writeln!(ptx, "AVG_SKIP_ADD_{step}:", step = step).map_err(write_err)?;
+        writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+        step += 1;
+    }
+
+    // Phase 2: warp-shuffle intra-warp reduction. Gate on tid < 32; the
+    // remaining strides (16, 8, 4, 2, 1) run register-only.
+    writeln!(ptx, "\tsetp.ge.u32 %p6, %r2, 32;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra AVG_DONE;").map_err(write_err)?;
+
+    // Lane 0..31 loads its own value into a register once.
+    writeln!(ptx, "\tld.shared.f64 %fd5, [%rd5];").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.b32 %r9, [%rd8];").map_err(write_err)?;
+
+    for &stride in &[16i32, 8, 4, 2, 1] {
+        // Sum (f64): split into two b32 halves, shuffle each, recombine.
+        writeln!(ptx, "\tmov.b64 {{%r10, %r11}}, %fd5;").map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tshfl.sync.down.b32 %r12, %r10, {stride}, 0x1f, 0xffffffff;",
+            stride = stride
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tshfl.sync.down.b32 %r13, %r11, {stride}, 0x1f, 0xffffffff;",
+            stride = stride
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tmov.b64 %fd6, {{%r12, %r13}};").map_err(write_err)?;
+        writeln!(ptx, "\tadd.f64 %fd5, %fd5, %fd6;").map_err(write_err)?;
+
+        // Count (u32 / b32): single shfl.
+        writeln!(
+            ptx,
+            "\tshfl.sync.down.b32 %r14, %r9, {stride}, 0x1f, 0xffffffff;",
+            stride = stride
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tadd.s32 %r9, %r9, %r14;").map_err(write_err)?;
+    }
+
+    // Only lane 0 of warp 0 writes the per-block partial.
+    writeln!(ptx, "\tsetp.ne.s32 %p5, %r2, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra AVG_DONE;").map_err(write_err)?;
+
+    // Write block_sums[blockIdx.x].
+    writeln!(ptx, "\tld.param.u64 %rd20, [{}_param_1];", AVG_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd20, %rd20;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd21, %r0, {bytes};",
+        bytes = AVG_SUM_ELEM_BYTES
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd22, %rd20, %rd21;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.f64 [%rd22], %fd5;").map_err(write_err)?;
+
+    // Write block_counts[blockIdx.x].
+    writeln!(ptx, "\tld.param.u64 %rd23, [{}_param_2];", AVG_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd23, %rd23;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd24, %r0, {bytes};",
+        bytes = AVG_COUNT_ELEM_BYTES
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd25, %rd23, %rd24;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.b32 [%rd25], %r9;").map_err(write_err)?;
+
+    writeln!(ptx, "AVG_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
