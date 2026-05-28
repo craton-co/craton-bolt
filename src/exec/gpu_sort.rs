@@ -94,10 +94,9 @@ use crate::jit::sort_kernel::{
     SortKernelSpec, SortLayout, MAX_SORT_KEYS, SORT_BLOCK_SIZE,
 };
 use crate::jit::sort_kernel_radix::{
-    compile_radix_histogram, compile_radix_msb_flip, compile_radix_scatter_with_indices,
-    radix_histogram_entry, radix_msb_flip_entry, radix_needs_msb_flip,
-    radix_scatter_with_indices_entry, radix_steps_for, radix_supports_dtype, RADIX_BLOCK_SIZE,
-    RADIX_BUCKETS,
+    compile_radix_histogram, compile_radix_scatter_with_indices,
+    radix_histogram_entry, radix_scatter_with_indices_entry, radix_steps_for,
+    radix_supports_dtype, RADIX_BLOCK_SIZE, RADIX_BUCKETS,
 };
 use crate::plan::logical_plan::DataType;
 
@@ -646,18 +645,18 @@ pub struct GpuSortKey<'a> {
 }
 
 // =============================================================================
-// v0.7: GPU radix-sort path (single-key Int32/Int64 ASC).
+// v0.7: GPU radix-sort path. Single-key (#15) and multi-key + DESC (#19).
 // =============================================================================
 //
-// Pairs with [`crate::jit::sort_kernel_radix`]. The flow:
+// Pairs with [`crate::jit::sort_kernel_radix`]. The single-key flow:
 //
 // ```text
 //  key column (host, n_rows)
 //     │
+//     ▼ host-side direction transform (XOR signed-MSB for ASC, bit-not for DESC)
 //     ▼ h2d (no padding — radix has no power-of-two requirement)
-//  keys_ping (device)        idx_ping (device, 0..n_rows)
+//  keys_ping (device)        idx_ping (device, 0..n_rows or starting-perm)
 //     │                            │
-//     ├─ optional MSB flip kernel  │  (signed int dtypes only)
 //     ▼                            ▼
 //  for pass in 0..radix_steps:
 //      zero hist (16 u32)
@@ -667,25 +666,47 @@ pub struct GpuSortKey<'a> {
 //          (keys_ping, idx_ping)  →  (keys_pong, idx_pong)
 //      swap ping ↔ pong
 //
-//  optional MSB flip on keys_ping  (restores original int values)
-//     │
 //     ▼ d2h idx_ping
-//  permutation: UInt32Array of length n_rows
-//     │
-//     ▼ arrow::compute::take per column
-//  sorted RecordBatch
+//  permutation: Vec<u32> of length n_rows
 // ```
 //
-// ## Scope (v0.7)
+// ## Multi-key extension (#19)
 //
-// - **Single key only.** Multi-key lex ordering needs a different driver
-//   (stable per-pass sort + outer key loop). Punted to v0.8.
-// - **Int32 / Int64 only.** Float radix wants the IEEE-monotonic
-//   transform (deferred); Bool / Utf8 fall through.
-// - **ASC direction only.** DESC would need a second post-pass index
-//   reversal or a flipped XOR constant. Easy to add but no need yet.
-// - **No NULLs.** Radix sort has no validity-bitmap routing; we reject
-//   nullable columns up front and let the bitonic / host path handle them.
+// Radix is LSD-stable, so an N-key lex sort is `N` sequential single-key
+// passes from the LAST key back to the FIRST. Each pass:
+//   1. Gather the new key's host values via the running permutation
+//      (`gathered[i] = key_M.host[ running_perm[i] ]`), applying the
+//      per-key direction transform during the gather.
+//   2. Upload as the fresh `keys_ping` buffer.
+//   3. Seed `idx_ping = running_perm` (identity for the first key).
+//   4. Run radix passes; the kernel carries `idx_ping` in lock-step with
+//      the keys, so the final `idx_ping` is the NEW running permutation.
+//
+// ## DESC strategy (#19)
+//
+// We pre-transform the host keys per-direction so the device kernel
+// always does an unsigned ASC bit-pattern sort:
+//   * **ASC, signed**: XOR with the dtype's MSB constant (`0x80000000`
+//     for i32 / `0x8000000000000000` for i64) — makes signed bit-patterns
+//     unsigned-ordered.
+//   * **DESC, signed**: XOR with all-ones (i.e. `!val`) — inverts the
+//     bit-pattern order so the unsigned ASC radix sort produces the
+//     value-DESC order. Mixes cleanly with the MSB-flip's algebra
+//     (`!v = v ^ 0xFF…F`, both are XOR isomorphisms).
+//
+// The kernel-side MSB-flip (`bolt_radix_msb_flip_<dty>`) stays available
+// but is no longer called from this path; the per-key host transform
+// during gather is strictly cheaper than a one-shot kernel pre-pass and
+// is the only point where DESC's bit-not can be applied per-key in a
+// multi-key chain.
+//
+// ## Scope
+//
+// - **Up to [`MAX_SORT_KEYS`] keys.** Each key Int32 or Int64 — float
+//   radix needs the IEEE-monotonic transform (deferred); Bool / Utf8
+//   fall through. Mixed ASC/DESC per-key is supported.
+// - **No NULLs in any key column.** Radix sort has no validity-bitmap
+//   routing; we reject nullable columns up front.
 // - **Env-gated.** `BOLT_GPU_SORT=1` opts in; default OFF.
 //
 // The dispatch decision in [`try_gpu_sort_radix`] returns `Ok(None)` on
@@ -705,8 +726,8 @@ pub struct GpuSortKey<'a> {
 pub(crate) static RADIX_DISPATCH_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// **Pure** predicate: does this `(arr, dtype, direction, nulls_first)`
-/// tuple satisfy every gate the v0.7 radix sort needs?
+/// **Pure** predicate: does this single-key `(arr, dtype, direction, nulls_first)`
+/// tuple satisfy every gate the radix sort needs?
 ///
 /// Splitting the predicate out of [`sort_indices_on_gpu_radix`] gives the
 /// `sort.rs` dispatcher a host-only check (no GPU touch, no allocation)
@@ -715,11 +736,15 @@ pub(crate) static RADIX_DISPATCH_COUNT: std::sync::atomic::AtomicUsize =
 ///
 /// The gates, in evaluation order:
 ///   1. `radix_supports_dtype(dtype)` — currently Int32 / Int64 only.
-///   2. `direction == Asc` — DESC deferred.
-///   3. `!nulls_first` is harmless on its own, but together with the
-///      next gate it pins the no-NULL contract.
-///   4. `arr.null_count() == 0` — radix sort has no validity routing.
-///   5. `arr.len() <= u32::MAX` — the indices payload is `u32`.
+///   2. **Direction**: ASC and DESC both accepted (#19; the multi-key
+///      driver applies the direction transform host-side during gather).
+///   3. `arr.null_count() == 0` — radix sort has no validity routing.
+///   4. `arr.len() <= u32::MAX` — the indices payload is `u32`.
+///
+/// `nulls_first` is meaningless on a column with no NULLs (gate 3 already
+/// guarantees that), so we accept any value for it. The gate is kept in the
+/// signature so a caller that wants to pin the parameter explicitly can
+/// continue to do so.
 pub(crate) fn radix_dispatch_predicate(
     arr: &dyn Array,
     dtype: DataType,
@@ -729,16 +754,16 @@ pub(crate) fn radix_dispatch_predicate(
     if !radix_supports_dtype(dtype) {
         return false;
     }
-    if !matches!(direction, SortDirection::Asc) {
-        return false;
-    }
+    // #19: both ASC and DESC are handled by the host-side per-direction
+    // pre-transform (signed-MSB XOR for ASC, bit-not for DESC).
+    let _ = direction;
     // No NULL routing in the radix kernel today.
     if arr.null_count() > 0 {
         return false;
     }
-    // `nulls_first` is meaningless without NULLs, but we keep the gate
-    // explicit so a caller that accidentally requests nulls_first=true on
-    // a nullable column doesn't fall through here silently.
+    // `nulls_first` is decoupled from routing (no NULLs by gate 3) — kept
+    // in the parameter list so callers can still pass it through verbatim
+    // from the `SortExpr`.
     let _ = nulls_first;
     // u32 indices payload.
     if arr.len() > (u32::MAX as usize) {
@@ -747,33 +772,53 @@ pub(crate) fn radix_dispatch_predicate(
     true
 }
 
-/// GPU radix sort for a single Int32/Int64 ASC key column.
+/// **Pure** predicate for a multi-key radix dispatch.
+///
+/// Returns true iff every key independently passes
+/// [`radix_dispatch_predicate`] AND the key list is non-empty and within
+/// `MAX_SORT_KEYS`. Used by [`try_gpu_sort_radix`] in `sort.rs` to gate
+/// the multi-key path without touching the GPU.
+///
+/// Each key's `direction` and `nulls_first` are evaluated independently,
+/// so mixed ASC/DESC across keys is fully supported.
+pub(crate) fn radix_dispatch_predicate_multi(keys: &[GpuSortKey<'_>]) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+    if keys.len() > MAX_SORT_KEYS {
+        return false;
+    }
+    // All keys must agree on row count — the per-key predicate covers the
+    // per-column dtype/null gates, but row-count equality is a multi-key
+    // invariant we enforce here.
+    let n_rows = keys[0].column.len();
+    for k in keys {
+        if k.column.len() != n_rows {
+            return false;
+        }
+        if !radix_dispatch_predicate(k.column, k.dtype, k.direction, k.nulls_first) {
+            return false;
+        }
+    }
+    true
+}
+
+/// GPU radix sort for a single Int32/Int64 key column.
+///
+/// Thin compatibility wrapper around [`sort_indices_on_gpu_radix_multi`]
+/// — the single-key path is just a multi-key sort with a 1-element key
+/// list, and unifying the two avoids two parallel drivers diverging.
 ///
 /// Returns `Ok(Some(perm))` with the row permutation on success, or
 /// `Ok(None)` if the input doesn't match the radix gate (caller falls
 /// through to bitonic / host). Returns `Err` only on hard GPU failures
 /// (OOM, kernel launch failure).
 ///
-/// The kernel side ([`crate::jit::sort_kernel_radix`]) emits three PTX
-/// entry points per dtype:
-///   - `bolt_radix_msb_flip_<dty>` — XOR every key with the MSB constant
-///     to make signed-int bit-patterns sort like unsigned.
-///   - `bolt_radix_histogram_<dty>` — per-pass 4-bit digit bucketing.
-///   - `bolt_radix_scatter_<dty>_with_indices` — per-pass scatter that
-///     carries the u32 row-index payload in lock-step with the key.
-///
-/// Per pass:
-///   1. Zero the 16-entry u32 histogram.
-///   2. Launch histogram (writes 16 atomic counts).
-///   3. D2H the 16 counts; compute exclusive scan host-side; H2D as offsets.
-///   4. Launch scatter (atom-bumps offsets, writes key+idx at the bumped slot).
-///   5. Swap ping ↔ pong.
-///
-/// 8 passes for Int32, 16 for Int64. The post-pass MSB-flip restores the
-/// original int values to the output keys buffer (we don't actually need
-/// the keys back, but the kernel can be reused on the same buffer because
-/// XOR is its own inverse — calling it again on the flipped buffer cancels
-/// the entry-flip).
+/// **#19 widening:** previously this path was ASC-only. The
+/// [`radix_dispatch_predicate`] now accepts both ASC and DESC; the
+/// direction transform is applied host-side inside
+/// [`sort_indices_on_gpu_radix_multi`] (XOR signed-MSB for ASC, bit-not
+/// for DESC).
 pub fn sort_indices_on_gpu_radix(
     arr: &dyn Array,
     dtype: DataType,
@@ -783,60 +828,173 @@ pub fn sort_indices_on_gpu_radix(
     if !radix_dispatch_predicate(arr, dtype, direction, nulls_first) {
         return Ok(None);
     }
+    // Single-key sort is a 1-element multi-key sort. We don't bump the
+    // dispatch counter here — `_multi` does, so we don't double-count.
+    let key = GpuSortKey {
+        column: arr,
+        dtype,
+        direction,
+        nulls_first,
+    };
+    sort_indices_on_gpu_radix_multi(&[key])
+}
+
+/// GPU radix sort for an arbitrary lexicographic key list (up to
+/// [`MAX_SORT_KEYS`] keys, mixed ASC/DESC fine).
+///
+/// The kernel side ([`crate::jit::sort_kernel_radix`]) emits the PTX
+/// entry points per dtype:
+///   - `bolt_radix_histogram_<dty>` — per-pass 4-bit digit bucketing.
+///   - `bolt_radix_scatter_<dty>_with_indices` — per-pass scatter that
+///     carries the u32 row-index payload in lock-step with the key.
+///   - `bolt_radix_msb_flip_<dty>` — kept available for the existing
+///     ABI but **no longer called from this path**. The direction-aware
+///     host-side pre-transform (see [`radix_pre_transform_i32`] /
+///     [`radix_pre_transform_i64`]) subsumes the signed-int MSB-flip and
+///     adds the DESC bit-not in the same XOR — strictly cheaper than a
+///     one-shot kernel pre-pass since we already touch every key on the
+///     host during gather.
+///
+/// ## LSD multi-key driver
+///
+/// Radix is LSD-stable, so an N-key lex sort is N sequential single-key
+/// passes from the LAST key back to the FIRST. Each per-key pass:
+///   1. Gather the new key's host values via the running permutation
+///      (`gathered[i] = host[key_M][running_perm[i]]`), applying the
+///      per-key direction transform during the gather.
+///   2. Upload as the fresh `keys_ping` buffer.
+///   3. Seed `idx_ping = running_perm` (identity on the first key).
+///   4. Run 8 (Int32) or 16 (Int64) radix passes. The kernel carries
+///      `idx_ping` in lock-step with the keys; final `idx_ping` is the
+///      NEW running permutation.
+///
+/// After every key is processed, the final permutation is the lexico-
+/// graphic sort across all keys with each key's per-direction order.
+pub fn sort_indices_on_gpu_radix_multi(
+    keys: &[GpuSortKey<'_>],
+) -> BoltResult<Option<UInt32Array>> {
+    if !radix_dispatch_predicate_multi(keys) {
+        return Ok(None);
+    }
     // Bump the dispatch counter as soon as we commit to the radix path.
-    // Tests observe this; production builds inline-decrement the counter
-    // through the AtomicUsize (negligible overhead).
+    // Tests observe this; production callers ignore it. We bump once per
+    // sort decision, regardless of key count — the counter measures
+    // *dispatch* events, not kernel launches.
     RADIX_DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let n_rows = arr.len();
+    let n_rows = keys[0].column.len();
     if n_rows == 0 {
         return Ok(Some(UInt32Array::from(Vec::<u32>::new())));
     }
     let n_rows_u32 = n_rows_to_u32(n_rows)?;
 
-    // ----- host-side key extraction ------------------------------------
-    //
-    // Re-use `host_values_for_key`: for Int32/Int64 it returns the bare
-    // typed Vec, no padding (radix has no pow2 requirement). We assert
-    // the dtype branch here so a future host_values_for_key change can't
-    // silently feed us the wrong width.
-    let host_keys = match host_values_for_key(arr, dtype)? {
-        Some(v) => v,
-        // host_values_for_key only returns None for high-cardinality Utf8
-        // — we've already gated to Int32/Int64 above, so this is a
-        // safety-net "should never happen" path. Fall through anyway.
-        None => return Ok(None),
-    };
-
-    // Run the dtype-monomorphic radix driver. Match arms differ only in
-    // the concrete int width — the launch / scan / D2H plumbing is the
-    // same shape.
-    let perm = match host_keys {
-        HostKeyValues::I32(host) => {
-            run_radix_pipeline_i32(&host, n_rows_u32, dtype)?
+    // Extract every key column once into typed host vectors. We don't apply
+    // the direction transform here — that happens inside the gather step,
+    // because the gather order (via the running permutation) is what feeds
+    // the next radix pass's keys_ping buffer.
+    let mut host_keys: Vec<HostKeyValues> = Vec::with_capacity(keys.len());
+    for k in keys {
+        match host_values_for_key(k.column, k.dtype)? {
+            Some(v) => host_keys.push(v),
+            // Predicate gates dtype to Int32/Int64, so the Utf8 fall-through
+            // signal from `host_values_for_key` can't fire — defensive None.
+            None => return Ok(None),
         }
-        HostKeyValues::I64(host) => {
-            run_radix_pipeline_i64(&host, n_rows_u32, dtype)?
-        }
-        // The predicate above gates dtype to Int32/Int64, so other arms
-        // are unreachable. Defensive `return Ok(None)` instead of panic
-        // so a future predicate widening doesn't crash the engine.
-        _ => return Ok(None),
-    };
+    }
 
-    Ok(Some(UInt32Array::from(perm)))
+    // Running permutation: identity at start, replaced with each per-key
+    // pass's output. By the LSD invariant, after all N passes this is the
+    // lex permutation across all N keys.
+    let mut running_perm: Vec<u32> = (0..n_rows_u32).collect();
+
+    // Iterate keys in REVERSE order — LSD radix wants the last key first,
+    // so its order is the least significant in the final lex ordering.
+    for (k, host) in keys.iter().zip(host_keys.iter()).rev() {
+        running_perm = match host {
+            HostKeyValues::I32(host_vals) => {
+                run_radix_pipeline_i32(host_vals, &running_perm, n_rows_u32, k.dtype, k.direction)?
+            }
+            HostKeyValues::I64(host_vals) => {
+                run_radix_pipeline_i64(host_vals, &running_perm, n_rows_u32, k.dtype, k.direction)?
+            }
+            // The predicate above gates dtype to Int32/Int64; other arms
+            // are unreachable. Defensive return so a future predicate
+            // widening doesn't crash the engine.
+            _ => return Ok(None),
+        };
+    }
+
+    Ok(Some(UInt32Array::from(running_perm)))
+}
+
+/// Host-side per-direction pre-transform for an i32 key.
+///
+/// The device kernel does an **unsigned** ASC bit-pattern sort over the
+/// key buffer. To turn that into value-ASC over signed ints, we XOR the
+/// MSB so the negative bit patterns sort below the positives. To turn it
+/// into value-DESC, we XOR every bit (`!val`) so the bit-pattern order
+/// flips. Both are XOR isomorphisms, so the transform is invertible if
+/// we ever needed to recover the original values (we don't — only the
+/// idx payload is read back).
+#[inline]
+fn radix_pre_transform_i32(val: i32, dir: SortDirection) -> i32 {
+    match dir {
+        // i32::MIN as i32 is 0x8000_0000 — the canonical signed-MSB
+        // constant. `wrapping_neg` would also work for the magnitude but
+        // XOR makes the bit-pattern intent explicit.
+        SortDirection::Asc => val ^ i32::MIN,
+        // Bit-not is the all-ones XOR. For any fixed-width int, `a < b`
+        // iff `!a > !b` bit-pattern-wise — so unsigned ASC of `!val` is
+        // value-DESC of `val`.
+        SortDirection::Desc => !val,
+    }
+}
+
+/// Host-side per-direction pre-transform for an i64 key. Same algebra as
+/// [`radix_pre_transform_i32`], scaled to 64 bits.
+#[inline]
+fn radix_pre_transform_i64(val: i64, dir: SortDirection) -> i64 {
+    match dir {
+        SortDirection::Asc => val ^ i64::MIN,
+        SortDirection::Desc => !val,
+    }
 }
 
 /// Inner pipeline for Int32 keys. Separated from the Int64 variant so the
 /// monomorphic GpuVec types stay statically typed throughout the loop.
+///
+/// `running_perm` is the running permutation from previous keys (or the
+/// identity for the first key). We gather the host key values via this
+/// permutation, apply the per-direction pre-transform, and upload the
+/// result as `keys_ping`. `idx_ping` is seeded with `running_perm` so
+/// the kernel carries it through in lock-step with the keys; the final
+/// `idx_ping` after all radix passes is the NEW running permutation.
 fn run_radix_pipeline_i32(
     host_keys: &[i32],
+    running_perm: &[u32],
     n_rows_u32: u32,
     dtype: DataType,
+    direction: SortDirection,
 ) -> BoltResult<Vec<u32>> {
     debug_assert!(matches!(dtype, DataType::Int32));
+    debug_assert_eq!(running_perm.len(), n_rows_u32 as usize);
     let radix_steps = radix_steps_for(dtype)?;
-    let needs_flip = radix_needs_msb_flip(dtype)?;
+
+    // ----- host-side gather + direction pre-transform ------------------
+    //
+    // For multi-key chains: `gathered[i] = host_keys[running_perm[i]]`
+    // reorders the key column to match the running ordering from previous
+    // passes. For the first key, running_perm is identity, so this
+    // collapses to `gathered[i] = host_keys[i]`.
+    //
+    // The per-direction transform (XOR signed-MSB for ASC, bit-not for
+    // DESC) subsumes the kernel's `bolt_radix_msb_flip_i32` and adds DESC
+    // support in the same XOR — see [`radix_pre_transform_i32`].
+    let mut gathered: Vec<i32> = Vec::with_capacity(running_perm.len());
+    for &row in running_perm {
+        let v = host_keys[row as usize];
+        gathered.push(radix_pre_transform_i32(v, direction));
+    }
 
     // ----- device allocation: ping-pong key + index buffers ------------
     //
@@ -846,12 +1004,14 @@ fn run_radix_pipeline_i32(
     // overwrites every slot), but the populated len is what lets the
     // final `to_vec()` D2H read all n_rows entries after the last
     // ping↔pong swap.
-    let mut keys_ping: GpuVec<i32> = GpuVec::<i32>::from_slice(host_keys)?;
-    let mut keys_pong: GpuVec<i32> = GpuVec::<i32>::from_slice(host_keys)?;
-    // Identity indices on host, uploaded once.
-    let idx_host: Vec<u32> = (0..n_rows_u32).collect();
-    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(&idx_host)?;
-    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(&idx_host)?;
+    let mut keys_ping: GpuVec<i32> = GpuVec::<i32>::from_slice(&gathered)?;
+    let mut keys_pong: GpuVec<i32> = GpuVec::<i32>::from_slice(&gathered)?;
+    // Seed idx_ping with the running permutation (identity for the first
+    // key in the LSD chain). The kernel reorders idx_ping in lock-step
+    // with keys_ping, so after all radix passes idx_ping holds the
+    // NEW running permutation.
+    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
+    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
     // Histogram + offsets buffers (16 u32 entries each, reused per pass).
     // Use `zeros(RADIX_BUCKETS)` so the GpuVec's bookkeeping len is the
     // full 16-entry size — required for any future to_vec(), and
@@ -877,27 +1037,15 @@ fn run_radix_pipeline_i32(
     )?;
     let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
 
-    // MSB-flip kernel: only built when the dtype actually needs it.
-    let flip_module_fn = if needs_flip {
-        let m = module_cache::get_or_build_module(
-            module_path!(),
-            format!("radix_msb_flip:{:?}", dtype),
-            None,
-            || compile_radix_msb_flip(dtype),
-        )?;
-        Some(m)
-    } else {
-        None
-    };
+    // #19: the kernel-side MSB-flip (`bolt_radix_msb_flip_i32`) is no
+    // longer invoked from this path. The host-side `radix_pre_transform_i32`
+    // applied during gather above subsumes the signed-MSB XOR and adds
+    // the per-key DESC bit-not in the same pass — strictly cheaper than
+    // a one-shot kernel pre-pass since we already touch every key on the
+    // host during gather (for multi-key) or upload (for single-key).
 
     let block_size = RADIX_BLOCK_SIZE;
     let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
-
-    // ----- one-shot pre-pass: MSB flip on keys_ping -------------------
-    if let Some(ref m) = flip_module_fn {
-        let flip_fn = m.function(&radix_msb_flip_entry(dtype)?)?;
-        launch_radix_msb_flip(&flip_fn, &mut keys_ping, n_rows_u32, grid_x, block_size, &stream)?;
-    }
 
     // ----- per-pass loop: histogram → host-scan → scatter -------------
     for step in 0..radix_steps {
@@ -979,12 +1127,6 @@ fn run_radix_pipeline_i32(
         std::mem::swap(&mut idx_ping, &mut idx_pong);
     }
 
-    // ----- one-shot post-pass: restore original int values ------------
-    if let Some(ref m) = flip_module_fn {
-        let flip_fn = m.function(&radix_msb_flip_entry(dtype)?)?;
-        launch_radix_msb_flip(&flip_fn, &mut keys_ping, n_rows_u32, grid_x, block_size, &stream)?;
-    }
-
     stream.synchronize()?;
 
     // ----- D2H the permutation ----------------------------------------
@@ -1005,23 +1147,35 @@ fn run_radix_pipeline_i32(
 
 /// Inner pipeline for Int64 keys. Mirror of `run_radix_pipeline_i32`
 /// except the key buffer is `GpuVec<i64>` and the pass count is 16.
+///
+/// See [`run_radix_pipeline_i32`] for the running-permutation + direction
+/// transform mechanics.
 fn run_radix_pipeline_i64(
     host_keys: &[i64],
+    running_perm: &[u32],
     n_rows_u32: u32,
     dtype: DataType,
+    direction: SortDirection,
 ) -> BoltResult<Vec<u32>> {
     debug_assert!(matches!(dtype, DataType::Int64));
+    debug_assert_eq!(running_perm.len(), n_rows_u32 as usize);
     let radix_steps = radix_steps_for(dtype)?;
-    let needs_flip = radix_needs_msb_flip(dtype)?;
+
+    // Host-side gather + per-direction pre-transform. See the i32 variant
+    // for the algebra — same shape, scaled to 64 bits.
+    let mut gathered: Vec<i64> = Vec::with_capacity(running_perm.len());
+    for &row in running_perm {
+        let v = host_keys[row as usize];
+        gathered.push(radix_pre_transform_i64(v, direction));
+    }
 
     // See the i32 driver for the rationale behind initialising both
     // ping and pong via `from_slice` — `to_vec()` after the final swap
     // needs the destination buffer's len bookkeeping to be n_rows.
-    let mut keys_ping: GpuVec<i64> = GpuVec::<i64>::from_slice(host_keys)?;
-    let mut keys_pong: GpuVec<i64> = GpuVec::<i64>::from_slice(host_keys)?;
-    let idx_host: Vec<u32> = (0..n_rows_u32).collect();
-    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(&idx_host)?;
-    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(&idx_host)?;
+    let mut keys_ping: GpuVec<i64> = GpuVec::<i64>::from_slice(&gathered)?;
+    let mut keys_pong: GpuVec<i64> = GpuVec::<i64>::from_slice(&gathered)?;
+    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
+    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
     let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
     let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
 
@@ -1040,24 +1194,14 @@ fn run_radix_pipeline_i64(
         || compile_radix_scatter_with_indices(dtype),
     )?;
     let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
-    let flip_module_fn = if needs_flip {
-        Some(module_cache::get_or_build_module(
-            module_path!(),
-            format!("radix_msb_flip:{:?}", dtype),
-            None,
-            || compile_radix_msb_flip(dtype),
-        )?)
-    } else {
-        None
-    };
+
+    // #19: kernel-side MSB-flip is no longer invoked from this path
+    // (see the i32 variant for the algebra). The host pre-transform
+    // applied during gather above subsumes both signed-MSB and DESC
+    // bit-not in a single XOR.
 
     let block_size = RADIX_BLOCK_SIZE;
     let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
-
-    if let Some(ref m) = flip_module_fn {
-        let flip_fn = m.function(&radix_msb_flip_entry(dtype)?)?;
-        launch_radix_msb_flip_i64(&flip_fn, &mut keys_ping, n_rows_u32, grid_x, block_size, &stream)?;
-    }
 
     for step in 0..radix_steps {
         let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
@@ -1120,11 +1264,6 @@ fn run_radix_pipeline_i64(
         std::mem::swap(&mut idx_ping, &mut idx_pong);
     }
 
-    if let Some(ref m) = flip_module_fn {
-        let flip_fn = m.function(&radix_msb_flip_entry(dtype)?)?;
-        launch_radix_msb_flip_i64(&flip_fn, &mut keys_ping, n_rows_u32, grid_x, block_size, &stream)?;
-    }
-
     stream.synchronize()?;
 
     let perm = idx_ping.to_vec()?;
@@ -1136,72 +1275,14 @@ fn run_radix_pipeline_i64(
     Ok(perm)
 }
 
-/// Launch `bolt_radix_msb_flip_i32` on `keys`. Pass the n_rows u32 alongside.
-///
-/// The kernel mutates the device buffer in place; we take `&mut GpuVec`
-/// here so the borrow-checker reflects that — even though the helper
-/// only reads `device_ptr()` itself, the FFI call writes through the
-/// pointer.
-fn launch_radix_msb_flip(
-    f: &crate::jit::CudaFunction<'_>,
-    keys: &mut GpuVec<i32>,
-    n_rows_u32: u32,
-    grid_x: u32,
-    block_size: u32,
-    stream: &CudaStream,
-) -> BoltResult<()> {
-    let mut keys_ptr: CUdeviceptr = keys.device_ptr();
-    let mut p_n_rows: u32 = n_rows_u32;
-    let mut params: Vec<*mut c_void> = vec![
-        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut p_n_rows as *mut u32 as *mut c_void,
-    ];
-    // SAFETY: every param slot points at a stack local that outlives the
-    // synchronous launch boundary used below.
-    unsafe {
-        cuda_sys::check(cuda_sys::cuLaunchKernel(
-            f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
-            0,
-            stream.raw(),
-            params.as_mut_ptr(),
-            ptr::null_mut(),
-        ))?;
-    }
-    Ok(())
-}
-
-/// Int64 variant of [`launch_radix_msb_flip`]. ABI is identical (keys_ptr +
-/// n_rows u32) — only the buffer's element type changes on the host side.
-fn launch_radix_msb_flip_i64(
-    f: &crate::jit::CudaFunction<'_>,
-    keys: &mut GpuVec<i64>,
-    n_rows_u32: u32,
-    grid_x: u32,
-    block_size: u32,
-    stream: &CudaStream,
-) -> BoltResult<()> {
-    let mut keys_ptr: CUdeviceptr = keys.device_ptr();
-    let mut p_n_rows: u32 = n_rows_u32;
-    let mut params: Vec<*mut c_void> = vec![
-        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut p_n_rows as *mut u32 as *mut c_void,
-    ];
-    // SAFETY: same as the i32 variant.
-    unsafe {
-        cuda_sys::check(cuda_sys::cuLaunchKernel(
-            f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
-            0,
-            stream.raw(),
-            params.as_mut_ptr(),
-            ptr::null_mut(),
-        ))?;
-    }
-    Ok(())
-}
+// Note: the `bolt_radix_msb_flip_<dty>` kernel-side helpers are still
+// emitted by `crate::jit::sort_kernel_radix` (the ABI is frozen per #18),
+// but #19's driver no longer invokes them — the host-side
+// `radix_pre_transform_i32` / `radix_pre_transform_i64` applied during
+// gather subsumes both the signed-MSB XOR and the DESC bit-not in a
+// single pass. The kernel-side flip is still reachable via the JIT
+// module compile / entry-name functions for any future caller that
+// needs it.
 
 /// Launch `bolt_radix_histogram_i32` for one radix step. The histogram
 /// buffer is atomically updated.
@@ -2390,6 +2471,219 @@ mod tests {
         let mut expected = values.clone();
         expected.sort();
         assert_eq!(sorted, expected);
+    }
+
+    // -- #19 GPU radix sort round-trips — DESC + multi-key. --
+
+    /// End-to-end Int32 DESC sort via the radix path. The host pre-transform
+    /// applies `!val` so the device's unsigned ASC bit-pattern sort yields
+    /// value-DESC.
+    #[test]
+    #[ignore = "gpu:sort_radix"]
+    fn gpu_sort_radix_int32_desc_round_trip() {
+        let n = 16_384usize;
+        let mut values: Vec<i32> = (0..n as i32).map(|i| i - 8_192).collect(); // include negatives
+        let mut rng_state: u64 = 0xabad_cafe;
+        for i in (1..n).rev() {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (rng_state as usize) % (i + 1);
+            values.swap(i, j);
+        }
+        let arr = Int32Array::from(values.clone());
+
+        let perm = sort_indices_on_gpu_radix(
+            &arr,
+            DataType::Int32,
+            SortDirection::Desc,
+            false,
+        )
+        .expect("gpu radix sort desc")
+        .expect("non-fallback on int32 desc no-null");
+        assert_eq!(perm.len(), n);
+
+        let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
+        for w in sorted.windows(2) {
+            assert!(
+                w[0] >= w[1],
+                "radix DESC non-monotonic: {} < {}",
+                w[0],
+                w[1]
+            );
+        }
+        let mut expected = values.clone();
+        expected.sort_by(|a, b| b.cmp(a));
+        assert_eq!(sorted, expected);
+    }
+
+    /// Two-key ASC ASC lex sort via the radix path. Key A is the primary
+    /// order, key B breaks ties. The LSD chain runs key B first (so its
+    /// relative order is preserved by the stable key A pass).
+    #[test]
+    #[ignore = "gpu:sort_radix"]
+    fn gpu_sort_radix_two_key_asc_asc_round_trip() {
+        let n = 16_384usize;
+        // Force lots of ties on key A so key B's tie-break is observable.
+        let key_a: Vec<i32> = (0..n as i32).map(|i| i % 64).collect();
+        let key_b: Vec<i32> = (0..n as i32).map(|i| (i * 31) % 1024).collect();
+        let a_arr = Int32Array::from(key_a.clone());
+        let b_arr = Int32Array::from(key_b.clone());
+
+        let keys = [
+            GpuSortKey {
+                column: &a_arr,
+                dtype: DataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+            GpuSortKey {
+                column: &b_arr,
+                dtype: DataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+        ];
+        let perm = sort_indices_on_gpu_radix_multi(&keys)
+            .expect("gpu radix multi")
+            .expect("non-fallback on two-key int32 asc asc");
+        assert_eq!(perm.len(), n);
+
+        // Verify lex ASC ASC: (a[i], b[i]) <= (a[i+1], b[i+1]).
+        for w in 0..(n - 1) {
+            let ia = perm.value(w) as usize;
+            let ib = perm.value(w + 1) as usize;
+            let pa = (key_a[ia], key_b[ia]);
+            let pb = (key_a[ib], key_b[ib]);
+            assert!(pa <= pb, "lex non-monotonic: {:?} > {:?}", pa, pb);
+        }
+    }
+
+    /// Two-key ASC DESC lex sort via the radix path. Key A is primary
+    /// ASC; key B is secondary DESC. Exercises the per-key direction
+    /// transform composition.
+    #[test]
+    #[ignore = "gpu:sort_radix"]
+    fn gpu_sort_radix_two_key_asc_desc_round_trip() {
+        let n = 16_384usize;
+        let key_a: Vec<i32> = (0..n as i32).map(|i| i % 32).collect();
+        let key_b: Vec<i32> = (0..n as i32).map(|i| (i * 17) % 1000).collect();
+        let a_arr = Int32Array::from(key_a.clone());
+        let b_arr = Int32Array::from(key_b.clone());
+
+        let keys = [
+            GpuSortKey {
+                column: &a_arr,
+                dtype: DataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+            GpuSortKey {
+                column: &b_arr,
+                dtype: DataType::Int32,
+                direction: SortDirection::Desc,
+                nulls_first: false,
+            },
+        ];
+        let perm = sort_indices_on_gpu_radix_multi(&keys)
+            .expect("gpu radix multi")
+            .expect("non-fallback on two-key int32 asc desc");
+        assert_eq!(perm.len(), n);
+
+        // For each adjacent pair: either a[i] < a[i+1] (primary ASC), or
+        // a[i] == a[i+1] AND b[i] >= b[i+1] (secondary DESC tie-break).
+        for w in 0..(n - 1) {
+            let ia = perm.value(w) as usize;
+            let ib = perm.value(w + 1) as usize;
+            if key_a[ia] != key_a[ib] {
+                assert!(
+                    key_a[ia] < key_a[ib],
+                    "primary ASC violated: a[{}]={} > a[{}]={}",
+                    w, key_a[ia], w + 1, key_a[ib],
+                );
+            } else {
+                assert!(
+                    key_b[ia] >= key_b[ib],
+                    "secondary DESC violated on tie a={}: b[{}]={} < b[{}]={}",
+                    key_a[ia], w, key_b[ia], w + 1, key_b[ib],
+                );
+            }
+        }
+    }
+
+    // -- #19 pure-host predicate / pre-transform tests --
+
+    /// `radix_pre_transform_i32` ASC = `val ^ MSB`; bit-pattern unsigned
+    /// ASC of the transformed values must match value-ASC of the originals.
+    #[test]
+    fn radix_pre_transform_i32_asc_orders_signed_int() {
+        let mut samples: Vec<i32> = vec![i32::MIN, -5, -1, 0, 1, 5, i32::MAX];
+        let mut transformed: Vec<u32> = samples
+            .iter()
+            .map(|v| radix_pre_transform_i32(*v, SortDirection::Asc) as u32)
+            .collect();
+        samples.sort();
+        transformed.sort();
+        // Apply the transform to the sorted samples and assert it equals
+        // the sorted transformed bit-patterns — i.e. the transform is
+        // order-preserving for ASC.
+        let from_sorted: Vec<u32> = samples
+            .iter()
+            .map(|v| radix_pre_transform_i32(*v, SortDirection::Asc) as u32)
+            .collect();
+        assert_eq!(from_sorted, transformed);
+    }
+
+    /// `radix_pre_transform_i32` DESC = `!val`; bit-pattern unsigned ASC
+    /// of the transformed values must match value-DESC of the originals.
+    #[test]
+    fn radix_pre_transform_i32_desc_orders_signed_int_descending() {
+        let mut samples: Vec<i32> = vec![i32::MIN, -5, -1, 0, 1, 5, i32::MAX];
+        let mut transformed: Vec<u32> = samples
+            .iter()
+            .map(|v| radix_pre_transform_i32(*v, SortDirection::Desc) as u32)
+            .collect();
+        // Sort samples DESC, then transform; result should match sorted
+        // ASC of transformed (because the bit-not flips the order).
+        samples.sort_by(|a, b| b.cmp(a));
+        transformed.sort();
+        let from_desc_sorted: Vec<u32> = samples
+            .iter()
+            .map(|v| radix_pre_transform_i32(*v, SortDirection::Desc) as u32)
+            .collect();
+        assert_eq!(from_desc_sorted, transformed);
+    }
+
+    /// Same property for i64.
+    #[test]
+    fn radix_pre_transform_i64_round_trips_for_both_directions() {
+        let mut samples: Vec<i64> = vec![i64::MIN, -100_000, -1, 0, 1, 100_000, i64::MAX];
+        // ASC.
+        let mut transformed_asc: Vec<u64> = samples
+            .iter()
+            .map(|v| radix_pre_transform_i64(*v, SortDirection::Asc) as u64)
+            .collect();
+        transformed_asc.sort();
+        let mut asc_samples = samples.clone();
+        asc_samples.sort();
+        let from_asc_sorted: Vec<u64> = asc_samples
+            .iter()
+            .map(|v| radix_pre_transform_i64(*v, SortDirection::Asc) as u64)
+            .collect();
+        assert_eq!(from_asc_sorted, transformed_asc);
+
+        // DESC.
+        let mut transformed_desc: Vec<u64> = samples
+            .iter()
+            .map(|v| radix_pre_transform_i64(*v, SortDirection::Desc) as u64)
+            .collect();
+        transformed_desc.sort();
+        samples.sort_by(|a, b| b.cmp(a));
+        let from_desc_sorted: Vec<u64> = samples
+            .iter()
+            .map(|v| radix_pre_transform_i64(*v, SortDirection::Desc) as u64)
+            .collect();
+        assert_eq!(from_desc_sorted, transformed_desc);
     }
 
     // -- Stage 5 — high-cardinality sampling gate. Pure host, no CUDA. --
