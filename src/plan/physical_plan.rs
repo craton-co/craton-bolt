@@ -420,6 +420,23 @@ impl<'a> Codegen<'a> {
             Expr::Literal(lit) => self.emit_literal(lit),
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
             Expr::Alias(inner, _) => self.emit_expr(inner),
+            // GPU codegen for IS [NOT] NULL is deferred: validity-propagating
+            // PTX needs an Op::IsNull / Op::IsNotNull pair that round-trips
+            // the validity bitmap through the register file. The plan-time
+            // `lower()` peels any Filter whose predicate contains Expr::Unary
+            // off the scan-kernel chain and routes it through the host-side
+            // `PhysicalPlan::Filter` instead (see `predicate_contains_unary`
+            // below), so this arm should be unreachable in practice — the
+            // explicit error message exists to localise any future regression
+            // (e.g. a Unary slipping into a Project's expression list).
+            //
+            // TODO(perf): emit `Op::IsNull` / `Op::IsNotNull` to push this onto
+            // the GPU once the IR + PTX emitter support reading validity bits.
+            Expr::Unary { op, .. } => Err(BoltError::Plan(format!(
+                "GPU codegen for unary {:?} not yet supported; \
+                 expected lower() to route this through PhysicalPlan::Filter",
+                op
+            ))),
         }
     }
 
@@ -742,6 +759,10 @@ fn substitute_one(expr: &Expr, map: &HashMap<String, Expr>) -> Expr {
             left: Box::new(substitute_one(left, map)),
             right: Box::new(substitute_one(right, map)),
         },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op: *op,
+            operand: Box::new(substitute_one(operand, map)),
+        },
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
         }
@@ -1052,6 +1073,55 @@ fn lower_aggregate(
 }
 
 /// True if `plan` is a Scan/Filter/Project chain that bottoms out in a Scan —
+/// Recursively test whether `expr` contains any `Expr::Unary` node.
+///
+/// Used by `lower()` to gate Filter predicates: anything with a unary
+/// op (today: `IS [NOT] NULL`) must take the host-side Filter detour
+/// because the GPU codegen doesn't yet emit validity-bitmap reads.
+///
+/// Aliases are transparent — we look through them and into their inner
+/// expression.
+fn predicate_contains_unary(expr: &Expr) -> bool {
+    match expr {
+        Expr::Unary { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            predicate_contains_unary(left) || predicate_contains_unary(right)
+        }
+        Expr::Alias(inner, _) => predicate_contains_unary(inner),
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
+/// Walk a `Scan` / `Filter` / `Project` chain and return true if any
+/// `Filter` node carries a predicate that contains an `Expr::Unary`.
+///
+/// Used by the `Project` arm of `lower()` to detect when a SELECT-list
+/// projection sits on top of a `WHERE … IS [NOT] NULL` chain. The GPU
+/// codegen path (`lower_projection` → `build_projection_kernel`) hoists
+/// every chain Filter into the fused projection kernel's predicate; the
+/// kernel cannot lower an Expr::Unary, so we have to detect this here
+/// and route the whole stack through the host-side executors.
+fn scan_chain_has_unary_filter(plan: &LogicalPlan) -> bool {
+    let mut cur = plan;
+    loop {
+        match cur {
+            LogicalPlan::Filter { input, predicate } => {
+                if predicate_contains_unary(predicate) {
+                    return true;
+                }
+                cur = input.as_ref();
+            }
+            LogicalPlan::Project { input, .. } => {
+                cur = input.as_ref();
+            }
+            // Reached the leaf or a non-scan-chain node; stop. (Callers
+            // gate this with `is_scan_chain` so the fall-through case is
+            // really just `Scan`.)
+            _ => return false,
+        }
+    }
+}
+
 /// i.e. something `resolve_source` (and therefore `lower_projection`) can fold
 /// down into a single-kernel `Projection`. Anything else (Aggregate, Distinct,
 /// Limit, Sort, Union, Join) needs a recursive `lower` call instead, with the
@@ -1240,6 +1310,35 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             // If the Project is a structural no-op (same field names in the
             // same order as the lowered inner plan), drop it so downstream
             // pattern-matchers (and tests) see the bare inner plan.
+            //
+            // Pre-flight: if any Filter in the underlying scan chain carries
+            // an `Expr::Unary` predicate, the predicate cannot survive the
+            // GPU codegen path (see `Codegen::emit_expr` and the Filter arm
+            // below). Force the SQL's `WHERE … IS [NOT] NULL` shape onto the
+            // host fallback by lowering the inner plan as-is and wrapping
+            // the SELECT-list Project on top. Each layer keeps its
+            // host-side semantics; the Project layer evaluates simple
+            // bare-column renames against the host RecordBatch produced by
+            // the Filter (see `engine.rs` PhysicalPlan::Project arm).
+            //
+            // TODO(perf): drop this branch when Op::IsNull lands.
+            if is_scan_chain(input) && scan_chain_has_unary_filter(input) {
+                log::debug!(
+                    "physical_plan: Expr::Unary in scan-chain Filter; \
+                     lowering Project to host-side stack \
+                     (GPU codegen for IS NULL is deferred)"
+                );
+                let inner = lower(input)?;
+                let output_schema = plan.schema()?;
+                if project_is_identity(exprs, inner.output_schema(), &output_schema) {
+                    return Ok(inner);
+                }
+                return Ok(PhysicalPlan::Project {
+                    input: Box::new(inner),
+                    exprs: exprs.clone(),
+                    output_schema,
+                });
+            }
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
             } else {
@@ -1257,6 +1356,31 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             }
         }
         LogicalPlan::Filter { input, predicate } => {
+            // GPU codegen does not (yet) support `IS [NOT] NULL`: emitting
+            // the right PTX requires reading the input column's validity
+            // bitmap into a register, and the IR/codegen are still
+            // value-only. Detect Expr::Unary anywhere in the predicate and
+            // detour the whole Filter through the host-side
+            // `PhysicalPlan::Filter` executor (`crate::exec::filter::
+            // execute_filter`), which already understands the full
+            // host evaluator including Unary IsNull/IsNotNull.
+            //
+            // TODO(perf): once Op::IsNull lands and `Codegen::emit_expr`
+            // can lower Expr::Unary, drop this branch so simple
+            // IS-NULL predicates over a Scan fold back into the fused
+            // projection kernel.
+            if predicate_contains_unary(predicate) {
+                log::debug!(
+                    "physical_plan: Expr::Unary in Filter predicate; \
+                     lowering to host-side PhysicalPlan::Filter \
+                     (GPU codegen for IS NULL is deferred)"
+                );
+                let inner = lower(input)?;
+                return Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                });
+            }
             if is_scan_chain(input) {
                 lower_projection(input, None, Some(predicate))
             } else {

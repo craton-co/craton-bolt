@@ -337,6 +337,19 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> BoltResult<Expr>
                 right: Box::new(new_right),
             })
         }
+        Expr::Unary { op, operand } => {
+            // `IS [NOT] NULL` does not interact with the string-literal
+            // rewriter: the rewriter folds `col = 'lit'` shapes into
+            // integer-index comparisons against a registered dictionary,
+            // and a unary validity test has no literal to resolve. We
+            // still walk the operand so any rewritable sub-expression
+            // (e.g. `(col = 'a') IS NULL`, however unusual) is normalised.
+            let new_operand = rewrite_expr_with(operand, r)?;
+            Ok(Expr::Unary {
+                op: *op,
+                operand: Box::new(new_operand),
+            })
+        }
     }
 }
 

@@ -225,6 +225,23 @@ impl BinaryOp {
     }
 }
 
+/// Unary operators in the AST.
+///
+/// Currently only the SQL `IS [NOT] NULL` predicates need a Unary node.
+/// Other prefix forms (`-x`, `NOT x`) are rewritten by the frontend into
+/// `0 - x` / `Binary { Eq, .. , Literal(false) }` shapes, so they do not
+/// appear here. A first-class `Not` would let logical-NOT codegen on the
+/// GPU; that's deferred until the GPU lowering has a `Not` IR op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    /// `expr IS NULL` — true iff the operand evaluates to SQL NULL on
+    /// that row. The result is always `Bool` and never NULL itself.
+    IsNull,
+    /// `expr IS NOT NULL` — boolean inverse of `IsNull`. Same total /
+    /// never-null result type.
+    IsNotNull,
+}
+
 /// Scalar expression tree.
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -240,6 +257,17 @@ pub enum Expr {
         left: Box<Expr>,
         /// Right operand.
         right: Box<Expr>,
+    },
+    /// One-operand expression — currently used for `IS [NOT] NULL`.
+    ///
+    /// The result of an IS [NOT] NULL test is *always* a defined (non-null)
+    /// `Bool`: it asks the validity bitmap of the operand, not its value,
+    /// so even NULL operands produce a `Some(_)` answer.
+    Unary {
+        /// Operator.
+        op: UnaryOp,
+        /// The single operand.
+        operand: Box<Expr>,
     },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
@@ -329,6 +357,22 @@ impl Expr {
         binary(BinaryOp::Or, self, rhs)
     }
 
+    /// `self IS NULL`. Returns a Bool expression, never null.
+    pub fn is_null(self) -> Expr {
+        Expr::Unary {
+            op: UnaryOp::IsNull,
+            operand: Box::new(self),
+        }
+    }
+
+    /// `self IS NOT NULL`. Returns a Bool expression, never null.
+    pub fn is_not_null(self) -> Expr {
+        Expr::Unary {
+            op: UnaryOp::IsNotNull,
+            operand: Box::new(self),
+        }
+    }
+
     /// Resolve the static type of this expression against `schema`.
     pub fn dtype(&self, schema: &Schema) -> BoltResult<DataType> {
         match self {
@@ -368,6 +412,16 @@ impl Expr {
                     }
                 } else {
                     Err(BoltError::Type(format!("unsupported operator {op:?}")))
+                }
+            }
+            Expr::Unary { op, operand } => {
+                // Validate the operand against the schema (column existence,
+                // sub-expression typing) but discard its dtype: `IS [NOT]
+                // NULL` is a validity test, not a value test, so it accepts
+                // any operand dtype and always yields Bool.
+                let _ = operand.dtype(schema)?;
+                match op {
+                    UnaryOp::IsNull | UnaryOp::IsNotNull => Ok(DataType::Bool),
                 }
             }
             Expr::Alias(inner, _) => inner.dtype(schema),

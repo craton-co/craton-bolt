@@ -160,7 +160,7 @@ mod tests {
     use arrow_schema::{DataType as ArrowDataType, Field, Schema};
     use std::sync::Arc;
 
-    use crate::plan::logical_plan::{BinaryOp, Expr, Literal};
+    use crate::plan::logical_plan::{BinaryOp, Expr, Literal, UnaryOp};
 
     fn two_col_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -231,5 +231,74 @@ mod tests {
         let out =
             execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("ok");
         assert_eq!(out.into_record_batch().num_rows(), 0);
+    }
+
+    /// Build a tiny batch with mixed nullable rows, then apply
+    /// `WHERE x IS NULL` via the host filter executor. The lowering layer
+    /// is exercised separately in `physical_plan.rs`; this test pins the
+    /// runtime behaviour of `execute_filter` over an `Expr::Unary` predicate.
+    fn nullable_int_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("x", ArrowDataType::Int32, true),
+        ]));
+        // id=1,x=10 ; id=2,x=NULL ; id=3,x=30 ; id=4,x=NULL ; id=5,x=50
+        let id = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as Arc<dyn Array>;
+        let x = Arc::new(Int32Array::from(vec![
+            Some(10),
+            None,
+            Some(30),
+            None,
+            Some(50),
+        ])) as Arc<dyn Array>;
+        RecordBatch::try_new(schema, vec![id, x]).unwrap()
+    }
+
+    #[test]
+    fn filter_is_null_keeps_only_null_rows() {
+        let batch = nullable_int_batch();
+        let predicate = Expr::Unary {
+            op: UnaryOp::IsNull,
+            operand: Box::new(Expr::Column("x".into())),
+        };
+        let out = execute_filter(QueryHandle::from_record_batch(batch), &predicate)
+            .expect("filter ok");
+        let result = out.into_record_batch();
+        assert_eq!(result.num_rows(), 2, "two rows have x IS NULL (id=2, id=4)");
+        let id_arr = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 id col");
+        let ids: Vec<i32> = (0..id_arr.len()).map(|i| id_arr.value(i)).collect();
+        assert_eq!(ids, vec![2, 4]);
+        // And the x column for those rows should be NULL.
+        let x_arr = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 x col");
+        assert!(x_arr.is_null(0));
+        assert!(x_arr.is_null(1));
+    }
+
+    #[test]
+    fn filter_is_not_null_drops_only_null_rows() {
+        let batch = nullable_int_batch();
+        let predicate = Expr::Unary {
+            op: UnaryOp::IsNotNull,
+            operand: Box::new(Expr::Column("x".into())),
+        };
+        let out = execute_filter(QueryHandle::from_record_batch(batch), &predicate)
+            .expect("filter ok");
+        let result = out.into_record_batch();
+        assert_eq!(result.num_rows(), 3);
+        let id_arr = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 id col");
+        let ids: Vec<i32> = (0..id_arr.len()).map(|i| id_arr.value(i)).collect();
+        assert_eq!(ids, vec![1, 3, 5]);
     }
 }

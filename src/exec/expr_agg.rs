@@ -29,12 +29,16 @@
 //!     * Arithmetic Add/Sub/Mul/Div on Int32/Int64/Float32/Float64.
 //!     * Comparison Eq/NotEq/Lt/LtEq/Gt/GtEq → `Bool` output.
 //!     * Logical And/Or on `Bool` operands → `Bool` output.
+//!   - `Expr::Unary { op, operand }`:
+//!     * `IsNull` / `IsNotNull` — accepts any operand dtype; returns
+//!       a non-null `Bool` column whose value is `Some(true)` /
+//!       `Some(false)` per row depending on the operand's validity.
 //!
 //! Anything else returns `BoltError::Other` with a `{:?}` of the
-//! offending expression. CAST, CASE, NULLIF, unary ops, scalar functions
-//! and so on are explicitly out of scope: the lowering does not produce
-//! them today, and adding them belongs in a separate change so that the
-//! GPU codegen path can keep up.
+//! offending expression. CAST, CASE, NULLIF, scalar functions and so on
+//! are explicitly out of scope: the lowering does not produce them
+//! today, and adding them belongs in a separate change so that the GPU
+//! codegen path can keep up.
 //!
 //! ## Numeric type promotion
 //!
@@ -126,7 +130,7 @@
 use std::collections::HashMap;
 
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{AggregateExpr, BinaryOp, DataType, Expr, Literal};
+use crate::plan::logical_plan::{AggregateExpr, BinaryOp, DataType, Expr, Literal, UnaryOp};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -305,6 +309,7 @@ fn eval_inner(
         Expr::Literal(lit) => eval_literal(lit, n_rows),
         Expr::Alias(inner, _) => eval_inner(inner, env, n_rows),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, n_rows),
+        Expr::Unary { op, operand } => eval_unary(*op, operand, env, n_rows),
     }
 }
 
@@ -380,6 +385,58 @@ fn eval_binary(
             "expr_agg: unsupported operator {:?}",
             op
         )))
+    }
+}
+
+/// Evaluate a unary op — today: `IS NULL` / `IS NOT NULL`.
+///
+/// The result is always a non-nullable `Bool` column: an `IS [NOT] NULL`
+/// test inspects the operand's validity bit, never its value, so the
+/// answer is always defined even when the operand row is NULL.
+///
+/// Implementation: evaluate the operand into a `HostColumn`, then walk
+/// each cell's `Option<_>` to derive the per-row boolean. Aliases inside
+/// the operand are handled transparently by the recursive call.
+///
+/// TODO(perf): this scans the whole operand row-by-row on the host. For
+/// large columns this is significantly slower than a kernel that just
+/// reads the validity bitmap. The plan-time `lower()` already routes any
+/// Filter whose predicate contains `Expr::Unary` through this host path
+/// (see `physical_plan::predicate_contains_unary`), which is fine for
+/// small inputs — push to GPU once the IR/codegen learn to read validity.
+fn eval_unary(
+    op: UnaryOp,
+    operand: &Expr,
+    env: &ColumnEnv<'_>,
+    n_rows: usize,
+) -> BoltResult<HostColumn> {
+    let col = eval_inner(operand, env, n_rows)?;
+    if col.len() != n_rows {
+        return Err(BoltError::Other(format!(
+            "expr_agg: unary operand produced {} rows, expected {}",
+            col.len(),
+            n_rows
+        )));
+    }
+    let out: Vec<Option<bool>> = match &col {
+        HostColumn::Bool(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
+        HostColumn::I32(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
+        HostColumn::I64(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
+        HostColumn::F32(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
+        HostColumn::F64(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
+        HostColumn::Utf8(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
+    };
+    Ok(HostColumn::Bool(out))
+}
+
+/// Map a per-row "operand was null" flag to the boolean result that
+/// `op` defines. Centralised so the per-variant arms of `eval_unary`
+/// don't each have to repeat the `match op { .. }` dispatch.
+#[inline]
+fn is_null_to_bool(op: UnaryOp, was_null: bool) -> bool {
+    match op {
+        UnaryOp::IsNull => was_null,
+        UnaryOp::IsNotNull => !was_null,
     }
 }
 
@@ -1314,6 +1371,121 @@ mod tests {
         let out = eval_expr(&col("a").eq(col("b")), &env, DataType::Bool, 2).unwrap();
         match out {
             HostColumn::Bool(v) => assert_eq!(v, vec![None, None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    // -- IS NULL / IS NOT NULL ------------------------------------------------
+
+    /// `col IS NULL` on a mixed nullable column should flag exactly the
+    /// rows whose Option is None, with no NULL bleed-through (the result
+    /// of IS [NOT] NULL is itself always defined).
+    #[test]
+    fn eval_unary_is_null_on_nullable_int() {
+        let x = HostColumn::I32(vec![Some(1), None, Some(3), None]);
+        let env = env_of(&[("x", &x)]);
+        let expr = col("x").is_null();
+        let out = eval_expr(&expr, &env, DataType::Bool, 4).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(
+                v,
+                vec![Some(false), Some(true), Some(false), Some(true)]
+            ),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `col IS NOT NULL` must be the pointwise inverse of `IS NULL` over
+    /// the same operand.
+    #[test]
+    fn eval_unary_is_not_null_is_inverse() {
+        let x = HostColumn::I32(vec![Some(1), None, Some(3), None]);
+        let env = env_of(&[("x", &x)]);
+        let expr = col("x").is_not_null();
+        let out = eval_expr(&expr, &env, DataType::Bool, 4).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(
+                v,
+                vec![Some(true), Some(false), Some(true), Some(false)]
+            ),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `col IS NULL` on an all-Some column produces all-false (and
+    /// crucially never None — even though the input dtype is nullable).
+    #[test]
+    fn eval_unary_is_null_on_all_non_null_is_all_false() {
+        let x = HostColumn::I64(vec![Some(1), Some(2), Some(3)]);
+        let env = env_of(&[("x", &x)]);
+        let expr = col("x").is_null();
+        let out = eval_expr(&expr, &env, DataType::Bool, 3).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![Some(false), Some(false), Some(false)]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Works uniformly over every HostColumn variant — pin the Utf8
+    /// path separately since it has a distinct branch in `eval_unary`.
+    #[test]
+    fn eval_unary_is_null_works_for_utf8() {
+        let s = HostColumn::Utf8(vec![Some("a".into()), None, Some("c".into())]);
+        let env = env_of(&[("s", &s)]);
+        let out = eval_expr(&col("s").is_null(), &env, DataType::Bool, 3).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![Some(false), Some(true), Some(false)]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Aliases inside the operand should be transparent (mirrors how
+    /// `eval_binary` and `Expr::Alias` handle the same).
+    #[test]
+    fn eval_unary_is_null_sees_through_alias() {
+        let x = HostColumn::I32(vec![Some(1), None]);
+        let env = env_of(&[("x", &x)]);
+        // (x AS renamed) IS NULL
+        let inner = col("x").alias("renamed");
+        let expr = Expr::Unary {
+            op: UnaryOp::IsNull,
+            operand: Box::new(inner),
+        };
+        let out = eval_expr(&expr, &env, DataType::Bool, 2).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![Some(false), Some(true)]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `IS NULL` over a `Literal::Null` broadcasts a True column —
+    /// because the literal evaluates to an all-`None` HostColumn, every
+    /// row is "operand was null" → Some(true).
+    #[test]
+    fn eval_unary_is_null_on_literal_null_is_all_true() {
+        let env: ColumnEnv = HashMap::new();
+        let expr = Expr::Unary {
+            op: UnaryOp::IsNull,
+            operand: Box::new(Expr::Literal(Literal::Null)),
+        };
+        let out = eval_expr(&expr, &env, DataType::Bool, 3).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![Some(true), Some(true), Some(true)]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `IS NULL` over a non-null literal should be all-false.
+    #[test]
+    fn eval_unary_is_null_on_literal_int_is_all_false() {
+        let env: ColumnEnv = HashMap::new();
+        let expr = Expr::Unary {
+            op: UnaryOp::IsNull,
+            operand: Box::new(Expr::Literal(Literal::Int64(42))),
+        };
+        let out = eval_expr(&expr, &env, DataType::Bool, 2).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![Some(false), Some(false)]),
             other => panic!("expected Bool, got {:?}", other.dtype()),
         }
     }

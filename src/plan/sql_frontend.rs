@@ -15,7 +15,7 @@ use sqlparser::parser::Parser;
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr,
+    AggregateExpr, BinaryOp, Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
 };
 
 /// Resolves table names to their schemas; the SQL frontend cannot know table shapes otherwise.
@@ -1169,6 +1169,7 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<bool> 
             Ok(contains_aggregate(left, resolver)? || contains_aggregate(right, resolver)?)
         }
         SqlExpr::UnaryOp { expr, .. } => contains_aggregate(expr, resolver),
+        SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => contains_aggregate(inner, resolver),
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver),
         _ => Ok(false),
     }
@@ -1214,6 +1215,20 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr
                 "unsupported unary operator: {other:?}"
             ))),
         },
+        SqlExpr::IsNull(inner) => {
+            let operand = lower_expr_in_having(inner, resolver)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(operand),
+            })
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let operand = lower_expr_in_having(inner, resolver)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(operand),
+            })
+        }
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
         // still rejects bare non-aggregate Function calls).
@@ -1271,6 +1286,24 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver) -> BoltResult<Expr> {
                 "unsupported unary operator: {other:?}"
             ))),
         },
+        // SQL `expr IS NULL` / `expr IS NOT NULL` — surfaced separately by
+        // sqlparser, not as a UnaryOp. Lower both into the same Expr::Unary
+        // node so downstream (host-side `expr_agg::eval_unary`) handles them
+        // uniformly.
+        SqlExpr::IsNull(inner) => {
+            let operand = lower_expr(inner, resolver)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(operand),
+            })
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let operand = lower_expr(inner, resolver)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(operand),
+            })
+        }
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "function calls are only allowed as top-level aggregates in SELECT".into(),
         )),
