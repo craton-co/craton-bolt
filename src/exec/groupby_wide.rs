@@ -1252,6 +1252,7 @@ mod tests {
                 AggregateExpr::Avg(Expr::Column("v".into())),
             ],
             output_schema,
+            input_has_validity: Vec::new(),
         };
         PhysicalPlan::Aggregate {
             table: "t".to_string(),
@@ -1416,6 +1417,7 @@ mod tests {
                     AggregateExpr::Max(Expr::Column("v".into())),
                 ],
                 output_schema,
+                input_has_validity: Vec::new(),
             },
         };
 
@@ -1494,6 +1496,7 @@ mod tests {
                 group_by: vec![0],
                 aggregates: vec![],
                 output_schema: Schema::new(vec![Field::new("s", DataType::Utf8, false)]),
+                input_has_validity: Vec::new(),
             },
         };
         // We never read the batch's `s` column for this plan because we fail
@@ -1543,6 +1546,7 @@ mod tests {
                     Field::new("a", DataType::Int64, false),
                     Field::new("sum_av", DataType::Int64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let batch = RecordBatch::try_new(
@@ -1595,6 +1599,7 @@ mod tests {
                     Field::new("a", DataType::Int64, false),
                     Field::new("sum_v", DataType::Int64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let out = execute_groupby_wide(&plan, &batch).expect("ok");
@@ -1697,6 +1702,7 @@ mod tests {
                     AggregateExpr::Avg(Expr::Column("v".into())),
                 ],
                 output_schema,
+                input_has_validity: Vec::new(),
             },
         };
         let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");
@@ -1764,6 +1770,7 @@ mod tests {
                     Field::new("b", DataType::Int64, true),
                     Field::new("sum_v", DataType::Int64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");
@@ -1826,6 +1833,7 @@ mod tests {
                     Field::new("count_v", DataType::Int64, true),
                     Field::new("avg_v", DataType::Float64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");

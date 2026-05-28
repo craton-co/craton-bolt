@@ -183,6 +183,7 @@ mod stage4_tests {
                     Field::new("k", DataType::Int32, false),
                     Field::new("sum_v", DataType::Float64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let key_arr = Int32Array::from(keys);

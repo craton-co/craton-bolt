@@ -902,10 +902,9 @@ fn launch_agg_kernel_inner<T: Pod>(
 /// past `n_rows` are zero-padded; the kernel never reads them because
 /// `tid >= n_rows` short-circuits earlier.
 ///
-/// Currently unused by the production path (the host-strip fallback
-/// avoids the per-row pack); exposed for when the native-validity
-/// kernel variant becomes the default.
-#[allow(dead_code)]
+/// PV-stage-f: now consumed by both `groupby_with_pre` (via
+/// `run_typed_agg_native_validity`) and `groupby` / `groupby_valid`,
+/// which call this directly from their no-pre native-validity paths.
 pub(crate) fn pack_validity_bits(bytes: &[u8]) -> Vec<u32> {
     let n_words = packed_validity_word_count(bytes.len());
     let mut out: Vec<u32> = vec![0u32; n_words];

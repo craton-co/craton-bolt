@@ -163,6 +163,18 @@ pub fn try_execute(
         return None;
     }
 
+    // PV-stage-f: NULL handling — the partition_reduce_kernel_multi_i64
+    // family has no `_with_validity` companion, and the host-side i64
+    // pack reads `.values()` directly. Defer NULL-bearing batches back
+    // through the no-pre single-key paths which handle validity
+    // correctly. Stage G follow-up: validity-aware partition+reduce.
+    if k1.null_count() > 0 || k2.null_count() > 0 {
+        return None;
+    }
+    if val_arrs.iter().any(|a| a.null_count() > 0) {
+        return None;
+    }
+
     Some(execute_inner(plan, k1, k2, val_arrs, n_vals))
 }
 
@@ -524,6 +536,7 @@ mod tests {
                 group_by: vec![0, 1],
                 aggregates,
                 output_schema: Schema::new(out_fields),
+                input_has_validity: Vec::new(),
             },
         }
     }
@@ -719,6 +732,7 @@ mod stage4_tests {
                     Field::new("k2", DataType::Int32, false),
                     Field::new("avg_v", DataType::Float64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![

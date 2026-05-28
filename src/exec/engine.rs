@@ -1476,7 +1476,14 @@ impl<'a> crate::plan::TableProvider for EngineProvider<'a> {
     }
 
     fn has_nulls(&self, table_name: &str, col_idx: usize) -> bool {
-        // Sum null_count across every registered batch for the table.
+        // PV-stage-f: returns `true` iff ANY registered batch for `table_name`
+        // has at least one NULL on column ordinal `col_idx` (via
+        // `RecordBatch::column(col_idx).null_count() > 0`). This is the
+        // plan-time signal `populate_input_validity` /
+        // `populate_aggregate_spec` (in `crate::plan::physical_plan`) read
+        // to fill `KernelSpec::input_has_validity` and
+        // `AggregateSpec::input_has_validity` respectively.
+        //
         // Safe-false on any miss — the executor's host-strip fallback still
         // handles the row filtering, so an under-flag is correctness-safe.
         let batches = match self.tables.get(table_name) {
@@ -1770,5 +1777,73 @@ mod tests {
                 Duration::from_secs(DEFAULT_POOL_STATS_INTERVAL_SECS)
             );
         }
+    }
+
+    // ---- PV-stage-f: `EngineProvider::has_nulls` surfaces RecordBatch null bitmaps ----
+
+    /// Register a batch whose column contains an Arrow validity bitmap with
+    /// at least one NULL row. `EngineProvider::has_nulls` MUST surface this
+    /// via `null_count() > 0` on the underlying `RecordBatch::column`.
+    /// Without this signal the planner under-flags `KernelSpec` /
+    /// `AggregateSpec::input_has_validity`, defeating PV-stage-d / -f
+    /// native-validity dispatch.
+    #[test]
+    #[ignore = "requires CUDA device - Engine::new() initializes driver"]
+    fn pv_stage_f_engine_provider_has_nulls_true_for_null_bearing_batch() {
+        use crate::plan::TableProvider;
+
+        let mut engine = Engine::new().expect("ctx");
+        let arr = Int32Array::from(vec![Some(1i32), None, Some(3)]);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
+        engine.register_table("t", batch).expect("register");
+
+        let provider = EngineProvider {
+            base: &engine.provider,
+            tables: &engine.tables,
+        };
+        assert!(
+            provider.has_nulls("t", 0),
+            "null-bearing column must surface true via EngineProvider::has_nulls"
+        );
+        assert_eq!(
+            provider.null_count("t", 0),
+            Some(1),
+            "null_count must reflect Arrow validity bitmap"
+        );
+    }
+
+    /// Mirror of the test above for a NULL-free column — provider must
+    /// return false so PV stages keep the legacy host-strip path bit-identical.
+    #[test]
+    #[ignore = "requires CUDA device - Engine::new() initializes driver"]
+    fn pv_stage_f_engine_provider_has_nulls_false_for_null_free_batch() {
+        use crate::plan::TableProvider;
+
+        let mut engine = Engine::new().expect("ctx");
+        let arr = Int32Array::from(vec![1i32, 2, 3]);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
+        engine.register_table("t", batch).expect("register");
+
+        let provider = EngineProvider {
+            base: &engine.provider,
+            tables: &engine.tables,
+        };
+        assert!(
+            !provider.has_nulls("t", 0),
+            "null-free column must surface false"
+        );
+        assert_eq!(provider.null_count("t", 0), Some(0));
     }
 }

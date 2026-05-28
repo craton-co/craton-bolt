@@ -498,6 +498,7 @@ mod stage4_tests {
                     Field::new("k", DataType::Int32, false),
                     Field::new("avg_v", DataType::Float64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -604,6 +605,7 @@ mod stage5_tests {
                         )
                         .collect(),
                 ),
+                input_has_validity: Vec::new(),
             },
         };
 
@@ -682,6 +684,7 @@ mod stage5_tests {
                     Field::new("k", DataType::Int32, false),
                     Field::new("avg_v", DataType::Float64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![

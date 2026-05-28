@@ -116,6 +116,21 @@ pub fn try_execute(
         return None;
     }
 
+    // PV-stage-f: NULL handling — the partition_reduce_kernel_i64 family
+    // has no `_with_validity` companion yet, and the host-side i64 pack
+    // reads `.values()` straight off the Arrow array (NULL positions
+    // carry garbage bytes that would synthesize ghost groups). Defer
+    // NULL-bearing batches back to `groupby::execute_groupby` → the
+    // sentinel / sentinel-free single-key paths, both of which carry
+    // proper validity handling. Stage G follow-up: native
+    // partition+reduce kernels with validity bitmaps.
+    if k0_arr.null_count() > 0
+        || k1_arr.null_count() > 0
+        || val_arr.null_count() > 0
+    {
+        return None;
+    }
+
     Some(execute_inner(plan, k0_arr, k1_arr, val_arr))
 }
 
@@ -246,6 +261,7 @@ mod tests {
                 group_by: vec![0, 1],
                 aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
                 output_schema,
+                input_has_validity: Vec::new(),
             },
         }
     }
@@ -368,6 +384,7 @@ mod stage4_tests {
                     Field::new("k2", DataType::Int32, false),
                     Field::new("sum_v", DataType::Float64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![

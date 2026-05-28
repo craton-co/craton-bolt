@@ -133,6 +133,24 @@ pub fn try_execute(
         return None;
     }
 
+    // PV-stage-f: NULL handling — the partition_reduce_kernel_count_i64
+    // family has no `_with_validity` companion yet, and the host-side
+    // i64 pack reads `.values()` straight off the Arrow array which
+    // would pick up garbage bytes at NULL positions and synthesize
+    // ghost groups. Defer NULL-bearing batches back through the
+    // sentinel-based / sentinel-free single-key paths where validity is
+    // handled correctly (`groupby::execute_groupby` → `groupby_valid::execute_groupby_valid`).
+    //
+    // Stage G follow-up: add a `_with_validity` partition reduce so
+    // high-cardinality two-key COUNT can stay on this fast path even
+    // with NULL inputs. The
+    // `crate::exec::groupby::column_should_use_native_validity`-style
+    // predicate isn't reusable here because the kernel family is
+    // different — we'd need partition-specific validity emitters.
+    if k1.null_count() > 0 || k2.null_count() > 0 {
+        return None;
+    }
+
     let n_rows = k1.len();
     if n_rows < 256 * 1024 {
         return None;
@@ -413,6 +431,7 @@ mod tests {
                 group_by: vec![0, 1],
                 aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Null))],
                 output_schema,
+                input_has_validity: Vec::new(),
             },
         }
     }
@@ -581,6 +600,7 @@ mod stage4_tests {
                     Field::new("k2", DataType::Int32, false),
                     Field::new("count_star", DataType::Int64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![

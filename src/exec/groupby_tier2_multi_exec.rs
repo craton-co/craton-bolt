@@ -254,6 +254,7 @@ mod stage4_tests {
                     Field::new("sum_v1", DataType::Float64, true),
                     Field::new("sum_v2", DataType::Float64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![

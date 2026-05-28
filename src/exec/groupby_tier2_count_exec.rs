@@ -388,6 +388,7 @@ mod tests {
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Null))],
                 output_schema,
+                input_has_validity: Vec::new(),
             },
         }
     }
@@ -642,6 +643,7 @@ mod stage4_tests {
                     Field::new("k", DataType::Int32, false),
                     Field::new("count_star", DataType::Int64, true),
                 ]),
+                input_has_validity: Vec::new(),
             },
         };
         let schema = Arc::new(ArrowSchema::new(vec![
