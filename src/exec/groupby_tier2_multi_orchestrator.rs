@@ -341,12 +341,17 @@ pub fn execute_tier2_multi_sum(
     }
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
 
-    // JIT + launch — module cached per (n_vals).
-    let reduce_module = module_cache::get_or_build_module(
-        module_path!(),
-        format!("partition_reduce_multi:{}", n_vals),
-        None,
-        || partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(n_vals as u32),
+    // JIT + launch — kernel is cached per (n_vals) via the PTX cache.
+    //
+    // TODO(batch-4-spill): switch to a future
+    // `compile_partition_reduce_kernel_multi_with_spill(n_vals)` once that
+    // emitter exists. See `groupby_tier2_orchestrator.rs::execute_tier2_sum`
+    // for the wiring pattern (zero-init u32 spill counter, push as the
+    // extra kernel arg, download + check after sync, return a structured
+    // `partition_reduce spill: …` error). Until then this path can drop
+    // rows silently on MAX_PROBES overflow under high-cardinality skew.
+    let reduce_ptx = partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(
+        n_vals as u32,
     )?;
     let reduce_entry_name = partition_reduce_kernel_multi::kernel_entry(n_vals as u32);
     let reduce_fn = reduce_module.function(&reduce_entry_name)?;

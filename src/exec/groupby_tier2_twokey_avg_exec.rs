@@ -73,6 +73,26 @@ enum KernelSpec {
 static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
+    if let Some(m) = MODULE_CACHE.lock().get(spec) {
+        return Ok(m.clone());
+    }
+    let ptx = match spec {
+        KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
+        KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
+        // TODO(batch-4-spill): switch to a future
+        // `*_with_spill` variant once the i64-key sibling kernels grow
+        // one. AVG composes SUM (multi) + COUNT, so both legs must
+        // detect spills together for correctness under skewed input.
+        KernelSpec::ReduceMultiI64 { n_vals } => {
+            partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64(*n_vals)?
+        }
+        // TODO(batch-4-spill): see above — wire together with the multi
+        // variant.
+        KernelSpec::ReduceCountI64 => {
+            partition_reduce_kernel_count_i64::compile_partition_reduce_kernel_count_i64()?
+        }
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
     let counter = Some(&LOAD_COUNT);
     #[cfg(not(test))]
