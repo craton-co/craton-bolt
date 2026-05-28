@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     join_combined_schema, AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal,
-    LogicalPlan, Schema, SortExpr, UnaryOp,
+    LogicalPlan, Schema, SortExpr,
 };
 
 /// SSA register handle. Just an index into the IR's value table.
@@ -1348,6 +1348,7 @@ fn expr_contains_div_or_mod(e: &Expr) -> bool {
             expr_contains_div_or_mod(left) || expr_contains_div_or_mod(right)
         }
         Expr::Alias(inner, _) => expr_contains_div_or_mod(inner),
+        Expr::Unary { operand, .. } => expr_contains_div_or_mod(operand),
     }
 }
 
@@ -1369,6 +1370,7 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
                 || expr_has_unsafe_eager_shortcircuit(right)
         }
         Expr::Alias(inner, _) => expr_has_unsafe_eager_shortcircuit(inner),
+        Expr::Unary { operand, .. } => expr_has_unsafe_eager_shortcircuit(operand),
     }
 }
 

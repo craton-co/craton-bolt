@@ -305,6 +305,9 @@ fn eval_inner(
         Expr::Literal(lit) => eval_literal(lit, n_rows),
         Expr::Alias(inner, _) => eval_inner(inner, env, n_rows),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, n_rows),
+        Expr::Unary { .. } => Err(BoltError::Other(
+            "IS NULL / IS NOT NULL not supported by host expression evaluator".to_string(),
+        )),
     }
 }
 

@@ -1299,14 +1299,14 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> B
         // aggregate calls inside the operand (`HAVING SUM(v) IS NOT NULL`)
         // are rewritten to the aggregate-output column reference.
         SqlExpr::IsNull(inner) => {
-            let operand = lower_expr_in_having(inner, resolver)?;
+            let operand = lower_expr_in_having(inner, resolver, depth + 1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::IsNull,
                 operand: Box::new(operand),
             })
         }
         SqlExpr::IsNotNull(inner) => {
-            let operand = lower_expr_in_having(inner, resolver)?;
+            let operand = lower_expr_in_having(inner, resolver, depth + 1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(operand),
@@ -1382,14 +1382,14 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
         // executor being silently wrong. See `Expr::Unary` for the typing
         // contract (always Bool).
         SqlExpr::IsNull(inner) => {
-            let operand = lower_expr(inner, resolver)?;
+            let operand = lower_expr(inner, resolver, depth + 1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::IsNull,
                 operand: Box::new(operand),
             })
         }
         SqlExpr::IsNotNull(inner) => {
-            let operand = lower_expr(inner, resolver)?;
+            let operand = lower_expr(inner, resolver, depth + 1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(operand),

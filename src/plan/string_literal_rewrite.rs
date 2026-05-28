@@ -280,7 +280,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             // nullness we're testing, not a constant. Recurse so any nested
             // string-literal comparisons inside a typed operand still get
             // normalised.
-            let new_operand = rewrite_expr_with(operand, r)?;
+            let new_operand = rewrite_expr_with(operand, r, depth + 1)?;
             Ok(Expr::Unary {
                 op: *op,
                 operand: Box::new(new_operand),
