@@ -196,6 +196,53 @@ impl GpuBuffer<u8> {
     }
 }
 
+/// # SAFETY — async DMA lifetime hazard (review finding C13)
+///
+/// **There is NO stream-completion fence in this `Drop` impl.** The device
+/// block is returned directly to [`crate::cuda::mem_pool::POOL`] for reuse
+/// the moment the owning `GpuBuffer` goes out of scope, regardless of
+/// whether any asynchronous transfer or memset is still in flight on a
+/// CUDA stream that touches `self.ptr`.
+///
+/// ## Why this matters
+///
+/// If a [`GpuBuffer`] participated in any async DMA — e.g. a future
+/// `copy_from_async` (H2D), `copy_to_async` (D2H), `zeros_async`
+/// (`cuMemsetD8Async`), or any external `cuMemcpy*Async` /
+/// `cuMemset*Async` keyed off [`GpuBuffer::device_ptr`] — and the buffer
+/// is dropped *before* its stream is synchronized, the pool will hand
+/// the recycled `CUdeviceptr` to the next allocator. The in-flight DMA
+/// continues chasing the same physical address and will silently corrupt
+/// whatever unrelated `GpuBuffer` happens to receive that pool block
+/// next. There is no driver-level error: the copy completes
+/// "successfully" into someone else's data.
+///
+/// (As of this revision the public async API surface is still being
+/// landed on top of this module; the hazard is documented here so the
+/// invariant is baked into the type from day one rather than retro-fitted
+/// after a real corruption is observed downstream.)
+///
+/// ## Required caller discipline
+///
+/// **Callers MUST `cuStreamSynchronize` on every stream that references
+/// this buffer's device pointer before letting the buffer drop.**
+///
+/// Equivalently, the stream itself may be destroyed first — destroying a
+/// CUDA stream implicitly synchronizes it — but relying on that ordering
+/// is fragile and discouraged.
+///
+/// When async copy methods are added to this type, each one must repeat
+/// this contract in its own rustdoc (`## Buffer lifetime` subsection)
+/// and cross-reference this `Drop` note.
+///
+/// ## Why we don't fence here
+///
+/// A blanket `cuCtxSynchronize` (or per-buffer event-record + wait) in
+/// `Drop` would serialize every buffer release against every stream in
+/// the context, which would obliterate the H2D / kernel / D2H overlap
+/// that the async API exists to enable. The architectural decision is
+/// to push the fence to the caller, who knows which stream(s) actually
+/// touched this buffer.
 impl<T: Pod> Drop for GpuBuffer<T> {
     fn drop(&mut self) {
         if self.ptr == 0 {
@@ -207,6 +254,9 @@ impl<T: Pod> Drop for GpuBuffer<T> {
         // backend when `--features cudarc` is active, or via the
         // hand-rolled FFI otherwise. Either way the call site here is
         // backend-agnostic because the pool stores raw `CUdeviceptr`s.
+        //
+        // NOTE (review C13): no stream-completion fence here. See the
+        // SAFETY rustdoc on this `impl` block above.
         crate::cuda::mem_pool::POOL.free(self.ptr, self.alloc_bytes);
     }
 }
