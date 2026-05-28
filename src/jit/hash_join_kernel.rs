@@ -594,6 +594,23 @@ pub fn compile_build_kernel() -> BoltResult<String> {
 /// resized output buffer. For Stage 1 the host pre-sizes the output to
 /// `build_n_rows + probe_n_rows` which is loose enough to never overflow
 /// in the INNER-equi-join-with-unique-build case.
+///
+/// TODO(perf): SoA probe could fuse adjacent slot loads via `ld.global.nc.v2.u64`
+/// with a 2-way-unrolled probe — the key array is 8-byte aligned and two
+/// adjacent i64 keys fit in one 16-byte transaction. Not implemented because
+/// the unroll is non-trivial: (a) `slot[s+1]` is really `(s+1) & mask`, so a
+/// v2 load at the wrap-around boundary (`s == cap - 1`) reads past the end of
+/// `keys_table`; (b) the `MAX_PROBE_FACTOR * cap` slot bound is counted per
+/// slot, not per iteration — unrolling needs the bound either halved or
+/// doubled-per-step; (c) empty-slot detection on slot[s] must short-circuit
+/// before we examine slot[s+1] (else we'd treat an empty followed by an
+/// occupied slot as a continuation). The companion AoS probe
+/// ([`compile_probe_aos_kernel`]) gets the fused-load win for free via its
+/// 16-byte slot footprint — workloads that are probe-bound enough to care
+/// should route through AoS instead. See also the read-only-cache hint
+/// (`.ca` qualifier) — it's the default on sm_70+ and the key table is
+/// megabytes anyway (far larger than L1), so an explicit hint would not
+/// change SASS.
 pub fn compile_probe_kernel() -> BoltResult<String> {
     let mut p = String::new();
     writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
@@ -902,6 +919,14 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
 ///     .param .u32 build_n_rows       // for sentinel check on chain walk
 /// )
 /// ```
+///
+/// TODO(perf): see [`compile_probe_kernel`] for the same `ld.global.nc.v2.u64`
+/// fused-adjacent-slot opportunity. The collision probe inherits all three
+/// blockers (wraparound at `slot == cap - 1`, slot-counted probe bound,
+/// empty-slot short-circuit ordering) plus an additional one: the chain walk
+/// hangs off the *matched* slot, so any speculation past that slot is pure
+/// waste. AoS layout ([`compile_probe_aos_kernel`]) is the better win for
+/// probe-bound joins.
 pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     let mut p = String::new();
     writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
