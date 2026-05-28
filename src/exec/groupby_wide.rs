@@ -459,13 +459,14 @@ enum AggKind {
     Max,
     Count,
     Avg,
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
 }
 
 impl AggKind {
-    /// Map an `AggregateExpr` to its `AggKind` discriminant. Returns an
-    /// error for VAR_POP/VAR_SAMP because the wide GROUP BY path has no
-    /// host-side accumulator variant for them yet (rejected at engine
-    /// dispatch in v0.5).
+    /// Map an `AggregateExpr` to its `AggKind` discriminant.
     fn from_expr(e: &AggregateExpr) -> BoltResult<Self> {
         match e {
             AggregateExpr::Sum(_) => Ok(AggKind::Sum),
@@ -473,19 +474,10 @@ impl AggKind {
             AggregateExpr::Max(_) => Ok(AggKind::Max),
             AggregateExpr::Count(_) => Ok(AggKind::Count),
             AggregateExpr::Avg(_) => Ok(AggKind::Avg),
-            AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => {
-                Err(BoltError::Other(
-                    "wide GROUP BY: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
-                        .into(),
-                ))
-            }
-            AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
-                Err(BoltError::Other(
-                    "wide GROUP BY: STDDEV_POP / STDDEV_SAMP not yet \
-                     supported (v0.5: scalar aggregate only)"
-                        .into(),
-                ))
-            }
+            AggregateExpr::VarPop(_) => Ok(AggKind::VarPop),
+            AggregateExpr::VarSamp(_) => Ok(AggKind::VarSamp),
+            AggregateExpr::StddevPop(_) => Ok(AggKind::StddevPop),
+            AggregateExpr::StddevSamp(_) => Ok(AggKind::StddevSamp),
         }
     }
 }
@@ -666,6 +658,11 @@ enum Accumulator {
     Count { n: u64 },
     /// `AVG` — running sum + count.
     Avg { sum: f64, n: u64 },
+    /// `VAR_POP` / `VAR_SAMP` / `STDDEV_POP` / `STDDEV_SAMP` — Welford
+    /// `(count, mean, M2)` state. The output finaliser
+    /// (`finalize_agg_column`) picks the right `var_*` / `stddev_*`
+    /// accessor on the state.
+    Welford { state: crate::exec::welford::WelfordState },
 }
 
 impl Accumulator {
@@ -776,6 +773,9 @@ impl Accumulator {
                 *sum += value.as_f64();
                 *n += 1;
             }
+            Accumulator::Welford { state } => {
+                state.push(value.as_f64());
+            }
         }
         Ok(())
     }
@@ -834,6 +834,12 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> BoltResult<Vec<Accumu
             },
             (AggKind::Count, _) => Accumulator::Count { n: 0 },
             (AggKind::Avg, _) => Accumulator::Avg { sum: 0.0, n: 0 },
+            (
+                AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp,
+                DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64,
+            ) => Accumulator::Welford {
+                state: crate::exec::welford::WelfordState::empty(),
+            },
             (_, DataType::Bool)
             | (_, DataType::Utf8)
             | (_, DataType::Decimal128(_, _))
@@ -975,24 +981,73 @@ fn finalize_agg_column(
             // the (possibly narrowing) cast to `pack_typed_array`.
             collect_sum_min_max(sorted, i, out_field.dtype)
         }
-        // v0.5: wide GROUP BY rejects VAR_POP/VAR_SAMP at the `resolve_aggregates`
-        // gate already (see `AggKind::from_expr`); this arm is unreachable in
-        // practice but keeps the match exhaustive.
-        AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => Err(BoltError::Other(
-            "wide GROUP BY: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
-                .into(),
-        )),
-        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
-            // Unreachable: `AggKind::from_expr` rejects STDDEV variants
-            // before any accumulator is allocated. Arm exists to keep the
-            // match exhaustive.
-            Err(BoltError::Other(
-                "wide GROUP BY: internal — STDDEV reached finalize \
-                 (should have been rejected at AggKind::from_expr)"
-                    .into(),
-            ))
+        // v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP. Output is
+        // always a nullable Float64 array — empty / single-observation
+        // groups produce SQL NULL via the matching `WelfordState`
+        // finaliser (see `crate::exec::welford` for the canonical
+        // numerics: `var_pop` returns None for count == 0, `var_samp` and
+        // `stddev_samp` return None for count <= 1).
+        AggregateExpr::VarPop(_) => {
+            finalize_welford_column(sorted, i, WelfordKind::VarPop, out_field)
+        }
+        AggregateExpr::VarSamp(_) => {
+            finalize_welford_column(sorted, i, WelfordKind::VarSamp, out_field)
+        }
+        AggregateExpr::StddevPop(_) => {
+            finalize_welford_column(sorted, i, WelfordKind::StddevPop, out_field)
+        }
+        AggregateExpr::StddevSamp(_) => {
+            finalize_welford_column(sorted, i, WelfordKind::StddevSamp, out_field)
         }
     }
+}
+
+/// Tag for finalising a per-group `WelfordState` in the wide GROUP BY path.
+#[derive(Clone, Copy, Debug)]
+enum WelfordKind {
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
+}
+
+/// Walk `sorted`, picking out the `i`-th accumulator (which must be a
+/// [`Accumulator::Welford`]) per group, and emit a nullable Float64
+/// array using the matching `var_*` / `stddev_*` finaliser.
+fn finalize_welford_column(
+    sorted: &[(TupleKey, Vec<Accumulator>)],
+    i: usize,
+    kind: WelfordKind,
+    out_field: &Field,
+) -> BoltResult<ArrayRef> {
+    if out_field.dtype != DataType::Float64 {
+        return Err(BoltError::Type(format!(
+            "wide GROUP BY: VAR/STDDEV output dtype must be Float64, got {:?}",
+            out_field.dtype
+        )));
+    }
+    let mut out: Vec<Option<f64>> = Vec::with_capacity(sorted.len());
+    for (_, accs) in sorted {
+        match accs.get(i) {
+            Some(Accumulator::Welford { state }) => {
+                let v = match kind {
+                    WelfordKind::VarPop => state.var_pop(),
+                    WelfordKind::VarSamp => state.var_samp(),
+                    WelfordKind::StddevPop => state.stddev_pop(),
+                    WelfordKind::StddevSamp => state.stddev_samp(),
+                };
+                out.push(v);
+            }
+            _ => {
+                return Err(BoltError::Other(
+                    "wide GROUP BY: internal — VAR/STDDEV accumulator missing \
+                     or wrong variant"
+                        .into(),
+                ))
+            }
+        }
+    }
+    Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
 }
 
 /// Walk `sorted`, picking out accumulator `i`, and collect into the
@@ -1102,6 +1157,11 @@ fn collect_sum_min_max(
         Accumulator::Count { .. } | Accumulator::Avg { .. } => {
             return Err(BoltError::Other(
                 "wide GROUP BY: internal — COUNT/AVG variant in SUM/MIN/MAX path".into(),
+            ))
+        }
+        Accumulator::Welford { .. } => {
+            return Err(BoltError::Other(
+                "wide GROUP BY: internal — Welford variant in SUM/MIN/MAX path".into(),
             ))
         }
     };
@@ -1437,6 +1497,99 @@ mod tests {
                 .to_vec(),
             other => panic!("unexpected dtype {other:?}"),
         }
+    }
+
+    /// v0.7: per-group VAR_POP / STDDEV_POP / VAR_SAMP / STDDEV_SAMP via
+    /// the wide host-side path. Constructs a 2-key GROUP BY where each
+    /// group has a different sample shape — empty (no rows reach it),
+    /// single-observation, and multi-observation — to cover the NULL
+    /// emission cases in one go.
+    #[test]
+    fn two_int64_keys_var_stddev_basic() {
+        // Two distinct (a, b) tuples:
+        //   (1, 10): vs = [1, 2, 3]  -> n=3, var_pop = 2/3, var_samp = 1.0
+        //   (1, 20): vs = [42]       -> n=1, var_pop = 0,   var_samp = NULL
+        let rows: Vec<(i64, i64, i64)> = vec![
+            (1, 10, 1),
+            (1, 10, 2),
+            (1, 10, 3),
+            (1, 20, 42),
+        ];
+        let batch = build_two_key_batch(&rows);
+
+        let inputs = vec![
+            ColumnIO { name: "a".into(), dtype: DataType::Int64 },
+            ColumnIO { name: "b".into(), dtype: DataType::Int64 },
+            ColumnIO { name: "v".into(), dtype: DataType::Int64 },
+        ];
+        let output_schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("var_pop_v", DataType::Float64, true),
+            Field::new("var_samp_v", DataType::Float64, true),
+            Field::new("stddev_pop_v", DataType::Float64, true),
+            Field::new("stddev_samp_v", DataType::Float64, true),
+        ]);
+        let aggregate = AggregateSpec {
+            inputs,
+            group_by: vec![0, 1],
+            aggregates: vec![
+                AggregateExpr::VarPop(Box::new(Expr::Column("v".into()))),
+                AggregateExpr::VarSamp(Box::new(Expr::Column("v".into()))),
+                AggregateExpr::StddevPop(Box::new(Expr::Column("v".into()))),
+                AggregateExpr::StddevSamp(Box::new(Expr::Column("v".into()))),
+            ],
+            output_schema,
+            input_has_validity: Vec::new(),
+        };
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".to_string(),
+            pre: None,
+            aggregate,
+        };
+        let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");
+        assert_eq!(out.num_rows(), 2);
+
+        let var_pop = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("var_pop f64");
+        let var_samp = out
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("var_samp f64");
+        let stddev_pop = out
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("stddev_pop f64");
+        let stddev_samp = out
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("stddev_samp f64");
+
+        // Sorted by (a, b): row 0 = (1, 10), row 1 = (1, 20).
+        // n=3, [1,2,3]
+        assert!((var_pop.value(0) - (2.0 / 3.0)).abs() < 1e-12);
+        assert!((var_samp.value(0) - 1.0).abs() < 1e-12);
+        assert!((stddev_pop.value(0) - (2.0_f64 / 3.0).sqrt()).abs() < 1e-12);
+        assert!((stddev_samp.value(0) - 1.0).abs() < 1e-12);
+        assert!(!var_pop.is_null(0));
+        assert!(!var_samp.is_null(0));
+
+        // n=1, [42]:
+        //   var_pop  = 0
+        //   var_samp = NULL (count-1 == 0)
+        //   stddev_pop = 0
+        //   stddev_samp = NULL
+        assert_eq!(var_pop.value(1), 0.0);
+        assert!(!var_pop.is_null(1));
+        assert!(var_samp.is_null(1));
+        assert_eq!(stddev_pop.value(1), 0.0);
+        assert!(stddev_samp.is_null(1));
     }
 
     /// 3. Three Int32 keys (which the narrow path rejects) work fine here;

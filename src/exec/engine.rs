@@ -1857,28 +1857,15 @@ impl Engine {
                 pre,
                 aggregate,
             } => {
-                // v0.5 scope: VAR_POP / VAR_SAMP only ship the scalar
-                // (no GROUP BY) path. The GROUP BY executors below have
-                // no idea what to do with them and would either silently
-                // skip them or panic on the match — so reject up front
-                // with a message that points the user at the supported
-                // shape.
-                if !aggregate.group_by.is_empty() {
-                    for agg in &aggregate.aggregates {
-                        match agg {
-                            crate::plan::AggregateExpr::VarPop(_)
-                            | crate::plan::AggregateExpr::VarSamp(_) => {
-                                return Err(BoltError::Other(
-                                    "VAR_POP / VAR_SAMP with GROUP BY is not implemented \
-                                     in v0.5; only the scalar (no GROUP BY) aggregate is \
-                                     supported"
-                                        .into(),
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                // v0.7: GROUP BY VAR_POP / VAR_SAMP / STDDEV_POP /
+                // STDDEV_SAMP are lowered to a per-group Welford pass in
+                // the downstream executors (`crate::exec::groupby`,
+                // `crate::exec::groupby_valid`, `crate::exec::groupby_with_pre`,
+                // and `crate::exec::groupby_wide`). The shared
+                // `crate::exec::welford::WelfordState` provides the
+                // numerically-stable single-pass update; the executors fold
+                // per-group state on the host after the GPU keys kernel
+                // populates the slot table.
                 let batch = self.materialize_table(table)?;
                 let out = match (!aggregate.group_by.is_empty(), pre.is_some()) {
                     (true, true) => {
