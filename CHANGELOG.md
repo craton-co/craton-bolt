@@ -8,24 +8,74 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
 
 ## [Unreleased]
 
-### Added
-- **Aggregate aliasing** (`SELECT SUM(x) AS total FROM t`) — the SQL
-  frontend now carries the user alias through the post-Aggregate Project,
-  so the output column is named `total` (not the plan-assigned
-  `sum_x`). The alias is visible to `HAVING` (`HAVING total > 100`) and
-  `ORDER BY` (`ORDER BY total DESC`). The bare aggregate call form
-  (`HAVING SUM(x) > 100`) continues to resolve via the existing
-  HAVING-aware lowerer.
+## [0.5.0] - 2026-05-28
 
-### Changed
+This release covers the M2 milestone from `docs/PATH_TO_1.0.md`: SQL scalar
+completeness. Version 0.4 is skipped — the M1 foundation work (streaming
+tables, async Stage 2, KernelSpec cache) is deferred to a later release;
+this cut focuses on bringing the SQL surface up to "table stakes" while
+keeping the existing in-memory execution model.
 
-### Fixed
+### Added — SQL scalar surface
+- **`NOT <bool-expr>`** — new `UnaryOp::Not` variant routed through the
+  host-side filter path (GPU lowering is a follow-up).
+- **`<expr> [NOT] IN (v1, v2, …)`** — desugared to an OR/AND chain of
+  element-wise comparisons. Capped at 64 values; a large-list hash probe
+  is a follow-up.
+- **`<expr> [NOT] BETWEEN low AND high`** — desugared to
+  `(expr >= low) AND (expr <= high)` (or the DeMorgan inverse).
+- **`CASE WHEN cond THEN val [WHEN…] [ELSE val] END`** — both plain and
+  simple (with-operand) forms. Type-check unifies numeric arms via
+  `unify_numeric` and requires exact match for non-numeric. Physical
+  lowering rejects cleanly with "CASE not yet lowered to GPU".
+- **`CAST(expr AS type)`** — primitive numeric and boolean pairs only.
+  Physical lowering rejects cleanly until the runtime conversion lands.
+- **`COALESCE(a, b, …)`** and **`NULLIF(a, b)`** — desugared to `CASE`.
+- **`<expr> [NOT] LIKE 'pattern'`** — constant-pattern LIKE with `%` and
+  `_` wildcards. Routes through the host-side `host_like` evaluator;
+  fast paths for prefix / suffix / contains / exact shapes.
+- **String concat `a || b`** — new `BinaryOp::Concat` operator, lowered
+  through the host-side `PhysicalPlan::Project` executor for SELECT
+  positions. WHERE-clause concat is rejected with a clear message.
+- **`STDDEV_POP`, `STDDEV_SAMP`, `STDDEV`** aggregates (Welford on host).
+  Scalar-aggregate only; GROUP BY support is a follow-up.
+- **`VAR_POP`, `VAR_SAMP`, `VARIANCE`** aggregates (shared Welford state).
+- **`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`** scalar functions
+  surfaced via `Expr::ScalarFn`. Parser + type-check only; physical
+  lowering rejects each with a "follow-up" message.
 
-### Removed
+### Added — SQL ergonomics
+- **Aggregate aliasing** (`SELECT SUM(x) AS total`) — the alias carries
+  through the post-Aggregate Project and is visible to HAVING / ORDER BY.
+- **Qualified column references** (`t.col`, `alias.col`) — resolved
+  against the FROM-tree, including JOIN aliases. Schema-qualified
+  three-part names are rejected with a dedicated message.
+- **Post-aggregate scalar expressions** (`SUM(x) + 1`, `AVG(qty) * 2`,
+  `(SUM(a) + SUM(b)) / 2`) — extracted as aggregate feeds + rewritten
+  surface expression in a post-Aggregate Project.
+- **Case-insensitive identifiers** — unquoted SQL idents fold to
+  lowercase at parse time; schema lookup falls back to case-insensitive
+  match when the lookup name is all-ASCII-lowercase. Quoted
+  (`"MyCol"`) identifiers preserve case and match verbatim.
 
-### Deprecated
+### Added — M1 foundation
+- **Validity propagation through primitive scalar aggregates** —
+  `COUNT(col)` now excludes NULLs via the bitmap; `SUM`/`MIN`/`MAX`/`AVG`
+  host-strip NULL positions before the GPU reduction. The zero-null
+  fast path (`null_count == 0`) remains a zero-copy `primitive_to_gpu`
+  upload.
 
-### Security
+### Notes
+- The execution surface remains conservative: many of the items above
+  parse and type-check, but the physical layer rejects them with a clear
+  "not yet lowered to GPU" message until the corresponding kernel /
+  host-side runtime path lands in a follow-up. The intent is to unblock
+  third-party tooling (which can now generate the SQL it would naturally
+  write) without claiming false execution coverage.
+- This release also skips the original 0.4 milestone (streaming /
+  async-memcpy Stage 2 / KernelSpec cache) for the same reason 0.2.0 was
+  skipped: scope grew past what a single minor bump could carry, and
+  scalar completeness was the more user-visible delta.
 
 ## [0.3.0] - 2026-05-26
 

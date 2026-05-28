@@ -1,10 +1,15 @@
 # Craton Bolt Roadmap
 
-This document tracks intentional gaps in the 0.3.0 release and the milestones
-planned for 0.4+. For day-to-day progress, see `CHANGELOG.md`. For supported
+This document tracks intentional gaps in the 0.5.0 release and the milestones
+planned for 0.6+. For day-to-day progress, see `CHANGELOG.md`. For supported
 SQL today, see `docs/SQL_REFERENCE.md`.
 
-## 0.3.0 (current — pre-production, API unstable)
+## 0.5.0 (current — pre-production, API unstable)
+
+This release covers the M2 milestone from `docs/PATH_TO_1.0.md`: SQL scalar
+completeness. Version 0.4 was skipped — the M1 foundation items (streaming
+tables, async-memcpy Stage 2, KernelSpec cache) are deferred to a later
+release.
 
 ### What works
 
@@ -13,8 +18,7 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 - `DISTINCT`, `LIMIT [OFFSET]`, `ORDER BY [ASC|DESC]`, `HAVING`, and
   `UNION [ALL]` (host-side executors for the non-GROUP-BY paths).
 - `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS`
-  joins (host-side hash join: build one side into a `HashMap`, probe the
-  other; CROSS is a host-side cartesian product capped at the
+  joins (host-side hash join; CROSS is host-side cartesian capped at the
   `arrow::compute::take` u32 row limit). Multiple joins per `SELECT` are
   permitted. Non-equi predicates remain out of scope.
 - Borrow-checked GPU memory primitives (`GpuVec` / `GpuView` /
@@ -28,76 +32,98 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   folding `WHERE col = 'X'` to integer equality at plan time.
 - Float GROUP BY with sentinel-free fallback for keys that collide with
   `i64::MIN` (notably `-0.0`).
-- Float MIN/MAX via `atom.cas` loop on the bit pattern (no native
-  `atom.global.{min,max}.f*` through sm_90).
+- Float MIN/MAX via `atom.cas` loop on the bit pattern.
 - GPU-side filter compaction (Hillis-Steele prefix scan + per-dtype
   gather), with a host-side fallback for Utf8 outputs and a multi-pass
   scan driver for `n_rows > 16.8M`.
-- Process-wide PTX module cache keyed on the emitted PTX hash, skipping
-  PTXAS reassembly on hit.
-- `--features cuda-stub` build path for CI and `docs.rs` (type-checks
-  without a CUDA toolkit on the host).
+- Process-wide PTX module cache keyed on the emitted PTX hash.
+- `--features cuda-stub` build path for CI and `docs.rs`.
+
+### New in 0.5.0 — SQL scalar surface
+
+- `IS NULL` / `IS NOT NULL` — GPU-lowered via the validity bitmap on
+  bare-column operands; compound operands route through the host filter.
+- `NOT <bool-expr>` — host-side filter path.
+- `<expr> [NOT] IN (v1, …, vN)` — desugared to OR/AND chain, capped at 64.
+- `<expr> [NOT] BETWEEN low AND high` — desugared to `>=` AND `<=`.
+- `CASE WHEN cond THEN val [WHEN…] [ELSE val] END` — parser + type-check
+  only; physical lowering rejects cleanly until a follow-up.
+- `CAST(expr AS type)` — primitive numeric / bool pairs at the type-check
+  layer; physical lowering rejects until the runtime conversion lands.
+- `COALESCE` / `NULLIF` — desugared to CASE.
+- `<expr> [NOT] LIKE 'pattern'` — host-side evaluator with prefix /
+  suffix / contains / exact fast paths plus a generic backtracking
+  matcher.
+- `<expr> || <expr>` — Utf8 concat, host-side projection. WHERE concat
+  rejected with a clear message.
+- `STDDEV_POP` / `STDDEV_SAMP` / `STDDEV` and `VAR_POP` / `VAR_SAMP` /
+  `VARIANCE` via host-side Welford. Scalar-aggregate only.
+- `UPPER` / `LOWER` / `LENGTH` / `SUBSTRING` / `CONCAT` parsed and
+  type-checked via `Expr::ScalarFn`; physical lowering rejects until the
+  runtime path lands.
+
+### New in 0.5.0 — SQL ergonomics
+
+- Aggregate aliasing (`SELECT SUM(x) AS total`) carries through the
+  post-Aggregate Project; visible to HAVING / ORDER BY.
+- Qualified column references (`t.col`, `alias.col`) resolve against the
+  FROM-tree; three-part `schema.table.col` rejected with a clear message.
+- Post-aggregate scalar expressions (`SUM(x) + 1`, `(SUM(a) + SUM(b)) / 2`)
+  via aggregate-feed extraction + rewritten projection.
+- Case-insensitive identifiers: unquoted idents fold to lowercase at
+  parse time; schema lookups fall back to case-insensitive match.
+  Quoted (`"MyCol"`) identifiers preserve case.
+
+### New in 0.5.0 — M1 foundation
+
+- Validity propagation through primitive scalar aggregates:
+  `COUNT(col)` excludes NULLs via the bitmap, and `SUM` / `MIN` / `MAX` /
+  `AVG` host-strip NULL positions before the GPU reduction. The
+  zero-null fast path (`null_count == 0`) remains a zero-copy upload.
 
 ### Known limitations (not bugs)
 
-- Multi-batch tables are supported, but no streaming (`register_table_stream`) or
-  larger-than-VRAM tables yet.
-- One CUDA context, one device per `Engine`. `Engine::new_with_device`
-  exists, but multi-GPU means one engine per device.
-- JOIN: INNER / LEFT / RIGHT / FULL / CROSS supported, equi predicates
-  (or no predicate for CROSS) only; non-equi predicates remain rejected
-  at the parser. The executor is host-side (build map + probe; cartesian
-  product for CROSS), not GPU-backed.
-- No CTE, subqueries, window functions.
-- No `IS NULL` / `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, `CASE`,
-- `NULLIF`, `COALESCE`, `CAST`, or string concat (`||`).
-- No `NOT` (would need a unary op in the AST).
-- Identifiers are case-sensitive; no folding.
-- Qualified column references (`t.col`) are rejected even when
-  unambiguous.
-- Validity propagation through compact / gpu_compact selection masks is implemented.
-  Primitive scalar aggregates now honour the Arrow validity bitmap (v0.5/M1):
-  `COUNT(col)` excludes NULLs via the bitmap, and `SUM`/`MIN`/`MAX`/`AVG` host-strip
-  NULL positions before the GPU reduction. The fast path (`null_count == 0`)
-  remains a zero-copy `primitive_to_gpu` upload.
-- Post-aggregate expressions (`SUM(price) + 1`) are not yet supported.
-- String functions (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING`)
-  are reachable only via `src/exec/string_ops*`, not via SQL.
+- Many of the new SQL scalar items above parse and type-check but reject
+  cleanly at the physical-plan boundary with "not yet lowered to GPU"
+  until the corresponding runtime path lands. Specifically: `CASE`,
+  `CAST`, `STDDEV` / `VAR` under GROUP BY, scalar string functions,
+  `LIKE` with ESCAPE, `||` in WHERE predicates.
+- Multi-batch tables are supported but no streaming
+  (`register_table_stream`) or larger-than-VRAM tables yet.
+- One CUDA context, one device per `Engine`.
+- JOIN executor is host-side (build map + probe); no GPU-resident path.
+- No CTE, subqueries, or window functions.
 - Date / time / timestamp / decimal / list / struct / map types are
   unimplemented.
-- Async memcpy: FFI is bound and Stage 1 safe wrappers
-  (`memcpy_h2d_async`, `memcpy_d2h_async`, `memset_d8_async`,
-  `PinnedHostBuffer<T>`, `GpuBuffer::copy_{from,to}_async`) have landed,
-  but executors still call the synchronous `from_slice` / `to_vec`
-  paths. Stage 2 (wiring executors onto explicit streams + pinned host
-  buffers) is the 0.4 task.
+- Async memcpy: FFI + Stage 1 safe wrappers have landed; Stage 2 (wiring
+  executors onto explicit streams + pinned host buffers) is deferred.
 
-## 0.4 — production-readiness target
+## 0.6 — execution catch-up (next)
+
+Most of the v0.5 work added SQL surface that the planner accepts and the
+physical layer rejects. 0.6 is about closing those gaps:
 
 ### Goals
 
+- GPU lowering for `CASE WHEN ... END` (predicated select).
+- GPU lowering for `CAST` over the documented primitive pairs.
+- Host-side runtime for the string scalar functions surfaced in 0.5
+  (`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`); `CONCAT` is already wired
+  through the host Project executor.
+- `STDDEV` / `VAR` under GROUP BY (per-group Welford state).
 - Streaming / multi-batch tables behind a stable `register_table_stream`
   API.
-- ~~Validity propagation through primitive aggregate kernels.~~ Landed in v0.5/M1
-  (host-strip on `null_count > 0`; zero-copy fast path otherwise).
-- Async memcpy + pinned host buffers. **Stage 1** (safe wrappers +
-  `PinnedHostBuffer<T>` + `GpuBuffer::copy_{from,to}_async`) has landed
-  on top of the 0.3.0 FFI bindings; **Stage 2** wires the per-shape
-  executors onto explicit streams and pinned host buffers and is the
-  remaining 0.4 task.
-- `KernelSpec`-keyed cache that skips codegen as well as PTXAS (the
-  current cache only skips PTXAS reassembly).
+- Async memcpy Stage 2 — wire per-shape executors onto explicit streams
+  and pinned host buffers.
+- `KernelSpec`-keyed cache that skips codegen as well as PTXAS.
 
 ### Stretch goals
 
-- GPU hash join (the 0.3.x INNER / LEFT / RIGHT / FULL / CROSS equi-join
-  executor is host-side; a GPU-resident probe path is the natural next
-  step).
+- GPU hash join (the existing executor is host-side; a GPU-resident
+  probe path is the natural next step).
 - Non-equi predicates via nested-loop.
 - GPU sort kernel to back `ORDER BY` and the dedup step of
   `UNION` / `DISTINCT` without round-tripping through host.
-- SQL functions surfaced through the parser (`UPPER`, `LOWER`, `LENGTH`,
-  `CONCAT`).
 
 ## 1.0 — public API freeze
 
