@@ -836,14 +836,16 @@ fn emit_binary(
             // String concat lives entirely on the host (see
             // `crate::exec::string_ops::host_concat_strings`); the
             // physical-plan lowerer routes any expression that contains
-            // `BinaryOp::Concat` through `PhysicalPlan::Project` (host
-            // executor) instead of the fused GPU kernel. Reaching this
+            // `BinaryOp::Concat` through `PhysicalPlan::Project` (SELECT
+            // list, v0.5) or `PhysicalPlan::Filter` (WHERE predicate,
+            // v0.7) — both backed by `expr_agg::eval_expr`. Reaching this
             // arm therefore indicates a missing route; surface a clear
             // error rather than emitting nonsense PTX.
             Err(BoltError::Other(
                 "ptx_gen: string concat (||) is not lowered to GPU; \
                  the planner should route this through the host-side \
-                 PhysicalPlan::Project executor"
+                 PhysicalPlan::Project (SELECT) or PhysicalPlan::Filter \
+                 (WHERE) executor"
                     .into(),
             ))
         }
@@ -1388,6 +1390,204 @@ mod validity_emission_tests {
             !ptx.contains("setp.eq.u32"),
             "IS NOT NULL must NOT contain setp.eq.u32 (would invert semantics)\n{ptx}"
         );
+    }
+
+    // ---- v0.7: BinaryOp::Concat in a kernel spec must reject at PTX-gen ----
+    //
+    // The physical-plan lowerer routes every Concat-bearing expression
+    // through a host-side executor (`PhysicalPlan::Project` for SELECT lists,
+    // `PhysicalPlan::Filter` for WHERE predicates), so a `BinaryOp::Concat`
+    // op should never reach this codegen. The arm in `emit_binary` is the
+    // last-line guard for a planner regression; these tests pin both the
+    // shapes the WHERE path now lowers cleanly and the error surface a
+    // hand-built kernel would see if Concat ever leaked through.
+
+    /// Hand-built kernel for `a || b` over two Utf8 columns. The PTX emitter
+    /// rejects Utf8 inputs eagerly at the parameter walk (before any op is
+    /// emitted), so we can't actually get into the `Concat` arm of
+    /// `emit_binary` via the public `compile` entry point — Utf8 inputs
+    /// fire the gate first. The right contract is therefore: a kernel spec
+    /// that contains a `BinaryOp::Concat` op MUST surface a `BoltError`
+    /// from `compile`. We assert the Utf8-input rejection here because the
+    /// downstream Concat-arm rejection is unreachable for a well-formed
+    /// spec (Concat's operands are necessarily Utf8).
+    #[test]
+    fn concat_a_b_eq_foo_compile_rejects_utf8_inputs() {
+        // Hand-built `WHERE a || b = 'foo'` projection kernel. The physical
+        // planner would NOT emit this — it routes the predicate to the host
+        // filter — but a hand-build round-trips the rejection so a future
+        // planner regression that misroutes the Concat surfaces here.
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: DataType::Utf8,
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: DataType::Utf8,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Bool,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Utf8,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Utf8,
+                },
+                // a || b → Utf8 (the op the planner is forbidden to emit
+                // into a GPU kernel; rejected at PTX-gen). Result register
+                // dtype is Utf8 — the emitter never gets to allocate it
+                // because the Utf8 input gate fires first.
+                Op::Binary {
+                    dst: Reg(2),
+                    op: BinaryOp::Concat,
+                    lhs: Reg(0),
+                    rhs: Reg(1),
+                    dtype: DataType::Utf8,
+                    result_dtype: DataType::Utf8,
+                },
+                Op::Store {
+                    src: Reg(2),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+            ],
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let err = compile(&spec, "bolt_concat_a_b_eq_foo").expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Utf8"),
+            "expected Utf8 rejection (since Concat operands are Utf8), got: {msg}"
+        );
+    }
+
+    /// Companion: `'a' || b` — a Utf8-literal-on-left shape. Same outcome
+    /// as the column||column case (Utf8 input rejection fires first), but
+    /// pinning both shapes makes the regression message obvious whichever
+    /// half a future planner bug hits first.
+    #[test]
+    fn concat_literal_b_eq_ab_compile_rejects_utf8_input() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "b".into(),
+                dtype: DataType::Utf8,
+            }],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Bool,
+            }],
+            ops: vec![
+                Op::Const {
+                    dst: Reg(0),
+                    lit: Literal::Utf8("a".into()),
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 0,
+                    dtype: DataType::Utf8,
+                },
+                Op::Binary {
+                    dst: Reg(2),
+                    op: BinaryOp::Concat,
+                    lhs: Reg(0),
+                    rhs: Reg(1),
+                    dtype: DataType::Utf8,
+                    result_dtype: DataType::Utf8,
+                },
+                Op::Store {
+                    src: Reg(2),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+            ],
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let err = compile(&spec, "bolt_concat_lit_b_eq_ab").expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Utf8"),
+            "expected Utf8 rejection on hand-built `'a' || b` kernel, got: {msg}"
+        );
+    }
+
+    /// The v0.7 lowering contract: `WHERE a || b = 'foo'` must NOT raise an
+    /// error from the physical-plan lowerer. The route lives in
+    /// `physical_plan::lower_depth`'s Filter arm, which detects
+    /// `BinaryOp::Concat` in the predicate and routes the whole Filter
+    /// through the host-side `PhysicalPlan::Filter` executor. This test
+    /// double-checks the public `lower_physical` re-export, complementing
+    /// the structural tests in `physical_plan.rs::tests`.
+    #[test]
+    fn where_concat_eq_lowers_via_public_api_without_error() {
+        use crate::plan::logical_plan::{Expr, Field, LogicalPlan, Schema};
+        use crate::plan::lower_physical;
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("a", DataType::Utf8, false),
+                Field::new("b", DataType::Utf8, false),
+            ]),
+        };
+        let pred = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Concat,
+                left: Box::new(Expr::Column("a".into())),
+                right: Box::new(Expr::Column("b".into())),
+            }),
+            right: Box::new(Expr::Literal(Literal::Utf8("foo".into()))),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let _phys = lower_physical(&plan)
+            .expect("WHERE a || b = 'foo' must lower via the public API in v0.7");
+    }
+
+    /// `WHERE 'a' || b = 'ab'` — literal-on-left companion to the column-
+    /// on-left case. Locks the routing for both binary shapes.
+    #[test]
+    fn where_literal_concat_b_eq_lowers_via_public_api_without_error() {
+        use crate::plan::logical_plan::{Expr, Field, LogicalPlan, Schema};
+        use crate::plan::lower_physical;
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("b", DataType::Utf8, false)]),
+        };
+        let pred = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Concat,
+                left: Box::new(Expr::Literal(Literal::Utf8("a".into()))),
+                right: Box::new(Expr::Column("b".into())),
+            }),
+            right: Box::new(Expr::Literal(Literal::Utf8("ab".into()))),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let _phys = lower_physical(&plan)
+            .expect("WHERE 'a' || b = 'ab' must lower via the public API in v0.7");
     }
 
     /// Planner-bug guard: an `IsNullCheck` referring to a `validity_input`

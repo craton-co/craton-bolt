@@ -281,21 +281,19 @@ fn parse_string_concat_type_mismatch_rejected() {
 }
 
 #[test]
-fn parse_string_concat_in_where_rejected_with_clear_message() {
-    // Per v0.5 scope: `||` in a WHERE predicate type-checks at the
-    // logical layer but is rejected at the physical-plan boundary so
-    // users get an actionable message instead of a kernel-launch failure.
+fn parse_string_concat_in_where_lowers_to_host_filter() {
+    // v0.7: `||` in a WHERE predicate now lowers cleanly. The GPU codegen
+    // still has no Utf8 register class, so the lowering routes the Filter
+    // through the host-side `PhysicalPlan::Filter` executor (the same path
+    // `LIKE` and compound `IS NULL` already use), which evaluates the
+    // concat row-by-row via `expr_agg::eval_expr` →
+    // `string_ops::host_concat_option_strings`.
     use craton_bolt::plan::lower_physical;
     let provider = s_provider();
     let plan = parse_sql("SELECT s FROM t WHERE s || s = 'foo'", &provider)
         .expect("WHERE s || s = 'foo' must type-check at the logical layer");
-    let err = lower_physical(&plan)
-        .expect_err("`||` in WHERE must reject at the physical layer in v0.5");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("string concat") && msg.contains("WHERE"),
-        "unexpected lower error for `||` in WHERE: {msg}"
-    );
+    let _phys = lower_physical(&plan)
+        .expect("`||` in WHERE must lower cleanly to a host-side filter in v0.7");
 }
 
 #[test]
