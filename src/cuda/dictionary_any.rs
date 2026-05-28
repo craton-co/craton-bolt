@@ -115,6 +115,89 @@ impl DictionaryColumnAny {
         }
     }
 
+    /// **Stage 7 (S1)** — build a `DictionaryColumnAny` directly from an
+    /// Arrow `DictionaryArray<Int32Type>` without re-scanning the values.
+    ///
+    /// `from_string_array` builds the dictionary from scratch by scanning a
+    /// `StringArray` row-by-row. When the input is already a
+    /// `DictionaryArray`, the dictionary has been built once on the Arrow
+    /// side — re-scanning is wasted work. This constructor takes that
+    /// already-built Arrow dictionary, copies the values into an owned
+    /// `Vec<String>` (slot 0 reserved for NULL, real strings shifted to
+    /// slot 1..N+1), and uploads the keys as `i32` indices.
+    ///
+    /// Emits the [`Self::I32`] variant by definition — the source is
+    /// `i32`-keyed. Callers whose dictionaries overflow the i32 range must
+    /// keep using [`Self::from_string_array`].
+    ///
+    /// # Errors
+    /// - `BoltError::Type` if the dictionary values aren't `Utf8`.
+    /// - `BoltError::Other` if the dictionary length exceeds `i32::MAX - 1`.
+    /// - `BoltError::Other` if any key is negative (violates Arrow's
+    ///   DictionaryArray invariants).
+    pub fn from_dictionary_array(
+        arr: &arrow_array::DictionaryArray<arrow_array::types::Int32Type>,
+    ) -> BoltResult<Self> {
+        use arrow_array::{Array, Int32Array};
+        use crate::error::BoltError;
+
+        let dict_vals = arr
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                BoltError::Type(format!(
+                    "DictionaryArray has non-Utf8 value type {:?}",
+                    arr.values().data_type()
+                ))
+            })?;
+        // Copy values into an owned Vec<String>. Dictionary-level NULLs
+        // (rare; means the dict itself has a null entry) become empty
+        // strings — row-level NULLs are tracked through the keys array.
+        let mut dictionary: Vec<String> = Vec::with_capacity(dict_vals.len());
+        for i in 0..dict_vals.len() {
+            if dict_vals.is_null(i) {
+                dictionary.push(String::new());
+            } else {
+                dictionary.push(dict_vals.value(i).to_string());
+            }
+        }
+        // i32 ceiling guard — mirrors `DictionaryColumn::from_string_array`.
+        if dictionary.len().saturating_add(1) > i32::MAX as usize {
+            return Err(BoltError::Other(format!(
+                "dictionary overflow: more than {} unique strings (i32 index space)",
+                i32::MAX
+            )));
+        }
+
+        // Shift keys by +1 so slot 0 reserves NULL; NULL rows land at 0.
+        let keys_arr: &Int32Array = arr.keys();
+        let n_rows = keys_arr.len();
+        let mut indices: Vec<i32> = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            if keys_arr.is_null(i) {
+                indices.push(0);
+            } else {
+                let k = keys_arr.value(i);
+                if k < 0 {
+                    return Err(BoltError::Other(format!(
+                        "negative dictionary key {} at row {} — Arrow \
+                         DictionaryArray invariants forbid negative keys",
+                        k, i
+                    )));
+                }
+                indices.push(k + 1);
+            }
+        }
+        let device_indices = crate::cuda::GpuVec::<i32>::from_slice(&indices)?;
+        let inner = DictionaryColumn {
+            dictionary,
+            indices: device_indices,
+            n_rows,
+        };
+        Ok(Self::I32(inner))
+    }
+
     /// Plan dtype of the index column. Drives the engine's `__idx_<col>`
     /// schema injection and any per-column kernel-arg dispatch.
     pub fn index_dtype(&self) -> DataType {
