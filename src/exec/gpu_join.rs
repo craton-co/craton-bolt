@@ -2486,6 +2486,30 @@ fn hash_rows_in_parallel(arr: &StringArray) -> BoltResult<Vec<u64>> {
         return Ok(Vec::new());
     }
 
+    // **Stage 6 (GJ)** — device-hash auto-route. For very-large inputs the
+    // GPU's per-thread hash over `(offsets, values)` beats spinning up host
+    // threads + walking u8 buffers. The kernel produces byte-identical
+    // hashes (same FNV+splitmix sequence as the host path), so the
+    // output is a drop-in substitute. On any failure (no CUDA context,
+    // OOM, kernel launch error) we fall through to the host path.
+    //
+    // Threshold tuned at `STREAMING_INTERN_DEVICE_HASH_THRESHOLD`; below
+    // it the kernel-launch + d2h fixed cost dominates and the host
+    // parallel path wins.
+    if n >= STREAMING_INTERN_DEVICE_HASH_THRESHOLD {
+        match compute_device_string_hashes(arr) {
+            Ok(hashes) => return Ok(hashes),
+            Err(e) => {
+                log::debug!(
+                    "gpu_join: device-hash failed on {} rows, falling back to host \
+                     parallel hash: {}",
+                    n,
+                    e
+                );
+            }
+        }
+    }
+
     // Worker count: cap at 8 threads. Higher worker counts hurt for
     // medium-sized joins (the kernel-launch + thread-spawn fixed cost
     // dominates). Below STREAMING_INTERN_PARALLEL_THRESHOLD we don't reach

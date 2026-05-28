@@ -1,0 +1,67 @@
+name: DCO
+
+on:
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  dco-check:
+    name: DCO Sign-off Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # Inline DCO verification: scan every commit in the PR range and
+      # require a `Signed-off-by:` trailer in each commit message body.
+      #
+      # We deliberately avoid third-party actions here (e.g.
+      # tim-actions/dco@v1.1.0) because we cannot SHA-pin them with a
+      # verified-by-us hash from this environment. If a trusted SHA pin
+      # is added later, this step can be replaced with:
+      #
+      #   uses: tim-actions/dco@<verified-sha>  # v1.1.0
+      #
+      # Required by CONTRIBUTING.md + PULL_REQUEST_TEMPLATE.md (DCO 1.1).
+      - name: Verify DCO sign-off on every commit
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$BASE_REF" --depth=0 || git fetch origin "$BASE_REF"
+          RANGE="origin/${BASE_REF}..${HEAD_SHA}"
+          echo "Checking DCO sign-off for commits in: $RANGE"
+
+          missing=0
+          # Iterate commit SHAs in the PR range (oldest first).
+          for sha in $(git rev-list --reverse "$RANGE"); do
+            # Skip merge commits — their sign-off is not meaningful.
+            parents=$(git rev-list --parents -n 1 "$sha" | wc -w)
+            if [ "$parents" -gt 2 ]; then
+              echo "skip merge commit $sha"
+              continue
+            fi
+            # A valid trailer looks like: Signed-off-by: Name <email@example.com>
+            if git log -1 --format=%B "$sha" \
+                | grep -Eq '^Signed-off-by: .+ <[^>]+>$'; then
+              echo "ok   $sha"
+            else
+              subject=$(git log -1 --format=%s "$sha")
+              echo "FAIL $sha  $subject"
+              missing=$((missing + 1))
+            fi
+          done
+
+          if [ "$missing" -gt 0 ]; then
+            echo ""
+            echo "::error::$missing commit(s) missing 'Signed-off-by:' trailer."
+            echo "Fix locally with:  git commit --amend --signoff   (or)  git rebase --signoff origin/${BASE_REF}"
+            echo "See CONTRIBUTING.md and the DCO file at the repo root."
+            exit 1
+          fi
+
+          echo "All commits in $RANGE carry a valid Signed-off-by trailer."

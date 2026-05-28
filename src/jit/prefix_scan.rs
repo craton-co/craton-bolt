@@ -158,10 +158,10 @@ pub fn compile_prefix_scan_kernel() -> BoltResult<String> {
     // -------- Load this thread's mask byte (0 if past the end). Treat any
     // non-zero byte as "keep" by emitting (m != 0) ? 1 : 0 to make the scan
     // robust to predicate kernels that emit truthy values other than 1.
-    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r5, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra AFTER_LOAD;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd3, %r3, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd3, %r3, 1;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd4, %rd0, %rd3;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u8 %rs0, [%rd4];").map_err(write_err)?;
     writeln!(ptx, "\tcvt.u32.u16 %r6, %rs0;").map_err(write_err)?;
@@ -186,7 +186,7 @@ pub fn compile_prefix_scan_kernel() -> BoltResult<String> {
         off = shared_bytes_per_buf
     )
     .map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd7, %r2, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd7, %r2, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd8, %rd5, %rd7;").map_err(write_err)?; // ping addr
     writeln!(ptx, "\tadd.s64 %rd9, %rd6, %rd7;").map_err(write_err)?; // pong addr
     writeln!(ptx, "\tst.shared.u32 [%rd8], %r5;").map_err(write_err)?;
@@ -252,9 +252,9 @@ pub fn compile_prefix_scan_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tsub.s32 %r11, %r10, %r5;").map_err(write_err)?;
 
     // -------- Write exclusive scan to local_indices[gid] (only in-range).
-    writeln!(ptx, "\tsetp.ge.s32 %p5, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p5, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra AFTER_LOCAL_STORE;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd12, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd12, %r3, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd13, %rd1, %rd12;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u32 [%rd13], %r11;").map_err(write_err)?;
     writeln!(ptx, "AFTER_LOCAL_STORE:").map_err(write_err)?;
@@ -272,7 +272,7 @@ pub fn compile_prefix_scan_kernel() -> BoltResult<String> {
     )
     .map_err(write_err)?;
     writeln!(ptx, "\t@%p6 bra DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd14, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd14, %r0, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u32 [%rd15], %r10;").map_err(write_err)?;
 
@@ -351,7 +351,7 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(ptx, "\tld.param.u32 %r4, [{}_param_5];", entry).map_err(write_err)?;
     // Bail out-of-range.
-    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // Globalize the five pointer params.

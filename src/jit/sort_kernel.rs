@@ -505,10 +505,10 @@ fn emit_multikey_multilaunch(
     writeln!(p, "\tld.param.u32 %r1, [{entry}_param_{}];", p_mask).map_err(write_err)?;
 
     // -- OOB + paired-skip ---------------------------------------------
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r2;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r2;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
     writeln!(p, "\txor.b32 %r7, %r3, %r1;").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.s32 %p1, %r3, %r7;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p1, %r3, %r7;").map_err(write_err)?;
     writeln!(p, "\t@%p1 bra DONE;").map_err(write_err)?;
 
     // asc_block_bit = (tid >> stage) & 1; %p2 = (asc_block_bit == 0)
@@ -563,9 +563,9 @@ fn emit_multikey_multilaunch(
     )
     .map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd40, %rd40;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd41, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd41, %r3, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd41, %rd40, %rd41;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd42, %r7, 4;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd42, %r7, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd42, %rd40, %rd42;").map_err(write_err)?;
     writeln!(p, "\tld.global.u32 %r11, [%rd41];").map_err(write_err)?;
     writeln!(p, "\tld.global.u32 %r12, [%rd42];").map_err(write_err)?;
@@ -834,9 +834,9 @@ fn emit_global_key_load(
     let (self_reg, part_reg) = key_regs(ki, k.dtype);
     writeln!(p, "\tld.param.u64 %rd30, [{entry}_param_{}];", key_param_idx).map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd30, %rd30;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd31, %r3, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd31, %r3, {key_w};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd32, %rd30, %rd31;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd33, %r7, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd33, %r7, {key_w};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd34, %rd30, %rd33;").map_err(write_err)?;
     writeln!(p, "\tld.global.{} {}, [%rd32];", flavour.ld_st_suffix, self_reg).map_err(write_err)?;
     writeln!(p, "\tld.global.{} {}, [%rd34];", flavour.ld_st_suffix, part_reg).map_err(write_err)?;
@@ -853,9 +853,9 @@ fn emit_key_swap(p: &mut String, entry: &str, ki: usize, k: &KeyDesc) -> BoltRes
     // compares; recomputing keeps each key's swap block self-contained).
     writeln!(p, "\tld.param.u64 %rd35, [{entry}_param_{}];", key_param_idx).map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd35, %rd35;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd36, %r3, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd36, %r3, {key_w};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd37, %rd35, %rd36;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd38, %r7, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd38, %r7, {key_w};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd39, %rd35, %rd38;").map_err(write_err)?;
     // Re-read; we lost the registers between compare blocks for later keys.
     writeln!(p, "\tld.global.{} {}, [%rd37];", flavour.ld_st_suffix, self_reg).map_err(write_err)?;
@@ -970,13 +970,13 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
     for (ki, k) in spec.keys.iter().enumerate() {
         if k.nullable {
             writeln!(p, "\tmov.u64 %rd0, sh_v{};", ki).map_err(write_err)?;
-            writeln!(p, "\tmul.wide.s32 %rd1, %r3, 4;").map_err(write_err)?;
+            writeln!(p, "\tmul.wide.u32 %rd1, %r3, 4;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
             writeln!(p, "\t@%p_skip st.shared.u32 [%rd2], 0;").map_err(write_err)?;
         }
     }
     writeln!(p, "\tmov.u64 %rd0, sh_pad;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(p, "\t@%p_skip st.shared.u32 [%rd2], 0;").map_err(write_err)?;
     writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
@@ -987,7 +987,7 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
         // Load from global.
         writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_{}];", ki * 2).map_err(write_err)?;
         writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-        writeln!(p, "\tmul.wide.s32 %rd1, %r3, {kw};").map_err(write_err)?;
+        writeln!(p, "\tmul.wide.u32 %rd1, %r3, {kw};").map_err(write_err)?;
         writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
         let (self_reg, _) = key_regs(ki, k.dtype);
         writeln!(p, "\t@%p_in ld.global.{} {}, [%rd2];", flavour.ld_st_suffix, self_reg)
@@ -1046,7 +1046,7 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
 
     // Identity index in shmem
     writeln!(p, "\tmov.u64 %rd9, sh_idx;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd10, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd10, %r3, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd11, %rd9, %rd10;").map_err(write_err)?;
     writeln!(p, "\t@%p_in st.shared.u32 [%rd11], %r3;").map_err(write_err)?;
 
@@ -1066,12 +1066,12 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
             // partner = tid XOR mask
             writeln!(p, "\txor.b32 %r7, %r3, {};", mask).map_err(write_err)?;
             // skip if tid >= partner (paired-skip)
-            writeln!(p, "\tsetp.ge.s32 %p1, %r3, %r7;").map_err(write_err)?;
+            writeln!(p, "\tsetp.ge.u32 %p1, %r3, %r7;").map_err(write_err)?;
             // also skip if tid >= n_pow2 (oob)
-            writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r2;").map_err(write_err)?;
+            writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r2;").map_err(write_err)?;
             writeln!(p, "\tor.pred %p_skip, %p0, %p1;").map_err(write_err)?;
             // also skip if partner >= n_pow2 (when shmem holds a padded slot)
-            writeln!(p, "\tsetp.ge.s32 %p_pgt, %r7, %r2;").map_err(write_err)?;
+            writeln!(p, "\tsetp.ge.u32 %p_pgt, %r7, %r2;").map_err(write_err)?;
             writeln!(p, "\tor.pred %p_skip, %p_skip, %p_pgt;").map_err(write_err)?;
 
             // asc_block_bit = (tid >> stage) & 1
@@ -1104,9 +1104,9 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
             }
             // indices
             writeln!(p, "\tmov.u64 %rd9, sh_idx;").map_err(write_err)?;
-            writeln!(p, "\tmul.wide.s32 %rd10, %r3, 4;").map_err(write_err)?;
+            writeln!(p, "\tmul.wide.u32 %rd10, %r3, 4;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd11, %rd9, %rd10;").map_err(write_err)?;
-            writeln!(p, "\tmul.wide.s32 %rd12, %r7, 4;").map_err(write_err)?;
+            writeln!(p, "\tmul.wide.u32 %rd12, %r7, 4;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd13, %rd9, %rd12;").map_err(write_err)?;
             writeln!(p, "\tld.shared.u32 %r13, [%rd11];").map_err(write_err)?;
             writeln!(p, "\tld.shared.u32 %r14, [%rd13];").map_err(write_err)?;
@@ -1128,7 +1128,7 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
     // its own copy and uses the indices to gather.
     writeln!(p, "\tld.param.u64 %rd20, [{entry}_param_{}];", MAX_SORT_KEYS * 2).map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd20, %rd20;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd21, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd21, %r3, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd22, %rd20, %rd21;").map_err(write_err)?;
     writeln!(p, "\tmov.u64 %rd23, sh_idx;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd24, %rd23, %rd21;").map_err(write_err)?;
@@ -1155,10 +1155,10 @@ fn emit_padded_route_shmem(p: &mut String, stage: u32, substage: u32) -> BoltRes
         .map_err(write_err)?;
     // Read orig indices for self and partner from sh_idx.
     writeln!(p, "\tmov.u64 %rd33, sh_idx;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd34, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd34, %r3, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd34, %rd33, %rd34;").map_err(write_err)?;
     writeln!(p, "\tld.shared.u32 %r25, [%rd34];").map_err(write_err)?; // orig_self
-    writeln!(p, "\tmul.wide.s32 %rd35, %r7, 4;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd35, %r7, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd35, %rd33, %rd35;").map_err(write_err)?;
     writeln!(p, "\tld.shared.u32 %r26, [%rd35];").map_err(write_err)?; // orig_partner
 
@@ -1222,10 +1222,10 @@ fn emit_shmem_key_compare(
         // already read by `emit_padded_route_shmem`; reload defensively in
         // case a future refactor reorders the blocks).
         writeln!(p, "\tmov.u64 %rd15, sh_idx;").map_err(write_err)?;
-        writeln!(p, "\tmul.wide.s32 %rd16, %r3, 4;").map_err(write_err)?;
+        writeln!(p, "\tmul.wide.u32 %rd16, %r3, 4;").map_err(write_err)?;
         writeln!(p, "\tadd.s64 %rd16, %rd15, %rd16;").map_err(write_err)?;
         writeln!(p, "\tld.shared.u32 %r20, [%rd16];").map_err(write_err)?; // orig_self
-        writeln!(p, "\tmul.wide.s32 %rd17, %r7, 4;").map_err(write_err)?;
+        writeln!(p, "\tmul.wide.u32 %rd17, %r7, 4;").map_err(write_err)?;
         writeln!(p, "\tadd.s64 %rd17, %rd15, %rd17;").map_err(write_err)?;
         writeln!(p, "\tld.shared.u32 %r21, [%rd17];").map_err(write_err)?; // orig_partner
 
@@ -1278,10 +1278,10 @@ fn emit_shmem_key_compare(
 
     // Value compare from shmem.
     writeln!(p, "\tmov.u64 %rd18, sh_k{};", ki).map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd19, %r3, {kw};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd19, %r3, {kw};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd19, %rd18, %rd19;").map_err(write_err)?;
     writeln!(p, "\tld.shared.{} {}, [%rd19];", flavour.ld_st_suffix, self_reg).map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd20, %r7, {kw};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd20, %r7, {kw};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd20, %rd18, %rd20;").map_err(write_err)?;
     writeln!(p, "\tld.shared.{} {}, [%rd20];", flavour.ld_st_suffix, part_reg).map_err(write_err)?;
 
@@ -1313,9 +1313,9 @@ fn emit_shmem_key_swap(p: &mut String, ki: usize, k: &KeyDesc) -> BoltResult<()>
     let kw = flavour.byte_width as i64;
     let (self_reg, part_reg) = key_regs(ki, k.dtype);
     writeln!(p, "\tmov.u64 %rd25, sh_k{};", ki).map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd26, %r3, {kw};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd26, %r3, {kw};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd26, %rd25, %rd26;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd27, %r7, {kw};").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd27, %r7, {kw};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd27, %rd25, %rd27;").map_err(write_err)?;
     writeln!(p, "\tld.shared.{} {}, [%rd26];", flavour.ld_st_suffix, self_reg).map_err(write_err)?;
     writeln!(p, "\tld.shared.{} {}, [%rd27];", flavour.ld_st_suffix, part_reg).map_err(write_err)?;
@@ -1475,8 +1475,8 @@ mod tests {
     fn ptx_has_n_pow2_oob_guard() {
         let ptx = compile_sort_kernel_spec(&single_key_spec(DataType::Int32, SortDirection::Asc))
             .unwrap();
-        // The OOB test: setp.ge.s32 <pred>, <tid>, <n_pow2>; some return path.
-        assert!(ptx.contains("setp.ge.s32"), "missing OOB compare against n_pow2");
+        // The OOB test: setp.ge.u32 <pred>, <tid>, <n_pow2>; some return path.
+        assert!(ptx.contains("setp.ge.u32"), "missing OOB compare against n_pow2");
     }
 
     /// The kernel must XOR tid against substage_mask to compute the partner

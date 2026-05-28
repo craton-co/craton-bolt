@@ -244,7 +244,7 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
         KEYS_KERNEL_ENTRY
     )
     .map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // Stage C: optional packed-bit key-validity gate. Skip the insert
@@ -300,7 +300,7 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     )
     .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -485,7 +485,7 @@ fn compile_groupby_agg_kernel_inner(
         AGG_KERNEL_ENTRY
     )
     .map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // Stage C: optional packed-bit value-validity gate. Skip the atomic
@@ -541,7 +541,7 @@ fn compile_groupby_agg_kernel_inner(
     )
     .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -599,7 +599,7 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "\tcvta.to.global.u64 %rd6, %rd6;").map_err(write_err)?;
     writeln!(
         ptx,
-        "\tmul.wide.s32 %rd7, %r3, {bytes};",
+        "\tmul.wide.u32 %rd7, %r3, {bytes};",
         bytes = elem_bytes
     )
     .map_err(write_err)?;

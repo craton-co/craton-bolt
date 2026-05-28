@@ -294,19 +294,30 @@ impl Engine {
     /// `tables` for the perf caveat.
     ///
     /// Subsequent batches MUST share the schema of the first batch; mismatched
-    /// schemas surface a `Plan` error here rather than at query time. The
-    /// dictionary registry is built from the first batch only — appended
-    /// batches with unseen Utf8 values are still queryable, but the string-
-    /// literal rewriter can only match values present in batch 0. (Refreshing
-    /// dictionaries per append is a 0.3 goal.)
+    /// schemas surface a `Plan` error here rather than at query time.
+    ///
+    /// Dictionaries are **unioned across all registered batches** (review C10):
+    /// after each append, the dict registry is rebuilt against the
+    /// concatenated host batches so the string-literal rewriter sees every
+    /// dictionary value that exists in any batch. Without this union, a query
+    /// like `WHERE s = 'literal_only_in_batch_2'` would constant-fold to
+    /// `Bool(false)` against batch 0's dictionary and silently return zero
+    /// rows even though batch 2 contains matching rows. The GPU index column
+    /// is rebuilt lazily on the next query via `ensure_gpu_table` (which
+    /// scans the same concatenated batch through `GpuTable::from_record_batch`),
+    /// so the registry's dictionary and the GPU's per-row indices stay aligned
+    /// — both are built from the same concat-batch input, in the same
+    /// first-occurrence order.
     ///
     /// Performance: this method does NOT re-upload anything to the GPU. It
-    /// only pushes the host-side `RecordBatch` and marks the corresponding
-    /// `gpu_tables` slot dirty (`None`). The combined upload of the
-    /// concatenated table happens lazily, inside the next query that touches
-    /// this table, via `ensure_gpu_table`. Without this, a streaming-append
-    /// workload would re-upload the *entire* concatenated history on every
-    /// append — `1+2+…+N = N(N+1)/2` batches' worth of bytes for N appends.
+    /// only pushes the host-side `RecordBatch`, rebuilds the host-side
+    /// dictionary against the materialised concat, and marks the
+    /// corresponding `gpu_tables` slot dirty (`None`). The combined GPU
+    /// upload of the concatenated table happens lazily, inside the next
+    /// query that touches this table, via `ensure_gpu_table`. Without this,
+    /// a streaming-append workload would re-upload the *entire* concatenated
+    /// history on every append — `1+2+…+N = N(N+1)/2` batches' worth of
+    /// bytes for N appends.
     pub fn register_batch(
         &mut self,
         name: &str,
@@ -330,18 +341,35 @@ impl Engine {
                 }
             }
             existing.push(batch);
-            // Stage 6: re-evaluate per-column nullability against the
-            // *concatenated* view — a previously null-free column may have
-            // just gained a null in the appended batch. We materialise here
-            // ONLY to read null counts; the GPU upload itself stays lazy
-            // (see below) so we don't pay the O(N²) PCIe upload cost.
+            // Review C10: rebuild the dict registry against the *concatenated*
+            // batches so the string-literal rewriter sees every dict value
+            // from every batch — not just batch 0. Without this, a literal
+            // that lives only in an appended batch resolves to `None` in the
+            // rewriter and the predicate folds to `Bool(false)`, silently
+            // dropping every otherwise-matching row in the appended batch.
+            //
+            // We also re-extend the provider schema in case rebuilding flipped
+            // any `__idx_<col>` between i32 and i64 (the union may push a
+            // column over the i64 cardinality threshold). And we re-evaluate
+            // per-column nullability against the same concatenated view — a
+            // previously null-free column may have just gained a null.
             let concatenated = self.materialize_table(name)?;
+            self.dict_registry.unregister_table(name);
+            self.dict_registry
+                .register_table(name.to_string(), &concatenated)?;
+            let base_schema =
+                arrow_schema_to_plan_schema(concatenated.schema().as_ref())?;
+            let extended = self.dict_registry.extended_schema(name, &base_schema);
+            self.provider.register(name.to_string(), extended);
             propagate_column_nullability(&mut self.provider, name, &concatenated);
             // Mark the GPU-resident copy dirty. The next query that hits this
-            // table will rebuild it from the concatenated host batches. We
-            // explicitly insert `None` (rather than `remove`) so the entry's
-            // existence still signals "this table has been registered" — keeps
-            // a future audit / introspection path simple.
+            // table will rebuild it from the concatenated host batches via
+            // `GpuTable::from_record_batch`, which scans the same input and
+            // therefore produces dictionary indices that line up with the
+            // registry's just-rebuilt host dictionary. We explicitly insert
+            // `None` (rather than `remove`) so the entry's existence still
+            // signals "this table has been registered" — keeps a future
+            // audit / introspection path simple.
             self.gpu_tables.borrow_mut().insert(name.to_string(), None);
             Ok(())
         } else {
@@ -1824,6 +1852,73 @@ mod tests {
             Some(1),
             "null_count must reflect Arrow validity bitmap"
         );
+    }
+
+    /// Review C10 regression: `register_batch` must union dictionaries across
+    /// all registered batches so the string-literal rewriter can resolve
+    /// literals that only appear in an appended batch.
+    ///
+    /// Before this fix, `register_batch` left the dict registry frozen at
+    /// batch 0's contents. A subsequent `WHERE s = 'c'` (where `'c'` is only
+    /// in batch 1's dictionary) folded to `Bool(false)` against batch 0's
+    /// dictionary and silently dropped every otherwise-matching row in
+    /// batch 1 — a classic silent-wrong-result bug.
+    ///
+    /// The fix rebuilds the dict registry against the concatenated batches
+    /// after each append, so the rewriter sees the union dict containing
+    /// every legal literal. This test exercises the canonical two-batch
+    /// scenario:
+    ///   * batch 0 has dict values ["a", "b"]
+    ///   * batch 1 has dict values ["a", "b", "c"]
+    ///   * `WHERE s = 'c'` must return the rows from batch 1 whose `s = "c"`.
+    #[test]
+    #[ignore = "requires CUDA device - dictionary construction uploads to GPU"]
+    fn c10_register_batch_unions_dictionaries_across_batches() {
+        use arrow_array::StringArray;
+
+        let mut engine = Engine::new().expect("ctx");
+
+        // Batch 0: dict values {"a", "b"}; no row holds "c".
+        let s0: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "a", "b"]));
+        let v0: ArrayRef = Arc::new(Int64Array::from(vec![10_i64, 11, 12, 13]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("s", ArrowDataType::Utf8, false),
+            ArrowField::new("v", ArrowDataType::Int64, false),
+        ]));
+        let b0 = RecordBatch::try_new(schema.clone(), vec![s0, v0]).expect("batch 0");
+
+        // Batch 1: dict values {"a", "b", "c"} — "c" appears only here.
+        let s1: ArrayRef = Arc::new(StringArray::from(vec!["a", "c", "b", "c"]));
+        let v1: ArrayRef = Arc::new(Int64Array::from(vec![20_i64, 21, 22, 23]));
+        let b1 = RecordBatch::try_new(schema, vec![s1, v1]).expect("batch 1");
+
+        engine.register_batch("t", b0).expect("batch 0");
+        engine.register_batch("t", b1).expect("batch 1");
+
+        // Pre-fix: the rewriter would constant-fold `s = 'c'` to Bool(false)
+        // because batch 0's dict never observed "c"; result is zero rows.
+        // Post-fix: the dict registry is rebuilt against the concatenated
+        // batches so "c" is in the union dict, and the predicate matches
+        // the two rows in batch 1 where s = "c" (indices 1, 3 → v = 21, 23).
+        let h = engine
+            .sql("SELECT v FROM t WHERE s = 'c'")
+            .expect("execute");
+        let out = h.record_batch();
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "literal that lives only in batch 1 must match its two rows; \
+             got {} (zero rows is the pre-fix silent-wrong-result bug)",
+            out.num_rows()
+        );
+        let actual = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("v is Int64");
+        let mut got: Vec<i64> = (0..actual.len()).map(|i| actual.value(i)).collect();
+        got.sort();
+        assert_eq!(got, vec![21, 23]);
     }
 
     /// Mirror of the test above for a NULL-free column — provider must

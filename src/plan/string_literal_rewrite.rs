@@ -939,6 +939,56 @@ mod tests {
         }
     }
 
+    /// Review C10: when the engine rebuilds the dict registry across all
+    /// registered batches (so the registry holds the union dict), the
+    /// rewriter must resolve a literal that lives only in an appended
+    /// batch — not constant-fold it to `Bool(false)`.
+    ///
+    /// This is the host-side counterpart to
+    /// `c10_register_batch_unions_dictionaries_across_batches` in
+    /// `engine.rs`. We can't construct a real `DictionaryColumnAny` without
+    /// CUDA, but the rewriter sees the union dict purely through the
+    /// `LiteralResolver` trait — so a `MockResolver` populated with the
+    /// expected union (entries from both "batches") is the exact same input
+    /// the post-fix engine produces. If the resolver knew only batch 0's
+    /// values, the predicate would fold to `Bool(false)`; the assertion
+    /// below would fail and surface the silent-wrong-result regression.
+    #[test]
+    fn c10_rewriter_resolves_literal_from_unioned_dict() {
+        // Pre-fix engine state: registry holds only batch 0 → resolver
+        // knows {"a": 1, "b": 2}. Demonstrates the broken behaviour:
+        // `s = 'c'` folds to `Bool(false)`.
+        let pre_fix = MockResolver::new()
+            .with_i32("s", "a", 1)
+            .with_i32("s", "b", 2);
+        let folded =
+            rewrite_expr_with(&col("s").eq(lit("c")), &pre_fix).unwrap();
+        assert!(
+            matches!(folded, Expr::Literal(Literal::Bool(false))),
+            "pre-fix: missing union dict folds to Bool(false) — silent-wrong-result"
+        );
+
+        // Post-fix engine state: registry rebuilt from union of batch 0
+        // (dict {"a","b"}) and batch 1 (dict {"a","b","c"}); resolver
+        // knows {"a": 1, "b": 2, "c": 3}.
+        let post_fix = MockResolver::new()
+            .with_i32("s", "a", 1)
+            .with_i32("s", "b", 2)
+            .with_i32("s", "c", 3);
+        let rewritten =
+            rewrite_expr_with(&col("s").eq(lit("c")), &post_fix).unwrap();
+        match rewritten {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Eq);
+                assert_column(&left, "__idx_s");
+                assert_int32_lit(&right, 3);
+            }
+            other => panic!(
+                "post-fix: union dict must resolve 'c' to its index, got {other:?}"
+            ),
+        }
+    }
+
     /// Regression: `extract_col_and_string_lit` must peel `Alias` wrappers
     /// off either operand. Without this, DataFrame-built predicates like
     /// `(col("region") AS "r").eq(lit("US"))` fall through the match arm

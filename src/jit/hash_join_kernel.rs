@@ -458,7 +458,7 @@ pub fn compile_build_kernel() -> BoltResult<String> {
     writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_3];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // cap and mask = cap - 1.
@@ -471,7 +471,7 @@ pub fn compile_build_kernel() -> BoltResult<String> {
     // Load key for this row.
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -627,7 +627,7 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_6];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // cap and mask = cap - 1.
@@ -643,7 +643,7 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     // Load probe key.
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -793,7 +793,7 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_5];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // cap and mask = cap - 1.
@@ -804,7 +804,7 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
     // Load this row's key.
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -868,7 +868,7 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
     // Atomic exchange: prev_head = head[slot]; head[slot] = tid.
     writeln!(p, "\tatom.global.exch.b32 %r22, [%rd10], %r3;").map_err(write_err)?;
     // next_idx[tid] = prev_head.
-    writeln!(p, "\tmul.wide.s32 %rd11, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd11, %r3, 4;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd12, %rd15, %rd11;").map_err(write_err)?;
     writeln!(p, "\tst.global.u32 [%rd12], %r22;").map_err(write_err)?;
 
@@ -938,7 +938,7 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_8];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // cap + mask, out_capacity, build_n_rows.
@@ -951,7 +951,7 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     // Load probe key.
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -1106,7 +1106,7 @@ pub fn compile_unmatched_build_kernel() -> BoltResult<String> {
     writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_3];").map_err(write_err)?; // build_n_rows
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // Load matched-bitmap word for this row.
@@ -1276,7 +1276,7 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_5];").map_err(write_err)?; // n_probe
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     writeln!(p, "\tld.param.u32 %r5, [{entry}_param_6];").map_err(write_err)?; // cap
@@ -1287,7 +1287,7 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     // Load probe key.
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -1444,7 +1444,7 @@ pub fn compile_build_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_2];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // cap, mask, max_probes.
@@ -1455,7 +1455,7 @@ pub fn compile_build_aos_kernel() -> BoltResult<String> {
     // Load this row's key.
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -1607,7 +1607,7 @@ pub fn compile_string_hash_kernel_with_offsets(
     writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_3];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // Load offsets[tid] and offsets[tid + 1]. **Stage 6 (GJ)** — the
@@ -1622,13 +1622,13 @@ pub fn compile_string_hash_kernel_with_offsets(
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     match width {
         StringOffsetWidth::I32 => {
-            writeln!(p, "\tmul.wide.s32 %rd1, %r3, 4;").map_err(write_err)?;
+            writeln!(p, "\tmul.wide.u32 %rd1, %r3, 4;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
             writeln!(p, "\tld.global.s32 %r5, [%rd2];").map_err(write_err)?;     // start
             writeln!(p, "\tld.global.s32 %r6, [%rd2 + 4];").map_err(write_err)?; // end
         }
         StringOffsetWidth::I64 => {
-            writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+            writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
             // i64 offsets — load into b64 scratch then narrow to b32 cursor.
             writeln!(p, "\tld.global.s64 %rd9, [%rd2];").map_err(write_err)?;
@@ -1694,7 +1694,7 @@ pub fn compile_string_hash_kernel_with_offsets(
     // out_hashes[tid] = h
     writeln!(p, "\tld.param.u64 %rd6, [{entry}_param_2];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd6, %rd6;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd7, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd7, %r3, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd8, %rd6, %rd7;").map_err(write_err)?;
     writeln!(p, "\tst.global.u64 [%rd8], %rh0;").map_err(write_err)?;
 
@@ -1808,7 +1808,7 @@ mod tests {
     #[test]
     fn build_ptx_has_oob_guard() {
         let ptx = compile_build_kernel().unwrap();
-        assert!(ptx.contains("setp.ge.s32"), "missing OOB compare against n_rows");
+        assert!(ptx.contains("setp.ge.u32"), "missing OOB compare against n_rows");
         assert!(ptx.contains("bra DONE"), "missing branch to DONE label");
         assert!(ptx.contains("DONE:"), "missing DONE label");
     }
@@ -2296,7 +2296,7 @@ mod tests {
     #[test]
     fn string_hash_ptx_has_oob_guard() {
         let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
-        assert!(ptx.contains("setp.ge.s32 %p0, %r3, %r4;"));
+        assert!(ptx.contains("setp.ge.u32 %p0, %r3, %r4;"));
         assert!(ptx.contains("DONE:"));
     }
 }

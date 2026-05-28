@@ -38,12 +38,11 @@ use std::collections::HashMap;
 //
 // These MUST match the GPU partition kernel exactly — a mismatch would mean
 // the oracle is checking the wrong reduction order and the cross-validation
-// would silently let real bugs through.
-
-/// Number of hash partitions. 1024 is the Tier-2 default in
-/// `docs/GROUPBY_PERF.md`: for 1M groups it yields ~1000 keys per partition,
-/// which fits comfortably in a Tier-1 block-local accumulator.
-const NUM_PARTITIONS: u32 = 1024;
+// would silently let real bugs through. We import `NUM_PARTITIONS` from the
+// crate's `__test_only_partition_offsets` re-export rather than hard-coding
+// the value so a future change to the kernel constant cannot drift the
+// oracle out from under us (review C1).
+use craton_bolt::__test_only_partition_offsets::NUM_PARTITIONS;
 
 /// Knuth-style multiplicative constant (golden ratio fraction of 2^32).
 /// This is the same constant used by the partition kernel.
@@ -293,11 +292,13 @@ fn fixture_is_deterministic() {
 #[test]
 fn partition_function_distributes_evenly() {
     // Hash 1M sequential keys. The multiplicative-by-odd hash is a bijection
-    // on the low 10 bits, so for n=1_000_000 (~976.5 keys per partition) the
-    // ideal load is 976 or 977 per partition — wildly tighter than the
-    // [900, 1100] bound below. We assert the loose bound so any future
-    // change to the hash constant that broke distribution would still fail
-    // here without false alarms on legitimate variance.
+    // on the low log2(NUM_PARTITIONS) bits, so the ideal load is
+    // `N / NUM_PARTITIONS` per partition. We assert a generous +/-15 % band
+    // around the ideal so any future change to the hash constant that
+    // broke distribution would still fail here without false alarms on
+    // legitimate variance. The band is computed from `NUM_PARTITIONS` so
+    // it auto-tracks the kernel constant (review C1 — see
+    // `__test_only_partition_offsets`).
     const N: u32 = 1_000_000;
     let mut counts = vec![0_u32; NUM_PARTITIONS as usize];
     for k in 0..N as i32 {
@@ -310,9 +311,12 @@ fn partition_function_distributes_evenly() {
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
     assert_eq!(total, N as u64, "every key must land in exactly one partition");
 
+    let ideal = N / NUM_PARTITIONS;
+    let lo = ideal - ideal / 7; // ~ -14 %
+    let hi = ideal + ideal / 7; // ~ +14 %
     assert!(
-        min >= 900 && max <= 1100,
-        "partition load out of bounds: min={min} max={max} (expected [900, 1100])"
+        min >= lo && max <= hi,
+        "partition load out of bounds: min={min} max={max} (expected [{lo}, {hi}], ideal={ideal})"
     );
 }
 

@@ -13,7 +13,7 @@ The project's two distinguishing ideas:
 
 ## Status
 
-**Active development — v0.3.0.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (multi-tier shared-memory + hash-partitioned), `INNER JOIN`, `DISTINCT`, `ORDER BY`, `LIMIT`, `HAVING`, and `UNION [ALL]` are implemented. String predicates (`=`, `!=`, `IN` over dictionary-encoded literals) and a small set of host-callable string operations (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`) are available; string functions are not yet reachable via SQL. Production use is **not** recommended — the public API is unstable pre-1.0.
+**Active development — v0.3.0.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (multi-tier shared-memory + hash-partitioned), joins (`INNER` on GPU, `LEFT [OUTER]` / `RIGHT [OUTER]` / `FULL [OUTER]` / `CROSS` host-side or GPU as applicable), `DISTINCT`, `ORDER BY`, `LIMIT`, `HAVING`, and `UNION [ALL]` are implemented. String predicates (`=`, `!=`, `IN` over dictionary-encoded literals) and a small set of host-callable string operations (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`) are available; string functions are not yet reachable via SQL. Production use is **not** recommended — the public API is unstable pre-1.0.
 
 See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported subset.
 
@@ -204,8 +204,21 @@ craton-bolt/
 │   ├── jit/                  # PTX codegen + module loader
 │   └── exec/                 # per-shape executors + top-level Engine
 ├── tests/
-│   ├── memory_tests.rs       # CUDA-Oxide compile-fail proofs
-│   └── e2e_tests.rs          # parser/plan/PTX-shape + ignored live-GPU
+│   ├── diff_duckdb.rs            # DuckDB cross-check (ignored, live-GPU)
+│   ├── e2e_tests.rs              # parser/plan/PTX-shape + ignored live-GPU
+│   ├── gpu_join_e2e.rs           # GPU INNER JOIN end-to-end
+│   ├── joins_e2e.rs              # host-side join matrix (LEFT/RIGHT/FULL/CROSS)
+│   ├── having_test.rs            # HAVING clause end-to-end
+│   ├── memory_pool_stress.rs     # GpuVec pool allocator stress
+│   ├── memory_tests.rs           # CUDA-Oxide compile-fail proofs
+│   ├── parser_tests.rs           # SQL frontend + sqlparser coverage
+│   ├── ptx_golden_tests.rs       # PTX-string golden snapshots
+│   ├── shmem_groupby_e2e.rs      # shared-memory GROUP BY path
+│   ├── sort_e2e.rs               # ORDER BY end-to-end
+│   ├── sql_proptest.rs           # proptest fuzzing of the SQL frontend
+│   ├── tier2_groupby_e2e.rs      # hash-partitioned GROUP BY path
+│   ├── tier2_multi_sum_e2e.rs    # multi-aggregate hash-partitioned path
+│   └── tier2_twokey_e2e.rs       # two-key hash-partitioned GROUP BY
 └── benches/
     ├── query_benchmarks.rs   # criterion + Polars + CPU-ref (small dataset)
     └── olap_benchmarks.rs    # h2o.ai groupby vs Polars vs DuckDB

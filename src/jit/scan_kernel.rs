@@ -189,7 +189,7 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
         n_rows,
         b.n_rows_param_name(spec.inputs.len())
     ))?;
-    b.emit(&format!("setp.ge.s32 {}, {}, {};", pred_oob, tid, n_rows))?;
+    b.emit(&format!("setp.ge.u32 {}, {}, {};", pred_oob, tid, n_rows))?;
     b.emit(&format!("@{} bra DONE;", pred_oob))?;
 
     // -------- Load and globalize each input column base pointer.
@@ -240,10 +240,12 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     // `mask_ptr + tid`.
     let pred_phys = b.alloc.get(predicate_reg)?.to_string();
 
-    // Compute byte offset = tid * 1, sign-extend to 64 bits, add to base.
+    // Compute byte offset = tid (1-byte stride), zero-extend to 64 bits, add
+    // to base. `cvt.u64.u32` is the canonical "widen unsigned tid to b64" —
+    // simpler than `mul.wide.u32 ..., tid, 1` and avoids a multiplier slot.
     let off = b.alloc.alloc("rd");
     let addr = b.alloc.alloc("rd");
-    b.emit(&format!("mul.wide.s32 {}, {}, 1;", off, tid))?;
+    b.emit(&format!("cvt.u64.u32 {}, {};", off, tid))?;
     b.emit(&format!("add.s64 {}, {}, {};", addr, mask_ptr, off))?;
 
     // Narrow the 0/1 b32 value into a b16 temp, since PTX `st.global.u8`
@@ -329,7 +331,7 @@ fn emit_load(
     let width = byte_width(dtype)?;
     let off = b.alloc.alloc("rd");
     let addr = b.alloc.alloc("rd");
-    b.emit(&format!("mul.wide.s32 {}, {}, {};", off, tid, width))?;
+    b.emit(&format!("mul.wide.u32 {}, {}, {};", off, tid, width))?;
     b.emit(&format!(
         "add.s64 {}, {}, {};",
         addr, input_ptrs[col_idx], off
