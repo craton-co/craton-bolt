@@ -57,6 +57,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
@@ -66,6 +67,73 @@ use arrow_schema::DataType;
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::QueryHandle;
+
+/// Maximum number of distinct rows the host-side DISTINCT may accumulate
+/// before bailing. ~10M rows × ~30 bytes/key = ~300 MiB peak; deliberately
+/// conservative for the host fallback. The GPU sort-based DISTINCT will
+/// replace this; tracked as follow-up (see module doc-comment + ROADMAP.md).
+///
+/// Rationale: without this bound, `SELECT DISTINCT col FROM big_table` on a
+/// high-cardinality column allocates `n_rows × n_cols × ~24 B` of host RAM
+/// with no upper limit — a memory-DoS surface on user-controlled inputs.
+/// The cap converts that into a clean `BoltError::Other(...)` long before
+/// the OOM killer gets involved.
+///
+/// Overridable at runtime via the `CRATON_DISTINCT_HOST_MAX_ROWS` env var
+/// (parsed once on first call; see [`distinct_host_max_rows`]).
+pub(crate) const DISTINCT_HOST_MAX_ROWS: usize = 10_000_000;
+
+/// Environment variable that overrides [`DISTINCT_HOST_MAX_ROWS`] at runtime.
+/// Parsed as a base-10 `usize`; values of `0` are rejected (would disable
+/// the cap entirely and reintroduce the unbounded-growth bug). On any parse
+/// failure a `log::warn!` is emitted and the default is used.
+const DISTINCT_HOST_MAX_ROWS_ENV: &str = "CRATON_DISTINCT_HOST_MAX_ROWS";
+
+/// Latch for the per-process DISTINCT host-row cap. First call resolves
+/// the env var; subsequent calls hit the cached `usize`. Mirrors the
+/// `HASH_TABLE_BYTE_CAP_CACHE` pattern in `gpu_join.rs`.
+static DISTINCT_HOST_MAX_ROWS_CACHE: OnceLock<usize> = OnceLock::new();
+
+/// Resolve the per-process DISTINCT host-row cap. First call performs the
+/// env-var lookup; subsequent calls hit the latch. On any parse failure a
+/// one-time `log::warn!` is emitted and the compile-time default
+/// [`DISTINCT_HOST_MAX_ROWS`] is used.
+fn distinct_host_max_rows() -> usize {
+    *DISTINCT_HOST_MAX_ROWS_CACHE.get_or_init(parse_distinct_host_max_rows_env)
+}
+
+/// Pure parser for `CRATON_DISTINCT_HOST_MAX_ROWS`. Extracted from the
+/// OnceLock so callers (and tests) can exercise the parsing rules without
+/// touching the latch. Returns the compile-time default on unset / empty /
+/// unparseable / zero values, logging a warning in the unparseable / zero
+/// cases.
+fn parse_distinct_host_max_rows_env() -> usize {
+    let raw = match std::env::var(DISTINCT_HOST_MAX_ROWS_ENV) {
+        Ok(v) => v,
+        Err(_) => return DISTINCT_HOST_MAX_ROWS,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DISTINCT_HOST_MAX_ROWS;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(0) => {
+            log::warn!(
+                "distinct: {DISTINCT_HOST_MAX_ROWS_ENV}='0' would disable the host-side cap; \
+                 using default of {DISTINCT_HOST_MAX_ROWS}"
+            );
+            DISTINCT_HOST_MAX_ROWS
+        }
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "distinct: {DISTINCT_HOST_MAX_ROWS_ENV}='{trimmed}' is not a valid usize ({e}); \
+                 using default of {DISTINCT_HOST_MAX_ROWS}"
+            );
+            DISTINCT_HOST_MAX_ROWS
+        }
+    }
+}
 
 /// A column value inside a row key. Variants cover every primitive dtype
 /// the engine produces; float variants store the raw bit pattern so that
@@ -179,6 +247,16 @@ impl<'a> ColumnReader<'a> {
 /// memory. When the GPU-side DISTINCT lands it should pick up the same
 /// async memcpy + pinned D2H pattern as the projection / aggregate paths.
 pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
+    let max_rows = distinct_host_max_rows();
+    execute_distinct_with_cap(input, max_rows)
+}
+
+/// Internal entry point that lets callers (and tests) inject a cap directly,
+/// bypassing the `OnceLock`-latched env-var resolution. Production code goes
+/// through [`execute_distinct`]; tests use this to exercise the bound-exceeded
+/// path without poisoning the global latch for other tests running in the
+/// same process.
+fn execute_distinct_with_cap(input: QueryHandle, max_rows: usize) -> BoltResult<QueryHandle> {
     let batch = input.into_record_batch();
     let n_rows = batch.num_rows();
     if n_rows == 0 {
@@ -195,20 +273,48 @@ pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
         .map(|c| ColumnReader::new(c.as_ref()))
         .collect::<BoltResult<Vec<_>>>()?;
 
+    // Pre-allocate the seen-set with at most `max_rows` slots so a giant
+    // `n_rows` cannot drive a multi-GiB single allocation up front (the
+    // unbounded-growth bug this guard exists to close). The set will still
+    // grow on demand if `unique_rows` exceeds the initial capacity, but
+    // the loop body's per-row cap check fires long before that becomes a
+    // memory problem.
+    let initial_cap = n_rows.min(max_rows);
+
     // Build an owned, typed key per row and check membership against the
     // set of already-seen keys. `HashSet::insert` returns `true` iff the
     // key was not already present — i.e. iff the row is a first occurrence.
     // The freshly-built `key` is *moved* into `insert`, so on a miss it
     // lives in the set and on a hit it is dropped — exactly one
     // `Vec<RowKeyValue>` allocation per input row.
-    let mut seen: HashSet<RowKey> = HashSet::with_capacity(n_rows);
+    //
+    // TODO(perf): for the common `n_cols <= 4` case, swap `RowKey =
+    // Vec<RowKeyValue>` for an inline-then-heap small-vec shape (e.g.
+    // `enum InlineRow { Small([Option<RowKeyValue>; 4]), Heap(Vec<_>) }`).
+    // Skipped here because a custom `Hash`/`Eq` on the enum is fiddly to get
+    // right against the existing column-order semantics, and the immediate
+    // priority is closing the memory-DoS surface. Deferred until the GPU
+    // sort-based variant lands (see module doc-comment).
+    let mut seen: HashSet<RowKey> = HashSet::with_capacity(initial_cap);
     let mut mask_bits: Vec<bool> = Vec::with_capacity(n_rows);
     for row in 0..n_rows {
         let mut key: RowKey = Vec::with_capacity(n_cols);
         for reader in &readers {
             key.push(reader.value_at(row));
         }
-        mask_bits.push(seen.insert(key));
+        let was_new = seen.insert(key);
+        mask_bits.push(was_new);
+        // Resource bound: keep the set from growing without limit on
+        // high-cardinality inputs. The check is on `seen.len()` (not the
+        // input row count) so a long input full of duplicates still
+        // completes; only the *distinct* count is bounded.
+        if seen.len() > max_rows {
+            return Err(BoltError::Other(format!(
+                "DISTINCT exceeded host bound of {max_rows} distinct rows; \
+                 use the GPU sort-based variant or LIMIT the input \
+                 (override via {DISTINCT_HOST_MAX_ROWS_ENV})"
+            )));
+        }
     }
 
     let mask = BooleanArray::from(mask_bits);
@@ -489,6 +595,117 @@ mod tests {
         let out_batch = out.into_record_batch();
         assert_eq!(out_batch.num_rows(), 1);
         assert_eq!(col_to_vec(&out_batch, 0), vec![None]);
+    }
+
+    /// Resource bound, happy path: a 100-row, 1-col input with all unique
+    /// values produces the correct unique count (100) and does NOT trip the
+    /// host cap. Locks in that the cap check is `>`-not-`>=` (off-by-one
+    /// regression guard).
+    #[test]
+    fn distinct_100_row_1_col_unique_count_is_correct() {
+        let values: Vec<Option<i32>> = (0..100).map(Some).collect();
+        let batch = int32_batch(values);
+        let input = QueryHandle::from_record_batch(batch);
+        let out = execute_distinct(input).unwrap();
+        let out_batch = out.into_record_batch();
+        assert_eq!(out_batch.num_rows(), 100);
+        // First-occurrence order is the natural 0..100 sequence.
+        let expected: Vec<Option<i32>> = (0..100).map(Some).collect();
+        assert_eq!(col_to_vec(&out_batch, 0), expected);
+    }
+
+    /// Resource bound, exceeded path: with the cap set to a small value
+    /// (3), an input whose distinct count overflows the cap must fail with
+    /// the "DISTINCT exceeded host bound" error rather than allocating
+    /// without limit. Goes through the cap-injection helper so the global
+    /// `OnceLock` is untouched (and concurrent tests are unaffected).
+    #[test]
+    fn distinct_bound_exceeded_returns_clear_error() {
+        // 5 distinct values, cap of 3 — must error after the 4th unique.
+        let batch = int32_batch(vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        let input = QueryHandle::from_record_batch(batch);
+        let err = execute_distinct_with_cap(input, 3).expect_err(
+            "expected DISTINCT bound to be exceeded with cap=3 and 5 distinct rows",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DISTINCT exceeded host bound"),
+            "error did not mention the bound: {msg}"
+        );
+        assert!(
+            msg.contains("3"),
+            "error did not include the configured cap: {msg}"
+        );
+        assert!(
+            msg.contains(DISTINCT_HOST_MAX_ROWS_ENV),
+            "error did not mention the override env var: {msg}"
+        );
+    }
+
+    /// Bound check operates on the *distinct* count, not the input row
+    /// count: an input full of duplicates well past `max_rows` total rows
+    /// but with `distinct <= max_rows` must still complete successfully.
+    /// Regression guard for the obvious off-by-one of testing `n_rows`
+    /// instead of `seen.len()`.
+    #[test]
+    fn distinct_bound_counts_uniques_not_input_rows() {
+        // 10 input rows, all duplicates of two values — only 2 uniques.
+        let batch = int32_batch(vec![
+            Some(1),
+            Some(2),
+            Some(1),
+            Some(2),
+            Some(1),
+            Some(2),
+            Some(1),
+            Some(2),
+            Some(1),
+            Some(2),
+        ]);
+        let input = QueryHandle::from_record_batch(batch);
+        // Cap of 2 is enough — `seen.len()` never exceeds 2.
+        let out = execute_distinct_with_cap(input, 2).unwrap();
+        assert_eq!(out.into_record_batch().num_rows(), 2);
+    }
+
+    /// Env-var parser: unset / empty / unparseable / zero all fall back to
+    /// the compile-time default; a valid positive integer wins. Exercised
+    /// against the pure parser ([`parse_distinct_host_max_rows_env`]) so
+    /// the `OnceLock` latch is not poisoned.
+    ///
+    /// Serialised on a local lock — `std::env` is process-global and other
+    /// tests in this module do not touch `CRATON_DISTINCT_HOST_MAX_ROWS`,
+    /// so a single lock here is sufficient.
+    #[test]
+    fn distinct_env_var_parser_handles_all_paths() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Helper: set/clear the env var around a single parser call.
+        let with_env = |val: Option<&str>, expected: usize, why: &str| {
+            match val {
+                Some(v) => std::env::set_var(DISTINCT_HOST_MAX_ROWS_ENV, v),
+                None => std::env::remove_var(DISTINCT_HOST_MAX_ROWS_ENV),
+            }
+            let got = parse_distinct_host_max_rows_env();
+            std::env::remove_var(DISTINCT_HOST_MAX_ROWS_ENV);
+            assert_eq!(got, expected, "{why}");
+        };
+
+        // Unset → default.
+        with_env(None, DISTINCT_HOST_MAX_ROWS, "unset should fall back to default");
+        // Empty / whitespace → default.
+        with_env(Some(""), DISTINCT_HOST_MAX_ROWS, "empty should fall back to default");
+        with_env(Some("   "), DISTINCT_HOST_MAX_ROWS, "whitespace should fall back to default");
+        // Unparseable → default (warn fires; we don't assert on the log).
+        with_env(Some("not-a-number"), DISTINCT_HOST_MAX_ROWS, "unparseable should fall back");
+        with_env(Some("-5"), DISTINCT_HOST_MAX_ROWS, "negative should fall back (usize parse fails)");
+        // Zero is explicitly rejected — would disable the cap entirely.
+        with_env(Some("0"), DISTINCT_HOST_MAX_ROWS, "zero should fall back to default");
+        // Valid positive integer wins.
+        with_env(Some("42"), 42, "valid positive integer should win");
+        with_env(Some("  100  "), 100, "leading/trailing whitespace should be trimmed");
     }
 
     /// Boolean dtype: only two possible values, plus optional NULLs.
