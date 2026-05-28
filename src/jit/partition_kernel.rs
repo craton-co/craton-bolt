@@ -59,6 +59,10 @@
 //!     dominates anyway. If the partition kernel shows up high in the
 //!     profile after Tier 2 lands, shared-mem staging is the obvious next
 //!     step.
+//!     TODO(perf): stage `counts[]` in shared memory — per-block atomic
+//!     adds on a 4 KiB shared-mem histogram, then a single global
+//!     `atom.global.add.u32` per (block, partition) pair at end-of-block.
+//!     Cuts L2 atomic traffic by `gridDim.x` for the hot partitions.
 //!   - The `st.global.u32` to `partition_ids[i]` is fully coalesced (one
 //!     warp writes 32 contiguous u32s per step). No hazard there.
 

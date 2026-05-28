@@ -1241,8 +1241,11 @@ pub fn compile_cross_kernel() -> BoltResult<String> {
 /// ```
 ///
 /// **AoS slot layout note:** padding 4 bytes per slot raises hash-table
-/// memory by a factor of 16 / 12 = 1.33× vs SoA, but the fused-load wins
-/// on probe-bound workloads outweigh the extra capacity. Build kernel
+/// memory by a factor of 16 / 12 = 1.33× vs SoA, but it makes each slot
+/// exactly 16 bytes and 16-byte aligned, which lets the probe load the
+/// full `[key, head, pad]` triple with a single `ld.global.v2.u64` (one
+/// 128-bit SASS `LDG.E.128`). That fused load is the per-iteration
+/// bandwidth win that pays for the extra capacity. Build kernel
 /// stays SoA in Stage 3 (CAS at offset 0 is layout-agnostic; we just
 /// haven't ported it).
 pub fn compile_probe_aos_kernel() -> BoltResult<String> {
@@ -1317,13 +1320,15 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tmul.wide.u32 %rd5, %r10, 1;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
 
-    // Fused load: key (8B) + head (4B) + pad (4B). PTX doesn't have a
-    // 16-byte vector load on global memory at all generations; we use
-    // separate loads but pack them at adjacent offsets so the L1/L2
-    // line-fill brings both into the same transaction. Equivalent fused-
-    // load wins without needing ld.global.v4.
-    writeln!(p, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;       // key
-    writeln!(p, "\tld.global.u32 %r9, [%rd6 + 8];").map_err(write_err)?;   // head
+    // Fused 16-byte slot load: the AoS slot is `[key:i64, head:u32, _pad:u32]`,
+    // exactly 16 bytes and 16-byte aligned (slot_offset = slot_idx * 16). We
+    // emit a single `ld.global.v2.u64` so PTXAS lowers it to one 128-bit SASS
+    // transaction (`LDG.E.128`) rather than relying on it to merge a scalar
+    // s64 + u32 pair. `%rl5` receives the key (low 8B); `%rl6` receives the
+    // packed (head:u32, pad:u32) high half, from which we extract `head` via
+    // `cvt.u32.u64` (low 32 bits of `%rl6`).
+    writeln!(p, "\tld.global.v2.u64 {{%rl5, %rl6}}, [%rd6];").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r9, %rl6;").map_err(write_err)?;          // head = low 32 bits of high half
 
     // Empty slot -> no match.
     writeln!(p, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
@@ -2175,15 +2180,28 @@ mod tests {
         assert_eq!(AOS_SLOT_BYTES, 16);
     }
 
-    /// AoS probe loads the head u32 at slot_offset + 8 — i.e. immediately
-    /// after the i64 key in the same slot. Catches accidental drift toward
-    /// SoA-style separate-array indexing.
+    /// AoS probe loads the whole 16-byte slot in a single
+    /// `ld.global.v2.u64` (key in low half, packed head+pad in high half),
+    /// then extracts the head u32 from the low 32 bits of the high register.
+    /// Catches accidental drift toward SoA-style separate-array indexing
+    /// AND accidental de-fusion back to a scalar `ld.global.s64` +
+    /// `ld.global.u32 [+8]` pair (which PTXAS is not guaranteed to merge
+    /// into a single SASS LDG.E.128).
     #[test]
     fn probe_aos_ptx_loads_head_at_plus_eight() {
         let ptx = compile_probe_aos_kernel().unwrap();
         assert!(
-            ptx.contains("ld.global.u32 %r9, [%rd6 + 8];"),
-            "AoS probe must load head u32 at slot_addr + 8\n{ptx}"
+            ptx.contains("ld.global.v2.u64 {%rl5, %rl6}, [%rd6];"),
+            "AoS probe must issue a fused 16-byte `ld.global.v2.u64` for the slot\n{ptx}"
+        );
+        assert!(
+            ptx.contains("cvt.u32.u64 %r9, %rl6;"),
+            "AoS probe must extract head from the low 32 bits of %rl6 (slot_addr + 8)\n{ptx}"
+        );
+        // De-fusion guard: the old scalar pair must NOT reappear.
+        assert!(
+            !ptx.contains("ld.global.u32 %r9, [%rd6 + 8];"),
+            "AoS probe must not emit the de-fused scalar head load\n{ptx}"
         );
     }
 

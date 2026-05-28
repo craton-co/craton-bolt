@@ -157,6 +157,13 @@ pub const I64_EMPTY_SENTINEL: i64 = i64::MIN;
 /// exists purely to prevent a runaway kernel — if the host's load-factor
 /// invariant is honoured, the bound never triggers. Mirrors the
 /// `MAX_PROBE_FACTOR` constant in [`crate::jit::valid_flag_kernels`].
+///
+/// TODO(perf): linear probing degrades into long clusters near the load-
+/// factor cap; consider robin-hood hashing (steal-from-richer reduces
+/// max-probe variance) or 2-way cuckoo hashing (worst-case O(1) probes
+/// at the cost of an insert-time eviction loop). Either upgrade would
+/// let us raise the load-factor ceiling and shrink the table — bigger
+/// L2 residency win than the per-iter probe shave.
 const MAX_PROBE_FACTOR: u32 = 2;
 
 /// Number of `u32` words required to pack a `n_rows`-row validity bitmap
