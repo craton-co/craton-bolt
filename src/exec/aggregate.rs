@@ -118,48 +118,14 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 // directly.
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 
-/// v0.6 async-memcpy pilot helper: upload a host slice to the GPU on
-/// `stream` via the async wrappers, falling back to the synchronous
-/// `from_slice` path under `--features cuda-stub`.
-///
-/// Under real CUDA this issues `cuMemcpyHtoDAsync_v2` on `stream` so the
-/// upload chains naturally with the subsequent kernel launch and D2H of
-/// the partials buffer, and the executor synchronizes the stream exactly
-/// once at the end. Pairing this with a pinned host source would unlock
-/// true DMA overlap; the current Arrow value buffer is pageable, so the
-/// driver may still stage the copy internally, but the stream-scoped
-/// dispatch still avoids the implicit `cuCtxSynchronize` that the legacy
-/// sync `from_slice` path took.
-///
-/// Under `--features cuda-stub` the async FFI shim returns
-/// `CUDA_ERROR_STUB`, so we route through the synchronous wrapper instead
-/// — both paths surface the same error at the FFI boundary in stub mode,
-/// but going through the sync wrapper means the failure happens in the
-/// same place it did before the pilot. This is the documented graceful
-/// degradation for the stub backend.
-///
-/// This helper is the **pilot template** other executors (filter, GROUP
-/// BY, …) will reuse when they migrate off the synchronous `from_slice`
-/// path in subsequent PRs.
-#[inline]
-fn upload_primitive_values_async<T: Pod>(
-    values: &[T],
-    stream: &CudaStream,
-) -> BoltResult<GpuVec<T>> {
-    #[cfg(feature = "cuda-stub")]
-    {
-        // Stub backend has no real CUDA: prefer the sync path so the
-        // call shape matches what existed before the async pilot. The
-        // sync FFI shim itself still returns `CUDA_ERROR_STUB`, so this
-        // is a graceful no-op routing change.
-        let _ = stream;
-        GpuVec::<T>::from_slice(values)
-    }
-    #[cfg(not(feature = "cuda-stub"))]
-    {
-        GpuVec::<T>::from_slice_async(values, stream.raw())
-    }
-}
+// v0.7 update: the v0.6 async-memcpy pilot helper formerly defined here
+// has moved to `crate::exec::async_copy::upload_primitive_values_async`
+// so the join executor's hash-build / probe upload paths can share the
+// same `cuda-stub` graceful-fallback wiring. The call sites below import
+// from the shared module unchanged — behaviour is byte-identical (the
+// async FFI shim runs under real CUDA, the sync `from_slice` fallback
+// under `--features cuda-stub`).
+use crate::exec::async_copy::upload_primitive_values_async;
 
 /// Execute an aggregate physical plan against a host-side RecordBatch.
 ///

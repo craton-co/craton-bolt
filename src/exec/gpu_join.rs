@@ -201,6 +201,7 @@ use arrow_schema::Schema as ArrowSchema;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
+use crate::exec::async_copy::{download_to_host_pinned, upload_primitive_values_async};
 use crate::exec::launch::CudaStream;
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
@@ -1234,8 +1235,15 @@ pub fn hash_join_indices_on_gpu_aos(
 
     let build_keys_host = encode_keys_i64(build_keys_col, dtype)?;
     let probe_keys_host = encode_keys_i64(probe_keys_col, dtype)?;
-    let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
-    let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
+
+    // v0.7 async-memcpy: per-call stream + async H2D for the key columns,
+    // matching the SoA INNER path above. The AoS slots buffer keeps its
+    // dedicated allocator (it's the device-side initialiser, not a host
+    // upload, so the async wrappers don't apply directly).
+    let stream = CudaStream::null_or_default();
+
+    let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
+    let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
     let mut slots_dev = alloc_aos_slots(cap)?;
 
@@ -1250,7 +1258,6 @@ pub fn hash_join_indices_on_gpu_aos(
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
-    let stream = CudaStream::null();
 
     launch_build_aos_kernel(&build_keys_dev, &mut slots_dev, n_build_u32, cap_u32, &stream)?;
     let n_matches_raw = launch_probe_aos_kernel(
@@ -1280,8 +1287,11 @@ pub fn hash_join_indices_on_gpu_aos(
         )));
     }
     let n_matches = n_matches_raw as usize;
-    let probe_full = out_probe_idx_dev.to_vec()?;
-    let build_full = out_build_idx_dev.to_vec()?;
+    // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the SoA
+    // INNER path. `download_to_host_pinned` falls back to `to_vec()` under
+    // `--features cuda-stub` for byte-stable failure mode.
+    let probe_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
+    let build_full = download_to_host_pinned::<u32>(&out_build_idx_dev, &stream)?;
     let probe_idx: Vec<u32> = probe_full.into_iter().take(n_matches).collect();
     let build_idx: Vec<u32> = build_full.into_iter().take(n_matches).collect();
     Ok((UInt32Array::from(build_idx), UInt32Array::from(probe_idx)))
@@ -1325,16 +1335,24 @@ pub fn hash_join_indices_on_gpu(
     let build_keys_host = encode_keys_i64(build_keys_col, dtype)?;
     let probe_keys_host = encode_keys_i64(probe_keys_col, dtype)?;
 
-    let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
-    let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
+    // v0.7 async-memcpy migration (mirrors `aggregate.rs`): mint a per-call
+    // stream and chain H2D uploads + kernel launches + D2H index downloads
+    // on it, syncing exactly once at the end of each launch helper. Under
+    // `--features cuda-stub` the async FFI shims fall back to the sync
+    // wrappers via `upload_primitive_values_async`, so the call shape
+    // matches what existed before the migration.
+    let stream = CudaStream::null_or_default();
+
+    let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
+    let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
     // Hash table buffers: keys init to i64::MIN, row_idx init to u32::MAX.
     // Use process-wide sentinel pools to avoid re-allocating up to ~357 MiB
     // of host memory per query at the large-cap limit.
     let keys_init = get_sentinel_i64_min_vec(cap);
     let row_idx_init = get_sentinel_u32_max_vec(cap);
-    let mut keys_table_dev = GpuVec::<i64>::from_slice(keys_init)?;
-    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(row_idx_init)?;
+    let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
+    let mut row_idx_table_dev = upload_primitive_values_async::<u32>(row_idx_init, &stream)?;
 
     // Output buffers. We pre-size for the worst INNER-equi case under the
     // unique-build-key invariant: every probe row matches at most one build
@@ -1352,8 +1370,6 @@ pub fn hash_join_indices_on_gpu(
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
-
-    let stream = CudaStream::null();
 
     // Build phase.
     launch_build_kernel(
@@ -1401,9 +1417,12 @@ pub fn hash_join_indices_on_gpu(
 
     let n_matches = n_matches_raw as usize;
 
-    // Download the index pairs.
-    let probe_idx_full = out_probe_idx_dev.to_vec()?;
-    let build_idx_full = out_build_idx_dev.to_vec()?;
+    // Download the index pairs. v0.7 async-memcpy: route through the pinned
+    // host buffer + per-call stream so the D2H DMA doesn't fall through to
+    // an implicit `cuCtxSynchronize`. Under `--features cuda-stub` the
+    // helper falls back to `GpuVec::to_vec()` for byte-stable failure mode.
+    let probe_idx_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
+    let build_idx_full = download_to_host_pinned::<u32>(&out_build_idx_dev, &stream)?;
 
     // Drop trailing buffers; we want the first n_matches entries.
     let probe_idx: Vec<u32> = probe_idx_full.into_iter().take(n_matches).collect();
@@ -1552,8 +1571,15 @@ pub fn hash_join_indices_on_gpu_with_shape(
     let build_keys_host = encode_keys_for_shape(build_key_columns, shape)?;
     let probe_keys_host = encode_keys_for_shape(probe_key_columns, shape)?;
 
-    let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
-    let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
+    // v0.7 async-memcpy migration: mint a per-call stream, async H2D every
+    // host-side init buffer, async D2H index outputs. See `aggregate.rs`
+    // for the pilot rationale; under `--features cuda-stub` the helpers
+    // fall back to the synchronous `from_slice` / `to_vec` shape for
+    // byte-stable failure mode at the FFI boundary.
+    let stream = CudaStream::null_or_default();
+
+    let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
+    let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
     // Reuse process-wide sentinel pools (see `get_sentinel_*_vec`). The
     // `head` / `next_idx` buffers share the u32::MAX pool since
@@ -1565,10 +1591,10 @@ pub fn hash_join_indices_on_gpu_with_shape(
     let head_init = get_sentinel_u32_max_vec(cap);
     let next_idx_init = get_sentinel_u32_max_vec(n_build);
 
-    let mut keys_table_dev = GpuVec::<i64>::from_slice(keys_init)?;
-    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(row_idx_init)?;
-    let mut head_dev = GpuVec::<u32>::from_slice(head_init)?;
-    let mut next_idx_dev = GpuVec::<u32>::from_slice(next_idx_init)?;
+    let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
+    let mut row_idx_table_dev = upload_primitive_values_async::<u32>(row_idx_init, &stream)?;
+    let mut head_dev = upload_primitive_values_async::<u32>(head_init, &stream)?;
+    let mut next_idx_dev = upload_primitive_values_async::<u32>(next_idx_init, &stream)?;
 
     // Output buffer size: 2x (n_build + n_probe) — a generous estimate for
     // typical workloads where duplicate-key fan-out is small. Pathological
@@ -1588,8 +1614,6 @@ pub fn hash_join_indices_on_gpu_with_shape(
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
-
-    let stream = CudaStream::null();
 
     launch_build_collision_kernel(
         &build_keys_dev,
@@ -1634,8 +1658,11 @@ pub fn hash_join_indices_on_gpu_with_shape(
         )));
     }
     let n_matches = n_matches_raw as usize;
-    let probe_idx_full = out_probe_idx_dev.to_vec()?;
-    let build_idx_full = out_build_idx_dev.to_vec()?;
+    // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the SoA
+    // INNER path. `download_to_host_pinned` falls back to `to_vec()` under
+    // `--features cuda-stub` for byte-stable failure mode.
+    let probe_idx_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
+    let build_idx_full = download_to_host_pinned::<u32>(&out_build_idx_dev, &stream)?;
     let probe_idx: Vec<u32> = probe_idx_full.into_iter().take(n_matches).collect();
     let build_idx: Vec<u32> = build_idx_full.into_iter().take(n_matches).collect();
 
@@ -1710,8 +1737,12 @@ pub fn execute_outer_join_indices_on_gpu(
     let build_keys_host = encode_keys_for_shape(build_key_columns, shape)?;
     let probe_keys_host = encode_keys_for_shape(probe_key_columns, shape)?;
 
-    let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
-    let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
+    // v0.7 async-memcpy migration: per-call stream + async H2D for every
+    // host-side init buffer. Mirrors the INNER collision-list path above.
+    let stream = CudaStream::null_or_default();
+
+    let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
+    let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
     // See top-of-file `get_sentinel_*_vec`: avoid re-allocating ~357 MiB of
     // host scratch per OUTER join.
@@ -1720,10 +1751,10 @@ pub fn execute_outer_join_indices_on_gpu(
     let head_init = get_sentinel_u32_max_vec(cap);
     let next_idx_init = get_sentinel_u32_max_vec(n_build);
 
-    let mut keys_table_dev = GpuVec::<i64>::from_slice(keys_init)?;
-    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(row_idx_init)?;
-    let mut head_dev = GpuVec::<u32>::from_slice(head_init)?;
-    let mut next_idx_dev = GpuVec::<u32>::from_slice(next_idx_init)?;
+    let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
+    let mut row_idx_table_dev = upload_primitive_values_async::<u32>(row_idx_init, &stream)?;
+    let mut head_dev = upload_primitive_values_async::<u32>(head_init, &stream)?;
+    let mut next_idx_dev = upload_primitive_values_async::<u32>(next_idx_init, &stream)?;
 
     // matched: u32[ceil(build_n_rows / 32)], zero-initialised. We always
     // allocate it for OUTER even when only the LEFT case is requested,
@@ -1748,8 +1779,6 @@ pub fn execute_outer_join_indices_on_gpu(
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
-
-    let stream = CudaStream::null();
 
     launch_build_collision_kernel(
         &build_keys_dev,
@@ -1794,8 +1823,11 @@ pub fn execute_outer_join_indices_on_gpu(
         )));
     }
     let n_matches = n_matches_raw as usize;
-    let probe_idx_full = out_probe_idx_dev.to_vec()?;
-    let build_idx_full = out_build_idx_dev.to_vec()?;
+    // v0.7 async-memcpy: pinned-host D2H + per-call sync for the candidate
+    // index pairs. The `matched` bitmap stays on the device until the
+    // unmatched-build emission pass needs it.
+    let probe_idx_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
+    let build_idx_full = download_to_host_pinned::<u32>(&out_build_idx_dev, &stream)?;
 
     // Stage 4 (lossy OUTER): the GPU's `matched` bitmap may contain false
     // positives that drop under host post-verify. Re-test the candidate
@@ -1922,7 +1954,13 @@ pub fn execute_outer_join_indices_on_gpu(
                 )));
             }
             let n_unmatched = n_unmatched as usize;
-            let unmatched_full = out_unmatched_dev.to_vec()?;
+            // v0.7 async-memcpy: pinned-host D2H for the unmatched-build
+            // index stream. The `launch_unmatched_build_kernel` call already
+            // synchronized `stream` to read its counter back, so the kernel's
+            // writes are visible; this D2H is the final readback before
+            // returning to the host.
+            let unmatched_full =
+                download_to_host_pinned::<u32>(&out_unmatched_dev, &stream)?;
             for &b in unmatched_full.iter().take(n_unmatched) {
                 build.push(Some(b));
                 probe.push(None);
@@ -2628,14 +2666,17 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
     let offsets: &[i32] = arr.value_offsets();
     let values: &[u8] = arr.value_data();
 
-    // Upload. The values slice can be empty if the entire StringArray is
-    // empty strings — we still need a valid device pointer for the kernel,
-    // so allocate a single-byte placeholder in that case.
-    let offsets_dev = GpuVec::<i32>::from_slice(offsets)?;
+    // v0.7 async-memcpy: per-call stream + async H2D for both the offsets
+    // and the values buffer (these are the Utf8 join key column's raw
+    // Arrow backing storage). The values slice can be empty if the entire
+    // StringArray is empty strings — we still need a valid device pointer
+    // for the kernel, so allocate a single-byte placeholder in that case.
+    let stream = CudaStream::null_or_default();
+    let offsets_dev = upload_primitive_values_async::<i32>(offsets, &stream)?;
     let values_dev = if values.is_empty() {
         GpuVec::<u8>::zeros(1)?
     } else {
-        GpuVec::<u8>::from_slice(values)?
+        upload_primitive_values_async::<u8>(values, &stream)?
     };
     let out_dev = GpuVec::<u64>::zeros(n)?;
 
@@ -2661,7 +2702,6 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
 
     let block: u32 = STRING_HASH_BLOCK_SIZE;
     let grid_x: u32 = n_u32.div_ceil(block).max(1);
-    let stream = CudaStream::null();
 
     // SAFETY: every param slot points at a stack local that outlives the
     // launch+sync below; device buffers are owned by this function and
@@ -2681,9 +2721,10 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
             ptr::null_mut(),
         ))?;
     }
-    stream.synchronize()?;
 
-    out_dev.to_vec()
+    // v0.7 async-memcpy: pinned-host D2H + per-call sync, replacing the
+    // legacy `sync + to_vec()` pair.
+    download_to_host_pinned::<u64>(&out_dev, &stream)
 }
 
 /// **Stage 6 (GJ)** — LargeUtf8 (i64 offsets) variant of
@@ -2713,11 +2754,15 @@ pub fn compute_device_string_hashes_large(
     let offsets: &[i64] = arr.value_offsets();
     let values: &[u8] = arr.value_data();
 
-    let offsets_dev = GpuVec::<i64>::from_slice(offsets)?;
+    // v0.7 async-memcpy: per-call stream + async H2D for both the i64
+    // offsets and the values buffer (the LargeUtf8 join key column's raw
+    // Arrow backing storage). Symmetric with the Utf8 path above.
+    let stream = CudaStream::null_or_default();
+    let offsets_dev = upload_primitive_values_async::<i64>(offsets, &stream)?;
     let values_dev = if values.is_empty() {
         GpuVec::<u8>::zeros(1)?
     } else {
-        GpuVec::<u8>::from_slice(values)?
+        upload_primitive_values_async::<u8>(values, &stream)?
     };
     let out_dev = GpuVec::<u64>::zeros(n)?;
 
@@ -2748,7 +2793,6 @@ pub fn compute_device_string_hashes_large(
 
     let block: u32 = STRING_HASH_BLOCK_SIZE;
     let grid_x: u32 = n_u32.div_ceil(block).max(1);
-    let stream = CudaStream::null();
 
     // SAFETY: every param slot points at a stack local that outlives the
     // launch+sync below; device buffers are owned by this function and
@@ -2768,9 +2812,10 @@ pub fn compute_device_string_hashes_large(
             ptr::null_mut(),
         ))?;
     }
-    stream.synchronize()?;
 
-    out_dev.to_vec()
+    // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the
+    // Utf8 path. Hashes flow into the streaming-intern dict.
+    download_to_host_pinned::<u64>(&out_dev, &stream)
 }
 
 /// Stage-5: parallel per-chunk dict-building variant of
@@ -3231,8 +3276,12 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
     let build_keys_host = encode_keys_for_shape(build_key_columns, shape)?;
     let probe_keys_host = encode_keys_for_shape(probe_key_columns, shape)?;
 
-    let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
-    let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
+    // v0.7 async-memcpy migration: per-call stream + async H2D for every
+    // host-side init buffer. Mirrors the exact-shape INNER path.
+    let stream = CudaStream::null_or_default();
+
+    let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
+    let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
     // See top-of-file `get_sentinel_*_vec`: avoid re-allocating ~357 MiB of
     // host scratch per AoS join.
@@ -3241,10 +3290,10 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
     let head_init = get_sentinel_u32_max_vec(cap);
     let next_idx_init = get_sentinel_u32_max_vec(n_build);
 
-    let mut keys_table_dev = GpuVec::<i64>::from_slice(keys_init)?;
-    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(row_idx_init)?;
-    let mut head_dev = GpuVec::<u32>::from_slice(head_init)?;
-    let mut next_idx_dev = GpuVec::<u32>::from_slice(next_idx_init)?;
+    let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
+    let mut row_idx_table_dev = upload_primitive_values_async::<u32>(row_idx_init, &stream)?;
+    let mut head_dev = upload_primitive_values_async::<u32>(head_init, &stream)?;
+    let mut next_idx_dev = upload_primitive_values_async::<u32>(next_idx_init, &stream)?;
 
     let out_capacity_usize = n_build
         .checked_add(n_probe)
@@ -3259,7 +3308,6 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
-    let stream = CudaStream::null();
 
     launch_build_collision_kernel(
         &build_keys_dev,
@@ -3302,8 +3350,11 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
         )));
     }
     let n_matches = n_matches_raw as usize;
-    let probe_idx_full = out_probe_idx_dev.to_vec()?;
-    let build_idx_full = out_build_idx_dev.to_vec()?;
+    // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the
+    // verified collision-list path. The candidate indices flow into the
+    // host post-verify pipeline.
+    let probe_idx_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
+    let build_idx_full = download_to_host_pinned::<u32>(&out_build_idx_dev, &stream)?;
     let probe_idx: Vec<u32> = probe_idx_full.into_iter().take(n_matches).collect();
     let build_idx: Vec<u32> = build_idx_full.into_iter().take(n_matches).collect();
     Ok(GpuJoinIndices {
@@ -4613,5 +4664,78 @@ mod tests {
                 s, device[i], host
             );
         }
+    }
+
+    // =========================================================================
+    // v0.7: async memcpy + pinned host buffers wired through the hash-join
+    // build/probe paths. Under `--features cuda-stub` the async FFI shims
+    // return `CUDA_ERROR_STUB`; the helper falls back to the synchronous
+    // `from_slice` wrapper which also returns `CUDA_ERROR_STUB`. Both paths
+    // surface a typed `BoltError` at the FFI boundary rather than panicking,
+    // and the executor returns that error to the host fallback path in
+    // `crate::exec::join::try_gpu_inner_join`. This test pins the contract.
+    // =========================================================================
+
+    /// Under `--features cuda-stub` the hash-join entry point must NOT
+    /// panic when the async H2D shim returns `CUDA_ERROR_STUB`. The
+    /// previous (synchronous) path also returned `Err(_)` here; this test
+    /// pins that the v0.7 async rewrite preserves that contract.
+    ///
+    /// On a real-CUDA host the same call succeeds; the test is split into
+    /// the "stub returns Err" case (gated on the feature) and the
+    /// "real-CUDA returns Ok" case (gated on `#[ignore]` so it only runs
+    /// when explicitly requested with `--ignored`, matching the rest of
+    /// the GPU-driver-dependent tests in this module).
+    #[cfg(feature = "cuda-stub")]
+    #[test]
+    fn hash_join_under_cuda_stub_returns_err_gracefully() {
+        // Inputs sized to clear every shape gate (≥ 1024 rows). The stub
+        // backend's `cuda_sys::check` maps `CUDA_ERROR_STUB` to a typed
+        // BoltError before the kernel launch ever happens, so we never
+        // actually look at the indices.
+        let n: usize = 2048;
+        let build_keys: Vec<i32> = (0..n as i32).collect();
+        let probe_keys: Vec<i32> = (0..n as i32).map(|i| i % 1024).collect();
+
+        let build_arr = Int32Array::from(build_keys);
+        let probe_arr = Int32Array::from(probe_keys);
+
+        // The contract: must return Err rather than panic. We do NOT
+        // assert on the error variant — the exact mapping is owned by
+        // `cuda_sys::check` and may change without breaking the
+        // executor's host-fallback path (which catches any `Err(_)`).
+        let result = hash_join_indices_on_gpu(
+            &build_arr,
+            &probe_arr,
+            DataType::Int32,
+        );
+        assert!(
+            result.is_err(),
+            "under cuda-stub, hash_join_indices_on_gpu must return Err so \
+             the host fallback in join.rs::try_gpu_inner_join can engage"
+        );
+    }
+
+    /// Same contract for the collision-list INNER path (lossy + exact
+    /// shapes share the entry below the `is_exact_in_i64()` gate).
+    #[cfg(feature = "cuda-stub")]
+    #[test]
+    fn hash_join_with_shape_under_cuda_stub_returns_err_gracefully() {
+        let n: usize = 1024;
+        let build_keys: Vec<i32> = (0..n as i32).collect();
+        let probe_keys: Vec<i32> = (0..n as i32).collect();
+
+        let build_arr = Int32Array::from(build_keys);
+        let probe_arr = Int32Array::from(probe_keys);
+        let b: &dyn Array = &build_arr;
+        let p: &dyn Array = &probe_arr;
+
+        let result =
+            hash_join_indices_on_gpu_with_shape(&[b], &[p], KeyShape::SingleI32);
+        assert!(
+            result.is_err(),
+            "under cuda-stub, hash_join_indices_on_gpu_with_shape must \
+             return Err so the host fallback engages"
+        );
     }
 }

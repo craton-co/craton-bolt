@@ -3,6 +3,13 @@
 #[doc(hidden)]
 pub mod launch;
 pub mod engine;
+/// Shared async memcpy + pinned-host-buffer helpers used by the
+/// aggregate, join, and (in subsequent migrations) GROUP BY / filter
+/// executors. Lifted out of `aggregate.rs` in v0.7 so the join hash-
+/// build / probe upload paths can reuse the same `cuda-stub` graceful
+/// fallback shape. See the module docs for the canonical call shape.
+#[doc(hidden)]
+pub(crate) mod async_copy;
 /// Process-wide JIT-module cache shared across executors. Lifted out of
 /// per-file `static MODULE_CACHE` declarations to avoid the multi-GPU
 /// hazard described in the module docs.
