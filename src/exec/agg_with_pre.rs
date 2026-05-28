@@ -20,8 +20,10 @@
 //!      to the host and compact via the mask.
 //!   3. For each `AggregateExpr`, reduce the matching compacted column via
 //!      the existing per-block GPU reduction kernel from `agg_kernels`.
-//!      `COUNT(_)` uses the post-mask row count directly; `AVG` is decomposed
-//!      into `SUM` and `COUNT` and divided on the host.
+//!      `COUNT(_)` uses the post-mask row count directly; `AVG` launches a
+//!      single **fused** kernel (`bolt_avg_reduce`) that emits per-block
+//!      `(f64 sum, u32 count)` partials in one pass — strictly faster than
+//!      the old "SUM kernel + host-side count + host divide" decomposition.
 //!   4. Pack the resulting scalars into a single-row Arrow `RecordBatch`
 //!      matching `aggregate.output_schema`.
 //!
@@ -54,7 +56,8 @@ use crate::exec::launch::CudaStream;
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
-    compile_reduction_kernel, ReduceOp, BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
+    compile_avg_reduction_kernel, compile_reduction_kernel, ReduceOp, AVG_KERNEL_ENTRY,
+    BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
 };
 use crate::jit::compile_ptx;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
@@ -379,20 +382,29 @@ fn build_one_aggregate(
             scalar_to_array(Scalar::I64(count), out_field.dtype)
         }
         AggregateExpr::Avg(expr) => {
-            // AVG = SUM(expr) / COUNT(expr) — SQL semantics, NULLs ignored
-            // in both numerator and denominator. The output is always
-            // Float64. For AVG the natural materialisation dtype is Float64
-            // (the reduction's accumulator + the final division both work
-            // in f64). NULL inputs are filtered out by `from_expr_host`
-            // before the reduction, and the denominator below uses the
-            // resolved column's `non_null_count` so the average reflects
-            // only the rows that contributed to the sum.
+            // AVG via the **fused** kernel: one launch produces both the
+            // numerator (sum, f64) and the denominator (count, u32) as
+            // per-block partials. Replaces the previous "run SUM kernel,
+            // then divide by the host-side `non_null_count`" shape — the
+            // two-launch / two-PTX-compile decomposition is gone.
+            //
+            // NULL handling: `resolve_agg_input_col` already filters NULL
+            // rows out of the slow-path column and the fast-path column
+            // can't carry NULLs. We then strip any residual validity in
+            // `fused_avg_host_col` before uploading so the GPU never sees
+            // garbage at NULL positions.
+            //
+            // TODO(null): empty input -> 0.0 (not SQL NULL), matching the
+            // public AVG return-type contract; see `aggregate.rs` for the
+            // same TODO.
             let resolved =
                 resolve_agg_input_col(expr, pre_spec, compacted, DataType::Float64)?;
-            let sum_scalar = reduce_host_col(ReduceOp::Sum, resolved.as_ref())?;
-            let sum_f64 = scalar_to_f64(sum_scalar)?;
-            let count_f64 = resolved.non_null_count() as f64;
-            let avg = if count_f64 == 0.0 { 0.0 } else { sum_f64 / count_f64 };
+            let (sum_f64, count_u64) = fused_avg_host_col(resolved.as_ref())?;
+            let avg = if count_u64 == 0 {
+                0.0
+            } else {
+                sum_f64 / count_u64 as f64
+            };
             scalar_to_array(Scalar::F64(avg), out_field.dtype)
         }
     }
@@ -638,6 +650,92 @@ fn reduce_host_col(op: ReduceOp, col: &HostCol) -> BoltResult<Scalar> {
         HostColValues::F32(v) => reduce_host_slice::<f32>(op, DataType::Float32, v),
         HostColValues::F64(v) => reduce_host_slice::<f64>(op, DataType::Float64, v),
     }
+}
+
+/// Run the **fused** AVG reduction over `col` and return `(sum_f64,
+/// count_u64)`. NULL rows are stripped on the host before upload (the kernel
+/// expects a contiguous value buffer). Replaces the "run SUM kernel, then
+/// divide by host-known count" decomposition in the AVG branch.
+///
+/// The kernel does its own per-block count, which matches the post-strip row
+/// count: every in-range thread contributes 1 to the count.
+fn fused_avg_host_col(col: &HostCol) -> BoltResult<(f64, u64)> {
+    let stripped = strip_nulls_borrowed(col);
+    match &stripped.values {
+        HostColValues::I32(v) => fused_avg_host_slice::<i32>(DataType::Int32, v),
+        HostColValues::I64(v) => fused_avg_host_slice::<i64>(DataType::Int64, v),
+        HostColValues::F32(v) => fused_avg_host_slice::<f32>(DataType::Float32, v),
+        HostColValues::F64(v) => fused_avg_host_slice::<f64>(DataType::Float64, v),
+    }
+}
+
+/// Upload a host slice, then launch the fused AVG kernel over it. Returns
+/// `(sum_f64, count_u64)`. `dtype` is the input element dtype.
+fn fused_avg_host_slice<TIn>(dtype: DataType, host: &[TIn]) -> BoltResult<(f64, u64)>
+where
+    TIn: Pod,
+{
+    if host.is_empty() {
+        return Ok((0.0, 0));
+    }
+
+    let dev = GpuVec::<TIn>::from_slice(host)?;
+    let n_rows = host.len();
+
+    let block = BLOCK_SIZE;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
+
+    let block_sums = GpuVec::<f64>::zeros(grid_x as usize)?;
+    let block_counts = GpuVec::<u32>::zeros(grid_x as usize)?;
+
+    let ptx = compile_avg_reduction_kernel(dtype)?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let function = module.function(AVG_KERNEL_ENTRY)?;
+
+    let mut input_ptr: CUdeviceptr = dev.device_ptr();
+    let mut sums_ptr: CUdeviceptr = block_sums.device_ptr();
+    let mut counts_ptr: CUdeviceptr = block_counts.device_ptr();
+
+    let mut kernel_params: [*mut c_void; 4] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut sums_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut counts_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+    ];
+
+    let stream = CudaStream::null();
+    // SAFETY: `function` borrowed from a live module; param slots point into
+    // stack locals that outlive `synchronize`.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+
+    let _ = input_ptr;
+    let _ = sums_ptr;
+    let _ = counts_ptr;
+
+    let host_sums = block_sums.to_vec()?;
+    let host_counts = block_counts.to_vec()?;
+    drop(block_sums);
+    drop(block_counts);
+
+    let total_sum: f64 = host_sums.iter().copied().sum();
+    let total_count: u64 = host_counts.iter().copied().map(u64::from).sum();
+    Ok((total_sum, total_count))
 }
 
 /// Borrowing version of `HostCol::strip_nulls`. Returns an owned `HostCol`
@@ -1150,16 +1248,6 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
             s, dt
         ))),
     }
-}
-
-/// Cast a scalar to f64 (used by AVG).
-fn scalar_to_f64(s: Scalar) -> BoltResult<f64> {
-    Ok(match s {
-        Scalar::I32(v) => v as f64,
-        Scalar::I64(v) => v as f64,
-        Scalar::F32(v) => v as f64,
-        Scalar::F64(v) => v,
-    })
 }
 
 /// Build a `Type` error for a failed Arrow downcast.

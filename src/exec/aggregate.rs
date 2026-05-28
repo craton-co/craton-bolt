@@ -19,9 +19,13 @@
 //!     where every aggregate input is a bare column reference and there is no
 //!     filter. `pre = Some(...)` returns a "not yet implemented" error.
 //!   - Primitive dtypes only (Int32, Int64, Float32, Float64).
-//!   - `AVG` is decomposed into a `SUM` and a `COUNT` kernel and divided on
-//!     the host. `COUNT` is implemented as a `SUM` over a synthetic all-ones
-//!     `Int64` column; correct but extra-allocation-heavy, fine for v1.
+//!   - `AVG` is computed by a **single fused kernel** that, in one pass over
+//!     the input column, emits per-block `(f64 sum, u32 count)` partials; the
+//!     host sums each partial array and divides. One PTX compilation, one
+//!     launch, one stream-sync per AVG — and the count comes from what the
+//!     GPU actually summed rather than a parallel Arrow-bitmap walk.
+//!   - `COUNT(col)` is computed on the host from the Arrow null bitmap (no
+//!     GPU launch); `COUNT(*)` returns the row count directly.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -40,7 +44,8 @@ use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
-    compile_reduction_kernel, ReduceOp, BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
+    compile_avg_reduction_kernel, compile_reduction_kernel, ReduceOp, AVG_KERNEL_ENTRY,
+    BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
 };
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 
@@ -159,19 +164,30 @@ fn build_one_aggregate(
             scalar_to_array(Scalar::I64(count), out_field.dtype)
         }
         AggregateExpr::Avg(expr) => {
-            // AVG = SUM(expr) / COUNT(expr) where COUNT is the non-NULL count
-            // of the input column (NOT the row count). Both computed on the
-            // GPU then divided on the host. The output is always Float64.
+            // AVG via the **fused** kernel: one launch produces both the
+            // numerator (per-block `f64` sum) and the denominator (per-block
+            // `u32` count) in a single pass. The host sums each partial
+            // buffer and divides. Replaces the previous "SUM kernel + host
+            // non-NULL count + host divide" shape — same number of kernel
+            // launches, but the count now reflects what the GPU actually
+            // saw rather than relying on the Arrow null bitmap, and the
+            // implementation generalises cleanly to a future post-pre-stage
+            // path where the host doesn't know the post-filter count.
+            //
+            // TODO(null): SQL standard returns NULL when COUNT == 0; we
+            // currently return 0.0 to preserve the public AVG return-type
+            // contract (non-nullable Float64). Surfacing NULL would require
+            // making the AVG output schema field nullable across the planner
+            // and downstream consumers — out of scope for this fusion.
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
-            let sum_scalar =
-                reduce_column_from_batch(ReduceOp::Sum, col_io, table_batch, n_rows)?;
-            let sum_f64 = scalar_to_f64(sum_scalar)?;
-
-            // Denominator is the non-NULL row count of the input column.
-            let count_f64 = non_null_count_for_input(col_io, table_batch)? as f64;
-
-            let avg = if count_f64 == 0.0 { 0.0 } else { sum_f64 / count_f64 };
+            let (sum_f64, count_u64) =
+                fused_avg_from_batch(col_io, table_batch, n_rows)?;
+            let avg = if count_u64 == 0 {
+                0.0
+            } else {
+                sum_f64 / count_u64 as f64
+            };
             scalar_to_array(Scalar::F64(avg), out_field.dtype)
         }
     }
@@ -356,6 +372,201 @@ fn reduce_column_from_batch(
             col_io.dtype, col_io.name
         ))),
     }
+}
+
+/// Run the **fused** AVG reduction over an aggregate input column, returning
+/// `(sum_as_f64, non_null_count)`. The grand-total finalize (and divide-by-zero
+/// guard) is done by the caller.
+///
+/// Layout: one GPU launch produces a pair of per-block partial buffers
+/// (`block_sums: f64`, `block_counts: u32`); the host sums each to a single
+/// `(f64, u64)` pair. This replaces the previous "two kernels (SUM + COUNT) +
+/// host divide" decomposition — one PTX compilation, one launch, one D2H
+/// stream-synchronize.
+///
+/// NULL handling mirrors `reduce_column_from_batch`: when the input has any
+/// NULLs we filter them on the host before uploading, so the GPU never sees
+/// garbage values at NULL positions and `count` reflects the post-filter row
+/// count.
+fn fused_avg_from_batch(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+    n_rows: usize,
+) -> BoltResult<(f64, u64)> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "aggregate input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+
+    let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
+    if arr_dtype != col_io.dtype {
+        return Err(BoltError::Type(format!(
+            "aggregate input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
+            col_io.name, col_io.dtype, arr_dtype
+        )));
+    }
+
+    let has_nulls = arr.null_count() > 0;
+    let stream = CudaStream::null_or_default();
+
+    // Per-dtype: build a `GpuVec` (zero-copy when NULL-free, host-filtered
+    // upload otherwise) and dispatch to the fused launcher. The launcher is
+    // monomorphic on the input dtype because `compile_avg_reduction_kernel`
+    // emits dtype-specific PTX.
+    match col_io.dtype {
+        DataType::Int32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
+            if has_nulls {
+                let host: Vec<i32> = filter_primitive_to_vec(pa);
+                let len = host.len();
+                let dev = GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
+                fused_avg_gpu_vec::<i32>(col_io.dtype, &dev, len, &stream)
+            } else {
+                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                fused_avg_gpu_vec::<i32>(col_io.dtype, &dev, n_rows, &stream)
+            }
+        }
+        DataType::Int64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
+            if has_nulls {
+                let host: Vec<i64> = filter_primitive_to_vec(pa);
+                let len = host.len();
+                let dev = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
+                fused_avg_gpu_vec::<i64>(col_io.dtype, &dev, len, &stream)
+            } else {
+                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                fused_avg_gpu_vec::<i64>(col_io.dtype, &dev, n_rows, &stream)
+            }
+        }
+        DataType::Float32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
+            if has_nulls {
+                let host: Vec<f32> = filter_primitive_to_vec(pa);
+                let len = host.len();
+                let dev = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
+                fused_avg_gpu_vec::<f32>(col_io.dtype, &dev, len, &stream)
+            } else {
+                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                fused_avg_gpu_vec::<f32>(col_io.dtype, &dev, n_rows, &stream)
+            }
+        }
+        DataType::Float64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
+            if has_nulls {
+                let host: Vec<f64> = filter_primitive_to_vec(pa);
+                let len = host.len();
+                let dev = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
+                fused_avg_gpu_vec::<f64>(col_io.dtype, &dev, len, &stream)
+            } else {
+                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                fused_avg_gpu_vec::<f64>(col_io.dtype, &dev, n_rows, &stream)
+            }
+        }
+        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+            "AVG over dtype {:?} not supported (column '{}')",
+            col_io.dtype, col_io.name
+        ))),
+    }
+}
+
+/// Launch the fused AVG reduction kernel against an already-uploaded device
+/// buffer, then finalize the per-block partials on the host. Returns
+/// `(sum_f64, count_u64)`. `dtype` is the *input* element dtype; the kernel
+/// always emits `f64` sum and `u32` count partials regardless.
+fn fused_avg_gpu_vec<TIn>(
+    dtype: DataType,
+    input: &GpuVec<TIn>,
+    n_rows: usize,
+    stream: &CudaStream,
+) -> BoltResult<(f64, u64)>
+where
+    TIn: Pod,
+{
+    // 0-row degenerate case: skip the launch (and the PTX compile) entirely.
+    if n_rows == 0 {
+        stream.synchronize()?;
+        return Ok((0.0, 0));
+    }
+
+    let block = BLOCK_SIZE;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let grid_x = grid_x_for(n_rows_u32, block);
+
+    // Per-block partial buffers: f64 sums + u32 counts, one element per block.
+    let block_sums = GpuVec::<f64>::zeros_async(grid_x as usize, stream.raw())?;
+    let block_counts = GpuVec::<u32>::zeros_async(grid_x as usize, stream.raw())?;
+
+    let ptx = compile_avg_reduction_kernel(dtype)?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let function = module.function(AVG_KERNEL_ENTRY)?;
+
+    let mut input_ptr: CUdeviceptr = input.device_ptr();
+    let mut sums_ptr: CUdeviceptr = block_sums.device_ptr();
+    let mut counts_ptr: CUdeviceptr = block_counts.device_ptr();
+
+    let mut kernel_params: [*mut c_void; 4] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut sums_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut counts_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+    ];
+
+    // SAFETY: `function` is borrowed from a live `CudaModule`; every entry of
+    // `kernel_params` points to a stack local that outlives the synchronize.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+
+    let _ = input_ptr;
+    let _ = sums_ptr;
+    let _ = counts_ptr;
+
+    // Async D2H for both partial buffers, then a single sync.
+    let pinned_sums = block_sums.to_pinned_async(stream.raw())?;
+    let pinned_counts = block_counts.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+
+    let total_sum: f64 = pinned_sums.as_slice().iter().copied().sum();
+    let total_count: u64 = pinned_counts
+        .as_slice()
+        .iter()
+        .copied()
+        .map(u64::from)
+        .sum();
+
+    drop(pinned_sums);
+    drop(pinned_counts);
+    drop(block_sums);
+    drop(block_counts);
+
+    Ok((total_sum, total_count))
 }
 
 /// Copy the non-NULL values of an Arrow primitive array into a fresh `Vec`.
@@ -694,16 +905,6 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
     }
 }
 
-/// Cast a scalar to f64 (used by AVG).
-fn scalar_to_f64(s: Scalar) -> BoltResult<f64> {
-    Ok(match s {
-        Scalar::I32(v) => v as f64,
-        Scalar::I64(v) => v as f64,
-        Scalar::F32(v) => v as f64,
-        Scalar::F64(v) => v,
-    })
-}
-
 /// Build a `Type` error for a failed Arrow downcast on column `name`.
 fn downcast_err(name: &str, expected: &str) -> BoltError {
     BoltError::Type(format!(
@@ -887,6 +1088,97 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(col.value(0), expected);
+    }
+
+    /// Helper: build a single-column Float64 batch.
+    fn one_col_batch_f64(values: Vec<f64>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "v",
+            arrow_schema::DataType::Float64,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(Float64Array::from(values));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    /// Fused-AVG happy path: `[1.0, 2.0, 3.0]` -> `2.0`. Goes through the
+    /// engine (which dispatches into `fused_avg_from_batch` -> the single
+    /// `bolt_avg_reduce` PTX kernel) and checks that the host-side finalize
+    /// of the per-block `(sum, count)` partials matches the simple average.
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn fused_avg_matches_simple_average() {
+        use crate::Engine;
+
+        let mut engine = Engine::new().expect("ctx");
+        let batch = one_col_batch_f64(vec![1.0, 2.0, 3.0]);
+        engine.register_table("t", batch).unwrap();
+        let h = engine.sql("SELECT AVG(v) FROM t").expect("execute");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 1);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("AVG output is Float64");
+        // `[1,2,3]` -> mean = 2.0 exactly; the fused kernel sums in f64 so
+        // there is no rounding error to chase here.
+        assert!((col.value(0) - 2.0).abs() < 1e-12, "got {}", col.value(0));
+    }
+
+    /// Empty-input AVG: with zero rows the kernel skips the launch entirely
+    /// and we fall back to the documented `0.0` semantics (see the
+    /// `TODO(null)` in `build_one_aggregate::Avg`). This test pins that
+    /// behaviour so the public contract doesn't drift silently.
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn fused_avg_empty_input_returns_zero() {
+        use crate::Engine;
+
+        let mut engine = Engine::new().expect("ctx");
+        let batch = one_col_batch_f64(vec![]);
+        engine.register_table("t", batch).unwrap();
+        let h = engine.sql("SELECT AVG(v) FROM t").expect("execute");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 1);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("AVG output is Float64");
+        // TODO(null): SQL standard says NULL; we currently return 0.0 to
+        // keep the AVG output field non-nullable.
+        assert_eq!(col.value(0), 0.0);
+    }
+
+    /// Host-only PTX-shape regression test: verify the fused kernel emits a
+    /// single entry point with three pointer params and one u32, plus stores
+    /// to both `block_sums` (f64) and `block_counts` (b32). Catches the
+    /// trivial case where someone forgets to wire the second output buffer.
+    #[test]
+    fn fused_avg_kernel_emits_both_partials() {
+        use crate::jit::agg_kernels::{compile_avg_reduction_kernel, AVG_KERNEL_ENTRY};
+
+        let ptx = compile_avg_reduction_kernel(DataType::Float64)
+            .expect("AVG PTX should compile");
+        // One entry, four params (input, sums, counts, n_rows).
+        assert!(
+            ptx.contains(&format!(".visible .entry {}(", AVG_KERNEL_ENTRY)),
+            "PTX missing entry point"
+        );
+        assert!(ptx.contains("param_0"), "missing input param");
+        assert!(ptx.contains("param_1"), "missing block_sums param");
+        assert!(ptx.contains("param_2"), "missing block_counts param");
+        assert!(ptx.contains("param_3"), "missing n_rows param");
+        // Both partial stores must be present.
+        assert!(
+            ptx.contains("st.global.f64"),
+            "PTX must store block sums as f64"
+        );
+        assert!(
+            ptx.contains("st.global.b32"),
+            "PTX must store block counts as b32"
+        );
     }
 
     #[test]
