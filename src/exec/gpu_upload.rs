@@ -68,6 +68,37 @@ pub(crate) fn upload_primitive_values_async<T: Pod>(
     }
 }
 
+/// Download a `GpuVec<T>` into a host `Vec<T>` via a pinned host buffer
+/// and a single stream-synchronize. Mirrors the `to_pinned_async +
+/// synchronize + to_vec` shape used in the scalar-aggregate executor.
+///
+/// `stream` is expected to already carry any prior work (the kernel
+/// launch that wrote `dev`). This helper enqueues the D2H on the same
+/// stream, synchronizes once, then copies the pinned bytes into a fresh
+/// owned `Vec` for downstream host-side consumers. The pinned hop lets
+/// the driver DMA directly without staging through a bounce buffer.
+///
+/// Under `--features cuda-stub` the pinned-async path is unavailable, so
+/// we fall back to `GpuVec::to_vec()` which itself surfaces
+/// `CUDA_ERROR_STUB` at the same FFI boundary.
+#[inline]
+pub(crate) fn download_to_host_pinned<T: Pod>(
+    dev: &GpuVec<T>,
+    stream: &CudaStream,
+) -> BoltResult<Vec<T>> {
+    #[cfg(feature = "cuda-stub")]
+    {
+        let _ = stream;
+        dev.to_vec()
+    }
+    #[cfg(not(feature = "cuda-stub"))]
+    {
+        let pinned = dev.to_pinned_async(stream.raw())?;
+        stream.synchronize()?;
+        Ok(pinned.as_slice().to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // `use super::*` is gated on cuda-stub because every test in this

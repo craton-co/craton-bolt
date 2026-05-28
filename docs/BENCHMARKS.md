@@ -31,15 +31,6 @@ spec; see [`benches/olap_benchmarks.rs`](../benches/olap_benchmarks.rs).
 | **q4** low-card 3-AVG (id1, 100 grps)  | 12.9 ms   | 97.0 ms    | **70.5 ms**    | Tier-1 AVG (SUM + COUNT)         |
 | **q5** high-card SUM (id3, 1 M grps)   | 623 ms    | 358 ms     | **237 ms** ⭐  | Tier-2.1 (NUM_PARTITIONS=4096, pass-2 on GPU) |
 
-<!--
-  The numbers in this table were captured on the reference machine
-  (NVIDIA A100 40 GB, driver 555.X, CUDA 12.6, Ubuntu 24.04, Rust 1.78).
-  Re-verify on your hardware with `cargo bench --bench olap_benchmarks`
-  after major code changes; an absolute drift > 10% on any of q1-q5
-  between adjacent releases warrants a perf-regression issue. See
-  docs/COMPETITIVE_BENCHMARKING.md §"Reproducing" for the canonical
-  methodology.
--->
 
 Craton Bolt wins outright on the two highest-cardinality workloads (q3,
 q5) where GPU-parallel hash-partitioning outpaces CPU per-core hash
