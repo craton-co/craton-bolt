@@ -37,3 +37,10 @@ pub mod hash_join_kernel;
 pub use ptx_gen::compile as compile_ptx;
 #[doc(hidden)]
 pub use jit_compiler::{compile_and_load, CudaFunction, CudaModule};
+
+/// Public observability hook: snapshot of the process-wide PTX module
+/// cache counters. Returns `(hits, misses, evictions)` — see
+/// [`jit_compiler::ptx_cache_stats`] for the full contract. Exposed at
+/// the `jit` module path (not crate root) to keep `lib.rs` focused on
+/// top-level engine surface.
+pub use jit_compiler::ptx_cache_stats;
