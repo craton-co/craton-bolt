@@ -378,6 +378,29 @@ pub(crate) fn get_or_build_module_for_spec<F>(
 where
     F: FnOnce(&KernelSpec) -> BoltResult<String>,
 {
+    get_or_build_module_for_spec_with(spec, entry, compile, CudaModule::from_ptx)
+}
+
+/// Shared cache logic, parameterised over the PTX-text → `CudaModule`
+/// loader. Production code supplies `CudaModule::from_ptx` (the real
+/// driver path); tests inject a stub loader that returns a fake module
+/// without touching CUDA. The shape mirrors
+/// `crate::jit::jit_compiler::CudaModule::from_ptx_with` so the two
+/// caches stay test-symmetric.
+///
+/// `pub(crate)` so a future cross-module test (e.g. one that wires the
+/// projection path against a stub) can drive this without a real GPU,
+/// but invisible in the public API.
+pub(crate) fn get_or_build_module_for_spec_with<F, L>(
+    spec: &KernelSpec,
+    entry: &'static str,
+    compile: F,
+    loader: L,
+) -> BoltResult<CudaModule>
+where
+    F: FnOnce(&KernelSpec) -> BoltResult<String>,
+    L: FnOnce(&str) -> BoltResult<CudaModule>,
+{
     let key = KernelSpecKey::new(spec, entry);
     // Fast path: hit.
     if let Some(entry) = KERNELSPEC_CACHE.lock().get(&key) {
@@ -386,7 +409,7 @@ where
     // Miss: run codegen + module load WITHOUT the cache lock held. Both
     // steps can be slow and we don't want to serialise unrelated misses.
     let ptx = compile(spec)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = loader(&ptx)?;
     // Store under the KernelSpec key so the next call skips codegen.
     KERNELSPEC_CACHE.lock().insert(
         key,
@@ -562,6 +585,116 @@ mod kernelspec_cache_tests {
             KernelSpecKey::new(&spec, "bolt_kernel"),
             KernelSpecKey::new(&cloned, "bolt_kernel"),
             "cloning the spec must not change its cache key"
+        );
+    }
+
+    /// v0.7 integration test: call the **real** `get_or_build_module_for_spec_with`
+    /// twice with the same spec and confirm the second call hits the cache
+    /// (compile closure runs exactly once across both calls). This is the
+    /// production code path — only the module loader is stubbed out, since
+    /// `CudaModule::from_ptx` requires a live CUDA context the test runner
+    /// doesn't have.
+    ///
+    /// The spec uses a distinctive `register_count` so its key cannot
+    /// collide with any other test's spec in the process-wide
+    /// `KERNELSPEC_CACHE` — tests in the same binary share the static.
+    #[test]
+    fn get_or_build_module_for_spec_runs_compile_once() {
+        let spec = KernelSpec {
+            // Distinctive marker so neither the cold-lookup test nor any
+            // unrelated test pollutes our cache slot. (Tests in the same
+            // binary all share the global `KERNELSPEC_CACHE`.)
+            register_count: 0xA7B0_07F1,
+            ..empty_spec()
+        };
+        let entry = "bolt_v07_integration_marker";
+        let compile_calls = AtomicUsize::new(0);
+        let loader_calls = AtomicUsize::new(0);
+
+        // First call: cold miss. Both the compile closure and the loader run.
+        let _m1 = get_or_build_module_for_spec_with(
+            &spec,
+            entry,
+            |_spec| {
+                compile_calls.fetch_add(1, AOrdering::SeqCst);
+                Ok("// fake ptx — never reaches the driver".to_string())
+            },
+            |_ptx| {
+                loader_calls.fetch_add(1, AOrdering::SeqCst);
+                Ok(crate::jit::CudaModule::stub_for_tests())
+            },
+        )
+        .expect("stub loader must succeed");
+        assert_eq!(compile_calls.load(AOrdering::SeqCst), 1, "cold miss must compile");
+        assert_eq!(loader_calls.load(AOrdering::SeqCst), 1, "cold miss must load");
+
+        // Second call with the same spec: warm hit. Neither the compile
+        // closure nor the loader should run.
+        let _m2 = get_or_build_module_for_spec_with(
+            &spec,
+            entry,
+            |_spec| {
+                compile_calls.fetch_add(1, AOrdering::SeqCst);
+                Ok("// MUST NOT RUN — warm cache hit was expected".to_string())
+            },
+            |_ptx| {
+                loader_calls.fetch_add(1, AOrdering::SeqCst);
+                Ok(crate::jit::CudaModule::stub_for_tests())
+            },
+        )
+        .expect("stub loader must succeed");
+        assert_eq!(
+            compile_calls.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip codegen — compile closure ran a second time"
+        );
+        assert_eq!(
+            loader_calls.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip module load — loader ran a second time"
+        );
+    }
+
+    /// Companion to `get_or_build_module_for_spec_runs_compile_once`: the
+    /// public `kernelspec_cache_stats()` hook must reflect the hit a
+    /// successful warm call generated. We use `>=` rather than `==` because
+    /// the static counter is shared across every test in the binary; this
+    /// test only proves the warm path *increments* `hits`.
+    #[test]
+    fn kernelspec_cache_stats_reflect_warm_hit() {
+        let spec = KernelSpec {
+            register_count: 0xA7B0_5747,
+            ..empty_spec()
+        };
+        let entry = "bolt_v07_stats_marker";
+
+        let (hits_before, _) = kernelspec_cache_stats();
+
+        // Cold miss — seeds the cache.
+        let _m = get_or_build_module_for_spec_with(
+            &spec,
+            entry,
+            |_| Ok("// fake ptx".to_string()),
+            |_| Ok(crate::jit::CudaModule::stub_for_tests()),
+        )
+        .expect("loader must succeed");
+
+        // Warm hit — bumps `hits` by 1.
+        let _m = get_or_build_module_for_spec_with(
+            &spec,
+            entry,
+            |_| panic!("compile must not run on the warm path"),
+            |_| panic!("loader must not run on the warm path"),
+        )
+        .expect("warm cache hit must succeed");
+
+        let (hits_after, _) = kernelspec_cache_stats();
+        assert!(
+            hits_after >= hits_before + 1,
+            "expected at least one hit bump (before={}, after={}); the warm \
+             call must have flowed through the hit path",
+            hits_before,
+            hits_after,
         );
     }
 }
