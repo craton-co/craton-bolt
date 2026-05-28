@@ -314,8 +314,15 @@ pub enum PhysicalPlan {
         /// Join kind.
         join_type: JoinType,
         /// Equi-join predicate pairs `(left_expr, right_expr)`. Empty for
-        /// `CROSS` joins (which have no ON clause).
+        /// `CROSS` joins (which have no ON clause) and for pure non-equi
+        /// joins (whose residual predicate lives entirely in `filter`).
         on: Vec<(Expr, Expr)>,
+        /// Optional residual non-equi predicate evaluated against the
+        /// combined left ++ right schema. When `Some(_)`, the executor
+        /// dispatches to the nested-loop fallback (see
+        /// [`crate::exec::join`]). `None` is the equi-join / CROSS fast
+        /// path.
+        filter: Option<Expr>,
         /// Combined left ++ right schema with right-side collisions
         /// renamed and outer-side nullability widened; see
         /// [`join_combined_schema`].
@@ -2344,6 +2351,7 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             right,
             join_type,
             on,
+            filter,
         } => {
             let l = lower_depth(left, depth + 1)?;
             let r = lower_depth(right, depth + 1)?;
@@ -2363,6 +2371,7 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 right: Box::new(r),
                 join_type: *join_type,
                 on: on.clone(),
+                filter: filter.clone(),
                 output_schema,
             })
         }

@@ -244,14 +244,22 @@ fn cross_join_parses() {
 }
 
 #[test]
-fn non_equi_join_unsupported() {
+fn non_equi_join_now_supported() {
+    // v0.6: non-equi JOIN predicates are no longer rejected at parse /
+    // physical-plan time. The SQL frontend extracts the residual non-equi
+    // expression into the `filter` slot on `LogicalPlan::Join` and the
+    // executor switches to the nested-loop fallback. Earlier versions
+    // emitted "non-equi join predicate" here; the new contract is that
+    // both parse and lowering must succeed.
     let provider = fixture_with_sales2();
     let res = try_plan(
         "SELECT * FROM sales INNER JOIN sales2 ON sales.id > sales2.id",
         &provider,
     );
-    // 0.3.x supports equi predicates only.
-    assert_err(res, "non-equi join predicate");
+    assert!(
+        res.is_ok(),
+        "v0.6: non-equi JOIN must parse and lower without error; got: {res:?}"
+    );
 }
 
 #[test]
