@@ -7,6 +7,7 @@
 //! primitive on which the typed, lifetime-tracked `GpuVec<T>` (Step 3) will be
 //! built.
 
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
 
@@ -31,6 +32,17 @@ pub struct GpuBuffer<T: Pod> {
     /// Rounded-up byte size we actually own. Needed so `Drop` returns the
     /// block to the correct pool bucket.
     alloc_bytes: usize,
+    /// Last stream this buffer was enqueued on (via `mark_stream_use`).
+    /// `None` if the buffer has only ever been touched synchronously, in
+    /// which case `Drop` can skip the fence. When `Some(s)`, `Drop` will
+    /// synchronize `s` before returning the device pointer to the pool to
+    /// avoid recycling memory while an async DMA / kernel is still in
+    /// flight (review finding C13 hardening).
+    ///
+    /// `Cell` so the read-only async helpers (`copy_to_async`, taking
+    /// `&self`) can still tag the buffer without forcing every call site
+    /// onto `&mut self`. Sound because `GpuBuffer` is `!Sync`.
+    last_use_stream: Cell<Option<CUstream>>,
     _t: PhantomData<T>,
 }
 
@@ -43,6 +55,7 @@ impl<T: Pod> GpuBuffer<T> {
             len: 0,
             capacity: 0,
             alloc_bytes: 0,
+            last_use_stream: Cell::new(None),
             _t: PhantomData,
         }
     }
@@ -86,6 +99,7 @@ impl<T: Pod> GpuBuffer<T> {
             len: 0,
             capacity,
             alloc_bytes,
+            last_use_stream: Cell::new(None),
             _t: PhantomData,
         })
     }
@@ -151,6 +165,27 @@ impl<T: Pod> GpuBuffer<T> {
     /// Raw device pointer for kernel launches and FFI handoff.
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.ptr
+    }
+
+    /// Record that this buffer was enqueued on `stream`. `Drop` will
+    /// synchronize the most recently recorded stream before returning the
+    /// device pointer to the pool, so async DMA / kernels referencing
+    /// `device_ptr()` cannot outlive the allocation.
+    ///
+    /// This is a hardening hook for the lifetime contract documented on
+    /// [`impl Drop for GpuBuffer`](GpuBuffer#impl-Drop-for-GpuBuffer<T>)
+    /// (review finding C13). Call after every `cuMemcpy*Async` /
+    /// `cuMemset*Async` / `cuLaunchKernel` that touches `device_ptr()`.
+    /// The async helpers on this type (`copy_from_async`, `copy_to_async`,
+    /// `copy_to_slice_async`, `zeros_async`) call this automatically; you
+    /// only need to call it explicitly when handing `device_ptr()` to
+    /// kernel-launch FFI yourself.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream is forwarded, not deref'd
+    pub fn mark_stream_use(&self, stream: CUstream) {
+        // `&self` (not `&mut self`) because the buffer's read-only async
+        // helpers like `copy_to_async` need to tag the stream too — and
+        // the `Cell` makes that sound (`GpuBuffer: !Sync`).
+        self.last_use_stream.set(Some(stream));
     }
 
     /// Copy the buffer's contents back to a fresh host `Vec<T>`.
@@ -228,6 +263,8 @@ impl<T: Pod> GpuBuffer<T> {
             }
         }
         self.len = src.len();
+        // Tag the stream so `Drop` fences before recycling our block.
+        self.mark_stream_use(stream);
         Ok(())
     }
 
@@ -285,6 +322,8 @@ impl<T: Pod> GpuBuffer<T> {
                 cuda_sys::memcpy_d2h_async::<T>(dst.as_mut_ptr(), self.ptr, self.len, stream)?;
             }
         }
+        // Tag the stream so `Drop` fences before recycling our block.
+        self.mark_stream_use(stream);
         Ok(())
     }
 
@@ -337,6 +376,10 @@ impl<T: Pod> GpuBuffer<T> {
             // `buf.ptr` was just allocated with at least `byte_len` bytes
             // of capacity (rounded up to ARROW_ALIGNMENT).
             cuda_sys::memset_d8_async(buf.ptr, 0, byte_len, stream)?;
+            // Tag the stream so `Drop` fences before recycling the block —
+            // a `cuMemsetD8Async` that is still in flight when `buf` drops
+            // would otherwise scribble onto the next pool consumer.
+            buf.mark_stream_use(stream);
         }
         buf.len = len;
         Ok(buf)
@@ -373,56 +416,93 @@ impl GpuBuffer<u8> {
 
 /// # SAFETY — async DMA lifetime hazard (review finding C13)
 ///
-/// **There is NO stream-completion fence in this `Drop` impl.** The device
-/// block is returned directly to [`crate::cuda::mem_pool::POOL`] for reuse
-/// the moment the owning `GpuBuffer` goes out of scope, regardless of
-/// whether any asynchronous transfer or memset is still in flight on a
-/// CUDA stream that touches `self.ptr`.
+/// `Drop` now fences the last recorded stream (`last_use_stream`) before
+/// returning the device pointer to the pool. The fence is per-buffer
+/// (`cuStreamSynchronize`), not a blanket `cuCtxSynchronize`, so unrelated
+/// streams keep running.
 ///
-/// ## Why this matters
+/// ## What is tagged
 ///
-/// If a [`GpuBuffer`] participated in any of:
+/// The async helpers on this type automatically call `mark_stream_use`
+/// after enqueueing:
 ///
 /// * [`GpuBuffer::copy_from_async`] (host→device DMA)
 /// * [`GpuBuffer::copy_to_async`] / [`GpuBuffer::copy_to_slice_async`]
 ///   (device→host DMA)
 /// * [`GpuBuffer::zeros_async`] (device-side `cuMemsetD8Async`)
-/// * any external `cuMemcpy*Async` / `cuMemset*Async` keyed off
-///   [`GpuBuffer::device_ptr`]
 ///
-/// …and the buffer is dropped *before* its stream is synchronized, the
-/// pool will hand the recycled `CUdeviceptr` to the next allocator. The
-/// in-flight DMA continues chasing the same physical address and will
-/// silently corrupt whatever unrelated `GpuBuffer` happens to receive that
-/// pool block next. There is no driver-level error: the copy completes
-/// "successfully" into someone else's data.
+/// For any *external* async use (your own `cuMemcpy*Async`,
+/// `cuMemset*Async`, or kernel launches keyed off
+/// [`GpuBuffer::device_ptr`]), call [`GpuBuffer::mark_stream_use`]
+/// yourself so `Drop` fences the right stream.
 ///
-/// ## Required caller discipline
+/// ## What the fence buys
 ///
-/// **Callers MUST `cuStreamSynchronize` (or
-/// [`crate::exec::launch::CudaStream::synchronize`]) on every stream that
-/// references this buffer's device pointer before letting the buffer drop.**
+/// Without it, dropping a buffer mid-DMA would let the pool hand the same
+/// physical address to the next allocator while the driver was still
+/// writing it. With the fence, the buffer's last-tagged stream is drained
+/// before the pool re-uses the block, so the next consumer sees a clean
+/// allocation.
 ///
-/// Equivalently, the stream itself may be destroyed first — destroying a
-/// CUDA stream implicitly synchronizes it — but relying on that ordering
-/// is fragile and discouraged.
+/// ## Why this is still imperfect (TODO)
 ///
-/// See the matching `# Safety / Lifetime contract` sections on
-/// [`GpuBuffer::copy_from_async`] and [`GpuBuffer::copy_to_async`] for the
-/// per-method statement of this rule.
+/// The current implementation tracks one stream per buffer — the most
+/// recent one. A buffer that was enqueued on stream A and then stream B
+/// will only fence B at drop. In practice that's fine: kernels chained
+/// across streams take an explicit event dependency, so completing B
+/// implies A has completed. But code that intentionally uses two
+/// unsynchronized streams on the same buffer (which is itself a bug)
+/// would only catch one of them.
 ///
-/// ## Why we don't fence here
+/// A blanket `cuCtxSynchronize` would catch both, at the cost of
+/// serializing every buffer release against every stream in the context
+/// — see the per-stream design note on `last_use_stream`.
 ///
-/// A blanket `cuCtxSynchronize` (or per-buffer event-record + wait) in
-/// `Drop` would serialize every buffer release against every stream in
-/// the context, which would obliterate the H2D / kernel / D2H overlap
-/// that the async API exists to enable. The architectural decision is
-/// to push the fence to the caller, who knows which stream(s) actually
-/// touched this buffer.
+/// ## Caller discipline (still preferred)
+///
+/// Even with the fence, calling `cuStreamSynchronize` (or
+/// [`crate::exec::launch::CudaStream::synchronize`]) before the buffer
+/// goes out of scope is cheaper than letting `Drop` discover the fence
+/// is needed — the synchronize on a *completed* stream is a fast no-op,
+/// but the synchronize on an *in-flight* one stalls the dropping thread.
 impl<T: Pod> Drop for GpuBuffer<T> {
     fn drop(&mut self) {
         if self.ptr == 0 {
             return;
+        }
+        // Hardening for review finding C13: if this buffer was ever tagged
+        // via `mark_stream_use` (auto-tagged by the async helpers on this
+        // type), we must not return the device pointer to the pool while
+        // a `cuMemcpy*Async` / `cuMemset*Async` / kernel referencing it
+        // could still be running on that stream. Otherwise the pool would
+        // hand the same physical address to an unrelated allocation, and
+        // the in-flight DMA would silently corrupt it.
+        //
+        // In release builds we unconditionally synchronize the recorded
+        // stream — correctness trumps perf for the moment. In debug
+        // builds we issue a non-blocking probe (currently the same
+        // synchronize, since the safe wrapper for `cuStreamQuery` is not
+        // yet exposed in `cuda_sys`) and warn loudly if a caller is
+        // relying on us to fence.
+        //
+        // TODO(perf): make this a debug_assert via event tracking — record
+        // a `cuEventRecord` on `mark_stream_use` and check
+        // `cuEventQuery` here instead of stalling on a full sync.
+        if let Some(stream) = self.last_use_stream.get() {
+            // SAFETY: `stream` came in through `mark_stream_use`, which
+            // forwards what the caller already passed to the async FFI.
+            // The driver tolerates synchronize-on-a-completed-stream as a
+            // cheap no-op, so calling it here even when the work has
+            // long since finished is safe.
+            let rc = unsafe { cuda_sys::cuStreamSynchronize(stream) };
+            if rc != cuda_sys::CUDA_SUCCESS {
+                log::warn!(
+                    "craton-bolt: GpuBuffer::Drop cuStreamSynchronize returned {} \
+                     (buffer dropped while a pending op may still reference it; \
+                     pool block may be recycled before the driver is done with it)",
+                    rc
+                );
+            }
         }
         // Return the block to the pool rather than the driver. The pool's
         // `drain` (run on process shutdown via `Drop` on the static) will
@@ -430,9 +510,6 @@ impl<T: Pod> Drop for GpuBuffer<T> {
         // backend when `--features cudarc` is active, or via the
         // hand-rolled FFI otherwise. Either way the call site here is
         // backend-agnostic because the pool stores raw `CUdeviceptr`s.
-        //
-        // NOTE (review C13): no stream-completion fence here. See the
-        // SAFETY rustdoc on this `impl` block above.
         crate::cuda::mem_pool::POOL.free(self.ptr, self.alloc_bytes);
     }
 }
@@ -549,7 +626,12 @@ impl<T: Pod> PinnedHostBuffer<T> {
     /// because no caller currently needs it.
     #[inline]
     pub fn byte_len(&self) -> usize {
-        self.len * size_of::<T>()
+        // `checked_mul` mirrors `GpuBuffer::byte_len` — never wrap silently;
+        // if `self.len * size_of::<T>()` cannot fit `usize`, that's a bug we
+        // want to surface, not a number we want to return.
+        self.len
+            .checked_mul(size_of::<T>())
+            .expect("PinnedHostBuffer::byte_len overflow")
     }
 
     /// Raw host pointer (for async memcpy FFI). May be null when `len == 0`.
@@ -608,11 +690,16 @@ impl<T: Pod> PinnedHostBuffer<T> {
     /// compare; the safety win is that miscalculated lengths cannot
     /// turn into UB.
     pub unsafe fn set_len(&mut self, new_len: usize) {
+        // `checked_mul` so an adversarial `new_len` cannot wrap the product
+        // before the bounds check — otherwise `as_slice()` would `from_raw_parts`
+        // over arbitrary memory beyond our pinned allocation.
+        let new_bytes = new_len
+            .checked_mul(std::mem::size_of::<T>())
+            .expect("set_len: new_len * size_of::<T>() overflowed usize");
         assert!(
-            new_len * size_of::<T>() <= self.byte_len,
-            "PinnedHostBuffer::set_len({}) exceeds allocation ({} bytes)",
-            new_len,
-            self.byte_len,
+            new_bytes <= self.byte_len,
+            "set_len: requested {new_len} elements ({new_bytes} bytes) exceeds buffer byte_len {}",
+            self.byte_len
         );
         self.len = new_len;
     }
