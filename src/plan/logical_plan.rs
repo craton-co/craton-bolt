@@ -354,6 +354,20 @@ pub enum Expr {
         /// `true` for `NOT LIKE`, `false` for `LIKE`.
         negated: bool,
     },
+    /// SQL `CAST(expr AS type)` over primitive (non-Utf8) types.
+    ///
+    /// Type-checks to `target` regardless of the source dtype, but only the
+    /// pairs documented on [`cast_is_supported`] are accepted at the logical
+    /// plane — anything else surfaces a `BoltError::Type` from
+    /// [`Expr::dtype`]. The physical planner currently rejects every `Cast`
+    /// at the lowering boundary (see [`crate::plan::physical_plan::lower`]);
+    /// GPU codegen for the runtime conversion is a v0.6 follow-up.
+    Cast {
+        /// Inner expression whose value is converted.
+        expr: Box<Expr>,
+        /// Target dtype the conversion produces.
+        target: DataType,
+    },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
 }
@@ -469,6 +483,16 @@ impl Expr {
         Expr::Unary {
             op: UnaryOp::Not,
             operand: Box::new(self),
+        }
+    }
+
+    /// `CAST(self AS target)`. Type-checking against the source dtype happens
+    /// later in [`Expr::dtype`]; see [`cast_is_supported`] for the accepted
+    /// source/target pairs.
+    pub fn cast(self, target: DataType) -> Expr {
+        Expr::Cast {
+            expr: Box::new(self),
+            target,
         }
     }
 
@@ -638,6 +662,22 @@ impl Expr {
                 }
                 Ok(DataType::Bool)
             }
+            Expr::Cast { expr, target } => {
+                // Tolerate an untyped `Literal::Null` operand the same way
+                // `IS NULL` does — `CAST(NULL AS Int32)` is a legitimate
+                // SQL fragment and the result type is purely declared by
+                // `target` anyway.
+                if matches!(expr.as_ref(), Expr::Literal(Literal::Null)) {
+                    return Ok(*target);
+                }
+                let src = expr.dtype_depth(schema, depth + 1)?;
+                if !cast_is_supported(src, *target) {
+                    return Err(BoltError::Type(format!(
+                        "unsupported CAST from {src:?} to {target:?}"
+                    )));
+                }
+                Ok(*target)
+            }
             Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
         }
     }
@@ -700,6 +740,42 @@ fn peer_typed_dtype(
         }
     }
     e.dtype(schema)
+}
+
+/// True if the engine's logical plane accepts `CAST(<src> AS <target>)`.
+///
+/// The v0.5 surface is intentionally small — only the primitive conversions
+/// the GPU executor will plausibly lower in v0.6 are admitted. Anything
+/// involving `Utf8` is rejected at this layer (string -> numeric parsing
+/// would need a runtime fallible path we don't have yet).
+///
+/// Accepted pairs:
+///   * `T -> T` (identity, no-op) for any primitive `T`
+///   * `Int32 <-> Int64`
+///   * `Int32` / `Int64` -> `Float32` / `Float64`
+///   * `Float32 <-> Float64`
+///   * `Bool <-> Int32` / `Bool <-> Int64`
+///
+/// Everything else returns `false` and surfaces a `BoltError::Type` at the
+/// caller in [`Expr::dtype_depth`].
+pub(crate) fn cast_is_supported(src: DataType, target: DataType) -> bool {
+    use DataType::*;
+    if src == target {
+        // Identity cast is always allowed (covers Utf8 -> Utf8 too, which
+        // is harmless — the executor would just return the column as-is).
+        return true;
+    }
+    match (src, target) {
+        // Integer widening / narrowing.
+        (Int32, Int64) | (Int64, Int32) => true,
+        // Integer -> float.
+        (Int32, Float32) | (Int32, Float64) | (Int64, Float32) | (Int64, Float64) => true,
+        // Float widening / narrowing.
+        (Float32, Float64) | (Float64, Float32) => true,
+        // Bool <-> integer (0/1 round-trip).
+        (Bool, Int32) | (Bool, Int64) | (Int32, Bool) | (Int64, Bool) => true,
+        _ => false,
+    }
 }
 
 /// Promote two numeric types to the wider one (float beats int, 64 beats 32).

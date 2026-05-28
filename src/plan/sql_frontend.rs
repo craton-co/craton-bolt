@@ -9,18 +9,18 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Offset, OrderByExpr, Query,
-    Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-    UnaryOperator, Value,
+    BinaryOperator, CastKind, DataType as SqlDataType, Distinct, Expr as SqlExpr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+    ObjectName, Offset, OrderByExpr, Query, Select, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, Statement, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, Expr,
-    JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
+    aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, DataType,
+    Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
 };
 
 /// Maximum recursion depth allowed when walking attacker-controlled SQL
@@ -1935,6 +1935,10 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
             || contains_aggregate(low, resolver, depth + 1)?
             || contains_aggregate(high, resolver, depth + 1)?),
         SqlExpr::Like { expr, .. } => contains_aggregate(expr, resolver, depth + 1),
+        // `CAST(<expr> AS <type>)` is a transparent wrapper — recurse into
+        // the inner expression so `HAVING CAST(SUM(v) AS Int64) > 0`
+        // is recognised as referencing an aggregate.
+        SqlExpr::Cast { expr, .. } => contains_aggregate(expr, resolver, depth + 1),
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
         // CASE: any nested subtree may contain an aggregate call (operand
         // of a simple CASE, any WHEN condition, any THEN value, the ELSE).
@@ -2321,6 +2325,39 @@ fn lower_expr_in_having(
                 else_branch: else_expr,
             })
         }
+        // HAVING CAST(...) — descend into the inner with the aggregate-aware
+        // lowerer so `HAVING CAST(SUM(v) AS Int64) > 0` rewrites correctly.
+        SqlExpr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => {
+            if format.is_some() {
+                return Err(BoltError::Sql(
+                    "CAST with FORMAT clause not supported".into(),
+                ));
+            }
+            match kind {
+                CastKind::Cast | CastKind::DoubleColon => {}
+                CastKind::TryCast => {
+                    return Err(BoltError::Sql(
+                        "TRY_CAST not supported; use CAST".into(),
+                    ));
+                }
+                CastKind::SafeCast => {
+                    return Err(BoltError::Sql(
+                        "SAFE_CAST not supported; use CAST".into(),
+                    ));
+                }
+            }
+            let target = lower_cast_data_type(data_type)?;
+            let inner = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
+            Ok(Expr::Cast {
+                expr: Box::new(inner),
+                target,
+            })
+        }
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
         // still rejects bare non-aggregate Function calls).
@@ -2371,6 +2408,7 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
                 }
             }
             Expr::Like { expr, .. } => stack.push(expr),
+            Expr::Cast { expr, .. } => stack.push(expr),
         }
     }
     Ok(())
@@ -2614,6 +2652,46 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                 "scalar function calls are not supported".into(),
             ))
         }
+        // `CAST(<expr> AS <type>)`. v0.5 accepts the standard SQL spelling
+        // and the Postgres `expr::type` shortcut (both surface as
+        // `CastKind::Cast` / `CastKind::DoubleColon`). `TRY_CAST` and
+        // `SAFE_CAST` carry NULL-on-failure semantics the planner can't
+        // honour yet, so we reject them with a clear message rather than
+        // silently treating them as a plain cast.
+        SqlExpr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => {
+            if format.is_some() {
+                return Err(BoltError::Sql(
+                    "CAST with FORMAT clause not supported".into(),
+                ));
+            }
+            match kind {
+                CastKind::Cast | CastKind::DoubleColon => {}
+                CastKind::TryCast => {
+                    return Err(BoltError::Sql(
+                        "TRY_CAST not supported; use CAST".into(),
+                    ));
+                }
+                CastKind::SafeCast => {
+                    return Err(BoltError::Sql(
+                        "SAFE_CAST not supported; use CAST".into(),
+                    ));
+                }
+            }
+            let target = lower_cast_data_type(data_type)?;
+            let inner = lower_expr(expr, resolver, depth + 1)?;
+            Ok(Expr::Cast {
+                expr: Box::new(inner),
+                target,
+            })
+        }
+        SqlExpr::Function(_) => Err(BoltError::Sql(
+            "scalar function calls are not supported".into(),
+        )),
         other => Err(BoltError::Sql(format!(
             "unsupported expression: {other}"
         ))),
@@ -2920,6 +2998,43 @@ fn lower_value(v: &Value) -> BoltResult<Expr> {
         Value::Null => Ok(Expr::Literal(Literal::Null)),
         other => Err(BoltError::Sql(format!("unsupported literal: {other}"))),
     }
+}
+
+/// Map a parsed `sqlparser::ast::DataType` into the engine's internal
+/// [`DataType`] for the v0.5 CAST surface.
+///
+/// Only the primitive types the executor will plausibly lower in v0.6 are
+/// accepted — anything else (CHAR(n), DECIMAL, DATE/TIME, structured types,
+/// etc.) surfaces a clear `BoltError::Sql` so the user knows the parser
+/// understood the type name but the engine doesn't support converting to it
+/// yet.
+///
+/// Recognised aliases follow common SQL spellings:
+///   * `INT`, `INTEGER`, `INT4`, `INT32`   -> [`DataType::Int32`]
+///   * `BIGINT`, `INT8`, `INT64`           -> [`DataType::Int64`]
+///   * `REAL`, `FLOAT4`, `FLOAT32`         -> [`DataType::Float32`]
+///   * `DOUBLE`, `DOUBLE PRECISION`,
+///     `FLOAT8`, `FLOAT64`                 -> [`DataType::Float64`]
+///   * `BOOL`, `BOOLEAN`                   -> [`DataType::Bool`]
+fn lower_cast_data_type(t: &SqlDataType) -> BoltResult<DataType> {
+    Ok(match t {
+        SqlDataType::Int(_)
+        | SqlDataType::Integer(_)
+        | SqlDataType::Int4(_)
+        | SqlDataType::Int32 => DataType::Int32,
+        SqlDataType::BigInt(_) | SqlDataType::Int8(_) | SqlDataType::Int64 => DataType::Int64,
+        SqlDataType::Real | SqlDataType::Float4 | SqlDataType::Float32 => DataType::Float32,
+        SqlDataType::Double
+        | SqlDataType::DoublePrecision
+        | SqlDataType::Float8
+        | SqlDataType::Float64 => DataType::Float64,
+        SqlDataType::Bool | SqlDataType::Boolean => DataType::Bool,
+        other => {
+            return Err(BoltError::Sql(format!(
+                "CAST target type not supported: {other}"
+            )));
+        }
+    })
 }
 
 /// True if `s` is written as a pure integer (no decimal point, no exponent).
@@ -3874,6 +3989,7 @@ mod wave7_tests {
                             }
                         }
                         Expr::Like { expr, .. } => stack.push(expr),
+                        Expr::Cast { expr, .. } => stack.push(expr),
                         Expr::Literal(_) => {}
                     }
                 }

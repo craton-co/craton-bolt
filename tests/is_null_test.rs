@@ -472,6 +472,7 @@ fn contains_unary(expr: &Expr) -> bool {
                 .any(|(w, t)| contains_unary(w) || contains_unary(t))
                 || else_branch.as_deref().is_some_and(contains_unary)
         }
+        Expr::Cast { expr, .. } => contains_unary(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }

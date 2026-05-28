@@ -330,6 +330,11 @@ fn eval_inner(
             escape,
             negated,
         } => eval_like(expr, pattern, *escape, *negated, env, n_rows),
+        Expr::Cast { .. } => Err(BoltError::Other(
+            "expr_agg: CAST not yet supported on the host evaluator; \
+             plan-time lowering should have rejected this expression"
+                .into(),
+        )),
     }
 }
 
