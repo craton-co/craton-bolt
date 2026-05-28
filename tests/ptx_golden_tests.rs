@@ -780,6 +780,101 @@ fn golden_hash_join_build_kernel_smoke() {
     assert!(ptx.contains("PROBE_LOOP:"), "{ptx}");
 }
 
+/// Helper: assert `needle` appears strictly before the first occurrence of
+/// `marker` in `haystack`. Used by the speculative-load goldens to lock the
+/// pre-check → CAS ordering.
+fn assert_appears_before(haystack: &str, needle: &str, marker: &str, ctx: &str) {
+    let needle_pos = haystack.find(needle).unwrap_or_else(|| {
+        panic!("{ctx}: expected '{needle}' to appear in PTX:\n{haystack}")
+    });
+    let marker_pos = haystack.find(marker).unwrap_or_else(|| {
+        panic!("{ctx}: expected marker '{marker}' to appear in PTX:\n{haystack}")
+    });
+    assert!(
+        needle_pos < marker_pos,
+        "{ctx}: '{needle}' must appear before '{marker}' \
+         (needle@{needle_pos}, marker@{marker_pos})\n{haystack}"
+    );
+}
+
+/// Batch 6: SoA build kernel emits a speculative `ld.acquire.gpu.s64`
+/// pre-check immediately before its slot-claim CAS. Skipping the CAS when
+/// the slot is already occupied by a non-matching key removes a
+/// guaranteed-miss atomic under hot-key skew.
+#[test]
+fn golden_hash_join_build_kernel_speculative_pre_check() {
+    use craton_bolt::jit::hash_join_kernel::compile_build_kernel;
+    let ptx = compile_build_kernel().expect("compile");
+    assert!(
+        ptx.contains("ld.acquire.gpu.s64"),
+        "SoA build must emit speculative ld.acquire.gpu.s64 before CAS\n{ptx}"
+    );
+    assert!(ptx.contains("DO_CAS:"), "SoA build must emit DO_CAS: label\n{ptx}");
+    assert_appears_before(
+        &ptx,
+        "ld.acquire.gpu.s64",
+        "atom.global.cas.b64",
+        "compile_build_kernel",
+    );
+    assert_appears_before(
+        &ptx,
+        "DO_CAS:",
+        "atom.global.cas.b64",
+        "compile_build_kernel",
+    );
+}
+
+/// Batch 6: collision-list build kernel emits the speculative pre-check
+/// before its slot-claim CAS. The chain-prepend `atom.global.exch.b32` on
+/// the head pointer is a different atomic and is NOT preceded by the
+/// pre-check.
+#[test]
+fn golden_hash_join_build_collision_kernel_speculative_pre_check() {
+    use craton_bolt::jit::hash_join_kernel::compile_build_collision_kernel;
+    let ptx = compile_build_collision_kernel().expect("compile");
+    assert!(
+        ptx.contains("ld.acquire.gpu.s64"),
+        "collision build must emit speculative ld.acquire.gpu.s64 before CAS\n{ptx}"
+    );
+    assert!(ptx.contains("DO_CAS:"), "collision build must emit DO_CAS: label\n{ptx}");
+    assert_appears_before(
+        &ptx,
+        "ld.acquire.gpu.s64",
+        "atom.global.cas.b64",
+        "compile_build_collision_kernel",
+    );
+    // Chain-head atomic stays untouched.
+    assert!(ptx.contains("atom.global.exch.b32"), "{ptx}");
+    // The speculative pre-check only guards the slot-claim CAS, not the
+    // head-pointer exch: there must be exactly one `ld.acquire.gpu.s64`.
+    let n_spec = ptx.matches("ld.acquire.gpu.s64").count();
+    assert_eq!(
+        n_spec, 1,
+        "collision build must emit exactly one speculative pre-check (slot CAS only); saw {n_spec}\n{ptx}"
+    );
+}
+
+/// Batch 6: AoS build kernel emits the speculative pre-check before its
+/// slot-claim CAS. AoS slot layout (`[key:u64, head:u32, _pad:u32]`)
+/// doesn't change the analysis — the i64 key word at slot offset 0 is the
+/// CAS target.
+#[test]
+fn golden_hash_join_build_aos_kernel_speculative_pre_check() {
+    use craton_bolt::jit::hash_join_kernel::compile_build_aos_kernel;
+    let ptx = compile_build_aos_kernel().expect("compile");
+    assert!(
+        ptx.contains("ld.acquire.gpu.s64"),
+        "AoS build must emit speculative ld.acquire.gpu.s64 before CAS\n{ptx}"
+    );
+    assert!(ptx.contains("DO_CAS:"), "AoS build must emit DO_CAS: label\n{ptx}");
+    assert_appears_before(
+        &ptx,
+        "ld.acquire.gpu.s64",
+        "atom.global.cas.b64",
+        "compile_build_aos_kernel",
+    );
+}
+
 #[test]
 fn golden_hash_join_probe_kernel_smoke() {
     use craton_bolt::jit::hash_join_kernel::compile_probe_kernel;
