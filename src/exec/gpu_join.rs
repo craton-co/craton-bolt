@@ -190,6 +190,8 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use parking_lot::Mutex;
+
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray, UInt32Array,
@@ -212,6 +214,89 @@ use crate::jit::hash_join_kernel::{
     STRING_HASH_BLOCK_SIZE, STRING_HASH_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
 };
 use crate::plan::logical_plan::DataType;
+
+// ---------------------------------------------------------------------------
+// Reusable host-side sentinel buffers
+// ---------------------------------------------------------------------------
+//
+// The hash-join hash table needs three sentinel-filled host buffers per query
+// that get H2D-uploaded to seed the device-side table:
+//   * `keys`     — initial value `i64::MIN`        (cap entries)
+//   * `row_idx`  — initial value `u32::MAX`        (cap entries)
+//   * `head`     — initial value `u32::MAX`        (cap entries)
+//   * `next_idx` — initial value `u32::MAX`        (n_build entries)
+//
+// At the large-cap limit (44.7 M slots) each `vec![i64::MIN; cap]` allocates
+// ~357 MiB on the heap *per query*. The contents are query-independent —
+// every query overwrites them identically. Allocating, zeroing, and freeing
+// 357 MiB per join is pure waste.
+//
+// We replace the per-query allocation with a process-wide cached buffer that
+// only ever grows. Each call returns a `&'static [T]` prefix of the requested
+// length; the buffer's storage is leaked on growth so the previously handed-
+// out references stay valid until process exit (which is when `Lazy` storage
+// would also be freed). Concurrent callers are serialised on a `Mutex` only
+// for the brief grow check; the returned slice points into leaked storage
+// and is freely shareable.
+//
+// PCIe upload itself is still per-query — eliminating that requires a true
+// device-side memset (cuMemsetD32 / cuMemsetD8) which the comment thread
+// flagged for a follow-up. The host alloc is the immediate ROI.
+
+/// Sentinel value for empty hash-table key slots. Must match the
+/// `i64::MIN` literal embedded in the GPU build/probe kernels.
+const SENTINEL_I64_MIN: i64 = i64::MIN;
+
+/// Sentinel value for empty row-index slots and unused collision-list
+/// `head` / `next_idx` entries. Must match `u32::MAX` everywhere it
+/// appears in the kernels.
+const SENTINEL_U32_MAX: u32 = u32::MAX;
+
+/// Process-wide pool of `i64::MIN`-filled host storage. Grown on demand.
+static SENTINEL_I64_MIN_POOL: Mutex<&'static [i64]> = Mutex::new(&[]);
+
+/// Process-wide pool of `u32::MAX`-filled host storage. Grown on demand.
+static SENTINEL_U32_MAX_POOL: Mutex<&'static [u32]> = Mutex::new(&[]);
+
+/// Return a `&'static [i64]` of length `cap` whose every element is
+/// `i64::MIN`. Reuses a process-wide buffer; only allocates when `cap`
+/// exceeds the largest previous request.
+pub fn get_sentinel_i64_min_vec(cap: usize) -> &'static [i64] {
+    let storage: &'static [i64] = {
+        let mut guard = SENTINEL_I64_MIN_POOL.lock();
+        if cap > guard.len() {
+            // Grow to at least `cap`. Round up to next power of two (matching
+            // the hash-table capacity discipline) so we don't realloc on the
+            // very next request that bumps cap by 1.
+            let new_cap = cap.next_power_of_two().max(cap);
+            let leaked: &'static mut [i64] =
+                Vec::leak(vec![SENTINEL_I64_MIN; new_cap]);
+            *guard = leaked;
+        }
+        // Copy out the `&'static [i64]` so we can drop the guard and still
+        // return a static-lifetime slice. The underlying storage is leaked
+        // and never freed, so this is sound.
+        *guard
+    };
+    &storage[..cap]
+}
+
+/// Return a `&'static [u32]` of length `cap` whose every element is
+/// `u32::MAX`. Reuses a process-wide buffer; only allocates when `cap`
+/// exceeds the largest previous request.
+pub fn get_sentinel_u32_max_vec(cap: usize) -> &'static [u32] {
+    let storage: &'static [u32] = {
+        let mut guard = SENTINEL_U32_MAX_POOL.lock();
+        if cap > guard.len() {
+            let new_cap = cap.next_power_of_two().max(cap);
+            let leaked: &'static mut [u32] =
+                Vec::leak(vec![SENTINEL_U32_MAX; new_cap]);
+            *guard = leaked;
+        }
+        *guard
+    };
+    &storage[..cap]
+}
 
 /// Minimum size threshold (per side) below which the host hash join wins. The
 /// GPU path eats a JIT-compile + h2d round trip; empirically 1024 rows on
@@ -1186,10 +1271,12 @@ pub fn hash_join_indices_on_gpu(
     let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
 
     // Hash table buffers: keys init to i64::MIN, row_idx init to u32::MAX.
-    let keys_init: Vec<i64> = vec![i64::MIN; cap];
-    let row_idx_init: Vec<u32> = vec![u32::MAX; cap];
-    let mut keys_table_dev = GpuVec::<i64>::from_slice(&keys_init)?;
-    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(&row_idx_init)?;
+    // Use process-wide sentinel pools to avoid re-allocating up to ~357 MiB
+    // of host memory per query at the large-cap limit.
+    let keys_init = get_sentinel_i64_min_vec(cap);
+    let row_idx_init = get_sentinel_u32_max_vec(cap);
+    let mut keys_table_dev = GpuVec::<i64>::from_slice(keys_init)?;
+    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(row_idx_init)?;
 
     // Output buffers. We pre-size for the worst INNER-equi case under the
     // unique-build-key invariant: every probe row matches at most one build
@@ -1410,15 +1497,20 @@ pub fn hash_join_indices_on_gpu_with_shape(
     let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
     let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
 
-    let keys_init: Vec<i64> = vec![i64::MIN; cap];
-    let row_idx_init: Vec<u32> = vec![u32::MAX; cap];
-    let head_init: Vec<u32> = vec![COLLISION_LIST_SENTINEL; cap];
-    let next_idx_init: Vec<u32> = vec![COLLISION_LIST_SENTINEL; n_build];
+    // Reuse process-wide sentinel pools (see `get_sentinel_*_vec`). The
+    // `head` / `next_idx` buffers share the u32::MAX pool since
+    // `COLLISION_LIST_SENTINEL == u32::MAX`. Per-query host allocation drops
+    // from ~357 MiB to ~0 at the large-cap limit; the H2D upload still
+    // happens (cuMemsetD32 is the next-level win).
+    let keys_init = get_sentinel_i64_min_vec(cap);
+    let row_idx_init = get_sentinel_u32_max_vec(cap);
+    let head_init = get_sentinel_u32_max_vec(cap);
+    let next_idx_init = get_sentinel_u32_max_vec(n_build);
 
-    let mut keys_table_dev = GpuVec::<i64>::from_slice(&keys_init)?;
-    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(&row_idx_init)?;
-    let mut head_dev = GpuVec::<u32>::from_slice(&head_init)?;
-    let mut next_idx_dev = GpuVec::<u32>::from_slice(&next_idx_init)?;
+    let mut keys_table_dev = GpuVec::<i64>::from_slice(keys_init)?;
+    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(row_idx_init)?;
+    let mut head_dev = GpuVec::<u32>::from_slice(head_init)?;
+    let mut next_idx_dev = GpuVec::<u32>::from_slice(next_idx_init)?;
 
     // Output buffer size: 2x (n_build + n_probe) — a generous estimate for
     // typical workloads where duplicate-key fan-out is small. Pathological
@@ -1563,15 +1655,17 @@ pub fn execute_outer_join_indices_on_gpu(
     let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
     let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
 
-    let keys_init: Vec<i64> = vec![i64::MIN; cap];
-    let row_idx_init: Vec<u32> = vec![u32::MAX; cap];
-    let head_init: Vec<u32> = vec![COLLISION_LIST_SENTINEL; cap];
-    let next_idx_init: Vec<u32> = vec![COLLISION_LIST_SENTINEL; n_build];
+    // See top-of-file `get_sentinel_*_vec`: avoid re-allocating ~357 MiB of
+    // host scratch per OUTER join.
+    let keys_init = get_sentinel_i64_min_vec(cap);
+    let row_idx_init = get_sentinel_u32_max_vec(cap);
+    let head_init = get_sentinel_u32_max_vec(cap);
+    let next_idx_init = get_sentinel_u32_max_vec(n_build);
 
-    let mut keys_table_dev = GpuVec::<i64>::from_slice(&keys_init)?;
-    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(&row_idx_init)?;
-    let mut head_dev = GpuVec::<u32>::from_slice(&head_init)?;
-    let mut next_idx_dev = GpuVec::<u32>::from_slice(&next_idx_init)?;
+    let mut keys_table_dev = GpuVec::<i64>::from_slice(keys_init)?;
+    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(row_idx_init)?;
+    let mut head_dev = GpuVec::<u32>::from_slice(head_init)?;
+    let mut next_idx_dev = GpuVec::<u32>::from_slice(next_idx_init)?;
 
     // matched: u32[ceil(build_n_rows / 32)], zero-initialised. We always
     // allocate it for OUTER even when only the LEFT case is requested,
@@ -3077,15 +3171,17 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
     let build_keys_dev = GpuVec::<i64>::from_slice(&build_keys_host)?;
     let probe_keys_dev = GpuVec::<i64>::from_slice(&probe_keys_host)?;
 
-    let keys_init: Vec<i64> = vec![i64::MIN; cap];
-    let row_idx_init: Vec<u32> = vec![u32::MAX; cap];
-    let head_init: Vec<u32> = vec![COLLISION_LIST_SENTINEL; cap];
-    let next_idx_init: Vec<u32> = vec![COLLISION_LIST_SENTINEL; n_build];
+    // See top-of-file `get_sentinel_*_vec`: avoid re-allocating ~357 MiB of
+    // host scratch per AoS join.
+    let keys_init = get_sentinel_i64_min_vec(cap);
+    let row_idx_init = get_sentinel_u32_max_vec(cap);
+    let head_init = get_sentinel_u32_max_vec(cap);
+    let next_idx_init = get_sentinel_u32_max_vec(n_build);
 
-    let mut keys_table_dev = GpuVec::<i64>::from_slice(&keys_init)?;
-    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(&row_idx_init)?;
-    let mut head_dev = GpuVec::<u32>::from_slice(&head_init)?;
-    let mut next_idx_dev = GpuVec::<u32>::from_slice(&next_idx_init)?;
+    let mut keys_table_dev = GpuVec::<i64>::from_slice(keys_init)?;
+    let mut row_idx_table_dev = GpuVec::<u32>::from_slice(row_idx_init)?;
+    let mut head_dev = GpuVec::<u32>::from_slice(head_init)?;
+    let mut next_idx_dev = GpuVec::<u32>::from_slice(next_idx_init)?;
 
     let out_capacity_usize = n_build
         .checked_add(n_probe)
@@ -3555,6 +3651,81 @@ mod tests {
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 
     // -- Pure-host helpers --
+
+    #[test]
+    fn sentinel_buffers_are_reused_and_grow_only_upwards() {
+        // Drive the pool through three asks and verify (a) the contents are
+        // always sentinel-filled to the requested length and (b) the backing
+        // storage only ever grows. Pointer identity confirms the second:
+        // requests at-or-below the high-water mark return slices into the
+        // same backing buffer; requests above it trigger a (leaked) realloc.
+        //
+        // The pools are process-wide; to keep the pointer-identity checks
+        // immune to parallel-test interference we serialise the whole
+        // sequence on a test-local mutex.
+        use parking_lot::Mutex as TestMutex;
+        use std::sync::OnceLock;
+        static TEST_GATE: OnceLock<TestMutex<()>> = OnceLock::new();
+        let _g = TEST_GATE.get_or_init(|| TestMutex::new(())).lock();
+
+        // Capture today's high-water by reading the pool length directly.
+        let baseline_i64 = SENTINEL_I64_MIN_POOL.lock().len();
+
+        // (1) Small ask. May or may not grow the pool depending on baseline.
+        let small_cap = baseline_i64.max(100);
+        let s1 = get_sentinel_i64_min_vec(small_cap);
+        assert_eq!(s1.len(), small_cap);
+        assert!(s1.iter().all(|&v| v == i64::MIN));
+        let s1_ptr = s1.as_ptr();
+
+        // (2) Smaller ask — MUST reuse the same backing storage.
+        let smaller_cap = small_cap / 2;
+        let s2 = get_sentinel_i64_min_vec(smaller_cap);
+        assert_eq!(s2.len(), smaller_cap);
+        assert!(s2.iter().all(|&v| v == i64::MIN));
+        assert_eq!(
+            s2.as_ptr(),
+            s1_ptr,
+            "smaller request should reuse the existing buffer, not reallocate"
+        );
+
+        // (3) Larger ask — forces a grow. New backing storage; pointer
+        // identity to the previous buffer is no longer required.
+        let larger_cap = small_cap.saturating_mul(2).max(small_cap + 1);
+        let s3 = get_sentinel_i64_min_vec(larger_cap);
+        assert_eq!(s3.len(), larger_cap);
+        assert!(s3.iter().all(|&v| v == i64::MIN));
+
+        // (4) After growth, a subsequent at-or-below ask reuses the new
+        // high-water buffer.
+        let s4 = get_sentinel_i64_min_vec(larger_cap - 1);
+        assert_eq!(s4.len(), larger_cap - 1);
+        assert!(s4.iter().all(|&v| v == i64::MIN));
+        assert_eq!(
+            s4.as_ptr(),
+            s3.as_ptr(),
+            "ask below new high-water should reuse the grown buffer"
+        );
+
+        // Same contract for the u32::MAX pool.
+        let baseline_u32 = SENTINEL_U32_MAX_POOL.lock().len();
+        let cap_a = baseline_u32.max(64);
+        let u1 = get_sentinel_u32_max_vec(cap_a);
+        assert_eq!(u1.len(), cap_a);
+        assert!(u1.iter().all(|&v| v == u32::MAX));
+        let u1_ptr = u1.as_ptr();
+
+        let u2 = get_sentinel_u32_max_vec(cap_a / 2);
+        assert_eq!(u2.as_ptr(), u1_ptr);
+        assert!(u2.iter().all(|&v| v == u32::MAX));
+
+        let u3 = get_sentinel_u32_max_vec(cap_a.saturating_mul(2).max(cap_a + 1));
+        assert!(u3.iter().all(|&v| v == u32::MAX));
+
+        // Zero-length asks are allowed and yield empty slices.
+        let z = get_sentinel_i64_min_vec(0);
+        assert!(z.is_empty());
+    }
 
     #[test]
     fn compute_capacity_powers_of_two() {
