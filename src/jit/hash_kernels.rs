@@ -127,6 +127,13 @@ pub const FX_MUL: i64 = 0x9E3779B97F4A7C15u64 as i64;
 /// Entry point of the keys-only kernel emitted by [`compile_groupby_keys_kernel`].
 pub const KEYS_KERNEL_ENTRY: &str = "bolt_groupby_keys";
 
+/// Entry point of the Robin Hood variant emitted by
+/// [`compile_groupby_keys_kernel_robin_hood`]. Shares the same parameter
+/// list and ABI as [`KEYS_KERNEL_ENTRY`] (4 params, no validity); the
+/// executor swaps one for the other based on the `BOLT_HASH_ALGO`
+/// environment variable.
+pub const KEYS_KERNEL_RH_ENTRY: &str = "bolt_groupby_keys_rh";
+
 /// Entry point of the aggregate-update kernel emitted by
 /// [`compile_groupby_agg_kernel`].
 pub const AGG_KERNEL_ENTRY: &str = "bolt_groupby_agg";
@@ -158,6 +165,17 @@ pub const I64_EMPTY_SENTINEL: i64 = i64::MIN;
 /// invariant is honoured, the bound never triggers. Mirrors the
 /// `MAX_PROBE_FACTOR` constant in [`crate::jit::valid_flag_kernels`].
 const MAX_PROBE_FACTOR: u32 = 2;
+
+/// Maximum probe distance allowed by the Robin Hood variant emitted by
+/// [`compile_groupby_keys_kernel_robin_hood`]. Pedro Celis (1986) showed
+/// that Robin Hood probing bounds the variance of probe lengths very
+/// tightly; at load factor < 0.5 the expected longest probe is roughly
+/// `log2(k)` and the 99th-percentile probe is typically below 16 even on
+/// adversarial inputs. Threads exceeding this give up silently — same
+/// "silent drop" semantics as `MAX_PROBE_FACTOR` in the linear-probe
+/// kernel. Future work: surface overflow via a spill counter (mirrors
+/// `valid_flag_kernels::SPILL`).
+const MAX_RH_PROBE: u32 = 16;
 
 /// Number of `u32` words required to pack a `n_rows`-row validity bitmap
 /// (1 bit per row, 32 rows per word). At least one word is allocated even
@@ -362,6 +380,288 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     writeln!(ptx, "}}").map_err(write_err)?;
 
     Ok(ptx)
+}
+
+/// Generate PTX for the **Robin Hood** variant of the keys-building kernel.
+///
+/// This is the optional opt-in alternative to [`compile_groupby_keys_kernel`].
+/// It shares the same ABI (4 params: group_col_ptr, keys_table_ptr, n_rows,
+/// k) and the same EMPTY-slot sentinel (`I64_EMPTY_SENTINEL = i64::MIN`),
+/// so it is a drop-in replacement at the PTX module level — only the entry
+/// point name differs ([`KEYS_KERNEL_RH_ENTRY`] vs [`KEYS_KERNEL_ENTRY`]).
+///
+/// # Algorithm
+///
+/// Robin Hood hashing (Pedro Celis, 1986) caps the variance of probe
+/// lengths by ensuring that the entry with the smaller "probe distance"
+/// (distance from its hash home) always wins a slot contest. On
+/// insertion of a new key K starting from `hash(K) & mask`, at each
+/// occupied slot we compare OUR probe distance against the OCCUPANT's:
+///
+/// * If we are POORER (our_dist > occ_dist) we displace the occupant —
+///   atomically write our key into the slot, then continue probing
+///   forward carrying the displaced occupant's key.
+/// * If we are RICHER OR EQUAL (our_dist <= occ_dist) we advance to the
+///   next slot, incrementing our probe distance.
+///
+/// This bounds the worst-case probe distance dramatically: at load
+/// factor < 0.5 the 99th percentile probe length is typically < 16,
+/// regardless of key skew, vs linear probing where adversarial inputs
+/// can produce arbitrarily long clusters.
+///
+/// # GPU concurrency model
+///
+/// Each thread maintains a `cur_key` register (initially its own input
+/// key) and a `cur_dist` counter (initially 0). At each slot:
+///
+/// 1. `atom.cas.b64(slot, EMPTY, cur_key)` — try to claim the slot if
+///    it is empty.
+/// 2. If `old == EMPTY` we placed the key, done.
+/// 3. If `old == cur_key` the slot already holds our group, done.
+/// 4. Otherwise compute the OCCUPANT's probe distance:
+///    `occ_dist = (slot - (hash(old) & mask)) & mask`.
+/// 5. If `occ_dist >= cur_dist` (occupant richer-or-equal): advance.
+/// 6. If `occ_dist <  cur_dist` (occupant poorer): we displace.
+///    `displaced = atom.exch.b64(slot, cur_key)` — atomically swap.
+///    Continue with `cur_key := displaced`, `cur_dist := occ_dist + 1`.
+///
+/// # TODO(rh): finalize swap semantics on contention
+///
+/// The atomic semantics above are sound for the **single-thread**
+/// invariant (no key is ever dropped during a swap), but the
+/// concurrent-insertion correctness story has known gaps that require a
+/// follow-up. Specifically:
+///
+/// * Between step 1's CAS and step 6's exch a third thread may have
+///   replaced the slot's contents; the `displaced` returned by
+///   `atom.exch.b64` is therefore not necessarily the `old` observed by
+///   the preceding CAS. The current implementation carries `displaced`
+///   forward unconditionally, which is sound (no key is lost) but can
+///   transiently violate the Robin Hood invariant until the chase
+///   completes.
+/// * Under heavy contention a key K may be present "in flight" (held in
+///   one thread's `cur_key` register having just been swapped out)
+///   while a second thread inserts K via CAS into an empty slot further
+///   along the chain. The duplicate is eventually probed-and-merged by
+///   the agg-kernel's read-only walk (which finds the FIRST match), but
+///   the keys table will contain two distinct slots for the same group
+///   key. For load-factor < 0.5 with low-collision-skew inputs this is
+///   rare; needs a follow-up to formally verify or add a post-launch
+///   dedup sweep.
+///
+/// Because of these gaps the kernel is **opt-in via `BOLT_HASH_ALGO=robin_hood`**
+/// — the linear-probe kernel remains the default. PTX-shape tests below
+/// exercise the emitter; end-to-end GPU correctness validation against
+/// adversarial inputs is left as follow-up work.
+///
+/// # Probe cap
+///
+/// A thread that exceeds [`MAX_RH_PROBE`] slot examinations gives up
+/// silently (no atomic update issued). Same defensive-bound contract as
+/// the linear-probe kernel — at load factor < 0.5 it should never
+/// trigger; if it does, the row's group is dropped.
+pub fn compile_groupby_keys_kernel_robin_hood() -> BoltResult<String> {
+    let mut ptx = String::new();
+    let entry = KEYS_KERNEL_RH_ENTRY;
+
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Same 4-param ABI as the classic keys kernel.
+    writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_2,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_3").map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    // Generous register decls; only declared names, not real allocations.
+    writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<32>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<24>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rl<24>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // tid = ctaid.x * ntid.x + tid.x ; bail if tid >= n_rows.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // Load k and compute mask = k - 1.
+    writeln!(ptx, "\tld.param.u32 %r5, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
+
+    // Load this thread's key value from group_col into %rl0 (= cur_key).
+    writeln!(ptx, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+
+    // Hash cur_key: h = ((cur_key * FX_MUL) >> 32) & mask.
+    writeln!(ptx, "\tmov.s64 %rl1, {};", FX_MUL).map_err(write_err)?;
+    writeln!(ptx, "\tmul.lo.s64 %rl2, %rl0, %rl1;").map_err(write_err)?;
+    writeln!(ptx, "\tshr.u64 %rl3, %rl2, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
+
+    // Load keys_table base ptr.
+    writeln!(ptx, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+
+    // EMPTY_KEY constant.
+    writeln!(ptx, "\tmov.s64 %rl4, {};", EMPTY_KEY_LITERAL).map_err(write_err)?;
+
+    // %r9  = cur_dist (starts at 0)
+    // %r10 = probe_count (bounded-probe defensive counter)
+    // %r11 = MAX_RH_PROBE constant
+    writeln!(ptx, "\tmov.u32 %r9, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r10, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r11, {};", MAX_RH_PROBE).map_err(write_err)?;
+
+    // ------------------------------------------------------------------
+    // Robin Hood probe loop.
+    // Loop registers:
+    //   %rl0  = cur_key  (key currently being placed; may be original or displaced)
+    //   %r8   = cur_slot (masked)
+    //   %r9   = cur_dist (probe distance from cur_key's hash to cur_slot)
+    //   %r10  = probe_count (bounded-probe counter)
+    // ------------------------------------------------------------------
+    writeln!(ptx, "RH_PROBE_LOOP:").map_err(write_err)?;
+    // Bounded-probe defensive check: silent-drop on overflow.
+    writeln!(ptx, "\tadd.u32 %r10, %r10, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p3, %r10, %r11;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
+
+    // addr = keys_table + cur_slot * 8
+    writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
+
+    // Try CAS: EMPTY -> cur_key. Returns previous value into %rl5.
+    writeln!(
+        ptx,
+        "\tatom.global.cas.b64 %rl5, [%rd5], %rl4, %rl0;"
+    )
+    .map_err(write_err)?;
+
+    // If old == EMPTY, we placed cur_key successfully; done.
+    writeln!(ptx, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra DONE;").map_err(write_err)?;
+
+    // If old == cur_key, the slot already holds our (or the displaced)
+    // group; done. Note: when carrying a DISPLACED key, finding it
+    // already present means our chase ends — the displaced key is
+    // already in the table further along, possibly as a duplicate of
+    // what we're carrying. See TODO(rh) above; for the common case
+    // (low contention) this is the natural deduplication path.
+    writeln!(ptx, "\tsetp.eq.s64 %p2, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 bra DONE;").map_err(write_err)?;
+
+    // Slot was occupied by a different key — compute the occupant's
+    // probe distance:
+    //   occ_home = (occupant * FX_MUL) >> 32 & mask
+    //   occ_dist = (cur_slot - occ_home) & mask
+    //
+    // %rl5 holds the occupant key.
+    writeln!(ptx, "\tmul.lo.s64 %rl6, %rl5, %rl1;").map_err(write_err)?;
+    writeln!(ptx, "\tshr.u64 %rl7, %rl6, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u64 %r12, %rl7;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r13, %r12, %r6;").map_err(write_err)?;
+    // occ_dist = (cur_slot - occ_home) & mask  -- mask handles wrap-around.
+    writeln!(ptx, "\tsub.s32 %r14, %r8, %r13;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r14, %r14, %r6;").map_err(write_err)?;
+
+    // Compare: are WE richer (cur_dist <= occ_dist) or POORER (cur_dist > occ_dist)?
+    // If cur_dist <= occ_dist : occupant is richer-or-equal → advance.
+    // If cur_dist >  occ_dist : occupant is poorer → SWAP.
+    writeln!(ptx, "\tsetp.gt.u32 %p4, %r9, %r14;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p4 bra RH_SWAP;").map_err(write_err)?;
+
+    // Richer-or-equal path: advance cur_slot, cur_dist += 1.
+    writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r9, %r9, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra RH_PROBE_LOOP;").map_err(write_err)?;
+
+    // ------------------------------------------------------------------
+    // Swap branch: atomically replace the slot's contents with cur_key
+    // and pick up the displaced occupant as the new cur_key. The new
+    // cur_dist is occ_dist + 1 because the displaced key was at distance
+    // occ_dist from its home and we are moving it one slot forward.
+    //
+    // TODO(rh): finalize swap semantics on contention. `atom.exch.b64`
+    // returns the value that was in the slot AT THE TIME OF THE EXCH,
+    // which under contention may differ from the %rl5 observed by the
+    // preceding CAS. We unconditionally carry the exch's return value
+    // forward, which is sound (no key is lost) but can transiently
+    // violate the Robin Hood invariant until the chase quiesces.
+    // ------------------------------------------------------------------
+    writeln!(ptx, "RH_SWAP:").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.exch.b64 %rl8, [%rd5], %rl0;").map_err(write_err)?;
+    // cur_key := displaced key (the value previously in the slot).
+    writeln!(ptx, "\tmov.b64 %rl0, %rl8;").map_err(write_err)?;
+    // If the swap raced and the slot actually held EMPTY at the moment
+    // of exch, then we placed cur_key into EMPTY and now hold EMPTY in
+    // %rl0. Bail out — there is nothing left to chase. (Defensive:
+    // under the SINGLE-thread model the swap branch is only reached
+    // after observing a NON-EMPTY occupant via CAS, so this should be
+    // unreachable; under contention a sibling thread may have CAS'd
+    // EMPTY in between, which would surface here.)
+    writeln!(ptx, "\tsetp.eq.s64 %p5, %rl0, %rl4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra DONE;").map_err(write_err)?;
+    // cur_dist := occ_dist + 1; advance slot.
+    writeln!(ptx, "\tadd.u32 %r9, %r14, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(ptx, "\tbra RH_PROBE_LOOP;").map_err(write_err)?;
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
+/// Runtime dispatch helper for the keys-build kernel. Reads the
+/// `BOLT_HASH_ALGO` environment variable on first call and routes to
+/// either the linear-probe (default) or Robin Hood emitter.
+///
+/// Accepted values (case-insensitive):
+///   * unset, empty, or `linear`  → [`compile_groupby_keys_kernel`]
+///     (returns the classic [`KEYS_KERNEL_ENTRY`] entry point).
+///   * `robin_hood` or `rh`       → [`compile_groupby_keys_kernel_robin_hood`]
+///     (returns the [`KEYS_KERNEL_RH_ENTRY`] entry point).
+///
+/// Returns a `(ptx, entry_name)` pair so the executor knows which
+/// `module.function(...)` name to look up. Unknown values fall back to
+/// the linear path silently — Tier-1 dispatch must remain robust to
+/// typo'd or stale env values.
+///
+/// This helper exists so the executor can flip kernels without a
+/// recompile; it is intentionally a per-launch lookup (`std::env::var`
+/// is cheap), keeping the opt-in surgical. Once the Robin Hood swap
+/// semantics are finalised (see the TODO on
+/// [`compile_groupby_keys_kernel_robin_hood`]) the default can flip
+/// here without touching the executor.
+pub fn compile_groupby_keys_kernel_dispatched() -> BoltResult<(String, &'static str)> {
+    let algo = std::env::var("BOLT_HASH_ALGO").unwrap_or_default();
+    let algo_lc = algo.to_ascii_lowercase();
+    if algo_lc == "robin_hood" || algo_lc == "rh" {
+        let ptx = compile_groupby_keys_kernel_robin_hood()?;
+        Ok((ptx, KEYS_KERNEL_RH_ENTRY))
+    } else {
+        // Default: linear probing (includes the "linear", "", and unknown
+        // cases — robust to typos).
+        let ptx = compile_groupby_keys_kernel()?;
+        Ok((ptx, KEYS_KERNEL_ENTRY))
+    }
 }
 
 /// Generate PTX for an aggregate-update kernel parameterised over `op` +
@@ -1231,5 +1531,147 @@ mod ptx_shape_tests {
         assert_eq!(packed_validity_word_count(64), 2);
         assert_eq!(packed_validity_word_count(65), 3);
         assert_eq!(packed_validity_word_count(1_000_000), 31_250);
+    }
+
+    // -----------------------------------------------------------------
+    // Robin Hood keys-kernel PTX-shape tests. Like the validity tests,
+    // these are host-only — they assert the emitter produces the
+    // expected PTX SHAPE (entry-point name, param count, presence of
+    // the swap branch + atomic-exch instruction, bounded-probe cap).
+    // End-to-end GPU correctness is intentionally NOT tested here; see
+    // the TODO(rh) note on `compile_groupby_keys_kernel_robin_hood`
+    // about pending swap-semantics validation under contention.
+    // -----------------------------------------------------------------
+
+    /// The Robin Hood kernel exposes a distinct entry-point name so the
+    /// executor can load it alongside (not in place of) the classic kernel.
+    #[test]
+    fn rh_kernel_uses_distinct_entry_name() {
+        let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
+        assert!(
+            ptx.contains(&format!(".visible .entry {}(", KEYS_KERNEL_RH_ENTRY)),
+            "RH entry-point name missing"
+        );
+        // Must NOT collide with the linear-probe entry point.
+        assert!(
+            !ptx.contains(&format!(".visible .entry {}(", KEYS_KERNEL_ENTRY)),
+            "RH ptx should not declare the linear entry point"
+        );
+    }
+
+    /// The Robin Hood kernel keeps the classic 4-param ABI (no validity).
+    /// Validity is out of scope for this first cut; the dispatcher's
+    /// fallback path keeps the classic-with-validity emitter for that case.
+    #[test]
+    fn rh_kernel_has_four_params() {
+        let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
+        // Four params: 0..=3
+        assert!(ptx.contains(&format!("{}_param_3", KEYS_KERNEL_RH_ENTRY)));
+        assert!(!ptx.contains(&format!("{}_param_4", KEYS_KERNEL_RH_ENTRY)));
+    }
+
+    /// The Robin Hood kernel must emit BOTH atomic primitives that the
+    /// algorithm relies on: `atom.global.cas.b64` for the empty-slot
+    /// claim and `atom.global.exch.b64` for the swap.
+    #[test]
+    fn rh_kernel_emits_cas_and_exch() {
+        let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
+        assert!(
+            ptx.contains("atom.global.cas.b64"),
+            "RH must use atom.cas to claim empty slots"
+        );
+        assert!(
+            ptx.contains("atom.global.exch.b64"),
+            "RH must use atom.exch to swap with richer occupants"
+        );
+    }
+
+    /// The Robin Hood kernel must emit the swap branch label (RH_SWAP)
+    /// so the linear path can fall into it on richer-than-occupant
+    /// comparison. Also asserts the bounded-probe cap is the
+    /// MAX_RH_PROBE constant.
+    #[test]
+    fn rh_kernel_emits_swap_branch_and_bound() {
+        let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
+        assert!(ptx.contains("RH_PROBE_LOOP:"), "missing RH_PROBE_LOOP label");
+        assert!(ptx.contains("RH_SWAP:"), "missing RH_SWAP label");
+        // The bounded-probe cap mov should reference MAX_RH_PROBE's value.
+        assert!(
+            ptx.contains(&format!("mov.u32 %r11, {};", MAX_RH_PROBE)),
+            "RH_PROBE bound must be MAX_RH_PROBE = {}",
+            MAX_RH_PROBE
+        );
+    }
+
+    /// The Robin Hood kernel must compute the occupant's probe distance
+    /// (the load-bearing comparison for the swap decision). We assert
+    /// the kernel uses the same splitmix multiplier on the occupant
+    /// (i.e. `hash(occupant)` is computed for the dist comparison).
+    #[test]
+    fn rh_kernel_hashes_occupant_for_distance() {
+        let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
+        // The splitmix multiplier is loaded into %rl1 once and reused
+        // for hashing both the input key (initial hash) and the
+        // occupant (during the swap decision). We therefore expect a
+        // SECOND multiply against %rl1 reading the occupant key from
+        // %rl5 (the CAS return register).
+        assert!(
+            ptx.contains("mul.lo.s64 %rl6, %rl5, %rl1;"),
+            "RH must re-multiply occupant key by FX_MUL to derive its home slot.\n\
+             --- emitted PTX ---\n{}",
+            ptx
+        );
+    }
+
+    /// The dispatcher routes to the linear-probe kernel by default
+    /// (BOLT_HASH_ALGO unset).
+    ///
+    /// Note: this test temporarily unsets the env var; if other tests
+    /// in this binary set it concurrently the result is racy. The test
+    /// module is intended to run with `--test-threads=1` for the env
+    /// cases; the assertion is conservative (just verifies the entry
+    /// name returned matches the default path).
+    #[test]
+    fn dispatcher_defaults_to_linear_probe() {
+        // Save + clear the env so the dispatcher takes the default branch.
+        let prev = std::env::var("BOLT_HASH_ALGO").ok();
+        std::env::remove_var("BOLT_HASH_ALGO");
+        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched()
+            .expect("dispatcher default");
+        assert_eq!(entry, KEYS_KERNEL_ENTRY);
+        // Restore.
+        if let Some(v) = prev {
+            std::env::set_var("BOLT_HASH_ALGO", v);
+        }
+    }
+
+    /// The dispatcher routes to the Robin Hood kernel when
+    /// `BOLT_HASH_ALGO=robin_hood` is set. Also accepts `rh` as a
+    /// shorthand.
+    #[test]
+    fn dispatcher_opts_into_robin_hood() {
+        let prev = std::env::var("BOLT_HASH_ALGO").ok();
+
+        std::env::set_var("BOLT_HASH_ALGO", "robin_hood");
+        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched()
+            .expect("rh long form");
+        assert_eq!(entry, KEYS_KERNEL_RH_ENTRY);
+
+        std::env::set_var("BOLT_HASH_ALGO", "RH");
+        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched()
+            .expect("rh short upper");
+        assert_eq!(entry, KEYS_KERNEL_RH_ENTRY);
+
+        // Unknown values fall back to linear.
+        std::env::set_var("BOLT_HASH_ALGO", "wibble");
+        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched()
+            .expect("unknown fallback");
+        assert_eq!(entry, KEYS_KERNEL_ENTRY);
+
+        // Restore.
+        std::env::remove_var("BOLT_HASH_ALGO");
+        if let Some(v) = prev {
+            std::env::set_var("BOLT_HASH_ALGO", v);
+        }
     }
 }

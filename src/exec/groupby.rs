@@ -110,8 +110,8 @@ use crate::jit::agg_kernels::ReduceOp;
 // remains correct.
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
-    compile_groupby_keys_kernel, groupby_block_size, AGG_KERNEL_ENTRY,
-    I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
+    compile_groupby_keys_kernel_dispatched, groupby_block_size,
+    AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL,
 };
 use crate::jit::CudaModule;
 use crate::plan::logical_plan::{
@@ -1064,9 +1064,15 @@ fn launch_keys_kernel(
         return Ok(());
     }
 
-    let ptx = compile_groupby_keys_kernel()?;
+    // Dispatch to either the classic linear-probe kernel (default) or the
+    // Robin Hood variant when the operator opts in via `BOLT_HASH_ALGO`.
+    // Both kernels share the same 4-param ABI, so only the entry-point
+    // name varies. See `compile_groupby_keys_kernel_dispatched` for the
+    // env-var contract and `compile_groupby_keys_kernel_robin_hood` for
+    // the Robin Hood algorithm + outstanding `TODO(rh)` items.
+    let (ptx, kernel_entry) = compile_groupby_keys_kernel_dispatched()?;
     let module = CudaModule::from_ptx(&ptx)?;
-    let function = module.function(KEYS_KERNEL_ENTRY)?;
+    let function = module.function(kernel_entry)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
     let mut keys_ptr: CUdeviceptr = keys_table.device_ptr();
