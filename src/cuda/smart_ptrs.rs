@@ -72,6 +72,46 @@ impl<T: Pod> GpuVec<T> {
         Self { buffer }
     }
 
+    /// Batch-5 incremental-cache helper. Allocates a new GpuVec sized for
+    /// `total_len` elements, DtoD-copies the leading `prefix_len`
+    /// elements from `self`'s buffer, then HtoD-uploads `tail` into the
+    /// trailing rows. `self` is consumed so the old device allocation
+    /// drops back to the pool at the end of the call (its memory has
+    /// already been copied off the device by then, since the DtoD copy
+    /// is synchronous).
+    ///
+    /// Returns an error if `prefix_len > self.len()` or if
+    /// `prefix_len + tail.len() != total_len`.
+    pub fn extended_with_prefix(
+        self,
+        total_len: usize,
+        prefix_len: usize,
+        tail: &[T],
+    ) -> BoltResult<Self> {
+        if prefix_len > self.buffer.len() {
+            return Err(crate::error::BoltError::Memory(format!(
+                "GpuVec::extended_with_prefix: prefix_len ({}) exceeds self.len ({})",
+                prefix_len,
+                self.buffer.len()
+            )));
+        }
+        // SAFETY: `self.buffer` is a live device allocation of `self.len()`
+        // `T`s and `prefix_len <= self.len()` (checked above). The
+        // `from_prefix_and_tail` constructor allocates a fresh device
+        // pointer distinct from `self.buffer`'s, so the non-overlap
+        // requirement of `cuMemcpyDtoD_v2` holds.
+        let buf = unsafe {
+            GpuBuffer::<T>::from_prefix_and_tail(
+                total_len,
+                self.buffer.device_ptr(),
+                prefix_len,
+                tail,
+            )?
+        };
+        // `self` drops here; its `GpuBuffer` returns to the pool.
+        Ok(Self { buffer: buf })
+    }
+
     /// Number of valid `T` elements.
     #[inline]
     pub fn len(&self) -> usize {

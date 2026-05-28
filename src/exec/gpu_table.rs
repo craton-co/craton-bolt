@@ -23,6 +23,21 @@ pub struct GpuColumn {
     pub dtype: DataType,
     /// Owned device storage.
     pub data: GpuColumnData,
+    /// Host-side revision counter at the time this column was uploaded.
+    ///
+    /// Compared against `Engine`'s `host_revisions[table].column_revisions[col]`
+    /// in [`crate::exec::engine::Engine::ensure_gpu_table`]; a match means the
+    /// upload is still fresh and the engine reuses this column in place,
+    /// avoiding a redundant HtoD transfer. A mismatch triggers a re-upload
+    /// (or a prefix-preserving extension for `register_batch` appends).
+    ///
+    /// Initialised by the engine — `GpuTable::from_record_batch` leaves it
+    /// at `0` and the engine sets it to the matching host revision right
+    /// after building. Callers outside the engine (direct
+    /// `GpuTable::from_record_batch` users) can leave it untouched; the
+    /// counter only matters when the column lives inside an engine-managed
+    /// `gpu_tables` cache.
+    pub host_revision: u64,
 }
 
 /// Heterogeneous owned device storage for a single column.
@@ -354,7 +369,12 @@ impl GpuColumn {
                 }
             }
         };
-        Ok(Self { name, dtype, data })
+        Ok(Self {
+            name,
+            dtype,
+            data,
+            host_revision: 0,
+        })
     }
 
     /// Upload an Arrow `DictionaryArray<Int32, Utf8>` to the GPU as a native
@@ -422,6 +442,7 @@ impl GpuColumn {
                 dict,
                 valid_mask,
             },
+            host_revision: 0,
         })
     }
 
@@ -453,68 +474,103 @@ pub struct GpuTable {
     pub n_rows: usize,
     /// Columns in source-schema order.
     pub columns: Vec<GpuColumn>,
+    /// Host-side `table_revision` at the time this table was last touched
+    /// by [`crate::exec::engine::Engine::ensure_gpu_table`].
+    ///
+    /// The engine's incremental-upload path compares the host's current
+    /// `table_revision` against this field on cache hit:
+    ///   - Equal: the cache is fully fresh — every column was uploaded at
+    ///     the current revision. Return as-is.
+    ///   - Less: at least one mutation has happened since the last upload.
+    ///     The engine walks `columns` and reuses any whose
+    ///     `host_revision` still matches, re-uploading only the rest.
+    ///
+    /// `GpuTable::from_record_batch` leaves this at `0` and the engine sets
+    /// it to the matching host revision right after building. Direct callers
+    /// can leave it untouched.
+    pub last_uploaded_revision: u64,
 }
 
 impl GpuTable {
+    /// Upload a single Arrow `Field`'s column from `batch` to the device,
+    /// dispatching on the Arrow dtype. Used by both
+    /// [`GpuTable::from_record_batch`] (full uploads) and the engine's
+    /// incremental cache (per-column re-upload on `register_batch`).
+    ///
+    /// This is the canonical Arrow-dtype → `GpuColumn` mapping; any future
+    /// dtype additions should go here so both code paths stay in sync.
+    pub fn upload_column_from_batch(
+        batch: &RecordBatch,
+        field: &arrow_schema::Field,
+        idx: usize,
+    ) -> BoltResult<GpuColumn> {
+        let arr = batch.column(idx);
+        let col = match field.data_type() {
+            arrow_schema::DataType::Int32 => {
+                GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Int32)?
+            }
+            arrow_schema::DataType::Int64 => {
+                GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Int64)?
+            }
+            arrow_schema::DataType::Float32 => {
+                GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Float32)?
+            }
+            arrow_schema::DataType::Float64 => {
+                GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Float64)?
+            }
+            arrow_schema::DataType::Boolean => {
+                GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Bool)?
+            }
+            arrow_schema::DataType::Utf8 => {
+                GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Utf8)?
+            }
+            // Stage 6: native ingest path for `DictionaryArray<Int32, Utf8>`.
+            // Stage 5 had this routed through `GpuColumn::upload` (which
+            // would build a `DictUtf8` variant without validity); Stage 6
+            // upgrades the path to `upload_dict_utf8`, which packs the
+            // Arrow null buffer into an on-device validity bitmap so
+            // downstream null-aware kernels see real per-row validity.
+            arrow_schema::DataType::Dictionary(key_t, val_t)
+                if key_t.as_ref() == &arrow_schema::DataType::Int32
+                    && val_t.as_ref() == &arrow_schema::DataType::Utf8 =>
+            {
+                let dict_arr = arr
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                    .ok_or_else(|| {
+                        BoltError::Type(format!(
+                            "column '{}' declared Dictionary<Int32, Utf8> but did not \
+                             downcast to DictionaryArray<Int32Type>",
+                            field.name()
+                        ))
+                    })?;
+                GpuColumn::upload_dict_utf8(field.name().clone(), dict_arr)?
+            }
+            other => {
+                return Err(BoltError::Type(format!(
+                    "GpuTable: unsupported Arrow dtype {:?} for column '{}'",
+                    other,
+                    field.name()
+                )));
+            }
+        };
+        Ok(col)
+    }
+
     /// Upload every column of `batch` to the device.
     pub fn from_record_batch(batch: &RecordBatch) -> BoltResult<Self> {
         let n_rows = batch.num_rows();
         let schema = batch.schema();
         let mut columns: Vec<GpuColumn> = Vec::with_capacity(batch.num_columns());
         for (idx, field) in schema.fields().iter().enumerate() {
-            let arr = batch.column(idx);
-            let col = match field.data_type() {
-                arrow_schema::DataType::Int32 => {
-                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Int32)?
-                }
-                arrow_schema::DataType::Int64 => {
-                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Int64)?
-                }
-                arrow_schema::DataType::Float32 => {
-                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Float32)?
-                }
-                arrow_schema::DataType::Float64 => {
-                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Float64)?
-                }
-                arrow_schema::DataType::Boolean => {
-                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Bool)?
-                }
-                arrow_schema::DataType::Utf8 => {
-                    GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Utf8)?
-                }
-                // Stage 6: native ingest path for `DictionaryArray<Int32, Utf8>`.
-                // Stage 5 had this routed through `GpuColumn::upload` (which
-                // would build a `DictUtf8` variant without validity); Stage 6
-                // upgrades the path to `upload_dict_utf8`, which packs the
-                // Arrow null buffer into an on-device validity bitmap so
-                // downstream null-aware kernels see real per-row validity.
-                arrow_schema::DataType::Dictionary(key_t, val_t)
-                    if key_t.as_ref() == &arrow_schema::DataType::Int32
-                        && val_t.as_ref() == &arrow_schema::DataType::Utf8 =>
-                {
-                    let dict_arr = arr
-                        .as_any()
-                        .downcast_ref::<DictionaryArray<Int32Type>>()
-                        .ok_or_else(|| {
-                            BoltError::Type(format!(
-                                "column '{}' declared Dictionary<Int32, Utf8> but did not \
-                                 downcast to DictionaryArray<Int32Type>",
-                                field.name()
-                            ))
-                        })?;
-                    GpuColumn::upload_dict_utf8(field.name().clone(), dict_arr)?
-                }
-                other => {
-                    return Err(BoltError::Type(format!(
-                        "GpuTable: unsupported Arrow dtype {:?} for column '{}'",
-                        other,
-                        field.name()
-                    )));
-                }
-            };
+            let col = Self::upload_column_from_batch(batch, field, idx)?;
             columns.push(col);
         }
-        Ok(Self { n_rows, columns })
+        Ok(Self {
+            n_rows,
+            columns,
+            last_uploaded_revision: 0,
+        })
     }
 
     /// Borrow the column with the given name, if present.
