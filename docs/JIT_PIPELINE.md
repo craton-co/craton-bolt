@@ -47,7 +47,7 @@ Source: `src/plan/sql_frontend.rs`.
 
 Uses [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) as the lexer/parser. We don't accept the full SQL grammar — `parse_sql` walks the parser's AST and only accepts shapes Craton Bolt can execute:
 
-- `SELECT` with optional `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT [OFFSET]`, `DISTINCT`, `UNION [ALL]`, and a single JOIN per `SELECT` — `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]` (all with equi `ON` predicates), or `CROSS` (no `ON`). All joins execute host-side. CTEs, subqueries, window functions, and non-equi join predicates are still rejected at parse time. See [`SQL_REFERENCE.md`](SQL_REFERENCE.md) for the full surface; the rest of this section focuses on the parts that drive PTX codegen.
+- `SELECT` with optional `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT [OFFSET]`, `DISTINCT`, `UNION [ALL]`, and a single JOIN per `SELECT` — `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]` (all with equi `ON` predicates), or `CROSS` (no `ON`). Equi-joins route through the GPU hash-join kernel (`src/jit/hash_join_kernel.rs` + `src/exec/gpu_join.rs`) when the key shape is supported, falling back to the host-side hash join otherwise; CROSS remains host-side. CTEs, subqueries, window functions, and non-equi join predicates are still rejected at parse time. See [`SQL_REFERENCE.md`](SQL_REFERENCE.md) for the full surface; the rest of this section focuses on the parts that drive PTX codegen.
 - A single base table in `FROM` (plus at most one joined table via the supported JOIN forms). No schema-qualified names.
 - Scalar expressions: column references, integer / float / string / bool / null literals, binary arithmetic (`+ - * /`), comparison (`= <> < <= > >=`), logical (`AND OR`), parenthesised sub-expressions, unary minus on literals (folded), unary plus (no-op).
 - Aggregate functions in SELECT: `COUNT(*)`, `COUNT(expr)`, `SUM`, `MIN`, `MAX`, `AVG`.
@@ -278,10 +278,39 @@ For non-bare aggregate inputs that aren't covered by the pre kernel's outputs (r
 
 ## What's not codegened
 
-- **NULL handling.** The current reduction kernels don't read a validity bitmap. `COUNT(expr)` counts every row, not just non-null rows. The host-side `extended_agg` path (Bool, Utf8) does honour nulls.
+- **NULL handling.** Validity-aware kernels are available — see `compile_*_with_validity` in `src/jit/hash_kernels.rs` and the sentinel-free variants in `src/jit/valid_flag_kernels.rs`. The dispatch in `src/exec/groupby.rs` auto-routes to the validity variant on null-bearing inputs (`AggregateSpec::input_has_validity`). Older reduction paths that don't yet read the bitmap fall back to host-side handling via the `extended_agg` path (Bool, Utf8), which honours nulls.
 - **Variable-width string outputs.** CONCAT producing genuinely new strings works via host-side dictionary cross-product (`src/exec/string_ops_extended.rs`), not on the GPU.
-- **Joins.** `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS` joins all work (one per `SELECT`), but the executor is a host-side hash join (build smaller side into a HashMap, probe the larger; CROSS is a host-side cartesian product) — no GPU join kernel yet. Non-equi predicates are rejected at parse time. A GPU-resident hash-join path is a 0.4 target.
+- **Joins.** `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS` joins all work (one per `SELECT`). The GPU hash-join kernel landed in 0.3.x — see `src/jit/hash_join_kernel.rs` for the build / probe / collision / unmatched emitters, wired through `src/exec/gpu_join.rs`. The host-side hash-join path (build smaller side into a HashMap, probe the larger; CROSS is a host-side cartesian product) remains as the fallback for shapes the GPU path doesn't yet cover. Non-equi predicates are still rejected at parse time.
 - **Window functions.** Not yet.
 - **CASE / NULLIF / CAST / unary ops beyond folded minus.** The expression evaluator covers the standard binary set; the AST doesn't model these.
 
 Each is a self-contained future change, not a blocker for the existing surface.
+
+## rust-cuda alternative emitter (experimental, opt-in)
+
+In addition to the default hand-emit PTX path (every kernel in
+`src/jit/*_kernel.rs`), the crate ships a second emitter that compiles
+Rust source code to PTX via the `rustc_codegen_nvvm` backend. This is
+gated behind `--features rust-cuda` and is currently *narrow in scope*:
+only the partition kernel (`src/jit/partition_kernel.rs` →
+`kernels/src/lib.rs::bolt_partition`) has a rust-cuda implementation.
+
+When the feature is enabled, `build.rs` invokes `cuda_builder` to
+compile `kernels/` to a PTX module (`OUT_DIR/partition.ptx`), and
+`compile_partition_kernel()` returns the embedded PTX bytes rather than
+the hand-emit string. Constants (`NUM_PARTITIONS`, `HASH_MULTIPLIER`)
+are duplicated between the two paths but verified equal via inline
+inspection (see `kernels/src/lib.rs:37` ≡ `src/jit/partition_kernel.rs:79`).
+
+Why a parallel path? The hand-emit PTX text emitter is fast,
+type-aware, and produces deterministic output — but it sits below the
+Rust type system. The rust-cuda path proves the same kernel can be
+written as readable Rust, with the cost of a much heavier toolchain
+(nightly + libNVVM + LLVM). The crate's default remains the hand-emit
+path; rust-cuda is a spike toward "everything in Rust" that may or may
+not become the default in a future release. See
+`docs/rust_cuda/` (internal design notes, not published) for the audit.
+
+Practical impact for downstream users: zero unless you opt in via
+`--features rust-cuda` AND have the rust-cuda toolchain installed (see
+`kernels/rust-toolchain.toml`).

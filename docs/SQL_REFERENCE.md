@@ -8,7 +8,9 @@ This document tracks the 0.3.0 release. For the JIT pipeline that lowers and exe
 
 ```
 SELECT [DISTINCT] <select_list>
-  FROM <table> [INNER JOIN <table> ON <equi_predicate>]
+  FROM <table>
+       [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table> ON <equi_predicate>
+        | CROSS JOIN <table>]
  [WHERE  <bool_expr>]
  [GROUP BY <expr_list>]
  [HAVING <bool_expr>]
@@ -20,12 +22,12 @@ Two queries can be combined with `UNION` or `UNION ALL`; the optional `ORDER BY`
 
 **Hard restrictions** (everything else returns a `BoltError`):
 
-- Exactly one base table in `FROM`, optionally widened by **one** JOIN per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an equi `ON` predicate, or `CROSS JOIN` (no `ON`). All joins execute host-side. `JOIN USING`, `NATURAL JOIN`, non-equi predicates, computed join keys, and chaining more than one JOIN per `SELECT` are rejected at the parser. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities.
+- Exactly one base table in `FROM`, optionally widened by **one** JOIN per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an equi `ON` predicate, or `CROSS JOIN` (no `ON`). `INNER` takes the GPU hash-join path; the OUTER and CROSS shapes execute on the host-side fallback. `JOIN USING`, `NATURAL JOIN`, non-equi predicates, computed join keys, and chaining more than one JOIN per `SELECT` are rejected at the parser. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities.
 - No CTEs (`WITH`), no subqueries in `FROM` or `WHERE`, no correlated subqueries, no `EXISTS`.
 - No `EXCEPT`, `INTERSECT`, `UNION BY NAME`.
 - No `WINDOW`, `OVER`, `QUALIFY`, `LATERAL`, table-valued functions, `PREWHERE` (ClickHouse-ism), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `FETCH`, `FOR UPDATE/SHARE`, `INTO`.
 - No `GROUP BY ALL`, `ROLLUP`, `CUBE`, `TOTALS`.
-- No schema-qualified table names. Qualified column references (`t.col`) are rejected everywhere *except* inside a `JOIN ... ON` predicate (where they're used for cross-side disambiguation, and only the column name survives lowering).
+- No schema-qualified table names. Single-level qualified column references (`t.col`) are supported in SELECT, WHERE, GROUP BY, HAVING, and `JOIN ... ON` predicates; the qualifier must match a FROM table and only the resolved column name survives lowering. Deeper qualifications (`db.t.col`, struct-field access) are rejected.
 - `LIMIT` and `OFFSET` must be integer literals; expressions and parameters are rejected.
 
 ## Data types
@@ -72,7 +74,7 @@ Integer division by zero produces `NULL` (host evaluator) or undefined behaviour
 
 `=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above.
 
-For `Utf8` columns, only equality (`=`, `<>`, `!=`) and `IN`-shaped equality against string *literals* are supported — the literal rewriter folds `WHERE col = 'X'` (or `col IN ('X', 'Y')`) into integer equality on the column's dictionary index at plan time. Ordering comparisons (`<`, `>`, `<=`, `>=`) on Utf8 columns are rejected, because dictionary indices reflect insertion order, not lex order. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
+For `Utf8` columns, only equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time. `IN (...)` lists are *not* yet wired through the frontend (no `InList` arm in `lower_expr`); use an explicit `OR` chain of equalities for now. Ordering comparisons (`<`, `>`, `<=`, `>=`) on Utf8 columns are rejected, because dictionary indices reflect insertion order, not lex order. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
 
 ### Logical
 
@@ -182,11 +184,11 @@ Supported:
 
 - Exactly one `INNER JOIN` per `SELECT` (chaining a second `INNER JOIN` is rejected — the frontend builds at most one `Join` node and complains on a second).
 - `ON` predicate must be a conjunction (`AND` only) of `<col> = <col>` equalities. Either side may be a bare or qualified column reference (`t1.a = t2.a` or `a = a`); only the trailing column name survives lowering and the executor matches it against each side's schema.
-- The executor is host-side: build a `HashMap<JoinKey, Vec<row_idx>>` on the smaller input, probe the larger, materialise matches via `arrow::compute::take`. Multi-key joins build a tuple key.
+- The executor runs on the GPU hash-join path (`src/exec/gpu_join.rs`): build a hash table on the smaller input on-device, probe the larger, then materialise matches via `arrow::compute::take` on the host. Multi-key joins build a tuple key. Equi-join key dtypes must match on both sides; cross-dtype keys are rejected.
 - `NULL` keys never match (`NULL = NULL → UNKNOWN`, per SQL).
 - The combined output schema is left's columns followed by right's columns, with collision-safe naming: a clashing right-side `c` becomes `right.c` (and gets a `__2`, `__3`, … suffix if that itself collides).
 
-Rejected: `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN`, `JOIN ... USING`, `INNER JOIN` without `ON`, non-equi predicates (`>`, `<`, function calls), and any join graph wider than one join per `SELECT`. A GPU-resident hash join is a 0.4 stretch goal.
+`INNER JOIN` is the only shape that takes the GPU hash-join path (see `src/exec/gpu_join.rs`); `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS JOIN` are accepted by the frontend and execute on the host-side fallback in `src/exec/join.rs` (see the broader [JOIN](#join) section below). Still rejected: `NATURAL JOIN`, `JOIN ... USING`, `INNER JOIN` without `ON`, non-equi predicates (`>`, `<`, function calls), and any join graph wider than one join per `SELECT`. A GPU-resident outer-join path is a 0.4 stretch goal.
 
 ## Dictionary-encoded Utf8 predicates
 
@@ -194,9 +196,8 @@ For every `Utf8` column registered on a table, the engine builds a dictionary (i
 
 - `WHERE col = 'X'`  →  `WHERE __idx_col = i32/i64(idx_of_X)`
 - `WHERE col != 'X'` →  the same with `!=`
-- `WHERE col IN ('X', 'Y', 'Z')` → a disjunction of those equalities (or a single one for a 1-element list)
 
-After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `LIKE`, `BETWEEN`, prefix / substring matching, and ordering comparisons on Utf8 are *not* supported.
+After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `IN (...)` against a Utf8 column is *not* yet supported (the SQL frontend has no `InList` lowering arm and the rewriter explicitly defers it — see `src/plan/string_literal_rewrite.rs`); rewrite as an `OR` chain of equalities. `LIKE`, `BETWEEN`, prefix / substring matching, and ordering comparisons on Utf8 are also not supported.
 
 ## SELECT DISTINCT
 
@@ -218,7 +219,7 @@ SELECT price FROM sales WHERE region_id = 1;
 SELECT price * tax FROM sales WHERE region_id = 1 AND price > 100.0;
 SELECT * FROM sales;
 SELECT region, price FROM sales WHERE region = 'US';
-SELECT region, price FROM sales WHERE region IN ('US', 'CA');
+SELECT region, price FROM sales WHERE region = 'US' OR region = 'CA';  -- IN not yet lowered; use OR chain
 SELECT * FROM sales WHERE active;
 
 -- Scalar aggregates
@@ -275,7 +276,7 @@ SELECT ... FROM <table>
 - Right-side column names that collide with a left-side name are prefixed with `right.` (e.g. left `id` and right `id` → output has `id` and `right.id`).
 - Both sides of an equi-join key must have the same dtype; cross-dtype equi-joins (e.g. `Int32 = Int64`) are rejected.
 - SQL NULL semantics on keys: `NULL = NULL` is `UNKNOWN`, so NULL-keyed rows never match. For OUTER joins they still emit on the preserved side with the opposite side NULL-padded.
-- The executor is host-side (build smaller side into a HashMap, probe larger; for CROSS, a host-side cartesian product). GPU hash join is a 0.4 target.
+- `INNER` executes on the GPU hash-join path (`src/exec/gpu_join.rs` — build → probe on device, then `take`-materialise). `LEFT`/`RIGHT`/`FULL`/`CROSS` fall back to a host-side executor (`src/exec/join.rs`: HashMap build/probe; for CROSS a host cartesian product). A GPU-resident OUTER-join probe is a 0.4 target.
 
 ## What's NOT supported
 
@@ -298,12 +299,12 @@ These produce explicit errors at parse / plan time:
 - `CAST(... AS ...)` — the planner does implicit numeric promotion only.
 - `CASE ... WHEN`, `NULLIF`, `COALESCE`, `IFNULL`, `IIF`.
 - `LIKE`, `BETWEEN`, `IS NULL`, `IS NOT NULL`.
-- `IN` other than the dictionary-equality form (i.e. `col IN ('lit', 'lit', ...)` against a Utf8 column).
-- `NOT` (would need a unary op in the AST).
+- `IN (...)` lists (any column type) — no `InList` arm in `sql_frontend::lower_expr`; rewrite as an `OR` chain of equalities. The dictionary-string rewriter explicitly defers this shape (see `src/plan/string_literal_rewrite.rs`).
+- `NOT` (no `UnaryOperator::Not` arm in `sql_frontend::lower_expr` — would need a unary-not node in the AST).
 - String concatenation operator `||`.
 - Ordering comparisons on Utf8 columns (`WHERE name < 'M'`).
-- Schema-qualified or table-qualified column refs (`t.col`) outside `JOIN ... ON`.
-- Aggregate aliasing (`SUM(price) AS total`).
+- Schema- or multi-level qualified column references (`db.t.col`, struct-field access). Single-level `t.col` *is* supported — see "Hard restrictions" above.
+- Aggregate aliasing (`SUM(price) AS total`) — the SQL frontend rejects an alias on an aggregate SELECT item; the plan auto-names aggregates and the SQL frontend doesn't carry the user alias through (see `sql_frontend.rs` aggregate-alias check).
 - Post-aggregate expressions (`SUM(price) + 1`, `SUM(a) / SUM(b)`).
 - `COUNT(DISTINCT col)`.
 
@@ -329,9 +330,9 @@ These produce explicit errors at parse / plan time:
 
 `UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING` are reachable only from the executor-level `src/exec/string_ops` / `src/exec/string_ops_extended` Rust API; no SQL or DataFrame surface exposes them yet. They run as pure-host dictionary transformations because variable-width device writes remain unsupported by the codegen path. Wiring them through the SQL frontend would mean teaching `sql_frontend::lower_expr` to recognise `Expr::FunctionCall` and routing it to a per-function host-side projection executor. Listed as a 0.4 stretch goal in `ROADMAP.md`.
 
-### GPU-resident JOIN
+### GPU-resident OUTER / CROSS JOIN
 
-The 0.3.0 `INNER JOIN` executor is host-side (build `HashMap`, probe). A GPU-resident hash-join probe path is the natural next step (also a 0.4 stretch goal).
+`INNER JOIN` already runs on the GPU hash-join path (`src/exec/gpu_join.rs`). The OUTER (LEFT/RIGHT/FULL) and CROSS shapes still round-trip through the host-side executor in `src/exec/join.rs`; a device-resident probe for those is the natural next step (0.4 stretch goal).
 
 ### GPU sort kernel
 
