@@ -1,10 +1,24 @@
 # Changelog
 
-All notable changes to this project will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project tries to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it leaves `0.1.x`.
+All notable changes to this project will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project tries to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it leaves `0.x`.
 
 ## Note on version 0.2.0
 
 There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) directly to `0.3.0` (2026-05-26) — a three-day span in which the scope grew well past what a single minor bump could honestly carry (multi-batch tables, INNER JOIN, DISTINCT / LIMIT / ORDER BY / HAVING / UNION, real `cuda-stub`, PTX cache, CI). Tagging an intermediate `0.2.0` would have been a paper milestone, so the version number was reserved and skipped.
+
+## [Unreleased]
+
+### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+### Security
 
 ## [0.3.0] - 2026-05-26
 
@@ -20,7 +34,7 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
   `UNION [ALL]`** — full plan + parser + standalone executors
   (`src/exec/{distinct,sort,limit}.rs`). HAVING desugars to a `Filter`
   over the `Aggregate`; plain `UNION` lowers to `Distinct(Union(..))`,
-  `UNION ALL` stays a flat `Union`. Executors are host-side for 0.1.x.
+  `UNION ALL` stays a flat `Union`. Executors are host-side for 0.3.x.
 - Multi-batch tables: the engine accepts more than one `RecordBatch` per
   registered table and threads them through the new operators (was:
   single-batch only).
@@ -96,7 +110,7 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
 - `GpuBuffer::zeros` uses `cuMemsetD8` (no host alloc + memcpy).
 - IR types (`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`,
   `Value`, `ColumnIO`) and internal re-exports under `exec::*` / `jit::*`
-  are marked `#[doc(hidden)]` for 0.1.x.
+  are marked `#[doc(hidden)]` for 0.3.x.
 - `Cargo.toml` gains `authors`, `repository`, `homepage`,
   `documentation`, `readme`, `keywords`, `categories`, `rust-version`,
   `[package.metadata.docs.rs]`. `log = "0.4"` added as a runtime dep.
