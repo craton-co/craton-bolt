@@ -7,6 +7,7 @@
 //! primitive on which the typed, lifetime-tracked `GpuVec<T>` (Step 3) will be
 //! built.
 
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
 
@@ -490,6 +491,20 @@ pub struct PinnedHostBuffer<T: Pod> {
     /// have to recompute (and so a future power-of-two-bucketed pool can
     /// hook in cleanly later).
     byte_len: usize,
+    /// Last stream this buffer was used on, if any. Callers that enqueue
+    /// async work referencing `self.ptr` (H2D / D2H DMA, kernels that
+    /// touch the pinned region, etc.) should call
+    /// [`PinnedHostBuffer::mark_stream_use`] after enqueueing so `Drop`
+    /// can fence against an in-flight transfer before `cuMemFreeHost`
+    /// reclaims the pages. See the `Drop` impl below for the rationale.
+    ///
+    /// `Cell<_>` rather than a plain field so `mark_stream_use` can take
+    /// `&self`: typical async copy helpers borrow the pinned buffer
+    /// shared (`as_ptr()` reads through `&self`), and forcing them to
+    /// `&mut self` here would ripple needlessly through the call sites.
+    /// The cell is single-threaded (the struct is `!Sync`), so no atomic
+    /// is required.
+    last_use_stream: Cell<Option<CUstream>>,
 }
 
 impl<T: Pod> PinnedHostBuffer<T> {
@@ -499,10 +514,14 @@ impl<T: Pod> PinnedHostBuffer<T> {
     /// FFI call is made. `as_slice` on a zero-length buffer returns `&[]`.
     pub fn new(len: usize) -> BoltResult<Self> {
         if len == 0 {
+            // Zero-length fast path: don't touch the driver, don't hand
+            // out a null pointer through `as_slice()` (the slice methods
+            // below short-circuit instead — see `as_slice` / `as_mut_slice`).
             return Ok(Self {
                 ptr: std::ptr::null_mut(),
                 len: 0,
                 byte_len: 0,
+                last_use_stream: Cell::new(None),
             });
         }
         let byte_len = len.checked_mul(size_of::<T>()).ok_or_else(|| {
@@ -526,6 +545,7 @@ impl<T: Pod> PinnedHostBuffer<T> {
             ptr: raw as *mut T,
             len,
             byte_len,
+            last_use_stream: Cell::new(None),
         })
     }
 
@@ -595,6 +615,49 @@ impl<T: Pod> PinnedHostBuffer<T> {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
+    /// Record that `stream` has enqueued (or is about to enqueue) work
+    /// that references this buffer's pinned host pages. The recorded
+    /// stream is the one `Drop` will `cuStreamSynchronize` against
+    /// before calling `cuMemFreeHost`, so the driver can't be still
+    /// DMA-ing into freed pages.
+    ///
+    /// Mirrors the `mark_stream_use` contract on `GpuBuffer` (review
+    /// finding C13). Callers MUST invoke this on the pinned source of
+    /// `cuMemcpyHtoDAsync_v2`, the pinned destination of
+    /// `cuMemcpyDtoHAsync_v2`, or any kernel parameter that holds
+    /// `as_ptr()` / `as_mut_ptr()`, after enqueueing the async work.
+    ///
+    /// Only the most recent stream is remembered. If a buffer is used
+    /// across multiple streams, the caller is responsible for the
+    /// cross-stream barriers (events, joins) that make a single
+    /// final-stream sync sufficient — or for explicitly synchronising
+    /// the buffer before drop.
+    ///
+    /// Takes `&self` (interior mutability via `Cell`) so call sites
+    /// holding a shared borrow — typical for an async helper that only
+    /// reads `as_ptr()` — don't have to be rewritten to `&mut self`.
+    /// The cell is single-threaded (the struct is `!Sync`) so no atomic
+    /// is required.
+    // `stream` is an opaque CUstream handle; we just store it. No deref,
+    // no FFI. The outer fn stays safe to keep the call-site ergonomics
+    // identical to the analogous helper on `GpuBuffer`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    #[inline]
+    pub fn mark_stream_use(&self, stream: CUstream) {
+        self.last_use_stream.set(Some(stream));
+    }
+
+    /// Read back the stream most recently recorded via
+    /// [`mark_stream_use`](Self::mark_stream_use), or `None` if the
+    /// buffer has never participated in async work.
+    ///
+    /// Primarily for tests; production code rarely needs to query this
+    /// because `Drop` consumes it directly.
+    #[inline]
+    pub fn last_use_stream(&self) -> Option<CUstream> {
+        self.last_use_stream.get()
+    }
+
     /// Override the logical length — used after an async D2H that filled
     /// fewer than the buffer's allocated length.
     ///
@@ -621,13 +684,51 @@ impl<T: Pod> PinnedHostBuffer<T> {
 impl<T: Pod> Drop for PinnedHostBuffer<T> {
     fn drop(&mut self) {
         if self.ptr.is_null() {
+            // Zero-length / never-allocated path: nothing to free and
+            // nothing to fence against. `last_use_stream` is meaningless
+            // here (callers shouldn't `mark_stream_use` on an empty
+            // buffer, but if they do we silently ignore it).
             return;
         }
+        // Fence against any in-flight DMA before returning the pinned
+        // pages to the driver. Without this, an outstanding
+        // `cuMemcpyHtoDAsync_v2` / `cuMemcpyDtoHAsync_v2` whose host
+        // operand is `self.ptr` would continue to read or write the
+        // page-locked region after `cuMemFreeHost` released it back to
+        // the kernel — classic use-after-free on the host side, and a
+        // particularly nasty one because the DMA engine has no notion
+        // of Rust ownership.
+        //
+        // TODO(perf): a blanket sync is the safe default but it
+        // serialises every pinned-buffer release against the recorded
+        // stream's full queue, which can stall pipelined H2D / kernel /
+        // D2H overlap if the caller has already arranged a
+        // cross-stream barrier (event-record + wait) elsewhere. A
+        // future optimisation could replace this with a per-buffer
+        // `cuEventRecord` + `cuEventSynchronize` on a tiny event
+        // attached at `mark_stream_use` time, so we wait only on the
+        // specific point in the stream's history that actually touched
+        // this buffer, not the entire trailing tail of the stream.
+        if let Some(stream) = self.last_use_stream.get() {
+            // SAFETY: `stream` is an opaque CUstream handle handed to
+            // us by the caller; we just forward it. If the stream has
+            // already been destroyed, `cuStreamSynchronize` returns an
+            // error which we surface as a warning — we still attempt
+            // the free so we don't leak the pinned pages.
+            let sync_rc =
+                unsafe { cuda_sys::check(cuda_sys::cuStreamSynchronize(stream)) };
+            if let Err(e) = sync_rc {
+                log::warn!(
+                    "craton-bolt: cuStreamSynchronize before pinned-host free failed ({:?}); proceeding with cuMemFreeHost but in-flight DMA may have UB'd",
+                    e
+                );
+            }
+        }
         // SAFETY: `self.ptr` came from `cuMemAllocHost_v2` and we have
-        // unique ownership (move-only, `!Sync`). The driver is responsible
-        // for ensuring no in-flight async copy still references this — by
-        // the time `Drop` runs, the caller has either synchronized the
-        // stream or violated the contract on `memcpy_*_async`.
+        // unique ownership (move-only, `!Sync`). The stream sync above
+        // is best-effort; the caller is still responsible for the
+        // overall lifetime contract on `memcpy_*_async` (see
+        // `mark_stream_use`).
         // Cast via `*mut std::ffi::c_void` so we don't pull `libc` into the
         // module's `use` list just for this one type — `std::ffi::c_void`
         // and `libc::c_void` are the same alias.
@@ -842,5 +943,92 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<PinnedHostBuffer<i32>>();
         assert_send::<PinnedHostBuffer<u8>>();
+    }
+}
+
+#[cfg(test)]
+mod pinned_safety_tests {
+    //! Host-only safety tests for `PinnedHostBuffer`'s zero-length path,
+    //! stream-tracking state, and `Drop` discipline. None of these tests
+    //! may call into the CUDA driver — they run on hosts without a GPU
+    //! and on docs.rs. The companion round-trip test that actually
+    //! exercises pinned DMA lives in `cuda_sys::tests` behind
+    //! `#[ignore]` per the existing module conventions.
+    use super::*;
+    use crate::cuda::cuda_sys::CUstream;
+    use std::ptr;
+
+    #[test]
+    fn empty_pinned_host_buffer_slice_is_zero_length() {
+        // Symmetric with the existing `pinned_host_buffer_zero_len_is_noop`
+        // test but written with the explicit `.len() == 0` form the safety
+        // hardening contract calls out. A `from_raw_parts(null, 0)` here
+        // would be UB even though the slice is empty — the production path
+        // must short-circuit before reaching that call.
+        let buf: PinnedHostBuffer<u8> = PinnedHostBuffer::new(0)
+            .expect("zero-length pinned alloc must not error");
+        let s = buf.as_slice();
+        assert_eq!(s.len(), 0);
+        // `as_ptr()` is allowed to be null for an empty buffer, but the
+        // slice itself must be a valid empty borrow; `iter().count()`
+        // forces the compiler to actually walk it.
+        assert_eq!(s.iter().count(), 0);
+    }
+
+    #[test]
+    fn empty_pinned_host_buffer_drop_without_stream_use_is_noop() {
+        // Constructing and dropping an empty buffer must not panic, must
+        // not call into the driver, and must not attempt to
+        // `cuStreamSynchronize` against a stream that was never recorded.
+        // We exercise the path by going out of scope at the end of the
+        // block: if `Drop` tried to fence with a `last_use_stream` of
+        // `None`, the `if let Some(stream) = ...` guard catches it; if
+        // the ptr-null short-circuit failed and we reached the FFI, the
+        // cuda-stub build would panic with `CUDA_ERROR_STUB`.
+        for _ in 0..8 {
+            let _b: PinnedHostBuffer<i64> =
+                PinnedHostBuffer::new(0).expect("zero-len alloc");
+        }
+    }
+
+    #[test]
+    fn mark_stream_use_is_preserved_across_method_calls() {
+        // The stream-tracking cell must survive arbitrary `&self` method
+        // calls — only an explicit second `mark_stream_use` (or Drop)
+        // should replace it. We use a fabricated non-null sentinel
+        // pointer for the stream handle; we never deref it.
+        //
+        // This buffer is empty, so its `Drop` will skip the FFI free and
+        // also skip the stream sync (the ptr-null short-circuit runs
+        // first). That keeps the test driver-free on hosts without CUDA.
+        let buf: PinnedHostBuffer<u32> =
+            PinnedHostBuffer::new(0).expect("zero-len alloc");
+        let fake_stream: CUstream = 0xDEAD_BEEF_usize as CUstream;
+        assert!(buf.last_use_stream().is_none());
+        buf.mark_stream_use(fake_stream);
+        assert_eq!(buf.last_use_stream(), Some(fake_stream));
+
+        // Hit a few `&self`-receiver methods and re-check.
+        let _ = buf.len();
+        let _ = buf.is_empty();
+        let _ = buf.byte_len();
+        let _ = buf.as_ptr();
+        let _ = buf.as_slice();
+        assert_eq!(
+            buf.last_use_stream(),
+            Some(fake_stream),
+            "method calls must not clobber the recorded stream"
+        );
+
+        // A second `mark_stream_use` replaces the recorded stream
+        // (last-wins, matching the documented contract).
+        let other_stream: CUstream = 0xCAFE_F00D_usize as CUstream;
+        buf.mark_stream_use(other_stream);
+        assert_eq!(buf.last_use_stream(), Some(other_stream));
+
+        // And a null stream is a perfectly legal value (the default
+        // stream is the null handle).
+        buf.mark_stream_use(ptr::null_mut());
+        assert_eq!(buf.last_use_stream(), Some(ptr::null_mut::<()>() as CUstream));
     }
 }
