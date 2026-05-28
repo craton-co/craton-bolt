@@ -8,6 +8,12 @@ pub mod engine;
 /// hazard described in the module docs.
 #[doc(hidden)]
 pub mod module_cache;
+/// Shared async-memcpy / pinned-host-buffer helpers for executors.
+/// Lifted out of `exec::aggregate` (v0.6 pilot) so filter, GROUP BY, joins
+/// and friends can adopt the same `(slice, &stream) -> GpuVec<T>` shape
+/// without each rolling their own `cfg(feature = "cuda-stub")` branch.
+#[doc(hidden)]
+pub(crate) mod gpu_upload;
 pub mod aggregate;
 pub mod compact;
 pub mod string_col;
