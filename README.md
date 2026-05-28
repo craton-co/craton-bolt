@@ -236,6 +236,8 @@ Version history and per-release notes live in [`CHANGELOG.md`](CHANGELOG.md). Cr
 
 Craton Bolt stands on the shoulders of [`arrow-rs`](https://github.com/apache/arrow-rs) (columnar memory format), [`sqlparser-rs`](https://github.com/apache/datafusion-sqlparser-rs) (SQL frontend), and NVIDIA's CUDA driver (everything below `cuModuleLoadData`).
 
+*Craton* and *Bolt* are trademarks of Craton Software Company.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
