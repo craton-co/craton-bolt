@@ -2319,13 +2319,208 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                 negated: *negated,
             })
         }
-        SqlExpr::Function(_) => Err(BoltError::Sql(
-            "scalar function calls are not supported".into(),
-        )),
+        SqlExpr::Function(func) => {
+            // Intercept COALESCE / NULLIF before the catch-all rejection.
+            // Both desugar to CASE so the existing CASE codegen path (and
+            // type-checker) handles them with no new IR node. Other scalar
+            // function calls remain unsupported.
+            if let Some(name) = scalar_function_name(func) {
+                let upper = name.to_ascii_uppercase();
+                match upper.as_str() {
+                    "COALESCE" => {
+                        let args = collect_scalar_function_args(func, &upper)?;
+                        return lower_coalesce(&args, resolver, depth + 1);
+                    }
+                    "NULLIF" => {
+                        let args = collect_scalar_function_args(func, &upper)?;
+                        return lower_nullif(&args, resolver, depth + 1);
+                    }
+                    _ => {}
+                }
+            }
+            Err(BoltError::Sql(
+                "scalar function calls are not supported".into(),
+            ))
+        }
         other => Err(BoltError::Sql(format!(
             "unsupported expression: {other}"
         ))),
     }
+}
+
+/// Return the single-identifier function name if `func` is a bare
+/// `NAME(args)` call with none of the SQL extensions (no OVER, no FILTER,
+/// no WITHIN GROUP, etc.) the COALESCE / NULLIF desugar path is willing
+/// to accept. Returns `None` for multi-part names or when any extension
+/// clause is present — those fall through to the catch-all
+/// "scalar function calls are not supported" rejection.
+fn scalar_function_name(func: &sqlparser::ast::Function) -> Option<&str> {
+    if func.name.0.len() != 1 {
+        return None;
+    }
+    if func.over.is_some()
+        || func.filter.is_some()
+        || func.null_treatment.is_some()
+        || !func.within_group.is_empty()
+        || !matches!(func.parameters, FunctionArguments::None)
+    {
+        return None;
+    }
+    Some(func.name.0[0].value.as_str())
+}
+
+/// Pull out the unnamed positional argument expressions of a scalar
+/// function call. Rejects wildcards, qualified wildcards, and named
+/// arguments — none of which are meaningful for `COALESCE` / `NULLIF`.
+/// `kind` is the upper-cased function name used in error messages.
+fn collect_scalar_function_args<'a>(
+    func: &'a sqlparser::ast::Function,
+    kind: &str,
+) -> BoltResult<Vec<&'a SqlExpr>> {
+    let arg_list = match &func.args {
+        FunctionArguments::List(list) => list,
+        FunctionArguments::None => {
+            return Err(BoltError::Sql(format!("{kind} requires arguments")));
+        }
+        FunctionArguments::Subquery(_) => {
+            return Err(BoltError::Sql(format!(
+                "unsupported: subquery argument to {kind}"
+            )));
+        }
+    };
+    if arg_list.duplicate_treatment.is_some() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: DISTINCT/ALL inside {kind}"
+        )));
+    }
+    if !arg_list.clauses.is_empty() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: argument clauses on {kind}"
+        )));
+    }
+    let mut out: Vec<&SqlExpr> = Vec::with_capacity(arg_list.args.len());
+    for arg in &arg_list.args {
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => out.push(e),
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                return Err(BoltError::Sql(format!(
+                    "{kind} does not accept a `*` argument"
+                )));
+            }
+            FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {
+                return Err(BoltError::Sql(format!(
+                    "{kind} does not accept a qualified wildcard argument"
+                )));
+            }
+            FunctionArg::Named { .. } => {
+                return Err(BoltError::Sql(format!(
+                    "unsupported: named argument to {kind}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Desugar `COALESCE(a, b, c, ..., last)` into the equivalent CASE:
+///
+/// ```text
+/// CASE
+///   WHEN a IS NOT NULL THEN a
+///   WHEN b IS NOT NULL THEN b
+///   ...
+///   ELSE last
+/// END
+/// ```
+///
+/// Edge cases:
+///   * `COALESCE()` (zero args)   → error.
+///   * `COALESCE(a)` (one arg)    → lowers to `a` (no CASE wrapping); per
+///     SQL semantics the value of a one-arg COALESCE is the argument
+///     itself, and we want the IR to reflect that so downstream
+///     optimisation isn't blocked on a trivially-collapsible CASE.
+///   * `COALESCE(a, b)` (two args) → one WHEN/THEN branch + ELSE.
+fn lower_coalesce(
+    args: &[&SqlExpr],
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if args.is_empty() {
+        return Err(BoltError::Sql(
+            "COALESCE requires at least one argument".into(),
+        ));
+    }
+    if args.len() == 1 {
+        // Single-arg COALESCE is identity. Lower the operand directly so
+        // the IR doesn't carry a vestigial single-branch CASE.
+        return lower_expr(args[0], resolver, depth + 1);
+    }
+    // Lower every argument once up front. We need each non-last argument
+    // twice (once in the `IS NOT NULL` test, once as the THEN value), so
+    // build the lowered list and clone the appropriate cells when
+    // assembling the CASE.
+    let mut lowered: Vec<Expr> = Vec::with_capacity(args.len());
+    for a in args {
+        lowered.push(lower_expr(a, resolver, depth + 1)?);
+    }
+    // Last argument becomes the ELSE. Everything before it becomes a
+    // `WHEN arg IS NOT NULL THEN arg` branch in source order.
+    let else_expr = lowered.pop().expect("len >= 2 checked above");
+    let mut branches: Vec<(Expr, Expr)> = Vec::with_capacity(lowered.len());
+    for arg in lowered {
+        let cond = Expr::Unary {
+            op: UnaryOp::IsNotNull,
+            operand: Box::new(arg.clone()),
+        };
+        branches.push((cond, arg));
+    }
+    Ok(Expr::Case {
+        branches,
+        else_branch: Some(Box::new(else_expr)),
+    })
+}
+
+/// Desugar `NULLIF(a, b)` into the equivalent CASE:
+///
+/// ```text
+/// CASE WHEN a = b THEN NULL ELSE a END
+/// ```
+///
+/// SQL `NULLIF` is strictly binary; any other arity is rejected at parse
+/// time so the user gets a clean error instead of a confusing type-check
+/// failure later.
+fn lower_nullif(
+    args: &[&SqlExpr],
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if args.len() != 2 {
+        return Err(BoltError::Sql(format!(
+            "NULLIF expects exactly 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let a = lower_expr(args[0], resolver, depth + 1)?;
+    let b = lower_expr(args[1], resolver, depth + 1)?;
+    let cond = Expr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(a.clone()),
+        right: Box::new(b),
+    };
+    Ok(Expr::Case {
+        branches: vec![(cond, Expr::Literal(Literal::Null))],
+        else_branch: Some(Box::new(a)),
+    })
 }
 
 /// Maximum number of values accepted on the right-hand side of a SQL
