@@ -272,7 +272,6 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
             collect_column_refs(right, out);
         }
         Expr::Unary { operand, .. } => collect_column_refs(operand, out),
-<<<<<<< HEAD
         Expr::Case {
             branches,
             else_branch,
@@ -285,9 +284,7 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 collect_column_refs(e, out);
             }
         }
-=======
         Expr::Like { expr, .. } => collect_column_refs(expr, out),
->>>>>>> feat/v0.5-like-constant-pattern
         Expr::Alias(inner, _) => collect_column_refs(inner, out),
     }
 }

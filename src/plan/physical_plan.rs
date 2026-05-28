@@ -1470,6 +1470,7 @@ fn expr_contains_concat(expr: &Expr) -> bool {
             branches.iter().any(|(w, t)| expr_contains_concat(w) || expr_contains_concat(t))
                 || else_branch.as_deref().map(expr_contains_concat).unwrap_or(false)
         }
+        Expr::Like { expr, .. } => expr_contains_concat(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1984,6 +1985,7 @@ fn expr_contains_case(e: &Expr) -> bool {
         }
         Expr::Unary { operand, .. } => expr_contains_case(operand),
         Expr::Alias(inner, _) => expr_contains_case(inner),
+        Expr::Like { expr, .. } => expr_contains_case(expr),
     }
 }
 
