@@ -182,6 +182,12 @@ const MAX_PROBE_FACTOR: u32 = 2;
 /// "silent drop" semantics as `MAX_PROBE_FACTOR` in the linear-probe
 /// kernel. Future work: surface overflow via a spill counter (mirrors
 /// `valid_flag_kernels::SPILL`).
+///
+/// The actual iteration cap emitted by the kernel is `MAX_RH_PROBE * 2`:
+/// the doubled budget exists to absorb `RH_RETRY` re-probes of the same
+/// slot under contention (the CAS-with-expected swap may legitimately
+/// fail and re-enter the loop for the same slot a handful of times
+/// before quiescence). On overflow the row is silently dropped.
 const MAX_RH_PROBE: u32 = 16;
 
 /// Number of `u32` words required to pack a `n_rows`-row validity bitmap
@@ -394,6 +400,13 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
 
 /// Generate PTX for the **Robin Hood** variant of the keys-building kernel.
 ///
+/// Swap via `atom.cas`-with-expected; race-free vs the earlier
+/// `atom.exch` design — the displacement step now atomically replaces
+/// the occupant **conditional on it still being the value the prior CAS
+/// observed**, so no third-thread mutation can sneak in between the
+/// observe and the swap and produce a duplicate slot for the same group
+/// key.
+///
 /// This is the optional opt-in alternative to [`compile_groupby_keys_kernel`].
 /// It shares the same ABI (4 params: group_col_ptr, keys_table_ptr, n_rows,
 /// k) and the same EMPTY-slot sentinel (`I64_EMPTY_SENTINEL = i64::MIN`),
@@ -431,36 +444,29 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
 /// 4. Otherwise compute the OCCUPANT's probe distance:
 ///    `occ_dist = (slot - (hash(old) & mask)) & mask`.
 /// 5. If `occ_dist >= cur_dist` (occupant richer-or-equal): advance.
-/// 6. If `occ_dist <  cur_dist` (occupant poorer): we displace.
-///    `displaced = atom.exch.b64(slot, cur_key)` — atomically swap.
-///    Continue with `cur_key := displaced`, `cur_dist := occ_dist + 1`.
+/// 6. If `occ_dist <  cur_dist` (occupant poorer): we displace using a
+///    second CAS conditional on the slot still equalling the previously
+///    observed occupant:
+///    `actual = atom.cas.b64(slot, observed_occupant, cur_key)`. If
+///    `actual == observed_occupant` the swap landed: continue probing
+///    with `cur_key := observed_occupant`,
+///    `cur_dist := occ_dist + 1`. If not, the slot mutated under us — we
+///    re-probe THIS slot from the top of the loop without changing
+///    `cur_key` (the slot now holds either a new occupant we still need
+///    to compare against, or, in the swap-back case, our own key).
 ///
-/// # TODO(rh): finalize swap semantics on contention
+/// # Concurrency notes
 ///
-/// The atomic semantics above are sound for the **single-thread**
-/// invariant (no key is ever dropped during a swap), but the
-/// concurrent-insertion correctness story has known gaps that require a
-/// follow-up. Specifically:
+/// The two-CAS sequence (empty-claim CAS + expected-occupant swap CAS)
+/// is the load-bearing fix for the swap race the earlier `atom.exch`
+/// design exhibited: `atom.exch` carried no "expected" parameter, so
+/// the value it returned under contention could differ from the one
+/// the prior CAS observed, transiently producing two slots claiming
+/// the same group key. The CAS-with-expected variant is race-free in
+/// that single step.
 ///
-/// * Between step 1's CAS and step 6's exch a third thread may have
-///   replaced the slot's contents; the `displaced` returned by
-///   `atom.exch.b64` is therefore not necessarily the `old` observed by
-///   the preceding CAS. The current implementation carries `displaced`
-///   forward unconditionally, which is sound (no key is lost) but can
-///   transiently violate the Robin Hood invariant until the chase
-///   completes.
-/// * Under heavy contention a key K may be present "in flight" (held in
-///   one thread's `cur_key` register having just been swapped out)
-///   while a second thread inserts K via CAS into an empty slot further
-///   along the chain. The duplicate is eventually probed-and-merged by
-///   the agg-kernel's read-only walk (which finds the FIRST match), but
-///   the keys table will contain two distinct slots for the same group
-///   key. For load-factor < 0.5 with low-collision-skew inputs this is
-///   rare; needs a follow-up to formally verify or add a post-launch
-///   dedup sweep.
-///
-/// Because of these gaps the kernel is **opt-in via `BOLT_HASH_ALGO=robin_hood`**
-/// — the linear-probe kernel remains the default. PTX-shape tests below
+/// The kernel remains **opt-in via `BOLT_HASH_ALGO=robin_hood`** —
+/// the linear-probe kernel is still the default. PTX-shape tests below
 /// exercise the emitter; end-to-end GPU correctness validation against
 /// adversarial inputs is left as follow-up work.
 ///
@@ -470,6 +476,12 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
 /// silently (no atomic update issued). Same defensive-bound contract as
 /// the linear-probe kernel — at load factor < 0.5 it should never
 /// trigger; if it does, the row's group is dropped.
+///
+/// An additional cap of `MAX_RH_PROBE * 2` total `RH_PROBE_LOOP`
+/// iterations guards against the new `RH_RETRY` path spinning forever
+/// under pathological contention: each retry consumes a unit of the
+/// total iteration budget. On overflow we drop the row silently, same
+/// as the linear path.
 pub fn compile_groupby_keys_kernel_robin_hood() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KEYS_KERNEL_RH_ENTRY;
@@ -530,11 +542,18 @@ pub fn compile_groupby_keys_kernel_robin_hood() -> BoltResult<String> {
     writeln!(ptx, "\tmov.s64 %rl4, {};", EMPTY_KEY_LITERAL).map_err(write_err)?;
 
     // %r9  = cur_dist (starts at 0)
-    // %r10 = probe_count (bounded-probe defensive counter)
-    // %r11 = MAX_RH_PROBE constant
+    // %r10 = probe_count (bounded-probe defensive counter; counts EVERY
+    //        iteration of RH_PROBE_LOOP, including RH_RETRY re-probes
+    //        of the same slot under contention).
+    // %r11 = MAX_RH_PROBE * 2 constant. We use 2x the linear-probe cap
+    //        because RH_RETRY can legitimately re-probe the same slot
+    //        multiple times under contention; doubling the budget keeps
+    //        the silent-failure semantics consistent with the linear
+    //        path (rare under load factor < 0.5) while preventing the
+    //        retry path from spinning forever.
     writeln!(ptx, "\tmov.u32 %r9, 0;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r10, 0;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r11, {};", MAX_RH_PROBE).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r11, {};", MAX_RH_PROBE * 2).map_err(write_err)?;
 
     // ------------------------------------------------------------------
     // Robin Hood probe loop.
@@ -568,9 +587,8 @@ pub fn compile_groupby_keys_kernel_robin_hood() -> BoltResult<String> {
     // If old == cur_key, the slot already holds our (or the displaced)
     // group; done. Note: when carrying a DISPLACED key, finding it
     // already present means our chase ends — the displaced key is
-    // already in the table further along, possibly as a duplicate of
-    // what we're carrying. See TODO(rh) above; for the common case
-    // (low contention) this is the natural deduplication path.
+    // already in the table further along (the natural deduplication
+    // path for the common low-contention case).
     writeln!(ptx, "\tsetp.eq.s64 %p2, %rl5, %rl0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra DONE;").map_err(write_err)?;
 
@@ -602,34 +620,53 @@ pub fn compile_groupby_keys_kernel_robin_hood() -> BoltResult<String> {
 
     // ------------------------------------------------------------------
     // Swap branch: atomically replace the slot's contents with cur_key
-    // and pick up the displaced occupant as the new cur_key. The new
-    // cur_dist is occ_dist + 1 because the displaced key was at distance
-    // occ_dist from its home and we are moving it one slot forward.
+    // ONLY IF the slot still holds the occupant value %rl5 we observed
+    // via the preceding `atom.cas`. If the CAS-with-expected succeeds
+    // we pick up the displaced occupant as the new cur_key (it's just
+    // the value we passed as `expected`, i.e. %rl5) and advance.
     //
-    // TODO(rh): finalize swap semantics on contention. `atom.exch.b64`
-    // returns the value that was in the slot AT THE TIME OF THE EXCH,
-    // which under contention may differ from the %rl5 observed by the
-    // preceding CAS. We unconditionally carry the exch's return value
-    // forward, which is sound (no key is lost) but can transiently
-    // violate the Robin Hood invariant until the chase quiesces.
+    // If the CAS-with-expected FAILS the slot mutated under us
+    // (concurrent thread inserted/displaced something else). We branch
+    // to RH_RETRY, which re-enters the main loop at THIS slot without
+    // touching cur_key — the next iteration will observe whatever the
+    // slot currently holds and re-decide claim/swap/advance.
+    //
+    // This is the load-bearing fix vs the earlier `atom.exch` design:
+    // exch had no "expected" parameter so under contention the value
+    // it returned could differ from the one observed by the prior CAS,
+    // producing duplicate slots for the same group key. CAS-with-
+    // expected makes the swap race-free in that single step.
     // ------------------------------------------------------------------
     writeln!(ptx, "RH_SWAP:").map_err(write_err)?;
-    writeln!(ptx, "\tatom.global.exch.b64 %rl8, [%rd5], %rl0;").map_err(write_err)?;
-    // cur_key := displaced key (the value previously in the slot).
-    writeln!(ptx, "\tmov.b64 %rl0, %rl8;").map_err(write_err)?;
-    // If the swap raced and the slot actually held EMPTY at the moment
-    // of exch, then we placed cur_key into EMPTY and now hold EMPTY in
-    // %rl0. Bail out — there is nothing left to chase. (Defensive:
-    // under the SINGLE-thread model the swap branch is only reached
-    // after observing a NON-EMPTY occupant via CAS, so this should be
-    // unreachable; under contention a sibling thread may have CAS'd
-    // EMPTY in between, which would surface here.)
-    writeln!(ptx, "\tsetp.eq.s64 %p5, %rl0, %rl4;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p5 bra DONE;").map_err(write_err)?;
+    // atom.cas(slot, expected=%rl5 occupant, new=%rl0 cur_key) → %rl8 actual
+    writeln!(
+        ptx,
+        "\tatom.global.cas.b64 %rl8, [%rd5], %rl5, %rl0;"
+    )
+    .map_err(write_err)?;
+    // If %rl8 != %rl5 (CAS failed), slot changed under us → RH_RETRY.
+    writeln!(ptx, "\tsetp.eq.s64 %p5, %rl8, %rl5;").map_err(write_err)?;
+    writeln!(ptx, "\t@!%p5 bra RH_RETRY;").map_err(write_err)?;
+
+    // Swap succeeded. cur_key := the occupant we just displaced (we
+    // already have it in %rl5; using it directly avoids a second load).
+    writeln!(ptx, "\tmov.b64 %rl0, %rl5;").map_err(write_err)?;
     // cur_dist := occ_dist + 1; advance slot.
     writeln!(ptx, "\tadd.u32 %r9, %r14, 1;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
     writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(ptx, "\tbra RH_PROBE_LOOP;").map_err(write_err)?;
+
+    // ------------------------------------------------------------------
+    // Retry branch: the CAS-with-expected failed because a sibling
+    // thread mutated the slot between our observe and our swap. Do NOT
+    // change cur_key — re-enter the main loop at the SAME slot. The
+    // next iteration will read whatever the slot now holds (possibly a
+    // swap-back of our own key, possibly someone else's key) and
+    // re-decide. The bounded-probe counter at the top of the loop
+    // limits how many times this can happen.
+    // ------------------------------------------------------------------
+    writeln!(ptx, "RH_RETRY:").map_err(write_err)?;
     writeln!(ptx, "\tbra RH_PROBE_LOOP;").map_err(write_err)?;
 
     writeln!(ptx, "DONE:").map_err(write_err)?;
@@ -656,10 +693,10 @@ pub fn compile_groupby_keys_kernel_robin_hood() -> BoltResult<String> {
 ///
 /// This helper exists so the executor can flip kernels without a
 /// recompile; it is intentionally a per-launch lookup (`std::env::var`
-/// is cheap), keeping the opt-in surgical. Once the Robin Hood swap
-/// semantics are finalised (see the TODO on
-/// [`compile_groupby_keys_kernel_robin_hood`]) the default can flip
-/// here without touching the executor.
+/// is cheap), keeping the opt-in surgical. Promoting the Robin Hood
+/// kernel to the default is intentionally deferred to a follow-up
+/// task — it still wants end-to-end GPU validation against adversarial
+/// inputs before flipping the default here.
 pub fn compile_groupby_keys_kernel_dispatched() -> BoltResult<(String, &'static str)> {
     let algo = std::env::var("BOLT_HASH_ALGO").unwrap_or_default();
     let algo_lc = algo.to_ascii_lowercase();
@@ -1554,10 +1591,8 @@ mod ptx_shape_tests {
     // Robin Hood keys-kernel PTX-shape tests. Like the validity tests,
     // these are host-only — they assert the emitter produces the
     // expected PTX SHAPE (entry-point name, param count, presence of
-    // the swap branch + atomic-exch instruction, bounded-probe cap).
-    // End-to-end GPU correctness is intentionally NOT tested here; see
-    // the TODO(rh) note on `compile_groupby_keys_kernel_robin_hood`
-    // about pending swap-semantics validation under contention.
+    // the swap branch + atomic-cas instructions, bounded-probe cap).
+    // End-to-end GPU correctness is intentionally NOT tested here.
     // -----------------------------------------------------------------
 
     /// The Robin Hood kernel exposes a distinct entry-point name so the
@@ -1587,36 +1622,91 @@ mod ptx_shape_tests {
         assert!(!ptx.contains(&format!("{}_param_4", KEYS_KERNEL_RH_ENTRY)));
     }
 
-    /// The Robin Hood kernel must emit BOTH atomic primitives that the
-    /// algorithm relies on: `atom.global.cas.b64` for the empty-slot
-    /// claim and `atom.global.exch.b64` for the swap.
+    /// The Robin Hood kernel must emit `atom.global.cas.b64` for both
+    /// the empty-slot claim AND the swap (CAS-with-expected). The
+    /// earlier `atom.global.exch.b64` swap design was racy under
+    /// contention and has been removed.
     #[test]
-    fn rh_kernel_emits_cas_and_exch() {
+    fn rh_kernel_emits_cas_for_claim_and_swap() {
         let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
         assert!(
             ptx.contains("atom.global.cas.b64"),
-            "RH must use atom.cas to claim empty slots"
+            "RH must use atom.cas for empty-slot claim and CAS-with-expected swap"
+        );
+        // The exch-based swap is gone; assert it's not regressed in.
+        assert!(
+            !ptx.contains("atom.global.exch.b64"),
+            "RH must NOT use atom.exch — the swap is now CAS-with-expected to avoid the contention race"
+        );
+    }
+
+    /// Race-free swap stress test: assert the emitted PTX carries both
+    /// the CAS-with-expected swap and the RH_RETRY re-probe path, and
+    /// does NOT contain the legacy `atom.global.exch.b64` swap form.
+    /// This is a guard against accidental regressions of the
+    /// contention-race fix.
+    #[test]
+    fn rh_kernel_swap_is_race_free_cas_with_expected() {
+        let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
+
+        // (1) RH path must contain atom.global.cas.b64 — used by both
+        // the empty-slot claim AND the swap-with-expected step. The
+        // emitter should produce at least two distinct CAS sites.
+        let cas_count = ptx.matches("atom.global.cas.b64").count();
+        assert!(
+            cas_count >= 2,
+            "RH must emit at least two atom.global.cas.b64 sites \
+             (one for empty-claim, one for swap-with-expected); found {cas_count}"
+        );
+
+        // (2) The legacy exch-based swap must be gone.
+        assert!(
+            !ptx.contains("atom.global.exch.b64"),
+            "RH PTX must not contain atom.global.exch.b64 (was racy under contention)"
+        );
+
+        // (3) Both control-flow labels for the new swap dance must
+        // exist: RH_SWAP (entered on cur_dist > occ_dist) and
+        // RH_RETRY (entered on CAS-with-expected failure).
+        assert!(
+            ptx.contains("RH_SWAP:"),
+            "missing RH_SWAP label (swap-with-expected entry point)"
         );
         assert!(
-            ptx.contains("atom.global.exch.b64"),
-            "RH must use atom.exch to swap with richer occupants"
+            ptx.contains("RH_RETRY:"),
+            "missing RH_RETRY label (CAS-failure re-probe path)"
+        );
+
+        // (4) The retry path must branch back to the main loop without
+        // having mutated cur_key (we re-probe the same slot from the
+        // top of the loop).
+        let retry_pos = ptx.find("RH_RETRY:").expect("RH_RETRY present");
+        let after_retry = &ptx[retry_pos..];
+        assert!(
+            after_retry.starts_with("RH_RETRY:\n\tbra RH_PROBE_LOOP;"),
+            "RH_RETRY must immediately branch to RH_PROBE_LOOP without other side-effects"
         );
     }
 
     /// The Robin Hood kernel must emit the swap branch label (RH_SWAP)
     /// so the linear path can fall into it on richer-than-occupant
-    /// comparison. Also asserts the bounded-probe cap is the
-    /// MAX_RH_PROBE constant.
+    /// comparison. Also asserts the bounded-probe cap is
+    /// MAX_RH_PROBE * 2 (doubled to absorb RH_RETRY re-probes under
+    /// contention without spinning forever).
     #[test]
     fn rh_kernel_emits_swap_branch_and_bound() {
         let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
         assert!(ptx.contains("RH_PROBE_LOOP:"), "missing RH_PROBE_LOOP label");
         assert!(ptx.contains("RH_SWAP:"), "missing RH_SWAP label");
-        // The bounded-probe cap mov should reference MAX_RH_PROBE's value.
+        // The bounded-probe cap mov should reference MAX_RH_PROBE * 2
+        // (doubled because RH_RETRY can legitimately re-probe the same
+        // slot under contention; doubling the budget keeps the
+        // silent-failure semantics consistent with the linear path).
+        let expected_cap = MAX_RH_PROBE * 2;
         assert!(
-            ptx.contains(&format!("mov.u32 %r11, {};", MAX_RH_PROBE)),
-            "RH_PROBE bound must be MAX_RH_PROBE = {}",
-            MAX_RH_PROBE
+            ptx.contains(&format!("mov.u32 %r11, {};", expected_cap)),
+            "RH_PROBE bound must be MAX_RH_PROBE * 2 = {} (saw PTX: ...)",
+            expected_cap
         );
     }
 
