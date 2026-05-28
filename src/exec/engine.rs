@@ -434,6 +434,14 @@ impl Engine {
     /// query. Failures (query error, log throttled, no-op observer)
     /// never affect the query result.
     pub fn sql(&self, query: &str) -> BoltResult<QueryHandle> {
+        // **Stage 6 (M3L5)** — retry the pool-watcher's context capture.
+        // If the watcher spawned before any engine thread had a context
+        // bound, `CAPTURED_CTX` is still zero and every poll silently
+        // no-ops. This call is cheap (atomic load when already
+        // captured) and a no-op when no context is bound on the
+        // calling thread — so it's safe to invoke unconditionally.
+        crate::cuda::mem_pool::pool_watcher_retry_context_capture();
+
         let plan: LogicalPlan = parse_sql(query, &self.provider)?;
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding __idx_<col> i32 column.

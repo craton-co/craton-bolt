@@ -1190,6 +1190,20 @@ pub fn __test_pool() -> &'static DeviceMemPool {
 #[inline(always)]
 fn ensure_watcher_started() {}
 
+/// Public shim around `pool_watcher::retry_context_capture` for
+/// `Engine::sql` to invoke on every query. **Stage 6 (M3L5)** —
+/// retry-on-first-engine-call hook. Under `not(feature = "pool-watcher")`
+/// this compiles to a no-op call site.
+#[cfg(not(feature = "pool-watcher"))]
+#[inline(always)]
+pub fn pool_watcher_retry_context_capture() {}
+
+#[cfg(feature = "pool-watcher")]
+#[inline]
+pub fn pool_watcher_retry_context_capture() {
+    pool_watcher::retry_context_capture();
+}
+
 // Under the `pool-watcher` feature `ensure_watcher_started` defers to
 // the real `pool_watcher::ensure_started` for production builds.
 // Under `#[cfg(test)]` it remains a no-op so the host-only test suite
@@ -1349,6 +1363,42 @@ pub(super) mod pool_watcher {
     /// `SHUTDOWN_QUANTUM`. Safe to call multiple times.
     pub(super) fn request_shutdown() {
         SHUTDOWN.store(true, Ordering::Release);
+    }
+
+    /// **Stage 6 (M3L5)** — retry-on-first-engine-call hook.
+    ///
+    /// If `ensure_started` ran before any engine thread had a CUDA context
+    /// bound (e.g. tests, or `DeviceMemPool::POOL` first-touched on an
+    /// idle thread), `CAPTURED_CTX` will be zero and every watcher poll
+    /// falls through `real_ctx_attach` as a no-op — losing visibility
+    /// into device memory pressure.
+    ///
+    /// This hook is called from `Engine::sql` (and other engine entry
+    /// points) on every query: if the slot is still empty AND the
+    /// calling thread has a context bound, populate it. Cheap atomic
+    /// load on the steady-state path; one `cuCtxGetCurrent` on the
+    /// first call after a context becomes available.
+    pub fn retry_context_capture() {
+        // Fast path: already captured.
+        if CAPTURED_CTX.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        match crate::cuda::cuda_sys::ctx_get_current() {
+            Ok(Some(ctx)) => {
+                // CAS so concurrent first-callers don't race. Only the
+                // winner stores; losers no-op.
+                let _ = CAPTURED_CTX.compare_exchange(
+                    0,
+                    ctx as usize,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            Ok(None) | Err(_) => {
+                // No context yet, or driver query failed — try again
+                // next call. Don't log; this is the steady-state miss.
+            }
+        }
     }
 
     /// Core loop. Factored out of `ensure_started` so the test harness
