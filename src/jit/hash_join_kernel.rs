@@ -119,6 +119,44 @@
 //! i64. `i64::MIN` remains reserved as the empty-slot sentinel; the host
 //! rejects any tuple whose packed encoding collides.
 //!
+//! ## Atomic contention guards
+//!
+//! Under hot-key skew many threads serialize on the same cacheline holding
+//! the contended atomic. To reduce this, every build kernel emits a
+//! *speculative pre-check* immediately before each
+//! `atom.global.cas.b64` that targets a slot-claim CAS against the
+//! `EMPTY_KEY` sentinel:
+//!
+//! ```text
+//! ld.acquire.gpu.s64 %rl_observed, [slot_addr];
+//! setp.eq.s64 %p_empty, %rl_observed, EMPTY_KEY;
+//! @%p_empty bra DO_CAS;
+//! setp.eq.s64 %p_match, %rl_observed, %rl_my_key;
+//! @%p_match bra DONE;        // someone already inserted our key
+//! bra ADVANCE;               // non-matching occupant; skip CAS entirely
+//! DO_CAS:
+//!   atom.global.cas.b64 %rl_actual, [slot_addr], EMPTY_KEY, my_key;
+//!   // ... existing post-CAS logic ...
+//! ```
+//!
+//! The speculative load is race-safe relative to the CAS:
+//!
+//! * Speculative load sees `EMPTY_KEY` → fall through to CAS; the CAS is
+//!   authoritative on the race.
+//! * Speculative load sees our key → another thread already inserted; we
+//!   exit (matches the existing first-writer-wins post-CAS logic).
+//! * Speculative load sees a non-EMPTY non-matching occupant → at observation
+//!   time the slot was claimed by someone with a different key. Even if it
+//!   becomes `EMPTY_KEY` again before we'd have CAS'd it, that's the
+//!   wrong slot for us to claim — advancing the probe is what we'd have
+//!   done after the CAS anyway. Skipping the CAS removes a guaranteed
+//!   `bra ADVANCE` cacheline contention.
+//!
+//! This pattern only applies to slot-claim CAS against the EMPTY sentinel.
+//! It does NOT apply to robin-hood SWAP-with-displaced-key CAS sites
+//! (those compare against a specific expected value, not EMPTY, and the
+//! speculative load would not help short-circuit the CAS).
+//!
 //! ## Stage-3 follow-ups
 //!
 //! * **Lift the slot-table layout to AoS.** SoA (parallel keys + head + chain)
@@ -505,6 +543,32 @@ pub fn compile_build_kernel() -> BoltResult<String> {
     writeln!(p, "\tmul.wide.u32 %rd5, %r8, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
 
+    // === Speculative pre-check (Batch 6 atomic-contention guard). ===
+    //
+    // Skip the CAS when the slot is already occupied by a non-matching key —
+    // that's a guaranteed CAS miss, and issuing the atomic only to advance
+    // serialises every thread on the same cacheline under hot-key skew.
+    //
+    // Race-safety (see file-level "Atomic contention guards"):
+    //   * observed == EMPTY    -> fall through to DO_CAS; the CAS is
+    //                             authoritative on the race.
+    //   * observed == my_key   -> first-writer-wins: another thread already
+    //                             claimed this slot for our key (and wrote
+    //                             its row_idx); exit.
+    //   * observed == other    -> wrong slot for us regardless of any
+    //                             subsequent vacate; advance the probe
+    //                             without touching the atomic.
+    writeln!(p, "\tld.acquire.gpu.s64 %rl6, [%rd6];").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s64 %p4, %rl6, %rl4;").map_err(write_err)?;
+    writeln!(p, "\t@%p4 bra DO_CAS;").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s64 %p5, %rl6, %rl0;").map_err(write_err)?;
+    writeln!(p, "\t@%p5 bra DONE;").map_err(write_err)?;
+    // Non-empty, non-matching occupant — advance without issuing the CAS.
+    writeln!(p, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
+
+    writeln!(p, "DO_CAS:").map_err(write_err)?;
     // atom.cas: EMPTY -> key. Returns the previous value.
     writeln!(p, "\tatom.global.cas.b64 %rl5, [%rd6], %rl4, %rl0;").map_err(write_err)?;
 
@@ -837,6 +901,32 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
     // addr_keys = keys_table + slot * 8
     writeln!(p, "\tmul.wide.u32 %rd5, %r8, 8;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
+
+    // === Speculative pre-check (Batch 6 atomic-contention guard). ===
+    //
+    // Skip the CAS when the slot already holds a non-matching key — the
+    // CAS would miss and we'd advance anyway, but issuing the atomic
+    // serialises threads on the same cacheline under hot-key skew. For
+    // the collision-list build the same correctness argument applies:
+    //
+    //   * observed == EMPTY    -> fall through to DO_CAS to claim the slot.
+    //   * observed == my_key   -> someone else already owns the slot for
+    //                             our key; jump to CHAIN to prepend.
+    //   * observed == other    -> wrong slot regardless; advance the probe.
+    //
+    // See file-level "Atomic contention guards" for the full race-safety
+    // analysis.
+    writeln!(p, "\tld.acquire.gpu.s64 %rl6, [%rd6];").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s64 %p4, %rl6, %rl4;").map_err(write_err)?;
+    writeln!(p, "\t@%p4 bra DO_CAS;").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s64 %p5, %rl6, %rl0;").map_err(write_err)?;
+    writeln!(p, "\t@%p5 bra CHAIN;").map_err(write_err)?;
+    // Non-matching occupant — advance without touching the atomic.
+    writeln!(p, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
+
+    writeln!(p, "DO_CAS:").map_err(write_err)?;
     writeln!(p, "\tatom.global.cas.b64 %rl5, [%rd6], %rl4, %rl0;").map_err(write_err)?;
 
     // prev == EMPTY  -> we now own the slot.
@@ -1487,6 +1577,29 @@ pub fn compile_build_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tmul.wide.u32 %rd5, %r10, 1;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
 
+    // === Speculative pre-check (Batch 6 atomic-contention guard). ===
+    //
+    // Same race-safe pattern as the SoA build kernel: skip the CAS when
+    // the slot is occupied by a non-matching key. AoS layout doesn't
+    // change the analysis — the i64 key word at slot offset 0 is what
+    // the CAS targets, and we speculatively read the same word.
+    //
+    //   * observed == EMPTY    -> fall through to DO_CAS.
+    //   * observed == my_key   -> first-writer-wins; exit.
+    //   * observed == other    -> wrong slot regardless; advance.
+    //
+    // See file-level "Atomic contention guards" for the full analysis.
+    writeln!(p, "\tld.acquire.gpu.s64 %rl6, [%rd6];").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s64 %p4, %rl6, %rl4;").map_err(write_err)?;
+    writeln!(p, "\t@%p4 bra DO_CAS;").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s64 %p5, %rl6, %rl0;").map_err(write_err)?;
+    writeln!(p, "\t@%p5 bra DONE;").map_err(write_err)?;
+    // Non-matching occupant — advance without issuing the CAS.
+    writeln!(p, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
+
+    writeln!(p, "DO_CAS:").map_err(write_err)?;
     // atom.cas.b64 against the key word at offset 0. The slot is 16-byte
     // aligned (host allocates `cap * 16` as one buffer; CUDA hands back
     // 256-byte aligned pointers), so the i64 at offset 0 is naturally
@@ -2298,5 +2411,132 @@ mod tests {
         let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
         assert!(ptx.contains("setp.ge.u32 %p0, %r3, %r4;"));
         assert!(ptx.contains("DONE:"));
+    }
+
+    // ----- Batch 6 atomic-contention guard goldens ------------------------
+    //
+    // Pin the speculative `ld.acquire.gpu.s64` pre-check that precedes every
+    // slot-claim `atom.global.cas.b64`. The optimisation is purely about
+    // skipping a guaranteed-miss CAS under hot-key skew; if a refactor drops
+    // the speculative load the kernel is still correct (the CAS is
+    // authoritative), but contention regresses.
+    //
+    // We assert (a) the mnemonic appears, (b) it appears BEFORE the CAS, and
+    // (c) the new `DO_CAS:` join-point label is emitted.
+
+    /// Assert that `needle` appears strictly before the *first* occurrence of
+    /// `marker` in `haystack`. Used to lock the speculative-load → CAS
+    /// ordering: dropping the speculative load (or moving it after the CAS,
+    /// which would be useless) would flip this.
+    fn assert_appears_before(haystack: &str, needle: &str, marker: &str, ctx: &str) {
+        let needle_pos = haystack.find(needle).unwrap_or_else(|| {
+            panic!("{ctx}: expected speculative pre-check '{needle}' to appear in PTX:\n{haystack}")
+        });
+        let marker_pos = haystack.find(marker).unwrap_or_else(|| {
+            panic!("{ctx}: expected CAS marker '{marker}' to appear in PTX:\n{haystack}")
+        });
+        assert!(
+            needle_pos < marker_pos,
+            "{ctx}: speculative pre-check '{needle}' must appear before CAS '{marker}' \
+             (needle@{needle_pos}, cas@{marker_pos})\n{haystack}"
+        );
+    }
+
+    /// SoA build kernel emits the speculative `ld.acquire.gpu.s64` pre-check
+    /// before its slot-claim CAS, and the join-point label `DO_CAS:` between
+    /// the speculative branches and the CAS itself.
+    #[test]
+    fn build_ptx_emits_speculative_pre_check_before_cas() {
+        let ptx = compile_build_kernel().unwrap();
+        assert!(
+            ptx.contains("ld.acquire.gpu.s64"),
+            "build kernel must emit speculative ld.acquire.gpu.s64 pre-check\n{ptx}"
+        );
+        assert!(
+            ptx.contains("DO_CAS:"),
+            "build kernel must emit DO_CAS: join-point label\n{ptx}"
+        );
+        assert_appears_before(
+            &ptx,
+            "ld.acquire.gpu.s64",
+            "atom.global.cas.b64",
+            "compile_build_kernel",
+        );
+        assert_appears_before(
+            &ptx,
+            "DO_CAS:",
+            "atom.global.cas.b64",
+            "compile_build_kernel",
+        );
+    }
+
+    /// Collision-list build kernel emits the speculative pre-check before
+    /// its slot-claim CAS. Only the slot-claim CAS gets the pre-check — the
+    /// chain-prepend `atom.global.exch.b32` on the head pointer is a
+    /// different atomic and untouched.
+    #[test]
+    fn build_collision_ptx_emits_speculative_pre_check_before_cas() {
+        let ptx = compile_build_collision_kernel().unwrap();
+        assert!(
+            ptx.contains("ld.acquire.gpu.s64"),
+            "collision build kernel must emit speculative ld.acquire.gpu.s64 pre-check\n{ptx}"
+        );
+        assert!(
+            ptx.contains("DO_CAS:"),
+            "collision build kernel must emit DO_CAS: join-point label\n{ptx}"
+        );
+        assert_appears_before(
+            &ptx,
+            "ld.acquire.gpu.s64",
+            "atom.global.cas.b64",
+            "compile_build_collision_kernel",
+        );
+        // exch.b32 stays — it's the chain-head atomic, not the slot CAS.
+        assert!(ptx.contains("atom.global.exch.b32"));
+    }
+
+    /// AoS build kernel emits the speculative pre-check before its
+    /// slot-claim CAS. Same race-safety argument as the SoA build kernel —
+    /// the AoS layout doesn't change the i64-at-offset-0 CAS target.
+    #[test]
+    fn build_aos_ptx_emits_speculative_pre_check_before_cas() {
+        let ptx = compile_build_aos_kernel().unwrap();
+        assert!(
+            ptx.contains("ld.acquire.gpu.s64"),
+            "AoS build kernel must emit speculative ld.acquire.gpu.s64 pre-check\n{ptx}"
+        );
+        assert!(
+            ptx.contains("DO_CAS:"),
+            "AoS build kernel must emit DO_CAS: join-point label\n{ptx}"
+        );
+        assert_appears_before(
+            &ptx,
+            "ld.acquire.gpu.s64",
+            "atom.global.cas.b64",
+            "compile_build_aos_kernel",
+        );
+    }
+
+    /// The speculative pre-check is build-kernel-only. The non-mutating
+    /// probe kernels never CAS the slot, so they must NOT emit the new
+    /// `ld.acquire.gpu.s64` (it would be dead code and would conflict with
+    /// the probe's existing `ld.global.s64` slot read).
+    #[test]
+    fn probe_kernels_do_not_emit_speculative_pre_check() {
+        let probe = compile_probe_kernel().unwrap();
+        let probe_collision = compile_probe_collision_kernel().unwrap();
+        let probe_aos = compile_probe_aos_kernel().unwrap();
+        assert!(
+            !probe.contains("ld.acquire.gpu.s64"),
+            "probe kernel must not emit slot-claim speculative pre-check\n{probe}"
+        );
+        assert!(
+            !probe_collision.contains("ld.acquire.gpu.s64"),
+            "collision probe kernel must not emit slot-claim speculative pre-check\n{probe_collision}"
+        );
+        assert!(
+            !probe_aos.contains("ld.acquire.gpu.s64"),
+            "AoS probe kernel must not emit slot-claim speculative pre-check\n{probe_aos}"
+        );
     }
 }
