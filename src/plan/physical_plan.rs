@@ -492,6 +492,17 @@ impl<'a> Codegen<'a> {
                 (lv, rv, unified, DataType::Bool)
             }
         } else if op_is_logical(op) {
+            // SHORT-CIRCUIT SEMANTICS — KNOWN DIVERGENCE FROM SQL STANDARD
+            //
+            // craton-bolt's GPU kernels evaluate both operands of AND/OR eagerly. SQL
+            // semantics require short-circuit: `WHERE b<>0 AND a/b>5` must NOT evaluate
+            // `a/b` when `b=0`. Predicates that rely on short-circuit evaluation for
+            // safety (divide-by-zero, NULL-poisoning, etc.) can produce wrong results.
+            //
+            // TODO(short-circuit): emit masked second-operand evaluation in JIT.
+            // Until that lands, the engine emits a warning when a query plan contains
+            // a divide / modulo nested under AND/OR (see
+            // `warn_if_eager_shortcircuit_unsafe`, invoked from `lower`).
             if l.dtype != DataType::Bool || r.dtype != DataType::Bool {
                 return Err(BoltError::Type(format!(
                     "logical {op:?} requires Bool operands, got {:?} and {:?}",
@@ -1228,7 +1239,130 @@ fn populate_aggregate_spec(
     aggregate.input_has_validity = flags;
 }
 
+/// True if `e` contains a divide (or modulo, once `BinaryOp::Mod` lands)
+/// anywhere in its subtree. Used to detect predicates whose correctness
+/// relies on SQL's standard short-circuit semantics — see
+/// [`warn_if_eager_shortcircuit_unsafe`].
+fn expr_contains_div_or_mod(e: &Expr) -> bool {
+    match e {
+        Expr::Column(_) | Expr::Literal(_) => false,
+        Expr::Binary { op, left, right } => {
+            // `BinaryOp::Mod` is not yet a variant; once it lands the matcher
+            // below will pick it up automatically. Today only `Div` exists.
+            if matches!(op, BinaryOp::Div) {
+                return true;
+            }
+            expr_contains_div_or_mod(left) || expr_contains_div_or_mod(right)
+        }
+        Expr::Alias(inner, _) => expr_contains_div_or_mod(inner),
+    }
+}
+
+/// True if `e` contains a `BinaryOp::And` or `BinaryOp::Or` whose left or
+/// right subtree contains a divide / modulo. This is the unsafe pattern
+/// described on the AND/OR arm of `Codegen::emit_binary`: standard
+/// SQL would short-circuit and skip the divide when the guard fails, but
+/// craton-bolt's GPU codegen evaluates both operands eagerly.
+fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
+    match e {
+        Expr::Column(_) | Expr::Literal(_) => false,
+        Expr::Binary { op, left, right } => {
+            if matches!(op, BinaryOp::And | BinaryOp::Or)
+                && (expr_contains_div_or_mod(left) || expr_contains_div_or_mod(right))
+            {
+                return true;
+            }
+            expr_has_unsafe_eager_shortcircuit(left)
+                || expr_has_unsafe_eager_shortcircuit(right)
+        }
+        Expr::Alias(inner, _) => expr_has_unsafe_eager_shortcircuit(inner),
+    }
+}
+
+/// True if any `Expr::Binary { op: Div, .. }` reachable from `op` lives
+/// underneath an `Op::Binary { op: And/Or }` in the linear IR. The IR is a
+/// register machine (operands are already evaluated before the binary op
+/// fires), so the eager-evaluation hazard is intrinsic to the IR shape:
+/// the presence of *any* Div op alongside *any* And/Or op in the same
+/// kernel means the divide ran unconditionally.
+fn kernel_has_unsafe_eager_shortcircuit(kernel: &KernelSpec) -> bool {
+    let mut has_div = false;
+    let mut has_logical = false;
+    for op in &kernel.ops {
+        if let Op::Binary { op, .. } = op {
+            if matches!(op, BinaryOp::Div) {
+                has_div = true;
+            }
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                has_logical = true;
+            }
+        }
+    }
+    has_div && has_logical
+}
+
+/// Walk `plan` and emit a `log::warn!` if any predicate / projection
+/// expression — or any compiled kernel's linear IR — contains `BinaryOp::And`
+/// or `BinaryOp::Or` whose subtree includes `BinaryOp::Div` (or `Mod`, once
+/// that variant exists).
+///
+/// This is a discoverability safety net for the documented divergence from
+/// SQL short-circuit semantics; see the doc block on the AND/OR arm of
+/// `Codegen::emit_binary`. The warning is non-fatal — the plan still
+/// executes, just with eager evaluation of both operands.
+fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
+    fn check_kernel(kernel: &KernelSpec) -> bool {
+        kernel_has_unsafe_eager_shortcircuit(kernel)
+    }
+    fn walk(plan: &PhysicalPlan) -> bool {
+        match plan {
+            PhysicalPlan::Projection { kernel, .. } => check_kernel(kernel),
+            PhysicalPlan::Aggregate { pre, .. } => {
+                pre.as_ref().map(check_kernel).unwrap_or(false)
+            }
+            PhysicalPlan::Filter { input, predicate } => {
+                expr_has_unsafe_eager_shortcircuit(predicate) || walk(input)
+            }
+            PhysicalPlan::Project { input, exprs, .. } => {
+                exprs.iter().any(expr_has_unsafe_eager_shortcircuit) || walk(input)
+            }
+            PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::Sort { input, .. } => walk(input),
+            PhysicalPlan::Union { inputs } => inputs.iter().any(walk),
+            PhysicalPlan::Join {
+                left, right, on, ..
+            } => {
+                on.iter()
+                    .any(|(l, r)| {
+                        expr_has_unsafe_eager_shortcircuit(l)
+                            || expr_has_unsafe_eager_shortcircuit(r)
+                    })
+                    || walk(left)
+                    || walk(right)
+            }
+        }
+    }
+    if walk(plan) {
+        log::warn!(
+            "query plan: AND/OR with divide/modulo child — short-circuit \
+             semantics not yet implemented; ensure no divide-by-zero in your data"
+        );
+    }
+}
+
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
+    let phys = lower_inner(plan)?;
+    // Static-analysis safety net for the documented short-circuit divergence
+    // (see the AND/OR arm in `emit_binary`). Runs once at the lowering
+    // boundary; non-fatal warning only.
+    warn_if_eager_shortcircuit_unsafe(&phys);
+    Ok(phys)
+}
+
+/// Internal recursion entry; `lower` wraps this with the post-lowering
+/// short-circuit safety scan.
+fn lower_inner(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
     match plan {
         LogicalPlan::Project { input, exprs } => {
             // Scan/Filter/Project chain → single fused kernel via `lower_projection`.
@@ -1243,7 +1377,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
             } else {
-                let inner = lower(input)?;
+                let inner = lower_inner(input)?;
                 let output_schema = plan.schema()?;
                 if project_is_identity(exprs, inner.output_schema(), &output_schema) {
                     Ok(inner)
@@ -1270,7 +1404,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
                 // rows that don't satisfy it. The inner plan's output is
                 // typically tiny (one row per group for HAVING), so a
                 // host-side pass is fine for 0.3.
-                let inner = lower(input)?;
+                let inner = lower_inner(input)?;
                 Ok(PhysicalPlan::Filter {
                     input: Box::new(inner),
                     predicate: predicate.clone(),
@@ -1284,7 +1418,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             aggregates,
         } => lower_aggregate(plan, input, group_by, aggregates),
         LogicalPlan::Distinct { input } => {
-            let inner = lower(input)?;
+            let inner = lower_inner(input)?;
             Ok(PhysicalPlan::Distinct {
                 input: Box::new(inner),
             })
@@ -1294,7 +1428,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             limit,
             offset,
         } => {
-            let inner = lower(input)?;
+            let inner = lower_inner(input)?;
             Ok(PhysicalPlan::Limit {
                 input: Box::new(inner),
                 limit: *limit,
@@ -1302,7 +1436,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             })
         }
         LogicalPlan::Sort { input, sort_exprs } => {
-            let inner = lower(input)?;
+            let inner = lower_inner(input)?;
             Ok(PhysicalPlan::Sort {
                 input: Box::new(inner),
                 sort_exprs: sort_exprs.clone(),
@@ -1316,7 +1450,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             }
             let mut lowered: Vec<PhysicalPlan> = Vec::with_capacity(inputs.len());
             for branch in inputs {
-                lowered.push(lower(branch)?);
+                lowered.push(lower_inner(branch)?);
             }
             // Schema integrity (matching shapes across branches) was
             // already enforced by `LogicalPlan::schema()`; trust that.
@@ -1328,8 +1462,8 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             join_type,
             on,
         } => {
-            let l = lower(left)?;
-            let r = lower(right)?;
+            let l = lower_inner(left)?;
+            let r = lower_inner(right)?;
             // Build the combined schema *from the physical inputs*: the
             // logical sides may have been folded / projected differently
             // than their physical counterparts, but for the operators
