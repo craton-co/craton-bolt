@@ -3,6 +3,11 @@
 #[doc(hidden)]
 pub mod launch;
 pub mod engine;
+/// Process-wide JIT-module cache shared across executors. Lifted out of
+/// per-file `static MODULE_CACHE` declarations to avoid the multi-GPU
+/// hazard described in the module docs.
+#[doc(hidden)]
+pub mod module_cache;
 pub mod aggregate;
 pub mod compact;
 pub mod string_col;

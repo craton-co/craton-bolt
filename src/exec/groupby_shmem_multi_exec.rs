@@ -37,10 +37,10 @@ use crate::exec::groupby_shmem_dispatch::{
 };
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::jit::shmem_multi_sum_kernel::{
     compile_shmem_multi_sum_kernel, kernel_entry, BLOCK_GROUPS, BLOCK_THREADS, MAX_VALS,
 };
-use crate::jit::CudaModule;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -185,8 +185,14 @@ fn execute_inner(
     }
 
     // --- JIT + load the kernel --------------------------------------------
-    let ptx = compile_shmem_multi_sum_kernel(n_vals)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // Cached by `n_vals` since that's the only parameter to the shmem multi-SUM
+    // PTX template; repeat launches with the same fan-out skip PTX gen entirely.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("shmem_multi_sum:{}", n_vals),
+        None,
+        || compile_shmem_multi_sum_kernel(n_vals),
+    )?;
     let entry = kernel_entry(n_vals);
     let function = module.function(&entry)?;
 

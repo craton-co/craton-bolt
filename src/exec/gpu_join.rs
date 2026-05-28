@@ -200,6 +200,7 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::hash_join_kernel::{
     compile_build_aos_kernel, compile_build_collision_kernel, compile_build_kernel,
@@ -768,8 +769,12 @@ fn launch_build_kernel(
     // here, the kernel now degrades to first-writer-wins semantics rather
     // than emitting u32::MAX sentinel row indices — but the collision kernel
     // is still the correct dispatch for known-duplicate inputs.
-    let ptx = compile_build_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "build".to_string(),
+        None,
+        || compile_build_kernel(),
+    )?;
     let function = module.function(BUILD_KERNEL_ENTRY)?;
 
     let mut build_keys_ptr: CUdeviceptr = build_keys_dev.device_ptr();
@@ -836,8 +841,12 @@ fn launch_probe_kernel(
         return Ok(0);
     }
 
-    let ptx = compile_probe_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "probe".to_string(),
+        None,
+        || compile_probe_kernel(),
+    )?;
     let function = module.function(PROBE_KERNEL_ENTRY)?;
 
     let mut probe_keys_ptr: CUdeviceptr = probe_keys_dev.device_ptr();
@@ -934,8 +943,12 @@ fn launch_build_aos_kernel(
     if n_build_rows == 0 {
         return Ok(());
     }
-    let ptx = compile_build_aos_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "build_aos".to_string(),
+        None,
+        || compile_build_aos_kernel(),
+    )?;
     let function = module.function(BUILD_AOS_KERNEL_ENTRY)?;
 
     let mut build_keys_ptr: CUdeviceptr = build_keys_dev.device_ptr();
@@ -994,8 +1007,12 @@ fn launch_probe_aos_kernel(
     if n_probe_rows == 0 {
         return Ok(0);
     }
-    let ptx = compile_probe_aos_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "probe_aos".to_string(),
+        None,
+        || compile_probe_aos_kernel(),
+    )?;
     let function = module.function(PROBE_AOS_KERNEL_ENTRY)?;
 
     let mut probe_keys_ptr: CUdeviceptr = probe_keys_dev.device_ptr();
@@ -1732,8 +1749,12 @@ fn launch_build_collision_kernel(
     if n_build_rows == 0 {
         return Ok(());
     }
-    let ptx = compile_build_collision_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "build_collision".to_string(),
+        None,
+        || compile_build_collision_kernel(),
+    )?;
     let function = module.function(BUILD_COLLISION_KERNEL_ENTRY)?;
 
     let mut build_keys_ptr: CUdeviceptr = build_keys_dev.device_ptr();
@@ -1793,8 +1814,12 @@ fn launch_probe_collision_kernel(
     if n_probe_rows == 0 {
         return Ok(0);
     }
-    let ptx = compile_probe_collision_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "probe_collision".to_string(),
+        None,
+        || compile_probe_collision_kernel(),
+    )?;
     let function = module.function(PROBE_COLLISION_KERNEL_ENTRY)?;
 
     let mut probe_keys_ptr: CUdeviceptr = probe_keys_dev.device_ptr();
@@ -1855,8 +1880,12 @@ fn launch_unmatched_build_kernel(
     if n_build_rows == 0 {
         return Ok(0);
     }
-    let ptx = compile_unmatched_build_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "unmatched_build".to_string(),
+        None,
+        || compile_unmatched_build_kernel(),
+    )?;
     let function = module.function(UNMATCHED_BUILD_KERNEL_ENTRY)?;
 
     let mut matched_ptr: CUdeviceptr = matched_dev.device_ptr();
@@ -2353,8 +2382,12 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
     };
     let out_dev = GpuVec::<u64>::zeros(n)?;
 
-    let ptx = compile_string_hash_kernel(DataType::Utf8)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "string_hash:Utf8".to_string(),
+        None,
+        || compile_string_hash_kernel(DataType::Utf8),
+    )?;
     let function = module.function(STRING_HASH_KERNEL_ENTRY)?;
 
     let mut offsets_ptr: CUdeviceptr = offsets_dev.device_ptr();
@@ -2431,10 +2464,16 @@ pub fn compute_device_string_hashes_large(
     };
     let out_dev = GpuVec::<u64>::zeros(n)?;
 
-    let ptx = crate::jit::hash_join_kernel::compile_string_hash_kernel_with_offsets(
-        crate::jit::hash_join_kernel::StringOffsetWidth::I64,
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "string_hash_with_offsets:I64".to_string(),
+        None,
+        || {
+            crate::jit::hash_join_kernel::compile_string_hash_kernel_with_offsets(
+                crate::jit::hash_join_kernel::StringOffsetWidth::I64,
+            )
+        },
     )?;
-    let module = CudaModule::from_ptx(&ptx)?;
     let function =
         module.function(crate::jit::hash_join_kernel::STRING_HASH_KERNEL_ENTRY_I64)?;
 
@@ -3043,8 +3082,12 @@ pub fn execute_cross_join_on_gpu(
     let stream = CudaStream::null();
 
     // Launch.
-    let ptx = compile_cross_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "cross".to_string(),
+        None,
+        || compile_cross_kernel(),
+    )?;
     let function = module.function(CROSS_KERNEL_ENTRY)?;
 
     let mut out_probe_idx_ptr: CUdeviceptr = out_probe_idx_dev.device_ptr();

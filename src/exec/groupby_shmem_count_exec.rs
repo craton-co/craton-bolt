@@ -30,10 +30,10 @@ use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::jit::shmem_count_kernel::{
     compile_shmem_count_kernel, BLOCK_GROUPS, KERNEL_ENTRY,
 };
-use crate::jit::CudaModule;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -106,8 +106,12 @@ fn execute_inner(
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
     let mut out_gpu: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_groups as usize, stream.raw())?;
 
-    let ptx = compile_shmem_count_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "shmem_count".to_string(),
+        None,
+        || compile_shmem_count_kernel(),
+    )?;
     let function = module.function(KERNEL_ENTRY)?;
 
     let params = tune(TuneInputs {

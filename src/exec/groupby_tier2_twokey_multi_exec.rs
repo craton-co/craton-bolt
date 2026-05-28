@@ -22,17 +22,15 @@
 //! handle them. Single-SUM two-key goes through the existing
 //! `groupby_tier2_twokey_exec`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel_i64, partition_reduce_kernel_multi_i64, scatter_kernel_i64, CudaModule,
@@ -55,28 +53,25 @@ enum KernelSpec {
     ReduceMultiI64 { n_vals: u32 },
 }
 
-static MODULE_CACHE: Lazy<Mutex<HashMap<KernelSpec, CudaModule>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
 #[cfg(test)]
-static LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
-    if let Some(m) = MODULE_CACHE.lock().get(spec) {
-        return Ok(m.clone());
-    }
-    let ptx = match spec {
-        KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
-        KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
-        KernelSpec::ReduceMultiI64 { n_vals } => {
-            partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64(*n_vals)?
-        }
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
-    LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut cache = MODULE_CACHE.lock();
-    Ok(cache.entry(spec.clone()).or_insert(module).clone())
+    let counter = Some(&LOAD_COUNT);
+    #[cfg(not(test))]
+    let counter = None;
+    module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
+        Ok(match spec {
+            KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
+            KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
+            KernelSpec::ReduceMultiI64 { n_vals } => {
+                partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64(
+                    *n_vals,
+                )?
+            }
+        })
+    })
 }
 
 pub fn try_execute(

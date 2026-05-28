@@ -37,12 +37,16 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::{primitive_to_gpu, GpuVec};
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{grid_x_for, CudaStream};
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
     compile_reduction_kernel, ReduceOp, BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
 };
-use crate::jit::CudaModule;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
+
+// `CudaModule` import dropped: every load site now routes through
+// `exec::module_cache::get_or_build_module`, which returns the cached module
+// directly.
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 
 /// Execute an aggregate physical plan against a host-side RecordBatch.
@@ -419,9 +423,15 @@ where
     // barrier.
     let partials = GpuVec::<T>::zeros_async(grid_x as usize, stream.raw())?;
 
-    // Compile + load the kernel.
-    let ptx = compile_reduction_kernel(op, dtype)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // Compile + load the kernel via the consolidated `exec::module_cache`.
+    // The reduction kernel is keyed by `(op, dtype)` — that's the entire
+    // PTX-template parameter surface. Repeat scalar reductions skip PTX gen.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("reduction:{:?}:{:?}", op, dtype),
+        None,
+        || compile_reduction_kernel(op, dtype),
+    )?;
     let function = module.function(REDUCTION_KERNEL_ENTRY)?;
 
     // Assemble the kernel parameter list (input_ptr, output_ptr, n_rows).
@@ -507,9 +517,15 @@ where
     let partials = GpuVec::<TAcc>::zeros_async(grid_x as usize, stream.raw())?;
 
     // Compile + load the kernel. The kernel takes the *input* dtype; it
-    // internally widens to the accumulator dtype.
-    let ptx = compile_reduction_kernel(op, dtype)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // internally widens to the accumulator dtype. Routed through the
+    // consolidated cache; same key as `reduce_gpu_vec` since the PTX
+    // template only depends on `(op, input dtype)`.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("reduction:{:?}:{:?}", op, dtype),
+        None,
+        || compile_reduction_kernel(op, dtype),
+    )?;
     let function = module.function(REDUCTION_KERNEL_ENTRY)?;
 
     let mut input_ptr: CUdeviceptr = input.device_ptr();

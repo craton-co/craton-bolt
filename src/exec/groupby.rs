@@ -97,6 +97,7 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{grid_x_for, CudaStream};
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
 // Stage C: the `_with_validity` variants in `crate::jit::hash_kernels`
@@ -113,7 +114,6 @@ use crate::jit::hash_kernels::{
     compile_groupby_keys_kernel, groupby_block_size, AGG_KERNEL_ENTRY,
     I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
 };
-use crate::jit::CudaModule;
 use crate::plan::logical_plan::{
     sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema,
 };
@@ -1064,8 +1064,12 @@ fn launch_keys_kernel(
         return Ok(());
     }
 
-    let ptx = compile_groupby_keys_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "groupby_keys".to_string(),
+        None,
+        || compile_groupby_keys_kernel(),
+    )?;
     let function = module.function(KEYS_KERNEL_ENTRY)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
@@ -1145,27 +1149,35 @@ fn launch_agg_kernel<T: Pod>(
     // caller passing `validity_ptr = Some(_)` for that combo is a bug
     // (the dispatch predicate filters it out).
     let use_validity = validity_ptr.is_some();
-    let ptx = match (op, input_dtype) {
+    let is_float_min_max = matches!(
+        (op, input_dtype),
         (ReduceOp::Min, DataType::Float32)
-        | (ReduceOp::Max, DataType::Float32)
-        | (ReduceOp::Min, DataType::Float64)
-        | (ReduceOp::Max, DataType::Float64) => {
-            debug_assert!(
-                !use_validity,
-                "float MIN/MAX has no _with_validity emitter — \
-                 dispatch predicate should have rejected this combo"
-            );
-            crate::jit::float_atomics::compile_groupby_float_atomic_kernel(op, input_dtype)?
-        }
-        _ => {
-            if use_validity {
-                compile_groupby_agg_kernel_with_validity(op, input_dtype)?
+            | (ReduceOp::Max, DataType::Float32)
+            | (ReduceOp::Min, DataType::Float64)
+            | (ReduceOp::Max, DataType::Float64)
+    );
+    debug_assert!(
+        !(is_float_min_max && use_validity),
+        "float MIN/MAX has no _with_validity emitter — \
+         dispatch predicate should have rejected this combo"
+    );
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!(
+            "groupby_agg:{:?}:{:?}:float_min_max={}:validity={}",
+            op, input_dtype, is_float_min_max, use_validity
+        ),
+        None,
+        || {
+            if is_float_min_max {
+                crate::jit::float_atomics::compile_groupby_float_atomic_kernel(op, input_dtype)
+            } else if use_validity {
+                compile_groupby_agg_kernel_with_validity(op, input_dtype)
             } else {
-                compile_groupby_agg_kernel(op, input_dtype)?
+                compile_groupby_agg_kernel(op, input_dtype)
             }
-        }
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
+        },
+    )?;
     let function = module.function(AGG_KERNEL_ENTRY)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();

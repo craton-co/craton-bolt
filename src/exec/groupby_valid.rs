@@ -97,6 +97,7 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{grid_x_for, CudaStream};
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::valid_flag_kernels::{
@@ -110,7 +111,6 @@ use crate::jit::valid_flag_kernels::{
 // through `valid_flag_float::compile_agg_valid_float_kernel_with_validity`.
 // The host-strip path remains as the correctness fallback for any
 // (op, dtype) outside that coverage.
-use crate::jit::CudaModule;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 
@@ -887,8 +887,12 @@ fn launch_keys_kernel(
         return Ok(());
     }
 
-    let ptx = compile_keys_valid_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "keys_valid".to_string(),
+        None,
+        || compile_keys_valid_kernel(),
+    )?;
     let function = module.function(VALID_KEYS_KERNEL_ENTRY)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
@@ -991,28 +995,33 @@ fn launch_agg_kernel<T: Pod>(
             | (ReduceOp::Max, DataType::Float64)
     );
     let use_validity = validity_ptr.is_some();
-    let (ptx, entry_symbol) = match (is_float_min_max, use_validity) {
-        (true, true) => (
-            crate::jit::valid_flag_float::compile_agg_valid_float_kernel_with_validity(
-                op,
-                input_dtype,
-            )?,
-            crate::jit::valid_flag_float::VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY,
-        ),
-        (true, false) => (
-            crate::jit::valid_flag_float::compile_agg_valid_float_kernel(op, input_dtype)?,
-            VALID_AGG_KERNEL_ENTRY,
-        ),
-        (false, true) => (
-            compile_agg_valid_kernel_with_validity(op, input_dtype)?,
-            crate::jit::valid_flag_kernels::VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY,
-        ),
-        (false, false) => (
-            compile_agg_valid_kernel(op, input_dtype)?,
-            VALID_AGG_KERNEL_ENTRY,
-        ),
+    let entry_symbol = match (is_float_min_max, use_validity) {
+        (true, true) => crate::jit::valid_flag_float::VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY,
+        (true, false) => VALID_AGG_KERNEL_ENTRY,
+        (false, true) => crate::jit::valid_flag_kernels::VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY,
+        (false, false) => VALID_AGG_KERNEL_ENTRY,
     };
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!(
+            "agg_valid:{:?}:{:?}:float_min_max={}:validity={}",
+            op, input_dtype, is_float_min_max, use_validity
+        ),
+        None,
+        || match (is_float_min_max, use_validity) {
+            (true, true) => {
+                crate::jit::valid_flag_float::compile_agg_valid_float_kernel_with_validity(
+                    op,
+                    input_dtype,
+                )
+            }
+            (true, false) => {
+                crate::jit::valid_flag_float::compile_agg_valid_float_kernel(op, input_dtype)
+            }
+            (false, true) => compile_agg_valid_kernel_with_validity(op, input_dtype),
+            (false, false) => compile_agg_valid_kernel(op, input_dtype),
+        },
+    )?;
     let function = module.function(entry_symbol)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();

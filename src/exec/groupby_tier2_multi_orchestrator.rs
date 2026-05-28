@@ -50,10 +50,11 @@
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel, partition_reduce_kernel_multi, scatter_values_by_dest_idx_kernel,
-    scatter_with_dest_idx_kernel, CudaModule,
+    scatter_with_dest_idx_kernel,
 };
 
 /// Tier-2 multi-SUM partial result: one `(keys, sums_per_value_column)` pair
@@ -128,8 +129,12 @@ pub fn execute_tier2_multi_sum(
     // Step 2. JIT + launch the partition kernel (once — pid depends only on
     // the key column, not on any value column).
     // ----------------------------------------------------------------------
-    let partition_ptx = partition_kernel::compile_partition_kernel()?;
-    let partition_module = CudaModule::from_ptx(&partition_ptx)?;
+    let partition_module = module_cache::get_or_build_module(
+        module_path!(),
+        "partition".to_string(),
+        None,
+        || partition_kernel::compile_partition_kernel(),
+    )?;
     let partition_fn = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
 
     const BLOCK_THREADS: u32 = 256;
@@ -213,9 +218,12 @@ pub fn execute_tier2_multi_sum(
     // This is the only place an atomic-ordered slot assignment happens.
     // After this kernel returns, `dest_idx` is the canonical row→slot map.
     // ----------------------------------------------------------------------
-    let claim_ptx =
-        scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel()?;
-    let claim_module = CudaModule::from_ptx(&claim_ptx)?;
+    let claim_module = module_cache::get_or_build_module(
+        module_path!(),
+        "scatter_with_dest_idx".to_string(),
+        None,
+        || scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel(),
+    )?;
     let claim_fn = claim_module.function(scatter_with_dest_idx_kernel::KERNEL_ENTRY)?;
 
     {
@@ -254,9 +262,12 @@ pub fn execute_tier2_multi_sum(
     // column's row i lands in the same slot as the key — alignment is
     // guaranteed by construction.
     // ----------------------------------------------------------------------
-    let val_scatter_ptx =
-        scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel()?;
-    let val_scatter_module = CudaModule::from_ptx(&val_scatter_ptx)?;
+    let val_scatter_module = module_cache::get_or_build_module(
+        module_path!(),
+        "scatter_values_by_dest_idx".to_string(),
+        None,
+        || scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel(),
+    )?;
 
     for j in 0..n_vals {
         let val_scatter_fn =
@@ -323,11 +334,13 @@ pub fn execute_tier2_multi_sum(
     }
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
 
-    // JIT + launch — kernel is cached per (n_vals) via the PTX cache.
-    let reduce_ptx = partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(
-        n_vals as u32,
+    // JIT + launch — module cached per (n_vals).
+    let reduce_module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("partition_reduce_multi:{}", n_vals),
+        None,
+        || partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(n_vals as u32),
     )?;
-    let reduce_module = CudaModule::from_ptx(&reduce_ptx)?;
     let reduce_entry_name = partition_reduce_kernel_multi::kernel_entry(n_vals as u32);
     let reduce_fn = reduce_module.function(&reduce_entry_name)?;
 

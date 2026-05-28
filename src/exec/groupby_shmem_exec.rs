@@ -35,10 +35,10 @@ use crate::exec::groupby_shmem_dispatch::{
 };
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::module_cache;
 use crate::jit::shmem_sum_kernel::{
     compile_shmem_sum_kernel, BLOCK_GROUPS, BLOCK_THREADS, KERNEL_ENTRY,
 };
-use crate::jit::CudaModule;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -155,8 +155,15 @@ fn execute_inner(
     let mut out_gpu = GpuVec::<f64>::zeros_async(n_groups as usize, stream.raw())?;
 
     // --- JIT + load the kernel (PTX cache hits after first run) -----------
-    let ptx = compile_shmem_sum_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // Routed through the consolidated `exec::module_cache` so repeated
+    // shmem-SUM launches skip PTX construction entirely. The kernel is
+    // unparameterised — a fixed string is a sufficient spec id.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "shmem_sum".to_string(),
+        None,
+        || compile_shmem_sum_kernel(),
+    )?;
     let function = module.function(KERNEL_ENTRY)?;
 
     // --- Launch params (Agent 3's tuner) ---------------------------------

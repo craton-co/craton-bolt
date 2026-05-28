@@ -53,8 +53,8 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::BoltResult;
 use crate::exec::launch::CudaStream;
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
-use crate::jit::jit_compiler::CudaModule;
 use crate::jit::prefix_scan::{compile_prefix_scan_kernel, BLOCK_SIZE, SCAN_KERNEL_ENTRY};
 use crate::jit::prefix_scan_multipass::{
     compile_add_block_bases_kernel, compile_prefix_scan_u32_kernel, ADD_BASES_KERNEL_ENTRY,
@@ -204,8 +204,15 @@ fn run_u8_scan(
     n_rows: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    let ptx = compile_prefix_scan_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // Share the `prefix_scan` cache slot with `gpu_compact::prefix_scan_mask`:
+    // both call sites compile the SAME unparameterised PTX. Namespacing on the
+    // sibling module path keeps lookups uniform without re-loading the cubin.
+    let module = module_cache::get_or_build_module(
+        "craton_bolt::exec::gpu_compact",
+        "prefix_scan".to_string(),
+        None,
+        || compile_prefix_scan_kernel(),
+    )?;
     let function = module.function(SCAN_KERNEL_ENTRY)?;
 
     let mut p_mask: CUdeviceptr = mask_ptr;
@@ -260,8 +267,12 @@ fn run_u32_scan(
     n: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    let ptx = compile_prefix_scan_u32_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "prefix_scan_u32".to_string(),
+        None,
+        || compile_prefix_scan_u32_kernel(),
+    )?;
     let function = module.function(SCAN_U32_KERNEL_ENTRY)?;
 
     let mut p_vals: CUdeviceptr = vals.device_ptr();
@@ -307,8 +318,12 @@ fn run_add_block_bases(
     n: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    let ptx = compile_add_block_bases_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "add_block_bases".to_string(),
+        None,
+        || compile_add_block_bases_kernel(),
+    )?;
     let function = module.function(ADD_BASES_KERNEL_ENTRY)?;
 
     let mut p_indices: CUdeviceptr = indices.device_ptr();

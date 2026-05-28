@@ -41,8 +41,8 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
+use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
-use crate::jit::jit_compiler::CudaModule;
 use crate::jit::prefix_scan::{
     compile_gather_kernel, compile_prefix_scan_kernel, gather_kernel_entry, BLOCK_SIZE,
     SCAN_KERNEL_ENTRY,
@@ -261,9 +261,14 @@ pub fn prefix_scan_mask(
     let local_indices = GpuVec::<u32>::zeros(n_rows)?;
     let block_sums = GpuVec::<u32>::zeros(n_blocks)?;
 
-    // JIT-compile and load the scan kernel.
-    let ptx = compile_prefix_scan_kernel()?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // JIT-compile and load the scan kernel via the consolidated cache.
+    // The scan kernel is unparameterised — a fixed spec id suffices.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "prefix_scan".to_string(),
+        None,
+        || compile_prefix_scan_kernel(),
+    )?;
     let function = module.function(SCAN_KERNEL_ENTRY)?;
 
     // Launch. cuLaunchKernel ABI: pointer-to-each-arg in a *mut c_void array.
@@ -372,9 +377,14 @@ pub fn gather_one(
         return Ok(col);
     }
 
-    // JIT-compile + load the gather kernel for this dtype.
-    let ptx = compile_gather_kernel(dtype)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    // JIT-compile + load the gather kernel for this dtype. The PTX is keyed
+    // by `dtype` only; consolidated cache lookup skips PTX gen on repeats.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("gather:{:?}", dtype),
+        None,
+        || compile_gather_kernel(dtype),
+    )?;
     let function = module.function(gather_kernel_entry(dtype))?;
 
     // Assemble the cuLaunchKernel argument array. Order matches the kernel
