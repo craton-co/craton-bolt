@@ -65,7 +65,13 @@
 //! size classes do not contend on a global lock. `total_bytes` becomes an
 //! `AtomicUsize`; cap checks read/write it with `Relaxed`/`AcqRel`
 //! ordering — the cap is soft, occasional overshoot by one block under
-//! race is acceptable and corrected on the next free.
+//! race is acceptable and corrected on the next free. Subtractions go
+//! through `sub_total_saturating` (a `fetch_update` CAS loop with
+//! `saturating_sub`) rather than a bare `fetch_sub`, so a `store` from
+//! `reconcile_total_bytes` that races an in-flight free can never drive
+//! the counter below zero and wrap into `~usize::MAX`. Saturation is
+//! equivalent under the soft-cap invariant — a transient under-count
+//! gets corrected on the next reconciliation pass anyway.
 //!
 //! ### Stage 2: cross-bucket global LRU + reconciliation
 //!
@@ -525,6 +531,36 @@ impl DeviceMemPool {
         }
     }
 
+    /// Saturating subtract `n` from `self.total_bytes`.
+    ///
+    /// Replaces a bare `fetch_sub(n, AcqRel)` to close a small race window:
+    /// `reconcile_total_bytes` performs an atomic `store` of the freshly
+    /// summed bucket bytes, and an in-flight `free` / `evict_one` whose
+    /// `fetch_sub` interleaves *after* that store can drive the counter
+    /// below zero and wrap a `usize` to ~`usize::MAX`. The wrong-direction
+    /// value then makes `try_insert_into_locked_bucket`'s cap check reject
+    /// every subsequent free until the next reconciliation pass — a window
+    /// of up to `RECONCILE_EVERY_N_FREES` (1024) calls.
+    ///
+    /// Saturating at zero is the correct fix: `total_bytes` is a soft
+    /// accounting counter (the source of truth is the bucket contents
+    /// themselves, recomputed by `reconcile_total_bytes`), so any
+    /// transient under-count is corrected on the next reconciliation
+    /// without ever producing a pathological value in between. The
+    /// memory ordering (`AcqRel` / `Acquire`) matches the prior
+    /// `fetch_sub` — `fetch_update`'s closure runs inside a CAS loop
+    /// and the orderings apply to the success / failure paths
+    /// respectively. The closure is total (always `Some(_)`), so the
+    /// `fetch_update` itself never returns `Err`.
+    #[inline]
+    fn sub_total_saturating(&self, n: usize) {
+        let _ = self.total_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+    }
+
     // ---- Storage abstraction helpers ----
     //
     // Hot-path code (alloc, free, evict_one, drain, …) calls these
@@ -679,7 +715,7 @@ impl DeviceMemPool {
             bucket.blocks.pop_back()
         });
         if let Some(Some(block)) = hit {
-            self.total_bytes.fetch_sub(alloc_bytes, Ordering::AcqRel);
+            self.sub_total_saturating(alloc_bytes);
             // Remove the block's entry from the global LRU index. Note
             // the lock order: we already dropped the bucket lock at
             // the end of `with_bucket`'s closure, so taking the LRU
@@ -810,8 +846,9 @@ impl DeviceMemPool {
         //
         // The atomic `total_bytes` counter can drift under concurrent
         // free: between the eviction-loop's `load` and the eventual
-        // `fetch_add`/`fetch_sub`, parallel frees may interleave in a
-        // way that produces a value slightly off from the true sum of
+        // `fetch_add` / `sub_total_saturating`, parallel frees may
+        // interleave in a way that produces a value slightly off from
+        // the true sum of
         // `bucket.len() * size_class`. Drift is bounded and self-
         // limiting (the cap re-check in `try_insert_into_bucket` keeps
         // overshoot to ≤ one block per racing thread), but over a long
@@ -936,12 +973,12 @@ impl DeviceMemPool {
             });
             match outcome {
                 Some(Outcome::ExactHit(ptr)) => {
-                    self.total_bytes.fetch_sub(size_class, Ordering::AcqRel);
+                    self.sub_total_saturating(size_class);
                     sink.push(ptr);
                     return true;
                 }
                 Some(Outcome::Approx { block, size_class }) => {
-                    self.total_bytes.fetch_sub(size_class, Ordering::AcqRel);
+                    self.sub_total_saturating(size_class);
                     // The block we actually evicted has its own LRU
                     // entry that is now stale — remove it. We're outside
                     // the bucket lock at this point; both touchings of
@@ -982,7 +1019,7 @@ impl DeviceMemPool {
         if let Some((key, _, _)) = best {
             let popped = self.with_bucket(key, |bucket| bucket.blocks.pop_front());
             if let Some(Some(block)) = popped {
-                self.total_bytes.fetch_sub(key, Ordering::AcqRel);
+                self.sub_total_saturating(key);
                 self.lru_index
                     .lock()
                     .remove(&(block.inserted, block.tick));
@@ -1000,7 +1037,7 @@ impl DeviceMemPool {
             }
         });
         if let Some((key, block)) = grabbed {
-            self.total_bytes.fetch_sub(key, Ordering::AcqRel);
+            self.sub_total_saturating(key);
             self.lru_index
                 .lock()
                 .remove(&(block.inserted, block.tick));
@@ -1021,8 +1058,9 @@ impl DeviceMemPool {
     /// size_class`, and atomically store the result into `total_bytes`.
     /// Returns the reconciled value.
     ///
-    /// **Why.** `total_bytes` is updated with `fetch_add`/`fetch_sub`
-    /// outside of any single transaction with the bucket mutation, so
+    /// **Why.** `total_bytes` is updated with `fetch_add` /
+    /// `sub_total_saturating` outside of any single transaction with the
+    /// bucket mutation, so
     /// concurrent free/alloc can interleave in patterns that leave the
     /// counter slightly off the true sum. The cap re-check in
     /// `try_insert_into_bucket` keeps any single overshoot bounded to
