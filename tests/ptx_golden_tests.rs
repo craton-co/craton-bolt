@@ -565,6 +565,374 @@ fn golden_float_atomic_min_uses_cas_loop() {
 // `pub(crate)`. Keeping the codegen smoke tests next to the codegen
 // itself also matches the existing structure of `scan_kernel.rs::tests`.
 
+// ---- Tests: partition_reduce_kernel variants (review L4) -------------------
+//
+// One canonical substring-shape test per emitter variant. Each pins the
+// kernel's entry-point name plus a load-bearing mnemonic that's specific to
+// that variant (e.g. atom.shared.add.u64 for COUNT, the CAS suffix for the
+// float CAS-loop variants, ld.global.s64 for i64-key variants). Keeps the
+// existence of each emitter in CI without going as deep as the wave-3
+// correctness goldens above.
+
+#[test]
+fn golden_partition_reduce_kernel_count_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_count::compile_partition_reduce_kernel_count;
+    let ptx = compile_partition_reduce_kernel_count().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_count"), "{ptx}");
+    // COUNT increments a per-slot u64 counter via shared-memory atomic add.
+    assert!(ptx.contains("atom.shared.add.u64"), "missing u64 atomic add\n{ptx}");
+    // Slot-ownership still goes through the b32 CAS like the base kernel.
+    assert!(ptx.contains("atom.shared.cas.b32"), "{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_count_i64_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_count_i64::compile_partition_reduce_kernel_count_i64;
+    let ptx = compile_partition_reduce_kernel_count_i64().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_count_i64"), "{ptx}");
+    // i64-key variant must load the row key with s64.
+    assert!(ptx.contains("ld.global.s64"), "missing s64 key load\n{ptx}");
+    assert!(ptx.contains("atom.shared.add.u64"), "{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_i64_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_i64::compile_partition_reduce_kernel_i64;
+    let ptx = compile_partition_reduce_kernel_i64().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_i64"), "{ptx}");
+    // f64 SUM combines via the shared-memory float atomic add.
+    assert!(ptx.contains("atom.shared.add.f64"), "missing f64 atomic\n{ptx}");
+    // i64-key variant identifies the i64 key load.
+    assert!(ptx.contains("ld.global.s64"), "{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_minmax_i32_min_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_minmax::{
+        compile_partition_reduce_kernel_minmax, MinMaxDtype, MinMaxOp,
+    };
+    let ptx =
+        compile_partition_reduce_kernel_minmax(MinMaxOp::Min, MinMaxDtype::Int32).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_min_i32"), "{ptx}");
+    // The integer MIN path uses a native shared-memory min atomic.
+    assert!(ptx.contains("atom.shared.min.s32"), "missing min.s32 atomic\n{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_minmax_i64val_max_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_minmax::{
+        compile_partition_reduce_kernel_minmax, MinMaxDtype, MinMaxOp,
+    };
+    let ptx =
+        compile_partition_reduce_kernel_minmax(MinMaxOp::Max, MinMaxDtype::Int64).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_max_i64"), "{ptx}");
+    assert!(ptx.contains("atom.shared.max.s64"), "missing max.s64 atomic\n{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_minmax_i64_key_min_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_minmax::{MinMaxDtype, MinMaxOp};
+    use craton_bolt::jit::partition_reduce_kernel_minmax_i64::compile_partition_reduce_kernel_minmax_i64;
+    let ptx = compile_partition_reduce_kernel_minmax_i64(MinMaxOp::Min, MinMaxDtype::Int32)
+        .expect("compile");
+    // Entry name encodes the i64-key suffix.
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_min_i32_keyi64"), "{ptx}");
+    assert!(ptx.contains("atom.shared.min.s32"), "{ptx}");
+    // The i64 key must be loaded with an s64 instruction.
+    assert!(ptx.contains("ld.global.s64"), "{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_minmax_float_f64_min_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_minmax::MinMaxOp;
+    use craton_bolt::jit::partition_reduce_kernel_minmax_float::{
+        compile_partition_reduce_kernel_minmax_float, FloatDtype,
+    };
+    let ptx = compile_partition_reduce_kernel_minmax_float(MinMaxOp::Min, FloatDtype::Float64)
+        .expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_min_f64"), "{ptx}");
+    // PTX has no atom.shared.min.f64 on sm_70 — CAS loop with float compare.
+    assert!(ptx.contains("atom.shared.cas.b64"), "missing b64 CAS loop\n{ptx}");
+    assert!(ptx.contains("setp.lt.f64"), "missing float < compare\n{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_minmax_float_f32_max_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_minmax::MinMaxOp;
+    use craton_bolt::jit::partition_reduce_kernel_minmax_float::{
+        compile_partition_reduce_kernel_minmax_float, FloatDtype,
+    };
+    let ptx = compile_partition_reduce_kernel_minmax_float(MinMaxOp::Max, FloatDtype::Float32)
+        .expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_max_f32"), "{ptx}");
+    assert!(ptx.contains("atom.shared.cas.b32"), "missing b32 CAS loop\n{ptx}");
+    assert!(ptx.contains("setp.gt.f32"), "missing float > compare\n{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_minmax_float_i64_key_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_minmax::MinMaxOp;
+    use craton_bolt::jit::partition_reduce_kernel_minmax_float::FloatDtype;
+    use craton_bolt::jit::partition_reduce_kernel_minmax_float_i64::compile_partition_reduce_kernel_minmax_float_i64;
+    let ptx =
+        compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Min, FloatDtype::Float64)
+            .expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_min_f64_keyi64"), "{ptx}");
+    assert!(ptx.contains("atom.shared.cas.b64"), "{ptx}");
+    // i64-key signature: s64 row-key load.
+    assert!(ptx.contains("ld.global.s64"), "{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_multi_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi;
+    // n_vals = 2 — exercises the multi-sum entry-name formatting and the
+    // per-val atomic-add emission inside the slot-claim and slot-match paths.
+    let ptx = compile_partition_reduce_kernel_multi(2).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_multi_sum_2"), "{ptx}");
+    // CLAIM and MATCH each issue n_vals f64 atomic adds -> at least 2 total.
+    let n = ptx.matches("atom.shared.add.f64").count();
+    assert!(n >= 2, "expected >=2 atom.shared.add.f64 for n_vals=2, got {n}\n{ptx}");
+}
+
+#[test]
+fn golden_partition_reduce_kernel_multi_i64_smoke() {
+    use craton_bolt::jit::partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64;
+    let ptx = compile_partition_reduce_kernel_multi_i64(2).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_partition_reduce_multi_sum_i64_2"), "{ptx}");
+    assert!(ptx.contains("atom.shared.add.f64"), "{ptx}");
+    assert!(ptx.contains("ld.global.s64"), "i64-key load missing\n{ptx}");
+}
+
+// ---- Tests: hash_join_kernel variants (review L4) --------------------------
+
+#[test]
+fn golden_hash_join_build_kernel_smoke() {
+    use craton_bolt::jit::hash_join_kernel::compile_build_kernel;
+    let ptx = compile_build_kernel().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_hash_join_build"), "{ptx}");
+    // Build claims a slot via global b64 CAS on the keys table.
+    assert!(ptx.contains("atom.global.cas.b64"), "missing build-side CAS\n{ptx}");
+    assert!(ptx.contains("PROBE_LOOP:"), "{ptx}");
+}
+
+#[test]
+fn golden_hash_join_probe_kernel_smoke() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_kernel;
+    let ptx = compile_probe_kernel().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_hash_join_probe"), "{ptx}");
+    // Probe is non-mutating; it only does atomic-add on the output counter.
+    assert!(ptx.contains("atom.global.add.u32"), "missing output-claim atomic\n{ptx}");
+    assert!(ptx.contains("PROBE_LOOP:"), "{ptx}");
+    assert!(ptx.contains("MATCH:"), "missing MATCH label\n{ptx}");
+}
+
+#[test]
+fn golden_hash_join_build_collision_kernel_smoke() {
+    use craton_bolt::jit::hash_join_kernel::compile_build_collision_kernel;
+    let ptx = compile_build_collision_kernel().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_hash_join_build_collision"), "{ptx}");
+    // The collision-list build atomically swaps the head pointer when
+    // prepending a new chain entry.
+    assert!(ptx.contains("atom.global.exch.b32"), "missing chain exch\n{ptx}");
+}
+
+#[test]
+fn golden_hash_join_probe_collision_kernel_smoke() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_collision_kernel;
+    let ptx = compile_probe_collision_kernel().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_hash_join_probe_collision"), "{ptx}");
+    // Collision probe walks the chain via WALK_CHAIN + CHAIN_LOOP labels.
+    assert!(ptx.contains("WALK_CHAIN:"), "{ptx}");
+    assert!(ptx.contains("CHAIN_LOOP:"), "{ptx}");
+}
+
+#[test]
+fn golden_hash_join_unmatched_build_kernel_smoke() {
+    use craton_bolt::jit::hash_join_kernel::compile_unmatched_build_kernel;
+    let ptx = compile_unmatched_build_kernel().expect("compile");
+    assert!(
+        ptx.contains(".visible .entry bolt_hash_join_emit_unmatched_build"),
+        "{ptx}"
+    );
+    // The outer-join unmatched scanner reads the matched-bitmap word and
+    // claims output slots via an atomic add on a u32 counter.
+    assert!(ptx.contains("atom.global.add.u32"), "{ptx}");
+}
+
+// ---- Tests: sort_kernel layouts (review L4) --------------------------------
+
+#[test]
+fn golden_sort_kernel_multilaunch_smoke() {
+    use craton_bolt::jit::sort_kernel::{
+        compile_sort_kernel_spec, KeyDesc, SortDirection, SortKernelSpec, SortLayout,
+    };
+    // Two-key spec — exercises the multi-key comparator emission. Both keys
+    // are non-nullable so the validity-load fast-path is skipped.
+    let spec = SortKernelSpec {
+        keys: vec![
+            KeyDesc {
+                dtype: DataType::Int32,
+                direction: SortDirection::Asc,
+                nullable: false,
+                nulls_first: false,
+            },
+            KeyDesc {
+                dtype: DataType::Float64,
+                direction: SortDirection::Desc,
+                nullable: false,
+                nulls_first: false,
+            },
+        ],
+        layout: SortLayout::MultiLaunch,
+        shmem_n_pow2: 0,
+    };
+    let ptx = compile_sort_kernel_spec(&spec).expect("compile");
+    // MultiLaunch entry prefix.
+    assert!(ptx.contains(".visible .entry bolt_bitonic_sort_ml"), "{ptx}");
+    // Bitonic partner index from XOR over tid + substage mask.
+    assert!(ptx.contains("xor.b32"), "{ptx}");
+    // Per-dtype compares for both keys.
+    assert!(ptx.contains("setp.gt.s32"), "{ptx}");
+    assert!(ptx.contains("setp.gt.f64"), "{ptx}");
+}
+
+#[test]
+fn golden_sort_kernel_shmem_smoke() {
+    use craton_bolt::jit::sort_kernel::{
+        compile_sort_kernel_spec, KeyDesc, SortDirection, SortKernelSpec, SortLayout,
+    };
+    let spec = SortKernelSpec {
+        keys: vec![KeyDesc {
+            dtype: DataType::Int32,
+            direction: SortDirection::Asc,
+            nullable: false,
+            nulls_first: false,
+        }],
+        layout: SortLayout::Shmem,
+        shmem_n_pow2: 128,
+    };
+    let ptx = compile_sort_kernel_spec(&spec).expect("compile");
+    // Shmem layout bakes n_pow2 into the entry name.
+    assert!(ptx.contains(".visible .entry bolt_bitonic_sort_sh_n128"), "{ptx}");
+    // Shared-memory key buffer declaration is exclusive to the shmem layout.
+    assert!(ptx.contains(".shared .align"), "{ptx}");
+    assert!(ptx.contains("sh_k0"), "missing shmem key buffer sh_k0\n{ptx}");
+    // In-kernel barriers between substages.
+    assert!(ptx.contains("bar.sync 0"), "{ptx}");
+}
+
+// ---- Tests: scatter_kernel variants (review L4) ----------------------------
+
+#[test]
+fn golden_scatter_kernel_i64_smoke() {
+    use craton_bolt::jit::scatter_kernel_i64::compile_scatter_kernel_i64;
+    let ptx = compile_scatter_kernel_i64().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_scatter_i64"), "{ptx}");
+    // i64 key variant -- must load the key with s64.
+    assert!(ptx.contains("ld.global.s64"), "{ptx}");
+    // Cursor reservation uses atom.global.add.u32 (per-partition u32 counter).
+    assert!(ptx.contains("atom.global.add.u32"), "{ptx}");
+}
+
+#[test]
+fn golden_scatter_with_dest_idx_kernel_smoke() {
+    use craton_bolt::jit::scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel;
+    let ptx = compile_scatter_with_dest_idx_kernel().expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_scatter_with_dest_idx"), "{ptx}");
+    assert!(ptx.contains("atom.global.add.u32"), "missing cursor atomic\n{ptx}");
+    // Two distinct u32 stores: out_keys[dest] and dest_idx[tid].
+    assert!(ptx.contains("st.global.u32"), "{ptx}");
+}
+
+#[test]
+fn golden_scatter_values_by_dest_idx_kernel_smoke() {
+    use craton_bolt::jit::scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel;
+    let ptx = compile_scatter_values_by_dest_idx_kernel().expect("compile");
+    assert!(
+        ptx.contains(".visible .entry bolt_scatter_values_by_dest_idx"),
+        "{ptx}"
+    );
+    // f64 value scatter -- no cursor atomic, just an indexed store.
+    assert!(ptx.contains("st.global.f64"), "missing f64 value store\n{ptx}");
+}
+
+// ---- Tests: agg_kernels op x dtype matrix (review L4) ----------------------
+//
+// Sum/Int32 is already covered by `golden_sum_int32_widens_to_s64_in_kernel`
+// above. The 11 tests below cover the remaining op x dtype combinations,
+// each pinning the combine mnemonic from `ReduceOp::combine_ptx`.
+
+#[test]
+fn golden_agg_kernel_sum_int64_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Int64).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_reduce"), "{ptx}");
+    assert!(ptx.contains("add.s64"), "{ptx}");
+    assert!(ptx.contains("ld.global.s64"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_sum_float32_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Float32).expect("compile");
+    assert!(ptx.contains("add.f32"), "{ptx}");
+    assert!(ptx.contains("ld.global.f32"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_sum_float64_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Float64).expect("compile");
+    assert!(ptx.contains("add.f64"), "{ptx}");
+    assert!(ptx.contains("ld.global.f64"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_min_int32_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Min, DataType::Int32).expect("compile");
+    assert!(ptx.contains("min.s32"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_min_int64_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Min, DataType::Int64).expect("compile");
+    assert!(ptx.contains("min.s64"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_min_float32_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Min, DataType::Float32).expect("compile");
+    assert!(ptx.contains("min.f32"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_min_float64_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Min, DataType::Float64).expect("compile");
+    assert!(ptx.contains("min.f64"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_max_int32_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Max, DataType::Int32).expect("compile");
+    assert!(ptx.contains("max.s32"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_max_int64_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Max, DataType::Int64).expect("compile");
+    assert!(ptx.contains("max.s64"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_max_float32_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Max, DataType::Float32).expect("compile");
+    assert!(ptx.contains("max.f32"), "{ptx}");
+}
+
+#[test]
+fn golden_agg_kernel_max_float64_smoke() {
+    let ptx = compile_reduction_kernel(ReduceOp::Max, DataType::Float64).expect("compile");
+    assert!(ptx.contains("max.f64"), "{ptx}");
+}
+
 // ---- Snapshot tests (insta) -------------------------------------------------
 //
 // Each test below mirrors a substring assertion test above, but pins the
