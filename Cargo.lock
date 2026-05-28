@@ -794,6 +794,8 @@ dependencies = [
  "proptest",
  "sqlparser",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
