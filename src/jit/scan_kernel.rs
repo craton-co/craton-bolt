@@ -109,6 +109,11 @@ impl RegAlloc {
             DataType::Int64 => "rl",
             DataType::Float32 => "f",
             DataType::Float64 => "fd",
+            // v0.7: Date32 / Timestamp lower to their underlying integer
+            // register classes (Date32 = i32, Timestamp = i64). Matches
+            // `ptx_gen::RegAlloc::class_for`.
+            DataType::Date32 => "r",
+            DataType::Timestamp(_, _) => "rl",
             DataType::Utf8 => {
                 return Err(BoltError::Other(
                     "scan_kernel: Utf8 not supported in PTX codegen".into(),
@@ -117,11 +122,6 @@ impl RegAlloc {
             DataType::Decimal128(_, _) => {
                 return Err(BoltError::Plan(
                     "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-                ))
-            }
-            DataType::Date32 | DataType::Timestamp(_, _) => {
-                return Err(BoltError::Other(
-                    "Date/Timestamp not yet lowered to GPU".into(),
                 ))
             }
         })
@@ -581,9 +581,16 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
         Literal::Decimal128(..) => Err(BoltError::Plan(
             "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
         )),
-        Literal::Date32(_) | Literal::Timestamp(_, _, _) => Err(BoltError::Other(
-            "Date/Timestamp not yet lowered to GPU".into(),
-        )),
+        // v0.7: Date32 / Timestamp literals lower to integer movs on the
+        // underlying days / ticks. Matches `ptx_gen::emit_const`.
+        Literal::Date32(v) => {
+            let dst_name = b.alloc.assign(dst, DataType::Date32)?;
+            b.emit(&format!("mov.s32 {}, {};", dst_name, *v as i64))
+        }
+        Literal::Timestamp(v, unit, tz) => {
+            let dst_name = b.alloc.assign(dst, DataType::Timestamp(*unit, *tz))?;
+            b.emit(&format!("mov.s64 {}, {};", dst_name, v))
+        }
         Literal::Bool(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Bool)?;
             let n: u32 = if *v { 1 } else { 0 };
@@ -638,11 +645,10 @@ fn emit_cast(
                         "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
                     ))
                 }
-                Date32 | Timestamp(_, _) => {
-                    return Err(BoltError::Other(
-                        "Date/Timestamp not yet lowered to GPU".into(),
-                    ))
-                }
+                // v0.7: identity-cast on Date32 / Timestamp = typed mov on
+                // the underlying integer width.
+                Date32 => "s32",
+                Timestamp(_, _) => "s64",
             };
             format!("mov.{} {}, {};", mov_ty, dst_name, src_name)
         }
@@ -731,17 +737,30 @@ fn emit_binary(
     use BinaryOp::*;
     match op {
         Add | Sub | Mul | Div => {
-            if result_dtype != dtype {
-                return Err(BoltError::Other(format!(
-                    "scan_kernel: arithmetic op {:?} expected result == operand dtype, got {:?}/{:?}",
-                    op, dtype, result_dtype
-                )));
-            }
-            if !is_numeric(dtype) {
-                return Err(BoltError::Other(format!(
-                    "scan_kernel: arithmetic op {:?} requires numeric operands, got {:?}",
-                    op, dtype
-                )));
+            // v0.7: same temporal-Sub shape as `ptx_gen::emit_binary`.
+            //   * Date32 - Date32 → Int32 (day count)
+            //   * Timestamp - Timestamp → Int64 (tick count in source unit)
+            // Other arithmetic on temporal operands surfaces as the
+            // catch-all unsupported error below (no mnemonic).
+            let is_temporal_sub = matches!(op, Sub)
+                && match (dtype, result_dtype) {
+                    (DataType::Date32, DataType::Int32) => true,
+                    (DataType::Timestamp(_, _), DataType::Int64) => true,
+                    _ => false,
+                };
+            if !is_temporal_sub {
+                if result_dtype != dtype {
+                    return Err(BoltError::Other(format!(
+                        "scan_kernel: arithmetic op {:?} expected result == operand dtype, got {:?}/{:?}",
+                        op, dtype, result_dtype
+                    )));
+                }
+                if !is_numeric(dtype) {
+                    return Err(BoltError::Other(format!(
+                        "scan_kernel: arithmetic op {:?} requires numeric operands, got {:?}",
+                        op, dtype
+                    )));
+                }
             }
             let dst_name = b.alloc.assign(dst, result_dtype)?;
             let mnemonic = arith_mnemonic(op, dtype)?;
@@ -816,6 +835,11 @@ fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         (Div, Int64) => "div.s64",
         (Div, Float32) => "div.rn.f32",
         (Div, Float64) => "div.rn.f64",
+        // v0.7: Date32 / Timestamp Sub lowers to the underlying integer
+        // sub. Add/Mul/Div on temporal operands has no meaningful PTX
+        // form here — the catch-all below produces "unsupported".
+        (Sub, Date32) => "sub.s32",
+        (Sub, Timestamp(_, _)) => "sub.s64",
         _ => {
             return Err(BoltError::Other(format!(
                 "scan_kernel: unsupported arithmetic {:?} on {:?}",
@@ -860,11 +884,10 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
-        Date32 | Timestamp(_, _) => {
-            return Err(BoltError::Other(
-                "Date/Timestamp not yet lowered to GPU".into(),
-            ))
-        }
+        // v0.7: temporal compare lowers to integer setp on the underlying
+        // days / ticks. Matching unit + tz is enforced upstream.
+        Date32 => "s32",
+        Timestamp(_, _) => "s64",
     };
     Ok(format!("setp.{}.{}", cond, ty))
 }
@@ -895,11 +918,10 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
-        DataType::Date32 | DataType::Timestamp(_, _) => {
-            return Err(BoltError::Other(
-                "Date/Timestamp not yet lowered to GPU".into(),
-            ))
-        }
+        // v0.7: Date32 / Timestamp ld/st widths follow the underlying
+        // integer type. Matches `ptx_gen::ld_st_suffix`.
+        DataType::Date32 => "s32",
+        DataType::Timestamp(_, _) => "s64",
     })
 }
 

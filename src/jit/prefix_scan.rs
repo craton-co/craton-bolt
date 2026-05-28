@@ -147,12 +147,12 @@ pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
         // loudly. The actual rejection happens in the executor before any
         // gather is launched.
         DataType::Decimal128(_, _) => "bolt_gather_decimal128_unsupported",
-        // v0.6 / M4: Date/Timestamp not yet lowered to GPU. The string
-        // returned here intentionally matches a non-existent kernel so a
-        // module lookup fails noisily if these dtypes do reach the gather.
-        DataType::Date32 | DataType::Timestamp(_, _) => {
-            "bolt_gather_date_timestamp_unsupported"
-        }
+        // v0.7: temporal gather reuses the matching integer kernel. The
+        // gather kernel is type-agnostic apart from the load/store width,
+        // so we route Date32 to the i32 kernel and Timestamp to the i64
+        // kernel — they emit the same PTX shape and same SM occupancy.
+        DataType::Date32 => "bolt_gather_i32",
+        DataType::Timestamp(_, _) => "bolt_gather_i64",
     }
 }
 
@@ -1374,11 +1374,10 @@ fn gather_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str, 
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
-        DataType::Date32 | DataType::Timestamp(_, _) => {
-            return Err(BoltError::Other(
-                "Date/Timestamp not yet lowered to GPU".into(),
-            ))
-        }
+        // v0.7: temporal gather lowers to integer gather on the underlying
+        // days / ticks. Same register classes as Int32 / Int64.
+        DataType::Date32 => ("s32", "r", "b32"),
+        DataType::Timestamp(_, _) => ("s64", "rl", "b64"),
     })
 }
 

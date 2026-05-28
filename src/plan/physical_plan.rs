@@ -917,6 +917,59 @@ fn cast_target_is_supported(target: DataType) -> BoltResult<()> {
     }
 }
 
+/// v0.7: result dtype for an arithmetic op on Date32 / Timestamp operands.
+///
+/// Mirrors the logical-plane helper of the same intent
+/// (`date_or_timestamp_arith_result` in `logical_plan.rs`) but returns
+/// errors and `Option<DataType>` instead of `Option<Result>` so the
+/// codegen caller can fall through to `unify_numeric` for the
+/// no-temporal case.
+///
+///   * `Sub, Date32, Date32`                          → `Some(Int32)`
+///   * `Sub, Timestamp(u, tz), Timestamp(u, tz)`      → `Some(Int64)`
+///   * `Add/Mul/Div on Date/Timestamp`                → `Err` with tight msg
+///   * `Sub, Timestamp(u1, _), Timestamp(u2, _)` with `u1 != u2` → `Err`
+///   * neither operand is Date/Timestamp                → `None` (fall through)
+///
+/// INTERVAL-day arithmetic on Date/Timestamp is intentionally not handled:
+/// the SQL frontend has no INTERVAL expression literal yet, so there is no
+/// path to produce a typed `Expr::Binary` with that shape.
+fn temporal_arith_result_dtype(
+    op: BinaryOp,
+    l: DataType,
+    r: DataType,
+) -> BoltResult<Option<DataType>> {
+    use DataType::*;
+    let l_is_temporal = matches!(l, Date32 | Timestamp(_, _));
+    let r_is_temporal = matches!(r, Date32 | Timestamp(_, _));
+    if !l_is_temporal && !r_is_temporal {
+        return Ok(None);
+    }
+    match (op, l, r) {
+        (BinaryOp::Sub, Date32, Date32) => Ok(Some(Int32)),
+        (BinaryOp::Sub, Timestamp(lu, ltz), Timestamp(ru, rtz)) => {
+            if lu != ru {
+                return Err(BoltError::Type(format!(
+                    "Timestamp subtraction requires matching TimeUnit, \
+                     got {lu:?} and {ru:?}"
+                )));
+            }
+            if ltz != rtz {
+                return Err(BoltError::Type(format!(
+                    "Timestamp subtraction requires matching time zones, \
+                     got {ltz:?} and {rtz:?}"
+                )));
+            }
+            Ok(Some(Int64))
+        }
+        _ => Err(BoltError::Type(format!(
+            "arithmetic {op:?} on Date/Timestamp operands ({l:?}, {r:?}) is not \
+             supported; only Date32 - Date32 and Timestamp - Timestamp \
+             (matching unit and tz) are wired in v0.7"
+        ))),
+    }
+}
+
 /// Returns the output column name for a projected expression at position `i`.
 fn output_name_for(expr: &Expr, i: usize) -> String {
     match expr {
@@ -1189,12 +1242,12 @@ impl<'a> Codegen<'a> {
                 name, dtype
             )));
         }
-        if matches!(dtype, DataType::Date32 | DataType::Timestamp(_, _)) {
-            return Err(BoltError::Plan(format!(
-                "Date/Timestamp not yet lowered to GPU (column '{}', dtype {:?})",
-                name, dtype
-            )));
-        }
+        // v0.7: Date32 and Timestamp lower to integer registers (Date32 as
+        // i32 days-since-epoch, Timestamp as i64 ticks in the source unit).
+        // The codegen treats them as their underlying integer type at the
+        // PTX layer, but preserves the logical dtype on the `Value` so
+        // downstream type-checks (e.g. binary subtraction yielding a plain
+        // Int32/Int64) see the temporal type and reject mixed-type ops.
         let col_idx = self.inputs.len();
         self.inputs.push(ColumnIO {
             name: name.to_string(),
@@ -1227,11 +1280,8 @@ impl<'a> Codegen<'a> {
                     .into(),
             ));
         }
-        if matches!(dtype, DataType::Date32 | DataType::Timestamp(_, _)) {
-            return Err(BoltError::Plan(
-                "Date/Timestamp not yet lowered to GPU".into(),
-            ));
-        }
+        // v0.7: Date32 / Timestamp literals lower to integer constants on
+        // the GPU side; ptx_gen emits the underlying i32/i64 bit pattern.
         let dst = self.fresh();
         self.ops.push(Op::Const {
             dst,
@@ -1342,10 +1392,23 @@ impl<'a> Codegen<'a> {
         };
 
         let (lhs_v, rhs_v, operand_dtype, result_dtype) = if op_is_arithmetic(op) {
-            let unified = unify_numeric(l.dtype, r.dtype)?;
-            let lv = self.emit_cast(l, unified);
-            let rv = self.emit_cast(r, unified);
-            (lv, rv, unified, unified)
+            // v0.7: Date32 / Timestamp arithmetic. Only `Date32 - Date32`
+            // (→ Int32) and `Timestamp(u, tz) - Timestamp(u, tz)` (→ Int64
+            // in the source unit) are wired. The operand_dtype handed to
+            // ptx_gen is still the temporal type so the PTX layer knows
+            // which integer width to use; the codegen path for Sub on
+            // Date32 / Timestamp emits the same `sub.s32` / `sub.s64`
+            // mnemonic it would for the underlying integer type. The
+            // result_dtype is the plain integer because the difference is
+            // a unit-less count of days / ticks, not a calendar value.
+            if let Some(out) = temporal_arith_result_dtype(op, l.dtype, r.dtype)? {
+                (l, r, l.dtype, out)
+            } else {
+                let unified = unify_numeric(l.dtype, r.dtype)?;
+                let lv = self.emit_cast(l, unified);
+                let rv = self.emit_cast(r, unified);
+                (lv, rv, unified, unified)
+            }
         } else if op_is_comparison(op) {
             if l.dtype == r.dtype {
                 (l, r, l.dtype, DataType::Bool)

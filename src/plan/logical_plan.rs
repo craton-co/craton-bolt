@@ -682,6 +682,16 @@ impl Expr {
                 let r = peer_typed_dtype(right, left, schema, *op)?;
                 let _ = depth; // depth threading enforced at function entry
                 if op.is_arithmetic() {
+                    // v0.7: Date32/Timestamp subtraction lowers to integer sub
+                    // on the underlying days/ticks. Only Sub is wired (Date - Date
+                    // yields a day count; Timestamp - Timestamp yields a tick
+                    // count in the source unit). Mixing two Timestamps with
+                    // different TimeUnits or non-matching tz literals is
+                    // intentionally out of scope; rejected with a tighter
+                    // message so the user knows what to do.
+                    if let Some(dt) = date_or_timestamp_arith_result(*op, l, r) {
+                        return dt;
+                    }
                     if !l.is_numeric() || !r.is_numeric() {
                         return Err(BoltError::Type(format!(
                             "arithmetic {op:?} requires numeric operands, got {l:?} and {r:?}"
@@ -1025,6 +1035,62 @@ pub(crate) fn cast_is_supported(src: DataType, target: DataType) -> bool {
     }
 }
 
+/// v0.7: result dtype for an arithmetic op on Date32 / Timestamp operands.
+///
+/// Returns `Some(Ok(dtype))` if the op is in scope:
+///   * `Date32 - Date32`              → `Int32` (number of days)
+///   * `Timestamp(u, tz) - Timestamp(u, tz)` → `Int64` (ticks in the source unit)
+///
+/// Returns `Some(Err(_))` with a clear message for out-of-scope cases that
+/// touch Date32 / Timestamp (e.g. `Date32 + Date32`, mixed `TimeUnit`s, or
+/// non-matching tz literals on a subtraction).
+///
+/// Returns `None` if neither operand is Date32 / Timestamp, letting the
+/// caller fall through to the standard numeric arithmetic path.
+///
+/// INTERVAL-based arithmetic (`Date + INTERVAL n DAY`) is intentionally not
+/// recognised here: the SQL frontend does not yet parse INTERVAL into an
+/// `Expr::Literal`, so there is no in-tree producer for the typed expression.
+fn date_or_timestamp_arith_result(
+    op: BinaryOp,
+    l: DataType,
+    r: DataType,
+) -> Option<BoltResult<DataType>> {
+    use DataType::*;
+    // Fast path: neither operand involves a temporal type.
+    let l_is_temporal = matches!(l, Date32 | Timestamp(_, _));
+    let r_is_temporal = matches!(r, Date32 | Timestamp(_, _));
+    if !l_is_temporal && !r_is_temporal {
+        return None;
+    }
+    match (op, l, r) {
+        (BinaryOp::Sub, Date32, Date32) => Some(Ok(Int32)),
+        (BinaryOp::Sub, Timestamp(lu, ltz), Timestamp(ru, rtz)) => {
+            if lu != ru {
+                return Some(Err(BoltError::Type(format!(
+                    "Timestamp subtraction requires matching TimeUnit, \
+                     got {lu:?} and {ru:?}"
+                ))));
+            }
+            if ltz != rtz {
+                return Some(Err(BoltError::Type(format!(
+                    "Timestamp subtraction requires matching time zones, \
+                     got {ltz:?} and {rtz:?}"
+                ))));
+            }
+            Some(Ok(Int64))
+        }
+        // Catch-all: any other Date/Timestamp arithmetic shape is rejected
+        // here with a tight message rather than falling through to the
+        // generic "requires numeric operands" rejection.
+        _ => Some(Err(BoltError::Type(format!(
+            "arithmetic {op:?} on Date/Timestamp operands ({l:?}, {r:?}) is not \
+             supported; only Date32 - Date32 and Timestamp - Timestamp \
+             (matching unit and tz) are wired in v0.7"
+        )))),
+    }
+}
+
 /// Promote two numeric types to the wider one (float beats int, 64 beats 32).
 fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
     use DataType::*;
@@ -1120,7 +1186,20 @@ impl AggregateExpr {
             AggregateExpr::Count(_) => Ok(DataType::Int64),
             AggregateExpr::Sum(e) => Ok(sum_output_dtype(e.dtype(input)?)),
             AggregateExpr::Min(e) | AggregateExpr::Max(e) => e.dtype(input),
-            AggregateExpr::Avg(_) => Ok(DataType::Float64),
+            AggregateExpr::Avg(e) => {
+                // v0.7: AVG over Date / Timestamp is non-standard SQL — the
+                // "mean of two dates" is not well-defined in the SQL spec
+                // (you can't average two calendar instants). Reject at the
+                // logical layer with a clear message rather than silently
+                // producing a Float64 from the underlying days/ticks.
+                let dt = e.dtype(input)?;
+                if matches!(dt, DataType::Date32 | DataType::Timestamp(_, _)) {
+                    return Err(BoltError::Type(format!(
+                        "AVG over Date/Timestamp is non-standard SQL (got {dt:?})"
+                    )));
+                }
+                Ok(DataType::Float64)
+            }
             AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => {
                 let _ = e.dtype(input)?;
                 Ok(DataType::Float64)

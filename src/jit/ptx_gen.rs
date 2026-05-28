@@ -91,6 +91,13 @@ impl RegAlloc {
             DataType::Int64 => "rl",
             DataType::Float32 => "f",
             DataType::Float64 => "fd",
+            // v0.7: Date32 / Timestamp lower to their underlying integer
+            // register classes. Date32 is i32 days-since-epoch (`r` class);
+            // Timestamp is i64 ticks-since-epoch in the source unit (`rl`
+            // class). The logical dtype is preserved on the IR `Value` so
+            // downstream type-checks still see the temporal type.
+            DataType::Date32 => "r",
+            DataType::Timestamp(_, _) => "rl",
             DataType::Utf8 => {
                 return Err(BoltError::Other(
                     "Utf8 not supported in PTX codegen yet".into(),
@@ -99,11 +106,6 @@ impl RegAlloc {
             DataType::Decimal128(_, _) => {
                 return Err(BoltError::Plan(
                     "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-                ))
-            }
-            DataType::Date32 | DataType::Timestamp(_, _) => {
-                return Err(BoltError::Other(
-                    "Date/Timestamp not yet lowered to GPU".into(),
                 ))
             }
         })
@@ -983,9 +985,18 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
         Literal::Decimal128(..) => Err(BoltError::Plan(
             "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
         )),
-        Literal::Date32(_) | Literal::Timestamp(_, _, _) => Err(BoltError::Other(
-            "Date/Timestamp not yet lowered to GPU".into(),
-        )),
+        // v0.7: Date32 / Timestamp literals lower to integer constants.
+        // Date32 is i32 days-since-epoch; Timestamp is i64 ticks-since-epoch
+        // in the source unit. Same hex-bit-pattern emission convention as
+        // the Int32 / Int64 paths (no codegen-injection surface).
+        Literal::Date32(v) => {
+            let dst_name = b.alloc.assign(dst, DataType::Date32)?;
+            b.emit(&format!("mov.s32 {}, 0x{:08X};", dst_name, *v as u32))
+        }
+        Literal::Timestamp(v, unit, tz) => {
+            let dst_name = b.alloc.assign(dst, DataType::Timestamp(*unit, *tz))?;
+            b.emit(&format!("mov.s64 {}, 0x{:016X};", dst_name, *v as u64))
+        }
         Literal::Bool(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Bool)?;
             // Value space is {0, 1}; not an injection surface, but keep the
@@ -1039,6 +1050,11 @@ fn emit_cast(
                 Int64 => "s64",
                 Float32 => "f32",
                 Float64 => "f64",
+                // v0.7: identity-cast on Date32 / Timestamp is a typed mov
+                // on the underlying integer width. Same logical dtype on
+                // both sides so the register class stays consistent.
+                Date32 => "s32",
+                Timestamp(_, _) => "s64",
                 Utf8 => {
                     return Err(BoltError::Other(
                         "ptx_gen: cannot cast Utf8".into(),
@@ -1047,11 +1063,6 @@ fn emit_cast(
                 Decimal128(_, _) => {
                     return Err(BoltError::Plan(
                         "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-                    ))
-                }
-                Date32 | Timestamp(_, _) => {
-                    return Err(BoltError::Other(
-                        "Date/Timestamp not yet lowered to GPU".into(),
                     ))
                 }
             };
@@ -1151,18 +1162,33 @@ fn emit_binary(
     use BinaryOp::*;
     match op {
         Add | Sub | Mul | Div => {
-            // Arithmetic preserves the operand dtype; the spec already unified.
-            if result_dtype != dtype {
-                return Err(BoltError::Other(format!(
-                    "ptx_gen: arithmetic op {:?} expected result dtype == operand dtype, got {:?}/{:?}",
-                    op, dtype, result_dtype
-                )));
-            }
-            if !is_numeric(dtype) {
-                return Err(BoltError::Other(format!(
-                    "ptx_gen: arithmetic op {:?} requires numeric operands, got {:?}",
-                    op, dtype
-                )));
+            // Arithmetic preserves the operand dtype for numerics. v0.7
+            // adds two temporal-Sub shapes that differ from numeric arith:
+            //   * Date32  - Date32          → Int32 (days count)
+            //   * Timestamp - Timestamp     → Int64 (tick count in source unit)
+            // The result_dtype is the underlying integer width because the
+            // difference is a unit-less count, not a calendar value. The
+            // PTX is otherwise identical to the corresponding integer
+            // sub.s32 / sub.s64.
+            let is_temporal_sub = matches!(op, Sub)
+                && match (dtype, result_dtype) {
+                    (DataType::Date32, DataType::Int32) => true,
+                    (DataType::Timestamp(_, _), DataType::Int64) => true,
+                    _ => false,
+                };
+            if !is_temporal_sub {
+                if result_dtype != dtype {
+                    return Err(BoltError::Other(format!(
+                        "ptx_gen: arithmetic op {:?} expected result dtype == operand dtype, got {:?}/{:?}",
+                        op, dtype, result_dtype
+                    )));
+                }
+                if !is_numeric(dtype) {
+                    return Err(BoltError::Other(format!(
+                        "ptx_gen: arithmetic op {:?} requires numeric operands, got {:?}",
+                        op, dtype
+                    )));
+                }
             }
             let dst_name = b.alloc.assign(dst, result_dtype)?;
             let mnemonic = arith_mnemonic(op, dtype)?;
@@ -1246,6 +1272,12 @@ fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         (Div, Int64) => "div.s64",
         (Div, Float32) => "div.rn.f32",
         (Div, Float64) => "div.rn.f64",
+        // v0.7: Date32 / Timestamp arithmetic. The physical-plan lowerer
+        // only emits `Sub` for these types (Date32 - Date32 → Int32 days;
+        // Timestamp(u, tz) - Timestamp(u, tz) → Int64 ticks); any other
+        // op surfaces here as an "unsupported" error below.
+        (Sub, Date32) => "sub.s32",
+        (Sub, Timestamp(_, _)) => "sub.s64",
         _ => {
             return Err(BoltError::Other(format!(
                 "ptx_gen: unsupported arithmetic {:?} on {:?}",
@@ -1280,6 +1312,12 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         Int64 => "s64",
         Float32 => "f32",
         Float64 => "f64",
+        // v0.7: Date32 / Timestamp comparisons fall through to integer
+        // setp on the underlying days / ticks. The logical type-checker
+        // already enforces matching unit / tz on Timestamp operands; at
+        // the PTX level it's identical to the corresponding integer cmp.
+        Date32 => "s32",
+        Timestamp(_, _) => "s64",
         Utf8 => {
             return Err(BoltError::Other(
                 "ptx_gen: cannot compare Utf8".into(),
@@ -1288,11 +1326,6 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         Decimal128(_, _) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-            ))
-        }
-        Date32 | Timestamp(_, _) => {
-            return Err(BoltError::Other(
-                "Date/Timestamp not yet lowered to GPU".into(),
             ))
         }
     };
@@ -1315,6 +1348,10 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
         DataType::Int64 => "s64",
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
+        // v0.7: Date32 is i32 days; Timestamp is i64 ticks. Storage layout
+        // matches the underlying integer type bit-for-bit.
+        DataType::Date32 => "s32",
+        DataType::Timestamp(_, _) => "s64",
         DataType::Utf8 => {
             return Err(BoltError::Other(
                 "Utf8 not supported in PTX codegen yet".into(),
@@ -1323,11 +1360,6 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
         DataType::Decimal128(_, _) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-            ))
-        }
-        DataType::Date32 | DataType::Timestamp(_, _) => {
-            return Err(BoltError::Other(
-                "Date/Timestamp not yet lowered to GPU".into(),
             ))
         }
     })
@@ -3524,5 +3556,483 @@ mod cast_emission_tests {
             ptx.contains("cvt.rzi.s32.f64"),
             "expected cvt.rzi.s32.f64 for Float64 -> Int32, got:\n{ptx}"
         );
+    }
+}
+
+#[cfg(test)]
+mod temporal_arith_tests {
+    //! v0.7: PTX-shape coverage for Date32 / Timestamp arithmetic.
+    //!
+    //! The supported v0.7 surface is:
+    //!   * `Date32 - Date32` → `Int32` (number of days)
+    //!   * `Timestamp(unit, tz) - Timestamp(unit, tz)` → `Int64` (ticks
+    //!     in the source unit; matching unit + tz enforced upstream)
+    //!
+    //! Anything else (Add/Mul/Div on temporal operands, mixed-unit
+    //! Timestamp subtraction, INTERVAL MONTH/YEAR — when an INTERVAL
+    //! expr eventually exists) must surface a clear rejection.
+    use super::*;
+    use crate::plan::logical_plan::{BinaryOp, Literal, TimeUnit};
+    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
+
+    /// Hand-build a kernel: `out0 = in0 - in1` with both inputs Date32
+    /// and the output typed Int32 — the IR shape the physical-plan
+    /// lowerer produces for `SELECT a - b FROM t` when `a, b` are
+    /// Date32 columns.
+    fn date_minus_date_spec() -> KernelSpec {
+        let ops = vec![
+            Op::LoadColumn {
+                dst: Reg(0),
+                col_idx: 0,
+                dtype: DataType::Date32,
+            },
+            Op::LoadColumn {
+                dst: Reg(1),
+                col_idx: 1,
+                dtype: DataType::Date32,
+            },
+            // operand dtype is Date32, result dtype is Int32 — exactly
+            // the shape the lowerer emits for `Date32 - Date32`.
+            Op::Binary {
+                dst: Reg(2),
+                op: BinaryOp::Sub,
+                lhs: Reg(0),
+                rhs: Reg(1),
+                dtype: DataType::Date32,
+                result_dtype: DataType::Int32,
+            },
+            Op::Store {
+                src: Reg(2),
+                col_idx: 0,
+                dtype: DataType::Int32,
+            },
+        ];
+        KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: DataType::Date32,
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: DataType::Date32,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "diff".into(),
+                dtype: DataType::Int32,
+            }],
+            ops,
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        }
+    }
+
+    /// Hand-build a kernel: `out0 = in0 - in1` for two Timestamps with
+    /// matching unit + tz, producing Int64.
+    fn timestamp_minus_timestamp_spec() -> KernelSpec {
+        let ts = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let ops = vec![
+            Op::LoadColumn {
+                dst: Reg(0),
+                col_idx: 0,
+                dtype: ts,
+            },
+            Op::LoadColumn {
+                dst: Reg(1),
+                col_idx: 1,
+                dtype: ts,
+            },
+            Op::Binary {
+                dst: Reg(2),
+                op: BinaryOp::Sub,
+                lhs: Reg(0),
+                rhs: Reg(1),
+                dtype: ts,
+                result_dtype: DataType::Int64,
+            },
+            Op::Store {
+                src: Reg(2),
+                col_idx: 0,
+                dtype: DataType::Int64,
+            },
+        ];
+        KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: ts,
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: ts,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "diff".into(),
+                dtype: DataType::Int64,
+            }],
+            ops,
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        }
+    }
+
+    /// `Date32 - Date32` → `Int32`. The PTX must:
+    ///   1. Load each input column as a 32-bit signed integer
+    ///      (`ld.global.nc.s32`) — Date32 storage is i32 days.
+    ///   2. Emit `sub.s32` (NOT `sub.s64`) for the subtraction —
+    ///      both operands are i32 days.
+    ///   3. Store the result as `st.global.s32` — output dtype is Int32.
+    ///   4. Use `b32` registers (the `r` allocator class) for the
+    ///      whole chain.
+    #[test]
+    fn date32_minus_date32_emits_sub_s32() {
+        let spec = date_minus_date_spec();
+        let ptx = compile(&spec, "bolt_kernel_date_sub").expect("compile");
+
+        let n_s32_loads = ptx.matches("ld.global.nc.s32").count();
+        assert!(
+            n_s32_loads >= 2,
+            "expected >=2 ld.global.nc.s32 for Date32 inputs, got {n_s32_loads}\n{ptx}"
+        );
+
+        assert!(
+            ptx.contains("sub.s32"),
+            "expected sub.s32 for Date32 - Date32, got:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("sub.s64"),
+            "Date32 - Date32 should NOT lower to s64 arith:\n{ptx}"
+        );
+
+        let n_s32_stores = ptx.matches("st.global.s32").count();
+        assert!(
+            n_s32_stores >= 1,
+            "expected >=1 st.global.s32 for Int32 output, got {n_s32_stores}\n{ptx}"
+        );
+    }
+
+    /// `Timestamp - Timestamp` → `Int64`. The PTX must:
+    ///   1. Load each input as a 64-bit signed integer (`ld.global.nc.s64`).
+    ///   2. Emit `sub.s64` (NOT `sub.s32`).
+    ///   3. Store the result as `st.global.s64`.
+    #[test]
+    fn timestamp_minus_timestamp_emits_sub_s64() {
+        let spec = timestamp_minus_timestamp_spec();
+        let ptx = compile(&spec, "bolt_kernel_ts_sub").expect("compile");
+
+        let n_s64_loads = ptx.matches("ld.global.nc.s64").count();
+        assert!(
+            n_s64_loads >= 2,
+            "expected >=2 ld.global.nc.s64 for Timestamp inputs, got {n_s64_loads}\n{ptx}"
+        );
+
+        assert!(
+            ptx.contains("sub.s64"),
+            "expected sub.s64 for Timestamp - Timestamp:\n{ptx}"
+        );
+
+        let n_s64_stores = ptx.matches("st.global.s64").count();
+        assert!(
+            n_s64_stores >= 1,
+            "expected >=1 st.global.s64 for Int64 output, got {n_s64_stores}\n{ptx}"
+        );
+    }
+
+    /// Date32 literals lower to a 32-bit `mov.s32` of the days-since-epoch
+    /// value. Specifically, `Literal::Date32(2)` (2 days post-epoch) must
+    /// emit the hex bit pattern `0x00000002`.
+    #[test]
+    fn date32_literal_emits_mov_s32() {
+        let ops = vec![
+            Op::Const {
+                dst: Reg(0),
+                lit: Literal::Date32(2),
+            },
+            Op::Store {
+                src: Reg(0),
+                col_idx: 0,
+                dtype: DataType::Date32,
+            },
+        ];
+        let spec = KernelSpec {
+            inputs: vec![],
+            outputs: vec![ColumnIO {
+                name: "d".into(),
+                dtype: DataType::Date32,
+            }],
+            ops,
+            predicate: None,
+            register_count: 1,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_kernel_date_lit").expect("compile");
+        assert!(
+            ptx.contains("mov.s32") && ptx.contains("0x00000002"),
+            "expected mov.s32 with 0x00000002 for Date32(2), got:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("st.global.s32"),
+            "expected st.global.s32 for Date32 output, got:\n{ptx}"
+        );
+    }
+
+    /// Sanity: `Date32 + Date32` is not in scope and must surface a clear
+    /// rejection from the codegen — `arith_mnemonic` only knows `Sub`
+    /// for Date32. (The physical-plan lowerer would normally have
+    /// rejected this earlier with a tighter "only Sub is wired"
+    /// message; this guards the codegen layer in case a future planner
+    /// regression lets the shape through.)
+    #[test]
+    fn date32_add_date32_codegen_rejected() {
+        let ops = vec![
+            Op::LoadColumn {
+                dst: Reg(0),
+                col_idx: 0,
+                dtype: DataType::Date32,
+            },
+            Op::LoadColumn {
+                dst: Reg(1),
+                col_idx: 1,
+                dtype: DataType::Date32,
+            },
+            Op::Binary {
+                dst: Reg(2),
+                op: BinaryOp::Add,
+                lhs: Reg(0),
+                rhs: Reg(1),
+                dtype: DataType::Date32,
+                result_dtype: DataType::Date32,
+            },
+            Op::Store {
+                src: Reg(2),
+                col_idx: 0,
+                dtype: DataType::Date32,
+            },
+        ];
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: DataType::Date32,
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: DataType::Date32,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Date32,
+            }],
+            ops,
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let err = compile(&spec, "bolt_kernel_date_add").expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported arithmetic") || msg.contains("Add"),
+            "rejection should mention unsupported Add on Date32, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod temporal_plan_tests {
+    //! v0.7: logical / physical plan type-check coverage for the Date32 /
+    //! Timestamp subtraction surface.
+    //!
+    //! These tests construct the plan directly (no SQL frontend) so they
+    //! cover the type-check independent of how the user might phrase the
+    //! query. INTERVAL-based arithmetic is intentionally not tested
+    //! because the SQL frontend has no INTERVAL expression literal yet
+    //! (see `sql_frontend.rs`); the physical-plan helper rejects every
+    //! op other than `Sub` on temporal operands, which is exercised here.
+    use crate::plan::logical_plan::{
+        AggregateExpr, BinaryOp, DataType, Expr, Field, Schema, TimeUnit,
+    };
+
+    fn date_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("a", DataType::Date32, false),
+            Field::new("b", DataType::Date32, false),
+        ])
+    }
+
+    fn ts_schema(unit: TimeUnit, tz: Option<&'static str>) -> Schema {
+        let ty = DataType::Timestamp(unit, tz);
+        Schema::new(vec![
+            Field::new("a", ty, false),
+            Field::new("b", ty, false),
+        ])
+    }
+
+    /// `a - b` over two Date32 columns must type as `Int32` (a count of
+    /// days, NOT another Date).
+    #[test]
+    fn date_minus_date_types_as_int32() {
+        let schema = date_schema();
+        let e = Expr::Binary {
+            op: BinaryOp::Sub,
+            left: Box::new(Expr::Column("a".into())),
+            right: Box::new(Expr::Column("b".into())),
+        };
+        let dt = e.dtype(&schema).expect("typecheck");
+        assert_eq!(dt, DataType::Int32, "Date32 - Date32 must produce Int32");
+    }
+
+    /// `a - b` over two matching Timestamps types as `Int64` (a count of
+    /// ticks in the source unit).
+    #[test]
+    fn timestamp_minus_timestamp_types_as_int64() {
+        let schema = ts_schema(TimeUnit::Microsecond, None);
+        let e = Expr::Binary {
+            op: BinaryOp::Sub,
+            left: Box::new(Expr::Column("a".into())),
+            right: Box::new(Expr::Column("b".into())),
+        };
+        let dt = e.dtype(&schema).expect("typecheck");
+        assert_eq!(
+            dt,
+            DataType::Int64,
+            "Timestamp - Timestamp must produce Int64"
+        );
+    }
+
+    /// Mixed Timestamp units must be rejected with a message naming
+    /// "TimeUnit" — coercion is out of scope for v0.7.
+    #[test]
+    fn timestamp_minus_timestamp_mismatched_units_rejected() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "a",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                "b",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]);
+        let e = Expr::Binary {
+            op: BinaryOp::Sub,
+            left: Box::new(Expr::Column("a".into())),
+            right: Box::new(Expr::Column("b".into())),
+        };
+        let err = e.dtype(&schema).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("TimeUnit") || msg.contains("matching"),
+            "rejection should mention TimeUnit / matching, got: {msg}"
+        );
+    }
+
+    /// `Date32 + Date32` is not a meaningful operation (adding two days-
+    /// since-epoch values is nonsense). Must be rejected with the
+    /// v0.7-tightened message rather than the generic "requires numeric
+    /// operands".
+    #[test]
+    fn date_plus_date_rejected() {
+        let schema = date_schema();
+        let e = Expr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Column("a".into())),
+            right: Box::new(Expr::Column("b".into())),
+        };
+        let err = e.dtype(&schema).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Date") || msg.contains("Timestamp") || msg.contains("not supported"),
+            "rejection should mention Date/Timestamp, got: {msg}"
+        );
+    }
+
+    /// `AVG(date_col)` is non-standard SQL — must be rejected at the
+    /// logical-plane aggregate output-dtype check with a clear message.
+    #[test]
+    fn avg_over_date32_rejected() {
+        let schema = date_schema();
+        let agg = AggregateExpr::Avg(Expr::Column("a".into()));
+        let err = avg_output(&agg, &schema).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("AVG") && (msg.contains("Date") || msg.contains("non-standard")),
+            "rejection should mention AVG/Date/non-standard, got: {msg}"
+        );
+    }
+
+    /// AVG over a Timestamp is likewise non-standard and rejected.
+    #[test]
+    fn avg_over_timestamp_rejected() {
+        let schema = ts_schema(TimeUnit::Microsecond, None);
+        let agg = AggregateExpr::Avg(Expr::Column("a".into()));
+        let err = avg_output(&agg, &schema).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("AVG") && (msg.contains("Timestamp") || msg.contains("non-standard")),
+            "rejection should mention AVG/Timestamp/non-standard, got: {msg}"
+        );
+    }
+
+    /// Mixed-tz Timestamp subtraction: tz conversion is out of scope, so
+    /// `Timestamp(_, Some("UTC")) - Timestamp(_, None)` (or any tz
+    /// mismatch) must be rejected with a message naming "zone".
+    #[test]
+    fn timestamp_minus_timestamp_mismatched_tz_rejected() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "a",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
+                false,
+            ),
+            Field::new(
+                "b",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]);
+        let e = Expr::Binary {
+            op: BinaryOp::Sub,
+            left: Box::new(Expr::Column("a".into())),
+            right: Box::new(Expr::Column("b".into())),
+        };
+        let err = e.dtype(&schema).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("zone") || msg.contains("matching"),
+            "rejection should mention time zones / matching, got: {msg}"
+        );
+    }
+
+    /// Route an AVG aggregate through the public `LogicalPlan::schema()`
+    /// surface so the rejection error message reflects exactly what the
+    /// planner produces. `AggregateExpr::output_dtype` is crate-private,
+    /// hence the indirection.
+    fn avg_output(
+        agg: &AggregateExpr,
+        schema: &Schema,
+    ) -> crate::error::BoltResult<DataType> {
+        use crate::plan::logical_plan::LogicalPlan;
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: schema.clone(),
+        };
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(scan),
+            group_by: vec![],
+            aggregates: vec![agg.clone()],
+        };
+        plan.schema().map(|s| s.fields[0].dtype)
     }
 }
