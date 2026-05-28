@@ -96,19 +96,15 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
 ///   1. **Env opt-in.** `BOLT_GPU_SORT=1`. Default OFF; we keep the
 ///      historical bitonic / host paths as the steady-state behaviour
 ///      until the radix path is bake-tested in production.
-///   2. **Single key.** `sort_exprs.len() == 1`. Multi-key lex ordering
-///      needs a stable per-pass sort + outer key loop — punted to v0.8.
-///   3. **Bare column reference.** No computed sort keys; matches the
+///   2. **Up to `MAX_SORT_KEYS` keys.** #19 widened this from the
+///      original single-key gate. Mixed ASC/DESC across keys is fine.
+///   3. **Bare column references.** No computed sort keys; matches the
 ///      bitonic path's gate 2.
-///   4. **ASC direction.** DESC would need a second post-pass reversal
-///      step or a flipped XOR constant; easy to add but no need today.
-///   5. **`nulls_first == false`.** Pinned for clarity — radix has no
-///      validity-bitmap routing.
-///   6. **Int32 / Int64 dtype.** Float radix needs the IEEE-monotonic
-///      transform (deferred); Bool / Utf8 fall through.
-///   7. **No NULLs in the key column.** Radix sort has no validity
-///      routing — checked inside [`radix_dispatch_predicate`].
-///   8. **`n_rows >= GPU_SORT_MIN_ROWS`.** Same threshold as the bitonic
+///   4. **Int32 / Int64 dtypes per key.** Float radix needs the
+///      IEEE-monotonic transform (deferred); Bool / Utf8 fall through.
+///   5. **No NULLs in any key column.** Radix sort has no validity
+///      routing — checked inside `radix_dispatch_predicate_multi`.
+///   6. **`n_rows >= GPU_SORT_MIN_ROWS`.** Same threshold as the bitonic
 ///      path — h2d/d2h overhead dominates below ~16k.
 ///
 /// On any miss we return `Ok(None)` and the caller falls through to the
@@ -117,6 +113,7 @@ fn try_gpu_sort_radix(
     batch: &RecordBatch,
     sort_exprs: &[SortExpr],
 ) -> BoltResult<Option<UInt32Array>> {
+    use crate::exec::gpu_sort::GpuSortKey;
     use crate::jit::sort_kernel::SortDirection;
     use crate::jit::sort_kernel_radix::gpu_sort_env_enabled;
 
@@ -124,64 +121,73 @@ fn try_gpu_sort_radix(
     if !gpu_sort_env_enabled() {
         return Ok(None);
     }
-    // Gate 2: single key.
-    if sort_exprs.len() != 1 {
+    // Gate 2: 1..=MAX_SORT_KEYS keys. The hard cap is enforced again
+    // inside the predicate (defence in depth) so this gate is mostly
+    // documentation; we early-out on the empty list to keep the rest of
+    // the function's invariants simple.
+    if sort_exprs.is_empty() {
         return Ok(None);
     }
-    let se = &sort_exprs[0];
-    // Gate 3: bare column reference.
-    let col_name = match expr_to_column_name(&se.expr) {
-        Ok(n) => n,
-        Err(_) => return Ok(None),
-    };
-    // Gate 4: ASC.
-    if se.descending {
-        return Ok(None);
-    }
-    // Gate 5: nulls_first off — pinned for clarity (the column is
-    // null-free by the gate-7 check inside the predicate anyway).
-    if se.nulls_first {
-        return Ok(None);
-    }
-
-    let col_idx = match batch.schema().index_of(&col_name) {
-        Ok(i) => i,
-        Err(_) => return Ok(None),
-    };
-    let column = batch.column(col_idx);
-
-    // Gate 6: dtype. `arrow_dtype_to_internal` maps the Arrow dtype to the
-    // engine's internal dtype; the radix predicate then gates Int32/Int64.
-    let dtype = match crate::exec::gpu_sort::arrow_dtype_to_internal(column.data_type()) {
-        Some(d) => d,
-        None => return Ok(None),
-    };
 
     let n_rows = batch.num_rows();
-    // Gate 8: row count threshold.
+    // Gate 6: row count threshold.
     if n_rows < GPU_SORT_MIN_ROWS {
         return Ok(None);
     }
 
-    // Gates 6 + 7 + "fits u32" are checked inside `radix_dispatch_predicate`.
-    // Calling it here lets `sort_indices_on_gpu_radix` re-check the same
-    // predicate (it does) without duplicating the gate ladder.
-    if !crate::exec::gpu_sort::radix_dispatch_predicate(
-        column.as_ref(),
-        dtype,
-        SortDirection::Asc,
-        se.nulls_first,
-    ) {
+    // Resolve every key into (column index, dtype, direction, nulls_first).
+    // Any miss on bare-column / known-dtype / index lookup falls through.
+    let mut resolved: Vec<(usize, crate::plan::logical_plan::DataType, SortDirection, bool)> =
+        Vec::with_capacity(sort_exprs.len());
+    for se in sort_exprs {
+        // Gate 3: bare column reference.
+        let col_name = match expr_to_column_name(&se.expr) {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        let col_idx = match batch.schema().index_of(&col_name) {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+        let column = batch.column(col_idx);
+        // Gate 4: dtype must map to a GPU-sortable internal dtype. The
+        // radix predicate then narrows that to Int32/Int64.
+        let dtype = match crate::exec::gpu_sort::arrow_dtype_to_internal(column.data_type()) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let dir = if se.descending {
+            SortDirection::Desc
+        } else {
+            SortDirection::Asc
+        };
+        resolved.push((col_idx, dtype, dir, se.nulls_first));
+    }
+
+    // Build the multi-key descriptor list. We materialise GpuSortKey
+    // references over the batch's columns; the borrow lives until the
+    // sort_indices_on_gpu_radix_multi call returns.
+    let keys: Vec<GpuSortKey<'_>> = resolved
+        .iter()
+        .map(|(idx, dtype, dir, nf)| GpuSortKey {
+            column: batch.column(*idx).as_ref(),
+            dtype: *dtype,
+            direction: *dir,
+            nulls_first: *nf,
+        })
+        .collect();
+
+    // Predicate is re-checked inside the driver; calling it here gives
+    // us a fast-fall-through on any per-key gate miss (dtype, NULLs, etc.)
+    // without allocating GPU buffers.
+    if !crate::exec::gpu_sort::radix_dispatch_predicate_multi(&keys) {
         return Ok(None);
     }
 
-    // All gates passed — hand off to the GPU driver.
-    crate::exec::gpu_sort::sort_indices_on_gpu_radix(
-        column.as_ref(),
-        dtype,
-        SortDirection::Asc,
-        se.nulls_first,
-    )
+    // All gates passed — hand off to the GPU driver. The multi-key driver
+    // handles single-key sorts as a 1-element list, so we don't need a
+    // separate code path.
+    crate::exec::gpu_sort::sort_indices_on_gpu_radix_multi(&keys)
 }
 
 /// Try the GPU sort fast path. Returns `Ok(Some(sorted_batch))` on success,
@@ -448,7 +454,9 @@ mod tests {
     // CI skips them but a developer with a real device can opt in via
     // `cargo test -- --ignored gpu:sort_radix`.
 
-    use crate::exec::gpu_sort::{radix_dispatch_predicate, RADIX_DISPATCH_COUNT};
+    use crate::exec::gpu_sort::{
+        radix_dispatch_predicate, radix_dispatch_predicate_multi, GpuSortKey, RADIX_DISPATCH_COUNT,
+    };
     use crate::jit::sort_kernel::SortDirection;
     use crate::plan::logical_plan::DataType as PlanDataType;
     use std::sync::atomic::Ordering;
@@ -467,35 +475,60 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
     }
 
-    /// The pure predicate accepts Int32 ASC with no nulls and rejects
-    /// every variation that should fall through to the bitonic / host
-    /// path. Single test, multiple assertions — each line documents the
-    /// branch it pins.
+    /// Build a 2-column batch (Int32 + Int32) with `n` rows.
+    fn padded_two_int_batch(
+        n: usize,
+        col_a_name: &str,
+        col_b_name: &str,
+    ) -> RecordBatch {
+        let n = n.max(GPU_SORT_MIN_ROWS);
+        let a: Vec<i32> = (0..n as i32).collect();
+        let b: Vec<i32> = (0..n as i32).map(|i| i * 2).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(col_a_name, DataType::Int32, false),
+            Field::new(col_b_name, DataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(a)),
+                Arc::new(Int32Array::from(b)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The single-key pure predicate accepts Int32 ASC with no nulls and
+    /// (per #19) Int32 DESC with no nulls. Rejects every variation that
+    /// should fall through to the bitonic / host path. Each assertion line
+    /// documents the branch it pins.
     #[test]
     fn radix_predicate_gates() {
         let arr = Int32Array::from(vec![3, 1, 2, 5, 4]);
-        // Happy path — Int32 ASC no-nulls.
+        // Int32 ASC no-nulls.
         assert!(radix_dispatch_predicate(
             &arr,
             PlanDataType::Int32,
             SortDirection::Asc,
             false,
         ));
-        // DESC rejected (gate 4).
-        assert!(!radix_dispatch_predicate(
+        // #19: Int32 DESC no-nulls now accepted (was rejected by the v0.7
+        // gate; the multi-key driver applies the direction transform
+        // host-side).
+        assert!(radix_dispatch_predicate(
             &arr,
             PlanDataType::Int32,
             SortDirection::Desc,
             false,
         ));
-        // Float dtype rejected (gate 6 — radix_supports_dtype gate).
+        // Float dtype rejected (radix_supports_dtype gate).
         assert!(!radix_dispatch_predicate(
             &arr,
             PlanDataType::Float32,
             SortDirection::Asc,
             false,
         ));
-        // Nullable column with at least one NULL rejected (gate 7).
+        // Nullable column with at least one NULL rejected (no-NULLs gate).
         let null_arr = Int32Array::from(vec![Some(3), None, Some(1)]);
         assert!(!radix_dispatch_predicate(
             &null_arr,
@@ -503,6 +536,81 @@ mod tests {
             SortDirection::Asc,
             false,
         ));
+    }
+
+    /// #19: the multi-key predicate accepts a 2-key Int32 ASC ASC list.
+    #[test]
+    fn radix_predicate_multi_two_key_asc_asc() {
+        let a = Int32Array::from(vec![1, 2, 3]);
+        let b = Int32Array::from(vec![4, 5, 6]);
+        let keys = vec![
+            GpuSortKey {
+                column: &a,
+                dtype: PlanDataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+            GpuSortKey {
+                column: &b,
+                dtype: PlanDataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+        ];
+        assert!(radix_dispatch_predicate_multi(&keys));
+    }
+
+    /// #19: the multi-key predicate accepts mixed ASC DESC across keys.
+    #[test]
+    fn radix_predicate_multi_two_key_asc_desc() {
+        let a = Int32Array::from(vec![1, 2, 3]);
+        let b = Int32Array::from(vec![4, 5, 6]);
+        let keys = vec![
+            GpuSortKey {
+                column: &a,
+                dtype: PlanDataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+            GpuSortKey {
+                column: &b,
+                dtype: PlanDataType::Int32,
+                direction: SortDirection::Desc,
+                nulls_first: false,
+            },
+        ];
+        assert!(radix_dispatch_predicate_multi(&keys));
+    }
+
+    /// #19: the multi-key predicate falls through when ANY key has an
+    /// unsupported dtype (one Int32, one Float64 — radix can't handle
+    /// the float, so the whole sort goes back to the bitonic / host path).
+    #[test]
+    fn radix_predicate_multi_mixed_int_float_rejected() {
+        let a = Int32Array::from(vec![1, 2, 3]);
+        let b = Float64Array::from(vec![1.0, 2.0, 3.0]);
+        let keys = vec![
+            GpuSortKey {
+                column: &a,
+                dtype: PlanDataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+            GpuSortKey {
+                column: &b,
+                dtype: PlanDataType::Float64,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+        ];
+        assert!(!radix_dispatch_predicate_multi(&keys));
+    }
+
+    /// Empty key list falls through (no sort to do — and the radix path
+    /// would have no key to histogram).
+    #[test]
+    fn radix_predicate_multi_empty_rejected() {
+        assert!(!radix_dispatch_predicate_multi(&[]));
     }
 
     /// `try_gpu_sort_radix` engages the radix path when every gate
@@ -598,6 +706,141 @@ mod tests {
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert_eq!(before, after, "small-input gate must short-circuit");
+
+        match prev {
+            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
+            None => std::env::remove_var("BOLT_GPU_SORT"),
+        }
+    }
+
+    /// #19: single-key DESC engages the radix path (the v0.7 gate would
+    /// have falled through). Same observability hook as the ASC test:
+    /// counter delta proves the dispatch decision committed.
+    #[test]
+    #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
+    fn radix_dispatch_engages_on_int32_desc() {
+        let prev = std::env::var("BOLT_GPU_SORT").ok();
+        std::env::set_var("BOLT_GPU_SORT", "1");
+
+        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+
+        let batch = padded_int_batch("a", vec![5, 3, 1, 4, 2]);
+        let _ = try_gpu_sort_radix(&batch, &[col("a", true, false)]);
+
+        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+        assert!(
+            after >= before + 1,
+            "DESC radix dispatch counter did not increment ({} -> {})",
+            before,
+            after,
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
+            None => std::env::remove_var("BOLT_GPU_SORT"),
+        }
+    }
+
+    /// #19: multi-key ASC ASC engages the radix path.
+    #[test]
+    #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
+    fn radix_dispatch_engages_on_two_key_asc_asc() {
+        let prev = std::env::var("BOLT_GPU_SORT").ok();
+        std::env::set_var("BOLT_GPU_SORT", "1");
+
+        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+
+        let batch = padded_two_int_batch(GPU_SORT_MIN_ROWS, "a", "b");
+        let _ = try_gpu_sort_radix(
+            &batch,
+            &[col("a", false, false), col("b", false, false)],
+        );
+
+        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+        assert!(
+            after >= before + 1,
+            "multi-key ASC ASC dispatch counter did not increment ({} -> {})",
+            before,
+            after,
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
+            None => std::env::remove_var("BOLT_GPU_SORT"),
+        }
+    }
+
+    /// #19: mixed ASC DESC across keys is handled — the per-key direction
+    /// transform applies independently, so each key picks its own XOR
+    /// constant.
+    #[test]
+    #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
+    fn radix_dispatch_engages_on_two_key_asc_desc() {
+        let prev = std::env::var("BOLT_GPU_SORT").ok();
+        std::env::set_var("BOLT_GPU_SORT", "1");
+
+        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+
+        let batch = padded_two_int_batch(GPU_SORT_MIN_ROWS, "a", "b");
+        let _ = try_gpu_sort_radix(
+            &batch,
+            &[col("a", false, false), col("b", true, false)],
+        );
+
+        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+        assert!(
+            after >= before + 1,
+            "mixed ASC DESC dispatch counter did not increment ({} -> {})",
+            before,
+            after,
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
+            None => std::env::remove_var("BOLT_GPU_SORT"),
+        }
+    }
+
+    /// #19: a mixed (Int32, Float64) multi-key sort falls through to the
+    /// bitonic / host path — the predicate rejects the float key, so the
+    /// radix counter never bumps.
+    #[test]
+    fn radix_dispatch_skipped_on_int_plus_float() {
+        let prev = std::env::var("BOLT_GPU_SORT").ok();
+        std::env::set_var("BOLT_GPU_SORT", "1");
+
+        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+
+        // Build a 2-column batch with one Int32 + one Float64. We only
+        // need >= GPU_SORT_MIN_ROWS rows; the predicate's dtype gate is
+        // the load-bearing assertion here.
+        let n = GPU_SORT_MIN_ROWS;
+        let a: Vec<i32> = (0..n as i32).collect();
+        let b: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(a)),
+                Arc::new(Float64Array::from(b)),
+            ],
+        )
+        .unwrap();
+
+        let res = try_gpu_sort_radix(
+            &batch,
+            &[col("a", false, false), col("b", false, false)],
+        );
+        assert!(matches!(res, Ok(None)), "mixed int+float must fall through");
+
+        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            before, after,
+            "predicate must reject mixed int+float without bumping"
+        );
 
         match prev {
             Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
