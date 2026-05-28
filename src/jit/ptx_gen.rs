@@ -479,11 +479,11 @@ fn emit_op(
             dtype,
         } => emit_select(b, *dst, *cond, *then_val, *else_val, *dtype),
         // ---- Decimal128 / i128 dual-register ops (v0.7 Sub-task A) ----
-        // No caller emits these today — `Codegen::emit_column` /
-        // `emit_literal` / `emit_binary` still reject Decimal128 with a
-        // `Plan` error — so these arms are dead code through `lower()`. They
-        // exist so the PTX emitter is structurally ready for the follow-up
-        // commit that wires upload + Codegen routing.
+        // v0.7 Sub-task B wired these through `Codegen::emit_column` /
+        // `emit_literal` / `emit_binary` (Add/Sub/Mul only) — see
+        // `physical_plan.rs`. Div / comparisons / CAST involving
+        // Decimal128 stay on the host fallback (rejected with a tighter
+        // message at lower time).
         Op::LoadColumn128 {
             dst_lo,
             dst_hi,
