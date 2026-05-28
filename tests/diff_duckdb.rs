@@ -523,8 +523,10 @@ fn t_strings_join_fixture(n: usize) -> (RecordBatch, RecordBatch) {
     )]));
     let vocab1 = ["foo", "bar", "only1", "foo"];
     let vocab2 = ["foo", "only2", "bar", "bar"];
-    let s1: StringArray = (0..n).map(|i| vocab1[i % vocab1.len()]).collect();
-    let s2: StringArray = (0..n).map(|i| vocab2[i % vocab2.len()]).collect();
+    let s1_vals: Vec<&str> = (0..n).map(|i| vocab1[i % vocab1.len()]).collect();
+    let s2_vals: Vec<&str> = (0..n).map(|i| vocab2[i % vocab2.len()]).collect();
+    let s1 = StringArray::from(s1_vals);
+    let s2 = StringArray::from(s2_vals);
     let t1 = RecordBatch::try_new(s1_schema, vec![Arc::new(s1)]).expect("t1 strings batch");
     let t2 = RecordBatch::try_new(s2_schema, vec![Arc::new(s2)]).expect("t2 strings batch");
     (t1, t2)
@@ -765,7 +767,10 @@ fn diff_groupby_multi_sum() {
 // rejects with `"Utf8 GROUP BY keys not yet supported"` (see
 // `src/exec/groupby_with_pre.rs` and `src/exec/groupby.rs`), so a diff
 // test would panic on the Bolt side rather than exercise the comparison
-// path. Add it the moment that error lifts.
+// path. The H8 review's "GROUP BY string" slot is substituted with the
+// `s <> 'lit'` (inequality) case below — same rewriter, opposite
+// constant-fold branch — so the dictionary path still gets two-shape
+// coverage. Promote the GROUP BY case here the moment that error lifts.
 //
 // Gating: `#[ignore = "gpu:string_diff"]` per the H8 review ask. Run on
 // a GPU host with:
@@ -809,6 +814,30 @@ fn diff_string_equality_value_absent() {
     diff_query(
         "diff_string_equality_value_absent",
         "SELECT s FROM t WHERE s = 'qux'",
+        &[TableSpec {
+            name: "t",
+            ddl_cols: "s VARCHAR NOT NULL, v BIGINT NOT NULL",
+            batch,
+        }],
+    );
+}
+
+/// Case 10b — `WHERE s <> 'lit'` round-trip. The rewriter folds NotEq
+/// the same way it folds Eq: when the literal is in the dictionary it
+/// rewrites to integer `<>` on `__idx_s`; when it isn't, it
+/// constant-folds to `Bool(true)` (the complement of the absent-case
+/// fold above). This case picks the in-dict literal so the rewriter
+/// emits a real GPU predicate — the constant-fold absent twin is
+/// covered by `diff_string_equality_value_absent`'s `Bool(false)`
+/// branch, which is the mirror image. Catches a bug that asymmetric-
+/// ally handles the two ops (e.g. swaps Eq for NotEq when folding).
+#[test]
+#[ignore = "gpu:string_diff"]
+fn diff_string_inequality_value_present() {
+    let batch = t_strings(1024);
+    diff_query(
+        "diff_string_inequality_value_present",
+        "SELECT s FROM t WHERE s <> 'foo'",
         &[TableSpec {
             name: "t",
             ddl_cols: "s VARCHAR NOT NULL, v BIGINT NOT NULL",
