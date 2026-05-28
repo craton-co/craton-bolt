@@ -46,7 +46,18 @@ const PTX_ADDRESS_SIZE: &str = ".address_size 64";
 ///
 /// Chosen so a single Hillis-Steele block scan fits easily in shared memory
 /// (`BLOCK_SIZE * 4 bytes` for u32 entries times two ping-pong buffers).
+///
+/// MUST be a power of two: the Hillis-Steele scan walks strides `1, 2, 4, ...`
+/// up to `BLOCK_SIZE/2`, and the lane-`tid >= offset` predicate assumes the
+/// final stride exactly halves the block.
 pub const BLOCK_SIZE: u32 = 256;
+
+// Compile-time invariant for the Hillis-Steele block scan. See the doc
+// comment on `BLOCK_SIZE` above.
+const _: () = assert!(
+    BLOCK_SIZE.is_power_of_two(),
+    "Hillis-Steele block scan requires power-of-two BLOCK_SIZE"
+);
 
 /// Entry-point name for the per-block prefix-scan kernel.
 pub const SCAN_KERNEL_ENTRY: &str = "bolt_prefix_scan";

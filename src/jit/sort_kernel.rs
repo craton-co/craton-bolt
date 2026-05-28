@@ -45,10 +45,10 @@
 //! deterministic compare-exchange waves, each fully parallel. It needs n to
 //! be a power of two — see `gpu_sort.rs` for the padding strategy.
 //!
-//! For Stage 1 we issue **one kernel launch per substage** for simplicity.
-//! An in-block shared-memory variant (which would amortise substages within
-//! a block into a single launch) is a deliberate follow-up; see the
-//! `TODO(s1-stage2)` notes in `gpu_sort.rs`.
+//! For the global-memory layout we issue **one kernel launch per substage**
+//! for simplicity. The in-block shared-memory variant (`SortLayout::Shmem`)
+//! amortises all substages within a block into a single launch when
+//! `n_pow2 <= block_size` — see [`compile_sort_kernel_spec`].
 //!
 //! The per-thread logic in pseudo-PTX:
 //!
@@ -70,13 +70,13 @@
 //! `setp.lt` / `setp.gt`. Stage `j` and substage-mask `k_mask` are passed as
 //! `.param .u32` arguments so a single PTX module can serve every wave.
 //!
-//! ## Limits (Stage 1)
+//! ## Limits
 //!
-//! - Single key only. Multi-key (lexicographic) is `TODO(s1-stage2)`; the
-//!   natural extension is a second value buffer and a cascading comparator.
-//! - No NULL handling. Stage 1 requires `null_count() == 0`. NULLs can be
-//!   threaded as a parallel `validity` buffer with a sentinel-aware
-//!   comparator (`TODO(s1-stage2)`).
+//! - Up to four sort keys (lexicographic), handled by
+//!   [`compile_sort_kernel_spec`]. Single-key sort is a one-entry
+//!   [`SortKernelSpec`].
+//! - NULL handling: each key may carry an Arrow-style packed validity buffer
+//!   with per-key NULLS FIRST/LAST placement, baked into the PTX at codegen.
 //! - `n_pow2 <= u32::MAX`. The grid index is `u32` and the (stage, substage)
 //!   pair fits in `u32`.
 //!
