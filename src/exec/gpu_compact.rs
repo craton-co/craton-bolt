@@ -1051,12 +1051,13 @@ mod tests {
 
     #[test]
     fn host_scan_checked_rejects_u32_overflow() {
-        // Two near-u32::MAX block sums add to ~2 * u32::MAX, which wraps in
-        // a naive `running as u32` cast. The checked path must surface the
-        // overflow before the cast.
-        let sums = vec![u32::MAX, u32::MAX];
+        // Three large block sums force the prefix to exceed u32::MAX on
+        // iteration 2 (running = u32::MAX + u32::MAX > u32::MAX), at which
+        // point the checked cast must surface a structured error rather
+        // than silently wrap.
+        let sums = vec![u32::MAX, u32::MAX, 1];
         let err = host_exclusive_scan_checked(&sums).expect_err(
-            "double-u32::MAX must overflow the u32 base cast on iteration 2",
+            "triple-u32::MAX must overflow the u32 base cast on iteration 2",
         );
         let msg = format!("{err}");
         assert!(

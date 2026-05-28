@@ -1767,7 +1767,10 @@ mod graph_cache_tests {
         std::env::set_var(BOLT_SORT_USE_GRAPH_ENV, "yes");
         assert!(!sort_uses_graph(), "\"yes\" must be off");
 
-        std::env::set_var(BOLT_SORT_USE_GRAPH_ENV, "garbage\u{0}bytes");
+        // Windows API rejects NUL bytes in env-var values; use a pure
+        // garbage string instead — both POSIX and Windows accept it and
+        // it exercises the same "not a recognised truthy value" branch.
+        std::env::set_var(BOLT_SORT_USE_GRAPH_ENV, "garbage-bytes");
         assert!(!sort_uses_graph(), "unparseable garbage must be off");
 
         // Restore env to a known-empty state for any follow-up tests.

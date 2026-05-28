@@ -555,9 +555,9 @@ mod tests {
         assert_eq!(out_batch.num_rows(), 3);
     }
 
-    /// Signed-zero: `+0.0` and `-0.0` have different bit patterns and are
-    /// therefore **not** deduped. Documented choice; locks in today's
-    /// behaviour against accidental drift (see module doc-comment).
+    /// Signed-zero: `+0.0` and `-0.0` collapse to a single equivalence class
+    /// per `canonicalise_f64` — DISTINCT, GROUP BY, and JOIN all share this
+    /// rule. The three input rows therefore reduce to a single output row.
     #[test]
     fn distinct_zero_signs() {
         let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
@@ -566,9 +566,9 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
         let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
         let out_batch = out.into_record_batch();
-        // +0.0 and -0.0 stay as two distinct rows; the third row (a
-        // second +0.0) is a true dup of row 0 and goes away. Expected: 2.
-        assert_eq!(out_batch.num_rows(), 2);
+        // All three rows are equivalent under the shared canonicalisation
+        // rule; expected: 1.
+        assert_eq!(out_batch.num_rows(), 1);
     }
 
     /// `f32::NAN` path: same bit-pattern dedup rule as `f64::NAN`.

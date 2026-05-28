@@ -2904,10 +2904,11 @@ mod tests {
             .filter_map(|(k, &keep)| if keep { Some(*k) } else { None })
             .collect();
         assert_eq!(filtered.len(), 3);
-        assert_eq!(filtered[0], i64::MIN);
-        assert_eq!(filtered[2], i64::MIN);
-        // 1.5_f64.to_bits() is non-i64::MIN.
-        assert_ne!(filtered[1], i64::MIN);
+        // -0.0 is canonicalised to +0.0 (see distinct::canonicalise_f64) so
+        // its bit pattern is 0, not i64::MIN. Same equivalence rule applies
+        // here so GROUP BY, DISTINCT, and JOIN agree on float identity.
+        assert_eq!(filtered[0], 0);
+        assert_eq!(filtered[2], 0);
         assert_eq!(filtered[1], 1.5f64.to_bits() as i64);
     }
 
