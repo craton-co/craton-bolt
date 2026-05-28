@@ -1338,7 +1338,7 @@ fn run_one_aggregate(
                 None => None,
             };
 
-            let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref())?;
+            let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref(), stream)?;
             let count_n_rows = filtered.n_rows();
 
             let ones: Vec<i64> = vec![1i64; count_n_rows];
@@ -1398,7 +1398,7 @@ fn run_one_aggregate(
             let col_io = resolve_input(inputs, col_name)?;
 
             let value_valid = column_null_mask(col_io, batch)?;
-            let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref())?;
+            let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref(), stream)?;
             let avg_n_rows = filtered.n_rows();
 
             // --- SUM(expr) cast to f64. We upcast the input host-side and
@@ -1508,11 +1508,19 @@ impl<'a> FilteredKeys<'a> {
 /// already had the `key_valid` rows kept; if `value_valid` is `None` we can
 /// reuse it directly. Otherwise we re-download once and refilter against
 /// the joint mask, then upload a fresh i64 column.
+///
+/// v0.7 async-memcpy: the DtoH of the shared key column and the HtoD of the
+/// freshly-filtered keys both ride `stream` via the pinned-D2H +
+/// `from_slice_async` pair, mirroring the per-aggregate buffer plumbing in
+/// `run_typed_agg`. This keeps the entire per-aggregate launch on a single
+/// ordering domain so the driver can chain the upload behind the previous
+/// kernel's D2H and overlap with unrelated stream activity.
 fn prepare_filtered_keys<'a>(
     group_col: &'a GpuVec<i64>,
     n_rows: usize,
     key_valid: Option<&[bool]>,
     value_valid: Option<&[bool]>,
+    stream: &CudaStream,
 ) -> BoltResult<FilteredKeys<'a>> {
     if value_valid.is_none() {
         return Ok(FilteredKeys::Borrowed { group_col, n_rows });
@@ -1531,7 +1539,12 @@ fn prepare_filtered_keys<'a>(
     };
     debug_assert_eq!(value_valid_filtered.len(), n_rows);
 
-    let host_keys: Vec<i64> = group_col.to_vec()?;
+    // v0.7 async DtoH of the shared key column via the pinned-buffer
+    // helper. The pinned hop lets the driver DMA into host memory without
+    // staging through a bounce buffer; the trailing `to_vec()` is the one
+    // unavoidable host-host copy. Routes through `download_pinned_i64` so
+    // the per-aggregate plumbing shares one D2H code path.
+    let host_keys: Vec<i64> = download_pinned_i64(group_col, stream)?;
     debug_assert_eq!(host_keys.len(), n_rows);
     let filtered: Vec<i64> = host_keys
         .iter()
@@ -1539,7 +1552,11 @@ fn prepare_filtered_keys<'a>(
         .filter_map(|(&k, &v)| if v { Some(k) } else { None })
         .collect();
     let filtered_n = filtered.len();
-    let owned = GpuVec::<i64>::from_slice(&filtered)?;
+    // v0.7 async HtoD of the freshly-filtered key column on the caller's
+    // stream so the subsequent agg-kernel launch is automatically ordered
+    // after this upload without a separate barrier. Replaces the prior
+    // synchronous `GpuVec::from_slice` here.
+    let owned = GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
     Ok(FilteredKeys::Owned { group_col: owned, n_rows: filtered_n })
 }
 
@@ -1618,7 +1635,7 @@ fn run_typed_agg(
         );
     }
 
-    let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref())?;
+    let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref(), stream)?;
     let n = filtered.n_rows();
 
     match col_io.dtype {
@@ -2810,5 +2827,140 @@ mod tests {
             !column_should_use_native_validity(&arr, ReduceOp::Max, DataType::Float64),
             "Float MAX has no _with_validity emitter; expected host-strip"
         );
+    }
+
+    // -------- v0.7 async-memcpy: prepare_filtered_keys round-trips --------
+
+    /// GROUP BY AVG over a Float64 column with NULLs: exercises the
+    /// `prepare_filtered_keys` value-validity branch end-to-end. The
+    /// downloaded key column is rebuilt for the filtered row set via the
+    /// async DtoH+HtoD pair added in v0.7. NULL value rows are dropped
+    /// before they reach the GPU (matching the SUM/COUNT pair feeding
+    /// AVG).
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn async_groupby_avg_float64_with_value_nulls_round_trip() {
+        use crate::Engine;
+
+        let mut engine = Engine::new().expect("ctx");
+        // Keys in {1, 2}, values with NULLs scattered through both groups.
+        // Expected per-group means computed below from the non-NULL pairs.
+        let keys: Vec<i32> = vec![1, 2, 1, 2, 1, 2, 1, 2];
+        let vals: Vec<Option<f64>> = vec![
+            Some(1.0),
+            Some(10.0),
+            None,
+            Some(20.0),
+            Some(3.0),
+            None,
+            Some(5.0),
+            Some(40.0),
+        ];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys.clone())) as ArrayRef,
+                Arc::new(Float64Array::from(vals.clone())) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        engine.register_table("t", batch).unwrap();
+
+        let h = engine
+            .sql("SELECT k, AVG(v) FROM t GROUP BY k")
+            .expect("execute");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 2);
+
+        let ks = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let avgs = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        // Build host-side expected (sum, count) pairs from the non-NULL
+        // values only — same filter the GPU side has to materialise.
+        let mut sums = std::collections::HashMap::<i32, f64>::new();
+        let mut counts = std::collections::HashMap::<i32, i64>::new();
+        for (k, v) in keys.iter().zip(vals.iter()) {
+            if let Some(v) = v {
+                *sums.entry(*k).or_default() += *v;
+                *counts.entry(*k).or_default() += 1;
+            }
+        }
+        for i in 0..out.num_rows() {
+            let k = ks.value(i);
+            let got = avgs.value(i);
+            let expected = sums[&k] / counts[&k] as f64;
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "k={k} got={got} expected={expected}"
+            );
+        }
+    }
+
+    /// GROUP BY COUNT(col) with NULL values: same `prepare_filtered_keys`
+    /// path as AVG but only the COUNT half. Pins that the v0.7 async
+    /// keys upload still produces the right per-group non-null counts.
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn async_groupby_count_with_value_nulls_round_trip() {
+        use crate::Engine;
+        use arrow_array::Int64Array;
+
+        let mut engine = Engine::new().expect("ctx");
+        let keys: Vec<i32> = vec![0, 1, 0, 1, 0, 1];
+        let vals: Vec<Option<i32>> = vec![Some(7), None, Some(9), Some(11), None, Some(13)];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys.clone())) as ArrayRef,
+                Arc::new(Int32Array::from(vals.clone())) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        engine.register_table("t", batch).unwrap();
+
+        let h = engine
+            .sql("SELECT k, COUNT(v) FROM t GROUP BY k")
+            .expect("execute");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 2);
+
+        let ks = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let cs = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let mut expected_counts = std::collections::HashMap::<i32, i64>::new();
+        for (k, v) in keys.iter().zip(vals.iter()) {
+            if v.is_some() {
+                *expected_counts.entry(*k).or_default() += 1;
+            }
+        }
+        for i in 0..out.num_rows() {
+            let k = ks.value(i);
+            let c = cs.value(i);
+            assert_eq!(c, expected_counts[&k], "k={k}");
+        }
     }
 }
