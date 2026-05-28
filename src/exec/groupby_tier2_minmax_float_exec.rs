@@ -24,7 +24,7 @@ use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::MinMaxOp;
 use crate::jit::partition_reduce_kernel_minmax_float::{
-    compile_partition_reduce_kernel_minmax_float, compile_partition_reduce_kernel_minmax_float_with_spill,
+    compile_partition_reduce_kernel_minmax_float_with_spill,
     kernel_entry_with_spill as minmax_float_entry_with_spill, FloatDtype, BLOCK_GROUPS,
     BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
@@ -91,8 +91,11 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
             KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
             KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
             KernelSpec::ReduceMinMaxFloat(rk) => {
+                // Batch 5: route to the spill-counter-aware emitter so the
+                // launch sites (which resolve `kernel_entry_with_spill`) can
+                // find their entry point in the loaded module.
                 let (op, dt) = rk.into_pair();
-                compile_partition_reduce_kernel_minmax_float(op, dt)?
+                compile_partition_reduce_kernel_minmax_float_with_spill(op, dt)?
             }
         })
     })

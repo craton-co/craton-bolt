@@ -84,10 +84,12 @@ enum KernelSpec {
     /// `scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel()`.
     /// Atomic-free per-value-column scatter using a pre-computed `dest_idx`.
     ScatterValuesByDestIdx,
-    /// `partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(n_vals)`.
-    /// `n_vals` is the per-row fan-out (1..=`MAX_VALS`).
+    /// `partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi_with_spill(n_vals)`.
+    /// `n_vals` is the per-row fan-out (1..=`MAX_VALS`). Batch-5 spill-aware
+    /// variant — launches resolve `kernel_entry_with_spill(n_vals)`.
     ReduceMulti { n_vals: u32 },
-    /// `partition_reduce_kernel_count::compile_partition_reduce_kernel_count()`.
+    /// `partition_reduce_kernel_count::compile_partition_reduce_kernel_count_with_spill()`.
+    /// Batch-5 spill-aware variant — launches resolve `KERNEL_ENTRY_WITH_SPILL`.
     ReduceCount,
 }
 
@@ -111,10 +113,19 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
                 scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel()?
             }
             KernelSpec::ReduceMulti { n_vals } => {
-                partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(*n_vals)?
+                // Batch 5: spill-counter-aware variant — the launch site
+                // resolves `kernel_entry_with_spill(n_vals)` and pushes a u32
+                // spill counter as the trailing kernel arg.
+                partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi_with_spill(
+                    *n_vals,
+                )?
             }
             KernelSpec::ReduceCount => {
-                partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
+                // Batch 5: spill-counter-aware variant. AVG drives two reduce
+                // kernels — the multi-SUM above and this COUNT — and both must
+                // surface MAX_PROBES overflow as a structured error rather
+                // than silently corrupting the per-key denominator.
+                partition_reduce_kernel_count::compile_partition_reduce_kernel_count_with_spill()?
             }
         })
     })
@@ -344,9 +355,12 @@ fn execute_inner(
     // its out_counts. Output dedup keys / set come from the SUM reduce.
     let mut count_out_keys_gpu: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_out_slots, stream.raw())?;
     let mut count_out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
-    // Spill counter for the multi-SUM reduce. Non-zero after sync means
-    // some rows dropped on probe overflow and the result is incorrect.
-    let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
+    // Spill counters for the multi-SUM and COUNT reduces. AVG = sum/count,
+    // so EITHER reduce dropping a row on MAX_PROBES overflow silently
+    // corrupts the per-key average. We allocate one counter per kernel and
+    // OR-merge the post-sync check below.
+    let mut spill_multi: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
+    let mut spill_count: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     // ---- Multi-SUM reduce -----------------------------------------------
     let reduce_multi_module =
@@ -361,7 +375,7 @@ fn execute_inner(
         let mut view_ok = out_keys_gpu.view_mut();
         let mut views_ov: Vec<_> = out_vals_gpu.iter_mut().map(|g| g.view_mut()).collect();
         let mut view_os = out_set_gpu.view_mut();
-        let mut view_sp = spill.view_mut();
+        let mut view_sp = spill_multi.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_sk);
@@ -389,13 +403,15 @@ fn execute_inner(
     // ---- COUNT reduce ----------------------------------------------------
     let reduce_count_module = get_or_build_module(&KernelSpec::ReduceCount)?;
     {
-        let func = reduce_count_module.function(partition_reduce_kernel_count::KERNEL_ENTRY)?;
+        let func = reduce_count_module
+            .function(partition_reduce_kernel_count::KERNEL_ENTRY_WITH_SPILL)?;
 
         let view_keys = scatter_keys.view();
         let view_offsets = offsets_kp1_gpu.view();
         let mut view_ok = count_out_keys_gpu.view_mut();
         let mut view_oc = out_counts_gpu.view_mut();
         let mut view_os = count_out_set_gpu.view_mut();
+        let mut view_sp = spill_count.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_keys);
@@ -403,6 +419,7 @@ fn execute_inner(
         args.push_output(&mut view_ok);
         args.push_output(&mut view_oc);
         args.push_output(&mut view_os);
+        args.push_output(&mut view_sp);
 
         launch_with_geometry(
             func,
@@ -435,11 +452,15 @@ fn execute_inner(
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     let pinned_counts = out_counts_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
-    let spill_count = spill.to_vec()?[0];
-    if spill_count > 0 {
+    // AVG = SUM/COUNT — both reduces must succeed for the per-key average to
+    // be correct. OR-merge the two counters and surface a structured error
+    // mentioning each component so the failure mode is unambiguous.
+    let spill_multi_count = spill_multi.to_vec()?[0];
+    let spill_count_count = spill_count.to_vec()?[0];
+    if spill_multi_count > 0 || spill_count_count > 0 {
         return Err(BoltError::Other(format!(
-            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
-            spill_count
+            "partition_reduce spill: multi={} count={} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_multi_count, spill_count_count
         )));
     }
     let host_out_keys: Vec<i32> = pinned_keys.as_slice().to_vec();

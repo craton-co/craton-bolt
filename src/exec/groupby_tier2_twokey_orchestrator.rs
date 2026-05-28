@@ -73,7 +73,12 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceSumI64 => {
-                partition_reduce_kernel_i64::compile_partition_reduce_kernel_i64()?
+                // Batch 5: spill-counter-aware variant. The launch site
+                // resolves `KERNEL_ENTRY_WITH_SPILL` and pushes a u32 spill
+                // counter as the trailing kernel arg; we surface a structured
+                // error on MAX_PROBES overflow instead of silently dropping
+                // rows.
+                partition_reduce_kernel_i64::compile_partition_reduce_kernel_i64_with_spill()?
             }
         })
     })
