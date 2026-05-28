@@ -186,6 +186,70 @@ pub struct KernelSpec {
     pub output_has_validity: Vec<bool>,
 }
 
+/// v0.7: domain-separated planner IR for a scalar (no-GROUP-BY) GPU
+/// reduction kernel.
+///
+/// The scalar-aggregate executor in [`crate::exec::aggregate`] historically
+/// fed `(op, dtype)` directly to the JIT layer, which means every warm call
+/// still paid the per-PTX-text codegen cost (`compile_reduction_kernel` /
+/// `compile_avg_reduction_kernel`). The projection path already routes through
+/// a `KernelSpec`-keyed cache (see [`crate::exec::module_cache`]); this type
+/// is the matching planner-IR handle for the scalar-aggregate family.
+///
+/// # Why a separate spec type?
+///
+/// `KernelSpec` describes the fused scan/filter/project IR — its `inputs`,
+/// `outputs`, and `ops` list don't make sense for a pure reduction. A scalar
+/// aggregate is fully described by `(op, input_dtype)`: every other knob
+/// (block size, identity, combine instruction) is derived inside
+/// [`crate::jit::agg_kernels`] from those two fields. Keeping the shape
+/// minimal also keeps the `Debug` fingerprint short, which is what the
+/// module cache hashes on the warm path.
+///
+/// The `Debug` shape is intentionally distinct from `KernelSpec`'s
+/// (`KernelSpec { inputs: [...], ... }`) so the disk-cache key prefix wired
+/// up in [`crate::exec::module_cache::get_or_build_module_for_scalar_agg`]
+/// (`"scalar_agg::"`) further domain-separates the two PTX families on
+/// disk — a hand inspection of a cache directory shows immediately which
+/// family produced an entry.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScalarAggSpec {
+    /// The reduction operator.
+    pub op: ScalarAggOp,
+    /// Element dtype of the input column (what the kernel loads). The
+    /// accumulator dtype is derived from `(op, input_dtype)` inside the
+    /// JIT layer per `crate::jit::agg_kernels::reduction_output_dtype` /
+    /// `compile_avg_reduction_kernel`.
+    pub input_dtype: DataType,
+}
+
+/// Reduction family for a [`ScalarAggSpec`]. Mirrors the variants the
+/// scalar-aggregate executor actually dispatches into the JIT layer for —
+/// the broader `AggregateExpr` enum has additional variants (VAR_*, STDDEV_*)
+/// that the v0.5/v0.6 path handles host-side via
+/// [`crate::exec::welford`], so they're absent here.
+///
+/// `Avg` is its own variant rather than a (`Sum`, `Count`) decomposition
+/// because the scalar-aggregate executor emits a **fused** single-kernel
+/// AVG (`bolt_avg_reduce`) that produces both partial buffers in one pass.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarAggOp {
+    /// SUM — `bolt_reduce` with `ReduceOp::Sum`.
+    Sum,
+    /// MIN — `bolt_reduce` with `ReduceOp::Min`.
+    Min,
+    /// MAX — `bolt_reduce` with `ReduceOp::Max`.
+    Max,
+    /// COUNT — `bolt_reduce` with `ReduceOp::Count`. (Distinct from `Sum`
+    /// so the disk-cache key fingerprint differs; the JIT layer treats them
+    /// identically beyond the identity value.)
+    Count,
+    /// AVG — the fused `bolt_avg_reduce` kernel; emits `(sum, count)` per-block.
+    Avg,
+}
+
 /// Description of an aggregation kernel.
 #[doc(hidden)]
 #[derive(Debug, Clone)]

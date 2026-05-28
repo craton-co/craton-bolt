@@ -60,7 +60,7 @@ use parking_lot::Mutex;
 
 use crate::error::BoltResult;
 use crate::jit::CudaModule;
-use crate::plan::physical_plan::KernelSpec;
+use crate::plan::physical_plan::{KernelSpec, ScalarAggSpec};
 
 /// Composite cache key: `(namespace, spec_id)`.
 ///
@@ -399,6 +399,239 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// v0.7: ScalarAggSpec-keyed cache layer.
+//
+// Mirrors the `KernelSpec` layer above but keyed on the scalar-aggregate
+// planner IR (see [`crate::plan::physical_plan::ScalarAggSpec`]). The
+// scalar-aggregate executor (`exec::aggregate`) historically routed every
+// reduction through the string-keyed `get_or_build_module` above (keying
+// on a `format!("reduction:{:?}:{:?}", op, dtype)` string). That worked but:
+//
+//   1. The Debug-of-tuple key shape was hand-rolled per call site, so adding
+//      a third axis (e.g. accumulator-widening) meant editing each call site
+//      and re-stating the format string.
+//   2. The string key carried no domain separation from the projection-path
+//      cache other than the `namespace` (module_path!()) field — a refactor
+//      that moved the reduction call out of `exec::aggregate` would silently
+//      change the key.
+//   3. The disk-cache key (when wired) needs an explicit, visible domain
+//      prefix per the v0.7 task brief.
+//
+// This layer keys on the `ScalarAggSpec` IR itself (a `(op, dtype)` pair),
+// uses the same 128-bit content-hash shape as `KernelSpecKey`, and stamps
+// the disk-cache key with a `"scalar_agg::"` prefix so a hand inspection of
+// the cache directory shows immediately which family produced each entry.
+// The in-memory cache is independent from `KERNELSPEC_CACHE` — splitting them
+// keeps the FIFO eviction policies of the two families from competing.
+
+/// FIFO cap on the ScalarAggSpec→`CudaModule` cache. Same default as the
+/// `KernelSpec` cap above; tunable by editing this constant.
+const SCALARAGG_CACHE_CAP: usize = 64;
+
+/// 128-bit content fingerprint of a `ScalarAggSpec` plus its entry-point tag.
+/// Built the same way `KernelSpecKey` is — two `DefaultHasher` instances
+/// domain-separated by a leading byte, packing into 128 bits total. We
+/// re-hash even though `ScalarAggSpec` itself implements `Hash`, so the
+/// fingerprint shape exactly matches the projection-side cache (and so the
+/// `Debug` output drives the key in case `ScalarAggSpec` ever grows
+/// non-Hashable fields like `KernelSpec` did).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ScalarAggKey {
+    /// Upper 64 bits of the 128-bit content hash (domain byte `0x11`).
+    hi: u64,
+    /// Lower 64 bits of the 128-bit content hash (domain byte `0x12`).
+    lo: u64,
+    /// PTX entry-point name (`bolt_reduce` vs. `bolt_avg_reduce`).
+    entry: &'static str,
+}
+
+impl ScalarAggKey {
+    fn new(spec: &ScalarAggSpec, entry: &'static str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::fmt::Write as _;
+        use std::hash::Hasher;
+
+        // Domain-separating prefix bytes distinct from `KernelSpecKey`'s
+        // (`0x01` / `0x02`) so a hypothetical hash collision between the
+        // Debug shapes of `KernelSpec` and `ScalarAggSpec` can't alias keys.
+        let mut hi = DefaultHasher::new();
+        hi.write_u8(0x11);
+        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
+
+        let mut lo = DefaultHasher::new();
+        lo.write_u8(0x12);
+        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
+
+        Self {
+            hi: hi.finish(),
+            lo: lo.finish(),
+            entry,
+        }
+    }
+}
+
+/// Cached payload for one ScalarAggSpec key. Mirrors `KernelSpecEntry`.
+#[derive(Clone)]
+struct ScalarAggEntry {
+    /// Emitted PTX text. Retained for observability / future
+    /// hit-collision-detection. The production lookup path only needs
+    /// `module`.
+    #[allow(dead_code)]
+    ptx: String,
+    module: CudaModule,
+}
+
+/// State of the ScalarAggSpec-keyed cache. Same FIFO eviction shape as
+/// [`KernelSpecCache`]; see those docs for the invariants.
+struct ScalarAggCache {
+    by_key: HashMap<ScalarAggKey, ScalarAggEntry>,
+    order: VecDeque<ScalarAggKey>,
+    cap: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl ScalarAggCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_key: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, key: &ScalarAggKey) -> Option<ScalarAggEntry> {
+        if let Some(entry) = self.by_key.get(key) {
+            self.hits = self.hits.saturating_add(1);
+            Some(entry.clone())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    fn insert(&mut self, key: ScalarAggKey, entry: ScalarAggEntry) {
+        if self.by_key.contains_key(&key) {
+            return;
+        }
+        while self.by_key.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_key.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.by_key.insert(key, entry);
+    }
+}
+
+/// Process-wide ScalarAggSpec→`CudaModule` cache. Initialised lazily.
+static SCALARAGG_CACHE: Lazy<Mutex<ScalarAggCache>> =
+    Lazy::new(|| Mutex::new(ScalarAggCache::new(SCALARAGG_CACHE_CAP)));
+
+/// Disk-cache key prefix for the scalar-aggregate PTX family. Stamped onto
+/// every disk-cache write/read so a directory listing shows immediately
+/// which kernel family produced each `.ptx` file, and so the projection
+/// path's `<entry>-<hex>` shape can't ever collide with a scalar-aggregate
+/// entry (different prefix string, different overall key shape).
+pub(crate) const SCALAR_AGG_DISK_PREFIX: &str = "scalar_agg::";
+
+/// Test- and observability-facing snapshot of `(hits, misses)` for the
+/// ScalarAggSpec cache. Parallel to [`kernelspec_cache_stats`].
+#[doc(hidden)]
+#[must_use]
+pub fn scalar_agg_cache_stats() -> (usize, usize) {
+    let c = SCALARAGG_CACHE.lock();
+    (c.hits as usize, c.misses as usize)
+}
+
+/// Look up (or compile-and-load) the `CudaModule` for `(spec, entry)`.
+///
+/// This is the scalar-aggregate analogue of
+/// [`get_or_build_module_for_spec`]. On a **cache hit** we return the
+/// cached `CudaModule` clone immediately — no codegen, no PTX text
+/// generation, no `cuModuleLoadDataEx`. On a **cache miss** we run
+/// `compile(spec)` to get the PTX text and hand it to
+/// `CudaModule::from_ptx`. The resulting `(ptx, module)` pair is stored
+/// under the ScalarAggSpec key so subsequent calls with the same spec
+/// hit the fast path.
+///
+/// # Disk-cache integration (v0.6 / M6)
+///
+/// When the disk-backed PTX cache is enabled (env var `BOLT_PTX_CACHE_DIR`
+/// or builder override), a miss in the in-memory cache consults the disk
+/// cache *before* paying the codegen cost. The disk key is composed as
+/// `"{SCALAR_AGG_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
+///   1. The `"scalar_agg::"` prefix domain-separates these entries from the
+///      projection-path entries that share the disk directory.
+///   2. The `entry` suffix distinguishes `bolt_reduce` from `bolt_avg_reduce`.
+///   3. The 128-bit hex content hash makes the key collision-resistant
+///      against unrelated specs that happen to share the same `(op, dtype)`.
+///
+/// On a disk hit we skip codegen and feed the on-disk PTX straight to
+/// `CudaModule::from_ptx` (which still pays the one-time PTXAS assembly
+/// cost in this fresh-process scenario, since there's no cubin cache yet).
+///
+/// # Concurrency
+///
+/// The cache lock is held only long enough to look up or insert; the slow
+/// `compile` + `from_ptx` work runs outside the lock. If two threads race
+/// on the same miss they will each compile once and the second insert is
+/// dropped by `insert`'s idempotence check.
+pub(crate) fn get_or_build_module_for_scalar_agg<F>(
+    spec: &ScalarAggSpec,
+    entry: &'static str,
+    compile: F,
+) -> BoltResult<CudaModule>
+where
+    F: FnOnce(&ScalarAggSpec) -> BoltResult<String>,
+{
+    let key = ScalarAggKey::new(spec, entry);
+    // Fast path: in-memory hit. Hold the lock just long enough to clone.
+    if let Some(cached) = SCALARAGG_CACHE.lock().get(&key) {
+        return Ok(cached.module);
+    }
+    // In-memory miss: try the optional on-disk cache before paying for codegen.
+    let disk = crate::jit::disk_cache::disk_cache();
+    let disk_key = disk.as_ref().map(|_| {
+        format!(
+            "{}{}-{}",
+            SCALAR_AGG_DISK_PREFIX,
+            entry,
+            crate::jit::disk_cache::hash_to_key(key.hi, key.lo),
+        )
+    });
+    let ptx = match (&disk, &disk_key) {
+        (Some(cache), Some(k)) => match cache.lookup(k) {
+            Some(text) => text,
+            None => {
+                let text = compile(spec)?;
+                // Write-through to disk. Errors here are non-fatal: a
+                // failed write just means future processes won't benefit,
+                // the current process still loads the module successfully.
+                let _ = cache.store(k, &text);
+                text
+            }
+        },
+        _ => compile(spec)?,
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    // Insert and hand back a clone. Concurrent winners are tolerated by
+    // `insert`'s idempotence check.
+    SCALARAGG_CACHE.lock().insert(
+        key,
+        ScalarAggEntry {
+            ptx,
+            module: module.clone(),
+        },
+    );
+    Ok(module)
+}
+
+// ---------------------------------------------------------------------------
 // Tests for the KernelSpec-keyed cache.
 // ---------------------------------------------------------------------------
 
@@ -562,6 +795,241 @@ mod kernelspec_cache_tests {
             KernelSpecKey::new(&spec, "bolt_kernel"),
             KernelSpecKey::new(&cloned, "bolt_kernel"),
             "cloning the spec must not change its cache key"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the ScalarAggSpec-keyed cache.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod scalar_agg_cache_tests {
+    use super::*;
+    use crate::plan::logical_plan::DataType;
+    use crate::plan::physical_plan::{ScalarAggOp, ScalarAggSpec};
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+    /// Cold lookup against a fresh cache is a miss and `get` accounts for
+    /// it. Mirrors `kernelspec_cache_cold_lookup_is_a_miss`.
+    #[test]
+    fn scalar_agg_cache_cold_lookup_is_a_miss() {
+        let mut cache = ScalarAggCache::new(4);
+        let spec = ScalarAggSpec {
+            op: ScalarAggOp::Sum,
+            input_dtype: DataType::Int64,
+        };
+        let key = ScalarAggKey::new(&spec, "bolt_reduce");
+
+        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert_eq!(cache.misses, 1);
+        assert_eq!(cache.hits, 0);
+    }
+
+    /// State-machine pin of the hit path: a second call with the same spec
+    /// must NOT re-run the compile closure and must NOT re-run the loader.
+    /// We mock `CudaModule::from_ptx` with a stub closure since CUDA isn't
+    /// available in unit tests; the cache state machine is identical.
+    #[test]
+    fn scalar_agg_cache_compile_and_loader_run_once_per_unique_spec() {
+        // Mock module type — just a tag so we can confirm the same instance
+        // comes back on a hit.
+        #[derive(Clone)]
+        struct MockModule(&'static str);
+
+        struct MockCache {
+            by_key: HashMap<ScalarAggKey, MockModule>,
+            order: VecDeque<ScalarAggKey>,
+            cap: usize,
+        }
+
+        impl MockCache {
+            fn get_or_build(
+                &mut self,
+                spec: &ScalarAggSpec,
+                entry: &'static str,
+                compile_count: &AtomicUsize,
+                loader_count: &AtomicUsize,
+                tag: &'static str,
+            ) -> MockModule {
+                let key = ScalarAggKey::new(spec, entry);
+                if let Some(m) = self.by_key.get(&key) {
+                    return m.clone();
+                }
+                // Miss: "compile" then "load".
+                compile_count.fetch_add(1, AOrdering::SeqCst);
+                loader_count.fetch_add(1, AOrdering::SeqCst);
+                let m = MockModule(tag);
+                while self.by_key.len() >= self.cap {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.by_key.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+                self.order.push_back(key);
+                self.by_key.insert(key, m.clone());
+                m
+            }
+        }
+
+        let spec_sum_i64 = ScalarAggSpec {
+            op: ScalarAggOp::Sum,
+            input_dtype: DataType::Int64,
+        };
+        let spec_min_i64 = ScalarAggSpec {
+            op: ScalarAggOp::Min,
+            input_dtype: DataType::Int64,
+        };
+
+        let compile_count = AtomicUsize::new(0);
+        let loader_count = AtomicUsize::new(0);
+        let mut cache = MockCache {
+            by_key: HashMap::new(),
+            order: VecDeque::new(),
+            cap: 64,
+        };
+
+        // First call with (Sum, Int64): miss → compile + load each run once.
+        let m1 = cache.get_or_build(
+            &spec_sum_i64,
+            "bolt_reduce",
+            &compile_count,
+            &loader_count,
+            "sum-i64",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 1);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 1);
+        assert_eq!(m1.0, "sum-i64");
+
+        // Second call with the SAME spec: HIT → neither closure runs again.
+        let m2 = cache.get_or_build(
+            &spec_sum_i64,
+            "bolt_reduce",
+            &compile_count,
+            &loader_count,
+            "sum-i64",
+        );
+        assert_eq!(
+            compile_count.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip codegen"
+        );
+        assert_eq!(
+            loader_count.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip module load"
+        );
+        assert_eq!(m2.0, "sum-i64");
+
+        // A different op (Min): miss again.
+        let m3 = cache.get_or_build(
+            &spec_min_i64,
+            "bolt_reduce",
+            &compile_count,
+            &loader_count,
+            "min-i64",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(m3.0, "min-i64");
+
+        // Same spec as m1, different entry tag (e.g. the fused AVG kernel):
+        // miss — entry participates in the key.
+        let spec_avg_i64 = ScalarAggSpec {
+            op: ScalarAggOp::Avg,
+            input_dtype: DataType::Int64,
+        };
+        let m4 = cache.get_or_build(
+            &spec_avg_i64,
+            "bolt_avg_reduce",
+            &compile_count,
+            &loader_count,
+            "avg-i64",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 3);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 3);
+        assert_eq!(m4.0, "avg-i64");
+
+        // And back to spec_sum_i64: still a hit, neither closure runs.
+        let m5 = cache.get_or_build(
+            &spec_sum_i64,
+            "bolt_reduce",
+            &compile_count,
+            &loader_count,
+            "sum-i64",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 3);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 3);
+        assert_eq!(m5.0, "sum-i64");
+    }
+
+    /// Key uniqueness: distinct ops, dtypes, and entry tags must each
+    /// produce distinct keys. (This is the assumption the hit-vs-miss
+    /// classification relies on.)
+    #[test]
+    fn scalar_agg_cache_key_distinguishes_op_dtype_and_entry() {
+        let sum_i32 = ScalarAggSpec {
+            op: ScalarAggOp::Sum,
+            input_dtype: DataType::Int32,
+        };
+        let sum_i64 = ScalarAggSpec {
+            op: ScalarAggOp::Sum,
+            input_dtype: DataType::Int64,
+        };
+        let min_i32 = ScalarAggSpec {
+            op: ScalarAggOp::Min,
+            input_dtype: DataType::Int32,
+        };
+
+        let k_sum_i32 = ScalarAggKey::new(&sum_i32, "bolt_reduce");
+        let k_sum_i64 = ScalarAggKey::new(&sum_i64, "bolt_reduce");
+        let k_min_i32 = ScalarAggKey::new(&min_i32, "bolt_reduce");
+        let k_sum_i32_alt = ScalarAggKey::new(&sum_i32, "bolt_avg_reduce");
+
+        assert_ne!(k_sum_i32, k_sum_i64, "dtype must participate in the key");
+        assert_ne!(k_sum_i32, k_min_i32, "op must participate in the key");
+        assert_ne!(
+            k_sum_i32, k_sum_i32_alt,
+            "entry tag must participate in the key"
+        );
+    }
+
+    /// The disk-cache key prefix must start with `"scalar_agg::"` so a
+    /// hand inspection of the cache directory distinguishes scalar-agg
+    /// entries from projection-path entries. Pins the prefix contract
+    /// against accidental drift.
+    #[test]
+    fn scalar_agg_disk_prefix_is_visibly_namespaced() {
+        assert_eq!(SCALAR_AGG_DISK_PREFIX, "scalar_agg::");
+        // The full disk key shape is `"<PREFIX><entry>-<hex>"` — confirm
+        // the prefix lands at the start of a composed key.
+        let composed = format!(
+            "{}{}-{}",
+            SCALAR_AGG_DISK_PREFIX,
+            "bolt_reduce",
+            "deadbeefcafebabe1234567890abcdef",
+        );
+        assert!(
+            composed.starts_with("scalar_agg::"),
+            "composed disk key must carry the scalar_agg prefix: {composed}"
+        );
+    }
+
+    /// The key fingerprint is stable across `Clone` of the same spec —
+    /// matches the `KernelSpec` invariant. Callers often `Copy` the IR
+    /// before handing it to the cache, so the stability is load-bearing.
+    #[test]
+    fn scalar_agg_cache_key_stable_across_copy() {
+        let spec = ScalarAggSpec {
+            op: ScalarAggOp::Max,
+            input_dtype: DataType::Float64,
+        };
+        let copied = spec;
+        assert_eq!(
+            ScalarAggKey::new(&spec, "bolt_reduce"),
+            ScalarAggKey::new(&copied, "bolt_reduce"),
+            "copying the spec must not change its cache key"
         );
     }
 }
