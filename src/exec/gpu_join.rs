@@ -1793,6 +1793,17 @@ fn launch_probe_collision_kernel(
     if n_probe_rows == 0 {
         return Ok(0);
     }
+    // Bitmap sizing contract: kernel indexes `matched[word_idx]` where
+    // `word_idx = cursor >> 5`, so the host MUST allocate exactly
+    // `((build_n_rows + 31) / 32) as usize` u32 elements. See
+    // `compile_probe_collision_kernel` doc.
+    if let Some(m) = matched_dev {
+        debug_assert_eq!(
+            m.len(),
+            ((n_build_rows as usize) + 31) / 32,
+            "probe-collision matched bitmap must be ceil(build_n_rows/32) u32 words"
+        );
+    }
     let ptx = compile_probe_collision_kernel()?;
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(PROBE_COLLISION_KERNEL_ENTRY)?;
@@ -1804,7 +1815,15 @@ fn launch_probe_collision_kernel(
     let mut out_probe_idx_ptr: CUdeviceptr = out_probe_idx_dev.device_ptr();
     let mut out_build_idx_ptr: CUdeviceptr = out_build_idx_dev.device_ptr();
     let mut out_counter_ptr: CUdeviceptr = out_counter_dev.device_ptr();
-    let mut matched_ptr: CUdeviceptr = matched_dev.map(|m| m.device_ptr()).unwrap_or(0);
+    // INNER path passes a strict null (exactly 0). MUST be strict null;
+    // kernel value-compares via `setp.eq.u64 %p6, %rd19, 0` to skip the
+    // bitmap OR — any non-zero garbage would trigger an OOB atomic.
+    // `CUdeviceptr` is `u64`; explicit `0u64` ensures a guaranteed-null
+    // value rather than relying on a pointer-cast.
+    let mut matched_ptr: CUdeviceptr = match matched_dev {
+        Some(m) => m.device_ptr(),
+        None => 0u64,
+    };
     let mut n_probe_u32: u32 = n_probe_rows;
     let mut cap_u32: u32 = cap;
     let mut out_capacity_u32: u32 = out_capacity;
@@ -1855,6 +1874,15 @@ fn launch_unmatched_build_kernel(
     if n_build_rows == 0 {
         return Ok(0);
     }
+    // Bitmap sizing contract: kernel indexes `matched[word_idx]` where
+    // `word_idx = tid >> 5`, so the host MUST allocate exactly
+    // `((build_n_rows + 31) / 32) as usize` u32 elements. See
+    // `compile_unmatched_build_kernel` doc.
+    debug_assert_eq!(
+        matched_dev.len(),
+        ((n_build_rows as usize) + 31) / 32,
+        "unmatched-build matched bitmap must be ceil(build_n_rows/32) u32 words"
+    );
     let ptx = compile_unmatched_build_kernel()?;
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(UNMATCHED_BUILD_KERNEL_ENTRY)?;
