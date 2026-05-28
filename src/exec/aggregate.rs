@@ -101,7 +101,10 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch,
+};
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -226,6 +229,19 @@ fn build_one_aggregate(
             let op = ReduceOp::from_agg(agg)?;
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
+            // v0.7 SUM(Decimal128) host fallback: a wide-128-bit accumulator
+            // requires either two-pass atomicCAS on 16-byte slots or a custom
+            // multi-word reduction — both are follow-up optimisations. For
+            // v0.7 we route SUM(Decimal128) through a host-side fold over the
+            // already-decoded `Decimal128Array` values, mirroring the
+            // (very similar) i64 host-strip fold below. MIN/MAX over
+            // Decimal128 stay rejected and fall through to
+            // `reduce_column_from_batch` (which rejects them as before).
+            if matches!(op, ReduceOp::Sum) {
+                if let DataType::Decimal128(p, s) = col_io.dtype {
+                    return sum_decimal128_from_batch(col_io, table_batch, p, s, out_field);
+                }
+            }
             let scalar = reduce_column_from_batch(op, col_io, table_batch, n_rows)?;
             scalar_to_array(scalar, out_field.dtype)
         }
@@ -471,6 +487,132 @@ fn bare_column_name(expr: &Expr) -> BoltResult<&str> {
                 .into(),
         )),
     }
+}
+
+/// v0.7: host-side `SUM(Decimal128(p, s))` reduction.
+///
+/// The GPU-side accumulator for a 128-bit SUM would need either a two-phase
+/// per-block reduction with a 16-byte atomicCAS (no native PTX op) or a
+/// custom multi-word merge — both are deferred. For v0.7 we walk the
+/// already-host-resident `Decimal128Array` once and fold every non-NULL
+/// row into an `i128` accumulator with a checked add. On overflow we
+/// return a `BoltError::Type` naming Decimal128 precision overflow rather
+/// than wrapping silently — the SUM result of a precision-p input set
+/// can exceed `i128::MAX` only if the input data is itself near-overflow,
+/// which the user expects to be loud rather than producing a wrong answer.
+///
+/// The result is packed as a single-row `Decimal128Array` carrying the
+/// same `(precision, scale)` as the input column. The plan-level output
+/// dtype rule for `SUM(Decimal128(p, s))` is `Decimal128(38, s)` — the
+/// widest precision Arrow supports — but the host-side checked add above
+/// already enforces the overflow contract, so packing with the input
+/// `(p, s)` and the planner's declared `Decimal128(38, s)` are both
+/// acceptable. We pack with `(38, s)` to match the planner-declared
+/// output schema (see `crate::plan::logical_plan::sum_output_dtype`); the
+/// checked add guarantees the value fits in Arrow's `i128` representation.
+///
+/// `out_field` is the planner's declared output field, used both to
+/// determine the result precision/scale and as the source of truth for
+/// the dtype contract the executor must satisfy. If `out_field.dtype`
+/// is not `Decimal128`, we surface a Type error so the planner / executor
+/// mismatch is loud.
+fn sum_decimal128_from_batch(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+    precision: u8,
+    scale: i8,
+    out_field: &Field,
+) -> BoltResult<ArrayRef> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "aggregate input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+
+    let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
+    if arr_dtype != col_io.dtype {
+        return Err(BoltError::Type(format!(
+            "aggregate input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
+            col_io.name, col_io.dtype, arr_dtype
+        )));
+    }
+
+    let da = arr
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| downcast_err(&col_io.name, "Decimal128"))?;
+
+    // The Arrow `Decimal128Array` carries its own (p, s); if it disagrees
+    // with the column's plan-level dtype the schema is internally
+    // inconsistent and any downstream consumer would mis-interpret the
+    // values. Mirror the upload-side guard in `gpu_table.rs`.
+    if let ArrowDataType::Decimal128(ap, as_) = da.data_type() {
+        if *ap != precision || *as_ != scale {
+            return Err(BoltError::Type(format!(
+                "SUM(Decimal128) column '{}': plan dtype Decimal128({precision}, {scale}) \
+                 disagrees with Arrow dtype Decimal128({ap}, {as_})",
+                col_io.name
+            )));
+        }
+    }
+
+    // Host-side fold: walk every row, skip NULLs, sum non-NULL i128 values
+    // into a checked accumulator. The empty-input identity is 0 — matches
+    // the SQL convention that SUM over an all-NULL (or empty) input is 0
+    // when the output column type is non-nullable, which is how this
+    // scalar-aggregate path packs every other SUM today.
+    let mut acc: i128 = 0;
+    for i in 0..da.len() {
+        if da.is_null(i) {
+            continue;
+        }
+        let v: i128 = da.value(i);
+        acc = match acc.checked_add(v) {
+            Some(s) => s,
+            None => {
+                return Err(BoltError::Type(format!(
+                    "SUM(Decimal128) precision overflow on column '{}': \
+                     accumulator exceeds i128 range",
+                    col_io.name
+                )));
+            }
+        };
+    }
+
+    // The output field's declared dtype is the source of truth. The
+    // planner's `sum_output_dtype` widens `Decimal128(p, s)` to
+    // `Decimal128(38, s)`, but we accept any Decimal128 output dtype as
+    // long as the scale matches; the precision is a digit-count limit
+    // that the checked add above has already verified the bit-pattern
+    // fits in i128 — Arrow's `with_precision_and_scale` enforces the
+    // digit-count limit on the values themselves and will surface an
+    // error if the accumulator's digit count exceeds the declared
+    // precision.
+    let (out_p, out_s) = match out_field.dtype {
+        DataType::Decimal128(p, s) => (p, s),
+        ref other => {
+            return Err(BoltError::Type(format!(
+                "SUM(Decimal128) output field dtype must be Decimal128, got {:?}",
+                other
+            )));
+        }
+    };
+    if out_s != scale {
+        return Err(BoltError::Type(format!(
+            "SUM(Decimal128) output scale {out_s} disagrees with input scale {scale}"
+        )));
+    }
+    let arr = Decimal128Array::from(vec![acc])
+        .with_precision_and_scale(out_p, out_s)
+        .map_err(|e| {
+            BoltError::Type(format!(
+                "SUM(Decimal128) result: precision/scale ({out_p}, {out_s}) \
+                 rejected by Arrow: {e}"
+            ))
+        })?;
+    Ok(Arc::new(arr) as ArrayRef)
 }
 
 /// Pull `col_io` out of the batch and run a GPU reduction over it.

@@ -1338,16 +1338,22 @@ pub fn sum_output_dtype(input: DataType) -> DataType {
         // engine's `DataType`). Overflow risk on Int64 is acknowledged at the
         // API boundary.
         DataType::Int64 | DataType::Float32 | DataType::Float64 => input,
-        // Non-numeric types fall through unchanged; the downstream typecheck
-        // (e.g. `ReduceOp::identity_ptx`) will reject the aggregate.
-        //
-        // Decimal128 is plan-level only in v0.6 / M4: the GPU codegen rejects
-        // it before any SUM accumulator is selected. We keep the type
-        // unchanged here so the rejection message names `Decimal128(p, s)`
-        // rather than a silently-widened sibling.
+        // v0.7: `SUM(Decimal128(p, s))` widens precision to the Arrow
+        // Decimal128 maximum (38 digits) and keeps the same scale. The
+        // host-side accumulator in `crate::exec::aggregate` (see
+        // `sum_decimal128_from_batch`) folds rows into an `i128` with a
+        // checked add — overflow on the i128 representation surfaces as
+        // a clear `BoltError::Type` rather than wrapping silently, so
+        // packing the result at the widest declared precision (38) is
+        // sound: the bit pattern is guaranteed to fit. Scale is preserved
+        // because SUM over a fixed-point input does not change the
+        // location of the decimal point.
+        DataType::Decimal128(_, s) => DataType::Decimal128(38, s),
+        // Other non-numeric types fall through unchanged; the downstream
+        // typecheck (e.g. `ReduceOp::identity_ptx`) will reject the
+        // aggregate.
         DataType::Bool
         | DataType::Utf8
-        | DataType::Decimal128(_, _)
         | DataType::Date32
         | DataType::Timestamp(_, _) => input,
     }
