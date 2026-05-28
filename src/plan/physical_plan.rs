@@ -219,6 +219,85 @@ pub struct AggregateSpec {
     pub input_has_validity: Vec<bool>,
 }
 
+/// Which prefix-scan algorithm a compaction kernel encodes.
+///
+/// The codegen helpers in [`crate::jit::prefix_scan`] emit one PTX
+/// blob per algorithm; the variant participates in the
+/// [`CompactionKernelSpec`] cache key so the three algorithms occupy
+/// distinct cache slots even though their host-side launch glue is
+/// nearly identical.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrefixScanAlgoTag {
+    /// O(n log n) Hillis-Steele ping-pong scan — `bolt_prefix_scan`.
+    /// The historical default. Pairs with the 4-arg launcher and
+    /// requires a host-side exclusive scan over the per-block sums.
+    HillisSteele,
+    /// O(n) Blelloch upsweep/downsweep scan — `bolt_prefix_scan_blelloch`.
+    /// Same 4-arg ABI as Hillis-Steele, so the launch glue can swap one
+    /// for the other without changing call sites.
+    Blelloch,
+    /// Single-pass decoupled-lookback scan — `bolt_prefix_scan_lookback`.
+    /// Folds the per-block reduce + global scan into one grid launch.
+    /// Pairs with a 5-arg launcher (extra `partial_status` array).
+    Lookback,
+}
+
+/// What kind of compaction kernel a [`CompactionKernelSpec`] describes.
+///
+/// Each variant maps 1:1 onto a PTX entry point in
+/// [`crate::jit::prefix_scan`] / [`crate::jit::prefix_scan_multipass`]:
+///
+/// * [`PrefixScan`](CompactionKernelKind::PrefixScan) — scans a `u8`
+///   mask. One PTX per [`PrefixScanAlgoTag`] variant.
+/// * [`PrefixScanU32`](CompactionKernelKind::PrefixScanU32) — the
+///   multipass recursion's intermediate level (`bolt_prefix_scan_u32`):
+///   same Hillis-Steele body but reads a `u32` count instead of a `u8`
+///   mask byte.
+/// * [`AddBlockBases`](CompactionKernelKind::AddBlockBases) — the
+///   multipass fold step (`bolt_add_block_bases`) that injects the
+///   parent-level bases into a child-level local index array.
+/// * [`Gather`](CompactionKernelKind::Gather) — per-dtype fixed-width
+///   gather kernel (`bolt_gather_<dty>`). Two specs with different
+///   `DataType` arguments are distinct cache entries because the PTX
+///   text differs.
+/// * [`GatherBoolNullable`](CompactionKernelKind::GatherBoolNullable) —
+///   logically a `Gather(Bool)` launch reused for the values + validity
+///   pair. The variant exists so a future kernel that fuses both
+///   buffers in one launch (today they are two `Gather(Bool)` launches)
+///   can claim its own cache slot without churning the IR.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionKernelKind {
+    /// Scan a `u8` mask using the named algorithm.
+    PrefixScan(PrefixScanAlgoTag),
+    /// Scan a `u32` array — multipass recursion's intermediate level.
+    PrefixScanU32,
+    /// Fold per-block bases into per-row local indices (multipass).
+    AddBlockBases,
+    /// Per-dtype fixed-width gather kernel.
+    Gather(DataType),
+    /// Reserved cache slot for a future fused values+validity gather.
+    /// Today the engine launches two `Gather(Bool)` kernels back-to-back
+    /// to compact a nullable-bool column; once a dedicated fused PTX
+    /// kernel exists it will own this slot.
+    GatherBoolNullable,
+}
+
+/// Spec describing one compaction-family PTX kernel.
+///
+/// The compaction family covers the prefix-scan + gather pipeline that
+/// `crate::exec::gpu_compact` and `crate::exec::gpu_compact_multipass`
+/// use to materialise filter results on the device. Every codegen-time
+/// knob the PTX text depends on lives in `kind`; two spec values with
+/// equal `kind` hash to the same cache slot.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompactionKernelSpec {
+    /// What flavour of compaction kernel this spec describes.
+    pub kind: CompactionKernelKind,
+}
+
 /// The top-level physical plan: a small ordered pipeline of kernels.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
