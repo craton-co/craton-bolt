@@ -353,7 +353,10 @@ pub fn device_name(dev: CUdevice) -> BoltResult<String> {
     const LEN: usize = 256;
     let mut buf: [c_char; LEN] = [0; LEN];
     check(unsafe { cuDeviceGetName(buf.as_mut_ptr(), LEN as c_int, dev) })?;
-    // Buffer is NUL-terminated by the driver; find the terminator ourselves to be safe.
+    // Defensively force a NUL terminator at the final byte. The driver is
+    // documented to NUL-terminate, but if it ever wrote exactly LEN bytes
+    // without a terminator, `CStr::from_ptr` would read past the array.
+    buf[LEN - 1] = 0;
     let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
     Ok(cstr.to_string_lossy().trim_end_matches('\0').to_string())
 }

@@ -76,6 +76,7 @@ fn device() -> BoltResult<Arc<CudaDevice>> {
     // Lazily initialise on device 0 if nobody called `ensure_device`
     // first. This preserves the original spike behaviour for callers
     // that go directly through this module's `mem_alloc` etc.
+    // PERF-NOTE: Arc::clone in hot memcpy path; defer optimisation to Stage 2.
     GLOBAL_DEVICE
         .get_or_try_init(|| {
             CudaDevice::new(0)
@@ -105,7 +106,19 @@ fn cudarc_err(context: &str, e: cudarc::driver::DriverError) -> BoltError {
 
 /// Allocate `bytes` of device memory via cudarc's raw `malloc_sync`.
 /// Returned pointer is bit-compatible with `cuda_sys::mem_alloc`.
+///
+/// `bytes == 0` is rejected at the wrapper boundary: the CUDA driver's
+/// behaviour for zero-byte allocations is implementation-defined (some
+/// versions return `CUDA_ERROR_INVALID_VALUE`, others a non-null sentinel
+/// pointer that cannot be freed by `cuMemFree_v2`). We refuse the call so
+/// callers get a deterministic, typed error instead of a context-dependent
+/// driver failure.
 pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
+    if bytes == 0 {
+        return Err(BoltError::Other(
+            "mem_alloc: zero-byte allocation not allowed".into(),
+        ));
+    }
     // Ensure the primary context is current on this thread.
     let _dev = device()?;
     unsafe {
@@ -135,12 +148,26 @@ pub unsafe fn memcpy_h2d<T>(
     src: *const T,
     count: usize,
 ) -> BoltResult<()> {
+    // Zero-length copies must short-circuit BEFORE synthesising a slice from
+    // `src`: `std::slice::from_raw_parts` requires a non-null, aligned, and
+    // dereferenceable pointer regardless of the requested length, so a caller
+    // passing `count = 0` with `src = null` would otherwise hit immediate UB.
+    if count == 0 {
+        return Ok(());
+    }
     let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
         BoltError::Memory(format!(
             "cudarc memcpy_h2d size overflow: {count} * {}",
             std::mem::size_of::<T>()
         ))
     })?;
+    if bytes == 0 {
+        return Ok(());
+    }
+    debug_assert!(
+        !src.is_null(),
+        "memcpy_h2d: src is null with non-zero count"
+    );
     let src_bytes = std::slice::from_raw_parts(src as *const u8, bytes);
     result::memcpy_htod_sync(dst as cudarc::driver::sys::CUdeviceptr, src_bytes)
         .map_err(|e| cudarc_err("cudarc memcpy_htod_sync", e))
@@ -156,12 +183,26 @@ pub unsafe fn memcpy_d2h<T>(
     src: CUdeviceptr,
     count: usize,
 ) -> BoltResult<()> {
+    // Zero-length copies must short-circuit BEFORE synthesising a slice from
+    // `dst`: `std::slice::from_raw_parts_mut` requires a non-null, aligned,
+    // dereferenceable pointer regardless of the requested length, so a caller
+    // passing `count = 0` with `dst = null` would otherwise hit immediate UB.
+    if count == 0 {
+        return Ok(());
+    }
     let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
         BoltError::Memory(format!(
             "cudarc memcpy_d2h size overflow: {count} * {}",
             std::mem::size_of::<T>()
         ))
     })?;
+    if bytes == 0 {
+        return Ok(());
+    }
+    debug_assert!(
+        !dst.is_null(),
+        "memcpy_d2h: dst is null with non-zero count"
+    );
     let dst_bytes = std::slice::from_raw_parts_mut(dst as *mut u8, bytes);
     result::memcpy_dtoh_sync(dst_bytes, src as cudarc::driver::sys::CUdeviceptr)
         .map_err(|e| cudarc_err("cudarc memcpy_dtoh_sync", e))
@@ -203,12 +244,26 @@ pub(crate) unsafe fn memcpy_h2d_async<T>(
     count: usize,
     stream: CUstream,
 ) -> BoltResult<()> {
+    // Defensive short-circuit on zero-length copies. Unlike the sync sibling
+    // this path does not synthesise a `&[u8]`, but the driver's behaviour on
+    // a zero-byte async copy with a null host pointer is implementation-
+    // defined, and the `debug_assert` below documents the non-zero contract.
+    if count == 0 {
+        return Ok(());
+    }
     let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
         BoltError::Memory(format!(
             "cudarc memcpy_h2d_async size overflow: {count} * {}",
             std::mem::size_of::<T>()
         ))
     })?;
+    if bytes == 0 {
+        return Ok(());
+    }
+    debug_assert!(
+        !src.is_null(),
+        "memcpy_h2d_async: src is null with non-zero count"
+    );
     // Ensure the primary context is current on this thread before any FFI.
     let _dev = device()?;
     cudarc::driver::sys::lib()
@@ -237,12 +292,24 @@ pub(crate) unsafe fn memcpy_d2h_async<T>(
     count: usize,
     stream: CUstream,
 ) -> BoltResult<()> {
+    // Defensive short-circuit on zero-length copies; mirrors the sync path
+    // and keeps the non-null contract on `dst` explicit via `debug_assert`.
+    if count == 0 {
+        return Ok(());
+    }
     let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
         BoltError::Memory(format!(
             "cudarc memcpy_d2h_async size overflow: {count} * {}",
             std::mem::size_of::<T>()
         ))
     })?;
+    if bytes == 0 {
+        return Ok(());
+    }
+    debug_assert!(
+        !dst.is_null(),
+        "memcpy_d2h_async: dst is null with non-zero count"
+    );
     let _dev = device()?;
     cudarc::driver::sys::lib()
         .cuMemcpyDtoHAsync_v2(
