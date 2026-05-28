@@ -1727,6 +1727,14 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
             }
             Ok(false)
         }
+        // BETWEEN/NOT-BETWEEN expand into a tree that references `expr`,
+        // `low`, and `high` — any of which may transitively contain an
+        // aggregate call (e.g. `HAVING SUM(v) BETWEEN 0 AND 10`).
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => Ok(contains_aggregate(expr, resolver, depth + 1)?
+            || contains_aggregate(low, resolver, depth + 1)?
+            || contains_aggregate(high, resolver, depth + 1)?),
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
         _ => Ok(false),
     }
@@ -1819,10 +1827,7 @@ fn lower_expr_in_having(
         // anywhere in the operand or the list (e.g.
         // `HAVING SUM(v) IN (10, 20)`) resolve to the aggregate-output
         // column reference, then desugar to the same OR/AND chain shape
-        // as scalar `lower_in_list`. Capping and empty-list folding are
-        // shared with the scalar path; we re-derive them here so the
-        // HAVING surface is total without depending on the scalar entry
-        // point for aggregate rewriting.
+        // as scalar `lower_in_list`.
         SqlExpr::InList {
             expr,
             list,
@@ -1863,6 +1868,53 @@ fn lower_expr_in_having(
                 });
             }
             Ok(acc.expect("non-empty IN list guarantees at least one chain element"))
+        }
+        // HAVING ... BETWEEN ...: desugar the same way as the scalar lowerer
+        // but route each operand through `lower_expr_in_having` so aggregate
+        // calls inside any of {expr, low, high} are rewritten to the
+        // aggregate-output column reference.
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let operand = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
+            let lo = lower_expr_in_having(low, resolver, agg_aliases, depth + 1)?;
+            let hi = lower_expr_in_having(high, resolver, agg_aliases, depth + 1)?;
+            if *negated {
+                let lt_low = Expr::Binary {
+                    op: BinaryOp::Lt,
+                    left: Box::new(operand.clone()),
+                    right: Box::new(lo),
+                };
+                let gt_high = Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(operand),
+                    right: Box::new(hi),
+                };
+                Ok(Expr::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(lt_low),
+                    right: Box::new(gt_high),
+                })
+            } else {
+                let ge_low = Expr::Binary {
+                    op: BinaryOp::GtEq,
+                    left: Box::new(operand.clone()),
+                    right: Box::new(lo),
+                };
+                let le_high = Expr::Binary {
+                    op: BinaryOp::LtEq,
+                    left: Box::new(operand),
+                    right: Box::new(hi),
+                };
+                Ok(Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(ge_low),
+                    right: Box::new(le_high),
+                })
+            }
         }
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
@@ -2006,10 +2058,54 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
         // of element-wise equalities/inequalities so existing comparison and
         // boolean codegen handles it without a new operator. See
         // [`lower_in_list`] for the cap (`MAX_IN_LIST_VALUES`) and the empty-
-        // list constant-folding rule. A large-list hash-probe path is a
-        // separate follow-up.
+        // list constant-folding rule.
         SqlExpr::InList { expr, list, negated } => {
             lower_in_list(expr, list, *negated, resolver, depth + 1)
+        }
+        // `expr BETWEEN low AND high`  →  `(expr >= low) AND (expr <= high)`
+        // `expr NOT BETWEEN low AND high`  →  `(expr <  low) OR  (expr >  high)`
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let operand = lower_expr(expr, resolver, depth + 1)?;
+            let lo = lower_expr(low, resolver, depth + 1)?;
+            let hi = lower_expr(high, resolver, depth + 1)?;
+            if *negated {
+                let lt_low = Expr::Binary {
+                    op: BinaryOp::Lt,
+                    left: Box::new(operand.clone()),
+                    right: Box::new(lo),
+                };
+                let gt_high = Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(operand),
+                    right: Box::new(hi),
+                };
+                Ok(Expr::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(lt_low),
+                    right: Box::new(gt_high),
+                })
+            } else {
+                let ge_low = Expr::Binary {
+                    op: BinaryOp::GtEq,
+                    left: Box::new(operand.clone()),
+                    right: Box::new(lo),
+                };
+                let le_high = Expr::Binary {
+                    op: BinaryOp::LtEq,
+                    left: Box::new(operand),
+                    right: Box::new(hi),
+                };
+                Ok(Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(ge_low),
+                    right: Box::new(le_high),
+                })
+            }
         }
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "scalar function calls are not supported".into(),
