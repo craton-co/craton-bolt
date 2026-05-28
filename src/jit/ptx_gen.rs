@@ -799,6 +799,21 @@ fn emit_binary(
                 mnemonic, dst_name, lhs_name, rhs_name
             ))
         }
+        Concat => {
+            // String concat lives entirely on the host (see
+            // `crate::exec::string_ops::host_concat_strings`); the
+            // physical-plan lowerer routes any expression that contains
+            // `BinaryOp::Concat` through `PhysicalPlan::Project` (host
+            // executor) instead of the fused GPU kernel. Reaching this
+            // arm therefore indicates a missing route; surface a clear
+            // error rather than emitting nonsense PTX.
+            Err(BoltError::Other(
+                "ptx_gen: string concat (||) is not lowered to GPU; \
+                 the planner should route this through the host-side \
+                 PhysicalPlan::Project executor"
+                    .into(),
+            ))
+        }
     }
 }
 

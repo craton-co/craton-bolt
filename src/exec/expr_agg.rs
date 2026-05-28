@@ -380,12 +380,39 @@ fn eval_binary(
         eval_comparison(op, l, r)
     } else if is_logical(op) {
         eval_logical(op, l, r)
+    } else if is_string(op) {
+        eval_string(op, l, r)
     } else {
         Err(BoltError::Other(format!(
             "expr_agg: unsupported operator {:?}",
             op
         )))
     }
+}
+
+/// Evaluate string-valued binary ops — today only `BinaryOp::Concat` (SQL
+/// `||`). Both operands must be Utf8; result is Utf8. NULL on either side
+/// propagates as NULL (standard SQL).
+fn eval_string(op: BinaryOp, lhs: HostColumn, rhs: HostColumn) -> BoltResult<HostColumn> {
+    if !matches!(op, BinaryOp::Concat) {
+        return Err(BoltError::Other(format!(
+            "expr_agg: unsupported string operator {:?}",
+            op
+        )));
+    }
+    let (a, b) = match (lhs, rhs) {
+        (HostColumn::Utf8(a), HostColumn::Utf8(b)) => (a, b),
+        (l, r) => {
+            return Err(BoltError::Type(format!(
+                "expr_agg: string {:?} requires Utf8 operands, got {:?} and {:?}",
+                op,
+                l.dtype(),
+                r.dtype()
+            )));
+        }
+    };
+    let out = crate::exec::string_ops::host_concat_option_strings(&a, &b)?;
+    Ok(HostColumn::Utf8(out))
 }
 
 /// Evaluate a unary op — today: `IS NULL` / `IS NOT NULL`.
@@ -930,6 +957,11 @@ fn is_comparison(op: BinaryOp) -> bool {
 /// True for `AND OR`.
 fn is_logical(op: BinaryOp) -> bool {
     matches!(op, BinaryOp::And | BinaryOp::Or)
+}
+
+/// True for string-valued binary ops — today only `||` (Concat).
+fn is_string(op: BinaryOp) -> bool {
+    matches!(op, BinaryOp::Concat)
 }
 
 // ---------------------------------------------------------------------------

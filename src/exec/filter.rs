@@ -84,7 +84,10 @@ pub fn execute_filter(input: QueryHandle, predicate: &Expr) -> BoltResult<QueryH
 /// Lift an Arrow array into a `HostColumn`. Only the primitive dtypes the
 /// engine actually surfaces above an Aggregate (Int32/Int64/Float32/Float64/
 /// Bool/Utf8) are supported — same set as `engine.rs`'s `arrow_dtype_to_plan`.
-fn arrow_array_to_host_column(arr: &dyn Array, n_rows: usize) -> BoltResult<HostColumn> {
+///
+/// Exposed `pub(crate)` so the `PhysicalPlan::Project` executor in
+/// `engine.rs` can reuse it for the compute path (string `||`, etc.).
+pub(crate) fn arrow_array_to_host_column(arr: &dyn Array, n_rows: usize) -> BoltResult<HostColumn> {
     match arr.data_type() {
         ArrowDataType::Int32 => {
             let a = arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {

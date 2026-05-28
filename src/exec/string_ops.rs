@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 
-use arrow_array::{BooleanArray, Int32Array};
+use arrow_array::{BooleanArray, Int32Array, StringArray};
 
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::GpuVec;
@@ -267,6 +267,77 @@ fn remap_and_upload(
 }
 
 // ---------------------------------------------------------------------------
+// SQL `||` (StringConcat) — host-side helper over Arrow `StringArray`s.
+//
+// `string_ops_extended::concat` operates on `DictionaryColumn`s (device-side
+// inputs / outputs) and is the right tool when the engine is already holding
+// dictionary-encoded columns. The v0.5 SQL frontend lowers `a || b` to
+// `BinaryOp::Concat`, which the executor's host-side projection path
+// evaluates over `StringArray` cells lifted from the input batch — see
+// `exec::expr_agg::eval_binary` / `exec::engine.rs::execute` Project arm.
+//
+// Semantics: NULL on either side propagates as NULL (standard SQL).
+// ---------------------------------------------------------------------------
+
+/// Concatenate two Arrow `StringArray`s row-by-row.
+///
+/// Returns a new `StringArray` with the same number of rows as both inputs.
+/// NULL on either side at row `i` yields NULL at row `i` in the output
+/// (standard SQL). Errors if the two inputs have different lengths.
+pub fn host_concat_strings(left: &StringArray, right: &StringArray) -> BoltResult<StringArray> {
+    if left.len() != right.len() {
+        return Err(BoltError::Other(format!(
+            "CONCAT (||): row count mismatch (left = {}, right = {})",
+            left.len(),
+            right.len()
+        )));
+    }
+    let n = left.len();
+    let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+    for i in 0..n {
+        if left.is_null(i) || right.is_null(i) {
+            out.push(None);
+        } else {
+            let mut s = String::with_capacity(left.value(i).len() + right.value(i).len());
+            s.push_str(left.value(i));
+            s.push_str(right.value(i));
+            out.push(Some(s));
+        }
+    }
+    Ok(StringArray::from(out))
+}
+
+/// Pure-host helper used by `crate::exec::expr_agg::eval_binary` to fold
+/// `BinaryOp::Concat` over two `Vec<Option<String>>` columns. NULL on either
+/// side propagates as NULL.
+pub fn host_concat_option_strings(
+    left: &[Option<String>],
+    right: &[Option<String>],
+) -> BoltResult<Vec<Option<String>>> {
+    if left.len() != right.len() {
+        return Err(BoltError::Other(format!(
+            "CONCAT (||): row count mismatch (left = {}, right = {})",
+            left.len(),
+            right.len()
+        )));
+    }
+    let out = left
+        .iter()
+        .zip(right.iter())
+        .map(|(l, r)| match (l, r) {
+            (Some(l), Some(r)) => {
+                let mut s = String::with_capacity(l.len() + r.len());
+                s.push_str(l);
+                s.push_str(r);
+                Some(s)
+            }
+            _ => None,
+        })
+        .collect();
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Tests. Live round-trip tests would need a CUDA runtime (the GpuVec
 // upload/download paths talk to the driver), so we instead exhaustively test
 // the pure helpers that contain all the actual logic. Anything that *does*
@@ -383,5 +454,48 @@ mod tests {
         let (new_dict, remap) = dedup_transformed(t).unwrap();
         assert_eq!(new_dict, vec!["X"]);
         assert_eq!(remap, vec![0, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn host_concat_strings_basic() {
+        let l = StringArray::from(vec!["a", "b", "c"]);
+        let r = StringArray::from(vec!["1", "2", "3"]);
+        let out = host_concat_strings(&l, &r).unwrap();
+        let got: Vec<&str> = (0..out.len()).map(|i| out.value(i)).collect();
+        assert_eq!(got, vec!["a1", "b2", "c3"]);
+    }
+
+    #[test]
+    fn host_concat_strings_propagates_nulls() {
+        let l = StringArray::from(vec![Some("a"), None, Some("c")]);
+        let r = StringArray::from(vec![Some("x"), Some("y"), None]);
+        let out = host_concat_strings(&l, &r).unwrap();
+        assert!(!out.is_null(0));
+        assert_eq!(out.value(0), "ax");
+        assert!(out.is_null(1));
+        assert!(out.is_null(2));
+    }
+
+    #[test]
+    fn host_concat_strings_length_mismatch_errors() {
+        let l = StringArray::from(vec!["a", "b"]);
+        let r = StringArray::from(vec!["x"]);
+        let err = host_concat_strings(&l, &r).unwrap_err();
+        match err {
+            BoltError::Other(msg) => assert!(msg.contains("row count mismatch")),
+            _ => panic!("expected Other(row count mismatch), got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn host_concat_option_strings_basic() {
+        let l: Vec<Option<String>> =
+            vec![Some("a".into()), None, Some("c".into())];
+        let r: Vec<Option<String>> =
+            vec![Some("x".into()), Some("y".into()), None];
+        let out = host_concat_option_strings(&l, &r).unwrap();
+        assert_eq!(out[0], Some("ax".into()));
+        assert_eq!(out[1], None);
+        assert_eq!(out[2], None);
     }
 }

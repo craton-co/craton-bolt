@@ -1403,39 +1403,79 @@ impl Engine {
                 exprs,
                 output_schema,
             } => {
-                // Rename/reorder layer over an arbitrary upstream. Each
-                // `exprs` entry is a bare column reference (possibly aliased)
-                // into the input's schema; we just pick those columns out
-                // and re-wrap them under `output_schema`. No compute.
+                // Rename/reorder/compute layer over an arbitrary upstream.
+                //
+                // Fast path: when an `exprs` entry is a bare `Column` or an
+                // `Alias` wrapping a `Column`, we just pick that column out
+                // of the input batch (no compute, zero-copy clone of the
+                // `ArrayRef`).
+                //
+                // Compute path: anything else (today: SQL `a || b`, i.e.
+                // `BinaryOp::Concat`) is materialised via
+                // `expr_agg::eval_expr` over a `HostColumn` env built from
+                // the input batch. The lazy lift (only build the env when
+                // a compute expr appears) keeps the bare-projection case
+                // free of overhead.
                 let h = self.execute(input)?;
                 let in_batch = h.batch;
                 let in_schema = in_batch.schema();
+                let n_rows = in_batch.num_rows();
+
+                // Lazily-built env for the compute path; `None` until the
+                // first non-bare-column expression in `exprs` forces us to
+                // lift every input column into a `HostColumn`.
+                let mut owned_env: Option<Vec<(String, crate::exec::expr_agg::HostColumn)>> = None;
+
                 let mut columns: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
-                for e in exprs {
-                    let name = match e {
-                        crate::plan::Expr::Column(n) => n.as_str(),
-                        crate::plan::Expr::Alias(inner, _) => match inner.as_ref() {
-                            crate::plan::Expr::Column(n) => n.as_str(),
-                            _ => {
-                                return Err(BoltError::Plan(
-                                    "PhysicalPlan::Project: aliased expression must be a column reference"
-                                        .into(),
-                                ));
+                for (out_idx, e) in exprs.iter().enumerate() {
+                    // Peel through transparent aliases to look at the inner
+                    // expression. A bare column reference (with any number
+                    // of aliases around it) gets the fast path; anything
+                    // else falls into the compute path.
+                    let inner = {
+                        let mut cur = e;
+                        loop {
+                            match cur {
+                                crate::plan::Expr::Alias(inner, _) => cur = inner.as_ref(),
+                                _ => break cur,
                             }
-                        },
-                        _ => {
-                            return Err(BoltError::Plan(
-                                "PhysicalPlan::Project: only column references / aliases are supported"
-                                    .into(),
-                            ));
                         }
                     };
-                    let idx = in_schema.index_of(name).map_err(|_| {
-                        BoltError::Plan(format!(
-                            "PhysicalPlan::Project: column '{name}' not found in input schema"
-                        ))
-                    })?;
-                    columns.push(in_batch.column(idx).clone());
+                    if let crate::plan::Expr::Column(name) = inner {
+                        let idx = in_schema.index_of(name).map_err(|_| {
+                            BoltError::Plan(format!(
+                                "PhysicalPlan::Project: column '{name}' not found in input schema"
+                            ))
+                        })?;
+                        columns.push(in_batch.column(idx).clone());
+                        continue;
+                    }
+                    // Compute path. Build the env if we haven't yet.
+                    if owned_env.is_none() {
+                        let mut v = Vec::with_capacity(in_batch.num_columns());
+                        for (i, field) in in_schema.fields().iter().enumerate() {
+                            let arr = in_batch.column(i);
+                            let hc = crate::exec::filter::arrow_array_to_host_column(
+                                arr.as_ref(),
+                                n_rows,
+                            )?;
+                            v.push((field.name().clone(), hc));
+                        }
+                        owned_env = Some(v);
+                    }
+                    let env_ref = owned_env.as_ref().expect("just built");
+                    let env: crate::exec::expr_agg::ColumnEnv<'_> = env_ref
+                        .iter()
+                        .map(|(n, c)| (n.clone(), c))
+                        .collect();
+                    let out_field = &output_schema.fields[out_idx];
+                    let computed = crate::exec::expr_agg::eval_expr(
+                        inner,
+                        &env,
+                        out_field.dtype,
+                        n_rows,
+                    )?;
+                    columns.push(host_column_to_arrow_array(computed)?);
                 }
                 let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
                 let out = RecordBatch::try_new(arrow_schema, columns).map_err(|e| {
@@ -2361,6 +2401,28 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
         fields.push(ArrowField::new(&f.name, dt, f.nullable));
     }
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+/// Convert a host-side computed `HostColumn` into an `ArrayRef`.
+///
+/// Used by the `PhysicalPlan::Project` compute path (string `||`,
+/// arithmetic over post-aggregate scalars, …) to fold a freshly
+/// materialised column back into the output `RecordBatch`. Mirrors the
+/// `arrow_array_to_host_column` shape in `filter.rs` (the inverse
+/// direction).
+fn host_column_to_arrow_array(col: crate::exec::expr_agg::HostColumn) -> BoltResult<ArrayRef> {
+    use crate::exec::expr_agg::HostColumn;
+    Ok(match col {
+        HostColumn::Bool(v) => Arc::new(BooleanArray::from(v)) as ArrayRef,
+        HostColumn::I32(v) => Arc::new(Int32Array::from(v)) as ArrayRef,
+        HostColumn::I64(v) => Arc::new(Int64Array::from(v)) as ArrayRef,
+        HostColumn::F32(v) => Arc::new(Float32Array::from(v)) as ArrayRef,
+        HostColumn::F64(v) => Arc::new(Float64Array::from(v)) as ArrayRef,
+        HostColumn::Utf8(v) => {
+            let arr = arrow_array::StringArray::from(v);
+            Arc::new(arr) as ArrayRef
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
