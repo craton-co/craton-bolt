@@ -2588,19 +2588,31 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             }
         }
         LogicalPlan::Filter { input, predicate } => {
-            // v0.5: `||` in a WHERE predicate (e.g. `WHERE a || b = 'foo'`)
-            // type-checks at the logical plane but is not yet lowered to a
-            // physical plan — the GPU codegen has no Utf8 support and the
-            // host-side fused Filter path lacks Utf8 column materialisation
-            // out of the scan kernel. Surface a clear plan error so users
-            // get an actionable message rather than a kernel-launch failure.
+            // v0.7: `||` in a WHERE predicate (e.g. `WHERE a || b = 'foo'`)
+            // routes through the host-side `PhysicalPlan::Filter` executor,
+            // mirroring how compound `IS NULL` and `LIKE` are handled. The
+            // GPU codegen has no Utf8 register class or string-compare ops
+            // and the SELECT-list `||` path is itself host-side
+            // (`expr_agg::eval_expr` → `host_concat_strings`), so the
+            // cleanest lift is to keep `||` host-side everywhere: lower the
+            // inner plan so its output batch carries the Utf8 columns the
+            // predicate references, then evaluate `predicate` row-by-row in
+            // `crate::exec::filter::execute_filter`. This composes for free
+            // with `LIKE` (the host evaluator already routes
+            // `(a || b) LIKE 'pat'` through `eval_like` → `eval_inner` →
+            // `eval_binary(Concat)`), so equality, inequality, and LIKE all
+            // work without a separate code path.
             if expr_contains_concat(predicate) {
-                return Err(BoltError::Plan(
-                    "string concat (||) in WHERE predicates is not yet supported; \
-                     use a host-side projection (SELECT a || b FROM t) or fold the \
-                     comparison literal into the SELECT list first"
-                        .into(),
-                ));
+                log::debug!(
+                    "physical_plan: BinaryOp::Concat in Filter predicate; \
+                     lowering to host-side PhysicalPlan::Filter \
+                     (GPU codegen has no Utf8 support)"
+                );
+                let inner = lower(input)?;
+                return Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                });
             }
             // GPU codegen handles `column IS [NOT] NULL` natively via
             // `Op::IsNullCheck` — see `Codegen::emit_unary`. The host
@@ -2969,6 +2981,165 @@ mod tests {
             ),
             other => panic!("expected BoltError::Plan, got {other:?}"),
         }
+    }
+
+    // ---- v0.7: WHERE `||` (BinaryOp::Concat) lowers to host-side filter ----
+
+    /// Schema fixture: two Utf8 columns `a`, `b` plus an Int64 `v`. Mirrors
+    /// the realistic shape of a `WHERE name || surname = 'JohnDoe'`
+    /// predicate alongside a non-Utf8 projection column.
+    fn ab_v_scan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("a", DataType::Utf8, false),
+                Field::new("b", DataType::Utf8, false),
+                Field::new("v", DataType::Int64, false),
+            ]),
+        }
+    }
+
+    /// `WHERE a || b = 'foo'` must lower to a `PhysicalPlan::Filter` that
+    /// preserves the predicate verbatim, mirroring the routing for LIKE and
+    /// compound `IS NULL`. The inner plan is whatever `lower()` produces for
+    /// the underlying Scan; the executor (`exec::filter::execute_filter`)
+    /// evaluates the concat row-by-row via `expr_agg::eval_expr`.
+    #[test]
+    fn where_concat_column_column_eq_literal_lowers_to_host_filter() {
+        let scan = ab_v_scan();
+        let pred = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Concat,
+                left: Box::new(Expr::Column("a".into())),
+                right: Box::new(Expr::Column("b".into())),
+            }),
+            right: Box::new(Expr::Literal(Literal::Utf8("foo".into()))),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let phys = lower(&plan).expect("WHERE a || b = 'foo' must lower cleanly in v0.7");
+        match phys {
+            PhysicalPlan::Filter { predicate, .. } => {
+                // Predicate is preserved verbatim — the host filter
+                // executor sees the same tree the planner built.
+                match &predicate {
+                    Expr::Binary {
+                        op: BinaryOp::Eq,
+                        left,
+                        right,
+                    } => {
+                        assert!(
+                            matches!(
+                                left.as_ref(),
+                                Expr::Binary { op: BinaryOp::Concat, .. }
+                            ),
+                            "LHS must be a Concat, got: {left:?}",
+                        );
+                        match right.as_ref() {
+                            Expr::Literal(Literal::Utf8(s)) => assert_eq!(s, "foo"),
+                            other => panic!("RHS must be Utf8 literal 'foo', got: {other:?}"),
+                        }
+                    }
+                    other => panic!("predicate not preserved: {other:?}"),
+                }
+            }
+            other => panic!(
+                "expected PhysicalPlan::Filter for WHERE-|| predicate, got {other:?}"
+            ),
+        }
+    }
+
+    /// `WHERE 'a' || b = 'ab'` — literal-on-left shape. Same routing as the
+    /// column-on-left case; just confirms the `expr_contains_concat` walk
+    /// catches the Concat regardless of which operand carries the literal.
+    #[test]
+    fn where_concat_literal_column_eq_literal_lowers_to_host_filter() {
+        let scan = ab_v_scan();
+        let pred = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Concat,
+                left: Box::new(Expr::Literal(Literal::Utf8("a".into()))),
+                right: Box::new(Expr::Column("b".into())),
+            }),
+            right: Box::new(Expr::Literal(Literal::Utf8("ab".into()))),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let phys = lower(&plan).expect("WHERE 'a' || b = 'ab' must lower cleanly in v0.7");
+        assert!(
+            matches!(phys, PhysicalPlan::Filter { .. }),
+            "expected PhysicalPlan::Filter for literal||column predicate, got {phys:?}",
+        );
+    }
+
+    /// `WHERE a || b <> 'foo'` — inequality composes the same way. The host
+    /// filter handles `=`, `<>`, and `LIKE` over a Concat operand uniformly
+    /// via `expr_agg::eval_expr`, so the routing test only needs to confirm
+    /// the lower produces a Filter shape (no concat-rejection error).
+    #[test]
+    fn where_concat_neq_literal_lowers_to_host_filter() {
+        let scan = ab_v_scan();
+        let pred = Expr::Binary {
+            op: BinaryOp::NotEq,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Concat,
+                left: Box::new(Expr::Column("a".into())),
+                right: Box::new(Expr::Column("b".into())),
+            }),
+            right: Box::new(Expr::Literal(Literal::Utf8("foo".into()))),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let phys = lower(&plan).expect("WHERE a || b <> 'foo' must lower cleanly in v0.7");
+        assert!(
+            matches!(phys, PhysicalPlan::Filter { .. }),
+            "expected PhysicalPlan::Filter for WHERE concat <> 'lit', got {phys:?}",
+        );
+    }
+
+    /// A Concat nested under an AND (e.g.
+    /// `WHERE v > 0 AND a || b = 'foo'`) must still route through the host
+    /// filter — the walk is recursive. Guards against a future refactor
+    /// that accidentally only inspects the top-level binary op.
+    #[test]
+    fn where_concat_under_and_lowers_to_host_filter() {
+        let scan = ab_v_scan();
+        let pred = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("v".into())),
+                right: Box::new(Expr::Literal(Literal::Int64(0))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Binary {
+                    op: BinaryOp::Concat,
+                    left: Box::new(Expr::Column("a".into())),
+                    right: Box::new(Expr::Column("b".into())),
+                }),
+                right: Box::new(Expr::Literal(Literal::Utf8("foo".into()))),
+            }),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let phys = lower(&plan)
+            .expect("WHERE v > 0 AND a || b = 'foo' must lower cleanly in v0.7");
+        assert!(
+            matches!(phys, PhysicalPlan::Filter { .. }),
+            "expected PhysicalPlan::Filter for AND-wrapped concat predicate, got {phys:?}",
+        );
     }
 
     /// Companion to `empty_union_surfaces_as_plan_error_not_panic`: a
