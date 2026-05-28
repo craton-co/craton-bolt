@@ -15,7 +15,7 @@ use sqlparser::ast::{
     UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::parser::{Parser, ParserError};
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
@@ -463,7 +463,8 @@ pub fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan>
 /// to read and so tests / benches that want to bypass the cache can.
 fn parse_uncached(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
     let dialect = GenericDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| BoltError::Sql(e.to_string()))?;
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
 
     if stmts.len() != 1 {
         return Err(BoltError::Sql(format!(
@@ -481,6 +482,130 @@ fn parse_uncached(sql: &str, provider: &dyn TableProvider) -> BoltResult<Logical
         }
     };
     plan_query(&query, provider, 0)
+}
+
+/// v0.6 / M5: convert a `sqlparser` [`ParserError`] into a [`BoltError`],
+/// preserving the location information that sqlparser appends to its
+/// `Display` output (`"... at Line: <L>, Column: <C>"`) as a byte-offset
+/// span on [`BoltError::SqlWithSpan`].
+///
+/// sqlparser 0.52 does NOT expose `Location` structurally on the error
+/// type itself — the location only appears as text in the formatted
+/// message — so this helper does a small amount of string surgery to
+/// recover the line/column pair, then maps it to a byte offset against
+/// `sql`. When no location suffix is present (e.g.
+/// [`ParserError::RecursionLimitExceeded`]) we fall back to the legacy
+/// unspanned [`BoltError::Sql`] shape so the public API surface stays
+/// uniform.
+///
+/// The half-open span is `[byte_offset .. byte_offset]` (zero-width)
+/// because sqlparser only tells us *where* the error is, not how wide
+/// the offending token is. A zero-width span is documented as legal on
+/// [`BoltError::SqlWithSpan`] and editor consumers typically render it
+/// as a single-character squiggle at the position.
+pub(crate) fn parse_error_to_bolt_error(e: ParserError, sql: &str) -> BoltError {
+    let rendered = e.to_string();
+    match extract_location_suffix(&rendered) {
+        Some((msg_without_loc, line, column)) => {
+            match line_column_to_byte_offset(sql, line, column) {
+                Some(offset) => BoltError::SqlWithSpan {
+                    msg: msg_without_loc,
+                    span: offset..offset,
+                },
+                // The location was syntactically valid but pointed past the
+                // input (e.g. an off-by-one in sqlparser's column counter
+                // for a multi-byte token). Fall back to unspanned rather
+                // than guessing.
+                None => BoltError::Sql(rendered),
+            }
+        }
+        None => BoltError::Sql(rendered),
+    }
+}
+
+/// Pull the `" at Line: <L>, Column: <C>"` suffix off a sqlparser-formatted
+/// error message and return the trimmed message plus the parsed `(line,
+/// column)` pair. Returns `None` if no recognisable suffix is present.
+///
+/// The exact format comes from `sqlparser::tokenizer::Location`'s `Display`
+/// impl (a leading space, then `"at Line: N, Column: M"`). Centralised so
+/// the parsing rule has a single point of maintenance if a future
+/// sqlparser version drops the suffix or changes its shape.
+fn extract_location_suffix(rendered: &str) -> Option<(String, u64, u64)> {
+    // We search for the *last* " at Line: " marker because sqlparser
+    // sometimes embeds its own internal location text inside the message
+    // body (e.g. "Expected: a value, found: ... at Line: 1, Column: 7"),
+    // and the trailing one is always the authoritative position.
+    let marker = " at Line: ";
+    let idx = rendered.rfind(marker)?;
+    let (head, tail) = rendered.split_at(idx);
+    // `tail` starts with " at Line: <L>, Column: <C>".
+    let rest = tail.strip_prefix(marker)?;
+    let comma_idx = rest.find(", Column: ")?;
+    let (line_str, after_line) = rest.split_at(comma_idx);
+    let col_str = after_line.strip_prefix(", Column: ")?;
+    let line: u64 = line_str.trim().parse().ok()?;
+    let column: u64 = col_str.trim().parse().ok()?;
+    Some((head.to_string(), line, column))
+}
+
+/// Convert a 1-based `(line, column)` pair (sqlparser convention) into a
+/// 0-based byte offset into `sql`. Returns `None` if the pair points
+/// outside the input, which we treat as "no usable span" rather than as a
+/// hard error — the caller falls back to the unspanned `Sql` shape.
+///
+/// `column` is interpreted as a character-column for ASCII input (the
+/// common case in our test corpus and dashboard workloads). For
+/// non-ASCII SQL the column count maps to chars, then we sum each char's
+/// UTF-8 byte length to get the byte offset — same convention sqlparser
+/// uses internally.
+fn line_column_to_byte_offset(sql: &str, line: u64, column: u64) -> Option<usize> {
+    if line == 0 || column == 0 {
+        // sqlparser's `Location` Display elides "Line: 0" output entirely,
+        // so a parsed `0` here means we mis-extracted; bail.
+        return None;
+    }
+    let mut current_line: u64 = 1;
+    let mut byte_offset: usize = 0;
+    let bytes = sql.as_bytes();
+    // Walk to the start of `line`. sqlparser counts a `\n` as the line
+    // terminator; carriage returns are not consumed specially.
+    while current_line < line {
+        match bytes[byte_offset..].iter().position(|&b| b == b'\n') {
+            Some(nl_rel) => {
+                byte_offset += nl_rel + 1;
+                current_line += 1;
+            }
+            // The line number is beyond the input.
+            None => return None,
+        }
+        if byte_offset > bytes.len() {
+            return None;
+        }
+    }
+    // Now advance `column - 1` characters within this line. Use
+    // `char_indices()` over the remainder so multi-byte chars contribute
+    // their full UTF-8 width.
+    let line_rest = sql.get(byte_offset..)?;
+    let mut chars_consumed: u64 = 0;
+    let target = column - 1;
+    for (ch_byte_off, ch) in line_rest.char_indices() {
+        if chars_consumed == target {
+            return Some(byte_offset + ch_byte_off);
+        }
+        if ch == '\n' {
+            // Column points past the end of this line.
+            return None;
+        }
+        chars_consumed += 1;
+    }
+    // Column points exactly at end-of-line / end-of-input — still a valid
+    // (zero-width) span.
+    if chars_consumed == target {
+        Some(byte_offset + line_rest.len())
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2328,6 +2453,157 @@ mod plan_cache_tests {
         assert!(
             msg.contains("unknown table"),
             "expected 'unknown table' error from re-parse, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_error_span_tests {
+    //! v0.6 / M5: unit tests for `parse_error_to_bolt_error` and the
+    //! supporting line/column → byte-offset helpers. We deliberately
+    //! exercise the pure helpers in isolation so the location-extraction
+    //! rule stays decoupled from the rest of the frontend pipeline; a
+    //! future sqlparser upgrade that changes the message shape can
+    //! re-target these tests without rewiring `parse_uncached`.
+    use super::*;
+
+    #[test]
+    fn extract_location_suffix_basic_case() {
+        // Shape mirrors sqlparser's `Location::Display`: leading space,
+        // then `"at Line: <L>, Column: <C>"`.
+        let s = "sql parser error: Expected: end of statement, found: FOO at Line: 1, Column: 14";
+        let (msg, line, col) =
+            extract_location_suffix(s).expect("recognised sqlparser location suffix");
+        assert_eq!(
+            msg,
+            "sql parser error: Expected: end of statement, found: FOO"
+        );
+        assert_eq!(line, 1);
+        assert_eq!(col, 14);
+    }
+
+    #[test]
+    fn extract_location_suffix_missing_returns_none() {
+        // Tokenizer errors don't carry a location in sqlparser 0.52, so
+        // the helper must gracefully signal "no span".
+        assert!(extract_location_suffix("sql parser error: recursion limit exceeded").is_none());
+        assert!(extract_location_suffix("").is_none());
+    }
+
+    #[test]
+    fn line_column_to_byte_offset_ascii_single_line() {
+        // "SELECT * FROM"  →  col 8 (1-based) is the '*'  →  byte 7.
+        let sql = "SELECT * FROM t";
+        assert_eq!(line_column_to_byte_offset(sql, 1, 8), Some(7));
+        // col 1 is the leading 'S'.
+        assert_eq!(line_column_to_byte_offset(sql, 1, 1), Some(0));
+    }
+
+    #[test]
+    fn line_column_to_byte_offset_multi_line() {
+        // Each newline advances the line counter; columns reset to 1.
+        let sql = "SELECT a\nFROM t\nWHERE x = 1";
+        // Line 2, col 1 should land on 'F' of "FROM".
+        let off = line_column_to_byte_offset(sql, 2, 1).expect("line 2 reachable");
+        assert_eq!(&sql[off..off + 4], "FROM");
+        // Line 3, col 7 should land on 'x'.
+        let off = line_column_to_byte_offset(sql, 3, 7).expect("line 3 reachable");
+        assert_eq!(&sql[off..off + 1], "x");
+    }
+
+    #[test]
+    fn line_column_to_byte_offset_handles_multibyte_chars() {
+        // The Greek 'α' is two bytes in UTF-8; the column counter must
+        // tick by characters, not by bytes, when computing offsets.
+        // "SELECT α" is 7 chars / 8 bytes (the α contributing two bytes).
+        let sql = "SELECT αβ FROM t";
+        // col 8 (1-based) lands on the 8th character — 'α' itself (the
+        // space before it is char 7). The byte offset is 7 (one byte
+        // per ASCII char up to and including the space).
+        let off = line_column_to_byte_offset(sql, 1, 8).expect("multibyte column reachable");
+        assert_eq!(off, 7);
+        let next_char = sql[off..].chars().next().expect("at least one char left");
+        assert_eq!(next_char, 'α');
+        // col 9 lands on 'β'; α (2 bytes) pushes the byte offset to 9.
+        let off = line_column_to_byte_offset(sql, 1, 9).expect("col 9 reachable");
+        assert_eq!(off, 9);
+        let next_char = sql[off..].chars().next().expect("char at col 9");
+        assert_eq!(next_char, 'β');
+    }
+
+    #[test]
+    fn line_column_to_byte_offset_out_of_range_returns_none() {
+        let sql = "SELECT 1";
+        // No line 99 in an 8-byte input.
+        assert!(line_column_to_byte_offset(sql, 99, 1).is_none());
+        // Line/column of zero are nonsensical under sqlparser's
+        // 1-based convention.
+        assert!(line_column_to_byte_offset(sql, 0, 1).is_none());
+        assert!(line_column_to_byte_offset(sql, 1, 0).is_none());
+    }
+
+    #[test]
+    fn parse_error_to_bolt_error_with_location_produces_sql_with_span() {
+        // The exact PE construction here mirrors the message format
+        // sqlparser would produce for a single-line query. We can't
+        // easily provoke a real error through `Parser::parse_sql`
+        // with a known canonical message text, so we synthesise the
+        // shape directly.
+        let sql = "SELECT FROM t";
+        let pe = ParserError::ParserError(
+            "Expected: an expression:, found: FROM at Line: 1, Column: 8".into(),
+        );
+        let be = parse_error_to_bolt_error(pe, sql);
+        match &be {
+            BoltError::SqlWithSpan { msg, span } => {
+                assert!(
+                    msg.contains("Expected: an expression"),
+                    "msg should still carry the diagnostic text, got: {msg}"
+                );
+                // sqlparser column 8 (1-based) → byte 7 → 'F' of "FROM".
+                assert_eq!(span.start, 7);
+                assert_eq!(span.end, 7, "zero-width span (position-only)");
+                assert_eq!(&sql[span.start..span.start + 4], "FROM");
+            }
+            other => panic!("expected SqlWithSpan, got {other:?}"),
+        }
+        // The new accessor agrees with the variant pattern-match.
+        assert_eq!(be.span(), Some(7..7));
+    }
+
+    #[test]
+    fn parse_error_to_bolt_error_without_location_falls_back_to_sql() {
+        // `RecursionLimitExceeded` renders without any location suffix —
+        // the helper must fall back to the legacy `Sql` shape rather
+        // than fabricate a span.
+        let sql = "SELECT 1";
+        let be = parse_error_to_bolt_error(ParserError::RecursionLimitExceeded, sql);
+        assert!(matches!(be, BoltError::Sql(_)));
+        assert_eq!(be.span(), None);
+    }
+
+    #[test]
+    fn parse_error_to_bolt_error_end_to_end_via_parser() {
+        // End-to-end check: run a deliberately-broken SQL through the
+        // real sqlparser-driven `parse_uncached` and confirm we get a
+        // span-aware error out the other side. This is the only test
+        // here that depends on sqlparser's actual error-formatting
+        // behaviour; if a future upgrade changes the message shape and
+        // breaks the regex above, this test is the canary.
+        let p = MemTableProvider::new();
+        // The trailing comma is a syntax error sqlparser reports with
+        // a location attached.
+        let err = parse_uncached("SELECT a, FROM t", &p).expect_err("parse must fail");
+        let span = err.span();
+        assert!(
+            span.is_some(),
+            "expected SqlWithSpan from a real parse error, got: {err:?}"
+        );
+        // The span must point somewhere inside the SQL (within bounds).
+        let span = span.unwrap();
+        assert!(
+            span.start <= "SELECT a, FROM t".len(),
+            "span start out of input bounds: {span:?}"
         );
     }
 }
