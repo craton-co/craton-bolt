@@ -52,7 +52,7 @@
 //! cannot disambiguate between modules belonging to different CUDA contexts
 //! on a multi-GPU host. Tracked as a follow-up.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use once_cell::sync::Lazy;
@@ -60,6 +60,7 @@ use parking_lot::Mutex;
 
 use crate::error::BoltResult;
 use crate::jit::CudaModule;
+use crate::plan::physical_plan::KernelSpec;
 
 /// Composite cache key: `(namespace, spec_id)`.
 ///
@@ -161,5 +162,406 @@ impl LoadCounter {
     #[allow(dead_code)] // exposed for tests; production code uses GLOBAL_LOAD_COUNT.
     pub fn load(&self, ordering: Ordering) -> usize {
         self.0.load(ordering)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.6 / M1+M6: KernelSpec-keyed cache layer.
+//
+// The PTX-text-hash cache in `jit::jit_compiler` (and the string-keyed
+// `GLOBAL_MODULE_CACHE` above) only short-circuits AFTER codegen has run —
+// every warm call still pays the cost of emitting the PTX text from the
+// planner IR. Codegen for a typical Tier-1 kernel runs in the low single
+// digits of milliseconds, which dominates the warm-cache JIT path.
+//
+// This layer adds a process-wide cache keyed by the **`KernelSpec`** itself
+// (the IR BEFORE PTX emission) plus an entry-point tag. On a hit we return
+// the cached PTX text + loaded `CudaModule` immediately, skipping codegen
+// entirely. On a miss we run codegen, then route the PTX through
+// `CudaModule::from_ptx` (which consults the PTX-text-hash cache so a
+// cross-spec PTX collision still reuses the loaded module). The resulting
+// `(ptx, module)` pair is stored under the KernelSpec key, so the next call
+// with the same IR hits the fast path.
+//
+// # Key shape
+//
+// `KernelSpec` transitively contains `Op::Const { lit: Literal }`, and
+// `Literal` carries `f32`/`f64` constants. Floats do not implement `Hash`
+// (NaN inequality), so a `#[derive(Hash)]` on the planner IR would require a
+// hand-rolled `Hash` impl over the raw bit patterns of every numeric literal
+// (with a matching `PartialEq` so the `Hash`/`Eq` contract holds). That
+// route reaches far outside this file's blast radius.
+//
+// We instead hash the `Debug` output of the spec with two domain-separated
+// `DefaultHasher` instances, packing the result into a `(u64, u64)` 128-bit
+// fingerprint. The same pattern is already used by
+// `crate::exec::engine::ModuleCacheKey`; consolidating it here lets both the
+// per-`Engine` cache and the new process-wide cache share the same shape.
+//
+// # Eviction
+//
+// FIFO, 256 entries — matching the convention in `jit::jit_compiler`
+// (`PTX_CACHE_CAP_DEFAULT`). We keep a `VecDeque<(Key, ())>` insertion-order
+// log alongside the map; on insert past the cap, we pop the front entry and
+// remove it from the map. FIFO is cheap (no LRU bookkeeping) and matches the
+// task brief; the PTX-text-hash cache below us is LRU and absorbs the
+// occasional hot-key-evicted-early case.
+
+/// FIFO cap on the KernelSpec→(PTX, module) cache. Matches the default
+/// `PTX_CACHE_CAP_DEFAULT` in `jit::jit_compiler`.
+const KERNELSPEC_CACHE_CAP: usize = 256;
+
+/// 128-bit content fingerprint of a `KernelSpec` plus its entry-point tag.
+///
+/// The tag distinguishes between the multiple PTX shapes a single spec can
+/// produce (e.g. the full projection kernel vs. the predicate-only mask
+/// kernel emitted from the same `KernelSpec`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct KernelSpecKey {
+    /// Upper 64 bits of the 128-bit content hash (domain byte `0x01`).
+    hi: u64,
+    /// Lower 64 bits of the 128-bit content hash (domain byte `0x02`).
+    lo: u64,
+    /// PTX entry-point name (e.g. `"bolt_kernel"` vs. `"bolt_predicate"`).
+    entry: &'static str,
+}
+
+/// `fmt::Write` → `Hasher` adapter so we can stream `Debug` output of a
+/// `KernelSpec` directly into a hasher with zero heap allocation.
+struct HasherWrite<'a, H: std::hash::Hasher>(&'a mut H);
+
+impl<H: std::hash::Hasher> std::fmt::Write for HasherWrite<'_, H> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+impl KernelSpecKey {
+    /// Compute the key for `(spec, entry)`. See type docs for rationale.
+    fn new(spec: &KernelSpec, entry: &'static str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::fmt::Write as _;
+        use std::hash::Hasher;
+
+        let mut hi = DefaultHasher::new();
+        hi.write_u8(0x01);
+        // Both arms are unreachable in practice; degrade to a benign cache
+        // miss rather than panic if Debug formatting ever fails.
+        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
+
+        let mut lo = DefaultHasher::new();
+        lo.write_u8(0x02);
+        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
+
+        Self {
+            hi: hi.finish(),
+            lo: lo.finish(),
+            entry,
+        }
+    }
+}
+
+/// Cached payload for one KernelSpec key: the emitted PTX text and the
+/// loaded module. The PTX text is retained so callers that want to inspect
+/// it (e.g. for tracing) can do so without re-running codegen, and so a
+/// future hit-collision-detection path can compare-by-content if needed.
+#[derive(Clone)]
+struct KernelSpecEntry {
+    /// Emitted PTX text. Retained for observability / future
+    /// hit-collision-detection. `#[allow(dead_code)]` because the
+    /// production lookup path only needs `module` — but storing the PTX
+    /// here is part of the cache contract per the v0.6 task brief, so we
+    /// don't want a future refactor to drop the field by mistake.
+    #[allow(dead_code)]
+    ptx: String,
+    module: CudaModule,
+}
+
+/// State of the KernelSpec-keyed cache.
+///
+/// `by_key` is the primary lookup; `order` is a parallel FIFO log used for
+/// eviction. The two are kept in sync by `insert` (the only mutator). On
+/// eviction we pop the front of `order` and remove the matching map entry.
+struct KernelSpecCache {
+    by_key: HashMap<KernelSpecKey, KernelSpecEntry>,
+    order: VecDeque<KernelSpecKey>,
+    /// Cap on the number of cached entries before FIFO eviction kicks in.
+    /// Stored on the struct (rather than read as a const) so tests can
+    /// drive eviction with a small cap without polluting the global.
+    cap: usize,
+    /// Cumulative count of cache hits (fast-path returns). Tests observe
+    /// this to confirm the hit path is wired up.
+    hits: u64,
+    /// Cumulative count of cache misses (codegen + module-load round trips).
+    misses: u64,
+}
+
+impl KernelSpecCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_key: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Look up `key`; on a hit, return the cached entry (cheap clone — the
+    /// inner `CudaModule` is `Arc`-shared and `String` is one allocation).
+    fn get(&mut self, key: &KernelSpecKey) -> Option<KernelSpecEntry> {
+        if let Some(entry) = self.by_key.get(key) {
+            self.hits = self.hits.saturating_add(1);
+            Some(entry.clone())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    /// Insert `(key, entry)`, evicting the oldest entry if we are at cap.
+    /// Idempotent: re-inserting an existing key is a no-op (preserves the
+    /// existing FIFO position rather than re-aging it).
+    fn insert(&mut self, key: KernelSpecKey, entry: KernelSpecEntry) {
+        if self.by_key.contains_key(&key) {
+            return;
+        }
+        while self.by_key.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_key.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.by_key.insert(key, entry);
+    }
+}
+
+/// Process-wide KernelSpec→(PTX, CudaModule) cache. Initialised lazily.
+static KERNELSPEC_CACHE: Lazy<Mutex<KernelSpecCache>> =
+    Lazy::new(|| Mutex::new(KernelSpecCache::new(KERNELSPEC_CACHE_CAP)));
+
+/// Test- and observability-facing snapshot of `(hits, misses)` for the
+/// KernelSpec cache.
+#[doc(hidden)]
+#[must_use]
+pub fn kernelspec_cache_stats() -> (usize, usize) {
+    let c = KERNELSPEC_CACHE.lock();
+    (c.hits as usize, c.misses as usize)
+}
+
+/// Look up (or compile-and-load) the `CudaModule` for `(spec, entry)`.
+///
+/// On a **cache hit** we return the cached `CudaModule` clone immediately —
+/// no codegen, no PTX text generation, no `cuModuleLoadDataEx`. This is the
+/// sub-microsecond warm-cache path that motivates this layer.
+///
+/// On a **cache miss** we run `compile(spec)` to get the PTX text, hand it
+/// to `CudaModule::from_ptx` (which consults the PTX-text-hash cache in
+/// `jit::jit_compiler` — so a cross-spec PTX collision still skips PTXAS
+/// reassembly), and store the resulting `(ptx, module)` pair under the
+/// KernelSpec key. Subsequent calls with the same spec hit the fast path.
+///
+/// Concurrency: the cache lock is held only long enough to look up or
+/// insert; the slow `compile` + `from_ptx` work runs outside the lock. If
+/// two threads race on the same miss they will each compile once and the
+/// second insert is dropped by `insert`'s idempotence check — the PTX-text
+/// cache below us deduplicates the heavier `cuModuleLoadDataEx` step
+/// regardless.
+pub(crate) fn get_or_build_module_for_spec<F>(
+    spec: &KernelSpec,
+    entry: &'static str,
+    compile: F,
+) -> BoltResult<CudaModule>
+where
+    F: FnOnce(&KernelSpec) -> BoltResult<String>,
+{
+    let key = KernelSpecKey::new(spec, entry);
+    // Fast path: hit.
+    if let Some(entry) = KERNELSPEC_CACHE.lock().get(&key) {
+        return Ok(entry.module);
+    }
+    // Miss: run codegen + module load WITHOUT the cache lock held. Both
+    // steps can be slow and we don't want to serialise unrelated misses.
+    let ptx = compile(spec)?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    // Store under the KernelSpec key so the next call skips codegen.
+    KERNELSPEC_CACHE.lock().insert(
+        key,
+        KernelSpecEntry {
+            ptx,
+            module: module.clone(),
+        },
+    );
+    Ok(module)
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the KernelSpec-keyed cache.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod kernelspec_cache_tests {
+    use super::*;
+    use crate::plan::physical_plan::KernelSpec;
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+    /// Stand-up an empty `KernelSpec`. All fields default to empty vectors /
+    /// `None`; the IR is degenerate but its `Debug` representation is
+    /// stable and unique enough for hashing (and we can perturb fields
+    /// across specs to test miss behaviour).
+    fn empty_spec() -> KernelSpec {
+        KernelSpec {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            ops: Vec::new(),
+            predicate: None,
+            register_count: 0,
+            input_has_validity: Vec::new(),
+            output_has_validity: Vec::new(),
+        }
+    }
+
+    /// Cold lookup against a fresh cache is a miss, and `get` accounts
+    /// it as such. Pins the miss-counter wiring used by the
+    /// `kernelspec_cache_stats` observability hook.
+    #[test]
+    fn kernelspec_cache_cold_lookup_is_a_miss() {
+        let mut cache = KernelSpecCache::new(4);
+        let spec = empty_spec();
+        let key = KernelSpecKey::new(&spec, "bolt_kernel");
+
+        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert_eq!(cache.misses, 1);
+        assert_eq!(cache.hits, 0);
+    }
+
+    /// State-machine-level pin of the hit path: `get_or_build_module_for_spec`
+    /// must run the compile closure exactly once per unique spec, and zero
+    /// times on the second call with the same spec.
+    ///
+    /// We can't actually invoke `CudaModule::from_ptx` without a CUDA
+    /// context, so this test drives the cache via a parallel mock that
+    /// reproduces the lookup-or-insert logic on a fake "module" type.
+    /// The production code path is the same shape — only the inner
+    /// `CudaModule::from_ptx` differs.
+    #[test]
+    fn kernelspec_cache_compile_runs_once_per_unique_spec() {
+        // Mock module type: just a tag so we can confirm we got the same
+        // entry back on a hit.
+        #[derive(Clone)]
+        struct MockModule(&'static str);
+
+        struct MockCache {
+            by_key: HashMap<KernelSpecKey, MockModule>,
+            order: VecDeque<KernelSpecKey>,
+            cap: usize,
+        }
+
+        impl MockCache {
+            fn get_or_build(
+                &mut self,
+                spec: &KernelSpec,
+                entry: &'static str,
+                compile_count: &AtomicUsize,
+                tag: &'static str,
+            ) -> MockModule {
+                let key = KernelSpecKey::new(spec, entry);
+                if let Some(m) = self.by_key.get(&key) {
+                    return m.clone();
+                }
+                // Miss: "compile".
+                compile_count.fetch_add(1, AOrdering::SeqCst);
+                let m = MockModule(tag);
+                while self.by_key.len() >= self.cap {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.by_key.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+                self.order.push_back(key);
+                self.by_key.insert(key, m.clone());
+                m
+            }
+        }
+
+        let spec_a = empty_spec();
+        let spec_b = KernelSpec {
+            register_count: 7,
+            ..empty_spec()
+        };
+
+        let compile_count = AtomicUsize::new(0);
+        let mut cache = MockCache {
+            by_key: HashMap::new(),
+            order: VecDeque::new(),
+            cap: 256,
+        };
+
+        // First call with spec_a: miss → compile runs.
+        let m1 = cache.get_or_build(&spec_a, "bolt_kernel", &compile_count, "A");
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 1);
+        assert_eq!(m1.0, "A");
+
+        // Second call with spec_a: HIT → compile does NOT run.
+        let m2 = cache.get_or_build(&spec_a, "bolt_kernel", &compile_count, "A");
+        assert_eq!(
+            compile_count.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip codegen"
+        );
+        assert_eq!(m2.0, "A");
+
+        // Third call with a DIFFERENT spec: miss again.
+        let m3 = cache.get_or_build(&spec_b, "bolt_kernel", &compile_count, "B");
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(m3.0, "B");
+
+        // Fourth call with spec_a again: still a hit.
+        let m4 = cache.get_or_build(&spec_a, "bolt_kernel", &compile_count, "A");
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(m4.0, "A");
+
+        // Fifth call with spec_a but a DIFFERENT entry tag: miss (entry
+        // participates in the key).
+        let m5 = cache.get_or_build(&spec_a, "bolt_predicate", &compile_count, "Ap");
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 3);
+        assert_eq!(m5.0, "Ap");
+    }
+
+    /// Key uniqueness: distinct `KernelSpec`s and distinct entry tags
+    /// must produce distinct keys. (This is the assumption the
+    /// hit-vs-miss classification relies on.)
+    #[test]
+    fn kernelspec_cache_key_distinguishes_specs_and_entries() {
+        let mk_spec = |rc: u32| KernelSpec {
+            register_count: rc,
+            ..empty_spec()
+        };
+        let k0 = KernelSpecKey::new(&mk_spec(0), "k");
+        let k1 = KernelSpecKey::new(&mk_spec(1), "k");
+        let k0_alt = KernelSpecKey::new(&mk_spec(0), "k_alt");
+        assert_ne!(k0, k1, "different specs must produce different keys");
+        assert_ne!(k0, k0_alt, "entry tag must participate in the key");
+    }
+
+    /// The key fingerprint is stable across `Clone` of the same spec — a
+    /// load-bearing invariant: callers often clone the IR before handing
+    /// it to the cache (e.g. to keep the planner output borrow-free).
+    #[test]
+    fn kernelspec_cache_key_stable_across_clone() {
+        let spec = KernelSpec {
+            register_count: 42,
+            ..empty_spec()
+        };
+        let cloned = spec.clone();
+        assert_eq!(
+            KernelSpecKey::new(&spec, "bolt_kernel"),
+            KernelSpecKey::new(&cloned, "bolt_kernel"),
+            "cloning the spec must not change its cache key"
+        );
     }
 }
