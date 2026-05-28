@@ -30,11 +30,24 @@
 //! loaded module (wrapped in a `OnceCell`; see the Concurrency section
 //! below and `CacheEntry`), and we compare the stored PTX text on lookup.
 //!
-//! The cache is bounded (default 256 entries) with FIFO eviction — LRU is
-//! overkill for what is essentially a hot-set of recently-issued query shapes,
-//! and FIFO needs only a `VecDeque<u64>` companion to the `HashMap`. When an
-//! entry is evicted from the cache its `Arc` strong count drops; if no
-//! `CudaModule` clones are live the underlying `CudaModuleInner::Drop`
+//! The cache is bounded (default 256 entries) with **LRU** eviction. The
+//! eviction policy was originally FIFO on the assumption that a process's
+//! working set of PTX shapes is small and stable, but long-running sessions
+//! that issue many ad-hoc queries (BI dashboards, exploratory notebooks)
+//! routinely fill the cache and then evict hot kernels (e.g. `shmem_sum`,
+//! `gpu_join_probe`) just because they were compiled earliest — a classic
+//! pathology FIFO has. LRU keeps the truly hot kernels resident regardless
+//! of when they were first compiled.
+//!
+//! The LRU is implemented as an intrusive doubly-linked list of nodes living
+//! in a `Vec<Option<LruNode>>` keyed by `usize` indices, with a free-list of
+//! removed indices so that node-slot reuse stays O(1). The `HashMap` maps
+//! PTX-hash key → node index. Cache hits move the node to the head of the
+//! list (most-recently-used); a fresh miss inserts at the head and evicts
+//! the tail if we are at cap. All operations are O(1).
+//!
+//! When an entry is evicted from the cache its `Arc` strong count drops; if
+//! no `CudaModule` clones are live the underlying `CudaModuleInner::Drop`
 //! runs and calls `cuModuleUnload`. If clones *are* live the module stays
 //! loaded until the last clone is dropped — exactly the lifetime users
 //! expect.
@@ -57,7 +70,7 @@
 //! receives the same `Arc<CudaModuleInner>` without paying the compile
 //! cost. Compiles for *different* PTX keys run fully in parallel.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -91,7 +104,7 @@ const JIT_LOG_BUF_SIZE: usize = 4096;
 
 /// Built-in default cap on the number of cached compiled modules. Override at
 /// process start via `CRATON_BOLT_PTX_CACHE_CAP` (see module docs). Eviction
-/// is FIFO once we exceed this many entries.
+/// is LRU (least-recently-used) once we exceed this many entries.
 const PTX_CACHE_CAP_DEFAULT: usize = 256;
 
 /// Environment variable that overrides the PTX cache capacity. Parsed as
@@ -151,9 +164,10 @@ impl Drop for CudaModuleInner {
 unsafe impl Send for CudaModuleInner {}
 unsafe impl Sync for CudaModuleInner {}
 
-/// One cache slot: a lazily-populated `OnceCell` holding the loaded module,
-/// plus the PTX text that produced it. We retain the source text so a hash
-/// collision can be detected (see the module-level comment).
+/// One cache slot's payload: the PTX text that produced this entry and the
+/// lazily-populated `OnceCell` holding the loaded module. We retain the
+/// source text so a hash collision can be detected (see the module-level
+/// comment).
 ///
 /// The `Arc<OnceCell<…>>` lets us release the cache lock before doing the
 /// slow PTXAS compile: the first thread to miss inserts an empty cell and
@@ -165,23 +179,169 @@ struct CacheEntry {
     module: Arc<OnceCell<Arc<CudaModuleInner>>>,
 }
 
-/// Cache state: a `HashMap` for O(1) lookup plus a `VecDeque` of keys in
-/// insertion order for FIFO eviction.
+/// One node in the intrusive doubly-linked LRU list. Indices reference
+/// other slots in `PtxCache::nodes`; `None` marks the head's `prev` and
+/// the tail's `next`.
+struct LruNode {
+    prev: Option<usize>,
+    next: Option<usize>,
+    key: u64,
+    entry: CacheEntry,
+}
+
+/// Cache state: a `HashMap` for O(1) key → index lookup plus an intrusive
+/// doubly-linked list (over `Vec<Option<LruNode>>`) for O(1) LRU eviction.
+///
+/// Nodes live in `nodes[i]`; `head` is the most-recently-used end and
+/// `tail` is the least-recently-used end. Removed slots are recycled via
+/// `free_list` so node-index churn does not grow the `Vec` unboundedly.
 struct PtxCache {
-    map: HashMap<u64, CacheEntry>,
-    order: VecDeque<u64>,
+    nodes: Vec<Option<LruNode>>,
+    free_list: Vec<usize>,
+    by_key: HashMap<u64, usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    /// Cumulative count of LRU evictions since cache creation. Used by
+    /// tests and (potentially) observability hooks.
+    evictions: u64,
 }
 
 impl PtxCache {
     fn new() -> Self {
         let cap = ptx_cache_cap();
         Self {
-            map: HashMap::with_capacity(cap),
-            order: VecDeque::with_capacity(cap),
+            nodes: Vec::with_capacity(cap),
+            free_list: Vec::new(),
+            by_key: HashMap::with_capacity(cap),
+            head: None,
+            tail: None,
+            evictions: 0,
         }
     }
 
-    /// Insert a fresh (empty) cell for `key` / `ptx`, performing FIFO
+    fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+
+    #[cfg(test)]
+    fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Borrow the node at `idx`. Panics if the slot has been freed — only
+    /// safe to call with indices we just read from `by_key` or `head`/
+    /// `tail`, which always point at occupied slots by construction.
+    fn node(&self, idx: usize) -> &LruNode {
+        self.nodes[idx]
+            .as_ref()
+            .expect("PtxCache: node index points at a freed slot")
+    }
+
+    fn node_mut(&mut self, idx: usize) -> &mut LruNode {
+        self.nodes[idx]
+            .as_mut()
+            .expect("PtxCache: node index points at a freed slot")
+    }
+
+    /// Detach `idx` from its position in the doubly-linked list, fixing
+    /// up its neighbours and the `head`/`tail` anchors. The node itself
+    /// is left in place inside `nodes`; the caller decides whether to
+    /// re-insert it at the head or free it.
+    fn unlink(&mut self, idx: usize) {
+        let (prev, next) = {
+            let n = self.node(idx);
+            (n.prev, n.next)
+        };
+        match prev {
+            Some(p) => self.node_mut(p).next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(n) => self.node_mut(n).prev = prev,
+            None => self.tail = prev,
+        }
+        let n = self.node_mut(idx);
+        n.prev = None;
+        n.next = None;
+    }
+
+    /// Insert `idx` at the head of the list (most-recently-used).
+    /// Assumes the node's `prev`/`next` are already `None`.
+    fn push_front(&mut self, idx: usize) {
+        let old_head = self.head;
+        self.node_mut(idx).next = old_head;
+        if let Some(h) = old_head {
+            self.node_mut(h).prev = Some(idx);
+        } else {
+            // List was empty: this node becomes both head and tail.
+            self.tail = Some(idx);
+        }
+        self.head = Some(idx);
+    }
+
+    /// Move an existing node to the head (mark as MRU). O(1).
+    fn touch(&mut self, idx: usize) {
+        if self.head == Some(idx) {
+            return; // Already MRU.
+        }
+        self.unlink(idx);
+        self.push_front(idx);
+    }
+
+    /// Allocate a node slot, reusing a freed index if available. Returns
+    /// the chosen index; the caller writes the `LruNode` into it.
+    fn alloc_slot(&mut self, node: LruNode) -> usize {
+        if let Some(idx) = self.free_list.pop() {
+            self.nodes[idx] = Some(node);
+            idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(Some(node));
+            idx
+        }
+    }
+
+    /// Pop the tail (LRU) entry, removing it from the map and freeing
+    /// its node slot. No-op when the cache is empty.
+    fn evict_lru(&mut self) {
+        let Some(tail_idx) = self.tail else {
+            return;
+        };
+        self.unlink(tail_idx);
+        let node = self.nodes[tail_idx]
+            .take()
+            .expect("PtxCache: tail pointed at a freed slot");
+        self.by_key.remove(&node.key);
+        self.free_list.push(tail_idx);
+        self.evictions = self.evictions.saturating_add(1);
+    }
+
+    /// Cache-hit path: look up `key`, verify the stored PTX text matches
+    /// `ptx`, and on success mark the entry as MRU and return its cell.
+    /// Returns `Some(Err(()))` to signal a hash collision (the stored PTX
+    /// did not match) — the caller routes those to the uncached loader,
+    /// preserving the long-standing `Slot::Collision` semantics.
+    fn get_and_touch(
+        &mut self,
+        key: u64,
+        ptx: &str,
+    ) -> Option<Result<Arc<OnceCell<Arc<CudaModuleInner>>>, ()>> {
+        let idx = *self.by_key.get(&key)?;
+        let n = self.node(idx);
+        if n.entry.ptx != ptx {
+            return Some(Err(()));
+        }
+        let cell = Arc::clone(&n.entry.module);
+        self.touch(idx);
+        Some(Ok(cell))
+    }
+
+    /// Insert a fresh (empty) cell for `key` / `ptx`, performing LRU
     /// eviction first if we are at or above `cap`. Returns the inserted
     /// `Arc<OnceCell>`. The caller is responsible for ensuring `key` is
     /// not already present in the map.
@@ -195,20 +355,21 @@ impl PtxCache {
         ptx: String,
         cap: usize,
     ) -> Arc<OnceCell<Arc<CudaModuleInner>>> {
-        if self.map.len() >= cap {
-            if let Some(old_key) = self.order.pop_front() {
-                self.map.remove(&old_key);
-            }
+        while self.len() >= cap {
+            self.evict_lru();
         }
         let cell = Arc::new(OnceCell::new());
-        self.map.insert(
+        let idx = self.alloc_slot(LruNode {
+            prev: None,
+            next: None,
             key,
-            CacheEntry {
+            entry: CacheEntry {
                 ptx,
                 module: Arc::clone(&cell),
             },
-        );
-        self.order.push_back(key);
+        });
+        self.by_key.insert(key, idx);
+        self.push_front(idx);
         cell
     }
 }
@@ -271,9 +432,14 @@ impl CudaModule {
         }
         let cell: Arc<OnceCell<Arc<CudaModuleInner>>> = {
             let mut cache = ptx_cache().lock();
-            let slot = match cache.map.get(&key) {
-                Some(entry) if entry.ptx == ptx => Slot::Reuse(Arc::clone(&entry.module)),
-                Some(_) => Slot::Collision,
+            // `get_and_touch` both classifies the slot AND, on a hit,
+            // re-orders the LRU to mark this entry as most-recently-used.
+            // We must do that bump *inside* the lock so concurrent threads
+            // see a consistent list. The match below collapses the three
+            // possible outcomes onto our existing `Slot` enum.
+            let slot = match cache.get_and_touch(key, ptx) {
+                Some(Ok(cell)) => Slot::Reuse(cell),
+                Some(Err(())) => Slot::Collision,
                 None => Slot::Miss,
             };
             match slot {
@@ -286,7 +452,7 @@ impl CudaModule {
                     return loader(ptx);
                 }
                 Slot::Miss => {
-                    // Fresh miss: insert an empty cell, FIFO-evict if at cap.
+                    // Fresh miss: insert an empty cell, LRU-evict if at cap.
                     let cap = ptx_cache_cap();
                     cache.insert_empty(key, ptx.to_owned(), cap)
                 }
@@ -556,33 +722,106 @@ mod tests {
         std::env::remove_var(key);
     }
 
-    // -- PtxCache eviction (P3, FIFO at the configured cap) ----------------
+    // -- PtxCache eviction (LRU at the configured cap) --------------------
 
-    /// With cap = 8, inserting 9 distinct keys evicts the *first* one
-    /// inserted, leaving the most-recent 8 in the map.
+    /// LRU semantics: with cap = 2, inserting three entries A B C evicts A
+    /// (the LRU). If we instead bump A to MRU *before* the third insert, the
+    /// LRU spot belongs to B, and B must be the one evicted. This is the
+    /// load-bearing distinction vs the prior FIFO policy, which would always
+    /// have evicted A regardless of access order.
     #[test]
     fn ptx_cache_evicts_oldest_at_cap() {
         let mut cache = PtxCache::new();
-        let cap = 8usize;
+        let cap = 2usize;
 
-        // Insert 8 entries — none should be evicted yet.
-        for i in 0..cap as u64 {
-            cache.insert_empty(i, format!("ptx-{}", i), cap);
-        }
-        assert_eq!(cache.map.len(), cap);
-        assert!(cache.map.contains_key(&0));
+        // Insert A, B → list (MRU → LRU): B, A. Cache at cap.
+        cache.insert_empty(0, "ptx-A".to_owned(), cap);
+        cache.insert_empty(1, "ptx-B".to_owned(), cap);
+        assert_eq!(cache.len(), cap);
+        assert_eq!(cache.evictions(), 0);
 
-        // The 9th insert must evict key 0 (the oldest) and seat key 8.
-        cache.insert_empty(cap as u64, format!("ptx-{}", cap), cap);
-        assert_eq!(cache.map.len(), cap);
+        // Insert C without touching A — A is LRU and gets evicted (B, A still
+        // had A older, so this is the same as FIFO would have done).
+        cache.insert_empty(2, "ptx-C".to_owned(), cap);
+        assert!(!cache.by_key.contains_key(&0), "A should have been evicted");
+        assert!(cache.by_key.contains_key(&1));
+        assert!(cache.by_key.contains_key(&2));
+        assert_eq!(cache.evictions(), 1);
+
+        // Reset for the LRU-specific case.
+        let mut cache = PtxCache::new();
+        cache.insert_empty(0, "ptx-A".to_owned(), cap); // list: A
+        cache.insert_empty(1, "ptx-B".to_owned(), cap); // list: B, A
+        cache.insert_empty(2, "ptx-C".to_owned(), cap); // evict A → list: C, B
+        assert!(!cache.by_key.contains_key(&0));
+
+        // ACCESS B → bump to MRU → list: B, C. C is now the LRU.
+        let _ = cache.get_and_touch(1, "ptx-B").expect("B is still cached");
+
+        // Insert D — must evict C (LRU after the bump), NOT B. Under the old
+        // FIFO policy this would have evicted B; under LRU it evicts C.
+        cache.insert_empty(3, "ptx-D".to_owned(), cap);
         assert!(
-            !cache.map.contains_key(&0),
-            "key 0 should have been FIFO-evicted at the 9th insert"
+            !cache.by_key.contains_key(&2),
+            "C should have been LRU-evicted after B was touched"
         );
-        assert!(cache.map.contains_key(&(cap as u64)));
-        // The order deque also tracks the surviving keys 1..=8.
-        assert_eq!(cache.order.front().copied(), Some(1));
-        assert_eq!(cache.order.back().copied(), Some(cap as u64));
+        assert!(
+            cache.by_key.contains_key(&1),
+            "B should still be cached (touched before the next insert)"
+        );
+        assert!(cache.by_key.contains_key(&3));
+    }
+
+    /// Classic LRU re-ordering: cap = 3, insert A B C, get(A), insert D.
+    /// The LRU at the moment of inserting D is B (because A was just
+    /// touched), so D evicts B — not A.
+    #[test]
+    fn ptx_cache_lru_reordering_keeps_touched_entries() {
+        let mut cache = PtxCache::new();
+        let cap = 3usize;
+
+        cache.insert_empty(10, "ptx-A".to_owned(), cap); // list: A
+        cache.insert_empty(11, "ptx-B".to_owned(), cap); // list: B, A
+        cache.insert_empty(12, "ptx-C".to_owned(), cap); // list: C, B, A
+        assert_eq!(cache.len(), cap);
+
+        // Touch A → list: A, C, B. B is now the LRU.
+        let _ = cache.get_and_touch(10, "ptx-A").expect("A is cached");
+
+        // Insert D → evicts B (LRU), keeps A (just touched), C (next-MRU).
+        cache.insert_empty(13, "ptx-D".to_owned(), cap);
+        assert!(cache.by_key.contains_key(&10), "A must survive — just touched");
+        assert!(
+            !cache.by_key.contains_key(&11),
+            "B must be evicted as the LRU after A's touch"
+        );
+        assert!(cache.by_key.contains_key(&12));
+        assert!(cache.by_key.contains_key(&13));
+        assert_eq!(cache.evictions(), 1);
+    }
+
+    /// `get_and_touch` distinguishes a true hit from a hash collision (same
+    /// 64-bit key, different PTX text). The collision arm is what protects
+    /// against the astronomically-rare-but-possible case where two distinct
+    /// PTX strings hash to the same `u64`; the cache must NOT silently serve
+    /// the wrong module.
+    #[test]
+    fn ptx_cache_get_and_touch_detects_collision() {
+        let mut cache = PtxCache::new();
+        let cap = 4usize;
+        cache.insert_empty(42, "stored ptx".to_owned(), cap);
+
+        // Same key, same text → Some(Ok(cell)).
+        let hit = cache.get_and_touch(42, "stored ptx");
+        assert!(matches!(hit, Some(Ok(_))));
+
+        // Same key, different text → Some(Err(())).
+        let collision = cache.get_and_touch(42, "DIFFERENT ptx");
+        assert!(matches!(collision, Some(Err(()))));
+
+        // Unknown key → None.
+        let miss = cache.get_and_touch(43, "anything");
+        assert!(miss.is_none());
     }
 
     // -- from_ptx_with concurrency (H3, no redundant compile on miss) ------
