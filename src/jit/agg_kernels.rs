@@ -44,7 +44,27 @@ pub fn reduction_output_dtype(op: ReduceOp, input_dtype: DataType) -> DataType {
 }
 
 /// Threads per block for every reduction kernel.
+///
+/// The phase-2 warp-shuffle path emits `shfl.sync.down.b32` with membermask
+/// `0xffffffff` and is gated on `tid < 32`. That requires at least one full
+/// warp of live threads, i.e. `BLOCK_SIZE >= 32`. The phase-1 strided reduce
+/// (`stride = BLOCK_SIZE / 2, /4, ...`) assumes `BLOCK_SIZE` is a power of
+/// two. A future tuning change that violates either invariant would silently
+/// deadlock at `shfl.sync` or produce a wrong result — the compile-time
+/// asserts below catch that at the constant-edit site.
 pub const BLOCK_SIZE: u32 = 256;
+
+// Compile-time invariants for the reduction kernel codegen. See the doc
+// comment on `BLOCK_SIZE` above.
+const _: () = assert!(
+    BLOCK_SIZE >= 32,
+    "warp-shuffle phase requires BLOCK_SIZE >= 32 (one full warp)"
+);
+const _: () = assert!(
+    BLOCK_SIZE.is_power_of_two(),
+    "phase-1 strided reduce requires power-of-two block size"
+);
+const _: () = assert!(BLOCK_SIZE <= 1024, "CUDA hard limit");
 
 /// PTX kernel entry-point name.
 pub const REDUCTION_KERNEL_ENTRY: &str = "bolt_reduce";

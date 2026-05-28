@@ -4,8 +4,8 @@
 //! GROUP BY perf plan).
 //!
 //! This is the i64 sibling of [`crate::jit::partition_kernel`]. The single-
-//! Int32 variant hashes 32-bit keys into one of `NUM_PARTITIONS = 1024`
-//! buckets using `(u32)key * 0x9E3779B1 & 0x3FF`. This file does the same
+//! Int32 variant hashes 32-bit keys into one of `NUM_PARTITIONS = 4096`
+//! buckets using `(u32)key * 0x9E3779B1 & 0xFFF`. This file does the same
 //! pipeline for `int64_t` keys produced by the host-side
 //! `groupby.rs::pack_keys` packing convention — two Int32 columns packed
 //! losslessly into an Int64 (high 32 bits = column 0, low 32 bits = column 1).
@@ -22,13 +22,13 @@
 //! ## Algorithm
 //!
 //! ```text
-//! const uint32_t K                 = 1024;
+//! const uint32_t K                 = 4096;
 //! const uint64_t HASH_MULTIPLIER64 = 0x9E3779B97F4A7C15ull;  // floor(2^64 / phi)
 //!
 //! for (i = blockIdx.x*blockDim.x + tid; i < n_rows; i += gridDim.x*blockDim.x) {
 //!     int64_t  key  = keys[i];
 //!     uint64_t hash = (uint64_t)key * HASH_MULTIPLIER64;  // wraps mod 2^64
-//!     uint32_t pid  = (uint32_t)(hash >> 54);             // top 10 bits
+//!     uint32_t pid  = (uint32_t)(hash >> 52);             // top 12 bits
 //!     atomicAdd(&counts[pid], 1u);
 //!     partition_ids[i] = pid;
 //! }
@@ -39,8 +39,8 @@
 //! distributes good mixing into the **high** bits of the product; the low
 //! bits remain heavily structured (the low bit of `x * M` is just the low
 //! bit of `x`, since M is odd). For a 64-bit key we therefore right-shift
-//! by `64 - log2(K) = 54` to read the top 10 bits as the partition id.
-//! The i32 sibling can get away with `(hash & 0x3FF)` because its 32-bit
+//! by `64 - log2(K) = 52` to read the top 12 bits as the partition id.
+//! The i32 sibling can get away with `(hash & 0xFFF)` because its 32-bit
 //! multiply already wraps and the wrap acts as a poor-man's mix; at 64
 //! bits we'd be reading entirely raw key bits otherwise.
 //!
@@ -49,7 +49,7 @@
 //! * Keys are loaded with `ld.global.s64` (8-byte loads). Stride per row is 8.
 //! * The 64-bit multiply uses `mul.lo.u64`, which writes the low 64 bits of
 //!   the 128-bit product — exactly the wrapping multiply we want.
-//! * The 10-bit shift to extract the partition id is `shr.u64 %rdN, %rd_hash, 54`,
+//! * The 12-bit shift to extract the partition id is `shr.u64 %rdN, %rd_hash, 52`,
 //!   followed by `cvt.u32.u64` to land in a 32-bit register for the atomic.
 //!   We deliberately use the unsigned `shr.u64` so the top bits zero-fill
 //!   (no sign extension hazard from `shr.s64`).
@@ -64,6 +64,15 @@ use crate::error::{BoltError, BoltResult};
 /// orchestrator can use the same `compute_partition_offsets` and Tier-2
 /// invariants ("each partition fits in shmem").
 pub const NUM_PARTITIONS: u32 = 4096;
+
+// Compile-time invariant: the PTX extracts the partition id as
+// `shr.u64 ... (64 - log2(NUM_PARTITIONS))`, which is only equivalent to
+// `hash & (K-1)` (and to the "top log2(K) bits as the partition id"
+// formulation) when K is a power of two.
+const _: () = assert!(
+    NUM_PARTITIONS.is_power_of_two(),
+    "partition mask requires power-of-two count"
+);
 
 /// 64-bit Fibonacci / Knuth multiplicative-hash constant —
 /// `floor(2^64 / phi)` rounded to the nearest odd integer. Mixes the low

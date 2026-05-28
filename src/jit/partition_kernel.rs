@@ -17,8 +17,8 @@
 //! live in L2.
 //!
 //! This file is the **pass-1 partition kernel**: count how many rows land
-//! in each of the K = 1024 partitions and remember which partition each row
-//! was assigned to. A sibling scatter kernel (written by another agent) then
+//! in each of the K = `NUM_PARTITIONS` (4096) partitions and remember which
+//! partition each row was assigned to. A sibling scatter kernel then
 //! uses the counts (after a prefix-sum) and the per-row partition ids to
 //! actually rearrange the rows. Keeping count + assignment in one kernel
 //! avoids re-hashing every row twice.
@@ -26,7 +26,7 @@
 //! ## Algorithm
 //!
 //! ```text
-//! const uint32_t K              = 1024;          // power of 2 → mask, not mod
+//! const uint32_t K              = 4096;          // power of 2 → mask, not mod
 //! const uint32_t HASH_MULTIPLIER = 0x9E3779B1;   // Knuth multiplicative
 //!
 //! for (i = blockIdx.x*blockDim.x + tid; i < n_rows; i += gridDim.x*blockDim.x) {
@@ -43,16 +43,16 @@
 //! * `atom.global.add.u32` (no result register written) is the cheapest form
 //!   of increment-and-discard. We still need a destination register because
 //!   PTX requires one syntactically; the value is simply never read.
-//! * The mask form `and.b32 %r_pid, %r_hash, 0x3FF` replaces `rem.u32`
-//!   because `NUM_PARTITIONS = 1024 = 2^10`. This avoids the expensive
+//! * The mask form `and.b32 %r_pid, %r_hash, 0xFFF` replaces `rem.u32`
+//!   because `NUM_PARTITIONS = 4096 = 2^12`. This avoids the expensive
 //!   software-emulated integer modulo SASS sequence.
 //! * Knuth's multiplicative hash (`x * 2654435761u32`) is emitted as a
 //!   single `mul.lo.u32`. We deliberately want the wrapping low 32 bits;
 //!   `mul.lo` is precisely that.
 //! * Bank-conflict / contention notes (acceptable for Tier-2 v0):
-//!   - `counts[]` has only 1024 slots. Concurrent `atom.global.add.u32`
-//!     traffic across blocks IS real and serialises on the L2 atomic unit,
-//!     same hazard the Tier-1 kernel exists to mitigate.
+//!   - `counts[]` has only `NUM_PARTITIONS` (4096) slots. Concurrent
+//!     `atom.global.add.u32` traffic across blocks IS real and serialises on
+//!     the L2 atomic unit, same hazard the Tier-1 kernel exists to mitigate.
 //!   - We intentionally do **not** stage `counts[]` in shared memory yet —
 //!     it would mean a per-block reduce-and-merge phase that doubles the
 //!     kernel's code surface for a step that the sibling prefix-sum pass
@@ -77,6 +77,14 @@ use crate::error::{BoltError, BoltResult};
 /// partition-counts array (16 KiB on device, host download is 16 KiB ≈
 /// 50 µs) for a much-better-behaved per-partition hash table.
 pub const NUM_PARTITIONS: u32 = 4096;
+
+// Compile-time invariant: the PTX emits `and.b32 %r_pid, %r_hash, (K-1)`
+// in place of `rem.u32`, which is only equivalent to `% K` when K is a
+// power of two. See the docstring on `NUM_PARTITIONS` above.
+const _: () = assert!(
+    NUM_PARTITIONS.is_power_of_two(),
+    "partition mask requires power-of-two count"
+);
 
 /// Knuth's multiplicative hash constant: `floor(2^32 / phi)` rounded to
 /// the nearest odd integer. Mixes the low bits of small integer keys
@@ -150,7 +158,7 @@ pub fn compile_partition_kernel() -> BoltResult<String> {
 pub fn compile_partition_kernel() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
-    let mask = NUM_PARTITIONS - 1; // 0x3FF for NUM_PARTITIONS = 1024
+    let mask = NUM_PARTITIONS - 1; // 0xFFF for NUM_PARTITIONS = 4096
     let block_threads = BLOCK_THREADS;
     let _ = block_threads; // launch geometry constant; not emitted into PTX
 
@@ -215,7 +223,7 @@ pub fn compile_partition_kernel() -> BoltResult<String> {
     //
     //   key   = keys[i]                       // ld.global.s32
     //   hash  = (u32)key * 0x9E3779B1         // mul.lo.u32 with wrap
-    //   pid   = hash & 0x3FF                  // and.b32  (== hash % 1024)
+    //   pid   = hash & 0xFFF                  // and.b32  (== hash % 4096)
     //   atom.global.add.u32 [counts + pid*4], 1
     //   partition_ids[i] = pid                // st.global.u32
     // ----------------------------------------------------------------------
