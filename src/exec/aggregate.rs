@@ -12,6 +12,30 @@
 //!   5. Pack the scalar results into a single-row Arrow `RecordBatch` whose
 //!      schema matches `AggregateSpec::output_schema`.
 //!
+//! # v0.6 async-memcpy pilot
+//!
+//! This executor is the **pilot** for the v0.6 async memcpy + pinned host
+//! buffer rollout. The whole H2D → kernel → D2H chain is issued on a single
+//! per-call [`CudaStream`] (`CudaStream::null_or_default`) with the
+//! [`GpuVec::from_slice_async`] / [`GpuVec::to_pinned_async`] wrappers, and
+//! the executor synchronizes exactly once at the very end.
+//!
+//! Pinned host buffers (`PinnedHostBuffer<T>`, allocated by
+//! `cuMemAllocHost_v2`) let the driver DMA straight in/out of host pages
+//! without synthesizing a staging copy first — that is what makes the
+//! H2D / kernel / D2H phases actually overlap on the same stream. The
+//! latency win compounds across multiple per-aggregate column uploads in
+//! a query like `SELECT SUM(a), AVG(b), MIN(c) FROM t`.
+//!
+//! Other executors (filter, GROUP BY, joins, …) currently still take the
+//! synchronous `GpuBuffer::from_slice` / `to_vec` path on the no-null fast
+//! path; they will follow this same template in subsequent PRs. Under
+//! `--features cuda-stub` the async FFI shims all return `CUDA_ERROR_STUB`,
+//! so this module falls back to the synchronous `from_slice` / `to_vec`
+//! path — both paths fail the same way at the FFI boundary in stub mode,
+//! but preferring the sync wrappers keeps the call shape closer to what
+//! existed before the pilot landed.
+//!
 //! Scope (first cut):
 //!   - No GROUP BY. `aggregate.group_by` must be empty.
 //!   - No pre-aggregation kernel. `pre` must be `None`; this is the shape the
@@ -38,7 +62,7 @@ use arrow_schema::{
 use bytemuck::Pod;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
-use crate::cuda::{primitive_to_gpu, GpuVec};
+use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::module_cache;
@@ -53,6 +77,49 @@ use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 // `exec::module_cache::get_or_build_module`, which returns the cached module
 // directly.
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
+
+/// v0.6 async-memcpy pilot helper: upload a host slice to the GPU on
+/// `stream` via the async wrappers, falling back to the synchronous
+/// `from_slice` path under `--features cuda-stub`.
+///
+/// Under real CUDA this issues `cuMemcpyHtoDAsync_v2` on `stream` so the
+/// upload chains naturally with the subsequent kernel launch and D2H of
+/// the partials buffer, and the executor synchronizes the stream exactly
+/// once at the end. Pairing this with a pinned host source would unlock
+/// true DMA overlap; the current Arrow value buffer is pageable, so the
+/// driver may still stage the copy internally, but the stream-scoped
+/// dispatch still avoids the implicit `cuCtxSynchronize` that the legacy
+/// sync `from_slice` path took.
+///
+/// Under `--features cuda-stub` the async FFI shim returns
+/// `CUDA_ERROR_STUB`, so we route through the synchronous wrapper instead
+/// — both paths surface the same error at the FFI boundary in stub mode,
+/// but going through the sync wrapper means the failure happens in the
+/// same place it did before the pilot. This is the documented graceful
+/// degradation for the stub backend.
+///
+/// This helper is the **pilot template** other executors (filter, GROUP
+/// BY, …) will reuse when they migrate off the synchronous `from_slice`
+/// path in subsequent PRs.
+#[inline]
+fn upload_primitive_values_async<T: Pod>(
+    values: &[T],
+    stream: &CudaStream,
+) -> BoltResult<GpuVec<T>> {
+    #[cfg(feature = "cuda-stub")]
+    {
+        // Stub backend has no real CUDA: prefer the sync path so the
+        // call shape matches what existed before the async pilot. The
+        // sync FFI shim itself still returns `CUDA_ERROR_STUB`, so this
+        // is a graceful no-op routing change.
+        let _ = stream;
+        GpuVec::<T>::from_slice(values)
+    }
+    #[cfg(not(feature = "cuda-stub"))]
+    {
+        GpuVec::<T>::from_slice_async(values, stream.raw())
+    }
+}
 
 /// Execute an aggregate physical plan against a host-side RecordBatch.
 ///
@@ -278,13 +345,15 @@ fn reduce_column_from_batch(
     // SUM/MIN/MAX. We detect that case and filter to a host vector of just the
     // non-null values before uploading; the GPU reduction then operates on a
     // post-filter prefix matching the natural identity (0 for SUM, +inf for
-    // MIN, -inf for MAX) at the (zero) NULL positions. The fast path stays
-    // zero-copy via `primitive_to_gpu` when there are no nulls.
+    // MIN, -inf for MAX) at the (zero) NULL positions. The fast path uploads
+    // Arrow's value buffer directly through the async H2D wrapper when there
+    // are no nulls.
     let has_nulls = arr.null_count() > 0;
 
-    // Stage 2 async memcpy: build a per-call stream and chain H2D-upload →
+    // v0.6 async-memcpy pilot: build a per-call stream and chain H2D-upload →
     // kernel-launch → D2H-partials on it, syncing exactly once at the end.
-    // `null_or_default` falls back to the NULL stream under `cuda-stub`.
+    // `null_or_default` falls back to the NULL stream under `cuda-stub` (and
+    // any other host without a working `cuStreamCreate`).
     let stream = CudaStream::null_or_default();
     match col_io.dtype {
         DataType::Int32 => {
@@ -301,14 +370,10 @@ fn reduce_column_from_batch(
                 let host: Vec<i32> = filter_primitive_to_vec(pa);
                 let len = host.len();
                 if matches!(op, ReduceOp::Sum) {
-                    // `reduce_host_slice` mints its own stream + uses async
-                    // H2D; for the widened SUM path we replicate that here
-                    // because `reduce_host_slice` is monomorphic over a single
-                    // accumulator type. The outer `stream` from this function
-                    // is intentionally unused on this branch (a fresh stream
-                    // is fine — the H2D/kernel/D2H still chain).
-                    let dev =
-                        GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
+                    // Widened SUM path: replicate the upload-async shape that
+                    // `reduce_host_slice` would have used, since that helper is
+                    // monomorphic over a single accumulator type.
+                    let dev = upload_primitive_values_async::<i32>(&host, &stream)?;
                     reduce_gpu_vec_widened::<i32, i64>(
                         op, col_io.dtype, &dev, len, &stream,
                     )
@@ -316,9 +381,11 @@ fn reduce_column_from_batch(
                     reduce_host_slice::<i32>(op, col_io.dtype, &host)
                 }
             } else {
-                // Zero-copy fast path: synchronous upload via Arrow's value
-                // buffer, then drive the kernel + partials D2H on `stream`.
-                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                // No-null fast path: async H2D of Arrow's value buffer on
+                // `stream`, then the kernel + partials D2H ride the same
+                // stream. v0.6 pilot replaced the synchronous
+                // `primitive_to_gpu`+`from_buffer` pair here.
+                let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
                 if matches!(op, ReduceOp::Sum) {
                     reduce_gpu_vec_widened::<i32, i64>(
                         op, col_io.dtype, &dev, n_rows, &stream,
@@ -337,7 +404,7 @@ fn reduce_column_from_batch(
                 let host: Vec<i64> = filter_primitive_to_vec(pa);
                 reduce_host_slice::<i64>(op, col_io.dtype, &host)
             } else {
-                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                let dev = upload_primitive_values_async::<i64>(pa.values(), &stream)?;
                 reduce_gpu_vec::<i64>(op, col_io.dtype, &dev, n_rows, &stream)
             }
         }
@@ -350,7 +417,7 @@ fn reduce_column_from_batch(
                 let host: Vec<f32> = filter_primitive_to_vec(pa);
                 reduce_host_slice::<f32>(op, col_io.dtype, &host)
             } else {
-                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                let dev = upload_primitive_values_async::<f32>(pa.values(), &stream)?;
                 reduce_gpu_vec::<f32>(op, col_io.dtype, &dev, n_rows, &stream)
             }
         }
@@ -363,7 +430,7 @@ fn reduce_column_from_batch(
                 let host: Vec<f64> = filter_primitive_to_vec(pa);
                 reduce_host_slice::<f64>(op, col_io.dtype, &host)
             } else {
-                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                let dev = upload_primitive_values_async::<f64>(pa.values(), &stream)?;
                 reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows, &stream)
             }
         }
@@ -412,10 +479,12 @@ fn fused_avg_from_batch(
     let has_nulls = arr.null_count() > 0;
     let stream = CudaStream::null_or_default();
 
-    // Per-dtype: build a `GpuVec` (zero-copy when NULL-free, host-filtered
-    // upload otherwise) and dispatch to the fused launcher. The launcher is
-    // monomorphic on the input dtype because `compile_avg_reduction_kernel`
-    // emits dtype-specific PTX.
+    // Per-dtype: build a `GpuVec` (async H2D of Arrow's value buffer when
+    // NULL-free, host-filtered upload otherwise) and dispatch to the fused
+    // launcher. The launcher is monomorphic on the input dtype because
+    // `compile_avg_reduction_kernel` emits dtype-specific PTX. v0.6 pilot:
+    // every upload site routes through `upload_primitive_values_async` so
+    // the `cuda-stub` graceful fallback lives in one place.
     match col_io.dtype {
         DataType::Int32 => {
             let pa = arr
@@ -425,10 +494,10 @@ fn fused_avg_from_batch(
             if has_nulls {
                 let host: Vec<i32> = filter_primitive_to_vec(pa);
                 let len = host.len();
-                let dev = GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
+                let dev = upload_primitive_values_async::<i32>(&host, &stream)?;
                 fused_avg_gpu_vec::<i32>(col_io.dtype, &dev, len, &stream)
             } else {
-                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
                 fused_avg_gpu_vec::<i32>(col_io.dtype, &dev, n_rows, &stream)
             }
         }
@@ -440,10 +509,10 @@ fn fused_avg_from_batch(
             if has_nulls {
                 let host: Vec<i64> = filter_primitive_to_vec(pa);
                 let len = host.len();
-                let dev = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
+                let dev = upload_primitive_values_async::<i64>(&host, &stream)?;
                 fused_avg_gpu_vec::<i64>(col_io.dtype, &dev, len, &stream)
             } else {
-                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                let dev = upload_primitive_values_async::<i64>(pa.values(), &stream)?;
                 fused_avg_gpu_vec::<i64>(col_io.dtype, &dev, n_rows, &stream)
             }
         }
@@ -455,10 +524,10 @@ fn fused_avg_from_batch(
             if has_nulls {
                 let host: Vec<f32> = filter_primitive_to_vec(pa);
                 let len = host.len();
-                let dev = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
+                let dev = upload_primitive_values_async::<f32>(&host, &stream)?;
                 fused_avg_gpu_vec::<f32>(col_io.dtype, &dev, len, &stream)
             } else {
-                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                let dev = upload_primitive_values_async::<f32>(pa.values(), &stream)?;
                 fused_avg_gpu_vec::<f32>(col_io.dtype, &dev, n_rows, &stream)
             }
         }
@@ -470,10 +539,10 @@ fn fused_avg_from_batch(
             if has_nulls {
                 let host: Vec<f64> = filter_primitive_to_vec(pa);
                 let len = host.len();
-                let dev = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
+                let dev = upload_primitive_values_async::<f64>(&host, &stream)?;
                 fused_avg_gpu_vec::<f64>(col_io.dtype, &dev, len, &stream)
             } else {
-                let dev = GpuVec::from_buffer(primitive_to_gpu(pa)?);
+                let dev = upload_primitive_values_async::<f64>(pa.values(), &stream)?;
                 fused_avg_gpu_vec::<f64>(col_io.dtype, &dev, n_rows, &stream)
             }
         }
@@ -593,16 +662,19 @@ where
 }
 
 /// Upload a host slice, then run the standard GPU reduction over it. Used by
-/// COUNT (which synthesizes an all-ones column on the host).
+/// COUNT (which synthesizes an all-ones column on the host) and by the
+/// has-nulls path which filters Arrow's value buffer into a fresh `Vec` first.
 ///
-/// Stage 2: drives the upload + reduction on a per-call stream so the H2D and
-/// the partials D2H overlap with the kernel where the driver allows it.
+/// v0.6 async-memcpy pilot: drives the upload + reduction on a per-call
+/// stream so the H2D and the partials D2H overlap with the kernel where
+/// the driver allows it. Routes through [`upload_primitive_values_async`]
+/// so the `cuda-stub` graceful fallback lives in one place.
 fn reduce_host_slice<T>(op: ReduceOp, dtype: DataType, host: &[T]) -> BoltResult<Scalar>
 where
     T: Pod + ReduceScalar,
 {
     let stream = CudaStream::null_or_default();
-    let dev = GpuVec::<T>::from_slice_async(host, stream.raw())?;
+    let dev = upload_primitive_values_async::<T>(host, &stream)?;
     reduce_gpu_vec::<T>(op, dtype, &dev, host.len(), &stream)
 }
 
