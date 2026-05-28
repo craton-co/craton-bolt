@@ -886,6 +886,13 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
 /// Optionally sets `matched[build_idx] = 1` via an atomic OR — the host
 /// passes a null `matched_ptr` for INNER and a real bitmap for outer.
 ///
+/// The `matched` bitmap is indexed in u32 words: the kernel computes
+/// `word_idx = cursor >> 5` and OR-sets `1 << (cursor & 31)` via
+/// `atom.global.or.b32`, so the host allocates
+/// `((build_n_rows + 31) / 32) as usize` u32 elements
+/// (= `ceil(build_n_rows / 8)` bytes). The INNER path must pass a strict
+/// null (exactly 0) because the kernel value-compares the pointer.
+///
 /// ```text
 /// .visible .entry bolt_hash_join_probe_collision(
 ///     .param .u64 probe_keys_ptr,    // i64, length n_probe
@@ -895,7 +902,7 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
 ///     .param .u64 out_probe_idx_ptr, // u32, length out_capacity
 ///     .param .u64 out_build_idx_ptr, // u32, length out_capacity
 ///     .param .u64 out_counter_ptr,   // u32, single counter (init=0)
-///     .param .u64 matched_ptr,       // u32, ceil(build_n_rows/4) — may be 0
+///     .param .u64 matched_ptr,       // u32, ceil(build_n_rows/32) words (= ceil(build_n_rows/8) bytes) — may be 0
 ///     .param .u32 n_probe,
 ///     .param .u32 cap,
 ///     .param .u32 out_capacity,
@@ -1035,10 +1042,9 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tst.global.u32 [%rd24], %r25;").map_err(write_err)?;
 
     // matched[cursor] |= 1 (only when matched_ptr non-null). The bitmap is
-    // a u32[ceil(build_n_rows/32)] viewed as u8[ceil(build_n_rows/4)] for
-    // the atomic-OR alignment; here we use the byte-resolution version:
-    // word_idx = cursor >> 5, bit = 1 << (cursor & 31). atom.global.or.b32
-    // on a u32 word is the simplest correct approach.
+    // a u32[ceil(build_n_rows/32)] (= ceil(build_n_rows/8) bytes). We compute
+    // word_idx = cursor >> 5 and bit = 1 << (cursor & 31), then atom.global.or.b32
+    // the bit into the word — naturally 4-byte aligned for the atomic.
     writeln!(p, "\tsetp.eq.u64 %p6, %rd19, 0;").map_err(write_err)?;
     writeln!(p, "\t@%p6 bra ADVANCE;").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd25, %rd19;").map_err(write_err)?;
@@ -1070,9 +1076,15 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
 /// pairs each claimed entry with a NULL probe-side index via
 /// `arrow::compute::take`.
 ///
+/// The `matched` bitmap is indexed in u32 words: the kernel computes
+/// `word_idx = tid >> 5` and tests `1 << (tid & 31)`, so the host allocates
+/// `((build_n_rows + 31) / 32) as usize` u32 elements
+/// (= `ceil(build_n_rows / 8)` bytes). This kernel always requires a real
+/// non-null pointer.
+///
 /// ```text
 /// .visible .entry bolt_hash_join_emit_unmatched_build(
-///     .param .u64 matched_ptr,       // u32, ceil(build_n_rows/32)
+///     .param .u64 matched_ptr,       // u32, ceil(build_n_rows/32) words (= ceil(build_n_rows/8) bytes)
 ///     .param .u64 out_build_idx_ptr, // u32, length out_capacity
 ///     .param .u64 out_counter_ptr,   // u32, single counter (init=0)
 ///     .param .u32 build_n_rows,
