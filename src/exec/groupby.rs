@@ -564,6 +564,21 @@ pub fn execute_groupby(
     // construction sites remain bit-identical.
     let any_input_has_validity: bool =
         aggregate.input_has_validity.iter().any(|&v| v);
+    // TODO(perf, review L3): when `aggregate.aggregates.len() > 1`, the keys
+    // are shared across every aggregate, and none of them is a float MIN/MAX
+    // (which still needs the `float_atomics` CAS path) and none needs
+    // `_with_validity` plumbing, route the whole bundle through the FUSED
+    // multi-aggregate kernel emitted by
+    // `crate::jit::hash_kernels::compile_groupby_agg_kernel_multi`. That
+    // kernel hashes the keys once and issues N atomic updates back-to-back,
+    // replacing the N separate per-agg launches below — each of which
+    // currently re-hashes the keys. Wiring it in requires extending
+    // `run_one_aggregate` / `run_typed_agg` to (a) allocate all N accumulator
+    // buffers up front, (b) upload all N input columns, (c) launch the
+    // single fused kernel, (d) download all N accumulators — i.e. a
+    // breaking refactor of the per-agg plumbing. The JIT-side fused emitter
+    // is already shipped behind this TODO; flipping the dispatch is the
+    // follow-up.
     let mut acc_results: Vec<AccDownload> = Vec::with_capacity(aggregate.aggregates.len());
     for agg in &aggregate.aggregates {
         let acc = run_one_aggregate(

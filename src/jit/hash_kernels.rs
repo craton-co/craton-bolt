@@ -646,6 +646,349 @@ fn compile_groupby_agg_kernel_inner(
     Ok(ptx)
 }
 
+/// Entry point of the fused multi-aggregate kernel emitted by
+/// [`compile_groupby_agg_kernel_multi`].
+pub const AGG_KERNEL_MULTI_ENTRY: &str = "bolt_groupby_agg_multi";
+
+/// One aggregate's contribution to the fused multi-aggregate kernel.
+///
+/// The fused kernel hashes the group key exactly once, walks the probe loop
+/// exactly once, and then issues `N` independent `atom.global.<op>.<dtype>`
+/// instructions — one per `AggSpec` in the slice — against `N` per-aggregate
+/// input columns and `N` per-aggregate accumulator tables.
+///
+/// Each spec contributes its own `(input_ptr, acc_ptr)` pointer pair through
+/// the kernel's parameter list (see the ABI in
+/// [`compile_groupby_agg_kernel_multi`]'s doc comment).
+#[derive(Debug, Clone, Copy)]
+pub struct AggSpec {
+    /// Reduction operator (Sum / Min / Max / Count). MIN/MAX over floats is
+    /// rejected by [`atomic_for`] just as in the single-agg path — Tier-1
+    /// dispatch is expected to route those through `float_atomics`.
+    pub op: ReduceOp,
+    /// Element type of both the input column and the accumulator slot for
+    /// this aggregate. Different specs may use different dtypes (e.g.
+    /// `SUM(i32)` + `COUNT(*) -> i64` + `MIN(f64)`).
+    pub input_dtype: DataType,
+}
+
+/// Generate PTX for the **fused multi-aggregate** kernel.
+///
+/// This is the multi-agg companion to [`compile_groupby_agg_kernel`]: where
+/// the single-agg kernel re-hashes the group key (and re-walks the probe
+/// chain) on every invocation, this kernel hashes ONCE and then issues `N`
+/// atomic updates back-to-back. For `SELECT SUM(a), COUNT(*), MIN(b)
+/// FROM t GROUP BY k` the dispatcher previously emitted three kernels each
+/// repeating the hash + probe; this folds them into one launch.
+///
+/// Pattern lifted from
+/// [`crate::jit::partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi`]
+/// (Tier-2's per-partition shared-mem reducer), adapted to Tier-1's global
+/// open-addressing layout.
+///
+/// # ABI
+///
+/// `N = specs.len()`. Parameter ordering (all `.u64` except where noted):
+///
+/// ```text
+/// .visible .entry bolt_groupby_agg_multi(
+///     .param .u64 group_col_ptr,        // i64 group keys, length n_rows
+///     .param .u64 keys_table_ptr,       // i64, length k, fully populated
+///     .param .u64 input_col_ptr_0,
+///     ...
+///     .param .u64 input_col_ptr_{N-1},
+///     .param .u64 acc_table_ptr_0,
+///     ...
+///     .param .u64 acc_table_ptr_{N-1},
+///     .param .u32 n_rows,
+///     .param .u32 k,                    // power-of-two table size
+/// )
+/// ```
+///
+/// Spec `j`'s input column elements are `specs[j].input_dtype.byte_width()`
+/// bytes wide, matching its accumulator table's slot width. The host must
+/// upload each input + accumulator buffer in spec order.
+///
+/// # Pre-conditions
+///
+/// Same cross-kernel synchronisation contract as the single-agg variant —
+/// `keys_table_ptr` must reference a fully-populated keys table produced by
+/// a prior [`compile_groupby_keys_kernel`] launch on the same stream (or
+/// the host must explicitly synchronise between launches).
+///
+/// # Restrictions
+///
+/// * `specs` must be non-empty.
+/// * Each spec is validated through [`atomic_for`] and [`ptx_type_info`],
+///   so float MIN/MAX is rejected here — Tier-1 dispatch must keep float
+///   MIN/MAX out of the fused path (route those through `float_atomics`
+///   per-aggregate just as today). When the dispatch sees a fusable
+///   homogeneous-key spec set with no float MIN/MAX, this is a strict win;
+///   when it doesn't, the per-agg path keeps working.
+///
+/// # Note on validity
+///
+/// This first cut does NOT emit the Stage-C `_with_validity` gate. Adding
+/// per-spec validity bitmaps multiplies the parameter list and forces a
+/// per-spec bit-extract before each atomic; that's a follow-up. The Tier-1
+/// dispatcher should keep the per-agg `_with_validity` path for queries
+/// where ANY agg-input column has validity; fuse only the no-validity case.
+pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String> {
+    if specs.is_empty() {
+        return Err(BoltError::Other(
+            "compile_groupby_agg_kernel_multi: specs must be non-empty"
+                .into(),
+        ));
+    }
+    let n = specs.len();
+
+    // Validate every spec up front; collect per-spec PTX type info so the
+    // body loop is allocation-free.
+    struct PerSpec {
+        atomic: &'static str,
+        load_suffix: &'static str,
+        reg_class: &'static str,
+        reg_decl_ty: &'static str,
+        elem_bytes: usize,
+    }
+    let mut per: Vec<PerSpec> = Vec::with_capacity(n);
+    for s in specs {
+        let atomic = atomic_for(s.op, s.input_dtype)?;
+        let (load_suffix, reg_class) = ptx_type_info(s.input_dtype)?;
+        let reg_decl_ty_s = reg_decl_ty(s.input_dtype)?;
+        let elem_bytes = s.input_dtype.byte_width().ok_or_else(|| {
+            BoltError::Other(format!(
+                "hash_kernels: variable-width dtype {:?} not supported in fused multi-agg",
+                s.input_dtype
+            ))
+        })?;
+        per.push(PerSpec {
+            atomic,
+            load_suffix,
+            reg_class,
+            reg_decl_ty: reg_decl_ty_s,
+            elem_bytes,
+        });
+    }
+
+    let entry = AGG_KERNEL_MULTI_ENTRY;
+    let mut ptx = String::new();
+
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Param layout (see ABI in doc comment):
+    //   p0  = group_col_ptr
+    //   p1  = keys_table_ptr
+    //   p[2 .. 2+n)            = input_col_ptr_j
+    //   p[2+n .. 2+2n)         = acc_table_ptr_j
+    //   p[2+2n]                = n_rows (u32)
+    //   p[3+2n]                = k      (u32)
+    let total_u64_params = 2 + 2 * n;
+    let n_rows_param = total_u64_params;
+    let k_param = total_u64_params + 1;
+    let total_params = total_u64_params + 2;
+
+    writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
+    for p in 0..total_params {
+        let trailing = if p == total_params - 1 { "" } else { "," };
+        let kind = if p < total_u64_params { "u64" } else { "u32" };
+        writeln!(ptx, "\t.param .{kind} {entry}_param_{p}{trailing}")
+            .map_err(write_err)?;
+    }
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    // Register pool. Per-spec value registers are emitted as separate
+    // `.reg` classes ("vr", "vl", "vf", "vd") so different dtypes don't
+    // alias. Each class is sized large enough for the worst case of all
+    // N specs sharing that class (4 vals per spec keeps headroom).
+    writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<32>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<64>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    // Emit one `.reg` declaration per dtype actually used by any spec, so
+    // we don't redeclare and don't waste names. Index `j` of a class is
+    // assigned by the spec's position within that class's per-dtype group;
+    // a fresh slot is allocated below when writing the atomic.
+    let mut declared_classes: Vec<&'static str> = Vec::new();
+    for p in &per {
+        if !declared_classes.contains(&p.reg_class) {
+            // Width per spec in this class: 4 names (loaded value + atomic
+            // return + 2 spare). With at most n specs sharing a class the
+            // declared range is 4*n which is a tight upper bound.
+            writeln!(
+                ptx,
+                "\t.reg .{ty}   %{rc}<{w}>;",
+                ty = p.reg_decl_ty,
+                rc = p.reg_class,
+                w = 4 * n.max(1),
+            )
+            .map_err(write_err)?;
+            declared_classes.push(p.reg_class);
+        }
+    }
+    writeln!(ptx).map_err(write_err)?;
+
+    // tid = ctaid.x * ntid.x + tid.x ; bail if tid >= n_rows.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u32 %r4, [{entry}_param_{n_rows_param}];"
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // k and mask = k - 1.
+    writeln!(
+        ptx,
+        "\tld.param.u32 %r5, [{entry}_param_{k_param}];"
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
+
+    // max_probes = k * MAX_PROBE_FACTOR.
+    writeln!(
+        ptx,
+        "\tmul.lo.u32 %r20, %r5, {factor};",
+        factor = MAX_PROBE_FACTOR
+    )
+    .map_err(write_err)?;
+
+    // Load the key for this row (param 0 = group_col_ptr).
+    writeln!(ptx, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+
+    // Hash — computed exactly ONCE for the entire fused kernel. This is the
+    // whole point: subsequent atomic updates reuse the resolved slot
+    // without re-hashing.
+    writeln!(ptx, "\tmov.s64 %rl1, {};", FX_MUL).map_err(write_err)?;
+    writeln!(ptx, "\tmul.lo.s64 %rl2, %rl0, %rl1;").map_err(write_err)?;
+    writeln!(ptx, "\tshr.u64 %rl3, %rl2, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
+
+    // Keys table base (param 1).
+    writeln!(ptx, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+
+    // Bounded-probe counter (matches single-agg `compile_groupby_agg_kernel`).
+    writeln!(ptx, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+
+    // Probe loop — non-mutating; walks slots until the matching key is found
+    // OR the bound trips (silent-drop, identical to the single-agg variant).
+    writeln!(ptx, "PROBE_LOOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p3, %r21, %r20;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s64 %rl5, [%rd5];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s64 %p1, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra FOUND;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PROBE_LOOP;").map_err(write_err)?;
+    writeln!(ptx, "FOUND:").map_err(write_err)?;
+
+    // ----------------- Phase: emit N atomic updates ----------------------
+    //
+    // Each spec j contributes:
+    //   1. load input_j[tid] into a typed value register
+    //   2. compute acc_j + slot * elem_bytes_j
+    //   3. atom.global.<op_j>.<dtype_j> at that address
+    //
+    // Register-name bookkeeping: per dtype-class we hand out two fresh slot
+    // indices per spec (one for the loaded value, one for the atomic's
+    // ignored return register). The slot offset is tracked in a small
+    // per-class counter so the names never collide across specs sharing a
+    // class.
+    let mut class_slot_counter: Vec<(&str, usize)> = Vec::new();
+    fn take_two_slots<'a>(
+        counter: &mut Vec<(&'a str, usize)>,
+        rc: &'a str,
+    ) -> (usize, usize) {
+        if let Some(entry) = counter.iter_mut().find(|(c, _)| *c == rc) {
+            let base = entry.1;
+            entry.1 = base + 2;
+            (base, base + 1)
+        } else {
+            counter.push((rc, 2));
+            (0, 1)
+        }
+    }
+    for (j, p) in per.iter().enumerate() {
+        let input_param = 2 + j;
+        let acc_param = 2 + n + j;
+        // Scratch %rd index pool: reuse %rd10..%rd13 per j — each spec owns
+        // them only between its load and its atom; nothing carries across.
+        // Load input_j[tid].
+        writeln!(
+            ptx,
+            "\tld.param.u64 %rd10, [{entry}_param_{input_param}];"
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd10, %rd10;").map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tmul.wide.u32 %rd11, %r3, {bytes};",
+            bytes = p.elem_bytes
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd12, %rd10, %rd11;").map_err(write_err)?;
+
+        let (val_idx, ret_idx) = take_two_slots(&mut class_slot_counter, p.reg_class);
+        writeln!(
+            ptx,
+            "\tld.global.{ld} %{rc}{vi}, [%rd12];",
+            ld = p.load_suffix,
+            rc = p.reg_class,
+            vi = val_idx,
+        )
+        .map_err(write_err)?;
+
+        // Accumulator slot address: acc_j + slot * elem_bytes_j.
+        writeln!(
+            ptx,
+            "\tld.param.u64 %rd13, [{entry}_param_{acc_param}];"
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd13, %rd13;").map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tmul.wide.u32 %rd14, %r8, {bytes};",
+            bytes = p.elem_bytes
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd15, %rd13, %rd14;").map_err(write_err)?;
+
+        writeln!(
+            ptx,
+            "\t{atomic} %{rc}{ri}, [%rd15], %{rc}{vi};",
+            atomic = p.atomic,
+            rc = p.reg_class,
+            ri = ret_idx,
+            vi = val_idx,
+        )
+        .map_err(write_err)?;
+    }
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
 /// Block size accessor for the host-side launcher. Kept private to the module
 /// for now; the executor reads it via [`groupby_block_size`].
 pub fn groupby_block_size() -> u32 {
@@ -796,6 +1139,85 @@ mod ptx_shape_tests {
         assert!(ptx.contains("@%p4 bra DONE;"));
         // The atom.add must still be present after the gate.
         assert!(ptx.contains("atom.global.add.u64"));
+    }
+
+    /// The fused multi-aggregate kernel hashes the key ONCE and emits one
+    /// atomic per spec — verifying both the fusion (single hash block) and
+    /// the spec-count scaling (N atomic.add lines for N SUM specs).
+    ///
+    /// We build three Sum/Count specs that all lower to `atom.global.add`
+    /// so a literal count of `atom.global.add` lines == 3, and we check
+    /// that the canonical splitmix multiplier appears exactly once
+    /// (a proxy for "the hash-mul-FNV block is emitted exactly once").
+    #[test]
+    fn agg_multi_kernel_emits_n_atomics_and_one_hash() {
+        let specs = [
+            AggSpec { op: ReduceOp::Sum,   input_dtype: DataType::Int64 },
+            AggSpec { op: ReduceOp::Count, input_dtype: DataType::Int64 },
+            AggSpec { op: ReduceOp::Sum,   input_dtype: DataType::Int32 },
+        ];
+        let ptx = compile_groupby_agg_kernel_multi(&specs)
+            .expect("fused multi-agg ptx");
+
+        // Three atomic updates, one per spec. Each Sum/Count over Int*
+        // lowers to `atom.global.add.<u64|s32>` (see `atomic_for`).
+        let n_atomics = ptx.matches("atom.global.add").count();
+        assert_eq!(
+            n_atomics, 3,
+            "expected 3 atom.global.add lines for 3 specs, got {n_atomics}\n\
+             --- emitted PTX ---\n{ptx}"
+        );
+
+        // The hash block writes the FNV/splitmix multiplier into %rl1
+        // exactly once. If the loop body re-hashed per spec, we'd see this
+        // literal appear N times.
+        let mul_literal = format!("mov.s64 %rl1, {};", FX_MUL);
+        let n_hash_blocks = ptx.matches(mul_literal.as_str()).count();
+        assert_eq!(
+            n_hash_blocks, 1,
+            "expected exactly one hash-mul-FNV block (one `mov.s64 %rl1, FX_MUL`), \
+             got {n_hash_blocks} — fusion isn't real\n\
+             --- emitted PTX ---\n{ptx}"
+        );
+
+        // And the entry point should be the fused name.
+        assert!(
+            ptx.contains(&format!(".visible .entry {AGG_KERNEL_MULTI_ENTRY}(")),
+            "fused entry-point name missing"
+        );
+    }
+
+    /// `specs` must be non-empty.
+    #[test]
+    fn agg_multi_rejects_empty_specs() {
+        assert!(compile_groupby_agg_kernel_multi(&[]).is_err());
+    }
+
+    /// The fused kernel's `.param .u64` count is `2 + 2 * n_specs`
+    /// (group_col + keys_table + N input ptrs + N acc ptrs); the trailing
+    /// `n_rows` and `k` are `.u32`.
+    #[test]
+    fn agg_multi_param_count_matches_signature() {
+        for n_specs in 1..=4 {
+            let specs: Vec<AggSpec> = (0..n_specs)
+                .map(|_| AggSpec {
+                    op: ReduceOp::Sum,
+                    input_dtype: DataType::Int64,
+                })
+                .collect();
+            let ptx = compile_groupby_agg_kernel_multi(&specs).unwrap();
+            let expected_u64 = 2 + 2 * n_specs;
+            let got_u64 = ptx.matches(".param .u64 ").count();
+            assert_eq!(
+                got_u64, expected_u64,
+                "n_specs={n_specs}: expected {expected_u64} .u64 params, got {got_u64}"
+            );
+            let got_u32 = ptx.matches(".param .u32 ").count();
+            assert_eq!(
+                got_u32, 2,
+                "n_specs={n_specs}: expected 2 .u32 params (n_rows + k), got {got_u32}"
+            );
+        }
     }
 
     /// Packed-bit word count rounds up.
