@@ -203,6 +203,10 @@ pub enum BinaryOp {
     And,
     /// `a OR b`.
     Or,
+    /// SQL `a || b` — string concatenation. Both operands must be Utf8;
+    /// result is Utf8. Lowered host-side (the GPU codegen path has no
+    /// Utf8 support); see `crate::exec::string_ops::host_concat_strings`.
+    Concat,
 }
 
 impl BinaryOp {
@@ -222,6 +226,12 @@ impl BinaryOp {
     /// True for `AND OR`.
     fn is_logical(self) -> bool {
         matches!(self, BinaryOp::And | BinaryOp::Or)
+    }
+
+    /// True for string ops (currently only `||`). Result is Utf8; both
+    /// operands must be Utf8 (the type-checker enforces this).
+    fn is_string(self) -> bool {
+        matches!(self, BinaryOp::Concat)
     }
 }
 
@@ -383,6 +393,12 @@ impl Expr {
         binary(BinaryOp::Or, self, rhs)
     }
 
+    /// `self || rhs` — SQL string concatenation. Both sides must type-check
+    /// to `Utf8`; result is `Utf8`. See [`BinaryOp::Concat`].
+    pub fn concat(self, rhs: Expr) -> Expr {
+        binary(BinaryOp::Concat, self, rhs)
+    }
+
     /// `self IS NULL`. Returns a Bool expression, never null.
     pub fn is_null(self) -> Expr {
         Expr::Unary {
@@ -465,6 +481,18 @@ impl Expr {
                     } else {
                         Err(BoltError::Type(format!(
                             "logical {op:?} requires Bool operands, got {l:?} and {r:?}"
+                        )))
+                    }
+                } else if op.is_string() {
+                    // String concat (`||`): both operands must be Utf8.
+                    // Result is always Utf8. NULL-peer-typing has already
+                    // run above, so a bare NULL opposite a Utf8 peer is
+                    // typed as Utf8 here and accepted.
+                    if l == DataType::Utf8 && r == DataType::Utf8 {
+                        Ok(DataType::Utf8)
+                    } else {
+                        Err(BoltError::Type(format!(
+                            "string {op:?} requires Utf8 operands, got {l:?} and {r:?}"
                         )))
                     }
                 } else {

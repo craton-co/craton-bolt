@@ -18,9 +18,11 @@
 //! `COUNT|SUM|MIN|MAX|AVG` — so UPPER, LOWER, LENGTH, SUBSTR/SUBSTRING,
 //! CONCAT, CONCAT_WS, and TRIM are unreachable through SQL today even though
 //! the per-row implementations exist on the executor side. Likewise
-//! `BinaryOperator::StringConcat` (`||`) and the `LIKE` operator have no arm
-//! in `lower_binary_op`, so they hit the catch-all "unsupported expression"
-//! /"unsupported binary operator" error.
+//! `BinaryOperator::StringConcat` (`||`) is supported as of v0.5 — it
+//! lowers to `BinaryOp::Concat`, type-checks Utf8 ⊗ Utf8 → Utf8, and runs
+//! host-side via `string_ops::host_concat_strings`. The `LIKE` operator
+//! still has no arm in `lower_binary_op`, so it hits the catch-all
+//! "unsupported expression" error.
 //!
 //! What IS supported:
 //!
@@ -245,18 +247,54 @@ fn parse_concat_function_rejected_by_frontend() {
 }
 
 #[test]
-fn parse_string_concat_operator_rejected_by_frontend() {
-    // TODO(post-0.3): `||` (StringConcat) not yet supported by frontend
-    // (review H7). `lower_binary_op` has no arm for
-    // `BinaryOperator::StringConcat`, so `a || b` falls into the
-    // "unsupported binary operator" rejection.
+fn parse_string_concat_operator_supported() {
+    // v0.5: `||` (StringConcat) is now lowered to `BinaryOp::Concat` by the
+    // SQL frontend. The frontend must parse it cleanly against Utf8
+    // operands; type-checking happens inside `LogicalPlan::schema()` and is
+    // exercised by the type-check tests below.
     let provider = s_provider();
-    let err = parse_sql("SELECT s || s FROM t", &provider)
-        .expect_err("s || s must reject until StringConcat is wired up");
+    parse_sql("SELECT s || s FROM t", &provider)
+        .expect("SELECT s || s FROM t must parse and type-check");
+}
+
+#[test]
+fn parse_string_concat_with_literal_supported() {
+    // SELECT a || ' literal' FROM t — Utf8 column on the left, Utf8
+    // literal on the right.
+    let provider = s_provider();
+    parse_sql("SELECT s || ' literal' FROM t", &provider)
+        .expect("SELECT s || ' literal' FROM t must parse and type-check");
+}
+
+#[test]
+fn parse_string_concat_type_mismatch_rejected() {
+    // `||` requires Utf8 ⊗ Utf8. A Utf8 ⊗ Int64 combination must surface a
+    // type error at plan-construction time.
+    let provider = sv_provider();
+    let err = parse_sql("SELECT s || v FROM t", &provider)
+        .expect_err("s (Utf8) || v (Int64) must reject as a type error");
     let msg = format!("{err}");
     assert!(
-        msg.contains("unsupported binary operator"),
-        "unexpected error for ||: {msg}"
+        msg.contains("Utf8") || msg.contains("requires Utf8"),
+        "unexpected error for Utf8 || Int64: {msg}"
+    );
+}
+
+#[test]
+fn parse_string_concat_in_where_rejected_with_clear_message() {
+    // Per v0.5 scope: `||` in a WHERE predicate type-checks at the
+    // logical layer but is rejected at the physical-plan boundary so
+    // users get an actionable message instead of a kernel-launch failure.
+    use craton_bolt::plan::lower_physical;
+    let provider = s_provider();
+    let plan = parse_sql("SELECT s FROM t WHERE s || s = 'foo'", &provider)
+        .expect("WHERE s || s = 'foo' must type-check at the logical layer");
+    let err = lower_physical(&plan)
+        .expect_err("`||` in WHERE must reject at the physical layer in v0.5");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("string concat") && msg.contains("WHERE"),
+        "unexpected lower error for `||` in WHERE: {msg}"
     );
 }
 
@@ -387,6 +425,74 @@ fn where_string_inequality_returns_complement_rows() {
     );
 }
 
+#[test]
+#[ignore = "gpu:string"]
+fn select_concat_two_columns_returns_concatenated_strings() {
+    // v0.5: `SELECT a || b FROM t` — host-side `||` over two Utf8 columns.
+    // The Project arm of `lower_depth` detects Concat in the SELECT list,
+    // lowers the underlying Scan as a passthrough Projection, then wraps a
+    // host-side `PhysicalPlan::Project` that calls `expr_agg::eval_expr`
+    // on each row.
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("ctx");
+    let a = StringArray::from(vec!["foo", "bar", "baz"]);
+    let b = StringArray::from(vec!["X", "Y", "Z"]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", ArrowDataType::Utf8, false),
+        ArrowField::new("b", ArrowDataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(a), Arc::new(b)]).unwrap();
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT a || b FROM t")
+        .expect("execute SELECT a || b FROM t");
+    let out = h.record_batch();
+    let s = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("output column is Utf8");
+    let got: Vec<&str> = (0..s.len()).map(|i| s.value(i)).collect();
+    assert_eq!(got, vec!["fooX", "barY", "bazZ"]);
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn select_concat_column_with_literal_returns_suffixed_strings() {
+    // `SELECT s || ' literal' FROM t` — exercises the column-on-left,
+    // Utf8-literal-on-right shape. The literal is broadcast to every row
+    // by `expr_agg::eval_literal`.
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("ctx");
+    let s = StringArray::from(vec!["a", "b", "c"]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(s)]).unwrap();
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT s || ' literal' FROM t")
+        .expect("execute SELECT s || ' literal' FROM t");
+    let out = h.record_batch();
+    let out_col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("output column is Utf8");
+    let got: Vec<&str> = (0..out_col.len()).map(|i| out_col.value(i)).collect();
+    assert_eq!(got, vec!["a literal", "b literal", "c literal"]);
+}
+
 // TODO(post-0.3): select_upper_lowercases_input — `SELECT UPPER(s) FROM t`.
 // TODO(post-0.3): select_lower_lowercases_input — `SELECT LOWER(s) FROM t`.
 // TODO(post-0.3): select_length_returns_byte_or_char_count
@@ -394,8 +500,6 @@ fn where_string_inequality_returns_complement_rows() {
 //                 `string_ops::length` doc).
 // TODO(post-0.3): select_substring_extracts_subrange
 //                 — `SELECT SUBSTR(s, 1, 3) FROM t`.
-// TODO(post-0.3): select_concat_two_columns
-//                 — `SELECT CONCAT(a, b) FROM t` or `a || b`.
 // TODO(post-0.3): where_like_prefix_pattern
 //                 — `SELECT s FROM t WHERE s LIKE 'foo%'`.
 // TODO(post-0.3): where_like_with_escape

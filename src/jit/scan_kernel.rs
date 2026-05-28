@@ -669,6 +669,17 @@ fn emit_binary(
                 mnemonic, dst_name, lhs_name, rhs_name
             ))
         }
+        Concat => {
+            // String concat is host-only (see ptx_gen.rs for the same
+            // arm). The physical-plan lowerer routes Concat through the
+            // host-side PhysicalPlan::Project, so this kernel path
+            // should never see one.
+            Err(BoltError::Other(
+                "scan_kernel: string concat (||) is not lowered to GPU; \
+                 the planner should route through host-side execution"
+                    .into(),
+            ))
+        }
     }
 }
 

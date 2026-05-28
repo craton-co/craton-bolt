@@ -2435,6 +2435,7 @@ fn lower_binary_op(op: &BinaryOperator) -> BoltResult<BinaryOp> {
         BinaryOperator::GtEq => BinaryOp::GtEq,
         BinaryOperator::And => BinaryOp::And,
         BinaryOperator::Or => BinaryOp::Or,
+        BinaryOperator::StringConcat => BinaryOp::Concat,
         other => {
             return Err(BoltError::Sql(format!(
                 "unsupported binary operator: {other}"

@@ -1417,6 +1417,50 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
     }
 }
 
+/// True if `expr` contains a `BinaryOp::Concat` subexpression anywhere.
+///
+/// String `||` is Utf8-valued and lives entirely on the host (the GPU
+/// codegen has no Utf8 support). Used by `lower()` to detect SELECT-list /
+/// Filter predicate trees that need the host-side projection path; see
+/// the `LogicalPlan::Project` arm in `lower_depth`.
+fn expr_contains_concat(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary { op, left, right } => {
+            matches!(op, BinaryOp::Concat)
+                || expr_contains_concat(left)
+                || expr_contains_concat(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_concat(operand),
+        Expr::Alias(inner, _) => expr_contains_concat(inner),
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
+/// Walk a `Scan` / `Filter` / `Project` chain and return true if any
+/// `Filter` node carries a predicate that contains a `BinaryOp::Concat`.
+///
+/// The GPU codegen path's fused-projection kernel cannot lower `||`
+/// (Utf8 has no device-side support), so the Project arm of `lower()`
+/// routes the whole chain through the host-side executor when this
+/// returns true.
+fn scan_chain_has_concat_filter(plan: &LogicalPlan) -> bool {
+    let mut cur = plan;
+    loop {
+        match cur {
+            LogicalPlan::Filter { input, predicate } => {
+                if expr_contains_concat(predicate) {
+                    return true;
+                }
+                cur = input.as_ref();
+            }
+            LogicalPlan::Project { input, .. } => {
+                cur = input.as_ref();
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Walk a `Scan` / `Filter` / `Project` chain and return true if any
 /// `Filter` node carries a predicate that contains an `Expr::Unary`.
 ///
@@ -1957,6 +2001,38 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     output_schema,
                 });
             }
+            // v0.5: SQL `||` (BinaryOp::Concat) is Utf8-valued and lives
+            // host-side. If any SELECT-list expression contains Concat —
+            // or any chain Filter does — we cannot fold the Project into
+            // the GPU codegen kernel. Instead, lower the inner plan (which
+            // is still a Scan / Filter / non-Concat-Project chain that the
+            // codegen can handle) so it surfaces every input column needed
+            // by the Concat expressions, then wrap a host-side
+            // `PhysicalPlan::Project` whose executor evaluates the Concat
+            // via `expr_agg::eval_expr` over a `HostColumn` env (see
+            // `engine.rs` PhysicalPlan::Project arm).
+            let proj_has_concat = exprs.iter().any(expr_contains_concat);
+            if proj_has_concat || scan_chain_has_concat_filter(input) {
+                log::debug!(
+                    "physical_plan: BinaryOp::Concat in Project / chain Filter; \
+                     lowering to host-side PhysicalPlan::Project \
+                     (GPU codegen has no Utf8 support)"
+                );
+                // Build a bare projection of every input column the
+                // Concat expressions reference, plus any other plain
+                // Column / Alias outputs in the SELECT list. We just
+                // gather column names into a set; the simplest correct
+                // thing is to lower the inner plan with NO projection
+                // override (i.e. surface every scan column) and let the
+                // host Project pull what it needs.
+                let inner = lower(input)?;
+                let output_schema = plan.schema()?;
+                return Ok(PhysicalPlan::Project {
+                    input: Box::new(inner),
+                    exprs: exprs.clone(),
+                    output_schema,
+                });
+            }
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
             } else {
@@ -1974,6 +2050,20 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             }
         }
         LogicalPlan::Filter { input, predicate } => {
+            // v0.5: `||` in a WHERE predicate (e.g. `WHERE a || b = 'foo'`)
+            // type-checks at the logical plane but is not yet lowered to a
+            // physical plan — the GPU codegen has no Utf8 support and the
+            // host-side fused Filter path lacks Utf8 column materialisation
+            // out of the scan kernel. Surface a clear plan error so users
+            // get an actionable message rather than a kernel-launch failure.
+            if expr_contains_concat(predicate) {
+                return Err(BoltError::Plan(
+                    "string concat (||) in WHERE predicates is not yet supported; \
+                     use a host-side projection (SELECT a || b FROM t) or fold the \
+                     comparison literal into the SELECT list first"
+                        .into(),
+                ));
+            }
             // GPU codegen handles `column IS [NOT] NULL` natively via
             // `Op::IsNullCheck` — see `Codegen::emit_unary`. The host
             // fallback is only required for compound Unary operands
