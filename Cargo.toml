@@ -146,6 +146,16 @@ harness = false
 name = "utf8_sort_bench"
 harness = false
 
+# v0.6 / M6 baseline regression bench. Three small representative queries
+# (scalar aggregate, GROUP BY, filter) timed at the parse / lower / ptx_gen
+# stages — no CUDA driver calls, so the suite runs on GPU-less CI runners
+# with `--features cuda-stub`. The convention is that a >5% slowdown in the
+# Criterion median vs. the committed baseline is a regression; the CI
+# gating wiring itself is a follow-up. See `benches/regression.rs`.
+[[bench]]
+name = "regression"
+harness = false
+
 [[example]]
 name = "quickstart"
 path = "examples/quickstart.rs"
