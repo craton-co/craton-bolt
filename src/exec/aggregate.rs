@@ -120,9 +120,11 @@ use crate::jit::agg_kernels::{
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 
 // `CudaModule` import dropped: every load site now routes through
-// `exec::module_cache::get_or_build_module`, which returns the cached module
-// directly.
-use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
+// `exec::module_cache::get_or_build_module_for_scalar_agg` (v0.7 — keys on
+// the `ScalarAggSpec` planner IR), which returns the cached module directly.
+use crate::plan::physical_plan::{
+    AggregateSpec, ColumnIO, PhysicalPlan, ScalarAggOp, ScalarAggSpec,
+};
 
 // v0.6 pilot helper `upload_primitive_values_async` was promoted to
 // `crate::exec::gpu_upload` in v0.7 so the filter / GROUP BY / join
@@ -743,11 +745,19 @@ where
     let block_sums = GpuVec::<f64>::zeros_async(grid_x as usize, stream.raw())?;
     let block_counts = GpuVec::<u32>::zeros_async(grid_x as usize, stream.raw())?;
 
-    let module = crate::exec::module_cache::get_or_build_module(
-        module_path!(),
-        format!("avg_reduce_{:?}", dtype),
-        None,
-        || compile_avg_reduction_kernel(dtype),
+    // v0.7 `ScalarAggSpec` cache layer: the fused AVG kernel is keyed by
+    // `(Avg, input_dtype)` and uses the `bolt_avg_reduce` entry point. Same
+    // layering as the non-fused reduction path (in-memory → disk → PTX-text
+    // hash inside `CudaModule::from_ptx`); separate cache slot from `Sum`
+    // because the fused PTX is structurally different (two output buffers).
+    let spec = ScalarAggSpec {
+        op: ScalarAggOp::Avg,
+        input_dtype: dtype,
+    };
+    let module = crate::exec::module_cache::get_or_build_module_for_scalar_agg(
+        &spec,
+        AVG_KERNEL_ENTRY,
+        |_| compile_avg_reduction_kernel(dtype),
     )?;
     let function = module.function(AVG_KERNEL_ENTRY)?;
 
@@ -1009,14 +1019,29 @@ where
     // barrier.
     let partials = GpuVec::<T>::zeros_async(grid_x as usize, stream.raw())?;
 
-    // Compile + load the kernel via the consolidated `exec::module_cache`.
-    // The reduction kernel is keyed by `(op, dtype)` — that's the entire
-    // PTX-template parameter surface. Repeat scalar reductions skip PTX gen.
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        format!("reduction:{:?}:{:?}", op, dtype),
-        None,
-        || compile_reduction_kernel(op, dtype),
+    // Compile + load the kernel via the **v0.7 `ScalarAggSpec` cache layer**
+    // in `exec::module_cache`. Cache layering, outer-to-inner:
+    //
+    //   1. Process-wide `ScalarAggSpec`-keyed cache (this call): on a hit
+    //      we skip codegen entirely and return a cloned `CudaModule`.
+    //   2. Optional disk-backed PTX cache (consulted inside the call
+    //      below) — domain-separated from the projection-path entries by
+    //      the `"scalar_agg::"` key prefix.
+    //   3. PTX-text-hash cache inside `CudaModule::from_ptx` — short-
+    //      circuits the `cuModuleLoadDataEx` step for cross-spec PTX
+    //      collisions.
+    //
+    // The spec captures the entire PTX-template parameter surface
+    // (`(op, input_dtype)`); repeat scalar reductions of the same shape
+    // skip PTX generation on the warm path.
+    let spec = ScalarAggSpec {
+        op: reduce_op_to_scalar_agg_op(op),
+        input_dtype: dtype,
+    };
+    let module = module_cache::get_or_build_module_for_scalar_agg(
+        &spec,
+        REDUCTION_KERNEL_ENTRY,
+        |_| compile_reduction_kernel(op, dtype),
     )?;
     let function = module.function(REDUCTION_KERNEL_ENTRY)?;
 
@@ -1063,6 +1088,25 @@ where
     T::finalize(op, dtype, &host_partials)
 }
 
+/// Adapter: collapse the JIT-layer `ReduceOp` (which has a host-only
+/// `Count` variant that lowers to `Sum` in PTX) into a planner-IR
+/// `ScalarAggOp`. Keeps the two enums in their respective domains and
+/// makes the lossy projection (`Count` → `Sum` would key-alias) explicit
+/// at the boundary.
+///
+/// `Count` keeps its own `ScalarAggOp::Count` variant so the cache key
+/// stays distinct from a `Sum` — this matters for the future case where
+/// the kernel grows a `Count`-specific shortcut and we don't want a stale
+/// `Sum` PTX entry to serve it.
+fn reduce_op_to_scalar_agg_op(op: ReduceOp) -> ScalarAggOp {
+    match op {
+        ReduceOp::Sum => ScalarAggOp::Sum,
+        ReduceOp::Min => ScalarAggOp::Min,
+        ReduceOp::Max => ScalarAggOp::Max,
+        ReduceOp::Count => ScalarAggOp::Count,
+    }
+}
+
 /// Variant of `reduce_gpu_vec` for reductions whose accumulator dtype is wider
 /// than the input dtype (currently only `SUM` over a narrow signed integer,
 /// per the widening contract in `crate::plan::logical_plan::sum_output_dtype`).
@@ -1104,13 +1148,19 @@ where
 
     // Compile + load the kernel. The kernel takes the *input* dtype; it
     // internally widens to the accumulator dtype. Routed through the
-    // consolidated cache; same key as `reduce_gpu_vec` since the PTX
-    // template only depends on `(op, input dtype)`.
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        format!("reduction:{:?}:{:?}", op, dtype),
-        None,
-        || compile_reduction_kernel(op, dtype),
+    // v0.7 `ScalarAggSpec` cache layer; the cache key is identical to the
+    // one `reduce_gpu_vec` uses for the same `(op, input dtype)` pair
+    // (the accumulator dtype is derived inside the JIT layer and is not
+    // part of the cache key), so a SUM(Int32) widened call hits the same
+    // entry a same-key non-widened call would create.
+    let spec = ScalarAggSpec {
+        op: reduce_op_to_scalar_agg_op(op),
+        input_dtype: dtype,
+    };
+    let module = module_cache::get_or_build_module_for_scalar_agg(
+        &spec,
+        REDUCTION_KERNEL_ENTRY,
+        |_| compile_reduction_kernel(op, dtype),
     )?;
     let function = module.function(REDUCTION_KERNEL_ENTRY)?;
 
