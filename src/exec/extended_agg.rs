@@ -60,6 +60,11 @@ pub fn handles(op: &AggregateExpr, input_dtype: DataType) -> bool {
             DataType::Utf8,
         ) => true,
 
+        // VAR_POP / VAR_SAMP are numeric-only (Welford in f64); reject
+        // Bool / Utf8 outright so the caller routes through the numeric
+        // scalar-aggregate path and surfaces a clean type error there.
+        (AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_), _) => false,
+
         // SUM/AVG over Utf8 is intentionally rejected here so the caller
         // raises its own type error on the standard dispatch path.
         _ => false,
@@ -249,6 +254,7 @@ fn aggregate_inner(expr: &AggregateExpr) -> &Expr {
         | AggregateExpr::Min(e)
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e) => e,
+        AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e.as_ref(),
     }
 }
 
@@ -300,6 +306,17 @@ fn validate_output_dtype(
         (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => {
             return Err(BoltError::Type(
                 "SUM/AVG over Utf8 is not defined".into(),
+            ))
+        }
+        // VAR_POP / VAR_SAMP never reach this module: `handles` returns
+        // false for them, so the caller's numeric dispatch takes over. If
+        // we land here it means a future refactor wired the dispatch wrong;
+        // surface the mistake clearly.
+        (AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_), _) => {
+            return Err(BoltError::Other(
+                "extended_agg: VAR_POP / VAR_SAMP should be handled by the numeric \
+                 scalar-aggregate path, not the Bool/Utf8 extended path"
+                    .into(),
             ))
         }
         (_, dt) => {

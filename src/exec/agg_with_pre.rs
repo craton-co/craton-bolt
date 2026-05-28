@@ -416,7 +416,78 @@ fn build_one_aggregate(
             };
             scalar_to_array(Scalar::F64(avg), out_field.dtype)
         }
+        AggregateExpr::VarPop(expr) | AggregateExpr::VarSamp(expr) => {
+            // v0.5 host-side Welford reduction over the slow-path
+            // pre-aggregation column, materialised at Float64. Matches
+            // the scalar-aggregate path in `aggregate.rs` so the two
+            // entry points produce identical results for a given input.
+            let resolved = resolve_agg_input_col(
+                expr.as_ref(),
+                pre_spec,
+                compacted,
+                DataType::Float64,
+            )?;
+            let xs = host_col_as_f64(resolved.as_ref())?;
+            let is_pop = matches!(agg, AggregateExpr::VarPop(_));
+            let result: Option<f64> = if is_pop {
+                crate::exec::welford::var_pop_f64(&xs)
+            } else {
+                crate::exec::welford::var_samp_f64(&xs)
+            };
+            Ok(Arc::new(Float64Array::from(vec![result])) as ArrayRef)
+        }
     }
+}
+
+/// Materialise a (NULL-stripped) host column as `Vec<f64>` for the
+/// Welford pass. The slow path of `resolve_agg_input_col` already
+/// validity-filters NULLs out of `Owned`; the fast path uses borrowed
+/// pre-stage outputs that carry no NULLs. This helper widens whichever
+/// dtype landed in `HostCol` to `f64` for the variance accumulator.
+fn host_col_as_f64(col: &HostCol) -> BoltResult<Vec<f64>> {
+    // If the borrowed fast-path column happens to carry residual validity
+    // (it shouldn't — the upload path rejects validity-bearing pre cols
+    // outright), strip it here so a stray garbage value at a NULL slot
+    // doesn't poison the Welford state.
+    let valid_at = |i: usize| -> bool {
+        match &col.validity {
+            Some(v) => v[i] != 0,
+            None => true,
+        }
+    };
+    let n = col.len();
+    let mut out: Vec<f64> = Vec::with_capacity(n);
+    match &col.values {
+        HostColValues::I32(v) => {
+            for (i, x) in v.iter().enumerate() {
+                if valid_at(i) {
+                    out.push(*x as f64);
+                }
+            }
+        }
+        HostColValues::I64(v) => {
+            for (i, x) in v.iter().enumerate() {
+                if valid_at(i) {
+                    out.push(*x as f64);
+                }
+            }
+        }
+        HostColValues::F32(v) => {
+            for (i, x) in v.iter().enumerate() {
+                if valid_at(i) {
+                    out.push(*x as f64);
+                }
+            }
+        }
+        HostColValues::F64(v) => {
+            for (i, x) in v.iter().enumerate() {
+                if valid_at(i) {
+                    out.push(*x);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Resolve an aggregate input expression to a host column ready for reduction.

@@ -258,6 +258,7 @@ fn agg_inner_expr(a: &AggregateExpr) -> &Expr {
         | AggregateExpr::Min(e)
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e) => e,
+        AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => e,
     }
 }
 
@@ -364,4 +365,18 @@ pub fn max(e: Expr) -> AggregateExpr {
 /// `AVG(expr)` aggregate.
 pub fn avg(e: Expr) -> AggregateExpr {
     AggregateExpr::Avg(e)
+}
+
+/// `VAR_POP(expr)` — population variance. Output dtype `Float64`. The
+/// GROUP BY path is rejected with a clear error in v0.5; the scalar
+/// (no GROUP BY) path is host-side Welford in `f64`.
+pub fn var_pop(e: Expr) -> AggregateExpr {
+    AggregateExpr::VarPop(Box::new(e))
+}
+
+/// `VAR_SAMP(expr)` — sample variance (`VARIANCE` per SQL standard).
+/// Output dtype `Float64`. Returns NULL when fewer than 2 observations
+/// were aggregated.
+pub fn var_samp(e: Expr) -> AggregateExpr {
+    AggregateExpr::VarSamp(Box::new(e))
 }

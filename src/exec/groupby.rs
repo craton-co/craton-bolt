@@ -1360,6 +1360,17 @@ fn run_one_aggregate(
             Ok(AccDownload::I64(download_pinned_i64(&acc_table, stream)?))
         }
 
+        AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => {
+            // v0.5: GROUP BY VAR_POP / VAR_SAMP is rejected at the engine
+            // dispatch layer (see `crate::exec::engine`). This arm is the
+            // belt-and-braces match-exhaustiveness guard: if a future code
+            // path reaches us anyway, we want a clear error rather than a
+            // panic or a silent wrong answer.
+            Err(BoltError::Other(
+                "groupby: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                    .into(),
+            ))
+        }
         AggregateExpr::Avg(expr) => {
             // AVG = SUM(expr) / COUNT(expr), where COUNT is the non-NULL row
             // count of the value column within each group. SUM in f64 (so we
@@ -2143,6 +2154,14 @@ fn build_agg_array(
                 }
             };
             pack_array(out_field.dtype, scalars)
+        }
+        // v0.5 contract: GROUP BY VAR_POP/VAR_SAMP is rejected before we
+        // get here. Surface a clear error if a future plan ever lands here.
+        (AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_), _) => {
+            Err(BoltError::Other(
+                "groupby: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                    .into(),
+            ))
         }
         (_, _) => Err(BoltError::Other(
             "internal: aggregate / accumulator-variant mismatch".into(),

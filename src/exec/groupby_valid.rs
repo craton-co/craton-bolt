@@ -1373,6 +1373,15 @@ fn run_one_aggregate(
             Ok(AccDownload::I64 { gpu_acc, spill })
         }
 
+        AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => {
+            // v0.5: rejected at engine dispatch. Defensive arm here so the
+            // match remains exhaustive against the new variants without
+            // accidentally treating them like another aggregate.
+            Err(BoltError::Other(
+                "groupby_valid: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                    .into(),
+            ))
+        }
         AggregateExpr::Avg(expr) => {
             // AVG = SUM(expr) / COUNT(expr), where COUNT is the non-NULL row
             // count of the value column within each group. SUM in f64; COUNT
@@ -2281,6 +2290,14 @@ fn build_agg_array_from_per_group(
                 ))),
             }
         }
+        // v0.5 contract: GROUP BY VAR_POP/VAR_SAMP is rejected before reaching
+        // this assembly step. Defensive arm to keep the match exhaustive.
+        (AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_), _) => {
+            Err(BoltError::Other(
+                "groupby_valid: VAR_POP / VAR_SAMP with GROUP BY is not implemented in v0.5"
+                    .into(),
+            ))
+        }
         (AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_), other) => {
             // NOTE on SQL NULL-group semantics: per docs/SQL_REFERENCE.md,
             // SUM/MIN/MAX over an all-NULL group should return NULL. In this
@@ -2331,6 +2348,12 @@ fn aggregate_to_op(agg: &AggregateExpr) -> ReduceOp {
         AggregateExpr::Max(_) => ReduceOp::Max,
         AggregateExpr::Count(_) => ReduceOp::Sum, // count = sum of ones
         AggregateExpr::Avg(_) => ReduceOp::Sum,   // AVG sum-side; count uses Sum too
+        // v0.5: GROUP BY VAR_POP/VAR_SAMP is rejected at engine dispatch
+        // and the run-time arms above also short-circuit; if a future
+        // refactor reaches this helper, fall back to Sum so the spill
+        // accounting stays defined while still surfacing the issue
+        // upstream (the run match returns an error).
+        AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => ReduceOp::Sum,
     }
 }
 

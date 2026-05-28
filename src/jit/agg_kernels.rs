@@ -94,6 +94,16 @@ impl ReduceOp {
             AggregateExpr::Avg(_) => Err(BoltError::Other(
                 "agg_kernels: AVG must be decomposed into Sum + Count by the caller".into(),
             )),
+            // v0.5 has no device-side Welford kernel yet; the scalar
+            // aggregate path in `exec::aggregate` reduces these on the
+            // host via `exec::welford`. Any caller that ends up here has
+            // routed a VAR_POP/VAR_SAMP through the GPU reduction path
+            // by mistake.
+            AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => Err(BoltError::Other(
+                "agg_kernels: VAR_POP / VAR_SAMP have no device-side reduction in v0.5; \
+                 the scalar-aggregate executor must dispatch to crate::exec::welford"
+                    .into(),
+            )),
         }
     }
 

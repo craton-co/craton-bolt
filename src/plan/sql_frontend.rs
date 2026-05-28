@@ -1595,7 +1595,11 @@ fn try_aggregate(
     }
     let fname = func.name.0[0].value.to_ascii_uppercase();
     let kind = match fname.as_str() {
-        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => fname,
+        // `VARIANCE` is the SQL-standard synonym for `VAR_SAMP`; normalise
+        // it here so the lowering match below only has to know about the
+        // two canonical forms.
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "VAR_POP" | "VAR_SAMP" => fname,
+        "VARIANCE" => "VAR_SAMP".to_string(),
         _ => return Ok(None),
     };
 
@@ -1684,6 +1688,8 @@ fn try_aggregate(
         "MIN" => AggregateExpr::Min(inner),
         "MAX" => AggregateExpr::Max(inner),
         "AVG" => AggregateExpr::Avg(inner),
+        "VAR_POP" => AggregateExpr::VarPop(Box::new(inner)),
+        "VAR_SAMP" => AggregateExpr::VarSamp(Box::new(inner)),
         _ => unreachable!("kind already filtered above"),
     }))
 }

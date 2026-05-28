@@ -22,6 +22,10 @@ pub mod gpu_compact_multipass;
 pub mod string_ops_extended;
 pub mod extended_agg;
 pub mod expr_agg;
+/// Welford's online algorithm for variance, shared by the `VAR_POP` /
+/// `VAR_SAMP` scalar-aggregate path. The GROUP BY path is intentionally
+/// rejected by the executors below in v0.5.
+pub mod welford;
 pub mod groupby_valid;
 pub mod gpu_table;
 pub mod groupby_shmem_dispatch;

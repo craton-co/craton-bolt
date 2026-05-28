@@ -1500,3 +1500,211 @@ fn e2e_groupby_with_nulls() {
         "null group key should be excluded; only k=1 and k=2 survive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// VAR_POP / VAR_SAMP / VARIANCE: v0.5 scalar-aggregate path
+//
+// The frontend lowers all three function names to either `AggregateExpr::VarPop`
+// or `AggregateExpr::VarSamp` (plain `VARIANCE` aliases to `VAR_SAMP` per SQL
+// standard). Both produce a nullable Float64; the scalar (no GROUP BY)
+// reducer downloads the column to the host and runs Welford in f64. GROUP BY
+// is intentionally rejected with a clear error in v0.5.
+// ---------------------------------------------------------------------------
+
+/// One-column Int64 table fixture for the variance tests.
+fn one_col_batch_i64(name: &str, values: Vec<i64>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        name,
+        ArrowDataType::Int64,
+        false,
+    )]));
+    let col = Arc::new(Int64Array::from(values)) as Arc<dyn Array>;
+    RecordBatch::try_new(schema, vec![col]).expect("int64 batch")
+}
+
+/// One-column Float64 table fixture for the variance tests.
+fn one_col_batch_f64(name: &str, values: Vec<f64>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        name,
+        ArrowDataType::Float64,
+        false,
+    )]));
+    let col = Arc::new(Float64Array::from(values)) as Arc<dyn Array>;
+    RecordBatch::try_new(schema, vec![col]).expect("float64 batch")
+}
+
+/// Parse-time: `VAR_POP(v)` resolves to a single nullable Float64 output
+/// named `var_pop_v`. No GPU is required for this check.
+#[test]
+fn var_pop_scalar_planning_yields_float64() {
+    let provider = MemTableProvider::new().with_table(
+        "t",
+        Schema::new(vec![Field {
+            name: "v".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        }]),
+    );
+    let plan = parse_sql("SELECT VAR_POP(v) FROM t", &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let out = phys.output_schema();
+    assert_eq!(out.fields.len(), 1);
+    assert_eq!(out.fields[0].name, "var_pop_v");
+    assert_eq!(out.fields[0].dtype, DataType::Float64);
+    assert!(out.fields[0].nullable, "variance output must be nullable");
+}
+
+/// Parse-time: `VARIANCE(v)` and `VAR_SAMP(v)` are synonyms and both emit
+/// `var_samp_v` as the output column name.
+#[test]
+fn variance_is_alias_for_var_samp() {
+    let provider = MemTableProvider::new().with_table(
+        "t",
+        Schema::new(vec![Field {
+            name: "v".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        }]),
+    );
+    for sql in ["SELECT VAR_SAMP(v) FROM t", "SELECT VARIANCE(v) FROM t"] {
+        let plan = parse_sql(sql, &provider).expect("parse");
+        let phys = lower_physical(&plan).expect("lower");
+        let out = phys.output_schema();
+        assert_eq!(out.fields.len(), 1, "sql: {sql}");
+        assert_eq!(out.fields[0].name, "var_samp_v", "sql: {sql}");
+        assert_eq!(out.fields[0].dtype, DataType::Float64);
+    }
+}
+
+/// Plan-time gate: GROUP BY VAR_POP / VAR_SAMP still type-checks (the plan
+/// is well-formed) — the rejection happens at execution time so the planner
+/// doesn't need to know about per-aggregate execution scope. This test
+/// just locks in that parse + lower succeed; the run-time rejection lives
+/// in the GPU-ignored test below.
+#[test]
+fn groupby_variance_parses_but_execution_is_gated() {
+    let provider = MemTableProvider::new().with_table(
+        "t",
+        Schema::new(vec![
+            Field {
+                name: "k".into(),
+                dtype: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "v".into(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+        ]),
+    );
+    let plan =
+        parse_sql("SELECT k, VAR_POP(v) FROM t GROUP BY k", &provider).expect("parse");
+    let _phys = lower_physical(&plan).expect("lower");
+}
+
+/// End-to-end: `SELECT VAR_POP(v) FROM t` over a small Int64 column matches
+/// the closed-form population variance.
+#[test]
+#[ignore = "gpu:tier1"]
+fn e2e_var_pop_int_column_matches_closed_form() {
+    use craton_bolt::Engine;
+    let batch = one_col_batch_i64("v", vec![1, 2, 3, 4, 5]);
+    let mut engine = Engine::new().expect("ctx");
+    engine.register_table("t", batch).unwrap();
+    let h = engine.sql("SELECT VAR_POP(v) FROM t").expect("execute");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), 1);
+    let col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("VAR_POP output is Float64");
+    assert!(!col.is_null(0), "VAR_POP over non-empty input is non-NULL");
+    // Closed form: values [1..5], mean = 3, deviations [-2,-1,0,1,2],
+    // M2 = 4+1+0+1+4 = 10, VAR_POP = 10/5 = 2.
+    let got = col.value(0);
+    assert!((got - 2.0).abs() < (REL_TOL * 2.0_f64).abs(), "got {got}");
+}
+
+/// End-to-end: `SELECT VAR_SAMP(v) FROM t` over Float64 input matches
+/// `M2 / (n - 1)`. Same five-element series, expected = 10/4 = 2.5.
+#[test]
+#[ignore = "gpu:tier1"]
+fn e2e_var_samp_float_column_matches_closed_form() {
+    use craton_bolt::Engine;
+    let batch = one_col_batch_f64("v", vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let mut engine = Engine::new().expect("ctx");
+    engine.register_table("t", batch).unwrap();
+    let h = engine.sql("SELECT VAR_SAMP(v) FROM t").expect("execute");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), 1);
+    let col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("VAR_SAMP output is Float64");
+    assert!(!col.is_null(0));
+    let got = col.value(0);
+    assert!((got - 2.5).abs() < (REL_TOL * 2.5_f64).abs(), "got {got}");
+}
+
+/// SQL NULL semantics: `VAR_SAMP` over a single-row input returns NULL
+/// (count <= 1). `VAR_POP` returns 0 for the same input (single
+/// observation has zero deviation from itself).
+#[test]
+#[ignore = "gpu:tier1"]
+fn e2e_var_samp_single_row_is_null() {
+    use craton_bolt::Engine;
+    let batch = one_col_batch_f64("v", vec![42.0]);
+    let mut engine = Engine::new().expect("ctx");
+    engine.register_table("t", batch).unwrap();
+
+    let h_samp = engine.sql("SELECT VAR_SAMP(v) FROM t").expect("execute");
+    let out_samp = h_samp.record_batch();
+    let col = out_samp
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64");
+    assert!(
+        col.is_null(0),
+        "VAR_SAMP of a single row must be NULL per SQL standard"
+    );
+
+    // Same engine — re-register isn't necessary, but rebuild for symmetry.
+    let h_pop = engine.sql("SELECT VAR_POP(v) FROM t").expect("execute");
+    let out_pop = h_pop.record_batch();
+    let col_pop = out_pop
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64");
+    assert!(!col_pop.is_null(0), "VAR_POP of a single row is defined (= 0)");
+    assert!(col_pop.value(0).abs() < 1e-12, "got {}", col_pop.value(0));
+}
+
+/// Execution-time rejection: GROUP BY + VAR_POP must surface a clear
+/// error message from the engine's dispatch layer.
+#[test]
+#[ignore = "gpu:tier1"]
+fn e2e_groupby_variance_returns_clear_error() {
+    use craton_bolt::Engine;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("k", ArrowDataType::Int32, false),
+        ArrowField::new("v", ArrowDataType::Float64, false),
+    ]));
+    let k = Arc::new(Int32Array::from(vec![1, 1, 2, 2])) as Arc<dyn Array>;
+    let v = Arc::new(Float64Array::from(vec![1.0, 2.0, 10.0, 20.0])) as Arc<dyn Array>;
+    let batch = RecordBatch::try_new(schema, vec![k, v]).expect("batch");
+    let mut engine = Engine::new().expect("ctx");
+    engine.register_table("t", batch).unwrap();
+    let err = engine
+        .sql("SELECT k, VAR_POP(v) FROM t GROUP BY k")
+        .expect_err("v0.5: GROUP BY VAR_POP must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("VAR_POP") || msg.contains("VAR_SAMP"),
+        "error must mention the rejected aggregate; got: {msg}"
+    );
+}

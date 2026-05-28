@@ -512,6 +512,16 @@ pub enum AggregateExpr {
     Max(Expr),
     /// `AVG(expr)` — output `Float64`.
     Avg(Expr),
+    /// `VAR_POP(expr)` — population variance, output `Float64`.
+    ///
+    /// Computed via Welford's online algorithm at scalar-aggregate level
+    /// (M2 / count, returning NULL for empty input). The scalar path lives
+    /// in `crate::exec::aggregate`; the GROUP BY path is intentionally
+    /// rejected with a clear error in v0.5.
+    VarPop(Box<Expr>),
+    /// `VAR_SAMP(expr)` — sample variance (`VARIANCE` / `VAR_SAMP` per SQL
+    /// standard), output `Float64`. Returns NULL when count <= 1.
+    VarSamp(Box<Expr>),
 }
 
 impl AggregateExpr {
@@ -531,6 +541,8 @@ impl AggregateExpr {
             AggregateExpr::Min(e) => format!("min{}", suffix(e)),
             AggregateExpr::Max(e) => format!("max{}", suffix(e)),
             AggregateExpr::Avg(e) => format!("avg{}", suffix(e)),
+            AggregateExpr::VarPop(e) => format!("var_pop{}", suffix(e)),
+            AggregateExpr::VarSamp(e) => format!("var_samp{}", suffix(e)),
         }
     }
 
@@ -551,6 +563,13 @@ impl AggregateExpr {
             AggregateExpr::Sum(e) => Ok(sum_output_dtype(e.dtype(input)?)),
             AggregateExpr::Min(e) | AggregateExpr::Max(e) => e.dtype(input),
             AggregateExpr::Avg(_) => Ok(DataType::Float64),
+            AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => {
+                // Resolve the operand's dtype to surface unknown-column /
+                // type errors at plan time. The result is always Float64
+                // regardless of the operand's numeric width.
+                let _ = e.dtype(input)?;
+                Ok(DataType::Float64)
+            }
         }
     }
 }
@@ -1103,6 +1122,12 @@ mod naming_consistency_tests {
 
         let agg = AggregateExpr::Max(Expr::Column("ts".to_string()));
         assert_eq!(aggregate_output_name(&agg), "max_ts");
+
+        // VAR_POP / VAR_SAMP follow the same suffix rule.
+        let agg = AggregateExpr::VarPop(Box::new(Expr::Column("v".to_string())));
+        assert_eq!(aggregate_output_name(&agg), "var_pop_v");
+        let agg = AggregateExpr::VarSamp(Box::new(Expr::Column("v".to_string())));
+        assert_eq!(aggregate_output_name(&agg), "var_samp_v");
 
         // Alias: take the alias name as the suffix.
         let aliased = Expr::Alias(Box::new(Expr::Column("c".to_string())), "renamed".to_string());
