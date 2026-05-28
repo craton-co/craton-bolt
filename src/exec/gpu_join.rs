@@ -681,6 +681,17 @@ pub fn encode_keys_for_shape(
                  see intern_utf8_columns".into(),
             ));
         }
+        KeyShape::SingleI32Candidate => {
+            // Stage 6 (GJ) — streaming-intern path. Like `SingleUtf8`, the
+            // raw `StringArray` has already been folded to i32 dict
+            // indices via `intern_utf8_columns_streaming_parallel`; this
+            // branch only sees i32 keys-as-i64, with the candidate-filter
+            // contract that the host must re-verify pairs.
+            return Err(BoltError::Other(
+                "gpu_join: SingleI32Candidate must be interned via streaming-intern before \
+                 encoding; see intern_utf8_columns_streaming_parallel".into(),
+            ));
+        }
         KeyShape::TwoI64 | KeyShape::MultiI32(_) => {
             // Stage-3 candidate-filter path. The host-side splitmix can
             // collide, so the GPU join emits *candidate* pairs that the

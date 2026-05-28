@@ -296,6 +296,20 @@ pub enum KeyShape {
     /// `n` Int32 columns folded into one i64 by the host via splitmix.
     /// `n >= 3`. Same candidate-filter contract as `TwoI64`.
     MultiI32(u8),
+    /// **Stage 6 (GJ)** — Single Utf8 key with candidate-filter contract.
+    ///
+    /// Streaming-intern produces a `HashMap<u64, i32>` keyed on a 64-bit
+    /// string hash (not the string itself), to keep dictionary memory
+    /// flat for high-cardinality inputs. The hash is not collision-free,
+    /// so the kernel-side i32-dict-index path is a *candidate filter*
+    /// rather than an exact match: every emitted pair must be re-tested
+    /// against the original `StringArray`s on the host before being
+    /// admitted. Same contract as `TwoI64` / `MultiI32(_)`.
+    ///
+    /// Use `SingleUtf8` (exact) for low-cardinality joins where the
+    /// full dict fits in memory; use `SingleI32Candidate` for streamed
+    /// high-cardinality joins.
+    SingleI32Candidate,
 }
 
 impl KeyShape {
@@ -331,7 +345,17 @@ impl KeyShape {
     /// Arrow columns and drops false positives produced by the lossy
     /// 64-bit fold. Other shapes are exact and return `false`.
     pub fn needs_host_post_verify(self) -> bool {
-        matches!(self, KeyShape::TwoI64 | KeyShape::MultiI32(_))
+        matches!(
+            self,
+            KeyShape::TwoI64
+                | KeyShape::MultiI32(_)
+                // Stage 6 (GJ): streaming-intern collapses strings to a
+                // 64-bit hash before kernel ingest; the hash isn't
+                // collision-free so the kernel acts as a candidate filter
+                // and the host must re-verify against the original
+                // StringArray rows.
+                | KeyShape::SingleI32Candidate
+        )
     }
 }
 
