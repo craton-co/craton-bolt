@@ -48,23 +48,45 @@ impl DictionaryColumnAny {
     ///
     /// The decision rule is exact, not heuristic: if
     /// [`estimate_distinct_count`] reports `>= I32_INDEX_THRESHOLD` distinct
-    /// non-null strings, the column is encoded as [`Self::I64`]; otherwise as
-    /// [`Self::I32`]. The threshold sits a small margin below `i32::MAX` so
-    /// callers never have to reason about the absolute edge of the i32 range.
+    /// non-null strings, the column would be encoded as [`Self::I64`];
+    /// otherwise as [`Self::I32`]. The threshold sits a small margin below
+    /// `i32::MAX` so callers never have to reason about the absolute edge of
+    /// the i32 range.
     ///
-    /// Both branches forward to the underlying type's `from_string_array`,
-    /// which in turn uploads the index column to the device.
+    /// **Wide path currently rejected.** The i64 index variant is plumbed
+    /// through the host types ([`DictionaryColumnI64`], the [`Self::I64`]
+    /// arm, the registry dispatch in `engine.rs`, and the literal resolver
+    /// in `string_literal_rewrite.rs`), but downstream PTX kernels only
+    /// consume `i32` indices today (see the module docs on
+    /// [`crate::cuda::dictionary_i64`]). Selecting the i64 path here would
+    /// hand a wider index column to codegen that cannot read it, which
+    /// would silently miscompile the kernel. Until the orchestrator is
+    /// wired to dispatch `i64`-index kernels, we surface a
+    /// [`BoltError::Other`] so callers fail loudly instead of executing
+    /// against a mismatched layout. The narrow (i32) path is unaffected.
+    ///
+    /// The narrow branch forwards to the underlying type's
+    /// `from_string_array`, which in turn uploads the index column to the
+    /// device.
     pub fn from_string_array(arr: &StringArray) -> BoltResult<Self> {
         let distinct = estimate_distinct_count(arr);
         if distinct >= I32_INDEX_THRESHOLD {
             // Wide path: i64 indices, headroom up to i64::MAX.
-            let inner = DictionaryColumnI64::from_string_array(arr)?;
-            Ok(Self::I64(inner))
-        } else {
-            // Narrow path: i32 indices, the common case.
-            let inner = DictionaryColumn::from_string_array(arr)?;
-            Ok(Self::I32(inner))
+            //
+            // Guarded: codegen does not yet accept i64 indices. Returning a
+            // `DictionaryColumnI64` here would silently mismatch the kernel
+            // signature. Fail loudly until the codegen wiring lands; see the
+            // doc comment above and `src/cuda/dictionary_i64.rs` for the
+            // re-enabling conditions.
+            return Err(crate::error::BoltError::Other(format!(
+                "i64-indexed dictionary not yet wired through codegen; \
+                 use i32 path (column has {} distinct strings, threshold is {})",
+                distinct, I32_INDEX_THRESHOLD
+            )));
         }
+        // Narrow path: i32 indices, the common case.
+        let inner = DictionaryColumn::from_string_array(arr)?;
+        Ok(Self::I32(inner))
     }
 
     /// Borrow the host-side dictionary (slot 0 = NULL, real strings at 1..).
@@ -186,6 +208,18 @@ impl DictionaryColumnAny {
                         k, i
                     )));
                 }
+                // `k + 1` on an Arrow key would overflow when `k == i32::MAX`.
+                // The upstream guard a few lines up rejects dictionaries with
+                // `len >= i32::MAX`, so any valid Arrow key here satisfies
+                // `k < i32::MAX` (since `k < dictionary.len() <= i32::MAX - 1`).
+                // Lock that invariant in with a debug assertion so a future
+                // bump of the upstream bound trips this site in tests rather
+                // than silently producing `i32::MIN` from wrap-around.
+                debug_assert!(
+                    k < i32::MAX,
+                    "Arrow key i32::MAX would overflow on k+1; upstream guard \
+                     at line 166 should have rejected"
+                );
                 indices.push(k + 1);
             }
         }
