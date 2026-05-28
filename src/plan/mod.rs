@@ -9,8 +9,8 @@ pub mod physical_plan;
 pub mod string_literal_rewrite;
 
 pub use logical_plan::{
-    AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema, UnaryOp,
-    col, lit,
+    AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,
+    UnaryOp, col, lit,
 };
 pub use dataframe::{
     DataFrame, GroupedDataFrame, avg, count, max, min, stddev_pop, stddev_samp, sum, var_pop,

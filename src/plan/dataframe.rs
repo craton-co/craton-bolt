@@ -289,6 +289,11 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
         }
         Expr::Like { expr, .. } => collect_column_refs(expr, out),
         Expr::Cast { expr, .. } => collect_column_refs(expr, out),
+        Expr::ScalarFn { args, .. } => {
+            for a in args {
+                collect_column_refs(a, out);
+            }
+        }
         Expr::Alias(inner, _) => collect_column_refs(inner, out),
     }
 }

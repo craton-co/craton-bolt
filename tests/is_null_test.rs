@@ -473,6 +473,7 @@ fn contains_unary(expr: &Expr) -> bool {
                 || else_branch.as_deref().is_some_and(contains_unary)
         }
         Expr::Cast { expr, .. } => contains_unary(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(contains_unary),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }

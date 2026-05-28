@@ -477,6 +477,13 @@ impl<'a> Codegen<'a> {
             Expr::Cast { .. } => Err(BoltError::Plan(
                 "CAST not yet lowered to GPU; coming in a follow-up".into(),
             )),
+            // v0.5: parser + type-check land, execution wiring is a
+            // follow-up. Reject cleanly so callers see a useful message
+            // rather than the kernel emitter producing nonsense PTX.
+            Expr::ScalarFn { kind, .. } => Err(BoltError::Plan(format!(
+                "string scalar function {} is not yet lowered to GPU; coming in a follow-up",
+                kind.sql_name()
+            ))),
             Expr::Alias(inner, _) => self.emit_expr(inner),
             // CASE has no GPU IR yet: there is no value-selection-by-mask
             // op in the kernel codegen, so a CASE expression in a fused
@@ -1075,6 +1082,13 @@ fn substitute_one_depth(
             expr: Box::new(substitute_one(expr, map)),
             target: *target,
         },
+        Expr::ScalarFn { kind, args } => Expr::ScalarFn {
+            kind: *kind,
+            args: args
+                .iter()
+                .map(|a| substitute_one_depth(a, map, depth + 1))
+                .collect(),
+        },
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
         }
@@ -1472,6 +1486,12 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
         // routing decision over a Cast-bearing predicate. Recurse for
         // safety — the answer is the same as for any transparent wrapper.
         Expr::Cast { expr, .. } => predicate_contains_unary(expr),
+        // ScalarFn predicates are rejected at `lower()` outright (no
+        // host-fallback path yet), so the unary-detection routing decision
+        // is moot here. Recurse into the args for completeness — if a
+        // future host-fallback wires ScalarFn through Filter, this keeps
+        // the routing correct.
+        Expr::ScalarFn { args, .. } => args.iter().any(predicate_contains_unary),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1497,6 +1517,7 @@ fn expr_contains_concat(expr: &Expr) -> bool {
         }
         Expr::Like { expr, .. } => expr_contains_concat(expr),
         Expr::Cast { expr, .. } => expr_contains_concat(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_concat),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1778,6 +1799,9 @@ fn expr_contains_div_or_mod(e: &Expr) -> bool {
         }
         Expr::Like { expr, .. } => expr_contains_div_or_mod(expr),
         Expr::Cast { expr, .. } => expr_contains_div_or_mod(expr),
+        // String scalar functions can't contain Div/Mod themselves, but
+        // their arguments are arbitrary scalar expressions, so recurse.
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_div_or_mod),
     }
 }
 
@@ -1813,6 +1837,10 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
         }
         Expr::Like { expr, .. } => expr_has_unsafe_eager_shortcircuit(expr),
         Expr::Cast { expr, .. } => expr_has_unsafe_eager_shortcircuit(expr),
+        // No And/Or wrapper inside a ScalarFn can short-circuit a sibling
+        // operand of the *function call*, but the arguments themselves
+        // might contain the unsafe pattern, so recurse.
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_has_unsafe_eager_shortcircuit),
     }
 }
 
@@ -2025,6 +2053,7 @@ fn expr_contains_case(e: &Expr) -> bool {
         Expr::Alias(inner, _) => expr_contains_case(inner),
         Expr::Like { expr, .. } => expr_contains_case(expr),
         Expr::Cast { expr, .. } => expr_contains_case(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_case),
     }
 }
 
@@ -2048,6 +2077,7 @@ fn logical_plan_contains_cast(plan: &LogicalPlan) -> bool {
                     || else_branch.as_deref().map(expr_has_cast).unwrap_or(false)
             }
             Expr::Like { expr, .. } => expr_has_cast(expr),
+            Expr::ScalarFn { args, .. } => args.iter().any(expr_has_cast),
         }
     }
     fn agg_has_cast(a: &AggregateExpr) -> bool {

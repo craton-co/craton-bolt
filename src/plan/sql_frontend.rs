@@ -20,7 +20,7 @@ use sqlparser::parser::Parser;
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, DataType,
-    Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
+    Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SortExpr, UnaryOp,
 };
 
 /// Maximum recursion depth allowed when walking attacker-controlled SQL
@@ -1895,6 +1895,136 @@ fn try_aggregate(
     }))
 }
 
+/// Recognise a string scalar function call (UPPER / LOWER / LENGTH / CONCAT)
+/// at the SQL-frontend layer and lower it into an `Expr::ScalarFn`.
+/// Returns `Ok(None)` for any other function name so the caller can produce
+/// the catch-all "scalar function calls are not supported" rejection.
+///
+/// Aggregate names (COUNT/SUM/MIN/MAX/AVG) are intentionally NOT recognised
+/// here — they're split off earlier by [`try_aggregate`] before `lower_expr`
+/// gets a chance to see them. SUBSTRING is also NOT routed here because
+/// sqlparser parses it as a dedicated `SqlExpr::Substring` variant rather
+/// than a generic `Function` call; that variant is handled directly in
+/// [`lower_expr`].
+///
+/// Argument lowering reuses the standard `lower_expr` path so column
+/// resolution, NULL peer typing, and recursion-depth tracking all behave
+/// identically inside function arguments. Type-checking (Utf8 / Int64
+/// shape, arity bounds) lives in
+/// [`crate::plan::logical_plan::scalar_fn_dtype`], which fires when the
+/// plan's schema is queried; we don't pre-check here.
+fn try_string_scalar_fn(
+    func: &sqlparser::ast::Function,
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Option<Expr>> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if func.name.0.len() != 1 {
+        return Ok(None);
+    }
+    let fname = func.name.0[0].value.to_ascii_uppercase();
+    let kind = match fname.as_str() {
+        "UPPER" => ScalarFnKind::Upper,
+        "LOWER" => ScalarFnKind::Lower,
+        "LENGTH" => ScalarFnKind::Length,
+        "CONCAT" => ScalarFnKind::Concat,
+        // Note: "SUBSTRING" is parsed by sqlparser as `SqlExpr::Substring`,
+        // not `SqlExpr::Function`, so we never see it here. If we ever do
+        // (e.g. via a non-standard dialect), explicitly reject so callers
+        // route through the dedicated `Substring` arm and pick up the
+        // FROM/FOR slot semantics correctly.
+        "SUBSTRING" => {
+            return Err(BoltError::Sql(
+                "SUBSTRING must use SUBSTRING(s FROM i [FOR n]) or SUBSTRING(s, i [, n]) syntax"
+                    .into(),
+            ));
+        }
+        _ => return Ok(None),
+    };
+
+    let name = kind.sql_name();
+    // Disallow OVER (window), FILTER, ORDER BY, WITHIN GROUP, parameters —
+    // identical guard set to `try_aggregate` so any escape hatch the parser
+    // produces lands as a `BoltError::Sql` here rather than silently
+    // ignored.
+    if func.over.is_some() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: OVER clause on {name}"
+        )));
+    }
+    if func.filter.is_some() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: FILTER clause on {name}"
+        )));
+    }
+    if func.null_treatment.is_some() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: IGNORE/RESPECT NULLS on {name}"
+        )));
+    }
+    if !func.within_group.is_empty() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: WITHIN GROUP on {name}"
+        )));
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return Err(BoltError::Sql(format!(
+            "unsupported: parametric {name}"
+        )));
+    }
+
+    let arg_list = match &func.args {
+        FunctionArguments::List(list) => list,
+        FunctionArguments::None => {
+            return Err(BoltError::Sql(format!("{name} requires arguments")));
+        }
+        FunctionArguments::Subquery(_) => {
+            return Err(BoltError::Sql(format!(
+                "unsupported: subquery argument to {name}"
+            )));
+        }
+    };
+    if arg_list.duplicate_treatment.is_some() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: DISTINCT/ALL inside {name}"
+        )));
+    }
+    if !arg_list.clauses.is_empty() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: argument clauses on {name}"
+        )));
+    }
+
+    let mut args: Vec<Expr> = Vec::with_capacity(arg_list.args.len());
+    for arg in &arg_list.args {
+        let e = match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                return Err(BoltError::Sql(format!(
+                    "unsupported: wildcard argument to {name}"
+                )));
+            }
+            FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {
+                return Err(BoltError::Sql(format!(
+                    "unsupported: qualified wildcard in {name}"
+                )));
+            }
+            FunctionArg::Named { .. } => {
+                return Err(BoltError::Sql(format!(
+                    "unsupported: named argument to {name}"
+                )));
+            }
+        };
+        args.push(lower_expr(e, resolver, depth + 1)?);
+    }
+
+    Ok(Some(Expr::ScalarFn { kind, args }))
+}
+
 /// True if `e` contains any aggregate function call (anywhere in the tree).
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
@@ -1966,6 +2096,39 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
             if let Some(e) = else_result {
                 if contains_aggregate(e, resolver, depth + 1)? {
                     return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            if contains_aggregate(expr, resolver, depth + 1)? {
+                return Ok(true);
+            }
+            if let Some(e) = substring_from {
+                if contains_aggregate(e, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            if let Some(e) = substring_for {
+                if contains_aggregate(e, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        SqlExpr::Function(f) => {
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = arg {
+                        if contains_aggregate(inner, resolver, depth + 1)? {
+                            return Ok(true);
+                        }
+                    }
                 }
             }
             Ok(false)
@@ -2409,6 +2572,11 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
             }
             Expr::Like { expr, .. } => stack.push(expr),
             Expr::Cast { expr, .. } => stack.push(expr),
+            Expr::ScalarFn { args, .. } => {
+                for a in args {
+                    stack.push(a);
+                }
+            }
         }
     }
     Ok(())
@@ -2692,6 +2860,53 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "scalar function calls are not supported".into(),
         )),
+        // `SUBSTRING(s FROM i [FOR n])` / `SUBSTRING(s, i [, n])`: sqlparser
+        // surfaces both syntaxes as `SqlExpr::Substring`, not as a generic
+        // `Function` call. Lower into the shared `Expr::ScalarFn` shape so
+        // the physical-plan boundary can reject every string scalar function
+        // uniformly. Type-checking (`Utf8`, `Int64`, `Int64`) lives in
+        // [`crate::plan::logical_plan::scalar_fn_dtype`].
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let s = lower_expr(expr, resolver, depth + 1)?;
+            let start = match substring_from {
+                Some(e) => lower_expr(e, resolver, depth + 1)?,
+                None => {
+                    return Err(BoltError::Sql(
+                        "SUBSTRING requires a start position (use SUBSTRING(s FROM i [FOR n]) \
+                         or SUBSTRING(s, i [, n]))"
+                            .into(),
+                    ));
+                }
+            };
+            let mut args = vec![s, start];
+            if let Some(e) = substring_for {
+                args.push(lower_expr(e, resolver, depth + 1)?);
+            }
+            Ok(Expr::ScalarFn {
+                kind: ScalarFnKind::Substring,
+                args,
+            })
+        }
+        // Intercept the named string scalar functions UPPER / LOWER / LENGTH
+        // / CONCAT before the generic Function rejection below. Aggregates
+        // are NOT routed here — callers split those off via `try_aggregate`
+        // ahead of `lower_expr` — so any `Function` we see here is genuinely
+        // a scalar call.
+        SqlExpr::Function(f) => {
+            if let Some(expr) = try_string_scalar_fn(f, resolver, depth)? {
+                Ok(expr)
+            } else {
+                Err(BoltError::Sql(format!(
+                    "scalar function calls are not supported: {}",
+                    f.name
+                )))
+            }
+        }
         other => Err(BoltError::Sql(format!(
             "unsupported expression: {other}"
         ))),
@@ -3990,6 +4205,11 @@ mod wave7_tests {
                         }
                         Expr::Like { expr, .. } => stack.push(expr),
                         Expr::Cast { expr, .. } => stack.push(expr),
+                        Expr::ScalarFn { args, .. } => {
+                            for a in args {
+                                stack.push(a);
+                            }
+                        }
                         Expr::Literal(_) => {}
                     }
                 }
