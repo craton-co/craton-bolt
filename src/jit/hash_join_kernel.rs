@@ -3005,7 +3005,8 @@ mod tests {
         assert!(
             ptx.contains(&needle),
             "tiled probe must init probe_left = MAX_PROBE_FACTOR * cap; got:\n{ptx}"
-
+        );
+    }
 
     // ----- Batch 6 atomic-contention guard goldens ------------------------
     //
