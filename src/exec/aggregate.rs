@@ -26,6 +26,46 @@
 //!     GPU actually summed rather than a parallel Arrow-bitmap walk.
 //!   - `COUNT(col)` is computed on the host from the Arrow null bitmap (no
 //!     GPU launch); `COUNT(*)` returns the row count directly.
+//!
+//! # Validity (NULL) propagation
+//!
+//! v0.5/M1: primitive scalar aggregates now honour the Arrow validity bitmap.
+//! The strategy is intentionally simple:
+//!
+//!   - **Fast path** (`null_count == 0`): zero-copy upload of the raw values
+//!     buffer via `primitive_to_gpu` and the standard GPU reduction kernel
+//!     (`bolt_reduce` / `bolt_avg_reduce`). No bitmap inspection on the GPU.
+//!   - **Slow path** (`null_count > 0`): the host strips NULL positions via
+//!     `filter_primitive_to_vec` into a dense `Vec<T>`, then either runs a
+//!     small host-side reduce (`reduce_host_slice`) or uploads the stripped
+//!     slice and runs the standard GPU kernel. The GPU never sees garbage at
+//!     NULL positions, so the kernel reuses its identity at empty positions
+//!     unchanged.
+//!
+//! Why host-strip rather than a masked GPU reduction:
+//!
+//!   - The fast path stays a true zero-copy launch; we don't pay any per-row
+//!     branch when there are no nulls (the common case).
+//!   - A masked GPU reduction would require a second kernel variant per (op,
+//!     dtype), tripling the codegen surface to skip a (typically tiny)
+//!     host-side strip. The Bool/Utf8 `extended_agg` path already takes the
+//!     same host-fallback shape — primitives just join it on the slow path.
+//!   - The 0.3.x compaction code already produces dense, post-filter inputs
+//!     to `aggregate.rs` in the WHERE path; the only remaining
+//!     null-on-primitive case at this entry is `pre = None` (bare-column
+//!     aggregate, no filter) where the source batch's null bitmap is the
+//!     only signal — exactly what `filter_primitive_to_vec` reads.
+//!
+//! Per-aggregate effect:
+//!
+//!   - `COUNT(col)`: `non_null_count_for_input` = `len - null_count` (no GPU).
+//!   - `SUM(col)`: NULL rows stripped before upload; GPU sums survivors.
+//!   - `MIN(col)` / `MAX(col)`: NULL rows stripped; GPU sees only valid values.
+//!   - `AVG(col)`: NULL rows stripped; the fused kernel's per-block count
+//!     therefore matches the non-NULL row count and the host divide is correct.
+//!
+//! `COUNT(*)` (no column reference) is unaffected — it always returns the
+//! source-batch row count regardless of any column's null bitmap.
 
 use std::ffi::c_void;
 use std::ptr;

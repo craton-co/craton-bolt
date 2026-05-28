@@ -55,10 +55,11 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 - Identifiers are case-sensitive; no folding.
 - Qualified column references (`t.col`) are rejected even when
   unambiguous.
-- Validity propagation through compact / gpu_compact selection masks is implemented,
-  but primitive aggregate kernels still do not propagate validity bitmaps.
-  `COUNT(expr)` over a primitive column counts every row; only the Bool/Utf8
-  `extended_agg` path honours nulls.
+- Validity propagation through compact / gpu_compact selection masks is implemented.
+  Primitive scalar aggregates now honour the Arrow validity bitmap (v0.5/M1):
+  `COUNT(col)` excludes NULLs via the bitmap, and `SUM`/`MIN`/`MAX`/`AVG` host-strip
+  NULL positions before the GPU reduction. The fast path (`null_count == 0`)
+  remains a zero-copy `primitive_to_gpu` upload.
 - Aggregate aliasing (`SUM(price) AS total`) is rejected by the SQL
   frontend — aggregates carry plan-assigned names.
 - Post-aggregate expressions (`SUM(price) + 1`) are not yet supported.
@@ -79,7 +80,8 @@ SQL today, see `docs/SQL_REFERENCE.md`.
 
 - Streaming / multi-batch tables behind a stable `register_table_stream`
   API.
-- Validity propagation through primitive aggregate kernels.
+- ~~Validity propagation through primitive aggregate kernels.~~ Landed in v0.5/M1
+  (host-strip on `null_count > 0`; zero-copy fast path otherwise).
 - Async memcpy + pinned host buffers. **Stage 1** (safe wrappers +
   `PinnedHostBuffer<T>` + `GpuBuffer::copy_{from,to}_async`) has landed
   on top of the 0.3.0 FFI bindings; **Stage 2** wires the per-shape
