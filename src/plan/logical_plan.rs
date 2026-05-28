@@ -4,7 +4,55 @@
 
 use crate::error::{BoltError, BoltResult};
 
+/// Time-unit for `DataType::Timestamp` values.
+///
+/// Mirrors `arrow::datatypes::TimeUnit` and indicates the resolution of the
+/// underlying `i64` count of ticks since the Unix epoch (1970-01-01T00:00:00Z).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimeUnit {
+    /// One tick = 1 second.
+    Second,
+    /// One tick = 1 millisecond (10^-3 s).
+    Millisecond,
+    /// One tick = 1 microsecond (10^-6 s).
+    Microsecond,
+    /// One tick = 1 nanosecond (10^-9 s). Matches Arrow's default
+    /// `TimestampNanosecondArray` storage.
+    Nanosecond,
+}
+
+/// Intern a timezone name string into the process-static interner so a
+/// [`DataType::Timestamp`] value can be `Copy` while still carrying an
+/// optional IANA timezone name.
+///
+/// The set of IANA timezone names is bounded (~600 strings) and the planner
+/// only materialises a handful per query, so the small one-time leak is
+/// acceptable. Subsequent calls with the same string return the same
+/// `&'static str` so `Eq` / `Hash` on `DataType` are well-defined.
+pub fn intern_timezone(name: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static INTERN: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+    let mut guard = INTERN.lock().expect("timezone interner mutex poisoned");
+    let set = guard.get_or_insert_with(HashSet::new);
+    if let Some(existing) = set.get(name) {
+        return *existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    set.insert(leaked);
+    leaked
+}
+
 /// Minimal set of column data types the GPU engine handles.
+///
+/// **v0.6 / M4**: `Date32` and `Timestamp` were added. The variant signature
+/// for `Timestamp` is documented in the project spec as
+/// `Timestamp(TimeUnit, Option<String>)`. To keep `DataType: Copy` (a deep
+/// invariant the executor depends on across hundreds of by-value call sites)
+/// without churning the entire codebase, the timezone is stored as
+/// `Option<&'static str>` interned via [`intern_timezone`] — semantically
+/// equivalent to `Option<String>`. The companion [`Literal::Timestamp`]
+/// constructor accepts a `String` and routes it through the interner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     /// Boolean (one byte on device).
@@ -25,6 +73,13 @@ pub enum DataType {
     /// follow-up lands). Round-trips losslessly to/from Arrow's
     /// `Decimal128(precision, scale)` array type.
     Decimal128(u8, i8),
+    /// Date as a 32-bit count of days since the Unix epoch. Matches Arrow's
+    /// `Date32Array` storage layout.
+    Date32,
+    /// Timestamp stored as `i64` ticks since the Unix epoch in `TimeUnit`
+    /// resolution, with an optional process-interned IANA time-zone name
+    /// (see [`intern_timezone`]). A `None` timezone means "local / naive".
+    Timestamp(TimeUnit, Option<&'static str>),
 }
 
 impl DataType {
@@ -40,6 +95,11 @@ impl DataType {
             // Decimal128 is a 16-byte (i128) fixed-width value, regardless of
             // precision / scale (those affect interpretation, not storage).
             DataType::Decimal128(_, _) => Some(16),
+            // `i32` days since epoch (mirrors Arrow `Date32Array`).
+            DataType::Date32 => Some(4),
+            // `i64` ticks since epoch regardless of TimeUnit / tz
+            // (mirrors Arrow `Timestamp*Array`).
+            DataType::Timestamp(_, _) => Some(8),
         }
     }
 
@@ -169,6 +229,14 @@ pub enum Literal {
     /// codegen rejects this with "Decimal128 not yet lowered to GPU" until
     /// the follow-up lands.
     Decimal128(i128, u8, i8),
+    /// Date constant — days since the Unix epoch (matches Arrow `Date32Array`).
+    Date32(i32),
+    /// Timestamp constant — `i64` ticks since the Unix epoch in the given
+    /// resolution, with an optional process-interned IANA time-zone name
+    /// (see [`intern_timezone`]). The variant stores the interned `&'static
+    /// str` so the literal stays cheap to clone; use
+    /// [`Literal::timestamp_with_tz`] to construct one from an owned `String`.
+    Timestamp(i64, TimeUnit, Option<&'static str>),
 }
 
 impl Literal {
@@ -183,7 +251,18 @@ impl Literal {
             Literal::Float64(_) => Some(DataType::Float64),
             Literal::Utf8(_) => Some(DataType::Utf8),
             Literal::Decimal128(_, p, s) => Some(DataType::Decimal128(*p, *s)),
+            Literal::Date32(_) => Some(DataType::Date32),
+            Literal::Timestamp(_, unit, tz) => Some(DataType::Timestamp(*unit, *tz)),
         }
+    }
+
+    /// Construct a `Literal::Timestamp` from an owned timezone `String`,
+    /// routing the tz through the process-static interner so the resulting
+    /// literal can be `Copy`-style cheap. Pass `tz = None` for a naive
+    /// timestamp.
+    pub fn timestamp_with_tz(ticks: i64, unit: TimeUnit, tz: Option<String>) -> Self {
+        let interned = tz.map(|s| intern_timezone(&s));
+        Literal::Timestamp(ticks, unit, interned)
     }
 }
 
@@ -1082,7 +1161,11 @@ pub fn sum_output_dtype(input: DataType) -> DataType {
         // it before any SUM accumulator is selected. We keep the type
         // unchanged here so the rejection message names `Decimal128(p, s)`
         // rather than a silently-widened sibling.
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => input,
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => input,
     }
 }
 

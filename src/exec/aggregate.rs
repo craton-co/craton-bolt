@@ -408,7 +408,11 @@ fn column_as_f64_no_nulls(
                 |v| v,
             ))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "VAR_POP/VAR_SAMP over dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -614,7 +618,11 @@ fn reduce_column_from_batch(
                 reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows, &stream)
             }
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -726,7 +734,11 @@ fn fused_avg_from_batch(
                 fused_avg_gpu_vec::<f64>(col_io.dtype, &dev, n_rows, &stream)
             }
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "AVG over dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -893,7 +905,11 @@ fn welford_state_from_batch(
                 }
             }
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => {
             return Err(BoltError::Type(format!(
                 "STDDEV over dtype {:?} not supported (column '{}')",
                 col_io.dtype, col_io.name
@@ -1331,6 +1347,11 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
         DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
+        // v0.6 / M4: Date/Timestamp not yet wired through this aggregate
+        // output helper. Reject so a regression is loud.
+        DataType::Date32 | DataType::Timestamp(_, _) => Err(crate::error::BoltError::Type(
+            format!("Date/Timestamp not yet supported in this aggregate output path: {:?}", d),
+        )),
     }
 }
 

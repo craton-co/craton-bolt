@@ -119,6 +119,11 @@ impl RegAlloc {
                     "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
                 ))
             }
+            DataType::Date32 | DataType::Timestamp(_, _) => {
+                return Err(BoltError::Other(
+                    "Date/Timestamp not yet lowered to GPU".into(),
+                ))
+            }
         })
     }
 
@@ -496,6 +501,9 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
         Literal::Decimal128(..) => Err(BoltError::Plan(
             "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
         )),
+        Literal::Date32(_) | Literal::Timestamp(_, _, _) => Err(BoltError::Other(
+            "Date/Timestamp not yet lowered to GPU".into(),
+        )),
         Literal::Bool(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Bool)?;
             let n: u32 = if *v { 1 } else { 0 };
@@ -548,6 +556,11 @@ fn emit_cast(
                 Decimal128(_, _) => {
                     return Err(BoltError::Plan(
                         "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+                    ))
+                }
+                Date32 | Timestamp(_, _) => {
+                    return Err(BoltError::Other(
+                        "Date/Timestamp not yet lowered to GPU".into(),
                     ))
                 }
             };
@@ -767,6 +780,11 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
+        Date32 | Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
+            ))
+        }
     };
     Ok(format!("setp.{}.{}", cond, ty))
 }
@@ -795,6 +813,11 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
         DataType::Decimal128(_, _) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+            ))
+        }
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
             ))
         }
     })

@@ -632,6 +632,12 @@ impl<'a> Codegen<'a> {
                 name, dtype
             )));
         }
+        if matches!(dtype, DataType::Date32 | DataType::Timestamp(_, _)) {
+            return Err(BoltError::Plan(format!(
+                "Date/Timestamp not yet lowered to GPU (column '{}', dtype {:?})",
+                name, dtype
+            )));
+        }
         let col_idx = self.inputs.len();
         self.inputs.push(ColumnIO {
             name: name.to_string(),
@@ -662,6 +668,11 @@ impl<'a> Codegen<'a> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up \
                  (Decimal128 literal in expression)"
                     .into(),
+            ));
+        }
+        if matches!(dtype, DataType::Date32 | DataType::Timestamp(_, _)) {
+            return Err(BoltError::Plan(
+                "Date/Timestamp not yet lowered to GPU".into(),
             ));
         }
         let dst = self.fresh();

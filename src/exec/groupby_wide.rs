@@ -299,6 +299,12 @@ fn resolve_key_columns<'a>(
                     io.name
                 )))
             }
+            DataType::Date32 | DataType::Timestamp(_, _) => {
+                return Err(BoltError::Type(format!(
+                    "Date/Timestamp keys in wide GROUP BY not yet supported (column '{}')",
+                    io.name
+                )))
+            }
         }
         let idx = batch.schema().index_of(&io.name).map_err(|e| {
             BoltError::Plan(format!(
@@ -362,7 +368,7 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> BoltResult<KeyValue> {
             // Review C12: same signed-zero canonicalisation as Float32.
             Ok(KeyValue::F64Bits(canonicalise_f64(pa.value(row)).to_bits()))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "wide GROUP BY: key dtype {:?} not supported",
             kc.dtype
         ))),
@@ -520,7 +526,7 @@ fn resolve_aggregates<'a>(
         // Reject Bool/Utf8 inputs.
         match io.dtype {
             DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 => {}
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
+            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: Bool/Utf8 aggregate inputs not supported (column '{}')",
                     io.name
@@ -586,7 +592,7 @@ fn agg_input_at(plan: &AggInputPlan<'_>, row: usize) -> BoltResult<AggInputValue
                 .ok_or_else(|| downcast_err(&plan.name, "Float64"))?;
             Ok(AggInputValue::F64(pa.value(row)))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "wide GROUP BY: aggregate input dtype {:?} not supported (column '{}')",
             plan.dtype, plan.name
         ))),
@@ -828,7 +834,11 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> BoltResult<Vec<Accumu
             },
             (AggKind::Count, _) => Accumulator::Count { n: 0 },
             (AggKind::Avg, _) => Accumulator::Avg { sum: 0.0, n: 0 },
-            (_, DataType::Bool) | (_, DataType::Utf8) | (_, DataType::Decimal128(_, _)) => {
+            (_, DataType::Bool)
+            | (_, DataType::Utf8)
+            | (_, DataType::Decimal128(_, _))
+            | (_, DataType::Date32)
+            | (_, DataType::Timestamp(_, _)) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: cannot make accumulator for ({:?}, {:?}) on column '{}'",
                     p.kind, p.dtype, p.name
@@ -868,7 +878,7 @@ fn build_key_arrays(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
+            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: key dtype {:?} not supported on output",
                     kc.dtype
@@ -1005,7 +1015,7 @@ fn collect_sum_min_max(
                 DataType::Int64 => TypedColumn::I64(Vec::new()),
                 DataType::Float32 => TypedColumn::F32(Vec::new()),
                 DataType::Float64 => TypedColumn::F64(Vec::new()),
-                DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
+                DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
                     return Err(BoltError::Type(format!(
                         "wide GROUP BY: cannot emit empty {:?} aggregate column",
                         out_dtype
@@ -1218,6 +1228,11 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
         DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
+        // v0.6 / M4: Date/Timestamp not yet wired through this aggregate
+        // output helper. Reject so a regression is loud.
+        DataType::Date32 | DataType::Timestamp(_, _) => Err(crate::error::BoltError::Type(
+            format!("Date/Timestamp not yet supported in this aggregate output path: {:?}", d),
+        )),
     }
 }
 

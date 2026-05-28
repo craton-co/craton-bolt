@@ -12,7 +12,7 @@ pub mod rewrite;
 
 pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,
-    UnaryOp, col, lit,
+    TimeUnit, UnaryOp, col, lit,
 };
 pub use dataframe::{
     DataFrame, GroupedDataFrame, avg, count, max, min, stddev_pop, stddev_samp, sum, var_pop,

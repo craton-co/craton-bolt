@@ -444,6 +444,11 @@ fn eval_literal(lit: &Literal, n_rows: usize) -> BoltResult<HostColumn> {
                  (host-side literal broadcast)".into(),
             ))
         }
+        // v0.6 / M4: Date32 stores as i32 days; Timestamp stores as i64
+        // ticks. Broadcast as the underlying integer; the expression
+        // evaluator does not yet apply temporal semantics.
+        Literal::Date32(v) => HostColumn::I32(vec![Some(*v); n_rows]),
+        Literal::Timestamp(v, _unit, _tz) => HostColumn::I64(vec![Some(*v); n_rows]),
     })
 }
 
@@ -927,6 +932,11 @@ fn cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up \
                  (host-side cast)".into(),
             ))
+        }
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Type(format!(
+                "cast to {to:?} is not supported in the expression evaluator"
+            )));
         }
     })
 }

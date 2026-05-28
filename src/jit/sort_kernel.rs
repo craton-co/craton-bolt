@@ -246,6 +246,12 @@ pub fn key_reg_cost(dtype: DataType) -> u32 {
         // a register cost so the validator can compute a budget without
         // panicking; the actual lowering rejects Decimal128 upstream.
         DataType::Decimal128(_, _) => 8,
+        // v0.6 / M4: Date32 (i32) and Timestamp (i64) sort like their
+        // underlying integer width. They will only reach the sort kernel
+        // once the rest of the GPU pipeline lowers them, but the cost
+        // accounting is well-defined either way.
+        DataType::Date32 => 2,
+        DataType::Timestamp(_, _) => 4,
     }
 }
 

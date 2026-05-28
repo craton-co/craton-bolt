@@ -134,7 +134,7 @@ impl ReduceOp {
             (Max, Float32) => Ok(format!("0f{:08X}", f32::NEG_INFINITY.to_bits())),
             (Max, Float64) => Ok(format!("0d{:016X}", f64::NEG_INFINITY.to_bits())),
 
-            (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) => Err(BoltError::Type(format!(
+            (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) | (_, Date32) | (_, Timestamp(_, _)) => Err(BoltError::Type(format!(
                 "agg_kernels: reduction over dtype {:?} is not supported",
                 dtype
             ))),
@@ -161,7 +161,7 @@ impl ReduceOp {
             (Max, Float32) => "max.f32",
             (Max, Float64) => "max.f64",
 
-            (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) => {
+            (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) | (_, Date32) | (_, Timestamp(_, _)) => {
                 return Err(BoltError::Type(format!(
                     "agg_kernels: reduction over dtype {:?} is not supported",
                     dtype
@@ -514,9 +514,11 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
                 writeln!(ptx, "\t{combine} %fd5, %fd5, %fd6;", combine = combine)
                     .map_err(write_err)?;
             }
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
-                // ptx_type_info already rejects these dtypes above, so this
-                // arm is unreachable in practice. Keep the match exhaustive.
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "agg_kernels: warp-shuffle reduction over dtype {:?} is not supported",
                     acc_dtype
@@ -575,7 +577,11 @@ fn ptx_type_info(
         DataType::Int64 => ("s64", "s64", "rl", "b64", "s64"),
         DataType::Float32 => ("f32", "f32", "f", "f32", "f32"),
         DataType::Float64 => ("f64", "f64", "fd", "f64", "f64"),
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => {
             return Err(BoltError::Type(format!(
                 "agg_kernels: dtype {:?} not supported in reduction kernels",
                 dtype

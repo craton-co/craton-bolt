@@ -935,6 +935,11 @@ fn alloc_gathered(dtype: DataType, len: usize) -> BoltResult<GatheredCol> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
+            ))
+        }
     })
 }
 

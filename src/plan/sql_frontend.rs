@@ -20,7 +20,7 @@ use sqlparser::parser::{Parser, ParserError};
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, DataType,
-    Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SortExpr, UnaryOp,
+    Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SortExpr, TimeUnit, UnaryOp,
 };
 
 /// Maximum recursion depth allowed when walking attacker-controlled SQL
@@ -3180,9 +3180,6 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                 target,
             })
         }
-        SqlExpr::Function(_) => Err(BoltError::Sql(
-            "scalar function calls are not supported".into(),
-        )),
         // `SUBSTRING(s FROM i [FOR n])` / `SUBSTRING(s, i [, n])`: sqlparser
         // surfaces both syntaxes as `SqlExpr::Substring`, not as a generic
         // `Function` call. Lower into the shared `Expr::ScalarFn` shape so
@@ -3228,6 +3225,20 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                     "scalar function calls are not supported: {}",
                     f.name
                 )))
+            }
+        }
+        // v0.6 / M4: typed-string literals — `DATE '2024-01-01'`,
+        // `TIMESTAMP '2024-01-01 00:00:00'`. Other typed strings (TIME,
+        // INTERVAL, ...) are not yet supported and surface the generic
+        // "unsupported expression" error below.
+        SqlExpr::TypedString { data_type, value } => {
+            use sqlparser::ast::DataType as SqlDataType;
+            match data_type {
+                SqlDataType::Date => parse_date_literal(value),
+                SqlDataType::Timestamp(_precision, _tz) => parse_timestamp_literal(value),
+                other => Err(BoltError::Sql(format!(
+                    "unsupported typed-string literal: {other} '{value}'"
+                ))),
             }
         }
         other => Err(BoltError::Sql(format!(
@@ -3628,6 +3639,172 @@ fn lower_cast_data_type(t: &SqlDataType) -> BoltResult<DataType> {
             )));
         }
     })
+}
+
+/// Parse a SQL `DATE 'YYYY-MM-DD'` literal into a [`Literal::Date32`]
+/// counting days since the Unix epoch (1970-01-01). Rejects malformed
+/// strings, out-of-range months/days, and dates outside the i32 day range.
+///
+/// The parser is intentionally minimal — exactly `YYYY-MM-DD`, no time
+/// component, no timezone. A SQL `DATE` literal in the spec carries no
+/// time component; if a caller wants time-of-day they should use
+/// `TIMESTAMP`. This routine never panics: every failure surfaces a
+/// `BoltError::Sql` with the offending text.
+fn parse_date_literal(s: &str) -> BoltResult<Expr> {
+    let s = s.trim();
+    let (y, m, d) = parse_ymd(s).ok_or_else(|| {
+        BoltError::Sql(format!(
+            "DATE literal must be 'YYYY-MM-DD', got '{s}'"
+        ))
+    })?;
+    let days = days_since_epoch(y, m, d).ok_or_else(|| {
+        BoltError::Sql(format!(
+            "DATE literal '{s}' is out of the supported range"
+        ))
+    })?;
+    Ok(Expr::Literal(Literal::Date32(days)))
+}
+
+/// Parse a SQL `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.fff]'` literal into a
+/// [`Literal::Timestamp`] of `TimeUnit::Nanosecond` resolution (matches
+/// Arrow's default `TimestampNanosecondArray`). No timezone is currently
+/// recognised here — the literal is interpreted as naive (TZ = `None`).
+///
+/// As with [`parse_date_literal`] this is intentionally minimal: the
+/// optional fractional-seconds tail accepts 1..=9 digits (anything past 9
+/// is truncated to nanoseconds), the date-time separator may be `' '` or
+/// `'T'`. Anything else surfaces a `BoltError::Sql`.
+fn parse_timestamp_literal(s: &str) -> BoltResult<Expr> {
+    let s = s.trim();
+    let (date_part, time_part) = split_date_time(s).ok_or_else(|| {
+        BoltError::Sql(format!(
+            "TIMESTAMP literal must be 'YYYY-MM-DD HH:MM:SS[.fff]', got '{s}'"
+        ))
+    })?;
+    let (y, m, d) = parse_ymd(date_part).ok_or_else(|| {
+        BoltError::Sql(format!(
+            "TIMESTAMP literal '{s}' has malformed date component"
+        ))
+    })?;
+    let (hh, mm, ss, nanos) = parse_hms_fraction(time_part).ok_or_else(|| {
+        BoltError::Sql(format!(
+            "TIMESTAMP literal '{s}' has malformed time component"
+        ))
+    })?;
+    let days = days_since_epoch(y, m, d).ok_or_else(|| {
+        BoltError::Sql(format!("TIMESTAMP literal '{s}' is out of range"))
+    })?;
+    let seconds_in_day = (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
+    let total_seconds = (days as i64)
+        .checked_mul(86_400)
+        .and_then(|d| d.checked_add(seconds_in_day))
+        .ok_or_else(|| {
+            BoltError::Sql(format!("TIMESTAMP literal '{s}' overflows i64 seconds"))
+        })?;
+    let ticks = total_seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|t| t.checked_add(nanos as i64))
+        .ok_or_else(|| {
+            BoltError::Sql(format!(
+                "TIMESTAMP literal '{s}' overflows i64 nanoseconds since epoch"
+            ))
+        })?;
+    Ok(Expr::Literal(Literal::Timestamp(
+        ticks,
+        TimeUnit::Nanosecond,
+        None,
+    )))
+}
+
+/// Parse a strict `YYYY-MM-DD` string into `(year, month, day)`. Returns
+/// `None` on any structural mismatch. Years are accepted as any signed
+/// `i32`-range integer (so `-0001-01-01` and `9999-12-31` both parse).
+fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+    // Allow a leading `-` for BC dates; the rest must be exactly digits and
+    // dashes in `Y-M-D` form. We don't fix-width the year so e.g.
+    // `2024-1-1` and `2024-01-01` both parse — DuckDB accepts both.
+    // For BC dates `-0001-01-01` the first split yields an empty string and
+    // the year is the second.
+    let (year_sign, body) = if let Some(rest) = s.strip_prefix('-') {
+        (-1i32, rest)
+    } else {
+        (1i32, s)
+    };
+    let parts: Vec<&str> = body.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y_abs: i32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    let y = y_abs.checked_mul(year_sign)?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// Split a timestamp string into `(date, time)` on the first `' '` or `'T'`.
+fn split_date_time(s: &str) -> Option<(&str, &str)> {
+    if let Some(idx) = s.find([' ', 'T']) {
+        let (a, b) = s.split_at(idx);
+        // `b` includes the separator; drop it.
+        Some((a, &b[1..]))
+    } else {
+        None
+    }
+}
+
+/// Parse `HH:MM:SS[.fff]` (fractional seconds optional). Returns
+/// `(hour, minute, second, nanos_in_second)`. Fractional digits past 9
+/// are silently truncated; fewer than 9 are left-padded with zeros.
+fn parse_hms_fraction(s: &str) -> Option<(u32, u32, u32, u32)> {
+    let (hms, frac) = match s.find('.') {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    };
+    let parts: Vec<&str> = hms.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hh: u32 = parts[0].parse().ok()?;
+    let mm: u32 = parts[1].parse().ok()?;
+    let ss: u32 = parts[2].parse().ok()?;
+    if hh > 23 || mm > 59 || ss > 60 {
+        return None; // 60 allowed for leap seconds; rejected here is fine
+    }
+    let nanos: u32 = if frac.is_empty() {
+        0
+    } else {
+        if !frac.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let truncated = &frac[..frac.len().min(9)];
+        // Left-pad with zeros after the digits to reach 9 (e.g. ".5" -> "500000000").
+        let mut buf = String::with_capacity(9);
+        buf.push_str(truncated);
+        while buf.len() < 9 {
+            buf.push('0');
+        }
+        buf.parse().ok()?
+    };
+    Some((hh, mm, ss, nanos))
+}
+
+/// Convert a `(year, month, day)` Gregorian calendar date into days since
+/// the Unix epoch (1970-01-01), returning `None` if the value is outside
+/// the `i32` day range that `DataType::Date32` carries. Uses Howard
+/// Hinnant's `days_from_civil` algorithm (public-domain, branch-free).
+fn days_since_epoch(y: i32, m: u32, d: u32) -> Option<i32> {
+    // Hinnant's algorithm. See
+    // https://howardhinnant.github.io/date_algorithms.html#days_from_civil
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe: u32 = (y - era * 400) as u32; // [0, 399]
+    let doy: u32 = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days: i64 = (era as i64) * 146_097 + (doe as i64) - 719_468;
+    i32::try_from(days).ok()
 }
 
 /// True if `s` is written as a pure integer (no decimal point, no exponent).

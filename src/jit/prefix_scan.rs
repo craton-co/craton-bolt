@@ -147,6 +147,12 @@ pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
         // loudly. The actual rejection happens in the executor before any
         // gather is launched.
         DataType::Decimal128(_, _) => "bolt_gather_decimal128_unsupported",
+        // v0.6 / M4: Date/Timestamp not yet lowered to GPU. The string
+        // returned here intentionally matches a non-existent kernel so a
+        // module lookup fails noisily if these dtypes do reach the gather.
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            "bolt_gather_date_timestamp_unsupported"
+        }
     }
 }
 
@@ -1366,6 +1372,11 @@ fn gather_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str, 
         DataType::Decimal128(_, _) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+            ))
+        }
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
             ))
         }
     })
