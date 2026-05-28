@@ -240,8 +240,12 @@ regressions, delete the hand-rolled path entirely.
    `&str` for `load_ptx_from_string`. Should be a no-op at the call
    site.
 3. **Error type interop.** cudarc returns `cudarc::driver::result::DriverError`.
-   We'd add a `From<DriverError> for BoltError::Cuda` impl in
-   `src/error.rs` (~5 lines).
+   **Decision (landed):** stringly-typed via `format!`. Every cudarc error
+   becomes `BoltError::Other(format!("cudarc …: {e:?}"))` at the call site
+   in `cudarc_backend.rs`. We considered a `From<DriverError>` impl, but
+   the cudarc error variants are sparse and a `{:?}` debug print carries
+   enough context for the error path; the trait impl would only add a
+   layer of indirection without changing what the user sees.
 4. **`cuda-stub` feature.** The current crate has a `cuda-stub` feature
    for docs.rs builds on hosts with no CUDA. cudarc handles this with a
    `dynamic-linking` feature flag — slightly nicer ergonomics. Stage 1
@@ -264,7 +268,7 @@ cudarc replacements at the API level (verified against cudarc 0.13's
 | `mem_free(ptr)` | `drop(slice)` (RAII) | Manual `mem_free` goes away — `CudaSlice::Drop` handles it. The whole `mem_pool` becomes optional (cudarc has its own internal recycling). |
 | `memcpy_h2d::<T>(dst, src, n)` | `device.htod_copy(host_vec)?` or `device.htod_sync_copy_into(...)` | cudarc takes `&[T]`, returns `CudaSlice<T>`. Our existing `GpuBuffer::from_slice` path is essentially the same call. |
 | `memcpy_d2h::<T>(dst, src, n)` | `device.dtoh_sync_copy(&slice)?` | Returns `Vec<T>`. Matches `GpuBuffer::to_vec`. |
-| `mem_alloc_host`/`mem_free_host` | Not needed in cudarc path | cudarc's `htod_copy` accepts plain `&[T]`. Page-locked memory is exposed via `Pinned<T>` if we need it later. |
+| `mem_alloc_host`/`mem_free_host` | **Stays hand-rolled** even under `--features cudarc` | cudarc 0.13's `driver` feature does not expose `cuMemAllocHost_v2` cleanly, so the pinned-host alloc/free path continues to call our `cuda_sys::mem_alloc_host` raw FFI under both feature flags. See [`src/cuda/buffer.rs:396`](../src/cuda/buffer.rs) for the in-code explanation. Revisit when cudarc 0.14+ surfaces pinned-host primitives (see Stage 3 future-work). |
 | `memset_d8(ptr, val, n)` | `device.memset_zeros(&mut slice)?` or `slice.fill(val)?` | Available; signature change is minor. |
 
 ### Feature-flag boilerplate (ready to drop into Cargo.toml)
@@ -319,32 +323,42 @@ The hand-rolled `extern "C"` block stays as the fallback. CI tests both
 paths; we'd add a `cargo build --features cudarc` line to whatever
 script runs.
 
-### Stage 1 spike — LANDED
+### Stage 1 + Stage 1.5 — LANDED
 
 Status as of this commit:
 
 - `cudarc = "0.13"` added to `Cargo.toml` as an **optional** dependency,
   feature-gated behind `[features] cudarc = ["dep:cudarc"]`.
-- New `src/cuda/cudarc_backend.rs` (~130 LOC) exposes
-  `mem_alloc` / `mem_free` / `memcpy_h2d` / `memcpy_d2h` backed by
-  cudarc's `result::{malloc_sync, free_sync, memcpy_htod_sync,
-  memcpy_dtoh_sync}`. `CudaDevice::new(0)` is cached in a `OnceCell`
-  so primary-context bootstrapping happens once.
+- `src/cuda/cudarc_backend.rs` exposes the full sync surface
+  (`mem_alloc` / `mem_free` / `memcpy_h2d` / `memcpy_d2h` / `memset_d8`)
+  backed by cudarc's `result::{malloc_sync, free_sync, memcpy_htod_sync,
+  memcpy_dtoh_sync, memset_d8_sync}`. `CudaDevice::new(0)` is cached in
+  a `OnceCell` so primary-context bootstrapping happens once.
+- **Async memcpy / memset are wired** (commit `e79b568`, "review C3"):
+  `memcpy_h2d_async`, `memcpy_d2h_async`, and `memset_d8_async` in
+  `cudarc_backend.rs` call through `cudarc::driver::sys` raw bindings
+  (`cuMemcpyHtoDAsync_v2`, `cuMemcpyDtoHAsync_v2`, `cuMemsetD8Async`).
+  No more sync fallback under `--features cudarc`.
+- **`GpuBuffer<T>::with_capacity` routes through the pool**, which under
+  `--features cudarc` calls `cudarc_backend::mem_alloc` (see
+  `mem_pool.rs:driver_mem_alloc` at line ~408 and `driver_free` at
+  ~384). Pointers minted by cudarc and pointers minted by the
+  hand-rolled FFI are bit-compatible `CUdeviceptr`s, so the pool's
+  drain path is backend-agnostic.
 - `src/cuda/mod.rs` registers the module behind `#[cfg(feature =
   "cudarc")]` so default builds remain identical.
 - Both `cargo build --release` (default) and `cargo build --release
-  --features cudarc` complete without errors. The two paths coexist:
-  with `--features cudarc` the cudarc crate compiles in but is not
-  yet *wired* into `GpuBuffer<T>` (that's Stage 1.5 — see below).
+  --features cudarc` complete without errors.
 
-What's deliberately **not** done in this session:
+What's deliberately **not** done in Stage 1 / 1.5:
 
-- `GpuBuffer<T>::with_capacity` still calls the hand-rolled
-  `cuda_sys::mem_alloc`. Switching it to `cudarc_backend::mem_alloc`
-  under the feature flag is a one-line `cfg!` shim — but breaks the
-  `mem_pool::POOL` invariants if the pool stores cudarc-minted
-  pointers and the cleanup path uses raw cuMemFree, or vice versa.
-  Resolving that interaction is Stage 1.5.
+- **Pinned-host alloc/free remain hand-rolled FFI even under
+  `--features cudarc`** — cudarc 0.13's `driver` feature doesn't expose
+  `cuMemAllocHost_v2` cleanly. The `PinnedHostBuffer` path
+  (`src/cuda/buffer.rs:396`, ~line 517) continues to call
+  `cuda_sys::mem_alloc_host` / `cuMemFreeHost` directly under both
+  feature flags. Tracked as Stage 3 future work — revisit when cudarc
+  0.14+ surfaces a usable pinned-host API.
 - `CudaContext` and `CudaModule` still use the hand-rolled FFI. cudarc
   exposes equivalents (`CudaDevice`, `CudaDevice::load_ptx`) but
   swapping them in is Stage 2.
@@ -352,51 +366,66 @@ What's deliberately **not** done in this session:
   GPU. The one `#[ignore]`'d smoke test in `cudarc_backend.rs` is a
   template for that follow-up.
 
-The spike's purpose was: prove cudarc COMPILES inside Craton Bolt behind a
-feature flag and exposes the right primitives for the migration. That's
-done. The actual migration (call-site swap, pool reconciliation, test
-sweep) is the next 1–2 day unit of work.
+Stage 1 + Stage 1.5 between them prove cudarc compiles, links, and
+serves real allocations and async transfers behind the feature flag.
+The next unit of work is Stage 2 (PTX module loading).
 
-### Why this session does NOT execute the FULL migration
+### Design choice: keep raw `CUdeviceptr` in `GpuBuffer<T>`
 
-`GpuBuffer<T>` currently exposes a raw `CUdeviceptr` accessor that the
-launch path (`launch_with_geometry`, `cuLaunchKernel`) feeds into a
-`*mut c_void` parameter slot. cudarc's `CudaSlice<T>` does expose a
-device pointer (`slice.device_ptr()` returns the same `CUdeviceptr`),
-so the launch path stays unchanged — **but** every `GpuBuffer<T>`
-constructor needs to swap from `cuda_sys::mem_alloc(bytes)` to
-`backend::mem_alloc(bytes)`, and the resulting `CudaSlice<u8>` needs
-to be stored inside the struct (replacing the raw `CUdeviceptr`).
+Rather than store a cudarc `CudaSlice<u8>` inside `GpuBuffer<T>`, the
+landed Stage 1.5 keeps the raw `CUdeviceptr` representation and routes
+allocation/free through the pool, which dispatches to either backend
+behind `#[cfg(feature = "cudarc")]`. The cudarc and hand-rolled paths
+mint bit-compatible `CUdeviceptr`s (cudarc's `malloc_sync` ultimately
+calls `cuMemAlloc_v2` too), so the pool's free path is backend-agnostic
+and `GpuBuffer::drop` did not need to learn about cudarc-specific drop
+semantics.
 
-That's about a dozen edits across `buffer.rs` plus the `mem_pool.rs`
-overhaul (cudarc's slice doesn't surface a re-allocatable pool the
-way we do; we'd either keep ours or delete it and rely on cudarc's
-internal caching). The risky bit is `Drop` semantics: today
-`GpuBuffer::drop` calls `cuda_sys::mem_free`; under cudarc it drops
-the inner `CudaSlice<u8>` (which calls `cuMemFree` itself). One has
-to be careful that `mem_pool.rs`'s drain doesn't double-free.
+The alternative — wrap `CudaSlice<u8>` inside `GpuBuffer<T>` and let
+cudarc's RAII drive the free — was rejected because it would either
+duplicate the pool (cudarc's `CudaSlice::Drop` calls `cuMemFree`
+directly, bypassing `mem_pool::POOL`'s recycling) or require cudarc to
+expose a "release without freeing" handle that 0.13 doesn't have.
+Keeping the pool means keeping the raw pointer; the cost is that
+`GpuBuffer::drop` still calls `mem_pool` rather than just `drop(slice)`,
+which is fine.
 
-Estimated effort: **1–2 engineering days** of focused work + a full
-bench + test sweep under both feature flags before flipping
-`default = ["cudarc"]`. That's the right unit of work for a separate
-PR, not an afterthought to a multi-task session.
+The Stage 2/3/4 migrations (PTX module, launch path, stream lifetimes)
+can adopt cudarc's typed handles independently of the buffer representation.
 
 ## Suggested execution order
 
-1. **Spike** (half a day): port `mem_alloc` / `mem_free` /
-   `memcpy_{h2d,d2h}` to cudarc behind a feature flag. Verify a
-   single bench query (q1) runs end-to-end with identical results.
-2. **Stage 1 full** (1–2 days): finish the `cuda_sys.rs` migration.
-3. **Stage 2** (1 day): port `jit_compiler.rs::CudaModule`.
-4. **Bench at end of Stage 2** — checkpoint. Numbers must match.
-5. **Stage 3** (2–3 days): port `CudaStream` + launch path.
-6. **Stage 4** (1–2 days): port memory pool.
-7. **Final bench + comprehensive doc update**. Flip
+1. ~~**Spike**~~ — **DONE**. `cudarc_backend.rs` ships with sync
+   `mem_alloc` / `mem_free` / `memcpy_{h2d,d2h}` / `memset_d8`.
+2. ~~**Stage 1 full**~~ — **DONE**. `cuda_sys` → `cudarc_backend`
+   dispatch lives in `mem_pool.rs::driver_mem_alloc` /
+   `driver_free`, so every `GpuBuffer<T>::with_capacity` routes through
+   cudarc under `--features cudarc`. Pinned-host explicitly stays
+   hand-rolled (see Stage 3 below).
+3. ~~**Stage 1.5 — async memcpy**~~ — **DONE** (commit `e79b568`,
+   "review C3"). `memcpy_h2d_async`, `memcpy_d2h_async`,
+   `memset_d8_async` go through `cudarc::driver::sys` raw bindings.
+4. **Stage 2** (1 day): port `jit_compiler.rs::CudaModule` to
+   `cudarc::driver::CudaModule` / `CudaDevice::load_ptx`. The PTX
+   cache key (64-bit FNV of PTX text) is unchanged; only the cache
+   value type and the `Drop` impl change.
+5. **Bench at end of Stage 2** — checkpoint. Numbers must match.
+6. **Stage 3** (2–3 days): port `CudaStream` + launch path. Also:
+   migrate pinned-host alloc to cudarc *if and only if* cudarc 0.14+
+   exposes a clean `cuMemAllocHost_v2` surface; otherwise leave the
+   hand-rolled FFI in place and document why.
+7. **Stage 4** (1–2 days): consider migrating `DeviceMemPool` to
+   cudarc's bucket-based pool. The wins are unclear: our pool's LRU
+   eviction policy and OOM-retry behaviour are tightly tuned to our
+   workload, and cudarc's pool is less configurable. Likely outcome:
+   keep ours.
+8. **Final bench + comprehensive doc update**. Flip
    `default = ["cudarc"]`. Remove the `hand-rolled` cfg blocks after
    one release cycle of soak.
 
-Total realistic estimate: **5–8 engineering days** for the full
-migration, **1–2 days** if we ship Stage 1 only.
+Remaining realistic estimate post Stage 1.5: **3–5 engineering days**
+for Stages 2–4. Stage 1 and the async-memcpy follow-up already cost
+their estimated 1–2 days and shipped.
 
 ## See also
 
