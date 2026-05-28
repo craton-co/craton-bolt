@@ -194,6 +194,45 @@ fn dispatch_native_validity(
     }
 }
 
+// ---------------------------------------------------------------------------
+// v0.7 async memcpy helpers (Stage-3 pattern lifted from `groupby.rs`).
+//
+// Each accumulator-download site previously called `gpu_vec.to_vec()?`,
+// which uses a synchronous `cuMemcpyDtoH_v2`. These helpers swap that for
+// the pinned `to_pinned_async` + `stream.synchronize()` + host-host copy
+// sequence so the D2H chains naturally with the upstream kernel launches
+// on the same stream. They are monomorphised on the element type so they
+// can land directly in an `AccDownload` variant without further casts.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn download_pinned_i32(v: &GpuVec<i32>, stream: &CudaStream) -> BoltResult<Vec<i32>> {
+    let pinned = v.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().to_vec())
+}
+
+#[inline]
+fn download_pinned_i64(v: &GpuVec<i64>, stream: &CudaStream) -> BoltResult<Vec<i64>> {
+    let pinned = v.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().to_vec())
+}
+
+#[inline]
+fn download_pinned_f32(v: &GpuVec<f32>, stream: &CudaStream) -> BoltResult<Vec<f32>> {
+    let pinned = v.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().to_vec())
+}
+
+#[inline]
+fn download_pinned_f64(v: &GpuVec<f64>, stream: &CudaStream) -> BoltResult<Vec<f64>> {
+    let pinned = v.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().to_vec())
+}
+
 /// Execute an `Aggregate` plan that has BOTH a pre kernel AND a non-empty
 /// `group_by`. Single-column GROUP BY only; Int32 / Int64 keys only.
 ///
@@ -359,11 +398,11 @@ pub fn execute_groupby_with_pre(
         ))
     })?;
 
-    let host_keys_init: Vec<i64> = vec![EMPTY_KEY; k];
-    let mut keys_table = GpuVec::<i64>::from_slice(&host_keys_init)?;
-    let key_col_gpu = GpuVec::<i64>::from_slice(&host_keys)?;
-
     let stream = CudaStream::null();
+    let host_keys_init: Vec<i64> = vec![EMPTY_KEY; k];
+    let mut keys_table =
+        GpuVec::<i64>::from_slice_async(&host_keys_init, stream.raw())?;
+    let key_col_gpu = GpuVec::<i64>::from_slice_async(&host_keys, stream.raw())?;
     // Key column already had its NULL rows rejected upstream (see the
     // Stage-B key-validity gate above), so we pass `None` here — the
     // classic 4-param keys kernel is sufficient. Stage C lifting for
@@ -416,7 +455,7 @@ pub fn execute_groupby_with_pre(
     }
 
     // -- 8. Download the keys table to drive output assembly.
-    let host_keys_table: Vec<i64> = keys_table.to_vec()?;
+    let host_keys_table: Vec<i64> = download_pinned_i64(&keys_table, &stream)?;
     drop(keys_table);
     drop(key_col_gpu);
 
@@ -1064,13 +1103,14 @@ fn run_one_aggregate(
             let (_col_io, resolved) =
                 resolve_agg_input_slow(agg, aggregate, input_ord, name_to_pre_ord, compacted)?;
             let (filtered_keys_gpu, n_valid) =
-                filter_keys_if_needed(host_keys, &resolved)?;
+                filter_keys_if_needed(host_keys, &resolved, stream)?;
             let count_group_col: &GpuVec<i64> =
                 filtered_keys_gpu.as_ref().unwrap_or(group_col);
             let ones: Vec<i64> = vec![1i64; n_valid];
-            let input_gpu = GpuVec::<i64>::from_slice(&ones)?;
+            let input_gpu = GpuVec::<i64>::from_slice_async(&ones, stream.raw())?;
             let identity_init: Vec<i64> = vec![0i64; k];
-            let mut acc_table = GpuVec::<i64>::from_slice(&identity_init)?;
+            let mut acc_table =
+                GpuVec::<i64>::from_slice_async(&identity_init, stream.raw())?;
             launch_agg_kernel::<i64>(
                 ReduceOp::Sum,
                 DataType::Int64,
@@ -1082,7 +1122,7 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
             )?;
-            Ok(AccDownload::I64(acc_table.to_vec()?))
+            Ok(AccDownload::I64(download_pinned_i64(&acc_table, stream)?))
         }
 
         AggregateExpr::VarPop(_) | AggregateExpr::VarSamp(_) => {
@@ -1116,7 +1156,7 @@ fn run_one_aggregate(
             // Build the filtered key column once for this aggregate (used by
             // both the SUM and COUNT kernel launches).
             let (filtered_keys_gpu, n_valid) =
-                filter_keys_if_needed(host_keys, &resolved)?;
+                filter_keys_if_needed(host_keys, &resolved, stream)?;
             let avg_group_col: &GpuVec<i64> =
                 filtered_keys_gpu.as_ref().unwrap_or(group_col);
 
@@ -1126,9 +1166,10 @@ fn run_one_aggregate(
                 None => host_col.to_f64(&col_io.name)?,
             };
             debug_assert_eq!(sum_input.len(), n_valid);
-            let input_gpu = GpuVec::<f64>::from_slice(&sum_input)?;
+            let input_gpu = GpuVec::<f64>::from_slice_async(&sum_input, stream.raw())?;
             let sum_init: Vec<f64> = vec![0.0f64; k];
-            let mut sum_acc = GpuVec::<f64>::from_slice(&sum_init)?;
+            let mut sum_acc =
+                GpuVec::<f64>::from_slice_async(&sum_init, stream.raw())?;
             launch_agg_kernel::<f64>(
                 ReduceOp::Sum,
                 DataType::Float64,
@@ -1140,13 +1181,14 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
             )?;
-            let sum_host = sum_acc.to_vec()?;
+            let sum_host = download_pinned_f64(&sum_acc, stream)?;
 
             // COUNT(non-NULL) per group over the same filtered keys.
             let ones: Vec<i64> = vec![1i64; n_valid];
-            let count_input = GpuVec::<i64>::from_slice(&ones)?;
+            let count_input = GpuVec::<i64>::from_slice_async(&ones, stream.raw())?;
             let count_init: Vec<i64> = vec![0i64; k];
-            let mut count_acc = GpuVec::<i64>::from_slice(&count_init)?;
+            let mut count_acc =
+                GpuVec::<i64>::from_slice_async(&count_init, stream.raw())?;
             launch_agg_kernel::<i64>(
                 ReduceOp::Sum,
                 DataType::Int64,
@@ -1158,7 +1200,7 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
             )?;
-            let count_host = count_acc.to_vec()?;
+            let count_host = download_pinned_i64(&count_acc, stream)?;
 
             Ok(AccDownload::Avg {
                 sum: sum_host,
@@ -1179,6 +1221,7 @@ fn run_one_aggregate(
 fn filter_keys_if_needed(
     host_keys: &[i64],
     resolved: &ResolvedHostCol<'_>,
+    stream: &CudaStream,
 ) -> BoltResult<(Option<GpuVec<i64>>, usize)> {
     match resolved.validity() {
         Some(mask) => {
@@ -1195,7 +1238,7 @@ fn filter_keys_if_needed(
                 .filter_map(|(&k, &v)| if v { Some(k) } else { None })
                 .collect();
             let n = filtered.len();
-            let gpu = GpuVec::<i64>::from_slice(&filtered)?;
+            let gpu = GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
             Ok((Some(gpu), n))
         }
         None => Ok((None, host_keys.len())),
@@ -1262,7 +1305,7 @@ fn run_typed_agg_native_validity(
     let validity_bytes: Vec<u8> =
         validity.iter().map(|&v| if v { 1u8 } else { 0u8 }).collect();
     let packed = pack_validity_bits(&validity_bytes);
-    let validity_gpu = GpuVec::<u32>::from_slice(&packed)?;
+    let validity_gpu = GpuVec::<u32>::from_slice_async(&packed, stream.raw())?;
 
     // Account the native-dispatch launch. The counter is observed by
     // inline tests; the production path does not read it.
@@ -1274,57 +1317,59 @@ fn run_typed_agg_native_validity(
             // Mirror the host-strip branch above.
             if matches!(op, ReduceOp::Sum) {
                 let widened: Vec<i64> = host.iter().map(|&x| x as i64).collect();
-                let input_gpu = GpuVec::<i64>::from_slice(&widened)?;
+                let input_gpu =
+                    GpuVec::<i64>::from_slice_async(&widened, stream.raw())?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
-                let mut acc = GpuVec::<i64>::from_slice(&init)?;
+                let mut acc =
+                    GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
                 launch_agg_kernel_with_validity::<i64>(
                     op, DataType::Int64, group_col, keys_table, &input_gpu,
                     &mut acc, &validity_gpu, n_rows, k_u32, stream,
                 )?;
-                return Ok(AccDownload::I64(acc.to_vec()?));
+                return Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?));
             }
-            let input_gpu = GpuVec::<i32>::from_slice(host)?;
+            let input_gpu = GpuVec::<i32>::from_slice_async(host, stream.raw())?;
             let init: Vec<i32> = vec![identity_i32(op); k];
-            let mut acc = GpuVec::<i32>::from_slice(&init)?;
+            let mut acc = GpuVec::<i32>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel_with_validity::<i32>(
                 op, DataType::Int32, group_col, keys_table, &input_gpu, &mut acc,
                 &validity_gpu, n_rows, k_u32, stream,
             )?;
-            Ok(AccDownload::I32(acc.to_vec()?))
+            Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
         }
         (DataType::Int64, HostColValues::I64(host)) => {
-            let input_gpu = GpuVec::<i64>::from_slice(host)?;
+            let input_gpu = GpuVec::<i64>::from_slice_async(host, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
-            let mut acc = GpuVec::<i64>::from_slice(&init)?;
+            let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel_with_validity::<i64>(
                 op, DataType::Int64, group_col, keys_table, &input_gpu, &mut acc,
                 &validity_gpu, n_rows, k_u32, stream,
             )?;
-            Ok(AccDownload::I64(acc.to_vec()?))
+            Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
         }
         (DataType::Float32, HostColValues::F32(host)) => {
             // Float MIN/MAX is filtered out by `dispatch_native_validity`,
             // so only SUM reaches here.
             debug_assert!(matches!(op, ReduceOp::Sum));
-            let input_gpu = GpuVec::<f32>::from_slice(host)?;
+            let input_gpu = GpuVec::<f32>::from_slice_async(host, stream.raw())?;
             let init: Vec<f32> = vec![identity_f32(op); k];
-            let mut acc = GpuVec::<f32>::from_slice(&init)?;
+            let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel_with_validity::<f32>(
                 op, DataType::Float32, group_col, keys_table, &input_gpu,
                 &mut acc, &validity_gpu, n_rows, k_u32, stream,
             )?;
-            Ok(AccDownload::F32(acc.to_vec()?))
+            Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
         }
         (DataType::Float64, HostColValues::F64(host)) => {
             debug_assert!(matches!(op, ReduceOp::Sum));
-            let input_gpu = GpuVec::<f64>::from_slice(host)?;
+            let input_gpu = GpuVec::<f64>::from_slice_async(host, stream.raw())?;
             let init: Vec<f64> = vec![identity_f64(op); k];
-            let mut acc = GpuVec::<f64>::from_slice(&init)?;
+            let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel_with_validity::<f64>(
                 op, DataType::Float64, group_col, keys_table, &input_gpu,
                 &mut acc, &validity_gpu, n_rows, k_u32, stream,
             )?;
-            Ok(AccDownload::F64(acc.to_vec()?))
+            Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
         (dt, _) => Err(BoltError::Type(format!(
             "groupby_with_pre: native-validity dispatch reached unsupported dtype {:?} \
@@ -1387,7 +1432,7 @@ fn run_typed_agg(
     // with any false bits, filter both (keys, values) together so the GPU
     // sees a parallel pair of rows with no NULL slots. The keys-table is
     // shared and remains correct because it indexes the original key set.
-    let (filtered_keys_gpu, n_eff) = filter_keys_if_needed(host_keys, resolved)?;
+    let (filtered_keys_gpu, n_eff) = filter_keys_if_needed(host_keys, resolved, stream)?;
     let eff_group_col: &GpuVec<i64> = filtered_keys_gpu.as_ref().unwrap_or(group_col);
 
     // Stage C: the Stage-B reject error is lifted. NULL value rows are
@@ -1421,9 +1466,11 @@ fn run_typed_agg(
                         .collect(),
                     None => host.iter().map(|&x| x as i64).collect(),
                 };
-                let input_gpu = GpuVec::<i64>::from_slice(&widened)?;
+                let input_gpu =
+                    GpuVec::<i64>::from_slice_async(&widened, stream.raw())?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
-                let mut acc = GpuVec::<i64>::from_slice(&init)?;
+                let mut acc =
+                    GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
                 launch_agg_kernel::<i64>(
                     op,
                     DataType::Int64,
@@ -1435,13 +1482,14 @@ fn run_typed_agg(
                     k_u32,
                     stream,
                 )?;
-                return Ok(AccDownload::I64(acc.to_vec()?));
+                return Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?));
             }
 
             let filtered: Vec<i32> = filter_by_validity(host, validity);
-            let input_gpu = GpuVec::<i32>::from_slice(&filtered)?;
+            let input_gpu =
+                GpuVec::<i32>::from_slice_async(&filtered, stream.raw())?;
             let init: Vec<i32> = vec![identity_i32(op); k];
-            let mut acc = GpuVec::<i32>::from_slice(&init)?;
+            let mut acc = GpuVec::<i32>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel::<i32>(
                 op,
                 DataType::Int32,
@@ -1453,7 +1501,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
             )?;
-            Ok(AccDownload::I32(acc.to_vec()?))
+            Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
         }
         (DataType::Int64, HostColValues::I64(host)) => {
             // Stage C: filter NULL rows in lockstep with the key column.
@@ -1462,9 +1510,10 @@ fn run_typed_agg(
             // Stage-B reject guarded against that. Now that the gate
             // is lifted we must apply the validity mask explicitly.
             let filtered: Vec<i64> = filter_by_validity(host, validity);
-            let input_gpu = GpuVec::<i64>::from_slice(&filtered)?;
+            let input_gpu =
+                GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
-            let mut acc = GpuVec::<i64>::from_slice(&init)?;
+            let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel::<i64>(
                 op,
                 DataType::Int64,
@@ -1476,7 +1525,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
             )?;
-            Ok(AccDownload::I64(acc.to_vec()?))
+            Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
         }
         (DataType::Float32, HostColValues::F32(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
@@ -1485,9 +1534,10 @@ fn run_typed_agg(
                 ));
             }
             let filtered: Vec<f32> = filter_by_validity(host, validity);
-            let input_gpu = GpuVec::<f32>::from_slice(&filtered)?;
+            let input_gpu =
+                GpuVec::<f32>::from_slice_async(&filtered, stream.raw())?;
             let init: Vec<f32> = vec![identity_f32(op); k];
-            let mut acc = GpuVec::<f32>::from_slice(&init)?;
+            let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel::<f32>(
                 op,
                 DataType::Float32,
@@ -1499,7 +1549,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
             )?;
-            Ok(AccDownload::F32(acc.to_vec()?))
+            Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
         }
         (DataType::Float64, HostColValues::F64(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
@@ -1508,9 +1558,10 @@ fn run_typed_agg(
                 ));
             }
             let filtered: Vec<f64> = filter_by_validity(host, validity);
-            let input_gpu = GpuVec::<f64>::from_slice(&filtered)?;
+            let input_gpu =
+                GpuVec::<f64>::from_slice_async(&filtered, stream.raw())?;
             let init: Vec<f64> = vec![identity_f64(op); k];
-            let mut acc = GpuVec::<f64>::from_slice(&init)?;
+            let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel::<f64>(
                 op,
                 DataType::Float64,
@@ -1522,7 +1573,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
             )?;
-            Ok(AccDownload::F64(acc.to_vec()?))
+            Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
         (DataType::Bool, _) | (DataType::Utf8, _) => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
@@ -2619,5 +2670,90 @@ mod null_propagation_tests {
             DataType::Int64,
         );
         assert!(!chose, "no mask -> no native dispatch");
+    }
+
+    // ---- v0.7 async-memcpy migration smoke -------------------------------
+    //
+    // Exercise the migrated `download_pinned_*` helpers under both stub
+    // and real CUDA. The helpers wrap `to_pinned_async` +
+    // `stream.synchronize()`; under `--features cuda-stub` the async
+    // FFI shim returns `CUDA_ERROR_STUB`, so we expect `Err` rather
+    // than a panic. The assertion is "did not panic" + "returned a
+    // Result". Under a live CUDA context (`gpu:tier1`) the helpers
+    // succeed against a tiny GpuVec round-trip.
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn v07_async_download_pinned_helpers_do_not_panic() {
+        let stream = CudaStream::null_or_default();
+        // If we can't even allocate a 4-element GpuVec on this backend
+        // (the stub will Err), short-circuit — the migrated pinned path
+        // simply wasn't reachable, which is fine for the "no panic"
+        // contract.
+        let Ok(v_i32) = GpuVec::<i32>::from_slice_async(&[1, 2, 3, 4], stream.raw()) else { return };
+        let _ = download_pinned_i32(&v_i32, &stream);
+        let Ok(v_i64) = GpuVec::<i64>::from_slice_async(&[1i64, 2, 3, 4], stream.raw()) else { return };
+        let _ = download_pinned_i64(&v_i64, &stream);
+        let Ok(v_f32) = GpuVec::<f32>::from_slice_async(&[1.0f32, 2.0, 3.0, 4.0], stream.raw()) else { return };
+        let _ = download_pinned_f32(&v_f32, &stream);
+        let Ok(v_f64) = GpuVec::<f64>::from_slice_async(&[1.0f64, 2.0, 3.0, 4.0], stream.raw()) else { return };
+        let _ = download_pinned_f64(&v_f64, &stream);
+    }
+
+    /// Engine-level GROUP BY WITH PRE round-trip: the only public entry
+    /// to `execute_groupby_with_pre`. Exercises the migrated async H2D
+    /// for the keys table + key column + agg input + agg accumulator,
+    /// and the migrated pinned D2H for the keys table + accumulator.
+    /// Stub mode short-circuits at the first CUDA FFI; the test is
+    /// satisfied as long as no panic escapes.
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn v07_async_groupby_with_pre_round_trip() {
+        use crate::Engine;
+
+        let mut engine = Engine::new().expect("ctx");
+        // 9 rows, key in {0,1,2}, val computed by the pre-stage as v*2.
+        let keys: Vec<i32> = (0..9i32).map(|i| i % 3).collect();
+        let vals: Vec<i64> = (0..9i64).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys)) as ArrayRef,
+                Arc::new(Int64Array::from(vals)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        engine.register_table("t", batch).unwrap();
+
+        // The `v + v` expression forces a pre-projection kernel; the
+        // GROUP BY then routes through `execute_groupby_with_pre`.
+        let h = match engine.sql("SELECT k, SUM(v + v) FROM t GROUP BY k") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let out = h.record_batch();
+        let mut expected: std::collections::HashMap<i32, i64> =
+            std::collections::HashMap::new();
+        for v in 0..9i64 {
+            *expected.entry((v as i32) % 3).or_default() += v + v;
+        }
+        let ks = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let ss = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..out.num_rows() {
+            let k = ks.value(i);
+            let s = ss.value(i);
+            assert_eq!(Some(&s), expected.get(&k), "k={k} sum={s}");
+        }
     }
 }
