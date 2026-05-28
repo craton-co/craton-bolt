@@ -57,3 +57,11 @@ pub use jit_compiler::ptx_cache_stats;
 /// `BOLT_PTX_CACHE_DIR` env var. Pass `None` to clear the override and
 /// re-fall-back to env-var resolution.
 pub use disk_cache::set_override_dir as set_disk_ptx_cache_dir;
+
+/// Public re-export of the builder-override read-back accessor. Mirrors
+/// [`set_disk_ptx_cache_dir`]: returns `Some(path)` if a builder
+/// override is currently installed via that setter, or `None`
+/// otherwise. Exposed primarily for `EngineBuilder` integration tests
+/// that assert the builder propagated its `persistent_cache(path)` knob
+/// into the process-wide JIT state.
+pub use disk_cache::current_override_dir as current_disk_ptx_cache_dir;

@@ -116,6 +116,24 @@ pub fn set_override_dir(dir: Option<PathBuf>) {
     *HANDLE.get_or_init(|| Mutex::new(None)).lock() = None;
 }
 
+/// Snapshot the current builder-supplied override directory (if any).
+///
+/// Returns `Some(path)` when [`set_override_dir`] has been called with a
+/// non-`None` argument and that path is still installed; returns `None`
+/// when no override is active (in which case the env var
+/// [`DISK_PTX_CACHE_ENV`] is the only path that would enable the
+/// cache).
+///
+/// This is the inverse of [`set_override_dir`] and exists primarily so
+/// the `EngineBuilder` integration tests can assert that the builder
+/// successfully propagated its `persistent_cache(path)` knob into the
+/// process-wide JIT state. Production callers typically don't need this
+/// — use [`disk_cache`] to obtain a usable handle instead.
+#[must_use]
+pub fn current_override_dir() -> Option<PathBuf> {
+    override_slot().lock().clone()
+}
+
 /// Process-wide cache handle, memoised after first resolution.
 ///
 /// `None` means the cache is disabled (no env var, no override, or
