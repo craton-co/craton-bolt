@@ -1,0 +1,17 @@
+# .github/ISSUE_TEMPLATE/config.yml
+#
+# Disables the "Open a blank issue" escape hatch so contributors land on
+# bug.md or feature.md. Security reports get redirected to SECURITY.md.
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/craton-co/craton-bolt/security/advisories/new
+    about: Report a vulnerability privately. Do NOT file a public issue for security bugs — see SECURITY.md for the disclosure SLA.
+  - name: Email security@cratonsoftware.com
+    url: mailto:security@cratonsoftware.com
+    about: Alternative private channel for security reports (PGP available on request).
+  - name: Read the docs
+    url: https://github.com/craton-co/craton-bolt/tree/main/docs
+    about: Architecture, SQL reference, JIT pipeline, FAQ, and roadmap all live under docs/.
