@@ -617,8 +617,10 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     let (table_name, scan_schema) = lower_table_factor(&twj.relation, provider)?;
     let schema = scan_schema.clone();
     // The name resolver tracks the FROM-tree's `table.col` namespace so we
-    // can resolve qualified references in WHERE / SELECT / GROUP BY / HAVING
-    // (the ON-clause lowerer keeps its own simpler path — see `lower_join_side`).
+    // can resolve qualified references in WHERE / SELECT / GROUP BY / HAVING.
+    // The ON-clause lowerer also consults the resolver (see `lower_join_on`
+    // / `lower_join_side`) to reject same-side and unknown-table qualifiers
+    // before the executor ever runs.
     let mut resolver = NameResolver::empty();
     resolver.push_base(table_name.clone(), &scan_schema);
     let mut plan = LogicalPlan::Scan {
@@ -661,6 +663,10 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         // the right-side Scan, so it sees the same rename rule as
         // `join_combined_schema` applies to the actual plan output.
         resolver.push_join(rhs_table.clone(), &rhs_schema);
+        // Keep `rhs_table` available after the move into `right_plan` so the
+        // ON-clause validator can distinguish "right side" (`rhs_table`) from
+        // "left side" (any earlier scope in `resolver`).
+        let rhs_table_for_on = rhs_table.clone();
         let right_plan = LogicalPlan::Scan {
             table: rhs_table,
             projection: None,
@@ -668,9 +674,11 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         };
         // CROSS has no ON predicate; everything else does. `lower_join_on`
         // is reused for the rest so non-equi forms keep a single
-        // rejection path.
+        // rejection path. The validator uses `resolver` + `rhs_table_for_on`
+        // to reject `t1.a = t1.a` style same-side equalities and references
+        // to tables not in scope (see `lower_join_on`).
         let on_pairs = match on_expr {
-            Some(e) => lower_join_on(e)?,
+            Some(e) => lower_join_on(e, &resolver, &rhs_table_for_on)?,
             None => Vec::new(),
         };
         plan = LogicalPlan::Join {
@@ -983,12 +991,43 @@ fn lower_join_constraint<'a>(
     }
 }
 
+/// Which side of the current join an ON-clause column reference belongs to.
+///
+/// `Right` means the column qualifier names the table just being added to
+/// the join (`rhs_table` in the caller). `Left` means it names any other
+/// table already in scope (the accumulated FROM-tree to the left of this
+/// join). `Unknown` is reserved for bare `Identifier(col)` references, which
+/// carry no qualifier and so cannot be classified by the planner — those
+/// pass straight through to keep the executor's existing bare-name
+/// behaviour intact (`t1 JOIN t2 ON a = b` is still accepted exactly as it
+/// was pre-validation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+    /// Bare identifier (no qualifier) — side cannot be determined at plan
+    /// time. Preserved as-is to avoid regressing queries that relied on the
+    /// pre-validation lenient lowering.
+    Unknown,
+}
+
 /// Look up a join predicate expression as a conjunction of `left.col = right.col`
 /// equalities. Reject non-equi joins and non-conjunctive forms with a clear
 /// message; the executor scaffold only handles equi joins.
-fn lower_join_on(e: &SqlExpr) -> BoltResult<Vec<(Expr, Expr)>> {
+///
+/// Validation added by the MED fix for `t1.a = t1.a`-style same-side
+/// equalities: each conjunct is required to reference *different* sides of
+/// the join when both sides are `table.col` qualified. `resolver` carries
+/// every in-scope table so we can also reject `t3.a = t2.a` when `t3` is
+/// not part of FROM. `rhs_table` is the table just being joined — anything
+/// else in `resolver` is "left".
+fn lower_join_on(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    rhs_table: &str,
+) -> BoltResult<Vec<(Expr, Expr)>> {
     let mut out = Vec::new();
-    collect_join_eq(e, &mut out, 0)?;
+    collect_join_eq(e, &mut out, resolver, rhs_table, 0)?;
     if out.is_empty() {
         return Err(BoltError::Sql(
             "JOIN ON clause must contain at least one equality predicate".into(),
@@ -1000,29 +1039,47 @@ fn lower_join_on(e: &SqlExpr) -> BoltResult<Vec<(Expr, Expr)>> {
 /// Walk `e` flattening `AND` nodes; each leaf must be `<expr> = <expr>`.
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
-fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>, depth: usize) -> BoltResult<()> {
+fn collect_join_eq(
+    e: &SqlExpr,
+    out: &mut Vec<(Expr, Expr)>,
+    resolver: &NameResolver,
+    rhs_table: &str,
+    depth: usize,
+) -> BoltResult<()> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(BoltError::Sql(format!(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
         )));
     }
     match e {
-        SqlExpr::Nested(inner) => collect_join_eq(inner, out, depth + 1),
+        SqlExpr::Nested(inner) => collect_join_eq(inner, out, resolver, rhs_table, depth + 1),
         SqlExpr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
         } => {
-            collect_join_eq(left, out, depth + 1)?;
-            collect_join_eq(right, out, depth + 1)
+            collect_join_eq(left, out, resolver, rhs_table, depth + 1)?;
+            collect_join_eq(right, out, resolver, rhs_table, depth + 1)
         }
         SqlExpr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
         } => {
-            let l = lower_join_side(left)?;
-            let r = lower_join_side(right)?;
+            let (l, lside) = lower_join_side(left, resolver, rhs_table)?;
+            let (r, rside) = lower_join_side(right, resolver, rhs_table)?;
+            // Same-side equality rejection. We only flag when *both* sides
+            // are classifiable (compound-identifier-with-known-qualifier);
+            // a bare `Identifier(col)` leaves the side `Unknown` so the
+            // pair still passes — matching the pre-fix lenient behaviour
+            // for queries like `t1 JOIN t2 ON a = b` where the column name
+            // is unambiguous across the schemas.
+            if lside != JoinSide::Unknown && lside == rside {
+                return Err(BoltError::Sql(format!(
+                    "JOIN ON ... both sides reference the same table; \
+                     expected a cross-table equality (got {left} = {right})"
+                )));
+            }
             out.push((l, r));
             Ok(())
         }
@@ -1032,21 +1089,73 @@ fn collect_join_eq(e: &SqlExpr, out: &mut Vec<(Expr, Expr)>, depth: usize) -> Bo
     }
 }
 
-/// Lower one side of an equi-join predicate. We accept either a bare
-/// identifier or a `table.column` qualified identifier so users can
-/// disambiguate same-named columns; both lower to a plain `Column` ref
-/// (qualified column lookups beyond bare-name matching aren't supported
-/// in 0.1.x but the parser accepts them so error messages stay friendly).
-fn lower_join_side(e: &SqlExpr) -> BoltResult<Expr> {
+/// Lower one side of an equi-join predicate and report which side of the
+/// join it lives on. We accept either a bare identifier or a `table.column`
+/// qualified identifier so users can disambiguate same-named columns; both
+/// lower to a plain `Column` ref (qualified column lookups beyond bare-name
+/// matching aren't supported in 0.1.x but the parser accepts them so error
+/// messages stay friendly).
+///
+/// Side classification:
+///   - `CompoundIdentifier([qual, col])` with `qual == rhs_table` → `Right`.
+///   - `CompoundIdentifier([qual, col])` with `qual` matching an earlier
+///     scope in `resolver` → `Left`.
+///   - `CompoundIdentifier([qual, col])` with `qual` unknown → hard error
+///     (`JOIN ON ... references unknown table '{qual}'`).
+///   - bare `Identifier` → `Unknown`. The caller treats this as "could be
+///     either side" and so will not raise a same-side error; matches the
+///     pre-validation lenient behaviour.
+fn lower_join_side(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    rhs_table: &str,
+) -> BoltResult<(Expr, JoinSide)> {
     match e {
-        SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
+        SqlExpr::Identifier(ident) => {
+            // Bare column reference — no qualifier to verify. Leave the
+            // side undetermined so the caller doesn't accidentally treat
+            // it as same-side.
+            Ok((Expr::Column(ident.value.clone()), JoinSide::Unknown))
+        }
         SqlExpr::CompoundIdentifier(parts) => {
-            // `table.col` — keep only the trailing column name. Cross-side
-            // matching is the executor's job.
-            let last = parts
-                .last()
-                .ok_or_else(|| BoltError::Sql("empty compound identifier in JOIN ON".into()))?;
-            Ok(Expr::Column(last.value.clone()))
+            // `table.col` — keep only the trailing column name in the
+            // lowered Expr (the executor compares by output column name).
+            // The qualifier is used purely for plan-time side validation.
+            if parts.len() < 2 {
+                let last = parts.last().ok_or_else(|| {
+                    BoltError::Sql("empty compound identifier in JOIN ON".into())
+                })?;
+                return Ok((Expr::Column(last.value.clone()), JoinSide::Unknown));
+            }
+            if parts.len() > 2 {
+                return Err(BoltError::Sql(format!(
+                    "unsupported: deeply qualified column reference '{}' in JOIN ON",
+                    parts
+                        .iter()
+                        .map(|p| p.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                )));
+            }
+            let qualifier = &parts[0].value;
+            let col = &parts[1].value;
+            // Verify the qualifier exists somewhere in the FROM-tree
+            // (resolver already contains every in-scope table, including
+            // the rhs we just pushed). This catches `t3.a` when only `t1`
+            // and `t2` are joined.
+            let in_scope = resolver.tables.iter().any(|t| &t.name == qualifier);
+            if !in_scope {
+                return Err(BoltError::Sql(format!(
+                    "JOIN ON ... references unknown table '{qualifier}' \
+                     in column reference '{qualifier}.{col}'"
+                )));
+            }
+            let side = if qualifier == rhs_table {
+                JoinSide::Right
+            } else {
+                JoinSide::Left
+            };
+            Ok((Expr::Column(col.clone()), side))
         }
         other => Err(BoltError::Sql(format!(
             "non-equi JOIN not yet supported (JOIN ON sides must be column references; got {other})"
@@ -2163,6 +2272,90 @@ mod wave7_tests {
         assert!(
             msg.contains("unknown table qualifier"),
             "expected 'unknown table qualifier', got: {msg}"
+        );
+    }
+
+    // ---- ON-clause cross-side equality validation (MED fix) ----
+    //
+    // The lowerer previously stripped table qualifiers from each ON-clause
+    // side without checking that the two sides came from different
+    // tables. `JOIN t2 ON t1.a = t1.a` therefore reached the executor as
+    // `(Column("a"), Column("a"))` and only blew up at run time; the four
+    // tests below pin the new plan-time validation in place.
+
+    #[test]
+    fn join_on_cross_table_equality_passes_lowering() {
+        // Sanity baseline: a well-formed `t1.a = t2.a` predicate is
+        // accepted and lowers to a Join with one equality pair. The ON
+        // clause keeps the original (pre-rename) bare column names — the
+        // executor (`src/exec/join.rs::split_keys`) matches those against
+        // its build/probe schemas directly. The rename rule applies only
+        // to the JOIN's *output* schema, not to its ON pairs.
+        let plan = lp("SELECT * FROM t1 JOIN t2 ON t1.a = t2.a");
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        match join_plan {
+            LogicalPlan::Join { on, join_type, .. } => {
+                assert_eq!(*join_type, JoinType::Inner);
+                assert_eq!(on.len(), 1, "expected one equi pair, got {on:?}");
+                match &on[0] {
+                    (Expr::Column(l), Expr::Column(r)) => {
+                        assert_eq!(l, "a", "left key uses bare column name");
+                        assert_eq!(r, "a", "right key uses bare column name");
+                    }
+                    other => panic!("expected two Column refs, got {other:?}"),
+                }
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_on_same_side_equality_is_rejected() {
+        // `t1.a = t1.a` is the bug case: both qualifiers name the left
+        // side, so the predicate cannot constrain the join. Reject at
+        // plan time with a clear message naming the failure mode.
+        let err = parse("SELECT * FROM t1 JOIN t2 ON t1.a = t1.a", &provider())
+            .expect_err("same-side ON equality must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("both sides reference the same table"),
+            "expected same-side message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn join_on_unknown_table_is_rejected() {
+        // `t3` is not part of FROM at all. The pre-fix lowerer dropped
+        // the qualifier and quietly produced a useless `(a, a)` pair;
+        // we now report the offending qualifier so the user can fix the
+        // typo.
+        let err = parse("SELECT * FROM t1 JOIN t2 ON t3.a = t2.a", &provider())
+            .expect_err("ON clause referencing unknown table must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown table 't3'"),
+            "expected 'unknown table t3' message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn join_on_second_conjunct_same_side_is_rejected() {
+        // The first conjunct is well-formed (`t1.a = t2.a`); the second
+        // is the bug shape (`t1.b = t1.b`). Validation must traverse
+        // the full AND tree and reject the offending leaf so a partial
+        // good prefix can't mask a bad tail.
+        let err = parse(
+            "SELECT * FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b = t1.b",
+            &provider(),
+        )
+        .expect_err("same-side conjunct anywhere in the AND tree must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("both sides reference the same table"),
+            "expected same-side message, got: {msg}"
         );
     }
 }
