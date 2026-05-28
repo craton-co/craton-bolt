@@ -24,7 +24,7 @@ use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::MinMaxOp;
 use crate::jit::partition_reduce_kernel_minmax_float::{
-    compile_partition_reduce_kernel_minmax_float_with_spill,
+    compile_partition_reduce_kernel_minmax_float, compile_partition_reduce_kernel_minmax_float_with_spill,
     kernel_entry_with_spill as minmax_float_entry_with_spill, FloatDtype, BLOCK_GROUPS,
     BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };

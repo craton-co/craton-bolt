@@ -38,7 +38,7 @@ use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::{
-    compile_partition_reduce_kernel_minmax_with_spill,
+    compile_partition_reduce_kernel_minmax, compile_partition_reduce_kernel_minmax_with_spill,
     kernel_entry_with_spill as minmax_entry_with_spill, MinMaxDtype, MinMaxOp,
     BLOCK_GROUPS, BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };

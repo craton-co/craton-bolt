@@ -49,7 +49,7 @@ use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::{MinMaxDtype, MinMaxOp};
 use crate::jit::partition_reduce_kernel_minmax_i64::{
-    compile_partition_reduce_kernel_minmax_i64_with_spill,
+    compile_partition_reduce_kernel_minmax_i64, compile_partition_reduce_kernel_minmax_i64_with_spill,
     kernel_entry_with_spill as minmax_i64_entry, BLOCK_GROUPS,
     BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
