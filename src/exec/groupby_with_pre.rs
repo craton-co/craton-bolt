@@ -617,10 +617,18 @@ fn run_pre_stage(
         let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
         let input_ptrs: Vec<CUdeviceptr> =
             input_cols.iter().map(|c| c.device_ptr()).collect();
+        // GroupBy pre-stage predicate kernel: same situation as
+        // `agg_with_pre`. The planner doesn't lower `Op::IsNullCheck`
+        // through this aggregate predicate path today (only the projection-
+        // scan-chain path uses it), so we pass an empty validity slice and
+        // the scan_kernel emits the legacy no-validity param layout
+        // bit-for-bit. See the matching comment in `agg_with_pre.rs`.
+        let validity_ptrs: Vec<CUdeviceptr> = Vec::new();
         crate::exec::compact::launch_predicate_kernel(
             pred_function,
             &input_ptrs,
             mask.device_ptr(),
+            &validity_ptrs,
             n_rows_u32,
             &stream,
         )?;

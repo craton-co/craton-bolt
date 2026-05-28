@@ -299,10 +299,19 @@ fn run_pre_stage(
         let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
         let input_ptrs: Vec<CUdeviceptr> =
             input_cols.iter().map(|c| c.device_ptr()).collect();
+        // Aggregate pre-stage predicate kernel: today's planner doesn't lower
+        // `Op::IsNullCheck` through this path (only the projection-scan-chain
+        // path uses it), so we pass an empty validity slice — the
+        // scan_kernel emits the legacy no-validity param layout bit-for-bit.
+        // When/if the aggregate planner grows IS NULL support, the validity
+        // ptrs would be assembled from `input_cols[i].validity_device_ptr()`
+        // in the same order as `KernelSpec::input_has_validity`.
+        let validity_ptrs: Vec<CUdeviceptr> = Vec::new();
         crate::exec::compact::launch_predicate_kernel(
             pred_function,
             &input_ptrs,
             mask.device_ptr(),
+            &validity_ptrs,
             n_rows_to_u32(n_rows)?,
             &stream,
         )?;

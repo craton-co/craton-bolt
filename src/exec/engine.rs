@@ -1554,13 +1554,92 @@ impl Engine {
         //
         // `KernelArgs` is monomorphic on `T` per push and cannot store heterogenous
         // column types in one list. We bypass it and assemble raw kernel params
-        // directly: inputs first, then outputs, then the row-count `u32`.
-        let mut device_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(input_ptrs.len() + output_cols.len());
+        // directly: inputs first, then outputs, then any flagged validity
+        // pointers (input then output, in the same order as `ptx_gen.rs`'s
+        // signature walk — see `ptx_gen::write_signature`), then the
+        // row-count `u32`.
+        //
+        // Validity pointer wiring (Batch 7, IS NULL e2e):
+        // For every input where `kernel.input_has_validity[i] == true` (set by
+        // `Codegen::emit_unary` for `column IS [NOT] NULL` checks), push the
+        // GPU column's *u8 validity-bitmap pointer here. The codegen's
+        // `Op::IsNullCheck` indexes into this list via `validity_input`.
+        //
+        // For columns where the codegen flagged validity but the GPU storage
+        // doesn't expose a validity pointer (e.g. nullable primitives whose
+        // GPU storage is still values-only today), we surface a structured
+        // error rather than silently emitting a NULL pointer — the kernel
+        // would then segfault on the first row. The plan-time constant-fold
+        // in `Codegen::emit_unary` already eliminates IsNullCheck on
+        // non-nullable schema fields, so this error only fires for genuine
+        // missing-validity-on-GPU plumbing gaps (a follow-up: nullable
+        // primitives on the device).
+        let need_input_validity: Vec<bool> = if kernel.input_has_validity.is_empty() {
+            vec![false; kernel.inputs.len()]
+        } else {
+            if kernel.input_has_validity.len() != kernel.inputs.len() {
+                return Err(BoltError::Other(format!(
+                    "engine: kernel.input_has_validity len {} != inputs len {}",
+                    kernel.input_has_validity.len(),
+                    kernel.inputs.len()
+                )));
+            }
+            kernel.input_has_validity.clone()
+        };
+        let mut input_validity_ptrs: Vec<CUdeviceptr> = Vec::new();
+        for (i, has) in need_input_validity.iter().enumerate() {
+            if !*has {
+                continue;
+            }
+            let io = &kernel.inputs[i];
+            // Synthesised `__idx_*` columns don't carry validity in the
+            // dictionary registry; they correspond to dictionary index
+            // columns whose null-bearing nature lives upstream on the
+            // source DictUtf8 column. Skip with a structured error so the
+            // caller knows to surface the breakage.
+            if io.name.starts_with("__idx_") {
+                return Err(BoltError::Plan(format!(
+                    "engine: kernel flags `__idx_` column '{}' as needing validity, but \
+                     dictionary registry does not yet expose a per-row validity bitmap; \
+                     route the predicate through the host fallback",
+                    io.name
+                )));
+            }
+            let column = gpu_table.column(&io.name).ok_or_else(|| {
+                BoltError::Plan(format!(
+                    "column '{}' not in table '{}' (validity wiring)",
+                    io.name, table
+                ))
+            })?;
+            let vptr = column.data.validity_ptr().ok_or_else(|| {
+                BoltError::Plan(format!(
+                    "engine: kernel flags input '{}' as needing validity but the GPU \
+                     column has no validity bitmap on device. The plan-time constant-fold \
+                     in physical_plan::Codegen::emit_unary should have collapsed this \
+                     IsNullCheck to a Bool constant — was the schema's nullable flag \
+                     out of sync with the actual GPU storage? \
+                     (Nullable primitives on the device are a follow-up; today only \
+                     BoolNullable and DictUtf8 expose `validity_ptr`.)",
+                    io.name
+                ))
+            })?;
+            input_validity_ptrs.push(vptr);
+        }
+
+        let mut device_ptrs: Vec<CUdeviceptr> =
+            Vec::with_capacity(input_ptrs.len() + output_cols.len() + input_validity_ptrs.len());
         for p in &input_ptrs {
             device_ptrs.push(*p);
         }
         for c in &output_cols {
             device_ptrs.push(c.device_ptr());
+        }
+        // Validity pointers come AFTER value inputs and outputs, matching the
+        // order in `ptx_gen::compile` (input-validity first, then output-
+        // validity). `KernelSpec::output_has_validity` is empty for the
+        // projection path today, so we only emit input-validity ptrs.
+        for vp in &input_validity_ptrs {
+            device_ptrs.push(*vp);
         }
         let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
 
@@ -1620,10 +1699,17 @@ impl Engine {
             let pred_function = pred_module.function(PREDICATE_ENTRY)?;
 
             let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
+            // Validity-pointer wiring for the predicate kernel (Batch 7,
+            // IS NULL e2e). The scan_kernel's emitted PTX consumes the
+            // flagged-input validity pointers AFTER the mask output, in
+            // input-slot order. `input_validity_ptrs` above was assembled
+            // for the projection kernel; reuse it here so the order and
+            // membership stay in lockstep with the kernel's signature.
             crate::exec::compact::launch_predicate_kernel(
                 pred_function,
                 &input_ptrs,
                 mask.device_ptr(),
+                &input_validity_ptrs,
                 n_rows_to_u32(n_rows)?,
                 &stream,
             )?;

@@ -15,12 +15,21 @@
 //!     ...
 //!     .param .u64 bolt_predicate_param_{N-1},    // input col N-1
 //!     .param .u64 bolt_predicate_param_{N},      // mask output (u8*)
-//!     .param .u32 bolt_predicate_param_{N+1}_n_rows
+//!     .param .u64 bolt_predicate_param_{N+1},    // validity ptr for input #i_a (u8*)
+//!     ...                                        //   one per flagged input
+//!     .param .u64 bolt_predicate_param_{N+K},    // validity ptr for input #i_K (u8*)
+//!     .param .u32 bolt_predicate_param_{N+K+1}_n_rows
 //! )
 //! ```
 //!
-//! where `N == spec.inputs.len()`. The grid is 1D, one thread per row, with
-//! block size 256 (chosen by `crate::exec::compact::launch_predicate_kernel`).
+//! where `N == spec.inputs.len()` and `K` is the count of `true` entries in
+//! `KernelSpec::input_has_validity` (zero when the field is empty — the
+//! legacy "no validity" shape). The validity pointers appear AFTER the mask
+//! output, in flagged-input order; `Op::IsNullCheck` references the
+//! input-slot index, and `compile_predicate_kernel` resolves it through
+//! `input_validity_ptrs[validity_input]` — same convention as
+//! `ptx_gen::compile`. The grid is 1D, one thread per row, with block size
+//! 256 (chosen by `crate::exec::compact::launch_predicate_kernel`).
 //!
 //! ## Why duplicate logic from `ptx_gen.rs`?
 //!
@@ -149,9 +158,15 @@ impl PtxBuilder {
     ///
     /// `n_input_params` is the count of input column pointers; the mask output
     /// pointer occupies index `n_input_params`, and `n_rows` sits at
-    /// `n_input_params + 1`.
-    fn n_rows_param_name(&self, n_input_params: usize) -> String {
-        format!("{}_param_{}_n_rows", self.kernel_name, n_input_params + 1)
+    /// `n_input_params + 1 + n_validity_params` (one validity pointer per
+    /// flagged input). `n_validity_params == 0` reproduces the historical
+    /// param layout bit-for-bit.
+    fn n_rows_param_name(&self, n_input_params: usize, n_validity_params: usize) -> String {
+        format!(
+            "{}_param_{}_n_rows",
+            self.kernel_name,
+            n_input_params + 1 + n_validity_params
+        )
     }
 }
 
@@ -170,6 +185,25 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
         )
     })?;
 
+    // -------- Validity wiring (mirror ptx_gen::compile). The
+    //          `input_has_validity` field is opt-in: when empty we emit the
+    //          historical PTX shape (no extra params, no validity loads) so
+    //          every legacy caller continues to work bit-for-bit. When set,
+    //          it MUST be parallel to `inputs`.
+    let input_valid: Vec<bool> = if spec.input_has_validity.is_empty() {
+        vec![false; spec.inputs.len()]
+    } else {
+        if spec.input_has_validity.len() != spec.inputs.len() {
+            return Err(BoltError::Other(format!(
+                "scan_kernel: input_has_validity len {} != inputs len {}",
+                spec.input_has_validity.len(),
+                spec.inputs.len()
+            )));
+        }
+        spec.input_has_validity.clone()
+    };
+    let n_input_validity: usize = input_valid.iter().filter(|b| **b).count();
+
     let mut b = PtxBuilder::new(kernel_name);
 
     // -------- TID setup: tid = ctaid.x * ntid.x + tid.x ; bail if tid >= n_rows.
@@ -187,7 +221,7 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     b.emit(&format!(
         "ld.param.u32 {}, [{}];",
         n_rows,
-        b.n_rows_param_name(spec.inputs.len())
+        b.n_rows_param_name(spec.inputs.len(), n_input_validity)
     ))?;
     b.emit(&format!("setp.ge.u32 {}, {}, {};", pred_oob, tid, n_rows))?;
     b.emit(&format!("@{} bra DONE;", pred_oob))?;
@@ -215,6 +249,27 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     ))?;
     b.emit(&format!("cvta.to.global.u64 {}, {};", mask_ptr, mask_ptr))?;
 
+    // -------- Load + globalize each flagged-input validity pointer. The
+    //          pointers occupy param indices `N+1 .. N+1+K` (mask is at
+    //          `N`). `input_validity_ptrs[i]` is `Some(name)` iff the
+    //          corresponding input was flagged; `Op::IsNullCheck` indexes
+    //          into this table via its `validity_input` field.
+    let mut input_validity_ptrs: Vec<Option<String>> = vec![None; spec.inputs.len()];
+    let mut next_param = spec.inputs.len() + 1;
+    for (i, has) in input_valid.iter().enumerate() {
+        if *has {
+            let rd = b.alloc.alloc("rd");
+            b.emit(&format!(
+                "ld.param.u64 {}, [{}];",
+                rd,
+                b.param_name(next_param)
+            ))?;
+            b.emit(&format!("cvta.to.global.u64 {}, {};", rd, rd))?;
+            input_validity_ptrs[i] = Some(rd);
+            next_param += 1;
+        }
+    }
+
     // -------- Lower compute ops (skip Store — projection's responsibility).
     //
     // The predicate's compute lineage is fully contained in the spec's
@@ -226,7 +281,7 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     for op in &spec.ops {
         match op {
             Op::Store { .. } => continue,
-            other => emit_op(&mut b, other, &input_ptrs, &tid)?,
+            other => emit_op(&mut b, other, &input_ptrs, &input_validity_ptrs, &tid)?,
         }
     }
 
@@ -274,7 +329,7 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     writeln!(out, "{}", PTX_ADDRESS_SIZE).map_err(write_err)?;
     writeln!(out).map_err(write_err)?;
 
-    write_signature(&mut out, &b, spec.inputs.len())?;
+    write_signature(&mut out, &b, spec.inputs.len(), n_input_validity)?;
 
     writeln!(out, "{{").map_err(write_err)?;
     write_reg_decls(&mut out, &b.alloc)?;
@@ -285,11 +340,13 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
 }
 
 /// Lower a single non-Store op into PTX. Mirrors `ptx_gen::emit_op` for the
-/// compute subset.
+/// compute subset, including the `Op::IsNullCheck` validity load (Batch 7,
+/// IS NULL e2e).
 fn emit_op(
     b: &mut PtxBuilder,
     op: &Op,
     input_ptrs: &[String],
+    input_validity_ptrs: &[Option<String>],
     tid: &str,
 ) -> BoltResult<()> {
     match op {
@@ -309,36 +366,87 @@ fn emit_op(
         Op::Store { .. } => Err(BoltError::Other(
             "scan_kernel: emit_op should not be called with a Store op".into(),
         )),
-        // Predicate-only kernel doesn't yet wire input validity pointers
-        // through its parameter list (the projection kernel emitted by
-        // `ptx_gen::compile` does, via `KernelSpec::input_has_validity`).
-        // Until `compile_predicate_kernel` learns the same validity-ABI
-        // extension and `compact::launch_predicate_kernel` is taught to
-        // pass the validity pointers, predicates that contain
-        // `Op::IsNullCheck` must fall back to the host filter. The
-        // physical planner today routes bare-column `IS [NOT] NULL`
-        // predicates onto the GPU path; this error fires only if a
-        // future planner change folds an IsNullCheck into a Filter that
-        // takes the predicate-kernel-via-mask path AND the launch hasn't
-        // been updated to match. Surfacing a clean BoltError here pins
-        // the breakage at the scan-kernel compile site rather than
-        // letting it manifest as a wrong-results bug.
-        //
-        // TODO(perf): teach `compile_predicate_kernel` to consume
-        // `KernelSpec::input_has_validity` (mirror the loop in
-        // `ptx_gen::compile`) and update
-        // `crate::exec::compact::launch_predicate_kernel` to push the
-        // validity device pointers into its param list in the same
-        // order. After that, the IsNullCheck arm here can delegate to a
-        // local emit_is_null_check that mirrors `ptx_gen::
-        // emit_is_null_check`.
-        Op::IsNullCheck { .. } => Err(BoltError::Other(
-            "scan_kernel: Op::IsNullCheck in a predicate-only kernel is not yet supported — \
-             the launch-side validity-pointer wiring is a follow-up; \
-             route the Filter through the host fallback for now"
-                .into(),
-        )),
+        // Predicate-only kernel's IsNullCheck arm: mirror `ptx_gen::
+        // emit_is_null_check`. The host side
+        // (`crate::exec::compact::launch_predicate_kernel`) pushes the
+        // flagged-input validity pointers AFTER the mask output, in
+        // input-slot order; `compile_predicate_kernel` loaded them into
+        // `input_validity_ptrs[i]` so this op just reads byte `tid` from
+        // the right slot.
+        Op::IsNullCheck {
+            dst,
+            validity_input,
+            want_null,
+        } => emit_is_null_check(
+            b,
+            *dst,
+            *validity_input,
+            *want_null,
+            input_validity_ptrs,
+            tid,
+        ),
     }
+}
+
+/// Emit PTX for `Op::IsNullCheck`: load the validity byte at row `tid` from
+/// `input_validity_ptrs[validity_input]` and produce a Bool (0/1) in `dst`.
+///
+/// Wire shape (matches `ptx_gen::emit_is_null_check`):
+///
+/// ```text
+///   cvt.s64.s32 %off,  %tid                 // widen row index to b64
+///   add.s64     %addr, %vptr, %off          // &validity[tid]
+///   ld.global.nc.u8 %byte, [%addr]          // 0=null, 1=non-null
+///   setp.eq.u32 %p,    %byte, 0             // (or setp.ne for IS NOT NULL)
+///   selp.s32    %dst,  1, 0, %p             // 0/1 Bool result
+/// ```
+///
+/// # Errors
+///
+/// Returns `BoltError::Other` if `validity_input` is out of range for
+/// `input_validity_ptrs`, or the slot is `None` (the spec was built without
+/// `KernelSpec::input_has_validity` set for this column — a planner bug;
+/// `Codegen::emit_unary` flips the flag whenever it emits this op).
+fn emit_is_null_check(
+    b: &mut PtxBuilder,
+    dst: Reg,
+    validity_input: usize,
+    want_null: bool,
+    input_validity_ptrs: &[Option<String>],
+    tid: &str,
+) -> BoltResult<()> {
+    if validity_input >= input_validity_ptrs.len() {
+        return Err(BoltError::Other(format!(
+            "scan_kernel: IsNullCheck validity_input {} out of range (have {} input slots)",
+            validity_input,
+            input_validity_ptrs.len()
+        )));
+    }
+    let vptr = match &input_validity_ptrs[validity_input] {
+        Some(p) => p.clone(),
+        None => {
+            return Err(BoltError::Other(format!(
+                "scan_kernel: IsNullCheck on input {} but KernelSpec::input_has_validity \
+                 has no validity pointer wired through — planner bug \
+                 (Codegen::emit_unary must flip input_has_validity[{}] = true)",
+                validity_input, validity_input
+            )));
+        }
+    };
+
+    let off = b.alloc.alloc("rd");
+    let addr = b.alloc.alloc("rd");
+    let byte_reg = b.alloc.alloc("r");
+    b.emit(&format!("cvt.s64.s32 {}, {};", off, tid))?;
+    b.emit(&format!("add.s64 {}, {}, {};", addr, vptr, off))?;
+    b.emit(&format!("ld.global.nc.u8 {}, [{}];", byte_reg, addr))?;
+
+    let dst_name = b.alloc.assign(dst, DataType::Bool)?;
+    let pred = b.alloc.alloc("p");
+    let cmp = if want_null { "setp.eq.u32" } else { "setp.ne.u32" };
+    b.emit(&format!("{} {}, {}, 0;", cmp, pred, byte_reg))?;
+    b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, pred))?;
+    Ok(())
 }
 
 /// Emit a typed `ld.global.<ty>` of input column `col_idx` at row `tid`.
@@ -684,17 +792,31 @@ fn validate_kernel_name(name: &str) -> BoltResult<()> {
     Ok(())
 }
 
-/// Write the `.visible .entry` signature: N input ptrs, mask output ptr, n_rows.
-fn write_signature(out: &mut String, b: &PtxBuilder, n_inputs: usize) -> BoltResult<()> {
+/// Write the `.visible .entry` signature: N input ptrs, mask output ptr, K
+/// input-validity ptrs (one per flagged input), n_rows.
+fn write_signature(
+    out: &mut String,
+    b: &PtxBuilder,
+    n_inputs: usize,
+    n_input_validity: usize,
+) -> BoltResult<()> {
     writeln!(out, ".visible .entry {}(", b.kernel_name).map_err(write_err)?;
 
-    // N input column pointers + 1 mask output pointer, all `.u64`.
-    let total_ptr_params = n_inputs + 1;
+    // N input column pointers + 1 mask output pointer + K input-validity
+    // pointers, all `.u64`. When `n_input_validity == 0` the param block
+    // reduces to the historical (N + 1) `.u64` slots, preserving binary
+    // compatibility for the legacy no-validity callers.
+    let total_ptr_params = n_inputs + 1 + n_input_validity;
     for i in 0..total_ptr_params {
         writeln!(out, "\t.param .u64 {},", b.param_name(i)).map_err(write_err)?;
     }
     // n_rows is u32, no trailing comma.
-    writeln!(out, "\t.param .u32 {}", b.n_rows_param_name(n_inputs)).map_err(write_err)?;
+    writeln!(
+        out,
+        "\t.param .u32 {}",
+        b.n_rows_param_name(n_inputs, n_input_validity)
+    )
+    .map_err(write_err)?;
     writeln!(out, ")").map_err(write_err)?;
     Ok(())
 }

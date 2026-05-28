@@ -125,17 +125,25 @@ pub fn alloc_mask_buffer(n: usize) -> BoltResult<GpuVec<u8>> {
 ///  ...,
 ///  input_col_{N-1}_ptr: .u64,
 ///  mask_output_ptr: .u64,
+///  input_validity_ptr_a: .u64,           // when input_validity_ptrs is non-empty
+///  ...,
+///  input_validity_ptr_K-1: .u64,
 ///  n_rows: .u32)
 /// ```
 ///
-/// where `N == input_ptrs.len()`. The launch is one thread per row,
-/// `PREDICATE_BLOCK_SIZE` threads per block, and the call synchronizes the
-/// stream before returning — so by the time `Ok(())` comes back, the mask is
-/// safe to download with [`download_mask`].
+/// where `N == input_ptrs.len()` and `K == input_validity_ptrs.len()`. The
+/// validity pointers correspond to the flagged inputs in
+/// `KernelSpec::input_has_validity` (in input-slot order, skipping
+/// non-flagged slots), matching the param walk in
+/// `crate::jit::scan_kernel::compile_predicate_kernel`. The launch is one
+/// thread per row, `PREDICATE_BLOCK_SIZE` threads per block, and the call
+/// synchronizes the stream before returning — so by the time `Ok(())` comes
+/// back, the mask is safe to download with [`download_mask`].
 pub fn launch_predicate_kernel(
     function: CudaFunction<'_>,
     input_ptrs: &[CUdeviceptr],
     mask_ptr: CUdeviceptr,
+    input_validity_ptrs: &[CUdeviceptr],
     n_rows: u32,
     stream: &CudaStream,
 ) -> BoltResult<()> {
@@ -145,12 +153,14 @@ pub fn launch_predicate_kernel(
         return Ok(());
     }
 
-    // Assemble the device-pointer argument list: inputs..., mask. The pointers
-    // must live at stable addresses until after the launch, so we copy them
-    // into an owned local Vec.
-    let mut device_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(input_ptrs.len() + 1);
+    // Assemble the device-pointer argument list: inputs..., mask,
+    // input_validity_ptrs... . The pointers must live at stable addresses
+    // until after the launch, so we copy them into an owned local Vec.
+    let mut device_ptrs: Vec<CUdeviceptr> =
+        Vec::with_capacity(input_ptrs.len() + 1 + input_validity_ptrs.len());
     device_ptrs.extend_from_slice(input_ptrs);
     device_ptrs.push(mask_ptr);
+    device_ptrs.extend_from_slice(input_validity_ptrs);
 
     let mut n_rows_local: u32 = n_rows;
 

@@ -29,7 +29,7 @@ use arrow_array::{Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Expr, Field, KernelSpec, MemTableProvider, Op,
+    lower_physical, parse_sql, DataType, Expr, Field, KernelSpec, Literal, MemTableProvider, Op,
     PhysicalPlan, Schema,
 };
 
@@ -209,6 +209,211 @@ fn compound_unary_operand_takes_host_fallback() {
     assert!(
         find_unary_filter_predicate(&phys).is_some(),
         "compound Unary operand must surface as a host-side PhysicalPlan::Filter, got {phys:?}"
+    );
+}
+
+/// `WHERE id IS NULL` over a non-nullable Int32 column constant-folds at
+/// codegen time: `Codegen::emit_unary` collapses to `Op::Const { Bool(false) }`
+/// (and `IS NOT NULL` to `Bool(true)`), avoiding the need to wire a validity
+/// pointer for a column whose GPU storage doesn't carry one. The plan is
+/// still a fused projection — no host fallback, no `Op::IsNullCheck` in the
+/// kernel ops.
+///
+/// Pins the second branch in `physical_plan::Codegen::emit_unary`. A
+/// regression that emitted an unconditional `Op::IsNullCheck` would either
+/// fail to launch (no validity pointer for the column) or silently return
+/// wrong results when the validity slot was read past-end-of-allocation.
+#[test]
+fn is_null_on_non_nullable_column_folds_to_const_false() {
+    // `id` is the non-nullable Int32 column in `t_schema()`.
+    let sql = "SELECT id FROM t WHERE id IS NULL";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+
+    let (kernel, _table) = unwrap_projection(&phys);
+
+    // No IsNullCheck must survive — the codegen folded to Const(Bool(false)).
+    let n_is_null_checks = kernel
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::IsNullCheck { .. }))
+        .count();
+    assert_eq!(
+        n_is_null_checks, 0,
+        "expected zero Op::IsNullCheck on a non-nullable column (constant-fold path), got {n_is_null_checks}: \
+         ops = {:?}",
+        kernel.ops
+    );
+
+    // Exactly one Const(Bool(false)) must show up in the ops list — the
+    // predicate is now a literal false.
+    let has_const_false = kernel.ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::Const {
+                lit: Literal::Bool(false),
+                ..
+            }
+        )
+    });
+    assert!(
+        has_const_false,
+        "expected a Const(Bool(false)) op from the IS NULL fold, got ops = {:?}",
+        kernel.ops
+    );
+}
+
+/// Symmetric: `IS NOT NULL` on a non-nullable column folds to
+/// `Const(Bool(true))`. Pinned alongside `is_null_on_non_nullable_column_folds_to_const_false`
+/// because the fold uses `!want_null` and a regression that flipped the
+/// polarity would only show up here.
+#[test]
+fn is_not_null_on_non_nullable_column_folds_to_const_true() {
+    let sql = "SELECT id FROM t WHERE id IS NOT NULL";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+
+    let (kernel, _table) = unwrap_projection(&phys);
+    let has_const_true = kernel.ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::Const {
+                lit: Literal::Bool(true),
+                ..
+            }
+        )
+    });
+    assert!(
+        has_const_true,
+        "expected a Const(Bool(true)) op from the IS NOT NULL fold, got ops = {:?}",
+        kernel.ops
+    );
+}
+
+/// PTX-shape coverage for the projection-kernel `Op::IsNullCheck` path
+/// (Batch 5+7). The fused projection-kernel PTX for `WHERE x IS NULL` over
+/// a nullable column must:
+///
+/// * include an `ld.global.nc.u8` of the validity byte
+/// * include `setp.eq.u32` (IS NULL polarity), since `want_null=true`
+/// * materialise the 0/1 Bool with `selp.s32`
+/// * declare an extra `.u64` param after the value-output params (the
+///   validity pointer). The param-naming convention in `ptx_gen.rs` is
+///   positional (`_param_<N>`), so we assert the COUNT of `.param .u64`
+///   declarations equals `inputs + outputs + 1` rather than matching the
+///   specific param name.
+#[test]
+fn projection_kernel_ptx_is_null_shape() {
+    use craton_bolt::jit::compile_ptx;
+
+    let sql = "SELECT id FROM t WHERE x IS NULL";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let (kernel, _) = unwrap_projection(&phys);
+
+    let ptx = compile_ptx(kernel, "bolt_kernel").expect("PTX codegen");
+
+    assert!(
+        ptx.contains("ld.global.nc.u8"),
+        "expected validity-byte read `ld.global.nc.u8` in PTX, got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("setp.eq.u32"),
+        "expected IS NULL polarity `setp.eq.u32` in PTX, got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("selp.s32"),
+        "expected `selp.s32` Bool materialisation in PTX, got:\n{ptx}"
+    );
+
+    // One `.param .u64 ...` line per value-input, per value-output, plus
+    // one for each flagged input-validity pointer (>= 1 here because `x`
+    // is the IsNullCheck source).
+    let n_u64_params = ptx.matches(".param .u64").count();
+    let expected_min = kernel.inputs.len() + kernel.outputs.len() + 1;
+    assert!(
+        n_u64_params >= expected_min,
+        "expected at least {expected_min} `.param .u64` lines (inputs {} + outputs {} + >=1 validity), \
+         got {n_u64_params} in:\n{ptx}",
+        kernel.inputs.len(),
+        kernel.outputs.len()
+    );
+}
+
+/// PTX-shape coverage for `IS NOT NULL`: same `selp.s32` and validity-byte
+/// load, but the polarity must be `setp.ne.u32` so the predicate fires
+/// when the byte is non-zero. Pinned separately because `want_null=false`
+/// flips the comparator and a regression that swapped polarities would
+/// pass the IS NULL test above but fail here.
+#[test]
+fn projection_kernel_ptx_is_not_null_shape() {
+    use craton_bolt::jit::compile_ptx;
+
+    let sql = "SELECT id FROM t WHERE x IS NOT NULL";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let (kernel, _) = unwrap_projection(&phys);
+
+    let ptx = compile_ptx(kernel, "bolt_kernel").expect("PTX codegen");
+    assert!(
+        ptx.contains("ld.global.nc.u8"),
+        "expected validity-byte read in PTX, got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("setp.ne.u32"),
+        "expected IS NOT NULL polarity `setp.ne.u32` in PTX, got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("selp.s32"),
+        "expected `selp.s32` in PTX, got:\n{ptx}"
+    );
+}
+
+/// `compile_predicate_kernel` (the scan-kernel-form predicate-only PTX)
+/// also lowers `Op::IsNullCheck`. Pins the matching wire shape for the
+/// `scan_kernel` path so a regression that taught `ptx_gen.rs` but not
+/// `scan_kernel.rs` would surface here.
+#[test]
+fn scan_kernel_ptx_is_null_shape() {
+    use craton_bolt::jit::scan_kernel::compile_predicate_kernel;
+
+    let sql = "SELECT id FROM t WHERE x IS NULL";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let (kernel, _) = unwrap_projection(&phys);
+
+    // The scan kernel only makes sense when the predicate path is active.
+    assert!(
+        kernel.predicate.is_some(),
+        "fixture must have a predicate; got ops = {:?}",
+        kernel.ops
+    );
+
+    let ptx = compile_predicate_kernel(kernel, "bolt_predicate")
+        .expect("scan_kernel PTX codegen");
+
+    assert!(
+        ptx.contains("ld.global.nc.u8"),
+        "expected validity-byte read in scan-kernel PTX, got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("setp.eq.u32"),
+        "expected IS NULL polarity `setp.eq.u32` in scan-kernel PTX, got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("selp.s32"),
+        "expected `selp.s32` Bool materialisation in scan-kernel PTX, got:\n{ptx}"
+    );
+
+    // Validity param count: scan_kernel adds N input pointers + 1 mask
+    // output + K validity pointers. With `x IS NULL` (one flagged input),
+    // K == 1.
+    let n_u64_params = ptx.matches(".param .u64").count();
+    let expected = kernel.inputs.len() + 1 + 1;
+    assert_eq!(
+        n_u64_params, expected,
+        "expected exactly {expected} `.param .u64` lines (inputs {} + mask 1 + validity 1), got {n_u64_params} in:\n{ptx}",
+        kernel.inputs.len()
     );
 }
 
