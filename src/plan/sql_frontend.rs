@@ -1781,6 +1781,17 @@ fn lower_expr_in_having(
                     right: Box::new(inner),
                 })
             }
+            // `HAVING NOT (...)`. Route the operand back through this same
+            // aggregate-aware lowerer so e.g. `HAVING NOT (SUM(v) > 0)`
+            // rewrites the aggregate call to the projected column ref
+            // before wrapping in the `UnaryOp::Not` node.
+            UnaryOperator::Not => {
+                let inner = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(inner),
+                })
+            }
             other => Err(BoltError::Sql(format!(
                 "unsupported unary operator: {other:?}"
             ))),
@@ -1958,6 +1969,16 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
         SqlExpr::UnaryOp { op, expr } => match op {
             UnaryOperator::Plus => lower_expr(expr, resolver, depth + 1),
             UnaryOperator::Minus => negate_expr(expr, resolver, depth + 1),
+            // SQL `NOT <bool-expr>`. The operand must type-check to `Bool`
+            // (enforced at the logical-plan layer in
+            // `Expr::dtype_depth` — see the `UnaryOp::Not` arm there).
+            UnaryOperator::Not => {
+                let operand = lower_expr(expr, resolver, depth + 1)?;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(operand),
+                })
+            }
             other => Err(BoltError::Sql(format!(
                 "unsupported unary operator: {other:?}"
             ))),

@@ -388,11 +388,14 @@ fn eval_binary(
     }
 }
 
-/// Evaluate a unary op — today: `IS NULL` / `IS NOT NULL`.
+/// Evaluate a unary op — today: `IS NULL` / `IS NOT NULL` / `NOT`.
 ///
-/// The result is always a non-nullable `Bool` column: an `IS [NOT] NULL`
-/// test inspects the operand's validity bit, never its value, so the
+/// For `IS [NOT] NULL` the result is always a non-nullable `Bool` column:
+/// the test inspects the operand's validity bit, never its value, so the
 /// answer is always defined even when the operand row is NULL.
+///
+/// For `NOT` the operand must be `Bool`-typed; the result preserves
+/// nullability (SQL `NOT NULL` is NULL).
 ///
 /// Implementation: evaluate the operand into a `HostColumn`, then walk
 /// each cell's `Option<_>` to derive the per-row boolean. Aliases inside
@@ -418,6 +421,21 @@ fn eval_unary(
             n_rows
         )));
     }
+    // `NOT` requires a Bool operand and propagates NULL per SQL three-valued
+    // logic: `NOT NULL = NULL`. Type-checking has already accepted the
+    // operand as Bool at the logical layer, so a non-Bool here is an
+    // internal invariant violation.
+    if matches!(op, UnaryOp::Not) {
+        return match col {
+            HostColumn::Bool(v) => Ok(HostColumn::Bool(
+                v.into_iter().map(|c| c.map(|b| !b)).collect(),
+            )),
+            other => Err(BoltError::Other(format!(
+                "expr_agg: NOT requires Bool operand, got {:?}",
+                other.dtype()
+            ))),
+        };
+    }
     let out: Vec<Option<bool>> = match &col {
         HostColumn::Bool(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
         HostColumn::I32(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
@@ -432,11 +450,19 @@ fn eval_unary(
 /// Map a per-row "operand was null" flag to the boolean result that
 /// `op` defines. Centralised so the per-variant arms of `eval_unary`
 /// don't each have to repeat the `match op { .. }` dispatch.
+///
+/// `UnaryOp::Not` is dispatched separately in `eval_unary` (it operates on
+/// the operand value, not the validity bit) and never reaches this helper.
 #[inline]
 fn is_null_to_bool(op: UnaryOp, was_null: bool) -> bool {
     match op {
         UnaryOp::IsNull => was_null,
         UnaryOp::IsNotNull => !was_null,
+        // Unreachable: NOT is short-circuited above in `eval_unary`. Treat
+        // any leak as a programming bug — return `false` rather than
+        // panicking so a regression manifests as a wrong answer that
+        // tests can pin, not a runtime abort.
+        UnaryOp::Not => false,
     }
 }
 

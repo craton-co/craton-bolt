@@ -476,6 +476,11 @@ impl<'a> Codegen<'a> {
     /// fallback — see [`predicate_contains_unary`] for the routing
     /// invariant.
     ///
+    /// `UnaryOp::Not` is not yet lowered to the GPU at all; it is rejected
+    /// here with a clear error so [`predicate_contains_unary`] can route
+    /// every `NOT`-bearing predicate through the host-side filter path
+    /// (which dispatches to `crate::exec::expr_agg::eval_unary`).
+    ///
     /// The emitted IR shape:
     /// * Non-nullable input schema → `Op::Const { Bool(false_or_true) }`,
     ///   since the column can never be NULL at runtime. `IS NULL` collapses
@@ -486,6 +491,14 @@ impl<'a> Codegen<'a> {
     ///   `KernelSpec::input_has_validity` will request the validity
     ///   pointer at kernel-launch time.
     fn emit_unary(&mut self, op: UnaryOp, operand: &Expr) -> BoltResult<Value> {
+        // NOT is not yet lowered to GPU. Surface a Plan error so the planner
+        // regression surfaces clearly if the route is ever miswired —
+        // `predicate_contains_unary` routes every `NOT` to the host fallback.
+        if matches!(op, UnaryOp::Not) {
+            return Err(BoltError::Plan(
+                "GPU codegen: NOT not yet lowered to GPU; requires host fallback".into(),
+            ));
+        }
         // Peel through any `Alias` wrappers so `x AS y IS NULL` lowers the
         // same as `x IS NULL`.
         let mut bare = operand;
@@ -1342,7 +1355,12 @@ fn lower_aggregate(
 /// naturally — "does the predicate contain a Unary we can't handle?".
 fn predicate_contains_unary(expr: &Expr) -> bool {
     match expr {
-        Expr::Unary { operand, .. } => {
+        Expr::Unary { op, operand } => {
+            // `NOT` always routes to the host fallback — the GPU codegen
+            // does not lower it yet (see `Codegen::emit_unary`).
+            if matches!(op, UnaryOp::Not) {
+                return true;
+            }
             // Peel through any Alias wrappers — `x AS y IS NULL` is
             // still a bare-column unary that the codegen can lower.
             let mut bare = operand.as_ref();
