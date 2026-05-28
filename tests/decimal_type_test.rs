@@ -161,18 +161,17 @@ fn cast_int_to_decimal_parses_then_rejects_at_lower() {
     }
 }
 
-/// Companion: CAST to a primitive non-Decimal type also routes through the
-/// same rejection arm for v0.6 / M4 — every CAST surfaces the same
-/// "Decimal128 follow-up" plan error. This guards the test above against
-/// a future relaxation that accidentally accepts CAST(int AS BIGINT) but
-/// not CAST(int AS DECIMAL).
+/// Companion: CAST to a primitive non-Decimal target lowers cleanly in
+/// v0.7 — the numeric ↔ numeric path is wired through PTX `cvt.*`. This
+/// guards the Decimal-rejection test above against silently degrading
+/// into "every CAST is rejected" again if the target-side guard ever
+/// over-reaches. CAST(Int32 -> Int64) must keep working even when the
+/// surrounding schema also contains a Decimal column.
 #[test]
-fn cast_to_primitive_also_rejects_for_now() {
+fn cast_to_primitive_lowers_in_v07() {
     let provider = provider_with_decimal();
-    let err = parse_sql("SELECT CAST(id AS BIGINT) FROM t", &provider)
-        .expect_err("CAST is unsupported at the lowering boundary in v0.6 / M4");
-    assert!(
-        matches!(err, BoltError::Plan(_) | BoltError::Type(_)),
-        "CAST rejection must be a Plan or Type error; got {err:?}",
-    );
+    let plan = parse_sql("SELECT CAST(id AS BIGINT) FROM t", &provider)
+        .expect("CAST(Int32 AS BIGINT) must parse + type-check");
+    lower_physical(&plan)
+        .expect("CAST(Int32 AS BIGINT) must lower cleanly in v0.7 GPU codegen");
 }

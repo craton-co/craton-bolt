@@ -2048,3 +2048,171 @@ mod dataflow_tests {
         assert_eq!(deps[0], vec![0]);
     }
 }
+
+#[cfg(test)]
+mod cast_emission_tests {
+    //! Per-pair coverage for the `Op::Cast` PTX emission table in
+    //! [`emit_cast`].
+    //!
+    //! v0.7 wires `CAST(<numeric> AS <numeric>)` (plus `Bool ↔ Int`)
+    //! through the existing `emit_cast` helper, which the codegen has
+    //! used since v0.5 for binary-op dtype unification. These tests pin
+    //! the emitted `cvt.*` mnemonic for each accepted source/target
+    //! pair so future relaxations (e.g. `Bool -> Float` going through a
+    //! different code path) regress visibly rather than silently
+    //! changing rounding / extension semantics.
+    //!
+    //! Approach: drive [`compile`] over a hand-crafted three-op spec
+    //! `[LoadColumn -> Cast -> Store]` so the output PTX contains
+    //! exactly one `cvt.*` instruction for the pair under test, and
+    //! assert the substring is present. The full compile pipeline
+    //! (rather than a direct `emit_cast` call) keeps the test honest
+    //! about the register-class allocator wiring around `emit_cast`.
+    use super::*;
+    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
+
+    /// Build a `[LoadColumn -> Cast -> Store]` spec converting input
+    /// column 0 (`from`) into output column 0 (`to`) and compile it.
+    fn compile_single_cast(from: DataType, to: DataType) -> String {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "x".into(),
+                dtype: from,
+            }],
+            outputs: vec![ColumnIO {
+                name: "y".into(),
+                dtype: to,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: from,
+                },
+                Op::Cast {
+                    dst: Reg(1),
+                    src: Reg(0),
+                    from,
+                    to,
+                },
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 0,
+                    dtype: to,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        compile(&spec, "bolt_cast_test").expect("compile cast spec")
+    }
+
+    /// `CAST(Int32 AS Int64)` lowers to `cvt.s64.s32` — sign-extending widen.
+    #[test]
+    fn cast_int32_to_int64_emits_cvt_s64_s32() {
+        let ptx = compile_single_cast(DataType::Int32, DataType::Int64);
+        assert!(
+            ptx.contains("cvt.s64.s32"),
+            "expected cvt.s64.s32 for Int32 -> Int64, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Int64 AS Int32)` lowers to `cvt.s32.s64` — truncating narrow.
+    #[test]
+    fn cast_int64_to_int32_emits_cvt_s32_s64() {
+        let ptx = compile_single_cast(DataType::Int64, DataType::Int32);
+        assert!(
+            ptx.contains("cvt.s32.s64"),
+            "expected cvt.s32.s64 for Int64 -> Int32, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Int32 AS Float32)` lowers to `cvt.rn.f32.s32` — round-to-nearest.
+    #[test]
+    fn cast_int32_to_float32_emits_cvt_rn_f32_s32() {
+        let ptx = compile_single_cast(DataType::Int32, DataType::Float32);
+        assert!(
+            ptx.contains("cvt.rn.f32.s32"),
+            "expected cvt.rn.f32.s32 for Int32 -> Float32, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Int32 AS Float64)` lowers to `cvt.rn.f64.s32` — round-to-nearest.
+    #[test]
+    fn cast_int32_to_float64_emits_cvt_rn_f64_s32() {
+        let ptx = compile_single_cast(DataType::Int32, DataType::Float64);
+        assert!(
+            ptx.contains("cvt.rn.f64.s32"),
+            "expected cvt.rn.f64.s32 for Int32 -> Float64, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Int64 AS Float64)` lowers to `cvt.rn.f64.s64` — round-to-nearest.
+    #[test]
+    fn cast_int64_to_float64_emits_cvt_rn_f64_s64() {
+        let ptx = compile_single_cast(DataType::Int64, DataType::Float64);
+        assert!(
+            ptx.contains("cvt.rn.f64.s64"),
+            "expected cvt.rn.f64.s64 for Int64 -> Float64, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Float32 AS Float64)` lowers to `cvt.f64.f32` — exact widen
+    /// (no rounding mode needed; f64 covers f32 losslessly).
+    #[test]
+    fn cast_float32_to_float64_emits_cvt_f64_f32() {
+        let ptx = compile_single_cast(DataType::Float32, DataType::Float64);
+        assert!(
+            ptx.contains("cvt.f64.f32"),
+            "expected cvt.f64.f32 for Float32 -> Float64, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Float64 AS Float32)` lowers to `cvt.rn.f32.f64` — narrowing
+    /// requires an explicit rounding mode.
+    #[test]
+    fn cast_float64_to_float32_emits_cvt_rn_f32_f64() {
+        let ptx = compile_single_cast(DataType::Float64, DataType::Float32);
+        assert!(
+            ptx.contains("cvt.rn.f32.f64"),
+            "expected cvt.rn.f32.f64 for Float64 -> Float32, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Float64 AS Int64)` lowers to `cvt.rzi.s64.f64` — round-to-zero
+    /// integer (SQL "truncation toward zero" semantics).
+    #[test]
+    fn cast_float64_to_int64_emits_cvt_rzi_s64_f64() {
+        let ptx = compile_single_cast(DataType::Float64, DataType::Int64);
+        assert!(
+            ptx.contains("cvt.rzi.s64.f64"),
+            "expected cvt.rzi.s64.f64 for Float64 -> Int64, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Float32 AS Int32)` lowers to `cvt.rzi.s32.f32` — same
+    /// round-toward-zero contract as Float64 -> Int64.
+    #[test]
+    fn cast_float32_to_int32_emits_cvt_rzi_s32_f32() {
+        let ptx = compile_single_cast(DataType::Float32, DataType::Int32);
+        assert!(
+            ptx.contains("cvt.rzi.s32.f32"),
+            "expected cvt.rzi.s32.f32 for Float32 -> Int32, got:\n{ptx}"
+        );
+    }
+
+    /// `CAST(Float64 AS Int32)` lowers to `cvt.rzi.s32.f64` — round-to-zero
+    /// AND narrow in a single instruction. Pinned separately from the
+    /// matching-width pair so a future split into rzi + s32-narrow shows
+    /// up as a regression.
+    #[test]
+    fn cast_float64_to_int32_emits_cvt_rzi_s32_f64() {
+        let ptx = compile_single_cast(DataType::Float64, DataType::Int32);
+        assert!(
+            ptx.contains("cvt.rzi.s32.f64"),
+            "expected cvt.rzi.s32.f64 for Float64 -> Int32, got:\n{ptx}"
+        );
+    }
+}
