@@ -5,8 +5,10 @@
 //! Single-pass open-addressing GPU hash table:
 //!
 //!   1. Host inspects the group-by key column to estimate `K` (the hash-table
-//!      size, rounded up to a power of two), and validates the key dtype +
-//!      no key collides with the `EMPTY_KEY = i64::MIN` sentinel.
+//!      size, rounded up to a power of two), validates the key dtype, and
+//!      pre-flight scans for collisions with the `EMPTY_KEY = i64::MIN`
+//!      sentinel; if any key collides the executor routes to the
+//!      sentinel-free [`crate::exec::groupby_valid`] (review C7).
 //!   2. Allocate keys table (`length K`, initialised to `EMPTY_KEY`) and one
 //!      accumulator table per aggregate (`length K`, initialised to that
 //!      aggregate's identity).
@@ -49,9 +51,15 @@
 //!     yet supported here; the caller should run the scalar path or extend
 //!     this module to materialise its outputs first.
 //!   - EMPTY_KEY sentinel: a single-Int64 key column whose value equals
-//!     `i64::MIN` is rejected. For multi-column packed keys, a packed value
-//!     of `0x8000_0000_0000_0000` is unlikely to clash with a real composite
-//!     tuple but CAN — accepted risk for v1; the same validation rejects it.
+//!     `i64::MIN` no longer aborts the query (review C7). Instead, both the
+//!     pre-encoding Arrow-array scan and the post-encoding `host_keys` scan
+//!     detect the collision and dispatch to
+//!     [`crate::exec::groupby_valid::execute_groupby_valid`], which uses
+//!     the slot-valid-flag protocol and so reserves no `i64` value as a
+//!     sentinel. For multi-column packed keys, a packed value of
+//!     `0x8000_0000_0000_0000` (a real composite tuple whose high bit is
+//!     set, e.g. `(i32::MIN, 0)`) is caught by the post-encoding scan and
+//!     routed the same way.
 //!
 //! ## PV-stage-d: validity handling
 //!
@@ -100,7 +108,7 @@ use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
     compile_groupby_keys_kernel, groupby_block_size, AGG_KERNEL_ENTRY,
-    KEYS_KERNEL_ENTRY,
+    I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
 };
 use crate::jit::CudaModule;
 use crate::plan::logical_plan::{
@@ -109,7 +117,60 @@ use crate::plan::logical_plan::{
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 
 /// Empty-slot sentinel; mirrors the literal baked into the keys kernel.
-const EMPTY_KEY: i64 = i64::MIN;
+/// Re-export of [`I64_EMPTY_SENTINEL`] under the legacy local name to keep
+/// existing call sites in this module unchanged.
+const EMPTY_KEY: i64 = I64_EMPTY_SENTINEL;
+
+/// Review C7: host-side pre-flight scan of an Int64 key column for the
+/// classic-kernel empty-slot sentinel ([`I64_EMPTY_SENTINEL`] = `i64::MIN`).
+///
+/// The non-validity keys kernel ([`compile_groupby_keys_kernel`]) reserves
+/// `i64::MIN` as the marker for "this slot is empty" in the open-addressing
+/// table. An Int64 input that legitimately contains that value would collide
+/// with the marker and the kernel would silently produce wrong results —
+/// either dropping the affected row's group entirely or merging it with
+/// adjacent groups depending on probe order. This helper lets the Tier-1
+/// dispatcher detect that condition and route to the sentinel-free
+/// valid-flag executor in [`crate::exec::groupby_valid`].
+///
+/// Returns `Ok(false)` for any dtype that cannot widen to `i64::MIN` in the
+/// kernel: Int32 keys are upcast via sign-extension and `i32::MIN` widens
+/// to `-2147483648i64`, which is far inside the safe range. Float keys,
+/// Utf8, Bool, and unsupported dtypes also return `Ok(false)` here — the
+/// Float path's `-0.0` collision is caught downstream by the
+/// post-encoding `host_keys` scan in `execute_groupby`.
+///
+/// Skips NULL rows (the kernel won't see them anyway: NULL-keyed rows are
+/// either pre-filtered upstream or routed through a separate path).
+fn key_array_contains_sentinel(arr: &dyn Array) -> BoltResult<bool> {
+    if let Some(int64) = arr.as_any().downcast_ref::<Int64Array>() {
+        // `iter()` yields `Option<i64>` and naturally skips NULLs only via
+        // the `flatten` step below; we want to inspect every non-NULL value.
+        for opt in int64.iter() {
+            if let Some(v) = opt {
+                if v == I64_EMPTY_SENTINEL {
+                    return Ok(true);
+                }
+            }
+        }
+        return Ok(false);
+    }
+    // Int32 → i64 widens via sign-extension. i32::MIN as i64 is
+    // -2147483648, nowhere near i64::MIN, so no value in an Int32Array can
+    // collide with the sentinel after widening. Confirm the cast is the
+    // expected one (defensive guard) and return false.
+    if arr.as_any().downcast_ref::<Int32Array>().is_some() {
+        debug_assert!(
+            (i32::MIN as i64) != I64_EMPTY_SENTINEL,
+            "Int32 widening invariant violated: i32::MIN as i64 must not equal I64_EMPTY_SENTINEL"
+        );
+        return Ok(false);
+    }
+    // Other dtypes (Float32/Float64/Bool/Utf8): the executor's encoding
+    // step either handles the collision itself (Float64 -0.0) or rejects
+    // the dtype upstream. Pre-flight scan is a no-op here.
+    Ok(false)
+}
 
 /// PV-stage-e: observability counter — increments once per agg launch this
 /// executor routes through a native `_with_validity` kernel path instead
@@ -369,6 +430,42 @@ pub fn execute_groupby(
         ));
     }
 
+    // Review C7: pre-flight scan each GROUP BY key column for the classic
+    // kernel's empty-slot sentinel (`i64::MIN`). If any Int64 input
+    // legitimately contains that value the row would silently collide with
+    // the marker; route to the sentinel-free valid-flag executor before
+    // we waste time encoding + uploading. The post-encoding scan below
+    // remains as a safety net for the Float64 `-0.0` case (its bit pattern
+    // also encodes to `i64::MIN`).
+    for &ord in &aggregate.group_by {
+        let io = aggregate.inputs.get(ord).ok_or_else(|| {
+            BoltError::Plan(format!(
+                "execute_groupby: group_by ordinal {} out of range (only {} inputs)",
+                ord,
+                aggregate.inputs.len()
+            ))
+        })?;
+        let col_idx = table_batch
+            .schema()
+            .index_of(&io.name)
+            .map_err(|_| {
+                BoltError::Plan(format!(
+                    "execute_groupby: GROUP BY key '{}' not present in input batch schema",
+                    io.name
+                ))
+            })?;
+        let key_array: &dyn Array = table_batch.column(col_idx).as_ref();
+        if key_array_contains_sentinel(key_array)? {
+            log::warn!(
+                "execute_groupby: GROUP BY key '{}' contains i64::MIN \
+                 (classic-kernel empty-slot sentinel); routing to \
+                 sentinel-free valid-flag executor to preserve correctness",
+                io.name
+            );
+            return crate::exec::groupby_valid::execute_groupby_valid(plan, table_batch);
+        }
+    }
+
     // Encode all group-by columns into i64 keys (host-side packing). If the
     // key is too wide to pack losslessly into i64, delegate to the wide-key
     // host-side fallback in `crate::exec::groupby_wide`.
@@ -402,10 +499,18 @@ pub fn execute_groupby(
     };
 
     // Check for EMPTY_KEY sentinel collision. If any encoded key equals
-    // i64::MIN (most commonly: a Float64 column containing -0.0), the
-    // sentinel-based classic kernel can't tell that row from an empty slot.
-    // Fall back to the sentinel-free valid-flag variant.
+    // i64::MIN (most commonly: a Float64 column containing -0.0, since
+    // `(-0.0f64).to_bits() as i64 == i64::MIN`), the sentinel-based classic
+    // kernel can't tell that row from an empty slot. Fall back to the
+    // sentinel-free valid-flag variant. Review C7 also adds a pre-encoding
+    // scan above for the Int64 case; this remains the safety net for
+    // encoded packings whose bit pattern only collides post-encoding.
     if host_keys.iter().any(|&k| k == EMPTY_KEY) {
+        log::warn!(
+            "execute_groupby: encoded GROUP BY key collides with i64::MIN \
+             sentinel after packing (likely Float64 -0.0 or a 2-col \
+             packing whose high bit is set); routing to valid-flag executor"
+        );
         return crate::exec::groupby_valid::execute_groupby_valid(plan, table_batch);
     }
 

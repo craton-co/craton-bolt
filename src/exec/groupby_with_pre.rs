@@ -100,7 +100,7 @@ use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
     compile_groupby_keys_kernel, compile_groupby_keys_kernel_with_validity,
     groupby_block_size, packed_validity_word_count, AGG_KERNEL_ENTRY,
-    KEYS_KERNEL_ENTRY,
+    I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
 };
 use crate::jit::{compile_ptx, CudaModule};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
@@ -116,7 +116,10 @@ const PRE_PREDICATE_ENTRY: &str = "bolt_pre_predicate";
 const PRE_BLOCK_SIZE: u32 = 256;
 
 /// Empty-slot sentinel; mirrors the literal baked into the keys kernel.
-const EMPTY_KEY: i64 = i64::MIN;
+/// Re-export of [`I64_EMPTY_SENTINEL`] under the legacy local name to keep
+/// existing call sites in this module unchanged. Review C7 centralises the
+/// value in [`crate::jit::hash_kernels`] so dispatchers + PTX stay in sync.
+const EMPTY_KEY: i64 = I64_EMPTY_SENTINEL;
 
 /// PV-stage-e: observability counter — increments once per agg launch that
 /// successfully dispatches through the native `_with_validity` GPU kernel
@@ -313,8 +316,19 @@ pub fn execute_groupby_with_pre(
         )));
     }
 
-    // Validate no key collides with the EMPTY_KEY sentinel.
+    // Validate no key collides with the EMPTY_KEY sentinel. Review C7:
+    // unlike `execute_groupby` (which routes the colliding case to the
+    // sentinel-free valid-flag executor), this pre-projected path has no
+    // valid-flag-with-pre fallback yet, so we still reject with a clear
+    // error rather than silently producing wrong results. A `log::warn!`
+    // makes the bail-out observable in production.
     if host_keys.iter().any(|&k| k == EMPTY_KEY) {
+        log::warn!(
+            "execute_groupby_with_pre: GROUP BY key '{}' contains \
+             i64::MIN (classic-kernel empty-slot sentinel); rejecting \
+             because no valid-flag-with-pre executor exists yet",
+            key_io.name
+        );
         return Err(BoltError::Other(format!(
             "GROUP BY key column '{}' contains the reserved sentinel value i64::MIN",
             key_io.name

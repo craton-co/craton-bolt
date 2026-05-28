@@ -137,6 +137,20 @@ const BLOCK_SIZE: u32 = 256;
 /// PTX `i64::MIN` literal used as the "empty slot" sentinel.
 const EMPTY_KEY_LITERAL: &str = "-9223372036854775808";
 
+/// Host-side mirror of [`EMPTY_KEY_LITERAL`]: the i64 value that the
+/// classic (non-validity) keys kernel reserves to mark empty slots in
+/// the open-addressing hash table.
+///
+/// Exposed so Tier-1 dispatchers in `crate::exec::*` can pre-flight-scan
+/// their key columns: if an Int64 input legitimately contains
+/// `i64::MIN`, the row's key would collide with the empty-slot marker
+/// and the kernel would silently drop (or overwrite) that group. Dispatch
+/// is expected to fall back to the sentinel-free valid-flag executor in
+/// [`crate::exec::groupby_valid`] when this collision is detected.
+///
+/// Must stay byte-identical to [`EMPTY_KEY_LITERAL`] (PTX) — review C7.
+pub const I64_EMPTY_SENTINEL: i64 = i64::MIN;
+
 /// Upper bound on the linear-probe loop, expressed as a multiple of `k`.
 /// At load factor < 0.5 (enforced by the executor) the expected probe length
 /// is well under `log2(k)`, so a full table sweep is generous. The bound
