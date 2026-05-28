@@ -146,6 +146,14 @@ harness = false
 name = "utf8_sort_bench"
 harness = false
 
+[[example]]
+name = "quickstart"
+path = "examples/quickstart.rs"
+
+[[example]]
+name = "groupby"
+path = "examples/groupby.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
