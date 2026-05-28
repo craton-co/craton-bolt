@@ -150,6 +150,28 @@ pub struct Tier2PartialResult {
     pub per_partition: Vec<(Vec<i32>, Vec<f64>)>,
 }
 
+/// Defensive host-side check that a `[K+1]`-length partition-offsets vector is
+/// monotonic non-decreasing. A reversed range `offsets[pid+1] < offsets[pid]`
+/// from a corrupt prefix-sum step would be reinterpreted by the reduce kernel
+/// as a (wrap-around) slice and walk OOB. Caller passes a short `tag` (e.g.
+/// `"tier2"`, `"tier2_multi"`, `"tier2_twokey"`) so the error message points at
+/// the orchestrator that surfaced the bad offsets.
+///
+/// O(K) where K = NUM_PARTITIONS = 4096 — ~16K compares, negligible vs. the
+/// H2D upload that immediately follows.
+pub(crate) fn validate_offsets_monotonic(offsets: &[u32], tag: &str) -> BoltResult<()> {
+    for pid in 0..offsets.len().saturating_sub(1) {
+        if offsets[pid + 1] < offsets[pid] {
+            return Err(BoltError::Other(format!(
+                "{tag}: partition offsets not monotonic at pid={pid}: {} < {}",
+                offsets[pid + 1],
+                offsets[pid]
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Execute Tier-2 hash-partitioned GROUP BY SUM.
 ///
 /// Inputs live on the device. `keys` and `vals` must each have length
@@ -342,6 +364,12 @@ pub fn execute_tier2_sum(
             n_rows
         )));
     }
+
+    // Defensive: validate monotonicity of partition offsets before re-uploading.
+    // A buggy prefix-sum step (e.g. host wrapping arithmetic in gpu_compact)
+    // could produce offsets[pid+1] < offsets[pid], which the reduce kernel
+    // would interpret as a (wrap-around) range and walk OOB in device memory.
+    validate_offsets_monotonic(&offsets, "tier2")?;
 
     // The reduce kernel needs the FULL K+1 offsets buffer on the device
     // — it reads `offsets[pid]` AND `offsets[pid+1]` to compute each
@@ -591,5 +619,48 @@ mod tests {
                 "sum mismatch for key {k}: oracle={expected}, got={got_v}"
             );
         }
+    }
+
+    // --- Host-only: validate_offsets_monotonic ------------------------------
+    //
+    // Pure host arithmetic — no CUDA context needed. Confirms the defensive
+    // check both lets well-formed offsets through unchanged and surfaces a
+    // structured error on a hand-crafted non-monotonic vec (the shape a
+    // wrapping host prefix-sum bug could produce).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_offsets_monotonic_accepts_well_formed() {
+        // Strictly increasing.
+        validate_offsets_monotonic(&[0, 1, 2, 5, 5, 10], "tier2")
+            .expect("strictly non-decreasing must pass");
+        // Empty and single-element are both vacuously monotonic.
+        validate_offsets_monotonic(&[], "tier2").expect("empty must pass");
+        validate_offsets_monotonic(&[42], "tier2").expect("single-element must pass");
+        // All-zero (every partition empty, offsets[K] = 0) must pass.
+        validate_offsets_monotonic(&[0; 8], "tier2").expect("all-zero must pass");
+    }
+
+    #[test]
+    fn validate_offsets_monotonic_rejects_reversal() {
+        // Hand-crafted: offsets[2]=10 then offsets[3]=4 — a wrap-around that
+        // a buggy prefix-sum could produce. The reduce kernel would read it
+        // as a slice `[10, 4)` which wraps to a huge range and walks OOB.
+        let bad = [0u32, 5, 10, 4, 12, 20];
+        let err =
+            validate_offsets_monotonic(&bad, "tier2").expect_err("non-monotonic must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not monotonic"),
+            "error message must mention monotonicity, got: {msg}"
+        );
+        assert!(
+            msg.contains("pid=2"),
+            "error message must pinpoint the offending index, got: {msg}"
+        );
+        assert!(
+            msg.contains("tier2"),
+            "error message must carry the orchestrator tag, got: {msg}"
+        );
     }
 }

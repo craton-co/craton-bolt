@@ -301,14 +301,48 @@ pub fn prefix_scan_mask(
     stream.synchronize()?;
 
     // Download block_sums, exclusive-scan on host, compute total, re-upload.
+    //
+    // Defensive: a buggy GPU prefix-scan kernel (or a corrupted download)
+    // could in principle push `running` past `u32::MAX`. The downstream
+    // `bases_host.push(running as u32)` would then silently wrap, producing
+    // a non-monotonic bases vec — and gather_one would scatter writes at
+    // the wrong device offset. We accumulate with `checked_add` (on u64,
+    // which dominates the per-block u32 sums) and surface overflow as a
+    // structured error rather than wrap. Each `running as u32` cast that
+    // *does* execute is then guaranteed to be lossless because we bound the
+    // accumulator below `u32::MAX` at the previous iteration.
     let sums_host: Vec<u32> = block_sums.to_vec()?;
     let mut bases_host: Vec<u32> = Vec::with_capacity(sums_host.len());
     let mut running: u64 = 0;
-    for s in &sums_host {
-        // u64 accumulator is overkill (we already bounded n_rows <= u32::MAX),
-        // but it's cheap and makes the bound obvious.
-        bases_host.push(running as u32);
-        running += *s as u64;
+    let mut prev_base: u32 = 0;
+    for (i, s) in sums_host.iter().enumerate() {
+        if running > u32::MAX as u64 {
+            return Err(BoltError::Other(format!(
+                "gpu_compact: prefix-sum overflowed u32 at block {i} \
+                 (running={running}, total exceeds u32::MAX)"
+            )));
+        }
+        let base_u32 = running as u32;
+        // Monotonicity guard: bases must be non-decreasing. The u64 accumulator
+        // can only ever grow (we add unsigned u32 values), so a decrease here
+        // would be a host-arithmetic bug, not a GPU bug — surface it loudly.
+        if i > 0 && base_u32 < prev_base {
+            return Err(BoltError::Other(format!(
+                "gpu_compact: non-monotonic block_bases at block {i}: {base_u32} < {prev_base}"
+            )));
+        }
+        bases_host.push(base_u32);
+        prev_base = base_u32;
+        running = running
+            .checked_add(*s as u64)
+            .ok_or_else(|| BoltError::Other(format!(
+                "gpu_compact: prefix-sum u64 overflow at block {i} (running={running}, +{s})"
+            )))?;
+    }
+    if running > usize::MAX as u64 {
+        return Err(BoltError::Other(format!(
+            "gpu_compact: total_count {running} exceeds usize::MAX"
+        )));
     }
     let total_count = running as usize;
 
@@ -607,6 +641,44 @@ mod tests {
         (bases, running as usize)
     }
 
+    /// Mirror of the in-kernel-driver post-scan with the same defensive checks
+    /// the production path applies: overflow surfaces as `Err`, monotonicity
+    /// is enforced. Keeping it as a local helper avoids exposing the
+    /// arithmetic on the public surface while still letting the unit tests
+    /// pin down the contract.
+    fn host_exclusive_scan_checked(sums: &[u32]) -> BoltResult<(Vec<u32>, usize)> {
+        let mut bases = Vec::with_capacity(sums.len());
+        let mut running: u64 = 0;
+        let mut prev_base: u32 = 0;
+        for (i, s) in sums.iter().enumerate() {
+            if running > u32::MAX as u64 {
+                return Err(BoltError::Other(format!(
+                    "gpu_compact: prefix-sum overflowed u32 at block {i} \
+                     (running={running}, total exceeds u32::MAX)"
+                )));
+            }
+            let base_u32 = running as u32;
+            if i > 0 && base_u32 < prev_base {
+                return Err(BoltError::Other(format!(
+                    "gpu_compact: non-monotonic block_bases at block {i}: {base_u32} < {prev_base}"
+                )));
+            }
+            bases.push(base_u32);
+            prev_base = base_u32;
+            running = running
+                .checked_add(*s as u64)
+                .ok_or_else(|| BoltError::Other(format!(
+                    "gpu_compact: prefix-sum u64 overflow at block {i} (running={running}, +{s})"
+                )))?;
+        }
+        if running > usize::MAX as u64 {
+            return Err(BoltError::Other(format!(
+                "gpu_compact: total_count {running} exceeds usize::MAX"
+            )));
+        }
+        Ok((bases, running as usize))
+    }
+
     #[test]
     fn host_scan_empty() {
         let (bases, total) = host_exclusive_scan(&[]);
@@ -641,6 +713,50 @@ mod tests {
         assert_eq!(bases, vec![0, 3, 3, 8, 264, 265, 274]);
         assert_eq!(total, 283);
         assert_eq!(total as u32, sums.iter().sum::<u32>());
+    }
+
+    // --- Defensive: checked scan -------------------------------------------
+    //
+    // Mirrors the host post-scan in `prefix_scan_mask`. Well-formed inputs
+    // must match the un-checked oracle exactly; pathological inputs must
+    // surface a structured error rather than silently wrap.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn host_scan_checked_matches_unchecked_on_clean_inputs() {
+        let sums = vec![3u32, 0, 5, 256, 1, 9, 9];
+        let (bases_unchecked, total_unchecked) = host_exclusive_scan(&sums);
+        let (bases_checked, total_checked) =
+            host_exclusive_scan_checked(&sums).expect("clean input must pass");
+        assert_eq!(bases_checked, bases_unchecked);
+        assert_eq!(total_checked, total_unchecked);
+    }
+
+    #[test]
+    fn host_scan_checked_rejects_u32_overflow() {
+        // Two near-u32::MAX block sums add to ~2 * u32::MAX, which wraps in
+        // a naive `running as u32` cast. The checked path must surface the
+        // overflow before the cast.
+        let sums = vec![u32::MAX, u32::MAX];
+        let err = host_exclusive_scan_checked(&sums).expect_err(
+            "double-u32::MAX must overflow the u32 base cast on iteration 2",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("overflowed u32") || msg.contains("u64 overflow"),
+            "error must mention u32/u64 overflow, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn host_scan_checked_zero_sums_all_monotonic() {
+        // All-zero per-block sums is the empty-mask case: bases are all 0,
+        // total is 0, and no monotonicity violation is possible.
+        let sums = vec![0u32; 16];
+        let (bases, total) =
+            host_exclusive_scan_checked(&sums).expect("all-zero must pass");
+        assert!(bases.iter().all(|&b| b == 0));
+        assert_eq!(total, 0);
     }
 
     #[test]
