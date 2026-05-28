@@ -65,6 +65,7 @@ use std::ptr;
 use std::sync::{Arc, OnceLock};
 
 use libc::c_void;
+use log::warn;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 
@@ -114,6 +115,8 @@ fn parse_cap(raw: Option<&str>, default: usize) -> usize {
 /// do not want a runaway query to change the cap mid-execution.
 fn ptx_cache_cap() -> usize {
     static CAP: OnceLock<usize> = OnceLock::new();
+    // TODO(cache-cap): re-read on each insert so misconfigured envs can be
+    // hot-fixed
     *CAP.get_or_init(|| {
         let raw = std::env::var(PTX_CACHE_CAP_ENV).ok();
         parse_cap(raw.as_deref(), PTX_CACHE_CAP_DEFAULT)
@@ -133,11 +136,9 @@ impl Drop for CudaModuleInner {
         }
         let code = unsafe { cuda_sys::cuModuleUnload(self.raw) };
         if code != cuda_sys::CUDA_SUCCESS {
-            // FIXME(orchestrator): use tracing/log once added as dep.
-            // Neither `tracing` nor `log` is in Cargo.toml today, so we still
-            // route this through stderr. Library consumers will want a proper
-            // logging facade — swap this `eprintln!` the moment one lands.
-            eprintln!(
+            // Non-fatal: we're in a Drop path and cannot propagate the error.
+            // Log via the `log` facade so library consumers can route it.
+            warn!(
                 "craton-bolt: cuModuleUnload failed with code {} (module leaked)",
                 code
             );
@@ -231,8 +232,14 @@ fn hash_ptx(ptx: &str) -> u64 {
 
 /// Loaded GPU module — owns one or more CUfunctions.
 #[derive(Clone)]
+#[must_use]
 pub struct CudaModule {
     inner: Arc<CudaModuleInner>,
+    // Make `CudaModule: !Sync` at the type level. The `Send` impl below is
+    // intentional, but we do NOT want `&CudaModule` to be shared across
+    // threads (see the comment on the `unsafe impl Send` block). A
+    // `PhantomData<Cell<()>>` is the standard zero-sized opt-out from `Sync`.
+    _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 
 impl CudaModule {
@@ -303,7 +310,10 @@ impl CudaModule {
         let inner = cell
             .get_or_try_init(|| loader(ptx).map(|m| m.inner))
             .map(Arc::clone)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            _not_sync: PhantomData,
+        })
     }
 
     /// Internal: drive `cuModuleLoadDataEx` and wrap the resulting handle in
@@ -327,8 +337,11 @@ impl CudaModule {
         // The CUDA driver reads each option value as a `void*`-sized slot. For
         // sizes we pass the integer bit-pattern in the pointer slot, which is
         // the documented contract for `*_SIZE_BYTES` options.
-        let info_size_slot = JIT_LOG_BUF_SIZE as u32 as usize as *mut c_void;
-        let error_size_slot = JIT_LOG_BUF_SIZE as u32 as usize as *mut c_void;
+        // CUDA option values use pointer-sized slots; the option SEMANTICS
+        // require the value to fit in u32 for *_SIZE_BYTES options, but the
+        // casting through `usize` is correct.
+        let info_size_slot = JIT_LOG_BUF_SIZE as usize as *mut c_void;
+        let error_size_slot = JIT_LOG_BUF_SIZE as usize as *mut c_void;
         let mut values: [*mut c_void; 4] = [
             info_buf.as_mut_ptr() as *mut c_void,
             info_size_slot,
@@ -370,6 +383,7 @@ impl CudaModule {
 
         Ok(Self {
             inner: Arc::new(CudaModuleInner { raw: module }),
+            _not_sync: PhantomData,
         })
     }
 
@@ -413,16 +427,21 @@ impl CudaModule {
 
 // SAFETY: `CudaModule` is now just an `Arc<CudaModuleInner>`. The inner type
 // already asserts `Send + Sync` (see above), and `Arc<T: Send + Sync>` is both
-// `Send` and `Sync` automatically — but we keep these impls explicit to match
-// the prior surface and to make the intent unambiguous to readers.
+// `Send` and `Sync` automatically — but we keep this `Send` impl explicit to
+// match the prior surface and to make the intent unambiguous to readers.
 unsafe impl Send for CudaModule {}
 // Not Sync — we don't want concurrent mutation across threads. (The inner
 // module *is* Sync, but exposing the wrapper as Sync would invite call sites
 // to share `&CudaModule` across threads, and `function()` returns a borrow
 // tied to `&self` that we'd rather not have aliased across threads.)
+// This is enforced at the type level by the `_not_sync: PhantomData<Cell<()>>`
+// field on `CudaModule`, which makes the struct `!Sync` automatically — no
+// explicit `unsafe impl !Sync` (which would require the unstable
+// `negative_impls` feature) is needed.
 
 /// Borrowed handle to a kernel within a `CudaModule`. Lifetime tied to the module.
 #[derive(Clone, Copy)]
+#[must_use]
 pub struct CudaFunction<'a> {
     raw: CUfunction,
     _marker: PhantomData<&'a CudaModule>,
@@ -504,6 +523,7 @@ mod tests {
             inner: Arc::new(CudaModuleInner {
                 raw: ptr::null_mut(),
             }),
+            _not_sync: PhantomData,
         }
     }
 
