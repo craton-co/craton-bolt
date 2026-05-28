@@ -130,11 +130,16 @@ pub fn execute_tier2_multi_sum(
     // Step 2. JIT + launch the partition kernel (once — pid depends only on
     // the key column, not on any value column).
     // ----------------------------------------------------------------------
+    let partition_spec_id = if n_rows < partition_kernel::SHMEM_STAGING_MIN_ROWS {
+        "partition_global_atomics"
+    } else {
+        "partition_shmem_staging"
+    };
     let partition_module = module_cache::get_or_build_module(
         module_path!(),
-        "partition".to_string(),
+        partition_spec_id.to_string(),
         None,
-        || partition_kernel::compile_partition_kernel(),
+        || partition_kernel::compile_partition_kernel_for_n_rows(n_rows),
     )?;
     let partition_fn = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
 

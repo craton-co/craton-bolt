@@ -64,6 +64,7 @@ const BLOCK_THREADS: u32 = 256;
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum KernelSpec {
     PartitionI64,
+    PartitionI64ShmemStaging,
     ScatterI64,
     ReduceMultiI64 { n_vals: u32 },
     ReduceCountI64,
@@ -80,6 +81,7 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
+            KernelSpec::PartitionI64ShmemStaging => partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?,
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceMultiI64 { n_vals } => {
                 // Batch 5: spill-counter-aware variant. The launch site
@@ -98,6 +100,15 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         })
     })
 }
+
+fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
+    if n_rows < partition_kernel_i64::SHMEM_STAGING_MIN_ROWS {
+        KernelSpec::PartitionI64
+    } else {
+        KernelSpec::PartitionI64ShmemStaging
+    }
+}
+
 
 /// Try the two-key Tier-2.1 multi-AVG fast path. `None` on any
 /// precondition miss so the caller falls through to the next strategy.
@@ -213,7 +224,7 @@ fn execute_inner(
     // ---- Partition pass (i64) ------------------------------------------
     let counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
     let partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
-    let partition_module = get_or_build_module(&KernelSpec::PartitionI64)?;
+    let partition_module = get_or_build_module(&partition_i64_spec_for(n_rows))?;
     {
         let func = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
         let mut keys_ptr = keys_gpu.device_ptr();

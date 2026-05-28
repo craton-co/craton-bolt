@@ -78,6 +78,7 @@ const BLOCK_THREADS: u32 = 256;
 enum KernelSpec {
     /// `partition_kernel::compile_partition_kernel()`.
     Partition,
+    PartitionShmemStaging,
     /// `scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel()`.
     /// Atomic-claim scatter pass that produces the per-row `dest_idx`.
     ScatterWithDestIdx,
@@ -106,6 +107,7 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
+            KernelSpec::PartitionShmemStaging => partition_kernel::compile_partition_kernel_shmem_staging()?,
             KernelSpec::ScatterWithDestIdx => {
                 scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel()?
             }
@@ -130,6 +132,15 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         })
     })
 }
+
+fn partition_spec_for(n_rows: u32) -> KernelSpec {
+    if n_rows < partition_kernel::SHMEM_STAGING_MIN_ROWS {
+        KernelSpec::Partition
+    } else {
+        KernelSpec::PartitionShmemStaging
+    }
+}
+
 
 /// Try to execute `plan` against `batch` via the Tier-2.1 AVG fast path.
 /// `None` on any miss — caller falls through to the next strategy.
@@ -240,7 +251,7 @@ fn execute_inner(
     let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
     let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
 
-    let partition_module = get_or_build_module(&KernelSpec::Partition)?;
+    let partition_module = get_or_build_module(&partition_spec_for(n_rows))?;
     {
         let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
 

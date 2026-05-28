@@ -56,6 +56,7 @@ use crate::jit::CudaModule;
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum KernelSpec {
     PartitionI64,
+    PartitionI64ShmemStaging,
     ScatterI64,
     ReduceSumI64,
 }
@@ -71,6 +72,7 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
+            KernelSpec::PartitionI64ShmemStaging => partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?,
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceSumI64 => {
                 // Batch 5: spill-counter-aware variant. The launch site
@@ -83,6 +85,15 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         })
     })
 }
+
+fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
+    if n_rows < partition_kernel_i64::SHMEM_STAGING_MIN_ROWS {
+        KernelSpec::PartitionI64
+    } else {
+        KernelSpec::PartitionI64ShmemStaging
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -147,7 +158,7 @@ pub fn execute_tier2_twokey_sum(
     //   .param .u64 counts            (out, u32* len K, zeroed)
     //   .param .u32 n_rows
     // ----------------------------------------------------------------------
-    let partition_module = get_or_build_module(&KernelSpec::PartitionI64)?;
+    let partition_module = get_or_build_module(&partition_i64_spec_for(n_rows))?;
     let partition_fn = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
 
     const BLOCK_THREADS: u32 = 256;

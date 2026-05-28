@@ -100,6 +100,7 @@ use crate::jit::partition_reduce_kernel;
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum KernelSpec {
     Partition,
+    PartitionShmemStaging,
     Scatter,
     ReduceSum,
 }
@@ -115,6 +116,7 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::Partition => stub_partition_kernel::compile_partition_kernel()?,
+            KernelSpec::PartitionShmemStaging => stub_partition_kernel::compile_partition_kernel_shmem_staging()?,
             KernelSpec::Scatter => stub_scatter_kernel::compile_scatter_kernel()?,
             // Batch 4: spill-counter-aware variant — MAX_PROBES overflow
             // surfaces as a structured error instead of silently dropping
@@ -126,6 +128,15 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         })
     })
 }
+
+fn partition_spec_for(n_rows: u32) -> KernelSpec {
+    if n_rows < stub_partition_kernel::SHMEM_STAGING_MIN_ROWS {
+        KernelSpec::Partition
+    } else {
+        KernelSpec::PartitionShmemStaging
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -220,7 +231,7 @@ pub fn execute_tier2_sum(
     // a grid-stride loop internally so the exact block count is not
     // performance-critical, but matching it to n_rows minimises idle warps.
     // ----------------------------------------------------------------------
-    let partition_module = get_or_build_module(&KernelSpec::Partition)?;
+    let partition_module = get_or_build_module(&partition_spec_for(n_rows))?;
     let partition_fn = partition_module.function(stub_partition_kernel::KERNEL_ENTRY)?;
 
     const BLOCK_THREADS: u32 = 256;

@@ -93,6 +93,7 @@ impl ReduceKey {
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum KernelSpec {
     Partition,
+    PartitionShmemStaging,
     Scatter,
     ScatterI32ToI64,
     ReduceMinMax(ReduceKey),
@@ -109,6 +110,7 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
+            KernelSpec::PartitionShmemStaging => partition_kernel::compile_partition_kernel_shmem_staging()?,
             KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
             KernelSpec::ScatterI32ToI64 => scatter_kernel::compile_scatter_kernel_i32_to_i64()?,
             KernelSpec::ReduceMinMax(rk) => {
@@ -121,6 +123,15 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         })
     })
 }
+
+fn partition_spec_for(n_rows: u32) -> KernelSpec {
+    if n_rows < partition_kernel::SHMEM_STAGING_MIN_ROWS {
+        KernelSpec::Partition
+    } else {
+        KernelSpec::PartitionShmemStaging
+    }
+}
+
 
 /// Try the Tier-2.1 MIN/MAX fast path. Returns `None` on any miss.
 pub fn try_execute(
@@ -217,7 +228,7 @@ fn execute_inner(
     // Partition pass.
     let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
     let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
-    let partition_module = get_or_build_module(&KernelSpec::Partition)?;
+    let partition_module = get_or_build_module(&partition_spec_for(n_rows))?;
     {
         let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
 
