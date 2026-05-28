@@ -15,7 +15,7 @@ use sqlparser::parser::Parser;
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr,
+    AggregateExpr, BinaryOp, Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
 };
 
 /// Maximum recursion depth allowed when walking attacker-controlled SQL
@@ -1238,6 +1238,11 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
                 || contains_aggregate(right, resolver, depth + 1)?,
         ),
         SqlExpr::UnaryOp { expr, .. } => contains_aggregate(expr, resolver, depth + 1),
+        // `IS NULL` / `IS NOT NULL` carry an operand expression that may
+        // itself contain an aggregate (e.g. `HAVING SUM(v) IS NOT NULL`).
+        SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
+            contains_aggregate(inner, resolver, depth + 1)
+        }
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
         _ => Ok(false),
     }
@@ -1289,6 +1294,24 @@ fn lower_expr_in_having(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> B
                 "unsupported unary operator: {other:?}"
             ))),
         },
+        // HAVING ... IS [NOT] NULL: handle the same way as the scalar
+        // surface but route the operand through `lower_expr_in_having` so
+        // aggregate calls inside the operand (`HAVING SUM(v) IS NOT NULL`)
+        // are rewritten to the aggregate-output column reference.
+        SqlExpr::IsNull(inner) => {
+            let operand = lower_expr_in_having(inner, resolver)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(operand),
+            })
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let operand = lower_expr_in_having(inner, resolver)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(operand),
+            })
+        }
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
         // still rejects bare non-aggregate Function calls).
@@ -1353,6 +1376,25 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                 "unsupported unary operator: {other:?}"
             ))),
         },
+        // `<expr> IS NULL` and `<expr> IS NOT NULL`. We accept the syntax at
+        // the planner; the physical-plan boundary rejects it cleanly with a
+        // `BoltError::Plan` so callers get a useful message rather than the
+        // executor being silently wrong. See `Expr::Unary` for the typing
+        // contract (always Bool).
+        SqlExpr::IsNull(inner) => {
+            let operand = lower_expr(inner, resolver)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(operand),
+            })
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let operand = lower_expr(inner, resolver)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(operand),
+            })
+        }
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "function calls are only allowed as top-level aggregates in SELECT".into(),
         )),

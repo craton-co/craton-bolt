@@ -270,6 +270,7 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
             collect_column_refs(left, out);
             collect_column_refs(right, out);
         }
+        Expr::Unary { operand, .. } => collect_column_refs(operand, out),
         Expr::Alias(inner, _) => collect_column_refs(inner, out),
     }
 }

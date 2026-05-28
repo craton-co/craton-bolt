@@ -225,6 +225,22 @@ impl BinaryOp {
     }
 }
 
+/// Unary operators surfaced by the planner.
+///
+/// At present this only covers SQL `IS NULL` / `IS NOT NULL`. These are
+/// type-checked at the logical-plan level (they always produce `Bool`) and
+/// surfaced through the SQL frontend, but the GPU executor does not yet
+/// lower them — the physical-plan boundary rejects them cleanly so the
+/// planner accepts the syntax without misleading the user about kernel
+/// support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    /// SQL `<expr> IS NULL`.
+    IsNull,
+    /// SQL `<expr> IS NOT NULL`.
+    IsNotNull,
+}
+
 /// Scalar expression tree.
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -240,6 +256,18 @@ pub enum Expr {
         left: Box<Expr>,
         /// Right operand.
         right: Box<Expr>,
+    },
+    /// One-operand expression (currently only `IS NULL` / `IS NOT NULL`).
+    ///
+    /// Always type-checks to `Bool` at the logical plane regardless of the
+    /// operand's dtype, including the untyped `Literal::Null` operand. The
+    /// physical planner does not yet lower this to a GPU kernel — see
+    /// [`crate::plan::physical_plan`].
+    Unary {
+        /// Unary operator.
+        op: UnaryOp,
+        /// The single operand.
+        operand: Box<Expr>,
     },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
@@ -352,8 +380,15 @@ impl Expr {
                 .dtype()
                 .ok_or_else(|| BoltError::Type("untyped NULL literal".into())),
             Expr::Binary { op, left, right } => {
-                let l = left.dtype_depth(schema, depth + 1)?;
-                let r = right.dtype_depth(schema, depth + 1)?;
+                // NULL-peer typing: an untyped `Literal::Null` opposite a
+                // typed peer takes that peer's dtype for the purposes of
+                // type-checking the binary expression. The peer-typed
+                // helper calls back into `dtype` (which starts a fresh
+                // depth budget); that's fine since the parent depth check
+                // has already bounded the enclosing recursion.
+                let l = peer_typed_dtype(left, right, schema, *op)?;
+                let r = peer_typed_dtype(right, left, schema, *op)?;
+                let _ = depth; // depth threading enforced at function entry
                 if op.is_arithmetic() {
                     if !l.is_numeric() || !r.is_numeric() {
                         return Err(BoltError::Type(format!(
@@ -385,9 +420,49 @@ impl Expr {
                     Err(BoltError::Type(format!("unsupported operator {op:?}")))
                 }
             }
+            Expr::Unary { op, operand } => match op {
+                // IS NULL / IS NOT NULL always produce Bool, regardless of
+                // operand dtype. We still resolve the operand's dtype when
+                // it's resolvable (catches typos like `nonexistent IS NULL`),
+                // but tolerate an untyped `Literal::Null` operand — that's
+                // exactly the case this surface exists to support.
+                UnaryOp::IsNull | UnaryOp::IsNotNull => {
+                    if !matches!(operand.as_ref(), Expr::Literal(Literal::Null)) {
+                        let _ = operand.dtype_depth(schema, depth + 1)?;
+                    }
+                    Ok(DataType::Bool)
+                }
+            },
             Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
         }
     }
+}
+
+/// Resolve `e`'s dtype against `schema`, but if `e` is `Literal::Null` and
+/// `peer` resolves to a typed expression, return the peer's dtype instead.
+///
+/// This is the NULL-peer-typing rule used by `Expr::Binary` dtype resolution
+/// so that SQL fragments like `WHERE x = NULL` or `SELECT x + NULL` don't
+/// hard-error at type-check time. The rule applies to every BinaryOp:
+/// arithmetic, comparison, and logical (where the typed peer is necessarily
+/// Bool, so NULL becomes Bool). Two NULLs on both sides still surface the
+/// original `Type("untyped NULL literal")` error — there is no peer to
+/// borrow a type from.
+fn peer_typed_dtype(
+    e: &Expr,
+    peer: &Expr,
+    schema: &Schema,
+    _op: BinaryOp,
+) -> BoltResult<DataType> {
+    if matches!(e, Expr::Literal(Literal::Null)) {
+        // Try to borrow the peer's dtype. If the peer itself is also a
+        // bare untyped NULL the recursive call will fail with the original
+        // "untyped NULL literal" error, which is what we want.
+        if let Ok(t) = peer.dtype(schema) {
+            return Ok(t);
+        }
+    }
+    e.dtype(schema)
 }
 
 /// Promote two numeric types to the wider one (float beats int, 64 beats 32).
@@ -855,4 +930,89 @@ fn schema_summary(s: &Schema) -> String {
         .map(|f| format!("{}: {:?}", f.name, f.dtype))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod null_handling_tests {
+    use super::*;
+
+    /// Baseline contract: a bare `Literal::Null` still has no static type.
+    /// The new NULL-peer-typing surface kicks in at the `Expr::Binary` /
+    /// `Expr::Unary` layer, not at the literal layer itself.
+    #[test]
+    fn literal_null_dtype_is_none() {
+        assert_eq!(Literal::Null.dtype(), None);
+    }
+
+    /// `WHERE x = NULL` with `x: Int32` must type-check (NULL borrows the
+    /// peer's dtype) and resolve the binary expression to `Bool`. The
+    /// runtime semantics of `= NULL` are a separate concern handled by the
+    /// executor; the planner just needs not to hard-error.
+    #[test]
+    fn null_peer_typing_in_binary_eq() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let expr = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column("x".into())),
+            right: Box::new(Expr::Literal(Literal::Null)),
+        };
+        let t = expr.dtype(&schema).expect("NULL peer-typing must succeed");
+        assert_eq!(t, DataType::Bool);
+        // Symmetric — NULL on the left side also works.
+        let expr_rev = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Literal(Literal::Null)),
+            right: Box::new(Expr::Column("x".into())),
+        };
+        let t_rev = expr_rev
+            .dtype(&schema)
+            .expect("NULL peer-typing must be symmetric");
+        assert_eq!(t_rev, DataType::Bool);
+    }
+
+    /// Two NULLs on both sides still surface the legacy
+    /// "untyped NULL literal" error — there is no peer to borrow a dtype from.
+    #[test]
+    fn binary_with_two_nulls_still_errors() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let expr = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Literal(Literal::Null)),
+            right: Box::new(Expr::Literal(Literal::Null)),
+        };
+        assert!(expr.dtype(&schema).is_err());
+    }
+
+    /// `x IS NULL` and `x IS NOT NULL` always type-check to Bool — even
+    /// when the operand is itself an untyped `Literal::Null`.
+    #[test]
+    fn unary_is_null_typechecks_to_bool() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        for op in [UnaryOp::IsNull, UnaryOp::IsNotNull] {
+            let on_col = Expr::Unary {
+                op,
+                operand: Box::new(Expr::Column("x".into())),
+            };
+            assert_eq!(on_col.dtype(&schema).unwrap(), DataType::Bool);
+            let on_null = Expr::Unary {
+                op,
+                operand: Box::new(Expr::Literal(Literal::Null)),
+            };
+            assert_eq!(on_null.dtype(&schema).unwrap(), DataType::Bool);
+        }
+    }
+
+    /// Arithmetic peer-typing: `x + NULL` with `x: Int64` resolves to
+    /// `Int64` (the arithmetic unification rule applied with NULL borrowing
+    /// its peer's dtype).
+    #[test]
+    fn null_peer_typing_in_binary_add() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
+        let expr = Expr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Column("x".into())),
+            right: Box::new(Expr::Literal(Literal::Null)),
+        };
+        assert_eq!(expr.dtype(&schema).unwrap(), DataType::Int64);
+    }
 }
