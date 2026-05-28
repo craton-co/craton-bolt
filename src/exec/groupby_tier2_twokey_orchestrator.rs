@@ -44,6 +44,7 @@ use parking_lot::Mutex;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
+use crate::exec::groupby_tier2_orchestrator::validate_offsets_monotonic;
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::partition_offsets;
 use crate::jit::partition_kernel_i64;
@@ -265,6 +266,12 @@ pub fn execute_tier2_twokey_sum(
             offsets[num_partitions as usize], n_rows
         )));
     }
+
+    // Defensive: validate monotonicity of partition offsets before re-uploading.
+    // A buggy prefix-sum step (e.g. host wrapping arithmetic in gpu_compact)
+    // could produce offsets[pid+1] < offsets[pid], which the reduce kernel
+    // would interpret as a (wrap-around) range and walk OOB in device memory.
+    validate_offsets_monotonic(&offsets, "tier2_twokey")?;
 
     // Reduce kernel needs the FULL K+1 offsets buffer on the device.
     let offsets_kp1_gpu: GpuVec<u32> = GpuVec::<u32>::from_slice_async(&offsets, stream.raw())?;
