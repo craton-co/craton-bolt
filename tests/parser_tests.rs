@@ -9,7 +9,8 @@
 //! message where the message is load-bearing.
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema,
+    lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider, Schema,
+    UnaryOp,
 };
 
 // ---- Fixture ----------------------------------------------------------------
@@ -496,4 +497,76 @@ fn join_where_uses_qualified_column() {
         &provider,
     );
     assert!(res.is_ok(), "WHERE with qualified column should work: {res:?}");
+}
+
+// ---- NOT unary operator (v0.5) ---------------------------------------------
+
+/// Walk a logical plan and return the first `Filter` predicate found.
+/// Used by the NOT tests below to inspect the lowered `WHERE` predicate
+/// without depending on physical-plan shape.
+fn find_filter_predicate(plan: &LogicalPlan) -> Option<&Expr> {
+    match plan {
+        LogicalPlan::Filter { predicate, .. } => Some(predicate),
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. } => find_filter_predicate(input),
+        LogicalPlan::Aggregate { input, .. } => find_filter_predicate(input),
+        _ => None,
+    }
+}
+
+/// `WHERE NOT (qty > 5)` must parse, type-check (operand is Bool), and
+/// lower to an `Expr::Unary { op: UnaryOp::Not, .. }` node sitting on the
+/// `Filter` predicate. End-to-end coverage of the SQL-frontend wiring
+/// added in v0.5.
+#[test]
+fn not_unary_parses_and_lowers_to_unary_not() {
+    let provider = fixture_table();
+    let sql = "SELECT * FROM sales WHERE NOT (qty > 5)";
+    let plan = parse_sql(sql, &provider).expect("parse NOT (qty > 5)");
+    // Physical lowering must succeed — `NOT` routes to the host-side
+    // filter path (see `physical_plan::predicate_contains_unary`).
+    lower_physical(&plan).expect("lower NOT (qty > 5) to physical plan");
+
+    let pred = find_filter_predicate(&plan).expect("Filter on the plan spine");
+    match pred {
+        Expr::Unary { op: UnaryOp::Not, operand } => match operand.as_ref() {
+            Expr::Binary { .. } => {} // `qty > 5` inside the NOT — good.
+            other => panic!(
+                "expected `qty > 5` (Binary) under NOT, got {other:?}"
+            ),
+        },
+        other => panic!(
+            "expected Expr::Unary(Not, _) at Filter predicate, got {other:?}"
+        ),
+    }
+}
+
+/// `WHERE NOT active` (over a bare Bool column) is the other shape we
+/// expect — `NOT` over a column reference, no parenthesised inner. The
+/// type-check enforces the operand is Bool, so `NOT region_id` (an Int32)
+/// must fail at lowering time.
+#[test]
+fn not_unary_on_bare_bool_column_works() {
+    let provider = fixture_table();
+    let plan =
+        parse_sql("SELECT * FROM sales WHERE NOT active", &provider).expect("parse NOT active");
+    lower_physical(&plan).expect("lower NOT active");
+
+    let pred = find_filter_predicate(&plan).expect("Filter on the plan spine");
+    assert!(
+        matches!(pred, Expr::Unary { op: UnaryOp::Not, .. }),
+        "expected NOT at Filter predicate, got {pred:?}"
+    );
+}
+
+/// `NOT` over a non-Bool operand must surface a `Type` error from the
+/// logical-plan layer. Pin the type-check rule so a future refactor
+/// can't silently drop it.
+#[test]
+fn not_unary_on_non_bool_operand_errors() {
+    let provider = fixture_table();
+    let res = try_plan("SELECT * FROM sales WHERE NOT region_id", &provider);
+    assert_err_contains(res, "NOT requires a Bool operand");
 }

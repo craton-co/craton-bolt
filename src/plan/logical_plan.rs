@@ -227,18 +227,21 @@ impl BinaryOp {
 
 /// Unary operators surfaced by the planner.
 ///
-/// At present this only covers SQL `IS NULL` / `IS NOT NULL`. These are
-/// type-checked at the logical-plan level (they always produce `Bool`) and
-/// surfaced through the SQL frontend, but the GPU executor does not yet
-/// lower them — the physical-plan boundary rejects them cleanly so the
-/// planner accepts the syntax without misleading the user about kernel
-/// support.
+/// Covers SQL `IS NULL` / `IS NOT NULL` and logical `NOT`. These are
+/// type-checked at the logical-plan level (`IS [NOT] NULL` always produces
+/// `Bool` regardless of operand dtype; `NOT` requires a `Bool` operand and
+/// produces `Bool`) and surfaced through the SQL frontend. The GPU executor
+/// lowers bare-column `IS [NOT] NULL` natively; `NOT` is currently rejected
+/// at the physical-plan boundary so the host-side filter path can handle it
+/// without misleading the user about kernel support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     /// SQL `<expr> IS NULL`.
     IsNull,
     /// SQL `<expr> IS NOT NULL`.
     IsNotNull,
+    /// SQL `NOT <bool-expr>`. Operand must be `Bool`; result is `Bool`.
+    Not,
 }
 
 /// Scalar expression tree.
@@ -373,6 +376,14 @@ impl Expr {
         }
     }
 
+    /// `NOT self`. Operand must type-check to `Bool`; the result is `Bool`.
+    pub fn not(self) -> Expr {
+        Expr::Unary {
+            op: UnaryOp::Not,
+            operand: Box::new(self),
+        }
+    }
+
     /// Resolve the static type of this expression against `schema`.
     // TODO(nullable): add CASE/COALESCE/IS NULL/IS NOT NULL variants
     pub fn dtype(&self, schema: &Schema) -> BoltResult<DataType> {
@@ -445,6 +456,22 @@ impl Expr {
                 UnaryOp::IsNull | UnaryOp::IsNotNull => {
                     if !matches!(operand.as_ref(), Expr::Literal(Literal::Null)) {
                         let _ = operand.dtype_depth(schema, depth + 1)?;
+                    }
+                    Ok(DataType::Bool)
+                }
+                // NOT requires a Bool operand; the result is Bool. An untyped
+                // `Literal::Null` is accepted under the same NULL-peer-typing
+                // spirit as `Binary` ops — `NOT NULL` is a Bool-typed NULL
+                // value, not a type error.
+                UnaryOp::Not => {
+                    if matches!(operand.as_ref(), Expr::Literal(Literal::Null)) {
+                        return Ok(DataType::Bool);
+                    }
+                    let t = operand.dtype_depth(schema, depth + 1)?;
+                    if t != DataType::Bool {
+                        return Err(BoltError::Type(format!(
+                            "logical NOT requires a Bool operand, got {t:?}"
+                        )));
                     }
                     Ok(DataType::Bool)
                 }
@@ -1063,6 +1090,26 @@ mod null_handling_tests {
             };
             assert_eq!(on_null.dtype(&schema).unwrap(), DataType::Bool);
         }
+    }
+
+    /// `NOT <bool>` type-checks to Bool when the operand is Bool, and
+    /// errors when it's a non-Bool numeric / string / etc. The convenience
+    /// `Expr::not()` constructor produces the same `Expr::Unary` shape.
+    #[test]
+    fn unary_not_typechecks_against_bool_operand() {
+        let schema = Schema::new(vec![
+            Field::new("b", DataType::Bool, true),
+            Field::new("x", DataType::Int32, true),
+        ]);
+        // Bool column under NOT → Bool result.
+        let on_bool = Expr::Column("b".into()).not();
+        assert_eq!(on_bool.dtype(&schema).unwrap(), DataType::Bool);
+        // Int column under NOT → Type error.
+        let on_int = Expr::Column("x".into()).not();
+        assert!(on_int.dtype(&schema).is_err());
+        // NULL under NOT → Bool (NULL-peer-typing surface).
+        let on_null = Expr::Literal(Literal::Null).not();
+        assert_eq!(on_null.dtype(&schema).unwrap(), DataType::Bool);
     }
 
     /// Arithmetic peer-typing: `x + NULL` with `x: Int64` resolves to
