@@ -143,7 +143,14 @@ struct NameResolver {
 /// One table's contribution to a [`NameResolver`].
 #[derive(Debug)]
 struct TableScope {
-    /// Table name as it appears in FROM (no aliases — we don't support those yet).
+    /// Qualifier that user-typed `qualifier.col` references must match. For
+    /// `FROM mytable` this is the bare table name; for `FROM mytable AS t`
+    /// this is the alias `t`. Either way it is the *only* name a
+    /// CompoundIdentifier in the SELECT / WHERE / ON tree is allowed to
+    /// spell — the underlying table name (used for the `Scan` and provider
+    /// lookup) is *not* in scope once an alias has shadowed it. This
+    /// matches standard SQL aliasing semantics and is what callers such as
+    /// `lower_join_side` and `resolve_compound` compare against.
     name: String,
     /// For each column of the table's original schema, the *output* column name
     /// it produces in the FROM-tree's combined schema. Indices align with the
@@ -224,17 +231,25 @@ impl NameResolver {
     /// combined schema.
     ///
     /// Errors with a clear message if the qualifier matches no in-scope table
-    /// or the column doesn't exist in the qualified table's schema.
+    /// or the column doesn't exist in the qualified table's schema. When the
+    /// qualifier is unknown, the message lists every in-scope qualifier so
+    /// users can spot typos / missing aliases at a glance.
     fn resolve_compound(&self, qualifier: &str, col: &str) -> BoltResult<String> {
-        let scope = self
-            .tables
-            .iter()
-            .find(|t| t.name == qualifier)
-            .ok_or_else(|| {
+        let scope = self.tables.iter().find(|t| t.name == qualifier).ok_or_else(
+            || {
+                let candidates: Vec<&str> =
+                    self.tables.iter().map(|t| t.name.as_str()).collect();
+                let candidate_msg = if candidates.is_empty() {
+                    "no tables in scope".to_string()
+                } else {
+                    format!("in-scope: {}", candidates.join(", "))
+                };
                 BoltError::Sql(format!(
-                    "unknown table qualifier '{qualifier}' in column reference '{qualifier}.{col}'"
+                    "unknown table qualifier '{qualifier}' in column reference \
+                     '{qualifier}.{col}' ({candidate_msg})"
                 ))
-            })?;
+            },
+        )?;
         let resolved = scope
             .cols
             .iter()
@@ -968,8 +983,11 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     }
     let twj = &select.from[0];
 
-    // Build the base Scan from the first table reference.
-    let (table_name, scan_schema) = lower_table_factor(&twj.relation, provider)?;
+    // Build the base Scan from the first table reference. `scan_table` is
+    // the physical table name fed to the executor; `base_qualifier` is the
+    // alias (if any) the user-typed `qualifier.col` references must match.
+    let (scan_table, base_qualifier, scan_schema) =
+        lower_table_factor(&twj.relation, provider)?;
     let schema = scan_schema.clone();
     // The name resolver tracks the FROM-tree's `table.col` namespace so we
     // can resolve qualified references in WHERE / SELECT / GROUP BY / HAVING.
@@ -977,9 +995,9 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     // / `lower_join_side`) to reject same-side and unknown-table qualifiers
     // before the executor ever runs.
     let mut resolver = NameResolver::empty();
-    resolver.push_base(table_name.clone(), &scan_schema);
+    resolver.push_base(base_qualifier, &scan_schema);
     let mut plan = LogicalPlan::Scan {
-        table: table_name,
+        table: scan_table,
         projection: None,
         schema,
     };
@@ -1013,17 +1031,21 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
                 )));
             }
         };
-        let (rhs_table, rhs_schema) = lower_table_factor(&join.relation, provider)?;
-        // Extend the resolver before we move `rhs_table` / `rhs_schema` into
-        // the right-side Scan, so it sees the same rename rule as
-        // `join_combined_schema` applies to the actual plan output.
-        resolver.push_join(rhs_table.clone(), &rhs_schema);
-        // Keep `rhs_table` available after the move into `right_plan` so the
-        // ON-clause validator can distinguish "right side" (`rhs_table`) from
-        // "left side" (any earlier scope in `resolver`).
-        let rhs_table_for_on = rhs_table.clone();
+        let (rhs_scan_table, rhs_qualifier, rhs_schema) =
+            lower_table_factor(&join.relation, provider)?;
+        // Extend the resolver before we move `rhs_*` into the right-side
+        // Scan, so it sees the same rename rule as `join_combined_schema`
+        // applies to the actual plan output. The resolver records the
+        // *qualifier* (alias if any) so user-typed `t.col` references in
+        // WHERE / SELECT / ON resolve against the alias-name the user
+        // wrote, not the underlying table name.
+        resolver.push_join(rhs_qualifier.clone(), &rhs_schema);
+        // Keep the qualifier available after the move into `right_plan` so
+        // the ON-clause validator can distinguish "right side" (the
+        // just-pushed qualifier) from "left side" (any earlier scope).
+        let rhs_qualifier_for_on = rhs_qualifier;
         let right_plan = LogicalPlan::Scan {
-            table: rhs_table,
+            table: rhs_scan_table,
             projection: None,
             schema: rhs_schema,
         };
@@ -1033,7 +1055,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         // to reject `t1.a = t1.a` style same-side equalities and references
         // to tables not in scope (see `lower_join_on`).
         let on_pairs = match on_expr {
-            Some(e) => lower_join_on(e, &resolver, &rhs_table_for_on)?,
+            Some(e) => lower_join_on(e, &resolver, &rhs_qualifier_for_on)?,
             None => Vec::new(),
         };
         plan = LogicalPlan::Join {
@@ -1280,12 +1302,24 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     Ok(plan)
 }
 
-/// Lower a single `TableFactor` into `(table_name, schema)`. Only bare
-/// table references are accepted (no aliases, TVFs, version, hints, etc.).
+/// Lower a single `TableFactor` into `(scan_table, qualifier, schema)`.
+///
+///   * `scan_table` is the underlying table name used for `LogicalPlan::Scan`
+///     and the provider's `schema(...)` lookup — i.e. the physical-side name.
+///   * `qualifier` is the name that user-typed `qualifier.col` references
+///     must match in the SELECT / WHERE / ON tree. When the user wrote
+///     `FROM mytable AS t` it is `t`; with no alias it equals `scan_table`.
+///     Once an alias shadows the underlying table, the bare table name is
+///     no longer in scope as a qualifier (standard SQL semantics).
+///
+/// Only bare table references are accepted (TVFs, version, hints, etc.
+/// remain rejected). Column-list aliases (`AS t (c1, c2)`) are rejected
+/// because they would also require renaming the table's schema fields,
+/// which the v0.5 frontend does not implement.
 fn lower_table_factor(
     tf: &TableFactor,
     provider: &dyn TableProvider,
-) -> BoltResult<(String, Schema)> {
+) -> BoltResult<(String, String, Schema)> {
     match tf {
         TableFactor::Table {
             name,
@@ -1296,9 +1330,6 @@ fn lower_table_factor(
             with_ordinality,
             partitions,
         } => {
-            if alias.is_some() {
-                return Err(BoltError::Sql("unsupported: table alias".into()));
-            }
             if args.is_some() {
                 return Err(BoltError::Sql("unsupported: table-valued function".into()));
             }
@@ -1316,7 +1347,21 @@ fn lower_table_factor(
             }
             let table_name = single_ident_from_object_name(name)?;
             let schema = provider.schema(&table_name)?;
-            Ok((table_name, schema))
+            // Table aliases: accept `AS t` (or just `t`) but reject the
+            // column-list form `AS t (c1, c2)` — we do not implement the
+            // column renaming that would require.
+            let qualifier = match alias {
+                None => table_name.clone(),
+                Some(a) => {
+                    if !a.columns.is_empty() {
+                        return Err(BoltError::Sql(
+                            "unsupported: table alias with column list (AS t(c1, c2))".into(),
+                        ));
+                    }
+                    a.name.value.clone()
+                }
+            };
+            Ok((table_name, qualifier, schema))
         }
         _ => Err(BoltError::Sql(
             "unsupported: only bare table references are allowed in FROM".into(),
@@ -1483,13 +1528,19 @@ fn lower_join_side(
                 return Ok((Expr::Column(last.value.clone()), JoinSide::Unknown));
             }
             if parts.len() > 2 {
+                let full = parts
+                    .iter()
+                    .map(|p| p.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if parts.len() == 3 {
+                    return Err(BoltError::Sql(format!(
+                        "schema-qualified names not supported: '{full}' in JOIN ON \
+                         (only `table.col` / `alias.col` is accepted)"
+                    )));
+                }
                 return Err(BoltError::Sql(format!(
-                    "unsupported: deeply qualified column reference '{}' in JOIN ON",
-                    parts
-                        .iter()
-                        .map(|p| p.value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".")
+                    "unsupported: deeply qualified column reference '{full}' in JOIN ON"
                 )));
             }
             let qualifier = &parts[0].value;
@@ -1849,33 +1900,45 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
     match e {
         SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
         SqlExpr::CompoundIdentifier(parts) => {
-            // We currently only support a single `table.column` qualifier
-            // (no schema-qualified or struct-field forms). The frontend has
-            // no schema/database concept, so anything deeper is meaningless.
-            if parts.len() != 2 {
-                // Cap the reflected fragment so adversarial input (very long
-                // identifiers, deeply nested chains) can't flood logs. 200
-                // chars is enough to identify the offending reference in
-                // practice; anything past that gets an ellipsis.
+            // We support the two-part `table.col` form. The three-part
+            // `schema.table.col` form is rejected with a dedicated message
+            // (the frontend has no schema/database concept). Anything
+            // deeper is rejected as "deeply qualified".
+            //
+            // Cap the reflected fragment so adversarial input (very long
+            // identifiers, deeply nested chains) can't flood logs. 200
+            // chars is enough to identify the offending reference in
+            // practice; anything past that gets an ellipsis.
+            let display = || {
                 let full = parts
                     .iter()
                     .map(|p| p.value.as_str())
                     .collect::<Vec<_>>()
                     .join(".");
-                let display = if full.chars().count() > 200 {
+                if full.chars().count() > 200 {
                     let truncated: String = full.chars().take(200).collect();
                     format!("{truncated}...")
                 } else {
                     full
-                };
-                return Err(BoltError::Sql(format!(
-                    "unsupported: deeply qualified column reference '{display}'"
-                )));
+                }
+            };
+            match parts.len() {
+                2 => {
+                    let qualifier = &parts[0].value;
+                    let col = &parts[1].value;
+                    let resolved = resolver.resolve_compound(qualifier, col)?;
+                    Ok(Expr::Column(resolved))
+                }
+                3 => Err(BoltError::Sql(format!(
+                    "schema-qualified names not supported: '{}' \
+                     (only `table.col` / `alias.col` is accepted)",
+                    display()
+                ))),
+                _ => Err(BoltError::Sql(format!(
+                    "unsupported: deeply qualified column reference '{}'",
+                    display()
+                ))),
             }
-            let qualifier = &parts[0].value;
-            let col = &parts[1].value;
-            let resolved = resolver.resolve_compound(qualifier, col)?;
-            Ok(Expr::Column(resolved))
         }
         SqlExpr::Value(v) => lower_value(v),
         SqlExpr::Nested(inner) => lower_expr(inner, resolver, depth + 1),
