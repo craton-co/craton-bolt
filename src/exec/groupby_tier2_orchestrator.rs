@@ -15,20 +15,21 @@
 //! in 16 KiB of shared memory, walks its partition's scatter slice with a
 //! grid-stride loop, and emits one slot's worth of `(key, val, set)` per
 //! shared-table position. The host then walks the (now fixed-size,
-//! `NUM_PARTITIONS * BLOCK_GROUPS * 13 B = 13 MiB`) output to collect the
-//! populated slots into the per-partition result vectors.
+//! `NUM_PARTITIONS * BLOCK_GROUPS * 13 B = 4096 * 1024 * 13 B = 52 MiB`)
+//! output to collect the populated slots into the per-partition result
+//! vectors.
 //!
 //! Net cost change:
-//!   * D2H: ~150 ms (n_rows-sized buffers) → ~13 ms (fixed 13 MiB output)
+//!   * D2H: ~150 ms (n_rows-sized buffers) → ~50 ms (fixed 52 MiB output)
 //!   * Host pass: ~100 ms of HashMap → ~5 ms of trivial scan
 //!   * GPU pass: +10–30 ms for the new kernel
-//! Net: ~150 ms saved, projected ~6× speedup on q5 per
+//! Net: ~120 ms saved, projected ~5× speedup on q5 per
 //! `docs/GROUPBY_PERF.md`.
 //!
 //! ## Pipeline
 //!
 //! 1. **Partition pass.** Hash every input row's key into one of
-//!    `NUM_PARTITIONS = 1024` buckets, count rows per bucket, and remember
+//!    `NUM_PARTITIONS = 4096` buckets, count rows per bucket, and remember
 //!    the per-row bucket assignment. (`partition_kernel`, sibling agent.)
 //! 2. **Prefix sum.** Exclusive prefix sum over the bucket counts gives the
 //!    write offset for each partition in the scattered output.
@@ -351,7 +352,7 @@ pub fn execute_tier2_sum(
 
     // Output buffers. NUM_PARTITIONS × BLOCK_GROUPS slots; one entry per
     // shared-table slot per partition. Total fixed cost regardless of
-    // n_rows: 1024 * 1024 * (4 + 8 + 1) = ~13 MiB.
+    // n_rows: 4096 * 1024 * (4 + 8 + 1) = ~52 MiB.
     let n_out_slots: usize =
         (num_partitions as usize) * (partition_reduce_kernel::BLOCK_GROUPS as usize);
     let mut out_keys: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_out_slots, stream.raw())?;
@@ -390,8 +391,10 @@ pub fn execute_tier2_sum(
     }
 
     // Stage-4 (P1b): pinned D2H for the three fixed-size output
-    // buffers. Each download enqueues an async copy; we synchronize
-    // once after all three are queued so the driver can overlap them.
+    // buffers (totalling ~52 MiB vs. ~150 MiB the host path used to
+    // download at N=10 M). Each download enqueues an async copy; we
+    // synchronize once after all three are queued so the driver can
+    // overlap them.
     let pinned_keys = out_keys.to_pinned_async(stream.raw())?;
     let pinned_vals = out_vals.to_pinned_async(stream.raw())?;
     let pinned_set = out_set.to_pinned_async(stream.raw())?;

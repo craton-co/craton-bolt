@@ -315,18 +315,32 @@ impl PhysicalPlan {
             PhysicalPlan::Union { inputs } => {
                 // Caller will have ensured at logical-plan time that all
                 // branches share a schema; here we just return the first.
-                // The Union { inputs: vec![] } case can only arise from a
-                // mis-constructed plan (parser rejects it) — fall back to
-                // the first plan's schema if present, else panic-free path
-                // by returning a degenerate empty schema would require an
-                // allocation we can't make through a `&Schema` API. The
-                // executor (engine.rs) errors on empty Union before this
-                // accessor is ever called, so we let `inputs[0]` panic in
-                // the degenerate case (consistent with `Vec::first` not
-                // having a graceful sentinel).
+                //
+                // The `Union { inputs: vec![] }` case is gated out at every
+                // public construction site that feeds the physical planner:
+                //   - `sql_frontend` never emits a zero-branch Union (the
+                //     SQL grammar requires at least one `SELECT`).
+                //   - `DataFrame::from_plan` runs `check_no_empty_union` and
+                //     records a `BoltError::Plan` in `first_error`, which
+                //     surfaces through `validation_error()` / `schema()`
+                //     before any caller can hand the plan to the engine.
+                //   - `lower()` itself re-rejects empty Union with
+                //     `BoltError::Plan` (see the `LogicalPlan::Union` arm
+                //     in this file), so a `PhysicalPlan::Union { inputs: [] }`
+                //     cannot arise from lowering.
+                //
+                // The only remaining way to reach this branch with no inputs
+                // is hand-constructing `PhysicalPlan::Union { inputs: vec![] }`
+                // directly — a clearly malformed plan that this crate does
+                // not produce. The `expect` documents that contract.
                 inputs
                     .first()
-                    .expect("Union with zero inputs is invalid; rejected upstream")
+                    .expect(
+                        "PhysicalPlan::Union { inputs: vec![] } is malformed; \
+                         construction sites (sql_frontend, DataFrame::from_plan, \
+                         lower) all reject empty Union before this accessor is \
+                         reached",
+                    )
                     .output_schema()
             }
             PhysicalPlan::Project { output_schema, .. } => output_schema,
@@ -1533,5 +1547,87 @@ mod tests {
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }
+    }
+
+    /// Regression (review C9): a hand-constructed `LogicalPlan::Union` with
+    /// zero inputs must surface as a `BoltError::Plan` through the public
+    /// `DataFrame::from_plan` entry point — never a panic. Before this fix,
+    /// the panic site was `PhysicalPlan::output_schema`'s
+    /// `inputs.first().expect(..)`, reachable because `from_plan` accepted
+    /// any `LogicalPlan` shape unconditionally.
+    ///
+    /// We assert three things, in order of how a real caller would hit them:
+    ///   1. `lower()` rejects the empty Union with `BoltError::Plan` (the
+    ///      pre-existing guard — kept as defence in depth).
+    ///   2. `DataFrame::from_plan(...).validation_error()` returns Some,
+    ///      naming the empty Union — the user-facing surface from review C9.
+    ///   3. `DataFrame::from_plan(...).schema()` returns the same
+    ///      `BoltError::Plan` rather than panicking.
+    #[test]
+    fn empty_union_surfaces_as_plan_error_not_panic() {
+        use crate::error::BoltError;
+        use crate::plan::dataframe::DataFrame;
+
+        // Build a zero-branch UNION directly. This is the malformed shape a
+        // user could hand `DataFrame::from_plan` to trip the old `expect()`.
+        let empty_union = LogicalPlan::Union { inputs: vec![] };
+
+        // (1) The lowerer's own guard still catches it.
+        let lower_err = lower(&empty_union).expect_err("lower must reject empty Union");
+        match lower_err {
+            BoltError::Plan(msg) => assert!(
+                msg.contains("UNION") || msg.contains("Union"),
+                "lower() error should mention UNION; got: {msg}",
+            ),
+            other => panic!("expected BoltError::Plan, got {other:?}"),
+        }
+
+        // (2) `DataFrame::from_plan` records the error in `first_error`,
+        //     surfaced via `validation_error()`. No panic, no `expect()`.
+        let df = DataFrame::from_plan(empty_union.clone());
+        let err_msg = df
+            .validation_error()
+            .expect("from_plan must record an error for empty Union");
+        assert!(
+            err_msg.contains("Union") || err_msg.contains("UNION"),
+            "validation_error should mention Union; got: {err_msg}",
+        );
+
+        // (3) `schema()` mirrors the same error rather than calling through
+        //     to the panicking accessor path.
+        let schema_err = df.schema().expect_err("schema() must surface the error");
+        match schema_err {
+            BoltError::Plan(msg) => assert!(
+                msg.contains("Union") || msg.contains("UNION"),
+                "schema() error should mention Union; got: {msg}",
+            ),
+            other => panic!("expected BoltError::Plan, got {other:?}"),
+        }
+    }
+
+    /// Companion to `empty_union_surfaces_as_plan_error_not_panic`: a
+    /// *nested* empty Union (e.g. as one branch of a Filter or a non-empty
+    /// outer Union) must also be caught at `from_plan` time. Ensures the
+    /// recursive walk in `check_no_empty_union` covers the structural cases
+    /// we care about.
+    #[test]
+    fn nested_empty_union_is_rejected_by_from_plan() {
+        use crate::plan::dataframe::DataFrame;
+
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("k", DataType::Int32, false)]),
+        };
+        // Outer Union has one valid branch and one degenerate empty Union —
+        // the recursive walk must still flag the inner empty.
+        let nested = LogicalPlan::Union {
+            inputs: vec![scan, LogicalPlan::Union { inputs: vec![] }],
+        };
+        let df = DataFrame::from_plan(nested);
+        assert!(
+            df.validation_error().is_some(),
+            "nested empty Union must be flagged by from_plan",
+        );
     }
 }

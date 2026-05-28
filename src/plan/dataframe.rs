@@ -77,11 +77,23 @@ impl DataFrame {
     }
 
     /// Wrap an already-built `LogicalPlan` as a `DataFrame`.
+    ///
+    /// Performs a builder-time structural check that rejects any
+    /// `LogicalPlan::Union { inputs: vec![] }` anywhere in the tree. A UNION
+    /// with zero branches has no well-defined schema, and several downstream
+    /// accessors (notably `PhysicalPlan::output_schema`) assume at least one
+    /// branch is present. Rather than letting that degenerate shape escape
+    /// through the public entry point and trip an internal `expect()` later,
+    /// the error is recorded here and surfaced via
+    /// [`DataFrame::validation_error`] / [`DataFrame::schema`], matching the
+    /// 0.1 pattern used by the other combinators (we cannot change the
+    /// signature to `BoltResult<Self>` without breaking the public builder
+    /// API — see the `first_error` field doc).
     pub fn from_plan(plan: LogicalPlan) -> Self {
-        Self {
-            plan,
-            first_error: None,
-        }
+        let first_error = check_no_empty_union(&plan)
+            .err()
+            .map(|e| e.to_string());
+        Self { plan, first_error }
     }
 
     /// SELECT — replace the projection list.
@@ -259,6 +271,43 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
             collect_column_refs(right, out);
         }
         Expr::Alias(inner, _) => collect_column_refs(inner, out),
+    }
+}
+
+/// Walk `plan` and reject any `LogicalPlan::Union { inputs: vec![] }`.
+///
+/// A UNION with no branches has no schema and would later panic in
+/// `PhysicalPlan::output_schema` (which calls `inputs.first().expect(..)`).
+/// This is the single public entry point for hand-built logical plans, so
+/// gating here closes the only way that degenerate shape can reach the
+/// physical planner from outside this crate. The check is `O(nodes)` and
+/// runs once per `from_plan` call.
+fn check_no_empty_union(plan: &LogicalPlan) -> BoltResult<()> {
+    match plan {
+        LogicalPlan::Scan { .. } => Ok(()),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. } => check_no_empty_union(input),
+        LogicalPlan::Union { inputs } => {
+            if inputs.is_empty() {
+                return Err(BoltError::Plan(
+                    "Union with zero inputs is invalid: UNION requires at \
+                     least one branch"
+                        .into(),
+                ));
+            }
+            for branch in inputs {
+                check_no_empty_union(branch)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::Join { left, right, .. } => {
+            check_no_empty_union(left)?;
+            check_no_empty_union(right)
+        }
     }
 }
 

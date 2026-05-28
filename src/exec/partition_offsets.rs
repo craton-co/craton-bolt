@@ -71,6 +71,13 @@
 //! (history reasons); when it migrates, the joint helper collapses the
 //! pinned-async sequence to a single `stream.synchronize()` for the
 //! whole call.
+//!
+//! ## Sizing rationale (K = 4096)
+//!
+//! If the partition count ever grows past ~16 K we should revisit, but
+//! 4096 is the right choice for q5-class workloads (~1 M groups, ~250
+//! groups per partition) and there's no plausible path to making it
+//! larger without also blowing up the per-partition hashtable budget.
 
 use std::cell::RefCell;
 
@@ -173,7 +180,8 @@ fn with_pinned_scratch<R>(
 /// scratch buffer on the NULL stream, then a single `cuStreamSynchronize`,
 /// then a host-side prefix-sum loop. The pinned buffer cuts DMA bandwidth
 /// roughly in half compared to the pageable D2H that the sync code path
-/// used to do. See the module docs for the lifecycle of the scratch slot.
+/// used to do. Downloads 4096 `u32`s (16 KiB) over PCIe. See the module
+/// docs for the lifecycle of the scratch slot and the cost rationale.
 pub fn compute_partition_offsets(counts: &GpuVec<u32>) -> BoltResult<Vec<u32>> {
     let expected = NUM_PARTITIONS as usize;
     if counts.len() != expected {
