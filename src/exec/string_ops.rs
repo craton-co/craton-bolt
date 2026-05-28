@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 
-use arrow_array::{BooleanArray, Int32Array, StringArray};
+use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
 
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::GpuVec;

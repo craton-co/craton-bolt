@@ -1432,6 +1432,10 @@ fn expr_contains_concat(expr: &Expr) -> bool {
         }
         Expr::Unary { operand, .. } => expr_contains_concat(operand),
         Expr::Alias(inner, _) => expr_contains_concat(inner),
+        Expr::Case { branches, else_branch } => {
+            branches.iter().any(|(w, t)| expr_contains_concat(w) || expr_contains_concat(t))
+                || else_branch.as_deref().map(expr_contains_concat).unwrap_or(false)
+        }
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
