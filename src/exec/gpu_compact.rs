@@ -45,7 +45,8 @@ use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::prefix_scan::{
     compile_gather_kernel, compile_prefix_scan_kernel, compile_prefix_scan_kernel_blelloch,
-    gather_kernel_entry, BLOCK_SIZE, SCAN_KERNEL_ENTRY, SCAN_KERNEL_ENTRY_BLELLOCH,
+    compile_prefix_scan_kernel_lookback, gather_kernel_entry, BLOCK_SIZE, SCAN_KERNEL_ENTRY,
+    SCAN_KERNEL_ENTRY_BLELLOCH, SCAN_KERNEL_ENTRY_LOOKBACK,
 };
 use crate::plan::logical_plan::DataType;
 
@@ -256,6 +257,14 @@ pub fn prefix_scan_mask(
         );
     }
 
+    // Decoupled-lookback takes a 5th `partial_status` argument and bakes the
+    // global prefix into `local_indices` in one launch, so it has its own
+    // launcher. Hillis-Steele / Blelloch share the 4-arg launcher below.
+    let (algo, spec_id, entry) = prefix_scan_algo_selection();
+    if algo == PrefixScanAlgo::Lookback {
+        return prefix_scan_mask_lookback(mask_ptr, n_rows, stream);
+    }
+
     let block_size = BLOCK_SIZE as usize;
     let n_blocks = n_rows.div_ceil(block_size);
 
@@ -268,7 +277,7 @@ pub fn prefix_scan_mask(
     //   * unset / "hillis" / "hillis-steele" -> Hillis-Steele (default, O(n log n))
     //   * "blelloch"                         -> Blelloch upsweep+downsweep (O(n))
     // Both kernels expose the same 4-arg ABI.
-    let (spec_id, entry) = prefix_scan_algo_selection();
+    let _ = algo;
     let module = module_cache::get_or_build_module(
         module_path!(),
         spec_id.to_string(),
@@ -362,6 +371,139 @@ pub fn prefix_scan_mask(
     drop(block_sums);
     drop(sums_host);
     drop(bases_host);
+
+    Ok(ScanResult {
+        local_indices,
+        block_bases,
+        total_count,
+        mask_ptr,
+        n_rows,
+    })
+}
+
+/// Single-pass decoupled-lookback variant of [`prefix_scan_mask`].
+///
+/// Activated by `BOLT_PREFIX_SCAN_ALGO=lookback` via the dispatch in
+/// [`prefix_scan_algo_selection`]. Unlike the Hillis-Steele / Blelloch
+/// kernels — which compute per-block sums and require a host
+/// download + exclusive-scan + re-upload of `block_sums` — the lookback
+/// kernel publishes its block aggregate to a per-block status array and
+/// walks the array backwards to derive the global prefix in the same grid
+/// launch. The returned `local_indices` already holds the **global**
+/// exclusive prefix, so the host pass and `block_bases` allocation are
+/// skipped entirely.
+///
+/// ## Output contract
+///
+/// The returned [`ScanResult`] has:
+///   * `local_indices[gid]` = global exclusive prefix of the mask at row `gid`;
+///   * `block_bases` = a length-`n_blocks` u32 buffer filled with zeros.
+///     This is load-bearing: the gather kernel reads
+///     `block_bases[blockIdx.x] + local_indices[gid]` as the output index,
+///     and lookback bakes the block prefix into `local_indices` so the
+///     block-bases term must contribute zero to leave the math correct;
+///   * `total_count` = the inclusive prefix at row `n_rows - 1` plus the
+///     mask byte at that row. The kernel publishes the block-`n_blocks-1`
+///     inclusive prefix to `partial_status` and we recover it by reading
+///     that slot's low 30 bits after the launch syncs.
+///
+/// ## Size bound
+///
+/// The 30-bit value field in each status slot caps any prefix at
+/// `(1 << 30) - 1 = 1_073_741_823`. We refuse `n_rows >= 1 << 30` up-front
+/// so a saturated prefix is impossible. Larger inputs should use the
+/// multipass path (Hillis-Steele) or one of the in-block scans.
+fn prefix_scan_mask_lookback(
+    mask_ptr: CUdeviceptr,
+    n_rows: usize,
+    stream: &CudaStream,
+) -> BoltResult<ScanResult> {
+    // 30-bit value field => max prefix is (1 << 30) - 1. Refuse anything
+    // that could conceivably saturate (the prefix never exceeds n_rows
+    // since every contribution is 0 or 1).
+    const LOOKBACK_ROW_LIMIT: usize = 1 << 30;
+    if n_rows >= LOOKBACK_ROW_LIMIT {
+        return Err(BoltError::Other(format!(
+            "decoupled-lookback scan requires n_rows < 2^30 (got {n_rows}); \
+             use multipass for larger inputs"
+        )));
+    }
+
+    let block_size = BLOCK_SIZE as usize;
+    let n_blocks = n_rows.div_ceil(block_size);
+
+    let local_indices = GpuVec::<u32>::zeros(n_rows)?;
+    let block_sums = GpuVec::<u32>::zeros(n_blocks)?;
+    // partial_status[i] starts at INVALID (= 0). Zero-init is exactly the
+    // initial state the kernel expects; any other value would be observed
+    // as a stale AGGREGATE/INCLUSIVE by a peer block.
+    let partial_status = GpuVec::<u32>::zeros(n_blocks)?;
+
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "prefix_scan_lookback".to_string(),
+        None,
+        || compile_prefix_scan_kernel_lookback(),
+    )?;
+    let function = module.function(SCAN_KERNEL_ENTRY_LOOKBACK)?;
+
+    let mut p_mask: CUdeviceptr = mask_ptr;
+    let mut p_local: CUdeviceptr = local_indices.device_ptr();
+    let mut p_block: CUdeviceptr = block_sums.device_ptr();
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let mut p_status: CUdeviceptr = partial_status.device_ptr();
+
+    let mut kernel_params: [*mut c_void; 5] = [
+        &mut p_mask as *mut CUdeviceptr as *mut c_void,
+        &mut p_local as *mut CUdeviceptr as *mut c_void,
+        &mut p_block as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+        &mut p_status as *mut CUdeviceptr as *mut c_void,
+    ];
+
+    let grid_x: u32 = n_rows_to_u32(n_blocks)?;
+    // SAFETY: every entry in `kernel_params` points at a stack local that
+    // outlives the launch+synchronize below; `function` is borrowed from a
+    // live `CudaModule`. The kernel writes only to `local_indices`,
+    // `block_sums`, and `partial_status`, all owned here.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            BLOCK_SIZE,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+
+    // Total count: read `partial_status[n_blocks - 1]`'s low 30 bits. The
+    // last block's PUBLISH_INCLUSIVE stored `(block_prefix +
+    // block_aggregate) & VALUE_MASK` there, which is the inclusive prefix
+    // at row `n_rows - 1`. Equivalently `n_rows - mask_zero_count`.
+    let status_host: Vec<u32> = partial_status.to_vec()?;
+    debug_assert_eq!(status_host.len(), n_blocks);
+    let last_slot = *status_host
+        .last()
+        .expect("n_blocks > 0 because n_rows > 0 and div_ceil");
+    let total_count = (last_slot & crate::jit::prefix_scan::LOOKBACK_VALUE_MASK) as usize;
+
+    // `block_bases` is zero-filled: lookback baked the block prefix into
+    // `local_indices`, so the gather kernel's `block_bases + local_indices`
+    // sum must contribute only the local term. We still allocate it (rather
+    // than reusing one global zero buffer) so the `ScanResult` API stays
+    // uniform across all three algorithms.
+    let block_bases = GpuVec::<u32>::zeros(n_blocks)?;
+
+    drop(block_sums);
+    drop(partial_status);
+    drop(status_host);
 
     Ok(ScanResult {
         local_indices,
@@ -691,34 +833,61 @@ pub fn compact_columns_on_gpu(
     Ok((out, scan.total_count))
 }
 
-/// Env-var-driven dispatch between the Hillis-Steele and Blelloch prefix-scan
-/// kernels. Returns `(ptx, entry_name)` so callers can hand both directly to
-/// `CudaModule::from_ptx` and `module.function`.
+/// Identifier for which prefix-scan algorithm should service the current
+/// call. Selected from the `BOLT_PREFIX_SCAN_ALGO` env var on every call —
+/// see [`prefix_scan_algo_selection`] for the resolution rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixScanAlgo {
+    /// O(n log n) ping-pong scan ([`SCAN_KERNEL_ENTRY`]). Default.
+    HillisSteele,
+    /// O(n) upsweep/downsweep scan ([`SCAN_KERNEL_ENTRY_BLELLOCH`]).
+    Blelloch,
+    /// Single-pass decoupled-lookback scan ([`SCAN_KERNEL_ENTRY_LOOKBACK`]).
+    /// Folds the per-block reduce + global scan into one grid launch — no
+    /// host round-trip on `block_sums`.
+    Lookback,
+}
+
+/// Env-var-driven dispatch between the three prefix-scan kernels. Returns
+/// the resolved [`PrefixScanAlgo`] plus matching `(spec_id, entry_name)` for
+/// the consolidated module cache.
 ///
 /// Selection rules for `BOLT_PREFIX_SCAN_ALGO`:
 ///   * `"blelloch"` (case-insensitive) -> Blelloch upsweep+downsweep
-///     (O(n) work). New code path; not yet the default.
+///     (O(n) work). New code path; not the default.
+///   * `"lookback"` (case-insensitive) -> single-pass decoupled-lookback
+///     ([`SCAN_KERNEL_ENTRY_LOOKBACK`]). Routes through
+///     [`prefix_scan_mask_lookback`] which allocates an extra
+///     `partial_status` buffer; the kernel returns GLOBAL exclusive
+///     prefixes directly in `local_indices`.
 ///   * Unset, `"hillis"`, `"hillis-steele"`, or any other value ->
 ///     Hillis-Steele (default; O(n log n) work, in production use since the
 ///     initial GPU compaction landing).
 ///
-/// The Hillis-Steele default is intentional while the Blelloch kernel is in
-/// shake-out: the existing path has soak time across the e2e tests, and the
-/// host-side validation we can do without a GPU (substring + golden tests)
-/// only catches structural regressions, not numerical ones. Once the
-/// Blelloch path has been exercised end-to-end on real hardware the default
-/// should flip and this helper can collapse to a single kernel.
-/// Returns `(spec_id_for_cache, kernel_entry_name)` based on the
-/// `BOLT_PREFIX_SCAN_ALGO` env var. The spec_id distinguishes the two
-/// algorithms in the module cache so they don't alias.
-fn prefix_scan_algo_selection() -> (&'static str, &'static str) {
-    let want_blelloch = std::env::var("BOLT_PREFIX_SCAN_ALGO")
-        .map(|s| s.eq_ignore_ascii_case("blelloch"))
-        .unwrap_or(false);
-    if want_blelloch {
-        ("prefix_scan_blelloch", SCAN_KERNEL_ENTRY_BLELLOCH)
-    } else {
-        ("prefix_scan", SCAN_KERNEL_ENTRY)
+/// The Hillis-Steele default is intentional while the alternative kernels
+/// are in shake-out: the existing path has soak time across the e2e tests,
+/// and the host-side validation we can do without a GPU (substring + golden
+/// tests) only catches structural regressions, not numerical ones. Once the
+/// alternative paths have been exercised end-to-end on real hardware the
+/// default should flip and this helper can collapse to a single kernel.
+fn prefix_scan_algo_selection() -> (PrefixScanAlgo, &'static str, &'static str) {
+    let env = std::env::var("BOLT_PREFIX_SCAN_ALGO").ok();
+    match env.as_deref() {
+        Some(s) if s.eq_ignore_ascii_case("blelloch") => (
+            PrefixScanAlgo::Blelloch,
+            "prefix_scan_blelloch",
+            SCAN_KERNEL_ENTRY_BLELLOCH,
+        ),
+        Some(s) if s.eq_ignore_ascii_case("lookback") => (
+            PrefixScanAlgo::Lookback,
+            "prefix_scan_lookback",
+            SCAN_KERNEL_ENTRY_LOOKBACK,
+        ),
+        _ => (
+            PrefixScanAlgo::HillisSteele,
+            "prefix_scan",
+            SCAN_KERNEL_ENTRY,
+        ),
     }
 }
 
@@ -727,13 +896,24 @@ fn compile_prefix_scan_for_algo() -> BoltResult<(String, &'static str)> {
     // changed without restart for ad-hoc benchmarking. If this lookup ever
     // shows up in a flamegraph the right fix is to cache the resolved
     // choice in a `OnceLock`, not to bake the default at compile time.
-    let want_blelloch = std::env::var("BOLT_PREFIX_SCAN_ALGO")
-        .map(|s| s.eq_ignore_ascii_case("blelloch"))
-        .unwrap_or(false);
-    if want_blelloch {
-        Ok((compile_prefix_scan_kernel_blelloch()?, SCAN_KERNEL_ENTRY_BLELLOCH))
-    } else {
-        Ok((compile_prefix_scan_kernel()?, SCAN_KERNEL_ENTRY))
+    //
+    // Lookback is dispatched through `prefix_scan_mask_lookback` because it
+    // takes a 5th `partial_status` argument; the 4-arg call sites in
+    // `prefix_scan_mask` use only the other two variants.
+    let (algo, _spec, _entry) = prefix_scan_algo_selection();
+    match algo {
+        PrefixScanAlgo::Blelloch => Ok((
+            compile_prefix_scan_kernel_blelloch()?,
+            SCAN_KERNEL_ENTRY_BLELLOCH,
+        )),
+        PrefixScanAlgo::Lookback | PrefixScanAlgo::HillisSteele => {
+            // For `HillisSteele` this is the genuine path. The `Lookback`
+            // arm should never reach here in practice (`prefix_scan_mask`
+            // delegates to `prefix_scan_mask_lookback` first); if it does
+            // we fall back to Hillis-Steele rather than emit a kernel with
+            // the wrong ABI for the 4-arg launcher.
+            Ok((compile_prefix_scan_kernel()?, SCAN_KERNEL_ENTRY))
+        }
     }
 }
 

@@ -34,6 +34,7 @@ use craton_bolt::jit::hash_kernels::{
 };
 use craton_bolt::jit::prefix_scan::{
     compile_prefix_scan_kernel, compile_prefix_scan_kernel_blelloch,
+    compile_prefix_scan_kernel_lookback,
 };
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
@@ -522,6 +523,59 @@ fn golden_prefix_scan_blelloch_has_shape() {
     assert_eq!(
         n_sync, 18,
         "expected exactly 18 bar.syncs (seed + 8 upsweep + pivot + 8 downsweep), got {n_sync}\n{ptx}"
+    );
+}
+
+/// Golden lock for the decoupled-lookback variant. Pins the load-bearing
+/// substrings of the publication protocol — drop any of these and the
+/// cross-CTA scan loses correctness on sm_70+:
+///
+///   * `PUBLISH_AGGREGATE` / `LOOKBACK_SPIN` / `PUBLISH_INCLUSIVE` /
+///     `BROADCAST` labels — the four phases of the algorithm.
+///   * `membar.gl;` (>= 2) — the post-publish fences that make a peer's
+///     `ld.acquire.gpu.u32` of the same address observe the new status.
+///   * `ld.acquire.gpu.u32` — acquire-scope read of `partial_status[pred]`
+///     during the spin loop.
+///   * 5-arg ABI (4 u64 + 1 u32) with the lookback entry name.
+#[test]
+fn golden_prefix_scan_lookback_has_shape() {
+    let ptx = compile_prefix_scan_kernel_lookback().expect("compile lookback");
+
+    // Entry + 5-param ABI.
+    assert!(
+        ptx.contains(".visible .entry bolt_prefix_scan_lookback("),
+        "missing lookback entry name:\n{ptx}"
+    );
+    assert!(ptx.contains(".param .u64 bolt_prefix_scan_lookback_param_0,"));
+    assert!(ptx.contains(".param .u64 bolt_prefix_scan_lookback_param_1,"));
+    assert!(ptx.contains(".param .u64 bolt_prefix_scan_lookback_param_2,"));
+    assert!(ptx.contains(".param .u32 bolt_prefix_scan_lookback_param_3,"));
+    assert!(ptx.contains(".param .u64 bolt_prefix_scan_lookback_param_4"));
+
+    // Phase markers.
+    for label in [
+        "PUBLISH_AGGREGATE:",
+        "LOOKBACK_SPIN:",
+        "PUBLISH_INCLUSIVE:",
+        "BROADCAST:",
+    ] {
+        assert!(
+            ptx.contains(label),
+            "missing label `{label}` in lookback PTX:\n{ptx}"
+        );
+    }
+
+    // Memory-order primitives. Two membar.gl fences (one per publish) +
+    // an acquire-scope load on the spin path are the load-bearing
+    // synchronization for the decoupled-lookback protocol on sm_70+.
+    let n_membar = ptx.matches("membar.gl;").count();
+    assert!(
+        n_membar >= 2,
+        "expected >=2 membar.gl (one per publish), got {n_membar}:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("ld.acquire.gpu.u32"),
+        "missing ld.acquire.gpu.u32 on partial_status spin read:\n{ptx}"
     );
 }
 
