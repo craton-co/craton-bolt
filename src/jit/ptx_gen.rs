@@ -473,6 +473,15 @@ fn emit_store(
 }
 
 /// Emit a `mov` of an immediate into a fresh register typed by the literal.
+///
+/// SECURITY: literals are emitted as **hex bit-patterns** (e.g. `0x{:08X}` for
+/// 32-bit, `0x{:016X}` for 64-bit) so no attacker-controlled value can produce
+/// PTX with characters other than `[0-9A-F]`. PTX `mov.s32`/`mov.s64` is a
+/// bitwise copy, so reading back the value as signed is sound — `0xFFFFFFFF`
+/// loaded into an `.s32` register is `-1`, identical to writing `-1` directly.
+/// Float literals are likewise hex-encoded (PTX `0f...` / `0d...` syntax).
+/// This closes the codegen-injection class even if a future planner regression
+/// lets attacker-controlled SQL values reach this function.
 fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
     match lit {
         Literal::Null => Err(BoltError::Other(
@@ -483,23 +492,30 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
         )),
         Literal::Bool(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Bool)?;
+            // Value space is {0, 1}; not an injection surface, but keep the
+            // emission consistent with the other integer paths for clarity.
             let n: u32 = if *v { 1 } else { 0 };
             b.emit(&format!("mov.b32 {}, {};", dst_name, n))
         }
         Literal::Int32(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Int32)?;
-            // Format via i64 so INT32_MIN's `-` parses as a unary on a 32-bit literal.
-            b.emit(&format!("mov.s32 {}, {};", dst_name, *v as i64))
+            // Emit the bit-pattern as hex: `mov.s32` is a bitwise copy, so
+            // `0xFFFFFFFF` here is -1, identical to writing `-1`. This avoids
+            // any sign / INT32_MIN parsing concerns AND removes the codegen-
+            // injection surface (output is restricted to `[0-9A-F]`).
+            b.emit(&format!("mov.s32 {}, 0x{:08X};", dst_name, *v as u32))
         }
         Literal::Int64(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Int64)?;
-            b.emit(&format!("mov.s64 {}, {};", dst_name, v))
+            b.emit(&format!("mov.s64 {}, 0x{:016X};", dst_name, *v as u64))
         }
         Literal::Float32(v) => {
+            // Already hex-encoded via PTX `0f<8 hex>` syntax — no injection surface.
             let dst_name = b.alloc.assign(dst, DataType::Float32)?;
             b.emit(&format!("mov.f32 {}, 0f{:08X};", dst_name, v.to_bits()))
         }
         Literal::Float64(v) => {
+            // Already hex-encoded via PTX `0d<16 hex>` syntax — no injection surface.
             let dst_name = b.alloc.assign(dst, DataType::Float64)?;
             b.emit(&format!("mov.f64 {}, 0d{:016X};", dst_name, v.to_bits()))
         }
@@ -776,6 +792,12 @@ fn byte_width(dtype: DataType) -> BoltResult<usize> {
 }
 
 /// Reject empty / whitespace-bearing kernel names that would break the PTX grammar.
+///
+/// SECURITY: also rejects PTX reserved identifiers (instruction mnemonics, type
+/// suffixes, state-space keywords), names starting with `__` (compiler-reserved),
+/// and any name containing `_param_` (would collide with synthesised parameter
+/// names from `PtxBuilder::param_name`). PTX is case-sensitive, so the reject
+/// list is matched case-sensitively.
 fn validate_kernel_name(name: &str) -> BoltResult<()> {
     if name.is_empty() {
         return Err(BoltError::Other(
@@ -797,6 +819,45 @@ fn validate_kernel_name(name: &str) -> BoltResult<()> {
             )));
         }
     }
+
+    // PTX reserved identifiers: instruction mnemonics, type suffixes, state-space
+    // keywords, and control words. Using one of these as an `.entry` name would
+    // either collide with the grammar outright or produce baffling assembler
+    // errors downstream. Case-sensitive — PTX is case-sensitive.
+    const RESERVED: &[&str] = &[
+        "bra", "ret", "mov", "entry", "ld", "st", "add", "sub", "mul", "div",
+        "mad", "cvt", "setp", "selp", "bar", "atom", "membar", "cvta", "shl",
+        "shr", "and", "or", "xor", "not", "sin", "cos", "exp2", "lg2", "sqrt",
+        "rsqrt", "rcp", "abs", "neg", "min", "max", "mma", "tex", "tld4",
+        "wmma", "cp", "callp", "ret", "exit", "trap", "brkpt", "prefetch",
+        "fma", "global", "shared", "local", "param", "const", "tex", "surf",
+        "sm", "sreg", "reg", "b8", "b16", "b32", "b64", "u8", "u16", "u32",
+        "u64", "s8", "s16", "s32", "s64", "f16", "f32", "f64", "pred",
+    ];
+    if RESERVED.iter().any(|r| *r == name) {
+        return Err(BoltError::Other(format!(
+            "ptx_gen: kernel name '{}' is a PTX reserved identifier",
+            name
+        )));
+    }
+
+    // Compiler-reserved: identifiers beginning with `__` are reserved for the
+    // PTX toolchain (libdevice, NVVM intrinsics, etc.).
+    if name.starts_with("__") {
+        return Err(BoltError::Other(format!(
+            "ptx_gen: kernel name '{}' starts with '__' (compiler-reserved)",
+            name
+        )));
+    }
+
+    // Would collide with synthesised parameter names like `_param_0`, `_param_1`.
+    if name.contains("_param_") {
+        return Err(BoltError::Other(format!(
+            "ptx_gen: kernel name '{}' contains reserved substring '_param_'",
+            name
+        )));
+    }
+
     Ok(())
 }
 
