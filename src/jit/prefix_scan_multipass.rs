@@ -164,10 +164,10 @@ pub fn compile_prefix_scan_u32_kernel() -> BoltResult<String> {
 
     // -------- Load this thread's u32 value (0 if past the end). No mask
     // truthiness coercion — every value IS the count we're scanning.
-    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r5, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra AFTER_LOAD;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd3, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd3, %r3, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd4, %rd0, %rd3;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u32 %r5, [%rd4];").map_err(write_err)?;
     writeln!(ptx, "AFTER_LOAD:").map_err(write_err)?;
@@ -189,7 +189,7 @@ pub fn compile_prefix_scan_u32_kernel() -> BoltResult<String> {
         off = shared_bytes_per_buf
     )
     .map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd7, %r2, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd7, %r2, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd8, %rd5, %rd7;").map_err(write_err)?; // ping addr
     writeln!(ptx, "\tadd.s64 %rd9, %rd6, %rd7;").map_err(write_err)?; // pong addr
     writeln!(ptx, "\tst.shared.u32 [%rd8], %r5;").map_err(write_err)?;
@@ -242,9 +242,9 @@ pub fn compile_prefix_scan_u32_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tsub.s32 %r11, %r10, %r5;").map_err(write_err)?;
 
     // -------- Write exclusive scan to local_indices[gid] (only in-range).
-    writeln!(ptx, "\tsetp.ge.s32 %p5, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p5, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra AFTER_LOCAL_STORE;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd12, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd12, %r3, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd13, %rd1, %rd12;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u32 [%rd13], %r11;").map_err(write_err)?;
     writeln!(ptx, "AFTER_LOCAL_STORE:").map_err(write_err)?;

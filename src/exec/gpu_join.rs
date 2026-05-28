@@ -2396,6 +2396,87 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
     out_dev.to_vec()
 }
 
+/// **Stage 6 (GJ)** — LargeUtf8 (i64 offsets) variant of
+/// [`compute_device_string_hashes`]. Routes through the i64-offset
+/// kernel companion emitted by [`compile_string_hash_kernel_with_offsets`].
+///
+/// Outputs byte-identical hashes to the `StringArray` path (same
+/// FNV+splitmix sequence), so the streaming-intern dict can mix
+/// `Utf8` and `LargeUtf8` columns without re-hashing.
+#[allow(dead_code)] // reason: kernel + wrapper land in Stage 6; engine-level
+                    //         dispatch on LargeStringArray columns is the
+                    //         next planner-time decision and isn't wired
+                    //         yet. The unit test in the tests submod
+                    //         exercises this path directly.
+pub fn compute_device_string_hashes_large(
+    arr: &arrow_array::LargeStringArray,
+) -> BoltResult<Vec<u64>> {
+    let n = arr.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_u32 = n_rows_to_u32(n)?;
+
+    // Arrow's LargeStringArray exposes its underlying ScalarBuffer<i64>
+    // offsets and u8 values buffer the same way StringArray does — just
+    // wider offsets.
+    let offsets: &[i64] = arr.value_offsets();
+    let values: &[u8] = arr.value_data();
+
+    let offsets_dev = GpuVec::<i64>::from_slice(offsets)?;
+    let values_dev = if values.is_empty() {
+        GpuVec::<u8>::zeros(1)?
+    } else {
+        GpuVec::<u8>::from_slice(values)?
+    };
+    let out_dev = GpuVec::<u64>::zeros(n)?;
+
+    let ptx = crate::jit::hash_join_kernel::compile_string_hash_kernel_with_offsets(
+        crate::jit::hash_join_kernel::StringOffsetWidth::I64,
+    )?;
+    let module = CudaModule::from_ptx(&ptx)?;
+    let function =
+        module.function(crate::jit::hash_join_kernel::STRING_HASH_KERNEL_ENTRY_I64)?;
+
+    let mut offsets_ptr: CUdeviceptr = offsets_dev.device_ptr();
+    let mut values_ptr: CUdeviceptr = values_dev.device_ptr();
+    let mut out_ptr: CUdeviceptr = out_dev.device_ptr();
+    let mut n_rows_param: u32 = n_u32;
+
+    let mut params: [*mut c_void; 4] = [
+        &mut offsets_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut values_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_param as *mut u32 as *mut c_void,
+    ];
+
+    let block: u32 = STRING_HASH_BLOCK_SIZE;
+    let grid_x: u32 = n_u32.div_ceil(block).max(1);
+    let stream = CudaStream::null();
+
+    // SAFETY: every param slot points at a stack local that outlives the
+    // launch+sync below; device buffers are owned by this function and
+    // outlive the launch.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+
+    out_dev.to_vec()
+}
+
 /// Stage-5: parallel per-chunk dict-building variant of
 /// [`intern_utf8_columns_streaming`].
 ///

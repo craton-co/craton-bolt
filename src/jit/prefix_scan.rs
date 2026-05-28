@@ -367,7 +367,7 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     writeln!(ptx, "\tcvta.to.global.u64 %rd4, %rd4;").map_err(write_err)?;
 
     // Load mask byte; bail if zero.
-    writeln!(ptx, "\tmul.wide.s32 %rd5, %r3, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd5, %r3, 1;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd6, %rd0, %rd5;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u8 %rs0, [%rd6];").map_err(write_err)?;
     writeln!(ptx, "\tcvt.u32.u16 %r5, %rs0;").map_err(write_err)?;
@@ -375,12 +375,12 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     writeln!(ptx, "\t@%p1 bra DONE;").map_err(write_err)?;
 
     // local_idx = local_indices[gid]
-    writeln!(ptx, "\tmul.wide.s32 %rd7, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd7, %r3, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd8, %rd1, %rd7;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u32 %r6, [%rd8];").map_err(write_err)?;
 
     // block_base = block_bases[blockIdx.x]
-    writeln!(ptx, "\tmul.wide.s32 %rd9, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd9, %r0, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd10, %rd2, %rd9;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u32 %r7, [%rd10];").map_err(write_err)?;
 
@@ -390,7 +390,7 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     // input_addr  = input  + gid * elem_bytes
     writeln!(
         ptx,
-        "\tmul.wide.s32 %rd11, %r3, {bytes};",
+        "\tmul.wide.u32 %rd11, %r3, {bytes};",
         bytes = elem_bytes
     )
     .map_err(write_err)?;
@@ -399,7 +399,7 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     // output_addr = output + out_idx * elem_bytes
     writeln!(
         ptx,
-        "\tmul.wide.s32 %rd13, %r8, {bytes};",
+        "\tmul.wide.u32 %rd13, %r8, {bytes};",
         bytes = elem_bytes
     )
     .map_err(write_err)?;
@@ -525,7 +525,7 @@ mod tests {
         );
 
         // Out-of-range guard at the top.
-        assert!(ptx.contains("setp.ge.s32 %p0, %r3, %r4;"));
+        assert!(ptx.contains("setp.ge.u32 %p0, %r3, %r4;"));
     }
 
     #[test]
