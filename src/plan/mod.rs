@@ -7,6 +7,7 @@ pub mod dataframe;
 pub mod sql_frontend;
 pub mod physical_plan;
 pub mod string_literal_rewrite;
+pub mod suggest;
 
 pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,

@@ -87,54 +87,33 @@ impl Schema {
 
     /// Index of `name` in this schema, or a `Plan` error if absent.
     ///
-    /// # SQL-standard case folding (v0.5 / M2)
-    ///
-    /// Lookup is case-sensitive first. If the exact match misses *and*
-    /// the requested `name` is all-ASCII-lowercase, we fall back to an
-    /// ASCII case-insensitive scan; otherwise the miss is final.
-    ///
-    /// This rule lets the SQL frontend's unquoted-identifier fold reach
-    /// a verbatim-cased schema field (the folded form is lowercase, so
-    /// the fallback fires) *and* preserves the SQL-standard verbatim
-    /// behaviour for quoted identifiers (`"MyCol"`): the parser passes
-    /// the quoted form through unchanged, the lookup-key carries a
-    /// mixed-case letter, the fallback is suppressed, and `"name"`
-    /// against a registered `Name` resolves while `"Name"` against a
-    /// registered `name` does NOT — matching what users expect from
-    /// Postgres / the SQL standard.
-    ///
-    /// Programmatic callers that pass a verbatim-cased name (the
-    /// pre-v0.5 behaviour, used throughout the executor) get the exact
-    /// path and are unaffected. The relaxation only kicks in for
-    /// pure-lowercase lookups, which is exactly the path the case-folded
-    /// SQL frontend exercises.
-    ///
-    /// Locale note: we use `to_ascii_lowercase` / `eq_ignore_ascii_case`
-    /// throughout. Locale-aware folding would make lowered plans
-    /// non-portable between machines.
+    /// Lookup is case-sensitive first. If the exact match misses and the
+    /// requested `name` is all-ASCII-lowercase, falls back to an ASCII
+    /// case-insensitive scan; otherwise the miss is final. On final miss
+    /// the error message includes a "did you mean '<X>'?" suggestion when
+    /// any field name is within edit distance 2.
     pub fn index_of(&self, name: &str) -> BoltResult<usize> {
         if let Some(i) = self.fields.iter().position(|f| f.name == name) {
             return Ok(i);
         }
-        // Only fall back to case-insensitive matching when the search key
-        // is ALREADY lowercase. A mixed-case key (e.g. from a quoted SQL
-        // identifier or a verbatim programmatic call) is taken at face
-        // value — that preserves "quoted identifiers are case-sensitive"
-        // semantics without an additional flag on Expr::Column.
-        if name.chars().any(|c| c.is_ascii_uppercase()) {
-            return Err(BoltError::Plan(format!(
-                "column '{name}' not found in schema"
-            )));
+        // Case-insensitive fallback only when key is already lowercase
+        // (case-folded by the SQL frontend) — quoted SQL identifiers
+        // / verbatim programmatic callers take the strict path.
+        if !name.chars().any(|c| c.is_ascii_uppercase()) {
+            if let Some(i) = self
+                .fields
+                .iter()
+                .position(|f| f.name.eq_ignore_ascii_case(name))
+            {
+                return Ok(i);
+            }
         }
-        if let Some(i) = self
-            .fields
-            .iter()
-            .position(|f| f.name.eq_ignore_ascii_case(name))
-        {
-            return Ok(i);
-        }
+        let suffix = crate::plan::suggest::did_you_mean_suffix(
+            name,
+            self.fields.iter().map(|f| f.name.as_str()),
+        );
         Err(BoltError::Plan(format!(
-            "column '{name}' not found in schema"
+            "column '{name}' not found in schema{suffix}"
         )))
     }
 

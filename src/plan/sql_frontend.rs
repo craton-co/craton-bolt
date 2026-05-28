@@ -292,9 +292,14 @@ impl NameResolver {
                     .find(|t| t.name.eq_ignore_ascii_case(qualifier))
             })
             .ok_or_else(|| {
+                // Suggest a close in-scope table qualifier if any.
+                let suffix = crate::plan::suggest::did_you_mean_suffix(
+                    qualifier,
+                    self.tables.iter().map(|t| t.name.as_str()),
+                );
                 BoltError::Sql(format!(
                     "unknown table qualifier '{qualifier}' in column reference \
-                     '{qualifier}.{col}' ({candidate_msg})"
+                     '{qualifier}.{col}' ({candidate_msg}){suffix}"
                 ))
             })?;
         let resolved = scope
@@ -311,8 +316,12 @@ impl NameResolver {
                     .find(|c| c.original.eq_ignore_ascii_case(col))
             })
             .ok_or_else(|| {
+                let suffix = crate::plan::suggest::did_you_mean_suffix(
+                    col,
+                    scope.cols.iter().map(|c| c.original.as_str()),
+                );
                 BoltError::Sql(format!(
-                    "unknown column '{col}' in table '{qualifier}'"
+                    "unknown column '{col}' in table '{qualifier}'{suffix}"
                 ))
             })?;
         Ok(resolved.output.clone())
@@ -1792,14 +1801,29 @@ fn try_aggregate(
     // to the canonical `STDDEV_SAMP` spelling before the variant match below
     // so there is exactly one downstream representation per aggregate.
     let kind = match fname.as_str() {
-        // `VARIANCE` is the SQL-standard synonym for `VAR_SAMP`; normalise
-        // it here so the lowering match below only has to know about the
-        // two canonical forms.
-        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "VAR_POP" | "VAR_SAMP" => fname,
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
+        | "VAR_POP" | "VAR_SAMP" | "STDDEV_POP" | "STDDEV_SAMP" => fname,
         "VARIANCE" => "VAR_SAMP".to_string(),
-        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "STDDEV_POP" | "STDDEV_SAMP" => fname,
         "STDDEV" => "STDDEV_SAMP".to_string(),
-        _ => return Ok(None),
+        _ => {
+            // Surface "did you mean...?" hint for near-miss aggregate names
+            // before falling through to scalar-function rejection downstream.
+            const KNOWN_AGGREGATES: &[&str] = &[
+                "COUNT", "SUM", "MIN", "MAX", "AVG",
+                "VAR_POP", "VAR_SAMP", "VARIANCE",
+                "STDDEV_POP", "STDDEV_SAMP", "STDDEV",
+            ];
+            if let Some(hint) = crate::plan::suggest::closest_match(
+                &fname,
+                KNOWN_AGGREGATES.iter().copied(),
+            ) {
+                let original = &func.name.0[0].value;
+                return Err(BoltError::Sql(format!(
+                    "unknown function '{original}' (did you mean '{hint}'?)"
+                )));
+            }
+            return Ok(None);
+        }
     };
 
     // Disallow OVER (window), FILTER, ORDER BY, WITHIN GROUP, parameters.
