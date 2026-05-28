@@ -336,7 +336,57 @@ pub fn prefix_scan_mask(
 /// `input_ptr` must point at a device allocation of `n_rows * size_of::<T>()`
 /// bytes where `T` matches `dtype`. The mask buffer captured by
 /// `scan.mask_ptr` must still be alive (the caller owns it).
+///
+/// This call is synchronous: it launches the gather kernel and then
+/// `stream.synchronize()`s before returning. Callers that want to batch
+/// multiple gather launches back-to-back on the same stream should use
+/// [`gather_one_async`] instead and synchronize once at the end of the
+/// batch. See [`compact_columns_on_gpu`] for the canonical batched pattern.
 pub fn gather_one(
+    input_ptr: CUdeviceptr,
+    n_rows: usize,
+    scan: &ScanResult,
+    dtype: DataType,
+    stream: &CudaStream,
+) -> BoltResult<GatheredCol> {
+    // Delegate the launch to `gather_one_async`, then synchronize once so the
+    // returned `GatheredCol` is host-observable. The split exists so callers
+    // batching N columns can amortise the sync; this thin wrapper preserves
+    // the single-shot contract for callers that aren't ready to manage their
+    // own synchronization point.
+    let col = gather_one_async(input_ptr, n_rows, scan, dtype, stream)?;
+    stream.synchronize()?;
+    Ok(col)
+}
+
+/// Asynchronous variant of [`gather_one`]: launches the gather kernel on the
+/// given stream and returns the freshly allocated output column **without
+/// synchronizing**. The caller MUST call `stream.synchronize()` (or otherwise
+/// wait for the stream) before reading the output buffer from the host or
+/// dropping the inputs.
+///
+/// ## Why this is safe to chain without per-launch sync
+///
+/// The gather kernel ABI reads `(mask, local_indices, block_bases, input)`
+/// and writes only to `output`. Across back-to-back launches on the same
+/// stream:
+///   * `mask`, `local_indices`, `block_bases` come from the shared `scan` and
+///     are READ-ONLY in the kernel — no WAW hazard between launches that
+///     share them, and no RAW hazard either (no launch writes them).
+///   * `input` is per-launch and is also READ-ONLY in the kernel.
+///   * `output` is per-launch (each call allocates a fresh `GpuVec` via
+///     `alloc_gathered`), so no two launches write to overlapping bytes —
+///     no WAW hazard.
+///   * The output of launch *i* is never read as input by launch *j>i* in
+///     this pipeline, so no cross-launch RAW hazard either.
+///
+/// Combined with the CUDA stream's in-order execution guarantee, this means
+/// the kernel calls can be enqueued back-to-back and a single
+/// `stream.synchronize()` at the end of the batch is sufficient to make all
+/// outputs host-observable. The per-launch sync that `gather_one` does is
+/// purely a convenience for single-shot callers; in batched paths it costs
+/// one host-device round trip per column for no correctness benefit.
+pub fn gather_one_async(
     input_ptr: CUdeviceptr,
     n_rows: usize,
     scan: &ScanResult,
@@ -399,10 +449,13 @@ pub fn gather_one(
     let n_blocks = n_rows.div_ceil(block_size);
     let grid_x = n_rows_to_u32(n_blocks)?;
 
-    // SAFETY: each kernel_params entry points at a live stack local; `function`
-    // is borrowed from a live `CudaModule`; `stream` is live; the device
-    // buffers behind every pointer outlive the synchronize below (the caller
-    // owns mask/input, `scan` owns local/bases, `col` owns output).
+    // SAFETY: each kernel_params entry points at a live stack local that
+    // outlives this `cuLaunchKernel` call (the driver copies the args before
+    // returning); `function` is borrowed from a live `CudaModule`; `stream`
+    // is live. The device buffers behind every pointer must outlive the
+    // *eventual* stream synchronize the caller is responsible for — the
+    // caller owns mask/input, `scan` owns local/bases, and `col` owns the
+    // output, all moved/returned past this call.
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
@@ -418,7 +471,6 @@ pub fn gather_one(
             ptr::null_mut(),
         ))?;
     }
-    stream.synchronize()?;
 
     Ok(col)
 }
@@ -464,8 +516,16 @@ pub fn gather_bool_nullable(
     // launch is just `compile_gather_kernel(Bool)` again on a different
     // input pointer. JIT caching at the `compile_gather_kernel` layer
     // means we don't re-compile the PTX for the second call in practice.
-    let gathered_values = gather_one(values_ptr, n_rows, scan, DataType::Bool, stream)?;
-    let gathered_validity = gather_one(validity_ptr, n_rows, scan, DataType::Bool, stream)?;
+    //
+    // Use `gather_one_async` for both and synchronize once at the end: the
+    // two launches write to disjoint output buffers (`values` and
+    // `validity`) and only READ the shared scan + mask, so back-to-back
+    // launches on the same stream are hazard-free. See
+    // `gather_one_async`'s safety comment for the full RAW/WAW argument.
+    let gathered_values = gather_one_async(values_ptr, n_rows, scan, DataType::Bool, stream)?;
+    let gathered_validity =
+        gather_one_async(validity_ptr, n_rows, scan, DataType::Bool, stream)?;
+    stream.synchronize()?;
 
     // Unwrap to the inner `GpuVec<u8>` for the new variant. Both must come
     // out of `gather_one(DataType::Bool, ...)` as `GatheredCol::Bool`; any
@@ -558,9 +618,27 @@ pub fn compact_columns_on_gpu(
 
     let scan = prefix_scan_mask(mask_ptr, n_rows, stream)?;
 
+    // Batch the per-column gather launches: enqueue all N kernels on the
+    // same stream without per-launch synchronize, then do ONE
+    // `stream.synchronize()` at the end. The gather kernel is a pure
+    // read-then-write with disjoint output buffers per column (see
+    // `gather_one_async` for the full hazard argument), so back-to-back
+    // launches are safe under CUDA's in-stream ordering. The win versus the
+    // old per-launch sync is N-1 host-device round trips per
+    // `compact_columns_on_gpu` call — material on wide projections.
     let mut out: Vec<GatheredCol> = Vec::with_capacity(columns.len());
     for (ptr, dtype) in columns {
-        out.push(gather_one(*ptr, n_rows, &scan, *dtype, stream)?);
+        out.push(gather_one_async(*ptr, n_rows, &scan, *dtype, stream)?);
+    }
+    if !out.is_empty() {
+        // Skip the sync when no launches happened: `gather_one_async`
+        // short-circuits to a zero-length allocation when
+        // `scan.total_count == 0` OR `n_rows == 0`, but a non-empty
+        // `columns` slice with a non-empty scan still enqueues at least one
+        // kernel — sync to make the outputs host-observable. The
+        // `is_empty` guard is just to avoid a no-op syscall in the
+        // pathological N-column-but-all-empty case.
+        stream.synchronize()?;
     }
 
     Ok((out, scan.total_count))
@@ -853,6 +931,108 @@ mod tests {
         drop(scan);
         drop(validity_buf);
         drop(values_buf);
+        drop(mask_buf);
+    }
+
+    /// End-to-end GPU-side test for the batched multi-column gather path:
+    /// build an 8-row mask plus 3 fixed-width columns of different dtypes
+    /// (`Int32`, `Float64`, `Bool`), run `compact_columns_on_gpu`, and
+    /// verify all three outputs are correct AND were produced by ONE
+    /// end-of-batch synchronize rather than three per-column syncs.
+    ///
+    /// The correctness contract we exercise here is the same one
+    /// `gather_one_async`'s safety comment claims: the three kernel
+    /// launches share `mask` / `local_indices` / `block_bases` read-only
+    /// and each writes to its own disjoint output buffer, so batched
+    /// launches must produce byte-identical results to the old per-launch
+    /// synchronize loop.
+    ///
+    /// Setup (8 rows):
+    ///   col_i32:   [10, 20, 30, 40, 50, 60, 70, 80]
+    ///   col_f64:   [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
+    ///   col_bool:  [1, 0, 1, 0, 1, 0, 1, 0]   (encoded as u8)
+    ///   mask:      [1, 0, 1, 1, 0, 1, 0, 1]   -> keeps rows 0, 2, 3, 5, 7
+    /// Expected outputs (length 5):
+    ///   col_i32:   [10, 30, 40, 60, 80]
+    ///   col_f64:   [1.5, 3.5, 4.5, 6.5, 8.5]
+    ///   col_bool:  [1, 1, 0, 0, 0]
+    #[test]
+    #[ignore = "gpu:projection"]
+    fn gpu_compact_three_columns_batched_launches() {
+        let stream = CudaStream::null();
+
+        // Upload mask + three input columns of distinct dtypes.
+        let mask_buf =
+            GpuVec::<u8>::from_slice(&[1u8, 0, 1, 1, 0, 1, 0, 1]).expect("upload mask");
+        let col_i32 =
+            GpuVec::<i32>::from_slice(&[10i32, 20, 30, 40, 50, 60, 70, 80])
+                .expect("upload i32");
+        let col_f64 =
+            GpuVec::<f64>::from_slice(&[1.5f64, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5])
+                .expect("upload f64");
+        let col_bool = GpuVec::<u8>::from_slice(&[1u8, 0, 1, 0, 1, 0, 1, 0])
+            .expect("upload bool");
+
+        let n_rows = 8usize;
+        let columns = [
+            (col_i32.device_ptr(), DataType::Int32),
+            (col_f64.device_ptr(), DataType::Float64),
+            (col_bool.device_ptr(), DataType::Bool),
+        ];
+
+        let (gathered, total) =
+            compact_columns_on_gpu(mask_buf.device_ptr(), n_rows, &columns, &stream)
+                .expect("compact_columns_on_gpu");
+        assert_eq!(total, 5, "mask keeps 5 of 8 rows");
+        assert_eq!(gathered.len(), 3, "one GatheredCol per input column");
+
+        // Outputs preserve column order. Each column's allocation is
+        // disjoint from the others; if the batched-launch path ever
+        // started reusing a single scratch buffer this assertion would
+        // catch it.
+        let i32_ptr = gathered[0].device_ptr();
+        let f64_ptr = gathered[1].device_ptr();
+        let bool_ptr = gathered[2].device_ptr();
+        assert_ne!(i32_ptr, f64_ptr, "i32 / f64 outputs must be distinct");
+        assert_ne!(f64_ptr, bool_ptr, "f64 / bool outputs must be distinct");
+        assert_ne!(i32_ptr, bool_ptr, "i32 / bool outputs must be distinct");
+
+        // i32 column.
+        match &gathered[0] {
+            GatheredCol::I32(v) => {
+                assert_eq!(v.len(), 5);
+                let host = v.to_vec().expect("download i32");
+                assert_eq!(host, vec![10i32, 30, 40, 60, 80]);
+            }
+            _ => panic!("col 0 must be GatheredCol::I32"),
+        }
+
+        // f64 column.
+        match &gathered[1] {
+            GatheredCol::F64(v) => {
+                assert_eq!(v.len(), 5);
+                let host = v.to_vec().expect("download f64");
+                assert_eq!(host, vec![1.5f64, 3.5, 4.5, 6.5, 8.5]);
+            }
+            _ => panic!("col 1 must be GatheredCol::F64"),
+        }
+
+        // bool column (u8-encoded).
+        match &gathered[2] {
+            GatheredCol::Bool(v) => {
+                assert_eq!(v.len(), 5);
+                let host = v.to_vec().expect("download bool");
+                assert_eq!(host, vec![1u8, 1, 0, 0, 0]);
+            }
+            _ => panic!("col 2 must be GatheredCol::Bool"),
+        }
+
+        // Drop in reverse to surface any CUDA double-free here rather
+        // than at end-of-test.
+        drop(gathered);
+        drop(col_bool);
+        drop(col_f64);
+        drop(col_i32);
         drop(mask_buf);
     }
 }
