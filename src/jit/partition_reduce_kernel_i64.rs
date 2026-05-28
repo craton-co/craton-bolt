@@ -423,10 +423,7 @@ pub fn compile_partition_reduce_kernel_i64_with_spill() -> BoltResult<String> {
     let set_bytes = BLOCK_GROUPS * 4;
     let max_probes = MAX_PROBES;
 
-    writeln!(ptx, ".version 7.5").map_err(write_err)?;
-    writeln!(ptx, ".target sm_70").map_err(write_err)?;
-    writeln!(ptx, ".address_size 64").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     // Distinct shmem symbol names so this PTX module can coexist with
     // the non-spill variant if both are loaded into the same context.
@@ -467,9 +464,7 @@ pub fn compile_partition_reduce_kernel_i64_with_spill() -> BoltResult<String> {
     writeln!(ptx, "\t.reg .f64   %fd<8>;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_thread_block_ids(&mut ptx)?;
 
     writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf_sp;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u64 %rd1, block_vals_buf_sp;").map_err(write_err)?;
@@ -596,17 +591,9 @@ pub fn compile_partition_reduce_kernel_i64_with_spill() -> BoltResult<String> {
 
     // SPILL_BUMP: probe-overflow path. Null-check the spill counter so
     // callers can opt out by passing 0. atom.global.add.u32 is sm_60+.
-    writeln!(ptx, "SPILL_BUMP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.u64 %p5, %rd9, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p5 bra LOOP_NEXT;").map_err(write_err)?;
-    writeln!(ptx, "\tatom.global.add.u32 %r36, [%rd9], 1;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_spill_bump_with_null_check(&mut ptx, 9)?;
 
-    writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r30, %r30, %r1;").map_err(write_err)?;
-    writeln!(ptx, "\tbra LOOP_TOP;").map_err(write_err)?;
-    writeln!(ptx, "LOOP_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_loop_next_done(&mut ptx)?;
 
     // Phase 3: export (identical to non-spill).
     writeln!(
