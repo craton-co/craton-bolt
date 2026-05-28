@@ -73,6 +73,15 @@ impl RegAlloc {
                     "Utf8 not supported in PTX codegen yet".into(),
                 ))
             }
+            // v0.6 / M4: Date32 / Timestamp are not yet lowered to GPU
+            // kernels; the physical-plan codegen layer rejects them
+            // upstream, but this branch makes the match exhaustive
+            // and surfaces a clean error if a regression slips by.
+            DataType::Date32 | DataType::Timestamp(_, _) => {
+                return Err(BoltError::Other(
+                    "Date/Timestamp not yet lowered to GPU".into(),
+                ))
+            }
         })
     }
 
@@ -596,6 +605,10 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
         Literal::Utf8(_) => Err(BoltError::Other(
             "ptx_gen: Utf8 literal not supported".into(),
         )),
+        // v0.6 / M4: Date32 / Timestamp literals not yet lowered to GPU.
+        Literal::Date32(_) | Literal::Timestamp(_, _, _) => Err(BoltError::Other(
+            "Date/Timestamp not yet lowered to GPU".into(),
+        )),
         Literal::Bool(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Bool)?;
             // Value space is {0, 1}; not an injection surface, but keep the
@@ -862,6 +875,12 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
                 "ptx_gen: cannot compare Utf8".into(),
             ))
         }
+        // v0.6 / M4: Date32 / Timestamp comparisons not yet lowered to GPU.
+        Date32 | Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
+            ))
+        }
     };
     Ok(format!("setp.{}.{}", cond, ty))
 }
@@ -885,6 +904,15 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
         DataType::Utf8 => {
             return Err(BoltError::Other(
                 "Utf8 not supported in PTX codegen yet".into(),
+            ))
+        }
+        // v0.6 / M4: GPU lowering for Date32 / Timestamp is not implemented.
+        // The physical-plan codegen rejects these types upstream; this arm
+        // keeps the match exhaustive and surfaces a clean error if a
+        // regression slips through.
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
             ))
         }
     })

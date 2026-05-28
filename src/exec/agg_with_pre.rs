@@ -952,7 +952,7 @@ impl PreCol {
                     .ok_or_else(|| downcast_err("input", "Float64"))?;
                 PreColValues::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
-            DataType::Bool | DataType::Utf8 => {
+            DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel column dtype {:?} not supported",
                     dtype
@@ -979,7 +979,7 @@ impl PreCol {
             DataType::Int64 => PreColValues::I64(GpuVec::<i64>::zeros(n)?),
             DataType::Float32 => PreColValues::F32(GpuVec::<f32>::zeros(n)?),
             DataType::Float64 => PreColValues::F64(GpuVec::<f64>::zeros(n)?),
-            DataType::Bool | DataType::Utf8 => {
+            DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel output dtype {:?} not supported",
                     dtype
@@ -1298,6 +1298,11 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        // v0.6 / M4: Date/Timestamp not yet wired through this aggregate
+        // output helper. Reject so a regression is loud.
+        DataType::Date32 | DataType::Timestamp(_, _) => Err(crate::error::BoltError::Type(
+            format!("Date/Timestamp not yet supported in this aggregate output path: {:?}", d),
+        )),
     }
 }
 

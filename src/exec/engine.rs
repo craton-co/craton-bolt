@@ -1857,6 +1857,13 @@ impl DeviceCol {
                 indices: GpuVec::<i32>::zeros(n)?,
                 n_rows: n,
             })),
+            // v0.6 / M4: Date32 / Timestamp don't have a device column
+            // backing yet — physical-plan codegen rejects them before
+            // reaching this allocation.
+            DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+                "Date/Timestamp not yet lowered to GPU: {:?}",
+                dtype
+            ))),
         }
     }
 
@@ -2060,6 +2067,36 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        // v0.6 / M4: Date32 maps to Arrow `Date32`; Timestamp carries unit + tz.
+        DataType::Date32 => Ok(ArrowDataType::Date32),
+        DataType::Timestamp(unit, tz) => Ok(ArrowDataType::Timestamp(
+            plan_time_unit_to_arrow(unit),
+            tz.map(|s| Arc::from(s)),
+        )),
+    }
+}
+
+/// Map our plan `TimeUnit` to Arrow's `TimeUnit`.
+fn plan_time_unit_to_arrow(u: crate::plan::logical_plan::TimeUnit) -> arrow_schema::TimeUnit {
+    use crate::plan::logical_plan::TimeUnit as PlanU;
+    use arrow_schema::TimeUnit as ArrowU;
+    match u {
+        PlanU::Second => ArrowU::Second,
+        PlanU::Millisecond => ArrowU::Millisecond,
+        PlanU::Microsecond => ArrowU::Microsecond,
+        PlanU::Nanosecond => ArrowU::Nanosecond,
+    }
+}
+
+/// Map Arrow's `TimeUnit` to our plan `TimeUnit`.
+fn arrow_time_unit_to_plan(u: &arrow_schema::TimeUnit) -> crate::plan::logical_plan::TimeUnit {
+    use crate::plan::logical_plan::TimeUnit as PlanU;
+    use arrow_schema::TimeUnit as ArrowU;
+    match u {
+        ArrowU::Second => PlanU::Second,
+        ArrowU::Millisecond => PlanU::Millisecond,
+        ArrowU::Microsecond => PlanU::Microsecond,
+        ArrowU::Nanosecond => PlanU::Nanosecond,
     }
 }
 
@@ -2085,6 +2122,17 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
+        // v0.6 / M4: Date32 round-trips as `DataType::Date32`. Arrow's
+        // `Timestamp` carries a `Option<Arc<str>>` timezone; we route any
+        // owned string through the process-static interner so the plan side
+        // keeps `Copy`.
+        ArrowDataType::Date32 => Ok(DataType::Date32),
+        ArrowDataType::Timestamp(unit, tz) => {
+            let interned: Option<&'static str> = tz
+                .as_deref()
+                .map(crate::plan::logical_plan::intern_timezone);
+            Ok(DataType::Timestamp(arrow_time_unit_to_plan(unit), interned))
+        }
         // Stage 4 / Stage 6: dictionary-encoded Utf8. Only string-valued
         // dicts map to `Utf8`; numeric-valued dicts are intentionally
         // rejected because the caller should hand the inner numeric column

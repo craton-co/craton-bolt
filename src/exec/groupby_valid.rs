@@ -546,7 +546,7 @@ fn key_bit_width(dtype: DataType) -> BoltResult<u32> {
     match dtype {
         DataType::Int32 | DataType::Float32 => Ok(32),
         DataType::Int64 | DataType::Float64 => Ok(64),
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "GROUP BY key dtype {:?} not supported in v1",
             dtype
         ))),
@@ -658,7 +658,7 @@ fn load_key_column_bits(
                 .map(|&v| canonicalise_f64(v).to_bits())
                 .collect()
         }
-        DataType::Bool | DataType::Utf8 => {
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => {
             return Err(BoltError::Type(format!(
                 "GROUP BY key dtype {:?} not supported in v1",
                 key_io.dtype
@@ -816,14 +816,14 @@ fn decode_key(packed: i64, components: &[KeyComponent]) -> Vec<KeyValue> {
                 ((u >> comp.bit_offset) & 0xFFFF_FFFFu64) as u64
             }
             DataType::Int64 | DataType::Float64 => u,
-            DataType::Bool | DataType::Utf8 => 0,
+            DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => 0,
         };
         let val = match comp.original_dtype {
             DataType::Int32 => KeyValue::I32(raw as u32 as i32),
             DataType::Int64 => KeyValue::I64(raw as i64),
             DataType::Float32 => KeyValue::F32(f32::from_bits(raw as u32)),
             DataType::Float64 => KeyValue::F64(f64::from_bits(raw)),
-            DataType::Bool | DataType::Utf8 => KeyValue::I64(0),
+            DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => KeyValue::I64(0),
         };
         out.push(val);
     }
@@ -1837,7 +1837,7 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::F64 { gpu_acc, spill })
         }
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -2041,7 +2041,7 @@ fn run_typed_agg_native_validity(
             let spill = download_agg_spill(sk, sv, sc, "f64 agg kernel (validity)")?;
             Ok(AccDownload::F64 { gpu_acc, spill })
         }
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "native-validity dispatch reached unsupported dtype {:?} (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -2121,7 +2121,7 @@ fn load_input_column_as_f64_filtered(
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
             Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v))
         }
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "AVG input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -2183,7 +2183,7 @@ fn build_key_arrays_from_entries(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool | DataType::Utf8 => {
+            DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "GROUP BY key dtype {:?} not supported on output",
                     comp.original_dtype
@@ -2719,6 +2719,11 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        // v0.6 / M4: Date/Timestamp not yet wired through this aggregate
+        // output helper. Reject so a regression is loud.
+        DataType::Date32 | DataType::Timestamp(_, _) => Err(crate::error::BoltError::Type(
+            format!("Date/Timestamp not yet supported in this aggregate output path: {:?}", d),
+        )),
     }
 }
 

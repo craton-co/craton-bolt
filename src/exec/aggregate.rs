@@ -367,7 +367,7 @@ fn reduce_column_from_batch(
                 reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows, &stream)
             }
         }
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -477,7 +477,7 @@ fn fused_avg_from_batch(
                 fused_avg_gpu_vec::<f64>(col_io.dtype, &dev, n_rows, &stream)
             }
         }
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "AVG over dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -943,6 +943,11 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        // v0.6 / M4: Date/Timestamp not yet wired through this aggregate
+        // output helper. Reject so a regression is loud.
+        DataType::Date32 | DataType::Timestamp(_, _) => Err(crate::error::BoltError::Type(
+            format!("Date/Timestamp not yet supported in this aggregate output path: {:?}", d),
+        )),
     }
 }
 

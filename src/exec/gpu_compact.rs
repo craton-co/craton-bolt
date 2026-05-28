@@ -930,6 +930,13 @@ fn alloc_gathered(dtype: DataType, len: usize) -> BoltResult<GatheredCol> {
                 "gpu_compact: gather Utf8 not supported (variable-width)".into(),
             ))
         }
+        // v0.6 / M4: Date32 / Timestamp not yet wired through the GPU
+        // compaction path; reject upstream rather than overflow silently.
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
+            ))
+        }
     })
 }
 

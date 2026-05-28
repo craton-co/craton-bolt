@@ -920,6 +920,14 @@ fn plan_dtype_to_arrow(d: crate::plan::logical_plan::DataType) -> BoltResult<Arr
         D::Float64 => ArrowDataType::Float64,
         D::Bool => ArrowDataType::Boolean,
         D::Utf8 => ArrowDataType::Utf8,
+        // v0.6 / M4: Date/Timestamp are not yet wired through the join
+        // output path; reject so a regression is loud.
+        D::Date32 | D::Timestamp(_, _) => {
+            return Err(crate::error::BoltError::Type(format!(
+                "Date/Timestamp not yet supported in join output path: {:?}",
+                d
+            )));
+        }
     })
 }
 

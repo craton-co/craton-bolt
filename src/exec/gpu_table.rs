@@ -368,6 +368,13 @@ impl GpuColumn {
                     }
                 }
             }
+            // v0.6 / M4: Date32 / Timestamp are not yet uploaded to the GPU.
+            DataType::Date32 | DataType::Timestamp(_, _) => {
+                return Err(BoltError::Type(format!(
+                    "GpuColumn: Date/Timestamp upload not yet supported (column '{}', dtype {:?})",
+                    name, dtype
+                )));
+            }
         };
         Ok(Self {
             name,

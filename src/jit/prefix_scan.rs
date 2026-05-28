@@ -142,6 +142,12 @@ pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
         DataType::Float32 => "bolt_gather_f32",
         DataType::Float64 => "bolt_gather_f64",
         DataType::Utf8 => "bolt_gather_utf8_unsupported",
+        // v0.6 / M4: Date/Timestamp not yet lowered to GPU. The string
+        // returned here intentionally matches a non-existent kernel so a
+        // module lookup fails noisily if these dtypes do reach the gather.
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            "bolt_gather_date_timestamp_unsupported"
+        }
     }
 }
 
@@ -1356,6 +1362,12 @@ fn gather_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str, 
         DataType::Utf8 => {
             return Err(BoltError::Other(
                 "prefix_scan: gather Utf8 not supported (variable-width)".into(),
+            ))
+        }
+        // v0.6 / M4: Date32 / Timestamp not yet lowered to GPU gather.
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
             ))
         }
     })

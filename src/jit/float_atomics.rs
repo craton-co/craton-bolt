@@ -125,7 +125,9 @@ pub fn compile_groupby_float_atomic_kernel(
         (_, DataType::Bool)
         | (_, DataType::Int32)
         | (_, DataType::Int64)
-        | (_, DataType::Utf8) => {
+        | (_, DataType::Utf8)
+        | (_, DataType::Date32)
+        | (_, DataType::Timestamp(_, _)) => {
             return Err(BoltError::Other(format!(
                 "float_atomics: dtype {:?} is not a floating-point type; \
                  use hash_kernels::compile_groupby_agg_kernel for integer MIN/MAX",

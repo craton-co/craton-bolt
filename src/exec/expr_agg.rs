@@ -350,6 +350,11 @@ fn eval_literal(lit: &Literal, n_rows: usize) -> BoltResult<HostColumn> {
         Literal::Float32(v) => HostColumn::F32(vec![Some(*v); n_rows]),
         Literal::Float64(v) => HostColumn::F64(vec![Some(*v); n_rows]),
         Literal::Utf8(s) => HostColumn::Utf8(vec![Some(s.clone()); n_rows]),
+        // v0.6 / M4: Date32 stores as i32 days; Timestamp stores as i64
+        // ticks. Broadcast as the underlying integer; the expression
+        // evaluator does not yet apply temporal semantics.
+        Literal::Date32(v) => HostColumn::I32(vec![Some(*v); n_rows]),
+        Literal::Timestamp(v, _unit, _tz) => HostColumn::I64(vec![Some(*v); n_rows]),
     })
 }
 
@@ -775,6 +780,13 @@ fn cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
         DataType::Float32 => HostColumn::F32(cast_to_f32(col)?),
         DataType::Float64 => HostColumn::F64(cast_to_f64(col)?),
         DataType::Utf8 => HostColumn::Utf8(cast_to_utf8(col)?),
+        // v0.6 / M4: Date/Timestamp aren't cast targets in the expression
+        // evaluator yet. Surface a clean planner-side error.
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Type(format!(
+                "cast to {to:?} is not supported in the expression evaluator"
+            )));
+        }
     })
 }
 

@@ -570,6 +570,17 @@ impl<'a> Codegen<'a> {
         }
         let field = self.scan_schema.field(name)?;
         let dtype = field.dtype;
+        // v0.6 / M4: Date32 and Timestamp lower to GPU is not yet wired —
+        // reject at the codegen boundary so callers get a clear message
+        // before any kernel emission. The aggregate / executor paths
+        // already reject these dtypes in their own arms, but this is the
+        // single point that ALL GPU-bound expressions flow through.
+        if matches!(dtype, DataType::Date32 | DataType::Timestamp(_, _)) {
+            return Err(BoltError::Plan(format!(
+                "Date/Timestamp not yet lowered to GPU (column '{}', dtype {:?})",
+                name, dtype
+            )));
+        }
         let col_idx = self.inputs.len();
         self.inputs.push(ColumnIO {
             name: name.to_string(),
@@ -592,6 +603,12 @@ impl<'a> Codegen<'a> {
         let dtype = lit
             .dtype()
             .ok_or_else(|| BoltError::Type("untyped NULL literal".into()))?;
+        // v0.6 / M4: Date32 / Timestamp literals are not yet lowered to GPU.
+        if matches!(dtype, DataType::Date32 | DataType::Timestamp(_, _)) {
+            return Err(BoltError::Plan(
+                "Date/Timestamp not yet lowered to GPU".into(),
+            ));
+        }
         let dst = self.fresh();
         self.ops.push(Op::Const {
             dst,

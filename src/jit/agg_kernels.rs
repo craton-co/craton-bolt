@@ -500,7 +500,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
                 writeln!(ptx, "\t{combine} %fd5, %fd5, %fd6;", combine = combine)
                     .map_err(write_err)?;
             }
-            DataType::Bool | DataType::Utf8 => {
+            DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => {
                 // ptx_type_info already rejects these dtypes above, so this
                 // arm is unreachable in practice. Keep the match exhaustive.
                 return Err(BoltError::Type(format!(
@@ -561,7 +561,7 @@ fn ptx_type_info(
         DataType::Int64 => ("s64", "s64", "rl", "b64", "s64"),
         DataType::Float32 => ("f32", "f32", "f", "f32", "f32"),
         DataType::Float64 => ("f64", "f64", "fd", "f64", "f64"),
-        DataType::Bool | DataType::Utf8 => {
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => {
             return Err(BoltError::Type(format!(
                 "agg_kernels: dtype {:?} not supported in reduction kernels",
                 dtype

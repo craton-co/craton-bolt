@@ -241,6 +241,12 @@ pub fn key_reg_cost(dtype: DataType) -> u32 {
         // Utf8 is dictionary-decoded into i32/i64 indices in gpu_sort; the
         // dtype that reaches the kernel is always one of the numeric ones.
         DataType::Utf8 => 4,
+        // v0.6 / M4: Date32 (i32) and Timestamp (i64) sort like their
+        // underlying integer width. They will only reach the sort kernel
+        // once the rest of the GPU pipeline lowers them, but the cost
+        // accounting is well-defined either way.
+        DataType::Date32 => 2,
+        DataType::Timestamp(_, _) => 4,
     }
 }
 
