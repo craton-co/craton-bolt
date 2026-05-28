@@ -824,6 +824,84 @@ fn golden_hash_join_unmatched_build_kernel_smoke() {
     assert!(ptx.contains("atom.global.add.u32"), "{ptx}");
 }
 
+// ---- Tests: speculative ld.acquire pre-check before output-counter atom.add
+//
+// All probe (and unmatched-build) kernels that claim output slots via
+// `atom.global.add.u32` on a shared counter must first emit a speculative
+// `ld.acquire.gpu.u32` of the counter and a `setp.ge.u32` against the
+// out_capacity register, branching to the bail label. Without this, under
+// capacity overflow EVERY matching thread issues an atomic increment on the
+// hot counter cacheline, serializing all warps even when no writes will
+// happen. The pre-check is purely additive — the atom.add's post-increment
+// bounds check still guards correctness, so a thread that races past the
+// pre-check is still safe.
+//
+// Each test asserts the literal speculative-load shape and verifies it
+// appears textually BEFORE the atom.global.add.u32 site in the emitted PTX.
+
+/// Helper: assert that `needle_pre` appears at a lower byte offset than
+/// `needle_post` in `ptx`. Reports both offsets on failure.
+fn assert_appears_before(ptx: &str, needle_pre: &str, needle_post: &str) {
+    let pre = ptx
+        .find(needle_pre)
+        .unwrap_or_else(|| panic!("missing pre-check `{needle_pre}`\n{ptx}"));
+    let post = ptx
+        .find(needle_post)
+        .unwrap_or_else(|| panic!("missing post site `{needle_post}`\n{ptx}"));
+    assert!(
+        pre < post,
+        "pre-check `{needle_pre}` must appear before `{needle_post}`; \
+         pre@{pre} >= post@{post}\n{ptx}"
+    );
+}
+
+#[test]
+fn probe_soa_ptx_speculative_load_before_atom_add() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_kernel;
+    let ptx = compile_probe_kernel().expect("compile");
+    // The speculative load shape: ld.acquire.gpu.u32 + setp.ge.u32.
+    assert!(
+        ptx.contains("ld.acquire.gpu.u32"),
+        "SoA probe must emit speculative ld.acquire.gpu.u32 before atom.add\n{ptx}"
+    );
+    assert_appears_before(&ptx, "ld.acquire.gpu.u32", "atom.global.add.u32");
+    // The pre-check's branch must hit a bail label (DONE).
+    assert_appears_before(&ptx, "ld.acquire.gpu.u32", "bra DONE");
+}
+
+#[test]
+fn probe_collision_ptx_speculative_load_before_atom_add() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_collision_kernel;
+    let ptx = compile_probe_collision_kernel().expect("compile");
+    assert!(
+        ptx.contains("ld.acquire.gpu.u32"),
+        "collision probe must emit speculative ld.acquire.gpu.u32 before atom.add\n{ptx}"
+    );
+    assert_appears_before(&ptx, "ld.acquire.gpu.u32", "atom.global.add.u32");
+}
+
+#[test]
+fn probe_aos_ptx_speculative_load_before_atom_add() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_aos_kernel;
+    let ptx = compile_probe_aos_kernel().expect("compile");
+    assert!(
+        ptx.contains("ld.acquire.gpu.u32"),
+        "AoS probe must emit speculative ld.acquire.gpu.u32 before atom.add\n{ptx}"
+    );
+    assert_appears_before(&ptx, "ld.acquire.gpu.u32", "atom.global.add.u32");
+}
+
+#[test]
+fn unmatched_build_ptx_speculative_load_before_atom_add() {
+    use craton_bolt::jit::hash_join_kernel::compile_unmatched_build_kernel;
+    let ptx = compile_unmatched_build_kernel().expect("compile");
+    assert!(
+        ptx.contains("ld.acquire.gpu.u32"),
+        "unmatched-build kernel must emit speculative ld.acquire.gpu.u32 before atom.add\n{ptx}"
+    );
+    assert_appears_before(&ptx, "ld.acquire.gpu.u32", "atom.global.add.u32");
+}
+
 // ---- Tests: sort_kernel layouts (review L4) --------------------------------
 
 #[test]
