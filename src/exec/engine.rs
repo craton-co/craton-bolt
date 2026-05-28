@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch,
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -233,6 +233,10 @@ fn column_storage_rows(data: &crate::exec::gpu_table::GpuColumnData) -> usize {
         BoolNullable { values, .. } => values.len(),
         Utf8 { indices, .. } => indices.len(),
         DictUtf8 { keys, .. } => keys.len(),
+        // v0.7 sub-task B: Decimal128 stores `2 * n_rows` u64 values
+        // (interleaved [lo, hi] pairs); divide back to get the logical
+        // row count.
+        Decimal128 { values, .. } => values.len() / 2,
     }
 }
 
@@ -406,6 +410,14 @@ fn try_extend_column(
         // out of scope for batch 5. Returning `None` triggers the
         // caller's full re-upload fallback.
         GpuColumnData::Utf8 { .. } | GpuColumnData::DictUtf8 { .. } => {
+            return Ok(None);
+        }
+        // v0.7 sub-task B: Decimal128 prefix-extend isn't wired yet —
+        // the tail would need a slice-and-pack helper paralleling
+        // `Decimal128Array::value(i)`. Punt to a full re-upload for now;
+        // every existing Decimal column test exercises the full-upload
+        // path through `GpuColumn::upload`.
+        GpuColumnData::Decimal128 { .. } => {
             return Ok(None);
         }
     };
@@ -2438,6 +2450,21 @@ enum DeviceCol {
     Bool(GpuVec<u8>),
     /// Utf8 stored as i32 dictionary indices; host dictionary lives alongside.
     Utf8(DictionaryColumn),
+    /// v0.7 sub-task B: 128-bit fixed-point output column. Stored as the
+    /// same interleaved `[lo0, hi0, lo1, hi1, ...]` u64 buffer the input
+    /// `GpuColumnData::Decimal128` uses, so the PTX `Op::Store128` can
+    /// write 16 bytes per row at offset `tid * 16` with no per-row
+    /// indirection. The plan-level `(precision, scale)` rides along so
+    /// the download path can reattach them to the resulting
+    /// `Decimal128Array`.
+    Decimal128 {
+        /// Interleaved 16-bytes-per-row output buffer (length `2 * n_rows`).
+        values: GpuVec<u64>,
+        /// Plan-level precision (digits of significance).
+        precision: u8,
+        /// Plan-level scale.
+        scale: i8,
+    },
 }
 
 impl DeviceCol {
@@ -2459,9 +2486,15 @@ impl DeviceCol {
                 indices: GpuVec::<i32>::zeros(n)?,
                 n_rows: n,
             })),
-            DataType::Decimal128(_, _) => Err(BoltError::Plan(
-                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-            )),
+            // v0.7 sub-task B: allocate the interleaved [lo, hi] u64 buffer
+            // (length `2 * n`) that `Op::Store128` writes into. Plan-level
+            // `(precision, scale)` rides on the variant so the download path
+            // can rebuild a `Decimal128Array` with the correct dtype.
+            DataType::Decimal128(precision, scale) => Ok(DeviceCol::Decimal128 {
+                values: GpuVec::<u64>::zeros(2 * n)?,
+                precision,
+                scale,
+            }),
             // v0.7: PTX codegen for Date32 / Timestamp arithmetic is wired
             // (see `crate::jit::ptx_gen`), but the device-side download
             // path is dtype-blind — `DeviceCol::I32::download` always
@@ -2490,6 +2523,10 @@ impl DeviceCol {
             DeviceCol::F64(v) => v.device_ptr(),
             DeviceCol::Bool(v) => v.device_ptr(),
             DeviceCol::Utf8(d) => d.indices.device_ptr(),
+            // v0.7 sub-task B: the interleaved [lo, hi] u64 buffer is
+            // the column's single base pointer — PTX `Op::Store128`
+            // computes per-row offsets as `tid * 16`.
+            DeviceCol::Decimal128 { values, .. } => values.device_ptr(),
         }
     }
 
@@ -2527,6 +2564,35 @@ impl DeviceCol {
             }
             DeviceCol::Utf8(d) => {
                 let arr = d.to_string_array()?;
+                Ok(Arc::new(arr) as ArrayRef)
+            }
+            // v0.7 sub-task B: reassemble the interleaved [lo, hi] u64
+            // buffer back into a `Decimal128Array`. Each pair of u64s
+            // reconstitutes one i128 via
+            //   `lo | ((hi as u128) << 64)` then `as i128`
+            // which preserves the sign because the high half carries
+            // the sign bits unchanged through the unsigned/signed cast.
+            DeviceCol::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => {
+                let host = copy_back::<u64>(&values, 2 * n_rows)?;
+                let mut out: Vec<i128> = Vec::with_capacity(n_rows);
+                for row in 0..n_rows {
+                    let lo = host[2 * row];
+                    let hi = host[2 * row + 1];
+                    let bits = (lo as u128) | ((hi as u128) << 64);
+                    out.push(bits as i128);
+                }
+                let arr = Decimal128Array::from(out)
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|e| {
+                        BoltError::Type(format!(
+                            "Decimal128 download: precision/scale ({precision}, {scale}) \
+                             rejected by Arrow: {e}"
+                        ))
+                    })?;
                 Ok(Arc::new(arr) as ArrayRef)
             }
         }
@@ -2590,6 +2656,36 @@ impl DeviceCol {
                 // synchronized above for the primitive siblings, so this
                 // is safe to invoke regardless.
                 self.download(n_rows)
+            }
+            // v0.7 sub-task B: Decimal128's pinned path mirrors the
+            // primitive pattern (u64 element type, length `2 * n_rows`).
+            // The check_len guard catches a buffer that didn't get sized
+            // correctly at alloc time.
+            DeviceCol::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => {
+                let staged = StagedDownload::<u64>::from_gpu(&values, stream.raw())?;
+                stream.synchronize()?;
+                let host = staged.into_vec();
+                check_len(host.len(), 2 * n_rows)?;
+                let mut out: Vec<i128> = Vec::with_capacity(n_rows);
+                for row in 0..n_rows {
+                    let lo = host[2 * row];
+                    let hi = host[2 * row + 1];
+                    let bits = (lo as u128) | ((hi as u128) << 64);
+                    out.push(bits as i128);
+                }
+                let arr = Decimal128Array::from(out)
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|e| {
+                        BoltError::Type(format!(
+                            "Decimal128 pinned download: precision/scale \
+                             ({precision}, {scale}) rejected by Arrow: {e}"
+                        ))
+                    })?;
+                Ok(Arc::new(arr) as ArrayRef)
             }
         }
     }

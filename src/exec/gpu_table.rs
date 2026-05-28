@@ -4,8 +4,8 @@
 
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{
-    Array, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    Array, BooleanArray, Decimal128Array, DictionaryArray, Float32Array, Float64Array, Int32Array,
+    Int64Array, RecordBatch, StringArray,
 };
 
 use crate::cuda::buffer::primitive_to_gpu;
@@ -64,6 +64,39 @@ pub enum GpuColumnData {
         /// Host-side dictionary, `dictionary[i - 1]` decodes index `i` (slot 0 is NULL).
         dictionary: Vec<String>,
     },
+    /// v0.7 sub-task B: 128-bit fixed-point column. Stored as a single
+    /// contiguous `GpuVec<u64>` of length `2 * n_rows`, interleaved
+    /// little-endian `[lo0, hi0, lo1, hi1, ...]` so the PTX-side
+    /// `Op::LoadColumn128` / `Op::Store128` (which read 16 bytes per row
+    /// starting at base + tid*16) addresses each row's low / high halves
+    /// at `[+0, +8]` from the row base.
+    ///
+    /// Storage layout note (deviation from the sub-task spec): the spec
+    /// description called for two separate `GpuVec<u64>` buffers (`lo`
+    /// + `hi`). That would imply TWO device base pointers per column,
+    /// which the PTX emitter (committed in sub-task A) does NOT support:
+    /// `Op::LoadColumn128` reads one base pointer per column and computes
+    /// `[tid * 16]` / `[tid * 16 + 8]`. The interleaved single-buffer
+    /// layout below is the only encoding that's compatible with the
+    /// committed PTX ABI. The host upload / download paths still expose
+    /// the i128 value as a logical `(lo, hi)` pair (see
+    /// [`GpuColumn::upload`] for the unpack and
+    /// [`crate::exec::engine`]'s download arm for the reassembly).
+    ///
+    /// Row `i`:
+    /// * low 64 bits  = `values[2 * i + 0]`
+    /// * high 64 bits = `values[2 * i + 1]`
+    /// * `i128 value  = ((hi as i128) << 64) | (lo as u128 as i128)`
+    ///   (the cast back is sign-preserving because the high half carries
+    ///   the sign bits unchanged).
+    Decimal128 {
+        /// Interleaved 16-bytes-per-row buffer, length `2 * n_rows`.
+        values: GpuVec<u64>,
+        /// Plan-level precision (digits of significance, 1..=38).
+        precision: u8,
+        /// Plan-level scale (digits right of the decimal point).
+        scale: i8,
+    },
     /// **Stage 5** — native dict-encoded Utf8 column. Stage 4 worked around
     /// the lack of this variant by flattening every `DictionaryArray<i32, Utf8>`
     /// into a plain `StringArray` at registration time, which then went
@@ -104,6 +137,11 @@ pub enum GpuColumnData {
 
 impl GpuColumnData {
     /// Raw device pointer to the column's primary buffer.
+    ///
+    /// For Decimal128 the buffer holds 16 bytes per row in interleaved
+    /// `[lo, hi]` little-endian order — see the variant doc. The PTX-side
+    /// `Op::LoadColumn128` knows to treat this single base pointer as a
+    /// stride-16 buffer.
     pub fn device_ptr(&self) -> CUdeviceptr {
         match self {
             GpuColumnData::I32(v) => v.device_ptr(),
@@ -115,6 +153,10 @@ impl GpuColumnData {
             GpuColumnData::Utf8 { indices, .. } => indices.device_ptr(),
             // Stage 5 — DictUtf8's primary buffer is its keys array.
             GpuColumnData::DictUtf8 { keys, .. } => keys.device_ptr(),
+            // v0.7 sub-task B: Decimal128's primary buffer is the
+            // interleaved 16-bytes-per-row u64 array; the PTX side
+            // computes per-row offsets as `tid * 16` from this base.
+            GpuColumnData::Decimal128 { values, .. } => values.device_ptr(),
         }
     }
 
@@ -368,12 +410,51 @@ impl GpuColumn {
                     }
                 }
             }
-            DataType::Decimal128(_, _) => {
-                return Err(BoltError::Plan(format!(
-                    "Decimal128 not yet lowered to GPU; coming in a follow-up \
-                     (column '{}' upload)",
-                    name
-                )));
+            DataType::Decimal128(precision, scale) => {
+                // v0.7 sub-task B: ingest a `Decimal128Array` as the
+                // interleaved [lo0, hi0, lo1, hi1, ...] u64 buffer that
+                // PTX `Op::LoadColumn128` expects. Each row's `i128`
+                // value is split into the low / high 64-bit halves via
+                // the (sign-preserving) `as u128` cast — masking with
+                // `as u64` and shifting `>> 64` gives the two halves of
+                // the same bit pattern.
+                let da = arr
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| type_mismatch_err(arr, "Decimal128"))?;
+                // The Arrow `Decimal128Array` may carry its own (p, s)
+                // declaration — if it disagrees with the column's plan-
+                // level dtype the schema is internally inconsistent and
+                // every downstream consumer would silently mis-interpret
+                // the values. Surface the mismatch eagerly.
+                if let arrow_schema::DataType::Decimal128(ap, as_) = da.data_type() {
+                    if *ap != precision || *as_ != scale {
+                        return Err(BoltError::Type(format!(
+                            "Decimal128 column '{}' upload: plan dtype \
+                             Decimal128({precision}, {scale}) disagrees with Arrow \
+                             dtype Decimal128({ap}, {as_})",
+                            name
+                        )));
+                    }
+                }
+                let n = da.len();
+                let mut packed: Vec<u64> = Vec::with_capacity(2 * n);
+                for i in 0..n {
+                    // NULL rows are stored as zeroed bit-patterns. The
+                    // device-side validity bitmap (a future sub-task)
+                    // will be the source of truth for per-row validity;
+                    // until then a NULL Decimal128 reads back as 0.
+                    let v: i128 = if da.is_null(i) { 0 } else { da.value(i) };
+                    let bits = v as u128;
+                    packed.push(bits as u64);
+                    packed.push((bits >> 64) as u64);
+                }
+                let buf = GpuVec::<u64>::from_slice(&packed)?;
+                GpuColumnData::Decimal128 {
+                    values: buf,
+                    precision,
+                    scale,
+                }
             }
             DataType::Date32 | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
@@ -559,6 +640,15 @@ impl GpuTable {
                     })?;
                 GpuColumn::upload_dict_utf8(field.name().clone(), dict_arr)?
             }
+            // v0.7 sub-task B: route `Decimal128(p, s)` through the
+            // canonical `GpuColumn::upload` path, which packs the i128
+            // values into the interleaved `[lo, hi]` u64 buffer that
+            // PTX `Op::LoadColumn128` reads.
+            arrow_schema::DataType::Decimal128(p, s) => GpuColumn::upload(
+                field.name().clone(),
+                arr.as_ref(),
+                DataType::Decimal128(*p, *s),
+            )?,
             other => {
                 return Err(BoltError::Type(format!(
                     "GpuTable: unsupported Arrow dtype {:?} for column '{}'",

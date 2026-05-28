@@ -1,20 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end tests for the v0.6 / M4 `DataType::Decimal128(precision, scale)`
-//! plumbing. Plan-level only — the GPU codegen rejects every Decimal column
-//! with a clear "Decimal128 not yet lowered to GPU; coming in a follow-up"
-//! message until the Decimal128 codegen lands.
+//! End-to-end tests for the v0.6/v0.7 `DataType::Decimal128(precision, scale)`
+//! plumbing.
 //!
-//! Three scenarios:
+//! v0.7 sub-task B (Decimal128 ingest + Codegen wiring) flipped the
+//! formerly-rejected SELECT-of-Decimal-column case to *accept* at physical
+//! lowering: a bare column reference now emits the dual-register
+//! `Op::LoadColumn128` and a paired `Op::Store128` (see
+//! `physical_plan::Codegen::emit_column` and the PTX `Op::LoadColumn128`
+//! / `Op::Store128` definitions). Decimal128 `+`/`-`/`*` between two
+//! matching Decimal columns lowers too, with SQL-convention result
+//! dtype rules.
+//!
+//! Still rejected (host-fallback / follow-up sub-tasks):
+//!   * Division and any non-arithmetic op on Decimal128 (comparisons,
+//!     logical, etc.).
+//!   * CAST involving Decimal128 (source OR target).
+//!   * SUM / MIN / MAX / AVG over Decimal128 (no atomic / per-group
+//!     accumulator wired yet).
+//!
+//! Scenarios below:
 //!
 //! 1. A schema with a `Decimal128(18, 2)` column registers cleanly through
 //!    `MemTableProvider`. This pins the `Field` constructor / Arrow
 //!    round-trip plumbing.
-//! 2. `SELECT decimal_col FROM t` parses and lowers logically; the
-//!    physical-plan boundary rejects it with the documented error.
-//! 3. `CAST(int_col AS DECIMAL(18, 2))` parses (sqlparser accepts the
-//!    syntax) but the SQL lowering step surfaces a clear `BoltError::Plan`
-//!    naming the Decimal128 follow-up.
+//! 2. `SELECT decimal_col FROM t` lowers successfully through the v0.7
+//!    physical-plan codegen.
+//! 3. `CAST(int_col AS DECIMAL(18, 2))` still parses (sqlparser accepts
+//!    the syntax) and is rejected at lowering with the documented
+//!    "CAST to/from Decimal128 not yet lowered" message.
 
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema,
@@ -75,40 +89,31 @@ fn decimal128_schema_registers_and_roundtrips() {
 
 // ---- 2. SELECT over a Decimal column ---------------------------------------
 
-/// `SELECT amount FROM t` parses successfully (the planner is happy to
-/// resolve the column and type-check the projection). The physical
-/// lowerer then refuses to lower the Decimal column with the documented
-/// "Decimal128 not yet lowered to GPU; coming in a follow-up" message.
+/// v0.7: `SELECT amount FROM t` now lowers cleanly through the physical
+/// codegen. The codegen emits `Op::LoadColumn128` + `Op::Store128`,
+/// flowing the i128 value through a pair of u64 registers — see
+/// `physical_plan::Codegen::emit_column` for the dual-register pair
+/// allocation. The plan-level schema still carries the
+/// `Decimal128(18, 2)` dtype so downstream consumers see the right
+/// precision / scale.
 #[test]
-fn select_decimal_column_parses_then_rejects_at_lower() {
+fn select_decimal_column_lowers_in_v07() {
     let provider = provider_with_decimal();
     let plan = parse_sql("SELECT amount FROM t", &provider)
         .expect("SELECT over a Decimal column must parse and type-check");
-    // The logical schema must already carry Decimal128 through.
+    // The logical schema must carry Decimal128 through unchanged.
     let schema = plan.schema().expect("logical schema resolution");
     assert_eq!(schema.fields.len(), 1);
     assert_eq!(schema.fields[0].dtype, DataType::Decimal128(18, 2));
 
-    // The physical lowerer is the documented rejection boundary.
-    let err = lower_physical(&plan)
-        .expect_err("physical lowering must reject Decimal128 columns");
-    match err {
-        BoltError::Plan(msg) => {
-            assert!(
-                msg.contains("Decimal128 not yet lowered to GPU"),
-                "physical lowering should surface the canonical Decimal128 \
-                 follow-up message; got: {msg}",
-            );
-            assert!(
-                msg.contains("follow-up"),
-                "rejection message should name the follow-up; got: {msg}",
-            );
-        }
-        other => panic!(
-            "expected BoltError::Plan with the Decimal128 follow-up message, \
-             got {other:?}"
-        ),
-    }
+    // v0.7 sub-task B: the physical lowerer accepts the bare-column
+    // SELECT and produces a Projection plan whose output schema preserves
+    // the source dtype.
+    let phys = lower_physical(&plan)
+        .expect("physical lowering of a Decimal SELECT must succeed in v0.7");
+    let out = phys.output_schema();
+    assert_eq!(out.fields.len(), 1);
+    assert_eq!(out.fields[0].dtype, DataType::Decimal128(18, 2));
 }
 
 /// Negative companion: a SELECT that touches only the non-Decimal column
@@ -174,4 +179,126 @@ fn cast_to_primitive_lowers_in_v07() {
         .expect("CAST(Int32 AS BIGINT) must parse + type-check");
     lower_physical(&plan)
         .expect("CAST(Int32 AS BIGINT) must lower cleanly in v0.7 GPU codegen");
+}
+
+// ---- 4. Decimal128 arithmetic (v0.7 sub-task B) ----------------------------
+
+/// Two `Decimal128(p, s)` columns sharing the same scale, used to exercise
+/// the v0.7 Add/Sub/Mul lowering path.
+fn provider_with_two_decimals() -> MemTableProvider {
+    let schema = Schema::new(vec![
+        Field {
+            name: "x".into(),
+            dtype: DataType::Decimal128(10, 2),
+            nullable: true,
+        },
+        Field {
+            name: "y".into(),
+            dtype: DataType::Decimal128(12, 2),
+            nullable: true,
+        },
+    ]);
+    MemTableProvider::new().with_table("d", schema)
+}
+
+/// `x + y` between two `Decimal128(p, s)` columns sharing the same scale
+/// lowers and resolves to `Decimal128(max(p1, p2) + 1, s)` per SQL
+/// convention.
+#[test]
+fn decimal128_add_two_columns_lowers_in_v07() {
+    let provider = provider_with_two_decimals();
+    let plan = parse_sql("SELECT x + y FROM d", &provider)
+        .expect("Decimal128 + Decimal128 must parse + type-check");
+    let phys = lower_physical(&plan)
+        .expect("Decimal128 + Decimal128 must lower in v0.7");
+    let out = phys.output_schema();
+    assert_eq!(out.fields.len(), 1);
+    // max(10, 12) + 1 = 13, scale unchanged.
+    assert_eq!(out.fields[0].dtype, DataType::Decimal128(13, 2));
+}
+
+/// Subtraction follows the same widening rule as addition.
+#[test]
+fn decimal128_sub_two_columns_lowers_in_v07() {
+    let provider = provider_with_two_decimals();
+    let plan = parse_sql("SELECT x - y FROM d", &provider)
+        .expect("Decimal128 - Decimal128 must parse + type-check");
+    let phys = lower_physical(&plan).expect("Decimal128 - Decimal128 must lower");
+    assert_eq!(
+        phys.output_schema().fields[0].dtype,
+        DataType::Decimal128(13, 2)
+    );
+}
+
+/// Multiplication widens precision and scale by addition:
+/// `Decimal128(10, 2) * Decimal128(12, 2)` → `Decimal128(22, 4)`.
+#[test]
+fn decimal128_mul_two_columns_lowers_in_v07() {
+    let provider = provider_with_two_decimals();
+    let plan = parse_sql("SELECT x * y FROM d", &provider)
+        .expect("Decimal128 * Decimal128 must parse + type-check");
+    let phys = lower_physical(&plan).expect("Decimal128 * Decimal128 must lower");
+    // p1 + p2 = 22, s1 + s2 = 4.
+    assert_eq!(
+        phys.output_schema().fields[0].dtype,
+        DataType::Decimal128(22, 4)
+    );
+}
+
+/// Division on Decimal128 stays rejected — the kernel has no wide-divide
+/// support yet, so the host fallback is the only sound path.
+#[test]
+fn decimal128_div_still_rejected() {
+    let provider = provider_with_two_decimals();
+    // The rejection may surface from the logical type-check or the
+    // physical lowering; either layer must mention Decimal128 + Div so
+    // the user can find the cause.
+    let r = parse_sql("SELECT x / y FROM d", &provider);
+    if let Ok(plan) = r {
+        let err = lower_physical(&plan).expect_err("Decimal128 Div must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Decimal128") && (msg.contains("Div") || msg.contains("/")),
+            "Decimal128 Div rejection should mention Decimal128 + Div; got: {msg}"
+        );
+    } else {
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("Decimal128") && (msg.contains("Div") || msg.contains("/")),
+            "Decimal128 Div rejection should mention Decimal128 + Div; got: {msg}"
+        );
+    }
+}
+
+/// Add between two Decimal128s with mismatched scale is rejected — the
+/// SQL convention requires explicit rescale before the user can add.
+#[test]
+fn decimal128_add_mismatched_scale_rejected() {
+    let schema = Schema::new(vec![
+        Field {
+            name: "a".into(),
+            dtype: DataType::Decimal128(10, 2),
+            nullable: true,
+        },
+        Field {
+            name: "b".into(),
+            dtype: DataType::Decimal128(10, 3),
+            nullable: true,
+        },
+    ]);
+    let provider = MemTableProvider::new().with_table("d", schema);
+    // The logical or physical layer must surface a clear scale-mismatch
+    // message.
+    let r = parse_sql("SELECT a + b FROM d", &provider);
+    let msg = match r {
+        Ok(plan) => format!(
+            "{}",
+            lower_physical(&plan).expect_err("scale mismatch must reject")
+        ),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        msg.contains("scale") || msg.contains("Decimal128"),
+        "scale-mismatch rejection should mention scale / Decimal128; got: {msg}"
+    );
 }

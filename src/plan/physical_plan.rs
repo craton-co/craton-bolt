@@ -26,13 +26,47 @@ impl Reg {
 }
 
 /// A typed value in the IR: a register plus its known dtype.
+///
+/// For "wide" 128-bit values (`Decimal128(p, s)`) the value occupies a
+/// PAIR of u64 registers (the PTX side has no native 128-bit register
+/// class — see `Op::LoadColumn128` / `RegAlloc::assign_pair`). In that
+/// case `reg` carries the LOW half and [`Value::hi_reg`] is `Some(hi)`.
+/// For every other (single-register) dtype `hi_reg` is `None`.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct Value {
-    /// The register holding the value.
+    /// The register holding the value (or the low half for Decimal128).
     pub reg: Reg,
     /// The runtime dtype of the value.
     pub dtype: DataType,
+    /// For 128-bit values (Decimal128) the high-half register. `None`
+    /// for every other (single-register) dtype.
+    ///
+    /// v0.7 sub-task B: representing a 128-bit value as a `(lo, hi)` pair
+    /// of u64 registers (rather than a hypothetical native 128-bit class)
+    /// mirrors the dual-register IR ops added in sub-task A
+    /// (`Op::LoadColumn128`, `Op::Add128`, etc.) and the PTX emitter's
+    /// `add.cc.u64 / addc.u64` carry-chain lowering.
+    pub hi_reg: Option<Reg>,
+}
+
+impl Value {
+    /// Convenience constructor for a single-register value (every non-128
+    /// dtype). Mirrors the historical `Value { reg, dtype }` literal so
+    /// every legacy callsite that wants a single-reg value stays terse.
+    fn single(reg: Reg, dtype: DataType) -> Self {
+        Self { reg, dtype, hi_reg: None }
+    }
+
+    /// Convenience constructor for a 128-bit value (Decimal128). `reg` is
+    /// the low-half register; `hi` is the high-half register.
+    fn pair(reg_lo: Reg, reg_hi: Reg, dtype: DataType) -> Self {
+        Self {
+            reg: reg_lo,
+            dtype,
+            hi_reg: Some(reg_hi),
+        }
+    }
 }
 
 /// A single instruction in the IR.
@@ -173,11 +207,11 @@ pub enum Op {
     // exactly once — and lets the existing dataflow walker treat the
     // halves as independent values reachable through a single op.
     //
-    // No end-to-end wiring lives in this slice: `Codegen::emit_column` /
-    // `emit_literal` / `emit_binary` still reject Decimal128 at lowering
-    // time, so these ops are unreachable from `lower()` today. They exist
-    // so the PTX emitter has a structurally complete IR target before the
-    // upload / Codegen-routing follow-up commits land.
+    // v0.7 sub-task B: `Codegen::emit_column` / `emit_literal` /
+    // `emit_binary` now emit these directly. Add / Sub / Mul on Decimal128
+    // are reachable from `lower()`; Div / comparisons / mixed Decimal +
+    // non-Decimal arithmetic stay on the host fallback (rejected with a
+    // tighter message at lower time, see `Codegen::emit_binary_decimal128`).
     // ---------------------------------------------------------------------
     /// Load row `tid` of an input Decimal128 column into a pair of u64
     /// registers. Emits two `ld.global.nc.u64` reads at byte offsets
@@ -865,6 +899,80 @@ fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
     }
 }
 
+/// Maximum supported Decimal128 precision. Matches Arrow's Decimal128
+/// ceiling — an `i128` holds at most 38 significant decimal digits.
+const DECIMAL128_MAX_PRECISION: u8 = 38;
+
+/// v0.7 sub-task B: result dtype for `Decimal128(p1, s1) op Decimal128(p2, s2)`
+/// per SQL convention. Only `Add` / `Sub` / `Mul` are wired (the kernel-
+/// level codegen rejects every other op anyway).
+///
+///   * `Add` / `Sub`: requires `s1 == s2`. Result is
+///     `Decimal128(max(p1, p2) + 1, s1)` — the +1 absorbs the carry from
+///     the worst-case widening add.
+///   * `Mul`: result is `Decimal128(p1 + p2, s1 + s2)` (the raw
+///     wrapping-i128 multiply leaves the result at the SUM of operand
+///     scales, no rescale).
+///
+/// Result precision exceeding `DECIMAL128_MAX_PRECISION` is rejected.
+fn decimal128_arith_result_dtype(
+    op: BinaryOp,
+    (p1, s1): (u8, i8),
+    (p2, s2): (u8, i8),
+) -> BoltResult<DataType> {
+    match op {
+        BinaryOp::Add | BinaryOp::Sub => {
+            if s1 != s2 {
+                return Err(BoltError::Type(format!(
+                    "Decimal128 {op:?} requires matching scale, \
+                     got Decimal128({p1}, {s1}) and Decimal128({p2}, {s2}); \
+                     wire an explicit CAST to align the scales"
+                )));
+            }
+            let p_max = p1.max(p2);
+            let new_p = p_max.checked_add(1).ok_or_else(|| {
+                BoltError::Type(format!(
+                    "Decimal128 {op:?} precision overflow: max({p1}, {p2}) + 1 \
+                     does not fit in u8"
+                ))
+            })?;
+            if new_p > DECIMAL128_MAX_PRECISION {
+                return Err(BoltError::Type(format!(
+                    "Decimal128 {op:?} result precision {new_p} exceeds \
+                     Arrow Decimal128 limit ({DECIMAL128_MAX_PRECISION}); \
+                     reduce input precision or rescale before adding"
+                )));
+            }
+            Ok(DataType::Decimal128(new_p, s1))
+        }
+        BinaryOp::Mul => {
+            let new_p = p1.checked_add(p2).ok_or_else(|| {
+                BoltError::Type(format!(
+                    "Decimal128 Mul precision overflow: {p1} + {p2} \
+                     does not fit in u8"
+                ))
+            })?;
+            if new_p > DECIMAL128_MAX_PRECISION {
+                return Err(BoltError::Type(format!(
+                    "Decimal128 Mul result precision {new_p} exceeds \
+                     Arrow Decimal128 limit ({DECIMAL128_MAX_PRECISION}); \
+                     reduce input precisions or split the product"
+                )));
+            }
+            let new_s = s1.checked_add(s2).ok_or_else(|| {
+                BoltError::Type(format!(
+                    "Decimal128 Mul scale overflow: {s1} + {s2} does not fit in i8"
+                ))
+            })?;
+            Ok(DataType::Decimal128(new_p, new_s))
+        }
+        other => Err(BoltError::Plan(format!(
+            "Decimal128 {other:?} not supported at result-dtype resolution; \
+             only Add/Sub/Mul are wired in v0.7"
+        ))),
+    }
+}
+
 /// Gate the source side of a CAST against the v0.7 GPU codegen surface.
 ///
 /// Accepted source dtypes: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`.
@@ -1186,10 +1294,7 @@ impl<'a> Codegen<'a> {
             let lit = Literal::Bool(!want_null);
             let dst = self.fresh();
             self.ops.push(Op::Const { dst, lit });
-            return Ok(Value {
-                reg: dst,
-                dtype: DataType::Bool,
-            });
+            return Ok(Value::single(dst, DataType::Bool));
         }
 
         // Nullable column: route through the value-load path so the input
@@ -1223,10 +1328,7 @@ impl<'a> Codegen<'a> {
             validity_input: col_idx,
             want_null,
         });
-        Ok(Value {
-            reg: dst,
-            dtype: DataType::Bool,
-        })
+        Ok(Value::single(dst, DataType::Bool))
     }
 
     /// Emit (or reuse) a column load.
@@ -1236,23 +1338,18 @@ impl<'a> Codegen<'a> {
         }
         let field = self.scan_schema.field(name)?;
         let dtype = field.dtype;
-        // v0.6 / M4: Decimal128 is plan-level only. The GPU codegen has no
-        // i128 register class or kernel atomics yet, so any attempt to lower
-        // a Decimal column into a kernel is surfaced here as a clear
-        // BoltError::Plan. The follow-up will fill in the actual codegen.
-        if matches!(dtype, DataType::Decimal128(_, _)) {
-            return Err(BoltError::Plan(format!(
-                "Decimal128 not yet lowered to GPU; coming in a follow-up \
-                 (column '{}' has dtype {:?})",
-                name, dtype
-            )));
-        }
         // v0.7: Date32 and Timestamp lower to integer registers (Date32 as
         // i32 days-since-epoch, Timestamp as i64 ticks in the source unit).
         // The codegen treats them as their underlying integer type at the
         // PTX layer, but preserves the logical dtype on the `Value` so
         // downstream type-checks (e.g. binary subtraction yielding a plain
         // Int32/Int64) see the temporal type and reject mixed-type ops.
+        //
+        // v0.7 sub-task B: Decimal128 lowers to a pair of u64 registers
+        // (low / high halves of the i128 value) via `Op::LoadColumn128`
+        // and `RegAlloc::assign_pair`. The IR `Value` carries both
+        // register handles so downstream `Op::Add128` / `Sub128` /
+        // `Mul128` ops can address each half individually.
         let col_idx = self.inputs.len();
         self.inputs.push(ColumnIO {
             name: name.to_string(),
@@ -1262,9 +1359,20 @@ impl<'a> Codegen<'a> {
         // `false` — `emit_unary` flips the slot to `true` if any
         // `Op::IsNullCheck` reads this column's validity bitmap.
         self.input_needs_validity.push(false);
-        let dst = self.fresh();
-        self.ops.push(Op::LoadColumn { dst, col_idx, dtype });
-        let value = Value { reg: dst, dtype };
+        let value = if matches!(dtype, DataType::Decimal128(_, _)) {
+            let dst_lo = self.fresh();
+            let dst_hi = self.fresh();
+            self.ops.push(Op::LoadColumn128 {
+                dst_lo,
+                dst_hi,
+                col_idx,
+            });
+            Value::pair(dst_lo, dst_hi, dtype)
+        } else {
+            let dst = self.fresh();
+            self.ops.push(Op::LoadColumn { dst, col_idx, dtype });
+            Value::single(dst, dtype)
+        };
         self.column_cache
             .insert(name.to_string(), (col_idx, value));
         Ok(value)
@@ -1275,24 +1383,33 @@ impl<'a> Codegen<'a> {
         let dtype = lit
             .dtype()
             .ok_or_else(|| BoltError::Type("untyped NULL literal".into()))?;
-        // v0.6 / M4: Decimal128 literals are plan-level only; reject before
-        // the codegen would attempt to allocate an i128 register class it
-        // doesn't have. Mirrors the column-load rejection in `emit_column`.
-        if matches!(dtype, DataType::Decimal128(_, _)) {
-            return Err(BoltError::Plan(
-                "Decimal128 not yet lowered to GPU; coming in a follow-up \
-                 (Decimal128 literal in expression)"
-                    .into(),
-            ));
-        }
         // v0.7: Date32 / Timestamp literals lower to integer constants on
         // the GPU side; ptx_gen emits the underlying i32/i64 bit pattern.
+        //
+        // v0.7 sub-task B: Decimal128 literals lower to `Op::Const128`,
+        // splitting the `i128` value into a `(lo: u64, hi: u64)` pair of
+        // 64-bit halves (little-endian: the wrapping `u128` cast preserves
+        // every bit, then we slice the low / high 64-bit windows).
+        if let Literal::Decimal128(value, _, _) = lit {
+            let bits = *value as u128;
+            let lo = bits as u64;
+            let hi = (bits >> 64) as u64;
+            let dst_lo = self.fresh();
+            let dst_hi = self.fresh();
+            self.ops.push(Op::Const128 {
+                dst_lo,
+                dst_hi,
+                lo,
+                hi,
+            });
+            return Ok(Value::pair(dst_lo, dst_hi, dtype));
+        }
         let dst = self.fresh();
         self.ops.push(Op::Const {
             dst,
             lit: lit.clone(),
         });
-        Ok(Value { reg: dst, dtype })
+        Ok(Value::single(dst, dtype))
     }
 
     /// Emit a `Const { Literal::Null }` op whose register carries `dtype`.
@@ -1305,12 +1422,32 @@ impl<'a> Codegen<'a> {
     /// codegen verbatim; only the surrounding `Value`'s dtype is borrowed
     /// from the peer.
     fn emit_null_as(&mut self, dtype: DataType) -> Value {
+        // v0.7 sub-task B: a NULL typed as Decimal128 lowers to a pair
+        // of zero-bit u64 registers. The PTX side has no NULL literal
+        // for the 128-bit class anyway (the emitter rejects
+        // `Op::Const { Literal::Null }`), and validity propagation is
+        // expected to mask the result before any consumer observes it
+        // — so zero is as good a placeholder as any. Returning a `pair`
+        // here keeps `emit_binary_decimal128`'s `hi_reg.ok_or` guard
+        // satisfied for the (extremely uncommon) `NULL + Decimal128`
+        // peer-typing path.
+        if matches!(dtype, DataType::Decimal128(_, _)) {
+            let dst_lo = self.fresh();
+            let dst_hi = self.fresh();
+            self.ops.push(Op::Const128 {
+                dst_lo,
+                dst_hi,
+                lo: 0,
+                hi: 0,
+            });
+            return Value::pair(dst_lo, dst_hi, dtype);
+        }
         let dst = self.fresh();
         self.ops.push(Op::Const {
             dst,
             lit: Literal::Null,
         });
-        Value { reg: dst, dtype }
+        Value::single(dst, dtype)
     }
 
     /// Insert a Cast from `value` to `to`, returning the cast value.
@@ -1325,7 +1462,7 @@ impl<'a> Codegen<'a> {
             from: value.dtype,
             to,
         });
-        Value { reg: dst, dtype: to }
+        Value::single(dst, to)
     }
 
     /// Lower a SQL `CAST(<inner> AS <target>)` expression for the GPU
@@ -1396,6 +1533,33 @@ impl<'a> Codegen<'a> {
             (l, r)
         };
 
+        // v0.7 sub-task B: Decimal128 arithmetic is handled BEFORE the
+        // generic numeric path so the dual-register (lo/hi) ops can be
+        // emitted directly. Only `Add`/`Sub`/`Mul` are wired; every other
+        // op on Decimal128 surfaces a tighter "not yet lowered to GPU"
+        // error here. Mixed Decimal128 / non-Decimal arithmetic is also
+        // out of scope for this sub-task (no implicit promotion path).
+        if op_is_arithmetic(op)
+            && (matches!(l.dtype, DataType::Decimal128(_, _))
+                || matches!(r.dtype, DataType::Decimal128(_, _)))
+        {
+            return self.emit_binary_decimal128(op, l, r);
+        }
+        // Reject the non-arithmetic Decimal128 ops (Div is rejected by
+        // the same arm above via `emit_binary_decimal128` since it's
+        // arithmetic — the catch-all below covers comparisons, logical,
+        // etc.).
+        if matches!(l.dtype, DataType::Decimal128(_, _))
+            || matches!(r.dtype, DataType::Decimal128(_, _))
+        {
+            return Err(BoltError::Plan(format!(
+                "Decimal128 {op:?} not yet lowered to GPU; only Add/Sub/Mul \
+                 on Decimal128 are wired in v0.7 (comparisons, Div, logical \
+                 ops, and CAST involving Decimal128 stay on the host fallback \
+                 — coming in a follow-up)"
+            )));
+        }
+
         let (lhs_v, rhs_v, operand_dtype, result_dtype) = if op_is_arithmetic(op) {
             // v0.7: Date32 / Timestamp arithmetic. Only `Date32 - Date32`
             // (→ Int32) and `Timestamp(u, tz) - Timestamp(u, tz)` (→ Int64
@@ -1456,10 +1620,112 @@ impl<'a> Codegen<'a> {
             dtype: operand_dtype,
             result_dtype,
         });
-        Ok(Value {
-            reg: dst,
-            dtype: result_dtype,
-        })
+        Ok(Value::single(dst, result_dtype))
+    }
+
+    /// Lower an arithmetic op (`Add`/`Sub`/`Mul`) over a pair of
+    /// Decimal128 operands to a dual-register `Op::Add128` / `Op::Sub128`
+    /// / `Op::Mul128`. Rejects every other op shape (Div, comparisons,
+    /// mixed Decimal128 / non-Decimal) with a clear v0.7-envelope message.
+    ///
+    /// Result-dtype rules follow the SQL convention:
+    ///
+    ///   * `Decimal128(p1, s1) + Decimal128(p2, s2)` (and `-`): requires
+    ///     `s1 == s2`, yields `Decimal128(max(p1, p2) + 1, s1)`. The
+    ///     +1-precision allows the carry from the widening add to fit.
+    ///     Result precision > 38 is rejected (Arrow's Decimal128 ceiling).
+    ///   * `Decimal128(p1, s1) * Decimal128(p2, s2)`: yields
+    ///     `Decimal128(p1 + p2, s1 + s2)`. Sum > 38 is rejected. We do
+    ///     NOT rescale the operand registers — the kernel multiplies the
+    ///     raw 128-bit two's-complement values (matching
+    ///     `i128::wrapping_mul`), so the scale of the result is the SUM
+    ///     of the operand scales by construction.
+    fn emit_binary_decimal128(
+        &mut self,
+        op: BinaryOp,
+        l: Value,
+        r: Value,
+    ) -> BoltResult<Value> {
+        let (l_p, l_s) = match l.dtype {
+            DataType::Decimal128(p, s) => (p, s),
+            other => {
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 {op:?}: left operand must be Decimal128, got {other:?} \
+                     (mixed Decimal128 / non-Decimal arithmetic is not yet lowered to GPU)"
+                )));
+            }
+        };
+        let (r_p, r_s) = match r.dtype {
+            DataType::Decimal128(p, s) => (p, s),
+            other => {
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 {op:?}: right operand must be Decimal128, got {other:?} \
+                     (mixed Decimal128 / non-Decimal arithmetic is not yet lowered to GPU)"
+                )));
+            }
+        };
+        // Pair-validity guard: every Decimal128 `Value` MUST carry a
+        // `hi_reg`. If it doesn't, the producer (column / literal / cast)
+        // forgot to call `Value::pair`, and the dual-register ops below
+        // would otherwise silently address the same register for both
+        // halves.
+        let l_hi = l.hi_reg.ok_or_else(|| {
+            BoltError::Other(
+                "physical_plan: Decimal128 lhs has no hi_reg — producer bug".into(),
+            )
+        })?;
+        let r_hi = r.hi_reg.ok_or_else(|| {
+            BoltError::Other(
+                "physical_plan: Decimal128 rhs has no hi_reg — producer bug".into(),
+            )
+        })?;
+
+        let result_dtype = decimal128_arith_result_dtype(op, (l_p, l_s), (r_p, r_s))?;
+
+        let dst_lo = self.fresh();
+        let dst_hi = self.fresh();
+        let new_op = match op {
+            BinaryOp::Add => Op::Add128 {
+                dst_lo,
+                dst_hi,
+                a_lo: l.reg,
+                a_hi: l_hi,
+                b_lo: r.reg,
+                b_hi: r_hi,
+            },
+            BinaryOp::Sub => Op::Sub128 {
+                dst_lo,
+                dst_hi,
+                a_lo: l.reg,
+                a_hi: l_hi,
+                b_lo: r.reg,
+                b_hi: r_hi,
+            },
+            BinaryOp::Mul => Op::Mul128 {
+                dst_lo,
+                dst_hi,
+                a_lo: l.reg,
+                a_hi: l_hi,
+                b_lo: r.reg,
+                b_hi: r_hi,
+            },
+            BinaryOp::Div => {
+                return Err(BoltError::Plan(
+                    "Decimal128 Div not yet lowered to GPU; only Add/Sub/Mul \
+                     on Decimal128 are wired in v0.7 (Div needs a host fallback \
+                     for the wide division)"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 {other:?} not yet lowered to GPU; only Add/Sub/Mul \
+                     on Decimal128 are wired in v0.7"
+                )));
+            }
+        };
+        self.ops.push(new_op);
+        Ok(Value::pair(dst_lo, dst_hi, result_dtype))
     }
 
     /// Lower a `CASE WHEN c1 THEN v1 [WHEN c2 THEN v2 ...] [ELSE e] END`
@@ -1632,16 +1898,28 @@ impl<'a> Codegen<'a> {
                 else_val: cur.reg,
                 dtype: result_dtype,
             });
-            cur = Value {
-                reg: dst,
-                dtype: result_dtype,
-            };
+            cur = Value::single(dst, result_dtype);
         }
         Ok(cur)
     }
 
     /// Append a Store op for column `col_idx`.
+    ///
+    /// v0.7 sub-task B: Decimal128 values route through `Op::Store128`
+    /// (two `st.global.u64` writes for the low / high halves) — the
+    /// `Value` carries both register handles via `hi_reg`.
     fn emit_store(&mut self, value: Value, col_idx: usize) {
+        if matches!(value.dtype, DataType::Decimal128(_, _)) {
+            let hi = value.hi_reg.expect(
+                "physical_plan: Decimal128 store value has no hi_reg — producer bug",
+            );
+            self.ops.push(Op::Store128 {
+                src_lo: value.reg,
+                src_hi: hi,
+                col_idx,
+            });
+            return;
+        }
         self.ops.push(Op::Store {
             src: value.reg,
             col_idx,

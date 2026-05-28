@@ -692,6 +692,16 @@ impl Expr {
                     if let Some(dt) = date_or_timestamp_arith_result(*op, l, r) {
                         return dt;
                     }
+                    // v0.7 sub-task B: Decimal128 arithmetic at the logical
+                    // plane returns the SQL-convention result dtype directly;
+                    // the physical-plan codegen mirrors the rule via
+                    // `decimal128_arith_result_dtype`. Mixed Decimal / non-
+                    // Decimal arithmetic isn't wired yet (it would require an
+                    // implicit promotion path); reject with a tight message
+                    // so the user sees the v0.7 envelope.
+                    if let Some(dt) = decimal128_arith_result(*op, l, r) {
+                        return dt;
+                    }
                     if !l.is_numeric() || !r.is_numeric() {
                         return Err(BoltError::Type(format!(
                             "arithmetic {op:?} requires numeric operands, got {l:?} and {r:?}"
@@ -1087,6 +1097,97 @@ fn date_or_timestamp_arith_result(
             "arithmetic {op:?} on Date/Timestamp operands ({l:?}, {r:?}) is not \
              supported; only Date32 - Date32 and Timestamp - Timestamp \
              (matching unit and tz) are wired in v0.7"
+        )))),
+    }
+}
+
+/// v0.7 sub-task B: result dtype for `Decimal128(p1, s1) op Decimal128(p2, s2)`
+/// arithmetic at the logical plane. Mirrors the physical-plane helper
+/// `physical_plan::decimal128_arith_result_dtype` so a SELECT that
+/// references a Decimal arithmetic expression resolves to the same dtype
+/// whether the planner asks the logical or the physical layer for it.
+///
+/// Returns `None` if neither operand is Decimal128 (let the caller fall
+/// through to the regular numeric path). Returns `Some(Err)` for the
+/// "either side is Decimal128 but the shape isn't supported" cases
+/// (Decimal vs non-Decimal, scale mismatch on Add/Sub, precision
+/// overflow on the result, etc.).
+fn decimal128_arith_result(
+    op: BinaryOp,
+    l: DataType,
+    r: DataType,
+) -> Option<BoltResult<DataType>> {
+    use DataType::*;
+    let l_dec = matches!(l, Decimal128(_, _));
+    let r_dec = matches!(r, Decimal128(_, _));
+    if !l_dec && !r_dec {
+        return None;
+    }
+    let (p1, s1) = match l {
+        Decimal128(p, s) => (p, s),
+        other => {
+            return Some(Err(BoltError::Type(format!(
+                "arithmetic {op:?} on mixed Decimal128 / {other:?} is not yet \
+                 supported; CAST to a common Decimal128(p, s) first"
+            ))));
+        }
+    };
+    let (p2, s2) = match r {
+        Decimal128(p, s) => (p, s),
+        other => {
+            return Some(Err(BoltError::Type(format!(
+                "arithmetic {op:?} on mixed Decimal128 / {other:?} is not yet \
+                 supported; CAST to a common Decimal128(p, s) first"
+            ))));
+        }
+    };
+    // 38 = Arrow Decimal128 max precision.
+    const MAX_P: u8 = 38;
+    match op {
+        BinaryOp::Add | BinaryOp::Sub => {
+            if s1 != s2 {
+                return Some(Err(BoltError::Type(format!(
+                    "Decimal128 {op:?} requires matching scale, \
+                     got Decimal128({p1}, {s1}) and Decimal128({p2}, {s2})"
+                ))));
+            }
+            let p = p1.max(p2);
+            let new_p = match p.checked_add(1) {
+                Some(v) if v <= MAX_P => v,
+                _ => {
+                    return Some(Err(BoltError::Type(format!(
+                        "Decimal128 {op:?} result precision exceeds {MAX_P} \
+                         (max({p1}, {p2}) + 1)"
+                    ))));
+                }
+            };
+            Some(Ok(Decimal128(new_p, s1)))
+        }
+        BinaryOp::Mul => {
+            let new_p = match p1.checked_add(p2) {
+                Some(v) if v <= MAX_P => v,
+                _ => {
+                    return Some(Err(BoltError::Type(format!(
+                        "Decimal128 Mul result precision {p1} + {p2} exceeds {MAX_P}"
+                    ))));
+                }
+            };
+            let new_s = match s1.checked_add(s2) {
+                Some(v) => v,
+                None => {
+                    return Some(Err(BoltError::Type(format!(
+                        "Decimal128 Mul scale overflow: {s1} + {s2} does not fit in i8"
+                    ))));
+                }
+            };
+            Some(Ok(Decimal128(new_p, new_s)))
+        }
+        BinaryOp::Div => Some(Err(BoltError::Type(
+            "Decimal128 Div not yet lowered to GPU; only Add/Sub/Mul are wired in v0.7"
+                .into(),
+        ))),
+        other => Some(Err(BoltError::Type(format!(
+            "arithmetic {other:?} on Decimal128 operands is not supported in v0.7"
         )))),
     }
 }
