@@ -3023,7 +3023,7 @@ mod tests {
     /// `marker` in `haystack`. Used to lock the speculative-load → CAS
     /// ordering: dropping the speculative load (or moving it after the CAS,
     /// which would be useless) would flip this.
-    fn assert_appears_before(haystack: &str, needle: &str, marker: &str, ctx: &str) {
+    fn assert_appears_before_with_ctx(haystack: &str, needle: &str, marker: &str, ctx: &str) {
         let needle_pos = haystack.find(needle).unwrap_or_else(|| {
             panic!("{ctx}: expected speculative pre-check '{needle}' to appear in PTX:\n{haystack}")
         });
@@ -3051,13 +3051,13 @@ mod tests {
             ptx.contains("DO_CAS:"),
             "build kernel must emit DO_CAS: join-point label\n{ptx}"
         );
-        assert_appears_before(
+        assert_appears_before_with_ctx(
             &ptx,
             "ld.acquire.gpu.s64",
             "atom.global.cas.b64",
             "compile_build_kernel",
         );
-        assert_appears_before(
+        assert_appears_before_with_ctx(
             &ptx,
             "DO_CAS:",
             "atom.global.cas.b64",
@@ -3080,7 +3080,7 @@ mod tests {
             ptx.contains("DO_CAS:"),
             "collision build kernel must emit DO_CAS: join-point label\n{ptx}"
         );
-        assert_appears_before(
+        assert_appears_before_with_ctx(
             &ptx,
             "ld.acquire.gpu.s64",
             "atom.global.cas.b64",
@@ -3104,7 +3104,7 @@ mod tests {
             ptx.contains("DO_CAS:"),
             "AoS build kernel must emit DO_CAS: join-point label\n{ptx}"
         );
-        assert_appears_before(
+        assert_appears_before_with_ctx(
             &ptx,
             "ld.acquire.gpu.s64",
             "atom.global.cas.b64",

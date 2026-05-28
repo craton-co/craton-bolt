@@ -783,7 +783,7 @@ fn golden_hash_join_build_kernel_smoke() {
 /// Helper: assert `needle` appears strictly before the first occurrence of
 /// `marker` in `haystack`. Used by the speculative-load goldens to lock the
 /// pre-check → CAS ordering.
-fn assert_appears_before(haystack: &str, needle: &str, marker: &str, ctx: &str) {
+fn assert_appears_before_with_ctx(haystack: &str, needle: &str, marker: &str, ctx: &str) {
     let needle_pos = haystack.find(needle).unwrap_or_else(|| {
         panic!("{ctx}: expected '{needle}' to appear in PTX:\n{haystack}")
     });
@@ -810,13 +810,13 @@ fn golden_hash_join_build_kernel_speculative_pre_check() {
         "SoA build must emit speculative ld.acquire.gpu.s64 before CAS\n{ptx}"
     );
     assert!(ptx.contains("DO_CAS:"), "SoA build must emit DO_CAS: label\n{ptx}");
-    assert_appears_before(
+    assert_appears_before_with_ctx(
         &ptx,
         "ld.acquire.gpu.s64",
         "atom.global.cas.b64",
         "compile_build_kernel",
     );
-    assert_appears_before(
+    assert_appears_before_with_ctx(
         &ptx,
         "DO_CAS:",
         "atom.global.cas.b64",
@@ -837,7 +837,7 @@ fn golden_hash_join_build_collision_kernel_speculative_pre_check() {
         "collision build must emit speculative ld.acquire.gpu.s64 before CAS\n{ptx}"
     );
     assert!(ptx.contains("DO_CAS:"), "collision build must emit DO_CAS: label\n{ptx}");
-    assert_appears_before(
+    assert_appears_before_with_ctx(
         &ptx,
         "ld.acquire.gpu.s64",
         "atom.global.cas.b64",
@@ -867,7 +867,7 @@ fn golden_hash_join_build_aos_kernel_speculative_pre_check() {
         "AoS build must emit speculative ld.acquire.gpu.s64 before CAS\n{ptx}"
     );
     assert!(ptx.contains("DO_CAS:"), "AoS build must emit DO_CAS: label\n{ptx}");
-    assert_appears_before(
+    assert_appears_before_with_ctx(
         &ptx,
         "ld.acquire.gpu.s64",
         "atom.global.cas.b64",
@@ -896,9 +896,8 @@ fn golden_hash_join_probe_kernel_smoke() {
 // the empty-check-before-second-lane ordering (obstacle 3).
 
 /// Local helper: assert `needle_a` appears strictly before `needle_b` in
-/// `haystack`. Both substrings must exist. Used to pin the EMPTY-slot check
-/// vs second-lane match-check ordering inside the tiled probe.
-fn assert_appears_before(haystack: &str, needle_a: &str, needle_b: &str) {
+/// `haystack`. (Tiled-probe variant.)
+fn assert_pre_before_post(haystack: &str, needle_a: &str, needle_b: &str) {
     let pos_a = haystack.find(needle_a).unwrap_or_else(|| {
         panic!("needle_a `{needle_a}` not found in:\n{haystack}")
     });
