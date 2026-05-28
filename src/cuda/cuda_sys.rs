@@ -819,13 +819,12 @@ mod init_cache_tests {
 // Backend split:
 //   - Default build: routes straight into the hand-rolled `extern "C"`
 //     async FFI.
-//   - `--features cudarc`: cudarc 0.13's scoped `driver` feature set does
-//     not expose async memcpy from the safe surface. To keep this Stage 1
-//     PR small we delegate to the synchronous path on this branch — the
-//     behaviour is identical to today, the wrappers just compile and link
-//     cleanly. Stage 2 will replace this with a real async path either by
-//     calling cudarc's `sys::*Async_v2` raw symbols or by enabling the
-//     wider cudarc feature flag.
+//   - `--features cudarc`: routes into `cudarc_backend::memcpy_{h2d,d2h}_async`
+//     and `cudarc_backend::memset_d8_async`, which invoke the
+//     `cuMemcpyHtoDAsync_v2` / `cuMemcpyDtoHAsync_v2` / `cuMemsetD8Async`
+//     entry points via `cudarc::driver::sys::lib()`. Both backends preserve
+//     stream-ordered semantics — Stage 1's synchronous fall-back has been
+//     retired (review C3).
 //
 // All three wrappers are `pub(crate)` rather than `pub`: Stage 1 deliberately
 // keeps the async surface internal until executors are wired in Stage 2.
@@ -847,13 +846,6 @@ mod init_cache_tests {
 /// - `dst` must point to a live device allocation of at least the same
 ///   size in the currently-bound context.
 /// - The caller must not mutate or free `src` until the copy completes.
-///
-/// # TODO(stage2)
-/// Wire cudarc async path — the cudarc 0.13 `driver` feature set does not
-/// expose `cuMemcpyHtoDAsync_v2` from the safe surface, so the
-/// `--features cudarc` branch currently falls back to the synchronous
-/// memcpy. Replace once the surface is widened or once we drop into
-/// `cudarc::driver::sys::*Async_v2` directly.
 pub(crate) unsafe fn memcpy_h2d_async<T: Pod>(
     dst: CUdeviceptr,
     src: *const T,
@@ -873,9 +865,9 @@ pub(crate) unsafe fn memcpy_h2d_async<T: Pod>(
 
     #[cfg(feature = "cudarc")]
     {
-        // TODO(stage2): wire cudarc async path.
-        let _ = stream;
-        return crate::cuda::cudarc_backend::memcpy_h2d::<T>(dst, src, n);
+        // Stage 2 (review C3): real async via cudarc's driver::sys raw
+        // bindings. The cudarc backend retains stream-ordered semantics.
+        return crate::cuda::cudarc_backend::memcpy_h2d_async::<T>(dst, src, n, stream);
     }
 
     #[cfg(not(feature = "cudarc"))]
@@ -904,10 +896,6 @@ pub(crate) unsafe fn memcpy_h2d_async<T: Pod>(
 /// - `src` must point to a live device allocation of at least the same size
 ///   in the currently-bound context.
 /// - The caller must not read `dst` until the copy completes.
-///
-/// # TODO(stage2)
-/// Wire cudarc async path — same constraint as
-/// [`memcpy_h2d_async`].
 pub(crate) unsafe fn memcpy_d2h_async<T: Pod>(
     dst: *mut T,
     src: CUdeviceptr,
@@ -927,9 +915,9 @@ pub(crate) unsafe fn memcpy_d2h_async<T: Pod>(
 
     #[cfg(feature = "cudarc")]
     {
-        // TODO(stage2): wire cudarc async path.
-        let _ = stream;
-        return crate::cuda::cudarc_backend::memcpy_d2h::<T>(dst, src, n);
+        // Stage 2 (review C3): real async via cudarc's driver::sys raw
+        // bindings. See `cudarc_backend::memcpy_d2h_async`.
+        return crate::cuda::cudarc_backend::memcpy_d2h_async::<T>(dst, src, n, stream);
     }
 
     #[cfg(not(feature = "cudarc"))]
@@ -957,11 +945,6 @@ pub(crate) unsafe fn memcpy_d2h_async<T: Pod>(
 /// This wrapper itself does not deref the pointer, so it does not need to
 /// be `unsafe fn` — the unsafety is moved into the caller's obligation to
 /// uphold the contract above.
-///
-/// # TODO(stage2)
-/// Wire cudarc async path. cudarc 0.13's `driver` feature does not expose
-/// `cuMemsetD8Async` from the safe surface, so the `--features cudarc`
-/// branch falls back to the synchronous memset.
 #[allow(dead_code)] // reason: Stage 2 will wire executors to async memset
 pub(crate) fn memset_d8_async(
     ptr: CUdeviceptr,
@@ -975,13 +958,13 @@ pub(crate) fn memset_d8_async(
 
     #[cfg(feature = "cudarc")]
     {
-        // TODO(stage2): wire cudarc async path. cudarc has no public
-        // memset_d8 helper, but the synchronous fall-back path below
-        // matches today's Stage 1 spike behaviour.
-        let _ = stream;
+        // Stage 2 (review C3): real async via cudarc's driver::sys raw
+        // bindings. See `cudarc_backend::memset_d8_async`.
         // SAFETY: precondition documented on the function — caller
         // guarantees the device range is live and not in use.
-        return unsafe { memset_d8(ptr, value, n_bytes) };
+        return unsafe {
+            crate::cuda::cudarc_backend::memset_d8_async(ptr, value, n_bytes, stream)
+        };
     }
 
     #[cfg(not(feature = "cudarc"))]

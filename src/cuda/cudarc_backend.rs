@@ -35,7 +35,7 @@
 use cudarc::driver::{result, CudaDevice};
 use std::sync::Arc;
 
-use crate::cuda::cuda_sys::CUdeviceptr;
+use crate::cuda::cuda_sys::{CUdeviceptr, CUstream};
 use crate::error::{BoltError, BoltResult};
 
 /// Per-process cudarc device cache. `CudaDevice::new` returns an
@@ -165,6 +165,120 @@ pub unsafe fn memcpy_d2h<T>(
     let dst_bytes = std::slice::from_raw_parts_mut(dst as *mut u8, bytes);
     result::memcpy_dtoh_sync(dst_bytes, src as cudarc::driver::sys::CUdeviceptr)
         .map_err(|e| cudarc_err("cudarc memcpy_dtoh_sync", e))
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 (review C3): real async memcpy/memset through cudarc's raw
+// driver::sys bindings.
+//
+// cudarc 0.13's safe `result::memcpy_*_async` wrappers take Rust slices,
+// which is awkward to feed from our raw-pointer-based `cuda_sys` surface
+// (the caller passes `*const T` / `*mut T` + count, and we cannot safely
+// synthesize a slice over device-bound memory or over potentially-unaligned
+// host pointers without imposing extra invariants on every call site).
+//
+// We therefore drop one level lower and invoke the dynamically-loaded
+// `cudarc::driver::sys::lib()` methods directly. These are the same FFI
+// symbols our hand-rolled `extern "C"` block exposes — the only difference
+// is the type alias for `CUstream` (cudarc uses `*mut CUstream_st`, we use
+// `*mut c_void`), so we cast at the boundary. The driver itself sees the
+// identical bit pattern.
+//
+// Error mapping goes through `cudarc_err` so OOM and other failures surface
+// as `BoltError::CudaWithCode` exactly like every other cudarc-backed call.
+// ---------------------------------------------------------------------------
+
+/// Asynchronously copy `count` elements of `T` from host `src` to device
+/// `dst` on `stream`. Cudarc-backed counterpart to
+/// `cuda_sys::memcpy_h2d_async`.
+///
+/// # Safety
+/// `src` must be valid for `count * size_of::<T>()` bytes of reads for the
+/// duration of the async copy (until the stream is synchronized); `dst`
+/// must point to a live device allocation of at least that size in the
+/// currently-bound context.
+pub(crate) unsafe fn memcpy_h2d_async<T>(
+    dst: CUdeviceptr,
+    src: *const T,
+    count: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "cudarc memcpy_h2d_async size overflow: {count} * {}",
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    // Ensure the primary context is current on this thread before any FFI.
+    let _dev = device()?;
+    cudarc::driver::sys::lib()
+        .cuMemcpyHtoDAsync_v2(
+            dst as cudarc::driver::sys::CUdeviceptr,
+            src as *const core::ffi::c_void,
+            bytes,
+            stream as cudarc::driver::sys::CUstream,
+        )
+        .result()
+        .map_err(|e| cudarc_err("cudarc cuMemcpyHtoDAsync_v2", e))
+}
+
+/// Asynchronously copy `count` elements of `T` from device `src` to host
+/// `dst` on `stream`. Cudarc-backed counterpart to
+/// `cuda_sys::memcpy_d2h_async`.
+///
+/// # Safety
+/// `dst` must be valid for `count * size_of::<T>()` bytes of writes for the
+/// duration of the async copy (until the stream is synchronized); `src`
+/// must point to a live device allocation of at least that size in the
+/// currently-bound context.
+pub(crate) unsafe fn memcpy_d2h_async<T>(
+    dst: *mut T,
+    src: CUdeviceptr,
+    count: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        BoltError::Memory(format!(
+            "cudarc memcpy_d2h_async size overflow: {count} * {}",
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    let _dev = device()?;
+    cudarc::driver::sys::lib()
+        .cuMemcpyDtoHAsync_v2(
+            dst as *mut core::ffi::c_void,
+            src as cudarc::driver::sys::CUdeviceptr,
+            bytes,
+            stream as cudarc::driver::sys::CUstream,
+        )
+        .result()
+        .map_err(|e| cudarc_err("cudarc cuMemcpyDtoHAsync_v2", e))
+}
+
+/// Asynchronously fill `n_bytes` at device pointer `ptr` with the byte
+/// `value`, on `stream`. Cudarc-backed counterpart to
+/// `cuda_sys::memset_d8_async`.
+///
+/// # Safety
+/// `ptr` must point to a live device allocation of at least `n_bytes`
+/// bytes in the currently-bound context; the memory must not be freed or
+/// concurrently mutated until the stream is synchronized.
+pub(crate) unsafe fn memset_d8_async(
+    ptr: CUdeviceptr,
+    value: u8,
+    n_bytes: usize,
+    stream: CUstream,
+) -> BoltResult<()> {
+    let _dev = device()?;
+    cudarc::driver::sys::lib()
+        .cuMemsetD8Async(
+            ptr as cudarc::driver::sys::CUdeviceptr,
+            value,
+            n_bytes,
+            stream as cudarc::driver::sys::CUstream,
+        )
+        .result()
+        .map_err(|e| cudarc_err("cudarc cuMemsetD8Async", e))
 }
 
 #[cfg(test)]
