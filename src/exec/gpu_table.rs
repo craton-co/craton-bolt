@@ -368,6 +368,16 @@ impl GpuColumn {
                     }
                 }
             }
+            DataType::Decimal128(_, _) => {
+                // v0.6 / M4: Decimal128 is plan-level only. There is no
+                // GPU-side `i128` column variant yet, so reject at the
+                // upload boundary with a clear, consistent message.
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 not yet lowered to GPU; coming in a follow-up \
+                     (column '{}' upload)",
+                    name
+                )));
+            }
         };
         Ok(Self {
             name,

@@ -292,6 +292,13 @@ fn resolve_key_columns<'a>(
                     io.name
                 )))
             }
+            DataType::Decimal128(_, _) => {
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 not yet lowered to GPU; coming in a follow-up \
+                     (column '{}' in GROUP BY)",
+                    io.name
+                )))
+            }
         }
         let idx = batch.schema().index_of(&io.name).map_err(|e| {
             BoltError::Plan(format!(
@@ -355,7 +362,7 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> BoltResult<KeyValue> {
             // Review C12: same signed-zero canonicalisation as Float32.
             Ok(KeyValue::F64Bits(canonicalise_f64(pa.value(row)).to_bits()))
         }
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
             "wide GROUP BY: key dtype {:?} not supported",
             kc.dtype
         ))),
@@ -489,7 +496,7 @@ fn resolve_aggregates<'a>(
         // Reject Bool/Utf8 inputs.
         match io.dtype {
             DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 => {}
-            DataType::Bool | DataType::Utf8 => {
+            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: Bool/Utf8 aggregate inputs not supported (column '{}')",
                     io.name
@@ -555,7 +562,7 @@ fn agg_input_at(plan: &AggInputPlan<'_>, row: usize) -> BoltResult<AggInputValue
                 .ok_or_else(|| downcast_err(&plan.name, "Float64"))?;
             Ok(AggInputValue::F64(pa.value(row)))
         }
-        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
+        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
             "wide GROUP BY: aggregate input dtype {:?} not supported (column '{}')",
             plan.dtype, plan.name
         ))),
@@ -837,7 +844,7 @@ fn build_key_arrays(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool | DataType::Utf8 => {
+            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: key dtype {:?} not supported on output",
                     kc.dtype
@@ -957,7 +964,7 @@ fn collect_sum_min_max(
                 DataType::Int64 => TypedColumn::I64(Vec::new()),
                 DataType::Float32 => TypedColumn::F32(Vec::new()),
                 DataType::Float64 => TypedColumn::F64(Vec::new()),
-                DataType::Bool | DataType::Utf8 => {
+                DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
                     return Err(BoltError::Type(format!(
                         "wide GROUP BY: cannot emit empty {:?} aggregate column",
                         out_dtype
@@ -1150,6 +1157,9 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
+        ArrowDataType::Decimal128(precision, scale) => {
+            Ok(DataType::Decimal128(*precision, *scale))
+        }
         other => Err(BoltError::Type(format!(
             "wide GROUP BY: unsupported Arrow dtype {:?}",
             other
@@ -1166,6 +1176,7 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
     }
 }
 

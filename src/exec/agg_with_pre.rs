@@ -952,7 +952,7 @@ impl PreCol {
                     .ok_or_else(|| downcast_err("input", "Float64"))?;
                 PreColValues::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
-            DataType::Bool | DataType::Utf8 => {
+            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel column dtype {:?} not supported",
                     dtype
@@ -979,7 +979,7 @@ impl PreCol {
             DataType::Int64 => PreColValues::I64(GpuVec::<i64>::zeros(n)?),
             DataType::Float32 => PreColValues::F32(GpuVec::<f32>::zeros(n)?),
             DataType::Float64 => PreColValues::F64(GpuVec::<f64>::zeros(n)?),
-            DataType::Bool | DataType::Utf8 => {
+            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel output dtype {:?} not supported",
                     dtype
@@ -1282,6 +1282,9 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
+        ArrowDataType::Decimal128(precision, scale) => {
+            Ok(DataType::Decimal128(*precision, *scale))
+        }
         other => Err(BoltError::Type(format!(
             "unsupported Arrow dtype {:?}",
             other
@@ -1298,6 +1301,7 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
     }
 }
 

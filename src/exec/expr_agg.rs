@@ -350,6 +350,12 @@ fn eval_literal(lit: &Literal, n_rows: usize) -> BoltResult<HostColumn> {
         Literal::Float32(v) => HostColumn::F32(vec![Some(*v); n_rows]),
         Literal::Float64(v) => HostColumn::F64(vec![Some(*v); n_rows]),
         Literal::Utf8(s) => HostColumn::Utf8(vec![Some(s.clone()); n_rows]),
+        Literal::Decimal128(..) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up \
+                 (host-side literal broadcast)".into(),
+            ))
+        }
     })
 }
 
@@ -775,6 +781,12 @@ fn cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
         DataType::Float32 => HostColumn::F32(cast_to_f32(col)?),
         DataType::Float64 => HostColumn::F64(cast_to_f64(col)?),
         DataType::Utf8 => HostColumn::Utf8(cast_to_utf8(col)?),
+        DataType::Decimal128(_, _) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up \
+                 (host-side cast)".into(),
+            ))
+        }
     })
 }
 

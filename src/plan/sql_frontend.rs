@@ -9,18 +9,18 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Offset, OrderByExpr, Query,
-    Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-    UnaryOperator, Value,
+    BinaryOperator, DataType as SqlDataType, Distinct, ExactNumberInfo, Expr as SqlExpr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, ObjectName, Offset, OrderByExpr, Query, Select, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, Statement, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, Expr,
-    JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
+    aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, DataType,
+    Expr, JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
 };
 
 /// Maximum recursion depth allowed when walking attacker-controlled SQL
@@ -1918,8 +1918,93 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "scalar function calls are not supported".into(),
         )),
+        // v0.6 / M4: CAST(...) parses and the SQL-level dtype is converted
+        // through `lower_sql_data_type`. Lowering the underlying expression
+        // succeeds so plan validation can run, but the lowerer surfaces a
+        // `BoltError::Plan` for every primitive pair — including
+        // `CAST(int AS DECIMAL(p, s))`. The dedicated Decimal128 follow-up
+        // will replace this with a real `Expr::Cast { expr, to }` variant
+        // and proper lowering; until then accepting the syntax here lets
+        // users surface the diagnostic at the lowering boundary rather than
+        // at the parser.
+        SqlExpr::Cast {
+            kind: _,
+            expr: inner,
+            data_type,
+            format: _,
+        } => {
+            // Lower the inner expression first so any underlying syntax
+            // errors (unknown column, bad literal) surface with their
+            // existing message rather than being swallowed by the CAST
+            // rejection. We discard the lowered expression: the CAST itself
+            // is unsupported, so even a clean inner expression can't reach
+            // the planner intact.
+            let _ = lower_expr(inner, resolver, depth + 1)?;
+            // Resolve the target SQL DataType so unknown types fail with a
+            // type error, not a generic "unsupported CAST" message.
+            let to = lower_sql_data_type(data_type)?;
+            Err(BoltError::Plan(format!(
+                "CAST to {to:?} is not yet supported at the lowering boundary; \
+                 the v0.6 / M4 Decimal128 follow-up will land real CAST lowering"
+            )))
+        }
         other => Err(BoltError::Sql(format!(
             "unsupported expression: {other}"
+        ))),
+    }
+}
+
+/// Translate a SQL `DataType` into our plan `DataType`.
+///
+/// v0.6 / M4: this is exclusively driven by the CAST path. Only the dtypes
+/// the rest of the engine recognises round-trip cleanly:
+/// `BOOLEAN`, `INT`/`INTEGER`, `BIGINT`, `REAL`/`FLOAT`/`FLOAT4`,
+/// `DOUBLE PRECISION`/`FLOAT8`, `VARCHAR`/`TEXT`/`STRING`, and
+/// `DECIMAL(p, s)` / `NUMERIC(p, s)`. Unknown / partially-specified types
+/// surface as a clear `BoltError::Type`.
+fn lower_sql_data_type(d: &SqlDataType) -> BoltResult<DataType> {
+    match d {
+        SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Bool),
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
+            Ok(DataType::Int32)
+        }
+        SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(DataType::Int64),
+        SqlDataType::Real | SqlDataType::Float4 => Ok(DataType::Float32),
+        SqlDataType::DoublePrecision | SqlDataType::Float8 => Ok(DataType::Float64),
+        SqlDataType::Float(_) => Ok(DataType::Float32),
+        SqlDataType::Varchar(_)
+        | SqlDataType::Text
+        | SqlDataType::String(_)
+        | SqlDataType::Char(_)
+        | SqlDataType::Character(_) => Ok(DataType::Utf8),
+        SqlDataType::Decimal(info)
+        | SqlDataType::Numeric(info)
+        | SqlDataType::Dec(info) => {
+            let (p, s) = match info {
+                ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s as i64),
+                ExactNumberInfo::Precision(p) => (*p, 0),
+                // Bare `DECIMAL` / `NUMERIC` without precision: max-precision
+                // i128 with zero scale is the safe default. Mirrors the
+                // `From<i128>` convention on `Literal`.
+                ExactNumberInfo::None => (38, 0),
+            };
+            // Clamp into the (u8, i8) representation. Decimal128 in Arrow
+            // allows precision 1..=38 and scale -128..=127 in principle; we
+            // surface a clear error on out-of-range inputs.
+            if p == 0 || p > 38 {
+                return Err(BoltError::Type(format!(
+                    "DECIMAL precision {p} out of range (must be 1..=38)"
+                )));
+            }
+            if !(-128..=127).contains(&s) {
+                return Err(BoltError::Type(format!(
+                    "DECIMAL scale {s} out of range (must fit in i8)"
+                )));
+            }
+            Ok(DataType::Decimal128(p as u8, s as i8))
+        }
+        other => Err(BoltError::Type(format!(
+            "unsupported SQL data type in CAST: {other}"
         ))),
     }
 }

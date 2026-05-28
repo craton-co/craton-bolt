@@ -333,6 +333,7 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
     }
 }
 

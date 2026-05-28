@@ -930,6 +930,11 @@ fn alloc_gathered(dtype: DataType, len: usize) -> BoltResult<GatheredCol> {
                 "gpu_compact: gather Utf8 not supported (variable-width)".into(),
             ))
         }
+        DataType::Decimal128(_, _) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+            ))
+        }
     })
 }
 

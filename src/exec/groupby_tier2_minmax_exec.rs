@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
-//! **MIN / MAX at Tier 2.1** — high-cardinality executor for
+//! **MIN / MAX at Tier 2.1** вЂ” high-cardinality executor for
 //! `SELECT key, {MIN,MAX}(val) FROM x GROUP BY key`.
 //!
 //! Integer value dtypes (Int32 / Int64) only. Float MIN/MAX requires a
 //! CAS-loop in PTX (no native `atom.shared.{min,max}.f{32,64}` on
-//! sm_70) and there's no benchmark workload demanding it yet —
+//! sm_70) and there's no benchmark workload demanding it yet вЂ”
 //! documented as deferred.
 //!
 //! Single-aggregate only (one MIN or one MAX per query). A future
@@ -24,7 +24,7 @@
 //!   `compile_scatter_kernel_i32_to_i64` kernel. Vals stay in 64-bit
 //!   integer registers end-to-end, so values with `|v| > 2^53`
 //!   round-trip losslessly. This replaces the earlier C4 host-side
-//!   `i64_values_exceed_f64_mantissa` guard — the fast lane is now
+//!   `i64_values_exceed_f64_mantissa` guard вЂ” the fast lane is now
 //!   exact across the full i64 range.
 
 use std::sync::Arc;
@@ -50,7 +50,7 @@ const BLOCK_THREADS: u32 = 256;
 
 // ---------------------------------------------------------------------------
 // Per-executor module cache. See `groupby_tier2_count_exec.rs` for the
-// motivation and concurrency notes — the design is identical.
+// motivation and concurrency notes вЂ” the design is identical.
 //
 // The reduce kernel here is parameterised on `(MinMaxOp, MinMaxDtype)`. We
 // mirror those as cache-key variants (rather than using the upstream types
@@ -246,16 +246,16 @@ fn execute_inner(
         launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
     }
 
-    // P1b-stage8: joint helper, 2 syncs → 1.
+    // P1b-stage8: joint helper, 2 syncs в†’ 1.
     let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
         partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
 
-    // ---- Scatter pass — dtype-specialised ----
+    // ---- Scatter pass вЂ” dtype-specialised ----
     //
     // Int32 vals route through the f64-val scatter: `i32 -> f64 -> i32`
     // is exact for every i32 (i32::MAX < 2^53), so there's no precision
     // loss. Int64 vals route through the typed
-    // `compile_scatter_kernel_i32_to_i64` kernel — vals stay in 64-bit
+    // `compile_scatter_kernel_i32_to_i64` kernel вЂ” vals stay in 64-bit
     // integer registers end-to-end, so values >2^53 round-trip
     // losslessly. This replaces the earlier f64 round-trip guard.
     match val_dtype {
@@ -623,6 +623,7 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
     }
 }
 
@@ -651,7 +652,7 @@ mod tests {
     use crate::jit::scatter_kernel;
 
     /// The Int64 value path MUST be wired to the typed scatter kernel
-    /// — i.e. `compile_scatter_kernel_i32_to_i64` produces PTX free of
+    /// вЂ” i.e. `compile_scatter_kernel_i32_to_i64` produces PTX free of
     /// `.f64` instructions. A regression that re-routed Int64 through
     /// the f64 sibling would silently narrow any value with bit 53 set.
     #[test]
@@ -668,7 +669,7 @@ mod tests {
         );
     }
 
-    /// The Int32 value path still uses the f64-val sibling — i32 -> f64
+    /// The Int32 value path still uses the f64-val sibling вЂ” i32 -> f64
     /// -> i32 round-trip is bit-exact for all i32 and we don't need a
     /// typed i32-val kernel for correctness.
     #[test]
