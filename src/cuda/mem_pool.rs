@@ -342,9 +342,11 @@ fn bucket_size(bytes: usize) -> usize {
     // zero and break `div_ceil`. We never hit that because `n >= 64`,
     // but the cost is one cmp instruction.
     let step = (pow2 / 4).max(1);
-    // ceil(n / step) * step. Saturating arithmetic guards against pathological
-    // sizes near `usize::MAX`; cuMemAlloc would refuse those anyway.
-    let rounded = n.saturating_add(step - 1) / step * step;
+    // bitmask round-up (step is power-of-two; saves a div+mul on every alloc/free).
+    // Equivalent to `ceil(n / step) * step` but compiles to an `add`+`andn`.
+    // Saturating arithmetic guards against pathological sizes near `usize::MAX`;
+    // cuMemAlloc would refuse those anyway.
+    let rounded = n.saturating_add(step - 1) & !(step - 1);
     rounded.max(ARROW_ALIGNMENT)
 }
 
@@ -387,7 +389,10 @@ unsafe fn driver_free(ptr: CUdeviceptr) {
     #[cfg(not(feature = "cudarc"))]
     let result = cuda_sys::mem_free(ptr);
     if let Err(e) = result {
-        eprintln!("craton-bolt: DeviceMemPool failed to free ptr: {}", e);
+        // Use `log::warn!` for consistency with the rest of the module
+        // (pool_watcher, OOM recovery). `eprintln!` bypasses the
+        // crate's structured logging and is harder to silence in tests.
+        log::warn!("craton-bolt: DeviceMemPool failed to free ptr: {}", e);
     }
 }
 
@@ -795,14 +800,25 @@ impl DeviceMemPool {
             return;
         }
 
-        let mut to_free: Vec<CUdeviceptr> = Vec::new();
+        // Pre-size for the common case: 0 or 1 evictions per free. Skips
+        // the initial-grow allocation that a default `Vec::new()` would
+        // pay for on the first `push` in the eviction loop.
+        let mut to_free: Vec<CUdeviceptr> = Vec::with_capacity(2);
 
         // ---- Byte-cap eviction (best-effort, lock-free counter) ----
         //
         // If the incoming block is bigger than the entire cap there's no
         // point evicting — we'll just route it straight to the driver.
         if alloc_bytes <= self.max_pooled_bytes {
-            while self.total_bytes.load(Ordering::Acquire) + alloc_bytes
+            // `saturating_add` guards against a transient overshoot where
+            // `total_bytes` is briefly close to `usize::MAX` (e.g. under
+            // an interleaved `reconcile_total_bytes` + bare `fetch_add`
+            // race window). A bare `+` could wrap and silently bypass
+            // the cap check.
+            while self
+                .total_bytes
+                .load(Ordering::Acquire)
+                .saturating_add(alloc_bytes)
                 > self.max_pooled_bytes
             {
                 if !self.evict_one(&mut to_free) {
@@ -885,8 +901,13 @@ impl DeviceMemPool {
         let fits_bucket = bucket.blocks.len() < self.max_bucket_entries;
         // Re-check byte cap under our local (bucket) lock — eviction
         // above might have already brought us under, or a parallel
-        // free may have pushed us back over.
-        let projected = self.total_bytes.load(Ordering::Acquire) + alloc_bytes;
+        // free may have pushed us back over. `saturating_add` matches
+        // the cap check in `free` so a near-`usize::MAX` transient
+        // can't wrap and slip past the limit.
+        let projected = self
+            .total_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(alloc_bytes);
         let fits_total = alloc_bytes <= self.max_pooled_bytes
             && projected <= self.max_pooled_bytes;
         if fits_bucket && fits_total {
@@ -1006,17 +1027,42 @@ impl DeviceMemPool {
     /// for the `evict_one` path when the LRU index has somehow drifted
     /// out of sync with the buckets (should not happen under correct
     /// accounting). O(buckets); bounded.
+    ///
+    /// Single-pass: collects both the oldest-front candidate and the
+    /// list of every non-empty bucket key in one `for_each_bucket` walk,
+    /// so we never lock every bucket twice. The previous implementation
+    /// re-iterated the bucket storage to find a fallback when the
+    /// chosen bucket got raced empty.
     fn evict_one_scan_fallback(&self, sink: &mut Vec<CUdeviceptr>) -> bool {
-        let mut best: Option<(usize, Instant, u64)> = None;
+        // Tracked together so one walk produces both:
+        //   - `best_key` / `best_t`: bucket whose `front` is globally oldest
+        //   - `non_empty`: every non-empty bucket key (fallback list,
+        //     used only if `best` races empty between the scan and our
+        //     follow-up pop).
+        // The bucket count is bounded (~4 × log2(max_alloc) ≈ 100) so a
+        // small `Vec` here is essentially free.
+        let mut best_key: Option<usize> = None;
+        let mut best_t: Option<Instant> = None;
+        let mut non_empty: Vec<usize> = Vec::with_capacity(8);
         self.for_each_bucket(|key, bucket| {
             if let Some(front) = bucket.blocks.front() {
-                match best {
-                    Some((_, t, _)) if front.inserted >= t => {}
-                    _ => best = Some((key, front.inserted, front.tick)),
+                non_empty.push(key);
+                if best_t.map_or(true, |t| front.inserted < t) {
+                    best_key = Some(key);
+                    best_t = Some(front.inserted);
                 }
             }
         });
-        if let Some((key, _, _)) = best {
+        // Try the oldest-front bucket first. If a concurrent alloc
+        // drained it between the scan and our pop, fall through to
+        // every other bucket we observed as non-empty during the
+        // same walk — preserving the original two-pass code's
+        // "try literally any non-empty bucket" last-ditch guarantee.
+        let primary = best_key.into_iter();
+        let secondary = non_empty
+            .into_iter()
+            .filter(|k| Some(*k) != best_key);
+        for key in primary.chain(secondary) {
             let popped = self.with_bucket(key, |bucket| bucket.blocks.pop_front());
             if let Some(Some(block)) = popped {
                 self.sub_total_saturating(key);
@@ -1026,23 +1072,6 @@ impl DeviceMemPool {
                 sink.push(block.ptr);
                 return true;
             }
-        }
-        // Last-ditch: pop any block from any non-empty bucket.
-        let mut grabbed: Option<(usize, PooledBlock)> = None;
-        self.for_each_bucket(|key, bucket| {
-            if grabbed.is_none() {
-                if let Some(block) = bucket.blocks.pop_front() {
-                    grabbed = Some((key, block));
-                }
-            }
-        });
-        if let Some((key, block)) = grabbed {
-            self.sub_total_saturating(key);
-            self.lru_index
-                .lock()
-                .remove(&(block.inserted, block.tick));
-            sink.push(block.ptr);
-            return true;
         }
         false
     }
@@ -1315,11 +1344,17 @@ pub(super) mod pool_watcher {
     /// `ensure_started()` time. The watcher thread re-attaches this
     /// context via `cuCtxSetCurrent` before each `cuMemGetInfo_v2` poll
     /// — otherwise the watcher thread inherits no current context and
-    /// every poll errors with `CUDA_ERROR_INVALID_CONTEXT`. Stored as
-    /// `usize` so it crosses the static-storage boundary (raw pointers
-    /// are not `Sync`).
-    static CAPTURED_CTX: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    /// every poll errors with `CUDA_ERROR_INVALID_CONTEXT`.
+    ///
+    /// Held as `AtomicPtr<c_void>` because `CUcontext` is itself
+    /// `*mut c_void` (see `cuda_sys`) — keeping the pointer in a
+    /// pointer-typed atomic preserves provenance through the static-
+    /// storage round-trip rather than launder it through `usize` (the
+    /// strict-provenance model treats `as usize` / `as *mut _` as a
+    /// provenance-erasing cast). Acquire/Release semantics fence the
+    /// capture against the load on the watcher thread.
+    static CAPTURED_CTX: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
     fn real_mem_info() -> BoltResult<(usize, usize)> {
         crate::cuda::cuda_sys::mem_get_info()
@@ -1330,11 +1365,15 @@ pub(super) mod pool_watcher {
     /// captured, which happens if `ensure_started` ran before any
     /// engine thread had a context current.
     fn real_ctx_attach() -> BoltResult<()> {
+        // Acquire load pairs with the Release store in `ensure_started`
+        // / `retry_context_capture` — guarantees the captured pointer
+        // is visible with its full provenance to this thread.
         let raw = CAPTURED_CTX.load(Ordering::Acquire);
-        if raw == 0 {
+        if raw.is_null() {
             return Ok(());
         }
-        let ctx = raw as crate::cuda::cuda_sys::CUcontext;
+        // `CUcontext` is itself `*mut c_void`, so this is a no-op cast.
+        let ctx: crate::cuda::cuda_sys::CUcontext = raw;
         // SAFETY: `raw` was captured via `cuCtxGetCurrent` on the
         // engine thread; the engine's `CudaContext` outlives the
         // watcher because `DeviceMemPool::Drop` requests shutdown
@@ -1362,7 +1401,9 @@ pub(super) mod pool_watcher {
             // empty context).
             match crate::cuda::cuda_sys::ctx_get_current() {
                 Ok(Some(ctx)) => {
-                    CAPTURED_CTX.store(ctx as usize, Ordering::Release);
+                    // `ctx` is `*mut c_void` (CUcontext) — store directly
+                    // into the typed `AtomicPtr` so provenance is preserved.
+                    CAPTURED_CTX.store(ctx, Ordering::Release);
                 }
                 Ok(None) => {
                     log::debug!(
@@ -1418,16 +1459,17 @@ pub(super) mod pool_watcher {
     /// first call after a context becomes available.
     pub fn retry_context_capture() {
         // Fast path: already captured.
-        if CAPTURED_CTX.load(Ordering::Acquire) != 0 {
+        if !CAPTURED_CTX.load(Ordering::Acquire).is_null() {
             return;
         }
         match crate::cuda::cuda_sys::ctx_get_current() {
             Ok(Some(ctx)) => {
                 // CAS so concurrent first-callers don't race. Only the
-                // winner stores; losers no-op.
+                // winner stores; losers no-op. `ctx` is `*mut c_void`
+                // (CUcontext) — feeds the typed `AtomicPtr` directly.
                 let _ = CAPTURED_CTX.compare_exchange(
-                    0,
-                    ctx as usize,
+                    std::ptr::null_mut(),
+                    ctx,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 );
@@ -2968,5 +3010,125 @@ mod tests {
             "mem_info must not be called when ctx_attach fails; \
              observed {calls} invocations"
         );
+    }
+}
+
+#[cfg(test)]
+mod hot_path_tests {
+    //! Targeted tests for the hot-path micro-optimisations applied to
+    //! `mem_pool.rs`:
+    //!
+    //!  * `bucket_size` switched its `ceil(n / step) * step` rounding
+    //!    from div/mul to a power-of-two bitmask. The test below
+    //!    cross-checks the new closed-form against the legacy formula
+    //!    across every byte size in `[0, 1024]` plus a sparse sweep up
+    //!    to several MiB to cover every octave the realistic workload
+    //!    touches.
+    //!
+    //!  * The cap-check in `free` and `try_insert_into_locked_bucket`
+    //!    learned `saturating_add` so a near-`usize::MAX` transient in
+    //!    `total_bytes` can't wrap and bypass the cap. We assert the
+    //!    arithmetic alone — the cap path through `pool.free` is
+    //!    already covered by `pool_evicts_when_max_bytes_exceeded`.
+    use super::*;
+
+    /// Reference implementation: the original div/mul rounding. Kept
+    /// in the test module ONLY — the production path now uses the
+    /// bitmask form. If this assertion ever fires it means the bitmask
+    /// form diverged from the historical formula (which would be a
+    /// regression callers depend on for bucket-size stability).
+    fn legacy_bucket_size(bytes: usize) -> usize {
+        let n = bytes.max(ARROW_ALIGNMENT);
+        let pow2 = 1usize << (usize::BITS - 1 - n.leading_zeros());
+        let step = (pow2 / 4).max(1);
+        // ceil(n / step) * step — the pre-optimisation formula.
+        let rounded = n.saturating_add(step - 1) / step * step;
+        rounded.max(ARROW_ALIGNMENT)
+    }
+
+    /// Bitmask round-up must match the legacy div/mul formula for
+    /// every reasonable input. Covers the small-size dense range
+    /// (where `step == ARROW_ALIGNMENT/4 == 16` is non-trivial) plus
+    /// a sweep across every octave up through 8 MiB.
+    #[test]
+    fn bucket_size_matches_legacy_formula() {
+        // Dense sweep across the small-size range — captures the floor
+        // (everything `<= ARROW_ALIGNMENT` maps to `ARROW_ALIGNMENT`)
+        // and the first non-trivial octave (step = 16).
+        for n in 0usize..=1024 {
+            assert_eq!(
+                bucket_size(n),
+                legacy_bucket_size(n),
+                "bucket_size({}) diverged: bitmask={}, legacy={}",
+                n,
+                bucket_size(n),
+                legacy_bucket_size(n)
+            );
+        }
+
+        // Sparse sweep across higher octaves: every (step-1, step, step+1)
+        // sub-class boundary plus a midpoint up to 8 MiB. The "+1"
+        // points are where the bitmask form would diverge from a
+        // naive `& !mask` if the mask were ever miscomputed.
+        for k in 6..=23 {
+            let pow2: usize = 1 << k;
+            let step = pow2 / 4;
+            for sub in 0..4 {
+                let base = pow2 + sub * step;
+                for delta in [0usize, 1, step / 2, step - 1, step] {
+                    let n = base.saturating_add(delta);
+                    assert_eq!(
+                        bucket_size(n),
+                        legacy_bucket_size(n),
+                        "bucket_size({}) diverged at octave 2^{} sub {}: \
+                         bitmask={}, legacy={}",
+                        n,
+                        k,
+                        sub,
+                        bucket_size(n),
+                        legacy_bucket_size(n)
+                    );
+                }
+            }
+        }
+    }
+
+    /// `saturating_add` on the cap check must clamp at `usize::MAX`
+    /// rather than wrap — otherwise a pathological `total_bytes` near
+    /// `usize::MAX` would silently bypass the cap. We exercise the
+    /// arithmetic directly because the only realistic way to reach
+    /// the wrap window is via the `reconcile_total_bytes` / `fetch_sub`
+    /// race the saturating helper closes, which is hard to reproduce
+    /// deterministically in a host test.
+    #[test]
+    fn cap_check_saturates_on_overflow() {
+        // Worst case: total at usize::MAX-1, alloc 10 more bytes. A
+        // bare `+` wraps to 9, slipping past any finite cap. The
+        // saturating form clamps at usize::MAX and the cap check
+        // correctly rejects.
+        let total = usize::MAX - 1;
+        let alloc = 10usize;
+        let projected = total.saturating_add(alloc);
+        assert_eq!(
+            projected,
+            usize::MAX,
+            "saturating_add must clamp at usize::MAX"
+        );
+        // Verify the cap check sees the clamped value as "too big"
+        // for any finite cap, including the default 512 MiB.
+        let cap = 512usize * 1024 * 1024;
+        assert!(
+            projected > cap,
+            "saturating-added projection ({}) should exceed cap ({})",
+            projected,
+            cap
+        );
+
+        // And the historical case the cap check needs to detect:
+        // a normal-sized total plus alloc must NOT saturate when
+        // the sum fits in usize.
+        let total = 1024usize;
+        let alloc = 256usize;
+        assert_eq!(total.saturating_add(alloc), 1280);
     }
 }
