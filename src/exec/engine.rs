@@ -352,9 +352,11 @@ fn try_extend_column(
             // the GpuColumnData variant would need to become
             // `BoolNullable`, and we can't extend across a variant
             // change. Punt to full re-upload.
+            use arrow::array::Array as _;
             if ba.null_count() != 0 {
                 return Ok(None);
             }
+            let tail_rows = n_rows_total - prev_rows;
             let mut tail: Vec<u8> = Vec::with_capacity(tail_rows);
             for i in prev_rows..n_rows_total {
                 tail.push(if ba.value(i) { 1 } else { 0 });
@@ -376,6 +378,7 @@ fn try_extend_column(
             let tail_rows = n_rows_total - prev_rows;
             let mut tail_v: Vec<u8> = Vec::with_capacity(tail_rows);
             let mut tail_m: Vec<u8> = Vec::with_capacity(tail_rows);
+            use arrow::array::Array as _;
             for i in prev_rows..n_rows_total {
                 if ba.is_null(i) {
                     tail_v.push(0);

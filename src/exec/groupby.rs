@@ -112,7 +112,7 @@ use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
     compile_groupby_keys_kernel_dispatched, groupby_block_size,
-    AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL,
+    AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
 };
 use crate::plan::logical_plan::{
     sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema,
