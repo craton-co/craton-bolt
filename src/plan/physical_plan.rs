@@ -481,65 +481,6 @@ pub struct AggregateSpec {
 // `&KernelSpec` directly; callers that want the new uniform envelope use
 // `KernelSpecKind`.
 
-/// Scalar-aggregate reduction operator. Mirror of
-/// [`crate::jit::agg_kernels::ReduceOp`] kept here so the planner-side
-/// spec type doesn't have to import from `jit::` (layering: `plan` is
-/// below `jit` in the dependency graph). The two enums are kept in sync
-/// by hand; the unit test
-/// [`scalar_agg_spec_op_round_trips`] pins the round-trip mapping.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ScalarAggOp {
-    /// `SUM` — identity 0, combine `add`. The accumulator dtype follows
-    /// the widening contract documented on
-    /// [`crate::plan::logical_plan::sum_output_dtype`].
-    Sum,
-    /// `MIN` — identity +inf / INT_MAX, combine `min`.
-    Min,
-    /// `MAX` — identity -inf / INT_MIN, combine `max`.
-    Max,
-    /// `COUNT(_)` — synthesised as `Sum` over ones at PTX-emit time, but
-    /// kept distinct here so the cache key disambiguates a literal
-    /// `SUM(col)` from a `COUNT(col)` even when the underlying combine
-    /// instruction is identical.
-    Count,
-    /// `AVG` — fused per-block `(f64 sum, u32 count)` partials in a
-    /// single pass; see [`crate::jit::agg_kernels::compile_avg_reduction_kernel`].
-    /// `AVG` is its own kernel because the combine and partial-shape
-    /// differ from the basic four reductions above.
-    Avg,
-}
-
-/// Spec for a per-block scalar reduction kernel emitted from
-/// [`crate::jit::agg_kernels::compile_reduction_kernel`] (or
-/// `compile_avg_reduction_kernel` when `op == ScalarAggOp::Avg`).
-///
-/// The knobs the codegen reads are exactly `(op, dtype)`: identity,
-/// combine instruction, accumulator widening, and PTX register class all
-/// derive from those two fields. The kernel entry symbol
-/// (`REDUCTION_KERNEL_ENTRY` / `AVG_KERNEL_ENTRY`) is fixed per-op, so the
-/// cache layer's `entry` tag domain-separates `Avg` from non-`Avg` even
-/// for the same input dtype.
-///
-/// # Cache key
-///
-/// The `Debug` impl emits `ScalarAggSpec { op: Sum, dtype: Int32 }` — i.e.
-/// no two distinct `(op, dtype)` pairs hash to the same string. The
-/// `assert_ne!` round-trip tests in this file pin that property for every
-/// pair the codegen accepts.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ScalarAggSpec {
-    /// Which reduction operator the kernel implements.
-    pub op: ScalarAggOp,
-    /// The INPUT-column dtype. The accumulator dtype (for `Sum` over
-    /// narrow signed ints) is derived from `dtype` via
-    /// [`crate::plan::logical_plan::sum_output_dtype`]; we don't store it
-    /// here so two specs that would lower to the same kernel can't
-    /// accidentally drift on the accumulator field.
-    pub dtype: DataType,
-}
-
 /// Which entry point of the hash-join kernel set this spec selects. The
 /// hash-join PTX is emitted by `compile_*_kernel` helpers in
 /// `crate::jit::hash_join_kernel`; each helper takes no arguments and
