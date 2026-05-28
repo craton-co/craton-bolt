@@ -52,6 +52,29 @@ impl RegAlloc {
         Ok(name)
     }
 
+    /// Allocate a pair of adjacent `b64` registers for a 128-bit (Decimal128 /
+    /// i128) value split into `lo` / `hi` halves. The PTX side has no native
+    /// 128-bit register class, so v0.7 represents an i128 value as two SSA
+    /// `Reg`s in the `rl` class; `assign_pair` issues both at once so the
+    /// `(lo_index, hi_index)` pair stays contiguous in the emitted `.reg`
+    /// block (helps SASS see the temporary as a single live range without
+    /// affecting correctness).
+    ///
+    /// Returns `(lo_name, hi_name)`. Both registers are tracked in
+    /// `RegAlloc::mapping` exactly as `assign` does so subsequent
+    /// `RegAlloc::get` calls can resolve either half independently.
+    fn assign_pair(&mut self, reg_lo: Reg, reg_hi: Reg) -> BoltResult<(String, String)> {
+        // Use the existing `rl` (b64) class — every 128-bit op reads/writes
+        // its halves with `ld.global.nc.u64`, `mov.u64`, `add.cc.u64`, etc.,
+        // all of which take `rl` operands. Going through `alloc` keeps the
+        // class-counter bookkeeping (used by `write_reg_decls`) consistent.
+        let lo_name = self.alloc("rl");
+        let hi_name = self.alloc("rl");
+        self.mapping.insert(reg_lo, lo_name.clone());
+        self.mapping.insert(reg_hi, hi_name.clone());
+        Ok((lo_name, hi_name))
+    }
+
     /// Look up the physical register name previously assigned to `reg`.
     fn get(&self, reg: Reg) -> BoltResult<&str> {
         self.mapping
@@ -330,12 +353,15 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
         Some(combined)
     };
 
-    // -------- Split ops into "compute" and "store" so the predicate gate sits between them.
+    // -------- Split ops into "compute" and "store" so the predicate gate
+    //          sits between them. `Store128` joins `Store` in the sink
+    //          partition so the predicate gate also masks Decimal128 row
+    //          writes (v0.7 Sub-task A).
     let mut compute_ops: Vec<&Op> = Vec::with_capacity(spec.ops.len());
     let mut store_ops: Vec<&Op> = Vec::with_capacity(spec.outputs.len());
     for op in &spec.ops {
         match op {
-            Op::Store { .. } => store_ops.push(op),
+            Op::Store { .. } | Op::Store128 { .. } => store_ops.push(op),
             _ => compute_ops.push(op),
         }
     }
@@ -450,7 +476,278 @@ fn emit_op(
             else_val,
             dtype,
         } => emit_select(b, *dst, *cond, *then_val, *else_val, *dtype),
+        // ---- Decimal128 / i128 dual-register ops (v0.7 Sub-task A) ----
+        // No caller emits these today — `Codegen::emit_column` /
+        // `emit_literal` / `emit_binary` still reject Decimal128 with a
+        // `Plan` error — so these arms are dead code through `lower()`. They
+        // exist so the PTX emitter is structurally ready for the follow-up
+        // commit that wires upload + Codegen routing.
+        Op::LoadColumn128 {
+            dst_lo,
+            dst_hi,
+            col_idx,
+        } => emit_load_128(b, *dst_lo, *dst_hi, *col_idx, input_ptrs, tid),
+        Op::Const128 {
+            dst_lo,
+            dst_hi,
+            lo,
+            hi,
+        } => emit_const_128(b, *dst_lo, *dst_hi, *lo, *hi),
+        Op::Store128 {
+            src_lo,
+            src_hi,
+            col_idx,
+        } => emit_store_128(b, *src_lo, *src_hi, *col_idx, output_ptrs, tid),
+        Op::Add128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_add_128(b, *dst_lo, *dst_hi, *a_lo, *a_hi, *b_lo, *b_hi),
+        Op::Sub128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_sub_128(b, *dst_lo, *dst_hi, *a_lo, *a_hi, *b_lo, *b_hi),
+        Op::Mul128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_mul_128(b, *dst_lo, *dst_hi, *a_lo, *a_hi, *b_lo, *b_hi),
     }
+}
+
+/// Emit `Op::LoadColumn128` — two `ld.global.nc.u64` reads at byte offsets
+/// `tid * 16` (lo) and `tid * 16 + 8` (hi) from input column `col_idx`'s
+/// base pointer.
+///
+/// Address arithmetic mirrors `emit_load`'s pattern (`mul.wide.u32` widens
+/// `tid` to 64 bits, then `add.s64` to the base) but uses a stride of 16
+/// instead of the dtype's byte width — every Decimal128 row is exactly 16
+/// bytes. The high half adds another `add.s64` of `+8` for the second load.
+fn emit_load_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    col_idx: usize,
+    input_ptrs: &[String],
+    tid: &str,
+) -> BoltResult<()> {
+    if col_idx >= input_ptrs.len() {
+        return Err(BoltError::Other(format!(
+            "ptx_gen: LoadColumn128 col_idx {} out of range (have {} inputs)",
+            col_idx,
+            input_ptrs.len()
+        )));
+    }
+    let off = b.alloc.alloc("rd");
+    let addr_lo = b.alloc.alloc("rd");
+    let addr_hi = b.alloc.alloc("rd");
+    b.emit(&format!("mul.wide.u32 {}, {}, 16;", off, tid))?;
+    b.emit(&format!(
+        "add.s64 {}, {}, {};",
+        addr_lo, input_ptrs[col_idx], off
+    ))?;
+    b.emit(&format!("add.s64 {}, {}, 8;", addr_hi, addr_lo))?;
+    let (lo_name, hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    // Read-only-cache hint matches `emit_load`: input column buffers never
+    // alias outputs of the same kernel (see `.ptr .global .restrict` in
+    // `write_signature`), so `ld.global.nc` is sound.
+    b.emit(&format!("ld.global.nc.u64 {}, [{}];", lo_name, addr_lo))?;
+    b.emit(&format!("ld.global.nc.u64 {}, [{}];", hi_name, addr_hi))?;
+    Ok(())
+}
+
+/// Emit `Op::Store128` — two `st.global.u64` writes at byte offsets
+/// `tid * 16` (lo) and `tid * 16 + 8` (hi) to output column `col_idx`'s
+/// base pointer.
+fn emit_store_128(
+    b: &mut PtxBuilder,
+    src_lo: Reg,
+    src_hi: Reg,
+    col_idx: usize,
+    output_ptrs: &[String],
+    tid: &str,
+) -> BoltResult<()> {
+    if col_idx >= output_ptrs.len() {
+        return Err(BoltError::Other(format!(
+            "ptx_gen: Store128 col_idx {} out of range (have {} outputs)",
+            col_idx,
+            output_ptrs.len()
+        )));
+    }
+    let lo_name = b.alloc.get(src_lo)?.to_string();
+    let hi_name = b.alloc.get(src_hi)?.to_string();
+    let off = b.alloc.alloc("rd");
+    let addr_lo = b.alloc.alloc("rd");
+    let addr_hi = b.alloc.alloc("rd");
+    b.emit(&format!("mul.wide.u32 {}, {}, 16;", off, tid))?;
+    b.emit(&format!(
+        "add.s64 {}, {}, {};",
+        addr_lo, output_ptrs[col_idx], off
+    ))?;
+    b.emit(&format!("add.s64 {}, {}, 8;", addr_hi, addr_lo))?;
+    b.emit(&format!("st.global.u64 [{}], {};", addr_lo, lo_name))?;
+    b.emit(&format!("st.global.u64 [{}], {};", addr_hi, hi_name))?;
+    Ok(())
+}
+
+/// Emit `Op::Const128` — two `mov.u64` instructions loading the hex
+/// bit-patterns into the low / high halves.
+///
+/// SECURITY: the bit-patterns are emitted as `0x{:016X}` hex, restricting
+/// the output to `[0-9A-F]`. Matches the same codegen-injection-hardening
+/// convention used by `emit_const` for `Int64` / `Float64`.
+fn emit_const_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    lo: u64,
+    hi: u64,
+) -> BoltResult<()> {
+    let (lo_name, hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    b.emit(&format!("mov.u64 {}, 0x{:016X};", lo_name, lo))?;
+    b.emit(&format!("mov.u64 {}, 0x{:016X};", hi_name, hi))?;
+    Ok(())
+}
+
+/// Emit `Op::Add128` — `add.cc.u64` on the low half (sets the implicit
+/// `%CC` carry flag), then `addc.u64` on the high half (adds the carry-in).
+fn emit_add_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    let a_lo_name = b.alloc.get(a_lo)?.to_string();
+    let a_hi_name = b.alloc.get(a_hi)?.to_string();
+    let b_lo_name = b.alloc.get(b_lo)?.to_string();
+    let b_hi_name = b.alloc.get(b_hi)?.to_string();
+    let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    b.emit(&format!(
+        "add.cc.u64 {}, {}, {};",
+        dst_lo_name, a_lo_name, b_lo_name
+    ))?;
+    b.emit(&format!(
+        "addc.u64 {}, {}, {};",
+        dst_hi_name, a_hi_name, b_hi_name
+    ))?;
+    Ok(())
+}
+
+/// Emit `Op::Sub128` — `sub.cc.u64` on the low half (sets the implicit
+/// `%CC` borrow flag), then `subc.u64` on the high half (subtracts the
+/// borrow-in).
+fn emit_sub_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    let a_lo_name = b.alloc.get(a_lo)?.to_string();
+    let a_hi_name = b.alloc.get(a_hi)?.to_string();
+    let b_lo_name = b.alloc.get(b_lo)?.to_string();
+    let b_hi_name = b.alloc.get(b_hi)?.to_string();
+    let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    b.emit(&format!(
+        "sub.cc.u64 {}, {}, {};",
+        dst_lo_name, a_lo_name, b_lo_name
+    ))?;
+    b.emit(&format!(
+        "subc.u64 {}, {}, {};",
+        dst_hi_name, a_hi_name, b_hi_name
+    ))?;
+    Ok(())
+}
+
+/// Emit `Op::Mul128` — 128-bit truncating multiply via schoolbook
+/// cross-multiply (4 partial products, summing into the high half).
+///
+/// Algebra:
+///
+/// ```text
+///   a = (a_hi << 64) | a_lo
+///   b = (b_hi << 64) | b_lo
+///   a * b = a_lo*b_lo
+///         + (a_lo*b_hi + a_hi*b_lo) << 64
+///         + (a_hi*b_hi)             << 128   // discarded (wraps)
+/// ```
+///
+/// We compute:
+///
+/// ```text
+///   dst_lo            = mul.lo.u64 a_lo, b_lo
+///   hi_acc            = mul.hi.u64 a_lo, b_lo
+///   cross1            = mul.lo.u64 a_lo, b_hi
+///   cross2            = mul.lo.u64 a_hi, b_lo
+///   hi_acc            = add.u64 hi_acc, cross1
+///   dst_hi            = add.u64 hi_acc, cross2
+/// ```
+///
+/// We use plain `add.u64` (not `add.cc.u64`) for the two high-half sums:
+/// any overflow there falls into bits 128+, which 128-bit wrapping
+/// arithmetic discards. This matches `i128::wrapping_mul` semantics and
+/// Arrow's Decimal128 arithmetic (which checks overflow at the validation
+/// layer, not in the kernel).
+fn emit_mul_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    let a_lo_name = b.alloc.get(a_lo)?.to_string();
+    let a_hi_name = b.alloc.get(a_hi)?.to_string();
+    let b_lo_name = b.alloc.get(b_lo)?.to_string();
+    let b_hi_name = b.alloc.get(b_hi)?.to_string();
+    // Temporaries for the three high-half partial products. Allocate
+    // before the destination pair so the dst registers land at higher
+    // indices in the `rl` class (purely cosmetic — SASS register
+    // assignment is downstream of PTX).
+    let hi_acc = b.alloc.alloc("rl");
+    let cross1 = b.alloc.alloc("rl");
+    let cross2 = b.alloc.alloc("rl");
+    let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    // Low half: a_lo * b_lo (truncated).
+    b.emit(&format!(
+        "mul.lo.u64 {}, {}, {};",
+        dst_lo_name, a_lo_name, b_lo_name
+    ))?;
+    // High half: cross-multiply sum.
+    b.emit(&format!(
+        "mul.hi.u64 {}, {}, {};",
+        hi_acc, a_lo_name, b_lo_name
+    ))?;
+    b.emit(&format!(
+        "mul.lo.u64 {}, {}, {};",
+        cross1, a_lo_name, b_hi_name
+    ))?;
+    b.emit(&format!(
+        "mul.lo.u64 {}, {}, {};",
+        cross2, a_hi_name, b_lo_name
+    ))?;
+    b.emit(&format!("add.u64 {}, {}, {};", hi_acc, hi_acc, cross1))?;
+    b.emit(&format!(
+        "add.u64 {}, {}, {};",
+        dst_hi_name, hi_acc, cross2
+    ))?;
+    Ok(())
 }
 
 /// Emit PTX for `Op::IsNullCheck`: load the validity byte for the current
@@ -2257,6 +2554,382 @@ mod scalar_string_fn_substrate_tests {
     }
 }
 
+#[cfg(test)]
+mod decimal128_ir_tests {
+    //! PTX shape tests for the dual-register Decimal128 / i128 ops
+    //! (v0.7 Sub-task A). These cover the *IR-emission* layer only —
+    //! `Codegen::emit_column` / `emit_literal` / `emit_binary` still
+    //! reject Decimal128 with a `Plan` error, so the end-to-end SQL
+    //! reject tests in `tests/decimal_type_test.rs` continue to pass
+    //! unchanged. The tests here build a `KernelSpec` by hand to drive
+    //! `compile` directly.
+    use super::*;
+    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
+    use crate::plan::logical_plan::DataType;
+    fn dec(prec: u8, scale: i8) -> DataType {
+        DataType::Decimal128(prec, scale)
+    }
+    /// `Op::LoadColumn128` should emit two `ld.global.nc.u64` loads — one
+    /// at byte offset `tid * 16` (low half) and one at `+8` (high half).
+    /// Mirrors the read-only-cache hint used by `Op::LoadColumn` so the
+    /// input column buffer doesn't pollute the L1 of stores.
+    #[test]
+    fn load_column_128_emits_two_u64_loads() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "amt".into(),
+                dtype: dec(18, 2),
+            }],
+            outputs: vec![ColumnIO {
+                name: "amt_out".into(),
+                dtype: dec(18, 2),
+            }],
+            ops: vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::Store128 {
+                    src_lo: Reg(0),
+                    src_hi: Reg(1),
+                    col_idx: 0,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_dec128_load").expect("compile");
+        // Two read-only-cache 64-bit loads (one per half).
+        let n_u64_loads = ptx.matches("ld.global.nc.u64").count();
+        assert!(
+            n_u64_loads >= 2,
+            "expected >=2 ld.global.nc.u64 for Decimal128 row load, got {n_u64_loads}\n{ptx}"
+        );
+        // `mul.wide.u32 ..., 16;` is the stride-16 offset arithmetic.
+        assert!(
+            ptx.contains("mul.wide.u32") && ptx.contains(", 16;"),
+            "expected `mul.wide.u32 ..., 16;` for tid*16 stride arithmetic\n{ptx}"
+        );
+        // Hi-half address is lo-address + 8 (single `add.s64 ..., 8;`).
+        assert!(
+            ptx.contains("add.s64") && ptx.contains(", 8;"),
+            "expected `add.s64 ..., 8;` for hi-half address offset\n{ptx}"
+        );
+    }
+    /// `Op::Store128` should emit two `st.global.u64` writes at the same
+    /// offsets the load uses (lo + lo+8).
+    #[test]
+    fn store_128_emits_two_u64_stores() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "amt".into(),
+                dtype: dec(18, 2),
+            }],
+            outputs: vec![ColumnIO {
+                name: "amt_out".into(),
+                dtype: dec(18, 2),
+            }],
+            ops: vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::Store128 {
+                    src_lo: Reg(0),
+                    src_hi: Reg(1),
+                    col_idx: 0,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_dec128_store").expect("compile");
+        let n_u64_stores = ptx.matches("st.global.u64").count();
+        assert!(
+            n_u64_stores >= 2,
+            "expected >=2 st.global.u64 for Decimal128 row store, got {n_u64_stores}\n{ptx}"
+        );
+    }
+    /// `Op::Const128` should emit two `mov.u64` instructions of the hex
+    /// bit-patterns. The values are chosen so the lo / hi hex strings are
+    /// distinguishable on inspection.
+    #[test]
+    fn const_128_emits_two_movs_of_hex_constants() {
+        let lo: u64 = 0x0123_4567_89AB_CDEF;
+        let hi: u64 = 0xFEDC_BA98_7654_3210;
+        let spec = KernelSpec {
+            inputs: vec![],
+            outputs: vec![ColumnIO {
+                name: "k".into(),
+                dtype: dec(38, 0),
+            }],
+            ops: vec![
+                Op::Const128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    lo,
+                    hi,
+                },
+                Op::Store128 {
+                    src_lo: Reg(0),
+                    src_hi: Reg(1),
+                    col_idx: 0,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_dec128_const").expect("compile");
+        let expected_lo = format!("0x{:016X}", lo);
+        let expected_hi = format!("0x{:016X}", hi);
+        assert!(
+            ptx.contains(&expected_lo),
+            "expected lo half hex constant {} in PTX\n{ptx}",
+            expected_lo
+        );
+        assert!(
+            ptx.contains(&expected_hi),
+            "expected hi half hex constant {} in PTX\n{ptx}",
+            expected_hi
+        );
+        // Both `mov.u64`s emitted.
+        let n_mov_u64 = ptx.matches("mov.u64").count();
+        assert!(
+            n_mov_u64 >= 2,
+            "expected >=2 mov.u64 for Const128, got {n_mov_u64}\n{ptx}"
+        );
+    }
+    /// `Op::Add128` lowers to `add.cc.u64` (low half, sets carry) then
+    /// `addc.u64` (high half, adds carry-in). Order matters — `addc` must
+    /// follow `add.cc` so PTX picks up the right `%CC` value.
+    #[test]
+    fn add_128_emits_add_cc_then_addc() {
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: dec(18, 2),
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: dec(18, 2),
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "sum".into(),
+                dtype: dec(18, 2),
+            }],
+            ops: vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::LoadColumn128 {
+                    dst_lo: Reg(2),
+                    dst_hi: Reg(3),
+                    col_idx: 1,
+                },
+                Op::Add128 {
+                    dst_lo: Reg(4),
+                    dst_hi: Reg(5),
+                    a_lo: Reg(0),
+                    a_hi: Reg(1),
+                    b_lo: Reg(2),
+                    b_hi: Reg(3),
+                },
+                Op::Store128 {
+                    src_lo: Reg(4),
+                    src_hi: Reg(5),
+                    col_idx: 0,
+                },
+            ],
+            predicate: None,
+            register_count: 6,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_dec128_add").expect("compile");
+        assert!(
+            ptx.contains("add.cc.u64"),
+            "expected add.cc.u64 (low half + sets carry)\n{ptx}"
+        );
+        assert!(
+            ptx.contains("addc.u64"),
+            "expected addc.u64 (high half + carry-in)\n{ptx}"
+        );
+        // Order: add.cc.u64 must come before addc.u64.
+        let pos_cc = ptx.find("add.cc.u64").expect("add.cc.u64 present");
+        let pos_c = ptx.find("addc.u64").expect("addc.u64 present");
+        assert!(
+            pos_cc < pos_c,
+            "add.cc.u64 must precede addc.u64 so the carry flag flows correctly\n{ptx}"
+        );
+    }
+    /// `Op::Sub128` lowers to `sub.cc.u64` (low half, sets borrow) then
+    /// `subc.u64` (high half, subtracts borrow-in).
+    #[test]
+    fn sub_128_emits_sub_cc_then_subc() {
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: dec(18, 2),
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: dec(18, 2),
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "diff".into(),
+                dtype: dec(18, 2),
+            }],
+            ops: vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::LoadColumn128 {
+                    dst_lo: Reg(2),
+                    dst_hi: Reg(3),
+                    col_idx: 1,
+                },
+                Op::Sub128 {
+                    dst_lo: Reg(4),
+                    dst_hi: Reg(5),
+                    a_lo: Reg(0),
+                    a_hi: Reg(1),
+                    b_lo: Reg(2),
+                    b_hi: Reg(3),
+                },
+                Op::Store128 {
+                    src_lo: Reg(4),
+                    src_hi: Reg(5),
+                    col_idx: 0,
+                },
+            ],
+            predicate: None,
+            register_count: 6,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_dec128_sub").expect("compile");
+        assert!(
+            ptx.contains("sub.cc.u64"),
+            "expected sub.cc.u64 (low half + sets borrow)\n{ptx}"
+        );
+        assert!(
+            ptx.contains("subc.u64"),
+            "expected subc.u64 (high half + borrow-in)\n{ptx}"
+        );
+        let pos_cc = ptx.find("sub.cc.u64").expect("sub.cc.u64 present");
+        let pos_c = ptx.find("subc.u64").expect("subc.u64 present");
+        assert!(
+            pos_cc < pos_c,
+            "sub.cc.u64 must precede subc.u64 so the borrow flag flows correctly\n{ptx}"
+        );
+    }
+    /// `Op::Mul128` lowers to a schoolbook cross-multiply: 1 `mul.lo.u64`
+    /// for the low half, then 1 `mul.hi.u64` + 2 more `mul.lo.u64`
+    /// instructions summed for the high half. No Karatsuba.
+    #[test]
+    fn mul_128_emits_cross_multiply_pattern() {
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: dec(18, 2),
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: dec(18, 2),
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "prod".into(),
+                dtype: dec(18, 2),
+            }],
+            ops: vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::LoadColumn128 {
+                    dst_lo: Reg(2),
+                    dst_hi: Reg(3),
+                    col_idx: 1,
+                },
+                Op::Mul128 {
+                    dst_lo: Reg(4),
+                    dst_hi: Reg(5),
+                    a_lo: Reg(0),
+                    a_hi: Reg(1),
+                    b_lo: Reg(2),
+                    b_hi: Reg(3),
+                },
+                Op::Store128 {
+                    src_lo: Reg(4),
+                    src_hi: Reg(5),
+                    col_idx: 0,
+                },
+            ],
+            predicate: None,
+            register_count: 6,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_dec128_mul").expect("compile");
+        // The cross-multiply uses exactly one `mul.hi.u64` (for
+        // a_lo*b_lo's high half) and three `mul.lo.u64` (a_lo*b_lo low,
+        // a_lo*b_hi low, a_hi*b_lo low).
+        assert!(
+            ptx.contains("mul.hi.u64"),
+            "expected `mul.hi.u64` for high half of a_lo*b_lo\n{ptx}"
+        );
+        let n_mul_lo = ptx.matches("mul.lo.u64").count();
+        assert!(
+            n_mul_lo >= 3,
+            "expected >=3 mul.lo.u64 partial products, got {n_mul_lo}\n{ptx}"
+        );
+        // The high half accumulates via two `add.u64` (plain, not .cc) —
+        // overflow above 128 bits is intentionally discarded.
+        let n_add_u64 = ptx.matches("add.u64").count();
+        assert!(
+            n_add_u64 >= 2,
+            "expected >=2 add.u64 for high-half partial-product sum, got {n_add_u64}\n{ptx}"
+        );
+    }
+    /// `RegAlloc::assign_pair` must hand out two distinct `rl` registers
+    /// and record both in the mapping table. Regression guard against an
+    /// accidental shared-name mistake.
+    #[test]
+    fn assign_pair_gives_two_distinct_rl_registers() {
+        let mut alloc = RegAlloc::new();
+        let (lo, hi) = alloc
+            .assign_pair(Reg(0), Reg(1))
+            .expect("assign_pair must succeed");
+        assert!(lo.starts_with("%rl"), "lo should be in the rl class, got {lo}");
+        assert!(hi.starts_with("%rl"), "hi should be in the rl class, got {hi}");
+        assert_ne!(lo, hi, "lo and hi must be distinct physical registers");
+        // Both halves resolvable via `get`.
+        assert_eq!(alloc.get(Reg(0)).unwrap(), lo);
+        assert_eq!(alloc.get(Reg(1)).unwrap(), hi);
+        // Class counter advanced by 2.
+        assert_eq!(alloc.count("rl"), 2);
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // PV-stage-d: per-output validity dataflow analysis.
@@ -2268,6 +2941,109 @@ mod scalar_string_fn_substrate_tests {
 // (the pre kernel codegen, the predicate kernel codegen) can emit a
 // narrower AND-tree per output.
 // ---------------------------------------------------------------------------
+
+/// Backward DFS shared by every `Store*` arm in `output_input_dependencies`.
+/// Seeded with the sink register IDs of one store, walks back through
+/// `reg_to_op` collecting every `LoadColumn` / `LoadColumn128` column
+/// ordinal that the sinks transitively depend on.
+fn walk_store_deps(
+    reg_to_op: &HashMap<u32, &crate::plan::physical_plan::Op>,
+    sinks: &[u32],
+) -> std::collections::HashSet<usize> {
+    use crate::plan::physical_plan::Op;
+    let mut found: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut stack: Vec<u32> = sinks.to_vec();
+    while let Some(r) = stack.pop() {
+        if !visited.insert(r) {
+            continue;
+        }
+        let producer = match reg_to_op.get(&r) {
+            Some(o) => *o,
+            None => continue, // dangling reg — IR bug, skip.
+        };
+        match producer {
+            Op::LoadColumn { col_idx, .. } => {
+                found.insert(*col_idx);
+            }
+            Op::Const { .. } => { /* leaf — no input dep */ }
+            Op::Cast { src, .. } => {
+                stack.push(src.id());
+            }
+            Op::Binary { lhs, rhs, .. } => {
+                stack.push(lhs.id());
+                stack.push(rhs.id());
+            }
+            Op::Select {
+                cond,
+                then_val,
+                else_val,
+                ..
+            } => {
+                // CASE's value-producing path: a downstream output's
+                // value depends on every input feeding any of the three
+                // operands. We don't try to model per-branch conditional
+                // liveness here — the AND-fold caller is the conservative
+                // validity tree, not a value dataflow optimiser.
+                stack.push(cond.id());
+                stack.push(then_val.id());
+                stack.push(else_val.id());
+            }
+            Op::IsNullCheck { .. } => {
+                // IS NULL / IS NOT NULL is itself never-null: it
+                // turns a (value, validity) pair into a Bool
+                // {0,1} that already encodes the NULL outcome.
+                // From a per-output validity AND-tree standpoint
+                // it acts as a leaf with no upstream input-VALUE
+                // dependency — even though the op reads its
+                // input's validity bitmap, that read does NOT
+                // need to be folded into a downstream output's
+                // validity bit.
+            }
+            Op::Store { .. } | Op::Store128 { .. } => {
+                // Stores don't produce a Reg, so reg_to_op can't
+                // return one. Unreachable in practice.
+            }
+            // 128-bit producers: a `LoadColumn128` is a leaf that
+            // contributes its input col ordinal exactly like
+            // `LoadColumn`. A `Const128` is a leaf. Add128 / Sub128 /
+            // Mul128 each read four operand halves; push every
+            // operand half so the walker reaches the underlying
+            // LoadColumn128s through either dst half.
+            Op::LoadColumn128 { col_idx, .. } => {
+                found.insert(*col_idx);
+            }
+            Op::Const128 { .. } => { /* leaf */ }
+            Op::Add128 {
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                ..
+            }
+            | Op::Sub128 {
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                ..
+            }
+            | Op::Mul128 {
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                ..
+            } => {
+                stack.push(a_lo.id());
+                stack.push(a_hi.id());
+                stack.push(b_lo.id());
+                stack.push(b_hi.id());
+            }
+        }
+    }
+    found
+}
 
 /// For each `Store` op in `spec.ops`, compute the set of `LoadColumn`
 /// `col_idx` values it transitively depends on. Returns a `Vec<Vec<usize>>`
@@ -2308,6 +3084,12 @@ pub fn output_input_dependencies(
 
     // (a) Map every produced Reg to the Op that produced it. Since the IR
     // is SSA each Reg appears as `dst` exactly once.
+    //
+    // The 128-bit ops produce *two* SSA destinations (a lo/hi pair); we
+    // insert both halves so a `Store128 { src_lo, src_hi, .. }` walking
+    // back from either half lands on the same producer op. The DFS below
+    // then dispatches per-op-kind, walking through whichever operand
+    // halves matter.
     let mut reg_to_op: HashMap<u32, &Op> = HashMap::with_capacity(spec.ops.len());
     for op in &spec.ops {
         match op {
@@ -2319,7 +3101,15 @@ pub fn output_input_dependencies(
             | Op::Select { dst, .. } => {
                 reg_to_op.insert(dst.id(), op);
             }
-            Op::Store { .. } => { /* no dst */ }
+            Op::Store { .. } | Op::Store128 { .. } => { /* no dst */ }
+            Op::LoadColumn128 { dst_lo, dst_hi, .. }
+            | Op::Const128 { dst_lo, dst_hi, .. }
+            | Op::Add128 { dst_lo, dst_hi, .. }
+            | Op::Sub128 { dst_lo, dst_hi, .. }
+            | Op::Mul128 { dst_lo, dst_hi, .. } => {
+                reg_to_op.insert(dst_lo.id(), op);
+                reg_to_op.insert(dst_hi.id(), op);
+            }
         }
     }
 
@@ -2330,76 +3120,32 @@ pub fn output_input_dependencies(
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); spec.outputs.len()];
 
     for op in &spec.ops {
-        if let Op::Store { src, col_idx, .. } = op {
-            if *col_idx >= deps.len() {
-                // Defensive: a Store referencing an unknown output index
-                // is a planner bug — skip rather than panic so codegen
-                // can surface the real diagnostic elsewhere.
-                continue;
-            }
-            let mut found: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            let mut stack: Vec<u32> = vec![src.id()];
-            let mut visited: std::collections::HashSet<u32> =
-                std::collections::HashSet::new();
-            while let Some(r) = stack.pop() {
-                if !visited.insert(r) {
-                    continue;
-                }
-                let producer = match reg_to_op.get(&r) {
-                    Some(o) => *o,
-                    None => continue, // dangling reg — IR bug, skip.
-                };
-                match producer {
-                    Op::LoadColumn { col_idx, .. } => {
-                        found.insert(*col_idx);
-                    }
-                    Op::Const { .. } => { /* leaf — no input dep */ }
-                    Op::Cast { src, .. } => {
-                        stack.push(src.id());
-                    }
-                    Op::Binary { lhs, rhs, .. } => {
-                        stack.push(lhs.id());
-                        stack.push(rhs.id());
-                    }
-                    Op::Select {
-                        cond,
-                        then_val,
-                        else_val,
-                        ..
-                    } => {
-                        // CASE's value-producing path: a downstream output's
-                        // value depends on every input feeding any of the
-                        // three operands. We don't try to model per-branch
-                        // conditional liveness here — the AND-fold caller
-                        // is the conservative validity tree, not a value
-                        // dataflow optimiser.
-                        stack.push(cond.id());
-                        stack.push(then_val.id());
-                        stack.push(else_val.id());
-                    }
-                    Op::IsNullCheck { .. } => {
-                        // IS NULL / IS NOT NULL is itself never-null: it
-                        // turns a (value, validity) pair into a Bool
-                        // {0,1} that already encodes the NULL outcome.
-                        // From a per-output validity AND-tree standpoint
-                        // it acts as a leaf with no upstream input-VALUE
-                        // dependency — even though the op reads its
-                        // input's validity bitmap, that read does NOT
-                        // need to be folded into a downstream output's
-                        // validity bit.
-                    }
-                    Op::Store { .. } => {
-                        // Stores don't produce a Reg, so reg_to_op can't
-                        // return one. Unreachable in practice.
-                    }
-                }
-            }
-            // Merge into the per-output set (sorted + dedup at the end).
-            for c in found {
-                if !deps[*col_idx].contains(&c) {
-                    deps[*col_idx].push(c);
-                }
+        // Identify each store and the register(s) it sinks. The 128-bit
+        // `Store128` shape produces two sink registers (`src_lo`,
+        // `src_hi`); both are seeded into the DFS so we collect every
+        // input column reached through either half. Other ops contribute
+        // nothing here (they're def-only — the sinks of the dataflow are
+        // exclusively `Store` and `Store128`).
+        let (col_idx, sinks): (usize, Vec<u32>) = match op {
+            Op::Store { src, col_idx, .. } => (*col_idx, vec![src.id()]),
+            Op::Store128 {
+                src_lo,
+                src_hi,
+                col_idx,
+            } => (*col_idx, vec![src_lo.id(), src_hi.id()]),
+            _ => continue,
+        };
+        if col_idx >= deps.len() {
+            // Defensive: a Store referencing an unknown output index
+            // is a planner bug — skip rather than panic so codegen
+            // can surface the real diagnostic elsewhere.
+            continue;
+        }
+        let found = walk_store_deps(&reg_to_op, &sinks);
+        // Merge into the per-output set (sorted + dedup at the end).
+        for c in found {
+            if !deps[col_idx].contains(&c) {
+                deps[col_idx].push(c);
             }
         }
     }
