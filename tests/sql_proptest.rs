@@ -240,12 +240,12 @@ mod semantic_diff {
         let v: Float64Array = (0..n).map(|i| (i as f64) * 0.5 - 8.0).collect();
         let s: StringArray = (0..n)
             .map(|i| match i % 3 {
-                0 => "a",
-                1 => "bb",
-                _ => "ccc",
+                0 => Some("a"),
+                1 => Some("bb"),
+                _ => Some("ccc"),
             })
             .collect();
-        let b: BooleanArray = (0..n).map(|i| i % 2 == 0).collect();
+        let b: BooleanArray = (0..n).map(|i| Some(i % 2 == 0)).collect();
         RecordBatch::try_new(
             schema,
             vec![Arc::new(k), Arc::new(v), Arc::new(s), Arc::new(b)],
