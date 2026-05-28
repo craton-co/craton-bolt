@@ -60,7 +60,9 @@ use parking_lot::Mutex;
 
 use crate::error::BoltResult;
 use crate::jit::CudaModule;
-use crate::plan::physical_plan::{HashJoinKernelSpec, KernelSpec, ScalarAggSpec};
+use crate::plan::physical_plan::{
+    HashJoinKernelSpec, KernelSpec, RadixSortKernelSpec, ScalarAggSpec,
+};
 
 /// Composite cache key: `(namespace, spec_id)`.
 ///
@@ -881,6 +883,285 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// v0.7: RadixSortKernelSpec-keyed cache layer.
+//
+// Mirrors the `ScalarAggSpec` / `HashJoinKernelSpec` layers above but keyed
+// on the radix-sort planner IR (see
+// [`crate::plan::physical_plan::RadixSortKernelSpec`]). Each per-pass radix
+// kernel in `crate::jit::sort_kernel_radix` takes a `DataType` argument and
+// returns a fixed PTX string for a fixed entry symbol; the codegen-time
+// knobs are exactly `(pass, dtype)`. The wrapper here maps a
+// `RadixSortKernelSpec` to the corresponding helper (the caller picks
+// which `compile_radix_*` to invoke based on `spec.pass`) and routes the
+// resulting PTX through the existing [`CudaModule::from_ptx`] pipeline.
+//
+// As with the sibling caches, we domain-separate the disk-cache key with
+// a `"radix_sort::"` prefix so a hand inspection of the cache directory
+// shows immediately which family produced each entry, and we keep the
+// in-memory cache independent from `KERNELSPEC_CACHE` / `SCALARAGG_CACHE`
+// / `HASHJOIN_CACHE` so the FIFO eviction policies of the four families
+// don't compete.
+//
+// # Why `entry: &str` participates in the key
+//
+// One `RadixSortKernelSpec { pass: Scatter, .. }` value can map to *two*
+// distinct PTX entry points in the executor: `bolt_radix_scatter_<dty>`
+// (keys-only) vs `bolt_radix_scatter_<dty>_with_indices` (keys + row-index
+// payload — the standard multi-column ORDER BY path). The `pass` field
+// now has a dedicated `ScatterWithIndices` variant for the latter, but
+// the `entry: &str` parameter is retained as the load-bearing
+// disambiguator so a future ABI variant doesn't have to grow the IR enum
+// just to claim its own cache slot.
+
+/// FIFO cap on the RadixSortKernelSpec→`CudaModule` cache. Matches the
+/// `SCALARAGG_CACHE_CAP` / `HASHJOIN_CACHE_CAP` default.
+const RADIX_SORT_CACHE_CAP: usize = 64;
+
+/// 128-bit content fingerprint of a `RadixSortKernelSpec` plus its
+/// entry-point tag. Built the same way `HashJoinKey` is — two
+/// `DefaultHasher` instances domain-separated by a leading byte, packing
+/// into 128 bits total. We re-hash even though `RadixSortKernelSpec` itself
+/// implements `Hash`, so the fingerprint shape exactly matches the
+/// projection-side / scalar-agg / hash-join caches (and so the `Debug`
+/// output drives the key in case `RadixSortKernelSpec` ever grows
+/// non-Hashable fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RadixSortKey {
+    /// Upper 64 bits of the 128-bit content hash (domain byte `0x31`).
+    hi: u64,
+    /// Lower 64 bits of the 128-bit content hash (domain byte `0x32`).
+    lo: u64,
+    /// PTX entry-point name. Drives the keys-only-vs-with-indices split
+    /// (`bolt_radix_scatter_<dty>` vs `bolt_radix_scatter_<dty>_with_indices`)
+    /// and the histogram/MSB-flip distinctions within the same `(pass,
+    /// dtype)` value.
+    entry: &'static str,
+}
+
+impl RadixSortKey {
+    fn new(spec: &RadixSortKernelSpec, entry: &'static str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::fmt::Write as _;
+        use std::hash::Hasher;
+
+        // Domain-separating prefix bytes distinct from `KernelSpecKey`'s
+        // (`0x01` / `0x02`), `ScalarAggKey`'s (`0x11` / `0x12`), and
+        // `HashJoinKey`'s (`0x21` / `0x22`) so a hypothetical hash
+        // collision between the Debug shapes of the four spec types
+        // can't alias keys.
+        let mut hi = DefaultHasher::new();
+        hi.write_u8(0x31);
+        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
+
+        let mut lo = DefaultHasher::new();
+        lo.write_u8(0x32);
+        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
+
+        Self {
+            hi: hi.finish(),
+            lo: lo.finish(),
+            entry,
+        }
+    }
+}
+
+/// Cached payload for one RadixSortKernelSpec key. Mirrors `HashJoinEntry`.
+#[derive(Clone)]
+struct RadixSortEntry {
+    /// Emitted PTX text. Retained for observability / future
+    /// hit-collision-detection. The production lookup path only needs
+    /// `module`.
+    #[allow(dead_code)]
+    ptx: String,
+    module: CudaModule,
+}
+
+/// State of the RadixSortKernelSpec-keyed cache. Same FIFO eviction shape
+/// as [`HashJoinCache`]; see those docs for the invariants.
+struct RadixSortCache {
+    by_key: HashMap<RadixSortKey, RadixSortEntry>,
+    order: VecDeque<RadixSortKey>,
+    cap: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl RadixSortCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_key: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, key: &RadixSortKey) -> Option<RadixSortEntry> {
+        if let Some(entry) = self.by_key.get(key) {
+            self.hits = self.hits.saturating_add(1);
+            Some(entry.clone())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    fn insert(&mut self, key: RadixSortKey, entry: RadixSortEntry) {
+        if self.by_key.contains_key(&key) {
+            return;
+        }
+        while self.by_key.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_key.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.by_key.insert(key, entry);
+    }
+}
+
+/// Process-wide RadixSortKernelSpec→`CudaModule` cache. Initialised lazily.
+static RADIXSORT_CACHE: Lazy<Mutex<RadixSortCache>> =
+    Lazy::new(|| Mutex::new(RadixSortCache::new(RADIX_SORT_CACHE_CAP)));
+
+/// Disk-cache key prefix for the radix-sort PTX family. Stamped onto every
+/// disk-cache write/read so a directory listing shows immediately which
+/// kernel family produced each `.ptx` file, and so the projection /
+/// scalar-aggregate / hash-join paths' key shapes can't ever collide with
+/// a radix-sort entry.
+pub(crate) const RADIX_SORT_DISK_PREFIX: &str = "radix_sort::";
+
+/// Test- and observability-facing snapshot of `(hits, misses)` for the
+/// RadixSortKernelSpec cache. Parallel to [`hash_join_cache_stats`].
+#[doc(hidden)]
+#[must_use]
+pub fn radix_sort_cache_stats() -> (usize, usize) {
+    let c = RADIXSORT_CACHE.lock();
+    (c.hits as usize, c.misses as usize)
+}
+
+/// Look up (or compile-and-load) the `CudaModule` for `(spec, entry)`.
+///
+/// This is the radix-sort analogue of [`get_or_build_module_for_hash_join`].
+/// On a **cache hit** we return the cached `CudaModule` clone immediately —
+/// no codegen, no PTX text generation, no `cuModuleLoadDataEx`. On a
+/// **cache miss** we run `compile(spec)` to get the PTX text and hand it to
+/// `CudaModule::from_ptx`. The resulting `(ptx, module)` pair is stored
+/// under the RadixSortKernelSpec key so subsequent calls with the same
+/// spec hit the fast path.
+///
+/// # Disk-cache integration
+///
+/// When the disk-backed PTX cache is enabled (env var `BOLT_PTX_CACHE_DIR`
+/// or builder override), a miss in the in-memory cache consults the disk
+/// cache *before* paying the codegen cost. The disk key is composed as
+/// `"{RADIX_SORT_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
+///   1. The `"radix_sort::"` prefix domain-separates these entries from
+///      the projection-path, scalar-aggregate, and hash-join entries that
+///      share the disk directory.
+///   2. The `entry` suffix distinguishes
+///      `bolt_radix_histogram_<dty>`, `bolt_radix_scatter_<dty>`,
+///      `bolt_radix_scatter_<dty>_with_indices`, and
+///      `bolt_radix_msb_flip_<dty>` slots even when the underlying
+///      `RadixSortKernelSpec.pass` value alone wouldn't.
+///   3. The 128-bit hex content hash makes the key collision-resistant
+///      against unrelated specs that happen to share the same
+///      `(pass, dtype)` tuple.
+///
+/// On a disk hit we skip codegen and feed the on-disk PTX straight to
+/// `CudaModule::from_ptx`.
+///
+/// # Concurrency
+///
+/// The cache lock is held only long enough to look up or insert; the slow
+/// `compile` + `from_ptx` work runs outside the lock. If two threads race
+/// on the same miss they will each compile once and the second insert is
+/// dropped by `insert`'s idempotence check.
+pub(crate) fn get_or_build_module_for_radix_sort<F>(
+    spec: &RadixSortKernelSpec,
+    entry: &'static str,
+    compile: F,
+) -> BoltResult<CudaModule>
+where
+    F: FnOnce(&RadixSortKernelSpec) -> BoltResult<String>,
+{
+    let key = RadixSortKey::new(spec, entry);
+    // Fast path: in-memory hit. Hold the lock just long enough to clone.
+    if let Some(cached) = RADIXSORT_CACHE.lock().get(&key) {
+        return Ok(cached.module);
+    }
+    // In-memory miss: try the optional on-disk cache before paying for codegen.
+    let disk = crate::jit::disk_cache::disk_cache();
+    let disk_key = disk.as_ref().map(|_| {
+        format!(
+            "{}{}-{}",
+            RADIX_SORT_DISK_PREFIX,
+            entry,
+            crate::jit::disk_cache::hash_to_key(key.hi, key.lo),
+        )
+    });
+    let ptx = match (&disk, &disk_key) {
+        (Some(cache), Some(k)) => match cache.lookup(k) {
+            Some(text) => text,
+            None => {
+                let text = compile(spec)?;
+                // Write-through to disk. Errors here are non-fatal: a
+                // failed write just means future processes won't benefit,
+                // the current process still loads the module successfully.
+                let _ = cache.store(k, &text);
+                text
+            }
+        },
+        _ => compile(spec)?,
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    // Insert and hand back a clone. Concurrent winners are tolerated by
+    // `insert`'s idempotence check.
+    RADIXSORT_CACHE.lock().insert(
+        key,
+        RadixSortEntry {
+            ptx,
+            module: module.clone(),
+        },
+    );
+    Ok(module)
+}
+
+/// Test-friendly variant of [`get_or_build_module_for_radix_sort`] that
+/// injects the module loader (so unit tests can stub out the CUDA driver
+/// dependency in `CudaModule::from_ptx`). Production callers use the
+/// non-`_with` form.
+#[cfg(test)]
+fn get_or_build_module_for_radix_sort_with<F, L>(
+    spec: &RadixSortKernelSpec,
+    entry: &'static str,
+    compile: F,
+    loader: L,
+) -> BoltResult<CudaModule>
+where
+    F: FnOnce(&RadixSortKernelSpec) -> BoltResult<String>,
+    L: FnOnce(&str) -> BoltResult<CudaModule>,
+{
+    let key = RadixSortKey::new(spec, entry);
+    if let Some(cached) = RADIXSORT_CACHE.lock().get(&key) {
+        return Ok(cached.module);
+    }
+    let ptx = compile(spec)?;
+    let module = loader(&ptx)?;
+    RADIXSORT_CACHE.lock().insert(
+        key,
+        RadixSortEntry {
+            ptx,
+            module: module.clone(),
+        },
+    );
+    Ok(module)
+}
+
+// ---------------------------------------------------------------------------
 // Tests for the KernelSpec-keyed cache.
 // ---------------------------------------------------------------------------
 
@@ -1638,6 +1919,348 @@ mod hash_join_cache_tests {
             HashJoinKey::new(&spec, "bolt_probe_tiled"),
             HashJoinKey::new(&copied, "bolt_probe_tiled"),
             "copying the spec must not change its cache key"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the RadixSortKernelSpec-keyed cache.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod radix_sort_cache_tests {
+    use super::*;
+    use crate::plan::logical_plan::DataType;
+    use crate::plan::physical_plan::{RadixSortKernelSpec, RadixSortPass};
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+    fn mk_spec(pass: RadixSortPass, dtype: DataType) -> RadixSortKernelSpec {
+        RadixSortKernelSpec { pass, dtype }
+    }
+
+    /// Cold lookup against a fresh cache is a miss and `get` accounts for
+    /// it. Mirrors `hash_join_cache_cold_lookup_is_a_miss`.
+    #[test]
+    fn radix_sort_cache_cold_lookup_is_a_miss() {
+        let mut cache = RadixSortCache::new(4);
+        let spec = mk_spec(RadixSortPass::Histogram, DataType::Int32);
+        let key = RadixSortKey::new(&spec, "bolt_radix_histogram_i32");
+
+        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert_eq!(cache.misses, 1);
+        assert_eq!(cache.hits, 0);
+    }
+
+    /// State-machine pin of the hit path: a second call with the same spec
+    /// must NOT re-run the compile closure and must NOT re-run the loader.
+    /// We mock `CudaModule::from_ptx` with a stub closure since CUDA isn't
+    /// available in unit tests; the cache state machine is identical.
+    #[test]
+    fn radix_sort_cache_compile_and_loader_run_once_per_unique_spec() {
+        #[derive(Clone)]
+        struct MockModule(&'static str);
+
+        struct MockCache {
+            by_key: HashMap<RadixSortKey, MockModule>,
+            order: VecDeque<RadixSortKey>,
+            cap: usize,
+        }
+
+        impl MockCache {
+            fn get_or_build(
+                &mut self,
+                spec: &RadixSortKernelSpec,
+                entry: &'static str,
+                compile_count: &AtomicUsize,
+                loader_count: &AtomicUsize,
+                tag: &'static str,
+            ) -> MockModule {
+                let key = RadixSortKey::new(spec, entry);
+                if let Some(m) = self.by_key.get(&key) {
+                    return m.clone();
+                }
+                compile_count.fetch_add(1, AOrdering::SeqCst);
+                loader_count.fetch_add(1, AOrdering::SeqCst);
+                let m = MockModule(tag);
+                while self.by_key.len() >= self.cap {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.by_key.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+                self.order.push_back(key);
+                self.by_key.insert(key, m.clone());
+                m
+            }
+        }
+
+        let hist_i32 = mk_spec(RadixSortPass::Histogram, DataType::Int32);
+        let scatter_i32 = mk_spec(RadixSortPass::Scatter, DataType::Int32);
+
+        let compile_count = AtomicUsize::new(0);
+        let loader_count = AtomicUsize::new(0);
+        let mut cache = MockCache {
+            by_key: HashMap::new(),
+            order: VecDeque::new(),
+            cap: 64,
+        };
+
+        // First call with (Histogram, Int32): miss → compile + load each
+        // run once.
+        let m1 = cache.get_or_build(
+            &hist_i32,
+            "bolt_radix_histogram_i32",
+            &compile_count,
+            &loader_count,
+            "hist-i32",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 1);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 1);
+        assert_eq!(m1.0, "hist-i32");
+
+        // Second call with the SAME spec: HIT → neither closure runs again.
+        let m2 = cache.get_or_build(
+            &hist_i32,
+            "bolt_radix_histogram_i32",
+            &compile_count,
+            &loader_count,
+            "hist-i32",
+        );
+        assert_eq!(
+            compile_count.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip codegen"
+        );
+        assert_eq!(
+            loader_count.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip module load"
+        );
+        assert_eq!(m2.0, "hist-i32");
+
+        // A different pass (Scatter) at the same dtype: miss again.
+        let m3 = cache.get_or_build(
+            &scatter_i32,
+            "bolt_radix_scatter_i32",
+            &compile_count,
+            &loader_count,
+            "scatter-i32",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 2);
+        assert_eq!(m3.0, "scatter-i32");
+
+        // The keys-only Scatter entry and the ScatterWithIndices entry
+        // both live under the Scatter→ScatterWithIndices branch but use
+        // different `entry` strings — the entry tag participates in the
+        // key, so the call must miss and compile again.
+        let scatter_with_indices_i32 =
+            mk_spec(RadixSortPass::ScatterWithIndices, DataType::Int32);
+        let m4 = cache.get_or_build(
+            &scatter_with_indices_i32,
+            "bolt_radix_scatter_i32_with_indices",
+            &compile_count,
+            &loader_count,
+            "scatter-wi-i32",
+        );
+        assert_eq!(
+            compile_count.load(AOrdering::SeqCst),
+            3,
+            "ScatterWithIndices is a distinct pass and entry — must miss"
+        );
+        assert_eq!(m4.0, "scatter-wi-i32");
+
+        // And back to the original (Histogram, Int32): still a hit, neither
+        // closure runs.
+        let m5 = cache.get_or_build(
+            &hist_i32,
+            "bolt_radix_histogram_i32",
+            &compile_count,
+            &loader_count,
+            "hist-i32",
+        );
+        assert_eq!(compile_count.load(AOrdering::SeqCst), 3);
+        assert_eq!(loader_count.load(AOrdering::SeqCst), 3);
+        assert_eq!(m5.0, "hist-i32");
+    }
+
+    /// Key uniqueness: distinct passes, dtypes, and entry tags must each
+    /// produce distinct keys. (This is the assumption the hit-vs-miss
+    /// classification relies on.)
+    #[test]
+    fn radix_sort_cache_key_distinguishes_pass_dtype_and_entry() {
+        let hist_i32 = mk_spec(RadixSortPass::Histogram, DataType::Int32);
+        let hist_i64 = mk_spec(RadixSortPass::Histogram, DataType::Int64);
+        let scatter_i32 = mk_spec(RadixSortPass::Scatter, DataType::Int32);
+        let scatter_wi_i32 = mk_spec(RadixSortPass::ScatterWithIndices, DataType::Int32);
+        let msb_flip_i32 = mk_spec(RadixSortPass::MsbFlip, DataType::Int32);
+
+        let k_hist_i32 = RadixSortKey::new(&hist_i32, "bolt_radix_histogram_i32");
+        let k_hist_i64 = RadixSortKey::new(&hist_i64, "bolt_radix_histogram_i64");
+        let k_scatter_i32 = RadixSortKey::new(&scatter_i32, "bolt_radix_scatter_i32");
+        let k_scatter_wi_i32 = RadixSortKey::new(
+            &scatter_wi_i32,
+            "bolt_radix_scatter_i32_with_indices",
+        );
+        let k_msb_flip_i32 = RadixSortKey::new(&msb_flip_i32, "bolt_radix_msb_flip_i32");
+        let k_hist_i32_alt = RadixSortKey::new(&hist_i32, "bolt_radix_histogram_alt");
+
+        assert_ne!(k_hist_i32, k_hist_i64, "dtype must participate in the key");
+        assert_ne!(k_hist_i32, k_scatter_i32, "pass must participate in the key");
+        assert_ne!(
+            k_scatter_i32, k_scatter_wi_i32,
+            "Scatter and ScatterWithIndices must hash distinctly"
+        );
+        assert_ne!(
+            k_hist_i32, k_msb_flip_i32,
+            "MsbFlip must hash distinctly from Histogram"
+        );
+        assert_ne!(
+            k_hist_i32, k_hist_i32_alt,
+            "entry tag must participate in the key"
+        );
+    }
+
+    /// The disk-cache key prefix must start with `"radix_sort::"` so a
+    /// hand inspection of the cache directory distinguishes radix-sort
+    /// entries from projection-path, scalar-agg, and hash-join entries.
+    /// Pins the prefix contract against accidental drift.
+    #[test]
+    fn radix_sort_disk_prefix_is_visibly_namespaced() {
+        assert_eq!(RADIX_SORT_DISK_PREFIX, "radix_sort::");
+        let composed = format!(
+            "{}{}-{}",
+            RADIX_SORT_DISK_PREFIX,
+            "bolt_radix_histogram_i32",
+            "deadbeefcafebabe1234567890abcdef",
+        );
+        assert!(
+            composed.starts_with("radix_sort::"),
+            "composed disk key must carry the radix_sort prefix: {composed}"
+        );
+    }
+
+    /// The key fingerprint is stable across `Copy` of the same spec.
+    /// Callers `Copy` the IR before handing it to the cache, so the
+    /// stability is load-bearing.
+    #[test]
+    fn radix_sort_cache_key_stable_across_copy() {
+        let spec = mk_spec(RadixSortPass::ScatterWithIndices, DataType::Int64);
+        let copied = spec;
+        assert_eq!(
+            RadixSortKey::new(&spec, "bolt_radix_scatter_i64_with_indices"),
+            RadixSortKey::new(&copied, "bolt_radix_scatter_i64_with_indices"),
+            "copying the spec must not change its cache key"
+        );
+    }
+
+    /// v0.7 integration test: call the real `get_or_build_module_for_radix_sort_with`
+    /// twice with the same `(spec, entry)` pair and confirm the second call
+    /// hits the cache. The compile closure runs exactly once across both
+    /// calls; the stub loader likewise runs exactly once. This is the
+    /// production code path with only `CudaModule::from_ptx` replaced
+    /// (since the test runner has no CUDA context).
+    ///
+    /// We use a distinctive `entry` tag so the cache slot cannot collide
+    /// with any other test's spec in the process-wide `RADIXSORT_CACHE` —
+    /// tests in the same binary share the static.
+    #[test]
+    fn get_or_build_module_for_radix_sort_with_runs_compile_once() {
+        let spec = mk_spec(RadixSortPass::Histogram, DataType::Int32);
+        let entry = "bolt_v07_radix_integration_marker";
+        let compile_calls = AtomicUsize::new(0);
+        let loader_calls = AtomicUsize::new(0);
+
+        // First call: cold miss. Both the compile closure and the loader run.
+        let _m1 = get_or_build_module_for_radix_sort_with(
+            &spec,
+            entry,
+            |_spec| {
+                compile_calls.fetch_add(1, AOrdering::SeqCst);
+                Ok("// fake ptx — never reaches the driver".to_string())
+            },
+            |_ptx| {
+                loader_calls.fetch_add(1, AOrdering::SeqCst);
+                Ok(crate::jit::CudaModule::stub_for_tests())
+            },
+        )
+        .expect("stub loader must succeed");
+        assert_eq!(
+            compile_calls.load(AOrdering::SeqCst),
+            1,
+            "cold miss must compile"
+        );
+        assert_eq!(
+            loader_calls.load(AOrdering::SeqCst),
+            1,
+            "cold miss must load"
+        );
+
+        // Second call with the same spec: warm hit. Neither the compile
+        // closure nor the loader should run.
+        let _m2 = get_or_build_module_for_radix_sort_with(
+            &spec,
+            entry,
+            |_spec| {
+                compile_calls.fetch_add(1, AOrdering::SeqCst);
+                Ok("// MUST NOT RUN — warm cache hit was expected".to_string())
+            },
+            |_ptx| {
+                loader_calls.fetch_add(1, AOrdering::SeqCst);
+                Ok(crate::jit::CudaModule::stub_for_tests())
+            },
+        )
+        .expect("stub loader must succeed");
+        assert_eq!(
+            compile_calls.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip codegen — compile closure ran a second time"
+        );
+        assert_eq!(
+            loader_calls.load(AOrdering::SeqCst),
+            1,
+            "warm-cache hit must skip module load — loader ran a second time"
+        );
+    }
+
+    /// Companion to `get_or_build_module_for_radix_sort_with_runs_compile_once`:
+    /// the public `radix_sort_cache_stats()` hook must reflect the hit a
+    /// successful warm call generated. We use `>=` rather than `==` because
+    /// the static counter is shared across every test in the binary; this
+    /// test only proves the warm path *increments* `hits`.
+    #[test]
+    fn radix_sort_cache_stats_reflect_warm_hit() {
+        let spec = mk_spec(RadixSortPass::Scatter, DataType::Int64);
+        let entry = "bolt_v07_radix_stats_marker";
+
+        let (hits_before, _) = radix_sort_cache_stats();
+
+        // Cold miss — seeds the cache.
+        let _m = get_or_build_module_for_radix_sort_with(
+            &spec,
+            entry,
+            |_| Ok("// fake ptx".to_string()),
+            |_| Ok(crate::jit::CudaModule::stub_for_tests()),
+        )
+        .expect("loader must succeed");
+
+        // Warm hit — bumps `hits` by 1.
+        let _m = get_or_build_module_for_radix_sort_with(
+            &spec,
+            entry,
+            |_| panic!("compile must not run on the warm path"),
+            |_| panic!("loader must not run on the warm path"),
+        )
+        .expect("warm cache hit must succeed");
+
+        let (hits_after, _) = radix_sort_cache_stats();
+        assert!(
+            hits_after >= hits_before + 1,
+            "expected at least one hit bump (before={}, after={}); the warm \
+             call must have flowed through the hit path",
+            hits_before,
+            hits_after,
         );
     }
 }
