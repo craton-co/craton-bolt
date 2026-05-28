@@ -842,6 +842,29 @@ pub fn sort_indices_on_gpu_multi<'a>(
             let grid_x: u32 = n_pow2.div_ceil(block_size);
             let log2_n = log2_pow2(n_pow2);
 
+            // Bitonic dispatch loop: O(log² n) launches.
+            //
+            // PERF: same-stream sequential launches; no per-iteration sync
+            // needed (CUDA stream-ordering guarantees that each launch
+            // observes the previous launch's writes against the same
+            // buffers, since they share `stream`). One final
+            // `stream.synchronize()` after the outer loop is sufficient.
+            // For n=16M this saves ~300 host-side serial syncs per sort.
+            //
+            // SAFETY: parameter stack locals (`kp`, `vp`, `p_stage`,
+            // `p_mask`) are recreated each iteration but the *kernel*
+            // captures only the values present at launch time (cuLaunchKernel
+            // copies the indirected scalars into the driver before returning),
+            // so they need to outlive only the `cuLaunchKernel` call, not the
+            // kernel execution.
+            //
+            // TODO(perf): wrap bitonic launches in cuGraph for one-submit
+            // semantics; current implementation drops intermediate syncs.
+            // A `cuStreamBeginCapture`/`cuStreamEndCapture` pass + a cached
+            // `(n_pow2, spec) -> cuGraphExec` mapping would let repeat sorts
+            // of the same shape replay a pre-instantiated graph with a
+            // single `cuGraphLaunch`, eliminating the per-iteration driver
+            // round-trip altogether. Behind `BOLT_SORT_USE_GRAPH=1`.
             for stage in 1..=log2_n {
                 let mut substage = stage;
                 loop {
@@ -863,7 +886,10 @@ pub fn sort_indices_on_gpu_multi<'a>(
                     params.push(&mut p_mask as *mut u32 as *mut c_void);
 
                     // SAFETY: same as Shmem branch — every param points at
-                    // a stack local that outlives the synchronous launch.
+                    // a stack local that outlives the `cuLaunchKernel`
+                    // call. The driver copies indirected scalars before
+                    // returning, so subsequent iterations that reuse those
+                    // stack slots cannot disturb already-queued launches.
                     unsafe {
                         cuda_sys::check(cuda_sys::cuLaunchKernel(
                             function.raw(),
@@ -879,13 +905,17 @@ pub fn sort_indices_on_gpu_multi<'a>(
                             ptr::null_mut(),
                         ))?;
                     }
-                    stream.synchronize()?;
                     if substage == 1 {
                         break;
                     }
                     substage -= 1;
                 }
             }
+            // Single sync after the whole bitonic dispatch — required
+            // because `idx_dev.to_vec()` below issues a blocking D2H on
+            // the default (null) stream, and we must ensure the
+            // sort-stream launches have completed before that read.
+            stream.synchronize()?;
         }
     }
 
