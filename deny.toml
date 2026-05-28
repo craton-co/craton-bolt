@@ -1,0 +1,75 @@
+# deny.toml — cargo-deny configuration for craton-bolt
+#
+# Run locally:
+#     cargo install --locked cargo-deny
+#     cargo deny check
+#
+# CI wires this in via .github/workflows/ — see RELEASING.md.
+#
+# Schema reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+no-default-features = false
+# Only check the host build. The nvptx64 kernels crate has its own
+# (much smaller) dep tree and a different toolchain; lint it separately
+# if/when we re-include it in workspace.
+exclude = []
+
+[licenses]
+# Apache-2.0 + MIT is the standard Rust-ecosystem permissive set. We add
+# BSD-2-Clause, BSD-3-Clause, ISC, Unicode-DFS-2016 because common transitive
+# deps (e.g., regex's `unicode-ident`) ship under them.
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+]
+# Confidence threshold for LICENSE-file inference. The default 0.8 is fine.
+confidence-threshold = 0.8
+
+[[licenses.clarify]]
+name = "ring"
+# `ring` ships with a mix-and-match license file; this is the standard
+# clarification crates use.
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+[bans]
+# Allow multiple versions of common transitive deps for now (the Rust
+# ecosystem is mid-flight on syn 1 → 2, etc.). Tighten over time.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Deny known-bad deps. Empty for now — add entries as advisories surface.
+deny = []
+skip = []
+skip-tree = []
+
+[advisories]
+version = 2
+# vulnerability advisories: deny. unmaintained / unsound: warn.
+# (cargo-deny v2 reads RUSTSEC database from the cargo-deny database mirror.)
+yanked = "warn"
+ignore = [
+    # Add RUSTSEC-XXXX-YYYY ids here only with justification + tracking
+    # GH issue. Default is empty.
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
