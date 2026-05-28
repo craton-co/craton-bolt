@@ -435,7 +435,7 @@ const DEFAULT_POOL_STATS_INTERVAL_SECS: u64 = 60;
 /// instead of duplicating it (drift between the constant here and a
 /// hard-coded string in the test would silently desynchronise the
 /// toggle smoke).
-pub(crate) const POOL_STATS_ENV: &str = "BOLT_POOL_STATS_INTERVAL_SECS";
+pub const POOL_STATS_ENV: &str = "BOLT_POOL_STATS_INTERVAL_SECS";
 
 /// Synchronize the default stream and convert any pending CUDA error.
 ///
@@ -2173,7 +2173,7 @@ pub(crate) fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<
 /// round-trip the parser against the live env var without going
 /// through `Engine::new` (which would also pay an eager CUDA-context
 /// init cost we want to keep off host-only smoke runs).
-pub(crate) fn pool_stats_interval_from_env() -> Duration {
+pub fn pool_stats_interval_from_env() -> Duration {
     match std::env::var(POOL_STATS_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
         Some(0) => Duration::ZERO,
         Some(n) => Duration::from_secs(n),

@@ -443,7 +443,7 @@ fn hash_table_byte_cap() -> usize {
 /// round-trip the parser against the live env var. The clamp policy is
 /// a per-process latch in `HASH_TABLE_BYTE_CAP_CACHE`, so the public
 /// surface here intentionally stays the unmemoised inner parser.
-pub(crate) fn parse_env_cap() -> Option<usize> {
+pub fn parse_env_cap() -> Option<usize> {
     let raw = std::env::var(CAP_ENV_VAR).ok()?;
     let raw_trim = raw.trim();
     if raw_trim.is_empty() {
@@ -2575,7 +2575,7 @@ fn utf8_hash64(bytes: &[u8]) -> u64 {
 /// pin the toggle semantics — the truthy/falsy parsing rule is the
 /// observable contract that downstream tooling tunes against, and
 /// drifting it silently has bitten us before.
-pub(crate) fn streaming_intern_enabled() -> bool {
+pub fn streaming_intern_enabled() -> bool {
     match std::env::var(STREAMING_INTERN_ENV_VAR) {
         Ok(v) => {
             let s = v.trim();
