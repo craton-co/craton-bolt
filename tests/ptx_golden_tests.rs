@@ -32,7 +32,9 @@ use craton_bolt::jit::float_atomics::compile_groupby_float_atomic_kernel;
 use craton_bolt::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_keys_kernel,
 };
-use craton_bolt::jit::prefix_scan::compile_prefix_scan_kernel;
+use craton_bolt::jit::prefix_scan::{
+    compile_prefix_scan_kernel, compile_prefix_scan_kernel_blelloch,
+};
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
 };
@@ -463,6 +465,62 @@ fn golden_prefix_scan_block_size_is_256() {
     assert!(
         ptx.contains(".shared .align 4 .b8 sdata[2048]"),
         "expected sdata[2048] (BLOCK_SIZE=256, 2 ping-pong u32 buffers)\n{ptx}"
+    );
+}
+
+/// Substring shape test for the Blelloch upsweep+downsweep variant.
+///
+/// Pins the load-bearing structural markers:
+///   * single shared-memory buffer (no ping-pong) — Blelloch operates
+///     in-place across barriers.
+///   * matching entry-name and 4-arg ABI so host code can swap kernels
+///     transparently.
+///   * BOTH algorithm-section markers present (`UPSWEEP` + `DOWNSWEEP`)
+///     plus the exclusive-scan `ZERO-INIT` pivot.
+///   * exact bar.sync count: 2*log2(BLOCK_SIZE) + 2 = 18 for BLOCK_SIZE=256,
+///     i.e. seed + K upsweep + pivot + K downsweep. If a future refactor
+///     drops a barrier this asserts the regression up-front.
+#[test]
+fn golden_prefix_scan_blelloch_has_shape() {
+    let ptx = compile_prefix_scan_kernel_blelloch().expect("compile blelloch");
+
+    // Single buffer = BLOCK_SIZE * 4 = 1024 bytes (vs. 2048 for Hillis-Steele).
+    assert!(
+        ptx.contains(".shared .align 4 .b8 sdata[1024]"),
+        "expected sdata[1024] (BLOCK_SIZE=256, single u32 buffer)\n{ptx}"
+    );
+
+    // Entry + ABI.
+    assert!(
+        ptx.contains(".visible .entry bolt_prefix_scan_blelloch("),
+        "missing Blelloch entry name\n{ptx}"
+    );
+    assert!(ptx.contains(".param .u64 bolt_prefix_scan_blelloch_param_0,"));
+    assert!(ptx.contains(".param .u64 bolt_prefix_scan_blelloch_param_1,"));
+    assert!(ptx.contains(".param .u64 bolt_prefix_scan_blelloch_param_2,"));
+    assert!(ptx.contains(".param .u32 bolt_prefix_scan_blelloch_param_3"));
+
+    // Phase markers: dropping any of these means the algorithm is missing
+    // a phase or has been silently renamed.
+    assert!(
+        ptx.contains("BLELLOCH UPSWEEP"),
+        "missing upsweep marker:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("BLELLOCH DOWNSWEEP"),
+        "missing downsweep marker:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("BLELLOCH ZERO-INIT"),
+        "missing exclusive-scan zero-init pivot:\n{ptx}"
+    );
+
+    // bar.sync count: seed + K upsweep levels + pivot + K downsweep levels.
+    // For BLOCK_SIZE = 256, K = log2(256) = 8, total = 2 * 8 + 2 = 18.
+    let n_sync = ptx.matches("bar.sync 0;").count();
+    assert_eq!(
+        n_sync, 18,
+        "expected exactly 18 bar.syncs (seed + 8 upsweep + pivot + 8 downsweep), got {n_sync}\n{ptx}"
     );
 }
 
@@ -1023,6 +1081,18 @@ fn snapshot_groupby_keys_kernel() {
 fn snapshot_prefix_scan_kernel() {
     let ptx = compile_prefix_scan_kernel().expect("compile prefix scan");
     assert_ptx_snapshot!("prefix_scan_kernel", ptx);
+}
+
+/// Snapshot test for the Blelloch variant. Bootstrap with
+/// `cargo insta test --accept -- --include-ignored` — the snapshot will
+/// land alongside the Hillis-Steele one under `tests/snapshots/` and
+/// later refactors that drift the normalized PTX will produce a
+/// reviewable diff.
+#[test]
+#[ignore = "bootstrap"]
+fn snapshot_prefix_scan_kernel_blelloch() {
+    let ptx = compile_prefix_scan_kernel_blelloch().expect("compile blelloch");
+    assert_ptx_snapshot!("prefix_scan_kernel_blelloch", ptx);
 }
 
 #[test]
