@@ -274,6 +274,17 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             let inner = rewrite_expr_with(inner, r, depth + 1)?;
             Ok(Expr::Alias(Box::new(inner), name.clone()))
         }
+        Expr::Cast { expr: inner, target } => {
+            // CAST has no string-literal comparison surface to rewrite —
+            // it converts a numeric / boolean expression into another
+            // primitive type. Recurse so any rewritable sub-expression
+            // (e.g. `CAST(col = 'lit' AS Int64)`) is still normalised.
+            let new_inner = rewrite_expr_with(inner, r, depth + 1)?;
+            Ok(Expr::Cast {
+                expr: Box::new(new_inner),
+                target: *target,
+            })
+        }
         Expr::Unary { op, operand } => {
             // The `IS NULL` / `IS NOT NULL` surface has no string-literal
             // operand to dictionary-rewrite — the operand is the value whose

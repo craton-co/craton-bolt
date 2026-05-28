@@ -463,6 +463,7 @@ fn contains_unary(expr: &Expr) -> bool {
         Expr::Unary { .. } => true,
         Expr::Binary { left, right, .. } => contains_unary(left) || contains_unary(right),
         Expr::Alias(inner, _) => contains_unary(inner),
+        Expr::Cast { expr, .. } => contains_unary(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }

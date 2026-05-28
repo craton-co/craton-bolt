@@ -463,6 +463,15 @@ impl<'a> Codegen<'a> {
             Expr::Literal(lit) => self.emit_literal(lit),
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
             Expr::Unary { op, operand } => self.emit_unary(*op, operand),
+            // v0.5 surface: parser + type-check only — the GPU codegen
+            // has no IR op for runtime conversion yet. The `lower()`
+            // boundary rejects every `Cast` before we get here, so this
+            // arm is defensive: if a future caller bypasses `lower()`
+            // we surface a clean error rather than silently producing
+            // the inner value.
+            Expr::Cast { .. } => Err(BoltError::Plan(
+                "CAST not yet lowered to GPU; coming in a follow-up".into(),
+            )),
             Expr::Alias(inner, _) => self.emit_expr(inner),
         }
     }
@@ -1006,6 +1015,10 @@ fn substitute_one_depth(
             op: *op,
             operand: Box::new(substitute_one(operand, map)),
         },
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(substitute_one(expr, map)),
+            target: *target,
+        },
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
         }
@@ -1359,6 +1372,11 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
             predicate_contains_unary(left) || predicate_contains_unary(right)
         }
         Expr::Alias(inner, _) => predicate_contains_unary(inner),
+        // CAST is rejected wholesale at `lower()` (see the early-reject
+        // walk in `lower_depth`), so we should never actually reach a
+        // routing decision over a Cast-bearing predicate. Recurse for
+        // safety — the answer is the same as for any transparent wrapper.
+        Expr::Cast { expr, .. } => predicate_contains_unary(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1603,6 +1621,7 @@ fn expr_contains_div_or_mod(e: &Expr) -> bool {
         }
         Expr::Alias(inner, _) => expr_contains_div_or_mod(inner),
         Expr::Unary { operand, .. } => expr_contains_div_or_mod(operand),
+        Expr::Cast { expr, .. } => expr_contains_div_or_mod(expr),
     }
 }
 
@@ -1625,6 +1644,7 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
         }
         Expr::Alias(inner, _) => expr_has_unsafe_eager_shortcircuit(inner),
         Expr::Unary { operand, .. } => expr_has_unsafe_eager_shortcircuit(operand),
+        Expr::Cast { expr, .. } => expr_has_unsafe_eager_shortcircuit(expr),
     }
 }
 
@@ -1701,12 +1721,89 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
 }
 
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
+    // v0.5: the planner accepts `CAST(<expr> AS <type>)` and type-checks it
+    // against [`cast_is_supported`], but the physical layer has no GPU IR
+    // op for the runtime conversion. Reject every `Cast` here with a clear
+    // message so callers see a "not yet lowered" error rather than a more
+    // confusing schema mismatch or silent miscompile further down.
+    if logical_plan_contains_cast(plan) {
+        return Err(BoltError::Plan(
+            "CAST not yet lowered to GPU; coming in a follow-up".into(),
+        ));
+    }
     let phys = lower_depth(plan, 0)?;
     // Static-analysis safety net for the documented short-circuit divergence
     // (see the AND/OR arm in `emit_binary`). Runs once at the lowering
     // boundary; non-fatal warning only.
     warn_if_eager_shortcircuit_unsafe(&phys);
     Ok(phys)
+}
+
+/// Walk `plan` looking for any `Expr::Cast` node. Used by [`lower`] to
+/// reject CAST-bearing plans at the physical-plan boundary while keeping
+/// the type-check surface alive at the logical plane. The traversal is
+/// recursion-bounded via [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`]
+/// the same way [`lower_depth`] guards itself; depth overflow here
+/// degrades safely to "no cast found" (the subsequent `lower_depth`
+/// will surface the same depth error with a more specific message).
+fn logical_plan_contains_cast(plan: &LogicalPlan) -> bool {
+    fn expr_has_cast(e: &Expr) -> bool {
+        match e {
+            Expr::Cast { .. } => true,
+            Expr::Column(_) | Expr::Literal(_) => false,
+            Expr::Binary { left, right, .. } => expr_has_cast(left) || expr_has_cast(right),
+            Expr::Unary { operand, .. } => expr_has_cast(operand),
+            Expr::Alias(inner, _) => expr_has_cast(inner),
+        }
+    }
+    fn agg_has_cast(a: &AggregateExpr) -> bool {
+        match a {
+            AggregateExpr::Count(e)
+            | AggregateExpr::Sum(e)
+            | AggregateExpr::Min(e)
+            | AggregateExpr::Max(e)
+            | AggregateExpr::Avg(e) => expr_has_cast(e),
+        }
+    }
+    fn walk(plan: &LogicalPlan, depth: usize) -> bool {
+        if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+            return false;
+        }
+        match plan {
+            LogicalPlan::Scan { .. } => false,
+            LogicalPlan::Filter { input, predicate } => {
+                expr_has_cast(predicate) || walk(input, depth + 1)
+            }
+            LogicalPlan::Project { input, exprs } => {
+                exprs.iter().any(expr_has_cast) || walk(input, depth + 1)
+            }
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => {
+                group_by.iter().any(expr_has_cast)
+                    || aggregates.iter().any(agg_has_cast)
+                    || walk(input, depth + 1)
+            }
+            LogicalPlan::Distinct { input } => walk(input, depth + 1),
+            LogicalPlan::Limit { input, .. } => walk(input, depth + 1),
+            LogicalPlan::Sort { input, sort_exprs } => {
+                sort_exprs.iter().any(|se| expr_has_cast(&se.expr))
+                    || walk(input, depth + 1)
+            }
+            LogicalPlan::Union { inputs } => inputs.iter().any(|b| walk(b, depth + 1)),
+            LogicalPlan::Join {
+                left, right, on, ..
+            } => {
+                on.iter()
+                    .any(|(l, r)| expr_has_cast(l) || expr_has_cast(r))
+                    || walk(left, depth + 1)
+                    || walk(right, depth + 1)
+            }
+        }
+    }
+    walk(plan, 0)
 }
 
 /// Inner recursion for [`lower`]. `depth` is the current recursion depth;
