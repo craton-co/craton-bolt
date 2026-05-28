@@ -321,11 +321,17 @@ fn bool_arithmetic_rejected() {
 }
 
 #[test]
-fn aggregate_alias_rejected() {
-    // Per the frontend doc: "unsupported: alias on aggregate expression".
+fn aggregate_alias_accepted() {
+    // v0.5: aggregate aliasing (`SUM(x) AS total`) is now supported.
+    // The SELECT-list lowerer attaches the alias to the post-Aggregate Project
+    // node, so the aggregate's plan-assigned name (e.g. `sum_qty`) is renamed
+    // to the user alias before downstream stages see it.
     let provider = fixture_table();
     let res = try_plan("SELECT SUM(qty) AS total FROM sales", &provider);
-    assert_err_contains(res, "alias");
+    assert!(
+        res.is_ok(),
+        "aggregate aliasing must succeed in v0.5; got: {res:?}"
+    );
 }
 
 // ---- INNER JOIN qualified-column resolution --------------------------------

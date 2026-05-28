@@ -59,8 +59,6 @@ SQL today, see `docs/SQL_REFERENCE.md`.
   but primitive aggregate kernels still do not propagate validity bitmaps.
   `COUNT(expr)` over a primitive column counts every row; only the Bool/Utf8
   `extended_agg` path honours nulls.
-- Aggregate aliasing (`SUM(price) AS total`) is rejected by the SQL
-  frontend — aggregates carry plan-assigned names.
 - Post-aggregate expressions (`SUM(price) + 1`) are not yet supported.
 - String functions (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING`)
   are reachable only via `src/exec/string_ops*`, not via SQL.
