@@ -791,6 +791,99 @@ fn golden_hash_join_probe_kernel_smoke() {
     assert!(ptx.contains("MATCH:"), "missing MATCH label\n{ptx}");
 }
 
+// ---- Batch 6: tile-aware 2-way unrolled SoA probe goldens -------------------
+//
+// The tiled probe is a drop-in for compile_probe_kernel with the same nine-
+// parameter ABI but reads two adjacent slots per iteration via one
+// ld.global.nc.v2.u64. These goldens pin the three load-bearing behaviours
+// that distinguish it from a naive 2-way unroll: the fused 16-byte load
+// (the entire point), the SCALAR_STEP wrap-edge handler (obstacle 1), and
+// the empty-check-before-second-lane ordering (obstacle 3).
+
+/// Local helper: assert `needle_a` appears strictly before `needle_b` in
+/// `haystack`. Both substrings must exist. Used to pin the EMPTY-slot check
+/// vs second-lane match-check ordering inside the tiled probe.
+fn assert_appears_before(haystack: &str, needle_a: &str, needle_b: &str) {
+    let pos_a = haystack.find(needle_a).unwrap_or_else(|| {
+        panic!("needle_a `{needle_a}` not found in:\n{haystack}")
+    });
+    let pos_b = haystack.find(needle_b).unwrap_or_else(|| {
+        panic!("needle_b `{needle_b}` not found in:\n{haystack}")
+    });
+    assert!(
+        pos_a < pos_b,
+        "expected `{needle_a}` before `{needle_b}` \
+         (pos_a={pos_a}, pos_b={pos_b})\n{haystack}"
+    );
+}
+
+#[test]
+fn golden_hash_join_probe_tiled_kernel_smoke() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_kernel_tiled;
+    let ptx = compile_probe_kernel_tiled().expect("compile");
+    // Entry-point shape.
+    assert!(
+        ptx.contains(".visible .entry bolt_hash_join_probe_tiled"),
+        "{ptx}"
+    );
+    // Same output-claim atomic as the single-load probe.
+    assert!(
+        ptx.contains("atom.global.add.u32"),
+        "missing output-claim atomic\n{ptx}"
+    );
+    // The tile loop has TILE_TOP and the two match labels split out so
+    // MATCH_S uses slot %r8 and MATCH_SP1 uses slot %r8 + 1.
+    assert!(ptx.contains("TILE_TOP:"), "{ptx}");
+    assert!(ptx.contains("MATCH_S:"), "{ptx}");
+    assert!(ptx.contains("MATCH_SP1:"), "{ptx}");
+}
+
+/// The tiled probe MUST emit the fused 16-byte `ld.global.nc.v2.u64` —
+/// that's the entire reason the kernel exists. Dropping it (e.g. an
+/// accidental regression to two scalar loads inside the tile) defeats
+/// the bandwidth win.
+#[test]
+fn golden_hash_join_probe_tiled_emits_v2_fused_load() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_kernel_tiled;
+    let ptx = compile_probe_kernel_tiled().expect("compile");
+    assert!(
+        ptx.contains("ld.global.nc.v2.u64"),
+        "tiled probe must emit ld.global.nc.v2.u64 for the fused 16-byte load\n{ptx}"
+    );
+}
+
+/// The tiled probe MUST contain a `SCALAR_STEP:` label that handles the
+/// wraparound edge (obstacle 1). Without it, the v2 load at slot == cap-1
+/// reads past the end of keys_table.
+#[test]
+fn golden_hash_join_probe_tiled_has_scalar_step_for_wraparound() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_kernel_tiled;
+    let ptx = compile_probe_kernel_tiled().expect("compile");
+    assert!(
+        ptx.contains("SCALAR_STEP:"),
+        "tiled probe must have a SCALAR_STEP label for wrap-edge\n{ptx}"
+    );
+    assert!(
+        ptx.contains("bra SCALAR_STEP"),
+        "tiled probe must conditionally branch to SCALAR_STEP on wrap\n{ptx}"
+    );
+}
+
+/// Obstacle 3 — the empty-slot check on `slot[s]` must precede the match
+/// check on `slot[s + 1]`. Otherwise a stale chain-tail key in slot[s + 1]
+/// can false-match against a probe key whose chain actually ended at
+/// slot[s].
+#[test]
+fn golden_hash_join_probe_tiled_empty_check_precedes_second_lane_match() {
+    use craton_bolt::jit::hash_join_kernel::compile_probe_kernel_tiled;
+    let ptx = compile_probe_kernel_tiled().expect("compile");
+    // slot[s] vs EMPTY (in %rl5 vs %rl4) must appear before slot[s+1] vs
+    // probe-key (in %rl6 vs %rl0).
+    let empty_slot_s = "setp.eq.s64 %p12, %rl5, %rl4;";
+    let match_slot_sp1 = "setp.eq.s64 %p13, %rl6, %rl0;";
+    assert_appears_before(&ptx, empty_slot_s, match_slot_sp1);
+}
+
 #[test]
 fn golden_hash_join_build_collision_kernel_smoke() {
     use craton_bolt::jit::hash_join_kernel::compile_build_collision_kernel;

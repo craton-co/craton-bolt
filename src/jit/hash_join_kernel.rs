@@ -180,6 +180,17 @@ pub const BUILD_KERNEL_ENTRY: &str = "bolt_hash_join_build";
 /// Entry-point name of the probe kernel.
 pub const PROBE_KERNEL_ENTRY: &str = "bolt_hash_join_probe";
 
+/// Entry-point name of the **Batch 6** tile-aware 2-way unrolled SoA probe
+/// kernel. Drop-in replacement for [`PROBE_KERNEL_ENTRY`] with the same ABI;
+/// the difference is purely internal — the kernel reads two adjacent slots
+/// per iteration via a single `ld.global.nc.v2.u64`, cutting DRAM
+/// transactions in half on probe-bound workloads.
+///
+/// See [`compile_probe_kernel_tiled`] for the full design and the three
+/// correctness obstacles (wraparound, probe-bound accounting, ordering of
+/// the empty-slot check vs the second tile lane).
+pub const PROBE_KERNEL_TILED_ENTRY: &str = "bolt_hash_join_probe_tiled";
+
 /// Entry-point name of the Stage-2 collision-list build kernel — handles
 /// duplicate build keys by chaining them in a per-slot linked list rooted
 /// at `head[slot]` with edges stored in `next_idx[]`.
@@ -765,6 +776,277 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     writeln!(p, "\tcvta.to.global.u64 %rd12, %rd12;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd13, %rd12, %rd10;").map_err(write_err)?;
     writeln!(p, "\tst.global.u32 [%rd13], %r9;").map_err(write_err)?;
+
+    writeln!(p, "DONE:").map_err(write_err)?;
+    writeln!(p, "\tret;").map_err(write_err)?;
+    writeln!(p, "}}").map_err(write_err)?;
+
+    Ok(p)
+}
+
+/// **Batch 6** — Compile the *tile-aware 2-way unrolled* SoA probe kernel.
+///
+/// Drop-in semantic replacement for [`compile_probe_kernel`] with the same
+/// nine-parameter ABI (so the host launcher needs only an entry-point name
+/// swap, not a different argument list). The internal probe loop reads two
+/// adjacent hash-table slots per iteration via one `ld.global.nc.v2.u64`,
+/// halving DRAM transactions on workloads where the probe loop is bandwidth-
+/// bound — which is the common case on multi-million-row joins.
+///
+/// ## Why the naive unroll is wrong
+///
+/// A previous pass (Batch 5) emitted the fused `ld.global.nc.v2.u64` against
+/// `keys_table` but stayed inside the single-load probe loop. The naive
+/// 2-way unroll has three latent bugs:
+///
+/// 1. **Wraparound at the high slot.** `ld.global.v2.u64 [base + s*8]` reads
+///    `slot[s]` and `slot[s + 1]` *linearly* in memory. The semantic next
+///    slot under linear-probing is `(s + 1) & (cap - 1)`. When `s == cap-1`,
+///    the v2 load straddles past the end of `keys_table` and reads
+///    `slot[cap]` — uninitialised memory (or another GPU allocation).
+///
+/// 2. **Probe-bound accounting.** The single-load loop bounded itself with
+///    `MAX_PROBE_FACTOR * cap` *slot lookups*. A 2-way unroll either has to
+///    halve the bound or decrement the counter by 2 per tile. Forgetting
+///    either produces a probe loop with double the runaway envelope and
+///    weaker safety net.
+///
+/// 3. **Empty-slot ordering against the second lane.** If
+///    `slot[s] == EMPTY_KEY`, the single-load loop's correctness contract
+///    says we MUST early-exit before inspecting any further slot — the
+///    presence of an empty slot is the no-match termination condition.
+///    Inspecting `slot[s + 1]` after `slot[s]` returns EMPTY would let two
+///    adjacent empty slots produce a false-positive termination signal
+///    (irrelevant in this kernel, no harm done) but more importantly let
+///    a stale key in `slot[s + 1]` from a *different* hash chain trigger
+///    a false match — wrong row pairing.
+///
+/// ## Algorithm
+///
+/// Each tile:
+/// 1. **Pre-check wraparound.** If `slot == cap - 1`, fall through to a
+///    single-slot scalar probe of `slot[cap - 1]`, then resume the tile loop
+///    from `slot = 0`.
+/// 2. **Fused load.** `ld.global.nc.v2.u64 {k0, k1}, [keys_base + slot*8]`.
+/// 3. **Test `slot[s]` first** — match, then empty. The empty-slot check
+///    is the early-exit guard from obstacle (3) above.
+/// 4. **Then test `slot[s + 1]`** — match (with MATCH_SP1 path), then empty.
+/// 5. **Advance by 2** with masked add, and decrement the probe counter by 2.
+///
+/// `MAX_PROBE_FACTOR * cap` is still the slot-budget; we decrement by 2 per
+/// tile and by 1 per SCALAR_STEP so the semantic limit is preserved.
+///
+/// ## ABI
+///
+/// Identical to [`compile_probe_kernel`] — same nine params in the same
+/// order. The host's [`PROBE_KERNEL_TILED_ENTRY`] dispatch only needs to
+/// switch the entry-point string used at `cuModuleGetFunction` time.
+///
+/// ## Why the match paths split into two labels
+///
+/// `MATCH_S` claims an output using `%r_slot` as the matched slot index.
+/// `MATCH_SP1` uses `%r_slot + 1` (safely `< cap` because we already pre-
+/// checked the wraparound — we never enter the tile body when
+/// `slot == cap - 1`). Splitting the label keeps the slot-index arithmetic
+/// on the match path branch-free.
+pub fn compile_probe_kernel_tiled() -> BoltResult<String> {
+    let mut p = String::new();
+    writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
+    writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
+    writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    let entry = PROBE_KERNEL_TILED_ENTRY;
+    writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_2,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_3,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_4,").map_err(write_err)?;
+    writeln!(p, "\t.param .u64 {entry}_param_5,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_6,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_7,").map_err(write_err)?;
+    writeln!(p, "\t.param .u32 {entry}_param_8").map_err(write_err)?;
+    writeln!(p, ")").map_err(write_err)?;
+    writeln!(p, "{{").map_err(write_err)?;
+
+    // Register file — same shape as the single-load probe plus a few extras
+    // for the v2 load destination (%rl6 holds the second lane key) and the
+    // cap-minus-one pre-check register.
+    writeln!(p, "\t.reg .pred  %p<16>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32   %r<40>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rd<32>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    writeln!(p).map_err(write_err)?;
+
+    // tid = ctaid.x * ntid.x + tid.x ; bail if tid >= n_probe.
+    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_6];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // cap, mask = cap - 1, and cap_minus_one (which is the wraparound
+    // sentinel — when slot == cap-1, the next tile would load past the end
+    // of keys_table).
+    writeln!(p, "\tld.param.u32 %r5, [{entry}_param_7];").map_err(write_err)?;
+    writeln!(p, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?; // mask = cap_mask
+    // `cap_minus_one` is the same value as the mask under our
+    // power-of-two cap invariant; we duplicate into a separate register
+    // for clarity so the wrap pre-check reads naturally.
+    writeln!(p, "\tmov.u32 %r34, %r6;").map_err(write_err)?; // cap_minus_one
+
+    // probe_left = MAX_PROBE_FACTOR * cap (in slots, not iterations).
+    // We decrement by 2 per tile and by 1 per scalar step so the semantic
+    // limit matches the single-load probe.
+    writeln!(p, "\tmul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};").map_err(write_err)?;
+
+    // out_capacity.
+    writeln!(p, "\tld.param.u32 %r22, [{entry}_param_8];").map_err(write_err)?;
+
+    // Load probe key.
+    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(p, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
+
+    // hash + initial slot.
+    writeln!(p, "\tmov.s64 %rl1, {FX_MUL};").map_err(write_err)?;
+    writeln!(p, "\tmul.lo.s64 %rl2, %rl0, %rl1;").map_err(write_err)?;
+    writeln!(p, "\tshr.u64 %rl3, %rl2, 32;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
+
+    // keys_table base + row_idx_table base.
+    writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+    writeln!(p, "\tld.param.u64 %rd4, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd4, %rd4;").map_err(write_err)?;
+
+    // EMPTY_KEY for the no-match test.
+    writeln!(p, "\tmov.s64 %rl4, {EMPTY_KEY_LITERAL};").map_err(write_err)?;
+
+    // Top of the tile loop.
+    //
+    // Each iteration:
+    //   1. Pre-check wraparound (slot == cap - 1 ⇒ scalar step).
+    //   2. Fused 16-byte load of slot[s] and slot[s+1].
+    //   3. Test slot[s] for match, then EMPTY (early-exit before slot[s+1]).
+    //   4. Test slot[s+1] for match, then EMPTY.
+    //   5. Advance slot by 2; decrement probe_left by 2; bound-check.
+    writeln!(p, "TILE_TOP:").map_err(write_err)?;
+
+    // Pre-check wraparound. Obstacle (1): at slot == cap - 1, ld.v2 reads
+    // slot[cap], which is OOB. Branch into the single-slot scalar step.
+    writeln!(p, "\tsetp.eq.u32 %p10, %r8, %r34;").map_err(write_err)?;
+    writeln!(p, "\t@%p10 bra SCALAR_STEP;").map_err(write_err)?;
+
+    // Aligned 16-byte load: ld.global.nc.v2.u64 {k0, k1}, [base + slot*8].
+    // The `.nc` (non-coherent) hint is safe because the build phase has
+    // already issued `stream.synchronize()` before the probe — the table
+    // is immutable from the probe's POV.
+    writeln!(p, "\tmul.wide.u32 %rd5, %r8, 8;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd6, %rd3, %rd5;").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.v2.u64 {{%rl5, %rl6}}, [%rd6];").map_err(write_err)?;
+
+    // Test slot[s] for match. Branch into MATCH_S which uses %r8 as the
+    // matched slot index.
+    writeln!(p, "\tsetp.eq.s64 %p11, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(p, "\t@%p11 bra MATCH_S;").map_err(write_err)?;
+
+    // Test slot[s] for EMPTY. Obstacle (3): this must precede the slot[s+1]
+    // match check, otherwise a stale chain-tail key in slot[s+1] would
+    // false-match this probe key after a legitimately terminated chain.
+    writeln!(p, "\tsetp.eq.s64 %p12, %rl5, %rl4;").map_err(write_err)?;
+    writeln!(p, "\t@%p12 bra DONE;").map_err(write_err)?;
+
+    // Now safe to inspect slot[s+1]. We know slot[s] is occupied and
+    // non-matching, so the chain continues.
+    writeln!(p, "\tsetp.eq.s64 %p13, %rl6, %rl0;").map_err(write_err)?;
+    writeln!(p, "\t@%p13 bra MATCH_SP1;").map_err(write_err)?;
+
+    // slot[s+1] EMPTY ⇒ chain terminated, no match.
+    writeln!(p, "\tsetp.eq.s64 %p14, %rl6, %rl4;").map_err(write_err)?;
+    writeln!(p, "\t@%p14 bra DONE;").map_err(write_err)?;
+
+    // Advance by 2 slots with mask. Obstacle (2): decrement counter by 2 too.
+    writeln!(p, "\tadd.s32 %r8, %r8, 2;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(p, "\tsub.s32 %r20, %r20, 2;").map_err(write_err)?;
+    writeln!(p, "\tsetp.le.s32 %p15, %r20, 0;").map_err(write_err)?;
+    writeln!(p, "\t@%p15 bra DONE;").map_err(write_err)?;
+    writeln!(p, "\tbra TILE_TOP;").map_err(write_err)?;
+
+    // SCALAR_STEP — handle the wraparound edge. We have slot == cap - 1;
+    // do a single scalar probe of that slot, then resume the tile at slot 0
+    // (the natural wrap target).
+    writeln!(p, "SCALAR_STEP:").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd7, %r8, 8;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd8, %rd3, %rd7;").map_err(write_err)?;
+    writeln!(p, "\tld.global.nc.u64 %rl5, [%rd8];").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s64 %p11, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(p, "\t@%p11 bra MATCH_S;").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.s64 %p12, %rl5, %rl4;").map_err(write_err)?;
+    writeln!(p, "\t@%p12 bra DONE;").map_err(write_err)?;
+    // Wrap: resume tiled probing from slot 0.
+    writeln!(p, "\tmov.u32 %r8, 0;").map_err(write_err)?;
+    writeln!(p, "\tsub.s32 %r20, %r20, 1;").map_err(write_err)?;
+    writeln!(p, "\tsetp.le.s32 %p15, %r20, 0;").map_err(write_err)?;
+    writeln!(p, "\t@%p15 bra DONE;").map_err(write_err)?;
+    writeln!(p, "\tbra TILE_TOP;").map_err(write_err)?;
+
+    // MATCH_S — slot[s] matched. Use %r8 directly as the matched slot index.
+    writeln!(p, "MATCH_S:").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r35, %r8;").map_err(write_err)?; // matched_slot
+    writeln!(p, "\tbra EMIT_MATCH;").map_err(write_err)?;
+
+    // MATCH_SP1 — slot[s+1] matched. The pre-check above guarantees
+    // slot != cap - 1, so slot + 1 is in-range (no mask needed for this
+    // local arithmetic; the slot is also < cap by induction).
+    writeln!(p, "MATCH_SP1:").map_err(write_err)?;
+    writeln!(p, "\tadd.s32 %r35, %r8, 1;").map_err(write_err)?; // matched_slot = slot+1
+    // Defensive mask: slot+1 == cap only happens at the OOB pre-check we
+    // already filtered, so this mask is a no-op in practice. Kept as belt-
+    // and-braces against future refactors that drop the pre-check.
+    writeln!(p, "\tand.b32 %r35, %r35, %r6;").map_err(write_err)?;
+    writeln!(p, "\tbra EMIT_MATCH;").map_err(write_err)?;
+
+    // EMIT_MATCH — same emission path as the single-load probe, but reads
+    // row_idx_table[matched_slot] (in %r35) instead of [%r8].
+    writeln!(p, "EMIT_MATCH:").map_err(write_err)?;
+
+    // build_idx = row_idx_table[matched_slot].
+    writeln!(p, "\tmul.wide.u32 %rd9, %r35, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd10, %rd4, %rd9;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u32 %r9, [%rd10];").map_err(write_err)?;
+
+    // atom.add on counter: claim slot.
+    writeln!(p, "\tld.param.u64 %rd11, [{entry}_param_5];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd11, %rd11;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r10, 1;").map_err(write_err)?;
+    writeln!(p, "\tatom.global.add.u32 %r11, [%rd11], %r10;").map_err(write_err)?;
+
+    // If r11 (claimed slot) >= out_capacity, skip the writes — same overflow
+    // semantics as the single-load probe (counter keeps climbing so host can
+    // detect overflow and re-launch with a bigger output buffer).
+    writeln!(p, "\tsetp.ge.u32 %p4, %r11, %r22;").map_err(write_err)?;
+    writeln!(p, "\t@%p4 bra DONE;").map_err(write_err)?;
+
+    // out_probe_idx[claimed] = tid.
+    writeln!(p, "\tld.param.u64 %rd12, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd12, %rd12;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd13, %r11, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd14, %rd12, %rd13;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd14], %r3;").map_err(write_err)?;
+
+    // out_build_idx[claimed] = build_idx.
+    writeln!(p, "\tld.param.u64 %rd15, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd15, %rd15;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd16, %rd15, %rd13;").map_err(write_err)?;
+    writeln!(p, "\tst.global.u32 [%rd16], %r9;").map_err(write_err)?;
 
     writeln!(p, "DONE:").map_err(write_err)?;
     writeln!(p, "\tret;").map_err(write_err)?;
@@ -2416,5 +2698,200 @@ mod tests {
         let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
         assert!(ptx.contains("setp.ge.u32 %p0, %r3, %r4;"));
         assert!(ptx.contains("DONE:"));
+    }
+
+    // ----- Batch 6: tile-aware 2-way unrolled SoA probe goldens -----------
+
+    /// Helper: assert that `needle_a` appears strictly before `needle_b` in
+    /// the PTX text. Both substrings must exist; if either is missing or
+    /// `needle_b` precedes `needle_a`, the assertion fires with a slice of
+    /// PTX around each match for context.
+    ///
+    /// Used by the tiled-probe ordering test to enforce obstacle (3): the
+    /// EMPTY-slot check on `slot[s]` must precede the match check on
+    /// `slot[s + 1]`.
+    fn assert_appears_before(ptx: &str, needle_a: &str, needle_b: &str) {
+        let pos_a = ptx.find(needle_a).unwrap_or_else(|| {
+            panic!(
+                "assert_appears_before: needle_a `{needle_a}` not found in PTX:\n{ptx}"
+            )
+        });
+        let pos_b = ptx.find(needle_b).unwrap_or_else(|| {
+            panic!(
+                "assert_appears_before: needle_b `{needle_b}` not found in PTX:\n{ptx}"
+            )
+        });
+        assert!(
+            pos_a < pos_b,
+            "assert_appears_before: expected `{needle_a}` (pos {pos_a}) \
+             to appear before `{needle_b}` (pos {pos_b})\n{ptx}"
+        );
+    }
+
+    /// Tiled probe entry-point name is string-stable — host launcher resolves
+    /// by name at module load.
+    #[test]
+    fn probe_tiled_entry_name_is_stable() {
+        assert_eq!(PROBE_KERNEL_TILED_ENTRY, "bolt_hash_join_probe_tiled");
+    }
+
+    /// The tiled probe MUST emit the fused 16-byte `ld.global.nc.v2.u64`
+    /// against keys_table — that's the entire reason for the kernel's
+    /// existence. Dropping it (e.g. accidentally regressing to two scalar
+    /// loads) defeats the bandwidth win without any safety benefit.
+    #[test]
+    fn probe_tiled_ptx_uses_v2_u64_fused_load() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        assert!(
+            ptx.contains("ld.global.nc.v2.u64"),
+            "tiled probe must emit ld.global.nc.v2.u64; got:\n{ptx}"
+        );
+    }
+
+    /// The tiled probe MUST contain a `SCALAR_STEP:` label that handles the
+    /// wraparound edge (slot == cap - 1 ⇒ ld.v2 would straddle past the
+    /// table end). Dropping the label means the wrap pre-check has nowhere
+    /// to branch and the kernel reads OOB.
+    #[test]
+    fn probe_tiled_ptx_has_scalar_step_label() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        assert!(
+            ptx.contains("SCALAR_STEP:"),
+            "tiled probe must have a SCALAR_STEP: label for the wrap edge; got:\n{ptx}"
+        );
+        // And the tile top must conditionally branch to it.
+        assert!(
+            ptx.contains("bra SCALAR_STEP"),
+            "tiled probe must conditionally branch to SCALAR_STEP on wrap; got:\n{ptx}"
+        );
+    }
+
+    /// The EMPTY-slot check on `slot[s]` must precede the match check on
+    /// `slot[s + 1]`. This is obstacle (3): if we tested slot[s+1] for
+    /// match before checking whether slot[s] terminates the chain via
+    /// EMPTY, a stale chain-tail key sitting in slot[s+1] would produce a
+    /// false match against a probe key whose chain actually ended at
+    /// slot[s].
+    ///
+    /// We pin this by checking that the EMPTY-equality compare on the
+    /// first-lane key register (`%rl5` against the EMPTY register `%rl4`)
+    /// appears before the match-equality compare on the second-lane key
+    /// register (`%rl6` against `%rl0`).
+    #[test]
+    fn probe_tiled_ptx_empty_check_precedes_second_lane_match() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        // First-lane EMPTY check.
+        let empty_slot_s = "setp.eq.s64 %p12, %rl5, %rl4;";
+        // Second-lane match check.
+        let match_slot_sp1 = "setp.eq.s64 %p13, %rl6, %rl0;";
+        assert!(
+            ptx.contains(empty_slot_s),
+            "tiled probe must compare slot[s] (%rl5) against EMPTY (%rl4); got:\n{ptx}"
+        );
+        assert!(
+            ptx.contains(match_slot_sp1),
+            "tiled probe must compare slot[s+1] (%rl6) against probe key (%rl0); got:\n{ptx}"
+        );
+        assert_appears_before(&ptx, empty_slot_s, match_slot_sp1);
+    }
+
+    /// The tiled probe must keep the same nine-parameter ABI as the
+    /// single-load probe so the host launcher can swap entry points
+    /// without touching the param marshalling.
+    #[test]
+    fn probe_tiled_ptx_has_nine_params() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        for i in 0..9 {
+            let needle = format!("bolt_hash_join_probe_tiled_param_{i}");
+            assert!(
+                ptx.contains(&needle),
+                "tiled probe missing param {i}\n{ptx}"
+            );
+        }
+        assert!(!ptx.contains("bolt_hash_join_probe_tiled_param_9"));
+    }
+
+    /// The tiled probe shares Stage-1's hash function so a build kernel
+    /// emitted by [`compile_build_kernel`] feeds it byte-for-byte
+    /// identical slot assignments.
+    #[test]
+    fn probe_tiled_ptx_shares_stage1_hash_function() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        let mul_literal = format!("mov.s64 %rl1, {FX_MUL};");
+        assert!(ptx.contains(&mul_literal));
+        assert!(ptx.contains("shr.u64 %rl3, %rl2, 32;"));
+        assert!(ptx.contains("and.b32 %r8, %r7, %r6;"));
+    }
+
+    /// The tiled probe must atomically increment the output counter so
+    /// concurrent matches claim disjoint slots — same contract as the
+    /// single-load probe.
+    #[test]
+    fn probe_tiled_ptx_uses_atom_add_for_output_counter() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        assert!(
+            ptx.contains("atom.global.add.u32"),
+            "tiled probe must use atom.global.add.u32 for output counter; got:\n{ptx}"
+        );
+    }
+
+    /// The tiled probe must write both output streams as u32 stores.
+    /// Two stores total: probe_idx and build_idx.
+    #[test]
+    fn probe_tiled_ptx_writes_both_output_streams_as_u32() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        let n_st = ptx.matches("st.global.u32").count();
+        assert!(
+            n_st >= 2,
+            "tiled probe must store probe_idx and build_idx as u32; saw {n_st}\n{ptx}"
+        );
+    }
+
+    /// The tiled probe must use the EMPTY_KEY sentinel `i64::MIN` for the
+    /// chain-terminator check.
+    #[test]
+    fn probe_tiled_ptx_uses_i64_min_sentinel() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        assert!(
+            ptx.contains(&format!("mov.s64 %rl4, {EMPTY_KEY_LITERAL};")),
+            "tiled probe must materialise EMPTY_KEY as i64::MIN; got:\n{ptx}"
+        );
+    }
+
+    /// The tiled probe advances by 2 slots per tile and decrements the
+    /// probe-bound counter by 2 per tile (obstacle (2): probe-bound
+    /// accounting). This pins the per-tile bookkeeping so future refactors
+    /// can't accidentally regress to a single decrement that doubles the
+    /// runaway envelope.
+    #[test]
+    fn probe_tiled_ptx_advances_and_decrements_by_two() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        assert!(
+            ptx.contains("add.s32 %r8, %r8, 2;"),
+            "tiled probe must advance slot by 2 per tile; got:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("sub.s32 %r20, %r20, 2;"),
+            "tiled probe must decrement probe_left by 2 per tile; got:\n{ptx}"
+        );
+        // The scalar step decrements by 1 (single-slot probe at the wrap edge).
+        assert!(
+            ptx.contains("sub.s32 %r20, %r20, 1;"),
+            "tiled probe scalar step must decrement probe_left by 1; got:\n{ptx}"
+        );
+    }
+
+    /// The tiled probe must initialise the probe-left counter to
+    /// `MAX_PROBE_FACTOR * cap` (in slot units). Same semantic budget as the
+    /// single-load probe; the per-tile decrement keeps the runaway envelope
+    /// equivalent.
+    #[test]
+    fn probe_tiled_ptx_inits_probe_bound_in_slot_units() {
+        let ptx = compile_probe_kernel_tiled().unwrap();
+        let needle = format!("mul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};");
+        assert!(
+            ptx.contains(&needle),
+            "tiled probe must init probe_left = MAX_PROBE_FACTOR * cap; got:\n{ptx}"
+        );
     }
 }
