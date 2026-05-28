@@ -72,6 +72,63 @@ pub const SCAN_KERNEL_ENTRY: &str = "bolt_prefix_scan";
 /// remains the default while the Blelloch path bakes.
 pub const SCAN_KERNEL_ENTRY_BLELLOCH: &str = "bolt_prefix_scan_blelloch";
 
+/// Entry-point name for the **single-pass decoupled-lookback** prefix-scan
+/// kernel.
+///
+/// Unlike the Hillis-Steele and Blelloch variants this kernel does NOT
+/// require a host round-trip to exclusive-scan `block_sums`: each block
+/// publishes its own aggregate to a per-block status slot and then walks
+/// previous slots backwards (the "decoupled lookback" of Merrill & Garland,
+/// "Single-pass Parallel Prefix Scan with Decoupled Look-back", NVR-2016-002)
+/// to derive its global prefix in one grid launch.
+///
+/// 5-arg ABI:
+/// ```text
+/// .visible .entry bolt_prefix_scan_lookback(
+///     .param .u64 ..._param_0,   // mask_ptr        (u8*)
+///     .param .u64 ..._param_1,   // local_indices   (u32*)  -- holds GLOBAL exclusive prefix on return
+///     .param .u64 ..._param_2,   // block_sums      (u32*)  -- written but unused by caller
+///     .param .u32 ..._param_3,   // n_rows
+///     .param .u64 ..._param_4    // partial_status  (u32*)  -- per-block decoupled-lookback slots
+/// )
+/// ```
+///
+/// `partial_status[blockIdx.x]` is a `u32` whose top 2 bits encode the
+/// publication status and the low 30 bits carry the aggregate or inclusive
+/// prefix value:
+///
+/// | bits  | meaning                                              |
+/// |-------|------------------------------------------------------|
+/// | 31:30 | status: 0 = INVALID, 1 = AGGREGATE, 2 = INCLUSIVE     |
+/// | 29:0  | value (block aggregate OR inclusive global prefix)   |
+///
+/// See [`LOOKBACK_VALUE_MASK`] / [`LOOKBACK_STATUS_AGGREGATE`] /
+/// [`LOOKBACK_STATUS_INCLUSIVE`] / [`LOOKBACK_STATUS_INVALID`].
+///
+/// On return `local_indices[gid]` holds the **global** exclusive prefix
+/// (already added the block prefix), so the host can skip the
+/// download-scan-upload round trip the other variants need. `block_sums`
+/// is still written (block aggregate) for diagnostic compatibility but
+/// is not required by the gather kernel — the caller passes an all-zero
+/// `block_bases` to `gather_one`.
+pub const SCAN_KERNEL_ENTRY_LOOKBACK: &str = "bolt_prefix_scan_lookback";
+
+/// Bitmask for the value (low 30) bits in a `partial_status` slot.
+pub const LOOKBACK_VALUE_MASK: u32 = 0x3FFF_FFFF;
+
+/// Status code: slot has not been published yet. The zero-init of the
+/// `partial_status` buffer naturally encodes this state.
+pub const LOOKBACK_STATUS_INVALID: u32 = 0;
+
+/// Status code: block published its own aggregate but has not yet
+/// resolved its global prefix. The aggregate value is in the low 30 bits.
+pub const LOOKBACK_STATUS_AGGREGATE: u32 = 1;
+
+/// Status code: block has resolved its global prefix; the low 30 bits
+/// carry the **inclusive** global prefix (`block_prefix + block_aggregate`),
+/// which is what successor blocks consume to short-circuit the lookback.
+pub const LOOKBACK_STATUS_INCLUSIVE: u32 = 2;
+
 /// Entry-point name for the per-dtype gather kernel.
 ///
 /// Returns a static string so callers can pass it straight to
@@ -712,6 +769,430 @@ pub fn compile_prefix_scan_kernel_blelloch() -> BoltResult<String> {
     Ok(ptx)
 }
 
+/// Generate the single-pass **decoupled-lookback** prefix-scan PTX module.
+///
+/// ## Why
+///
+/// The Hillis-Steele and Blelloch kernels compute per-block exclusive scans
+/// and `block_sums`; the global prefix step then requires a host
+/// download + exclusive-scan + re-upload of `block_sums`. That round trip
+/// costs a `cudaMemcpy` each way plus a kernel sync. The decoupled-lookback
+/// algorithm (Merrill & Garland, NVR-2016-002) folds the global pass into the
+/// same kernel launch by having each block publish its own aggregate to a
+/// status array and then walk previous slots backwards until it finds the
+/// nearest already-INCLUSIVE block, summing intervening aggregates as it
+/// goes. The result: one kernel launch, no host round-trip, and the
+/// resulting `local_indices[gid]` already holds the global exclusive prefix.
+///
+/// ## ABI
+///
+/// See [`SCAN_KERNEL_ENTRY_LOOKBACK`] for the full 5-arg signature
+/// (`mask`, `local_indices`, `block_sums`, `n_rows`, `partial_status`).
+///
+/// Status-slot encoding (a single `u32` per block):
+///
+/// ```text
+///   31:30  status (0 = INVALID, 1 = AGGREGATE, 2 = INCLUSIVE)
+///   29:0   value  (block aggregate OR inclusive global prefix)
+/// ```
+///
+/// See [`LOOKBACK_VALUE_MASK`], [`LOOKBACK_STATUS_INVALID`],
+/// [`LOOKBACK_STATUS_AGGREGATE`], [`LOOKBACK_STATUS_INCLUSIVE`].
+///
+/// ## Algorithm
+///
+/// 1. **Block scan**. Re-uses the Hillis-Steele ping-pong scan from
+///    [`compile_prefix_scan_kernel`] to compute the per-block exclusive
+///    prefix in `local_indices_excl` (low) plus the block's inclusive sum
+///    `block_aggregate`.
+///
+/// 2. **PUBLISH_AGGREGATE** (thread 0). Stores the block aggregate to
+///    `partial_status[blockIdx.x]` tagged with `STATUS_AGGREGATE`, then
+///    issues `membar.gl` so the publication is observable to peers BEFORE
+///    we start reading their slots.
+///
+/// 3. **LOOKBACK_SPIN** (thread 0). For `pred = blockIdx.x - 1` down to
+///    `0`, spin-loads `partial_status[pred]` with `ld.acquire.gpu.u32`
+///    until the status is non-INVALID, then:
+///       * if INCLUSIVE: add the inclusive value, **break** (we've
+///         absorbed every prior block in one step);
+///       * if AGGREGATE: add the aggregate and continue to `pred - 1`.
+///    The result accumulates `block_prefix` (the exclusive global prefix
+///    for this block). Block 0 simply skips the loop with `block_prefix = 0`.
+///
+/// 4. **PUBLISH_INCLUSIVE** (thread 0). Stores
+///    `(block_prefix + block_aggregate)` to `partial_status[blockIdx.x]`
+///    tagged with `STATUS_INCLUSIVE`, then `membar.gl`. Stashes
+///    `block_prefix` in a shared scalar so other threads can read it after
+///    the broadcast barrier.
+///
+/// 5. **BROADCAST**. `bar.sync 0` so every thread in the block has visibility
+///    on `block_prefix_slot`. Each in-range thread writes
+///    `local_indices[gid] = within_block_excl + block_prefix` (i.e. the
+///    GLOBAL exclusive prefix). Thread `BLOCK_SIZE-1` also stores the
+///    block aggregate into `block_sums[blockIdx.x]` for diagnostic
+///    compatibility with the other two kernels (the host-side caller does
+///    not consume it).
+///
+/// ## Correctness notes
+///
+/// * **Value bit budget**: the low-30-bits encoding caps the cumulative
+///   prefix at `(1 << 30) - 1 = 1_073_741_823`. The host-side caller
+///   ([`crate::exec::gpu_compact::prefix_scan_mask_lookback`]) refuses
+///   `n_rows >= (1 << 30)` so the prefix cannot saturate.
+/// * **Aggregate-first publish**. Publishing AGGREGATE *before* lookback
+///   ensures every block's predecessor walk is well-founded: peers can
+///   always make progress because the previous block has already advertised
+///   at least its own aggregate.
+/// * **membar.gl on the publisher + ld.acquire on the reader** together
+///   provide the cross-CTA ordering guarantee on sm_70+. We use the GPU
+///   scope (`.gpu` qualifier) on the load because peer blocks may execute
+///   on different SMs.
+/// * **Single-thread lookback** keeps the algorithm simple. A warp-wide
+///   lookback (one thread per `pred`, ballot to find the leftmost
+///   INCLUSIVE) is a known optimisation; we defer it to a follow-up.
+/// * **Out-of-range lanes** in a partial last block contribute zero to the
+///   block aggregate (the existing AFTER_LOAD predicate handles it), so
+///   the published aggregate is correct for any `n_rows`.
+pub fn compile_prefix_scan_kernel_lookback() -> BoltResult<String> {
+    // Re-use Hillis-Steele's shared-memory layout for the block scan: two
+    // ping-pong u32 buffers of BLOCK_SIZE entries each. We also need ONE
+    // extra u32 of shared scratch to broadcast `block_prefix` from thread 0
+    // to every lane after the lookback completes, and ONE extra u32 to
+    // stash the block aggregate (computed by thread BLOCK_SIZE-1) where
+    // thread 0 can read it.
+    let elem_bytes: u32 = 4;
+    let shared_bytes_per_buf: u32 = BLOCK_SIZE * elem_bytes;
+    let shared_scan_bytes: u32 = shared_bytes_per_buf * 2;
+    // Offset of the broadcast slot (`block_prefix_slot`) in `sdata`.
+    let block_prefix_off: u32 = shared_scan_bytes;
+    // Offset of the aggregate slot (`block_aggregate_slot`) in `sdata`.
+    let block_aggregate_off: u32 = shared_scan_bytes + 4;
+    let shared_bytes_total: u32 = shared_scan_bytes + 8;
+
+    let mut ptx = String::new();
+    writeln!(ptx, "{}", PTX_VERSION).map_err(write_err)?;
+    writeln!(ptx, "{}", PTX_TARGET).map_err(write_err)?;
+    writeln!(ptx, "{}", PTX_ADDRESS_SIZE).map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 sdata[{shared}];",
+        shared = shared_bytes_total
+    )
+    .map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Signature: mask, local_indices, block_sums, n_rows, partial_status.
+    writeln!(ptx, ".visible .entry {}(", SCAN_KERNEL_ENTRY_LOOKBACK).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_0,", SCAN_KERNEL_ENTRY_LOOKBACK).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_1,", SCAN_KERNEL_ENTRY_LOOKBACK).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_2,", SCAN_KERNEL_ENTRY_LOOKBACK).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {}_param_3,", SCAN_KERNEL_ENTRY_LOOKBACK).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_4", SCAN_KERNEL_ENTRY_LOOKBACK).map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    // Register pool. The lookback adds a spin loop with status decoding;
+    // size the pool generously to cover it plus the inherited Hillis-Steele
+    // body.
+    writeln!(ptx, "\t.reg .pred  %p<16>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b16   %rs<4>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<64>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<64>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // -------- Indices: tid_x = %tid.x ; ctaid = %ctaid.x ; gid = ctaid*ntid+tid
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    // n_rows
+    writeln!(
+        ptx,
+        "\tld.param.u32 %r4, [{}_param_3];",
+        SCAN_KERNEL_ENTRY_LOOKBACK
+    )
+    .map_err(write_err)?;
+
+    // -------- Globalize parameter pointers.
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd0, [{}_param_0];",
+        SCAN_KERNEL_ENTRY_LOOKBACK
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd1, [{}_param_1];",
+        SCAN_KERNEL_ENTRY_LOOKBACK
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd2, [{}_param_2];",
+        SCAN_KERNEL_ENTRY_LOOKBACK
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd40, [{}_param_4];",
+        SCAN_KERNEL_ENTRY_LOOKBACK
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd40, %rd40;").map_err(write_err)?;
+
+    // -------- Load this thread's mask byte (0 if past the end). Mirror the
+    // Hillis-Steele normalisation: any non-zero byte counts as `1`.
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r5, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra AFTER_LOAD;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd3, %r3, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd4, %rd0, %rd3;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd4];").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u16 %r6, %rs0;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 %p1, %r6, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tselp.s32 %r5, 1, 0, %p1;").map_err(write_err)?;
+    writeln!(ptx, "AFTER_LOAD:").map_err(write_err)?;
+
+    // -------- Stash own 0/1 value into ping buffer (sdata[0..BLOCK_SIZE]).
+    writeln!(ptx, "\tmov.u64 %rd5, sdata;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tadd.s64 %rd6, %rd5, {off};",
+        off = shared_bytes_per_buf
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd7, %r2, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd8, %rd5, %rd7;").map_err(write_err)?; // ping addr
+    writeln!(ptx, "\tadd.s64 %rd9, %rd6, %rd7;").map_err(write_err)?; // pong addr
+    writeln!(ptx, "\tst.shared.u32 [%rd8], %r5;").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+
+    // -------- Hillis-Steele block scan (same as the default kernel).
+    let mut offset: u32 = 1;
+    let mut step: usize = 0;
+    while offset < BLOCK_SIZE {
+        let off_bytes = offset * elem_bytes;
+        writeln!(ptx, "\tld.shared.u32 %r7, [%rd8];").map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tsetp.lt.s32 %p{p}, %r2, {off};",
+            p = 2 + (step % 4),
+            off = offset
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tmov.u32 %r8, 0;").map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\t@%p{p} bra LB_SKIP_LOAD_{step};",
+            p = 2 + (step % 4),
+            step = step
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tsub.s64 %rd10, %rd8, {off};",
+            off = off_bytes
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tld.shared.u32 %r8, [%rd10];").map_err(write_err)?;
+        writeln!(ptx, "LB_SKIP_LOAD_{step}:", step = step).map_err(write_err)?;
+        writeln!(ptx, "\tadd.s32 %r9, %r7, %r8;").map_err(write_err)?;
+        writeln!(ptx, "\tst.shared.u32 [%rd9], %r9;").map_err(write_err)?;
+        writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+        // Swap ping/pong pointers via tmp.
+        writeln!(ptx, "\tmov.u64 %rd11, %rd8;").map_err(write_err)?;
+        writeln!(ptx, "\tmov.u64 %rd8, %rd9;").map_err(write_err)?;
+        writeln!(ptx, "\tmov.u64 %rd9, %rd11;").map_err(write_err)?;
+        offset <<= 1;
+        step += 1;
+    }
+
+    // %r10 = inclusive scan at this thread; %r11 = exclusive (incl - own).
+    writeln!(ptx, "\tld.shared.u32 %r10, [%rd8];").map_err(write_err)?;
+    writeln!(ptx, "\tsub.s32 %r11, %r10, %r5;").map_err(write_err)?;
+
+    // -------- Thread (BLOCK_SIZE - 1) publishes the block aggregate to a
+    // shared slot so thread 0 can read it (different lanes own those two
+    // duties; the slot lets us avoid a warp shuffle).
+    writeln!(
+        ptx,
+        "\tsetp.ne.s32 %p5, %r2, {last};",
+        last = BLOCK_SIZE - 1
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra AFTER_AGG_STASH;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tadd.s64 %rd12, %rd5, {off};",
+        off = block_aggregate_off
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd12], %r10;").map_err(write_err)?;
+    // Diagnostic compatibility: also publish to block_sums[blockIdx.x].
+    writeln!(ptx, "\tmul.wide.u32 %rd13, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd14, %rd2, %rd13;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u32 [%rd14], %r10;").map_err(write_err)?;
+    writeln!(ptx, "AFTER_AGG_STASH:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+
+    // ============================================================
+    //   Thread 0: PUBLISH_AGGREGATE, LOOKBACK_SPIN, PUBLISH_INCLUSIVE.
+    //   Every other lane jumps straight to BROADCAST.
+    // ============================================================
+    writeln!(ptx, "\tsetp.ne.s32 %p6, %r2, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra BROADCAST;").map_err(write_err)?;
+
+    // ---- Read block aggregate from the shared slot (own thread did the
+    // bar.sync above, so this read is safe).
+    writeln!(
+        ptx,
+        "\tadd.s64 %rd15, %rd5, {off};",
+        off = block_aggregate_off
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.u32 %r20, [%rd15];").map_err(write_err)?;
+
+    // ---- Compute &partial_status[blockIdx.x] in %rd16.
+    writeln!(ptx, "\tmul.wide.u32 %rd17, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd16, %rd40, %rd17;").map_err(write_err)?;
+
+    // ---- PUBLISH_AGGREGATE: pack (1 << 30) | (aggregate & 0x3FFFFFFF).
+    writeln!(ptx, "PUBLISH_AGGREGATE:").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tand.b32 %r21, %r20, {mask};",
+        mask = LOOKBACK_VALUE_MASK
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tor.b32 %r22, %r21, {flag};",
+        flag = LOOKBACK_STATUS_AGGREGATE << 30
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u32 [%rd16], %r22;").map_err(write_err)?;
+    // Make the publication observable to peer CTAs BEFORE we start reading
+    // their slots.
+    writeln!(ptx, "\tmembar.gl;").map_err(write_err)?;
+
+    // ---- LOOKBACK: pred = blockIdx.x - 1 ; block_prefix = 0.
+    //   while pred >= 0:
+    //     LOOKBACK_SPIN: status = ld.acquire.gpu.u32 [partial_status + pred*4]
+    //       if status == INVALID: spin
+    //       else: value = status & 0x3FFFFFFF
+    //             block_prefix += value
+    //             if (status >> 30) == INCLUSIVE: break
+    //             pred -= 1
+    //
+    // Block 0 (%r0 == 0) skips this loop entirely with block_prefix = 0.
+    writeln!(ptx, "\tmov.u32 %r30, 0;").map_err(write_err)?; // block_prefix
+    writeln!(ptx, "\tsetp.eq.s32 %p7, %r0, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra AFTER_LOOKBACK;").map_err(write_err)?;
+    writeln!(ptx, "\tsub.s32 %r31, %r0, 1;").map_err(write_err)?; // pred
+
+    writeln!(ptx, "LOOKBACK_OUTER:").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd18, %r31, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd19, %rd40, %rd18;").map_err(write_err)?;
+    writeln!(ptx, "LOOKBACK_SPIN:").map_err(write_err)?;
+    // Acquire load gives the matching ordering for the publisher's
+    // membar.gl + st.global on the same address. `.gpu` scope because peers
+    // may live on a different SM.
+    writeln!(ptx, "\tld.acquire.gpu.u32 %r32, [%rd19];").map_err(write_err)?;
+    writeln!(ptx, "\tshr.u32 %r33, %r32, 30;").map_err(write_err)?; // status
+    writeln!(
+        ptx,
+        "\tsetp.eq.s32 %p8, %r33, {inv};",
+        inv = LOOKBACK_STATUS_INVALID
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p8 bra LOOKBACK_SPIN;").map_err(write_err)?;
+    // Non-INVALID -> accumulate value into block_prefix.
+    writeln!(
+        ptx,
+        "\tand.b32 %r34, %r32, {mask};",
+        mask = LOOKBACK_VALUE_MASK
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r30, %r30, %r34;").map_err(write_err)?;
+    // INCLUSIVE -> done.
+    writeln!(
+        ptx,
+        "\tsetp.eq.s32 %p9, %r33, {inc};",
+        inc = LOOKBACK_STATUS_INCLUSIVE
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p9 bra AFTER_LOOKBACK;").map_err(write_err)?;
+    // AGGREGATE -> walk further left. Stop after pred == 0.
+    writeln!(ptx, "\tsetp.eq.s32 %p10, %r31, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p10 bra AFTER_LOOKBACK;").map_err(write_err)?;
+    writeln!(ptx, "\tsub.s32 %r31, %r31, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOKBACK_OUTER;").map_err(write_err)?;
+    writeln!(ptx, "AFTER_LOOKBACK:").map_err(write_err)?;
+
+    // ---- PUBLISH_INCLUSIVE: (block_prefix + block_aggregate) tagged 0b10.
+    writeln!(ptx, "PUBLISH_INCLUSIVE:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r35, %r30, %r20;").map_err(write_err)?; // incl_value
+    writeln!(
+        ptx,
+        "\tand.b32 %r36, %r35, {mask};",
+        mask = LOOKBACK_VALUE_MASK
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tor.b32 %r37, %r36, {flag};",
+        flag = LOOKBACK_STATUS_INCLUSIVE << 30
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u32 [%rd16], %r37;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.gl;").map_err(write_err)?;
+
+    // Stash block_prefix into the shared broadcast slot so every lane can
+    // read it after the upcoming bar.sync.
+    writeln!(
+        ptx,
+        "\tadd.s64 %rd20, %rd5, {off};",
+        off = block_prefix_off
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd20], %r30;").map_err(write_err)?;
+
+    // ============================================================
+    //   BROADCAST: every thread reads block_prefix and writes the global
+    //   exclusive prefix to local_indices[gid].
+    // ============================================================
+    writeln!(ptx, "BROADCAST:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        "\tadd.s64 %rd21, %rd5, {off};",
+        off = block_prefix_off
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.u32 %r40, [%rd21];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r41, %r11, %r40;").map_err(write_err)?;
+
+    // Only in-range threads write.
+    writeln!(ptx, "\tsetp.ge.u32 %p11, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p11 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd22, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u32 [%rd23], %r41;").map_err(write_err)?;
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
 /// Generate the per-dtype gather PTX module.
 ///
 /// ABI (per `<dtype>`):
@@ -1103,6 +1584,107 @@ mod tests {
         // load-bearing structural difference.
         assert!(hillis.contains(".shared .align 4 .b8 sdata[2048]"));
         assert!(blelloch.contains(".shared .align 4 .b8 sdata[1024]"));
+    }
+
+    /// The three status codes plus the 30-bit value mask must form a
+    /// disjoint encoding inside a single u32. If any of these constants
+    /// drifts to overlap with another the lookback kernel's pack/unpack
+    /// logic silently corrupts running prefixes.
+    #[test]
+    fn lookback_constants_are_distinct() {
+        // Three status codes are pairwise different.
+        assert_ne!(LOOKBACK_STATUS_INVALID, LOOKBACK_STATUS_AGGREGATE);
+        assert_ne!(LOOKBACK_STATUS_INVALID, LOOKBACK_STATUS_INCLUSIVE);
+        assert_ne!(LOOKBACK_STATUS_AGGREGATE, LOOKBACK_STATUS_INCLUSIVE);
+
+        // INVALID is the implicit value of a freshly zeroed slot.
+        assert_eq!(LOOKBACK_STATUS_INVALID, 0);
+
+        // Each status fits in 2 bits.
+        for s in [
+            LOOKBACK_STATUS_INVALID,
+            LOOKBACK_STATUS_AGGREGATE,
+            LOOKBACK_STATUS_INCLUSIVE,
+        ] {
+            assert!(s < 4, "status {s} does not fit in 2 bits");
+        }
+
+        // Value mask covers exactly the low 30 bits — no overlap with the
+        // top-2-bits status field.
+        assert_eq!(LOOKBACK_VALUE_MASK, (1u32 << 30) - 1);
+        let status_field_mask: u32 = !LOOKBACK_VALUE_MASK;
+        assert_eq!(
+            status_field_mask, 0xC000_0000,
+            "status field must cover bits 30:31"
+        );
+        assert_eq!(
+            LOOKBACK_VALUE_MASK & status_field_mask,
+            0,
+            "value and status fields overlap"
+        );
+        // Packed AGGREGATE/INCLUSIVE shifted into the status field never
+        // intersect a value in the low 30 bits.
+        let packed_agg = LOOKBACK_STATUS_AGGREGATE << 30;
+        let packed_inc = LOOKBACK_STATUS_INCLUSIVE << 30;
+        assert_eq!(packed_agg & LOOKBACK_VALUE_MASK, 0);
+        assert_eq!(packed_inc & LOOKBACK_VALUE_MASK, 0);
+        assert_ne!(packed_agg, packed_inc);
+    }
+
+    /// Structural smoke test for the decoupled-lookback variant: header,
+    /// 5-arg signature, the three publication-protocol labels, and the
+    /// memory-fence / acquire-load mnemonics that make the cross-CTA
+    /// synchronization correct on sm_70+.
+    #[test]
+    fn lookback_ptx_has_shape() {
+        let ptx =
+            compile_prefix_scan_kernel_lookback().expect("lookback PTX compiles");
+
+        // Header.
+        assert!(ptx.contains(".version 7.5"));
+        assert!(ptx.contains(".target sm_70"));
+        assert!(ptx.contains(".address_size 64"));
+
+        // Entry name + 5-param ABI (4x u64 ptr + 1x u32).
+        assert!(
+            ptx.contains(".visible .entry bolt_prefix_scan_lookback("),
+            "missing lookback entry name:\n{ptx}"
+        );
+        assert!(ptx.contains(".param .u64 bolt_prefix_scan_lookback_param_0,"));
+        assert!(ptx.contains(".param .u64 bolt_prefix_scan_lookback_param_1,"));
+        assert!(ptx.contains(".param .u64 bolt_prefix_scan_lookback_param_2,"));
+        assert!(ptx.contains(".param .u32 bolt_prefix_scan_lookback_param_3,"));
+        assert!(ptx.contains(".param .u64 bolt_prefix_scan_lookback_param_4"));
+
+        // Publication / spin / broadcast labels — the load-bearing markers
+        // for the decoupled-lookback protocol.
+        for label in [
+            "PUBLISH_AGGREGATE:",
+            "LOOKBACK_SPIN:",
+            "PUBLISH_INCLUSIVE:",
+            "BROADCAST:",
+        ] {
+            assert!(
+                ptx.contains(label),
+                "missing label `{label}` in lookback PTX:\n{ptx}"
+            );
+        }
+
+        // At least two membar.gl: one after PUBLISH_AGGREGATE, one after
+        // PUBLISH_INCLUSIVE. Drop either fence and peer blocks can observe
+        // a stale slot.
+        let n_membar = ptx.matches("membar.gl;").count();
+        assert!(
+            n_membar >= 2,
+            "expected >=2 membar.gl (one per publish), got {n_membar}:\n{ptx}"
+        );
+
+        // Acquire-scope read of the partial_status slot. Without it the
+        // spin loop could observe a torn write on sm_70+.
+        assert!(
+            ptx.contains("ld.acquire.gpu.u32"),
+            "missing ld.acquire.gpu.u32 on partial_status read:\n{ptx}"
+        );
     }
 }
 
