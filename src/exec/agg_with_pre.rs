@@ -390,6 +390,46 @@ fn build_one_aggregate(
             let count = resolved.non_null_count() as i64;
             scalar_to_array(Scalar::I64(count), out_field.dtype)
         }
+        AggregateExpr::StddevPop(expr) | AggregateExpr::StddevSamp(expr) => {
+            // STDDEV with a pre-aggregation (Project/Filter) stage. v0.5
+            // cut: the pre-aggregated scalar path is still in scope (a
+            // SELECT/WHERE feeding STDDEV doesn't involve GROUP BY), so
+            // we resolve the value column through the same expression
+            // evaluator AVG uses, then fold it with the host Welford
+            // state. `resolve_agg_input_col` materialises a NULL-aware
+            // HostCol; we then route through `strip_nulls_borrowed` (the
+            // same NULL handling AVG uses) so the Welford fold only sees
+            // valid values.
+            //
+            // `expected_dtype` is Float64 because Welford accumulates
+            // in f64 — but the helper still validates the cast for
+            // narrower dtypes, so we don't lose the type-error surface.
+            let resolved = resolve_agg_input_col(
+                expr.as_ref(),
+                pre_spec,
+                compacted,
+                DataType::Float64,
+            )?;
+            let host_col = resolved.as_ref();
+            let stripped = strip_nulls_borrowed(host_col);
+            let mut state = crate::exec::welford::WelfordState::empty();
+            match &stripped.values {
+                HostColValues::I32(v) => state.push_slice_i32(v),
+                HostColValues::I64(v) => state.push_slice_i64(v),
+                HostColValues::F32(v) => state.push_slice_f32(v),
+                HostColValues::F64(v) => state.push_slice_f64(v),
+            }
+            let kind = match agg {
+                AggregateExpr::StddevPop(_) => crate::exec::welford::StddevKind::Pop,
+                AggregateExpr::StddevSamp(_) => crate::exec::welford::StddevKind::Samp,
+                _ => unreachable!("matched in outer arm"),
+            };
+            stddev_to_array_with_pre(
+                crate::exec::welford::finalize(&state, kind),
+                agg,
+                out_field,
+            )
+        }
         AggregateExpr::Avg(expr) => {
             // AVG via the **fused** kernel: one launch produces both the
             // numerator (sum, f64) and the denominator (count, u32) as
@@ -658,6 +698,46 @@ fn reduce_host_col(op: ReduceOp, col: &HostCol) -> BoltResult<Scalar> {
         HostColValues::I64(v) => reduce_host_slice::<i64>(op, DataType::Int64, v),
         HostColValues::F32(v) => reduce_host_slice::<f32>(op, DataType::Float32, v),
         HostColValues::F64(v) => reduce_host_slice::<f64>(op, DataType::Float64, v),
+    }
+}
+
+/// Pack a finalized stddev (`Some(σ)` or `None`) into a one-row Arrow
+/// `Float64Array`. Mirrors [`aggregate::stddev_to_array`] (see that
+/// module's doc); duplicated here so the pre-aggregated path doesn't
+/// have to reach across module boundaries for a single
+/// dtype-checked-pack helper.
+fn stddev_to_array_with_pre(
+    value: Option<f64>,
+    agg: &AggregateExpr,
+    out_field: &Field,
+) -> BoltResult<ArrayRef> {
+    if out_field.dtype != DataType::Float64 {
+        return Err(BoltError::Type(format!(
+            "STDDEV output dtype must be Float64, got {:?}",
+            out_field.dtype
+        )));
+    }
+    match (agg, value) {
+        (AggregateExpr::StddevPop(_), Some(v)) => {
+            Ok(Arc::new(Float64Array::from(vec![v])) as ArrayRef)
+        }
+        (AggregateExpr::StddevPop(_), None) => {
+            // Empty / all-NULL input → 0.0 (mirrors the AVG convention so
+            // a non-nullable downstream consumer never sees a NULL here).
+            Ok(Arc::new(Float64Array::from(vec![0.0_f64])) as ArrayRef)
+        }
+        (AggregateExpr::StddevSamp(_), Some(v)) => {
+            Ok(Arc::new(Float64Array::from(vec![v])) as ArrayRef)
+        }
+        (AggregateExpr::StddevSamp(_), None) => {
+            // count <= 1 → SQL NULL. The aggregate output field is
+            // nullable by `LogicalPlan::Aggregate` construction, so this
+            // single-element nullable Float64Array packs cleanly.
+            Ok(Arc::new(Float64Array::from(vec![None::<f64>])) as ArrayRef)
+        }
+        _ => Err(BoltError::Other(
+            "stddev_to_array_with_pre called with non-STDDEV aggregate".into(),
+        )),
     }
 }
 

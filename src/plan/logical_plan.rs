@@ -512,6 +512,18 @@ pub enum AggregateExpr {
     Max(Expr),
     /// `AVG(expr)` — output `Float64`.
     Avg(Expr),
+    /// `STDDEV_POP(expr)` — population standard deviation; output `Float64`.
+    /// Computed via Welford's one-pass algorithm on the host (see
+    /// [`crate::exec::welford`]); GPU offload is a v0.6 stretch goal.
+    /// Returns `0.0` (not NULL) when no rows are aggregated, mirroring the
+    /// existing AVG convention for an empty/all-NULL input.
+    StddevPop(Box<Expr>),
+    /// `STDDEV_SAMP(expr)` — sample standard deviation; output `Float64`.
+    /// Computed via Welford's one-pass algorithm (shared state with
+    /// `STDDEV_POP`). Returns SQL NULL when `count <= 1` (the divisor
+    /// `count - 1` is zero or negative — undefined per SQL standard); also
+    /// returns NULL when the input is empty / all-NULL.
+    StddevSamp(Box<Expr>),
 }
 
 impl AggregateExpr {
@@ -531,6 +543,8 @@ impl AggregateExpr {
             AggregateExpr::Min(e) => format!("min{}", suffix(e)),
             AggregateExpr::Max(e) => format!("max{}", suffix(e)),
             AggregateExpr::Avg(e) => format!("avg{}", suffix(e)),
+            AggregateExpr::StddevPop(e) => format!("stddev_pop{}", suffix(e)),
+            AggregateExpr::StddevSamp(e) => format!("stddev_samp{}", suffix(e)),
         }
     }
 
@@ -551,6 +565,24 @@ impl AggregateExpr {
             AggregateExpr::Sum(e) => Ok(sum_output_dtype(e.dtype(input)?)),
             AggregateExpr::Min(e) | AggregateExpr::Max(e) => e.dtype(input),
             AggregateExpr::Avg(_) => Ok(DataType::Float64),
+            // STDDEV_POP and STDDEV_SAMP always emit Float64 regardless of
+            // the input dtype — the Welford reduction accumulates in f64 and
+            // the final `sqrt` is naturally a Float64 operation. We still
+            // resolve the operand's dtype below to surface "unknown column"
+            // and "non-numeric operand" errors at plan-build time rather
+            // than at execution.
+            AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => {
+                let dt = e.dtype(input)?;
+                if !matches!(
+                    dt,
+                    DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+                ) {
+                    return Err(BoltError::Type(format!(
+                        "STDDEV requires a numeric operand, got {dt:?}"
+                    )));
+                }
+                Ok(DataType::Float64)
+            }
         }
     }
 }

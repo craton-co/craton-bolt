@@ -1360,6 +1360,20 @@ fn run_one_aggregate(
             Ok(AccDownload::I64(download_pinned_i64(&acc_table, stream)?))
         }
 
+        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+            // v0.5 cut: STDDEV is only supported in the scalar-aggregate
+            // path (no GROUP BY). The shared Welford state extends cleanly
+            // to per-group accumulation but the integration with the GPU
+            // group-by reduction kernels is a v0.6 follow-up — gate here
+            // with a clear error so users get a useful message rather than
+            // the executor silently falling through to a different path.
+            Err(BoltError::Other(
+                "STDDEV_POP / STDDEV_SAMP are not yet supported with GROUP BY \
+                 (v0.5: scalar aggregate only)"
+                    .into(),
+            ))
+        }
+
         AggregateExpr::Avg(expr) => {
             // AVG = SUM(expr) / COUNT(expr), where COUNT is the non-NULL row
             // count of the value column within each group. SUM in f64 (so we
@@ -2143,6 +2157,17 @@ fn build_agg_array(
                 }
             };
             pack_array(out_field.dtype, scalars)
+        }
+        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => {
+            // Unreachable: `run_one_aggregate` rejects STDDEV variants for
+            // GROUP BY mode with a clear error before any accumulator is
+            // even allocated. This arm exists only to keep the match
+            // exhaustive against the AggregateExpr enum surface.
+            Err(BoltError::Other(
+                "internal: STDDEV reached GROUP BY array-builder path \
+                 (should have been rejected at run_one_aggregate)"
+                    .into(),
+            ))
         }
         (_, _) => Err(BoltError::Other(
             "internal: aggregate / accumulator-variant mismatch".into(),

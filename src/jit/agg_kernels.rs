@@ -94,6 +94,16 @@ impl ReduceOp {
             AggregateExpr::Avg(_) => Err(BoltError::Other(
                 "agg_kernels: AVG must be decomposed into Sum + Count by the caller".into(),
             )),
+            // STDDEV doesn't decompose to a single ReduceOp — the
+            // Welford state (count, mean, M2) carries more than the
+            // additive accumulator the reduction kernel template
+            // supports. STDDEV is handled by `crate::exec::welford` on
+            // the host (and, in a v0.6 follow-up, by a dedicated GPU
+            // kernel that doesn't share this PTX template).
+            AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => Err(BoltError::Other(
+                "agg_kernels: STDDEV_POP / STDDEV_SAMP do not lower to a \
+                 single ReduceOp; handled via the Welford state path".into(),
+            )),
         }
     }
 

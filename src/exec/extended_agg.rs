@@ -60,6 +60,11 @@ pub fn handles(op: &AggregateExpr, input_dtype: DataType) -> bool {
             DataType::Utf8,
         ) => true,
 
+        // STDDEV over Bool / Utf8 isn't defined (already gated at the
+        // logical-plan dtype check); falling through here lets the caller
+        // surface its own type error on the standard dispatch path.
+        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => false,
+
         // SUM/AVG over Utf8 is intentionally rejected here so the caller
         // raises its own type error on the standard dispatch path.
         _ => false,
@@ -249,6 +254,9 @@ fn aggregate_inner(expr: &AggregateExpr) -> &Expr {
         | AggregateExpr::Min(e)
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e) => e,
+        // STDDEV variants store the operand boxed; deref so the helper's
+        // borrow shape matches the other arms.
+        AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => e.as_ref(),
     }
 }
 
@@ -301,6 +309,13 @@ fn validate_output_dtype(
             return Err(BoltError::Type(
                 "SUM/AVG over Utf8 is not defined".into(),
             ))
+        }
+        (AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_), _) => {
+            // Already rejected by `handles()`; defensive arm to keep the
+            // exhaustive-match shape valid against the AggregateExpr enum.
+            return Err(BoltError::Type(
+                "STDDEV is not defined for Bool / Utf8 inputs".into(),
+            ));
         }
         (_, dt) => {
             return Err(BoltError::Other(format!(

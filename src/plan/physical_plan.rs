@@ -1193,6 +1193,11 @@ fn lower_aggregate(
             | AggregateExpr::Min(e)
             | AggregateExpr::Max(e)
             | AggregateExpr::Avg(e) => e.clone(),
+            // STDDEV variants box their operand; clone the contents so the
+            // collected feed list shape matches the other arms (a Vec<Expr>,
+            // not Vec<Box<Expr>>). The physical-plan lowerer treats the
+            // feed-collection step uniformly across aggregate variants.
+            AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => (**e).clone(),
         };
         agg_input_exprs.push(e);
     }
@@ -1293,6 +1298,15 @@ fn lower_aggregate(
                 AggregateExpr::Min(e) => AggregateExpr::Min(substitute_one(e, m)),
                 AggregateExpr::Max(e) => AggregateExpr::Max(substitute_one(e, m)),
                 AggregateExpr::Avg(e) => AggregateExpr::Avg(substitute_one(e, m)),
+                // STDDEV variants box their operand; deref, substitute,
+                // re-box. The substituted expression goes through the same
+                // chain-projection rewrite as every other aggregate input.
+                AggregateExpr::StddevPop(e) => {
+                    AggregateExpr::StddevPop(Box::new(substitute_one(e.as_ref(), m)))
+                }
+                AggregateExpr::StddevSamp(e) => {
+                    AggregateExpr::StddevSamp(Box::new(substitute_one(e.as_ref(), m)))
+                }
             },
         })
         .collect();

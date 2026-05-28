@@ -258,6 +258,9 @@ fn agg_inner_expr(a: &AggregateExpr) -> &Expr {
         | AggregateExpr::Min(e)
         | AggregateExpr::Max(e)
         | AggregateExpr::Avg(e) => e,
+        // STDDEV variants store their operand boxed; deref so the inner
+        // `Expr` borrow shape matches the other arms.
+        AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => e.as_ref(),
     }
 }
 
@@ -364,4 +367,21 @@ pub fn max(e: Expr) -> AggregateExpr {
 /// `AVG(expr)` aggregate.
 pub fn avg(e: Expr) -> AggregateExpr {
     AggregateExpr::Avg(e)
+}
+
+/// `STDDEV_POP(expr)` aggregate — population standard deviation. The
+/// operand is boxed under the hood to keep the `AggregateExpr` enum
+/// payload size from growing for the existing variants. See the v0.5
+/// roadmap (`STDDEV_POP / STDDEV_SAMP via Welford on device`) for the
+/// numerics; scalar-aggregate only in v0.5 (GROUP BY is rejected with a
+/// clear error by the executor).
+pub fn stddev_pop(e: Expr) -> AggregateExpr {
+    AggregateExpr::StddevPop(Box::new(e))
+}
+
+/// `STDDEV_SAMP(expr)` aggregate — sample standard deviation. Returns
+/// SQL NULL when the input has 0 or 1 non-NULL rows (the divisor
+/// `count - 1` is then undefined per the SQL standard).
+pub fn stddev_samp(e: Expr) -> AggregateExpr {
+    AggregateExpr::StddevSamp(Box::new(e))
 }

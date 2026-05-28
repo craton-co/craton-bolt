@@ -449,13 +449,26 @@ enum AggKind {
 }
 
 impl AggKind {
-    fn from_expr(e: &AggregateExpr) -> Self {
+    fn from_expr(e: &AggregateExpr) -> BoltResult<Self> {
         match e {
-            AggregateExpr::Sum(_) => AggKind::Sum,
-            AggregateExpr::Min(_) => AggKind::Min,
-            AggregateExpr::Max(_) => AggKind::Max,
-            AggregateExpr::Count(_) => AggKind::Count,
-            AggregateExpr::Avg(_) => AggKind::Avg,
+            AggregateExpr::Sum(_) => Ok(AggKind::Sum),
+            AggregateExpr::Min(_) => Ok(AggKind::Min),
+            AggregateExpr::Max(_) => Ok(AggKind::Max),
+            AggregateExpr::Count(_) => Ok(AggKind::Count),
+            AggregateExpr::Avg(_) => Ok(AggKind::Avg),
+            // STDDEV variants don't fit the (Sum/Min/Max/Count/Avg)
+            // accumulator model this wide-GROUP-BY path is built around
+            // (Welford state is three scalars per group rather than one).
+            // GROUP BY support for STDDEV is out of scope for v0.5 — gate
+            // here so any future caller that reaches us with one fails
+            // with a clear message instead of a silent miscalculation.
+            AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+                Err(BoltError::Other(
+                    "wide GROUP BY: STDDEV_POP / STDDEV_SAMP not yet \
+                     supported (v0.5: scalar aggregate only)"
+                        .into(),
+                ))
+            }
         }
     }
 }
@@ -474,6 +487,12 @@ fn resolve_aggregates<'a>(
             | AggregateExpr::Max(e)
             | AggregateExpr::Count(e)
             | AggregateExpr::Avg(e) => e,
+            // STDDEV variants box their operand. The wide-GROUP-BY path is
+            // gated by `AggKind::from_expr` to reject STDDEV up front, but
+            // this match needs an exhaustive arm to compile — deref so the
+            // borrow shape matches if it ever does reach here through a
+            // future code path.
+            AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => e.as_ref(),
         };
         let col_name = bare_column_name(expr)?;
         let io = aggregate
@@ -511,7 +530,7 @@ fn resolve_aggregates<'a>(
             )));
         }
         out.push(AggInputPlan {
-            kind: AggKind::from_expr(agg),
+            kind: AggKind::from_expr(agg)?,
             name: io.name.clone(),
             dtype: io.dtype,
             arr,
@@ -933,6 +952,16 @@ fn finalize_agg_column(
             // We collect into the accumulator's natural dtype, then defer
             // the (possibly narrowing) cast to `pack_typed_array`.
             collect_sum_min_max(sorted, i, out_field.dtype)
+        }
+        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+            // Unreachable: `AggKind::from_expr` rejects STDDEV variants
+            // before any accumulator is allocated. Arm exists to keep the
+            // match exhaustive.
+            Err(BoltError::Other(
+                "wide GROUP BY: internal — STDDEV reached finalize \
+                 (should have been rejected at AggKind::from_expr)"
+                    .into(),
+            ))
         }
     }
 }

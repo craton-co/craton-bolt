@@ -22,6 +22,10 @@ pub mod gpu_compact_multipass;
 pub mod string_ops_extended;
 pub mod extended_agg;
 pub mod expr_agg;
+/// Welford's one-pass algorithm for numerically-stable mean / variance.
+/// Shared between STDDEV_* (this crate's v0.5 surface) and the upcoming
+/// VAR_* aggregates.
+pub mod welford;
 pub mod groupby_valid;
 pub mod gpu_table;
 pub mod groupby_shmem_dispatch;
