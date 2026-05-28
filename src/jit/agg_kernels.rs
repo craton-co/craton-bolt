@@ -239,13 +239,13 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
     )
     .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra LOAD_IDENTITY;").map_err(write_err)?;
     // Address arithmetic for the source-column load uses the *input* element
     // size (the source array is laid out at input dtype, not accumulator).
     writeln!(
         ptx,
-        "\tmul.wide.s32 %rd1, %r3, {bytes};",
+        "\tmul.wide.u32 %rd1, %r3, {bytes};",
         bytes = input_elem_bytes
     )
     .map_err(write_err)?;
@@ -289,7 +289,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
     // by the accumulator element size, not the input element size.
     writeln!(
         ptx,
-        "\tmul.wide.s32 %rd3, %r2, {bytes};",
+        "\tmul.wide.u32 %rd3, %r2, {bytes};",
         bytes = elem_bytes
     )
     .map_err(write_err)?;
@@ -398,7 +398,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
     // must stay live for `shfl.sync` (membermask 0xffffffff). Threads with
     // tid >= 32 jump straight to DONE — they have no value to contribute and
     // sdata[0..32] already holds warp 0's working set from phase 1.
-    writeln!(ptx, "\tsetp.ge.s32 %p6, %r2, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p6, %r2, 32;").map_err(write_err)?;
     writeln!(ptx, "\t@%p6 bra DONE;").map_err(write_err)?;
 
     // Load this lane's value (sdata[tid]) into a register once. After this
@@ -505,7 +505,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
     writeln!(ptx, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
     writeln!(
         ptx,
-        "\tmul.wide.s32 %rd9, %r0, {bytes};",
+        "\tmul.wide.u32 %rd9, %r0, {bytes};",
         bytes = elem_bytes
     )
     .map_err(write_err)?;

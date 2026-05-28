@@ -156,7 +156,7 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
         b.n_rows_param_name(spec.inputs.len(), spec.outputs.len())
     ))?;
     b.emit(&format!(
-        "setp.ge.s32 {}, {}, {};",
+        "setp.ge.u32 {}, {}, {};",
         pred_oob, tid, n_rows
     ))?;
     b.emit(&format!("@{} bra DONE;", pred_oob))?;
@@ -286,7 +286,7 @@ fn emit_load(
     let width = byte_width(dtype)?;
     let off = b.alloc.alloc("rd");
     let addr = b.alloc.alloc("rd");
-    b.emit(&format!("mul.wide.s32 {}, {}, {};", off, tid, width))?;
+    b.emit(&format!("mul.wide.u32 {}, {}, {};", off, tid, width))?;
     b.emit(&format!(
         "add.s64 {}, {}, {};",
         addr, input_ptrs[col_idx], off
@@ -317,7 +317,7 @@ fn emit_store(
     let off = b.alloc.alloc("rd");
     let addr = b.alloc.alloc("rd");
     let src_name = b.alloc.get(src)?.to_string();
-    b.emit(&format!("mul.wide.s32 {}, {}, {};", off, tid, width))?;
+    b.emit(&format!("mul.wide.u32 {}, {}, {};", off, tid, width))?;
     b.emit(&format!(
         "add.s64 {}, {}, {};",
         addr, output_ptrs[col_idx], off
