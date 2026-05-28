@@ -1503,6 +1503,13 @@ pub fn execute_inner_join_on_gpu(
 /// Sentinel value used in the collision-list `head[]` and `next_idx[]` arrays
 /// to denote "no more entries". Picked to match the kernel side
 /// (`u32::MAX`).
+///
+/// Kept as a named constant (rather than inlining `u32::MAX`) so the
+/// host/kernel contract is documented in one place; the actual host-side
+/// buffers are filled by `get_sentinel_u32_max_vec(..)` which inlines the
+/// raw value, leaving this symbol unreferenced under `cargo build`. Do not
+/// delete without also revisiting that pool.
+#[allow(dead_code)]
 const COLLISION_LIST_SENTINEL: u32 = u32::MAX;
 
 /// Result of a Stage-2 GPU INNER join: index pairs in arbitrary order, ready
