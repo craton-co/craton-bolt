@@ -2,21 +2,19 @@
 
 //! Integration tests for `CASE WHEN ... THEN ... [ELSE ...] END`.
 //!
-//! v0.5 / M2 SQL scalar completeness: the SQL frontend now lowers SQL
-//! `CASE` expressions — both the plain and the simple form — into the
-//! new `Expr::Case { branches, else_branch }` IR variant. The physical
-//! planner currently rejects the construct at the `lower()` boundary
-//! with a dedicated "CASE not yet lowered to GPU; coming in a
-//! follow-up" `Plan` error, so this test suite pins the *parse-only*
-//! contract: SQL → `LogicalPlan` lowering succeeds, type-checks
-//! correctly, and the lowered shape matches what downstream stages
-//! expect.
+//! v0.5 / M2 SQL scalar completeness: the SQL frontend lowers SQL `CASE`
+//! expressions — both the plain and the simple form — into the
+//! `Expr::Case { branches, else_branch }` IR variant. This test suite pins
+//! the parse-time contract: SQL -> `LogicalPlan` lowering succeeds,
+//! type-checks correctly, and the lowered shape matches what downstream
+//! stages expect.
 //!
-//! GPU lowering is left for a follow-up PR — when it lands, an
-//! execution-level test will join this file. Until then any attempt
-//! to push a CASE expression past the physical-plan boundary must
-//! surface the dedicated error message rather than a less informative
-//! codegen failure.
+//! v0.7 GPU lowering: CASE over numeric / Bool branches is now lowered to
+//! GPU via the `Op::Select` IR op (see `src/plan/physical_plan.rs` and
+//! `src/jit/ptx_gen.rs`). CASE over Utf8 / Decimal128 / Date / Timestamp
+//! is still rejected at the codegen boundary with a tighter dtype-specific
+//! message; see the `case_over_strings_rejected_with_tighter_message`
+//! test for the contract.
 
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Expr, Field, Literal, LogicalPlan, MemTableProvider,
@@ -323,23 +321,50 @@ fn case_rejects_incompatible_non_numeric_arms() {
     );
 }
 
-// ---- Physical-plan rejection ------------------------------------------------
+// ---- Physical-plan lowering ------------------------------------------------
 
-/// Lowering a plan that contains a CASE expression must surface a clear
-/// "CASE not yet lowered to GPU; coming in a follow-up" `Plan` error.
-/// This pins the option-(b) contract: the planner accepts CASE syntax
-/// (so users get a useful type-checker error for malformed CASE
-/// expressions), but the physical-plan boundary refuses to compile CASE
-/// down to a kernel until the codegen learns value-selection-by-mask.
+/// v0.7: CASE WHEN over numeric branches is now lowered to GPU via
+/// `Op::Select`. Scan-chain SELECT lists with a CASE expression must
+/// lower successfully — the previous "CASE not yet lowered to GPU"
+/// rejection at the physical-plan boundary has been retired. The host
+/// evaluator still surfaces a clear error for CASE in post-aggregate /
+/// HAVING positions; that path is covered separately.
 #[test]
-fn case_rejected_at_physical_lowering_with_followup_message() {
+fn case_in_scan_chain_select_lowers_successfully() {
     let sql = "SELECT CASE WHEN x > 0 THEN 1 ELSE 0 END AS s FROM t";
     let plan = parse_sql(sql, &t_provider()).expect("parse must succeed");
-    let err = lower_physical(&plan).expect_err("physical lowering must reject CASE");
+    lower_physical(&plan).expect("physical lowering must accept CASE in scan-chain SELECT");
+}
+
+/// CASE over Utf8 branches is still rejected at the codegen boundary —
+/// the v0.7 envelope is numeric / Bool only. The error message must be
+/// tighter than the legacy "CASE not yet lowered to GPU" so the user
+/// knows the path forward (e.g. host-side projection of strings).
+#[test]
+fn case_over_strings_rejected_with_tighter_message() {
+    // Build a fixture with a Utf8 column so a CASE over it survives the
+    // type-checker and reaches the GPU codegen, which then rejects it.
+    let schema = Schema::new(vec![
+        Field {
+            name: "x".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "name".into(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        },
+    ]);
+    let provider = MemTableProvider::new().with_table("t", schema);
+    let sql = "SELECT CASE WHEN x > 0 THEN name ELSE name END AS s FROM t";
+    let plan = parse_sql(sql, &provider).expect("parse must succeed");
+    let err = lower_physical(&plan).expect_err("CASE over Utf8 must still be rejected");
     let msg = format!("{err}");
     assert!(
-        msg.contains("CASE not yet lowered to GPU")
-            && msg.contains("follow-up"),
-        "rejection message should match the documented contract, got: {msg}"
+        msg.contains("CASE over string")
+            || msg.contains("string (Utf8)")
+            || msg.contains("Utf8"),
+        "rejection should mention strings/Utf8 explicitly, got: {msg}"
     );
 }
