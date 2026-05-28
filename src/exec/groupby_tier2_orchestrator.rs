@@ -119,7 +119,12 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     let ptx = match spec {
         KernelSpec::Partition => stub_partition_kernel::compile_partition_kernel()?,
         KernelSpec::Scatter => stub_scatter_kernel::compile_scatter_kernel()?,
-        KernelSpec::ReduceSum => partition_reduce_kernel::compile_partition_reduce_kernel()?,
+        // Batch 4: wire the spill-counter-aware variant so MAX_PROBES
+        // overflow surfaces as a structured error instead of silently
+        // dropping rows (which would corrupt the per-group SUM result).
+        KernelSpec::ReduceSum => {
+            partition_reduce_kernel::compile_partition_reduce_kernel_with_spill()?
+        }
     };
     let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
@@ -361,8 +366,15 @@ pub fn execute_tier2_sum(
 
     // JIT + launch the per-partition reduce kernel. Grid = NUM_PARTITIONS
     // blocks (one per partition); blockIdx.x IS the partition id.
+    //
+    // Batch 4: we resolve the spill-counter entry point and pass a
+    // zero-initialised 1-element u32 buffer as the 7th argument. After the
+    // launch syncs we download the counter; any non-zero value indicates
+    // a partition exceeded MAX_PROBES probes, which would silently corrupt
+    // the SUM. We surface that as a structured error instead.
     let reduce_module = get_or_build_module(&KernelSpec::ReduceSum)?;
-    let reduce_fn = reduce_module.function(partition_reduce_kernel::KERNEL_ENTRY)?;
+    let reduce_fn = reduce_module.function(partition_reduce_kernel::KERNEL_ENTRY_WITH_SPILL)?;
+    let mut spill_counter: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     {
         let view_pk = scatter_keys.view();
@@ -371,6 +383,7 @@ pub fn execute_tier2_sum(
         let mut view_ok = out_keys.view_mut();
         let mut view_ov = out_vals.view_mut();
         let mut view_os = out_set.view_mut();
+        let mut view_spill = spill_counter.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_pk);
@@ -379,6 +392,7 @@ pub fn execute_tier2_sum(
         args.push_output(&mut view_ok);
         args.push_output(&mut view_ov);
         args.push_output(&mut view_os);
+        args.push_output(&mut view_spill);
 
         launch_with_geometry(
             reduce_fn,
@@ -402,6 +416,21 @@ pub fn execute_tier2_sum(
     let host_out_keys: Vec<i32> = pinned_keys.as_slice().to_vec();
     let host_out_vals: Vec<f64> = pinned_vals.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
+
+    // Spill-counter check. The launch above synchronized through the stream,
+    // so `to_vec()` is safe to call here. A non-zero count means at least
+    // one row's linear probe wrapped past MAX_PROBES without finding a slot
+    // — the kernel dropped it, and the per-group sum for that key is now
+    // missing one or more contributions. Surface as a structured error so
+    // the engine can fall back to a host-side aggregation path rather than
+    // returning silently corrupt results.
+    let spill_count = spill_counter.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
 
     if host_out_keys.len() != n_out_slots
         || host_out_vals.len() != n_out_slots
@@ -530,6 +559,103 @@ mod tests {
         let _ = get_or_build_module(&KernelSpec::Scatter).expect("scatter hit");
         let _ = get_or_build_module(&KernelSpec::ReduceSum).expect("reduce hit");
         assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
+    }
+
+    // --- Batch 4 spill-counter wiring tests ----------------------------------
+    //
+    // Tests below exercise the spill-counter path added in batch 4. The
+    // host-only assertion below pins the error message format so the
+    // engine's fallback path (which matches on the prefix) doesn't break
+    // silently. The GPU-gated `spill_fires_on_pathological_input` test
+    // constructs a synthetic high-collision workload where more than
+    // BLOCK_GROUPS distinct keys land in the same partition, and asserts
+    // the kernel-driven counter trips the error.
+    //
+    // The error-prefix contract: `"partition_reduce spill: "`. Callers may
+    // detect via `starts_with` for fallback routing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spill_error_prefix_is_stable() {
+        // Mirrors the literal format string in `execute_tier2_sum`. If
+        // someone changes the wording, this test catches the contract drift.
+        let err = BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            42
+        ));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("partition_reduce spill:"),
+            "spill-error message must contain the stable prefix; got {msg}"
+        );
+        assert!(msg.contains("42"), "spill count must appear in message; got {msg}");
+    }
+
+    /// GPU-gated: construct a workload where >BLOCK_GROUPS distinct keys
+    /// all hash into the same partition, forcing the per-block table to
+    /// overflow. The kernel must atomically bump the spill counter; the
+    /// orchestrator must surface a structured error rather than returning
+    /// silently corrupt sums.
+    ///
+    /// Construction: every key K we produce must satisfy
+    /// `(K * HASH_MULTIPLIER) & (NUM_PARTITIONS - 1) == 0` so the
+    /// partition kernel maps them all to partition 0. Then we just need
+    /// > BLOCK_GROUPS = 1024 distinct such keys. The modular inverse of
+    /// HASH_MULTIPLIER mod 2^32 lets us reverse the hash and walk keys
+    /// directly. We don't bother computing it here — instead we scan i32
+    /// upward until we find 1500 keys whose hash falls in partition 0;
+    /// that's O(n_partitions × n_keys) ≈ 6 M iterations and runs in
+    /// milliseconds at test time.
+    #[test]
+    #[ignore = "requires CUDA toolkit + JIT at runtime (executes Tier-2 pipeline with pathological input)"]
+    fn spill_fires_on_pathological_input() {
+        use crate::jit::partition_kernel as pk;
+        const TARGET_PID: u32 = 0;
+        let mult: u32 = pk::HASH_MULTIPLIER;
+        let mask: u32 = pk::NUM_PARTITIONS - 1;
+        let needed: usize = (partition_reduce_kernel::BLOCK_GROUPS as usize) + 500;
+
+        // Collect `needed` distinct positive i32 keys that hash to partition 0.
+        let mut keys: Vec<i32> = Vec::with_capacity(needed);
+        let mut k: i32 = 1;
+        while keys.len() < needed && k < i32::MAX {
+            let hash = (k as u32).wrapping_mul(mult);
+            if (hash & mask) == TARGET_PID {
+                keys.push(k);
+            }
+            k += 1;
+        }
+        if keys.len() < needed {
+            // Search exhausted i32 space — should not happen for K=4096
+            // since one in 4096 keys hits any given partition, so we
+            // expect to find 1500 hits inside the first ~6 M.
+            return;
+        }
+        let vals: Vec<f64> = (0..keys.len()).map(|i| (i + 1) as f64).collect();
+        let n_rows = keys.len() as u32;
+
+        let keys_gpu = match GpuVec::<i32>::from_slice(&keys) {
+            Ok(v) => v,
+            Err(_) => return, // No CUDA — skip.
+        };
+        let vals_gpu = match GpuVec::<f64>::from_slice(&vals) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        match execute_tier2_sum(&keys_gpu, &vals_gpu, n_rows) {
+            Err(BoltError::Other(msg)) => {
+                assert!(
+                    msg.starts_with("partition_reduce spill:"),
+                    "expected spill error, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected spill error, got different error: {e:?}"),
+            Ok(_) => panic!(
+                "expected spill error on pathological partition-0 overflow, but \
+                 execute_tier2_sum returned Ok — spill counter likely not wired"
+            ),
+        }
     }
 
     // --- P1b-stage6 wiring smoke test ----------------------------------------

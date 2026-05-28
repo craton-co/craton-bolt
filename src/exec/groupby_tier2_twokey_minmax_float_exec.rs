@@ -114,6 +114,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     let ptx = match spec {
         KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
         KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
+        // TODO(batch-4-spill): wire a `_with_spill` variant once it
+        // exists. See `groupby_tier2_orchestrator.rs::execute_tier2_sum`
+        // for the pattern.
         KernelSpec::ReduceMinMaxFloatI64(rk) => {
             let (op, dt) = rk.into_pair();
             compile_partition_reduce_kernel_minmax_float_i64(op, dt)?

@@ -96,8 +96,11 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     let ptx = match spec {
         KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
         KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
+        // Batch 4: spill-counter-aware variant. The kernel atomically
+        // bumps a host-visible counter when a row exceeds MAX_PROBES; the
+        // caller checks it after sync and surfaces a structured error.
         KernelSpec::ReduceCount => {
-            partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
+            partition_reduce_kernel_count::compile_partition_reduce_kernel_count_with_spill()?
         }
     };
     let module = CudaModule::from_ptx(&ptx)?;
@@ -259,16 +262,20 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
 
     // CUDA-Oxide typed launch.
-    // Kernel ABI: scatter_keys, offsets, out_keys, out_counts, out_set
+    // Kernel ABI (spill variant): scatter_keys, offsets, out_keys,
+    // out_counts, out_set, spill_counter.
     let reduce_module = get_or_build_module(&KernelSpec::ReduceCount)?;
+    let mut spill_counter: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
     {
-        let func = reduce_module.function(partition_reduce_kernel_count::KERNEL_ENTRY)?;
+        let func = reduce_module
+            .function(partition_reduce_kernel_count::KERNEL_ENTRY_WITH_SPILL)?;
 
         let view_keys = scatter_keys.view();
         let view_offsets = offsets_kp1_gpu.view();
         let mut view_ok = out_keys_gpu.view_mut();
         let mut view_oc = out_counts_gpu.view_mut();
         let mut view_os = out_set_gpu.view_mut();
+        let mut view_spill = spill_counter.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_keys);
@@ -276,6 +283,7 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
         args.push_output(&mut view_ok);
         args.push_output(&mut view_oc);
         args.push_output(&mut view_os);
+        args.push_output(&mut view_spill);
 
         launch_with_geometry(
             func,
@@ -296,6 +304,18 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
     let host_out_keys: Vec<i32> = pinned_keys.as_slice().to_vec();
     let host_out_counts: Vec<u64> = pinned_counts.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
+
+    // Batch 4 spill-counter check. Mirrors the SUM orchestrator: a
+    // non-zero counter means the kernel dropped at least one row when
+    // its partition's open-addressing table overflowed past MAX_PROBES,
+    // so the COUNT for the spilled key would be one or more short.
+    let spill_count = spill_counter.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
 
     let mut pairs: Vec<(i32, i64)> = Vec::new();
     for pid in 0..num_partitions as usize {

@@ -114,9 +114,19 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         KernelSpec::ScatterValuesByDestIdx => {
             scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel()?
         }
+        // TODO(batch-4-spill): wire `_with_spill` once
+        // `compile_partition_reduce_kernel_multi_with_spill` exists. The
+        // multi-SUM variant emits 600+ lines of PTX per `n_vals`, so adding
+        // a spill branch in this batch was out of scope. Until both legs
+        // of AVG (SUM via multi + COUNT) use the spill kernel, switching
+        // only one would still leave the other silently dropping rows.
         KernelSpec::ReduceMulti { n_vals } => {
             partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(*n_vals)?
         }
+        // TODO(batch-4-spill): switch to
+        // `compile_partition_reduce_kernel_count_with_spill` together with
+        // the multi-SUM variant above, since both must surface a spill
+        // error for AVG to remain correct under high-cardinality skew.
         KernelSpec::ReduceCount => {
             partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
         }

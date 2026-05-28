@@ -124,6 +124,12 @@ pub const NUM_PARTITIONS: u32 = 4096;
 /// Entry-point name embedded in the emitted PTX.
 pub const KERNEL_ENTRY: &str = "bolt_partition_reduce";
 
+/// Entry-point name for the spill-counter variant. Different from
+/// [`KERNEL_ENTRY`] so the two PTX modules can coexist in the JIT cache
+/// without colliding, and so an orchestrator that requests the spill
+/// variant cannot accidentally resolve the non-spill function.
+pub const KERNEL_ENTRY_WITH_SPILL: &str = "bolt_partition_reduce_spill";
+
 /// Probe bound: how many slots a single key will examine before giving
 /// up. Equal to BLOCK_GROUPS so we walk the whole table at worst, which
 /// at a < 1× key-load-factor is far more than enough. On overflow the
@@ -470,6 +476,281 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     Ok(ptx)
 }
 
+/// Spill-counter-aware sibling of [`compile_partition_reduce_kernel`].
+///
+/// Identical algorithm and shared-memory layout, with one extra kernel
+/// parameter:
+///
+/// ```text
+/// .param .u64 spill_counter   //       uint32_t*  &spill_counter[1]
+/// ```
+///
+/// When a row's linear probe exceeds [`MAX_PROBES`] without finding a
+/// matching slot (or claiming an empty one), the kernel issues
+/// `atom.global.add.u32 [spill_counter], 1` before dropping the row.
+/// Host orchestrators read the counter after launch+sync; any non-zero
+/// value indicates the partition table overflowed and the per-group sums
+/// for the spilled key would be silently incorrect.
+///
+/// This variant exports a distinct entry point
+/// ([`KERNEL_ENTRY_WITH_SPILL`]) so it can coexist with the non-spill
+/// kernel in the same JIT module cache. The non-spill emitter is
+/// untouched — existing golden tests still pass.
+pub fn compile_partition_reduce_kernel_with_spill() -> BoltResult<String> {
+    let mut ptx = String::new();
+    let entry = KERNEL_ENTRY_WITH_SPILL;
+    let block_groups = BLOCK_GROUPS;
+    let mask = BLOCK_GROUPS - 1;
+    let block_threads = BLOCK_THREADS;
+    let keys_bytes = BLOCK_GROUPS * 4;
+    let vals_bytes = BLOCK_GROUPS * 8;
+    let set_bytes = BLOCK_GROUPS * 4;
+    let max_probes = MAX_PROBES;
+
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 block_keys_buf_sp[{bytes}];",
+        bytes = keys_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align 8 .b8 block_vals_buf_sp[{bytes}];",
+        bytes = vals_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 block_set_buf_sp[{bytes}];",
+        bytes = set_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_2,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_3,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_4,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_5,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_6").map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    writeln!(ptx, "\t.reg .pred  %p<16>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<64>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<64>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .f64   %fd<8>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf_sp;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u64 %rd1, block_vals_buf_sp;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u64 %rd2, block_set_buf_sp;").map_err(write_err)?;
+
+    // Global pointer setup. Slots 3..=8 mirror the non-spill kernel;
+    // slot 9 carries the new spill counter pointer.
+    writeln!(ptx, "\tld.param.u64 %rd3, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd4, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd4, %rd4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd5, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd5, %rd5;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd6, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd6, %rd6;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd7, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd7, %rd7;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd8, [{entry}_param_5];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd9, [{entry}_param_6];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd9, %rd9;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Partition slice [start, end).
+    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 1: zero shared arrays.
+    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.ge.u32 %p0, %r20, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd21], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u64 [%rd23], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tadd.u32 %r20, %r20, {bt};",
+        bt = block_threads
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 2: probe + atomic add.
+    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s32 %r31, [%rd31];").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd32, %r30, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd33, %rd4, %rd32;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.f64 %fd0, [%rd33];").map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        "\tand.b32 %r32, %r31, 0x{mask:X};",
+        mask = mask
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
+
+    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.gt.u32 %p2, %r33, {mp};",
+        mp = max_probes
+    )
+    .map_err(write_err)?;
+    // On probe overflow, bump the spill counter then drop the row. The
+    // counter is process-global so we use atom.global.add.u32 — at most
+    // ~n_rows total bumps in the worst case (one per dropped row), well
+    // within u32's range for any input that fits in GPU memory.
+    writeln!(ptx, "\t@%p2 bra SPILL_BUMP;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd34;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?;
+
+    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+
+    // MATCH-path inter-address fence (same fix as the non-spill kernel).
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tand.b32 %r32, %r32, 0x{mask:X};",
+        mask = mask
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
+
+    writeln!(ptx, "CLAIM:").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.shared.add.f64 %fd1, [%rd38], %fd0;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+
+    writeln!(ptx, "MATCH:").map_err(write_err)?;
+    writeln!(ptx, "\tatom.shared.add.f64 %fd2, [%rd38], %fd0;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+
+    // SPILL_BUMP: atomically increment *spill_counter, then drop the row
+    // and proceed to the next iteration. We use atom.global.add.u32 (sm_60+).
+    writeln!(ptx, "SPILL_BUMP:").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r36, [%rd9], 1;").map_err(write_err)?;
+
+    writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r30, %r30, %r1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_TOP;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 3: export, identical to the non-spill kernel.
+    writeln!(
+        ptx,
+        "\tmul.lo.u32 %r40, %r0, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.ge.u32 %p5, %r41, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra EXPORT_DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd40, %r41, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd41, %rd0, %rd40;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r43, [%rd41];").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd42, %r41, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd43, %rd1, %rd42;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.f64 %fd3, [%rd43];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd44, %rd2, %rd40;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.u32 %r44, [%rd44];").map_err(write_err)?;
+
+    writeln!(ptx, "\tsetp.ne.s32 %p6, %r44, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tselp.u32 %r45, 1, 0, %p6;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd45, %r42, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd46, %rd6, %rd45;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.s32 [%rd46], %r43;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd47, %r42, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd48, %rd7, %rd47;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.f64 [%rd48], %fd3;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u64.u32 %rd49, %r42;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd50, %rd8, %rd49;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u8 [%rd50], %r45;").map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        "\tadd.u32 %r41, %r41, {bt};",
+        bt = block_threads
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
+
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
 /// Adapt a `std::fmt::Error` into a `BoltError`. Same shape as the
 /// helpers in sibling JIT files — kept local so each kernel emitter is
 /// independent.
@@ -656,5 +937,64 @@ mod tests {
         let _fn = module
             .function(KERNEL_ENTRY)
             .expect("kernel entry point should be reachable");
+    }
+
+    // ----- _with_spill variant shape tests ---------------------------------
+
+    /// The spill-counter variant exposes a different entry point than the
+    /// base kernel so both can coexist in one PTX cache without colliding.
+    #[test]
+    fn with_spill_uses_distinct_entry_name() {
+        let ptx = compile_partition_reduce_kernel_with_spill().expect("kernel compiles");
+        assert_eq!(KERNEL_ENTRY_WITH_SPILL, "bolt_partition_reduce_spill");
+        let needle = format!(".visible .entry {}(", KERNEL_ENTRY_WITH_SPILL);
+        assert!(
+            ptx.contains(&needle),
+            "PTX must declare the spill entry point:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains(".visible .entry bolt_partition_reduce("),
+            "spill variant must NOT also export the base entry name:\n{ptx}"
+        );
+    }
+
+    /// The spill kernel adds one extra .u64 parameter (the spill-counter
+    /// pointer) and bumps it atomically when MAX_PROBES is exceeded.
+    #[test]
+    fn with_spill_has_seven_pointer_params_and_global_atomic() {
+        let ptx = compile_partition_reduce_kernel_with_spill().expect("kernel compiles");
+        let n_params = ptx.matches(".param .u64 ").count();
+        assert_eq!(
+            n_params, 7,
+            "spill variant must expose 7 .u64 params (6 + spill_counter), got {n_params}\n{ptx}"
+        );
+        assert!(
+            ptx.contains("atom.global.add.u32"),
+            "spill variant must atomically bump the counter on overflow:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("SPILL_BUMP:"),
+            "spill variant must label its overflow path:\n{ptx}"
+        );
+    }
+
+    /// Spill variant must keep the membar.cta inter-address fences — the
+    /// CAS-race fix from batch 2 still applies here.
+    #[test]
+    fn with_spill_preserves_membar_cta_fences() {
+        let ptx = compile_partition_reduce_kernel_with_spill().expect("kernel compiles");
+        let count = ptx.matches("membar.cta").count();
+        assert!(
+            count >= 2,
+            "spill variant must keep both membar.cta fences, saw {count}:\n{ptx}"
+        );
+    }
+
+    /// The spill variant is deterministic just like the base emitter.
+    #[test]
+    fn with_spill_is_deterministic() {
+        let a = compile_partition_reduce_kernel_with_spill().expect("compile a");
+        let b = compile_partition_reduce_kernel_with_spill().expect("compile b");
+        assert_eq!(a, b, "spill emitter must be deterministic");
     }
 }

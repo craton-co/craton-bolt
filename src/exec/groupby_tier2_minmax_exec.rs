@@ -113,6 +113,13 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
         KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
         KernelSpec::ScatterI32ToI64 => scatter_kernel::compile_scatter_kernel_i32_to_i64()?,
+        // TODO(batch-4-spill): wire a `_with_spill` variant once we add
+        // `compile_partition_reduce_kernel_minmax_with_spill`. Sibling
+        // SUM/COUNT kernels already get the wiring in batch 4 — see
+        // `groupby_tier2_orchestrator.rs::execute_tier2_sum` for the
+        // pattern. Without spill detection, MAX_PROBES overflow on a
+        // skewed-key partition silently drops rows and returns the wrong
+        // MIN/MAX for the spilled keys.
         KernelSpec::ReduceMinMax(rk) => {
             let (op, dt) = rk.into_pair();
             compile_partition_reduce_kernel_minmax(op, dt)?
