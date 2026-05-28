@@ -309,6 +309,35 @@ fn emit_op(
         Op::Store { .. } => Err(BoltError::Other(
             "scan_kernel: emit_op should not be called with a Store op".into(),
         )),
+        // Predicate-only kernel doesn't yet wire input validity pointers
+        // through its parameter list (the projection kernel emitted by
+        // `ptx_gen::compile` does, via `KernelSpec::input_has_validity`).
+        // Until `compile_predicate_kernel` learns the same validity-ABI
+        // extension and `compact::launch_predicate_kernel` is taught to
+        // pass the validity pointers, predicates that contain
+        // `Op::IsNullCheck` must fall back to the host filter. The
+        // physical planner today routes bare-column `IS [NOT] NULL`
+        // predicates onto the GPU path; this error fires only if a
+        // future planner change folds an IsNullCheck into a Filter that
+        // takes the predicate-kernel-via-mask path AND the launch hasn't
+        // been updated to match. Surfacing a clean BoltError here pins
+        // the breakage at the scan-kernel compile site rather than
+        // letting it manifest as a wrong-results bug.
+        //
+        // TODO(perf): teach `compile_predicate_kernel` to consume
+        // `KernelSpec::input_has_validity` (mirror the loop in
+        // `ptx_gen::compile`) and update
+        // `crate::exec::compact::launch_predicate_kernel` to push the
+        // validity device pointers into its param list in the same
+        // order. After that, the IsNullCheck arm here can delegate to a
+        // local emit_is_null_check that mirrors `ptx_gen::
+        // emit_is_null_check`.
+        Op::IsNullCheck { .. } => Err(BoltError::Other(
+            "scan_kernel: Op::IsNullCheck in a predicate-only kernel is not yet supported — \
+             the launch-side validity-pointer wiring is a follow-up; \
+             route the Filter through the host fallback for now"
+                .into(),
+        )),
     }
 }
 
