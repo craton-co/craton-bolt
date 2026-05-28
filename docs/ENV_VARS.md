@@ -21,6 +21,7 @@ variable.
 | `BOLT_POOL_WATCH_LOW_WATER_FRAC` | 0.10                 | `(0, 1)`    | Watcher proactive-evict threshold (free/total)  |
 | `BOLT_GPU_JOIN_TABLE_CAP_MB`     | driver-detected      | `64..=4096` | Override hash-table byte cap (MiB)              |
 | `BOLT_GPU_JOIN_STREAMING_INTERN` | off                  | `1`         | Streaming Utf8 intern for high-cardinality keys |
+| `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root (v0.6 / M6)   |
 | `BOLT_BENCH_GPU`                 | off                  | `1`         | Enable GPU paths in `cargo bench`               |
 | `BOLT_BENCH_THRESHOLD`           | off                  | `1`         | Enable the Utf8-sort threshold bench            |
 | `CUDA_PATH`                      | toolkit-default      | path        | Build-time CUDA toolkit location (build.rs)     |
@@ -147,6 +148,34 @@ variable.
   strings) where the default path is faster.
 - **Source**: `src/exec/gpu_join.rs::streaming_intern_enabled`
   (env var name constant: `STREAMING_INTERN_ENV_VAR`, line 2132).
+
+## JIT module cache
+
+### `BOLT_PTX_CACHE_DIR`
+- **Default**: unset (disk-backed cache disabled — in-process cache only)
+- **Type**: path to a writable directory
+- **What**: Enables the optional disk-backed PTX cache (v0.6 / M6). On a
+  miss in the in-process module cache the engine reads
+  `<dir>/<entry>-<hash>.ptx` from disk before re-running codegen; on a
+  disk miss it writes the freshly-generated PTX back to disk for the
+  next process. The codegen pipeline is deterministic so reuse is
+  byte-identical.
+- **When**: Set on benchmark harnesses, CLI tools, serverless workers,
+  and any other context where the engine is constructed and torn down
+  per request — those processes never benefit from the in-process cache
+  alone and pay full codegen on every invocation.
+- **Path conventions**: Pick any writable directory. Convenient
+  platform defaults are documented in `jit::disk_cache::platform_default_dir`
+  (`~/.cache/craton-bolt/ptx/` on Linux, `~/Library/Caches/craton-bolt/ptx/`
+  on macOS, `%LOCALAPPDATA%\craton-bolt\ptx\` on Windows) — pass one of
+  these as the env var value to opt in to the conventional location.
+- **Notes**: An in-engine `Engine::Builder::persistent_cache(path)` hook
+  overrides this env var when set (see `jit::set_disk_ptx_cache_dir`).
+  Writes are atomic (tempfile + rename); read failures fall back to the
+  codegen path silently — a corrupt cache entry never produces a wrong
+  result.
+- **Source**: `src/jit/disk_cache.rs` (env var name constant:
+  `DISK_PTX_CACHE_ENV`).
 
 ## Benchmark gates
 

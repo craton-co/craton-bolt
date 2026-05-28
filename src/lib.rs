@@ -168,4 +168,7 @@ pub mod __test_only_env_vars {
     pub use crate::exec::gpu_join::STREAMING_INTERN_ENV_VAR;
     pub use crate::jit::jit_compiler::parse_cap as parse_ptx_cache_cap;
     pub use crate::jit::jit_compiler::PTX_CACHE_CAP_ENV;
+    // v0.6 / M6 disk-PTX-cache opt-in env var. Re-exported so the
+    // env-var smoke test can assert the canonical name from one place.
+    pub use crate::jit::disk_cache::DISK_PTX_CACHE_ENV;
 }

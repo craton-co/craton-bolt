@@ -2,6 +2,10 @@
 
 pub mod ptx_gen;
 pub mod jit_compiler;
+/// Optional disk-backed PTX cache (v0.6 / M6). Opt-in via the
+/// `BOLT_PTX_CACHE_DIR` env var or `Engine::Builder::persistent_cache`.
+/// See [`disk_cache`] module docs for the path-resolution rules.
+pub mod disk_cache;
 pub mod agg_kernels;
 pub mod scan_kernel;
 pub mod hash_kernels;
@@ -46,3 +50,10 @@ pub use jit_compiler::{compile_and_load, CudaFunction, CudaModule};
 /// the `jit` module path (not crate root) to keep `lib.rs` focused on
 /// top-level engine surface.
 pub use jit_compiler::ptx_cache_stats;
+
+/// Public re-export of the disk-PTX-cache builder hook. Engine builders
+/// (or the test harness) call [`disk_cache::set_override_dir`] to point
+/// the process-wide disk cache at a specific directory, overriding the
+/// `BOLT_PTX_CACHE_DIR` env var. Pass `None` to clear the override and
+/// re-fall-back to env-var resolution.
+pub use disk_cache::set_override_dir as set_disk_ptx_cache_dir;

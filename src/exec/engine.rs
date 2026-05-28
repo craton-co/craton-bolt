@@ -901,11 +901,44 @@ impl Engine {
         {
             return Ok(m.clone());
         }
-        // Miss: compile + load without the cache lock held — PTX gen and
-        // `cuModuleLoadDataEx` can be slow and we don't want to serialise
-        // unrelated cache misses behind one ongoing compile. The jit
-        // PTX-text-hash cache deduplicates the cubin load on its own.
-        let ptx = compile(spec)?;
+        // Miss in the in-process cache. Before paying the codegen cost,
+        // check the optional disk-backed cache (v0.6 / M6): if the user
+        // opted in via `BOLT_PTX_CACHE_DIR` or `Engine::Builder::
+        // persistent_cache`, the PTX text for this spec may already be
+        // on disk from a previous process invocation. The disk key is
+        // namespaced by entry-point name so the projection and
+        // predicate-only PTX shapes don't alias.
+        //
+        // We still pay the `cuModuleLoadDataEx` cost (no cubin cache
+        // yet in v0.6), but we skip the multi-millisecond PTX-text
+        // codegen step on a disk hit.
+        let disk = crate::jit::disk_cache::disk_cache();
+        let disk_key = disk.as_ref().map(|_| {
+            // Compose a disk key that domain-separates entry-point
+            // names: two kernels with identical KernelSpec content but
+            // different entry symbols (KERNEL_ENTRY vs
+            // PREDICATE_ENTRY) must NOT alias to the same .ptx file.
+            format!(
+                "{}-{}",
+                entry,
+                crate::jit::disk_cache::hash_to_key(key.spec_hash_hi, key.spec_hash_lo),
+            )
+        });
+        let ptx = match (&disk, &disk_key) {
+            (Some(cache), Some(k)) => match cache.lookup(k) {
+                Some(text) => text,
+                None => {
+                    let text = compile(spec)?;
+                    // Write-through to disk. Errors here are non-fatal:
+                    // a failed write just means future processes won't
+                    // benefit, but the current process still loads the
+                    // module successfully via the in-process cache.
+                    let _ = cache.store(k, &text);
+                    text
+                }
+            },
+            _ => compile(spec)?,
+        };
         let module = CudaModule::from_ptx(&ptx)?;
         self.module_cache_loads
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
