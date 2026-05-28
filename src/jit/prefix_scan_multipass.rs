@@ -257,7 +257,7 @@ pub fn compile_prefix_scan_u32_kernel() -> BoltResult<String> {
     )
     .map_err(write_err)?;
     writeln!(ptx, "\t@%p6 bra DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd14, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd14, %r0, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u32 [%rd15], %r10;").map_err(write_err)?;
 
@@ -316,7 +316,7 @@ pub fn compile_add_block_bases_kernel() -> BoltResult<String> {
         ADD_BASES_KERNEL_ENTRY
     )
     .map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // Globalize pointers.
@@ -336,12 +336,12 @@ pub fn compile_add_block_bases_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
 
     // base = block_bases[blockIdx.x]
-    writeln!(ptx, "\tmul.wide.s32 %rd2, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd2, %r0, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd3, %rd1, %rd2;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u32 %r5, [%rd3];").map_err(write_err)?;
 
     // v = indices[gid]
-    writeln!(ptx, "\tmul.wide.s32 %rd4, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd4, %r3, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd0, %rd4;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.u32 %r6, [%rd5];").map_err(write_err)?;
 
@@ -450,7 +450,7 @@ mod tests {
         );
 
         // Out-of-range guard.
-        assert!(ptx.contains("setp.ge.s32 %p0, %r3, %r4;"));
+        assert!(ptx.contains("setp.ge.u32 %p0, %r3, %r4;"));
         assert!(ptx.contains("@%p0 bra DONE;"));
 
         assert!(ptx.contains("DONE:"));

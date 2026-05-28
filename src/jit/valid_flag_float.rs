@@ -274,7 +274,7 @@ fn emit_agg_valid_float_kernel(
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     writeln!(ptx, "\tld.param.u32 %r4, [{entry}_param_8];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // === Stage E: validity bit-test (only in the `_with_validity` variant).
@@ -333,7 +333,7 @@ fn emit_agg_valid_float_kernel(
     // Load this thread's i64-encoded key.
     writeln!(ptx, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl0, [%rd2];").map_err(write_err)?;
 
@@ -358,7 +358,7 @@ fn emit_agg_valid_float_kernel(
     writeln!(ptx, "\tcvta.to.global.u64 %rd9, %rd9;").map_err(write_err)?;
     writeln!(
         ptx,
-        "\tmul.wide.s32 %rd10, %r3, {bytes};",
+        "\tmul.wide.u32 %rd10, %r3, {bytes};",
         bytes = elem_bytes
     )
     .map_err(write_err)?;
