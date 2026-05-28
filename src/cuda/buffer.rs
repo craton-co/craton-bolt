@@ -180,6 +180,22 @@ impl<T: Pod> GpuBuffer<T> {
     /// a staging copy and the call effectively serializes.
     ///
     /// Errors if `src.len()` exceeds the buffer's allocated capacity.
+    ///
+    /// # Safety / Lifetime contract
+    ///
+    /// **The buffer (NOT just the host source) must outlive the stream's
+    /// completion.** There is no fence in [`GpuBuffer`]'s `Drop` impl;
+    /// dropping `self` while the DMA is still in flight recycles the
+    /// device pointer into the pool while the driver is still writing
+    /// it, which is undefined behaviour and can corrupt unrelated
+    /// allocations.
+    ///
+    /// Callers **MUST** call `cuStreamSynchronize` (or
+    /// [`crate::exec::launch::CudaStream::synchronize`]) on `stream`
+    /// before dropping `self`, or knowingly accept the risk (e.g. the
+    /// stream is destroyed before drop, which itself synchronizes).
+    /// The same rule applies to `src`: the host pages it points to must
+    /// remain valid and unmodified until the stream completes.
     pub fn copy_from_async(&mut self, src: &[T], stream: CUstream) -> BoltResult<()> {
         if src.len() > self.capacity {
             return Err(BoltError::Memory(format!(
@@ -210,6 +226,22 @@ impl<T: Pod> GpuBuffer<T> {
     ///
     /// For real D2H / kernel overlap, pass a [`PinnedHostBuffer`]-backed
     /// slice. The caller must `cuStreamSynchronize` before reading `dst`.
+    ///
+    /// # Safety / Lifetime contract
+    ///
+    /// **The buffer (NOT just the host destination) must outlive the
+    /// stream's completion.** There is no fence in [`GpuBuffer`]'s
+    /// `Drop` impl; dropping `self` while the DMA is still in flight
+    /// recycles the device pointer into the pool while the driver is
+    /// still reading it, which is undefined behaviour and can corrupt
+    /// unrelated allocations (the next pool consumer of that block
+    /// will see torn writes from this copy).
+    ///
+    /// Callers **MUST** call `cuStreamSynchronize` (or
+    /// [`crate::exec::launch::CudaStream::synchronize`]) on `stream`
+    /// before dropping `self`, or knowingly accept the risk. The same
+    /// rule applies to `dst`: the host pages it points to must remain
+    /// valid until the stream completes.
     pub fn copy_to_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
         if dst.len() != self.len {
             return Err(BoltError::Memory(format!(
@@ -414,9 +446,14 @@ impl<T: Pod> PinnedHostBuffer<T> {
     }
 
     /// Byte length (`len * size_of::<T>()`).
+    ///
+    /// Computed on the fly from the *logical* element count so it tracks
+    /// `set_len` truncations. To recover the original pinned allocation
+    /// size, read `self.byte_len` (the cached field) directly — not exposed
+    /// because no caller currently needs it.
     #[inline]
     pub fn byte_len(&self) -> usize {
-        self.byte_len
+        self.len * size_of::<T>()
     }
 
     /// Raw host pointer (for async memcpy FFI). May be null when `len == 0`.
@@ -466,10 +503,21 @@ impl<T: Pod> PinnedHostBuffer<T> {
     /// fewer than the buffer's allocated length.
     ///
     /// # Safety
-    /// `new_len` must be `<= len()` at allocation time and the first
-    /// `new_len` elements must be initialised (e.g. by a completed async D2H).
+    /// The first `new_len` elements must be initialised (e.g. by a
+    /// completed async D2H). The upper bound (`new_len * size_of::<T>()
+    /// <= self.byte_len`) is enforced unconditionally by an `assert!`
+    /// below — in release as well as debug — so an out-of-range
+    /// `new_len` will panic rather than silently expose uninitialised
+    /// pinned memory through `as_slice()`. The cost is an integer
+    /// compare; the safety win is that miscalculated lengths cannot
+    /// turn into UB.
     pub unsafe fn set_len(&mut self, new_len: usize) {
-        debug_assert!(new_len * size_of::<T>() <= self.byte_len);
+        assert!(
+            new_len * size_of::<T>() <= self.byte_len,
+            "PinnedHostBuffer::set_len({}) exceeds allocation ({} bytes)",
+            new_len,
+            self.byte_len,
+        );
         self.len = new_len;
     }
 }

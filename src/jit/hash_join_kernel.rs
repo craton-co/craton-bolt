@@ -208,6 +208,29 @@ pub const BUILD_AOS_KERNEL_ENTRY: &str = "bolt_hash_join_build_aos";
 /// step (which dominates multi-billion-row Utf8 joins) onto the GPU.
 pub const STRING_HASH_KERNEL_ENTRY: &str = "bolt_string_hash";
 
+/// **Stage 6 (GJ)** — entry-point name for the `LargeUtf8` (i64 offsets)
+/// variant of the device-side string-hash kernel. Distinct from
+/// [`STRING_HASH_KERNEL_ENTRY`] so the module cache picks up the right
+/// kernel and so a future planner-level dispatch can name them
+/// unambiguously.
+pub const STRING_HASH_KERNEL_ENTRY_I64: &str = "bolt_string_hash_i64";
+
+/// **Stage 6 (GJ)** — width of the Arrow offsets array consumed by the
+/// device-side string-hash kernel.
+///
+/// * [`StringOffsetWidth::I32`] — `arrow_array::StringArray` (the common
+///   case). Offsets fit in `i32`, total byte budget per array is 2 GiB.
+/// * [`StringOffsetWidth::I64`] — `arrow_array::LargeStringArray`. Used
+///   when either an individual string exceeds 2 GiB or the cumulative
+///   byte buffer exceeds 4 GiB. Same byte-loop body, just wider offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringOffsetWidth {
+    /// Arrow `Utf8` — i32 offsets.
+    I32,
+    /// Arrow `LargeUtf8` — i64 offsets.
+    I64,
+}
+
 /// Threads per block for the Stage-5 string-hash kernel. Same default as
 /// the rest of the hash-join kernels — picked for occupancy uniformity, not
 /// for any string-specific tuning.
@@ -1505,13 +1528,26 @@ pub fn compile_build_aos_kernel() -> BoltResult<String> {
 /// mean a host-built dict can't be used to look up device-hashed keys and
 /// vice-versa.
 pub fn compile_string_hash_kernel(_dtype: DataType) -> BoltResult<String> {
+    compile_string_hash_kernel_with_offsets(StringOffsetWidth::I32)
+}
+
+/// **Stage 6 (GJ)** — actual implementation. Parameterised over the
+/// Arrow offset width so `Utf8` and `LargeUtf8` share one byte-loop
+/// body. The original (i32-only) `compile_string_hash_kernel` is now a
+/// thin trampoline over this.
+pub fn compile_string_hash_kernel_with_offsets(
+    width: StringOffsetWidth,
+) -> BoltResult<String> {
     let mut p = String::new();
     writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
     writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
     writeln!(p, "{PTX_ADDRESS_SIZE}").map_err(write_err)?;
     writeln!(p).map_err(write_err)?;
 
-    let entry = STRING_HASH_KERNEL_ENTRY;
+    let entry = match width {
+        StringOffsetWidth::I32 => STRING_HASH_KERNEL_ENTRY,
+        StringOffsetWidth::I64 => STRING_HASH_KERNEL_ENTRY_I64,
+    };
     writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
     writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
     writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
@@ -1541,15 +1577,33 @@ pub fn compile_string_hash_kernel(_dtype: DataType) -> BoltResult<String> {
     writeln!(p, "\tsetp.ge.s32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
-    // Load offsets[tid] and offsets[tid + 1]. Offsets are i32 in Arrow's
-    // Utf8 layout (not i64) — that's the LargeUtf8 case, which we don't
-    // yet route through this kernel.
+    // Load offsets[tid] and offsets[tid + 1]. **Stage 6 (GJ)** — the
+    // offset-width parameter selects between Arrow's `Utf8` (i32
+    // offsets, 4-byte stride) and `LargeUtf8` (i64 offsets, 8-byte
+    // stride). The cursor / end registers stay in `%r5` / `%r6` for
+    // i32 to preserve byte-identical PTX with the original kernel; the
+    // i64 path widens the start/end into `%r5_lo`/`%r6_lo` via a 64→32
+    // narrow (LargeUtf8 strings still fit per-string in u32 in any
+    // sane workload, even if the cumulative byte buffer exceeds 4 GiB).
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.s32 %rd1, %r3, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-    writeln!(p, "\tld.global.s32 %r5, [%rd2];").map_err(write_err)?;       // start
-    writeln!(p, "\tld.global.s32 %r6, [%rd2 + 4];").map_err(write_err)?;   // end
+    match width {
+        StringOffsetWidth::I32 => {
+            writeln!(p, "\tmul.wide.s32 %rd1, %r3, 4;").map_err(write_err)?;
+            writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+            writeln!(p, "\tld.global.s32 %r5, [%rd2];").map_err(write_err)?;     // start
+            writeln!(p, "\tld.global.s32 %r6, [%rd2 + 4];").map_err(write_err)?; // end
+        }
+        StringOffsetWidth::I64 => {
+            writeln!(p, "\tmul.wide.s32 %rd1, %r3, 8;").map_err(write_err)?;
+            writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+            // i64 offsets — load into b64 scratch then narrow to b32 cursor.
+            writeln!(p, "\tld.global.s64 %rd9, [%rd2];").map_err(write_err)?;
+            writeln!(p, "\tld.global.s64 %rd10, [%rd2 + 8];").map_err(write_err)?;
+            writeln!(p, "\tcvt.u32.u64 %r5, %rd9;").map_err(write_err)?;   // start
+            writeln!(p, "\tcvt.u32.u64 %r6, %rd10;").map_err(write_err)?;  // end
+        }
+    }
 
     // Values base pointer.
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
