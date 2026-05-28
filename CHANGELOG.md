@@ -8,6 +8,120 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-28
+
+This release covers milestones M1 (foundation), M3 (join + sort), M4
+(types), M5 (observability + ergonomics), M6 (performance), M7 (API
+stabilization), and M8 (freeze prep) from `docs/PATH_TO_1.0.md`. v0.5
+brought the SQL surface up to "table stakes"; v0.6 turns to the
+execution-layer plumbing, the type system, and the public-API shape
+that 1.0 will freeze. Many of the new code paths are present but
+intentionally not yet wired into the default execution hot path — see
+the closing paragraph for the explicit carry-overs.
+
+### Added — M1 (Foundation)
+- **`Engine::register_table_stream(name, schema, iter)`** in
+  `src/exec/engine.rs`. v0.6 ships an eager implementation that drains
+  the iterator into the existing in-memory table representation; the
+  signature is future-compatible with a truly-lazy streaming path so
+  callers won't need to rewrite their code when the lazy executor
+  lands.
+- **Async memcpy + pinned host buffers** piloted in the scalar
+  aggregate executor (`src/exec/aggregate.rs::upload_primitive_values_async`).
+  Per-shape rollout to the other executors is deferred to v0.7.
+- **`KernelSpec`-keyed module cache** in `src/exec/module_cache.rs`,
+  built and unit-tested. The cache skips both codegen and PTXAS on a
+  hit. Call-site wiring is deferred to v0.7.
+
+### Added — M3 (Join + Sort)
+- **GPU radix-sort kernel scaffold** for `Int32` and `Int64` in
+  `src/jit/sort_kernel_radix.rs`. Env-gated via `BOLT_GPU_SORT=1`; not
+  integrated into `src/exec/sort.rs` yet (that wiring is a v0.7 task).
+- **Non-equi join via nested-loop** in
+  `src/exec/join.rs::execute_nested_loop_join`. INNER only, capped at
+  `MAX_NESTED_LOOP_INNER_ROWS = 1024`. Closes the long-standing
+  non-equi gap for small-cardinality cases.
+
+### Added — M4 (Types)
+- **`DataType::Decimal128(p, s)`** plumbed end-to-end through the
+  logical plan + Arrow round-trip. `Literal::Decimal128` carried
+  through the parser and type-checker. `CAST(int AS DECIMAL(p, s))`
+  parses; GPU codegen rejects cleanly with `"Decimal128 not yet
+  lowered to GPU"` until the runtime path lands.
+- **`DataType::Date32`** and **`DataType::Timestamp(TimeUnit,
+  Option<&'static str>)`** with a `TimeUnit` enum. `Literal::Date32(i32)`
+  and `Literal::Timestamp(i64, unit, tz)`. `DATE '...'` and
+  `TIMESTAMP '...'` literals parse. Timezones are interned via
+  `crate::plan::logical_plan::intern_timezone` so `DataType` stays
+  `Copy`.
+
+### Added — M5 (Observability + ergonomics)
+- **`tracing` crate dependency** with spans on the full
+  parse / plan / lower / codegen / ptx_load / launch / transfer /
+  materialize pipeline. Span names catalogued in
+  `src/observability.rs`. Off by default; opt-in via the consumer's
+  `tracing_subscriber`.
+- **`BoltError` is now `#[non_exhaustive]`** and gains a
+  `SqlWithSpan { msg, span: Range<usize> }` variant plus a
+  `BoltError::span()` accessor. sqlparser parse errors are wrapped
+  via `parse_error_to_bolt_error` in `src/plan/sql_frontend.rs`.
+- **Did-you-mean suggestions** in `Schema::index_of`,
+  `NameResolver::resolve_compound`, and `try_aggregate`. Backed by a
+  shared Levenshtein helper in `src/plan/suggest.rs` (edit distance
+  capped at 2).
+
+### Added — M6 (Performance)
+- **Disk-backed PTX cache** in `src/jit/disk_cache.rs`. Opt-in via the
+  `BOLT_PTX_CACHE_DIR=/path` env var or a builder hook. Writes are
+  atomic (`tempfile` + rename) so a partially-written cache entry
+  can't poison subsequent runs.
+- **Criterion regression bench scaffold** in `benches/regression.rs`.
+  Three queries (scalar aggregate, GROUP BY, filter) measured at
+  parse / lower / ptx_gen. cuda-stub invocation is documented; a >5%
+  slowdown convention is established for the regression workflow.
+
+### Added — M7 (API stabilization)
+- **`Engine::Builder` (`EngineBuilder`)** with knobs for `device`,
+  `memory_budget`, `persistent_cache`, and `enable_tracing`.
+  `Engine::new` and `Engine::new_with_device` are preserved as thin
+  wrappers over the builder. `Engine` is now `#[non_exhaustive]` so
+  future fields don't break downstream destructuring.
+- **`DataFrame::collect(self, engine: &mut Engine) -> BoltResult<RecordBatch>`** —
+  the `#[doc(hidden)]` tombstone is gone; `collect` now materializes
+  through the new `Engine::run_logical_plan` entry point.
+- **`PlanRewrite` trait** in `src/plan/rewrite.rs`. `Engine` stores
+  `rewrites: Vec<Box<dyn PlanRewrite>>` and threads them through
+  `Engine::sql` immediately before `lower_physical`. Builder /
+  fluent hook: `Engine::with_rewrite(self, r) -> Self`.
+- **`docs/API_SURFACE.md`** enumerates the public surface by
+  stability tier, distinguishing the items 1.0 will freeze from the
+  ones still subject to change.
+
+### Added — M8 (Freeze prep)
+- **`docs/MIGRATION_GUIDE.md`** — covers `0.3 → 0.5 → 0.6` upgrade
+  paths.
+
+### Added — Docs
+- **`docs/USER_GUIDE.md`** — 10-minute-tutorial structure aimed at
+  first-time users.
+
+### Notes — intentionally NOT in v0.6 (carry-overs for v0.7+)
+
+The following items parse and type-check in v0.6 but reject at the
+GPU lowering boundary; the runtime paths are scheduled for v0.7+:
+
+- GPU lowering for `CASE`, `CAST`, scalar string funcs, `LIKE` with
+  `ESCAPE`, `||` in `WHERE` predicates, grouped `STDDEV` / `VAR`,
+  `Decimal128` arithmetic, and `Date` / `Timestamp` arithmetic.
+- Per-executor async-memcpy wiring beyond the scalar aggregate pilot.
+- `KernelSpec` cache integration into call sites (the cache is built
+  and unit-tested; wiring is deferred).
+- GPU radix sort integration in `src/exec/sort.rs` (the kernel
+  scaffold exists; the dispatch is gated behind an env var and not
+  yet selected by the planner).
+- Disk PTX cache wiring through `EngineBuilder::build` — the env-var
+  path works today, but the builder knob is not yet honored.
+
 ## [0.5.0] - 2026-05-28
 
 This release covers the M2 milestone from `docs/PATH_TO_1.0.md`: SQL scalar
@@ -322,5 +436,7 @@ Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --
 - Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
 - Polars head-to-head numbers are not yet published.
 
+[0.6.0]: https://github.com/craton-co/craton-bolt/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/craton-co/craton-bolt/compare/v0.3.0...v0.5.0
 [0.3.0]: https://github.com/craton-co/craton-bolt/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/craton-co/craton-bolt/releases/tag/v0.1.0
