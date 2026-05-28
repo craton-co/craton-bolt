@@ -204,11 +204,12 @@ use crate::exec::n_rows_to_u32;
 use crate::jit::hash_join_kernel::{
     compile_build_aos_kernel, compile_build_collision_kernel, compile_build_kernel,
     compile_cross_kernel, compile_probe_aos_kernel, compile_probe_collision_kernel,
-    compile_probe_kernel, compile_string_hash_kernel, compile_unmatched_build_kernel,
-    KeyShape, AOS_SLOT_BYTES, BUILD_AOS_KERNEL_ENTRY, BUILD_COLLISION_KERNEL_ENTRY,
-    BUILD_KERNEL_ENTRY, CROSS_KERNEL_ENTRY, HASH_JOIN_BLOCK_SIZE,
-    PROBE_AOS_KERNEL_ENTRY, PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY,
-    STRING_HASH_BLOCK_SIZE, STRING_HASH_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
+    compile_probe_kernel, compile_probe_kernel_tiled, compile_string_hash_kernel,
+    compile_unmatched_build_kernel, KeyShape, AOS_SLOT_BYTES, BUILD_AOS_KERNEL_ENTRY,
+    BUILD_COLLISION_KERNEL_ENTRY, BUILD_KERNEL_ENTRY, CROSS_KERNEL_ENTRY,
+    HASH_JOIN_BLOCK_SIZE, PROBE_AOS_KERNEL_ENTRY, PROBE_COLLISION_KERNEL_ENTRY,
+    PROBE_KERNEL_ENTRY, PROBE_KERNEL_TILED_ENTRY, STRING_HASH_BLOCK_SIZE,
+    STRING_HASH_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
 };
 use crate::jit::jit_compiler::CudaModule;
 use crate::plan::logical_plan::DataType;
@@ -811,6 +812,41 @@ fn launch_build_kernel(
     Ok(())
 }
 
+/// **Batch 6** — env var that opts the SoA probe into the tile-aware 2-way
+/// unrolled variant emitted by
+/// [`crate::jit::hash_join_kernel::compile_probe_kernel_tiled`].
+///
+/// Default is **off**: the single-load probe is the byte-stable Stage-1 path
+/// and remains the dispatch default until the tiled kernel is smoke-tested
+/// on real GPU hardware. Set the env var to any non-empty value other than
+/// `"0"` / `"false"` (case-insensitive) to opt in:
+///
+/// ```text
+/// BOLT_HASH_PROBE_TILED=1     # opt in
+/// BOLT_HASH_PROBE_TILED=true  # opt in
+/// BOLT_HASH_PROBE_TILED=0     # off (same as unset)
+/// BOLT_HASH_PROBE_TILED=false # off
+/// ```
+///
+/// The tiled kernel has an identical nine-parameter ABI, so opting in only
+/// switches which entry point [`launch_probe_kernel`] resolves at module
+/// load. All other launch parameters (block size, grid shape, output
+/// buffer sizing) are unchanged.
+pub const PROBE_TILED_ENV_VAR: &str = "BOLT_HASH_PROBE_TILED";
+
+/// Read [`PROBE_TILED_ENV_VAR`]. Returns `true` when the variable is set to
+/// a non-empty value other than `"0"` / `"false"` (case-insensitive).
+/// Returns `false` on any other value (unset, empty, `"0"`, `"false"`).
+fn probe_tiled_enabled() -> bool {
+    match std::env::var(PROBE_TILED_ENV_VAR) {
+        Ok(v) => {
+            let s = v.trim();
+            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
+}
+
 /// Run the probe kernel: for each probe row, walk the hash table and emit
 /// `(probe_idx, build_idx)` into the output buffers via an atomic counter.
 ///
@@ -819,6 +855,11 @@ fn launch_build_kernel(
 /// more than `out_capacity` slots the counter will still hold the true count
 /// (the kernel only skips the *writes* on overflow), so callers can detect
 /// the overflow and re-run with a bigger output buffer.
+///
+/// **Batch 6** — when [`PROBE_TILED_ENV_VAR`] is opted in, the launcher
+/// resolves [`PROBE_KERNEL_TILED_ENTRY`] instead of [`PROBE_KERNEL_ENTRY`]
+/// and ships the 2-way unrolled `compile_probe_kernel_tiled` PTX. The two
+/// kernels share an identical ABI so the launch params don't change.
 fn launch_probe_kernel(
     probe_keys_dev: &GpuVec<i64>,
     keys_table_dev: &GpuVec<i64>,
@@ -836,9 +877,28 @@ fn launch_probe_kernel(
         return Ok(0);
     }
 
-    let ptx = compile_probe_kernel()?;
+    // Batch-6 tile-aware probe dispatch. Off by default (PROBE_TILED_ENV_VAR
+    // unset) until smoke-tested on real GPU hardware; the single-load probe
+    // remains the byte-stable Stage-1 default. The two kernels share an
+    // identical nine-parameter ABI so the only difference here is the
+    // entry-point name and the PTX source.
+    let tiled = probe_tiled_enabled();
+    let ptx = if tiled {
+        compile_probe_kernel_tiled()?
+    } else {
+        compile_probe_kernel()?
+    };
     let module = CudaModule::from_ptx(&ptx)?;
-    let function = module.function(PROBE_KERNEL_ENTRY)?;
+    let function = module.function(if tiled {
+        PROBE_KERNEL_TILED_ENTRY
+    } else {
+        PROBE_KERNEL_ENTRY
+    })?;
+    log::debug!(
+        "gpu_join: launching probe kernel (tiled={tiled}, {PROBE_TILED_ENV_VAR}={:?}, \
+         n_probe={n_probe_rows}, cap={cap}, out_capacity={out_capacity})",
+        std::env::var(PROBE_TILED_ENV_VAR).ok()
+    );
 
     let mut probe_keys_ptr: CUdeviceptr = probe_keys_dev.device_ptr();
     let mut keys_table_ptr: CUdeviceptr = keys_table_dev.device_ptr();
@@ -3915,6 +3975,42 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var(STREAMING_INTERN_ENV_VAR, v),
             None => std::env::remove_var(STREAMING_INTERN_ENV_VAR),
+        }
+    }
+
+    /// **Batch 6** — `BOLT_HASH_PROBE_TILED` toggles the SoA probe between
+    /// the single-load Stage-1 kernel and the tile-aware 2-way unrolled
+    /// kernel. Default off (unset / empty / "0" / "false"); any other
+    /// non-empty value flips it on. Host-only, no CUDA driver involvement.
+    #[test]
+    fn probe_tiled_env_var_toggle() {
+        let prev = std::env::var(PROBE_TILED_ENV_VAR).ok();
+
+        std::env::remove_var(PROBE_TILED_ENV_VAR);
+        assert!(!probe_tiled_enabled(), "unset env: tiled OFF");
+
+        std::env::set_var(PROBE_TILED_ENV_VAR, "");
+        assert!(!probe_tiled_enabled(), "empty env: tiled OFF");
+
+        std::env::set_var(PROBE_TILED_ENV_VAR, "0");
+        assert!(!probe_tiled_enabled(), "'0' env: tiled OFF");
+
+        std::env::set_var(PROBE_TILED_ENV_VAR, "false");
+        assert!(!probe_tiled_enabled(), "'false' env: tiled OFF");
+
+        std::env::set_var(PROBE_TILED_ENV_VAR, "FALSE");
+        assert!(!probe_tiled_enabled(), "'FALSE' env (case-insensitive): tiled OFF");
+
+        std::env::set_var(PROBE_TILED_ENV_VAR, "1");
+        assert!(probe_tiled_enabled(), "'1' env: tiled ON");
+
+        std::env::set_var(PROBE_TILED_ENV_VAR, "true");
+        assert!(probe_tiled_enabled(), "'true' env: tiled ON");
+
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var(PROBE_TILED_ENV_VAR, v),
+            None => std::env::remove_var(PROBE_TILED_ENV_VAR),
         }
     }
 
