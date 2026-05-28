@@ -357,6 +357,22 @@ impl Expr {
         binary(BinaryOp::Or, self, rhs)
     }
 
+    /// `self IS NULL`. Returns a Bool expression, never null.
+    pub fn is_null(self) -> Expr {
+        Expr::Unary {
+            op: UnaryOp::IsNull,
+            operand: Box::new(self),
+        }
+    }
+
+    /// `self IS NOT NULL`. Returns a Bool expression, never null.
+    pub fn is_not_null(self) -> Expr {
+        Expr::Unary {
+            op: UnaryOp::IsNotNull,
+            operand: Box::new(self),
+        }
+    }
+
     /// Resolve the static type of this expression against `schema`.
     // TODO(nullable): add CASE/COALESCE/IS NULL/IS NOT NULL variants
     pub fn dtype(&self, schema: &Schema) -> BoltResult<DataType> {
