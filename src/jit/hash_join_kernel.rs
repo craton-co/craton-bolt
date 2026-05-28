@@ -6,6 +6,17 @@
 //! single-key, Int32/Int64 INNER joins. Two kernels cooperate via an open-
 //! addressing, linear-probed hash table held entirely in device memory.
 //!
+//! ## Output-counter contention guard
+//!
+//! Probe kernels use a speculative `ld.acquire` pre-check before
+//! `atom.global.add` on the output counter to avoid serialization under
+//! capacity overflow. Without it, every matching thread issues an atomic
+//! increment even after the output buffer is full, causing all warps to
+//! serialize on the single counter cacheline. With the pre-check, threads
+//! that observe `counter >= out_capacity` bail before the atomic; the atomic
+//! still re-checks (it returns the pre-increment value) so a thread that
+//! raced past the pre-check still bounds-checks the claimed index.
+//!
 //! ## Hash table layout (SoA)
 //!
 //! Two parallel device buffers of length `cap` (power of two):
@@ -705,6 +716,15 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     // atom.add on counter: claim slot.
     writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_5];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    // Speculative ld.acquire pre-check: if the counter is already at or past
+    // out_capacity, every subsequent atom.add is wasted work that serializes
+    // matching threads on the counter cacheline. Skip the atomic and bail.
+    // Correctness: the atomic still bounds-checks below, so a thread that
+    // races past this pre-check (seeing a stale-but-low counter) is still
+    // guarded by the post-atomic setp.ge.u32 against the returned index.
+    writeln!(p, "\tld.acquire.gpu.u32 %r12, [%rd8];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p5, %r12, %r22;").map_err(write_err)?;
+    writeln!(p, "\t@%p5 bra DONE;").map_err(write_err)?;
     writeln!(p, "\tmov.u32 %r10, 1;").map_err(write_err)?;
     writeln!(p, "\tatom.global.add.u32 %r11, [%rd8], %r10;").map_err(write_err)?;
 
@@ -1019,7 +1039,19 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tsetp.ge.u32 %p4, %r25, %r24;").map_err(write_err)?;
     writeln!(p, "\t@%p4 bra DONE;").map_err(write_err)?;
 
-    // Atomic claim an output index.
+    // Atomic claim an output index. Speculative ld.acquire pre-check first:
+    // if the counter is already at or past out_capacity, skip the atom.add
+    // entirely so contending threads don't all serialize on the counter
+    // cacheline. We bail to DONE on a confirmed overflow — the host will
+    // re-launch with a larger output buffer (counter > out_capacity is the
+    // only signal it needs; the exact overflow magnitude isn't required).
+    // Correctness: a thread that races past this pre-check (e.g. sees a
+    // stale low counter) still bounds-checks the atom.add's pre-increment
+    // return against out_capacity below, so we still never write past the
+    // end of the output buffers.
+    writeln!(p, "\tld.acquire.gpu.u32 %r33, [%rd18];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p7, %r33, %r23;").map_err(write_err)?;
+    writeln!(p, "\t@%p7 bra DONE;").map_err(write_err)?;
     writeln!(p, "\tmov.u32 %r26, 1;").map_err(write_err)?;
     writeln!(p, "\tatom.global.add.u32 %r27, [%rd18], %r26;").map_err(write_err)?;
     // Skip stores on overflow but keep counter climbing so host can detect.
@@ -1123,12 +1155,20 @@ pub fn compile_unmatched_build_kernel() -> BoltResult<String> {
     writeln!(p, "\tsetp.ne.u32 %p1, %r9, 0;").map_err(write_err)?;
     writeln!(p, "\t@%p1 bra DONE;").map_err(write_err)?;
 
-    // Claim a slot.
+    // Claim a slot. Speculative ld.acquire pre-check: if the counter is
+    // already past out_capacity, skip the atom.add entirely so contending
+    // threads don't all serialize on the counter cacheline. Correctness:
+    // the post-atomic setp.ge.u32 below still bounds-checks the returned
+    // (pre-increment) index, so a thread that races past the pre-check is
+    // still safe.
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_2];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+    writeln!(p, "\tld.param.u32 %r12, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(p, "\tld.acquire.gpu.u32 %r13, [%rd3];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p3, %r13, %r12;").map_err(write_err)?;
+    writeln!(p, "\t@%p3 bra DONE;").map_err(write_err)?;
     writeln!(p, "\tmov.u32 %r10, 1;").map_err(write_err)?;
     writeln!(p, "\tatom.global.add.u32 %r11, [%rd3], %r10;").map_err(write_err)?;
-    writeln!(p, "\tld.param.u32 %r12, [{entry}_param_4];").map_err(write_err)?;
     writeln!(p, "\tsetp.ge.u32 %p2, %r11, %r12;").map_err(write_err)?;
     writeln!(p, "\t@%p2 bra DONE;").map_err(write_err)?;
 
@@ -1339,9 +1379,16 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
 
     writeln!(p, "MATCH:").map_err(write_err)?;
-    // atom.add on counter.
+    // atom.add on counter. Speculative ld.acquire pre-check: if the counter
+    // is already past out_capacity, skip the atom.add to avoid serializing
+    // matching threads on a hot cacheline. The post-atomic setp.ge.u32
+    // below still bounds-checks the returned (pre-increment) index, so the
+    // pre-check is purely additive and overflow can never bypass the guard.
     writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_4];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    writeln!(p, "\tld.acquire.gpu.u32 %r13, [%rd8];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p5, %r13, %r22;").map_err(write_err)?;
+    writeln!(p, "\t@%p5 bra DONE;").map_err(write_err)?;
     writeln!(p, "\tmov.u32 %r11, 1;").map_err(write_err)?;
     writeln!(p, "\tatom.global.add.u32 %r12, [%rd8], %r11;").map_err(write_err)?;
     writeln!(p, "\tsetp.ge.u32 %p4, %r12, %r22;").map_err(write_err)?;
