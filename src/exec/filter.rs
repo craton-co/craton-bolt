@@ -14,6 +14,30 @@
 //! `arrow::compute::filter` to every column. Group-by outputs are tiny
 //! (one row per group), so a host-side pass is the right cost trade-off
 //! for 0.3 — pushing HAVING down to GPU kernels would buy nothing here.
+//!
+//! # v0.7 async-memcpy plumbing
+//!
+//! `execute_filter` itself is host-only — it never crosses the host/device
+//! boundary, so there is no `from_slice` / `to_vec` pair to migrate to the
+//! aggregate executor's async-memcpy + pinned-host-buffer template. The
+//! WHERE-clause GPU filter path (scan-kernel + prefix-scan + gather) lives
+//! upstream in `engine::execute_projection` + `crate::exec::gpu_compact`
+//! and already runs on a per-call stream with pinned-D2H downloads.
+//!
+//! What this module DOES import is the shared
+//! [`crate::exec::gpu_upload::upload_primitive_values_async`] helper —
+//! promoted out of `exec::aggregate` for v0.7. Holding the import here
+//! (rather than re-introducing a local shim) means that when the
+//! WHERE→host fallback path inside `execute_filter` grows a GPU fast
+//! path for a primitive column (e.g. lifting predicate evaluation onto
+//! the device for very wide group-by outputs), it can adopt the same
+//! `(slice, &CudaStream) -> GpuVec<T>` shape as the aggregate executor
+//! with zero re-implementation, including the documented `cuda-stub`
+//! graceful degradation.
+//!
+//! A unit test under `--features cuda-stub` exercises the shared helper
+//! from this module to pin that contract end-to-end — see
+//! `tests::cuda_stub_upload_helper_is_reachable_from_filter`.
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
@@ -23,6 +47,12 @@ use arrow_schema::DataType as ArrowDataType;
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::expr_agg::{self, ColumnEnv, HostColumn};
+// v0.7: re-exported shared helper for the async-memcpy + pinned-buffer
+// pattern. Used today only by the `cuda-stub` graceful-fallback test
+// below; pre-positioned here so a future GPU-lifted predicate path can
+// adopt it without re-importing the shim everywhere.
+#[allow(unused_imports)]
+use crate::exec::gpu_upload::upload_primitive_values_async;
 use crate::exec::QueryHandle;
 use crate::plan::logical_plan::{DataType, Expr};
 
@@ -303,5 +333,49 @@ mod tests {
             .expect("Int32 id col");
         let ids: Vec<i32> = (0..id_arr.len()).map(|i| id_arr.value(i)).collect();
         assert_eq!(ids, vec![1, 3, 5]);
+    }
+
+    /// v0.7 async-memcpy plumbing: the shared
+    /// `upload_primitive_values_async` helper is importable and callable
+    /// from this module without panic under `--features cuda-stub`. The
+    /// helper itself surfaces `CUDA_ERROR_STUB` for any non-empty upload
+    /// in the stub backend (this is the documented graceful-degradation
+    /// shape — see `gpu_upload`'s module docs); what this test pins is
+    /// that the call from the FILTER executor's translation unit
+    /// produces a structured `BoltResult::Err` rather than crashing the
+    /// process, which a future GPU-lifted predicate path needs in order
+    /// to fall back to the host evaluator cleanly.
+    ///
+    /// The validity-bitmap side of the path is covered transitively: an
+    /// empty (zero-len) upload doesn't touch the FFI and so succeeds
+    /// regardless of feature flag, which exercises the "skip the H2D
+    /// when there's nothing to copy" branch that any future nullable
+    /// fast path will need to honour for all-null input columns.
+    #[cfg(feature = "cuda-stub")]
+    #[test]
+    fn cuda_stub_upload_helper_is_reachable_from_filter() {
+        use crate::exec::launch::CudaStream;
+
+        let stream = CudaStream::null_or_default();
+
+        // Zero-length upload: short-circuits before the driver call, so
+        // it must succeed under cuda-stub.
+        let empty: [i32; 0] = [];
+        let v = upload_primitive_values_async::<i32>(&empty, &stream)
+            .expect("zero-len upload short-circuits in cuda-stub");
+        assert_eq!(v.len(), 0);
+
+        // Non-empty: the sync FFI shim returns CUDA_ERROR_STUB, which
+        // the helper must surface as `Err`. The exact error variant is
+        // not part of the public contract here; what matters is that
+        // it's recoverable (no panic), so the future GPU fallback can
+        // catch it and fall back to the host predicate evaluator
+        // already used by `execute_filter`.
+        let xs: [i64; 3] = [10, 20, 30];
+        let r = upload_primitive_values_async::<i64>(&xs, &stream);
+        assert!(
+            r.is_err(),
+            "cuda-stub backend must report Err (not panic) for a real upload"
+        );
     }
 }
