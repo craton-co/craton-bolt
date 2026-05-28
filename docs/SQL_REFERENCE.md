@@ -95,7 +95,7 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 
 - Every non-aggregate SELECT item must appear in `GROUP BY` (verified via structural equality).
 - Aggregate inputs that aren't bare columns are routed through the `pre` kernel (which materialises the expression) then the standard reduction.
-- Post-aggregate expressions (`SUM(price) + 1`) are not yet supported — emits a `BoltError::Sql("post-aggregate expressions not yet supported")`.
+- Post-aggregate scalar expressions are accepted by the SQL frontend: `SUM(price) + 1`, `AVG(qty) * 2`, `(SUM(a) + SUM(b)) / 2`, and `SUM(x) + 1 AS total` (alias). The aggregates nested inside the expression are extracted as feed inputs (deduplicated by output name across the SELECT list), and the surface expression is rewritten with `Column("<aggregate_output_name>")` at each aggregate position — then evaluated by the post-Aggregate `Project`. End-to-end execution of the rewritten Project lands in a follow-up: the physical `Project` executor still only handles bare column references / aliases; computed projections currently surface a `BoltError::Plan` at execute time.
 
 ## Aggregate functions
 

@@ -1217,9 +1217,15 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         .any(|o| o.is_some());
 
     if has_agg_in_select || !group_by_sql.is_empty() {
-        // Aggregate mode. Simplification: every selected item is either a bare
-        // aggregate call or a bare group key already listed in GROUP BY. Mixed
-        // post-aggregate scalar work (e.g. `SUM(a) + 1`) is rejected up front.
+        // Aggregate mode. Each SELECT item is one of:
+        //   * a bare aggregate call (`SUM(v)`),
+        //   * a bare group key already listed in GROUP BY (`k`),
+        //   * a scalar expression containing one or more aggregates
+        //     (`SUM(price) + 1`, `AVG(qty) * 2`, `(SUM(a) + SUM(b)) / 2`) —
+        //     the nested aggregates are extracted as feed inputs and the
+        //     surface expression is rewritten with `Column("<agg_out>")` at
+        //     each aggregate position. The rewritten expression goes into the
+        //     post-Aggregate Project as a computed projection.
         let group_by: Vec<Expr> = group_by_sql
             .iter()
             .map(|e| lower_expr(e, &resolver, 0))
@@ -1238,11 +1244,22 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
             /// Project (so HAVING and downstream stages can reference it by
             /// the user-friendly name).
             Aggregate { index: usize, alias: Option<String> },
+            /// SELECT is a scalar expression with one or more aggregates
+            /// inside. The expression has already been lowered with each
+            /// aggregate position replaced by `Expr::Column(agg_out_name)`;
+            /// each extracted aggregate has been pushed onto `aggregates`
+            /// (deduplicated by output name). The Project step evaluates
+            /// `expr` against the Aggregate's output schema.
+            Computed { expr: Expr, alias: Option<String> },
         }
         let mut select_sources: Vec<SelectSource> = Vec::new();
 
         for (sql_expr, alias) in &items {
             if let Some(agg) = try_aggregate(sql_expr, &resolver, 0)? {
+                // Bare aggregate path is unchanged: append the aggregate
+                // without deduplication so the Aggregate plan node mirrors
+                // the SELECT list 1:1 (pre-existing behaviour, exercised
+                // by tier-2 tests).
                 let idx = aggregates.len();
                 aggregates.push(agg);
                 select_sources.push(SelectSource::Aggregate {
@@ -1251,11 +1268,23 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
                 });
                 continue;
             }
-            // Non-aggregate: must contain no nested aggregate (no post-aggregate exprs).
+            // Non-bare-aggregate item. Two sub-cases:
+            //   (a) the item contains aggregates nested inside scalar
+            //       operators (post-aggregate scalar expression). Extract
+            //       each aggregate as a feed input and rewrite the surface
+            //       expression with `Column("<agg_out>")` at each aggregate
+            //       position. The rewritten expression becomes a `Computed`
+            //       projection that the post-Aggregate Project evaluates.
+            //   (b) the item has no aggregates at all. It must then resolve
+            //       to a declared GROUP BY key (existing path).
             if contains_aggregate(sql_expr, &resolver, 0)? {
-                return Err(BoltError::Sql(
-                    "post-aggregate expressions not yet supported".into(),
-                ));
+                let rewritten =
+                    extract_and_rewrite_aggregates(sql_expr, &resolver, &mut aggregates, 0)?;
+                select_sources.push(SelectSource::Computed {
+                    expr: rewritten,
+                    alias: alias.clone(),
+                });
+                continue;
             }
             let lowered = lower_expr(sql_expr, &resolver, 0)?;
             // Must match some declared GROUP BY key by structural equality of the lowered form.
@@ -1329,6 +1358,17 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
                     proj_exprs.push(match alias {
                         Some(a) => col.alias(a.clone()),
                         None => col,
+                    });
+                }
+                SelectSource::Computed { expr, alias } => {
+                    // The expression already references aggregate output
+                    // columns (`Column("sum_price")`) and/or any other
+                    // columns visible in the Aggregate's output schema. Wrap
+                    // in `Alias` if the SELECT item carried `AS <name>`.
+                    let e = expr.clone();
+                    proj_exprs.push(match alias {
+                        Some(a) => e.alias(a.clone()),
+                        None => e,
                     });
                 }
             }
@@ -1927,6 +1967,126 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
             Ok(false)
         }
         _ => Ok(false),
+    }
+}
+
+/// Append `agg` to `aggregates` unless an aggregate with the same
+/// `aggregate_output_name` is already present, in which case return the
+/// existing index. Used by the post-aggregate scalar rewriter so that
+/// `SUM(x) + SUM(x)` (and `SELECT SUM(x), SUM(x) + 1` from the same
+/// SELECT list) feed off a single physical aggregate, and the rewritten
+/// surface expression references the same output column at both
+/// positions.
+fn push_aggregate_dedup(aggregates: &mut Vec<AggregateExpr>, agg: AggregateExpr) -> usize {
+    let name = aggregate_output_name(&agg);
+    if let Some(pos) = aggregates
+        .iter()
+        .position(|a| aggregate_output_name(a) == name)
+    {
+        return pos;
+    }
+    let idx = aggregates.len();
+    aggregates.push(agg);
+    idx
+}
+
+/// Walk a SQL expression that contains one or more aggregate calls,
+/// extracting each aggregate into `aggregates` (deduplicated by output
+/// name via [`push_aggregate_dedup`]) and returning a lowered `Expr`
+/// where every aggregate position has been replaced by
+/// `Expr::Column(aggregate_output_name)`.
+///
+/// Used by `plan_select` for post-aggregate scalar SELECT items like
+/// `SUM(price) + 1`, `AVG(qty) * 2`, `(SUM(a) + SUM(b)) / 2`. The returned
+/// `Expr` is evaluated by the post-Aggregate Project against the
+/// Aggregate's output schema.
+///
+/// Sub-expressions that contain no aggregate (e.g. the `1` in
+/// `SUM(price) + 1`, or a bare column reference resolved at scan time
+/// but kept in the Aggregate's output via GROUP BY) fall through to
+/// [`lower_expr`] unchanged. That keeps the rule for non-aggregate
+/// fragments — name resolution, value lowering, literal parsing — in a
+/// single place.
+///
+/// `depth` is the current recursion depth; returns Err if
+/// `MAX_RECURSION_DEPTH` is exceeded.
+fn extract_and_rewrite_aggregates(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    aggregates: &mut Vec<AggregateExpr>,
+    depth: usize,
+) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    // Aggregate call at this node: lower it, dedup against the pool,
+    // return a reference to its output column.
+    if let Some(agg) = try_aggregate(e, resolver, depth + 1)? {
+        // Compute the dedup key *before* moving `agg` into the pool.
+        let name = aggregate_output_name(&agg);
+        let _idx = push_aggregate_dedup(aggregates, agg);
+        return Ok(Expr::Column(name));
+    }
+    match e {
+        SqlExpr::Nested(inner) => {
+            extract_and_rewrite_aggregates(inner, resolver, aggregates, depth + 1)
+        }
+        SqlExpr::BinaryOp { left, op, right } => {
+            let lop = lower_binary_op(op)?;
+            let l = extract_and_rewrite_aggregates(left, resolver, aggregates, depth + 1)?;
+            let r = extract_and_rewrite_aggregates(right, resolver, aggregates, depth + 1)?;
+            Ok(Expr::Binary {
+                op: lop,
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        }
+        SqlExpr::UnaryOp { op, expr } => match op {
+            UnaryOperator::Plus => {
+                extract_and_rewrite_aggregates(expr, resolver, aggregates, depth + 1)
+            }
+            UnaryOperator::Minus => {
+                // Mirror `lower_expr_in_having`'s unary-minus handling: we
+                // cannot fall through to `negate_expr` because it would
+                // route the operand through `lower_expr` and reject any
+                // aggregate call nested under the unary minus
+                // (`-SUM(v)`). Lower the operand recursively then negate
+                // structurally as `0 - operand`.
+                let inner =
+                    extract_and_rewrite_aggregates(expr, resolver, aggregates, depth + 1)?;
+                Ok(Expr::Binary {
+                    op: BinaryOp::Sub,
+                    left: Box::new(Expr::Literal(Literal::Int64(0))),
+                    right: Box::new(inner),
+                })
+            }
+            other => Err(BoltError::Sql(format!(
+                "unsupported unary operator: {other:?}"
+            ))),
+        },
+        SqlExpr::IsNull(inner) => {
+            let operand =
+                extract_and_rewrite_aggregates(inner, resolver, aggregates, depth + 1)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(operand),
+            })
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let operand =
+                extract_and_rewrite_aggregates(inner, resolver, aggregates, depth + 1)?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(operand),
+            })
+        }
+        // Any other shape (Identifier, CompoundIdentifier, Value, ...)
+        // is by construction aggregate-free at this node (otherwise the
+        // `try_aggregate` branch above would have fired). Defer to the
+        // normal lowerer for name resolution and literal parsing.
+        _ => lower_expr(e, resolver, depth + 1),
     }
 }
 
