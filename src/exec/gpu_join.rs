@@ -1106,7 +1106,17 @@ pub fn hash_join_indices_on_gpu_aos(
         &stream,
     )?;
     if n_matches_raw > out_capacity_u32 {
-        return Err(BoltError::Other(format!(
+        // Probe overflow: kernel wrote more matches than out_capacity.
+        // The host join handles this input fine — return the fallback
+        // signal so the executor retries there. The caller
+        // (`try_gpu_inner_join`) treats any `Err(_)` as "GPU declined"
+        // and falls back; we use the typed `GpuCapacity` variant so the
+        // pattern-match is recognisable rather than string-parsed.
+        log::warn!(
+            "gpu join probe overflow ({n_matches_raw} > {out_capacity_u32}); \
+             falling back to host hash join"
+        );
+        return Err(BoltError::GpuCapacity(format!(
             "gpu_join: AoS probe claimed {n_matches_raw} matches > capacity {out_capacity_u32}"
         )));
     }
@@ -1209,11 +1219,19 @@ pub fn hash_join_indices_on_gpu(
     )?;
 
     if n_matches_raw > out_capacity_u32 {
-        // Overflow: the kernel saw more matches than we sized for. This
-        // shouldn't happen under the INNER + unique-build invariant
-        // enforced by the gate, but if it does we surface a clear error
-        // rather than silently truncating.
-        return Err(BoltError::Other(format!(
+        // Probe overflow: kernel wrote more matches than out_capacity. The
+        // host join handles this input fine — return the fallback signal so
+        // the executor retries there. Under the INNER + unique-build
+        // invariant enforced by the gate this shouldn't fire, but if it
+        // does (e.g. duplicate-key violation slipping past the conservative
+        // gate) we route to the host hash-join rather than silently
+        // truncating. `try_gpu_inner_join` maps any `Err(_)` to `Ok(None)`,
+        // and `GpuCapacity` is the typed marker for that path.
+        log::warn!(
+            "gpu join probe overflow ({n_matches_raw} > {out_capacity_u32}); \
+             falling back to host hash join"
+        );
+        return Err(BoltError::GpuCapacity(format!(
             "gpu_join: probe kernel claimed {n_matches_raw} matches but \
              output buffer was sized for {out_capacity_u32}; \
              likely a build-side duplicate-key violation. Fall back to host path."
@@ -1435,7 +1453,16 @@ pub fn hash_join_indices_on_gpu_with_shape(
     )?;
 
     if n_matches_raw > out_capacity_u32 {
-        return Err(BoltError::Other(format!(
+        // Probe overflow: kernel wrote more matches than out_capacity. The
+        // host join handles this input fine — return the fallback signal so
+        // the executor retries there. `try_gpu_inner_join` catches any
+        // `Err(_)` and falls back to the host hash-join; `GpuCapacity` is
+        // the typed marker for that path.
+        log::warn!(
+            "gpu join probe overflow ({n_matches_raw} > {out_capacity_u32}); \
+             falling back to host hash join"
+        );
+        return Err(BoltError::GpuCapacity(format!(
             "gpu_join: probe kernel claimed {n_matches_raw} matches but \
              output buffer was sized for {out_capacity_u32}"
         )));
@@ -1584,7 +1611,17 @@ pub fn execute_outer_join_indices_on_gpu(
     )?;
 
     if n_matches_raw > out_capacity_u32 {
-        return Err(BoltError::Other(format!(
+        // Probe overflow: kernel wrote more matches than out_capacity. The
+        // host join handles this input fine — return the fallback signal so
+        // the executor retries there. Cartesian-explosion outer joins land
+        // here (the kernel counter increments past the actual writes); the
+        // typed `GpuCapacity` variant is what `try_gpu_outer_join` maps to
+        // `Ok(None)` for the host-join fallback.
+        log::warn!(
+            "gpu join probe overflow ({n_matches_raw} > {out_capacity_u32}); \
+             falling back to host hash join"
+        );
+        return Err(BoltError::GpuCapacity(format!(
             "gpu_join: outer-join probe claimed {n_matches_raw} matches > capacity {out_capacity_u32}"
         )));
     }
@@ -1701,7 +1738,18 @@ pub fn execute_outer_join_indices_on_gpu(
                 &stream,
             )?;
             if n_unmatched > n_build_u32 {
-                return Err(BoltError::Other(format!(
+                // Probe overflow (second-pass): the unmatched-build kernel's
+                // counter exceeded the n_build upper bound, meaning the
+                // bitmap-walk wrote outside the sized buffer. The host
+                // outer-join handles this input fine — return the fallback
+                // signal so the executor retries there. `try_gpu_outer_join`
+                // maps `Err(BoltError::GpuCapacity(_))` (along with any other
+                // `Err(_)`) to its host-fallback `Ok(None)` path.
+                log::warn!(
+                    "gpu join probe overflow ({n_unmatched} > {n_build_u32}); \
+                     falling back to host hash join"
+                );
+                return Err(BoltError::GpuCapacity(format!(
                     "gpu_join: unmatched-build kernel claimed {n_unmatched} > n_build {n_build_u32}"
                 )));
             }
@@ -3042,7 +3090,17 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
         &stream,
     )?;
     if n_matches_raw > out_capacity_u32 {
-        return Err(BoltError::Other(format!(
+        // Probe overflow: kernel wrote more candidate matches than
+        // out_capacity. The host join handles this input fine — return the
+        // fallback signal so the executor retries there. Lossy-fold
+        // false-positive blow-ups land here; `try_gpu_inner_join` maps
+        // `Err(BoltError::GpuCapacity(_))` to its host-fallback `Ok(None)`
+        // path.
+        log::warn!(
+            "gpu join probe overflow ({n_matches_raw} > {out_capacity_u32}); \
+             falling back to host hash join"
+        );
+        return Err(BoltError::GpuCapacity(format!(
             "gpu_join: lossy-shape candidate filter claimed {n_matches_raw} > capacity {out_capacity_u32}"
         )));
     }

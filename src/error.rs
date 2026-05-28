@@ -59,6 +59,19 @@ pub enum BoltError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Typed marker for "GPU path declined due to a capacity / sizing
+    /// mismatch — please retry on the host". Emitted by the GPU hash-join
+    /// when the kernel's match counter overshoots the pre-sized output
+    /// buffer (cartesian explosion, lossy-fold false-positive blow-up,
+    /// duplicate-build-key invariant violation, etc.). The host hash-join
+    /// handles the same input fine, so callers that have a host fallback
+    /// (`try_gpu_inner_join`, `try_gpu_outer_join`) MAP this variant to
+    /// their "fall back to host" signal (`Ok(None)`) — they do this for
+    /// any `Err(_)` today, the variant is here so the pattern-match is
+    /// type-safe rather than string-parsed.
+    #[error("GPU capacity exceeded: {0}")]
+    GpuCapacity(String),
+
     #[error("{0}")]
     Other(String),
 }
