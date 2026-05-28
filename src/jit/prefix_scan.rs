@@ -51,6 +51,16 @@ pub const BLOCK_SIZE: u32 = 256;
 /// Entry-point name for the per-block prefix-scan kernel.
 pub const SCAN_KERNEL_ENTRY: &str = "bolt_prefix_scan";
 
+/// Entry-point name for the Blelloch upsweep+downsweep variant of the
+/// per-block prefix-scan kernel.
+///
+/// Same ABI as [`SCAN_KERNEL_ENTRY`], so host code can swap one PTX for the
+/// other without re-plumbing argument arrays. Activated via the
+/// `BOLT_PREFIX_SCAN_ALGO=blelloch` env var (see
+/// [`crate::exec::gpu_compact::prefix_scan_mask`]); the Hillis-Steele kernel
+/// remains the default while the Blelloch path bakes.
+pub const SCAN_KERNEL_ENTRY_BLELLOCH: &str = "bolt_prefix_scan_blelloch";
+
 /// Entry-point name for the per-dtype gather kernel.
 ///
 /// Returns a static string so callers can pass it straight to
@@ -275,6 +285,411 @@ pub fn compile_prefix_scan_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tmul.wide.u32 %rd14, %r0, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u32 [%rd15], %r10;").map_err(write_err)?;
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
+/// Generate the per-block exclusive prefix-scan PTX module using a **Blelloch
+/// upsweep + downsweep** scan instead of the Hillis-Steele variant emitted by
+/// [`compile_prefix_scan_kernel`].
+///
+/// ## Why
+///
+/// Hillis-Steele performs O(n log n) work and `log2(BLOCK_SIZE)` barriers;
+/// Blelloch performs O(n) work with the same number of barriers, so for
+/// `BLOCK_SIZE = 256` it issues ~8x fewer adds in shared memory. Both
+/// kernels have identical ABI:
+///
+/// ```text
+/// .visible .entry bolt_prefix_scan_blelloch(
+///     .param .u64 ..._param_0,   // mask_ptr      (u8*)
+///     .param .u64 ..._param_1,   // local_indices (u32*)
+///     .param .u64 ..._param_2,   // block_sums    (u32*)
+///     .param .u32 ..._param_3    // n_rows
+/// )
+/// ```
+///
+/// so host code can swap one PTX for the other transparently.
+///
+/// ## Algorithm
+///
+/// Operates on a single shared-memory buffer `arr[BLOCK_SIZE]` of u32. With
+/// `BLOCK_SIZE = 256` we have `K = log2(256) = 8` levels.
+///
+/// 1. **Seed**: every thread loads its mask byte (0 if out of range),
+///    normalises to 0/1, stores into `arr[tid]`. One `bar.sync`.
+///
+/// 2. **Upsweep (reduce tree)**: for `d in 0..K`:
+///       stride = 1 << (d + 1)        // 2, 4, 8, ..., BLOCK_SIZE
+///       idx    = tid * stride + stride - 1
+///       if idx < BLOCK_SIZE:
+///           arr[idx] += arr[idx - (stride / 2)]
+///       bar.sync
+///    After K levels `arr[BLOCK_SIZE - 1]` holds the inclusive sum of the
+///    whole block (i.e. the count of kept rows = the value
+///    `block_sums[blockIdx.x]` needs).
+///
+/// 3. **Pivot**: thread 0 saves `arr[BLOCK_SIZE - 1]` into a private register
+///    (so the block-sum survives the zero-out), then writes
+///    `arr[BLOCK_SIZE - 1] = 0`. One `bar.sync`. The zero is the additive
+///    identity for the downsweep that turns the upsweep tree into the
+///    exclusive scan.
+///
+/// 4. **Downsweep**: for `d in (K-1)..=0` (i.e. strides `BLOCK_SIZE, ..., 2`):
+///       stride = 1 << (d + 1)
+///       idx_r  = tid * stride + stride - 1
+///       idx_l  = tid * stride + (stride / 2) - 1
+///       if idx_r < BLOCK_SIZE:
+///           t          = arr[idx_l];
+///           arr[idx_l] = arr[idx_r];
+///           arr[idx_r] = arr[idx_r] + t;
+///       bar.sync
+///    After K levels `arr[tid]` holds the exclusive prefix sum of the
+///    original 0/1 values across the block.
+///
+/// 5. **Stores**: each in-range thread writes `arr[tid]` to
+///    `local_indices[gid]`. Thread 0 writes the saved inclusive sum to
+///    `block_sums[blockIdx.x]`.
+///
+/// ## Correctness notes
+///
+/// * Partial last block: out-of-range lanes seed `arr[tid] = 0` (the
+///   `AFTER_LOAD` predicate is identical to Hillis-Steele's), so the
+///   inclusive sum at `arr[BLOCK_SIZE - 1]` after upsweep still counts only
+///   in-range "keep" bits.
+/// * The downsweep predicate `(tid * stride + stride - 1) < BLOCK_SIZE` is
+///   equivalent to `tid < BLOCK_SIZE / stride`, which we compute once per
+///   level as an immediate comparison against the corresponding small
+///   constant — this lets the level loops be unrolled with no per-iteration
+///   strength reduction in the PTX.
+/// * Only thread 0 writes the block sum, mirroring Hillis-Steele's last-
+///   thread store but issued from the same thread that did the pivot
+///   zero-out (no extra synchronisation needed).
+pub fn compile_prefix_scan_kernel_blelloch() -> BoltResult<String> {
+    // Single u32 buffer of BLOCK_SIZE entries. Blelloch does in-place
+    // reads-and-writes against the same locations, so unlike Hillis-Steele
+    // there is no ping-pong; the per-level `bar.sync` provides the ordering
+    // between read and write across threads.
+    let elem_bytes: u32 = 4;
+    let shared_bytes_total: u32 = BLOCK_SIZE * elem_bytes;
+
+    // log2(BLOCK_SIZE). BLOCK_SIZE is a compile-time pow2 by construction
+    // (= 256), so this is exact.
+    debug_assert!(BLOCK_SIZE.is_power_of_two(), "Blelloch requires pow2 BLOCK_SIZE");
+    let k_levels: u32 = BLOCK_SIZE.trailing_zeros();
+
+    let mut ptx = String::new();
+    writeln!(ptx, "{}", PTX_VERSION).map_err(write_err)?;
+    writeln!(ptx, "{}", PTX_TARGET).map_err(write_err)?;
+    writeln!(ptx, "{}", PTX_ADDRESS_SIZE).map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 sdata[{shared}];",
+        shared = shared_bytes_total
+    )
+    .map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Signature mirrors the Hillis-Steele kernel exactly so the host launcher
+    // can swap PTX without touching argument plumbing.
+    writeln!(ptx, ".visible .entry {}(", SCAN_KERNEL_ENTRY_BLELLOCH).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t.param .u64 {}_param_0,",
+        SCAN_KERNEL_ENTRY_BLELLOCH
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t.param .u64 {}_param_1,",
+        SCAN_KERNEL_ENTRY_BLELLOCH
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t.param .u64 {}_param_2,",
+        SCAN_KERNEL_ENTRY_BLELLOCH
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t.param .u32 {}_param_3",
+        SCAN_KERNEL_ENTRY_BLELLOCH
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    // Generous register pool: upsweep + downsweep each unroll to ~K levels
+    // with a handful of address/value regs per level, but PTX `.reg` decls
+    // only allocate names so over-sizing is free.
+    writeln!(ptx, "\t.reg .pred  %p<16>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b16   %rs<4>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<48>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // -------- Indices: gid = ctaid.x * ntid.x + tid.x ; load n_rows.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u32 %r4, [{}_param_3];",
+        SCAN_KERNEL_ENTRY_BLELLOCH
+    )
+    .map_err(write_err)?;
+
+    // -------- Globalize parameter pointers.
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd0, [{}_param_0];",
+        SCAN_KERNEL_ENTRY_BLELLOCH
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd1, [{}_param_1];",
+        SCAN_KERNEL_ENTRY_BLELLOCH
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd2, [{}_param_2];",
+        SCAN_KERNEL_ENTRY_BLELLOCH
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
+
+    // -------- Load this thread's mask byte (0 if past the end). Normalise
+    // non-zero bytes to 1 so the scan is robust to predicate kernels that
+    // emit truthy values other than literal 1.
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r5, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra AFTER_LOAD;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd3, %r3, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd4, %rd0, %rd3;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u8 %rs0, [%rd4];").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u16 %r6, %rs0;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 %p1, %r6, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tselp.s32 %r5, 1, 0, %p1;").map_err(write_err)?;
+    writeln!(ptx, "AFTER_LOAD:").map_err(write_err)?;
+
+    // %r5 now holds the per-thread 0/1 value. Stash into arr[tid].
+    //
+    // Address arithmetic: we keep base = sdata (state-space `.shared`) in
+    // %rd5 and per-thread `tid * 4` in %rd6. The thread's own slot is
+    // %rd5 + %rd6 (stored in %rd7). For the upsweep/downsweep we need slot
+    // pointers at offsets keyed off `idx`, computed per-level below. Keep
+    // shared-state addresses (no `cvta.shared.u64`) so `st.shared.u32` /
+    // `ld.shared.u32` see the right state-space qualifier.
+    writeln!(ptx, "\tmov.u64 %rd5, sdata;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd6, %r2, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd7, %rd5, %rd6;").map_err(write_err)?; // arr[tid]
+    writeln!(ptx, "\tst.shared.u32 [%rd7], %r5;").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+
+    // ============================================================
+    //   UPSWEEP (reduce tree). Levels d = 0 .. K-1.
+    //
+    //   stride       = 1 << (d + 1)   (2, 4, 8, ..., BLOCK_SIZE)
+    //   half_stride  = 1 << d         (1, 2, 4, ..., BLOCK_SIZE/2)
+    //   active mask  = tid < BLOCK_SIZE / stride
+    //
+    //   active thread does:
+    //     idx_r = tid * stride + stride - 1
+    //     idx_l = idx_r - half_stride
+    //     arr[idx_r] += arr[idx_l]
+    // ============================================================
+    writeln!(ptx, "\t// ---- BLELLOCH UPSWEEP ----").map_err(write_err)?;
+    for d in 0..k_levels {
+        let stride: u32 = 1u32 << (d + 1);
+        let half_stride: u32 = 1u32 << d;
+        // Number of active threads at this level. Equivalently the upper
+        // bound on `tid` such that `tid * stride + stride - 1 < BLOCK_SIZE`.
+        let active_threads: u32 = BLOCK_SIZE / stride;
+
+        writeln!(
+            ptx,
+            "\t// upsweep level d={d}, stride={stride}, half={half_stride}, active={active_threads}",
+            d = d,
+            stride = stride,
+            half_stride = half_stride,
+            active_threads = active_threads,
+        )
+        .map_err(write_err)?;
+
+        // Predicate: skip if `tid >= active_threads`.
+        writeln!(
+            ptx,
+            "\tsetp.ge.u32 %p2, %r2, {at};",
+            at = active_threads
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\t@%p2 bra UPSWEEP_SKIP_{d};", d = d).map_err(write_err)?;
+
+        // idx_r = tid * stride + (stride - 1); byte offset = idx_r * 4.
+        // We compute the address directly to avoid a redundant intermediate.
+        // %r10 = tid * stride
+        writeln!(ptx, "\tmul.lo.u32 %r10, %r2, {stride};", stride = stride)
+            .map_err(write_err)?;
+        // %r11 = idx_r = %r10 + (stride - 1)
+        writeln!(
+            ptx,
+            "\tadd.s32 %r11, %r10, {sm1};",
+            sm1 = stride - 1
+        )
+        .map_err(write_err)?;
+        // %r12 = idx_l = idx_r - half_stride
+        writeln!(
+            ptx,
+            "\tsub.s32 %r12, %r11, {hs};",
+            hs = half_stride
+        )
+        .map_err(write_err)?;
+        // Byte offsets and shared addresses for idx_r / idx_l.
+        writeln!(ptx, "\tmul.wide.u32 %rd10, %r11, 4;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?; // &arr[idx_r]
+        writeln!(ptx, "\tmul.wide.u32 %rd12, %r12, 4;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd13, %rd5, %rd12;").map_err(write_err)?; // &arr[idx_l]
+        // arr[idx_r] += arr[idx_l]
+        writeln!(ptx, "\tld.shared.u32 %r13, [%rd11];").map_err(write_err)?;
+        writeln!(ptx, "\tld.shared.u32 %r14, [%rd13];").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s32 %r15, %r13, %r14;").map_err(write_err)?;
+        writeln!(ptx, "\tst.shared.u32 [%rd11], %r15;").map_err(write_err)?;
+
+        writeln!(ptx, "UPSWEEP_SKIP_{d}:", d = d).map_err(write_err)?;
+        writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    }
+
+    // ============================================================
+    //   PIVOT: capture inclusive block sum into a register on thread 0,
+    //   then zero arr[BLOCK_SIZE-1] so the downsweep produces an
+    //   exclusive scan.
+    //
+    //   Why thread 0? Any single thread works; thread 0 is convenient
+    //   because it can also issue the final `block_sums[blockIdx.x]`
+    //   store later (no extra barrier needed: only thread 0 reads %r20).
+    // ============================================================
+    writeln!(ptx, "\t// ---- BLELLOCH ZERO-INIT (exclusive-scan identity) ----")
+        .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 %p3, %r2, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra AFTER_PIVOT;").map_err(write_err)?;
+    // Last-element address: %rd5 + (BLOCK_SIZE - 1) * 4
+    writeln!(
+        ptx,
+        "\tadd.s64 %rd14, %rd5, {off};",
+        off = (BLOCK_SIZE - 1) * elem_bytes
+    )
+    .map_err(write_err)?;
+    // %r20 = arr[BLOCK_SIZE - 1] (the inclusive block sum). Survives in
+    // thread 0's register file across the downsweep.
+    writeln!(ptx, "\tld.shared.u32 %r20, [%rd14];").map_err(write_err)?;
+    // arr[BLOCK_SIZE - 1] = 0
+    writeln!(ptx, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd14], %r21;").map_err(write_err)?;
+    writeln!(ptx, "AFTER_PIVOT:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+
+    // ============================================================
+    //   DOWNSWEEP. Levels d = K-1 .. 0 (largest stride first).
+    //
+    //   stride       = 1 << (d + 1)
+    //   half_stride  = 1 << d
+    //   active mask  = tid < BLOCK_SIZE / stride
+    //
+    //   active thread does:
+    //     idx_r = tid * stride + stride - 1
+    //     idx_l = idx_r - half_stride
+    //     t          = arr[idx_l]
+    //     arr[idx_l] = arr[idx_r]
+    //     arr[idx_r] = arr[idx_r] + t
+    // ============================================================
+    writeln!(ptx, "\t// ---- BLELLOCH DOWNSWEEP ----").map_err(write_err)?;
+    for d in (0..k_levels).rev() {
+        let stride: u32 = 1u32 << (d + 1);
+        let half_stride: u32 = 1u32 << d;
+        let active_threads: u32 = BLOCK_SIZE / stride;
+
+        writeln!(
+            ptx,
+            "\t// downsweep level d={d}, stride={stride}, half={half_stride}, active={active_threads}",
+            d = d,
+            stride = stride,
+            half_stride = half_stride,
+            active_threads = active_threads,
+        )
+        .map_err(write_err)?;
+
+        writeln!(
+            ptx,
+            "\tsetp.ge.u32 %p4, %r2, {at};",
+            at = active_threads
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\t@%p4 bra DOWNSWEEP_SKIP_{d};", d = d).map_err(write_err)?;
+
+        // idx_r / idx_l + addresses (same shape as upsweep).
+        writeln!(ptx, "\tmul.lo.u32 %r25, %r2, {stride};", stride = stride)
+            .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tadd.s32 %r26, %r25, {sm1};",
+            sm1 = stride - 1
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tsub.s32 %r27, %r26, {hs};",
+            hs = half_stride
+        )
+        .map_err(write_err)?;
+        writeln!(ptx, "\tmul.wide.u32 %rd20, %r26, 4;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd21, %rd5, %rd20;").map_err(write_err)?; // &arr[idx_r]
+        writeln!(ptx, "\tmul.wide.u32 %rd22, %r27, 4;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd23, %rd5, %rd22;").map_err(write_err)?; // &arr[idx_l]
+        // t = arr[idx_l]
+        writeln!(ptx, "\tld.shared.u32 %r28, [%rd23];").map_err(write_err)?;
+        // r29 = arr[idx_r]
+        writeln!(ptx, "\tld.shared.u32 %r29, [%rd21];").map_err(write_err)?;
+        // arr[idx_l] = r29
+        writeln!(ptx, "\tst.shared.u32 [%rd23], %r29;").map_err(write_err)?;
+        // arr[idx_r] = r29 + t
+        writeln!(ptx, "\tadd.s32 %r30, %r29, %r28;").map_err(write_err)?;
+        writeln!(ptx, "\tst.shared.u32 [%rd21], %r30;").map_err(write_err)?;
+
+        writeln!(ptx, "DOWNSWEEP_SKIP_{d}:", d = d).map_err(write_err)?;
+        writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    }
+
+    // -------- Each in-range thread writes arr[tid] (its exclusive prefix)
+    // to local_indices[gid]. Mirrors the Hillis-Steele tail.
+    writeln!(ptx, "\tld.shared.u32 %r35, [%rd7];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p5, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra AFTER_LOCAL_STORE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd30, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd31, %rd1, %rd30;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u32 [%rd31], %r35;").map_err(write_err)?;
+    writeln!(ptx, "AFTER_LOCAL_STORE:").map_err(write_err)?;
+
+    // -------- Thread 0 (the pivot thread) writes block_sums[blockIdx.x]
+    // from %r20, which captured arr[BLOCK_SIZE - 1] just before the
+    // zero-out. For partial last blocks, out-of-range lanes seeded 0, so
+    // the inclusive sum is still the correct kept-row count.
+    writeln!(ptx, "\tsetp.ne.s32 %p6, %r2, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd32, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd33, %rd2, %rd32;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u32 [%rd33], %r20;").map_err(write_err)?;
 
     writeln!(ptx, "DONE:").map_err(write_err)?;
     writeln!(ptx, "\tret;").map_err(write_err)?;
@@ -560,6 +975,116 @@ mod tests {
         let err = compile_gather_kernel(DataType::Utf8)
             .expect_err("Utf8 gather must error: variable-width");
         assert!(format!("{}", err).contains("Utf8"));
+    }
+
+    /// Structural smoke test for the Blelloch variant: header, signature,
+    /// shared-memory size, and the upsweep/downsweep/pivot markers must all
+    /// be present. We do not run the kernel here — it's compiled and
+    /// inspected as a string.
+    #[test]
+    fn blelloch_scan_ptx_has_shape() {
+        let ptx = compile_prefix_scan_kernel_blelloch().expect("blelloch PTX compiles");
+
+        // Header.
+        assert!(ptx.contains(".version 7.5"));
+        assert!(ptx.contains(".target sm_70"));
+        assert!(ptx.contains(".address_size 64"));
+
+        // Single buffer (no ping-pong): BLOCK_SIZE * 4 bytes.
+        let total = (BLOCK_SIZE * 4) as u64;
+        assert!(
+            ptx.contains(&format!(".shared .align 4 .b8 sdata[{total}]")),
+            "shared decl missing or wrong size; got:\n{ptx}"
+        );
+
+        // Signature must match the Blelloch entry name and the same 4-arg
+        // ABI as Hillis-Steele.
+        assert!(ptx.contains(".visible .entry bolt_prefix_scan_blelloch("));
+        assert!(ptx.contains(".param .u64 bolt_prefix_scan_blelloch_param_0,"));
+        assert!(ptx.contains(".param .u64 bolt_prefix_scan_blelloch_param_1,"));
+        assert!(ptx.contains(".param .u64 bolt_prefix_scan_blelloch_param_2,"));
+        assert!(ptx.contains(".param .u32 bolt_prefix_scan_blelloch_param_3"));
+
+        // Algorithm-section markers we emit as comments so reviewers and this
+        // test can both confirm the upsweep and downsweep halves are wired
+        // up. If these vanish we either dropped a phase or renamed it
+        // unexpectedly.
+        assert!(
+            ptx.contains("BLELLOCH UPSWEEP"),
+            "missing upsweep marker comment:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("BLELLOCH DOWNSWEEP"),
+            "missing downsweep marker comment:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("BLELLOCH ZERO-INIT"),
+            "missing exclusive-scan zero-init marker:\n{ptx}"
+        );
+
+        // Per-level skip labels: BLOCK_SIZE = 256 -> log2 = 8 levels per phase.
+        // Each level emits UPSWEEP_SKIP_<d>: / DOWNSWEEP_SKIP_<d>: labels.
+        for d in 0..BLOCK_SIZE.trailing_zeros() {
+            assert!(
+                ptx.contains(&format!("UPSWEEP_SKIP_{d}:")),
+                "missing UPSWEEP_SKIP_{d}: label\n{ptx}"
+            );
+            assert!(
+                ptx.contains(&format!("DOWNSWEEP_SKIP_{d}:")),
+                "missing DOWNSWEEP_SKIP_{d}: label\n{ptx}"
+            );
+        }
+
+        // Barrier accounting. The Blelloch pattern is:
+        //   * one bar.sync after the seed store
+        //   * one bar.sync per upsweep level (K = log2(BLOCK_SIZE))
+        //   * one bar.sync after the pivot zero-init
+        //   * one bar.sync per downsweep level (K)
+        // Total = 2 * K + 2 = 2*8 + 2 = 18.
+        let k = BLOCK_SIZE.trailing_zeros();
+        let expected_syncs = (2 * k + 2) as usize;
+        let n_sync = ptx.matches("bar.sync 0;").count();
+        assert_eq!(
+            n_sync, expected_syncs,
+            "expected {expected_syncs} bar.syncs (seed + K upsweep + pivot + K downsweep, K={k}), got {n_sync}\n{ptx}"
+        );
+
+        // Shared-memory ops must be present (this is the load-bearing
+        // mnemonic for both phases).
+        assert!(ptx.contains("ld.shared.u32"), "missing ld.shared.u32");
+        assert!(ptx.contains("st.shared.u32"), "missing st.shared.u32");
+
+        // Thread 0 captures the inclusive sum into %r20 before zero-out and
+        // the same register feeds the final block_sums store. Pin both ends
+        // of that dataflow so a refactor that drops one side surfaces here.
+        assert!(
+            ptx.contains("ld.shared.u32 %r20, [%rd14];"),
+            "missing pivot capture of inclusive block sum\n{ptx}"
+        );
+        assert!(
+            ptx.contains("st.global.u32 [%rd33], %r20;"),
+            "missing block_sums store from captured inclusive sum\n{ptx}"
+        );
+
+        assert!(ptx.contains("DONE:"));
+        assert!(ptx.contains("ret;"));
+    }
+
+    /// Sanity check that the Blelloch PTX is non-empty and structurally
+    /// distinct from the Hillis-Steele PTX. The two kernels share an ABI
+    /// but should never be byte-identical.
+    #[test]
+    fn blelloch_scan_ptx_differs_from_hillis_steele() {
+        let blelloch = compile_prefix_scan_kernel_blelloch().expect("blelloch compiles");
+        let hillis = compile_prefix_scan_kernel().expect("hillis-steele compiles");
+        assert!(!blelloch.is_empty());
+        assert_ne!(blelloch, hillis, "Blelloch and Hillis-Steele PTX must differ");
+
+        // Hillis-Steele uses two ping-pong shmem buffers (2048 bytes);
+        // Blelloch uses one (1024 bytes). The shared decl is the most
+        // load-bearing structural difference.
+        assert!(hillis.contains(".shared .align 4 .b8 sdata[2048]"));
+        assert!(blelloch.contains(".shared .align 4 .b8 sdata[1024]"));
     }
 }
 

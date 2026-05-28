@@ -44,8 +44,8 @@ use crate::exec::launch::CudaStream;
 use crate::exec::n_rows_to_u32;
 use crate::jit::jit_compiler::CudaModule;
 use crate::jit::prefix_scan::{
-    compile_gather_kernel, compile_prefix_scan_kernel, gather_kernel_entry, BLOCK_SIZE,
-    SCAN_KERNEL_ENTRY,
+    compile_gather_kernel, compile_prefix_scan_kernel, compile_prefix_scan_kernel_blelloch,
+    gather_kernel_entry, BLOCK_SIZE, SCAN_KERNEL_ENTRY, SCAN_KERNEL_ENTRY_BLELLOCH,
 };
 use crate::plan::logical_plan::DataType;
 
@@ -261,10 +261,19 @@ pub fn prefix_scan_mask(
     let local_indices = GpuVec::<u32>::zeros(n_rows)?;
     let block_sums = GpuVec::<u32>::zeros(n_blocks)?;
 
-    // JIT-compile and load the scan kernel.
-    let ptx = compile_prefix_scan_kernel()?;
+    // JIT-compile and load the scan kernel. The algorithm choice is
+    // controlled by `BOLT_PREFIX_SCAN_ALGO`:
+    //   * unset / "hillis" / "hillis-steele" / anything-else  -> Hillis-Steele
+    //     (default; O(n log n) work, well-tested in production).
+    //   * "blelloch"                                          -> Blelloch
+    //     upsweep+downsweep (O(n) work; activated explicitly while the
+    //     newer kernel bakes in).
+    //
+    // Both kernels expose the same 4-arg ABI, so the launch-arg array below
+    // is unchanged either way.
+    let (ptx, entry) = compile_prefix_scan_for_algo()?;
     let module = CudaModule::from_ptx(&ptx)?;
-    let function = module.function(SCAN_KERNEL_ENTRY)?;
+    let function = module.function(entry)?;
 
     // Launch. cuLaunchKernel ABI: pointer-to-each-arg in a *mut c_void array.
     let mut p_mask: CUdeviceptr = mask_ptr;
@@ -564,6 +573,38 @@ pub fn compact_columns_on_gpu(
     }
 
     Ok((out, scan.total_count))
+}
+
+/// Env-var-driven dispatch between the Hillis-Steele and Blelloch prefix-scan
+/// kernels. Returns `(ptx, entry_name)` so callers can hand both directly to
+/// `CudaModule::from_ptx` and `module.function`.
+///
+/// Selection rules for `BOLT_PREFIX_SCAN_ALGO`:
+///   * `"blelloch"` (case-insensitive) -> Blelloch upsweep+downsweep
+///     (O(n) work). New code path; not yet the default.
+///   * Unset, `"hillis"`, `"hillis-steele"`, or any other value ->
+///     Hillis-Steele (default; O(n log n) work, in production use since the
+///     initial GPU compaction landing).
+///
+/// The Hillis-Steele default is intentional while the Blelloch kernel is in
+/// shake-out: the existing path has soak time across the e2e tests, and the
+/// host-side validation we can do without a GPU (substring + golden tests)
+/// only catches structural regressions, not numerical ones. Once the
+/// Blelloch path has been exercised end-to-end on real hardware the default
+/// should flip and this helper can collapse to a single kernel.
+fn compile_prefix_scan_for_algo() -> BoltResult<(String, &'static str)> {
+    // Read at every call. Cheap (an env lookup) and lets the algorithm be
+    // changed without restart for ad-hoc benchmarking. If this lookup ever
+    // shows up in a flamegraph the right fix is to cache the resolved
+    // choice in a `OnceLock`, not to bake the default at compile time.
+    let want_blelloch = std::env::var("BOLT_PREFIX_SCAN_ALGO")
+        .map(|s| s.eq_ignore_ascii_case("blelloch"))
+        .unwrap_or(false);
+    if want_blelloch {
+        Ok((compile_prefix_scan_kernel_blelloch()?, SCAN_KERNEL_ENTRY_BLELLOCH))
+    } else {
+        Ok((compile_prefix_scan_kernel()?, SCAN_KERNEL_ENTRY))
+    }
 }
 
 /// Allocate a `GpuVec<T>` matching `dtype` with `len` elements and wrap it.
