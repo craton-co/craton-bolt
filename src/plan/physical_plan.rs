@@ -403,6 +403,63 @@ fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
     }
 }
 
+/// Gate the source side of a CAST against the v0.7 GPU codegen surface.
+///
+/// Accepted source dtypes: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`.
+/// Everything else surfaces a `BoltError::Plan` whose message names the
+/// specific offending category — "CAST to/from {Decimal128|Date32|
+/// Timestamp|String} not yet lowered to GPU" — so callers see one
+/// consistent message regardless of which type tripped the rejection.
+/// The logical-plane `cast_is_supported` predicate accepts identity
+/// casts for every primitive (including `Utf8 -> Utf8`); this guard
+/// keeps such hand-built physical plans from sneaking into the kernel.
+fn cast_source_is_supported(src: DataType) -> BoltResult<()> {
+    match src {
+        DataType::Bool
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64 => Ok(()),
+        DataType::Decimal128(_, _) => Err(BoltError::Plan(
+            "CAST to/from Decimal128 not yet lowered to GPU".into(),
+        )),
+        DataType::Date32 => Err(BoltError::Plan(
+            "CAST to/from Date32 not yet lowered to GPU".into(),
+        )),
+        DataType::Timestamp(_, _) => Err(BoltError::Plan(
+            "CAST to/from Timestamp not yet lowered to GPU".into(),
+        )),
+        DataType::Utf8 => Err(BoltError::Plan(
+            "CAST to/from String not yet lowered to GPU".into(),
+        )),
+    }
+}
+
+/// Mirror of [`cast_source_is_supported`] for the target dtype. Kept as
+/// a separate predicate (rather than a single combined `(src, target)`
+/// check) so the error message can name the offending side directly.
+fn cast_target_is_supported(target: DataType) -> BoltResult<()> {
+    match target {
+        DataType::Bool
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64 => Ok(()),
+        DataType::Decimal128(_, _) => Err(BoltError::Plan(
+            "CAST to/from Decimal128 not yet lowered to GPU".into(),
+        )),
+        DataType::Date32 => Err(BoltError::Plan(
+            "CAST to/from Date32 not yet lowered to GPU".into(),
+        )),
+        DataType::Timestamp(_, _) => Err(BoltError::Plan(
+            "CAST to/from Timestamp not yet lowered to GPU".into(),
+        )),
+        DataType::Utf8 => Err(BoltError::Plan(
+            "CAST to/from String not yet lowered to GPU".into(),
+        )),
+    }
+}
+
 /// Returns the output column name for a projected expression at position `i`.
 fn output_name_for(expr: &Expr, i: usize) -> String {
     match expr {
@@ -479,11 +536,12 @@ impl<'a> Codegen<'a> {
             Expr::Like { .. } => Err(BoltError::Plan(
                 "GPU codegen: LIKE requires host fallback".into(),
             )),
-            // v0.5 surface: parser + type-check only — the GPU codegen
-            // has no IR op for runtime conversion yet.
-            Expr::Cast { .. } => Err(BoltError::Plan(
-                "CAST not yet lowered to GPU; coming in a follow-up".into(),
-            )),
+            // v0.7: numeric ↔ numeric (and Bool ↔ Int) CASTs lower to a
+            // PTX `cvt.*` instruction via `emit_cast` (which already exists
+            // for arithmetic dtype unification). Non-numeric source/target
+            // (Decimal128 / Date32 / Timestamp / Utf8) are still rejected
+            // here with a tightened message — see `cast_target_is_supported`.
+            Expr::Cast { expr, target } => self.emit_cast_expr(expr, *target),
             // v0.5: parser + type-check land, execution wiring is a
             // follow-up. Reject cleanly so callers see a useful message
             // rather than the kernel emitter producing nonsense PTX.
@@ -714,6 +772,45 @@ impl<'a> Codegen<'a> {
             to,
         });
         Value { reg: dst, dtype: to }
+    }
+
+    /// Lower a SQL `CAST(<inner> AS <target>)` expression for the GPU
+    /// codegen path.
+    ///
+    /// Numeric ↔ numeric (Int32 / Int64 / Float32 / Float64) plus
+    /// Bool ↔ Int conversions are lowered to a single PTX `cvt.*`
+    /// instruction by `emit_cast` (which already exists for binary-op
+    /// dtype unification). The accepted set is exactly what
+    /// [`crate::plan::logical_plan::cast_is_supported`] admits MINUS the
+    /// non-numeric / non-bool types this codegen still can't handle —
+    /// any `Decimal128` / `Date32` / `Timestamp` / `Utf8` involvement is
+    /// rejected here with a clear error so the planner regression is
+    /// obvious. The non-numeric types are also rejected upstream by
+    /// `emit_column` / `emit_literal`, but we keep this guard so a
+    /// hand-built physical plan can't sneak past the policy.
+    ///
+    /// `Literal::Null` source is special-cased the same way it is for
+    /// `IS [NOT] NULL` and binary ops — the result is a typed NULL at
+    /// `target`. The runtime semantics of NULL through `cvt.*` are
+    /// undefined; the executor's per-row validity bitmap masks the result
+    /// out before any consumer can observe it.
+    fn emit_cast_expr(&mut self, inner: &Expr, target: DataType) -> BoltResult<Value> {
+        // CAST(NULL AS T) is admitted at the logical plane (see
+        // `Expr::dtype_depth`); mirror that here by emitting a typed NULL
+        // constant directly rather than recursing into the bare-null literal
+        // and hitting "untyped NULL literal" in `emit_literal`.
+        if matches!(inner, Expr::Literal(Literal::Null)) {
+            cast_target_is_supported(target)?;
+            return Ok(self.emit_null_as(target));
+        }
+        let value = self.emit_expr(inner)?;
+        // Identity cast is always fine — emit_cast collapses it to no-op.
+        if value.dtype == target {
+            return Ok(self.emit_cast(value, target));
+        }
+        cast_source_is_supported(value.dtype)?;
+        cast_target_is_supported(target)?;
+        Ok(self.emit_cast(value, target))
     }
 
     /// Emit a binary op, inserting casts and computing the result dtype.
@@ -1969,12 +2066,22 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
             "CASE not yet lowered to GPU; coming in a follow-up".into(),
         ));
     }
-    // v0.5: the planner accepts `CAST(<expr> AS <type>)` and type-checks it
-    // but the physical layer has no GPU IR op for runtime conversion.
-    if logical_plan_contains_cast(plan) {
-        return Err(BoltError::Plan(
-            "CAST not yet lowered to GPU; coming in a follow-up".into(),
-        ));
+    // v0.7: numeric ↔ numeric CASTs lower to a PTX `cvt.*` instruction via
+    // `Codegen::emit_cast_expr` (which routes through the existing
+    // `emit_cast` helper for binary-op dtype unification). What remains
+    // rejected here is any CAST whose declared TARGET is non-numeric —
+    // i.e. Decimal128 / Date32 / Timestamp / Utf8 — because those types
+    // have no PTX register class. CAST with a non-numeric SOURCE is
+    // caught downstream when the underlying column / literal is loaded
+    // (see `emit_column` / `emit_literal`). Surfacing the target-side
+    // rejection here keeps the error message one consistent line
+    // regardless of where in the plan the CAST appears (Sort key
+    // expressions, in particular, don't go through `Codegen::emit_expr`).
+    if let Some(target) = logical_plan_contains_unsupported_cast_target(plan) {
+        return Err(BoltError::Plan(format!(
+            "CAST to/from {} not yet lowered to GPU",
+            cast_unsupported_type_label(target)
+        )));
     }
     let phys = lower_depth(plan, 0)?;
     // Static-analysis safety net for the documented short-circuit divergence
@@ -2097,78 +2204,135 @@ fn expr_contains_case(e: &Expr) -> bool {
     }
 }
 
-/// Walk `plan` looking for any `Expr::Cast` node. Used by [`lower`] to
-/// reject CAST-bearing plans at the physical-plan boundary while keeping
-/// the type-check surface alive at the logical plane. The traversal is
-/// recursion-bounded via [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`]
-/// the same way [`lower_depth`] guards itself; depth overflow here
-/// degrades safely to "no cast found" (the subsequent `lower_depth`
-/// will surface the same depth error with a more specific message).
-fn logical_plan_contains_cast(plan: &LogicalPlan) -> bool {
-    fn expr_has_cast(e: &Expr) -> bool {
+/// Human-readable label naming the unsupported category in a CAST
+/// rejection — used by [`lower`] to format
+/// `"CAST to/from {label} not yet lowered to GPU"` consistently
+/// whether the trip-point fired on a target-type scan or on a runtime
+/// source-type rejection from `cast_target_is_supported`. The label
+/// elides the type parameters (precision/scale for Decimal128,
+/// TimeUnit/tz for Timestamp) so the message stays stable as those
+/// vary across schemas.
+fn cast_unsupported_type_label(dt: DataType) -> &'static str {
+    match dt {
+        DataType::Decimal128(_, _) => "Decimal128",
+        DataType::Date32 => "Date32",
+        DataType::Timestamp(_, _) => "Timestamp",
+        DataType::Utf8 => "String",
+        // Numeric / Bool targets are supported — this label is for the
+        // rejection path only. Fall through to a generic catch-all if
+        // it's ever called on a supported type (a programmer bug — the
+        // walker's job is to return Some only for unsupported targets).
+        _ => "unsupported",
+    }
+}
+
+/// Walk `plan` looking for any `Expr::Cast` node whose declared TARGET
+/// dtype is non-numeric / non-Bool — i.e. `Decimal128`, `Date32`,
+/// `Timestamp(_, _)`, or `Utf8`. Used by [`lower`] to reject such
+/// CASTs at the physical-plan boundary with a tightened message before
+/// any kernel codegen runs.
+///
+/// Numeric ↔ numeric (and Bool ↔ Int) targets are accepted here and
+/// then lowered to a PTX `cvt.*` instruction by `Codegen::emit_cast_expr`
+/// (see that method for the per-pair PTX mnemonic mapping).
+///
+/// Source-side rejection is the symmetric guard's job, but the SOURCE
+/// dtype of a `CAST` node depends on its inner expression and therefore
+/// the surrounding schema — which this walker does not have. The
+/// source-side rejection is therefore deferred to runtime in
+/// `Codegen::emit_cast_expr`, where the source dtype is known after
+/// `emit_expr` has resolved the inner expression. The user observes a
+/// single consistent error message regardless of which side tripped the
+/// guard, via [`cast_unsupported_type_label`].
+///
+/// The traversal is recursion-bounded via
+/// [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`] the same way
+/// [`lower_depth`] guards itself; depth overflow here degrades safely
+/// to "no offending cast found" (the subsequent `lower_depth` will
+/// surface the same depth error with a more specific message).
+fn logical_plan_contains_unsupported_cast_target(plan: &LogicalPlan) -> Option<DataType> {
+    fn cast_target_unsupported(target: DataType) -> bool {
+        matches!(
+            target,
+            DataType::Decimal128(_, _)
+                | DataType::Date32
+                | DataType::Timestamp(_, _)
+                | DataType::Utf8
+        )
+    }
+    fn expr_bad_cast(e: &Expr) -> Option<DataType> {
         match e {
-            Expr::Cast { .. } => true,
-            Expr::Column(_) | Expr::Literal(_) => false,
-            Expr::Binary { left, right, .. } => expr_has_cast(left) || expr_has_cast(right),
-            Expr::Unary { operand, .. } => expr_has_cast(operand),
-            Expr::Alias(inner, _) => expr_has_cast(inner),
-            Expr::Case { branches, else_branch } => {
-                branches.iter().any(|(w, t)| expr_has_cast(w) || expr_has_cast(t))
-                    || else_branch.as_deref().map(expr_has_cast).unwrap_or(false)
+            Expr::Cast { expr, target } => {
+                if cast_target_unsupported(*target) {
+                    return Some(*target);
+                }
+                expr_bad_cast(expr)
             }
-            Expr::Like { expr, .. } => expr_has_cast(expr),
-            Expr::ScalarFn { args, .. } => args.iter().any(expr_has_cast),
+            Expr::Column(_) | Expr::Literal(_) => None,
+            Expr::Binary { left, right, .. } => expr_bad_cast(left).or_else(|| expr_bad_cast(right)),
+            Expr::Unary { operand, .. } => expr_bad_cast(operand),
+            Expr::Alias(inner, _) => expr_bad_cast(inner),
+            Expr::Case { branches, else_branch } => {
+                for (w, t) in branches {
+                    if let Some(d) = expr_bad_cast(w).or_else(|| expr_bad_cast(t)) {
+                        return Some(d);
+                    }
+                }
+                else_branch.as_deref().and_then(expr_bad_cast)
+            }
+            Expr::Like { expr, .. } => expr_bad_cast(expr),
+            Expr::ScalarFn { args, .. } => args.iter().find_map(expr_bad_cast),
         }
     }
-    fn agg_has_cast(a: &AggregateExpr) -> bool {
+    fn agg_bad_cast(a: &AggregateExpr) -> Option<DataType> {
         match a {
             AggregateExpr::Count(e)
             | AggregateExpr::Sum(e)
             | AggregateExpr::Min(e)
             | AggregateExpr::Max(e)
-            | AggregateExpr::Avg(e) => expr_has_cast(e),
+            | AggregateExpr::Avg(e) => expr_bad_cast(e),
             AggregateExpr::VarPop(e)
             | AggregateExpr::VarSamp(e)
             | AggregateExpr::StddevPop(e)
-            | AggregateExpr::StddevSamp(e) => expr_has_cast(e.as_ref()),
+            | AggregateExpr::StddevSamp(e) => expr_bad_cast(e.as_ref()),
         }
     }
-    fn walk(plan: &LogicalPlan, depth: usize) -> bool {
+    fn walk(plan: &LogicalPlan, depth: usize) -> Option<DataType> {
         if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
-            return false;
+            return None;
         }
         match plan {
-            LogicalPlan::Scan { .. } => false,
+            LogicalPlan::Scan { .. } => None,
             LogicalPlan::Filter { input, predicate } => {
-                expr_has_cast(predicate) || walk(input, depth + 1)
+                expr_bad_cast(predicate).or_else(|| walk(input, depth + 1))
             }
-            LogicalPlan::Project { input, exprs } => {
-                exprs.iter().any(expr_has_cast) || walk(input, depth + 1)
-            }
+            LogicalPlan::Project { input, exprs } => exprs
+                .iter()
+                .find_map(expr_bad_cast)
+                .or_else(|| walk(input, depth + 1)),
             LogicalPlan::Aggregate {
                 input,
                 group_by,
                 aggregates,
-            } => {
-                group_by.iter().any(expr_has_cast)
-                    || aggregates.iter().any(agg_has_cast)
-                    || walk(input, depth + 1)
-            }
+            } => group_by
+                .iter()
+                .find_map(expr_bad_cast)
+                .or_else(|| aggregates.iter().find_map(agg_bad_cast))
+                .or_else(|| walk(input, depth + 1)),
             LogicalPlan::Distinct { input } => walk(input, depth + 1),
             LogicalPlan::Limit { input, .. } => walk(input, depth + 1),
-            LogicalPlan::Sort { input, sort_exprs } => {
-                sort_exprs.iter().any(|se| expr_has_cast(&se.expr))
-                    || walk(input, depth + 1)
-            }
-            LogicalPlan::Union { inputs } => inputs.iter().any(|b| walk(b, depth + 1)),
+            LogicalPlan::Sort { input, sort_exprs } => sort_exprs
+                .iter()
+                .find_map(|se| expr_bad_cast(&se.expr))
+                .or_else(|| walk(input, depth + 1)),
+            LogicalPlan::Union { inputs } => inputs.iter().find_map(|b| walk(b, depth + 1)),
             LogicalPlan::Join {
                 left, right, on, ..
-            } => {
-                on.iter()
-                    .any(|(l, r)| expr_has_cast(l) || expr_has_cast(r))
-                    || walk(left, depth + 1)
-                    || walk(right, depth + 1)
-            }
+            } => on
+                .iter()
+                .find_map(|(l, r)| expr_bad_cast(l).or_else(|| expr_bad_cast(r)))
+                .or_else(|| walk(left, depth + 1))
+                .or_else(|| walk(right, depth + 1)),
         }
     }
     walk(plan, 0)

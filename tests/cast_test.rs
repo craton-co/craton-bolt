@@ -2,7 +2,8 @@
 
 //! Integration tests for SQL `CAST(<expr> AS <type>)` over primitive types.
 //!
-//! v0.5 scope (this PR): parser + type-check + physical-plan rejection.
+//! v0.7 scope (this PR): parser + type-check + numeric ↔ numeric (and
+//! Bool ↔ Int) GPU lowering.
 //!
 //! * The SQL frontend parses `CAST(<expr> AS <type>)` and the Postgres
 //!   `expr::type` shortcut, mapping the type name onto the engine's
@@ -12,9 +13,11 @@
 //! * The logical plane type-checks the source-target pair against
 //!   `cast_is_supported`; unsupported pairs (e.g. `Utf8 -> Int32`) error
 //!   with a `BoltError::Type` carrying the source and target types.
-//! * The physical plane rejects every `Cast` at the `lower()` boundary
-//!   with a "not yet lowered to GPU" message. GPU codegen for the
-//!   runtime conversion is a v0.6 follow-up.
+//! * The physical plane lowers numeric ↔ numeric and Bool ↔ Int casts
+//!   to a PTX `cvt.*` instruction (see `Codegen::emit_cast_expr` in
+//!   `physical_plan.rs`). CASTs whose target is `Decimal128`, `Date32`,
+//!   `Timestamp`, or `Utf8` are still rejected at `lower()` with a
+//!   tightened "CAST to/from {Type} not yet lowered to GPU" message.
 //!
 //! These tests cover the three surfaces individually so a regression in
 //! any one of them surfaces clearly.
@@ -293,37 +296,26 @@ fn try_cast_rejected_with_clear_message() {
     );
 }
 
-// ---- 3. Physical-plan rejection -------------------------------------------
+// ---- 3. Physical-plan lowering --------------------------------------------
 
-/// Until the GPU codegen path for runtime conversion lands, the physical
-/// planner must reject every CAST-bearing plan with a clear, stable error
-/// message. Pin the substring so the user-facing wording doesn't drift
-/// silently and so a downstream test harness can match against it.
+/// Numeric ↔ numeric CASTs lower cleanly through `lower_physical` — no
+/// rejection, the physical plan carries an `Op::Cast` IR node that the
+/// PTX emitter turns into a `cvt.*` instruction (golden coverage for
+/// the per-pair PTX opcodes lives in `src/jit/ptx_gen.rs`'s unit tests).
 #[test]
-fn cast_rejected_at_lower_with_clear_message() {
+fn cast_int32_to_int64_lowers_cleanly() {
     let provider = fixture();
     let plan = parse_sql("SELECT CAST(i32 AS BIGINT) FROM t", &provider).unwrap();
-    let err = lower_physical(&plan).expect_err("lower() must reject CAST-bearing plans");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("CAST") && msg.contains("not yet lowered"),
-        "expected lower() error to mention 'CAST' and 'not yet lowered', got: {msg}"
-    );
+    lower_physical(&plan).expect("Int32 -> Int64 CAST must lower cleanly");
 }
 
-/// The reject must fire even when the CAST is nested inside a Filter
-/// predicate (not just the SELECT list) — the contains-cast walker has to
-/// descend every plan-shape's child expressions.
+/// CAST inside a Filter predicate also lowers — `Codegen::emit_expr`
+/// handles `Expr::Cast` uniformly across projection-list and predicate
+/// positions.
 #[test]
-fn cast_inside_filter_rejected_at_lower() {
+fn cast_inside_filter_lowers_cleanly() {
     let provider = fixture();
     let plan =
         parse_sql("SELECT i32 FROM t WHERE CAST(i32 AS BIGINT) > 0", &provider).unwrap();
-    let err = lower_physical(&plan)
-        .expect_err("lower() must reject CAST nested in a Filter predicate");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("CAST") && msg.contains("not yet lowered"),
-        "expected lower() error to mention 'CAST' and 'not yet lowered', got: {msg}"
-    );
+    lower_physical(&plan).expect("CAST in WHERE clause must lower cleanly");
 }
