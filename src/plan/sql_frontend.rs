@@ -3099,11 +3099,28 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                     "unsupported: LIKE ANY (...)".into(),
                 ));
             }
-            if escape_char.is_some() {
-                return Err(BoltError::Sql(
-                    "unsupported: LIKE ... ESCAPE '<char>' (v0.5 follow-up)".into(),
-                ));
-            }
+            // sqlparser hands us the ESCAPE clause as an `Option<String>`
+            // (the literal text between the quotes). Standard SQL requires
+            // exactly one character — reject anything else with a clear
+            // message so the user sees the constraint up front.
+            let escape: Option<char> = match escape_char.as_deref() {
+                None => None,
+                Some(s) => {
+                    let mut iter = s.chars();
+                    let first = iter.next().ok_or_else(|| {
+                        BoltError::Sql(
+                            "LIKE ESCAPE clause must be a single character, got an empty string"
+                                .into(),
+                        )
+                    })?;
+                    if iter.next().is_some() {
+                        return Err(BoltError::Sql(format!(
+                            "LIKE ESCAPE clause must be a single character, got {s:?}"
+                        )));
+                    }
+                    Some(first)
+                }
+            };
             let pattern_str = match pattern.as_ref() {
                 SqlExpr::Value(Value::SingleQuotedString(s)) => s.clone(),
                 other => {
@@ -3116,7 +3133,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
             Ok(Expr::Like {
                 expr: Box::new(operand),
                 pattern: pattern_str,
-                escape: None,
+                escape,
                 negated: *negated,
             })
         }
@@ -5191,20 +5208,64 @@ mod like_tests {
     }
 
     #[test]
-    fn parse_like_with_escape_rejected_for_v05() {
-        let err = parse(
+    fn parse_like_with_escape_captured_on_expr() {
+        // v0.7: ESCAPE is now supported. The frontend captures both the
+        // pattern (verbatim) and the escape character on Expr::Like.
+        let plan = parse(
             r"SELECT s FROM t WHERE s LIKE 'a\_b' ESCAPE '\'",
             &s_provider(),
         )
-        .expect_err("ESCAPE must be rejected for v0.5");
+        .expect("ESCAPE must parse");
+        match predicate(&plan) {
+            Expr::Like {
+                pattern,
+                escape,
+                negated,
+                ..
+            } => {
+                assert_eq!(pattern, r"a\_b");
+                assert_eq!(*escape, Some('\\'));
+                assert!(!negated);
+            }
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_like_with_multichar_escape_rejected() {
+        // Standard SQL requires the ESCAPE clause to be a single
+        // character — a two-char literal must reject cleanly.
+        let err = parse(
+            r"SELECT s FROM t WHERE s LIKE 'foo' ESCAPE 'ab'",
+            &s_provider(),
+        )
+        .expect_err("multi-char ESCAPE must reject");
         let msg = format!("{err}");
         assert!(
-            msg.contains("ESCAPE"),
-            "expected ESCAPE-rejection message, got: {msg}"
+            msg.contains("single character"),
+            "expected single-character message, got: {msg}"
         );
-        assert!(
-            msg.contains("follow-up") || msg.contains("v0.5"),
-            "error message should mark this as a follow-up, got: {msg}"
-        );
+    }
+
+    #[test]
+    fn parse_not_like_with_escape_captures_negation_and_escape() {
+        let plan = parse(
+            r"SELECT s FROM t WHERE s NOT LIKE 'a!%b' ESCAPE '!'",
+            &s_provider(),
+        )
+        .expect("NOT LIKE ... ESCAPE must parse");
+        match predicate(&plan) {
+            Expr::Like {
+                pattern,
+                escape,
+                negated,
+                ..
+            } => {
+                assert_eq!(pattern, "a!%b");
+                assert_eq!(*escape, Some('!'));
+                assert!(*negated, "NOT LIKE ... ESCAPE must set negated=true");
+            }
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
     }
 }

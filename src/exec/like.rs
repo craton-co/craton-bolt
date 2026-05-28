@@ -39,11 +39,24 @@
 //!
 //! ## ESCAPE
 //!
-//! `escape` is reserved on [`crate::plan::logical_plan::Expr::Like`] but
-//! the SQL frontend rejects `ESCAPE '<char>'` for v0.5 — implementing the
-//! escape rule (a `\%` becomes a literal `%`, etc.) is a follow-up. The
-//! `compile` API still takes an `Option<char>` so the eventual change
-//! doesn't have to reshape callers.
+//! `expr LIKE 'pat' ESCAPE '<c>'` is supported as of v0.7. The escape
+//! character is a single-codepoint literal known at compile time (the SQL
+//! frontend enforces single-char). When the matcher encounters the escape
+//! character in the pattern, the *following* character is interpreted
+//! literally (no wildcard semantics): `'\%'` matches a literal `%`,
+//! `'\_'` matches a literal `_`, and `'\\'` matches a literal `\` when
+//! `ESCAPE '\'` is in effect. An escape character with no following char
+//! (trailing escape at end of pattern) is a malformed pattern and surfaces
+//! as a clear error from [`PatternMatcher::compile`]. Choosing an escape
+//! character equal to `%` or `_` is rejected for the same reason — it
+//! would make the wildcard unreachable.
+//!
+//! The fast-path shape classifier ([`classify`]) deliberately routes any
+//! pattern carrying an escape character straight to [`Shape::Generic`] —
+//! the prefix/suffix/contains fast paths reason about raw `%` positions
+//! and cannot account for escaped occurrences without a second scan.
+//! The generic matcher handles escape semantics uniformly via the
+//! tokeniser.
 
 use arrow_array::{Array, BooleanArray, StringArray};
 
@@ -94,19 +107,25 @@ enum Token {
 impl PatternMatcher {
     /// Compile a SQL LIKE pattern.
     ///
-    /// `escape` is currently always `None` (the SQL frontend rejects the
-    /// `ESCAPE '<char>'` clause for v0.5). Passing `Some(_)` here returns
-    /// a clear "not yet supported" error so a hand-built logical plan that
-    /// tried to use escape fails loudly rather than silently producing
-    /// wrong results.
+    /// When `escape` is `Some(c)`, the pattern is interpreted with `c` as
+    /// the escape character: a `c` in the pattern causes the *next*
+    /// character to be treated as a literal (no wildcard semantics). The
+    /// escape character itself does not appear in the matched input.
+    ///
+    /// Errors on:
+    /// * trailing escape character (e.g. pattern `"abc\"` with
+    ///   `ESCAPE '\'`) — no character follows the escape;
+    /// * escape character equal to `%` or `_` — would render the wildcard
+    ///   unreachable, which is almost certainly a user mistake.
     pub fn compile(pattern: &str, escape: Option<char>) -> BoltResult<Self> {
-        if escape.is_some() {
-            return Err(BoltError::Plan(
-                "LIKE ... ESCAPE '<char>' is not yet implemented (v0.5 follow-up)"
-                    .into(),
-            ));
+        if let Some(c) = escape {
+            if c == '%' || c == '_' {
+                return Err(BoltError::Plan(format!(
+                    "LIKE ESCAPE character must not be a wildcard (got {c:?})"
+                )));
+            }
         }
-        let shape = classify(pattern);
+        let shape = classify(pattern, escape)?;
         Ok(Self { shape })
     }
 
@@ -134,29 +153,45 @@ impl PatternMatcher {
 /// The fast-path recognisers all require the pattern to contain *no* `_`
 /// wildcards (those force per-character matching, so they go to Generic),
 /// and the `%` placements must match one of the four canonical shapes.
-fn classify(pattern: &str) -> Shape {
+///
+/// When an escape character is in effect, any pattern that *contains* the
+/// escape character routes straight to [`Shape::Generic`] — the fast paths
+/// can't reason about escaped vs. unescaped `%` without re-scanning, and
+/// the generic matcher already handles escape semantics via [`tokenise`].
+/// The escape character is also validated here: a trailing escape (no
+/// following char) is rejected as a malformed pattern.
+fn classify(pattern: &str, escape: Option<char>) -> BoltResult<Shape> {
+    // Any pattern that carries the escape character cannot use the prefix /
+    // suffix / contains / exact fast paths (those look at raw `%` / `_`
+    // positions, ignoring escapes). Route to Generic so [`tokenise`] can
+    // apply escape semantics uniformly.
+    if let Some(c) = escape {
+        if pattern.contains(c) {
+            return Ok(Shape::Generic(tokenise(pattern, Some(c))?));
+        }
+    }
     // Bail out to Generic immediately if there's any `_` — fast paths only
     // handle `%`-style shapes.
     if pattern.contains('_') {
-        return Shape::Generic(tokenise(pattern));
+        return Ok(Shape::Generic(tokenise(pattern, escape)?));
     }
     let n_pct = pattern.chars().filter(|c| *c == '%').count();
     if n_pct == 0 {
         // No wildcards at all → exact match.
-        return Shape::Exact(pattern.to_string());
+        return Ok(Shape::Exact(pattern.to_string()));
     }
     if n_pct == 1 {
         if let Some(rest) = pattern.strip_suffix('%') {
             // `foo%` — prefix. (Pattern `%` alone strips to empty rest →
             // prefix "" matches everything, which is the correct semantic.)
-            return Shape::Prefix(rest.to_string());
+            return Ok(Shape::Prefix(rest.to_string()));
         }
         if let Some(rest) = pattern.strip_prefix('%') {
             // `%foo` — suffix.
-            return Shape::Suffix(rest.to_string());
+            return Ok(Shape::Suffix(rest.to_string()));
         }
         // `%` was internal (`fo%o`) — not one of the fast-path shapes.
-        return Shape::Generic(tokenise(pattern));
+        return Ok(Shape::Generic(tokenise(pattern, escape)?));
     }
     if n_pct == 2 {
         // Look for the canonical `%foo%` shape: starts with `%`, ends with
@@ -168,12 +203,12 @@ fn classify(pattern: &str) -> Shape {
             // The middle slice contains no `%` (we already accounted for
             // exactly two in the original) and no `_` (we bailed out above
             // for that), so `Contains` is correct.
-            return Shape::Contains(mid.to_string());
+            return Ok(Shape::Contains(mid.to_string()));
         }
     }
     // Anything else (multiple internal `%`s, mix of `_` already handled
     // above) → generic matcher.
-    Shape::Generic(tokenise(pattern))
+    Ok(Shape::Generic(tokenise(pattern, escape)?))
 }
 
 /// Split `pattern` into a `Vec<Token>` for the generic matcher.
@@ -181,10 +216,43 @@ fn classify(pattern: &str) -> Shape {
 /// Runs of literal characters become one [`Token::Literal`]; each `_` and
 /// `%` becomes its own token. The matcher then walks tokens linearly,
 /// backtracking on `%` when a subsequent literal/`_` fails to match.
-fn tokenise(pattern: &str) -> Vec<Token> {
+///
+/// When `escape` is `Some(c)`, a `c` in the pattern marks the next
+/// character as a literal: `c%` emits a literal `%`, `c_` emits a literal
+/// `_`, and `cc` emits a literal `c`. The escape character itself does
+/// not appear in the emitted tokens. A trailing escape (`...c` with no
+/// following char) is rejected — it's a malformed pattern.
+fn tokenise(pattern: &str, escape: Option<char>) -> BoltResult<Vec<Token>> {
     let mut out: Vec<Token> = Vec::new();
     let mut buf = String::new();
-    for ch in pattern.chars() {
+    // Hold the iterator by-ref so the loop body can also call `next()` to
+    // consume the character *after* an escape — that two-character peek is
+    // the whole point of escape handling.
+    let mut chars = pattern.chars();
+    #[allow(clippy::while_let_on_iterator)]
+    while let Some(ch) = chars.next() {
+        // Handle escape *before* wildcard interpretation so `\%` and `\_`
+        // become literal `%` / `_` rather than the wildcards they would
+        // otherwise be.
+        if let Some(esc) = escape {
+            if ch == esc {
+                match chars.next() {
+                    Some(next) => {
+                        // Any character following the escape is a literal —
+                        // wildcards (`%`, `_`), the escape char itself
+                        // (`\\`), or any other character (`\a` → literal
+                        // `a`, which is harmless / standard SQL behaviour).
+                        buf.push(next);
+                        continue;
+                    }
+                    None => {
+                        return Err(BoltError::Plan(format!(
+                            "LIKE pattern ends with a dangling escape character {esc:?}"
+                        )));
+                    }
+                }
+            }
+        }
         match ch {
             '%' => {
                 if !buf.is_empty() {
@@ -209,7 +277,7 @@ fn tokenise(pattern: &str) -> Vec<Token> {
     if !buf.is_empty() {
         out.push(Token::Literal(buf));
     }
-    out
+    Ok(out)
 }
 
 /// Generic LIKE matcher: char-level backtracking over `s` against
@@ -302,8 +370,13 @@ fn match_chars(s: &[char], tokens: &[Token]) -> bool {
 /// expression evaluator both call into — see
 /// [`crate::exec::filter::execute_filter`] and
 /// [`crate::exec::expr_agg::eval_expr`].
-pub fn host_like(col: &StringArray, pattern: &str, negated: bool) -> BoltResult<BooleanArray> {
-    let matcher = PatternMatcher::compile(pattern, None)?;
+pub fn host_like(
+    col: &StringArray,
+    pattern: &str,
+    escape: Option<char>,
+    negated: bool,
+) -> BoltResult<BooleanArray> {
+    let matcher = PatternMatcher::compile(pattern, escape)?;
     let n = col.len();
     let mut pairs: Vec<Option<bool>> = Vec::with_capacity(n);
     for i in 0..n {
@@ -324,9 +397,16 @@ mod tests {
     use super::*;
     use arrow_array::StringArray;
 
-    /// Helper: compile + match in one call.
+    /// Helper: compile + match in one call (no ESCAPE clause).
     fn m(pattern: &str, s: &str) -> bool {
         PatternMatcher::compile(pattern, None)
+            .unwrap()
+            .matches(s)
+    }
+
+    /// Helper: compile + match with an explicit ESCAPE character.
+    fn me(pattern: &str, escape: char, s: &str) -> bool {
+        PatternMatcher::compile(pattern, Some(escape))
             .unwrap()
             .matches(s)
     }
@@ -400,7 +480,7 @@ mod tests {
     #[test]
     fn host_like_handles_nulls_3vl() {
         let arr = StringArray::from(vec![Some("foo"), None, Some("bar"), None, Some("fool")]);
-        let out = host_like(&arr, "foo%", false).expect("ok");
+        let out = host_like(&arr, "foo%", None, false).expect("ok");
         assert_eq!(out.len(), 5);
         // foo, NULL, bar, NULL, fool  → t, NULL, f, NULL, t
         assert_eq!(out.value(0), true);
@@ -414,23 +494,129 @@ mod tests {
     fn host_like_negated_preserves_nulls() {
         // NOT LIKE: `NULL NOT LIKE 'pat'` is still NULL, not TRUE.
         let arr = StringArray::from(vec![Some("foo"), None, Some("bar")]);
-        let out = host_like(&arr, "foo", true).expect("ok");
+        let out = host_like(&arr, "foo", None, true).expect("ok");
         assert_eq!(out.value(0), false);
         assert!(out.is_null(1), "NULL NOT LIKE 'pat' must be NULL");
         assert_eq!(out.value(2), true);
     }
 
+    // ─── ESCAPE clause (v0.7) ────────────────────────────────────────────
+
+    /// Canonical task example: `'a\%b' ESCAPE '\'` matches literal
+    /// `'a%b'` and does NOT match `'a_b'` (the escaped `%` no longer acts
+    /// as a wildcard).
     #[test]
-    fn escape_clause_rejected_for_v05() {
-        // The SQL frontend rejects ESCAPE at parse time, but
-        // PatternMatcher::compile also rejects so hand-built plans
-        // surface the same error.
-        let err = PatternMatcher::compile("foo", Some('\\')).expect_err("must reject");
+    fn escape_literalises_percent() {
+        assert!(me(r"a\%b", '\\', "a%b"));
+        assert!(!me(r"a\%b", '\\', "a_b"));
+        // Also doesn't match arbitrary strings the way unescaped `%`
+        // would.
+        assert!(!me(r"a\%b", '\\', "axb"));
+        assert!(!me(r"a\%b", '\\', "ab"));
+        assert!(!me(r"a\%b", '\\', "aXYZb"));
+    }
+
+    /// Escape of `_` produces a literal `_` (no single-char wildcard).
+    #[test]
+    fn escape_literalises_underscore() {
+        assert!(me(r"a\_b", '\\', "a_b"));
+        assert!(!me(r"a\_b", '\\', "aXb"));
+        assert!(!me(r"a\_b", '\\', "ab"));
+    }
+
+    /// Escape of the escape character itself — `'\\'` matches a literal
+    /// backslash when `ESCAPE '\'`.
+    #[test]
+    fn escape_of_escape_yields_literal_escape_char() {
+        assert!(me(r"a\\b", '\\', r"a\b"));
+        assert!(!me(r"a\\b", '\\', "ab"));
+        assert!(!me(r"a\\b", '\\', r"a\\b"));
+    }
+
+    /// Standard `%` and `_` wildcards still work when ESCAPE is set — the
+    /// escape only changes the next char, not the wildcard semantics
+    /// elsewhere in the pattern.
+    #[test]
+    fn unescaped_wildcards_still_work_when_escape_set() {
+        // Unescaped `%` is still "zero-or-more".
+        assert!(me("a%b", '\\', "ab"));
+        assert!(me("a%b", '\\', "aXYZb"));
+        assert!(!me("a%b", '\\', "a"));
+        // Unescaped `_` is still "exactly one".
+        assert!(me("a_b", '\\', "aXb"));
+        assert!(!me("a_b", '\\', "ab"));
+        // Mix: literal `%` then wildcard `_`.
+        assert!(me(r"a\%_b", '\\', "a%Xb"));
+        assert!(!me(r"a\%_b", '\\', "aXXb"));
+    }
+
+    /// Custom non-backslash escape character (`!`) — same rules apply.
+    #[test]
+    fn custom_escape_character() {
+        assert!(me("a!%b", '!', "a%b"));
+        assert!(!me("a!%b", '!', "aXb"));
+        // Unescaped `%` in the same pattern still wildcards.
+        assert!(me("a%!_b", '!', "axyz_b"));
+        assert!(!me("a%!_b", '!', "axyzb"));
+    }
+
+    /// Trailing escape character (no char follows) is a malformed
+    /// pattern — surface a clean error.
+    #[test]
+    fn dangling_escape_rejected() {
+        let err = PatternMatcher::compile(r"abc\", Some('\\')).expect_err("must reject");
         let msg = format!("{err}");
         assert!(
-            msg.contains("ESCAPE"),
-            "expected ESCAPE-related error, got: {msg}"
+            msg.contains("dangling escape"),
+            "expected dangling-escape error, got: {msg}"
         );
+    }
+
+    /// Choosing the escape character equal to a wildcard would render the
+    /// wildcard unreachable — reject so users get a clear error rather
+    /// than silently broken matching.
+    #[test]
+    fn escape_equal_to_wildcard_rejected() {
+        let err = PatternMatcher::compile("foo", Some('%')).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("wildcard"),
+            "expected wildcard-conflict error, got: {msg}"
+        );
+        let err = PatternMatcher::compile("foo", Some('_')).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("wildcard"),
+            "expected wildcard-conflict error, got: {msg}"
+        );
+    }
+
+    /// `host_like` honors the escape clause end-to-end with 3VL NULL
+    /// semantics preserved.
+    #[test]
+    fn host_like_with_escape() {
+        let arr = StringArray::from(vec![
+            Some("a%b"), // matches literal `%`
+            Some("a_b"), // does not match literal `%`
+            None,        // NULL stays NULL
+            Some("axb"), // unescaped `%` would match, escaped does not
+        ]);
+        let out = host_like(&arr, r"a\%b", Some('\\'), false).expect("ok");
+        assert_eq!(out.value(0), true);
+        assert_eq!(out.value(1), false);
+        assert!(out.is_null(2));
+        assert_eq!(out.value(3), false);
+    }
+
+    /// Patterns whose escape sequences happen to leave only literal
+    /// characters still classify (via Generic) and match exactly.
+    #[test]
+    fn escape_pattern_routes_through_generic_shape() {
+        // No wildcards survive after escaping — Generic shape with a
+        // single Literal token matches the literal string only.
+        assert!(me(r"\%\%", '\\', "%%"));
+        assert!(!me(r"\%\%", '\\', "anything"));
+        assert!(!me(r"\%\%", '\\', "%"));
     }
 
     /// `%%` (multiple `%`) collapses cleanly — and matches everything.

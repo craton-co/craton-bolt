@@ -475,18 +475,22 @@ pub enum Expr {
         /// Optional ELSE value; SQL NULL when omitted.
         else_branch: Option<Box<Expr>>,
     },
-    /// SQL `expr LIKE 'pattern'` / `expr NOT LIKE 'pattern'`.
+    /// SQL `expr LIKE 'pattern'` / `expr NOT LIKE 'pattern'`,
+    /// optionally with `ESCAPE '<char>'`.
     ///
-    /// v0.5 minimum: the pattern must be a string literal constant.
+    /// The pattern must be a string literal constant.
     /// Wildcards: `%` matches zero-or-more characters; `_` matches exactly
-    /// one character. `ESCAPE '<char>'` is rejected at the frontend until
-    /// kernel codegen catches up.
+    /// one character. When `escape` is `Some(c)`, a `c` in the pattern
+    /// causes the next character to be interpreted literally — see
+    /// [`crate::exec::like::PatternMatcher::compile`] for the exact rules.
     Like {
         /// Operand: must be a `Utf8`-typed expression.
         expr: Box<Expr>,
         /// Literal pattern (`%` = wildcard any, `_` = wildcard one).
         pattern: String,
-        /// Optional ESCAPE character. Currently always `None`.
+        /// Optional ESCAPE character (single Unicode scalar). When set,
+        /// any occurrence of this character in `pattern` marks the next
+        /// character as a literal.
         escape: Option<char>,
         /// `true` for `NOT LIKE`, `false` for `LIKE`.
         negated: bool,

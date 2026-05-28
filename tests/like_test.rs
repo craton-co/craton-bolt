@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! v0.5 end-to-end tests for SQL `LIKE` with a constant pattern.
+//! End-to-end tests for SQL `LIKE` with a constant pattern.
+//!
+//! v0.5 wired the host-side matcher (`%` / `_` wildcards) and the SQL
+//! frontend / lowerer. v0.7 added support for the optional
+//! `ESCAPE '<char>'` clause; the ESCAPE coverage lives alongside the
+//! basic shape tests below.
 //!
 //! The host-side `LIKE` evaluator (`src/exec/like.rs`) is reachable through
 //! two surfaces:
@@ -71,7 +76,7 @@ fn boolarr_to_vec(arr: &BooleanArray) -> Vec<Option<bool>> {
 #[test]
 fn host_like_exact_match() {
     let arr = StringArray::from(vec!["foo", "foobar", "bar", "foo"]);
-    let out = craton_bolt::exec::like::host_like(&arr, "foo", false).expect("ok");
+    let out = craton_bolt::exec::like::host_like(&arr, "foo", None, false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
         vec![Some(true), Some(false), Some(false), Some(true)],
@@ -82,7 +87,7 @@ fn host_like_exact_match() {
 #[test]
 fn host_like_prefix_pattern() {
     let arr = StringArray::from(vec!["foo", "foobar", "bar", "fo", "foobaz"]);
-    let out = craton_bolt::exec::like::host_like(&arr, "foo%", false).expect("ok");
+    let out = craton_bolt::exec::like::host_like(&arr, "foo%", None, false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
         vec![
@@ -99,7 +104,7 @@ fn host_like_prefix_pattern() {
 #[test]
 fn host_like_suffix_pattern() {
     let arr = StringArray::from(vec!["foo", "foobar", "barfoo", "fo"]);
-    let out = craton_bolt::exec::like::host_like(&arr, "%foo", false).expect("ok");
+    let out = craton_bolt::exec::like::host_like(&arr, "%foo", None, false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
         vec![Some(true), Some(false), Some(true), Some(false)],
@@ -110,7 +115,7 @@ fn host_like_suffix_pattern() {
 #[test]
 fn host_like_contains_pattern() {
     let arr = StringArray::from(vec!["foo", "abcfoodef", "bar", "afoo", "foob"]);
-    let out = craton_bolt::exec::like::host_like(&arr, "%foo%", false).expect("ok");
+    let out = craton_bolt::exec::like::host_like(&arr, "%foo%", None, false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
         vec![
@@ -129,7 +134,7 @@ fn host_like_contains_pattern() {
 #[test]
 fn host_like_underscore_uses_generic_matcher() {
     let arr = StringArray::from(vec!["foo", "fbo", "fo", "fooo", "fxo"]);
-    let out = craton_bolt::exec::like::host_like(&arr, "f_o", false).expect("ok");
+    let out = craton_bolt::exec::like::host_like(&arr, "f_o", None, false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
         vec![
@@ -146,7 +151,7 @@ fn host_like_underscore_uses_generic_matcher() {
 #[test]
 fn host_like_not_like_inverts_and_preserves_nulls() {
     let arr = StringArray::from(vec![Some("foo"), None, Some("bar")]);
-    let out = craton_bolt::exec::like::host_like(&arr, "foo", true).expect("ok");
+    let out = craton_bolt::exec::like::host_like(&arr, "foo", None, true).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
         vec![Some(false), None, Some(true)],
@@ -242,25 +247,60 @@ fn like_lowers_for_each_shape() {
     }
 }
 
-/// Sanity-check that the SQL frontend correctly rejects the unsupported
-/// surfaces — variable patterns and `ESCAPE '<char>'`. Mirrors the parse
-/// tests in `src/plan/sql_frontend.rs::like_tests` so a CI grep for
+/// Sanity-check that the SQL frontend correctly rejects unsupported
+/// surfaces (variable patterns) and *accepts* the v0.7 ESCAPE clause,
+/// surfacing the escape character on `Expr::Like.escape`. Mirrors the
+/// parse tests in `src/plan/sql_frontend.rs::like_tests` so a CI grep for
 /// "ESCAPE" lands in either file.
 #[test]
-fn like_frontend_rejects_unsupported_surfaces() {
-    // Variable pattern.
+fn like_frontend_surface() {
+    // Variable pattern still rejects — the v0.5 constant-pattern
+    // constraint is unchanged.
     let err = parse_sql("SELECT s FROM t WHERE s LIKE s", &s_provider())
         .expect_err("variable pattern must reject");
     assert!(format!("{err}").contains("string literal constant"));
 
-    // ESCAPE clause.
-    let err = parse_sql(
+    // ESCAPE clause now parses and captures the escape char.
+    let plan = parse_sql(
         r"SELECT s FROM t WHERE s LIKE 'a\_b' ESCAPE '\'",
         &s_provider(),
     )
-    .expect_err("ESCAPE must reject");
-    let msg = format!("{err}");
-    assert!(msg.contains("ESCAPE"));
+    .expect("ESCAPE must parse for v0.7");
+    let phys = lower_physical(&plan).expect("lower");
+    let inner = match &phys {
+        PhysicalPlan::Project { input, .. } => input.as_ref(),
+        other => other,
+    };
+    let predicate = match inner {
+        PhysicalPlan::Filter { predicate, .. } => predicate,
+        other => panic!("expected Filter, got {other:?}"),
+    };
+    match predicate {
+        Expr::Like { pattern, escape, .. } => {
+            assert_eq!(pattern, r"a\_b");
+            assert_eq!(*escape, Some('\\'));
+        }
+        other => panic!("expected Expr::Like, got {other:?}"),
+    }
+}
+
+/// End-to-end host-evaluator check of the ESCAPE semantics: a `\%` in the
+/// pattern must match a literal `%` and must *not* match arbitrary
+/// characters the way an unescaped `%` would.
+#[test]
+fn host_like_with_escape_matches_literal_percent() {
+    let arr = StringArray::from(vec![
+        Some("a%b"), // literal % — matches
+        Some("a_b"), // not a literal % — doesn't match
+        Some("axb"), // unescaped % would match, escaped does not
+        None,        // NULL stays NULL
+    ]);
+    let out =
+        craton_bolt::exec::like::host_like(&arr, r"a\%b", Some('\\'), false).expect("ok");
+    assert_eq!(
+        boolarr_to_vec(&out),
+        vec![Some(true), Some(false), Some(false), None],
+    );
 }
 
 /// Sanity-check that the plan does in fact route LIKE through
