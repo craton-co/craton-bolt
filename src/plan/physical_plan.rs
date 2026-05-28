@@ -463,6 +463,15 @@ impl<'a> Codegen<'a> {
             Expr::Literal(lit) => self.emit_literal(lit),
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
             Expr::Unary { op, operand } => self.emit_unary(*op, operand),
+            // GPU codegen does not yet lower LIKE — it requires Utf8 column
+            // access which the kernel doesn't support. The lowering layer
+            // (`lower_depth`) routes LIKE predicates through the host-side
+            // `PhysicalPlan::Filter` path; this arm is unreachable for any
+            // plan that came through `lower()`. Surface a clear error if it
+            // ever gets here (e.g. via a hand-built physical plan).
+            Expr::Like { .. } => Err(BoltError::Plan(
+                "GPU codegen: LIKE requires host fallback".into(),
+            )),
             Expr::Alias(inner, _) => self.emit_expr(inner),
             // CASE has no GPU IR yet: there is no value-selection-by-mask
             // op in the kernel codegen, so a CASE expression in a fused
@@ -1046,6 +1055,17 @@ fn substitute_one_depth(
                 .as_deref()
                 .map(|e| Box::new(substitute_one_depth(e, map, depth + 1))),
         },
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(substitute_one_depth(expr, map, depth + 1)),
+            pattern: pattern.clone(),
+            escape: *escape,
+            negated: *negated,
+        },
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
         }
@@ -1366,10 +1386,15 @@ fn lower_aggregate(
 }
 
 /// True if `plan` is a Scan/Filter/Project chain that bottoms out in a Scan —
-/// Recursively test whether `expr` contains an `Expr::Unary` node that
-/// the GPU codegen cannot lower — i.e. one whose operand is something
-/// other than a bare column reference (with any number of transparent
-/// `Alias` wrappers around it).
+/// Recursively test whether `expr` contains a node the GPU codegen cannot
+/// lower — currently:
+///   * an `Expr::Unary` whose operand is something other than a bare
+///     column reference (with any number of transparent `Alias` wrappers
+///     around it), or
+///   * any `Expr::Like` (v0.5 has no GPU codegen for `LIKE` — every
+///     LIKE forces the host fallback). The function name is kept
+///     historic for grep-stability; callers care only about "does this
+///     need the host path?".
 ///
 /// Used by `lower()` to gate Filter predicates. Today the GPU codegen
 /// emits `Op::IsNullCheck` for `column IS [NOT] NULL` and
@@ -1414,15 +1439,14 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
             predicate_contains_unary(left) || predicate_contains_unary(right)
         }
         Expr::Alias(inner, _) => predicate_contains_unary(inner),
-        // CASE inside a predicate or projection cannot be lowered to the
-        // fused GPU kernel today (no value-selection-by-mask op). The
-        // lowering entry point already rejects the enclosing plan with a
-        // "CASE not yet lowered to GPU" Plan error via `plan_contains_case`;
-        // we conservatively return `true` here so any leftover code path
-        // (a host-side CASE in a Filter predicate, say, if a future
-        // refactor adds host CASE support without revisiting this
-        // gate) still routes away from the fused kernel.
+        // CASE inside a predicate cannot be lowered to the fused GPU
+        // kernel today; route to host path.
         Expr::Case { .. } => true,
+        // LIKE has no GPU codegen yet — every LIKE forces the host fallback.
+        Expr::Like { expr, .. } => {
+            let _ = predicate_contains_unary(expr);
+            true
+        }
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1725,6 +1749,7 @@ fn expr_contains_div_or_mod(e: &Expr) -> bool {
                 .as_deref()
                 .is_some_and(expr_contains_div_or_mod)
         }
+        Expr::Like { expr, .. } => expr_contains_div_or_mod(expr),
     }
 }
 
@@ -1758,6 +1783,7 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
                 .as_deref()
                 .is_some_and(expr_has_unsafe_eager_shortcircuit)
         }
+        Expr::Like { expr, .. } => expr_has_unsafe_eager_shortcircuit(expr),
     }
 }
 

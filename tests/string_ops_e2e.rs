@@ -299,33 +299,27 @@ fn parse_string_concat_in_where_rejected_with_clear_message() {
 }
 
 #[test]
-fn parse_like_rejected_by_frontend() {
-    // TODO(post-0.3): LIKE not yet supported by frontend (review H7).
-    // sqlparser surfaces LIKE as a dedicated `SqlExpr::Like { .. }` node, not
-    // a `BinaryOp`, so it falls into `lower_expr`'s catch-all "unsupported
-    // expression" arm. This covers both the prefix-pattern case and the
-    // backslash-escape variant listed in the H7 checklist.
+fn parse_like_constant_pattern_supported_v05() {
+    // v0.5 (M2 SQL scalar completeness): LIKE with a constant pattern is
+    // now accepted by the frontend. Plan-shape and matcher behaviour are
+    // covered in `tests/like_test.rs`; here we just lock the parse-time
+    // surface (no GPU needed).
     let provider = s_provider();
+    parse_sql("SELECT s FROM t WHERE s LIKE 'foo%'", &provider)
+        .expect("LIKE 'foo%' must parse in v0.5");
+    parse_sql("SELECT s FROM t WHERE s NOT LIKE 'foo%'", &provider)
+        .expect("NOT LIKE 'foo%' must parse in v0.5");
 
-    let err = parse_sql("SELECT s FROM t WHERE s LIKE 'foo%'", &provider)
-        .expect_err("LIKE 'foo%' must reject until pattern matching lands");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("unsupported"),
-        "unexpected error for LIKE prefix: {msg}"
-    );
-
-    // TODO(post-0.3): where_like_with_escape — `WHERE s LIKE 'a\_b' ESCAPE '\'`.
-    // Same rejection path; locked here so re-enabling either form flips both
-    // tests together.
+    // ESCAPE is still a follow-up — same TODO marker but now with a
+    // narrower scope (everything else about LIKE works).
     let err_esc = parse_sql(
         r"SELECT s FROM t WHERE s LIKE 'a\_b' ESCAPE '\'",
         &provider,
     )
-    .expect_err("LIKE ... ESCAPE must reject until pattern matching lands");
+    .expect_err("LIKE ... ESCAPE must reject until v0.5 follow-up lands");
     let msg = format!("{err_esc}");
     assert!(
-        msg.contains("unsupported"),
+        msg.contains("ESCAPE"),
         "unexpected error for LIKE escape: {msg}"
     );
 }

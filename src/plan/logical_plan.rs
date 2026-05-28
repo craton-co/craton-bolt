@@ -283,27 +283,28 @@ pub enum Expr {
         operand: Box<Expr>,
     },
     /// SQL `CASE WHEN cond1 THEN val1 [WHEN cond2 THEN val2 ...] [ELSE
-    /// val_else] END`. Each `(cond, then)` branch is evaluated in order;
-    /// the first branch whose condition is `true` contributes the
-    /// expression's value. If no branch matches, the value is `else_branch`
-    /// when present and SQL `NULL` otherwise.
-    ///
-    /// Type-checks every WHEN condition to `Bool`, and unifies every THEN
-    /// value and the optional ELSE to a single dtype: numeric pairs go
-    /// through [`unify_numeric`]; non-numeric pairs must match exactly. If
-    /// the ELSE branch is absent the dtype is taken from the first THEN
-    /// value (and SQL NULL is implicit for unmatched rows).
-    ///
-    /// The physical planner does not yet lower this to a GPU kernel — the
-    /// codegen path in `physical_plan::emit_expr` rejects it with a clear
-    /// "CASE not yet lowered to GPU; coming in a follow-up" `Plan` error,
-    /// so callers using CASE in a fused projection / filter will see that
-    /// message rather than a misleading runtime failure.
+    /// val_else] END`.
     Case {
         /// One or more WHEN/THEN branches in source order.
         branches: Vec<(Expr, Expr)>,
         /// Optional ELSE value; SQL NULL when omitted.
         else_branch: Option<Box<Expr>>,
+    },
+    /// SQL `expr LIKE 'pattern'` / `expr NOT LIKE 'pattern'`.
+    ///
+    /// v0.5 minimum: the pattern must be a string literal constant.
+    /// Wildcards: `%` matches zero-or-more characters; `_` matches exactly
+    /// one character. `ESCAPE '<char>'` is rejected at the frontend until
+    /// kernel codegen catches up.
+    Like {
+        /// Operand: must be a `Utf8`-typed expression.
+        expr: Box<Expr>,
+        /// Literal pattern (`%` = wildcard any, `_` = wildcard one).
+        pattern: String,
+        /// Optional ESCAPE character. Currently always `None`.
+        escape: Option<char>,
+        /// `true` for `NOT LIKE`, `false` for `LIKE`.
+        negated: bool,
     },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
@@ -537,12 +538,6 @@ impl Expr {
                         "CASE expression requires at least one WHEN/THEN branch".into(),
                     ));
                 }
-                // Every WHEN must type-check to Bool against the input
-                // schema. We accept the same NULL-peer-typing latitude as
-                // `Expr::Binary` (a bare `Literal::Null` condition would
-                // hard-error here; users hit this so rarely it isn't worth
-                // a special case — SQL CASE conditions are always real
-                // boolean expressions in practice).
                 for (i, (when, _)) in branches.iter().enumerate() {
                     let wt = when.dtype_depth(schema, depth + 1)?;
                     if wt != DataType::Bool {
@@ -551,14 +546,6 @@ impl Expr {
                         )));
                     }
                 }
-                // Walk THEN values + optional ELSE and unify into a single
-                // dtype. NULL operands borrow their peer's dtype just like
-                // `peer_typed_dtype` does for binary ops, so a CASE arm of
-                // bare NULL doesn't hard-error when there's a typed peer.
-                //
-                // Collect (idx_label, dtype_option) so error messages can
-                // name the failing branch precisely. `None` means the arm
-                // is an untyped `Literal::Null`.
                 let mut arms: Vec<(String, Option<DataType>)> =
                     Vec::with_capacity(branches.len() + 1);
                 for (i, (_, then)) in branches.iter().enumerate() {
@@ -569,11 +556,6 @@ impl Expr {
                     let t = case_arm_dtype(e, schema, depth + 1)?;
                     arms.push(("ELSE".to_string(), t));
                 }
-                // The unified dtype is the first typed arm's dtype, then
-                // pairwise-unified against every other typed arm. Untyped
-                // NULL arms borrow whatever the accumulator already has.
-                // If every arm is an untyped NULL we have nothing to anchor
-                // on — surface a clear error.
                 let mut acc: Option<DataType> = None;
                 for (label, t) in &arms {
                     match t {
@@ -588,11 +570,7 @@ impl Expr {
                                 })?);
                             }
                         },
-                        None => {
-                            // Untyped NULL arm — no dtype information; we
-                            // adopt whatever `acc` already has (which may
-                            // be `None` if every preceding arm was NULL).
-                        }
+                        None => {}
                     }
                 }
                 acc.ok_or_else(|| {
@@ -602,6 +580,15 @@ impl Expr {
                             .into(),
                     )
                 })
+            }
+            Expr::Like { expr, .. } => {
+                let t = expr.dtype_depth(schema, depth + 1)?;
+                if t != DataType::Utf8 {
+                    return Err(BoltError::Type(format!(
+                        "LIKE requires a Utf8 operand, got {t:?}"
+                    )));
+                }
+                Ok(DataType::Bool)
             }
             Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
         }
@@ -1270,24 +1257,48 @@ mod null_handling_tests {
         }
     }
 
-    /// `NOT <bool>` type-checks to Bool when the operand is Bool, and
-    /// errors when it's a non-Bool numeric / string / etc. The convenience
-    /// `Expr::not()` constructor produces the same `Expr::Unary` shape.
+    /// `NOT <bool>` type-checks to Bool when the operand is Bool.
     #[test]
     fn unary_not_typechecks_against_bool_operand() {
         let schema = Schema::new(vec![
             Field::new("b", DataType::Bool, true),
             Field::new("x", DataType::Int32, true),
         ]);
-        // Bool column under NOT → Bool result.
         let on_bool = Expr::Column("b".into()).not();
         assert_eq!(on_bool.dtype(&schema).unwrap(), DataType::Bool);
-        // Int column under NOT → Type error.
         let on_int = Expr::Column("x".into()).not();
         assert!(on_int.dtype(&schema).is_err());
-        // NULL under NOT → Bool (NULL-peer-typing surface).
         let on_null = Expr::Literal(Literal::Null).not();
         assert_eq!(on_null.dtype(&schema).unwrap(), DataType::Bool);
+    }
+
+    /// `expr LIKE 'pat'` resolves to Bool when the operand is Utf8.
+    #[test]
+    fn like_typechecks_to_bool_on_utf8() {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("v", DataType::Int32, false),
+        ]);
+        let ok = Expr::Like {
+            expr: Box::new(Expr::Column("s".into())),
+            pattern: "foo%".into(),
+            escape: None,
+            negated: false,
+        };
+        assert_eq!(ok.dtype(&schema).unwrap(), DataType::Bool);
+
+        let bad = Expr::Like {
+            expr: Box::new(Expr::Column("v".into())),
+            pattern: "foo%".into(),
+            escape: None,
+            negated: false,
+        };
+        let err = bad.dtype(&schema).expect_err("LIKE on Int32 must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LIKE requires a Utf8 operand"),
+            "expected Utf8 type error, got: {msg}"
+        );
     }
 
     /// Arithmetic peer-typing: `x + NULL` with `x: Int64` resolves to

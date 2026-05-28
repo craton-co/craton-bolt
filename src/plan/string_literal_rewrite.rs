@@ -361,13 +361,6 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             branches,
             else_branch,
         } => {
-            // CASE WHEN ... THEN ... [ELSE ...] END: rewrite every WHEN /
-            // THEN / ELSE sub-expression so string-literal comparisons
-            // inside arms are normalised against the dictionary in the
-            // same way they would be at the top level. CASE itself has
-            // no `col = 'lit'` shape to fold against — the rewriter only
-            // matches direct binary comparisons — so we just recurse and
-            // rebuild.
             let new_branches = branches
                 .iter()
                 .map(|(w, t)| {
@@ -384,6 +377,20 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             Ok(Expr::Case {
                 branches: new_branches,
                 else_branch: new_else,
+            })
+        }
+        Expr::Like {
+            expr: like_expr,
+            pattern,
+            escape,
+            negated,
+        } => {
+            let new_inner = rewrite_expr_with(like_expr, r, depth + 1)?;
+            Ok(Expr::Like {
+                expr: Box::new(new_inner),
+                pattern: pattern.clone(),
+                escape: *escape,
+                negated: *negated,
             })
         }
     }
