@@ -3710,7 +3710,10 @@ mod tests {
         let mut dbgs: HashSet<String> = HashSet::new();
         for op in ops {
             for dtype in dtypes {
-                let spec = ScalarAggSpec { op, dtype };
+                let spec = ScalarAggSpec {
+                    op,
+                    input_dtype: dtype,
+                };
                 let dbg = format!("{:?}", spec);
                 assert!(
                     dbgs.insert(dbg.clone()),
@@ -4052,7 +4055,7 @@ mod tests {
             KernelSpecKind::Projection(bare_spec),
             KernelSpecKind::ScalarAgg(ScalarAggSpec {
                 op: ScalarAggOp::Sum,
-                dtype: DataType::Int32,
+                input_dtype: DataType::Int32,
             }),
             KernelSpecKind::HashJoin(HashJoinKernelSpec {
                 kind: HashJoinKernelKind::Build,
