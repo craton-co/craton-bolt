@@ -463,6 +463,15 @@ fn contains_unary(expr: &Expr) -> bool {
         Expr::Unary { .. } => true,
         Expr::Binary { left, right, .. } => contains_unary(left) || contains_unary(right),
         Expr::Alias(inner, _) => contains_unary(inner),
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            branches
+                .iter()
+                .any(|(w, t)| contains_unary(w) || contains_unary(t))
+                || else_branch.as_deref().is_some_and(contains_unary)
+        }
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }

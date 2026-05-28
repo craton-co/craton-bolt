@@ -310,6 +310,17 @@ fn eval_inner(
         Expr::Alias(inner, _) => eval_inner(inner, env, n_rows),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, n_rows),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, n_rows),
+        // CASE has no host evaluator yet: the lowering boundary in
+        // `physical_plan::lower` rejects any plan containing CASE with a
+        // dedicated "CASE not yet lowered to GPU; coming in a follow-up"
+        // Plan error, so the executor should never reach this arm in
+        // practice. The explicit `BoltError::Other` here is a defensive
+        // surface for hand-built plans that bypass `lower()`.
+        Expr::Case { .. } => Err(BoltError::Other(
+            "expr_agg: CASE expressions not yet supported on the host evaluator; \
+             plan-time lowering should have rejected this expression"
+                .into(),
+        )),
     }
 }
 

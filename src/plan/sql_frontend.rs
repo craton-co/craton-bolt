@@ -1736,6 +1736,36 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
             || contains_aggregate(low, resolver, depth + 1)?
             || contains_aggregate(high, resolver, depth + 1)?),
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
+        // CASE: any nested subtree may contain an aggregate call (operand
+        // of a simple CASE, any WHEN condition, any THEN value, the ELSE).
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                if contains_aggregate(o, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            for c in conditions {
+                if contains_aggregate(c, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            for r in results {
+                if contains_aggregate(r, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            if let Some(e) = else_result {
+                if contains_aggregate(e, resolver, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         _ => Ok(false),
     }
 }
@@ -1916,6 +1946,61 @@ fn lower_expr_in_having(
                 })
             }
         }
+        // HAVING ... CASE: walk every subtree through the aggregate-aware
+        // lowerer so an aggregate call buried in a CASE arm resolves to the
+        // post-aggregate column reference.
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            let lowered_operand = match operand {
+                Some(o) => Some(lower_expr_in_having(o, resolver, agg_aliases, depth + 1)?),
+                None => None,
+            };
+            if conditions.len() != results.len() {
+                return Err(BoltError::Sql(format!(
+                    "CASE expression has {} conditions and {} results; they must match",
+                    conditions.len(),
+                    results.len(),
+                )));
+            }
+            if conditions.is_empty() {
+                return Err(BoltError::Sql(
+                    "CASE expression requires at least one WHEN/THEN branch".into(),
+                ));
+            }
+            let mut branches: Vec<(Expr, Expr)> = Vec::with_capacity(conditions.len());
+            for (w, t) in conditions.iter().zip(results.iter()) {
+                let cond = match &lowered_operand {
+                    Some(op_expr) => {
+                        let v = lower_expr_in_having(w, resolver, agg_aliases, depth + 1)?;
+                        Expr::Binary {
+                            op: BinaryOp::Eq,
+                            left: Box::new(op_expr.clone()),
+                            right: Box::new(v),
+                        }
+                    }
+                    None => lower_expr_in_having(w, resolver, agg_aliases, depth + 1)?,
+                };
+                let then = lower_expr_in_having(t, resolver, agg_aliases, depth + 1)?;
+                branches.push((cond, then));
+            }
+            let else_expr = match else_result {
+                Some(e) => Some(Box::new(lower_expr_in_having(
+                    e,
+                    resolver,
+                    agg_aliases,
+                    depth + 1,
+                )?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                branches,
+                else_branch: else_expr,
+            })
+        }
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
         // still rejects bare non-aggregate Function calls).
@@ -1953,6 +2038,18 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
             }
             Expr::Alias(inner, _) => stack.push(inner),
             Expr::Unary { operand, .. } => stack.push(operand),
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
+                for (when, then) in branches {
+                    stack.push(when);
+                    stack.push(then);
+                }
+                if let Some(e) = else_branch {
+                    stack.push(e);
+                }
+            }
         }
     }
     Ok(())
@@ -2056,9 +2153,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
         }
         // `<expr> [NOT] IN (v1, v2, ...)` — desugared into an OR/AND chain
         // of element-wise equalities/inequalities so existing comparison and
-        // boolean codegen handles it without a new operator. See
-        // [`lower_in_list`] for the cap (`MAX_IN_LIST_VALUES`) and the empty-
-        // list constant-folding rule.
+        // boolean codegen handles it without a new operator.
         SqlExpr::InList { expr, list, negated } => {
             lower_in_list(expr, list, *negated, resolver, depth + 1)
         }
@@ -2107,6 +2202,20 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                 })
             }
         }
+        // SQL `CASE` — both the plain (no operand) and the simple (with operand) forms.
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => lower_case(
+            operand.as_deref(),
+            conditions,
+            results,
+            else_result.as_deref(),
+            resolver,
+            depth + 1,
+        ),
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "scalar function calls are not supported".into(),
         )),
@@ -2118,17 +2227,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
 
 /// Maximum number of values accepted on the right-hand side of a SQL
 /// `IN (...)` list operator. Lists at or under this bound are desugared
-/// to a balanced OR/AND chain of element-wise comparisons (see
-/// [`lower_in_list`]); anything larger is rejected with a clear error so
-/// the user is steered toward a JOIN against a derived table while the
-/// large-list hash-probe path is still on the v0.5 roadmap.
-///
-/// 64 was picked as a round power-of-two large enough to comfortably
-/// cover the typical "status code allowlist" / "small id set" use case
-/// (which empirically tops out in the low tens of values) and small
-/// enough that the resulting OR-chain still fits within a reasonable
-/// JIT instruction budget. Bumping this is a back-compat change (more
-/// queries succeed); shrinking it is not.
+/// to a balanced OR/AND chain of element-wise comparisons.
 const MAX_IN_LIST_VALUES: usize = 64;
 
 /// Desugar SQL `<expr> [NOT] IN (v1, v2, ..., vN)` into the equivalent
@@ -2136,21 +2235,6 @@ const MAX_IN_LIST_VALUES: usize = 64;
 ///
 ///   * `IN`     → `(expr = v1) OR  (expr = v2) OR  ... OR  (expr = vN)`
 ///   * `NOT IN` → `(expr <> v1) AND (expr <> v2) AND ... AND (expr <> vN)`
-///
-/// `NOT IN` is lowered directly via De Morgan rather than wrapping the
-/// `IN` form in a logical NOT — the planner does not yet surface a NOT
-/// node, and the AND-of-`<>` form is more amenable to downstream short-
-/// circuiting anyway. Both forms reuse the existing `BinaryOp::{Eq,
-/// NotEq, And, Or}` so no new operator is required.
-///
-/// Empty-list semantics follow the SQL standard: `x IN ()` is always
-/// false, `x NOT IN ()` is always true (with the usual caveat that
-/// `GenericDialect` rejects literal `IN ()` at parse time — this branch
-/// is a safety net for dialects or future callers that do allow it).
-///
-/// Lists with more than [`MAX_IN_LIST_VALUES`] entries are rejected with
-/// a message pointing the user at a JOIN; the large-list hash-probe
-/// path is a separate v0.5 follow-up.
 fn lower_in_list(
     expr: &SqlExpr,
     list: &[SqlExpr],
@@ -2170,26 +2254,15 @@ fn lower_in_list(
             list.len()
         )));
     }
-    // SQL-standard empty-list constants: `x IN ()` ≡ false, `x NOT IN ()` ≡ true.
-    // Note: `GenericDialect::supports_in_empty_list` defaults to false so the
-    // parser rejects literal `IN ()` before we ever get here; this arm exists
-    // so the lowerer remains total for any AST node carrying an empty list.
     if list.is_empty() {
         return Ok(Expr::Literal(Literal::Bool(negated)));
     }
-
-    // Lower the probed expression once; the desugared chain reuses it via
-    // `Clone` for each element. Cloning is necessary because each branch of
-    // the OR/AND tree owns its own copy of the operand.
     let lowered_expr = lower_expr(expr, resolver, depth + 1)?;
-
-    // Element-wise (op, combiner) pair: IN uses Eq + OR, NOT IN uses NotEq + AND.
     let (cmp_op, combine_op) = if negated {
         (BinaryOp::NotEq, BinaryOp::And)
     } else {
         (BinaryOp::Eq, BinaryOp::Or)
     };
-
     let mut acc: Option<Expr> = None;
     for item in list {
         let item_lowered = lower_expr(item, resolver, depth + 1)?;
@@ -2207,9 +2280,65 @@ fn lower_in_list(
             },
         });
     }
-    // `list.is_empty()` was handled above, so `acc` is always `Some` here;
-    // the `.expect` documents that invariant for future readers.
     Ok(acc.expect("non-empty IN list guarantees at least one chain element"))
+}
+
+/// Lower a SQL `CASE` expression — both the plain form (no operand) and
+/// the simple form (with operand). The simple form is desugared into the
+/// plain form by rewriting each WHEN `value` into `operand = value`.
+fn lower_case(
+    operand: Option<&SqlExpr>,
+    conditions: &[SqlExpr],
+    results: &[SqlExpr],
+    else_result: Option<&SqlExpr>,
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if conditions.len() != results.len() {
+        return Err(BoltError::Sql(format!(
+            "CASE expression has {} conditions and {} results; they must match",
+            conditions.len(),
+            results.len(),
+        )));
+    }
+    if conditions.is_empty() {
+        return Err(BoltError::Sql(
+            "CASE expression requires at least one WHEN/THEN branch".into(),
+        ));
+    }
+    let lowered_operand = match operand {
+        Some(e) => Some(lower_expr(e, resolver, depth + 1)?),
+        None => None,
+    };
+    let mut branches: Vec<(Expr, Expr)> = Vec::with_capacity(conditions.len());
+    for (when_sql, then_sql) in conditions.iter().zip(results.iter()) {
+        let cond_expr = match &lowered_operand {
+            Some(op_expr) => {
+                let v = lower_expr(when_sql, resolver, depth + 1)?;
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(op_expr.clone()),
+                    right: Box::new(v),
+                }
+            }
+            None => lower_expr(when_sql, resolver, depth + 1)?,
+        };
+        let then_expr = lower_expr(then_sql, resolver, depth + 1)?;
+        branches.push((cond_expr, then_expr));
+    }
+    let else_expr = match else_result {
+        Some(e) => Some(Box::new(lower_expr(e, resolver, depth + 1)?)),
+        None => None,
+    };
+    Ok(Expr::Case {
+        branches,
+        else_branch: else_expr,
+    })
 }
 
 /// Translate a SQL literal `Value` into our `Literal` expression.
@@ -3161,6 +3290,18 @@ mod wave7_tests {
                         }
                         Expr::Alias(inner, _) => stack.push(inner),
                         Expr::Unary { operand, .. } => stack.push(operand),
+                        Expr::Case {
+                            branches,
+                            else_branch,
+                        } => {
+                            for (w, t) in branches {
+                                stack.push(w);
+                                stack.push(t);
+                            }
+                            if let Some(e) = else_branch {
+                                stack.push(e);
+                            }
+                        }
                         Expr::Literal(_) => {}
                     }
                 }

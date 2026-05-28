@@ -271,6 +271,18 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
             collect_column_refs(right, out);
         }
         Expr::Unary { operand, .. } => collect_column_refs(operand, out),
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            for (w, t) in branches {
+                collect_column_refs(w, out);
+                collect_column_refs(t, out);
+            }
+            if let Some(e) = else_branch {
+                collect_column_refs(e, out);
+            }
+        }
         Expr::Alias(inner, _) => collect_column_refs(inner, out),
     }
 }
