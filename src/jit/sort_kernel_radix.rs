@@ -80,6 +80,7 @@
 //! engine's per-row kernels).
 
 use std::fmt::Write;
+use std::sync::atomic::{AtomicI8, Ordering};
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::DataType;
@@ -219,6 +220,50 @@ pub fn radix_steps_for(dtype: DataType) -> BoltResult<u32> {
     Ok(RadixFlavour::for_dtype(dtype)?.radix_steps)
 }
 
+/// Cached dispatch state for the radix-sort gate. Tri-state so we can
+/// distinguish "not yet read" from the two terminal values:
+///
+///   - `-1` — never read; first reader latches from the env var.
+///   - ` 0` — gate is OFF (env unset or not exactly `"1"` after trimming).
+///   - ` 1` — gate is ON (`BOLT_GPU_SORT=1`).
+///
+/// We use an atomic (rather than a `OnceLock<bool>`) so the `#[cfg(test)]`
+/// override hook [`set_radix_dispatch_for_tests`] can flip the value without
+/// having to touch process-global env state. The env-var read happens lazily
+/// on first call to [`gpu_sort_env_enabled`]; subsequent calls are a plain
+/// relaxed atomic load.
+///
+/// Why not `std::env::var(...)` on every call? Two reasons:
+///
+/// 1. Under `cargo test --lib` the test harness runs tests in parallel and
+///    `std::env::set_var` / `std::env::remove_var` mutate process-global
+///    state. Tests that probed the gate by toggling the env var would flake
+///    against each other. Caching the value behind an atomic plus exposing
+///    a test-only override hook lets each test pin a deterministic gate
+///    state without racing on `std::env`.
+/// 2. The env read happens on the hot dispatch path; a cached atomic load
+///    is several orders of magnitude cheaper than `std::env::var` (which
+///    takes a process-wide lock on most platforms).
+static RADIX_DISPATCH_STATE: AtomicI8 = AtomicI8::new(-1);
+
+/// Lazily latch the gate from the `BOLT_GPU_SORT` env var, returning the
+/// terminal `0` / `1` value. Idempotent: subsequent calls see the cached
+/// state via the atomic load and skip the env read.
+fn read_env_into_dispatch_state() -> i8 {
+    let v = std::env::var(BOLT_GPU_SORT_ENV)
+        .ok()
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    let encoded: i8 = if v { 1 } else { 0 };
+    // Relaxed store: the gate is advisory; we don't need an ordering edge
+    // with any other memory. A racing initialiser that lands a different
+    // value would only happen if the env var changed between two threads'
+    // first reads, which violates the env-var contract anyway ("read once
+    // at startup").
+    RADIX_DISPATCH_STATE.store(encoded, Ordering::Relaxed);
+    encoded
+}
+
 /// Public: is the `BOLT_GPU_SORT` env var set to a truthy value?
 ///
 /// "Truthy" is exactly `"1"` — we deliberately don't accept `"true"` /
@@ -226,11 +271,37 @@ pub fn radix_steps_for(dtype: DataType) -> BoltResult<u32> {
 /// Returns `false` if the var is unset or set to anything else. Whitespace
 /// is stripped before the equality check so an accidental trailing newline
 /// from a shell-script export still trips the gate.
+///
+/// The env var is read once and cached; tests can override the cached value
+/// via [`set_radix_dispatch_for_tests`] (test-only) without touching
+/// process-global env state. See [`RADIX_DISPATCH_STATE`] for the
+/// rationale.
 pub fn gpu_sort_env_enabled() -> bool {
-    std::env::var(BOLT_GPU_SORT_ENV)
-        .ok()
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    match RADIX_DISPATCH_STATE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        // -1 (or any other sentinel) → latch from env and recurse on the
+        // cached value.
+        _ => read_env_into_dispatch_state() == 1,
+    }
+}
+
+/// Test-only: override the cached radix-sort dispatch gate without touching
+/// the `BOLT_GPU_SORT` env var. Lets parallel test cases pin the gate
+/// deterministically without racing on `std::env::set_var`.
+///
+/// `Some(true)`  → gate forced ON.
+/// `Some(false)` → gate forced OFF.
+/// `None`        → reset to "uninitialised"; the next call to
+///                 [`gpu_sort_env_enabled`] re-reads the env var.
+#[cfg(test)]
+pub fn set_radix_dispatch_for_tests(state: Option<bool>) {
+    let encoded: i8 = match state {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    };
+    RADIX_DISPATCH_STATE.store(encoded, Ordering::Relaxed);
 }
 
 /// Build the entry-point name for the histogram kernel of a given dtype.
@@ -606,42 +677,50 @@ mod tests {
     }
 
     /// **The env-var off path still works.** This is the key contract from
-    /// the v0.6 scaffold task: when `BOLT_GPU_SORT` is unset / not `"1"`,
+    /// the v0.6 scaffold task: when the radix-sort dispatch gate is off,
     /// `try_gpu_radix_sort` returns `Ok(false)` regardless of dtype, so the
     /// executor falls back to its existing host path.
     ///
-    /// Implementation note: we don't `set_var`/`remove_var` here because the
+    /// Implementation note: we never call `set_var`/`remove_var` here. The
     /// Rust test runner shares one process across tests and env mutations
-    /// race. We test the deterministic branch — the dtype gate — directly,
-    /// which is what `try_gpu_radix_sort` checks **after** the env gate.
-    /// Then we verify `gpu_sort_env_enabled()` reads `"1"` correctly by
-    /// briefly mutating + restoring under a single-threaded assumption is
-    /// avoided too: the function under test is a pure read of `std::env`.
-    /// Instead, we assert the *composition*: the function returns `false`
-    /// for unsupported dtypes regardless of env state, which is the
-    /// fall-back guarantee we promised. Float keys hit the `radix_supports_dtype`
-    /// gate first and never need to consult the env var.
+    /// race when run in parallel. Instead we use the test-only override hook
+    /// [`set_radix_dispatch_for_tests`] to pin the cached atomic gate to a
+    /// known value, then restore it to "uninitialised" so any follow-up
+    /// test that depends on the env-derived default sees the same view it
+    /// would have had if this test never ran.
     #[test]
     fn env_off_path_falls_back() {
-        // Float dtypes always fall back (regardless of env state) because
+        // Capture the cached state so we can restore it on exit; otherwise
+        // a sibling test that latched the env value would see the OFF
+        // override leak in. We use `None` (sentinel "re-read on next call")
+        // as the restore target — equivalent to the process-startup state.
+        set_radix_dispatch_for_tests(Some(false));
+
+        // Float dtypes always fall back regardless of gate state because
         // the radix kernel doesn't support them yet — IEEE-monotonic
-        // transform deferred. This exercises the dtype gate without
-        // touching process-global env state.
+        // transform deferred. This exercises the dtype gate.
         assert!(!try_gpu_radix_sort(DataType::Float32).unwrap());
         assert!(!try_gpu_radix_sort(DataType::Float64).unwrap());
         assert!(!try_gpu_radix_sort(DataType::Bool).unwrap());
         assert!(!try_gpu_radix_sort(DataType::Utf8).unwrap());
 
-        // For Int32 / Int64 the answer depends on the env var. We can
-        // observe at least one of the two branches deterministically: if
-        // the var is unset (the default in `cargo test`), the gate must
-        // return `false`. If a developer happens to run with `BOLT_GPU_SORT=1`
-        // exported, the assertion below would correctly trip — which is the
-        // right behaviour ("you flipped the gate on, and the radix path
-        // engaged"). The test isolates `is_err` from the env-influenced
-        // branch by inspecting `gpu_sort_env_enabled()` directly.
-        let env_on = gpu_sort_env_enabled();
-        assert_eq!(try_gpu_radix_sort(DataType::Int32).unwrap(), env_on);
-        assert_eq!(try_gpu_radix_sort(DataType::Int64).unwrap(), env_on);
+        // Gate OFF: supported dtypes also fall back.
+        assert!(!try_gpu_radix_sort(DataType::Int32).unwrap());
+        assert!(!try_gpu_radix_sort(DataType::Int64).unwrap());
+        assert!(!gpu_sort_env_enabled());
+
+        // Gate ON: supported dtypes engage; unsupported dtypes still fall
+        // back via the dtype gate.
+        set_radix_dispatch_for_tests(Some(true));
+        assert!(gpu_sort_env_enabled());
+        assert!(try_gpu_radix_sort(DataType::Int32).unwrap());
+        assert!(try_gpu_radix_sort(DataType::Int64).unwrap());
+        assert!(!try_gpu_radix_sort(DataType::Float32).unwrap());
+        assert!(!try_gpu_radix_sort(DataType::Bool).unwrap());
+
+        // Restore to "uninitialised" so the next call latches from env —
+        // the same behaviour the process would have at startup if this
+        // test had never run.
+        set_radix_dispatch_for_tests(None);
     }
 }
