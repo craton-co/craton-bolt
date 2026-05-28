@@ -179,7 +179,7 @@ impl<'a> StringPredicateRewriter<'a> {
     /// Returns a new owned plan. Unsupported string ops (`Lt`/`Gt`/...)
     /// yield [`BoltError::Plan`].
     pub fn rewrite(&self, plan: &LogicalPlan) -> BoltResult<LogicalPlan> {
-        rewrite_plan_with(plan, self)
+        rewrite_plan_with(plan, self, 0)
     }
 }
 
@@ -259,17 +259,25 @@ fn extract_col_and_string_lit(left: &Expr, right: &Expr) -> Option<(String, Stri
 }
 
 /// Recursive expression rewrite, post-order: children first, then `self`.
-fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> BoltResult<Expr> {
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
+fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> BoltResult<Expr> {
+    if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+        return Err(BoltError::Plan(format!(
+            "expression nesting exceeds depth limit ({})",
+            crate::plan::sql_frontend::MAX_RECURSION_DEPTH
+        )));
+    }
     match expr {
         Expr::Column(_) | Expr::Literal(_) => Ok(expr.clone()),
         Expr::Alias(inner, name) => {
-            let inner = rewrite_expr_with(inner, r)?;
+            let inner = rewrite_expr_with(inner, r, depth + 1)?;
             Ok(Expr::Alias(Box::new(inner), name.clone()))
         }
         Expr::Binary { op, left, right } => {
             // Rewrite children first so nested predicates are normalised.
-            let new_left = rewrite_expr_with(left, r)?;
-            let new_right = rewrite_expr_with(right, r)?;
+            let new_left = rewrite_expr_with(left, r, depth + 1)?;
+            let new_right = rewrite_expr_with(right, r, depth + 1)?;
 
             // Try to match a `col <op> 'lit'` (or reversed) shape against a
             // registered Utf8 column.
@@ -343,10 +351,19 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> BoltResult<Expr>
 /// Pass-through walker that does NOT rewrite aggregate / group-by
 /// expressions but DOES rewrite filter / project expressions on the way
 /// down.
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
 fn rewrite_plan_with<R: LiteralResolver>(
     plan: &LogicalPlan,
     r: &R,
+    depth: usize,
 ) -> BoltResult<LogicalPlan> {
+    if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+        return Err(BoltError::Plan(format!(
+            "plan nesting exceeds depth limit ({})",
+            crate::plan::sql_frontend::MAX_RECURSION_DEPTH
+        )));
+    }
     match plan {
         LogicalPlan::Scan {
             table,
@@ -401,18 +418,18 @@ fn rewrite_plan_with<R: LiteralResolver>(
             })
         }
         LogicalPlan::Filter { input, predicate } => {
-            let new_input = rewrite_plan_with(input, r)?;
-            let new_predicate = rewrite_expr_with(predicate, r)?;
+            let new_input = rewrite_plan_with(input, r, depth + 1)?;
+            let new_predicate = rewrite_expr_with(predicate, r, 0)?;
             Ok(LogicalPlan::Filter {
                 input: Box::new(new_input),
                 predicate: new_predicate,
             })
         }
         LogicalPlan::Project { input, exprs } => {
-            let new_input = rewrite_plan_with(input, r)?;
+            let new_input = rewrite_plan_with(input, r, depth + 1)?;
             let mut new_exprs = Vec::with_capacity(exprs.len());
             for e in exprs {
-                new_exprs.push(rewrite_expr_with(e, r)?);
+                new_exprs.push(rewrite_expr_with(e, r, 0)?);
             }
             Ok(LogicalPlan::Project {
                 input: Box::new(new_input),
@@ -424,7 +441,7 @@ fn rewrite_plan_with<R: LiteralResolver>(
             group_by,
             aggregates,
         } => {
-            let new_input = rewrite_plan_with(input, r)?;
+            let new_input = rewrite_plan_with(input, r, depth + 1)?;
             // TODO: rewriting group_by / aggregate expressions over Utf8
             // columns would require a dictionary-aware GROUP BY codegen
             // path. For now we leave them untouched; callers that GROUP BY
@@ -439,13 +456,13 @@ fn rewrite_plan_with<R: LiteralResolver>(
         // dictionary-encoded `__idx_<col>` extension is applied at every
         // Scan leaf — the wrappers are transparent for that purpose.
         LogicalPlan::Distinct { input } => {
-            let new_input = rewrite_plan_with(input, r)?;
+            let new_input = rewrite_plan_with(input, r, depth + 1)?;
             Ok(LogicalPlan::Distinct {
                 input: Box::new(new_input),
             })
         }
         LogicalPlan::Limit { input, limit, offset } => {
-            let new_input = rewrite_plan_with(input, r)?;
+            let new_input = rewrite_plan_with(input, r, depth + 1)?;
             Ok(LogicalPlan::Limit {
                 input: Box::new(new_input),
                 limit: *limit,
@@ -453,7 +470,7 @@ fn rewrite_plan_with<R: LiteralResolver>(
             })
         }
         LogicalPlan::Sort { input, sort_exprs } => {
-            let new_input = rewrite_plan_with(input, r)?;
+            let new_input = rewrite_plan_with(input, r, depth + 1)?;
             Ok(LogicalPlan::Sort {
                 input: Box::new(new_input),
                 sort_exprs: sort_exprs.clone(),
@@ -462,13 +479,13 @@ fn rewrite_plan_with<R: LiteralResolver>(
         LogicalPlan::Union { inputs } => {
             let new_inputs = inputs
                 .iter()
-                .map(|inp| rewrite_plan_with(inp, r))
+                .map(|inp| rewrite_plan_with(inp, r, depth + 1))
                 .collect::<BoltResult<Vec<_>>>()?;
             Ok(LogicalPlan::Union { inputs: new_inputs })
         }
         LogicalPlan::Join { left, right, join_type, on } => {
-            let new_left = rewrite_plan_with(left, r)?;
-            let new_right = rewrite_plan_with(right, r)?;
+            let new_left = rewrite_plan_with(left, r, depth + 1)?;
+            let new_right = rewrite_plan_with(right, r, depth + 1)?;
             Ok(LogicalPlan::Join {
                 left: Box::new(new_left),
                 right: Box::new(new_right),
@@ -616,7 +633,7 @@ mod tests {
     fn rewrite_eq_with_known_literal() {
         let r = MockResolver::new().with_i32("region", "US", 5);
         let expr = col("region").eq(lit("US"));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
@@ -632,7 +649,7 @@ mod tests {
     fn i32_dict_still_emits_int32_literal() {
         let r = MockResolver::new().with_i32("region", "US", 5);
         let expr = col("region").eq(lit("US"));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
@@ -648,7 +665,7 @@ mod tests {
     fn i64_dict_emits_int64_literal() {
         let r = MockResolver::new().with_i64("region", "US", 5);
         let expr = col("region").eq(lit("US"));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
@@ -670,7 +687,7 @@ mod tests {
         let expr = col("region")
             .eq(lit("US"))
             .and(col("user_id").eq(lit("alice")));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         let Expr::Binary { op: and_op, left, right } = out else {
             panic!("expected top-level AND");
         };
@@ -701,7 +718,7 @@ mod tests {
         // Column is known but literal not in the dictionary.
         let r = MockResolver::new().known_i32("region");
         let expr = col("region").eq(lit("ZZ"));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Literal(Literal::Bool(false)) => {}
             other => panic!("expected Bool(false), got {other:?}"),
@@ -714,16 +731,16 @@ mod tests {
     fn unknown_literal_still_folds_to_bool() {
         // i32 side.
         let r32 = MockResolver::new().known_i32("region");
-        let eq = rewrite_expr_with(&col("region").eq(lit("ZZ")), &r32).unwrap();
+        let eq = rewrite_expr_with(&col("region").eq(lit("ZZ")), &r32, 0).unwrap();
         assert!(matches!(eq, Expr::Literal(Literal::Bool(false))));
-        let neq = rewrite_expr_with(&col("region").neq(lit("ZZ")), &r32).unwrap();
+        let neq = rewrite_expr_with(&col("region").neq(lit("ZZ")), &r32, 0).unwrap();
         assert!(matches!(neq, Expr::Literal(Literal::Bool(true))));
 
         // i64 side: same behaviour.
         let r64 = MockResolver::new().known_i64("user_id");
-        let eq64 = rewrite_expr_with(&col("user_id").eq(lit("ghost")), &r64).unwrap();
+        let eq64 = rewrite_expr_with(&col("user_id").eq(lit("ghost")), &r64, 0).unwrap();
         assert!(matches!(eq64, Expr::Literal(Literal::Bool(false))));
-        let neq64 = rewrite_expr_with(&col("user_id").neq(lit("ghost")), &r64).unwrap();
+        let neq64 = rewrite_expr_with(&col("user_id").neq(lit("ghost")), &r64, 0).unwrap();
         assert!(matches!(neq64, Expr::Literal(Literal::Bool(true))));
     }
 
@@ -731,7 +748,7 @@ mod tests {
     fn rewrite_neq_with_unknown_literal_folds_to_true() {
         let r = MockResolver::new().known_i32("region");
         let expr = col("region").neq(lit("ZZ"));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Literal(Literal::Bool(true)) => {}
             other => panic!("expected Bool(true), got {other:?}"),
@@ -742,7 +759,7 @@ mod tests {
     fn rewrite_reversed_literal_on_left() {
         let r = MockResolver::new().with_i32("region", "US", 5);
         let expr = lit("US").eq(col("region"));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
@@ -757,7 +774,7 @@ mod tests {
     fn pass_through_non_string_predicate() {
         let r = MockResolver::new().with_i32("region", "US", 5);
         let expr = col("price").gt(lit(100.0_f64));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Gt);
@@ -775,7 +792,7 @@ mod tests {
     fn reject_lt_on_string_column() {
         let r = MockResolver::new().with_i32("region", "US", 5);
         let expr = col("region").lt(lit("US"));
-        let err = rewrite_expr_with(&expr, &r).unwrap_err();
+        let err = rewrite_expr_with(&expr, &r, 0).unwrap_err();
         match err {
             BoltError::Plan(msg) => {
                 assert!(
@@ -800,7 +817,7 @@ mod tests {
             projection: None,
             schema,
         };
-        let out = rewrite_plan_with(&plan, &r).unwrap();
+        let out = rewrite_plan_with(&plan, &r, 0).unwrap();
         match out {
             LogicalPlan::Scan { schema, .. } => {
                 let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
@@ -827,7 +844,7 @@ mod tests {
             projection: None,
             schema,
         };
-        let out = rewrite_plan_with(&plan, &r).unwrap();
+        let out = rewrite_plan_with(&plan, &r, 0).unwrap();
         match out {
             LogicalPlan::Scan { schema, .. } => {
                 assert_eq!(schema.fields.len(), 2);
@@ -858,7 +875,7 @@ mod tests {
             input: Box::new(scan),
             predicate,
         };
-        let out = rewrite_plan_with(&plan, &r).unwrap();
+        let out = rewrite_plan_with(&plan, &r, 0).unwrap();
         let LogicalPlan::Filter { input, predicate } = out else {
             panic!("expected Filter at root");
         };
@@ -903,7 +920,7 @@ mod tests {
         // reject Utf8 == Utf8 as appropriate.)
         let r = MockResolver::new(); // no columns known
         let expr = col("name").eq(lit("Alice"));
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
@@ -922,7 +939,7 @@ mod tests {
         // Make sure recursion descends through Alias.
         let r = MockResolver::new().with_i32("region", "US", 5);
         let expr = col("region").eq(lit("US")).alias("is_us");
-        let out = rewrite_expr_with(&expr, &r).unwrap();
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
             Expr::Alias(inner, name) => {
                 assert_eq!(name, "is_us");
@@ -962,7 +979,7 @@ mod tests {
             .with_i32("s", "a", 1)
             .with_i32("s", "b", 2);
         let folded =
-            rewrite_expr_with(&col("s").eq(lit("c")), &pre_fix).unwrap();
+            rewrite_expr_with(&col("s").eq(lit("c")), &pre_fix, 0).unwrap();
         assert!(
             matches!(folded, Expr::Literal(Literal::Bool(false))),
             "pre-fix: missing union dict folds to Bool(false) — silent-wrong-result"
@@ -976,7 +993,7 @@ mod tests {
             .with_i32("s", "b", 2)
             .with_i32("s", "c", 3);
         let rewritten =
-            rewrite_expr_with(&col("s").eq(lit("c")), &post_fix).unwrap();
+            rewrite_expr_with(&col("s").eq(lit("c")), &post_fix, 0).unwrap();
         match rewritten {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
@@ -999,12 +1016,13 @@ mod tests {
         let r = MockResolver::new().with_i32("region", "US", 5);
 
         // Baseline: plain `col = 'US'`.
-        let plain = rewrite_expr_with(&col("region").eq(lit("US")), &r).unwrap();
+        let plain = rewrite_expr_with(&col("region").eq(lit("US")), &r, 0).unwrap();
 
         // Aliased: `(col AS x) = 'US'` — must fold identically.
         let aliased_left = rewrite_expr_with(
             &col("region").alias("r").eq(lit("US")),
             &r,
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -1017,6 +1035,7 @@ mod tests {
         let aliased_right = rewrite_expr_with(
             &col("region").eq(lit("US").alias("v")),
             &r,
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -1029,6 +1048,7 @@ mod tests {
         let aliased_both_reversed = rewrite_expr_with(
             &lit("US").alias("l").eq(col("region").alias("c")),
             &r,
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -1066,7 +1086,7 @@ mod tests {
             projection: None,
             schema,
         };
-        let out = rewrite_plan_with(&plan, &r).unwrap();
+        let out = rewrite_plan_with(&plan, &r, 0).unwrap();
         match out {
             LogicalPlan::Scan { schema, .. } => {
                 let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
@@ -1083,7 +1103,7 @@ mod tests {
         // Cross-check: the rewritten predicate against the same column
         // really does carry an Int64 literal, so the scan-side dtype above
         // genuinely matches the predicate-side dtype below.
-        let pred = rewrite_expr_with(&col("user_id").eq(lit("alice")), &r).unwrap();
+        let pred = rewrite_expr_with(&col("user_id").eq(lit("alice")), &r, 0).unwrap();
         match pred {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
