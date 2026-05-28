@@ -69,7 +69,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
         KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
         KernelSpec::ReduceMultiI64 { n_vals } => {
-            partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64(*n_vals)?
+            partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64_with_spill(
+                *n_vals,
+            )?
         }
     };
     let module = CudaModule::from_ptx(&ptx)?;
@@ -265,18 +267,20 @@ fn execute_inner(
         out_vals_gpu.push(GpuVec::<f64>::zeros_async(n_out_slots, stream.raw())?);
     }
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     let reduce_module = get_or_build_module(&KernelSpec::ReduceMultiI64 {
         n_vals: n_vals as u32,
     })?;
     {
-        let entry = partition_reduce_kernel_multi_i64::kernel_entry(n_vals as u32);
+        let entry =
+            partition_reduce_kernel_multi_i64::kernel_entry_with_spill(n_vals as u32);
         let func = reduce_module.function(&entry)?;
 
         // Kernel param order:
         //   partition_keys, partition_vals_0..={N-1},
         //   partition_offsets, out_keys,
-        //   out_vals_0..={N-1}, out_set
+        //   out_vals_0..={N-1}, out_set, spill_counter
         //
         // Collect iterated views eagerly so they outlive `args`.
         let view_pk = scatter_keys.view();
@@ -286,6 +290,7 @@ fn execute_inner(
         let mut views_ov: Vec<_> =
             out_vals_gpu.iter_mut().map(|g| g.view_mut()).collect();
         let mut view_os = out_set_gpu.view_mut();
+        let mut view_sp = spill.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_pk);
@@ -298,6 +303,7 @@ fn execute_inner(
             args.push_output(v);
         }
         args.push_output(&mut view_os);
+        args.push_output(&mut view_sp);
 
         launch_with_geometry(
             func,
@@ -318,6 +324,13 @@ fn execute_inner(
     }
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
+    let spill_count = spill.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
     let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
     let host_out_vals: Vec<Vec<f64>> = pinned_vals
         .iter()

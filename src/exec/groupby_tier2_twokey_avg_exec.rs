@@ -85,10 +85,12 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
         KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
         KernelSpec::ReduceMultiI64 { n_vals } => {
-            partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64(*n_vals)?
+            partition_reduce_kernel_multi_i64::compile_partition_reduce_kernel_multi_i64_with_spill(
+                *n_vals,
+            )?
         }
         KernelSpec::ReduceCountI64 => {
-            partition_reduce_kernel_count_i64::compile_partition_reduce_kernel_count_i64()?
+            partition_reduce_kernel_count_i64::compile_partition_reduce_kernel_count_i64_with_spill()?
         }
     };
     let module = CudaModule::from_ptx(&ptx)?;
@@ -318,16 +320,22 @@ fn execute_inner(
     // kernel signature.)
     let count_out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
     let count_out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    // Two independent spill counters — the multi-SUM reduce and the
+    // COUNT reduce both bump on probe overflow; either non-zero means
+    // the result is silently truncated.
+    let spill_multi: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
+    let spill_count_buf: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     // ---- Multi-SUM reduce (i64-key) ------------------------------------
     let reduce_multi_module = get_or_build_module(&KernelSpec::ReduceMultiI64 {
         n_vals: n_vals as u32,
     })?;
     {
-        let entry = partition_reduce_kernel_multi_i64::kernel_entry(n_vals as u32);
+        let entry =
+            partition_reduce_kernel_multi_i64::kernel_entry_with_spill(n_vals as u32);
         let func = reduce_multi_module.function(&entry)?;
 
-        let mut storage: Vec<CUdeviceptr> = Vec::with_capacity(4 + 2 * n_vals);
+        let mut storage: Vec<CUdeviceptr> = Vec::with_capacity(4 + 2 * n_vals + 1);
         storage.push(scatter_keys.device_ptr());
         for sv in &scatter_vals {
             storage.push(sv.device_ptr());
@@ -338,6 +346,7 @@ fn execute_inner(
             storage.push(ov.device_ptr());
         }
         storage.push(out_set_gpu.device_ptr());
+        storage.push(spill_multi.device_ptr());
 
         let mut params: Vec<*mut c_void> = storage
             .iter_mut()
@@ -364,18 +373,21 @@ fn execute_inner(
     // ---- COUNT reduce (i64-key) ----------------------------------------
     let reduce_count_module = get_or_build_module(&KernelSpec::ReduceCountI64)?;
     {
-        let func = reduce_count_module.function(partition_reduce_kernel_count_i64::KERNEL_ENTRY)?;
+        let func = reduce_count_module
+            .function(partition_reduce_kernel_count_i64::KERNEL_ENTRY_WITH_SPILL)?;
         let mut keys_ptr = scatter_keys.device_ptr();
         let mut offsets_ptr = offsets_kp1_gpu.device_ptr();
         let mut ok_ptr = count_out_keys_gpu.device_ptr();
         let mut oc_ptr = out_counts_gpu.device_ptr();
         let mut os_ptr = count_out_set_gpu.device_ptr();
-        let mut params: [*mut c_void; 5] = [
+        let mut sp_ptr = spill_count_buf.device_ptr();
+        let mut params: [*mut c_void; 6] = [
             &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
             &mut offsets_ptr as *mut CUdeviceptr as *mut c_void,
             &mut ok_ptr as *mut CUdeviceptr as *mut c_void,
             &mut oc_ptr as *mut CUdeviceptr as *mut c_void,
             &mut os_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut sp_ptr as *mut CUdeviceptr as *mut c_void,
         ];
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
@@ -405,6 +417,14 @@ fn execute_inner(
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     let pinned_counts = out_counts_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
+    let multi_spill = spill_multi.to_vec()?[0];
+    let count_spill = spill_count_buf.to_vec()?[0];
+    if multi_spill > 0 || count_spill > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: multi-sum={} count={} rows exceeded MAX_PROBES; result may be incorrect",
+            multi_spill, count_spill
+        )));
+    }
     let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
     let host_out_vals: Vec<Vec<f64>> = pinned_vals
         .iter()

@@ -83,6 +83,11 @@ pub fn kernel_entry(n_vals: u32) -> String {
     format!("bolt_partition_reduce_multi_sum_{}", n_vals)
 }
 
+/// Entry-point name for the spill-counter variant.
+pub fn kernel_entry_with_spill(n_vals: u32) -> String {
+    format!("{}_spill", kernel_entry(n_vals))
+}
+
 /// Generate PTX for the multi-value per-partition reduce kernel.
 ///
 /// `n_vals` must be in `1..=MAX_VALS` (1..=4). The emitted kernel has
@@ -451,6 +456,329 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     Ok(ptx)
 }
 
+/// Spill-counter-aware sibling of
+/// [`compile_partition_reduce_kernel_multi`]. Same algorithm with one
+/// extra trailing `.param .u64 spill_counter` (uint32_t*, may be null).
+/// Total params = 4 + 2*n_vals + 1. On MAX_PROBES overflow the kernel
+/// null-checks the pointer then issues `atom.global.add.u32`.
+pub fn compile_partition_reduce_kernel_multi_with_spill(n_vals: u32) -> BoltResult<String> {
+    if n_vals == 0 || n_vals > MAX_VALS {
+        return Err(BoltError::Other(format!(
+            "partition_reduce_kernel_multi_with_spill: n_vals must be 1..={MAX_VALS}, got {n_vals}"
+        )));
+    }
+    let mut ptx = String::new();
+    let entry = kernel_entry_with_spill(n_vals);
+    let entry = entry.as_str();
+    let block_groups = BLOCK_GROUPS;
+    let mask = BLOCK_GROUPS - 1;
+    let block_threads = BLOCK_THREADS;
+    let keys_bytes = BLOCK_GROUPS * 4;
+    let vals_bytes = BLOCK_GROUPS * 8;
+    let set_bytes = BLOCK_GROUPS * 4;
+    let max_probes = MAX_PROBES;
+
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 block_keys_buf_sp[{bytes}];",
+        bytes = keys_bytes
+    )
+    .map_err(write_err)?;
+    for j in 0..n_vals {
+        writeln!(
+            ptx,
+            ".shared .align 8 .b8 block_vals{j}_buf_sp[{bytes}];",
+            j = j,
+            bytes = vals_bytes
+        )
+        .map_err(write_err)?;
+    }
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 block_set_buf_sp[{bytes}];",
+        bytes = set_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // 4 + 2*n_vals base params + 1 spill_counter trailing.
+    writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
+    let total_params = 4 + 2 * n_vals + 1;
+    for p in 0..total_params {
+        let trailing = if p == total_params - 1 { "" } else { "," };
+        writeln!(ptx, "\t.param .u64 {entry}_param_{p}{trailing}").map_err(write_err)?;
+    }
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    writeln!(ptx, "\t.reg .pred  %p<24>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<96>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<128>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .f64   %fd<32>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf_sp;").map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd = 1 + j;
+        writeln!(ptx, "\tmov.u64 %rd{rd}, block_vals{j}_buf_sp;").map_err(write_err)?;
+    }
+    let rd_set = 1 + n_vals;
+    writeln!(ptx, "\tmov.u64 %rd{rd_set}, block_set_buf_sp;").map_err(write_err)?;
+
+    let rd_pkeys = rd_set + 1;
+    let rd_pvals_base = rd_pkeys + 1;
+    let rd_poff = rd_pvals_base + n_vals;
+    let rd_okeys = rd_poff + 1;
+    let rd_ovals_base = rd_okeys + 1;
+    let rd_oset = rd_ovals_base + n_vals;
+    let rd_spill = rd_oset + 1;
+
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd{rd_pkeys}, [{entry}_param_0];"
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tcvta.to.global.u64 %rd{rd_pkeys}, %rd{rd_pkeys};"
+    )
+    .map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd = rd_pvals_base + j;
+        let p = 1 + j;
+        writeln!(ptx, "\tld.param.u64 %rd{rd}, [{entry}_param_{p}];").map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd{rd}, %rd{rd};").map_err(write_err)?;
+    }
+    let p_off = 1 + n_vals;
+    writeln!(ptx, "\tld.param.u64 %rd{rd_poff}, [{entry}_param_{p_off}];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd{rd_poff}, %rd{rd_poff};").map_err(write_err)?;
+    let p_ok = 2 + n_vals;
+    writeln!(ptx, "\tld.param.u64 %rd{rd_okeys}, [{entry}_param_{p_ok}];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd{rd_okeys}, %rd{rd_okeys};").map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd = rd_ovals_base + j;
+        let p = 3 + n_vals + j;
+        writeln!(ptx, "\tld.param.u64 %rd{rd}, [{entry}_param_{p}];").map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd{rd}, %rd{rd};").map_err(write_err)?;
+    }
+    let p_os = 3 + 2 * n_vals;
+    writeln!(ptx, "\tld.param.u64 %rd{rd_oset}, [{entry}_param_{p_os}];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd{rd_oset}, %rd{rd_oset};").map_err(write_err)?;
+    let p_sp = 4 + 2 * n_vals;
+    writeln!(ptx, "\tld.param.u64 %rd{rd_spill}, [{entry}_param_{p_sp}];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd{rd_spill}, %rd{rd_spill};").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd80, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd81, %rd{rd_poff}, %rd80;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r10, [%rd81];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd82, %rd81, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r11, [%rd82];").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 1: zero.
+    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.ge.u32 %p0, %r20, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd83, %r20, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd84, %rd0, %rd83;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd84], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd85, %r20, 8;").map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd_v = 1 + j;
+        writeln!(ptx, "\tadd.s64 %rd86, %rd{rd_v}, %rd85;").map_err(write_err)?;
+        writeln!(ptx, "\tst.shared.u64 [%rd86], 0;").map_err(write_err)?;
+    }
+    writeln!(ptx, "\tadd.s64 %rd87, %rd{rd_set}, %rd83;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd87], 0;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tadd.u32 %r20, %r20, {bt};",
+        bt = block_threads
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 2.
+    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd88, %r30, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd89, %rd{rd_pkeys}, %rd88;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s32 %r31, [%rd89];").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd90, %r30, 8;").map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd_v = rd_pvals_base + j;
+        let fd_v = j;
+        writeln!(ptx, "\tadd.s64 %rd91, %rd{rd_v}, %rd90;").map_err(write_err)?;
+        writeln!(ptx, "\tld.global.f64 %fd{fd_v}, [%rd91];").map_err(write_err)?;
+    }
+
+    writeln!(
+        ptx,
+        "\tand.b32 %r32, %r31, 0x{mask:X};",
+        mask = mask
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
+
+    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.gt.u32 %p2, %r33, {mp};",
+        mp = max_probes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 bra SPILL_BUMP;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd92, %r32, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd93, %rd{rd_set}, %rd92;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd94, %rd0, %rd92;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd95, %r32, 8;").map_err(write_err)?;
+
+    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd93], 0, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r35, [%rd94];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tand.b32 %r32, %r32, 0x{mask:X};",
+        mask = mask
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
+
+    writeln!(ptx, "CLAIM:").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd94], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd_v = 1 + j;
+        let fd_v = j;
+        writeln!(ptx, "\tadd.s64 %rd96, %rd{rd_v}, %rd95;").map_err(write_err)?;
+        let fd_scratch = 16 + j;
+        writeln!(
+            ptx,
+            "\tatom.shared.add.f64 %fd{fd_scratch}, [%rd96], %fd{fd_v};"
+        )
+        .map_err(write_err)?;
+    }
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+
+    writeln!(ptx, "MATCH:").map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd_v = 1 + j;
+        let fd_v = j;
+        writeln!(ptx, "\tadd.s64 %rd96, %rd{rd_v}, %rd95;").map_err(write_err)?;
+        let fd_scratch = 24 + j;
+        writeln!(
+            ptx,
+            "\tatom.shared.add.f64 %fd{fd_scratch}, [%rd96], %fd{fd_v};"
+        )
+        .map_err(write_err)?;
+    }
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+
+    writeln!(ptx, "SPILL_BUMP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u64 %p5, %rd{rd_spill}, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra LOOP_NEXT;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r36, [%rd{rd_spill}], 1;").map_err(write_err)?;
+
+    writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r30, %r30, %r1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_TOP;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Phase 3.
+    writeln!(
+        ptx,
+        "\tmul.lo.u32 %r40, %r0, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.ge.u32 %p6, %r41, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra EXPORT_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd97, %r41, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd98, %rd0, %rd97;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r43, [%rd98];").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd99, %r41, 8;").map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd_v = 1 + j;
+        let fd_v = j;
+        writeln!(ptx, "\tadd.s64 %rd100, %rd{rd_v}, %rd99;").map_err(write_err)?;
+        writeln!(ptx, "\tld.shared.f64 %fd{fd_v}, [%rd100];").map_err(write_err)?;
+    }
+    writeln!(ptx, "\tadd.s64 %rd101, %rd{rd_set}, %rd97;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.u32 %r44, [%rd101];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 %p7, %r44, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tselp.u32 %r45, 1, 0, %p7;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd102, %r42, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd103, %rd{rd_okeys}, %rd102;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.s32 [%rd103], %r43;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd104, %r42, 8;").map_err(write_err)?;
+    for j in 0..n_vals {
+        let rd_ov = rd_ovals_base + j;
+        let fd_v = j;
+        writeln!(ptx, "\tadd.s64 %rd105, %rd{rd_ov}, %rd104;").map_err(write_err)?;
+        writeln!(ptx, "\tst.global.f64 [%rd105], %fd{fd_v};").map_err(write_err)?;
+    }
+    writeln!(ptx, "\tcvt.u64.u32 %rd106, %r42;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd107, %rd{rd_oset}, %rd106;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u8 [%rd107], %r45;").map_err(write_err)?;
+
+    writeln!(
+        ptx,
+        "\tadd.u32 %r41, %r41, {bt};",
+        bt = block_threads
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
+
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!(
         "partition_reduce_kernel_multi: write failed: {}",
@@ -555,6 +883,41 @@ mod tests {
                 count, expected,
                 "n_vals={n}: expected {expected} .param .u64 lines, got {count}"
             );
+        }
+    }
+
+    // ----- _with_spill variant shape tests ---------------------------------
+
+    #[test]
+    fn with_spill_compiles_for_all_n_vals() {
+        for n in 1..=MAX_VALS {
+            let ptx = compile_partition_reduce_kernel_multi_with_spill(n)
+                .unwrap_or_else(|e| panic!("n_vals={n} should compile: {e}"));
+            assert!(!ptx.is_empty());
+        }
+    }
+
+    #[test]
+    fn with_spill_rejects_zero_and_overflow() {
+        assert!(compile_partition_reduce_kernel_multi_with_spill(0).is_err());
+        assert!(compile_partition_reduce_kernel_multi_with_spill(MAX_VALS + 1).is_err());
+    }
+
+    #[test]
+    fn with_spill_has_extra_param_and_spill_atomic() {
+        for n in 1..=MAX_VALS {
+            let ptx = compile_partition_reduce_kernel_multi_with_spill(n).unwrap();
+            let expected = 4 + 2 * n as usize + 1;
+            let count = ptx.matches(".param .u64 ").count();
+            assert_eq!(count, expected, "n_vals={n}");
+            assert!(ptx.contains("atom.global.add.u32"));
+            assert!(ptx.contains("SPILL_BUMP:"));
+            assert!(ptx.contains("setp.eq.u64"));
+            let needle = format!(".visible .entry {}(", kernel_entry_with_spill(n));
+            assert!(ptx.contains(&needle));
+            // Must NOT export the base entry.
+            let base_needle = format!(".visible .entry {}(", kernel_entry(n));
+            assert!(!ptx.contains(&base_needle));
         }
     }
 }

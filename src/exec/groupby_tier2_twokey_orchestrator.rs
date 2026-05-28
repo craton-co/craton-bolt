@@ -77,7 +77,7 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
         KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
         KernelSpec::ReduceSumI64 => {
-            partition_reduce_kernel_i64::compile_partition_reduce_kernel_i64()?
+            partition_reduce_kernel_i64::compile_partition_reduce_kernel_i64_with_spill()?
         }
     };
     let module = CudaModule::from_ptx(&ptx)?;
@@ -274,9 +274,11 @@ pub fn execute_tier2_twokey_sum(
     let mut out_keys_gpu: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_vals_gpu: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     let reduce_module = get_or_build_module(&KernelSpec::ReduceSumI64)?;
-    let reduce_fn = reduce_module.function(partition_reduce_kernel_i64::KERNEL_ENTRY)?;
+    let reduce_fn =
+        reduce_module.function(partition_reduce_kernel_i64::KERNEL_ENTRY_WITH_SPILL)?;
 
     {
         let view_pk = scatter_keys.view();
@@ -285,6 +287,7 @@ pub fn execute_tier2_twokey_sum(
         let mut view_ok = out_keys_gpu.view_mut();
         let mut view_ov = out_vals_gpu.view_mut();
         let mut view_os = out_set_gpu.view_mut();
+        let mut view_sp = spill.view_mut();
 
         let mut args = KernelArgs::empty();
         args.push_input(&view_pk);
@@ -293,6 +296,7 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_ok);
         args.push_output(&mut view_ov);
         args.push_output(&mut view_os);
+        args.push_output(&mut view_sp);
 
         launch_with_geometry(
             reduce_fn,
@@ -309,6 +313,13 @@ pub fn execute_tier2_twokey_sum(
     let pinned_vals = out_vals_gpu.to_pinned_async(stream.raw())?;
     let pinned_set = out_set_gpu.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
+    let spill_count = spill.to_vec()?[0];
+    if spill_count > 0 {
+        return Err(BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            spill_count
+        )));
+    }
     let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
     let host_out_vals: Vec<f64> = pinned_vals.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
