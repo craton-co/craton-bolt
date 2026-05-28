@@ -314,14 +314,16 @@ fn eval_inner(
         Expr::Alias(inner, _) => eval_inner(inner, env, n_rows),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, n_rows),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, n_rows),
-        // CASE has no host evaluator yet: the lowering boundary in
-        // `physical_plan::lower` rejects any plan containing CASE with a
-        // dedicated "CASE not yet lowered to GPU; coming in a follow-up"
-        // Plan error, so the executor should never reach this arm in
-        // practice.
-        Expr::Case { .. } => Err(BoltError::Other(
-            "expr_agg: CASE expressions not yet supported on the host evaluator; \
-             plan-time lowering should have rejected this expression"
+        // v0.7: CASE is lowered to GPU `Op::Select` for scan-chain
+        // Project / Filter positions (and the pre-aggregation kernel
+        // feeding GROUP BY / aggregates). It still has no host-side
+        // evaluator, so any CASE that survives to a host-side
+        // `PhysicalPlan::Project` / `PhysicalPlan::Filter` (HAVING,
+        // post-aggregate SELECT, etc.) lands here with a clear
+        // not-yet-supported message.
+        Expr::Case { .. } => Err(BoltError::Plan(
+            "CASE in host-side expressions (HAVING / post-aggregate \
+             projection / sort) is not yet supported; coming in a follow-up"
                 .into(),
         )),
         Expr::Like {

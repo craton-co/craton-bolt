@@ -443,6 +443,13 @@ fn emit_op(
             validity_input,
             want_null,
         } => emit_is_null_check(b, *dst, *validity_input, *want_null, input_validity_ptrs, tid),
+        Op::Select {
+            dst,
+            cond,
+            then_val,
+            else_val,
+            dtype,
+        } => emit_select(b, *dst, *cond, *then_val, *else_val, *dtype),
     }
 }
 
@@ -520,6 +527,75 @@ fn emit_is_null_check(
     b.emit(&format!("{} {}, {}, 0;", cmp, pred, byte_reg))?;
     b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, pred))?;
     Ok(())
+}
+
+/// Emit PTX for `Op::Select`: pick `then_val` when `cond` is true (Bool 1)
+/// and `else_val` otherwise, materialising the chosen value in `dst`.
+///
+/// Wire shape (for a Float32 example):
+///
+/// ```text
+///   setp.ne.s32 %p,    %cond, 0           // Bool 0/1 -> predicate
+///   selp.f32    %dst,  %then, %else, %p   // dst = p ? then : else
+/// ```
+///
+/// `cond` must live in the b32 (`r`) register class because the codegen
+/// invariant says every Bool value sits there (see `RegAlloc::class_for`).
+/// The materialisation uses `setp.ne.s32 cond, 0` so any nonzero Bool
+/// register (defensively wider than {0, 1}) still picks the THEN branch.
+///
+/// Supported value dtypes (v0.7 envelope):
+///
+/// * `Bool` / `Int32` -> `selp.s32`
+/// * `Int64`          -> `selp.s64`
+/// * `Float32`        -> `selp.f32`
+/// * `Float64`        -> `selp.f64`
+///
+/// `Codegen::emit_case` rejects Utf8 / Decimal128 / Date / Timestamp at
+/// the plan layer with a tighter message, so by the time we get here
+/// the dtype envelope is guaranteed.
+fn emit_select(
+    b: &mut PtxBuilder,
+    dst: Reg,
+    cond: Reg,
+    then_val: Reg,
+    else_val: Reg,
+    dtype: DataType,
+) -> BoltResult<()> {
+    let cond_name = b.alloc.get(cond)?.to_string();
+    let then_name = b.alloc.get(then_val)?.to_string();
+    let else_name = b.alloc.get(else_val)?.to_string();
+    let selp_ty = match dtype {
+        // Bool values live in the b32 (r) class same as Int32.
+        DataType::Bool | DataType::Int32 => "s32",
+        DataType::Int64 => "s64",
+        DataType::Float32 => "f32",
+        DataType::Float64 => "f64",
+        DataType::Utf8 => {
+            return Err(BoltError::Other(
+                "ptx_gen: Select over Utf8 not supported \
+                 (planner should have rejected CASE over string types)"
+                    .into(),
+            ))
+        }
+        DataType::Decimal128(_, _) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+            ))
+        }
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
+            ))
+        }
+    };
+    let dst_name = b.alloc.assign(dst, dtype)?;
+    let pred = b.alloc.alloc("p");
+    b.emit(&format!("setp.ne.s32 {}, {}, 0;", pred, cond_name))?;
+    b.emit(&format!(
+        "selp.{} {}, {}, {}, {};",
+        selp_ty, dst_name, then_name, else_name, pred
+    ))
 }
 
 /// Emit a `ld.global.nc.<type>` of input column `col_idx` at row `tid` into a fresh register.
@@ -1435,6 +1511,277 @@ mod validity_emission_tests {
             "error should mention validity wiring, got: {msg}"
         );
     }
+
+    // ---- Op::Select (CASE WHEN) -------------------------------------------
+
+    /// v0.7 CASE WHEN lowering: a single-WHEN `Op::Select` must materialise
+    /// the chosen value via `setp.ne.s32` (Bool 0/1 -> predicate) followed
+    /// by `selp.<ty>` on the value class. Mirrors the contract documented
+    /// on `Op::Select` in physical_plan.rs and `emit_select` above.
+    ///
+    /// Spec shape (logically `CASE WHEN cond THEN then ELSE else END` where
+    /// `cond` is a Bool column and the value branches are Int32 columns):
+    ///
+    /// ```text
+    ///   r0 = LoadColumn(0)   ; cond  (Bool)
+    ///   r1 = LoadColumn(1)   ; then  (Int32)
+    ///   r2 = LoadColumn(2)   ; else  (Int32)
+    ///   r3 = Select(r0, r1, r2, Int32)
+    ///   Store(r3 -> out0, Int32)
+    /// ```
+    #[test]
+    fn select_emits_setp_and_selp_s32() {
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "cond".into(),
+                    dtype: DataType::Bool,
+                },
+                ColumnIO {
+                    name: "t".into(),
+                    dtype: DataType::Int32,
+                },
+                ColumnIO {
+                    name: "e".into(),
+                    dtype: DataType::Int32,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Int32,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Int32,
+                },
+                Op::LoadColumn {
+                    dst: Reg(2),
+                    col_idx: 2,
+                    dtype: DataType::Int32,
+                },
+                Op::Select {
+                    dst: Reg(3),
+                    cond: Reg(0),
+                    then_val: Reg(1),
+                    else_val: Reg(2),
+                    dtype: DataType::Int32,
+                },
+                Op::Store {
+                    src: Reg(3),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+            ],
+            predicate: None,
+            register_count: 4,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+
+        let ptx = compile(&spec, "bolt_select_s32").expect("compile");
+
+        // The Bool -> predicate materialisation is `setp.ne.s32 ..., cond, 0`.
+        assert!(
+            ptx.contains("setp.ne.s32"),
+            "expected setp.ne.s32 to turn the Bool cond register into a %p\n{ptx}"
+        );
+
+        // The value selection uses `selp.s32` for the Int32 branch dtype.
+        assert!(
+            ptx.contains("selp.s32"),
+            "expected selp.s32 for Int32 CASE branches\n{ptx}"
+        );
+
+        // 3 inputs + 1 output = 4 pointer params, no validity wiring.
+        let n_ptr_params = ptx.matches(".param .u64 .ptr").count();
+        assert_eq!(
+            n_ptr_params, 4,
+            "expected 4 .ptr params (3 in + 1 out, no validity), got {n_ptr_params}\n{ptx}"
+        );
+    }
+
+    /// `selp.f64` is used for Float64-valued CASE branches; the predicate
+    /// materialisation is the same `setp.ne.s32` regardless of value dtype.
+    #[test]
+    fn select_uses_selp_f64_for_float64_branches() {
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "cond".into(),
+                    dtype: DataType::Bool,
+                },
+                ColumnIO {
+                    name: "t".into(),
+                    dtype: DataType::Float64,
+                },
+                ColumnIO {
+                    name: "e".into(),
+                    dtype: DataType::Float64,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Float64,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Float64,
+                },
+                Op::LoadColumn {
+                    dst: Reg(2),
+                    col_idx: 2,
+                    dtype: DataType::Float64,
+                },
+                Op::Select {
+                    dst: Reg(3),
+                    cond: Reg(0),
+                    then_val: Reg(1),
+                    else_val: Reg(2),
+                    dtype: DataType::Float64,
+                },
+                Op::Store {
+                    src: Reg(3),
+                    col_idx: 0,
+                    dtype: DataType::Float64,
+                },
+            ],
+            predicate: None,
+            register_count: 4,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+
+        let ptx = compile(&spec, "bolt_select_f64").expect("compile");
+        assert!(
+            ptx.contains("setp.ne.s32"),
+            "Bool cond -> predicate materialisation should still be setp.ne.s32\n{ptx}"
+        );
+        assert!(
+            ptx.contains("selp.f64"),
+            "Float64 branch dtype must use selp.f64\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("selp.s32"),
+            "Float64-branch CASE must NOT emit selp.s32 (would truncate value)\n{ptx}"
+        );
+    }
+
+    /// A two-WHEN CASE folds to a chain of two Selects. The PTX must
+    /// contain at least two `selp.<ty>` instructions and the inner Select's
+    /// dst must thread into the outer Select's `else_val`.
+    #[test]
+    fn nested_selects_emit_two_selp_instructions() {
+        // Logical: CASE WHEN c0 THEN t0 WHEN c1 THEN t1 ELSE e END
+        //   inner = Select(c1, t1, e)
+        //   outer = Select(c0, t0, inner)
+        let spec = KernelSpec {
+            inputs: vec![
+                // c0 (Bool), c1 (Bool), t0 (Int32), t1 (Int32), e (Int32)
+                ColumnIO {
+                    name: "c0".into(),
+                    dtype: DataType::Bool,
+                },
+                ColumnIO {
+                    name: "c1".into(),
+                    dtype: DataType::Bool,
+                },
+                ColumnIO {
+                    name: "t0".into(),
+                    dtype: DataType::Int32,
+                },
+                ColumnIO {
+                    name: "t1".into(),
+                    dtype: DataType::Int32,
+                },
+                ColumnIO {
+                    name: "e".into(),
+                    dtype: DataType::Int32,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Int32,
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Bool,
+                },
+                Op::LoadColumn {
+                    dst: Reg(2),
+                    col_idx: 2,
+                    dtype: DataType::Int32,
+                },
+                Op::LoadColumn {
+                    dst: Reg(3),
+                    col_idx: 3,
+                    dtype: DataType::Int32,
+                },
+                Op::LoadColumn {
+                    dst: Reg(4),
+                    col_idx: 4,
+                    dtype: DataType::Int32,
+                },
+                // inner = Select(c1, t1, e)
+                Op::Select {
+                    dst: Reg(5),
+                    cond: Reg(1),
+                    then_val: Reg(3),
+                    else_val: Reg(4),
+                    dtype: DataType::Int32,
+                },
+                // outer = Select(c0, t0, inner)
+                Op::Select {
+                    dst: Reg(6),
+                    cond: Reg(0),
+                    then_val: Reg(2),
+                    else_val: Reg(5),
+                    dtype: DataType::Int32,
+                },
+                Op::Store {
+                    src: Reg(6),
+                    col_idx: 0,
+                    dtype: DataType::Int32,
+                },
+            ],
+            predicate: None,
+            register_count: 7,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+
+        let ptx = compile(&spec, "bolt_select_nested").expect("compile");
+        let n_selp = ptx.matches("selp.s32").count();
+        assert!(
+            n_selp >= 2,
+            "two-WHEN CASE must emit at least two selp.s32 instructions, got {n_selp}\n{ptx}"
+        );
+        let n_setp = ptx.matches("setp.ne.s32").count();
+        assert!(
+            n_setp >= 2,
+            "two-WHEN CASE must materialise each Bool cond via setp.ne.s32, got {n_setp}\n{ptx}"
+        );
+    }
 }
 
 
@@ -1495,7 +1842,8 @@ pub fn output_input_dependencies(
             | Op::Const { dst, .. }
             | Op::Cast { dst, .. }
             | Op::Binary { dst, .. }
-            | Op::IsNullCheck { dst, .. } => {
+            | Op::IsNullCheck { dst, .. }
+            | Op::Select { dst, .. } => {
                 reg_to_op.insert(dst.id(), op);
             }
             Op::Store { .. } => { /* no dst */ }
@@ -1540,6 +1888,22 @@ pub fn output_input_dependencies(
                     Op::Binary { lhs, rhs, .. } => {
                         stack.push(lhs.id());
                         stack.push(rhs.id());
+                    }
+                    Op::Select {
+                        cond,
+                        then_val,
+                        else_val,
+                        ..
+                    } => {
+                        // CASE's value-producing path: a downstream output's
+                        // value depends on every input feeding any of the
+                        // three operands. We don't try to model per-branch
+                        // conditional liveness here — the AND-fold caller
+                        // is the conservative validity tree, not a value
+                        // dataflow optimiser.
+                        stack.push(cond.id());
+                        stack.push(then_val.id());
+                        stack.push(else_val.id());
                     }
                     Op::IsNullCheck { .. } => {
                         // IS NULL / IS NOT NULL is itself never-null: it

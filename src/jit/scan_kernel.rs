@@ -395,6 +395,17 @@ fn emit_op(
             input_validity_ptrs,
             tid,
         ),
+        // CASE WHEN ... THEN ... [ELSE ...] END nested inside a WHERE
+        // predicate lowers to one or more `Op::Select` ops (right-to-left
+        // fold over the WHEN branches; see `physical_plan::Codegen::emit_case`).
+        // Mirrors `ptx_gen::emit_select`.
+        Op::Select {
+            dst,
+            cond,
+            then_val,
+            else_val,
+            dtype,
+        } => emit_select(b, *dst, *cond, *then_val, *else_val, *dtype),
     }
 }
 
@@ -457,6 +468,53 @@ fn emit_is_null_check(
     b.emit(&format!("{} {}, {}, 0;", cmp, pred, byte_reg))?;
     b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, pred))?;
     Ok(())
+}
+
+/// Emit PTX for `Op::Select`: `dst = cond ? then_val : else_val`. Mirrors
+/// `ptx_gen::emit_select`; the predicate-only scan-kernel emitter needs
+/// this op for predicates whose Bool result is itself the output of a
+/// CASE WHEN expression (e.g. `WHERE CASE WHEN x > 0 THEN a > 0 ELSE FALSE END`).
+fn emit_select(
+    b: &mut PtxBuilder,
+    dst: Reg,
+    cond: Reg,
+    then_val: Reg,
+    else_val: Reg,
+    dtype: DataType,
+) -> BoltResult<()> {
+    let cond_name = b.alloc.get(cond)?.to_string();
+    let then_name = b.alloc.get(then_val)?.to_string();
+    let else_name = b.alloc.get(else_val)?.to_string();
+    let selp_ty = match dtype {
+        DataType::Bool | DataType::Int32 => "s32",
+        DataType::Int64 => "s64",
+        DataType::Float32 => "f32",
+        DataType::Float64 => "f64",
+        DataType::Utf8 => {
+            return Err(BoltError::Other(
+                "scan_kernel: Select over Utf8 not supported \
+                 (planner should have rejected CASE over string types)"
+                    .into(),
+            ))
+        }
+        DataType::Decimal128(_, _) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+            ))
+        }
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            return Err(BoltError::Other(
+                "Date/Timestamp not yet lowered to GPU".into(),
+            ))
+        }
+    };
+    let dst_name = b.alloc.assign(dst, dtype)?;
+    let pred = b.alloc.alloc("p");
+    b.emit(&format!("setp.ne.s32 {}, {}, 0;", pred, cond_name))?;
+    b.emit(&format!(
+        "selp.{} {}, {}, {}, {};",
+        selp_ty, dst_name, then_name, else_name, pred
+    ))
 }
 
 /// Emit a typed `ld.global.<ty>` of input column `col_idx` at row `tid`.

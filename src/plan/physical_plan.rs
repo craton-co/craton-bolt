@@ -120,6 +120,46 @@ pub enum Op {
         /// non-zero).
         want_null: bool,
     },
+    /// Predicated value selection: `dst = cond ? then_val : else_val`.
+    ///
+    /// Used as the kernel-level building block for SQL `CASE WHEN cond THEN a
+    /// ELSE b END`. The codegen (`Codegen::emit_case`) folds a multi-arm
+    /// CASE right-to-left into a chain of these ops:
+    ///
+    /// ```text
+    ///   CASE WHEN c1 THEN v1
+    ///        WHEN c2 THEN v2
+    ///        ELSE e
+    ///   END
+    /// ```
+    ///
+    /// lowers to (logically):
+    ///
+    /// ```text
+    ///   r1 = Select(c2, v2, e)
+    ///   r0 = Select(c1, v1, r1)
+    /// ```
+    ///
+    /// `cond` must be a Bool register; `then_val` and `else_val` must already
+    /// share the unified result dtype (insert `Op::Cast` first). PTX lowers
+    /// this to a per-dtype `selp.<ty>` after materialising `cond` as a `%p`
+    /// predicate via `setp.ne.s32 cond, 0`.
+    ///
+    /// v0.7 minimum: Bool / Int32 / Int64 / Float32 / Float64. Utf8 /
+    /// Decimal128 / Date / Timestamp values are rejected at
+    /// `Codegen::emit_case`.
+    Select {
+        /// Destination register holding the chosen value.
+        dst: Reg,
+        /// Bool register (0/1) driving the choice.
+        cond: Reg,
+        /// Register holding the value selected when `cond == 1`.
+        then_val: Reg,
+        /// Register holding the value selected when `cond == 0`.
+        else_val: Reg,
+        /// Common dtype of `then_val` / `else_val` and of `dst`.
+        dtype: DataType,
+    },
 }
 
 /// Description of an input column the kernel consumes.
@@ -492,16 +532,15 @@ impl<'a> Codegen<'a> {
                 kind.sql_name()
             ))),
             Expr::Alias(inner, _) => self.emit_expr(inner),
-            // CASE has no GPU IR yet: there is no value-selection-by-mask
-            // op in the kernel codegen, so a CASE expression in a fused
-            // projection / filter kernel cannot be lowered. The lowering
-            // entry point (`lower_depth`) catches this earlier via
-            // `plan_contains_case` and surfaces the same message before
-            // we ever get here; reach this arm only on hand-built plans
-            // that bypass `lower_depth`.
-            Expr::Case { .. } => Err(BoltError::Plan(
-                "CASE not yet lowered to GPU; coming in a follow-up".into(),
-            )),
+            // v0.7: CASE WHEN ... THEN ... [ELSE ...] END is lowered to a
+            // right-to-left fold of `Op::Select` ops. See `Codegen::emit_case`
+            // for the fold and the supported dtype envelope (numeric / Bool
+            // only — Utf8 and the wider numeric variants are rejected with a
+            // tighter message there).
+            Expr::Case {
+                branches,
+                else_branch,
+            } => self.emit_case(branches, else_branch.as_deref()),
         }
     }
 
@@ -796,6 +835,184 @@ impl<'a> Codegen<'a> {
             reg: dst,
             dtype: result_dtype,
         })
+    }
+
+    /// Lower a `CASE WHEN c1 THEN v1 [WHEN c2 THEN v2 ...] [ELSE e] END`
+    /// expression to a right-to-left fold of `Op::Select` ops.
+    ///
+    /// Pipeline:
+    ///
+    /// 1. Resolve the unified result dtype from the logical-plane's CASE
+    ///    type-check (it already enforced that every THEN/ELSE arm shares a
+    ///    unifiable dtype). We re-derive it here by asking `Expr::dtype`
+    ///    against the scan schema so the codegen knows what dtype to allocate
+    ///    for the result register.
+    /// 2. v0.7 envelope: reject Utf8 / Decimal128 / Date / Timestamp result
+    ///    dtypes with a tighter, GPU-codegen-specific message. The PTX
+    ///    `selp.*` mnemonic doesn't cover those classes, and string-typed
+    ///    CASE in particular needs a heap-aware ABI we don't have yet.
+    /// 3. Emit the ELSE arm first, cast to result dtype. If ELSE is omitted,
+    ///    materialise a zero literal of the result dtype as the "no WHEN
+    ///    fired" sentinel. SQL semantics call for SQL NULL in that case;
+    ///    full per-row validity propagation through the Select op is a
+    ///    v0.7 follow-up, so the v0.7 envelope settles for a deterministic
+    ///    zero on the missed-every-WHEN path.
+    /// 4. Fold backwards over the branches: `cur = Select(cond_i, then_i, cur)`.
+    ///    Right-to-left iteration mirrors SQL's left-to-right WHEN priority:
+    ///    earlier WHENs sit closer to the top of the chain and win when their
+    ///    condition fires.
+    ///
+    /// NULL propagation: an `Op::Const { Literal::Null }` register is allowed
+    /// through `Op::Select` just like any other typed value — the kernel
+    /// stores the bit-pattern unchanged. Per-row NULL propagation through
+    /// CASE branches is a follow-up; v0.7 emits the value with no
+    /// per-output validity AND-fold beyond what the input loads already
+    /// contribute.
+    fn emit_case(
+        &mut self,
+        branches: &[(Expr, Expr)],
+        else_branch: Option<&Expr>,
+    ) -> BoltResult<Value> {
+        if branches.is_empty() {
+            // Type-checker already rejects this at the logical plane; mirror
+            // the error here so a hand-built plan that bypasses `dtype()`
+            // surfaces it consistently.
+            return Err(BoltError::Plan(
+                "GPU codegen: CASE requires at least one WHEN/THEN branch".into(),
+            ));
+        }
+
+        // (1) Pin the unified result dtype against the scan schema. Any
+        //     dtype error here (incompatible arms etc.) is the same error
+        //     `lower_depth` would surface from a later `plan.schema()` call;
+        //     we just trigger it earlier so codegen has a concrete dtype.
+        let case_expr = Expr::Case {
+            branches: branches.to_vec(),
+            else_branch: else_branch.map(|e| Box::new(e.clone())),
+        };
+        let result_dtype = case_expr.dtype(self.scan_schema)?;
+
+        // (2) v0.7 dtype envelope. PTX `selp` only supports the b32/b64
+        //     register classes (Bool/Int32/Int64/Float32/Float64). Utf8
+        //     CASE is a heap-aware ABI we don't have; Decimal128 and
+        //     Date/Timestamp share the same "not yet lowered to GPU"
+        //     story as the other scalar code paths.
+        match result_dtype {
+            DataType::Utf8 => {
+                return Err(BoltError::Plan(
+                    "CASE over string (Utf8) types not yet lowered to GPU; \
+                     coming in a follow-up"
+                        .into(),
+                ))
+            }
+            DataType::Decimal128(_, _) => {
+                return Err(BoltError::Plan(
+                    "CASE over Decimal128 types not yet lowered to GPU; \
+                     coming in a follow-up"
+                        .into(),
+                ))
+            }
+            DataType::Date32 | DataType::Timestamp(_, _) => {
+                return Err(BoltError::Plan(
+                    "CASE over Date/Timestamp types not yet lowered to GPU; \
+                     coming in a follow-up"
+                        .into(),
+                ))
+            }
+            DataType::Bool
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64 => {}
+        }
+
+        // (3) ELSE seed. If ELSE is omitted, materialise a zero literal of
+        //     the result dtype as the "missed every WHEN" sentinel.
+        //     Validity-aware SQL-NULL propagation through CASE is a v0.7
+        //     follow-up; the SQL frontend's COALESCE / NULLIF desugar
+        //     always supplies an explicit ELSE so this branch is dead for
+        //     those common entry points.
+        let mut cur = match else_branch {
+            Some(e) => {
+                // NULL-arm typing (mirrors `emit_binary`'s NULL-peer rule):
+                // a bare `Literal::Null` arm carries no static type. Type it
+                // as the unified result dtype so the downstream Select op
+                // sees a register typed compatibly with the other arms. The
+                // current PTX emitter still rejects a `Literal::Null` Const,
+                // so an ELSE-only-NULL CASE remains best-effort — but
+                // NULLIF's `CASE WHEN a = b THEN NULL ELSE a END` always
+                // populates ELSE with `a`, so this arm is exercised in
+                // practice for typed (non-NULL) ELSEs.
+                let v = if matches!(e, Expr::Literal(Literal::Null)) {
+                    self.emit_null_as(result_dtype)
+                } else {
+                    self.emit_expr(e)?
+                };
+                self.emit_cast(v, result_dtype)
+            }
+            None => {
+                // Synthesise a zero literal of the result dtype as the
+                // "missed every WHEN" sentinel. Validity-aware NULL
+                // propagation through CASE is a v0.7 follow-up.
+                let lit = match result_dtype {
+                    DataType::Bool => Literal::Bool(false),
+                    DataType::Int32 => Literal::Int32(0),
+                    DataType::Int64 => Literal::Int64(0),
+                    DataType::Float32 => Literal::Float32(0.0),
+                    DataType::Float64 => Literal::Float64(0.0),
+                    // The envelope check above already rejected every
+                    // non-numeric/non-Bool dtype.
+                    other => {
+                        return Err(BoltError::Other(format!(
+                            "physical_plan: CASE without ELSE: unexpected \
+                             result dtype {other:?} survived the envelope check"
+                        )))
+                    }
+                };
+                self.emit_literal(&lit)?
+            }
+        };
+
+        // (4) Right-to-left fold over the WHEN branches. For each (cond,
+        //     then) pair we evaluate `cond`, cast `then` to the result dtype,
+        //     and emit a Select that picks `then` when `cond` is true and
+        //     `cur` otherwise. Iterating in reverse gives earlier WHENs
+        //     higher priority — `Select(c1, v1, Select(c2, v2, else))`
+        //     evaluates c1 first and short-circuits visually even though
+        //     the kernel evaluates both arms eagerly (the same eager-arm
+        //     caveat that applies to AND/OR — see the SHORT-CIRCUIT
+        //     SEMANTICS note in `emit_binary`).
+        for (cond_expr, then_expr) in branches.iter().rev() {
+            let cond_v = self.emit_expr(cond_expr)?;
+            if cond_v.dtype != DataType::Bool {
+                return Err(BoltError::Type(format!(
+                    "CASE WHEN condition must be Bool, got {:?}",
+                    cond_v.dtype
+                )));
+            }
+            // NULL-arm typing for THEN: same rule as the ELSE arm above. A
+            // bare `Literal::Null` THEN inherits the result dtype so the
+            // Op::Cast / Op::Select stack sees a typed register.
+            let then_v = if matches!(then_expr, Expr::Literal(Literal::Null)) {
+                self.emit_null_as(result_dtype)
+            } else {
+                self.emit_expr(then_expr)?
+            };
+            let then_cast = self.emit_cast(then_v, result_dtype);
+            let dst = self.fresh();
+            self.ops.push(Op::Select {
+                dst,
+                cond: cond_v.reg,
+                then_val: then_cast.reg,
+                else_val: cur.reg,
+                dtype: result_dtype,
+            });
+            cur = Value {
+                reg: dst,
+                dtype: result_dtype,
+            };
+        }
+        Ok(cur)
     }
 
     /// Append a Store op for column `col_idx`.
@@ -1957,18 +2174,14 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
 
 #[tracing::instrument(name = "lower", level = "info", skip_all)]
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
-    // Pre-flight: the GPU codegen path has no value-selection-by-mask op,
-    // so a SQL `CASE WHEN ... THEN ... END` expression anywhere in the
-    // plan cannot be lowered today. Surface a clear `Plan` error before
-    // we walk the plan so the user sees one consistent message — without
-    // this, the SELECT-list / WHERE codegen would surface the same error
-    // deep inside `Codegen::emit_expr`, with a less informative stack.
-    // Tracked for a follow-up that adds the predicated-store op.
-    if plan_contains_case(plan)? {
-        return Err(BoltError::Plan(
-            "CASE not yet lowered to GPU; coming in a follow-up".into(),
-        ));
-    }
+    // v0.7: CASE is now lowered through the GPU codegen path via
+    // `Op::Select` (see `Codegen::emit_case`). Scan-chain Project /
+    // Filter / pre-aggregation kernels accept CASE; host-side positions
+    // (HAVING, post-aggregate SELECT, sort keys) surface a clear
+    // not-yet-supported error from `expr_agg::eval_inner` when reached.
+    // The previous global pre-flight gate (`plan_contains_case`) has
+    // therefore been retired — the codegen and host evaluator each carry
+    // their own targeted message.
     // v0.5: the planner accepts `CAST(<expr> AS <type>)` and type-checks it
     // but the physical layer has no GPU IR op for runtime conversion.
     if logical_plan_contains_cast(plan) {
@@ -1982,119 +2195,6 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
     // boundary; non-fatal warning only.
     warn_if_eager_shortcircuit_unsafe(&phys);
     Ok(phys)
-}
-
-/// True if any expression in `plan` (predicate, projection, aggregate
-/// input, group key, sort key, join key) is — or contains — an
-/// `Expr::Case` node. Used by [`lower`] as a single-pass gate that
-/// rejects CASE expressions cleanly before any kernel codegen runs.
-///
-/// The walker bounds its own recursion via
-/// [`crate::plan::sql_frontend::MAX_RECURSION_DEPTH`] so a pathologically
-/// nested plan can't overflow the host stack here.
-fn plan_contains_case(plan: &LogicalPlan) -> BoltResult<bool> {
-    plan_contains_case_depth(plan, 0)
-}
-
-fn plan_contains_case_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<bool> {
-    if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
-        return Err(BoltError::Plan(format!(
-            "plan nesting exceeds depth limit ({})",
-            crate::plan::sql_frontend::MAX_RECURSION_DEPTH
-        )));
-    }
-    match plan {
-        LogicalPlan::Scan { .. } => Ok(false),
-        LogicalPlan::Filter { input, predicate } => {
-            if expr_contains_case(predicate) {
-                return Ok(true);
-            }
-            plan_contains_case_depth(input, depth + 1)
-        }
-        LogicalPlan::Project { input, exprs } => {
-            if exprs.iter().any(expr_contains_case) {
-                return Ok(true);
-            }
-            plan_contains_case_depth(input, depth + 1)
-        }
-        LogicalPlan::Aggregate {
-            input,
-            group_by,
-            aggregates,
-        } => {
-            if group_by.iter().any(expr_contains_case) {
-                return Ok(true);
-            }
-            for agg in aggregates {
-                let has_case = match agg {
-                    AggregateExpr::Count(e)
-                    | AggregateExpr::Sum(e)
-                    | AggregateExpr::Min(e)
-                    | AggregateExpr::Max(e)
-                    | AggregateExpr::Avg(e) => expr_contains_case(e),
-                    AggregateExpr::VarPop(e) | AggregateExpr::VarSamp(e) => {
-                        expr_contains_case(e.as_ref())
-                    }
-                    AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => {
-                        expr_contains_case(e.as_ref())
-                    }
-                };
-                if has_case {
-                    return Ok(true);
-                }
-            }
-            plan_contains_case_depth(input, depth + 1)
-        }
-        LogicalPlan::Distinct { input } | LogicalPlan::Limit { input, .. } => {
-            plan_contains_case_depth(input, depth + 1)
-        }
-        LogicalPlan::Sort { input, sort_exprs } => {
-            if sort_exprs.iter().any(|se| expr_contains_case(&se.expr)) {
-                return Ok(true);
-            }
-            plan_contains_case_depth(input, depth + 1)
-        }
-        LogicalPlan::Union { inputs } => {
-            for branch in inputs {
-                if plan_contains_case_depth(branch, depth + 1)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        LogicalPlan::Join {
-            left, right, on, ..
-        } => {
-            for (l, r) in on {
-                if expr_contains_case(l) || expr_contains_case(r) {
-                    return Ok(true);
-                }
-            }
-            if plan_contains_case_depth(left, depth + 1)? {
-                return Ok(true);
-            }
-            plan_contains_case_depth(right, depth + 1)
-        }
-    }
-}
-
-/// True if `e` (recursively) contains an `Expr::Case` node anywhere in its
-/// subtree. Used by [`plan_contains_case`] to scan every expression
-/// position in a logical plan; see that function for the full list of
-/// scanned positions.
-fn expr_contains_case(e: &Expr) -> bool {
-    match e {
-        Expr::Case { .. } => true,
-        Expr::Column(_) | Expr::Literal(_) => false,
-        Expr::Binary { left, right, .. } => {
-            expr_contains_case(left) || expr_contains_case(right)
-        }
-        Expr::Unary { operand, .. } => expr_contains_case(operand),
-        Expr::Alias(inner, _) => expr_contains_case(inner),
-        Expr::Like { expr, .. } => expr_contains_case(expr),
-        Expr::Cast { expr, .. } => expr_contains_case(expr),
-        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_case),
-    }
 }
 
 /// Walk `plan` looking for any `Expr::Cast` node. Used by [`lower`] to
