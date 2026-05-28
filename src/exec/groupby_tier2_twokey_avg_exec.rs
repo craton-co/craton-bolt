@@ -37,7 +37,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, Int32Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;

@@ -1463,6 +1463,7 @@ mod tests {
                 group_by: vec![0],
                 aggregates: vec![],
                 output_schema: Schema::new(vec![Field::new("a", DataType::Int64, false)]),
+                input_has_validity: vec![],
             },
         };
         let batch = RecordBatch::try_new(

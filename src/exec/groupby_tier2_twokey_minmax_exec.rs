@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;

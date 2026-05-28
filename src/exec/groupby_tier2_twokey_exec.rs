@@ -21,7 +21,7 @@
 //! to the next strategy). This is the same return-shape convention as
 //! `groupby_tier2_exec::try_execute` and `groupby_shmem_exec::try_execute`.
 
-use arrow_array::{Float64Array, Int32Array, RecordBatch};
+use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
