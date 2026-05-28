@@ -111,8 +111,8 @@ use crate::jit::agg_kernels::ReduceOp;
 // remains correct.
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
-    compile_groupby_keys_kernel, groupby_block_size, AGG_KERNEL_ENTRY,
-    I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
+    compile_groupby_keys_kernel_dispatched, groupby_block_size,
+    AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL,
 };
 use crate::plan::logical_plan::{
     sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema,
@@ -1064,13 +1064,31 @@ fn launch_keys_kernel(
         return Ok(());
     }
 
+    // Dispatch to classic linear-probe (default) or Robin Hood (when
+    // BOLT_HASH_ALGO=robin_hood). Both kernels share the same 4-param ABI;
+    // only the entry-point name varies. Route through the consolidated
+    // module cache so the two variants are cached separately by spec id.
+    let want_rh = std::env::var("BOLT_HASH_ALGO")
+        .map(|s| {
+            let l = s.to_ascii_lowercase();
+            l == "robin_hood" || l == "rh"
+        })
+        .unwrap_or(false);
+    let (spec_id, kernel_entry) = if want_rh {
+        ("groupby_keys_rh", crate::jit::hash_kernels::KEYS_KERNEL_RH_ENTRY)
+    } else {
+        ("groupby_keys", KEYS_KERNEL_ENTRY)
+    };
     let module = module_cache::get_or_build_module(
         module_path!(),
-        "groupby_keys".to_string(),
+        spec_id.to_string(),
         None,
-        || compile_groupby_keys_kernel(),
+        || {
+            let (ptx, _e) = compile_groupby_keys_kernel_dispatched()?;
+            Ok(ptx)
+        },
     )?;
-    let function = module.function(KEYS_KERNEL_ENTRY)?;
+    let function = module.function(kernel_entry)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
     let mut keys_ptr: CUdeviceptr = keys_table.device_ptr();
