@@ -38,7 +38,7 @@ use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::{
-    compile_partition_reduce_kernel_minmax, compile_partition_reduce_kernel_minmax_with_spill,
+    compile_partition_reduce_kernel_minmax_with_spill,
     kernel_entry_with_spill as minmax_entry_with_spill, MinMaxDtype, MinMaxOp,
     BLOCK_GROUPS, BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
@@ -112,8 +112,11 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
             KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
             KernelSpec::ScatterI32ToI64 => scatter_kernel::compile_scatter_kernel_i32_to_i64()?,
             KernelSpec::ReduceMinMax(rk) => {
+                // Batch 5: route to the spill-counter-aware emitter so the
+                // launch sites (which already resolve `kernel_entry_with_spill`)
+                // can find their entry point in the loaded module.
                 let (op, dt) = rk.into_pair();
-                compile_partition_reduce_kernel_minmax(op, dt)?
+                compile_partition_reduce_kernel_minmax_with_spill(op, dt)?
             }
         })
     })

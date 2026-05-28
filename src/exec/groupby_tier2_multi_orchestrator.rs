@@ -346,19 +346,21 @@ pub fn execute_tier2_multi_sum(
 
     // JIT + launch — kernel is cached per (n_vals) via the PTX cache.
     //
-    // TODO(batch-4-spill): switch to a future
-    // `compile_partition_reduce_kernel_multi_with_spill(n_vals)` once that
-    // emitter exists. See `groupby_tier2_orchestrator.rs::execute_tier2_sum`
-    // for the wiring pattern (zero-init u32 spill counter, push as the
-    // extra kernel arg, download + check after sync, return a structured
-    // `partition_reduce spill: …` error). Until then this path can drop
-    // rows silently on MAX_PROBES overflow under high-cardinality skew.
-    let reduce_entry_name = partition_reduce_kernel_multi::kernel_entry(n_vals as u32);
+    // Batch 5: route to the spill-counter-aware emitter so the launch
+    // (which pushes a u32 spill counter as the trailing kernel arg)
+    // resolves a kernel that actually consumes that arg. The post-sync
+    // check below surfaces a structured `partition_reduce spill: …` error
+    // on MAX_PROBES overflow instead of silently dropping rows.
+    let reduce_entry_name = partition_reduce_kernel_multi::kernel_entry_with_spill(n_vals as u32);
     let reduce_module = crate::exec::module_cache::get_or_build_module(
         module_path!(),
-        format!("partition_reduce_multi_n{}", n_vals),
+        format!("partition_reduce_multi_with_spill_n{}", n_vals),
         None,
-        || partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(n_vals as u32),
+        || {
+            partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi_with_spill(
+                n_vals as u32,
+            )
+        },
     )?;
     let reduce_fn = reduce_module.function(&reduce_entry_name)?;
 

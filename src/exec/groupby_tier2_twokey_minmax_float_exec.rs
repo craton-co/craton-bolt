@@ -49,7 +49,7 @@ use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::MinMaxOp;
 use crate::jit::partition_reduce_kernel_minmax_float::FloatDtype;
 use crate::jit::partition_reduce_kernel_minmax_float_i64::{
-    compile_partition_reduce_kernel_minmax_float_i64, compile_partition_reduce_kernel_minmax_float_i64_with_spill,
+    compile_partition_reduce_kernel_minmax_float_i64_with_spill,
     kernel_entry_with_spill as minmax_float_i64_entry, BLOCK_GROUPS,
     BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
@@ -112,8 +112,11 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceMinMaxFloatI64(rk) => {
+                // Batch 5: spill-counter-aware variant. The launch site
+                // resolves `kernel_entry_with_spill(op, dt)` and pushes a u32
+                // spill counter as the trailing kernel arg.
                 let (op, dt) = rk.into_pair();
-                compile_partition_reduce_kernel_minmax_float_i64(op, dt)?
+                compile_partition_reduce_kernel_minmax_float_i64_with_spill(op, dt)?
             }
         })
     })
