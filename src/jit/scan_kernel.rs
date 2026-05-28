@@ -290,7 +290,11 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     // assembler can prune unused values when it lowers PTX -> SASS.
     for op in &spec.ops {
         match op {
-            Op::Store { .. } => continue,
+            // The predicate kernel ignores value Stores — projection's
+            // responsibility. `Store128` is similarly skipped (it never
+            // contributes to a Bool predicate's compute lineage; would
+            // also blow up in `emit_op` via the i128 reject arm).
+            Op::Store { .. } | Op::Store128 { .. } => continue,
             other => emit_op(&mut b, other, &input_ptrs, &input_validity_ptrs, &tid)?,
         }
     }
@@ -395,6 +399,24 @@ fn emit_op(
             input_validity_ptrs,
             tid,
         ),
+        // Decimal128 / i128 dual-register ops (v0.7 Sub-task A) are not
+        // valid in a predicate kernel: a WHERE clause produces a Bool,
+        // never a 128-bit value, and the scan kernel's `RegAlloc`
+        // doesn't track i128 register classes. The mainline lowering
+        // (`Codegen::emit_binary`) still rejects every Decimal128
+        // expression with a Plan error, so these arms are unreachable
+        // through `lower()` today. Surface a clear error if a future
+        // planner regression routes one in.
+        Op::LoadColumn128 { .. }
+        | Op::Const128 { .. }
+        | Op::Store128 { .. }
+        | Op::Add128 { .. }
+        | Op::Sub128 { .. }
+        | Op::Mul128 { .. } => Err(BoltError::Other(
+            "scan_kernel: Decimal128 / i128 ops are not valid in a predicate kernel \
+             (predicates produce Bool, never i128); planner bug if this fires"
+                .into(),
+        )),
     }
 }
 

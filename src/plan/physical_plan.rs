@@ -120,6 +120,121 @@ pub enum Op {
         /// non-zero).
         want_null: bool,
     },
+    // ---------------------------------------------------------------------
+    // Decimal128 / i128 dual-register ops (v0.7 Sub-task A).
+    //
+    // The PTX side has no native 128-bit register class, so an i128 value
+    // is represented in the IR as a *pair* of u64 registers (`_lo` / `_hi`,
+    // little-endian: `value == ((hi as i128) << 64) | (lo as u128 as i128)`).
+    // Every 128-bit op therefore carries a pair of destination registers
+    // and (for binary ops) a pair of source-operand registers each. The
+    // pair-of-`Reg` representation (rather than a `Reg128(Reg, Reg)`
+    // wrapper) preserves the SSA invariant — each `Reg` is still written
+    // exactly once — and lets the existing dataflow walker treat the
+    // halves as independent values reachable through a single op.
+    //
+    // No end-to-end wiring lives in this slice: `Codegen::emit_column` /
+    // `emit_literal` / `emit_binary` still reject Decimal128 at lowering
+    // time, so these ops are unreachable from `lower()` today. They exist
+    // so the PTX emitter has a structurally complete IR target before the
+    // upload / Codegen-routing follow-up commits land.
+    // ---------------------------------------------------------------------
+    /// Load row `tid` of an input Decimal128 column into a pair of u64
+    /// registers. Emits two `ld.global.nc.u64` reads at byte offsets
+    /// `tid * 16` (lo) and `tid * 16 + 8` (hi) from the input buffer base.
+    LoadColumn128 {
+        /// Destination register for the low 64 bits.
+        dst_lo: Reg,
+        /// Destination register for the high 64 bits.
+        dst_hi: Reg,
+        /// Ordinal of the column in `KernelSpec::inputs`.
+        col_idx: usize,
+    },
+    /// Materialise a 128-bit constant into a pair of u64 registers by
+    /// emitting two `mov.u64` instructions of the hex bit-patterns.
+    Const128 {
+        /// Destination register for the low 64 bits.
+        dst_lo: Reg,
+        /// Destination register for the high 64 bits.
+        dst_hi: Reg,
+        /// Low 64 bits of the constant (little-endian half).
+        lo: u64,
+        /// High 64 bits of the constant (little-endian half).
+        hi: u64,
+    },
+    /// Store value `src_lo`/`src_hi` to an output Decimal128 column at row
+    /// `tid` (mask permitting). Emits two `st.global.u64` writes at byte
+    /// offsets `tid * 16` (lo) and `tid * 16 + 8` (hi).
+    Store128 {
+        /// Source register for the low 64 bits.
+        src_lo: Reg,
+        /// Source register for the high 64 bits.
+        src_hi: Reg,
+        /// Ordinal of the column in `KernelSpec::outputs`.
+        col_idx: usize,
+    },
+    /// 128-bit add: lowered as `add.cc.u64` on the low half followed by
+    /// `addc.u64` on the high half (carry propagation via the implicit
+    /// `%CC` carry flag — see PTX ISA §8.7.1.1).
+    Add128 {
+        /// Destination low half.
+        dst_lo: Reg,
+        /// Destination high half.
+        dst_hi: Reg,
+        /// Left operand low half.
+        a_lo: Reg,
+        /// Left operand high half.
+        a_hi: Reg,
+        /// Right operand low half.
+        b_lo: Reg,
+        /// Right operand high half.
+        b_hi: Reg,
+    },
+    /// 128-bit subtract: lowered as `sub.cc.u64` then `subc.u64` (borrow
+    /// propagation via `%CC`).
+    Sub128 {
+        /// Destination low half.
+        dst_lo: Reg,
+        /// Destination high half.
+        dst_hi: Reg,
+        /// Left operand low half.
+        a_lo: Reg,
+        /// Left operand high half.
+        a_hi: Reg,
+        /// Right operand low half.
+        b_lo: Reg,
+        /// Right operand high half.
+        b_hi: Reg,
+    },
+    /// 128-bit multiply (truncated to 128 bits — matches `i128::wrapping_mul`
+    /// / Arrow Decimal128 arithmetic semantics).
+    ///
+    /// Lowered as schoolbook cross-multiply:
+    ///
+    /// ```text
+    ///   dst_lo = a_lo * b_lo                                  (mul.lo.u64)
+    ///   dst_hi = mul.hi(a_lo, b_lo)                           (mul.hi.u64)
+    ///          + a_lo * b_hi                                  (mul.lo.u64)
+    ///          + a_hi * b_lo                                  (mul.lo.u64)
+    /// ```
+    ///
+    /// The `a_hi * b_hi` partial product (and the high halves of the two
+    /// cross terms) shifts into bits 128+, which we discard for wrapping
+    /// semantics. No Karatsuba — clarity > shaving one multiply.
+    Mul128 {
+        /// Destination low half.
+        dst_lo: Reg,
+        /// Destination high half.
+        dst_hi: Reg,
+        /// Left operand low half.
+        a_lo: Reg,
+        /// Left operand high half.
+        a_hi: Reg,
+        /// Right operand low half.
+        b_lo: Reg,
+        /// Right operand high half.
+        b_hi: Reg,
+    },
 }
 
 /// Description of an input column the kernel consumes.
