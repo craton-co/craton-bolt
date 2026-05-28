@@ -1711,6 +1711,14 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> Bol
         SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
             contains_aggregate(inner, resolver, depth + 1)
         }
+        // BETWEEN/NOT-BETWEEN expand into a tree that references `expr`,
+        // `low`, and `high` — any of which may transitively contain an
+        // aggregate call (e.g. `HAVING SUM(v) BETWEEN 0 AND 10`).
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => Ok(contains_aggregate(expr, resolver, depth + 1)?
+            || contains_aggregate(low, resolver, depth + 1)?
+            || contains_aggregate(high, resolver, depth + 1)?),
         SqlExpr::Nested(inner) => contains_aggregate(inner, resolver, depth + 1),
         _ => Ok(false),
     }
@@ -1786,6 +1794,54 @@ fn lower_expr_in_having(
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(operand),
             })
+        }
+        // HAVING ... BETWEEN ...: desugar the same way as the scalar lowerer
+        // but route each operand through `lower_expr_in_having` so aggregate
+        // calls inside any of {expr, low, high} are rewritten to the
+        // aggregate-output column reference. See the BETWEEN arm in
+        // `lower_expr` for the rationale on duplicating the lowered operand.
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let operand = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
+            let lo = lower_expr_in_having(low, resolver, agg_aliases, depth + 1)?;
+            let hi = lower_expr_in_having(high, resolver, agg_aliases, depth + 1)?;
+            if *negated {
+                let lt_low = Expr::Binary {
+                    op: BinaryOp::Lt,
+                    left: Box::new(operand.clone()),
+                    right: Box::new(lo),
+                };
+                let gt_high = Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(operand),
+                    right: Box::new(hi),
+                };
+                Ok(Expr::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(lt_low),
+                    right: Box::new(gt_high),
+                })
+            } else {
+                let ge_low = Expr::Binary {
+                    op: BinaryOp::GtEq,
+                    left: Box::new(operand.clone()),
+                    right: Box::new(lo),
+                };
+                let le_high = Expr::Binary {
+                    op: BinaryOp::LtEq,
+                    left: Box::new(operand),
+                    right: Box::new(hi),
+                };
+                Ok(Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(ge_low),
+                    right: Box::new(le_high),
+                })
+            }
         }
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
@@ -1914,6 +1970,60 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(operand),
             })
+        }
+        // `expr BETWEEN low AND high`  →  `(expr >= low) AND (expr <= high)`
+        // `expr NOT BETWEEN low AND high`  →  `(expr <  low) OR  (expr >  high)`
+        //
+        // SQL semantics evaluate `expr` exactly once but our IR has no
+        // sharing yet — duplicating the lowered tree is fine because
+        // `Expr` is a cheap deep-copy (Strings + Boxes) and constant
+        // folding / CSE happen at later passes. If `expr` is ever
+        // generalised to carry side effects (e.g. UDF calls) this duplication
+        // would need to change, but the current frontend already rejects
+        // scalar function calls so the operand is purely value-deterministic.
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let operand = lower_expr(expr, resolver, depth + 1)?;
+            let lo = lower_expr(low, resolver, depth + 1)?;
+            let hi = lower_expr(high, resolver, depth + 1)?;
+            if *negated {
+                // `(expr < low) OR (expr > high)` — DeMorgan of the positive form.
+                let lt_low = Expr::Binary {
+                    op: BinaryOp::Lt,
+                    left: Box::new(operand.clone()),
+                    right: Box::new(lo),
+                };
+                let gt_high = Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(operand),
+                    right: Box::new(hi),
+                };
+                Ok(Expr::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(lt_low),
+                    right: Box::new(gt_high),
+                })
+            } else {
+                let ge_low = Expr::Binary {
+                    op: BinaryOp::GtEq,
+                    left: Box::new(operand.clone()),
+                    right: Box::new(lo),
+                };
+                let le_high = Expr::Binary {
+                    op: BinaryOp::LtEq,
+                    left: Box::new(operand),
+                    right: Box::new(hi),
+                };
+                Ok(Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(ge_low),
+                    right: Box::new(le_high),
+                })
+            }
         }
         SqlExpr::Function(_) => Err(BoltError::Sql(
             "scalar function calls are not supported".into(),
