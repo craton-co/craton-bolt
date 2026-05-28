@@ -16,6 +16,9 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 
 use craton_bolt::Engine;
 
+mod common;
+use common::shuffle_deterministic;
+
 /// Build a single-column Int32 batch from the given values.
 fn int32_batch(name: &str, values: Vec<i32>) -> RecordBatch {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -44,17 +47,6 @@ fn float64_batch(name: &str, values: Vec<f64>) -> RecordBatch {
         false,
     )]));
     RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(values))]).unwrap()
-}
-
-/// Deterministic Fisher-Yates shuffle so tests are reproducible without
-/// pulling a `rand` dev-dep. The LCG constants are Knuth's.
-fn shuffle_deterministic<T: Copy>(xs: &mut [T], seed: u64) {
-    let mut s = seed;
-    for i in (1..xs.len()).rev() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let j = (s as usize) % (i + 1);
-        xs.swap(i, j);
-    }
 }
 
 /// Above the GPU_SORT_MIN_ROWS threshold so the GPU path is taken.

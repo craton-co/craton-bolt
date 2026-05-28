@@ -32,6 +32,9 @@
 //!
 //! Algorithm context: see `docs/GROUPBY_PERF.md` Tier 2.
 
+mod common;
+use common::Xorshift64Star;
+
 use std::collections::HashMap;
 
 // ---- Tier-2 constants -------------------------------------------------------
@@ -128,36 +131,21 @@ fn cpu_naive_sum_groupby(keys: &[i32], vals: &[f64]) -> Vec<(i32, f64)> {
 /// after birthday-paradox collisions, which is what the
 /// `model_agrees_with_naive_super_high` test exercises.
 ///
-/// Uses xorshift64* inlined here — no extra dev-deps. Values are in
-/// `[-1.0, 1.0)` so SUMs across millions of rows stay in a numerically
-/// interesting range and the reordered partition sums diverge from the
-/// naive single-pass sum by an amount visible to a tight `1e-9` tolerance.
+/// Uses the shared `Xorshift64Star` from `tests/common/mod.rs` — no extra
+/// dev-deps. Values are in `[-1.0, 1.0)` so SUMs across millions of rows
+/// stay in a numerically interesting range and the reordered partition sums
+/// diverge from the naive single-pass sum by an amount visible to a tight
+/// `1e-9` tolerance.
 fn fixture(n_rows: usize, n_distinct_keys: i32, seed: u64) -> (Vec<i32>, Vec<f64>) {
     assert!(n_distinct_keys > 0, "n_distinct_keys must be positive");
     let modulus = n_distinct_keys as u64;
-    let mut state: u64 = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    if state == 0 {
-        state = 0xDEAD_BEEF_CAFE_BABE;
-    }
-
-    // xorshift64* — fast, deterministic, sufficient quality for fixtures.
-    let mut next = || -> u64 {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    };
+    let mut rng = Xorshift64Star::new(seed);
 
     let mut keys = Vec::with_capacity(n_rows);
     let mut vals = Vec::with_capacity(n_rows);
     for _ in 0..n_rows {
-        let r = next();
-        let k = (r % modulus) as i32;
-        // Map upper 53 bits of a fresh draw to a uniform f64 in [0, 1),
-        // then shift to [-1, 1).
-        let r2 = next();
-        let unit = ((r2 >> 11) as f64) * (1.0_f64 / ((1_u64 << 53) as f64));
-        let v = unit * 2.0 - 1.0;
+        let k = (rng.next_u64() % modulus) as i32;
+        let v = rng.next_signed_unit_f64();
         keys.push(k);
         vals.push(v);
     }

@@ -21,6 +21,9 @@
 //!
 //! Algorithm context: see `docs/GROUPBY_PERF.md` Tier 1.
 
+mod common;
+use common::Xorshift64Star;
+
 // ---- CPU references ---------------------------------------------------------
 
 /// CPU model of the per-block shared-mem pre-aggregation kernel — used to
@@ -120,36 +123,20 @@ fn cpu_naive_sum(keys: &[i32], vals: &[f64], n_groups: u32) -> Vec<f64> {
 /// Generate `(keys, vals)` for the unit tests. Deterministic from a seed so
 /// tests are reproducible across runs and across the four sibling worktrees.
 ///
-/// Uses a tiny xorshift64* PRNG inlined here — keeps the test self-contained
-/// with no extra dev-deps. Keys are spread roughly uniformly across
-/// `[0, n_groups)`; values are in `[-1.0, 1.0)` so SUMs across 10M rows stay
-/// in a numerically interesting (non-degenerate) range and exercise float
-/// reordering sensitivity.
+/// Uses the shared `Xorshift64Star` PRNG from `tests/common/mod.rs` — keeps
+/// the test self-contained with no extra dev-deps. Keys are spread roughly
+/// uniformly across `[0, n_groups)`; values are in `[-1.0, 1.0)` so SUMs
+/// across 10M rows stay in a numerically interesting (non-degenerate) range
+/// and exercise float reordering sensitivity.
 fn fixture(n_rows: usize, n_groups: u32, seed: u64) -> (Vec<i32>, Vec<f64>) {
     assert!(n_groups > 0, "n_groups must be positive");
-    let mut state: u64 = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    if state == 0 {
-        state = 0xDEAD_BEEF_CAFE_BABE;
-    }
-
-    // xorshift64* — fast, deterministic, perfectly adequate for fixtures.
-    let mut next = || -> u64 {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    };
+    let mut rng = Xorshift64Star::new(seed);
 
     let mut keys = Vec::with_capacity(n_rows);
     let mut vals = Vec::with_capacity(n_rows);
     for _ in 0..n_rows {
-        let r = next();
-        let k = (r % n_groups as u64) as i32;
-        // Map upper bits of a fresh draw to a value in [-1.0, 1.0).
-        let r2 = next();
-        // Take the top 53 bits as a uniform f64 in [0, 1), then shift to [-1, 1).
-        let unit = ((r2 >> 11) as f64) * (1.0_f64 / ((1_u64 << 53) as f64));
-        let v = unit * 2.0 - 1.0;
+        let k = (rng.next_u64() % n_groups as u64) as i32;
+        let v = rng.next_signed_unit_f64();
         keys.push(k);
         vals.push(v);
     }

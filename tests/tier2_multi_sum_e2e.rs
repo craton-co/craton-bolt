@@ -12,6 +12,9 @@
 //! naive sum is not guaranteed; we test numerical equivalence within a tight
 //! relative tolerance (1e-9), per the existing Tier-2 contract.
 
+mod common;
+use common::Xorshift64Star;
+
 use std::collections::HashMap;
 
 // ---- Tier-2 constants (mirror the kernel) ----------------------------------
@@ -99,8 +102,9 @@ fn cpu_naive_multi_sum_groupby(
 // ---- Fixture ---------------------------------------------------------------
 
 /// Generate `(keys, vals[n_vals])` for unit tests. Deterministic from seed;
-/// same xorshift64* pattern as the single-SUM Tier-2 test. Values land in
-/// [-1.0, 1.0) so SUMs across millions of rows stay numerically interesting.
+/// uses the shared `Xorshift64Star` PRNG, same stream as the single-SUM
+/// Tier-2 test. Values land in `[-1.0, 1.0)` so SUMs across millions of
+/// rows stay numerically interesting.
 fn fixture(
     n_rows: usize,
     n_distinct_keys: i32,
@@ -110,30 +114,18 @@ fn fixture(
     assert!(n_distinct_keys > 0, "n_distinct_keys must be positive");
     assert!(n_vals >= 1 && n_vals <= 4, "n_vals must be 1..=4");
     let modulus = n_distinct_keys as u64;
-    let mut state: u64 = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    if state == 0 {
-        state = 0xDEAD_BEEF_CAFE_BABE;
-    }
-    let mut next = || -> u64 {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    };
+    let mut rng = Xorshift64Star::new(seed);
 
     let mut keys = Vec::with_capacity(n_rows);
     let mut vals: Vec<Vec<f64>> = (0..n_vals).map(|_| Vec::with_capacity(n_rows)).collect();
     for _ in 0..n_rows {
-        let r = next();
-        let k = (r % modulus) as i32;
+        let k = (rng.next_u64() % modulus) as i32;
         keys.push(k);
         for j in 0..n_vals {
-            let r2 = next();
-            let unit = ((r2 >> 11) as f64) * (1.0_f64 / ((1_u64 << 53) as f64));
             // Vary scale slightly per column so a column-misalignment bug
             // shows up as wrong sums rather than coincidentally-matching
             // values across columns.
-            let v = (unit * 2.0 - 1.0) * (1.0 + j as f64 * 0.5);
+            let v = rng.next_signed_unit_f64() * (1.0 + j as f64 * 0.5);
             vals[j].push(v);
         }
     }
