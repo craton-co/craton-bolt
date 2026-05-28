@@ -205,11 +205,12 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
         launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
     }
 
-    // Offsets. (`compute_partition_offsets` does its own sync D2H of the
-    // 4 KiB counts vector; not on our critical path — see partition_offsets
-    // module docs.)
-    let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
-    let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
+    // P1b-stage8: joint helper collapses the legacy
+    // `compute_partition_offsets` + `upload_offsets` 2-sync pair into 1
+    // sync via a single async D2H → host scan → async H2D round-trip
+    // through a thread-local pinned scratch buffer.
+    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
+        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
 
     // Scatter keys only. We still use the scatter kernel; it requires a
     // value column input, but for COUNT we have no meaningful value —

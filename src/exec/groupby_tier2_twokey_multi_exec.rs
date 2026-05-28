@@ -205,8 +205,9 @@ fn execute_inner(
         launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
     }
 
-    let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
-    let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
+    // P1b-stage8: joint helper, 2 syncs → 1.
+    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
+        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
 
     // -------- Scatter (keys + each value column) --------
     // scatter_kernel_i64 takes i64 keys + f64 vals. Reuse for each val

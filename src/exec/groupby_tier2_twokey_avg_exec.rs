@@ -244,9 +244,9 @@ fn execute_inner(
         stream.synchronize()?;
     }
 
-    // ---- Offsets -------------------------------------------------------
-    let offsets: Vec<u32> = partition_offsets::compute_partition_offsets(&counts)?;
-    let offsets_gpu: GpuVec<u32> = partition_offsets::upload_offsets(&offsets)?;
+    // ---- Offsets (P1b-stage8: joint helper, 2 syncs → 1) --------------
+    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
+        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
 
     // ---- Scatter (keys shared + N value passes) ------------------------
     let scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
