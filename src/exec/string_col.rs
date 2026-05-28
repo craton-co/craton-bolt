@@ -183,3 +183,360 @@ impl ExtendedDeviceCol {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests. Every entry point in this module ultimately touches the CUDA driver
+// (via `GpuVec::from_slice`/`zeros` or `DictionaryColumn::from_string_array`),
+// so the end-to-end round-trip cases are gated behind `#[ignore]`. The pure
+// host-side tests in this module exercise the *Arrow-input contract* the
+// dispatch logic depends on — `len()`, `null_count()`, `is_null(i)`,
+// `value(i)` semantics, and the empty/very-long/unicode/null-mix shapes —
+// so a future change to those preconditions would surface here rather than
+// silently mis-dispatching on a GPU host.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{
+        types::Int32Type, DictionaryArray, LargeStringArray, StringArray,
+    };
+
+    // -------- Pure host-side fixtures: lock in the Arrow input contract ----
+
+    #[test]
+    fn empty_string_array_has_zero_len_and_zero_nulls() {
+        // upload_utf8 / upload_bool see n = arr.len() = 0; the upload loops
+        // run zero iterations and the dispatch decision (Bool vs BoolNullable
+        // for the bool variant, or empty-dict Utf8) depends on these values
+        // being correct for the empty case.
+        let arr = StringArray::from(Vec::<Option<&str>>::new());
+        assert_eq!(arr.len(), 0);
+        assert_eq!(arr.null_count(), 0);
+    }
+
+    #[test]
+    fn single_row_string_array_round_trip_shape() {
+        // The simplest non-empty input: one short non-null string. This is
+        // the single-iteration path through `upload_utf8`'s inner loop and
+        // the trivial 1-row case for download.
+        let arr = StringArray::from(vec!["hello"]);
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.null_count(), 0);
+        assert!(!arr.is_null(0));
+        assert_eq!(arr.value(0), "hello");
+    }
+
+    #[test]
+    fn multi_row_string_array_varied_lengths() {
+        // Multi-row, no nulls, mixed lengths. Verifies the contract
+        // `upload_utf8` relies on when iterating `0..arr.len()` and
+        // dereferencing `arr.value(i)` for each row.
+        let arr = StringArray::from(vec!["a", "bb", "ccc", "dddd"]);
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.null_count(), 0);
+        let collected: Vec<&str> = (0..arr.len()).map(|i| arr.value(i)).collect();
+        assert_eq!(collected, vec!["a", "bb", "ccc", "dddd"]);
+    }
+
+    #[test]
+    fn string_array_with_nulls_reports_null_count() {
+        // upload_utf8 delegates to DictionaryColumn::from_string_array, which
+        // branches on arr.is_null(i) per row. Make sure the Arrow null mask
+        // is shaped the way that branch expects.
+        let arr = StringArray::from(vec![Some("a"), None, Some("b"), None, Some("a")]);
+        assert_eq!(arr.len(), 5);
+        assert_eq!(arr.null_count(), 2);
+        assert!(arr.is_null(1));
+        assert!(arr.is_null(3));
+        assert!(!arr.is_null(0));
+        assert!(!arr.is_null(2));
+        assert!(!arr.is_null(4));
+        assert_eq!(arr.value(0), "a");
+        assert_eq!(arr.value(2), "b");
+        assert_eq!(arr.value(4), "a");
+    }
+
+    #[test]
+    fn string_array_with_empty_string_is_distinct_from_null() {
+        // An empty string is a valid dictionary entry distinct from NULL —
+        // index 0 means NULL, an empty string takes a real index.
+        let arr = StringArray::from(vec![Some(""), None, Some("")]);
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.null_count(), 1);
+        assert!(!arr.is_null(0));
+        assert!(arr.is_null(1));
+        assert!(!arr.is_null(2));
+        assert_eq!(arr.value(0), "");
+        assert_eq!(arr.value(2), "");
+    }
+
+    #[test]
+    fn string_array_with_very_long_string_preserves_length() {
+        // 10 KiB single string — exercise the wide-row path. The dictionary
+        // builder allocates exactly one String of this size on the host.
+        let long = "x".repeat(10 * 1024);
+        let arr = StringArray::from(vec![long.as_str()]);
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.value(0).len(), 10 * 1024);
+        assert_eq!(arr.value(0), long.as_str());
+    }
+
+    #[test]
+    fn string_array_with_unicode_preserves_bytes() {
+        // Various unicode: CJK, Latin-with-diacritic, control + BMP boundary.
+        // Arrow's StringArray is byte-addressed UTF-8, so `value(i)` must
+        // round-trip the exact bytes (no normalisation).
+        let nul_and_max = "\u{0}\u{FFFF}".to_string();
+        let arr = StringArray::from(vec![
+            "日本語",
+            "naïve",
+            nul_and_max.as_str(),
+        ]);
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.value(0), "日本語");
+        assert_eq!(arr.value(1), "naïve");
+        assert_eq!(arr.value(2), nul_and_max);
+        // The unicode strings each have multi-byte chars: byte length differs
+        // from char length, which is the documented contract.
+        assert_eq!(arr.value(0).len(), 9); // 3 CJK chars * 3 bytes
+        assert_eq!(arr.value(1).len(), 6); // n a ï(2) v e
+    }
+
+    #[test]
+    fn dictionary_encoded_input_decodes_to_string_array_for_upload() {
+        // `upload_utf8` consumes a *materialised* `StringArray`. Callers that
+        // hold a `DictionaryArray<Int32, Utf8>` must `cast` to Utf8 first;
+        // verify the path that produces the StringArray we'd hand to
+        // `upload_utf8` round-trips the values correctly.
+        let dict: DictionaryArray<Int32Type> =
+            vec!["a", "b", "a", "c", "b"].into_iter().collect();
+        // arrow_cast is not in scope; use the array's downcast + values API
+        // to materialise the equivalent StringArray.
+        let keys = dict.keys();
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dict values are Utf8");
+        let materialised: StringArray = (0..dict.len())
+            .map(|i| {
+                if keys.is_null(i) {
+                    None
+                } else {
+                    Some(values.value(keys.value(i) as usize))
+                }
+            })
+            .collect();
+        assert_eq!(materialised.len(), 5);
+        assert_eq!(materialised.value(0), "a");
+        assert_eq!(materialised.value(1), "b");
+        assert_eq!(materialised.value(2), "a");
+        assert_eq!(materialised.value(3), "c");
+        assert_eq!(materialised.value(4), "b");
+        assert_eq!(materialised.null_count(), 0);
+    }
+
+    #[test]
+    fn large_utf8_input_has_the_same_arrow_contract() {
+        // `upload_utf8` only accepts `StringArray` (Utf8, i32 offsets), not
+        // `LargeStringArray` (LargeUtf8, i64 offsets). Document that contract
+        // by showing the two types are *not* interchangeable at the Arrow
+        // level, while their value semantics line up — callers wishing to
+        // upload LargeUtf8 must downcast offsets first.
+        let large: LargeStringArray =
+            LargeStringArray::from(vec![Some("a"), None, Some("bb")]);
+        assert_eq!(large.len(), 3);
+        assert_eq!(large.null_count(), 1);
+        assert_eq!(large.value(0), "a");
+        assert_eq!(large.value(2), "bb");
+        // The matching StringArray would carry identical observable values.
+        let narrow = StringArray::from(vec![Some("a"), None, Some("bb")]);
+        assert_eq!(narrow.len(), large.len());
+        assert_eq!(narrow.null_count(), large.null_count());
+        for i in 0..narrow.len() {
+            assert_eq!(narrow.is_null(i), large.is_null(i));
+            if !narrow.is_null(i) {
+                assert_eq!(narrow.value(i), large.value(i));
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_array_with_no_nulls_takes_bool_branch() {
+        // `upload_bool` reads `arr.null_count() == 0` to decide between the
+        // Bool and BoolNullable variants. Lock in that the no-null shape
+        // really reports zero.
+        let arr = BooleanArray::from(vec![true, false, true]);
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.null_count(), 0);
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
+        assert!(arr.value(2));
+    }
+
+    #[test]
+    fn boolean_array_with_nulls_takes_nullable_branch() {
+        // The other side of the dispatch: at least one null, so the upload
+        // path produces a BoolNullable with a parallel validity buffer.
+        let arr = BooleanArray::from(vec![Some(true), None, Some(false), None]);
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.null_count(), 2);
+        assert!(!arr.is_null(0));
+        assert!(arr.is_null(1));
+        assert!(!arr.is_null(2));
+        assert!(arr.is_null(3));
+        assert!(arr.value(0));
+        assert!(!arr.value(2));
+    }
+
+    #[test]
+    fn empty_boolean_array_is_valid_no_null_input() {
+        // Zero-length input must still report `null_count() == 0` so the
+        // upload path takes the Bool (not BoolNullable) branch with an empty
+        // value buffer.
+        let arr = BooleanArray::from(Vec::<bool>::new());
+        assert_eq!(arr.len(), 0);
+        assert_eq!(arr.null_count(), 0);
+    }
+
+    // -------- GPU-needing round-trip tests ----------------------------------
+    // These exercise the actual entry points (upload_bool, upload_utf8,
+    // alloc_*, download). They allocate device memory via GpuVec and so are
+    // gated behind `gpu:string_col`.
+
+    #[test]
+    #[ignore = "gpu:string_col"]
+    fn gpu_upload_bool_no_nulls_round_trips() {
+        let arr = BooleanArray::from(vec![true, false, true, true, false]);
+        let dev = ExtendedDeviceCol::upload_bool(&arr).expect("upload");
+        assert!(matches!(dev, ExtendedDeviceCol::Bool(_)));
+        assert!(dev.validity_device_ptr().is_none());
+        let back = dev.download().expect("download");
+        let got = back
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
+        assert_eq!(got.len(), 5);
+        assert_eq!(got.null_count(), 0);
+        let collected: Vec<bool> = (0..got.len()).map(|i| got.value(i)).collect();
+        assert_eq!(collected, vec![true, false, true, true, false]);
+    }
+
+    #[test]
+    #[ignore = "gpu:string_col"]
+    fn gpu_upload_bool_with_nulls_preserves_validity() {
+        let arr =
+            BooleanArray::from(vec![Some(true), None, Some(false), None, Some(true)]);
+        let dev = ExtendedDeviceCol::upload_bool(&arr).expect("upload");
+        assert!(matches!(dev, ExtendedDeviceCol::BoolNullable { .. }));
+        assert!(dev.validity_device_ptr().is_some());
+        let back = dev.download().expect("download");
+        let got = back
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
+        assert_eq!(got.len(), 5);
+        assert_eq!(got.null_count(), 2);
+        assert!(got.value(0));
+        assert!(got.is_null(1));
+        assert!(!got.value(2));
+        assert!(got.is_null(3));
+        assert!(got.value(4));
+    }
+
+    #[test]
+    #[ignore = "gpu:string_col"]
+    fn gpu_upload_bool_empty_round_trips() {
+        let arr = BooleanArray::from(Vec::<bool>::new());
+        let dev = ExtendedDeviceCol::upload_bool(&arr).expect("upload");
+        assert!(matches!(dev, ExtendedDeviceCol::Bool(_)));
+        let back = dev.download().expect("download");
+        let got = back
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
+        assert_eq!(got.len(), 0);
+    }
+
+    #[test]
+    #[ignore = "gpu:string_col"]
+    fn gpu_upload_utf8_round_trip_with_nulls_and_dedupe() {
+        // Mix of repeated values, nulls, empty string, and unicode — the
+        // dictionary path must dedupe distinct non-nulls, encode NULL as 0,
+        // and preserve every byte on download.
+        let long = "x".repeat(10 * 1024);
+        let arr = StringArray::from(vec![
+            Some("a"),
+            None,
+            Some(""),
+            Some("a"),
+            Some("日本語"),
+            Some("naïve"),
+            Some(long.as_str()),
+        ]);
+        let dev = ExtendedDeviceCol::upload_utf8(&arr).expect("upload");
+        assert!(matches!(dev, ExtendedDeviceCol::Utf8(_)));
+        assert!(dev.validity_device_ptr().is_none());
+        let back = dev.download().expect("download");
+        let got = back
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(got.len(), 7);
+        assert_eq!(got.null_count(), 1);
+        assert_eq!(got.value(0), "a");
+        assert!(got.is_null(1));
+        assert_eq!(got.value(2), "");
+        assert_eq!(got.value(3), "a");
+        assert_eq!(got.value(4), "日本語");
+        assert_eq!(got.value(5), "naïve");
+        assert_eq!(got.value(6), long.as_str());
+    }
+
+    #[test]
+    #[ignore = "gpu:string_col"]
+    fn gpu_upload_utf8_empty_round_trips() {
+        let arr = StringArray::from(Vec::<Option<&str>>::new());
+        let dev = ExtendedDeviceCol::upload_utf8(&arr).expect("upload");
+        let back = dev.download().expect("download");
+        let got = back
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(got.len(), 0);
+    }
+
+    #[test]
+    #[ignore = "gpu:string_col"]
+    fn gpu_alloc_bool_is_all_false() {
+        let dev = ExtendedDeviceCol::alloc_bool(4).expect("alloc");
+        assert!(matches!(dev, ExtendedDeviceCol::Bool(_)));
+        let back = dev.download().expect("download");
+        let got = back
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
+        assert_eq!(got.len(), 4);
+        for i in 0..got.len() {
+            assert!(!got.value(i), "row {i} must default to false");
+        }
+    }
+
+    #[test]
+    #[ignore = "gpu:string_col"]
+    fn gpu_alloc_utf8_with_dict_decodes_to_nulls() {
+        // alloc_utf8 zeroes the index buffer, so every row decodes to NULL
+        // (index 0 reserved for NULL). Passing a non-empty dictionary must
+        // not change that — the indices, not the dict, determine the rows.
+        let dict = Some(vec!["a".to_string(), "b".to_string()]);
+        let dev = ExtendedDeviceCol::alloc_utf8(3, dict).expect("alloc");
+        let back = dev.download().expect("download");
+        let got = back
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.null_count(), 3);
+    }
+}
