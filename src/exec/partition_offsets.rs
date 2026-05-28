@@ -281,6 +281,10 @@ pub fn upload_offsets(offsets: &[u32]) -> BoltResult<GpuVec<u32>> {
 /// which now each do an internal `stream.synchronize()` on the NULL
 /// stream — totalling 2 syncs per orchestrator call vs the 1 sync this
 /// helper offers.
+// `stream: CUstream` is an opaque handle forwarded to FFI; not dereferenced
+// in this function. The clippy lint suggests `unsafe fn` but that would be
+// a major API break for no actual safety win.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn compute_and_upload_partition_offsets_async(
     counts: &GpuVec<u32>,
     stream: CUstream,

@@ -206,6 +206,10 @@ impl<T: Pod> GpuBuffer<T> {
     /// the pool re-issue the same address to an unrelated allocation while
     /// the driver is still writing to it. That is silent data corruption,
     /// not an error. Synchronize before drop.
+    // `stream` is an opaque CUstream handle, not actually dereferenced in this
+    // function — only forwarded into a genuinely-unsafe FFI call. Marking the
+    // outer fn `unsafe` would be a major API break for no real safety win.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn copy_from_async(&mut self, src: &[T], stream: CUstream) -> BoltResult<()> {
         if src.len() > self.capacity {
             return Err(BoltError::Memory(format!(
@@ -263,6 +267,7 @@ impl<T: Pod> GpuBuffer<T> {
     /// in-flight read will then race with whatever the new owner writes
     /// there, and `dst` will receive a mixture of the two. Synchronize
     /// before drop.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream is forwarded, not deref'd
     pub fn copy_to_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
         if dst.len() != self.len {
             return Err(BoltError::Memory(format!(
@@ -293,6 +298,7 @@ impl<T: Pod> GpuBuffer<T> {
     /// [`copy_to_async`](Self::copy_to_async); see the SAFETY rustdoc on
     /// [`impl Drop for GpuBuffer`](GpuBuffer#impl-Drop-for-GpuBuffer<T>)
     /// (review finding C13). Synchronize the stream before dropping `self`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream is forwarded, not deref'd
     pub fn copy_to_slice_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
         self.copy_to_async(dst, stream)
     }
@@ -314,6 +320,7 @@ impl<T: Pod> GpuBuffer<T> {
     /// driver is still zero-filling it, which will silently scribble over
     /// the next allocation that lands on the same block. Synchronize
     /// before drop.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream forwarded to FFI, not deref'd here
     pub fn zeros_async(len: usize, stream: CUstream) -> BoltResult<Self> {
         let mut buf = Self::with_capacity(len)?;
         if len > 0 {

@@ -58,7 +58,7 @@
             if base_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(base_dir) {
                     let mut entries: Vec<_> = entries.flatten().collect();
-                    entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+                    entries.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
                     for entry in entries {
                         let path = entry.path();
                         let lib_path = path.join("lib").join("x64");
