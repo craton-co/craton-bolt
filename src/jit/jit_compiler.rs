@@ -13,26 +13,25 @@
 //! PTXAS assembly inside `cuModuleLoadDataEx` is the dominant cost of
 //! `Engine::sql` for short queries — typically tens of milliseconds per
 //! invocation. To eliminate that cost for repeated identical queries we keep
-//! a process-wide cache keyed by a 64-bit hash of the PTX text.
+//! a process-wide cache keyed by a 128-bit hash of the PTX text (a pair of
+//! `DefaultHasher` outputs with domain-separation bytes — see [`hash_ptx`]).
 //!
 //! **Invariant.** The codegen pipeline is deterministic: for a given
 //! `(PhysicalPlan, kernel_name)` pair the emitted PTX text is byte-identical
 //! across runs within a process. Therefore hashing the PTX text and reusing
 //! the loaded `CUmodule` is sound — two cache lookups that collide on the
 //! hash *and* the full string match represent literally the same program.
-//! Hash collisions on the 64-bit DefaultHasher key are astronomically
-//! unlikely for the cache sizes we use (default cap = 256), and even on collision
-//! the worst case is a spurious cache miss on the second program: we only
-//! match the hash here, but every cached entry was inserted from a PTX
-//! string we ourselves produced, so reusing a colliding module would launch
-//! the wrong kernel. We therefore guard against that by *also* keying on the
-//! PTX string itself: each cache entry retains the source PTX alongside the
-//! loaded module (wrapped in a `OnceCell`; see the Concurrency section
-//! below and `CacheEntry`), and we compare the stored PTX text on lookup.
+//! The cache always re-checks the stored PTX text on a hit, so even a hash
+//! collision is correctness-safe: it falls through to [`Slot::Collision`]
+//! and the caller runs an uncached `load_uncached`. The hash width was
+//! upgraded from the original 64 bits (birthday-paradox bound ≈ 2^-32 over
+//! the lifetime of a busy process) to 128 bits (≈ 2^-64) so that the
+//! Collision-fallback path is effectively unreachable rather than merely
+//! rare — it remains in place as defence-in-depth.
 //!
 //! The cache is bounded (default 256 entries) with FIFO eviction — LRU is
 //! overkill for what is essentially a hot-set of recently-issued query shapes,
-//! and FIFO needs only a `VecDeque<u64>` companion to the `HashMap`. When an
+//! and FIFO needs only a `VecDeque<(u64, u64)>` companion to the `HashMap`. When an
 //! entry is evicted from the cache its `Arc` strong count drops; if no
 //! `CudaModule` clones are live the underlying `CudaModuleInner::Drop`
 //! runs and calls `cuModuleUnload`. If clones *are* live the module stays
@@ -59,7 +58,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
-use std::hash::{Hash, Hasher};
+// `Hasher` is needed in scope so `DefaultHasher::write` / `write_u8` /
+// `finish` resolve via the trait. We no longer reach for `Hash` directly
+// (the 128-bit `hash_ptx` writes raw bytes) but keep the import to mirror
+// the test module's needs and avoid a churn on the import line.
+use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::ptr;
 use std::sync::{Arc, OnceLock};
@@ -168,9 +171,14 @@ struct CacheEntry {
 
 /// Cache state: a `HashMap` for O(1) lookup plus a `VecDeque` of keys in
 /// insertion order for FIFO eviction.
+///
+/// The key is a 128-bit `(hi, lo)` PTX hash — see [`hash_ptx`] for the
+/// rationale on the width upgrade from the original 64-bit
+/// `DefaultHasher`. `(u64, u64)` already derives `Hash`/`Eq` via the
+/// tuple impl, so the upgrade is a pure type-level change here.
 struct PtxCache {
-    map: HashMap<u64, CacheEntry>,
-    order: VecDeque<u64>,
+    map: HashMap<(u64, u64), CacheEntry>,
+    order: VecDeque<(u64, u64)>,
 }
 
 impl PtxCache {
@@ -192,7 +200,7 @@ impl PtxCache {
     /// one place.
     fn insert_empty(
         &mut self,
-        key: u64,
+        key: (u64, u64),
         ptx: String,
         cap: usize,
     ) -> Arc<OnceCell<Arc<CudaModuleInner>>> {
@@ -221,13 +229,34 @@ fn ptx_cache() -> &'static Mutex<PtxCache> {
     PTX_CACHE.get_or_init(|| Mutex::new(PtxCache::new()))
 }
 
-/// 64-bit hash of the PTX source. We use the std default hasher; it is not
-/// cryptographic but the cache treats hash collisions as misses (we also
-/// compare the full PTX text in the hit path), so any reasonable hash works.
-fn hash_ptx(ptx: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    ptx.hash(&mut h);
-    h.finish()
+/// 128-bit hash of the PTX source, packed into `(hi, lo)`.
+///
+/// The cache always verifies the full PTX string on a hit (the
+/// `entry.ptx == ptx` check in [`CudaModule::from_ptx_with`]), so a hash
+/// collision is *correctness-safe* — it triggers the [`Slot::Collision`]
+/// path and falls back to an uncached compile. The cost of that fallback
+/// is one extra `cuModuleLoadDataEx` (~10 ms), which is the entire reason
+/// to upgrade to 128 bits here: the previous 64-bit `DefaultHasher` key
+/// had a birthday-paradox collision probability of ~1 in 2^32 over the
+/// distinct PTX strings a long-running process sees, which is well within
+/// reach for a busy analytical workload and would manifest as sporadic
+/// ~10 ms latency spikes on cached queries.
+///
+/// We use two `DefaultHasher` instances domain-separated by a leading
+/// byte (`0x10` vs `0x20`) so the two 64-bit halves are independent.
+/// `DefaultHasher` is internally SipHash-1-3; it is non-cryptographic
+/// but more than adequate for collision-resistance against our own
+/// deterministic PTX output. The `Slot::Collision` fallback is retained
+/// as defence-in-depth — at 128 bits it is effectively unreachable.
+fn hash_ptx(ptx: &str) -> (u64, u64) {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hi = DefaultHasher::new();
+    hi.write_u8(0x10);
+    hi.write(ptx.as_bytes());
+    let mut lo = DefaultHasher::new();
+    lo.write_u8(0x20);
+    lo.write(ptx.as_bytes());
+    (hi.finish(), lo.finish())
 }
 
 /// Loaded GPU module — owns one or more CUfunctions.
@@ -580,6 +609,12 @@ mod tests {
 
     /// With cap = 8, inserting 9 distinct keys evicts the *first* one
     /// inserted, leaving the most-recent 8 in the map.
+    ///
+    /// The cache key is now `(u64, u64)` (128-bit PTX hash — see
+    /// [`hash_ptx`]). We synthesise distinct keys with the second half
+    /// pinned to `0` and walk the first half so the eviction policy
+    /// exercises tuple-keyed lookup and the surviving-keys assertion
+    /// remains expressible as `(i, 0)`.
     #[test]
     fn ptx_cache_evicts_oldest_at_cap() {
         let mut cache = PtxCache::new();
@@ -587,22 +622,23 @@ mod tests {
 
         // Insert 8 entries — none should be evicted yet.
         for i in 0..cap as u64 {
-            cache.insert_empty(i, format!("ptx-{}", i), cap);
+            cache.insert_empty((i, 0), format!("ptx-{}", i), cap);
         }
         assert_eq!(cache.map.len(), cap);
-        assert!(cache.map.contains_key(&0));
+        assert!(cache.map.contains_key(&(0u64, 0u64)));
 
-        // The 9th insert must evict key 0 (the oldest) and seat key 8.
-        cache.insert_empty(cap as u64, format!("ptx-{}", cap), cap);
+        // The 9th insert must evict key (0, 0) (the oldest) and seat
+        // key (cap, 0).
+        cache.insert_empty((cap as u64, 0), format!("ptx-{}", cap), cap);
         assert_eq!(cache.map.len(), cap);
         assert!(
-            !cache.map.contains_key(&0),
-            "key 0 should have been FIFO-evicted at the 9th insert"
+            !cache.map.contains_key(&(0u64, 0u64)),
+            "key (0, 0) should have been FIFO-evicted at the 9th insert"
         );
-        assert!(cache.map.contains_key(&(cap as u64)));
+        assert!(cache.map.contains_key(&(cap as u64, 0u64)));
         // The order deque also tracks the surviving keys 1..=8.
-        assert_eq!(cache.order.front().copied(), Some(1));
-        assert_eq!(cache.order.back().copied(), Some(cap as u64));
+        assert_eq!(cache.order.front().copied(), Some((1u64, 0u64)));
+        assert_eq!(cache.order.back().copied(), Some((cap as u64, 0u64)));
     }
 
     // -- from_ptx_with concurrency (H3, no redundant compile on miss) ------
