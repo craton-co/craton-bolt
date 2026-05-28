@@ -511,8 +511,12 @@ where
     let block_sums = GpuVec::<f64>::zeros_async(grid_x as usize, stream.raw())?;
     let block_counts = GpuVec::<u32>::zeros_async(grid_x as usize, stream.raw())?;
 
-    let ptx = compile_avg_reduction_kernel(dtype)?;
-    let module = CudaModule::from_ptx(&ptx)?;
+    let module = crate::exec::module_cache::get_or_build_module(
+        module_path!(),
+        format!("avg_reduce_{:?}", dtype),
+        None,
+        || compile_avg_reduction_kernel(dtype),
+    )?;
     let function = module.function(AVG_KERNEL_ENTRY)?;
 
     let mut input_ptr: CUdeviceptr = input.device_ptr();

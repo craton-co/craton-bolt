@@ -64,21 +64,6 @@ enum KernelSpec {
 static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
-    if let Some(m) = MODULE_CACHE.lock().get(spec) {
-        return Ok(m.clone());
-    }
-    let ptx = match spec {
-        KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
-        KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
-        // TODO(batch-4-spill): wire `_with_spill` once
-        // `compile_partition_reduce_kernel_i64_with_spill` exists. See
-        // `groupby_tier2_orchestrator.rs::execute_tier2_sum` for the
-        // pattern.
-        KernelSpec::ReduceSumI64 => {
-            partition_reduce_kernel_i64::compile_partition_reduce_kernel_i64()?
-        }
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
     let counter = Some(&LOAD_COUNT);
     #[cfg(not(test))]

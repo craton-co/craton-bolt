@@ -108,20 +108,6 @@ enum KernelSpec {
 static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
-    if let Some(m) = MODULE_CACHE.lock().get(spec) {
-        return Ok(m.clone());
-    }
-    let ptx = match spec {
-        KernelSpec::Partition => stub_partition_kernel::compile_partition_kernel()?,
-        KernelSpec::Scatter => stub_scatter_kernel::compile_scatter_kernel()?,
-        // Batch 4: wire the spill-counter-aware variant so MAX_PROBES
-        // overflow surfaces as a structured error instead of silently
-        // dropping rows (which would corrupt the per-group SUM result).
-        KernelSpec::ReduceSum => {
-            partition_reduce_kernel::compile_partition_reduce_kernel_with_spill()?
-        }
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
     let counter = Some(&LOAD_COUNT);
     #[cfg(not(test))]
@@ -130,7 +116,13 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
         Ok(match spec {
             KernelSpec::Partition => stub_partition_kernel::compile_partition_kernel()?,
             KernelSpec::Scatter => stub_scatter_kernel::compile_scatter_kernel()?,
-            KernelSpec::ReduceSum => partition_reduce_kernel::compile_partition_reduce_kernel()?,
+            // Batch 4: spill-counter-aware variant — MAX_PROBES overflow
+            // surfaces as a structured error instead of silently dropping
+            // rows. The caller MUST allocate a u32 spill counter and pass
+            // it as the extra kernel arg.
+            KernelSpec::ReduceSum => {
+                partition_reduce_kernel::compile_partition_reduce_kernel_with_spill()?
+            }
         })
     })
 }

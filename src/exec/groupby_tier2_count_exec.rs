@@ -66,20 +66,6 @@ static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
 /// Cache-aware module loader. See module-cache comment above.
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
-    if let Some(m) = MODULE_CACHE.lock().get(spec) {
-        return Ok(m.clone());
-    }
-    let ptx = match spec {
-        KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
-        KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
-        // Batch 4: spill-counter-aware variant. The kernel atomically
-        // bumps a host-visible counter when a row exceeds MAX_PROBES; the
-        // caller checks it after sync and surfaces a structured error.
-        KernelSpec::ReduceCount => {
-            partition_reduce_kernel_count::compile_partition_reduce_kernel_count_with_spill()?
-        }
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
     let counter = Some(&LOAD_COUNT);
     #[cfg(not(test))]

@@ -81,22 +81,6 @@ enum KernelSpec {
 static LOAD_COUNT: module_cache::LoadCounter = module_cache::LoadCounter::new();
 
 fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
-    if let Some(m) = MODULE_CACHE.lock().get(spec) {
-        return Ok(m.clone());
-    }
-    let ptx = match spec {
-        KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
-        KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
-        // TODO(batch-4-spill): wire a `_with_spill` variant once we add
-        // `compile_partition_reduce_kernel_minmax_float_with_spill`. See
-        // `groupby_tier2_orchestrator.rs::execute_tier2_sum` for the
-        // pattern used by the SUM/COUNT kernels in batch 4.
-        KernelSpec::ReduceMinMaxFloat(rk) => {
-            let (op, dt) = rk.into_pair();
-            compile_partition_reduce_kernel_minmax_float(op, dt)?
-        }
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
     #[cfg(test)]
     let counter = Some(&LOAD_COUNT);
     #[cfg(not(test))]

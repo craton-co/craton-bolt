@@ -364,7 +364,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             // and a unary validity test has no literal to resolve. We
             // still walk the operand so any rewritable sub-expression
             // (e.g. `(col = 'a') IS NULL`, however unusual) is normalised.
-            let new_operand = rewrite_expr_with(operand, r)?;
+            let new_operand = rewrite_expr_with(operand, r, depth + 1)?;
             Ok(Expr::Unary {
                 op: *op,
                 operand: Box::new(new_operand),

@@ -350,10 +350,13 @@ pub fn execute_tier2_multi_sum(
     // extra kernel arg, download + check after sync, return a structured
     // `partition_reduce spill: …` error). Until then this path can drop
     // rows silently on MAX_PROBES overflow under high-cardinality skew.
-    let reduce_ptx = partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(
-        n_vals as u32,
-    )?;
     let reduce_entry_name = partition_reduce_kernel_multi::kernel_entry(n_vals as u32);
+    let reduce_module = crate::exec::module_cache::get_or_build_module(
+        module_path!(),
+        format!("partition_reduce_multi_n{}", n_vals),
+        None,
+        || partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi(n_vals as u32),
+    )?;
     let reduce_fn = reduce_module.function(&reduce_entry_name)?;
 
     {
