@@ -769,6 +769,149 @@ impl Engine {
         Ok(())
     }
 
+    /// Register a table from a producer that yields batches lazily.
+    ///
+    /// `schema` declares the expected per-batch schema up front (column
+    /// names + dtypes); every batch yielded by `batches` is validated
+    /// against it before being installed. Producer-side errors propagate
+    /// out of the iterator as `BoltResult::Err(_)` — yielding an `Err`
+    /// aborts registration with that error, leaving the engine in the
+    /// state it had before this call (modulo any batches already
+    /// installed for *this* table, which are rolled back via
+    /// `tables.remove`).
+    ///
+    /// # v0.6 semantics: eager consumption
+    ///
+    /// The v0.6 cut consumes `batches` EAGERLY: every batch is pulled
+    /// from the iterator and pushed into the engine's existing
+    /// multi-batch in-memory table representation (the same `Vec<RecordBatch>`
+    /// that backs `register_table` + repeated `register_batch`). This is
+    /// deliberate — the goal here is to land a stable API *shape* so
+    /// callers can write streaming-style code today and have it keep
+    /// compiling when v0.7+ replaces the body with a truly lazy
+    /// per-batch query plan. Until then, large streams still pay the
+    /// full host-side materialisation cost on every `sql()` call (see
+    /// the field doc on `tables` for the perf caveat).
+    ///
+    /// Roadmap: v0.7 is expected to land lazy streaming where each
+    /// yielded batch is processed and discarded without materialising
+    /// the full table in host memory. The signature here is
+    /// future-compatible with that change.
+    ///
+    /// # Errors
+    /// - The iterator is empty (a table must contain at least one batch
+    ///   for `materialize_table` to succeed).
+    /// - Any yielded `Err` propagates out unchanged.
+    /// - Any batch's schema (column names + plan-level dtypes) does not
+    ///   match the declared `schema`.
+    /// - A table named `name` is already registered.
+    pub fn register_table_stream<I>(
+        &mut self,
+        name: impl Into<String>,
+        schema: Schema,
+        batches: I,
+    ) -> BoltResult<()>
+    where
+        I: IntoIterator<Item = BoltResult<RecordBatch>>,
+    {
+        let name = name.into();
+        if self.tables.contains_key(&name) {
+            return Err(BoltError::Plan(format!(
+                "table '{name}' is already registered — register_table_stream \
+                 cannot append to an existing table; use register_batch instead"
+            )));
+        }
+        // Validate one batch against the declared plan schema (names +
+        // dtypes match positionally). We compare via the plan schema
+        // rather than the raw Arrow schema so a caller-declared
+        // `nullable: true` doesn't clash with a batch whose Arrow
+        // schema happens to mark the same column non-nullable — the
+        // engine treats per-row null counts as the truth and the
+        // declared `nullable` is informational only at registration
+        // time.
+        fn validate_batch_schema(
+            declared: &Schema,
+            batch: &RecordBatch,
+            name: &str,
+            batch_idx: usize,
+        ) -> BoltResult<()> {
+            let actual = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
+            if actual.fields.len() != declared.fields.len() {
+                return Err(BoltError::Plan(format!(
+                    "register_table_stream: batch {batch_idx} for table '{name}' \
+                     has {} columns but declared schema has {}",
+                    actual.fields.len(),
+                    declared.fields.len()
+                )));
+            }
+            for (i, (a, d)) in actual.fields.iter().zip(declared.fields.iter()).enumerate() {
+                if a.name != d.name || a.dtype != d.dtype {
+                    return Err(BoltError::Plan(format!(
+                        "register_table_stream: batch {batch_idx} for table '{name}' \
+                         column {i} mismatch — declared {:?}:{:?}, got {:?}:{:?}",
+                        d.name, d.dtype, a.name, a.dtype
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        // Eagerly drain the iterator, threading errors out and rolling
+        // back the (just-installed) table on any failure so the engine
+        // never observes a partially-installed table from this call.
+        let mut iter = batches.into_iter();
+        let first = match iter.next() {
+            Some(Ok(b)) => b,
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(BoltError::Plan(format!(
+                    "register_table_stream: iterator for table '{name}' yielded \
+                     zero batches — a registered table must contain at least one batch"
+                )));
+            }
+        };
+        validate_batch_schema(&schema, &first, &name, 0)?;
+        // Install the first batch through the same path
+        // `register_table` uses — dictionaries, provider, GpuTable,
+        // host-revisions all set up in one place.
+        self.register_table(name.clone(), first)?;
+        // Stream subsequent batches in. On any error, roll back the
+        // entire table install so this call is atomic from the caller's
+        // perspective.
+        let mut batch_idx: usize = 1;
+        loop {
+            let next = match iter.next() {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => {
+                    self.unregister_table_best_effort(&name);
+                    return Err(e);
+                }
+                None => break,
+            };
+            if let Err(e) = validate_batch_schema(&schema, &next, &name, batch_idx) {
+                self.unregister_table_best_effort(&name);
+                return Err(e);
+            }
+            if let Err(e) = self.register_batch(&name, next) {
+                self.unregister_table_best_effort(&name);
+                return Err(e);
+            }
+            batch_idx += 1;
+        }
+        Ok(())
+    }
+
+    /// Best-effort rollback helper used by `register_table_stream` when a
+    /// mid-stream error needs to undo the partial install. Mirrors the
+    /// state touched by `register_table` / `register_batch`.
+    fn unregister_table_best_effort(&mut self, name: &str) {
+        self.tables.remove(name);
+        self.dict_registry.unregister_table(name);
+        self.provider.unregister_table(name);
+        self.host_revisions.remove(name);
+        self.gpu_tables.borrow_mut().remove(name);
+    }
+
     /// Replace any existing table named `name` with a single-batch table
     /// holding `batch`. Idempotent; equivalent to "unregister then
     /// register_table" but performs both halves atomically with respect to
