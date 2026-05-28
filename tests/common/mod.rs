@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
+/// Standard #[ignore] categories used across the test suite (review L5):
+///   gpu:tier1       — Tier-1 GROUP BY / aggregate
+///   gpu:tier2       — Tier-2 hash-partitioned GROUP BY
+///   gpu:join        — GPU hash join
+///   gpu:sort        — GPU sort
+///   gpu:mempool     — Memory pool / VRAM tests
+///   gpu:string      — Utf8 / dictionary tests
+///   gpu:e2e         — Generic e2e SQL needing GPU
+///   gpu:proptest-semantic — Property-test semantic diff vs DuckDB
+///   bootstrap       — Snapshot bootstrap (rare)
+///
+/// Run a subset via: `cargo test -- --ignored --filter <bucket>`.
+
 //! Shared test helpers. Integration tests under `tests/<name>.rs` include
 //! this via `mod common;`. Not part of the published crate.
 //!

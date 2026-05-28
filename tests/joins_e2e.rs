@@ -145,7 +145,7 @@ fn cross_join_lowers_with_empty_on() {
 //   cargo test --test joins_e2e -- --ignored
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test --test joins_e2e -- --ignored`"]
+#[ignore = "gpu:join"]
 fn e2e_inner_join_basic() {
     use craton_bolt::Engine;
 
@@ -163,7 +163,7 @@ fn e2e_inner_join_basic() {
 }
 
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn e2e_left_join_unmatched_rows_get_null_right() {
     use craton_bolt::Engine;
 
@@ -192,7 +192,7 @@ fn e2e_left_join_unmatched_rows_get_null_right() {
 }
 
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn e2e_right_join_unmatched_rows_get_null_left() {
     use craton_bolt::Engine;
 
@@ -220,7 +220,7 @@ fn e2e_right_join_unmatched_rows_get_null_left() {
 }
 
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn e2e_full_outer_join_emits_both_sides() {
     use craton_bolt::Engine;
 
@@ -257,7 +257,7 @@ fn e2e_full_outer_join_emits_both_sides() {
 }
 
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn e2e_cross_join_row_count_is_product() {
     use craton_bolt::Engine;
 

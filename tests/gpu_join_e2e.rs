@@ -66,7 +66,7 @@ fn int64_batch(name_k: &str, name_v: &str, keys: Vec<i64>, vals: Vec<i64>) -> Re
 /// 0..N_BUILD are unique; probe keys cycle 0..(N_BUILD * 2), so exactly
 /// N_PROBE / 2 = 4096 probe rows land on a build key.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test --test gpu_join_e2e -- --ignored`"]
+#[ignore = "gpu:join"]
 fn e2e_gpu_inner_join_int32_basic() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -136,7 +136,7 @@ fn e2e_gpu_inner_join_int32_basic() {
 /// 4k × 8k Int64 INNER join — exercises the Int64 path through the same
 /// fast path.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn e2e_gpu_inner_join_int64_basic() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -190,7 +190,7 @@ fn e2e_gpu_inner_join_int64_basic() {
 /// goes through the host path. Sanity-check that the fall-through doesn't
 /// break correctness when the GPU gate rejects.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn e2e_gpu_inner_join_small_falls_through_to_host() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -222,7 +222,7 @@ fn e2e_gpu_inner_join_small_falls_through_to_host() {
 /// (probe) side as the build, so the GPU executor flips orientation. This
 /// test catches the build_is_left=false branch of the orient logic.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn e2e_gpu_inner_join_build_larger_than_probe() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -300,7 +300,7 @@ fn int32x3_batch(
 /// side has unique (a,b) tuples; probe contains exactly half-matching rows.
 /// Exercises the Stage-2 [`KeyShape::TwoI32`] composite-pack path.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn two_key_inner_join() {
     let mut engine = Engine::new().expect("ctx");
     // Build: 4096 rows, (a, b) = (i / 64, i % 64), payload = i + 1000.
@@ -340,7 +340,7 @@ fn two_key_inner_join() {
 /// whose key doesn't appear in the build side surface with the build
 /// (right-side) columns NULL-padded.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn left_outer_with_unmatched() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -383,7 +383,7 @@ fn left_outer_with_unmatched() {
 /// RIGHT OUTER JOIN: every right row appears at least once. Symmetric to
 /// LEFT — the build side is now the LEFT table.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn right_outer_with_unmatched_build() {
     let mut engine = Engine::new().expect("ctx");
     let l_keys: Vec<i32> = (0..N_BUILD as i32).collect();
@@ -416,7 +416,7 @@ fn right_outer_with_unmatched_build() {
 /// FULL OUTER JOIN: union of LEFT + RIGHT semantics. Both unmatched sets
 /// surface — one with the right NULL'd, the other with the left NULL'd.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn full_outer_emits_both_sides() {
     let mut engine = Engine::new().expect("ctx");
     let l_keys: Vec<i32> = (0..N_BUILD as i32).collect();
@@ -453,7 +453,7 @@ fn full_outer_emits_both_sides() {
 /// probe has two rows with key=K → expect 6 output rows. Exercises the
 /// collision-list build + chain-walking probe kernels.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn duplicate_build_keys_emit_all_matches() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -490,7 +490,7 @@ fn duplicate_build_keys_emit_all_matches() {
 /// as its key; probe has multiple rows whose NaN bit-pattern differs from
 /// `f64::NAN.to_bits()`. After canonicalisation they must all match.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn float_key_join() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -594,7 +594,7 @@ fn int64_pair_batch(
 /// enough to count host-side; total cell count is above the GPU min and
 /// below the GPU cap, so the GPU CROSS kernel runs.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn cross_join_on_gpu() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -655,7 +655,7 @@ fn cross_join_on_gpu() {
 /// and routes through the Stage-1 kernel. Output reattaches the original
 /// StringArray columns.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn utf8_inner_join() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -724,7 +724,7 @@ fn utf8_inner_join() {
 /// drop the false positives — only the rows whose tuples actually agree
 /// are kept.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn lossy_twoi64_host_verify_drops_false_positives() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -827,7 +827,7 @@ fn env_var_overrides_cap() {
 ///   * The Utf8-value-equality contract holds (the host post-verify drops
 ///     any hash collisions).
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test --test gpu_join_e2e -- --ignored`"]
+#[ignore = "gpu:join"]
 fn streaming_intern_high_cardinality_utf8() {
     // Tag the test so it is independent of other env-var users; restore on
     // exit so subsequent tests run with the byte-borrowed dict path.
@@ -940,7 +940,7 @@ fn streaming_intern_high_cardinality_utf8() {
 /// invariant so any future planner wiring that flips the SoA -> AoS
 /// switch lands without changing observable output.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn aos_build_layout_no_regression() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -991,7 +991,7 @@ fn aos_build_layout_no_regression() {
 /// composite keys) and verify both the matched pairs and the unmatched
 /// LEFT rows appear correctly.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn lossy_twoi64_left_outer_host_verify() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -1091,7 +1091,7 @@ fn lossy_twoi64_left_outer_host_verify() {
 /// the routing now goes through `cuCtxGetDevice` instead of
 /// `cuDeviceGet(0)`, so the test exercises the new code path.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn multi_gpu_cap_uses_current_device() {
     use craton_bolt::cuda::cuda_sys;
 
@@ -1157,7 +1157,7 @@ fn utf8_batch(name_k: &str, name_v: &str, keys: Vec<String>, vals: Vec<i32>) -> 
 /// `SingleUtf8` and routes through `execute_utf8_outer_join_on_gpu`.
 /// Stage 4 fell back to host for this.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn outer_utf8_with_unmatched_rows() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -1213,7 +1213,7 @@ fn outer_utf8_with_unmatched_rows() {
 /// join invariant). Any regression in AoS (slot layout drift, wrong
 /// stride) is caught here.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn aos_routing_probe_heavy() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -1275,7 +1275,7 @@ fn aos_routing_probe_heavy() {
 /// produce correct output, but a future test could grep for the routing
 /// log if debug logging is enabled.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn aos_routing_balanced_picks_soa() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -1335,7 +1335,7 @@ fn aos_routing_balanced_picks_soa() {
 /// supposed to replay. A divergence between host and device hashing
 /// would surface here as a missing match.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:join"]
 fn device_string_hash_matches_host_via_engine() {
     let prev = std::env::var("BOLT_GPU_JOIN_STREAMING_INTERN").ok();
     std::env::set_var("BOLT_GPU_JOIN_STREAMING_INTERN", "1");

@@ -39,7 +39,7 @@
 //! 1. Parse-only tests (un-ignored, no GPU) — confirm what the frontend
 //!    accepts vs rejects today. These are the regression guard against a
 //!    silent widening or narrowing of the supported subset.
-//! 2. Execution tests gated on `#[ignore = "gpu:string_ops"]` — run the full
+//! 2. Execution tests gated on `#[ignore = "gpu:string"]` — run the full
 //!    SQL pipeline against a GPU device. Currently only the
 //!    `WHERE s = 'literal'` path lands here; the rest become enabled as
 //!    `// TODO(post-0.3)` items below are implemented.
@@ -312,14 +312,14 @@ fn parse_trim_rejected_by_frontend() {
 // ===========================================================================
 // Execution tests (require a CUDA device).
 //
-// Gated on `#[ignore = "gpu:string_ops"]` per the H7 review ask. Run with
+// Gated on `#[ignore = "gpu:string"]` per the H7 review ask. Run with
 //     cargo test --test string_ops_e2e -- --ignored
 // on a GPU host. Each test mirrors the parse-only assertion above to make
 // sure the round-trip works, not just the lower.
 // ===========================================================================
 
 #[test]
-#[ignore = "gpu:string_ops"]
+#[ignore = "gpu:string"]
 fn where_string_equality_returns_matching_rows() {
     // `WHERE s = 'foo'` is the only string-touching predicate the frontend
     // currently lowers cleanly. The rewriter folds it into integer eq on
@@ -356,7 +356,7 @@ fn where_string_equality_returns_matching_rows() {
 }
 
 #[test]
-#[ignore = "gpu:string_ops"]
+#[ignore = "gpu:string"]
 fn where_string_inequality_returns_complement_rows() {
     // `WHERE s <> 'foo'` is the constant-folded twin of the equality test;
     // confirms the rewriter routes both ops through the same path.

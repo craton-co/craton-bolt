@@ -316,7 +316,7 @@ fn partition_function_distributes_evenly() {
 // inline so the integrator can wire it up mechanically.
 
 #[test]
-#[ignore = "requires CUDA + Tier-2 pipeline; enable post-merge"]
+#[ignore = "gpu:tier2"]
 fn tier2_pipeline_matches_cpu_model() {
     use std::sync::Arc;
 

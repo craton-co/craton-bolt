@@ -161,7 +161,7 @@ fn having_logical_plan_shape_lowers_to_filter() {
 // ---- Online: end-to-end correctness ----------------------------------------
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:tier1"]
 fn e2e_having_filters_out_groups() {
     use craton_bolt::Engine;
 

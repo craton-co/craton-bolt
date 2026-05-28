@@ -42,7 +42,7 @@ fn with_ctx<F: FnOnce()>(body: F) {
 // ---- 1. alloc/free churn ----------------------------------------------------
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn pool_alloc_free_churn() {
     // Allocate and immediately drop 10k buffers across a span of small sizes.
     // Each drop returns its block to the pool; the next alloc of the same
@@ -96,7 +96,7 @@ fn pool_alloc_free_churn() {
 // ---- 2. drain empties the pool ---------------------------------------------
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn pool_drain_empties_pool() {
     with_ctx(|| {
         let pool = __test_pool();
@@ -141,7 +141,7 @@ fn pool_drain_empties_pool() {
 // ---- 3. concurrent alloc/free pairs ----------------------------------------
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn pool_concurrent_alloc() {
     // 8 threads × 1000 alloc/free pairs each. The pool uses a `parking_lot::
     // Mutex` internally, so we're stressing both the lock and the
@@ -220,7 +220,7 @@ fn pool_concurrent_alloc() {
 // ---- 4. bucket reuse: same-size alloc after free must hit the pool ---------
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn pool_bucket_reuse() {
     // Allocate, free, then allocate the *same* size again. The second alloc
     // must come from the pool (we can detect that by watching the bucket
@@ -279,7 +279,7 @@ fn pool_bucket_reuse() {
 // ---- 5. drain-on-context-drop must keep subsequent allocs safe -------------
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn pool_drain_after_context_drop() {
     // The bug class this guards against: `CudaContext::Drop` calls
     // `POOL.drain()` so that no `CUdeviceptr` minted in a destroyed context

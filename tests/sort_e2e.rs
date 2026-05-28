@@ -55,7 +55,7 @@ const N_BIG: usize = 16_384;
 /// `ORDER BY v ASC` on a 16k-row Int32 column. Validates that the GPU fast
 /// path returns a strictly ascending sequence.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn e2e_order_by_int32_asc() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -92,7 +92,7 @@ fn e2e_order_by_int32_asc() {
 
 /// `ORDER BY v DESC` on a 16k-row Int32 column.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn e2e_order_by_int32_desc() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -129,7 +129,7 @@ fn e2e_order_by_int32_desc() {
 /// Non-power-of-two size exercises the padding path. 20_000 rounds up to
 /// 32_768, with 12_768 sentinel entries.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn e2e_order_by_int64_asc_non_pow2() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -161,7 +161,7 @@ fn e2e_order_by_int64_asc_non_pow2() {
 
 /// Float64 ASC on a non-power-of-two size.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn e2e_order_by_float64_asc() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -194,7 +194,7 @@ fn e2e_order_by_float64_asc() {
 /// Multi-column projection with `ORDER BY` on one column — confirms the
 /// non-key columns get gathered in lockstep so payload tracks the key.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn e2e_order_by_keeps_payload_aligned() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -276,7 +276,7 @@ fn two_int32_batch(a: Vec<i32>, b: Vec<i32>) -> RecordBatch {
 /// `ORDER BY a ASC, b DESC` — multi-key lexicographic. Build inputs where
 /// the major key has ties so the minor key's polarity is observable.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn multi_key_int_int() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -315,7 +315,7 @@ fn multi_key_int_int() {
 
 /// `ORDER BY a NULLS FIRST` — NULL rows must precede every non-NULL row.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn null_first_int_with_nulls() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -363,7 +363,7 @@ fn null_first_int_with_nulls() {
 
 /// `ORDER BY a NULLS LAST` — NULLs trailing.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn null_last_int_with_nulls() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -413,7 +413,7 @@ fn null_last_int_with_nulls() {
 /// the GPU path normally, so we drive the shmem dispatcher directly via the
 /// public `sort_indices_on_gpu_multi` entry point.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn shmem_variant_small_input() {
     use craton_bolt::__test_only_gpu_sort::{sort_indices_on_gpu_multi, GpuSortKey, SortLayout};
     use craton_bolt::__test_only_sort_kernel::SortDirection;
@@ -460,7 +460,7 @@ fn shmem_variant_small_input() {
 /// `ORDER BY a, b, c, d, e, f, g, h ASC` — 8 keys, well above the Stage-2
 /// hard cap of 4. Drives the lifted register-pressure-based cap.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn eight_key_sort() {
     use arrow_array::Int32Array;
     let mut engine = Engine::new().expect("ctx");
@@ -511,7 +511,7 @@ fn eight_key_sort() {
 
 /// `ORDER BY b ASC` on a Bool column — Stage 3 added Bool support.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn bool_key_sort() {
     use arrow_array::{BooleanArray, Int32Array};
     let mut engine = Engine::new().expect("ctx");
@@ -574,7 +574,7 @@ fn bool_key_sort() {
 /// the load-bearing piece: `host_values_for_key` peeling off the index
 /// column and routing it through the i32 kernel.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn dict_utf8_key_sort() {
     use arrow_array::types::Int32Type;
     use arrow_array::{DictionaryArray, Int32Array, StringArray};
@@ -629,7 +629,7 @@ fn dict_utf8_key_sort() {
 /// the sentinel; Stage 3 routes padded rows via an explicit bit so real
 /// `i32::MAX` values survive.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn sentinel_collision_does_not_drop_row() {
     use arrow_array::Int32Array;
     let mut engine = Engine::new().expect("ctx");
@@ -684,7 +684,7 @@ fn sentinel_collision_does_not_drop_row() {
 /// value win the tiebreak regardless of direction; this test locks the
 /// DESC half of that behaviour.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn sentinel_collision_desc_i32_min_does_not_drop_row() {
     use arrow_array::Int32Array;
     let mut engine = Engine::new().expect("ctx");
@@ -750,7 +750,7 @@ fn sentinel_collision_desc_i32_min_does_not_drop_row() {
 /// the low-cardinality case where the dict-build cost is amortised across
 /// many rows.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn utf8_sort_via_inline_dictionary() {
     use arrow_array::StringArray;
     let mut engine = Engine::new().expect("ctx");
@@ -806,7 +806,7 @@ fn utf8_sort_via_inline_dictionary() {
 /// This test guards against an accidental gate inversion that would route
 /// small queries through the GPU and break on its preconditions.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn e2e_small_input_uses_host_path() {
     let mut engine = Engine::new().expect("ctx");
 
@@ -846,7 +846,7 @@ fn e2e_small_input_uses_host_path() {
 /// the dispatch decision from outside, but we *can* assert the result is
 /// correct — which is the load-bearing property.
 #[test]
-#[ignore = "requires CUDA device (engine SQL pipeline)"]
+#[ignore = "gpu:sort"]
 fn high_cardinality_utf8_e2e_via_host_path() {
     use arrow_array::StringArray;
     let mut engine = Engine::new().expect("ctx");
@@ -995,7 +995,7 @@ fn decode_utf8_column(batch: &RecordBatch) -> Vec<Option<String>> {
 /// Stage 6 — `ORDER BY col ASC NULLS LAST` on a Dict-encoded column with
 /// NULLs: NULLs sort to the end, real values ascend lex.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn order_by_dict_utf8_nulls_last() {
     let mut engine = Engine::new().expect("engine");
     engine.register_table("t", dict_batch()).expect("register");
@@ -1020,7 +1020,7 @@ fn order_by_dict_utf8_nulls_last() {
 /// Stage 6 — `ORDER BY col ASC NULLS FIRST` on a Dict-encoded column with
 /// NULLs: NULLs sort to the front, real values ascend lex.
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:sort"]
 fn order_by_dict_utf8_nulls_first() {
     let mut engine = Engine::new().expect("engine");
     engine.register_table("t", dict_batch()).expect("register");

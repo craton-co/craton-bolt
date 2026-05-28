@@ -499,7 +499,7 @@ fn no_value_column_swap_under_permutation_n2() {
 // `#[ignore]` and finish the body.
 
 #[test]
-#[ignore = "requires CUDA + integration"]
+#[ignore = "gpu:tier2"]
 fn tier2_multi_pipeline_matches_cpu_model() {
     use std::sync::Arc;
 
@@ -586,7 +586,7 @@ fn tier2_multi_pipeline_matches_cpu_model() {
 /// floating-point reordering. The CPU model already runs the same fixture
 /// above; this is the live-GPU end of the regression.
 #[test]
-#[ignore = "requires CUDA + integration"]
+#[ignore = "gpu:tier2"]
 fn tier2_multi_pipeline_preserves_value_column_alignment() {
     let n_rows: usize = 10_000_000;
     let n_distinct_keys: i32 = 100_000;

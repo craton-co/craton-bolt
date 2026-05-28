@@ -772,7 +772,7 @@ fn diff_groupby_multi_sum() {
 // constant-fold branch — so the dictionary path still gets two-shape
 // coverage. Promote the GROUP BY case here the moment that error lifts.
 //
-// Gating: `#[ignore = "gpu:string_diff"]` per the H8 review ask. Run on
+// Gating: `#[ignore = "gpu:string"]` per the H8 review ask. Run on
 // a GPU host with:
 //
 //     cargo test --test diff_duckdb -- --ignored
@@ -784,7 +784,7 @@ fn diff_groupby_multi_sum() {
 /// indicates either a dictionary-index bug (wrong index for "foo") or a
 /// gather-compaction bug.
 #[test]
-#[ignore = "gpu:string_diff"]
+#[ignore = "gpu:string"]
 fn diff_string_equality_value_present() {
     let batch = t_strings(1024);
     diff_query(
@@ -805,7 +805,7 @@ fn diff_string_equality_value_present() {
 /// where the fold either fires too eagerly (returns 0 when matches
 /// exist) or fails to fire (returns garbage indices).
 #[test]
-#[ignore = "gpu:string_diff"]
+#[ignore = "gpu:string"]
 fn diff_string_equality_value_absent() {
     // "qux" is not present in `t_strings`'s 4-word vocabulary, so the
     // rewriter must fold the predicate to Bool(false) and surface zero
@@ -832,7 +832,7 @@ fn diff_string_equality_value_absent() {
 /// branch, which is the mirror image. Catches a bug that asymmetric-
 /// ally handles the two ops (e.g. swaps Eq for NotEq when folding).
 #[test]
-#[ignore = "gpu:string_diff"]
+#[ignore = "gpu:string"]
 fn diff_string_inequality_value_present() {
     let batch = t_strings(1024);
     diff_query(
@@ -854,7 +854,7 @@ fn diff_string_inequality_value_present() {
 /// produce false negatives — DuckDB's row count gives the canonical
 /// answer.
 #[test]
-#[ignore = "gpu:string_diff"]
+#[ignore = "gpu:string"]
 fn diff_string_join_inner() {
     let (t1, t2) = t_strings_join_fixture(256);
     diff_query(
@@ -882,7 +882,7 @@ fn diff_string_join_inner() {
 /// Order is meaningful here — we route through `diff_query_ordered` so
 /// row positions are checked.
 #[test]
-#[ignore = "gpu:string_diff"]
+#[ignore = "gpu:string"]
 fn diff_string_distinct() {
     let batch = t_strings(1024);
     diff_query_ordered(
@@ -903,7 +903,7 @@ fn diff_string_distinct() {
 /// (e.g. the rewriter stomping over the other side) shows up as a row
 /// count or per-row value mismatch.
 #[test]
-#[ignore = "gpu:string_diff"]
+#[ignore = "gpu:string"]
 fn diff_string_compound_predicate() {
     let batch = t_strings(1024);
     diff_query(

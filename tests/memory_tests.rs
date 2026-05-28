@@ -150,7 +150,7 @@ pub fn _doc_use_after_move_into_fn() {}
 // (or `cargo test --test memory_tests -- --ignored` to scope to this file).
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn round_trip_i32() {
     let _ctx = craton_bolt::cuda::CudaContext::new(0).expect("CUDA context");
     let data: Vec<i32> = (0..1024).collect();
@@ -160,7 +160,7 @@ fn round_trip_i32() {
 }
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn round_trip_f64() {
     let _ctx = craton_bolt::cuda::CudaContext::new(0).expect("CUDA context");
     let data: Vec<f64> = (0..1024).map(|i| i as f64 * 0.5).collect();
@@ -170,7 +170,7 @@ fn round_trip_f64() {
 }
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn views_observe_same_buffer() {
     // Two shared views of the same vec must report the same length and the
     // same device pointer — they're aliases of one allocation.
@@ -184,7 +184,7 @@ fn views_observe_same_buffer() {
 }
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn mut_view_reborrow_as_shared() {
     // `GpuViewMut::as_view` lets you temporarily downgrade to a shared view
     // without giving up the exclusive borrow.
@@ -197,7 +197,7 @@ fn mut_view_reborrow_as_shared() {
 }
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:mempool"]
 fn drop_is_safe_no_double_free() {
     // Dropping a `GpuVec` must call `cuMemFree` exactly once. If `Drop` ever
     // fired twice we'd see a CUDA error on the second free. This test passes

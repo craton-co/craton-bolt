@@ -486,7 +486,7 @@ fn groupby_sum_int32_widens_to_i64() {
 // ---- Online (require CUDA device) ------------------------------------------
 
 #[test]
-#[ignore = "gpu:projection"]
+#[ignore = "gpu:e2e"]
 fn e2e_simple_projection() {
     use craton_bolt::Engine;
 
@@ -513,7 +513,7 @@ fn e2e_simple_projection() {
 }
 
 #[test]
-#[ignore = "gpu:projection"]
+#[ignore = "gpu:e2e"]
 fn e2e_arithmetic_projection() {
     use craton_bolt::Engine;
 
@@ -547,7 +547,7 @@ fn e2e_arithmetic_projection() {
 }
 
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:e2e"]
 fn e2e_filtered_select() {
     use craton_bolt::Engine;
 
@@ -587,7 +587,7 @@ fn e2e_filtered_select() {
 }
 
 #[test]
-#[ignore = "requires CUDA device"]
+#[ignore = "gpu:e2e"]
 fn e2e_large_i64_add() {
     use craton_bolt::Engine;
 
@@ -1058,7 +1058,7 @@ fn sales_batch_with_nulls(n: usize, n_null: usize) -> RecordBatch {
 }
 
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:tier1"]
 fn e2e_sum_price_times_tax_with_nulls_in_price() {
     // Option B contract: `SELECT SUM(price * tax) FROM sales` where
     // `price` has NULL rows must propagate validity through the pre
@@ -1119,7 +1119,7 @@ fn e2e_sum_price_times_tax_with_nulls_in_price() {
 /// NULL rows in lockstep with the GROUP BY key column on the host
 /// before upload.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:tier1"]
 fn e2e_groupby_sum_with_nulls_in_value_column() {
     use craton_bolt::Engine;
 
@@ -1286,7 +1286,7 @@ fn provider_override_populates_input_has_validity() {
 /// atomic counter. `#[ignore]`'d because it requires a real CUDA
 /// device for the launch.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:tier1"]
 fn groupby_sum_with_nulls_uses_native_validity_path() {
     use craton_bolt::exec::groupby_with_pre::NATIVE_VALIDITY_LAUNCHES;
     use craton_bolt::Engine;
@@ -1396,7 +1396,7 @@ fn groupby_sum_with_nulls_uses_native_validity_path() {
 /// informative rather than brittle if a future planner change muffles
 /// the signal; the correctness assertion on per-group SUM is hard.
 #[test]
-#[ignore = "requires CUDA device - run with `cargo test -- --ignored`"]
+#[ignore = "gpu:tier1"]
 fn pv_stage_f_groupby_no_pre_native_validity_round_trip() {
     use craton_bolt::exec::groupby::NATIVE_VALIDITY_LAUNCHES;
     use craton_bolt::Engine;
@@ -1470,7 +1470,7 @@ fn pv_stage_f_groupby_no_pre_native_validity_round_trip() {
 /// this test verifies that the engine still answers correctly via the
 /// host-strip fallback path — i.e. nulls are excluded from the grouping.
 #[test]
-#[ignore]
+#[ignore = "gpu:tier1"]
 fn e2e_groupby_with_nulls() {
     use arrow_array::ArrayRef;
 

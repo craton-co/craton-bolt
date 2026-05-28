@@ -977,56 +977,56 @@ macro_rules! assert_ptx_snapshot {
 // Bootstrap: `cargo insta test --accept -- --include-ignored`
 
 #[test]
-#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+#[ignore = "bootstrap"]
 fn snapshot_scalar_projection_int32() {
     let ptx = build_ptx_for("SELECT int_col + 1 FROM t");
     assert_ptx_snapshot!("scalar_projection_int32", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+#[ignore = "bootstrap"]
 fn snapshot_scalar_projection_float64() {
     let ptx = build_ptx_for("SELECT f64_col * 2.0 FROM t");
     assert_ptx_snapshot!("scalar_projection_float64", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+#[ignore = "bootstrap"]
 fn snapshot_predicate_filter_int32() {
     let ptx = build_ptx_for("SELECT int_col FROM t WHERE int_col = 5");
     assert_ptx_snapshot!("predicate_filter_int32", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+#[ignore = "bootstrap"]
 fn snapshot_predicate_filter_and_or() {
     let ptx = build_ptx_for("SELECT a FROM t WHERE a = 1 AND (b = 2 OR c = 3)");
     assert_ptx_snapshot!("predicate_filter_and_or", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+#[ignore = "bootstrap"]
 fn snapshot_sum_int32_reduction_kernel() {
     let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Int32).expect("compile");
     assert_ptx_snapshot!("sum_int32_reduction_kernel", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+#[ignore = "bootstrap"]
 fn snapshot_groupby_keys_kernel() {
     let ptx = compile_groupby_keys_kernel().expect("compile keys kernel");
     assert_ptx_snapshot!("groupby_keys_kernel", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+#[ignore = "bootstrap"]
 fn snapshot_prefix_scan_kernel() {
     let ptx = compile_prefix_scan_kernel().expect("compile prefix scan");
     assert_ptx_snapshot!("prefix_scan_kernel", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap-gated snapshot; populate via `cargo insta test --accept -- --include-ignored`"]
+#[ignore = "bootstrap"]
 fn snapshot_float_atomic_min_kernel() {
     let ptx = compile_groupby_float_atomic_kernel(ReduceOp::Min, DataType::Float64)
         .expect("compile float atomic kernel");

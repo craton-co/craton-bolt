@@ -232,7 +232,7 @@ fn fixture_is_deterministic() {
 // next agent can fill it in mechanically.
 
 #[test]
-#[ignore = "requires CUDA device + tier-1 shared-mem kernel; enable once merge lands"]
+#[ignore = "gpu:tier1"]
 fn shmem_kernel_matches_cpu_model() {
     use std::sync::Arc;
 
