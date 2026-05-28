@@ -266,6 +266,18 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R) -> BoltResult<Expr>
             let inner = rewrite_expr_with(inner, r)?;
             Ok(Expr::Alias(Box::new(inner), name.clone()))
         }
+        Expr::Unary { op, operand } => {
+            // The `IS NULL` / `IS NOT NULL` surface has no string-literal
+            // operand to dictionary-rewrite — the operand is the value whose
+            // nullness we're testing, not a constant. Recurse so any nested
+            // string-literal comparisons inside a typed operand still get
+            // normalised.
+            let new_operand = rewrite_expr_with(operand, r)?;
+            Ok(Expr::Unary {
+                op: *op,
+                operand: Box::new(new_operand),
+            })
+        }
         Expr::Binary { op, left, right } => {
             // Rewrite children first so nested predicates are normalised.
             let new_left = rewrite_expr_with(left, r)?;

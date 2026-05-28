@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     join_combined_schema, AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal,
-    LogicalPlan, Schema, SortExpr,
+    LogicalPlan, Schema, SortExpr, UnaryOp,
 };
 
 /// SSA register handle. Just an index into the IR's value table.
@@ -419,6 +419,9 @@ impl<'a> Codegen<'a> {
             Expr::Column(name) => self.emit_column(name),
             Expr::Literal(lit) => self.emit_literal(lit),
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
+            Expr::Unary { op, .. } => Err(BoltError::Plan(format!(
+                "{op:?} not yet supported by GPU executor; use host fallback"
+            ))),
             Expr::Alias(inner, _) => self.emit_expr(inner),
         }
     }
@@ -456,6 +459,24 @@ impl<'a> Codegen<'a> {
         Ok(Value { reg: dst, dtype })
     }
 
+    /// Emit a `Const { Literal::Null }` op whose register carries `dtype`.
+    ///
+    /// Used by the NULL-peer-typing rule in `emit_binary`: when one operand
+    /// of a binary expression is an untyped `Literal::Null` and the other
+    /// is a typed expression, we type the NULL as the peer's dtype so the
+    /// downstream cast/comparison logic can treat the two operands
+    /// uniformly. The `Op::Const { Literal::Null }` op still flows through
+    /// codegen verbatim; only the surrounding `Value`'s dtype is borrowed
+    /// from the peer.
+    fn emit_null_as(&mut self, dtype: DataType) -> Value {
+        let dst = self.fresh();
+        self.ops.push(Op::Const {
+            dst,
+            lit: Literal::Null,
+        });
+        Value { reg: dst, dtype }
+    }
+
     /// Insert a Cast from `value` to `to`, returning the cast value.
     fn emit_cast(&mut self, value: Value, to: DataType) -> Value {
         if value.dtype == to {
@@ -472,9 +493,33 @@ impl<'a> Codegen<'a> {
     }
 
     /// Emit a binary op, inserting casts and computing the result dtype.
+    ///
+    /// NULL-peer-typing: if one operand is `Literal::Null` and the other is
+    /// a typed expression, we pre-resolve the peer's dtype against the scan
+    /// schema and emit the NULL operand's `Const` op carrying the peer's
+    /// dtype (rather than failing in `emit_literal` with
+    /// `untyped NULL literal`). The runtime semantics of NULL in
+    /// comparisons / arithmetic are left to the kernel — see
+    /// `crate::jit::ptx_gen` for current behaviour.
     fn emit_binary(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> BoltResult<Value> {
-        let l = self.emit_expr(left)?;
-        let r = self.emit_expr(right)?;
+        let left_is_null = matches!(left, Expr::Literal(Literal::Null));
+        let right_is_null = matches!(right, Expr::Literal(Literal::Null));
+        // If exactly one side is an untyped NULL, type it as the peer's dtype
+        // (resolved against the scan schema). Two NULLs fall through and will
+        // surface the legacy "untyped NULL literal" error from `emit_literal`.
+        let (l, r) = if left_is_null && !right_is_null {
+            let r = self.emit_expr(right)?;
+            let l = self.emit_null_as(r.dtype);
+            (l, r)
+        } else if right_is_null && !left_is_null {
+            let l = self.emit_expr(left)?;
+            let r = self.emit_null_as(l.dtype);
+            (l, r)
+        } else {
+            let l = self.emit_expr(left)?;
+            let r = self.emit_expr(right)?;
+            (l, r)
+        };
 
         let (lhs_v, rhs_v, operand_dtype, result_dtype) = if op_is_arithmetic(op) {
             let unified = unify_numeric(l.dtype, r.dtype)?;
@@ -741,6 +786,10 @@ fn substitute_one(expr: &Expr, map: &HashMap<String, Expr>) -> Expr {
             op: *op,
             left: Box::new(substitute_one(left, map)),
             right: Box::new(substitute_one(right, map)),
+        },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op: *op,
+            operand: Box::new(substitute_one(operand, map)),
         },
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
