@@ -1916,6 +1916,7 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
     }
 }
 
+#[tracing::instrument(name = "lower", level = "info", skip_all)]
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
     // Pre-flight: the GPU codegen path has no value-selection-by-mask op,
     // so a SQL `CASE WHEN ... THEN ... END` expression anywhere in the

@@ -128,6 +128,12 @@ impl<T: Pod> GpuBuffer<T> {
 
     /// Allocate and copy `slice` from host to device.
     pub fn from_slice(slice: &[T]) -> BoltResult<Self> {
+        let _span = tracing::info_span!(
+            "transfer",
+            direction = "h2d",
+            bytes = slice.len() * size_of::<T>(),
+        )
+        .entered();
         let mut buf = Self::with_capacity(slice.len())?;
         if !slice.is_empty() {
             // SAFETY: `buf.ptr` was allocated with capacity for `slice.len()`
@@ -250,6 +256,12 @@ impl<T: Pod> GpuBuffer<T> {
 
     /// Copy the buffer's contents back to a fresh host `Vec<T>`.
     pub fn to_vec(&self) -> BoltResult<Vec<T>> {
+        let _span = tracing::info_span!(
+            "transfer",
+            direction = "d2h",
+            bytes = self.len * size_of::<T>(),
+        )
+        .entered();
         let mut out: Vec<T> = Vec::with_capacity(self.len);
         if self.len > 0 {
             // SAFETY: `out` has capacity for `self.len` elements; we copy
@@ -306,6 +318,12 @@ impl<T: Pod> GpuBuffer<T> {
     // outer fn `unsafe` would be a major API break for no real safety win.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn copy_from_async(&mut self, src: &[T], stream: CUstream) -> BoltResult<()> {
+        let _span = tracing::info_span!(
+            "transfer",
+            direction = "h2d",
+            bytes = src.len() * size_of::<T>(),
+        )
+        .entered();
         if src.len() > self.capacity {
             return Err(BoltError::Memory(format!(
                 "GpuBuffer::copy_from_async length exceeds capacity: src={}, cap={}",
@@ -366,6 +384,12 @@ impl<T: Pod> GpuBuffer<T> {
     /// before drop.
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream is forwarded, not deref'd
     pub fn copy_to_async(&self, dst: &mut [T], stream: CUstream) -> BoltResult<()> {
+        let _span = tracing::info_span!(
+            "transfer",
+            direction = "d2h",
+            bytes = self.len * size_of::<T>(),
+        )
+        .entered();
         if dst.len() != self.len {
             return Err(BoltError::Memory(format!(
                 "GpuBuffer::copy_to_async length mismatch: dst={}, buffer={}",
@@ -447,6 +471,12 @@ impl<T: Pod> GpuBuffer<T> {
 
     /// Copy the buffer's contents into `dst`. Errors if lengths differ.
     pub fn copy_to_slice(&self, dst: &mut [T]) -> BoltResult<()> {
+        let _span = tracing::info_span!(
+            "transfer",
+            direction = "d2h",
+            bytes = self.len * size_of::<T>(),
+        )
+        .entered();
         if dst.len() != self.len {
             return Err(BoltError::Memory(format!(
                 "GpuBuffer::copy_to_slice length mismatch: dst={}, buffer={}",

@@ -165,6 +165,7 @@ fn upload_primitive_values_async<T: Pod>(
 ///
 /// `table_batch` must already be the relevant batch for `plan` (the caller
 /// resolves the table name to a batch).
+#[tracing::instrument(name = "materialize", level = "info", skip_all, fields(n_rows = table_batch.num_rows()))]
 pub fn execute_aggregate(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,

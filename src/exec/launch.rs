@@ -213,6 +213,12 @@ impl<'a> KernelArgs<'a> {
 /// "one thread per row" — shared-memory GROUP BY, partition kernels,
 /// scatter, per-partition reduce — and which take more than one trailing
 /// scalar.
+#[tracing::instrument(
+    name = "launch",
+    level = "info",
+    skip(function, stream, args),
+    fields(grid_x, block_x, shared_bytes)
+)]
 pub fn launch_with_geometry(
     function: CudaFunction<'_>,
     grid_x: u32,
@@ -252,6 +258,12 @@ pub fn launch_with_geometry(
 
 /// Launch the kernel with one thread per row, block size 256, on `stream`.
 /// Synchronizes before returning.
+#[tracing::instrument(
+    name = "launch",
+    level = "info",
+    skip(function, stream, args),
+    fields(n_rows = args.n_rows)
+)]
 pub fn launch_1d(
     function: CudaFunction<'_>,
     stream: &CudaStream,

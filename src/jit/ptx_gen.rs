@@ -139,6 +139,7 @@ impl PtxBuilder {
 }
 
 /// Compile a `KernelSpec` to a complete PTX module.
+#[tracing::instrument(name = "codegen", level = "info", skip(spec), fields(kernel = kernel_name))]
 pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
     validate_kernel_name(kernel_name)?;
 

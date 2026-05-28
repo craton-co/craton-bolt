@@ -542,6 +542,7 @@ impl TableProvider for MemTableProvider {
 /// (`Err`) are *not* cached — a re-parse of bad SQL still pays the parser
 /// cost, but that's a one-time hit at development time, not the dashboard
 /// hot path the cache is here to accelerate.
+#[tracing::instrument(name = "parse", level = "info", skip_all, fields(sql_len = sql.len()))]
 pub fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
     let version = provider.schema_version();
     if let Some(plan) = plan_cache_lookup(sql, version) {

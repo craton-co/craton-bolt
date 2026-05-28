@@ -26,9 +26,19 @@ pub mod cuda;
 pub mod plan;
 pub mod jit;
 pub mod exec;
+pub mod observability;
 
 mod error;
 pub use error::{BoltError, BoltResult};
+
+/// Re-export of the [`tracing`] crate so downstream users can install a
+/// subscriber and reference span/event APIs without having to add `tracing`
+/// to their own `Cargo.toml`. Stable: the major version of `tracing` is part
+/// of our SemVer contract.
+///
+/// See [`observability`] for the catalogue of span names emitted across the
+/// query pipeline and the recommended subscriber-installation snippet.
+pub use ::tracing;
 
 pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
 pub use plan::{DataFrame, LogicalPlan, PhysicalPlan, Expr};
@@ -78,73 +88,6 @@ pub use cuda::mem_pool::{pool_stats, PoolStats};
 /// }));
 /// ```
 pub use observability::install_pool_stats_observer;
-
-/// Pool-stats observer plumbing. Crate-internal callers (currently the
-/// engine periodic-log path) invoke [`observability::notify_observers`]
-/// every time they emit a snapshot.
-pub(crate) mod observability {
-    use std::sync::{Mutex, OnceLock};
-
-    use crate::PoolStats;
-
-    /// Type of a pool-stats observer callback. `Send + Sync` so it can
-    /// be invoked from any engine thread; `'static` so it outlives the
-    /// process.
-    pub type PoolStatsObserver = Box<dyn Fn(PoolStats) + Send + Sync + 'static>;
-
-    /// Single-slot observer registry. Replacing the observer is allowed
-    /// (the typical install-once-on-startup pattern is the default, but
-    /// integration-test code may want to swap collectors mid-process).
-    /// The mutex is contended only on install — `notify_observers` reads
-    /// the slot via `lock().ok().and_then(...)` and never blocks on
-    /// itself.
-    static REGISTRY: OnceLock<Mutex<Option<PoolStatsObserver>>> = OnceLock::new();
-
-    fn registry() -> &'static Mutex<Option<PoolStatsObserver>> {
-        REGISTRY.get_or_init(|| Mutex::new(None))
-    }
-
-    /// Install (or replace) the process-wide pool-stats observer.
-    ///
-    /// Called by downstream observability layers that want structured
-    /// access to the periodic pool snapshots — Prometheus exporters,
-    /// OTel meters, custom dashboards. The engine invokes the registered
-    /// observer once per periodic emit, AFTER the default log line.
-    ///
-    /// Pass `Box::new(|_| ())` to install a no-op observer (effectively
-    /// uninstalling the previous one — there's no separate
-    /// `uninstall_pool_stats_observer` because the single-slot design
-    /// makes "install no-op" semantically identical and keeps the
-    /// surface minimal).
-    ///
-    /// The argument type is spelled as the full `Box<dyn Fn ... + 'static>`
-    /// trait object (rather than the crate-internal `PoolStatsObserver`
-    /// alias) to keep the public signature self-describing and avoid
-    /// leaking an alias through a `pub(crate)` module boundary.
-    pub fn install_pool_stats_observer(
-        f: Box<dyn Fn(PoolStats) + Send + Sync + 'static>,
-    ) {
-        if let Ok(mut slot) = registry().lock() {
-            *slot = Some(f);
-        }
-    }
-
-    /// Invoke the registered observer with `stats`, if any. Silently
-    /// drops the call if the mutex is poisoned — an observer that
-    /// panicked once should not stop subsequent engine work.
-    pub(crate) fn notify_observers(stats: PoolStats) {
-        if let Ok(slot) = registry().lock() {
-            if let Some(observer) = slot.as_ref() {
-                // We intentionally hold the lock across the observer
-                // call: it's a `Send + Sync` `Fn`, no re-entrant install
-                // is expected, and serialising notifications is the
-                // simpler contract. Heavy observer work is the caller's
-                // problem to offload (e.g. via a channel).
-                observer(stats);
-            }
-        }
-    }
-}
 
 /// Test-only re-exports of the multi-key GPU sort entry points. NOT a stable
 /// API surface — exists so the E2E test in `tests/sort_e2e.rs` can drive the
