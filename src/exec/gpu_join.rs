@@ -760,6 +760,14 @@ fn launch_build_kernel(
         return Ok(());
     }
 
+    // `compile_build_kernel` emits the Stage-1 NO-DUPLICATES build kernel.
+    // The caller is responsible for routing duplicate build keys through
+    // `compile_build_collision_kernel` (the chained-list variant) instead;
+    // this kernel assumes the host has already verified uniqueness of the
+    // build-side join keys. See review C5: even if a duplicate slips through
+    // here, the kernel now degrades to first-writer-wins semantics rather
+    // than emitting u32::MAX sentinel row indices — but the collision kernel
+    // is still the correct dispatch for known-duplicate inputs.
     let ptx = compile_build_kernel()?;
     let module = CudaModule::from_ptx(&ptx)?;
     let function = module.function(BUILD_KERNEL_ENTRY)?;
@@ -1331,6 +1339,14 @@ pub fn hash_join_indices_on_gpu_with_shape(
     probe_key_columns: &[&dyn Array],
     shape: KeyShape,
 ) -> BoltResult<GpuJoinIndices> {
+    // Review C4: guard before indexing `[0]` below — passing an empty slice
+    // here used to panic with "index out of bounds" instead of surfacing a
+    // clear planner-level error.
+    if build_key_columns.is_empty() || probe_key_columns.is_empty() {
+        return Err(BoltError::Plan(
+            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into()
+        ));
+    }
     if !shape.is_exact_in_i64() {
         return Err(BoltError::Other(format!(
             "gpu_join: lossy fold for shape {shape:?} would risk false matches; \
@@ -1468,6 +1484,14 @@ pub fn execute_outer_join_indices_on_gpu(
     emit_unmatched_probe: bool,
     emit_unmatched_build: bool,
 ) -> BoltResult<GpuOuterJoinIndices> {
+    // Review C4: guard before indexing `[0]` below — passing an empty slice
+    // here used to panic with "index out of bounds" instead of surfacing a
+    // clear planner-level error.
+    if build_key_columns.is_empty() || probe_key_columns.is_empty() {
+        return Err(BoltError::Plan(
+            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into()
+        ));
+    }
     let needs_verify = shape.needs_host_post_verify();
     // Stage 4: lossy shapes are admitted via host post-verify; only truly
     // unsupported shapes bail here.
@@ -2755,6 +2779,15 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
     probe_key_columns: &[&dyn Array],
     shape: KeyShape,
 ) -> BoltResult<GpuJoinIndices> {
+    // Review C4: guard before indexing `[0]` below — passing an empty slice
+    // here used to panic with "index out of bounds" instead of surfacing a
+    // clear planner-level error. (This helper is reachable from the pub
+    // `execute_inner_join_on_gpu_with_shape_and_verify` entry point.)
+    if build_key_columns.is_empty() || probe_key_columns.is_empty() {
+        return Err(BoltError::Plan(
+            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into()
+        ));
+    }
     // Re-route exact shapes through the existing verified entry point so
     // we don't fork the kernel-launch logic.
     if !shape.needs_host_post_verify() {
