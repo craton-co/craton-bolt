@@ -287,7 +287,12 @@ pub fn compile_partition_reduce_kernel_minmax_float(
     // racing thread can read a still-zeroed key under set==1 and
     // false-match key 0.
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
+    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
+    // read-of-published-value contract explicit (sm_70+). Replaces the
+    // plain `ld.<space>.<ty>` which relied on the publisher's release +
+    // SASS-level implicit acquire — sound in practice but not promised
+    // by PTX semantics.
+    writeln!(ptx, "\tld.acquire.cta.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;

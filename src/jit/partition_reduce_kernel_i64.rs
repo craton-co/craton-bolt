@@ -280,7 +280,12 @@ pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
     // thread that observes set==1 can never read a still-zeroed i64 key
     // and false-match key 0.
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s64 %rd61, [%rd36];").map_err(write_err)?;
+    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
+    // read-of-published-value contract explicit (sm_70+). Replaces the
+    // plain `ld.<space>.<ty>` which relied on the publisher's release +
+    // SASS-level implicit acquire — sound in practice but not promised
+    // by PTX semantics.
+    writeln!(ptx, "\tld.acquire.cta.s64 %rd61, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s64 %p4, %rd61, %rd60;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
     // Collision: advance.

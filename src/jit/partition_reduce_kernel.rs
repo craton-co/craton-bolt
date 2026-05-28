@@ -362,7 +362,12 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     // its own membar.cta on the CLAIM path). Without this fence a racing
     // thread can read a still-zeroed key and false-match key 0.
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
+    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
+    // read-of-published-value contract explicit (sm_70+). Replaces the
+    // plain `ld.<space>.<ty>` which relied on the publisher's release +
+    // SASS-level implicit acquire — sound in practice but not promised
+    // by PTX semantics.
+    writeln!(ptx, "\tld.acquire.cta.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
     // Collision: advance slot = (slot + 1) & mask.
@@ -539,7 +544,9 @@ mod tests {
         );
         // The MATCH-path fence must live between the CAS and the key
         // load. We locate the CAS and assert the next `membar.cta`
-        // appears before the `ld.shared.s32 %r35` (the key load).
+        // appears before the `ld.acquire.cta.s32 %r35` (the key load).
+        // The acquire load is in ADDITION to the membar.cta — it makes
+        // the read-of-published-value contract explicit at the PTX level.
         let cas_pos = ptx
             .find("atom.shared.cas.b32")
             .expect("CAS must be present");
@@ -548,8 +555,8 @@ mod tests {
             .find("membar.cta")
             .expect("membar.cta missing after CAS");
         let ld_pos = after_cas
-            .find("ld.shared.s32 %r35")
-            .expect("MATCH-path key load missing");
+            .find("ld.acquire.cta.s32 %r35")
+            .expect("MATCH-path acquire key load missing");
         assert!(
             mb_pos < ld_pos,
             "membar.cta must appear between CAS and key load on MATCH path:\n{ptx}"
