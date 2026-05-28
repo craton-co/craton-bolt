@@ -190,6 +190,11 @@ impl RadixFlavour {
                      Fall back to host or bitonic sort.".into(),
                 ))
             }
+            DataType::Decimal128(_, _) => {
+                return Err(BoltError::Other(
+                    "sort_kernel_radix: Decimal128 not yet supported".into(),
+                ))
+            }
         })
     }
 }

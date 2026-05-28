@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 
-//! **Two-key MIN / MAX at Tier 2.1** — high-cardinality executor for
+//! **Two-key MIN / MAX at Tier 2.1** вЂ” high-cardinality executor for
 //! `SELECT a, b, {MIN,MAX}(v) FROM x GROUP BY a, b` over **integer** value
 //! columns (Int32 / Int64).
 //!
@@ -11,20 +11,20 @@
 //! single dense key column.
 //!
 //! Float MIN/MAX over two keys is handled by the sibling executor
-//! [`crate::exec::groupby_tier2_twokey_minmax_float_exec`] — PTX has no
+//! [`crate::exec::groupby_tier2_twokey_minmax_float_exec`] вЂ” PTX has no
 //! native `atom.shared.{min,max}.f{32,64}` on sm_70 and the float kernel
 //! emits a CAS-loop instead.
 //!
 //! ## Algorithm
 //!
-//! 1. Pack `(k1, k2)` → `i64` host-side.
+//! 1. Pack `(k1, k2)` в†’ `i64` host-side.
 //! 2. Run `partition_kernel_i64` over the packed keys.
-//! 3. Scatter pass — dtype-specialised:
+//! 3. Scatter pass вЂ” dtype-specialised:
 //!    * Int32 vals: round-trip through `f64` via `scatter_kernel_i64`
 //!      (`Int32 -> f64 -> Int32` is bit-exact for every i32).
 //!    * Int64 vals: stay in 64-bit integer registers end-to-end via
 //!      `scatter_kernel_i64_to_i64`, so values >2^53 round-trip
-//!      losslessly — no narrowing.
+//!      losslessly вЂ” no narrowing.
 //! 4. Run `partition_reduce_kernel_minmax_i64` with the integer vals.
 //! 5. Walk slots, unpack `(key_hi, key_lo)`, sort by packed-i64 ASC,
 //!    build the output RecordBatch.
@@ -64,7 +64,7 @@ const BLOCK_THREADS: u32 = 256;
 // the i64-key kernel variants.
 //
 // Scatter has two variants: the f64-val sibling (`KernelSpec::ScatterI64`,
-// used by the Int32 path — `i32 -> f64 -> i32` is bit-exact) and the
+// used by the Int32 path вЂ” `i32 -> f64 -> i32` is bit-exact) and the
 // typed i64-key + i64-val variant (`KernelSpec::ScatterI64ToI64`, used by
 // the Int64 path so values >2^53 round-trip losslessly).
 // ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ pub fn try_execute(
         return None;
     }
 
-    // PV-stage-f: NULL handling — the partition_reduce_kernel_minmax_i64
+    // PV-stage-f: NULL handling вЂ” the partition_reduce_kernel_minmax_i64
     // family has no `_with_validity` companion. Defer NULL-bearing
     // batches back to the no-pre single-key paths. Stage G follow-up.
     if k1.null_count() > 0 || k2.null_count() > 0 || val_col.null_count() > 0 {
@@ -258,15 +258,15 @@ fn execute_inner(
         launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
     }
 
-    // P1b-stage8: joint helper, 2 syncs → 1.
+    // P1b-stage8: joint helper, 2 syncs в†’ 1.
     let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
         partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
 
-    // ---- Scatter pass — dtype-specialised ----
+    // ---- Scatter pass вЂ” dtype-specialised ----
     //
     // Int32 vals route through the f64-val scatter (round-trip is exact
     // for every i32). Int64 vals route through the typed
-    // `bolt_scatter_i64_to_i64` kernel — vals stay in 64-bit integer
+    // `bolt_scatter_i64_to_i64` kernel вЂ” vals stay in 64-bit integer
     // registers end-to-end, so values >2^53 round-trip losslessly. The
     // previous f64 round-trip narrowed Int64 above the f64 mantissa
     // boundary; the typed path is exact for the full i64 range.
@@ -622,6 +622,7 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
     }
 }
 
@@ -648,7 +649,7 @@ mod tests {
     use crate::jit::scatter_kernel_i64;
 
     /// The Int64 two-key path MUST be wired to the typed i64-val
-    /// scatter — the kernel PTX must contain no `.f64` references.
+    /// scatter вЂ” the kernel PTX must contain no `.f64` references.
     #[test]
     fn int64_twokey_scatter_kernel_has_no_f64() {
         let ptx = scatter_kernel_i64::compile_scatter_kernel_i64_to_i64()
@@ -669,7 +670,7 @@ mod tests {
         );
     }
 
-    /// The Int32 two-key path still uses the f64-val sibling — round-trip
+    /// The Int32 two-key path still uses the f64-val sibling вЂ” round-trip
     /// is bit-exact for i32.
     #[test]
     fn int32_twokey_scatter_kernel_remains_f64() {
@@ -784,7 +785,7 @@ mod eligibility_tests {
         assert!(try_execute(&plan, &batch).is_none());
     }
 
-    /// Two aggregates → multi-agg territory.
+    /// Two aggregates в†’ multi-agg territory.
     #[test]
     fn rejects_two_aggregates() {
         let mut plan = build_twokey_minmax_plan(true, DataType::Int32);
@@ -795,7 +796,7 @@ mod eligibility_tests {
         assert!(try_execute(&plan, &batch).is_none());
     }
 
-    /// SUM / COUNT / AVG aggregates → reject.
+    /// SUM / COUNT / AVG aggregates в†’ reject.
     #[test]
     fn rejects_sum_aggregate() {
         let mut plan = build_twokey_minmax_plan(true, DataType::Int32);
@@ -806,7 +807,7 @@ mod eligibility_tests {
         assert!(try_execute(&plan, &batch).is_none());
     }
 
-    /// MIN over Float64 → goes to the float-minmax sibling, not this exec.
+    /// MIN over Float64 в†’ goes to the float-minmax sibling, not this exec.
     #[test]
     fn rejects_float_value_column() {
         let plan = build_twokey_minmax_plan(true, DataType::Float64);
@@ -830,7 +831,7 @@ mod eligibility_tests {
         assert!(try_execute(&plan, &batch).is_none());
     }
 
-    /// Below the row threshold → defer.
+    /// Below the row threshold в†’ defer.
     #[test]
     fn rejects_below_row_threshold() {
         let plan = build_twokey_minmax_plan(false, DataType::Int32);
@@ -838,7 +839,7 @@ mod eligibility_tests {
         assert!(try_execute(&plan, &batch).is_none());
     }
 
-    /// `pre` kernel present → with-pre executor handles this.
+    /// `pre` kernel present в†’ with-pre executor handles this.
     #[test]
     fn rejects_plan_with_pre_kernel() {
         use crate::plan::physical_plan::KernelSpec;

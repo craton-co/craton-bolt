@@ -142,6 +142,11 @@ pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
         DataType::Float32 => "bolt_gather_f32",
         DataType::Float64 => "bolt_gather_f64",
         DataType::Utf8 => "bolt_gather_utf8_unsupported",
+        // Decimal128 has no GPU gather kernel yet (v0.6 / M4 plan-only);
+        // surface an unsupported-named entry so any dispatch attempt fails
+        // loudly. The actual rejection happens in the executor before any
+        // gather is launched.
+        DataType::Decimal128(_, _) => "bolt_gather_decimal128_unsupported",
     }
 }
 
@@ -1356,6 +1361,11 @@ fn gather_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str, 
         DataType::Utf8 => {
             return Err(BoltError::Other(
                 "prefix_scan: gather Utf8 not supported (variable-width)".into(),
+            ))
+        }
+        DataType::Decimal128(_, _) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
     })

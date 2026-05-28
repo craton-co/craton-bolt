@@ -241,6 +241,11 @@ pub fn key_reg_cost(dtype: DataType) -> u32 {
         // Utf8 is dictionary-decoded into i32/i64 indices in gpu_sort; the
         // dtype that reaches the kernel is always one of the numeric ones.
         DataType::Utf8 => 4,
+        // Decimal128 is plan-level only in v0.6 / M4: the GPU sort path
+        // would need an i128 comparator that doesn't exist yet. We surface
+        // a register cost so the validator can compute a budget without
+        // panicking; the actual lowering rejects Decimal128 upstream.
+        DataType::Decimal128(_, _) => 8,
     }
 }
 

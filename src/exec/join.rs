@@ -1070,6 +1070,7 @@ fn plan_dtype_to_arrow(d: crate::plan::logical_plan::DataType) -> BoltResult<Arr
         D::Float64 => ArrowDataType::Float64,
         D::Bool => ArrowDataType::Boolean,
         D::Utf8 => ArrowDataType::Utf8,
+        D::Decimal128(p, s) => ArrowDataType::Decimal128(p, s),
     })
 }
 

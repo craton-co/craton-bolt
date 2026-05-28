@@ -621,6 +621,17 @@ impl<'a> Codegen<'a> {
         }
         let field = self.scan_schema.field(name)?;
         let dtype = field.dtype;
+        // v0.6 / M4: Decimal128 is plan-level only. The GPU codegen has no
+        // i128 register class or kernel atomics yet, so any attempt to lower
+        // a Decimal column into a kernel is surfaced here as a clear
+        // BoltError::Plan. The follow-up will fill in the actual codegen.
+        if matches!(dtype, DataType::Decimal128(_, _)) {
+            return Err(BoltError::Plan(format!(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up \
+                 (column '{}' has dtype {:?})",
+                name, dtype
+            )));
+        }
         let col_idx = self.inputs.len();
         self.inputs.push(ColumnIO {
             name: name.to_string(),
@@ -643,6 +654,16 @@ impl<'a> Codegen<'a> {
         let dtype = lit
             .dtype()
             .ok_or_else(|| BoltError::Type("untyped NULL literal".into()))?;
+        // v0.6 / M4: Decimal128 literals are plan-level only; reject before
+        // the codegen would attempt to allocate an i128 register class it
+        // doesn't have. Mirrors the column-load rejection in `emit_column`.
+        if matches!(dtype, DataType::Decimal128(_, _)) {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up \
+                 (Decimal128 literal in expression)"
+                    .into(),
+            ));
+        }
         let dst = self.fresh();
         self.ops.push(Op::Const {
             dst,

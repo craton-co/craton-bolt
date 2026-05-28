@@ -2390,6 +2390,9 @@ impl DeviceCol {
                 indices: GpuVec::<i32>::zeros(n)?,
                 n_rows: n,
             })),
+            DataType::Decimal128(_, _) => Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+            )),
         }
     }
 
@@ -2593,6 +2596,7 @@ fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Float64 => Ok(ArrowDataType::Float64),
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
+        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
     }
 }
 
@@ -2618,6 +2622,13 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
+        // v0.6 / M4: round-trip Arrow's `Decimal128(precision, scale)` into
+        // our plan's `DataType::Decimal128(precision, scale)`. Plan-level
+        // only — GPU codegen rejects this with
+        // "Decimal128 not yet lowered to GPU".
+        ArrowDataType::Decimal128(precision, scale) => {
+            Ok(DataType::Decimal128(*precision, *scale))
+        }
         // Stage 4 / Stage 6: dictionary-encoded Utf8. Only string-valued
         // dicts map to `Utf8`; numeric-valued dicts are intentionally
         // rejected because the caller should hand the inner numeric column

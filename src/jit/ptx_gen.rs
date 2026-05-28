@@ -73,6 +73,11 @@ impl RegAlloc {
                     "Utf8 not supported in PTX codegen yet".into(),
                 ))
             }
+            DataType::Decimal128(_, _) => {
+                return Err(BoltError::Plan(
+                    "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+                ))
+            }
         })
     }
 
@@ -597,6 +602,9 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
         Literal::Utf8(_) => Err(BoltError::Other(
             "ptx_gen: Utf8 literal not supported".into(),
         )),
+        Literal::Decimal128(..) => Err(BoltError::Plan(
+            "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+        )),
         Literal::Bool(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Bool)?;
             // Value space is {0, 1}; not an injection surface, but keep the
@@ -653,6 +661,11 @@ fn emit_cast(
                 Utf8 => {
                     return Err(BoltError::Other(
                         "ptx_gen: cannot cast Utf8".into(),
+                    ))
+                }
+                Decimal128(_, _) => {
+                    return Err(BoltError::Plan(
+                        "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
                     ))
                 }
             };
@@ -714,6 +727,12 @@ fn emit_cast(
         (Utf8, _) | (_, Utf8) => {
             return Err(BoltError::Other(
                 "ptx_gen: Utf8 casts not supported".into(),
+            ))
+        }
+
+        (Decimal128(_, _), _) | (_, Decimal128(_, _)) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
 
@@ -878,6 +897,11 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
                 "ptx_gen: cannot compare Utf8".into(),
             ))
         }
+        Decimal128(_, _) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+            ))
+        }
     };
     Ok(format!("setp.{}.{}", cond, ty))
 }
@@ -901,6 +925,11 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
         DataType::Utf8 => {
             return Err(BoltError::Other(
                 "Utf8 not supported in PTX codegen yet".into(),
+            ))
+        }
+        DataType::Decimal128(_, _) => {
+            return Err(BoltError::Plan(
+                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
     })

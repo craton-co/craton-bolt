@@ -9,10 +9,10 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType as SqlDataType, Distinct, Expr as SqlExpr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    ObjectName, Offset, OrderByExpr, Query, Select, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, Statement, TableFactor, UnaryOperator, Value,
+    BinaryOperator, CastKind, DataType as SqlDataType, Distinct, ExactNumberInfo,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    JoinConstraint, JoinOperator, ObjectName, Offset, OrderByExpr, Query, Select, SelectItem,
+    SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -3525,6 +3525,61 @@ fn lower_case(
         branches,
         else_branch: else_expr,
     })
+}
+
+/// Translate a SQL `DataType` into our plan `DataType`.
+///
+/// v0.6 / M4: this is exclusively driven by the CAST path. Only the dtypes
+/// the rest of the engine recognises round-trip cleanly:
+/// `BOOLEAN`, `INT`/`INTEGER`, `BIGINT`, `REAL`/`FLOAT`/`FLOAT4`,
+/// `DOUBLE PRECISION`/`FLOAT8`, `VARCHAR`/`TEXT`/`STRING`, and
+/// `DECIMAL(p, s)` / `NUMERIC(p, s)`. Unknown / partially-specified types
+/// surface as a clear `BoltError::Type`.
+fn lower_sql_data_type(d: &SqlDataType) -> BoltResult<DataType> {
+    match d {
+        SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Bool),
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
+            Ok(DataType::Int32)
+        }
+        SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(DataType::Int64),
+        SqlDataType::Real | SqlDataType::Float4 => Ok(DataType::Float32),
+        SqlDataType::DoublePrecision | SqlDataType::Float8 => Ok(DataType::Float64),
+        SqlDataType::Float(_) => Ok(DataType::Float32),
+        SqlDataType::Varchar(_)
+        | SqlDataType::Text
+        | SqlDataType::String(_)
+        | SqlDataType::Char(_)
+        | SqlDataType::Character(_) => Ok(DataType::Utf8),
+        SqlDataType::Decimal(info)
+        | SqlDataType::Numeric(info)
+        | SqlDataType::Dec(info) => {
+            let (p, s) = match info {
+                ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s as i64),
+                ExactNumberInfo::Precision(p) => (*p, 0),
+                // Bare `DECIMAL` / `NUMERIC` without precision: max-precision
+                // i128 with zero scale is the safe default. Mirrors the
+                // `From<i128>` convention on `Literal`.
+                ExactNumberInfo::None => (38, 0),
+            };
+            // Clamp into the (u8, i8) representation. Decimal128 in Arrow
+            // allows precision 1..=38 and scale -128..=127 in principle; we
+            // surface a clear error on out-of-range inputs.
+            if p == 0 || p > 38 {
+                return Err(BoltError::Type(format!(
+                    "DECIMAL precision {p} out of range (must be 1..=38)"
+                )));
+            }
+            if !(-128..=127).contains(&s) {
+                return Err(BoltError::Type(format!(
+                    "DECIMAL scale {s} out of range (must fit in i8)"
+                )));
+            }
+            Ok(DataType::Decimal128(p as u8, s as i8))
+        }
+        other => Err(BoltError::Type(format!(
+            "unsupported SQL data type in CAST: {other}"
+        ))),
+    }
 }
 
 /// Translate a SQL literal `Value` into our `Literal` expression.

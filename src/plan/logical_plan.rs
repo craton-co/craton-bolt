@@ -19,6 +19,12 @@ pub enum DataType {
     Float64,
     /// UTF-8 string; variable width, only legal in filter/group-by columns.
     Utf8,
+    /// Fixed-point decimal with `precision` total digits and `scale` digits
+    /// after the decimal point (v0.6 / M4 plan-level only — GPU codegen
+    /// rejects this with "Decimal128 not yet lowered to GPU" until the
+    /// follow-up lands). Round-trips losslessly to/from Arrow's
+    /// `Decimal128(precision, scale)` array type.
+    Decimal128(u8, i8),
 }
 
 impl DataType {
@@ -31,6 +37,9 @@ impl DataType {
             DataType::Float32 => Some(4),
             DataType::Float64 => Some(8),
             DataType::Utf8 => None,
+            // Decimal128 is a 16-byte (i128) fixed-width value, regardless of
+            // precision / scale (those affect interpretation, not storage).
+            DataType::Decimal128(_, _) => Some(16),
         }
     }
 
@@ -47,6 +56,17 @@ impl DataType {
     /// True for any numeric (int or float) type.
     fn is_numeric(self) -> bool {
         self.is_int() || self.is_float()
+    }
+
+    /// True if this is a `Decimal128(precision, scale)` type. Plan-level
+    /// helper used by callers that want to special-case decimal handling
+    /// before GPU codegen rejects the type. Not part of `is_numeric()` yet:
+    /// arithmetic / comparison between decimals and the existing primitive
+    /// numerics is intentionally NOT defined in v0.6, so leaving
+    /// `is_numeric()` unchanged means a decimal column will surface a clear
+    /// type error if anyone tries to add it to (e.g.) an Int64.
+    pub fn is_decimal(self) -> bool {
+        matches!(self, DataType::Decimal128(_, _))
     }
 }
 
@@ -144,6 +164,11 @@ pub enum Literal {
     Float64(f64),
     /// UTF-8 string constant.
     Utf8(String),
+    /// Fixed-point decimal constant: raw i128 value scaled by `10^scale`,
+    /// with `precision` total digits. v0.6 / M4 plan-level only; the GPU
+    /// codegen rejects this with "Decimal128 not yet lowered to GPU" until
+    /// the follow-up lands.
+    Decimal128(i128, u8, i8),
 }
 
 impl Literal {
@@ -157,6 +182,7 @@ impl Literal {
             Literal::Float32(_) => Some(DataType::Float32),
             Literal::Float64(_) => Some(DataType::Float64),
             Literal::Utf8(_) => Some(DataType::Utf8),
+            Literal::Decimal128(_, p, s) => Some(DataType::Decimal128(*p, *s)),
         }
     }
 }
@@ -200,6 +226,15 @@ impl From<&str> for Literal {
 impl From<String> for Literal {
     fn from(v: String) -> Self {
         Literal::Utf8(v)
+    }
+}
+
+impl From<i128> for Literal {
+    /// Lift a raw `i128` into a `Decimal128(v, 38, 0)` — i.e. max-precision
+    /// integer-valued decimal. Callers that need a non-zero scale should
+    /// construct the variant directly (`Literal::Decimal128(value, p, s)`).
+    fn from(v: i128) -> Self {
+        Literal::Decimal128(v, 38, 0)
     }
 }
 
@@ -1042,7 +1077,12 @@ pub fn sum_output_dtype(input: DataType) -> DataType {
         DataType::Int64 | DataType::Float32 | DataType::Float64 => input,
         // Non-numeric types fall through unchanged; the downstream typecheck
         // (e.g. `ReduceOp::identity_ptx`) will reject the aggregate.
-        DataType::Bool | DataType::Utf8 => input,
+        //
+        // Decimal128 is plan-level only in v0.6 / M4: the GPU codegen rejects
+        // it before any SUM accumulator is selected. We keep the type
+        // unchanged here so the rejection message names `Decimal128(p, s)`
+        // rather than a silently-widened sibling.
+        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => input,
     }
 }
 
