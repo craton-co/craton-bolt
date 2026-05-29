@@ -382,6 +382,10 @@ fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             let _ = writeln!(out, "Distinct");
             format_physical_into(input, depth + 1, out);
         }
+        PhysicalPlan::CountRows { input, .. } => {
+            let _ = writeln!(out, "CountRows");
+            format_physical_into(input, depth + 1, out);
+        }
         PhysicalPlan::Limit {
             input,
             limit,

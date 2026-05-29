@@ -2312,6 +2312,22 @@ impl Engine {
                 let h = self.execute(input)?;
                 crate::exec::distinct::execute_distinct(h)
             }
+            PhysicalPlan::CountRows {
+                input,
+                output_schema,
+            } => {
+                // Scalar `COUNT(...)` over a non-scan-chain child (notably
+                // `COUNT(DISTINCT col)`, where `input` is a `Distinct`). The
+                // fused scalar-aggregate executor can't fold a Distinct, so the
+                // lowerer routed this shape here: execute the child (the
+                // Distinct executor materialises the deduped rows as part of
+                // that), then emit a single-row Int64 batch holding the child's
+                // row count.
+                let h = self.execute(input)?;
+                let n_rows = h.batch.num_rows();
+                let batch = build_count_rows_batch(n_rows, output_schema)?;
+                Ok(QueryHandle { batch })
+            }
             PhysicalPlan::Limit {
                 input,
                 limit,
@@ -4051,6 +4067,28 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     crate::exec::schema_convert::plan_schema_to_arrow_schema(s)
 }
 
+/// Build the single-row `Int64` output batch for a `PhysicalPlan::CountRows`
+/// node: one column holding `n_rows` (the materialised child plan's row
+/// count). `output_schema` must describe exactly one column (the count); its
+/// Arrow shape comes from `plan_schema_to_arrow_schema`, so the column name /
+/// nullability follow whatever the lowerer stored (a single Int64 field).
+///
+/// Factored out of the `execute` arm so the host-side row-count step is unit
+/// testable without a GPU / engine.
+fn build_count_rows_batch(n_rows: usize, output_schema: &Schema) -> BoltResult<RecordBatch> {
+    if output_schema.fields.len() != 1 {
+        return Err(BoltError::Plan(format!(
+            "CountRows output schema must have exactly one column, got {}",
+            output_schema.fields.len()
+        )));
+    }
+    let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+    let arr: ArrayRef = Arc::new(Int64Array::from(vec![n_rows as i64]));
+    RecordBatch::try_new(arrow_schema, vec![arr]).map_err(|e| {
+        BoltError::Other(format!("failed to build CountRows RecordBatch: {e}"))
+    })
+}
+
 /// Convert a host-side computed `HostColumn` into an `ArrayRef`.
 ///
 /// Used by the `PhysicalPlan::Project` compute path (string `||`,
@@ -4218,6 +4256,49 @@ mod tests {
     use arrow_array::{Int32Array, Int64Array};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
+
+    /// `build_count_rows_batch` (the host-side row-count step for
+    /// `PhysicalPlan::CountRows`) must emit a single-row Int64 batch holding the
+    /// supplied row count, with the column named per the supplied schema. This
+    /// runs purely on the host (no GPU) so it is not `#[ignore]`'d.
+    #[test]
+    fn count_rows_batch_holds_row_count() {
+        let schema = Schema::new(vec![Field::new("count", DataType::Int64, false)]);
+        let batch = build_count_rows_batch(7, &schema).expect("must build");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "count");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count column");
+        assert_eq!(col.value(0), 7);
+    }
+
+    /// Zero rows in the child plan -> COUNT == 0 (not NULL).
+    #[test]
+    fn count_rows_batch_zero() {
+        let schema = Schema::new(vec![Field::new("count", DataType::Int64, false)]);
+        let batch = build_count_rows_batch(0, &schema).expect("must build");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 0);
+    }
+
+    /// A malformed multi-column output schema is rejected (defensive — the
+    /// lowerer only ever stores a single Int64 count column).
+    #[test]
+    fn count_rows_batch_rejects_multi_column_schema() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]);
+        assert!(build_count_rows_batch(3, &schema).is_err());
+    }
 
     /// Build a single-column `RecordBatch` whose `x` column holds the half-open
     /// range `[start, start+n)` as `Int64`. The schema is shared across all
