@@ -242,9 +242,13 @@ use crate::plan::physical_plan::{HashJoinKernelKind, HashJoinKernelSpec};
 // for the brief grow check; the returned slice points into leaked storage
 // and is freely shareable.
 //
-// PCIe upload itself is still per-query — eliminating that requires a true
-// device-side memset (cuMemsetD32 / cuMemsetD8) which the comment thread
-// flagged for a follow-up. The host alloc is the immediate ROI.
+// PERF (join key encoding): the PCIe upload is now elided for the u32::MAX
+// collision-list tables (`row_idx` / `head` / `next_idx`) — they are filled
+// on-device with `cuMemsetD8Async(0xFF)` via `alloc_u32_max_table_async`,
+// since `u32::MAX` is byte-replicable. The i64::MIN *key* table still uploads
+// (its bit pattern `0x8000_0000_0000_0000` is neither byte- nor 32-bit-word
+// replicable, and there is no 64-bit memset wrapper in `crate::cuda`), so the
+// pooled host slice below remains the right ROI for that buffer.
 
 /// Sentinel value for empty hash-table key slots. Must match the
 /// `i64::MIN` literal embedded in the GPU build/probe kernels.
@@ -299,6 +303,66 @@ pub fn get_sentinel_u32_max_vec(cap: usize) -> &'static [u32] {
         *guard
     };
     &storage[..cap]
+}
+
+/// PERF (join key encoding): device-side `u32::MAX` initialiser.
+///
+/// The collision-list `row_idx`, `head`, and `next_idx` tables are all
+/// initialised to the `u32::MAX` sentinel (`COLLISION_LIST_SENTINEL` /
+/// `SENTINEL_U32_MAX`). Previously each was built as a cap-sized host
+/// `&[u32]` (via [`get_sentinel_u32_max_vec`]) and shipped across PCIe with
+/// an H2D upload. Because `u32::MAX` has the all-bytes-equal bit pattern
+/// `0xFF`, the entire fill is exactly expressible as a byte-memset, so we
+/// allocate on-device and fill with `cuMemsetD8Async(0xFF)` — no host
+/// staging buffer and no H2D transfer at all.
+///
+/// Note: the *key* table sentinel (`i64::MIN` = `0x8000_0000_0000_0000`) is
+/// NOT byte-replicable (only the top byte is `0x80`; the rest are `0x00`)
+/// and its two 32-bit words differ, so neither D8 nor a hypothetical D32
+/// memset can synthesise it — that buffer keeps its H2D upload. There is no
+/// 64-bit memset wrapper in `crate::cuda::cuda_sys` to revisit this with.
+///
+/// The memset is enqueued on `stream`; every kernel that reads these buffers
+/// is launched on the *same* stream afterwards, so stream ordering
+/// guarantees the fill completes before the read with no explicit sync. The
+/// stream is tagged via [`GpuVec::mark_stream_use`] so `Drop` fences before
+/// recycling the device block (mirrors `GpuBuffer::zeros_async`).
+///
+/// Under `--features cuda-stub` we deliberately keep the host-staged upload
+/// path (via [`get_sentinel_u32_max_vec`] + `from_slice`) so the FFI failure
+/// mode stays byte-stable with the rest of the join — exactly the routing
+/// `upload_primitive_values_async` uses for the same reason.
+fn alloc_u32_max_table_async(len: usize, stream: &CudaStream) -> BoltResult<GpuVec<u32>> {
+    #[cfg(feature = "cuda-stub")]
+    {
+        // Stub backend: no real device memset. Match the pre-existing call
+        // shape (host sentinel slice + sync H2D) so the stubbed FFI returns
+        // the same `CUDA_ERROR_STUB` at the same boundary as before.
+        let _ = stream;
+        GpuVec::<u32>::from_slice(get_sentinel_u32_max_vec(len))
+    }
+    #[cfg(not(feature = "cuda-stub"))]
+    {
+        // Start from a device allocation (zeros_async sets `len` correctly
+        // and tags the stream); then overwrite every byte with `0xFF` so
+        // each u32 reads back as `u32::MAX`. Two stream-ordered device
+        // memsets are still far cheaper than building a cap-sized host Vec
+        // and DMA'ing it over PCIe, and carry no per-query host allocation.
+        let buf = GpuVec::<u32>::zeros_async(len, stream.raw())?;
+        if len > 0 {
+            let byte_len = len.checked_mul(std::mem::size_of::<u32>()).ok_or_else(|| {
+                BoltError::Other(format!("gpu_join: u32::MAX table size overflow ({len} * 4)"))
+            })?;
+            // SAFETY: `buf` was just allocated with at least `byte_len` bytes
+            // in the currently-bound context; nothing else references the
+            // block yet and we keep `buf` (and thus the allocation) live
+            // until the stream is synchronised by the caller. The 0xFF fill
+            // yields `u32::MAX` for every element (matches `SENTINEL_U32_MAX`).
+            cuda_sys::memset_d8_async(buf.device_ptr(), 0xFF, byte_len, stream.raw())?;
+            buf.mark_stream_use(stream.raw());
+        }
+        Ok(buf)
+    }
 }
 
 /// Minimum size threshold (per side) below which the host hash join wins. The
@@ -1369,12 +1433,13 @@ pub fn hash_join_indices_on_gpu(
     let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
     // Hash table buffers: keys init to i64::MIN, row_idx init to u32::MAX.
-    // Use process-wide sentinel pools to avoid re-allocating up to ~357 MiB
-    // of host memory per query at the large-cap limit.
+    // PERF (join key encoding): the u32::MAX row_idx table is filled on-device
+    // via `cuMemsetD8Async(0xFF)` (see `alloc_u32_max_table_async`), dropping
+    // its host staging buffer + H2D upload. The i64::MIN key table is not
+    // byte-replicable, so it keeps the pooled host slice + async H2D.
     let keys_init = get_sentinel_i64_min_vec(cap);
-    let row_idx_init = get_sentinel_u32_max_vec(cap);
     let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
-    let mut row_idx_table_dev = upload_primitive_values_async::<u32>(row_idx_init, &stream)?;
+    let mut row_idx_table_dev = alloc_u32_max_table_async(cap, &stream)?;
 
     // Output buffers. We pre-size for the worst INNER-equi case under the
     // unique-build-key invariant: every probe row matches at most one build
@@ -1527,10 +1592,12 @@ pub fn execute_inner_join_on_gpu(
 /// (`u32::MAX`).
 ///
 /// Kept as a named constant (rather than inlining `u32::MAX`) so the
-/// host/kernel contract is documented in one place; the actual host-side
-/// buffers are filled by `get_sentinel_u32_max_vec(..)` which inlines the
-/// raw value, leaving this symbol unreferenced under `cargo build`. Do not
-/// delete without also revisiting that pool.
+/// host/kernel contract is documented in one place. PERF (join key encoding):
+/// these collision-list buffers are now filled on-device via
+/// `alloc_u32_max_table_async` (`cuMemsetD8Async(0xFF)`), which relies on
+/// `u32::MAX` being byte-replicable; the stub path / pool still uses
+/// `get_sentinel_u32_max_vec(..)`. This symbol stays unreferenced under
+/// `cargo build`. Do not delete without also revisiting that pool/memset.
 #[allow(dead_code)]
 const COLLISION_LIST_SENTINEL: u32 = u32::MAX;
 
@@ -1610,20 +1677,20 @@ pub fn hash_join_indices_on_gpu_with_shape(
     let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
     let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
-    // Reuse process-wide sentinel pools (see `get_sentinel_*_vec`). The
-    // `head` / `next_idx` buffers share the u32::MAX pool since
-    // `COLLISION_LIST_SENTINEL == u32::MAX`. Per-query host allocation drops
-    // from ~357 MiB to ~0 at the large-cap limit; the H2D upload still
-    // happens (cuMemsetD32 is the next-level win).
+    // PERF (join key encoding): the three `u32::MAX`-init tables (`row_idx`,
+    // `head`, `next_idx`) no longer round-trip through a host staging buffer.
+    // `u32::MAX` is byte-replicable (`0xFF`), so `alloc_u32_max_table_async`
+    // fills them on-device with `cuMemsetD8Async`, eliminating both the
+    // per-query host allocation and the H2D upload for these buffers.
+    //
+    // The key table sentinel (`i64::MIN`) is NOT byte-replicable and there is
+    // no 64-bit memset wrapper, so it keeps the pooled host slice + async H2D
+    // upload (the host allocation here is already amortised by the pool).
     let keys_init = get_sentinel_i64_min_vec(cap);
-    let row_idx_init = get_sentinel_u32_max_vec(cap);
-    let head_init = get_sentinel_u32_max_vec(cap);
-    let next_idx_init = get_sentinel_u32_max_vec(n_build);
-
     let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
-    let mut row_idx_table_dev = upload_primitive_values_async::<u32>(row_idx_init, &stream)?;
-    let mut head_dev = upload_primitive_values_async::<u32>(head_init, &stream)?;
-    let mut next_idx_dev = upload_primitive_values_async::<u32>(next_idx_init, &stream)?;
+    let mut row_idx_table_dev = alloc_u32_max_table_async(cap, &stream)?;
+    let mut head_dev = alloc_u32_max_table_async(cap, &stream)?;
+    let mut next_idx_dev = alloc_u32_max_table_async(n_build, &stream)?;
 
     // Output buffer size: 2x (n_build + n_probe) — a generous estimate for
     // typical workloads where duplicate-key fan-out is small. Pathological
@@ -1773,17 +1840,15 @@ pub fn execute_outer_join_indices_on_gpu(
     let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
     let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
-    // See top-of-file `get_sentinel_*_vec`: avoid re-allocating ~357 MiB of
-    // host scratch per OUTER join.
+    // PERF (join key encoding): u32::MAX collision-list tables filled on-device
+    // (cuMemsetD8Async 0xFF) — no host scratch, no H2D. The i64::MIN key table
+    // is not byte-replicable so it keeps its pooled host slice + async H2D
+    // (see top-of-file `get_sentinel_*_vec` and `alloc_u32_max_table_async`).
     let keys_init = get_sentinel_i64_min_vec(cap);
-    let row_idx_init = get_sentinel_u32_max_vec(cap);
-    let head_init = get_sentinel_u32_max_vec(cap);
-    let next_idx_init = get_sentinel_u32_max_vec(n_build);
-
     let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
-    let mut row_idx_table_dev = upload_primitive_values_async::<u32>(row_idx_init, &stream)?;
-    let mut head_dev = upload_primitive_values_async::<u32>(head_init, &stream)?;
-    let mut next_idx_dev = upload_primitive_values_async::<u32>(next_idx_init, &stream)?;
+    let mut row_idx_table_dev = alloc_u32_max_table_async(cap, &stream)?;
+    let mut head_dev = alloc_u32_max_table_async(cap, &stream)?;
+    let mut next_idx_dev = alloc_u32_max_table_async(n_build, &stream)?;
 
     // matched: u32[ceil(build_n_rows / 32)], zero-initialised. We always
     // allocate it for OUTER even when only the LEFT case is requested,
@@ -3341,17 +3406,15 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
     let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
     let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
 
-    // See top-of-file `get_sentinel_*_vec`: avoid re-allocating ~357 MiB of
-    // host scratch per AoS join.
+    // PERF (join key encoding): u32::MAX collision-list tables filled on-device
+    // (cuMemsetD8Async 0xFF) — no host scratch, no H2D. The i64::MIN key table
+    // is not byte-replicable so it keeps its pooled host slice + async H2D
+    // (see top-of-file `get_sentinel_*_vec` and `alloc_u32_max_table_async`).
     let keys_init = get_sentinel_i64_min_vec(cap);
-    let row_idx_init = get_sentinel_u32_max_vec(cap);
-    let head_init = get_sentinel_u32_max_vec(cap);
-    let next_idx_init = get_sentinel_u32_max_vec(n_build);
-
     let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
-    let mut row_idx_table_dev = upload_primitive_values_async::<u32>(row_idx_init, &stream)?;
-    let mut head_dev = upload_primitive_values_async::<u32>(head_init, &stream)?;
-    let mut next_idx_dev = upload_primitive_values_async::<u32>(next_idx_init, &stream)?;
+    let mut row_idx_table_dev = alloc_u32_max_table_async(cap, &stream)?;
+    let mut head_dev = alloc_u32_max_table_async(cap, &stream)?;
+    let mut next_idx_dev = alloc_u32_max_table_async(n_build, &stream)?;
 
     let out_capacity_usize = n_build
         .checked_add(n_probe)

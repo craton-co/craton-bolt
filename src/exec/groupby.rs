@@ -532,21 +532,44 @@ pub fn execute_groupby(
     // construction sites remain bit-identical.
     let any_input_has_validity: bool =
         aggregate.input_has_validity.iter().any(|&v| v);
-    // TODO(perf, review L3): when `aggregate.aggregates.len() > 1`, the keys
-    // are shared across every aggregate, and none of them is a float MIN/MAX
-    // (which still needs the `float_atomics` CAS path) and none needs
-    // `_with_validity` plumbing, route the whole bundle through the FUSED
-    // multi-aggregate kernel emitted by
-    // `crate::jit::hash_kernels::compile_groupby_agg_kernel_multi`. That
-    // kernel hashes the keys once and issues N atomic updates back-to-back,
-    // replacing the N separate per-agg launches below — each of which
-    // currently re-hashes the keys. Wiring it in requires extending
-    // `run_one_aggregate` / `run_typed_agg` to (a) allocate all N accumulator
-    // buffers up front, (b) upload all N input columns, (c) launch the
-    // single fused kernel, (d) download all N accumulators — i.e. a
-    // breaking refactor of the per-agg plumbing. The JIT-side fused emitter
-    // is already shipped behind this TODO; flipping the dispatch is the
-    // follow-up.
+    // PERF L3 (fused multi-agg): when `aggregate.aggregates.len() > 1`, the
+    // keys are shared across every aggregate, so the N per-agg launches below
+    // re-hash + re-probe the key column N times. The fused kernel hashes the
+    // keys ONCE and issues N atomic updates back-to-back, which would replace
+    // the loop. The eligible shape is: N>1, no float MIN/MAX (those still need
+    // the `float_atomics` CAS path), no `_with_validity` plumbing (the fused
+    // emitter explicitly does NOT emit the Stage-C validity gate — see its doc
+    // comment), and only fixed-width atomic-compatible dtypes.
+    //
+    // STATUS — dispatch deliberately NOT flipped. Audit notwithstanding, only
+    // the *PTX emitter* is shipped, not a callable executor. Verified by grep:
+    // `crate::jit::hash_kernels::compile_groupby_agg_kernel_multi` /
+    // `AGG_KERNEL_MULTI_ENTRY` ("bolt_groupby_agg_multi") have NO production
+    // caller — they are referenced only by their own definition, doc comments,
+    // and three PTX-string unit tests in `hash_kernels.rs`. The host-side
+    // launch/download driver does not exist anywhere in the tree.
+    //
+    // What is MISSING to flip the dispatch (cannot be done in `launch.rs` /
+    // `module_cache` shims — needs a NEW fused launcher, which would have to be
+    // authored here in groupby.rs since this is the only file we may touch):
+    //   (a) build `&[AggSpec]` in canonical agg order, mapping each
+    //       AggregateExpr to its (op, input_dtype) — including SUM(i32)->i64
+    //       widening and COUNT(*)->i64, exactly as `run_typed_agg` does today;
+    //   (b) allocate N accumulators of HETEROGENEOUS widths (i32/i64/f32/f64)
+    //       initialised to each op's identity, and upload N input columns of
+    //       mixed dtype — the current `launch_agg_kernel<T: Pod>` is monomorphic
+    //       in a single element type `T` and cannot express this;
+    //   (c) marshal a RUNTIME-LENGTH param array of `2 + 2*N + 2` entries
+    //       (group_ptr, keys_ptr, N input_ptrs, N acc_ptrs, n_rows, k) into
+    //       `cuLaunchKernel` — the existing launcher uses a fixed `[_; 6]`/`[_; 7]`,
+    //       and the N owning typed `GpuVec`s must be kept alive across the call;
+    //   (d) download N heterogeneous accumulators back into `AccDownload`.
+    // All of (a)-(d) is new `unsafe` FFI glue with a hand-marshalled variadic
+    // param list that CANNOT be runtime-verified on this host. Routing live
+    // multi-agg queries onto unverified launch glue is a correctness hazard, so
+    // the always-correct N-launch path below is retained until a fused launcher
+    // lands with hardware coverage. The per-agg loop already preserves the
+    // `try_fast_path!` soft-miss / global-atomic semantics established above.
     let mut acc_results: Vec<AccDownload> = Vec::with_capacity(aggregate.aggregates.len());
     for agg in &aggregate.aggregates {
         let acc = run_one_aggregate(

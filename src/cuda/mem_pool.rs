@@ -78,15 +78,16 @@
 //! Stage 2 closes the LRU and reliability gaps that the per-bucket-lock
 //! split opened up.
 //!
-//! * **Cross-bucket global LRU index.** A `Mutex<BTreeMap<Instant, (size,
-//!   ptr)>>` runs alongside the `DashMap`. Every `free` insert into a
-//!   bucket also inserts `(now, (size_class, ptr))` into the BTreeMap.
-//!   `evict_one` pops the BTreeMap's first key (oldest across all
-//!   buckets), looks up the owning bucket, takes its lock, and removes
-//!   the matching block — restoring true global LRU at the cost of one
-//!   BTreeMap operation per pool action.
+//! * **Cross-bucket global LRU index (sharded — see PERF P-1 below).**
+//!   A set of `BTreeMap`s keyed by `(inserted, tick)` runs alongside the
+//!   `DashMap`. Every `free` insert into a bucket also inserts
+//!   `(now, tick) -> (size_class, ptr)` into the index. `evict_one`
+//!   finds the oldest key (oldest across all buckets), looks up the
+//!   owning bucket, takes its lock, and removes the matching block —
+//!   restoring true global LRU at the cost of one index operation per
+//!   pool action.
 //!
-//!   **Race-handling.** The BTreeMap pop and the bucket lock are not a
+//!   **Race-handling.** The index pop and the bucket lock are not a
 //!   single transaction. Between the two, another `alloc` may have
 //!   already pulled `ptr` out of the bucket (and removed its LRU
 //!   entry — see lock-order discussion below — but our evictor had
@@ -101,19 +102,44 @@
 //!   the (should-not-happen) "LRU fully out of sync" case where the
 //!   global index disagrees with the per-bucket truth.
 //!
-//!   **Lock order.** Two locks coexist anywhere in the pool: the
-//!   per-bucket `Mutex` (inside a DashMap entry) and the global
-//!   `lru_index` mutex. The canonical order is **bucket-first,
-//!   lru-second**. `try_insert_into_bucket` and `alloc` follow this
-//!   order: they take the bucket lock, mutate the deque, then take
-//!   the LRU lock to insert / remove the matching entry while still
-//!   holding the bucket. `evict_one`'s primary path inverts the order
-//!   (LRU first, to pick the global oldest) — to avoid deadlock it
-//!   *releases* the LRU lock immediately after `pop_first` and only
-//!   then reaches for the bucket. `evict_one_scan_fallback` is
-//!   bucket-first throughout. The combined invariant: **no thread
-//!   ever holds the LRU lock while waiting on a bucket lock**, so
-//!   the lock graph has no cycle.
+//! * **PERF P-1: the LRU index is sharded.** The earlier design used a
+//!   single `Mutex<BTreeMap<..>>` taken on *every* `alloc`-hit and *every*
+//!   `free`-insert, on top of the per-bucket lock — re-serialising all
+//!   size classes through one mutex under many-stream churn. The index is
+//!   now an array of `LRU_SHARDS` (= 32) independent `Mutex<BTreeMap<..>>`
+//!   shards, with a block assigned to `lru_index[size_class % LRU_SHARDS]`
+//!   (mirroring how the bucket storage is sharded). The two hot paths each
+//!   touch exactly one shard — the one for the size class they already
+//!   hold — so frees/allocs into size classes on distinct shards run in
+//!   parallel. The `(inserted, tick)` key is globally unique (`tick` is a
+//!   process-wide counter), so a cross-shard ordering / minimum comparison
+//!   is well-defined; `evict_one` still honours global LRU by scanning all
+//!   shards for the globally-oldest entry (`lru_pop_global_oldest`).
+//!
+//!   **Lock order (extended for the sharded LRU).** Two *kinds* of lock
+//!   coexist in the pool: the per-bucket `Mutex` (inside a DashMap entry
+//!   or a storage shard) and the per-shard `lru_index` mutexes. The
+//!   canonical order is **bucket-first, lru-second**.
+//!   `try_insert_into_locked_bucket` follows it: it holds the bucket lock,
+//!   mutates the deque, then takes the *single* LRU shard for that size
+//!   class to insert the matching entry. `alloc`'s hit path and the
+//!   eviction stale-entry cleanup take an LRU shard only *after* the
+//!   bucket lock has been released. `evict_one`'s primary path inverts the
+//!   order (LRU first, to pick the global oldest) — to avoid deadlock it
+//!   takes each LRU shard lock individually, **never two LRU shards at
+//!   once**, and *releases* the chosen shard before reaching for any
+//!   bucket. `evict_one_scan_fallback` is bucket-first throughout. The
+//!   combined invariant, strengthened by sharding:
+//!     1. **no thread ever holds any LRU-shard lock while waiting on a
+//!        bucket lock**, and
+//!     2. **no thread ever holds two LRU-shard locks at the same time**.
+//!   The only nested acquisition anywhere is bucket → one-lru-shard (in
+//!   `try_insert_into_locked_bucket`); every other LRU touch holds no
+//!   other lock. The lock graph therefore has no cycle and cannot
+//!   deadlock. Because a block's shard is a pure function of its size
+//!   class, the insert (in `try_insert`) and the matching remove (in
+//!   `alloc`-hit / eviction) always target the *same* shard, so the LRU
+//!   index can never strand a half-inserted entry across shards.
 //!
 //! * **`total_bytes` reconciliation.** The atomic counter can transiently
 //!   drift under heavy concurrent free because the bucket lock and the
@@ -224,6 +250,28 @@ const RECONCILE_EVERY_N_FREES: u64 = 1024;
 /// enough that contention degenerates to a per-bucket mutex in practice.
 #[cfg(feature = "pool-sharded")]
 const SHARDS: usize = 32;
+
+/// Number of independent shards the cross-bucket global LRU index is split
+/// across (PERF P-1). Power of two so `size_class % LRU_SHARDS` folds to a
+/// mask. A block always lands in the shard chosen by its `size_class`, so
+/// the hot `alloc`-hit / `free`-insert paths touch exactly one LRU shard
+/// keyed by the size class they already hold — frees/allocs into distinct
+/// size classes no longer re-serialise through one global BTreeMap mutex.
+/// 32 mirrors `SHARDS` (the bucket-storage shard count) so the LRU and the
+/// bucket map shard congruently: blocks of a given size class share both a
+/// bucket-storage shard and an LRU shard, keeping the two locks' contention
+/// profiles aligned rather than cross-interleaved.
+const LRU_SHARDS: usize = 32;
+
+/// Pick the LRU-index shard for a given `size_class`. `LRU_SHARDS` is a
+/// power of two, so `%` lowers to a mask. A block is always inserted into,
+/// removed from, and (during eviction) located in the *same* shard chosen
+/// here — the shard assignment is a pure function of `size_class`, so the
+/// insert/remove pair for one block can never straddle two shards.
+#[inline]
+fn lru_shard_of(size_class: usize) -> usize {
+    size_class % LRU_SHARDS
+}
 
 /// CUDA driver result code for "out of memory" (`CUDA_ERROR_OUT_OF_MEMORY = 2`).
 ///
@@ -498,22 +546,33 @@ pub struct DeviceMemPool {
     /// `RECONCILE_EVERY_N_FREES` frees, or via explicit
     /// `reconcile_total_bytes`).
     total_bytes: AtomicUsize,
-    /// Cross-bucket global LRU index. Keyed by `(inserted, tick)`:
-    /// `tick` disambiguates blocks that landed on the same coarse-clock
-    /// `Instant`. Value is `(size_class, ptr)` so eviction can locate
-    /// the owning bucket without a scan. See module doc for the race-
-    /// handling protocol.
+    /// Cross-bucket global LRU index, **sharded** into `LRU_SHARDS`
+    /// independent `BTreeMap`s (PERF P-1). Each shard is keyed by
+    /// `(inserted, tick)`: `tick` (a process-wide monotonic counter) makes
+    /// the key globally unique across *all* shards, so a cross-shard min /
+    /// ordering comparison is well-defined. Value is `(size_class, ptr)` so
+    /// eviction can locate the owning bucket without a scan. A block always
+    /// lives in `lru_index[lru_shard_of(size_class)]`; see module doc for
+    /// the race-handling protocol and the shard-fan-out eviction scan.
     //
-    // TODO(perf) P-1: this single global `lru_index` mutex is taken on
-    // *every* `alloc` hit and *every* `free` insert (on top of the
-    // per-bucket lock), so under many-stream concurrent churn it is the
-    // pool's central contention point even though the per-bucket `DashMap`
-    // split removed the old global bucket lock. Left untouched on purpose —
-    // a fix (sharded LRU clocks, or an approximate CLOCK / second-chance
-    // scheme that needs no globally-ordered structure) is a separate change
-    // with its own benchmarking. No behaviour change is intended here; the
-    // DashMap/LRU design is deliberately not altered in this commit.
-    lru_index: Mutex<BTreeMap<(Instant, u64), (usize, CUdeviceptr)>>,
+    // PERF P-1 (resolved here): the previous single global `lru_index`
+    // mutex was taken on *every* `alloc` hit and *every* `free` insert (on
+    // top of the per-bucket lock), so under many-stream concurrent churn it
+    // re-serialised every size class through one BTreeMap mutex even though
+    // the per-bucket `DashMap`/array split had already removed the old
+    // global *bucket* lock.
+    //
+    // Fix: shard the LRU index by `size_class` (mirroring how the bucket
+    // storage is already sharded). The two hot paths —
+    //   * `alloc`-hit:  remove from `lru_index[lru_shard_of(size_class)]`
+    //   * `free`-insert: insert into `lru_index[lru_shard_of(size_class)]`
+    // now touch exactly one shard, the one for the size class they already
+    // hold, so distinct size classes that hash to different LRU shards run
+    // fully in parallel. Eviction (`evict_one`) still honours global LRU by
+    // peeking the oldest `(Instant, tick)` across all shards and popping the
+    // single global minimum — see `evict_one` for the deadlock-free
+    // shard-fan-out protocol and the extended lock-order invariant.
+    lru_index: [Mutex<BTreeMap<(Instant, u64), (usize, CUdeviceptr)>>; LRU_SHARDS],
     /// Process-wide monotonic counter feeding `PooledBlock::tick`.
     /// `Relaxed` is sufficient: we only need uniqueness, not ordering
     /// against other atomics.
@@ -532,7 +591,8 @@ impl DeviceMemPool {
         Self {
             buckets: new_bucket_storage(),
             total_bytes: AtomicUsize::new(0),
-            lru_index: Mutex::new(BTreeMap::new()),
+            // PERF P-1: one independent BTreeMap mutex per LRU shard.
+            lru_index: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
             next_tick: AtomicU64::new(0),
             frees_since_reconcile: AtomicU64::new(0),
             max_pooled_bytes: read_env_usize(
@@ -574,6 +634,121 @@ impl DeviceMemPool {
             Ordering::Acquire,
             |cur| Some(cur.saturating_sub(n)),
         );
+    }
+
+    // ---- Sharded LRU-index helpers (PERF P-1) ----
+    //
+    // A block's LRU entry always lives in the shard chosen by its
+    // `size_class` (`lru_shard_of`). These helpers funnel every LRU
+    // touch through that single deterministic shard so the insert/remove
+    // pair for one block can never straddle two shards, and so the hot
+    // paths take exactly one shard lock instead of one global lock.
+
+    /// Insert `(inserted, tick) -> (size_class, ptr)` into the LRU shard
+    /// owning `size_class`. Takes only that one shard's lock.
+    ///
+    /// **Lock order.** Callers hold the bucket lock when they call this
+    /// (the `try_insert_into_locked_bucket` path), so this is the
+    /// *inner* lock of the bucket-then-lru order — same discipline as
+    /// the pre-P-1 single-mutex design, just on a sharded mutex.
+    #[inline]
+    fn lru_insert(
+        &self,
+        size_class: usize,
+        inserted: Instant,
+        tick: u64,
+        ptr: CUdeviceptr,
+    ) {
+        self.lru_index[lru_shard_of(size_class)]
+            .lock()
+            .insert((inserted, tick), (size_class, ptr));
+    }
+
+    /// Remove the LRU entry for a block of `size_class` keyed by
+    /// `(inserted, tick)`. Takes only that one shard's lock. Used by the
+    /// `alloc`-hit path and the eviction stale-entry cleanup; in both
+    /// cases the caller is *not* holding any bucket lock, so this never
+    /// inverts the bucket-then-lru order.
+    #[inline]
+    fn lru_remove(&self, size_class: usize, inserted: Instant, tick: u64) {
+        self.lru_index[lru_shard_of(size_class)]
+            .lock()
+            .remove(&(inserted, tick));
+    }
+
+    /// Pop the globally-oldest LRU entry across *all* shards.
+    ///
+    /// Returns the `((inserted, tick), (size_class, ptr))` whose key is
+    /// the minimum over every shard, having removed it from its shard, or
+    /// `None` when every shard is empty.
+    ///
+    /// **Why two passes.** `(inserted, tick)` is globally unique (`tick`
+    /// is a process-wide monotonic counter), so "oldest across the pool"
+    /// is just the minimum first-key over all shards. We first *peek*
+    /// each shard's `first_key_value` to find which shard holds the
+    /// global minimum, then re-lock that one shard and `pop_first` it.
+    ///
+    /// **Deadlock-freedom (PERF P-1 lock order).** Each shard lock is
+    /// taken and released individually — at no point are two LRU-shard
+    /// locks held at once, and at no point is any bucket lock held while
+    /// scanning. A concurrent insert into a shard we already peeked can
+    /// only add a *newer* (larger-keyed) entry, so it cannot change which
+    /// entry is the global minimum at peek time; a concurrent pop of the
+    /// very entry we selected is handled by re-reading `pop_first` under
+    /// the shard lock and accepting whatever is now oldest there (or
+    /// retrying the scan if that shard drained). The popped entry's
+    /// `size_class` is intrinsic to the block, so the caller can still
+    /// route to the correct bucket.
+    fn lru_pop_global_oldest(
+        &self,
+    ) -> Option<((Instant, u64), (usize, CUdeviceptr))> {
+        loop {
+            // Pass 1: peek every shard's oldest key, one shard lock at a
+            // time (never two at once), and remember which shard owns the
+            // global minimum.
+            let mut best_shard: Option<usize> = None;
+            let mut best_key: Option<(Instant, u64)> = None;
+            for (idx, shard) in self.lru_index.iter().enumerate() {
+                let guard = shard.lock();
+                if let Some((k, _v)) = guard.first_key_value() {
+                    if best_key.map_or(true, |b| *k < b) {
+                        best_key = Some(*k);
+                        best_shard = Some(idx);
+                    }
+                }
+            }
+            let shard_idx = best_shard?;
+            // Pass 2: re-lock just the winning shard and pop its oldest.
+            // Between pass 1 and here, a racing `evict_one` on another
+            // thread (or an `alloc`-hit / `lru_remove`) may have already
+            // taken the entry we picked. `pop_first` returns whatever is
+            // oldest in that shard *now*; if the shard drained entirely in
+            // the meantime we loop and re-scan rather than return a false
+            // `None` while other shards may still be populated.
+            if let Some((k, v)) = self.lru_index[shard_idx].lock().pop_first() {
+                return Some((k, v));
+            }
+            // Winning shard raced empty; re-scan. Progress is guaranteed:
+            // either some other shard still holds entries (next scan picks
+            // one) or every shard is empty (scan returns `None`).
+        }
+    }
+
+    /// Clear every LRU shard. Used by `drain`.
+    #[inline]
+    fn lru_clear_all(&self) {
+        for shard in self.lru_index.iter() {
+            shard.lock().clear();
+        }
+    }
+
+    /// Total number of entries across all LRU shards. Test/diagnostic
+    /// only — walks every shard under its own lock. Not a consistent
+    /// snapshot under concurrent mutation, but exact when the pool is
+    /// quiescent (which is when the tests consult it).
+    #[cfg(test)]
+    fn lru_total_len(&self) -> usize {
+        self.lru_index.iter().map(|s| s.lock().len()).sum()
     }
 
     // ---- Storage abstraction helpers ----
@@ -734,18 +909,20 @@ impl DeviceMemPool {
             // Remove the block's entry from the global LRU index. Note
             // the lock order: we already dropped the bucket lock at
             // the end of `with_bucket`'s closure, so taking the LRU
-            // lock here cannot cause a hold-and-wait cycle with any
+            // shard lock here cannot cause a hold-and-wait cycle with any
             // bucket lock — this is bucket-then-lru as required, just
             // with the bucket lock having been released by the helper.
+            //
+            // PERF P-1: the block's LRU entry lives in the shard chosen
+            // by `alloc_bytes` (its size class), so `lru_remove` touches
+            // exactly that one shard — no global LRU lock.
             //
             // Together the (bucket-push, lru-insert) and (bucket-pop,
             // lru-remove) pairs guarantee that the LRU index never
             // holds a stale entry pointing at a no-longer-pooled block,
             // which is what the `lru_handles_concurrent_free_race`
             // test asserts.
-            self.lru_index
-                .lock()
-                .remove(&(block.inserted, block.tick));
+            self.lru_remove(alloc_bytes, block.inserted, block.tick);
             return Ok((block.ptr, alloc_bytes));
         }
         // Miss: call the driver. cuMemAlloc_v2 guarantees at least 256-byte
@@ -945,10 +1122,16 @@ impl DeviceMemPool {
             // `alloc` on the same bucket — without it, an `alloc` could
             // pop our just-pushed block, try to remove the (not-yet-
             // inserted) LRU entry as a no-op, and then leave a stale
-            // entry behind once our later `lru_index.insert` runs.
-            self.lru_index
-                .lock()
-                .insert((inserted, tick), (alloc_bytes, ptr));
+            // entry behind once our later `lru_insert` runs.
+            //
+            // PERF P-1: `lru_insert` writes only the shard owning
+            // `alloc_bytes`. That shard is the *inner* lock under the
+            // currently-held bucket lock, preserving bucket-then-lru.
+            // Because a block's shard is a pure function of its size
+            // class, the matching `lru_remove` in `alloc` and the
+            // eviction cleanup always target this same shard, so the
+            // insert/remove pair never straddles two shards.
+            self.lru_insert(alloc_bytes, inserted, tick, ptr);
             true
         } else {
             false
@@ -959,28 +1142,42 @@ impl DeviceMemPool {
     /// index. Returns `true` if an eviction happened; `false` when the
     /// pool is empty.
     ///
-    /// **Algorithm.** Pop the smallest `(Instant, tick)` from the LRU
-    /// `BTreeMap`, releasing the LRU lock immediately. Look up the owning
-    /// bucket in the DashMap, take its lock, and remove the block whose
-    /// `ptr` matches. If the block is no longer in the bucket (an `alloc`
-    /// raced ahead of us between our LRU pop and our bucket lock), fall
-    /// back to popping any block from the front of that bucket — that
-    /// block is at least as old as anything else in the bucket.
+    /// **Algorithm.** Pop the globally-smallest `(Instant, tick)` across
+    /// all LRU shards (`lru_pop_global_oldest`), releasing every LRU shard
+    /// lock before continuing. Look up the owning bucket, take its lock,
+    /// and remove the block whose `ptr` matches. If the block is no longer
+    /// in the bucket (an `alloc` raced ahead of us between our LRU pop and
+    /// our bucket lock), fall back to popping any block from the front of
+    /// that bucket — that block is at least as old as anything else in the
+    /// bucket.
     ///
-    /// **Lock order.** LRU mutex is taken and released, *then* the bucket
-    /// mutex is taken. This is the only order in which both locks ever
-    /// coexist anywhere in the pool. `free` releases the bucket lock
-    /// before acquiring the LRU lock (see `try_insert_into_bucket`), so
-    /// there is no possibility of deadlock.
+    /// **Lock order (PERF P-1, extended).** The LRU index is sharded; this
+    /// path takes and releases each LRU shard lock individually inside
+    /// `lru_pop_global_oldest` (never two LRU-shard locks at once, never a
+    /// bucket lock while scanning), and the chosen entry's shard lock is
+    /// fully released *before* the bucket lock is taken. So the global
+    /// invariant is unchanged and strengthened:
+    ///   1. **no thread ever holds any LRU-shard lock while waiting on a
+    ///      bucket lock** (the bucket-then-lru order — eviction is the lone
+    ///      exception and it drops the LRU shard first), and
+    ///   2. **no thread ever holds two LRU-shard locks simultaneously**
+    ///      (the cross-shard scan visits one shard at a time).
+    /// The bucket→lru edge and the (now per-shard) lru→nothing edges form
+    /// an acyclic graph, so deadlock is impossible. `free` still releases
+    /// the bucket lock before its `lru_remove` cleanup; the bucket-locked
+    /// `lru_insert` in `try_insert_into_locked_bucket` is the only
+    /// bucket-then-lru-shard nesting and it never inverts.
     ///
-    /// **Fallbacks.** If the LRU index is empty but `total_bytes > 0`
+    /// **Fallbacks.** If every LRU shard is empty but `total_bytes > 0`
     /// (cannot happen under correct accounting but defended against),
     /// fall through to `evict_one_scan_fallback`, the M3L5 cross-bucket
     /// scan. That keeps the eviction loop terminating even if the LRU
     /// index has somehow drifted out of sync with the buckets.
     fn evict_one(&self, sink: &mut Vec<CUdeviceptr>) -> bool {
-        // Pop the oldest LRU entry under a brief lock.
-        let popped = self.lru_index.lock().pop_first();
+        // Pop the globally-oldest LRU entry across all shards. Every LRU
+        // shard lock is released before we return here, so the bucket
+        // lock below is taken with no LRU lock held (PERF P-1 order).
+        let popped = self.lru_pop_global_oldest();
         if let Some(((_, _tick), (size_class, target_ptr))) = popped {
             // Look up the owning bucket. If the bucket vanished (drain in
             // flight, or this is a stale entry the storage has already
@@ -1022,12 +1219,15 @@ impl DeviceMemPool {
                     self.sub_total_saturating(size_class);
                     // The block we actually evicted has its own LRU
                     // entry that is now stale — remove it. We're outside
-                    // the bucket lock at this point; both touchings of
-                    // the LRU lock happen *after* the bucket lock has
-                    // been released, preserving the global lock order.
-                    self.lru_index
-                        .lock()
-                        .remove(&(block.inserted, block.tick));
+                    // the bucket lock at this point; the LRU shard lock is
+                    // taken *after* the bucket lock has been released,
+                    // preserving the global lock order.
+                    //
+                    // PERF P-1: the front block came out of the bucket for
+                    // `size_class`, so its LRU entry lives in that size
+                    // class's shard — `lru_remove(size_class, ..)` targets
+                    // exactly the right shard.
+                    self.lru_remove(size_class, block.inserted, block.tick);
                     sink.push(block.ptr);
                     return true;
                 }
@@ -1086,9 +1286,10 @@ impl DeviceMemPool {
             let popped = self.with_bucket(key, |bucket| bucket.blocks.pop_front());
             if let Some(Some(block)) = popped {
                 self.sub_total_saturating(key);
-                self.lru_index
-                    .lock()
-                    .remove(&(block.inserted, block.tick));
+                // PERF P-1: `key` is this block's size class, so its LRU
+                // entry lives in `lru_shard_of(key)`. Bucket lock already
+                // released — bucket-then-lru order preserved.
+                self.lru_remove(key, block.inserted, block.tick);
                 sink.push(block.ptr);
                 return true;
             }
@@ -1203,8 +1404,9 @@ impl DeviceMemPool {
         // it indexes. Any entry left behind would either be a phantom
         // pointer (already passed to the driver below) or a stale ref
         // into a now-deleted bucket; either way it has no business
-        // staying around.
-        self.lru_index.lock().clear();
+        // staying around. PERF P-1: clear every shard (one lock at a
+        // time inside `lru_clear_all`).
+        self.lru_clear_all();
         for ptr in drained {
             // SAFETY: every pointer in the pool came from the matching
             // backend's `mem_alloc` (either `cuda_sys` or `cudarc_backend`,
@@ -2069,7 +2271,10 @@ mod tests {
                     });
                 });
                 pool.total_bytes.fetch_add(64, Ordering::AcqRel);
-                pool.lru_index.lock().insert((inserted, tick), (64, p));
+                // PERF P-1: LRU is sharded; route the white-box insert
+                // through the same helper the production path uses so the
+                // entry lands in the correct shard for size class 64.
+                pool.lru_insert(64, inserted, tick, p);
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
@@ -2354,12 +2559,90 @@ mod tests {
 
         // And the LRU index size should match the bucket count exactly
         // — every pooled block has a unique LRU entry, every popped
-        // block had its entry removed.
-        let lru_len = pool.lru_index.lock().len();
+        // block had its entry removed. PERF P-1: the index is sharded,
+        // so we sum across shards via `lru_total_len`.
+        let lru_len = pool.lru_total_len();
         let pooled_count = pool.pooled_block_count();
         assert_eq!(
             lru_len, pooled_count,
             "LRU index ({}) should mirror pooled block count ({})",
+            lru_len, pooled_count
+        );
+    }
+
+    /// PERF P-1: concurrent free/alloc churn into *distinct size classes*
+    /// must remain correct under the sharded LRU index. This is the
+    /// cross-shard analogue of `lru_handles_concurrent_free_race` — each
+    /// worker hammers a different size class so the LRU shards are
+    /// exercised in parallel rather than all funnelling through one mutex.
+    ///
+    /// We deliberately span many octaves and include non-power-of-two
+    /// bucket sizes so the size classes spread across several
+    /// `size_class % LRU_SHARDS` shards (power-of-two sizes alone would
+    /// all collapse onto shard 0). The invariant under test is the same
+    /// one the single-mutex design guaranteed: after the churn settles,
+    /// reconciliation equals the hand-summed bucket truth AND the LRU
+    /// index (summed across all shards) mirrors the pooled block count
+    /// exactly — i.e. no entry was lost, double-inserted, or stranded in
+    /// the wrong shard, and no block was double-freed.
+    #[test]
+    fn sharded_lru_handles_concurrent_distinct_size_classes() {
+        use std::sync::Arc;
+
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        // Big caps so eviction doesn't kick in — we're stress-testing the
+        // per-shard insert/remove pairing across distinct size classes,
+        // not the eviction race (covered elsewhere).
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1000000"),
+        ]);
+        let pool = Arc::new(DeviceMemPool::new());
+
+        // One distinct request size per worker. These round (via
+        // `bucket_size`) to a spread of size classes — including
+        // non-power-of-two ones (e.g. 100 -> 112, 5000 -> 5120) — so the
+        // resulting `lru_shard_of(size_class)` values are not all 0.
+        let sizes: [usize; 8] = [64, 100, 256, 1000, 4096, 5000, 16384, 20000];
+        let per_thread = 2000;
+        let handles: Vec<_> = sizes
+            .iter()
+            .copied()
+            .map(|s| {
+                let pool = Arc::clone(&pool);
+                std::thread::spawn(move || {
+                    for _ in 0..per_thread {
+                        let (p, ab) = pool.alloc(s).unwrap();
+                        pool.free(p, ab);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        // Accounting self-heals to the hand-summed truth.
+        let mut true_sum: usize = 0;
+        pool.for_each_bucket(|key, bucket| {
+            true_sum += bucket.blocks.len() * key;
+        });
+        let reconciled = pool.reconcile_total_bytes();
+        assert_eq!(
+            reconciled, true_sum,
+            "reconcile must equal hand-summed truth across shards"
+        );
+        assert_eq!(pool.total_pooled_bytes(), true_sum);
+
+        // The sharded LRU index, summed over every shard, must still
+        // mirror the pooled block count one-for-one. A lost / duplicated
+        // / mis-sharded entry would break this equality.
+        let lru_len = pool.lru_total_len();
+        let pooled_count = pool.pooled_block_count();
+        assert_eq!(
+            lru_len, pooled_count,
+            "sharded LRU index ({}) should mirror pooled block count ({})",
             lru_len, pooled_count
         );
     }

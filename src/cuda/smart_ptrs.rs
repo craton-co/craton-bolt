@@ -136,6 +136,18 @@ impl<T: Pod> GpuVec<T> {
         self.buffer.device_ptr()
     }
 
+    /// Record that `stream` has been used to launch/copy against this vec's
+    /// device allocation, so the buffer's `Drop` fences `stream` before the
+    /// block is recycled to the pool (mirrors [`GpuBuffer::mark_stream_use`],
+    /// which this delegates to). Used by callers that drive a raw async memset
+    /// or `cuLaunchKernel` off [`device_ptr`](Self::device_ptr) rather than
+    /// through a [`GpuView`] — e.g. the join sentinel-table fill. `insert`
+    /// dedups, so repeated/multi-stream use accumulates rather than clobbers.
+    #[inline]
+    pub fn mark_stream_use(&self, stream: CUstream) {
+        self.buffer.mark_stream_use(stream);
+    }
+
     /// Borrow as a shared GPU view; many such views may coexist.
     ///
     /// The view carries a back-reference to this vec's buffer stream set so

@@ -95,6 +95,7 @@ use parking_lot::Mutex;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr, CUgraphExec};
 use crate::cuda::GpuVec;
+use crate::cuda::PinnedHostBuffer;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
 use crate::exec::module_cache;
@@ -1100,6 +1101,21 @@ fn run_radix_pipeline_i32(
     let block_size = RADIX_BLOCK_SIZE;
     let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
 
+    // PERF (radix round-trip): hoist the two 16-entry host scratch buffers
+    // out of the per-pass loop so we allocate them exactly once for the
+    // whole sort instead of churning a fresh `vec![0u32; 16]` (×2) on every
+    // pass. They are page-locked (`PinnedHostBuffer`) so the per-pass D2H of
+    // the histogram and H2D of the offsets can run as *real* async DMAs on
+    // the sort stream (`cuMemcpy*Async` requires pinned host memory to
+    // overlap — a pageable copy silently degrades to a synchronizing
+    // staging copy). The contents are fully overwritten each pass (the D2H
+    // fills `hist_host`, the scan rewrites `offsets_host` from index 0), so
+    // carrying stale bytes across passes is benign.
+    let mut hist_host: PinnedHostBuffer<u32> =
+        PinnedHostBuffer::<u32>::new(RADIX_BUCKETS as usize)?;
+    let mut offsets_host: PinnedHostBuffer<u32> =
+        PinnedHostBuffer::<u32>::new(RADIX_BUCKETS as usize)?;
+
     // ----- per-pass loop: histogram → host-scan → scatter -------------
     for step in 0..radix_steps {
         let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
@@ -1127,37 +1143,72 @@ fn run_radix_pipeline_i32(
             &stream,
         )?;
 
-        // D2H the 16 histogram counts. We use a fresh zeros() then
-        // copy_to_async would be ideal, but GpuVec's to_vec requires
-        // self.len > 0 and a tracked len. Cheapest stable path: re-create
-        // a small typed view via `read_hist_as_u32` which uses raw memcpy.
-        let mut hist_host = vec![0u32; RADIX_BUCKETS as usize];
-        // SAFETY: hist_dev is a u32 allocation of RADIX_BUCKETS entries;
-        // we read exactly that many u32 elements.
+        // PERF (radix round-trip): D2H the 16 histogram counts as an *async*
+        // copy on the sort stream into the hoisted pinned buffer, then take
+        // exactly ONE synchronize — this is the single unavoidable serialize
+        // point, because the host prefix-scan below reads `hist_host`. The
+        // old code used `memcpy_d2h` (a synchronizing copy) here AND another
+        // synchronizing `memcpy_h2d` for the offsets, i.e. two stream
+        // serializations per pass; we collapse that to one.
+        // SAFETY: hist_dev is a u32 allocation of RADIX_BUCKETS entries and
+        // hist_host is a pinned buffer of RADIX_BUCKETS u32s; we copy exactly
+        // that many elements. The pinned host pages stay live until the sync
+        // below retires the DMA.
         unsafe {
-            cuda_sys::memcpy_d2h::<u32>(
+            cuda_sys::memcpy_d2h_async::<u32>(
                 hist_host.as_mut_ptr(),
                 hist_dev.device_ptr(),
                 RADIX_BUCKETS as usize,
+                stream.raw(),
             )?;
         }
+        stream.synchronize()?;
 
         // Exclusive prefix scan on host (16 elements — cheaper than a
-        // kernel launch).
-        let mut offsets_host = vec![0u32; RADIX_BUCKETS as usize];
+        // kernel launch). The device-side scan kernel (a 16-element exclusive
+        // scan launched on `stream`) would eliminate this host leg entirely,
+        // but it requires a new JIT kernel + GPU validation and is out of
+        // scope for this host-only change (see module notes).
+        let hist_slice = hist_host.as_slice();
+        let offsets_slice = offsets_host.as_mut_slice();
         let mut running: u32 = 0;
-        for (i, h) in hist_host.iter().enumerate() {
-            offsets_host[i] = running;
-            running = running.wrapping_add(*h);
+        for i in 0..RADIX_BUCKETS as usize {
+            offsets_slice[i] = running;
+            // PERF (radix round-trip): the original used `wrapping_add`. The
+            // sum of all bucket counts is exactly `n_rows` (every key lands in
+            // one of the 16 buckets), and `n_rows <= u32::MAX`, so `running`
+            // can never exceed `n_rows` and the add never actually wraps. Use
+            // `checked_add` + a panic-on-overflow to make that invariant
+            // load-bearing rather than silently masked. The `debug_assert`
+            // documents the bound at the point it must hold.
+            debug_assert!(
+                running <= n_rows_u32,
+                "radix histogram prefix exceeded n_rows: {running} > {n_rows_u32}",
+            );
+            running = running
+                .checked_add(hist_slice[i])
+                .expect("radix histogram bucket-sum overflowed u32 (invariant: sum == n_rows)");
         }
-        // H2D the offsets. Same memcpy_h2d trick as above (re-using
-        // offsets_dev's allocation).
-        // SAFETY: offsets_dev was allocated with RADIX_BUCKETS u32 entries.
+        debug_assert_eq!(
+            running, n_rows_u32,
+            "radix histogram bucket-sum != n_rows ({running} != {n_rows_u32})",
+        );
+
+        // PERF (radix round-trip): H2D the offsets as an *async* copy on the
+        // same stream. We deliberately do NOT synchronize here — the scatter
+        // kernel is enqueued on `stream` immediately below, and same-stream
+        // ordering guarantees it observes the completed H2D. The final
+        // `stream.synchronize()` after the loop fences the last pass's pinned
+        // source pages before they are reused / dropped.
+        // SAFETY: offsets_dev has RADIX_BUCKETS u32 entries; offsets_host is a
+        // pinned buffer of RADIX_BUCKETS u32s. The pinned source stays live
+        // until the post-loop synchronize (the buffer outlives the loop).
         unsafe {
-            cuda_sys::memcpy_h2d::<u32>(
+            cuda_sys::memcpy_h2d_async::<u32>(
                 offsets_dev.device_ptr(),
                 offsets_host.as_ptr(),
                 RADIX_BUCKETS as usize,
+                stream.raw(),
             )?;
         }
 
@@ -1264,6 +1315,17 @@ fn run_radix_pipeline_i64(
     let block_size = RADIX_BLOCK_SIZE;
     let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
 
+    // PERF (radix round-trip): hoist the two 16-entry host scratch buffers
+    // out of the per-pass loop (i64 mirror of the i32 driver) — allocate the
+    // pinned histogram / offsets scratch once for all 16 passes instead of a
+    // fresh `vec![0u32; 16]` (×2) per pass, and use page-locked memory so the
+    // per-pass D2H/H2D run as real async DMAs on the sort stream. Contents
+    // are fully overwritten each pass, so stale carry-over is benign.
+    let mut hist_host: PinnedHostBuffer<u32> =
+        PinnedHostBuffer::<u32>::new(RADIX_BUCKETS as usize)?;
+    let mut offsets_host: PinnedHostBuffer<u32> =
+        PinnedHostBuffer::<u32>::new(RADIX_BUCKETS as usize)?;
+
     for step in 0..radix_steps {
         let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
 
@@ -1283,27 +1345,60 @@ fn run_radix_pipeline_i64(
             &stream,
         )?;
 
-        let mut hist_host = vec![0u32; RADIX_BUCKETS as usize];
-        // SAFETY: hist_dev has RADIX_BUCKETS u32 elements.
+        // PERF (radix round-trip): async D2H of the histogram + exactly one
+        // synchronize (the host scan depends on it), mirroring the i32 driver.
+        // Replaces the old pair of synchronizing `memcpy_d2h` / `memcpy_h2d`
+        // calls (two serializations per pass) with a single sync per pass.
+        // SAFETY: hist_dev has RADIX_BUCKETS u32 elements; hist_host is a
+        // pinned buffer of RADIX_BUCKETS u32s. Pinned pages stay live until
+        // the sync below retires the DMA.
         unsafe {
-            cuda_sys::memcpy_d2h::<u32>(
+            cuda_sys::memcpy_d2h_async::<u32>(
                 hist_host.as_mut_ptr(),
                 hist_dev.device_ptr(),
                 RADIX_BUCKETS as usize,
+                stream.raw(),
             )?;
         }
-        let mut offsets_host = vec![0u32; RADIX_BUCKETS as usize];
+        stream.synchronize()?;
+
+        // Exclusive prefix scan on host. A device-side 16-element scan kernel
+        // would remove this leg but needs a new JIT kernel + GPU validation —
+        // deliberately out of scope here (see module notes).
+        let hist_slice = hist_host.as_slice();
+        let offsets_slice = offsets_host.as_mut_slice();
         let mut running: u32 = 0;
-        for (i, h) in hist_host.iter().enumerate() {
-            offsets_host[i] = running;
-            running = running.wrapping_add(*h);
+        for i in 0..RADIX_BUCKETS as usize {
+            offsets_slice[i] = running;
+            // PERF (radix round-trip): bucket sums total exactly `n_rows`
+            // (<= u32::MAX), so `running` never wraps. Use `checked_add` to
+            // make that invariant load-bearing instead of masking it with
+            // `wrapping_add`.
+            debug_assert!(
+                running <= n_rows_u32,
+                "radix histogram prefix exceeded n_rows: {running} > {n_rows_u32}",
+            );
+            running = running
+                .checked_add(hist_slice[i])
+                .expect("radix histogram bucket-sum overflowed u32 (invariant: sum == n_rows)");
         }
-        // SAFETY: offsets_dev has RADIX_BUCKETS u32 entries.
+        debug_assert_eq!(
+            running, n_rows_u32,
+            "radix histogram bucket-sum != n_rows ({running} != {n_rows_u32})",
+        );
+
+        // PERF (radix round-trip): async H2D of the offsets on the same
+        // stream — no synchronize; same-stream ordering makes the scatter
+        // below observe the completed copy. The post-loop synchronize fences
+        // the last pass's pinned source before reuse / drop.
+        // SAFETY: offsets_dev has RADIX_BUCKETS u32 entries; offsets_host is a
+        // pinned buffer of RADIX_BUCKETS u32s that outlives the loop.
         unsafe {
-            cuda_sys::memcpy_h2d::<u32>(
+            cuda_sys::memcpy_h2d_async::<u32>(
                 offsets_dev.device_ptr(),
                 offsets_host.as_ptr(),
                 RADIX_BUCKETS as usize,
+                stream.raw(),
             )?;
         }
 

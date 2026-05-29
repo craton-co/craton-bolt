@@ -72,17 +72,26 @@ pub(crate) fn ensure_device(ordinal: i32) -> BoltResult<()> {
         .map(|_| ())
 }
 
-fn device() -> BoltResult<Arc<CudaDevice>> {
-    // Lazily initialise on device 0 if nobody called `ensure_device`
-    // first. This preserves the original spike behaviour for callers
-    // that go directly through this module's `mem_alloc` etc.
-    // PERF-NOTE: Arc::clone in hot memcpy path; defer optimisation to Stage 2.
-    GLOBAL_DEVICE
-        .get_or_try_init(|| {
-            CudaDevice::new(0)
-                .map_err(|e| cudarc_err("cudarc CudaDevice::new", e))
-        })
-        .map(Arc::clone)
+/// Lazily initialise the primary context on device 0 (if nobody called
+/// `ensure_device` first) and return a **borrow** of the cached
+/// `Arc<CudaDevice>`. This preserves the original spike behaviour for
+/// callers that go directly through this module's `mem_alloc` etc.
+///
+/// PERF (cudarc Stage 2): this used to return `Arc<CudaDevice>` via
+/// `.map(Arc::clone)`, charging an atomic refcount bump on every
+/// alloc/free/memcpy. Every call site only needs the device *borrowed*
+/// for the duration of the call — solely to make the primary context
+/// current via the lazy `get_or_try_init` — and never stores or returns
+/// the handle. We therefore hand back `&Arc<CudaDevice>` tied to the
+/// `GLOBAL_DEVICE` cell's `'static` storage, eliminating the per-op
+/// clone entirely. The lazy-init semantics, error propagation, and
+/// public behaviour are unchanged; only the no-longer-needed `Arc::clone`
+/// is gone. No call site requires owned escape, so no clone remains.
+fn device_ref() -> BoltResult<&'static Arc<CudaDevice>> {
+    GLOBAL_DEVICE.get_or_try_init(|| {
+        CudaDevice::new(0)
+            .map_err(|e| cudarc_err("cudarc CudaDevice::new", e))
+    })
 }
 
 /// Stage 5 (M3L5): translate a cudarc `DriverError` into the typed
@@ -120,7 +129,9 @@ pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
         ));
     }
     // Ensure the primary context is current on this thread.
-    let _dev = device()?;
+    // PERF (cudarc Stage 2): borrow the cached device instead of cloning
+    // its `Arc` — the handle is only used transiently to drive lazy-init.
+    let _dev = device_ref()?;
     unsafe {
         result::malloc_sync(bytes)
             .map(|p| p as CUdeviceptr)
@@ -133,7 +144,7 @@ pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
 /// # Context-currency invariant
 /// Every freed pointer belongs to cudarc's primary context, so
 /// `cuMemFree_v2` must run with that context current on the *calling*
-/// thread. We therefore establish currency by calling [`device()`]
+/// thread. We therefore establish currency by calling [`device_ref()`]
 /// first — exactly as [`mem_alloc`] does before `malloc_sync` — rather
 /// than assuming the caller already made the context current. This
 /// matters because frees originate from threads that never touched the
@@ -145,19 +156,21 @@ pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
 /// Self-guarding here keeps the alloc/free pair symmetric and makes the
 /// `Drop`-drain path correct regardless of which thread runs it.
 ///
-/// `get_or_try_init` makes the `device()` call idempotent and cheap on
-/// the common path (the cell is already latched after the first
-/// `ensure_device`/`mem_alloc`), so this adds no FFI — only an
-/// `Arc::clone` that is dropped immediately.
+/// `get_or_try_init` makes the `device_ref()` call idempotent and cheap
+/// on the common path (the cell is already latched after the first
+/// `ensure_device`/`mem_alloc`), so this adds no FFI. PERF (cudarc
+/// Stage 2): it also adds no atomic refcount traffic — `device_ref()`
+/// hands back a borrow of the cached `Arc`, not a clone.
 ///
 /// # Safety
 /// `ptr` must have been returned by `mem_alloc` (or by
 /// `cuda_sys::mem_alloc` — both call into the same `cuMemAlloc_v2`).
 pub unsafe fn mem_free(ptr: CUdeviceptr) -> BoltResult<()> {
     // Ensure the primary context is current on this thread before the free.
-    // Mirrors `mem_alloc`'s `let _dev = device()?;` guard.
-    // PERF-NOTE: Arc::clone on the free path; matches mem_alloc, defer to Stage 2.
-    let _dev = match device() {
+    // Mirrors `mem_alloc`'s `let _dev = device_ref()?;` guard.
+    // PERF (cudarc Stage 2): borrow the cached device — no `Arc::clone` on
+    // the free path (matches mem_alloc).
+    let _dev = match device_ref() {
         Ok(dev) => dev,
         Err(e) => {
             // The device could not be made current — the pointer cannot be
@@ -301,7 +314,8 @@ pub(crate) unsafe fn memcpy_h2d_async<T>(
         "memcpy_h2d_async: src is null with non-zero count"
     );
     // Ensure the primary context is current on this thread before any FFI.
-    let _dev = device()?;
+    // PERF (cudarc Stage 2): borrow, don't clone, the cached device.
+    let _dev = device_ref()?;
     cudarc::driver::sys::lib()
         .cuMemcpyHtoDAsync_v2(
             dst as cudarc::driver::sys::CUdeviceptr,
@@ -346,7 +360,8 @@ pub(crate) unsafe fn memcpy_d2h_async<T>(
         !dst.is_null(),
         "memcpy_d2h_async: dst is null with non-zero count"
     );
-    let _dev = device()?;
+    // PERF (cudarc Stage 2): borrow, don't clone, the cached device.
+    let _dev = device_ref()?;
     cudarc::driver::sys::lib()
         .cuMemcpyDtoHAsync_v2(
             dst as *mut core::ffi::c_void,
@@ -372,7 +387,8 @@ pub(crate) unsafe fn memset_d8_async(
     n_bytes: usize,
     stream: CUstream,
 ) -> BoltResult<()> {
-    let _dev = device()?;
+    // PERF (cudarc Stage 2): borrow, don't clone, the cached device.
+    let _dev = device_ref()?;
     cudarc::driver::sys::lib()
         .cuMemsetD8Async(
             ptr as cudarc::driver::sys::CUdeviceptr,
