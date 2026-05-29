@@ -181,6 +181,21 @@ fn prune(plan: LogicalPlan, required: &BTreeSet<String>) -> LogicalPlan {
             }
         }
 
+        LogicalPlan::SetOp { left, right, op, all } => {
+            // EXCEPT / INTERSECT compare *whole rows* across both inputs, so
+            // neither side may have columns pruned (dropping a column would
+            // change the row-equality relation and the result schema). Keep
+            // both sides' full schemas, mirroring the UNION rule above.
+            let left_full = full_schema_cols(&left);
+            let right_full = full_schema_cols(&right);
+            LogicalPlan::SetOp {
+                left: Box::new(prune(*left, &left_full)),
+                right: Box::new(prune(*right, &right_full)),
+                op,
+                all,
+            }
+        }
+
         LogicalPlan::Join {
             left,
             right,

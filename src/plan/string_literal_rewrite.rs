@@ -860,6 +860,16 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 filter: filter.clone(),
             })
         }
+        LogicalPlan::SetOp { left, right, op, all } => {
+            let new_left = rewrite_plan_with(left, r, depth + 1)?;
+            let new_right = rewrite_plan_with(right, r, depth + 1)?;
+            Ok(LogicalPlan::SetOp {
+                left: Box::new(new_left),
+                right: Box::new(new_right),
+                op: *op,
+                all: *all,
+            })
+        }
     }
 }
 

@@ -275,6 +275,12 @@ fn format_logical_into(plan: &LogicalPlan, depth: usize, out: &mut String) {
                 format_logical_into(child, depth + 1, out);
             }
         }
+        LogicalPlan::SetOp { left, right, op, all } => {
+            let all_str = if *all { " all" } else { "" };
+            let _ = writeln!(out, "SetOp: op={}{all_str}", op.keyword());
+            format_logical_into(left, depth + 1, out);
+            format_logical_into(right, depth + 1, out);
+        }
         LogicalPlan::Join {
             left,
             right,
@@ -394,6 +400,12 @@ fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             for child in inputs {
                 format_physical_into(child, depth + 1, out);
             }
+        }
+        PhysicalPlan::SetOp { left, right, op, all } => {
+            let all_str = if *all { " all" } else { "" };
+            let _ = writeln!(out, "SetOp: op={}{all_str}", op.keyword());
+            format_physical_into(left, depth + 1, out);
+            format_physical_into(right, depth + 1, out);
         }
         PhysicalPlan::Project {
             input, exprs, ..

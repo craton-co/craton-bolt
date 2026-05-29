@@ -122,6 +122,12 @@ fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Union { inputs } => LogicalPlan::Union {
             inputs: inputs.into_iter().map(rewrite_plan).collect(),
         },
+        LogicalPlan::SetOp { left, right, op, all } => LogicalPlan::SetOp {
+            left: Box::new(rewrite_plan(*left)),
+            right: Box::new(rewrite_plan(*right)),
+            op,
+            all,
+        },
         LogicalPlan::Join {
             left,
             right,

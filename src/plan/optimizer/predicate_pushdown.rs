@@ -124,6 +124,13 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             on,
             filter,
         },
+        // EXCEPT / INTERSECT: no own predicate to push; recurse into inputs.
+        LogicalPlan::SetOp { left, right, op, all } => LogicalPlan::SetOp {
+            left: Box::new(push_plan(*left)),
+            right: Box::new(push_plan(*right)),
+            op,
+            all,
+        },
     }
 }
 

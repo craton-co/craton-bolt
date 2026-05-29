@@ -326,7 +326,8 @@ fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
                     walk(inp, out);
                 }
             }
-            LogicalPlan::Join { left, right, .. } => {
+            LogicalPlan::Join { left, right, .. }
+            | LogicalPlan::SetOp { left, right, .. } => {
                 walk(left, out);
                 walk(right, out);
             }

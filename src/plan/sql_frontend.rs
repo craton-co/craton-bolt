@@ -20,8 +20,8 @@ use sqlparser::parser::{Parser, ParserError};
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, DataType,
-    Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SortExpr, TimeUnit, UnaryOp,
-    WindowExpr, WindowFunc,
+    Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SetOpKind, SortExpr, TimeUnit,
+    UnaryOp, WindowExpr, WindowFunc,
 };
 use sqlparser::ast::{WindowFrameBound, WindowFrameUnits, WindowType};
 
@@ -1174,7 +1174,9 @@ fn plan_query(
 
 /// Lower a `SetExpr` (SELECT body or UNION/EXCEPT/INTERSECT node) into a
 /// `LogicalPlan`. UNION ALL becomes `Union { inputs }`; plain UNION becomes
-/// `Distinct(Union { inputs })`. EXCEPT/INTERSECT are rejected.
+/// `Distinct(Union { inputs })`; EXCEPT / INTERSECT (with optional ALL) become
+/// a binary `LogicalPlan::SetOp` node (executed host-side by
+/// [`crate::exec::setops`]).
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
 fn lower_set_expr(
@@ -1197,38 +1199,61 @@ fn lower_set_expr(
             left,
             right,
         } => {
-            if *op != SetOperator::Union {
-                return Err(BoltError::Sql(format!(
-                    "unsupported set operator: {op}; only UNION / UNION ALL"
-                )));
-            }
-            // Reject the BY NAME variants (non-standard, schema-rewriting).
-            let dedup = match set_quantifier {
-                SetQuantifier::All => false,
-                SetQuantifier::Distinct | SetQuantifier::None => true,
+            // `BY NAME` variants are non-standard (schema-rewriting) and
+            // rejected for every operator before we branch on the operator.
+            let all = match set_quantifier {
+                SetQuantifier::All => true,
+                SetQuantifier::Distinct | SetQuantifier::None => false,
                 SetQuantifier::ByName
                 | SetQuantifier::AllByName
                 | SetQuantifier::DistinctByName => {
-                    return Err(BoltError::Sql(
-                        "unsupported: UNION BY NAME".into(),
-                    ));
+                    return Err(BoltError::Sql(format!(
+                        "unsupported: {op} BY NAME"
+                    )));
                 }
             };
-            // Flatten left-recursive UNION chains into a single Union node so
-            // `q1 UNION ALL q2 UNION ALL q3` becomes one 3-input Union rather
-            // than a nested binary tree. UNION (dedup) does NOT flatten across
-            // UNION ALL boundaries: their semantics differ.
-            let mut inputs: Vec<LogicalPlan> = Vec::new();
-            collect_union_branches(left, provider, ctes, dedup, &mut inputs, depth + 1)?;
-            collect_union_branches(right, provider, ctes, dedup, &mut inputs, depth + 1)?;
-            let union = LogicalPlan::Union { inputs };
-            Ok(if dedup {
-                LogicalPlan::Distinct {
-                    input: Box::new(union),
+            match op {
+                SetOperator::Union => {
+                    // `dedup` is the inverse of `all`: plain UNION dedups.
+                    let dedup = !all;
+                    // Flatten left-recursive UNION chains into a single Union
+                    // node so `q1 UNION ALL q2 UNION ALL q3` becomes one
+                    // 3-input Union rather than a nested binary tree. UNION
+                    // (dedup) does NOT flatten across UNION ALL boundaries:
+                    // their semantics differ.
+                    let mut inputs: Vec<LogicalPlan> = Vec::new();
+                    collect_union_branches(left, provider, ctes, dedup, &mut inputs, depth + 1)?;
+                    collect_union_branches(right, provider, ctes, dedup, &mut inputs, depth + 1)?;
+                    let union = LogicalPlan::Union { inputs };
+                    Ok(if dedup {
+                        LogicalPlan::Distinct {
+                            input: Box::new(union),
+                        }
+                    } else {
+                        union
+                    })
                 }
-            } else {
-                union
-            })
+                // EXCEPT / INTERSECT (with optional ALL) lower to a binary
+                // `SetOp` node executed host-side by `crate::exec::setops`.
+                // We do NOT flatten chains here — the multiset semantics of
+                // `a EXCEPT b EXCEPT c` are left-associative `(a EXCEPT b)
+                // EXCEPT c`, which the nested-binary shape expresses directly.
+                SetOperator::Except | SetOperator::Intersect => {
+                    let set_op = match op {
+                        SetOperator::Except => SetOpKind::Except,
+                        SetOperator::Intersect => SetOpKind::Intersect,
+                        SetOperator::Union => unreachable!("handled above"),
+                    };
+                    let left_plan = lower_set_expr(left, provider, ctes, depth + 1)?;
+                    let right_plan = lower_set_expr(right, provider, ctes, depth + 1)?;
+                    Ok(LogicalPlan::SetOp {
+                        left: Box::new(left_plan),
+                        right: Box::new(right_plan),
+                        op: set_op,
+                        all,
+                    })
+                }
+            }
         }
         SetExpr::Values(_) => Err(BoltError::Sql("unsupported: VALUES".into())),
         SetExpr::Insert(_) | SetExpr::Update(_) => Err(BoltError::Sql(
@@ -1402,23 +1427,26 @@ fn plan_select(
                 "unsupported: GLOBAL JOIN (ClickHouse extension)".into(),
             ));
         }
-        // Pick out the (join_type, optional ON expr) pair. CROSS JOIN
-        // has no ON clause — sqlparser models it with its own variant.
-        let (join_type, on_expr) = match &join.join_operator {
-            JoinOperator::Inner(c) => (JoinType::Inner, lower_join_constraint(c, "INNER")?),
-            JoinOperator::LeftOuter(c) => (JoinType::LeftOuter, lower_join_constraint(c, "LEFT")?),
-            JoinOperator::RightOuter(c) => {
-                (JoinType::RightOuter, lower_join_constraint(c, "RIGHT")?)
-            }
-            JoinOperator::FullOuter(c) => (JoinType::FullOuter, lower_join_constraint(c, "FULL")?),
-            JoinOperator::CrossJoin => (JoinType::Cross, None),
-            other => {
-                return Err(BoltError::Sql(format!(
-                    "unsupported join kind: {other:?}; \
-                     supported: INNER, LEFT, RIGHT, FULL OUTER, CROSS"
-                )));
-            }
-        };
+        // Pick out the (join_type, join constraint) pair. CROSS JOIN has no
+        // constraint — sqlparser models it with its own variant. We keep the
+        // raw `&JoinConstraint` (rather than eagerly extracting an ON expr) so
+        // the `USING (...)` / `NATURAL` desugaring below can run *after* the
+        // RHS schema is in scope; an ON predicate still routes through
+        // `lower_join_on` exactly as before.
+        let (join_type, constraint): (JoinType, Option<&JoinConstraint>) =
+            match &join.join_operator {
+                JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
+                JoinOperator::LeftOuter(c) => (JoinType::LeftOuter, Some(c)),
+                JoinOperator::RightOuter(c) => (JoinType::RightOuter, Some(c)),
+                JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
+                JoinOperator::CrossJoin => (JoinType::Cross, None),
+                other => {
+                    return Err(BoltError::Sql(format!(
+                        "unsupported join kind: {other:?}; \
+                         supported: INNER, LEFT, RIGHT, FULL OUTER, CROSS"
+                    )));
+                }
+            };
         let (rhs_plan, rhs_qualifier, rhs_schema) =
             lower_table_factor(&join.relation, provider, ctes)?;
         // Extend the resolver before we move `rhs_*` into the right-side
@@ -1426,24 +1454,41 @@ fn plan_select(
         // applies to the actual plan output. The resolver records the
         // *qualifier* (alias if any) so user-typed `t.col` references in
         // WHERE / SELECT / ON resolve against the alias-name the user
-        // wrote, not the underlying table name.
+        // wrote, not the underlying table name. The USING / NATURAL
+        // desugaring below also consults the just-pushed RHS scope.
         resolver.push_join(rhs_qualifier.clone(), &rhs_schema);
         // Keep the qualifier available after the move into `right_plan` so
         // the ON-clause validator can distinguish "right side" (the
         // just-pushed qualifier) from "left side" (any earlier scope).
         let rhs_qualifier_for_on = rhs_qualifier;
         let right_plan = rhs_plan;
-        // CROSS has no ON predicate; everything else does. `lower_join_on`
-        // is reused for the rest so non-equi forms keep a single
-        // rejection path. The validator uses `resolver` + `rhs_table_for_on`
-        // to reject `t1.a = t1.a` style same-side equalities and references
-        // to tables not in scope (see `lower_join_on`).
-        // Splits the ON clause into equi-join pairs (fast path) and an
-        // optional non-equi residual filter (nested-loop path).
-        let (on_pairs, filter) = match on_expr {
-            Some(e) => {
+        // Resolve the join constraint into `(equi_pairs, residual_filter)`:
+        //   * `ON <expr>`        — `lower_join_on` splits equi pairs from a
+        //     non-equi residual (single rejection path for unsupported forms);
+        //   * `USING (c1, ...)`  — each named column is desugared to an
+        //     equi-pair `left.c = right.c` (see `desugar_using_columns`);
+        //   * `NATURAL`          — every column common to both sides becomes
+        //     such an equi-pair (see `desugar_natural_columns`);
+        //   * CROSS / no clause  — no predicate.
+        // USING / NATURAL never produce a residual filter — they are pure
+        // equalities — so the nested-loop path is reserved for ON residuals.
+        let (on_pairs, filter) = match constraint {
+            Some(JoinConstraint::On(e)) => {
                 let lowered = lower_join_on(e, &resolver, &rhs_qualifier_for_on)?;
                 (lowered.equi_pairs, lowered.filter)
+            }
+            Some(JoinConstraint::Using(cols)) => {
+                let pairs = desugar_using_columns(cols, &resolver)?;
+                (pairs, None)
+            }
+            Some(JoinConstraint::Natural) => {
+                let pairs = desugar_natural_columns(&resolver)?;
+                (pairs, None)
+            }
+            Some(JoinConstraint::None) => {
+                return Err(BoltError::Sql(
+                    "JOIN requires an ON, USING, or NATURAL clause".into(),
+                ));
             }
             None => (Vec::new(), None),
         };
@@ -1532,6 +1577,104 @@ fn plan_select(
             SelectItem::QualifiedWildcard(_, _) => {
                 return Err(BoltError::Sql("unsupported: qualified wildcard".into()));
             }
+        }
+    }
+
+    // `COUNT(DISTINCT col)` — the one DISTINCT-quantified aggregate form we
+    // support. It is only handled as the *sole* SELECT item with *no* GROUP BY;
+    // anything richer (multiple SELECT items, a GROUP BY, or DISTINCT on a
+    // non-COUNT aggregate) is rejected with a precise message so the user is
+    // not left guessing. We lower it to
+    //   Aggregate(COUNT(*)) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)
+    // which gives the SQL-standard NULL-excluding distinct count: the
+    // pre-Distinct Filter drops NULL rows, Distinct dedupes the surviving
+    // values (reusing the row-key / NULL canonicalisation in
+    // `crate::exec::distinct`), and COUNT(*) over a single-column projection
+    // tallies them.
+    {
+        // Detect COUNT(DISTINCT ...) anywhere in the SELECT list so we can
+        // either special-case the sole-item form or reject the unsupported
+        // combinations clearly.
+        let mut count_distinct_positions: Vec<usize> = Vec::new();
+        for (i, (sql_expr, _)) in items.iter().enumerate() {
+            if try_count_distinct(sql_expr, &resolver)?.is_some() {
+                count_distinct_positions.push(i);
+            }
+        }
+        if !count_distinct_positions.is_empty() {
+            if items.len() != 1 {
+                return Err(BoltError::Sql(
+                    "COUNT(DISTINCT col) is only supported as the sole SELECT item \
+                     (no other columns or aggregates alongside it)"
+                        .into(),
+                ));
+            }
+            if !group_by_sql.is_empty() {
+                return Err(BoltError::Sql(
+                    "COUNT(DISTINCT col) with GROUP BY is not supported".into(),
+                ));
+            }
+            if select.having.is_some() {
+                return Err(BoltError::Sql(
+                    "COUNT(DISTINCT col) with HAVING is not supported".into(),
+                ));
+            }
+            if matches!(select.distinct, Some(Distinct::Distinct)) {
+                return Err(BoltError::Sql(
+                    "SELECT DISTINCT COUNT(DISTINCT col) is not supported".into(),
+                ));
+            }
+            let (sql_expr, alias) = &items[0];
+            // Safe to unwrap: the position scan above already confirmed this.
+            let inner = try_count_distinct(sql_expr, &resolver)?
+                .expect("count_distinct_positions implies this item matches");
+            let col = lower_expr(inner, &resolver, 0)?;
+            // Type-check the argument against the current plan's schema so a
+            // misnamed column surfaces here, not at execution time.
+            let _ = col.dtype(&plan.schema()?)?;
+
+            // Filter(col IS NOT NULL): exclude NULLs per SQL DISTINCT semantics.
+            let not_null = Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(col.clone()),
+            };
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: not_null,
+            };
+            // Project([col]) — narrow to the single distinct-counted column.
+            plan = LogicalPlan::Project {
+                input: Box::new(plan),
+                exprs: vec![col],
+            };
+            // Distinct — dedupe the surviving non-NULL values.
+            plan = LogicalPlan::Distinct {
+                input: Box::new(plan),
+            };
+            // Aggregate(COUNT(*)) — tally the distinct values. COUNT(*) uses
+            // the literal-1 sentinel mirroring `try_aggregate`'s COUNT(*) path.
+            let aggregates = vec![AggregateExpr::Count(Expr::Literal(Literal::Int64(1)))];
+            let aggregate_plan = LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_by: Vec::new(),
+                aggregates,
+            };
+            // Re-project to honour any SELECT alias on the result column,
+            // matching the post-aggregate Project the ordinary aggregate path
+            // builds (so downstream stages see the user-friendly name).
+            let out_name = aggregate_output_name(&AggregateExpr::Count(Expr::Literal(
+                Literal::Int64(1),
+            )));
+            let col_ref = Expr::Column(out_name);
+            let proj = match alias {
+                Some(a) => col_ref.alias(a.clone()),
+                None => col_ref,
+            };
+            plan = LogicalPlan::Project {
+                input: Box::new(aggregate_plan),
+                exprs: vec![proj],
+            };
+            return Ok(plan);
         }
     }
 
@@ -1920,26 +2063,152 @@ fn lower_table_factor(
     }
 }
 
-/// Pull the ON expression out of a `JoinConstraint` for non-CROSS joins.
-/// USING / NATURAL get explicit rejections; an absent constraint is an
-/// error for INNER/LEFT/RIGHT/FULL (all four require ON). CROSS doesn't
-/// flow through this helper — the caller handles its `None` arm directly.
-fn lower_join_constraint<'a>(
-    c: &'a JoinConstraint,
-    kind: &'static str,
-) -> BoltResult<Option<&'a SqlExpr>> {
-    match c {
-        JoinConstraint::On(e) => Ok(Some(e)),
-        JoinConstraint::Using(_) => Err(BoltError::Sql(format!(
-            "unsupported: {kind} JOIN ... USING; rewrite as ON"
-        ))),
-        JoinConstraint::Natural => Err(BoltError::Sql(format!(
-            "unsupported: NATURAL {kind} JOIN"
-        ))),
-        JoinConstraint::None => Err(BoltError::Sql(format!(
-            "{kind} JOIN requires an ON clause"
-        ))),
+/// Whether a column (by its qualifier-local `original` name) is present on
+/// the *left* side of the current join — i.e. in any of `resolver.tables`
+/// except the last, which is the just-pushed RHS.
+///
+/// SQL-standard case folding (mirrors [`NameResolver::resolve_compound`]): an
+/// exact match is tried first; if the lookup name is all-ASCII-lowercase
+/// (i.e. an unquoted identifier), a case-insensitive fallback is attempted.
+///
+/// * `Ok(true)`  — present in exactly one left table.
+/// * `Ok(false)` — not present on the left side at all.
+/// * `Err(_)`    — present in more than one left table (ambiguous), so a
+///   USING / NATURAL column cannot be unambiguously resolved.
+fn left_join_column_present(
+    resolver: &NameResolver<'_>,
+    col: &str,
+) -> BoltResult<bool> {
+    let col_lc = !col.chars().any(|c| c.is_ascii_uppercase());
+    // All scopes left of the RHS (which is always the last pushed scope).
+    let left_scopes = &resolver.tables[..resolver.tables.len() - 1];
+    let mut hits = 0usize;
+    for scope in left_scopes {
+        let matched = scope
+            .cols
+            .iter()
+            .find(|c| c.original == col)
+            .or_else(|| {
+                if !col_lc {
+                    return None;
+                }
+                scope.cols.iter().find(|c| c.original.eq_ignore_ascii_case(col))
+            });
+        if matched.is_some() {
+            hits += 1;
+        }
     }
+    if hits > 1 {
+        return Err(BoltError::Sql(format!(
+            "JOIN column '{col}' is ambiguous: it appears in more than one \
+             table on the left side of the join"
+        )));
+    }
+    Ok(hits == 1)
+}
+
+/// Whether a column (by `original` name) is present in the RHS scope (the
+/// last pushed table). Same case-folding rule as [`left_join_column_present`].
+fn rhs_join_column_present(resolver: &NameResolver<'_>, col: &str) -> bool {
+    let col_lc = !col.chars().any(|c| c.is_ascii_uppercase());
+    let rhs = resolver
+        .tables
+        .last()
+        .expect("RHS scope was pushed before constraint resolution");
+    rhs.cols
+        .iter()
+        .any(|c| c.original == col || (col_lc && c.original.eq_ignore_ascii_case(col)))
+}
+
+/// Build the equi-pair for a join column shared by both sides.
+///
+/// USING / NATURAL join columns have the *same* name on each side, so the
+/// pair is `(Column(col), Column(col))` — exactly the shape [`lower_join_on`]
+/// produces for an explicit `left.c = right.c` ON clause: a bare (original)
+/// column name on each side. The join executor resolves the left name against
+/// the left input batch and the right name against the (un-renamed) right
+/// input batch (see [`crate::exec::join`]), so the un-renamed original name is
+/// the correct key for both — the `join_combined_schema` rename only applies
+/// to the *output* schema, never to the key lookups.
+fn join_column_equi_pair(col: &str) -> (Expr, Expr) {
+    (Expr::Column(col.to_string()), Expr::Column(col.to_string()))
+}
+
+/// Desugar a `JOIN ... USING (c1, c2, ...)` clause into equi-join pairs.
+///
+/// Each named column must exist on exactly one left table and on the RHS.
+/// Missing, ambiguous, or duplicate USING columns are rejected with a clear
+/// message.
+fn desugar_using_columns(
+    cols: &[Ident],
+    resolver: &NameResolver<'_>,
+) -> BoltResult<Vec<(Expr, Expr)>> {
+    if cols.is_empty() {
+        return Err(BoltError::Sql(
+            "JOIN ... USING (...) requires at least one column".into(),
+        ));
+    }
+    let mut pairs = Vec::with_capacity(cols.len());
+    let mut seen: Vec<String> = Vec::with_capacity(cols.len());
+    for ident in cols {
+        let name = ident_to_name(ident);
+        // A repeated column in the USING list is a user error.
+        if seen.iter().any(|s| s == &name) {
+            return Err(BoltError::Sql(format!(
+                "JOIN ... USING lists column '{name}' more than once"
+            )));
+        }
+        seen.push(name.clone());
+
+        if !left_join_column_present(resolver, &name)? {
+            return Err(BoltError::Sql(format!(
+                "JOIN ... USING column '{name}' is not present on the left side of the join"
+            )));
+        }
+        if !rhs_join_column_present(resolver, &name) {
+            return Err(BoltError::Sql(format!(
+                "JOIN ... USING column '{name}' is not present in the right table"
+            )));
+        }
+        pairs.push(join_column_equi_pair(&name));
+    }
+    Ok(pairs)
+}
+
+/// Desugar a `NATURAL JOIN` into equi-join pairs over every column common to
+/// both sides.
+///
+/// The common set is every RHS column (by `original` name) that also resolves
+/// on the left side. A `NATURAL JOIN` with no common column is rejected (it
+/// would silently degenerate to a CROSS join, which is almost never the
+/// intent), as is one whose common column is ambiguous on the left (surfaced
+/// by [`left_join_column_present`]).
+fn desugar_natural_columns(
+    resolver: &NameResolver<'_>,
+) -> BoltResult<Vec<(Expr, Expr)>> {
+    // Snapshot the RHS column names first so we don't hold a borrow of
+    // `resolver` across the `left_join_column_present` calls below.
+    let rhs_cols: Vec<String> = resolver
+        .tables
+        .last()
+        .expect("RHS scope was pushed before constraint resolution")
+        .cols
+        .iter()
+        .map(|tc| tc.original.clone())
+        .collect();
+    let mut pairs = Vec::new();
+    for col in &rhs_cols {
+        // Match RHS columns against the left side by their original name.
+        if left_join_column_present(resolver, col)? {
+            pairs.push(join_column_equi_pair(col));
+        }
+    }
+    if pairs.is_empty() {
+        return Err(BoltError::Sql(
+            "NATURAL JOIN has no common column between the two sides".into(),
+        ));
+    }
+    Ok(pairs)
 }
 
 /// Which side of the current join an ON-clause column reference belongs to.
@@ -2512,6 +2781,92 @@ fn try_aggregate(
         "STDDEV_SAMP" => AggregateExpr::StddevSamp(Box::new(inner)),
         _ => unreachable!("kind already filtered above"),
     }))
+}
+
+/// Recognise the special `COUNT(DISTINCT <expr>)` SELECT item.
+///
+/// `COUNT(DISTINCT col)` is the one aggregate form where the `DISTINCT`
+/// argument-quantifier is meaningful to us: it counts the number of distinct
+/// *non-NULL* values of `col` (standard SQL — `DISTINCT` inside an aggregate
+/// excludes NULLs just like the bare aggregate does). [`plan_select`] lowers a
+/// sole, GROUP-BY-free `COUNT(DISTINCT col)` to
+/// `Aggregate(COUNT) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)`;
+/// see that call site for the wiring.
+///
+/// Returns:
+///   * `Ok(Some(expr))` — `e` is `COUNT(DISTINCT <expr>)`; `expr` is the
+///     *unlowered* SQL argument (the caller lowers it against the resolver).
+///   * `Ok(None)`        — `e` is not a `COUNT(DISTINCT ...)` call (could be a
+///     plain aggregate, a window, or a scalar expression).
+///   * `Err(_)`          — `e` is a malformed / unsupported `COUNT(DISTINCT)`
+///     shape that must surface a clear message rather than fall through:
+///     `COUNT(DISTINCT *)`, `COUNT(DISTINCT a, b)`, `DISTINCT` on a windowed
+///     `COUNT`, or `DISTINCT` on any aggregate other than `COUNT` (the latter
+///     two are detected here so the error names the exact unsupported form).
+fn try_count_distinct<'a>(
+    e: &'a SqlExpr,
+    _resolver: &NameResolver<'_>,
+) -> BoltResult<Option<&'a SqlExpr>> {
+    let func = match e {
+        SqlExpr::Function(f) => f,
+        _ => return Ok(None),
+    };
+    if func.name.0.len() != 1 {
+        return Ok(None);
+    }
+    let fname = func.name.0[0].value.to_ascii_uppercase();
+    let arg_list = match &func.args {
+        FunctionArguments::List(list) => list,
+        // No argument list at all (`COUNT`/`COUNT()`); not a DISTINCT form.
+        FunctionArguments::None | FunctionArguments::Subquery(_) => return Ok(None),
+    };
+    // Only the `DISTINCT` quantifier concerns us here. `ALL` (or absent)
+    // routes through the ordinary aggregate path.
+    if !matches!(
+        arg_list.duplicate_treatment,
+        Some(sqlparser::ast::DuplicateTreatment::Distinct)
+    ) {
+        return Ok(None);
+    }
+    // From here on we KNOW the user wrote `<AGG>(DISTINCT ...)`. Anything we
+    // can't lower must produce a precise error (rather than `Ok(None)`, which
+    // would let `try_aggregate`'s generic "DISTINCT inside {kind}" rejection
+    // fire and lose the specificity these messages provide).
+
+    // DISTINCT is only supported inside COUNT.
+    if fname != "COUNT" {
+        return Err(BoltError::Sql(format!(
+            "unsupported: DISTINCT inside {fname}; only COUNT(DISTINCT col) is supported"
+        )));
+    }
+    // A windowed `COUNT(DISTINCT col) OVER (...)` is out of scope.
+    if func.over.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: COUNT(DISTINCT ...) OVER (window)".into(),
+        ));
+    }
+    if func.filter.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: FILTER on COUNT(DISTINCT ...)".into(),
+        ));
+    }
+    if arg_list.args.len() != 1 {
+        return Err(BoltError::Sql(format!(
+            "COUNT(DISTINCT ...) expects exactly one argument, got {}",
+            arg_list.args.len()
+        )));
+    }
+    match &arg_list.args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Ok(Some(inner)),
+        // `COUNT(DISTINCT *)` is meaningless (and ambiguous) — reject clearly.
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+        | FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => Err(BoltError::Sql(
+            "COUNT(DISTINCT *) is not supported; use COUNT(DISTINCT <column>)".into(),
+        )),
+        FunctionArg::Named { .. } => Err(BoltError::Sql(
+            "unsupported: named argument to COUNT(DISTINCT ...)".into(),
+        )),
+    }
 }
 
 /// A window function call recognised in a SELECT item: the function plus its

@@ -220,6 +220,24 @@ fn estimate_rows_f64(plan: &LogicalPlan, stats: &dyn StatsProvider) -> Option<f6
             }
             Some(total)
         }
+        LogicalPlan::SetOp { left, right, op, all } => {
+            use crate::plan::logical_plan::SetOpKind;
+            let l = estimate_rows_f64(left, stats)?;
+            let r = estimate_rows_f64(right, stats)?;
+            // Coarse cardinality heuristics for the set operators:
+            //   * EXCEPT       — at most |L|; assume roughly half survive.
+            //   * EXCEPT ALL   — at most |L|; same upper bound, kept as |L|
+            //     since multiplicities are only reduced, not eliminated.
+            //   * INTERSECT(/ALL) — at most min(|L|, |R|).
+            // These are deliberately simple (no per-column NDV modelling);
+            // they only need to be monotone and bounded for the cost model.
+            let est = match (op, all) {
+                (SetOpKind::Except, false) => (l * 0.5).max(1.0),
+                (SetOpKind::Except, true) => l,
+                (SetOpKind::Intersect, _) => l.min(r),
+            };
+            Some(est.max(1.0))
+        }
         LogicalPlan::Join {
             left,
             right,
@@ -474,7 +492,8 @@ fn scan_ndv_for_column(
         LogicalPlan::Union { inputs } => inputs
             .iter()
             .find_map(|b| scan_ndv_for_column(b, column, stats)),
-        LogicalPlan::Join { left, right, .. } => scan_ndv_for_column(left, column, stats)
+        LogicalPlan::Join { left, right, .. }
+        | LogicalPlan::SetOp { left, right, .. } => scan_ndv_for_column(left, column, stats)
             .or_else(|| scan_ndv_for_column(right, column, stats)),
     }
 }

@@ -16,7 +16,7 @@ pub mod subquery;
 
 pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,
-    TimeUnit, UnaryOp, col, lit,
+    SetOpKind, TimeUnit, UnaryOp, col, lit,
 };
 pub use dataframe::{
     DataFrame, GroupedDataFrame, avg, count, max, min, stddev_pop, stddev_samp, sum, var_pop,

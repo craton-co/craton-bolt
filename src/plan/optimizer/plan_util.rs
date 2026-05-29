@@ -88,5 +88,13 @@ where
                 .collect(),
             filter: filter.map(map_expr),
         },
+        // EXCEPT / INTERSECT carry no scalar / aggregate expressions of their
+        // own — just recurse into both inputs.
+        LogicalPlan::SetOp { left, right, op, all } => LogicalPlan::SetOp {
+            left: Box::new(map_plan_exprs(*left, map_expr, map_agg)),
+            right: Box::new(map_plan_exprs(*right, map_expr, map_agg)),
+            op,
+            all,
+        },
     }
 }
