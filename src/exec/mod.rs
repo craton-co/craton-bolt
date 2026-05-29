@@ -43,6 +43,12 @@ pub mod string_length;
 /// length/scan/write kernels in
 /// [`crate::jit::string_kernel`], with a clean host-side fallback.
 pub mod string_project;
+/// Executor for the GPU per-row `LIKE` matcher over variable-width (non-dict)
+/// `Utf8` columns
+/// ([`crate::plan::physical_plan::PhysicalPlan::StringLikeFilter`]). UNVALIDATED
+/// device path — see the module docs; correctness is guaranteed by a host
+/// mirror + a clean host fallback for any unsupported shape / layout.
+pub mod string_like;
 pub mod dict_registry;
 // Pre-lowering pass that resolves uncorrelated scalar / IN subqueries to
 // constants before physical lowering. See the module docs.
