@@ -113,7 +113,7 @@ use crate::jit::valid_flag_kernels::{
 // The host-strip path remains as the correctness fallback for any
 // (op, dtype) outside that coverage.
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
-use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
+use crate::plan::physical_plan::{ColumnIO, PhysicalPlan};
 
 /// Capacity (in rows) of each per-kernel spill buffer used by the
 /// deadlock-hardening path in [`crate::jit::valid_flag_kernels`]. At a

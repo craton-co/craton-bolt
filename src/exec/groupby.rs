@@ -118,7 +118,7 @@ use crate::jit::hash_kernels::{
 use crate::plan::logical_plan::{
     sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema,
 };
-use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
+use crate::plan::physical_plan::{ColumnIO, PhysicalPlan};
 
 /// Empty-slot sentinel; mirrors the literal baked into the keys kernel.
 /// Re-export of [`I64_EMPTY_SENTINEL`] under the legacy local name to keep
