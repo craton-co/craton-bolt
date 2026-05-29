@@ -2007,6 +2007,43 @@ impl Engine {
     /// line is off the latency-critical path for the just-returned
     /// query. Failures (query error, log throttled, no-op observer)
     /// never affect the query result.
+    /// Snapshot the registered tables' row counts into an estimator the
+    /// cost-based optimizer can consume.
+    ///
+    /// Each base table's row count is the sum of its registered `RecordBatch`
+    /// row counts (eager `tables` store) plus any already-materialised
+    /// streaming source. Lazily-registered streaming tables that haven't been
+    /// drained yet are intentionally omitted — costing them would force
+    /// materialisation at plan time. Their absence simply leaves any join chain
+    /// touching them un-reordered (the conservative default).
+    ///
+    /// The result is an owned `Arc<dyn RowEstimator>` (a
+    /// [`crate::plan::optimizer::StatsEstimator`] over an [`EngineTableStats`]
+    /// snapshot) ready to hand to
+    /// [`crate::plan::default_passes_with_estimator`].
+    fn row_estimator(&self) -> Arc<dyn crate::plan::RowEstimator> {
+        let mut row_counts: HashMap<String, usize> = HashMap::new();
+        for (name, batches) in &self.tables {
+            let rows = batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .fold(0usize, |a, n| a.saturating_add(n));
+            row_counts.insert(name.clone(), rows);
+        }
+        // Fold in any streaming sources that have already been materialised
+        // (a still-streaming source is skipped — see the method docs).
+        for (name, src) in self.streaming_sources.borrow().iter() {
+            if let crate::exec::streaming::TableSource::Materialized(batches) = src {
+                let rows = batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .fold(0usize, |a, n| a.saturating_add(n));
+                row_counts.entry(name.clone()).or_insert(rows);
+            }
+        }
+        Arc::new(crate::plan::StatsEstimator::new(EngineTableStats { row_counts }))
+    }
+
     pub fn sql(&self, query: &str) -> BoltResult<QueryHandle> {
         // **Stage 6 (M3L5)** — retry the pool-watcher's context capture.
         // If the watcher spawned before any engine thread had a context
@@ -2025,8 +2062,12 @@ impl Engine {
         // Built-in logical optimizer: run the default pass pipeline
         // (constant folding, predicate pushdown, filter-into-join, join
         // reorder, projection pruning) BEFORE any user-registered rewrites.
-        // See `crate::plan::optimizer` for the pipeline and ordering.
-        let plan = crate::plan::default_passes()
+        // The join-reorder pass is driven by a statistics-backed row
+        // estimator snapshotted from the registered tables, so left-deep
+        // INNER chains are reordered smallest-input-first (it stays a no-op
+        // for chains whose leaves the snapshot can't cost). See
+        // `crate::plan::optimizer` for the pipeline and ordering.
+        let plan = crate::plan::default_passes_with_estimator(self.row_estimator())
             .iter()
             .try_fold(plan, |p, r| r.rewrite(p))?;
         // v0.6 / M7: run user-registered PlanRewrite implementations in
@@ -2122,8 +2163,9 @@ impl Engine {
         let plan = self.dict_registry.rewrite_plan(plan)?;
         // Built-in logical optimizer: mirror the `sql()` path so a plan built
         // via the DataFrame builder gets the same default optimizations before
-        // lowering. See `crate::plan::optimizer`.
-        let plan = crate::plan::default_passes()
+        // lowering — including statistics-driven join reordering. See
+        // `crate::plan::optimizer`.
+        let plan = crate::plan::default_passes_with_estimator(self.row_estimator())
             .iter()
             .try_fold(plan, |p, r| r.rewrite(p))?;
         let mut phys = crate::plan::lower_physical(&plan)?;
@@ -3554,6 +3596,42 @@ impl<'a> crate::plan::TableProvider for EngineProvider<'a> {
             total = total.saturating_add(batch.column(col_idx).null_count());
         }
         Some(total)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cost-based optimizer wiring: a `StatsProvider` backed by the engine's
+// registered tables.
+//
+// The join-reorder pass (`crate::plan::optimizer::join_reorder`) is a no-op
+// until it is handed a row estimator. We feed it one built from real data:
+// each base table's `row_count` is the sum of its registered `RecordBatch`
+// row counts. The engine takes a cheap *snapshot* of those counts at plan
+// time (a `HashMap<String, usize>`), wraps it in `StatsEstimator`, and threads
+// it into the default pass pipeline via `default_passes_with_estimator`.
+// ---------------------------------------------------------------------------
+
+/// Owned snapshot of base-table row counts used to drive cost-based join
+/// reordering.
+///
+/// Built once per query in [`Engine::table_stats_snapshot`] from the engine's
+/// registered tables. Owning the counts (rather than borrowing the engine)
+/// makes this `Send + Sync + 'static`, so it can live behind the
+/// `Arc<dyn RowEstimator>` the [`crate::plan::optimizer::JoinReorder`] pass
+/// holds. A table absent from the snapshot has no entry and the estimator
+/// returns `None` for it — which keeps reordering conservative (the pass only
+/// fires when *every* leaf in a chain is costed).
+#[derive(Debug, Default)]
+struct EngineTableStats {
+    /// Table name → total registered row count.
+    row_counts: HashMap<String, usize>,
+}
+
+impl crate::plan::statistics::StatsProvider for EngineTableStats {
+    fn table_stats(&self, name: &str) -> Option<crate::plan::statistics::TableStats> {
+        self.row_counts
+            .get(name)
+            .map(|&n| crate::plan::statistics::TableStats::new(n))
     }
 }
 
