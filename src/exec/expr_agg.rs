@@ -350,6 +350,20 @@ fn eval_inner(
              the physical-plan boundary rejects it before lowering",
             kind.sql_name()
         ))),
+        // v0.7 date-scalar-fns: EXTRACT / DATE_TRUNC have a standalone GPU
+        // codegen module but no host evaluator yet. The physical-plan boundary
+        // rejects them before execution; reaching here means a future caller
+        // built a Filter / Project around one without going through `lower()`.
+        Expr::Extract { field, .. } => Err(BoltError::Plan(format!(
+            "expr_agg: EXTRACT({} FROM ...) is not yet evaluated host-side; \
+             coming in a follow-up",
+            field.sql_name()
+        ))),
+        Expr::DateTrunc { unit, .. } => Err(BoltError::Plan(format!(
+            "expr_agg: DATE_TRUNC('{}', ...) is not yet evaluated host-side; \
+             coming in a follow-up",
+            unit.sql_name()
+        ))),
     }
 }
 

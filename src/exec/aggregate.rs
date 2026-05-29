@@ -240,24 +240,15 @@ fn build_one_aggregate(
             let op = ReduceOp::from_agg(agg)?;
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
-            // v0.7 SUM(Decimal128) host fallback: a wide-128-bit accumulator
-            // requires either two-pass atomicCAS on 16-byte slots or a custom
-            // multi-word reduction — both are follow-up optimisations. For
-            // v0.7 we route SUM(Decimal128) through a host-side fold over the
-            // already-decoded `Decimal128Array` values, mirroring the
-            // (very similar) i64 host-strip fold below.
-            //
-            // MIN/MAX(Decimal128) are likewise routed host-side: the GPU
-            // reduction kernels only know 32/64-bit primitives, and the
-            // raw i128 ordering equals decimal ordering (scale is uniform
-            // per column), so a host fold over the decoded `Decimal128Array`
-            // gives the correct result without a 128-bit kernel. Without
-            // these arms MIN/MAX(Decimal128) would fall through to
-            // `reduce_column_from_batch`, which rejects Decimal128.
+            // Decimal128: SUM via the dedicated i128 GPU block-reduce kernel
+            // (`decimal_sum_from_batch`; host-fold fallback inside it). MIN/MAX
+            // via the host fold over the decoded `Decimal128Array` (raw i128
+            // ordering == decimal ordering at the column's uniform scale).
             if let DataType::Decimal128(p, s) = col_io.dtype {
                 match op {
                     ReduceOp::Sum => {
-                        return sum_decimal128_from_batch(col_io, table_batch, p, s, out_field);
+                        let scalar = decimal_sum_from_batch(col_io, table_batch, n_rows)?;
+                        return scalar_to_array(scalar, out_field.dtype);
                     }
                     ReduceOp::Min | ReduceOp::Max => {
                         return minmax_decimal128_from_batch(
@@ -1114,6 +1105,152 @@ where
     Ok((total_sum, total_count))
 }
 
+/// Compute `SUM(Decimal128)` over an aggregate input column.
+///
+/// `Decimal128` is a fixed-width `i128`, so the sum is a 128-bit integer
+/// reduction. We dispatch to the dedicated GPU block-reduce kernel
+/// (`crate::jit::decimal_agg`) which carries the accumulator as hi/lo `u64`
+/// halves with a carry-chain add and writes one `i128` partial per block; the
+/// host folds the partials. The GPU path is **reachable-but-skippable**: if it
+/// declines (today: a degenerate zero-row input or a non-Decimal column), the
+/// caller still gets a correct result via the host fold in
+/// [`decimal_sum_host`].
+///
+/// NULL handling mirrors `reduce_column_from_batch`: NULL rows are stripped on
+/// the host before upload so the kernel never sees garbage at masked positions.
+/// The returned [`Scalar::Decimal128`] carries the column's `(precision,
+/// scale)` so the caller can build a correctly-typed output array.
+fn decimal_sum_from_batch(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+    n_rows: usize,
+) -> BoltResult<Scalar> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "aggregate input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+
+    let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
+    if arr_dtype != col_io.dtype {
+        return Err(BoltError::Type(format!(
+            "aggregate input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
+            col_io.name, col_io.dtype, arr_dtype
+        )));
+    }
+    let (precision, scale) = match col_io.dtype {
+        DataType::Decimal128(p, s) => (p, s),
+        other => {
+            return Err(BoltError::Type(format!(
+                "decimal_sum_from_batch called on non-Decimal column '{}' (dtype {:?})",
+                col_io.name, other
+            )))
+        }
+    };
+
+    let da = arr
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| downcast_err(&col_io.name, "Decimal128"))?;
+
+    // Strip NULLs into a dense host Vec<i128>. SUM ignores NULL inputs; the
+    // dense buffer is also exactly what both the GPU upload and the host
+    // fallback consume.
+    let mut host: Vec<i128> = Vec::with_capacity(da.len() - da.null_count());
+    for i in 0..da.len() {
+        if !da.is_null(i) {
+            host.push(da.value(i));
+        }
+    }
+
+    let total = match decimal_sum_gpu(&host)? {
+        Some(v) => v,
+        // GPU path declined (e.g. empty input) — fold on the host. Correct and
+        // cheap; this is the documented graceful fallback.
+        None => decimal_sum_host(&host),
+    };
+    let _ = n_rows; // n_rows is the pre-strip row count; we sum the survivors.
+    Ok(Scalar::Decimal128(total, precision, scale))
+}
+
+/// Host-side `i128` fold. Wrapping add matches the kernel's modular 128-bit
+/// carry-chain arithmetic, so the GPU and host paths agree bit-for-bit even on
+/// an overflowing sum (SQL leaves decimal overflow semantics to the caller).
+fn decimal_sum_host(host: &[i128]) -> i128 {
+    host.iter().copied().fold(0i128, i128::wrapping_add)
+}
+
+/// Launch the Decimal128 SUM block-reduce kernel over `host` and fold the
+/// per-block `i128` partials. Returns `Ok(None)` when the GPU path declines
+/// (empty input — nothing to launch), in which case the caller folds on the
+/// host. Any hard GPU error propagates as `Err`.
+fn decimal_sum_gpu(host: &[i128]) -> BoltResult<Option<i128>> {
+    use crate::jit::decimal_agg::{compile_decimal_sum_kernel, DECIMAL_SUM_KERNEL_ENTRY};
+
+    // Empty input: skip the launch + PTX compile entirely and let the caller
+    // take the trivial host fold (sum of nothing == 0).
+    if host.is_empty() {
+        return Ok(None);
+    }
+
+    let stream = CudaStream::null_or_default();
+    let dev = upload_primitive_values_async::<i128>(host, &stream)?;
+
+    let block = BLOCK_SIZE;
+    let mut n_rows_u32: u32 = n_rows_to_u32(host.len())?;
+    let grid_x = grid_x_for(n_rows_u32, block);
+
+    // One i128 partial per block.
+    let partials = GpuVec::<i128>::zeros_async(grid_x as usize, stream.raw())?;
+
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "decimal_sum_reduce".to_string(),
+        None,
+        compile_decimal_sum_kernel,
+    )?;
+    let function = module.function(DECIMAL_SUM_KERNEL_ENTRY)?;
+
+    let mut input_ptr: CUdeviceptr = dev.device_ptr();
+    let mut output_ptr: CUdeviceptr = partials.device_ptr();
+    let mut kernel_params: [*mut c_void; 3] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut output_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+    ];
+
+    // SAFETY: `function` is borrowed from a live module; every param points at
+    // a stack local that outlives the synchronize below.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    let _ = input_ptr;
+    let _ = output_ptr;
+
+    let pinned = partials.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_partials: Vec<i128> = pinned.as_slice().to_vec();
+    drop(pinned);
+    drop(partials);
+    drop(dev);
+
+    Ok(Some(decimal_sum_host(&host_partials)))
+}
+
 /// Build a Welford `(count, mean, M2)` state by folding the non-NULL values
 /// of `col_io` from `batch` in source order. Used by the scalar
 /// `STDDEV_POP` / `STDDEV_SAMP` aggregates; the host-side fold is
@@ -1681,6 +1818,12 @@ enum Scalar {
     I64(i64),
     F32(f32),
     F64(f64),
+    /// `SUM(Decimal128)` accumulator: the raw `i128` plus the output column's
+    /// `(precision, scale)` so `scalar_to_array` can build a `Decimal128Array`
+    /// with the correct dtype. The sum of a decimal column keeps the input
+    /// scale (SQL widens precision, never scale) — the caller passes the
+    /// declared output precision/scale through `out_field.dtype`.
+    Decimal128(i128, u8, i8),
 }
 
 /// Per-`T` helpers for the GPU reduction path.
@@ -1838,6 +1981,25 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
             Ok(Arc::new(Float64Array::from(vec![v as f64])) as ArrayRef)
         }
 
+        // Decimal128 SUM: pack the raw i128 into a one-element Decimal128Array
+        // carrying the declared output precision/scale. We tag the array with
+        // the OUTPUT field's (p, s) (via `with_precision_and_scale`) so the
+        // result column round-trips to Arrow's `Decimal128(p, s)` type. The
+        // scale of the accumulated value already matches the input scale (a
+        // plain integer sum doesn't shift the decimal point); SQL's SUM widens
+        // precision only, so the carried-through `s` is correct.
+        (Scalar::Decimal128(v, _ps, _ss), DataType::Decimal128(p, s)) => {
+            let arr = Decimal128Array::from(vec![v])
+                .with_precision_and_scale(p, s)
+                .map_err(|e| {
+                    BoltError::Type(format!(
+                        "aggregate: SUM(Decimal128) output precision/scale {:?} invalid: {e}",
+                        (p, s)
+                    ))
+                })?;
+            Ok(Arc::new(arr) as ArrayRef)
+        }
+
         (s, dt) => Err(BoltError::Type(format!(
             "aggregate: cannot pack scalar {:?} into output dtype {:?}",
             s, dt
@@ -1989,6 +2151,68 @@ mod tests {
             dtype: DataType::Int64,
         };
         assert_eq!(non_null_count_for_input(&col_io, &batch).unwrap(), 0);
+    }
+
+    /// `decimal_sum_host` folds an `i128` slice with wrapping add — the same
+    /// modular arithmetic the GPU carry-chain kernel performs, so the two
+    /// paths agree even across the 2^64 boundary.
+    #[test]
+    fn decimal_sum_host_folds_i128() {
+        assert_eq!(decimal_sum_host(&[]), 0);
+        assert_eq!(decimal_sum_host(&[1, 2, 3]), 6);
+        // Values that individually fit in 64 bits but whose sum crosses 2^64,
+        // exercising the carry path the kernel emits (`add.cc`/`addc`).
+        let big = u64::MAX as i128; // 2^64 - 1
+        assert_eq!(decimal_sum_host(&[big, big, big]), big * 3);
+        // Negative + positive decimal raw values.
+        assert_eq!(decimal_sum_host(&[-5, 10, -2]), 3);
+    }
+
+    /// `decimal_sum_from_batch` strips NULL rows and returns the surviving
+    /// sum tagged with the column's precision/scale. Runs the GPU path when a
+    /// device is present and the host fold otherwise — either way the
+    /// `Scalar::Decimal128` payload must carry the dense sum and (p, s).
+    /// Gated on a real GPU because `decimal_sum_gpu` launches a kernel.
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn decimal_sum_from_batch_strips_nulls() {
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(100i128), None, Some(250), None, Some(50)])
+                .with_precision_and_scale(20, 2)
+                .unwrap(),
+        );
+        let batch = batch_one("d", arr);
+        let col_io = ColumnIO {
+            name: "d".to_string(),
+            dtype: DataType::Decimal128(20, 2),
+        };
+        let scalar = decimal_sum_from_batch(&col_io, &batch, 5).expect("decimal sum ok");
+        match scalar {
+            Scalar::Decimal128(v, p, s) => {
+                assert_eq!(v, 400);
+                assert_eq!((p, s), (20, 2));
+            }
+            other => panic!("expected Scalar::Decimal128, got {other:?}"),
+        }
+    }
+
+    /// `scalar_to_array` packs a `Scalar::Decimal128` into a one-row
+    /// `Decimal128Array` carrying the declared output precision/scale.
+    #[test]
+    fn scalar_to_array_packs_decimal128() {
+        let arr = scalar_to_array(
+            Scalar::Decimal128(12345, 20, 2),
+            DataType::Decimal128(20, 2),
+        )
+        .expect("pack ok");
+        let da = arr
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Decimal128Array");
+        assert_eq!(da.len(), 1);
+        assert_eq!(da.value(0), 12345);
+        assert_eq!(da.precision(), 20);
+        assert_eq!(da.scale(), 2);
     }
 
     #[test]

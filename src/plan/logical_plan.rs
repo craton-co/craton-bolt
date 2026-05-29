@@ -439,6 +439,99 @@ impl ScalarFnKind {
     }
 }
 
+/// Calendar field selectable by SQL `EXTRACT(field FROM ts)`.
+///
+/// **v0.7 / date-scalar-fns**: a focused subset that lowers to pure integer
+/// arithmetic on the underlying fixed-width storage (`Date32` = days since the
+/// Unix epoch as `i32`; `Timestamp` = `i64` ticks since the epoch). The fields
+/// that need a full proleptic-Gregorian civil-date decomposition (`YEAR`,
+/// `MONTH`, `DAY`, `DAYOFWEEK`) share the day-count → civil-date algorithm
+/// (Howard Hinnant's `civil_from_days`), while the intra-day fields (`HOUR`,
+/// `MINUTE`, `SECOND`) are plain modular arithmetic on the tick count and are
+/// only defined for `Timestamp` inputs.
+///
+/// The numeric result is always `Int64` (matching the SQL standard, which
+/// returns an exact numeric for `EXTRACT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DateField {
+    /// Calendar year (e.g. 2026). Defined for `Date32` and `Timestamp`.
+    Year,
+    /// Month of year, 1..=12. Defined for `Date32` and `Timestamp`.
+    Month,
+    /// Day of month, 1..=31. Defined for `Date32` and `Timestamp`.
+    Day,
+    /// Hour of day, 0..=23. `Timestamp` only.
+    Hour,
+    /// Minute of hour, 0..=59. `Timestamp` only.
+    Minute,
+    /// Second of minute, 0..=59. `Timestamp` only.
+    Second,
+}
+
+impl DateField {
+    /// Canonical SQL spelling for error messages.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            DateField::Year => "YEAR",
+            DateField::Month => "MONTH",
+            DateField::Day => "DAY",
+            DateField::Hour => "HOUR",
+            DateField::Minute => "MINUTE",
+            DateField::Second => "SECOND",
+        }
+    }
+
+    /// True for the intra-day fields that are only meaningful on a `Timestamp`
+    /// (a bare `Date32` has no time-of-day component).
+    pub fn is_intraday(self) -> bool {
+        matches!(self, DateField::Hour | DateField::Minute | DateField::Second)
+    }
+}
+
+/// Granularity selectable by SQL `DATE_TRUNC(unit, ts)`.
+///
+/// **v0.7 / date-scalar-fns**: `DATE_TRUNC` rounds a temporal value *down* to
+/// the start of the given unit, preserving the input dtype (`Date32` →
+/// `Date32`, `Timestamp` → `Timestamp` at the same `TimeUnit`/timezone). The
+/// sub-day units (`Hour`, `Minute`, `Second`) are only defined on `Timestamp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DateTruncUnit {
+    /// Truncate to Jan 1 of the year.
+    Year,
+    /// Truncate to the first day of the month.
+    Month,
+    /// Truncate to midnight of the day.
+    Day,
+    /// Truncate to the top of the hour. `Timestamp` only.
+    Hour,
+    /// Truncate to the top of the minute. `Timestamp` only.
+    Minute,
+    /// Truncate to the whole second. `Timestamp` only.
+    Second,
+}
+
+impl DateTruncUnit {
+    /// Canonical SQL spelling for error messages.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            DateTruncUnit::Year => "year",
+            DateTruncUnit::Month => "month",
+            DateTruncUnit::Day => "day",
+            DateTruncUnit::Hour => "hour",
+            DateTruncUnit::Minute => "minute",
+            DateTruncUnit::Second => "second",
+        }
+    }
+
+    /// True for the sub-day units only valid on a `Timestamp` input.
+    pub fn is_intraday(self) -> bool {
+        matches!(
+            self,
+            DateTruncUnit::Hour | DateTruncUnit::Minute | DateTruncUnit::Second
+        )
+    }
+}
+
 /// Scalar expression tree.
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -519,6 +612,32 @@ pub enum Expr {
         kind: ScalarFnKind,
         /// Arguments, evaluated left-to-right.
         args: Vec<Expr>,
+    },
+    /// SQL `EXTRACT(field FROM ts)` — pull a calendar/clock field out of a
+    /// `Date32` or `Timestamp` value as an `Int64`.
+    ///
+    /// **v0.7 / date-scalar-fns**: lowered to integer arithmetic on the
+    /// underlying fixed-width storage. See [`DateField`] for the per-field
+    /// dtype rules (intra-day fields require a `Timestamp` operand). The GPU
+    /// codegen lives in [`crate::jit::date_scalar`].
+    Extract {
+        /// Which calendar/clock field to extract.
+        field: DateField,
+        /// Operand expression; must type-check to `Date32` or `Timestamp`.
+        expr: Box<Expr>,
+    },
+    /// SQL `DATE_TRUNC(unit, ts)` — round a temporal value down to the start
+    /// of `unit`, preserving the operand's dtype.
+    ///
+    /// **v0.7 / date-scalar-fns**: lowered to integer arithmetic on the
+    /// underlying fixed-width storage. See [`DateTruncUnit`] for the per-unit
+    /// dtype rules (sub-day units require a `Timestamp` operand). The GPU
+    /// codegen lives in [`crate::jit::date_scalar`].
+    DateTrunc {
+        /// Truncation granularity.
+        unit: DateTruncUnit,
+        /// Operand expression; must type-check to `Date32` or `Timestamp`.
+        expr: Box<Expr>,
     },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
@@ -851,6 +970,14 @@ impl Expr {
                 Ok(*target)
             }
             Expr::ScalarFn { kind, args } => scalar_fn_dtype(*kind, args, schema, depth + 1),
+            Expr::Extract { field, expr } => {
+                let src = expr.dtype_depth(schema, depth + 1)?;
+                extract_output_dtype(*field, src)
+            }
+            Expr::DateTrunc { unit, expr } => {
+                let src = expr.dtype_depth(schema, depth + 1)?;
+                date_trunc_output_dtype(*unit, src)
+            }
             Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
         }
     }
@@ -882,6 +1009,59 @@ fn unify_case_dtypes(a: DataType, b: DataType) -> Option<DataType> {
         unify_numeric(a, b).ok()
     } else {
         None
+    }
+}
+
+/// Type-check `EXTRACT(field FROM src)` and return its output dtype.
+///
+/// Every `EXTRACT` produces `Int64` (an exact numeric per the SQL standard).
+/// The operand must be `Date32` or `Timestamp`; intra-day fields (`HOUR` /
+/// `MINUTE` / `SECOND`) additionally require a `Timestamp` because a bare
+/// `Date32` has no time-of-day component.
+pub fn extract_output_dtype(field: DateField, src: DataType) -> BoltResult<DataType> {
+    match src {
+        DataType::Date32 => {
+            if field.is_intraday() {
+                return Err(BoltError::Type(format!(
+                    "EXTRACT({} FROM <Date32>) is undefined — a Date32 has no \
+                     time-of-day component; cast to Timestamp first",
+                    field.sql_name()
+                )));
+            }
+            Ok(DataType::Int64)
+        }
+        DataType::Timestamp(_, _) => Ok(DataType::Int64),
+        other => Err(BoltError::Type(format!(
+            "EXTRACT({} FROM ...) requires a Date32 or Timestamp operand, got {:?}",
+            field.sql_name(),
+            other
+        ))),
+    }
+}
+
+/// Type-check `DATE_TRUNC(unit, src)` and return its output dtype.
+///
+/// `DATE_TRUNC` preserves the operand dtype (`Date32` → `Date32`, `Timestamp`
+/// → the same `Timestamp` type). Sub-day units (`hour` / `minute` / `second`)
+/// require a `Timestamp` operand.
+pub fn date_trunc_output_dtype(unit: DateTruncUnit, src: DataType) -> BoltResult<DataType> {
+    match src {
+        DataType::Date32 => {
+            if unit.is_intraday() {
+                return Err(BoltError::Type(format!(
+                    "DATE_TRUNC('{}', <Date32>) is undefined — a Date32 has no \
+                     sub-day component; cast to Timestamp first",
+                    unit.sql_name()
+                )));
+            }
+            Ok(DataType::Date32)
+        }
+        DataType::Timestamp(tu, tz) => Ok(DataType::Timestamp(tu, tz)),
+        other => Err(BoltError::Type(format!(
+            "DATE_TRUNC('{}', ...) requires a Date32 or Timestamp operand, got {:?}",
+            unit.sql_name(),
+            other
+        ))),
     }
 }
 
@@ -1941,6 +2121,108 @@ mod scalar_fn_typecheck_tests {
             args: vec![Expr::Column("n".into())],
         };
         assert!(e.dtype(&schema).is_err());
+    }
+}
+
+#[cfg(test)]
+mod date_scalar_typecheck_tests {
+    //! Type-check coverage for `Expr::Extract` / `Expr::DateTrunc` at the
+    //! logical-plan layer. The GPU codegen lives in
+    //! `crate::jit::date_scalar` and has its own PTX-assertion tests; here we
+    //! pin the per-(field/unit, operand-dtype) dtype rules.
+    use super::*;
+
+    fn dt_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("d", DataType::Date32, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new("n", DataType::Int32, false),
+        ])
+    }
+
+    #[test]
+    fn extract_calendar_field_is_int64() {
+        let schema = dt_schema();
+        for (col, field) in [
+            ("d", DateField::Year),
+            ("d", DateField::Month),
+            ("d", DateField::Day),
+            ("ts", DateField::Year),
+            ("ts", DateField::Hour),
+            ("ts", DateField::Second),
+        ] {
+            let e = Expr::Extract {
+                field,
+                expr: Box::new(Expr::Column(col.into())),
+            };
+            assert_eq!(e.dtype(&schema).unwrap(), DataType::Int64);
+        }
+    }
+
+    #[test]
+    fn extract_intraday_from_date32_rejected() {
+        let schema = dt_schema();
+        for field in [DateField::Hour, DateField::Minute, DateField::Second] {
+            let e = Expr::Extract {
+                field,
+                expr: Box::new(Expr::Column("d".into())),
+            };
+            assert!(
+                e.dtype(&schema).is_err(),
+                "EXTRACT({:?} FROM Date32) must be a type error",
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn extract_from_non_temporal_rejected() {
+        let schema = dt_schema();
+        let e = Expr::Extract {
+            field: DateField::Year,
+            expr: Box::new(Expr::Column("n".into())),
+        };
+        assert!(e.dtype(&schema).is_err());
+    }
+
+    #[test]
+    fn date_trunc_preserves_operand_dtype() {
+        let schema = dt_schema();
+        // Date32 → Date32 for calendar units.
+        let e = Expr::DateTrunc {
+            unit: DateTruncUnit::Month,
+            expr: Box::new(Expr::Column("d".into())),
+        };
+        assert_eq!(e.dtype(&schema).unwrap(), DataType::Date32);
+        // Timestamp → same Timestamp type.
+        let e = Expr::DateTrunc {
+            unit: DateTruncUnit::Hour,
+            expr: Box::new(Expr::Column("ts".into())),
+        };
+        assert_eq!(
+            e.dtype(&schema).unwrap(),
+            DataType::Timestamp(TimeUnit::Second, None)
+        );
+    }
+
+    #[test]
+    fn date_trunc_subday_on_date32_rejected() {
+        let schema = dt_schema();
+        for unit in [
+            DateTruncUnit::Hour,
+            DateTruncUnit::Minute,
+            DateTruncUnit::Second,
+        ] {
+            let e = Expr::DateTrunc {
+                unit,
+                expr: Box::new(Expr::Column("d".into())),
+            };
+            assert!(
+                e.dtype(&schema).is_err(),
+                "DATE_TRUNC({:?}, Date32) must be a type error",
+                unit
+            );
+        }
     }
 }
 

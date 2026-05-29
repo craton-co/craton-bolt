@@ -510,6 +510,23 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 args: new_args,
             })
         }
+        Expr::Extract { field, expr: inner } => {
+            // EXTRACT operates on a Date32 / Timestamp operand — never a
+            // registered Utf8 column — so there is nothing for the dictionary
+            // rewriter to fold here. Recurse for structural consistency.
+            let new_inner = rewrite_expr_with(inner, r, depth + 1)?;
+            Ok(Expr::Extract {
+                field: *field,
+                expr: Box::new(new_inner),
+            })
+        }
+        Expr::DateTrunc { unit, expr: inner } => {
+            let new_inner = rewrite_expr_with(inner, r, depth + 1)?;
+            Ok(Expr::DateTrunc {
+                unit: *unit,
+                expr: Box::new(new_inner),
+            })
+        }
     }
 }
 
