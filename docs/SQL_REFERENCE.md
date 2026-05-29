@@ -223,7 +223,7 @@ SELECT <select_list>
 
 Supported:
 
-- Exactly one `INNER JOIN` per `SELECT` (chaining a second `INNER JOIN` is rejected — the frontend builds at most one `Join` node and complains on a second).
+- Multiple joins per `SELECT` are supported: the frontend folds each `JOIN` in FROM order into a left-deep chain of `Join` nodes (see `sql_frontend.rs`, the `for join in &twj.joins` loop). Note: joins execute in written order — there is no cost-based join reordering yet (a conservative reorder pass exists but is a no-op until table statistics are wired in).
 - `ON` predicate must be a conjunction (`AND` only) of `<col> = <col>` equalities. Either side may be a bare or qualified column reference (`t1.a = t2.a` or `a = a`); only the trailing column name survives lowering and the executor matches it against each side's schema.
 - The executor runs on the GPU hash-join path (`src/exec/gpu_join.rs`): build a hash table on the smaller input on-device, probe the larger, then materialise matches via `arrow::compute::take` on the host. Multi-key joins build a tuple key. Equi-join key dtypes must match on both sides; cross-dtype keys are rejected.
 - `NULL` keys never match (`NULL = NULL → UNKNOWN`, per SQL).
