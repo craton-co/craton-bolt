@@ -41,6 +41,7 @@ use std::sync::Arc;
 use crate::error::BoltResult;
 use crate::plan::logical_plan::{Expr, JoinType, LogicalPlan};
 use crate::plan::rewrite::PlanRewrite;
+use crate::plan::statistics::{estimate_rows, StatsProvider};
 
 use super::expr_util::collect_columns;
 
@@ -64,6 +65,44 @@ pub struct NoStats;
 impl RowEstimator for NoStats {
     fn estimate(&self, _plan: &LogicalPlan) -> Option<u64> {
         None
+    }
+}
+
+/// Cost-based [`RowEstimator`] bridging the join-reorder pass to the
+/// standalone cardinality model in [`crate::plan::statistics`].
+///
+/// This is the adapter that makes join reordering *actually* cost-based: it
+/// owns a [`StatsProvider`] (base-table statistics) and answers
+/// [`RowEstimator::estimate`] by running
+/// [`estimate_rows`](crate::plan::statistics::estimate_rows) over the leaf
+/// plan. The two modules are otherwise decoupled — `statistics.rs` knows
+/// nothing about the optimizer's `RowEstimator` trait, and the optimizer knows
+/// nothing about how statistics are sourced — so this newtype is the single
+/// seam that joins them.
+///
+/// The provider is owned (not borrowed) so the estimator can live behind the
+/// `Arc<dyn RowEstimator>` the pass holds, which outlives any single rewrite.
+/// `estimate_rows` returns a `usize` clamped to `>= 1`; we widen it to the
+/// `u64` the trait speaks. A leaf whose base table has no stats entry yields
+/// `None`, which (per the pass contract) disables reordering for that whole
+/// chain — exactly the conservative fallback we want.
+pub struct StatsEstimator<P: StatsProvider + Send + Sync> {
+    provider: P,
+}
+
+impl<P: StatsProvider + Send + Sync> StatsEstimator<P> {
+    /// Construct an estimator backed by `provider`.
+    pub fn new(provider: P) -> Self {
+        Self { provider }
+    }
+}
+
+impl<P: StatsProvider + Send + Sync> RowEstimator for StatsEstimator<P> {
+    fn estimate(&self, plan: &LogicalPlan) -> Option<u64> {
+        // `estimate_rows` clamps its result into `[1, usize::MAX]`, so the
+        // `as u64` cast is lossless on 64-bit targets and saturating-by-clamp
+        // on 32-bit ones (a row count above `u64::MAX` is unreachable anyway).
+        estimate_rows(plan, &self.provider).map(|rows| rows as u64)
     }
 }
 
@@ -430,6 +469,110 @@ mod tests {
             }
             other => panic!("expected left-deep join tree, got {other:?}"),
         }
+    }
+
+    // ----- StatsEstimator bridge tests -------------------------------------
+    //
+    // These exercise the cost-based path end-to-end: a `StatsProvider` of
+    // base-table row counts, bridged through `StatsEstimator` into the pass.
+
+    use crate::plan::statistics::{StatsProvider, TableStats};
+
+    /// In-memory `StatsProvider` keyed by table name → row count.
+    #[derive(Default)]
+    struct MockStats(std::collections::HashMap<String, usize>);
+
+    impl MockStats {
+        fn with(mut self, name: &str, rows: usize) -> Self {
+            self.0.insert(name.to_string(), rows);
+            self
+        }
+    }
+
+    impl StatsProvider for MockStats {
+        fn table_stats(&self, name: &str) -> Option<TableStats> {
+            self.0.get(name).map(|&n| TableStats::new(n))
+        }
+    }
+
+    /// Walk a left-deep join tree collecting the leaf scans' table names in
+    /// the order they appear along the spine (deepest-left first, then each
+    /// right input from the bottom up).
+    fn leaf_tables_in_order(plan: &LogicalPlan) -> Vec<String> {
+        fn go(plan: &LogicalPlan, out: &mut Vec<String>) {
+            match plan {
+                LogicalPlan::Join { left, right, .. } => {
+                    go(left, out);
+                    go(right, out);
+                }
+                LogicalPlan::Scan { table, .. } => out.push(table.clone()),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        go(plan, &mut out);
+        out
+    }
+
+    #[test]
+    fn stats_estimator_reorders_three_way_smallest_first() {
+        // a=1000, b=10, c=5. Original spine order is [a, b, c]; costing every
+        // leaf via the StatsEstimator must reorder smallest-first. The
+        // equi-pairs are a.k=b.k2 and b.m=c.m2, so the only valid
+        // smallest-first rebuild that still places every pair is [c, b, a]:
+        // c-b connects on m/m2, then a connects on k/k2.
+        let stats = MockStats::default()
+            .with("a", 1000)
+            .with("b", 10)
+            .with("c", 5);
+        let est = Arc::new(StatsEstimator::new(stats));
+        let pass = JoinReorder::with_estimator(est);
+
+        let plan = three_way();
+        let out = pass.rewrite(plan).expect("reorder");
+
+        // Leaves now ordered smallest-first along the rebuilt spine.
+        let order = leaf_tables_in_order(&out);
+        assert_eq!(
+            order,
+            vec!["c".to_string(), "b".to_string(), "a".to_string()],
+            "leaves must be reordered smallest-row-count first"
+        );
+    }
+
+    #[test]
+    fn stats_estimator_noop_without_stats() {
+        // Empty provider: every leaf estimate is None, so the pass must leave
+        // the chain byte-for-byte unchanged (the conservative default).
+        let est = Arc::new(StatsEstimator::new(MockStats::default()));
+        let pass = JoinReorder::with_estimator(est);
+
+        let plan = three_way();
+        let before = format!("{:?}", plan);
+        let out = pass.rewrite(plan).expect("noop");
+        assert_eq!(
+            before,
+            format!("{:?}", out),
+            "missing stats must leave the join order unchanged"
+        );
+    }
+
+    #[test]
+    fn stats_estimator_noop_when_one_leaf_unknown() {
+        // 'b' has no stats entry → its leaf can't be costed → the whole chain
+        // stays conservative even though a and c are known.
+        let stats = MockStats::default().with("a", 1000).with("c", 5);
+        let est = Arc::new(StatsEstimator::new(stats));
+        let pass = JoinReorder::with_estimator(est);
+
+        let plan = three_way();
+        let before = format!("{:?}", plan);
+        let out = pass.rewrite(plan).expect("noop");
+        assert_eq!(
+            before,
+            format!("{:?}", out),
+            "a partially-costed chain must not be reordered"
+        );
     }
 
     #[test]
