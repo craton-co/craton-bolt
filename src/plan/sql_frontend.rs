@@ -1363,12 +1363,20 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         }
     }
 
+    // Use `contains_aggregate` (not `try_aggregate`) so that SELECT items
+    // with aggregates *nested inside a scalar expression* — e.g.
+    // `SUM(price) + 1` with no GROUP BY and no bare top-level aggregate —
+    // still route into aggregate mode. `try_aggregate` only matches a bare
+    // top-level aggregate call, which would leave such items to fall through
+    // to plain projection where `lower_expr` rejects the aggregate as an
+    // unsupported scalar function call. This aligns the gate with the
+    // post-aggregate scalar-expression handling documented below.
     let has_agg_in_select = items
         .iter()
-        .map(|(e, _)| try_aggregate(e, &resolver, 0))
+        .map(|(e, _)| contains_aggregate(e, &resolver, 0))
         .collect::<BoltResult<Vec<_>>>()?
         .iter()
-        .any(|o| o.is_some());
+        .any(|&b| b);
 
     if has_agg_in_select || !group_by_sql.is_empty() {
         // Aggregate mode. Each SELECT item is one of:

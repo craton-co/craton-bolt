@@ -153,97 +153,63 @@ fn parse_projection_of_utf8_column_supported() {
 }
 
 #[test]
-fn parse_upper_rejected_by_frontend() {
-    // TODO(post-0.3): UPPER not yet supported by frontend (review H7).
-    // `src/exec/string_ops::upper` exists and is unit-tested, but the SQL
-    // frontend currently routes every non-aggregate function call to
-    // `BoltError::Sql("function calls are only allowed as top-level
-    // aggregates in SELECT")`. Lock that rejection so a later widening
-    // (e.g. adding UPPER to a scalar-function whitelist) flips this test
-    // and prompts the e2e author to add execution coverage at the same time.
+fn parse_upper_supported_by_frontend() {
+    // v0.5 (M2 SQL scalar completeness): UPPER is now accepted by the SQL
+    // frontend, which lowers it to `Expr::ScalarFn { kind: Upper, .. }`
+    // (`src/exec/string_ops::upper` provides the host-side evaluation).
+    // This previously locked the rejection; the canary fired as designed when
+    // scalar-function support landed. End-to-end execution is covered by the
+    // gpu:string tests below.
     let provider = s_provider();
-    let err = parse_sql("SELECT UPPER(s) FROM t", &provider)
-        .expect_err("UPPER must reject at the frontend until scalar fns land");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("function calls are only allowed as top-level aggregates"),
-        "unexpected error for UPPER: {msg}"
-    );
+    parse_sql("SELECT UPPER(s) FROM t", &provider)
+        .expect("UPPER(s) must parse and lower in v0.5");
 }
 
 #[test]
-fn parse_lower_rejected_by_frontend() {
-    // TODO(post-0.3): LOWER not yet supported by frontend (review H7).
+fn parse_lower_supported_by_frontend() {
+    // v0.5: LOWER is now accepted by the frontend, lowering to
+    // `Expr::ScalarFn { kind: Lower, .. }`.
     let provider = s_provider();
-    let err = parse_sql("SELECT LOWER(s) FROM t", &provider)
-        .expect_err("LOWER must reject at the frontend until scalar fns land");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("function calls are only allowed as top-level aggregates"),
-        "unexpected error for LOWER: {msg}"
-    );
+    parse_sql("SELECT LOWER(s) FROM t", &provider)
+        .expect("LOWER(s) must parse and lower in v0.5");
 }
 
 #[test]
-fn parse_length_rejected_by_frontend() {
-    // TODO(post-0.3): LENGTH not yet supported by frontend (review H7).
-    // The host-side `string_ops::length` returns Int32 byte counts — but
-    // it's only reachable through the executor's internal API today, not via
-    // SQL. Lock the rejection.
+fn parse_length_supported_by_frontend() {
+    // v0.5: LENGTH is now accepted by the frontend, lowering to
+    // `Expr::ScalarFn { kind: Length, .. }`. The host-side
+    // `string_ops::length` returns Int32 byte counts.
     let provider = s_provider();
-    let err = parse_sql("SELECT LENGTH(s) FROM t", &provider)
-        .expect_err("LENGTH must reject at the frontend until scalar fns land");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("function calls are only allowed as top-level aggregates"),
-        "unexpected error for LENGTH: {msg}"
-    );
+    parse_sql("SELECT LENGTH(s) FROM t", &provider)
+        .expect("LENGTH(s) must parse and lower in v0.5");
 }
 
 #[test]
-fn parse_substring_rejected_by_frontend() {
-    // TODO(post-0.3): SUBSTR/SUBSTRING not yet supported by frontend
-    // (review H7). `string_ops_extended::substring` is implemented and unit
-    // tested but unreachable through SQL. SUBSTR lowers as a regular
-    // function call → rejected by the same arm as UPPER. SUBSTRING is a
-    // SQL-standard special form that sqlparser surfaces as
-    // `SqlExpr::Substring { .. }` (not a function call), so it hits the
-    // catch-all "unsupported expression" arm — both rejections lock the
-    // current surface.
+fn parse_substr_rejected_by_frontend() {
+    // Unlike UPPER/LOWER/LENGTH/CONCAT, SUBSTR is NOT yet wired into the
+    // frontend's scalar-function set. `string_ops_extended::substring` exists
+    // and is unit-tested but remains unreachable via SQL; the frontend
+    // rejects the call as an unsupported scalar function. (Lock this so the
+    // test flips — prompting e2e coverage — if SUBSTR is added later.)
     let provider = s_provider();
-    let err_substr = parse_sql("SELECT SUBSTR(s, 1, 3) FROM t", &provider)
-        .expect_err("SUBSTR must reject at the frontend until scalar fns land");
-    let msg = format!("{err_substr}");
+    let err = parse_sql("SELECT SUBSTR(s, 1, 3) FROM t", &provider)
+        .expect_err("SUBSTR is not yet supported by the frontend");
+    let msg = format!("{err}");
     assert!(
-        msg.contains("function calls are only allowed as top-level aggregates"),
+        msg.contains("SUBSTR")
+            || msg.contains("scalar function calls are not supported"),
         "unexpected error for SUBSTR: {msg}"
     );
-    let err_substring = parse_sql("SELECT SUBSTRING(s, 1, 3) FROM t", &provider)
-        .expect_err("SUBSTRING must reject at the frontend until scalar fns land");
-    let msg = format!("{err_substring}");
-    assert!(
-        // Accept either the function-call or the special-form rejection,
-        // since the SUBSTRING(... FROM ... FOR ...) syntax is its own
-        // sqlparser variant and our error path may differ between versions.
-        msg.contains("function calls are only allowed as top-level aggregates")
-            || msg.contains("unsupported expression")
-            || msg.contains("unsupported"),
-        "unexpected error for SUBSTRING: {msg}"
-    );
 }
 
 #[test]
-fn parse_concat_function_rejected_by_frontend() {
-    // TODO(post-0.3): CONCAT not yet supported by frontend (review H7).
-    // `string_ops_extended::concat` is implemented for two-column inputs.
+fn parse_concat_function_supported_by_frontend() {
+    // v0.5: CONCAT is now accepted by the frontend, lowering to
+    // `Expr::ScalarFn { kind: Concat, .. }`
+    // (`string_ops_extended::concat` provides host-side evaluation).
     let provider = sv_provider();
-    let err = parse_sql("SELECT CONCAT(s, s) FROM t", &provider)
-        .expect_err("CONCAT must reject at the frontend until scalar fns land");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("function calls are only allowed as top-level aggregates"),
-        "unexpected error for CONCAT: {msg}"
-    );
+    parse_sql("SELECT CONCAT(s, s) FROM t", &provider)
+        .expect("CONCAT(s, s) must parse and lower in v0.5");
 }
 
 #[test]
@@ -269,9 +235,14 @@ fn parse_string_concat_with_literal_supported() {
 #[test]
 fn parse_string_concat_type_mismatch_rejected() {
     // `||` requires Utf8 ⊗ Utf8. A Utf8 ⊗ Int64 combination must surface a
-    // type error at plan-construction time.
+    // type error. The frontend parses `||` structurally; the operand
+    // type-check lives in `LogicalPlan::schema()` and fires during lowering
+    // (`lower_physical`), not at parse time.
+    use craton_bolt::plan::lower_physical;
     let provider = sv_provider();
-    let err = parse_sql("SELECT s || v FROM t", &provider)
+    let plan = parse_sql("SELECT s || v FROM t", &provider)
+        .expect("s || v parses structurally; type-check happens at lowering");
+    let err = lower_physical(&plan)
         .expect_err("s (Utf8) || v (Int64) must reject as a type error");
     let msg = format!("{err}");
     assert!(
@@ -308,18 +279,13 @@ fn parse_like_constant_pattern_supported_v05() {
     parse_sql("SELECT s FROM t WHERE s NOT LIKE 'foo%'", &provider)
         .expect("NOT LIKE 'foo%' must parse in v0.5");
 
-    // ESCAPE is still a follow-up — same TODO marker but now with a
-    // narrower scope (everything else about LIKE works).
-    let err_esc = parse_sql(
+    // ESCAPE is now supported too: the frontend lowers `LIKE .. ESCAPE c`
+    // to `Like { escape: Some(c), .. }`.
+    parse_sql(
         r"SELECT s FROM t WHERE s LIKE 'a\_b' ESCAPE '\'",
         &provider,
     )
-    .expect_err("LIKE ... ESCAPE must reject until v0.5 follow-up lands");
-    let msg = format!("{err_esc}");
-    assert!(
-        msg.contains("ESCAPE"),
-        "unexpected error for LIKE escape: {msg}"
-    );
+    .expect("LIKE ... ESCAPE must parse in v0.5");
 }
 
 #[test]
