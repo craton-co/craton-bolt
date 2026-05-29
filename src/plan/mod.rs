@@ -24,7 +24,8 @@ pub use dataframe::{
 };
 pub use sql_frontend::{parse as parse_sql, MemTableProvider, TableProvider};
 pub use physical_plan::{
-    lower as lower_physical, ColumnIO, KernelSpec, Op, PhysicalPlan, Reg, Value,
+    lower as lower_physical, ColumnIO, KernelSpec, Op, PhysicalPlan, Reg, StringLengthOutput,
+    Value,
 };
 pub use rewrite::PlanRewrite;
 pub use optimizer::{default_passes, default_passes_with_estimator, RowEstimator, StatsEstimator};

@@ -18,8 +18,8 @@
 //!     representative case is enough — the rejection lives in one place).
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider,
-    ScalarFnKind, Schema,
+    lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider, PhysicalPlan,
+    ScalarFnKind, Schema, StringLengthOutput,
 };
 
 // ---- Fixture ----------------------------------------------------------------
@@ -280,6 +280,60 @@ fn upper_rejected_at_lower_with_followup_marker() {
     );
 }
 
+// ---- GPU LENGTH: now lowered to the fully-GPU StringLength variant ---------
+
+#[test]
+fn length_lowers_to_gpu_string_length_variant() {
+    // `SELECT LENGTH(s) FROM txt` over a bare scan now lowers to the fully-GPU
+    // `PhysicalPlan::StringLength` gather (no host fallback at the lowering
+    // boundary). The output column is the `Int64` LENGTH contract.
+    let plan = parse("SELECT LENGTH(s) FROM txt").expect("LENGTH(s) parses");
+    let phys = lower_physical(&plan).expect("LENGTH(s) must lower to a GPU StringLength");
+    match phys {
+        PhysicalPlan::StringLength {
+            ref table,
+            ref outputs,
+            ref output_schema,
+        } => {
+            assert_eq!(table, "txt");
+            assert_eq!(outputs.len(), 1);
+            assert!(
+                matches!(&outputs[0], StringLengthOutput::Length { source } if source == "s"),
+                "expected a single LENGTH(s) output, got {:?}",
+                outputs[0]
+            );
+            assert_eq!(output_schema.fields.len(), 1);
+            assert_eq!(output_schema.fields[0].dtype, DataType::Int64);
+        }
+        other => panic!("expected PhysicalPlan::StringLength, got {other:?}"),
+    }
+}
+
+#[test]
+fn length_with_passthrough_column_lowers_to_string_length() {
+    // A mix of `LENGTH(s)` and a passthrough column still routes to the GPU
+    // gather (the passthrough is lifted from the host batch by the executor).
+    let plan = parse("SELECT n, LENGTH(s) FROM txt").expect("n, LENGTH(s) parses");
+    let phys = lower_physical(&plan).expect("must lower to StringLength");
+    match phys {
+        PhysicalPlan::StringLength { outputs, .. } => {
+            assert_eq!(outputs.len(), 2);
+            assert!(matches!(&outputs[0], StringLengthOutput::Passthrough { source } if source == "n"));
+            assert!(matches!(&outputs[1], StringLengthOutput::Length { source } if source == "s"));
+        }
+        other => panic!("expected StringLength, got {other:?}"),
+    }
+}
+
+#[test]
+fn upper_still_rejected_not_string_length() {
+    // Only LENGTH is wired to the GPU; UPPER (a variable-width producer) must
+    // still reject at the lowering boundary rather than route to StringLength.
+    let plan = parse("SELECT UPPER(s) FROM txt").expect("UPPER(s) parses");
+    let res = lower_physical(&plan);
+    assert!(res.is_err(), "UPPER must still be rejected at lowering");
+}
+
 // ---- Unknown function names still rejected ---------------------------------
 
 #[test]
@@ -291,4 +345,90 @@ fn unknown_scalar_function_still_rejected() {
     let res: Result<LogicalPlan, String> =
         parse_sql("SELECT SQRT(n) FROM txt", &provider).map_err(|e| format!("{e}"));
     assert_err_contains(res, "scalar function");
+}
+
+// ---- GPU end-to-end: LENGTH runs on the device -----------------------------
+//
+// Gated on `#[ignore = "gpu:string"]` per project convention (GpuVec uploads
+// and kernel launches require a CUDA device). Run with:
+//     cargo test --test string_fns_sql_test -- --ignored
+// on a GPU host.
+
+#[test]
+#[ignore = "gpu:string"]
+fn length_runs_on_gpu_for_plain_utf8_column() {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("CUDA ctx");
+    // Plain StringArray → the engine's `Utf8` GpuColumnData variant
+    // (slot-0-NULL, 1-based keys). Byte lengths: 5,3,4,5.
+    let s = StringArray::from(vec!["alpha", "bb!", "gamm", "alpha"]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(s)]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT LENGTH(s) FROM t")
+        .expect("execute SELECT LENGTH(s)");
+    let out = h.record_batch();
+    assert_eq!(out.num_columns(), 1);
+    let lens = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("LENGTH output is Int64");
+    let got: Vec<i64> = (0..lens.len()).map(|i| lens.value(i)).collect();
+    assert_eq!(got, vec![5, 3, 4, 5]);
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn length_runs_on_gpu_for_dict_encoded_column() {
+    use std::sync::Arc;
+
+    use arrow_array::builder::StringDictionaryBuilder;
+    use arrow_array::types::Int32Type;
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("CUDA ctx");
+    // Dictionary-encoded Utf8 (no nulls) → the native `DictUtf8` variant
+    // (0-based keys), exercising the GPU ZeroBased gather path.
+    let mut b: StringDictionaryBuilder<Int32Type> = StringDictionaryBuilder::new();
+    for v in ["us", "eu", "us", "canada"] {
+        b.append_value(v);
+    }
+    let dict = b.finish();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "region",
+        ArrowDataType::Dictionary(
+            Box::new(ArrowDataType::Int32),
+            Box::new(ArrowDataType::Utf8),
+        ),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(dict)]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT LENGTH(region) FROM t")
+        .expect("execute SELECT LENGTH(region)");
+    let out = h.record_batch();
+    let lens = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("LENGTH output is Int64");
+    let got: Vec<i64> = (0..lens.len()).map(|i| lens.value(i)).collect();
+    // byte lengths: "us"=2, "eu"=2, "us"=2, "canada"=6
+    assert_eq!(got, vec![2, 2, 2, 6]);
 }

@@ -32,6 +32,11 @@ pub(crate) mod groupby_common;
 pub mod agg_with_pre;
 pub mod gpu_compact;
 pub mod string_ops;
+/// Fully-GPU `SELECT LENGTH(<utf8_col>)` executor: a per-row gather of a
+/// precomputed per-dictionary-entry byte-length table (see
+/// [`crate::jit::string_kernel::compile_length_gather_kernel`]), with a clean
+/// host-side fallback for non-dict / null-bearing inputs.
+pub mod string_length;
 pub mod dict_registry;
 pub mod groupby_with_pre;
 pub mod groupby_wide;

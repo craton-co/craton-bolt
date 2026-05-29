@@ -2235,6 +2235,11 @@ impl Engine {
                 kernel,
                 output_schema,
             } => self.execute_projection(table, kernel, output_schema),
+            PhysicalPlan::StringLength {
+                table,
+                outputs,
+                output_schema,
+            } => self.execute_string_length(table, outputs, output_schema),
             PhysicalPlan::Aggregate {
                 table,
                 pre,
@@ -2776,6 +2781,214 @@ impl Engine {
             BoltError::Other(format!("failed to build output RecordBatch: {e}"))
         })?;
         Ok(QueryHandle { batch: batch_out })
+    }
+
+    /// Execute a [`PhysicalPlan::StringLength`]: a `SELECT LENGTH(<utf8_col>)`
+    /// projection (plus passthrough columns) over a bare scan, with the
+    /// `LENGTH` outputs computed on the GPU via the dictionary-index gather
+    /// kernel ([`crate::jit::string_kernel::compile_length_gather_kernel`]).
+    ///
+    /// Passthrough columns are lifted directly from the host-side source batch
+    /// (zero-copy `ArrayRef` clone). Each `LENGTH(col)` output runs the gather
+    /// against the GPU-resident dictionary column when it is dictionary-encoded
+    /// (and, for the native `DictUtf8` layout, null-free); otherwise it falls
+    /// back to a host-side gather over the downloaded keys (see
+    /// [`crate::exec::string_length`]). Both paths produce an `Int64Array`
+    /// matching the logical-plan `LENGTH` output dtype.
+    fn execute_string_length(
+        &self,
+        table: &str,
+        outputs: &[crate::plan::physical_plan::StringLengthOutput],
+        output_schema: &Schema,
+    ) -> BoltResult<QueryHandle> {
+        use crate::plan::physical_plan::StringLengthOutput;
+
+        // Source host batch — used for passthrough columns (and as the row
+        // count authority so an empty / partial table still works).
+        let src_batch = self.materialize_table(table)?;
+        let src_schema = src_batch.schema();
+        let n_rows = src_batch.num_rows();
+
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(outputs.len());
+        for out in outputs {
+            match out {
+                StringLengthOutput::Passthrough { source } => {
+                    let idx = src_schema.index_of(source).map_err(|_| {
+                        BoltError::Plan(format!(
+                            "StringLength: passthrough column '{source}' not found in \
+                             table '{table}'"
+                        ))
+                    })?;
+                    arrays.push(src_batch.column(idx).clone());
+                }
+                StringLengthOutput::Length { source } => {
+                    arrays.push(self.string_length_column(table, source, n_rows)?);
+                }
+            }
+        }
+
+        let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+        let batch_out = RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
+            BoltError::Other(format!(
+                "StringLength: failed to build output RecordBatch: {e}"
+            ))
+        })?;
+        Ok(QueryHandle { batch: batch_out })
+    }
+
+    /// Compute `LENGTH(<source>)` for the GPU-resident `Utf8` column `source`
+    /// of `table`, returning an `Int64Array` of `n_rows` rows.
+    ///
+    /// GPU path: build the per-dictionary-entry `i32` length table that matches
+    /// the column's device key layout, upload it, launch the gather kernel
+    /// (`out[row] = length_table[keys[row]]`), download the `Int32` result, and
+    /// widen to `Int64`. When the column is not safe to gather on the GPU
+    /// (non-dict storage, or a `DictUtf8` column with NULLs — whose zeroed keys
+    /// would gather the wrong slot), fall back to a host-side gather over the
+    /// downloaded keys, which is byte-for-byte identical for the supported case.
+    fn string_length_column(
+        &self,
+        table: &str,
+        source: &str,
+        n_rows: usize,
+    ) -> BoltResult<ArrayRef> {
+        use crate::exec::string_length::{
+            build_length_table, gpu_gather_layout, host_gather_lengths, KeyLayout,
+        };
+
+        let gpu_table_ref = self.ensure_gpu_table(table)?;
+        let gpu_table: &crate::exec::gpu_table::GpuTable = &gpu_table_ref;
+        let column = gpu_table.column(source).ok_or_else(|| {
+            BoltError::Plan(format!(
+                "StringLength: column '{source}' not in GPU table '{table}'"
+            ))
+        })?;
+
+        // Resolve the host-side dictionary + device key buffer + layout for
+        // this column. `None` layout ⇒ host fallback.
+        let dict = column.utf8_dictionary().ok_or_else(|| {
+            BoltError::Plan(format!(
+                "StringLength: column '{source}' is not a Utf8 column (LENGTH requires Utf8)"
+            ))
+        })?;
+        let (keys_vec, layout): (&GpuVec<i32>, Option<KeyLayout>) = match &column.data {
+            crate::exec::gpu_table::GpuColumnData::Utf8 { indices, .. } => {
+                (indices, gpu_gather_layout(&column.data))
+            }
+            crate::exec::gpu_table::GpuColumnData::DictUtf8 { keys, .. } => {
+                (keys, gpu_gather_layout(&column.data))
+            }
+            _ => {
+                return Err(BoltError::Plan(format!(
+                    "StringLength: column '{source}' has non-Utf8 GPU storage"
+                )))
+            }
+        };
+
+        let layout = match layout {
+            Some(l) => l,
+            None => {
+                // Host fallback: download keys and gather over the 1-based
+                // NULL-sentinel table (DictUtf8-with-nulls keys are zeroed to
+                // 0, which this table maps to length 0 — matching the
+                // documented `exec::string_ops::length` NULL → 0 behaviour).
+                let table_lengths =
+                    build_length_table(dict, KeyLayout::OneBasedNullSlot0)?;
+                let keys_host = keys_vec.to_vec()?;
+                // DictUtf8 keys are 0-based; remap to the 1-based table by
+                // adding 1 only when the column is the DictUtf8 layout.
+                let lens = match &column.data {
+                    crate::exec::gpu_table::GpuColumnData::DictUtf8 { valid_mask, .. } => {
+                        // Consult validity: NULL rows → 0, valid rows → table[key+1].
+                        let mask = valid_mask
+                            .as_ref()
+                            .map(|m| m.to_vec())
+                            .transpose()?;
+                        let mut out: Vec<i64> = Vec::with_capacity(keys_host.len());
+                        for (row, &k) in keys_host.iter().enumerate() {
+                            let is_valid = match &mask {
+                                None => true,
+                                Some(bits) => {
+                                    let byte = bits.get(row / 8).copied().unwrap_or(0);
+                                    (byte >> (row % 8)) & 1 == 1
+                                }
+                            };
+                            if !is_valid {
+                                out.push(0);
+                            } else if k < 0 {
+                                return Err(BoltError::Other(format!(
+                                    "LENGTH: negative dictionary key {k}"
+                                )));
+                            } else {
+                                // table index = key + 1 (slot 0 is NULL).
+                                let len = *table_lengths
+                                    .get(k as usize + 1)
+                                    .ok_or_else(|| {
+                                        BoltError::Other(format!(
+                                            "LENGTH: key {k} out of range"
+                                        ))
+                                    })?;
+                                out.push(len as i64);
+                            }
+                        }
+                        out
+                    }
+                    _ => host_gather_lengths(&keys_host, &table_lengths)?,
+                };
+                check_len(lens.len(), n_rows)?;
+                return Ok(Arc::new(Int64Array::from(lens)) as ArrayRef);
+            }
+        };
+
+        // GPU gather path.
+        let length_table = build_length_table(dict, layout)?;
+        let table_gpu = GpuVec::<i32>::from_slice(&length_table)?;
+        let out_gpu = GpuVec::<i32>::zeros(n_rows)?;
+
+        let module =
+            CudaModule::from_ptx(&crate::jit::string_kernel::compile_length_gather_kernel()?)?;
+        let function =
+            module.function(crate::jit::string_kernel::LENGTH_GATHER_ENTRY)?;
+
+        // ABI: (indices, length_table, out, n_rows). Assemble raw kernel
+        // params directly (heterogeneous list; same pattern as
+        // `execute_projection`).
+        let mut indices_ptr = keys_vec.device_ptr();
+        let mut table_ptr = table_gpu.device_ptr();
+        let mut out_ptr = out_gpu.device_ptr();
+        let mut n_rows_u32 = n_rows_to_u32(n_rows)?;
+        let mut kernel_params: Vec<*mut c_void> = vec![
+            &mut indices_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut table_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut out_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+        ];
+
+        let stream = CudaStream::null_or_default();
+        let grid_x = grid_x_for(n_rows_u32, BLOCK_SIZE);
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                BLOCK_SIZE,
+                1,
+                1,
+                0,
+                stream.raw(),
+                kernel_params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
+        debug_sync_check()?;
+        stream.synchronize()?;
+
+        // Download Int32 lengths and widen to the Int64 SQL contract.
+        let lens_i32 = out_gpu.to_vec()?;
+        check_len(lens_i32.len(), n_rows)?;
+        let lens_i64: Vec<i64> = lens_i32.into_iter().map(|v| v as i64).collect();
+        Ok(Arc::new(Int64Array::from(lens_i64)) as ArrayRef)
     }
 }
 

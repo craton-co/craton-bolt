@@ -9,7 +9,7 @@ use crate::plan::logical_plan::{
     date_or_timestamp_arith_result as logical_temporal_arith_result,
     decimal128_arith_result as logical_decimal128_arith_result, join_combined_schema,
     unify_numeric as logical_unify_numeric, AggregateExpr, BinaryOp, DataType, Expr, Field,
-    JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
+    JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SortExpr, UnaryOp,
 };
 
 /// SSA register handle. Just an index into the IR's value table.
@@ -804,6 +804,22 @@ pub enum KernelSpecKind {
     /// One of the compaction-pipeline kernels; see
     /// [`CompactionKernelSpec`].
     Compaction(CompactionKernelSpec),
+/// One output column of a [`PhysicalPlan::StringLength`] projection: either a
+/// passthrough of a source column or the byte length of a (dictionary-encoded)
+/// Utf8 column.
+#[derive(Debug, Clone)]
+pub enum StringLengthOutput {
+    /// Pass the named source column through unchanged.
+    Passthrough {
+        /// Source column name in the scanned table.
+        source: String,
+    },
+    /// `LENGTH(source)` — per-row byte length of the Utf8 column `source`,
+    /// emitted as `Int64`.
+    Length {
+        /// Source Utf8 column name in the scanned table.
+        source: String,
+    },
 }
 
 /// The top-level physical plan: a small ordered pipeline of kernels.
@@ -885,6 +901,29 @@ pub enum PhysicalPlan {
         /// One entry per output column; each references a column of `input`.
         exprs: Vec<Expr>,
         /// Output schema, in `exprs` order with aliases applied.
+        output_schema: Schema,
+    },
+    /// Fully-GPU `SELECT LENGTH(<utf8_col>)` (plus passthrough columns) over a
+    /// bare table scan whose Utf8 columns are dictionary-encoded on the device.
+    ///
+    /// This is the first GPU-resident string scalar function (see
+    /// [`crate::jit::string_kernel::compile_length_gather_kernel`]): each
+    /// `LENGTH(col)` output is computed by gathering a precomputed
+    /// per-dictionary-entry `i32` length table indexed by the column's device
+    /// keys — no host materialisation of the strings. The lowering router only
+    /// produces this variant for the lowest-risk shape (a `Project` directly
+    /// over a `Scan`, every output expr a bare/aliased `Column` or
+    /// `LENGTH(Column)`); UPPER / LOWER / SUBSTRING / CONCAT still route to the
+    /// host fallback / rejection. At execution time, if the source column is
+    /// NOT dictionary-encoded on the device the executor falls back to the
+    /// host-side `exec::string_ops::length` path (no panic).
+    StringLength {
+        /// Source table name.
+        table: String,
+        /// One spec per output column, in `output_schema` order.
+        outputs: Vec<StringLengthOutput>,
+        /// Output schema (`LENGTH` columns are `Int64`; passthroughs keep their
+        /// source dtype).
         output_schema: Schema,
     },
     /// Host-side post-aggregate (or other non-scan-chain) filter layer.
@@ -999,6 +1038,7 @@ impl PhysicalPlan {
             }
             PhysicalPlan::Project { output_schema, .. } => output_schema,
             PhysicalPlan::Window { output_schema, .. } => output_schema,
+            PhysicalPlan::StringLength { output_schema, .. } => output_schema,
             PhysicalPlan::Join { output_schema, .. } => output_schema,
         }
     }
@@ -3014,6 +3054,178 @@ fn expr_contains_concat(expr: &Expr) -> bool {
     }
 }
 
+/// True if `expr` contains an `Expr::ScalarFn` (string scalar function:
+/// `UPPER`/`LOWER`/`LENGTH`/`SUBSTRING`/`CONCAT`) anywhere in its subtree.
+///
+/// Used by the `LogicalPlan::Project` arm of [`lower_depth`] to route
+/// string-scalar-function projections onto the host-side `PhysicalPlan::Project`
+/// path. The fused GPU codegen kernel ([`Codegen::emit_expr`]) has no IR op for
+/// scalar string functions yet — the GPU codegen lives in
+/// [`crate::jit::string_kernel`] (a fully-GPU fixed-width `LENGTH` gather plus
+/// the two-pass `UPPER`/`LOWER`/`SUBSTRING` producers) but is not yet wired
+/// into the executor's launch path. Until that runtime plumbing lands, routing
+/// here keeps the existing host fallback reachable rather than rejecting the
+/// query outright.
+///
+// TODO(string-fn-gpu): once the executor can (a) build + upload the
+// per-dictionary-entry length table and (b) run the two-pass
+// length/scan/write kernels from `crate::jit::string_kernel`, lower a
+// top-level `LENGTH(<col>)` (and then `UPPER`/`LOWER`/`SUBSTRING`) into a GPU
+// projection here instead of the host-side `PhysicalPlan::Project`. Start with
+// `LENGTH` — it is fixed-width `Int32` output and the lowest-risk path.
+fn expr_contains_scalar_fn(expr: &Expr) -> bool {
+    match expr {
+        Expr::ScalarFn { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_scalar_fn(left) || expr_contains_scalar_fn(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_scalar_fn(operand),
+        Expr::Alias(inner, _) => expr_contains_scalar_fn(inner),
+        Expr::Case { branches, else_branch } => {
+            branches
+                .iter()
+                .any(|(w, t)| expr_contains_scalar_fn(w) || expr_contains_scalar_fn(t))
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_scalar_fn)
+                    .unwrap_or(false)
+        }
+        Expr::Like { expr, .. } => expr_contains_scalar_fn(expr),
+        Expr::Cast { expr, .. } => expr_contains_scalar_fn(expr),
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
+/// Return the [`ScalarFnKind`] of the first `Expr::ScalarFn` found (depth-first)
+/// in `exprs`, or `None` if there is none. Used only to enrich the lowering
+/// rejection message in [`lower_depth`]'s `LogicalPlan::Project` arm with the
+/// offending function name.
+fn first_scalar_fn_kind(exprs: &[Expr]) -> Option<ScalarFnKind> {
+    fn walk(e: &Expr) -> Option<ScalarFnKind> {
+        match e {
+            Expr::ScalarFn { kind, .. } => Some(*kind),
+            Expr::Binary { left, right, .. } => walk(left).or_else(|| walk(right)),
+            Expr::Unary { operand, .. } => walk(operand),
+            Expr::Alias(inner, _) => walk(inner),
+            Expr::Case { branches, else_branch } => branches
+                .iter()
+                .find_map(|(w, t)| walk(w).or_else(|| walk(t)))
+                .or_else(|| else_branch.as_deref().and_then(walk)),
+            Expr::Like { expr, .. } => walk(expr),
+            Expr::Cast { expr, .. } => walk(expr),
+            Expr::Column(_) | Expr::Literal(_) => None,
+        }
+    }
+    exprs.iter().find_map(walk)
+}
+
+/// Peel transparent `Alias` wrappers off `expr`, returning the inner
+/// expression. Aliases only affect output naming, not the value computed.
+fn peel_aliases(expr: &Expr) -> &Expr {
+    let mut cur = expr;
+    while let Expr::Alias(inner, _) = cur {
+        cur = inner.as_ref();
+    }
+    cur
+}
+
+/// Try to lower a SELECT list of bare-column / `LENGTH(<column>)` outputs over a
+/// **bare table `Scan`** (no Filter, no nested Project) into the fully-GPU
+/// [`PhysicalPlan::StringLength`] variant. Returns `Ok(None)` when the shape is
+/// not the supported one — the caller then falls back to its existing routing
+/// (host fallback / rejection).
+///
+/// This is the lowest-risk GPU string path: `LENGTH` on a dictionary-encoded
+/// Utf8 column is a fixed-width `Int32` per-row gather (widened to the
+/// logical-plan `Int64` output dtype by the executor), so there is no
+/// variable-width offset bookkeeping. We deliberately keep the accepted shape
+/// narrow — every output must be either:
+///
+///   * a bare `Column(name)` (optionally aliased), passed through unchanged, or
+///   * `LENGTH(Column(name))` (optionally aliased) where `name` is a `Utf8`
+///     column of the scanned table.
+///
+/// At least one output must be a `LENGTH` (otherwise this is a plain
+/// projection that the existing codegen path handles). Anything else — a
+/// `LENGTH` over a non-column argument, UPPER/LOWER/SUBSTRING/CONCAT, a
+/// computed expression, a Filter in the chain — returns `Ok(None)`.
+fn try_lower_string_length(
+    plan: &LogicalPlan,
+    input: &LogicalPlan,
+    exprs: &[Expr],
+) -> BoltResult<Option<PhysicalPlan>> {
+    // Only a bare `Scan` underneath (no Filter / Project chain). A Filter
+    // would require fusing a predicate into the gather, which is out of scope
+    // for this lowest-risk path.
+    let (table, scan_schema) = match input {
+        LogicalPlan::Scan { table, schema, .. } => (table.as_str(), schema),
+        _ => return Ok(None),
+    };
+
+    let mut outputs: Vec<StringLengthOutput> = Vec::with_capacity(exprs.len());
+    let mut any_length = false;
+
+    for e in exprs {
+        let body = peel_aliases(e);
+        match body {
+            Expr::Column(name) => {
+                // Passthrough of a Utf8 column would require materialising the
+                // (possibly dictionary-encoded) source array back into the
+                // plan-declared `Utf8` Arrow dtype — out of scope for this
+                // lowest-risk LENGTH path. Bail to the caller's existing
+                // routing so the dtype-faithful host projection handles it.
+                let idx = scan_schema.index_of(name)?;
+                if scan_schema.fields[idx].dtype == DataType::Utf8 {
+                    return Ok(None);
+                }
+                outputs.push(StringLengthOutput::Passthrough {
+                    source: name.clone(),
+                });
+            }
+            Expr::ScalarFn {
+                kind: ScalarFnKind::Length,
+                args,
+            } => {
+                // Only `LENGTH(<bare column>)` is handled on the GPU here.
+                if args.len() != 1 {
+                    return Ok(None);
+                }
+                let src = match peel_aliases(&args[0]) {
+                    Expr::Column(name) => name.clone(),
+                    _ => return Ok(None),
+                };
+                // The argument column must exist and be Utf8 in the scan
+                // schema (the type-checker already guarantees this for a
+                // well-formed plan, but verify so a hand-built plan can't
+                // sneak a non-Utf8 column into the gather).
+                let idx = scan_schema.index_of(&src)?;
+                if scan_schema.fields[idx].dtype != DataType::Utf8 {
+                    return Ok(None);
+                }
+                any_length = true;
+                outputs.push(StringLengthOutput::Length { source: src });
+            }
+            // Any other expression (UPPER/LOWER/SUBSTRING/CONCAT, computed
+            // arithmetic, LENGTH over a non-column, literals, ...) is out of
+            // scope — let the caller's existing routing handle it.
+            _ => return Ok(None),
+        }
+    }
+
+    if !any_length {
+        // No LENGTH in the list — this is a plain projection that the regular
+        // codegen path lowers (and would lower better, fused).
+        return Ok(None);
+    }
+
+    let output_schema = plan.schema()?;
+    Ok(Some(PhysicalPlan::StringLength {
+        table: table.to_string(),
+        outputs,
+        output_schema,
+    }))
+}
+
 /// Walk a `Scan` / `Filter` / `Project` chain and return true if any
 /// `Filter` node carries a predicate that contains a `BinaryOp::Concat`.
 ///
@@ -3181,6 +3393,10 @@ pub fn populate_input_validity(
             populate_input_validity(left.as_mut(), provider);
             populate_input_validity(right.as_mut(), provider);
         }
+        // No fused `KernelSpec` to flag: the LENGTH gather kernel reads only
+        // the dictionary index column (never a value-validity bitmap) and
+        // NULL rows are handled by the length-table's slot-0 sentinel.
+        PhysicalPlan::StringLength { .. } => {}
     }
 }
 
@@ -3517,6 +3733,9 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
                     || walk(left)
                     || walk(right)
             }
+            // No expression IR to inspect: outputs are bare passthrough /
+            // LENGTH gathers with no Div / And / Or anywhere.
+            PhysicalPlan::StringLength { .. } => false,
         }
     }
     if walk(plan) {
@@ -3841,6 +4060,49 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     exprs: exprs.clone(),
                     output_schema,
                 });
+            }
+            // String scalar functions (UPPER / LOWER / LENGTH / SUBSTRING /
+            // CONCAT) are Utf8-valued (LENGTH excepted, which is Int32) and the
+            // fused GPU codegen kernel has no IR op for them yet. The dedicated
+            // GPU codegen now exists in `crate::jit::string_kernel` — a
+            // fully-GPU fixed-width LENGTH dictionary-gather plus the two-pass
+            // length/scan/write producers for UPPER/LOWER/SUBSTRING — but it is
+            // not yet wired into the executor's kernel-launch path (no buffer
+            // allocation / dictionary length-table upload / two-pass launch),
+            // and the host fallback (`exec::expr_agg::eval_expr`) does not yet
+            // evaluate ScalarFn either. Rather than route to a
+            // `PhysicalPlan::Project` that would fail at *execution* time, we
+            // reject at lowering with a single clear message — the same
+            // contract `lower()` upholds for CASE / CAST. This keeps the
+            // pre-existing behavior (and `tests/string_fns_sql_test.rs`) intact.
+            //
+            // TODO(string-fn-gpu): once the executor can launch the
+            // `string_kernel` kernels, replace this rejection with a GPU
+            // projection that drives `compile_length_gather_kernel` for a
+            // top-level `LENGTH(<col>)` (fixed-width Int32, lowest risk), then
+            // the two-pass UPPER/LOWER/SUBSTRING kernels. See the doc comment
+            // on `expr_contains_scalar_fn`.
+            if exprs.iter().any(expr_contains_scalar_fn) {
+                // GPU LENGTH is wired end-to-end: a top-level
+                // `SELECT LENGTH(<utf8_col>)` (plus passthrough columns) over a
+                // bare scan lowers to the fully-GPU `PhysicalPlan::StringLength`
+                // gather (see `crate::exec::string_length` /
+                // `crate::jit::string_kernel::compile_length_gather_kernel`).
+                // Everything else — UPPER/LOWER/SUBSTRING/CONCAT, LENGTH over a
+                // computed/non-column arg, a Filter in the chain — is not yet
+                // wired into the executor and is rejected below so the
+                // pre-existing behavior (and `tests/string_fns_sql_test.rs`)
+                // stays intact.
+                if let Some(string_len) = try_lower_string_length(plan, input, exprs)? {
+                    return Ok(string_len);
+                }
+                let kind = first_scalar_fn_kind(exprs);
+                return Err(BoltError::Plan(format!(
+                    "string scalar function{} is not yet lowered to GPU; the GPU \
+                     codegen exists in jit::string_kernel but is not yet wired \
+                     into the executor (coming in a follow-up)",
+                    kind.map(|k| format!(" {}", k.sql_name())).unwrap_or_default()
+                )));
             }
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
