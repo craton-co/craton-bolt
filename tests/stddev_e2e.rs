@@ -400,9 +400,11 @@ fn e2e_stddev_with_group_by_is_rejected() {
     let mut engine = Engine::new().expect("ctx");
     engine.register_table("t", batch).unwrap();
 
-    let err = engine
-        .sql("SELECT k, STDDEV_POP(v) FROM t GROUP BY k")
-        .expect_err("STDDEV with GROUP BY must error in v0.5");
+    // `QueryHandle` is not `Debug`, so match rather than `.expect_err()`.
+    let err = match engine.sql("SELECT k, STDDEV_POP(v) FROM t GROUP BY k") {
+        Ok(_) => panic!("STDDEV with GROUP BY must error in v0.5"),
+        Err(e) => e,
+    };
     let msg = format!("{err}");
     assert!(
         msg.contains("STDDEV") && msg.contains("GROUP BY"),

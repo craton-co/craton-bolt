@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, Date32Array, Int32Array, RecordBatch, TimestampNanosecondArray,
+    Date32Array, Int32Array, RecordBatch, TimestampNanosecondArray,
 };
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,

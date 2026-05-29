@@ -1699,9 +1699,10 @@ fn e2e_groupby_variance_returns_clear_error() {
     let batch = RecordBatch::try_new(schema, vec![k, v]).expect("batch");
     let mut engine = Engine::new().expect("ctx");
     engine.register_table("t", batch).unwrap();
-    let err = engine
-        .sql("SELECT k, VAR_POP(v) FROM t GROUP BY k")
-        .expect_err("v0.5: GROUP BY VAR_POP must be rejected");
+    let err = match engine.sql("SELECT k, VAR_POP(v) FROM t GROUP BY k") {
+        Ok(_) => panic!("v0.5: GROUP BY VAR_POP must be rejected"),
+        Err(e) => e,
+    };
     let msg = format!("{err}");
     assert!(
         msg.contains("VAR_POP") || msg.contains("VAR_SAMP"),

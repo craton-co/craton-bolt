@@ -113,10 +113,10 @@ fn builder_rejects_out_of_range_device() {
     // Negative is unconditionally invalid — no CUDA driver call needed
     // to reject. (Positive-but-too-large would require the driver to
     // know `cuDeviceGetCount`; we test the cheap branch.)
-    let err = Engine::builder()
-        .device(-1)
-        .build()
-        .expect_err("negative device index must be rejected");
+    let err = match Engine::builder().device(-1).build() {
+        Ok(_) => panic!("negative device index must be rejected"),
+        Err(e) => e,
+    };
     let msg = format!("{err}");
     assert!(
         msg.contains("out of range") || msg.contains("-1"),
