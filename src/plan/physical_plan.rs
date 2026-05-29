@@ -910,6 +910,19 @@ pub enum PhysicalPlan {
         /// Branches to concatenate, in source order.
         inputs: Vec<PhysicalPlan>,
     },
+    /// SQL `EXCEPT` / `INTERSECT` (with optional `ALL`). Schema is the left
+    /// input's (branch compatibility was verified at logical-plan time).
+    /// Executed host-side by [`crate::exec::setops`].
+    SetOp {
+        /// Left input.
+        left: Box<PhysicalPlan>,
+        /// Right input.
+        right: Box<PhysicalPlan>,
+        /// `EXCEPT` or `INTERSECT`.
+        op: crate::plan::logical_plan::SetOpKind,
+        /// `true` for the `ALL` (multiset) variant.
+        all: bool,
+    },
     /// Pure column-rename / reorder layer over `input`. Used when the SQL
     /// frontend places a `Project` on top of an `Aggregate` (or other
     /// non-scan-chain operator) purely to surface SELECT-list order and
@@ -1063,6 +1076,10 @@ impl PhysicalPlan {
             PhysicalPlan::Window { output_schema, .. } => output_schema,
             PhysicalPlan::StringLength { output_schema, .. } => output_schema,
             PhysicalPlan::Join { output_schema, .. } => output_schema,
+            // EXCEPT / INTERSECT preserve the left input's schema (rows are
+            // only filtered, never reshaped); branch compatibility was
+            // verified at logical-plan time.
+            PhysicalPlan::SetOp { left, .. } => left.output_schema(),
         }
     }
 }
@@ -2570,6 +2587,7 @@ fn shape(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Sort { .. } => "Sort",
         LogicalPlan::Window { .. } => "Window",
         LogicalPlan::Union { .. } => "Union",
+        LogicalPlan::SetOp { .. } => "SetOp",
         LogicalPlan::Join { .. } => "Join",
     }
 }
@@ -3439,6 +3457,10 @@ pub fn populate_input_validity(
             populate_input_validity(left.as_mut(), provider);
             populate_input_validity(right.as_mut(), provider);
         }
+        PhysicalPlan::SetOp { left, right, .. } => {
+            populate_input_validity(left.as_mut(), provider);
+            populate_input_validity(right.as_mut(), provider);
+        }
         // No fused `KernelSpec` to flag: the LENGTH gather kernel reads only
         // the dictionary index column (never a value-validity bitmap) and
         // NULL rows are handled by the length-table's slot-0 sentinel.
@@ -3770,6 +3792,7 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Window { input, .. } => walk(input),
             PhysicalPlan::Union { inputs } => inputs.iter().any(walk),
+            PhysicalPlan::SetOp { left, right, .. } => walk(left) || walk(right),
             PhysicalPlan::Join {
                 left, right, on, ..
             } => {
@@ -3954,6 +3977,9 @@ fn logical_plan_contains_unsupported_cast_target(plan: &LogicalPlan) -> Option<D
                 .find_map(|se| expr_bad_cast(&se.expr))
                 .or_else(|| walk(input, depth + 1)),
             LogicalPlan::Union { inputs } => inputs.iter().find_map(|b| walk(b, depth + 1)),
+            LogicalPlan::SetOp { left, right, .. } => {
+                walk(left, depth + 1).or_else(|| walk(right, depth + 1))
+            }
             LogicalPlan::Join {
                 left, right, on, ..
             } => on
@@ -4342,6 +4368,24 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             // Schema integrity (matching shapes across branches) was
             // already enforced by `LogicalPlan::schema()`; trust that.
             Ok(PhysicalPlan::Union { inputs: lowered })
+        }
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
+            // Schema compatibility was enforced by `LogicalPlan::schema()`;
+            // lower both sides and carry the operator / multiset flag through
+            // to the host-side executor (`crate::exec::setops`).
+            let l = lower_depth(left, depth + 1)?;
+            let r = lower_depth(right, depth + 1)?;
+            Ok(PhysicalPlan::SetOp {
+                left: Box::new(l),
+                right: Box::new(r),
+                op: *op,
+                all: *all,
+            })
         }
         LogicalPlan::Join {
             left,

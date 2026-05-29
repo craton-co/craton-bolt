@@ -207,6 +207,12 @@ impl JoinReorder {
             LogicalPlan::Union { inputs } => LogicalPlan::Union {
                 inputs: inputs.into_iter().map(|i| self.rewrite_plan(i)).collect(),
             },
+            LogicalPlan::SetOp { left, right, op, all } => LogicalPlan::SetOp {
+                left: Box::new(self.rewrite_plan(*left)),
+                right: Box::new(self.rewrite_plan(*right)),
+                op,
+                all,
+            },
             LogicalPlan::Join {
                 left,
                 right,

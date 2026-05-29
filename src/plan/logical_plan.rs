@@ -1810,6 +1810,33 @@ impl JoinType {
     }
 }
 
+/// Set-operation kind for [`LogicalPlan::SetOp`] / `PhysicalPlan::SetOp`.
+///
+/// `UNION` is *not* represented here — it lowers to
+/// [`LogicalPlan::Union`] (concatenation, plus a wrapping
+/// [`LogicalPlan::Distinct`] for the dedup variant). This enum carries only
+/// the two operators that need a dedicated host-side multiset executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    /// `EXCEPT` — rows present in the left input but not the right
+    /// (multiset difference; see [`crate::exec::setops`] for the ALL vs
+    /// distinct multiset semantics).
+    Except,
+    /// `INTERSECT` — rows present in both inputs (multiset intersection).
+    Intersect,
+}
+
+impl SetOpKind {
+    /// SQL keyword for this operator (`"EXCEPT"` / `"INTERSECT"`), used in
+    /// EXPLAIN output and error messages.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            SetOpKind::Except => "EXCEPT",
+            SetOpKind::Intersect => "INTERSECT",
+        }
+    }
+}
+
 /// Relational logical plan node.
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
@@ -1894,6 +1921,34 @@ pub enum LogicalPlan {
     Union {
         /// Branches to concatenate, in source order.
         inputs: Vec<LogicalPlan>,
+    },
+    /// SQL `EXCEPT` / `INTERSECT` (with optional `ALL`). `left` and `right`
+    /// must share a compatible schema (same field count + per-field dtypes,
+    /// the same rule [`LogicalPlan::Union`] enforces); the result schema is
+    /// the left input's. The dedup-vs-multiset semantics are chosen by
+    /// `all`:
+    ///
+    /// * `all == false` (plain `EXCEPT` / `INTERSECT`) — the result is a
+    ///   *set*: each surviving row appears at most once.
+    /// * `all == true` (`EXCEPT ALL` / `INTERSECT ALL`) — the result is a
+    ///   *multiset*: row multiplicities follow the SQL standard
+    ///   (`EXCEPT ALL`: `max(0, lc - rc)` copies; `INTERSECT ALL`:
+    ///   `min(lc, rc)` copies, where `lc`/`rc` are the per-row counts in the
+    ///   left / right inputs).
+    ///
+    /// Executed host-side by [`crate::exec::setops`], which reuses the
+    /// `DISTINCT` executor's row-key / NULL canonicalisation so two NULLs in
+    /// the same column compare equal (matching the engine-wide convention).
+    SetOp {
+        /// Left input.
+        left: Box<LogicalPlan>,
+        /// Right input.
+        right: Box<LogicalPlan>,
+        /// `EXCEPT` or `INTERSECT`.
+        op: SetOpKind,
+        /// `true` for the `ALL` (multiset) variant; `false` for the
+        /// set-returning default.
+        all: bool,
     },
     /// SQL JOIN: combine `left` and `right` rows that satisfy `on`.
     /// Supports `JoinType::Inner`, `LeftOuter`, `RightOuter`, `FullOuter`,
@@ -2078,6 +2133,27 @@ impl LogicalPlan {
                     }
                 }
                 Ok(first)
+            }
+            LogicalPlan::SetOp {
+                left, right, op, ..
+            } => {
+                // Both inputs must share a compatible schema (same field
+                // count + per-field dtypes), the same rule UNION enforces.
+                // The result schema is the left input's.
+                let l = left.schema_depth(depth + 1)?;
+                let r = right.schema_depth(depth + 1)?;
+                if !schemas_compatible(&l, &r) {
+                    return Err(BoltError::Plan(format!(
+                        "{} inputs have incompatible schemas: \
+                         left has {} fields ({}), right has {} fields ({})",
+                        op.keyword(),
+                        l.fields.len(),
+                        schema_summary(&l),
+                        r.fields.len(),
+                        schema_summary(&r),
+                    )));
+                }
+                Ok(l)
             }
             LogicalPlan::Join {
                 left,

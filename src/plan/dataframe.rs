@@ -355,7 +355,8 @@ fn check_no_empty_union(plan: &LogicalPlan) -> BoltResult<()> {
             }
             Ok(())
         }
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. }
+        | LogicalPlan::SetOp { left, right, .. } => {
             check_no_empty_union(left)?;
             check_no_empty_union(right)
         }

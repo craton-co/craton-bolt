@@ -9,8 +9,8 @@
 //! message where the message is load-bearing.
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider, Schema,
-    UnaryOp,
+    lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider, PhysicalPlan,
+    Schema, UnaryOp,
 };
 
 // ---- Fixture ----------------------------------------------------------------
@@ -894,4 +894,125 @@ fn count_distinct_with_group_by_rejected() {
     );
     // Either the "not sole item"/"GROUP BY" guard fires; both are clear.
     assert_err(res, "COUNT(DISTINCT) with GROUP BY");
+}
+
+// ---- EXCEPT / INTERSECT (+ ALL) ---------------------------------------------
+
+use craton_bolt::plan::SetOpKind;
+
+#[test]
+fn except_lowers_to_setop() {
+    let provider = fixture_table();
+    let plan = plan_ok(
+        "SELECT region_id FROM sales EXCEPT SELECT region_id FROM sales",
+        &provider,
+    );
+    let LogicalPlan::SetOp { op, all, .. } = &plan else {
+        panic!("expected SetOp at root, got {plan:?}");
+    };
+    assert_eq!(*op, SetOpKind::Except);
+    assert!(!*all, "plain EXCEPT is the set (non-ALL) variant");
+    // Result schema is the left input's.
+    let schema = plan.schema().expect("type-check");
+    assert_eq!(schema.fields.len(), 1);
+    assert_eq!(schema.fields[0].name, "region_id");
+}
+
+#[test]
+fn except_all_sets_multiset_flag() {
+    let provider = fixture_table();
+    let plan = plan_ok(
+        "SELECT region_id FROM sales EXCEPT ALL SELECT region_id FROM sales",
+        &provider,
+    );
+    let LogicalPlan::SetOp { op, all, .. } = &plan else {
+        panic!("expected SetOp, got {plan:?}");
+    };
+    assert_eq!(*op, SetOpKind::Except);
+    assert!(*all, "EXCEPT ALL is the multiset variant");
+}
+
+#[test]
+fn intersect_lowers_to_setop() {
+    let provider = fixture_table();
+    let plan = plan_ok(
+        "SELECT region_id FROM sales INTERSECT SELECT region_id FROM sales",
+        &provider,
+    );
+    let LogicalPlan::SetOp { op, all, .. } = &plan else {
+        panic!("expected SetOp, got {plan:?}");
+    };
+    assert_eq!(*op, SetOpKind::Intersect);
+    assert!(!*all);
+}
+
+#[test]
+fn intersect_all_sets_multiset_flag() {
+    let provider = fixture_table();
+    let plan = plan_ok(
+        "SELECT region_id FROM sales INTERSECT ALL SELECT region_id FROM sales",
+        &provider,
+    );
+    let LogicalPlan::SetOp { op, all, .. } = &plan else {
+        panic!("expected SetOp, got {plan:?}");
+    };
+    assert_eq!(*op, SetOpKind::Intersect);
+    assert!(*all);
+}
+
+#[test]
+fn except_left_associative_chain() {
+    // `a EXCEPT b EXCEPT c` is left-associative: SetOp(SetOp(a, b), c).
+    let provider = fixture_table();
+    let plan = plan_ok(
+        "SELECT region_id FROM sales \
+         EXCEPT SELECT region_id FROM sales \
+         EXCEPT SELECT region_id FROM sales",
+        &provider,
+    );
+    let LogicalPlan::SetOp { left, op, .. } = &plan else {
+        panic!("expected SetOp at root, got {plan:?}");
+    };
+    assert_eq!(*op, SetOpKind::Except);
+    assert!(
+        matches!(left.as_ref(), LogicalPlan::SetOp { .. }),
+        "left of an EXCEPT chain should itself be a SetOp, got {left:?}"
+    );
+}
+
+#[test]
+fn except_lowers_to_physical_setop() {
+    let provider = fixture_table();
+    let plan = parse_sql(
+        "SELECT region_id FROM sales EXCEPT SELECT region_id FROM sales",
+        &provider,
+    )
+    .expect("parse + lower logical");
+    let phys = lower_physical(&plan).expect("physical lowering of EXCEPT");
+    assert!(
+        matches!(phys, PhysicalPlan::SetOp { .. }),
+        "expected PhysicalPlan::SetOp, got {phys:?}"
+    );
+}
+
+#[test]
+fn except_incompatible_schemas_rejected() {
+    let provider = fixture_table();
+    // Left has one column, right has two — incompatible schemas.
+    let res = try_plan(
+        "SELECT region_id FROM sales EXCEPT SELECT region_id, qty FROM sales",
+        &provider,
+    );
+    assert_err_contains(res, "EXCEPT");
+}
+
+#[test]
+fn except_by_name_rejected() {
+    let provider = fixture_table();
+    let res = try_plan(
+        "SELECT region_id FROM sales EXCEPT BY NAME SELECT region_id FROM sales",
+        &provider,
+    );
+    // The BY NAME variant is rejected for every set operator.
+    assert_err(res, "EXCEPT BY NAME");
 }

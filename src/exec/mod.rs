@@ -94,6 +94,11 @@ pub mod groupby_tier2_twokey_minmax_float_exec;
 // surfaces, not part of the public 0.2 API.
 #[doc(hidden)]
 pub mod distinct;
+/// Host-side `EXCEPT` / `INTERSECT` (with optional `ALL`) executor. Lowered
+/// from `LogicalPlan::SetOp` / `PhysicalPlan::SetOp`; reuses the DISTINCT
+/// executor's row-key / NULL canonicalisation. Host-only for now.
+#[doc(hidden)]
+pub mod setops;
 #[doc(hidden)]
 pub mod sort;
 /// Host-side window-function executor (`func(...) OVER (...)`). Lowered from

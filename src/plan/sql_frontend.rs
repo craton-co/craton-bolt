@@ -20,8 +20,8 @@ use sqlparser::parser::{Parser, ParserError};
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, DataType,
-    Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SortExpr, TimeUnit, UnaryOp,
-    WindowExpr, WindowFunc,
+    Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SetOpKind, SortExpr, TimeUnit,
+    UnaryOp, WindowExpr, WindowFunc,
 };
 use sqlparser::ast::{WindowFrameBound, WindowFrameUnits, WindowType};
 
@@ -1197,38 +1197,61 @@ fn lower_set_expr(
             left,
             right,
         } => {
-            if *op != SetOperator::Union {
-                return Err(BoltError::Sql(format!(
-                    "unsupported set operator: {op}; only UNION / UNION ALL"
-                )));
-            }
-            // Reject the BY NAME variants (non-standard, schema-rewriting).
-            let dedup = match set_quantifier {
-                SetQuantifier::All => false,
-                SetQuantifier::Distinct | SetQuantifier::None => true,
+            // `BY NAME` variants are non-standard (schema-rewriting) and
+            // rejected for every operator before we branch on the operator.
+            let all = match set_quantifier {
+                SetQuantifier::All => true,
+                SetQuantifier::Distinct | SetQuantifier::None => false,
                 SetQuantifier::ByName
                 | SetQuantifier::AllByName
                 | SetQuantifier::DistinctByName => {
-                    return Err(BoltError::Sql(
-                        "unsupported: UNION BY NAME".into(),
-                    ));
+                    return Err(BoltError::Sql(format!(
+                        "unsupported: {op} BY NAME"
+                    )));
                 }
             };
-            // Flatten left-recursive UNION chains into a single Union node so
-            // `q1 UNION ALL q2 UNION ALL q3` becomes one 3-input Union rather
-            // than a nested binary tree. UNION (dedup) does NOT flatten across
-            // UNION ALL boundaries: their semantics differ.
-            let mut inputs: Vec<LogicalPlan> = Vec::new();
-            collect_union_branches(left, provider, ctes, dedup, &mut inputs, depth + 1)?;
-            collect_union_branches(right, provider, ctes, dedup, &mut inputs, depth + 1)?;
-            let union = LogicalPlan::Union { inputs };
-            Ok(if dedup {
-                LogicalPlan::Distinct {
-                    input: Box::new(union),
+            match op {
+                SetOperator::Union => {
+                    // `dedup` is the inverse of `all`: plain UNION dedups.
+                    let dedup = !all;
+                    // Flatten left-recursive UNION chains into a single Union
+                    // node so `q1 UNION ALL q2 UNION ALL q3` becomes one
+                    // 3-input Union rather than a nested binary tree. UNION
+                    // (dedup) does NOT flatten across UNION ALL boundaries:
+                    // their semantics differ.
+                    let mut inputs: Vec<LogicalPlan> = Vec::new();
+                    collect_union_branches(left, provider, ctes, dedup, &mut inputs, depth + 1)?;
+                    collect_union_branches(right, provider, ctes, dedup, &mut inputs, depth + 1)?;
+                    let union = LogicalPlan::Union { inputs };
+                    Ok(if dedup {
+                        LogicalPlan::Distinct {
+                            input: Box::new(union),
+                        }
+                    } else {
+                        union
+                    })
                 }
-            } else {
-                union
-            })
+                // EXCEPT / INTERSECT (with optional ALL) lower to a binary
+                // `SetOp` node executed host-side by `crate::exec::setops`.
+                // We do NOT flatten chains here — the multiset semantics of
+                // `a EXCEPT b EXCEPT c` are left-associative `(a EXCEPT b)
+                // EXCEPT c`, which the nested-binary shape expresses directly.
+                SetOperator::Except | SetOperator::Intersect => {
+                    let set_op = match op {
+                        SetOperator::Except => SetOpKind::Except,
+                        SetOperator::Intersect => SetOpKind::Intersect,
+                        SetOperator::Union => unreachable!("handled above"),
+                    };
+                    let left_plan = lower_set_expr(left, provider, ctes, depth + 1)?;
+                    let right_plan = lower_set_expr(right, provider, ctes, depth + 1)?;
+                    Ok(LogicalPlan::SetOp {
+                        left: Box::new(left_plan),
+                        right: Box::new(right_plan),
+                        op: set_op,
+                        all,
+                    })
+                }
+            }
         }
         SetExpr::Values(_) => Err(BoltError::Sql("unsupported: VALUES".into())),
         SetExpr::Insert(_) | SetExpr::Update(_) => Err(BoltError::Sql(

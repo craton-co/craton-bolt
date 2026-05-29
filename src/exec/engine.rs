@@ -2364,6 +2364,20 @@ impl Engine {
                     })?;
                 Ok(QueryHandle { batch: merged })
             }
+            PhysicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => {
+                // EXCEPT / INTERSECT (with optional ALL): execute both inputs,
+                // then compute the multiset difference / intersection
+                // host-side (see `crate::exec::setops`), reusing the DISTINCT
+                // executor's row-key / NULL canonicalisation.
+                let l = self.execute(left)?;
+                let r = self.execute(right)?;
+                crate::exec::setops::execute_setop(l, r, *op, *all)
+            }
             PhysicalPlan::Join {
                 left,
                 right,

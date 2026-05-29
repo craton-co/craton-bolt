@@ -139,8 +139,12 @@ fn parse_distinct_host_max_rows_env() -> usize {
 /// the engine produces; float variants store the raw bit pattern so that
 /// `PartialEq + Eq + Hash` are bit-wise (see the module doc-comment for
 /// the NaN / signed-zero implications).
+///
+/// Exposed `pub(crate)` so the EXCEPT / INTERSECT executor
+/// ([`crate::exec::setops`]) can build the *same* row keys and therefore
+/// share one row-equality / NULL-canonicalisation relation with DISTINCT.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum RowKeyValue {
+pub(crate) enum RowKeyValue {
     /// Column is NULL at this row. Two NULLs in the same column position
     /// compare equal, which matches the engine-wide "two NULLs dedupe to
     /// one row" convention used by the SQL `DISTINCT` operator.
@@ -158,12 +162,17 @@ enum RowKeyValue {
 }
 
 /// A row's full key — one `RowKeyValue` per column, in column order.
-type RowKey = Vec<RowKeyValue>;
+/// `pub(crate)` so [`crate::exec::setops`] can build matching keys.
+pub(crate) type RowKey = Vec<RowKeyValue>;
 
 /// Pre-downcast column reader: a typed, zero-cost view into one column of
 /// the input batch. Built once per column up-front so the inner row loop
 /// no longer pays `Array::as_any` + `downcast_ref` per (row, column).
-enum ColumnReader<'a> {
+///
+/// `pub(crate)` so [`crate::exec::setops`] can build the same typed readers
+/// (and thus the same canonicalised row keys) without re-implementing the
+/// per-dtype downcast.
+pub(crate) enum ColumnReader<'a> {
     I32(&'a Int32Array),
     I64(&'a Int64Array),
     F32(&'a Float32Array),
@@ -173,7 +182,7 @@ enum ColumnReader<'a> {
 }
 
 impl<'a> ColumnReader<'a> {
-    fn new(array: &'a dyn Array) -> BoltResult<Self> {
+    pub(crate) fn new(array: &'a dyn Array) -> BoltResult<Self> {
         Ok(match array.data_type() {
             DataType::Int32 => ColumnReader::I32(array.as_any().downcast_ref().unwrap()),
             DataType::Int64 => ColumnReader::I64(array.as_any().downcast_ref().unwrap()),
@@ -194,7 +203,7 @@ impl<'a> ColumnReader<'a> {
     /// null row. The only path that allocates is `Utf8`, which clones the
     /// underlying `&str` into a `String`.
     #[inline]
-    fn value_at(&self, row: usize) -> RowKeyValue {
+    pub(crate) fn value_at(&self, row: usize) -> RowKeyValue {
         match self {
             ColumnReader::I32(a) => {
                 if a.is_null(row) { RowKeyValue::Null } else { RowKeyValue::I32(a.value(row)) }
