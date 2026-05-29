@@ -492,6 +492,23 @@ impl<'a> Codegen<'a> {
                 kind.sql_name()
             ))),
             Expr::Alias(inner, _) => self.emit_expr(inner),
+            // v0.7 date-scalar-fns: EXTRACT / DATE_TRUNC type-check at the
+            // logical plane and have a standalone GPU codegen module
+            // (`crate::jit::date_scalar`), but they are not yet wired into
+            // this fused-projection IR emitter. Reject cleanly so a hand-built
+            // plan reaching here gets a useful message rather than nonsense
+            // PTX; the standalone module is exercised directly by its own
+            // PTX-assertion tests until the IR plumbing lands.
+            Expr::Extract { field, .. } => Err(BoltError::Plan(format!(
+                "EXTRACT({} FROM ...) is not yet lowered through the fused-projection \
+                 kernel IR; coming in a follow-up",
+                field.sql_name()
+            ))),
+            Expr::DateTrunc { unit, .. } => Err(BoltError::Plan(format!(
+                "DATE_TRUNC('{}', ...) is not yet lowered through the fused-projection \
+                 kernel IR; coming in a follow-up",
+                unit.sql_name()
+            ))),
             // CASE has no GPU IR yet: there is no value-selection-by-mask
             // op in the kernel codegen, so a CASE expression in a fused
             // projection / filter kernel cannot be lowered. The lowering
@@ -1128,6 +1145,14 @@ fn substitute_one_depth(
                 .map(|a| substitute_one_depth(a, map, depth + 1))
                 .collect(),
         },
+        Expr::Extract { field, expr } => Expr::Extract {
+            field: *field,
+            expr: Box::new(substitute_one_depth(expr, map, depth + 1)),
+        },
+        Expr::DateTrunc { unit, expr } => Expr::DateTrunc {
+            unit: *unit,
+            expr: Box::new(substitute_one_depth(expr, map, depth + 1)),
+        },
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
         }
@@ -1557,6 +1582,7 @@ fn expr_contains_concat(expr: &Expr) -> bool {
         Expr::Like { expr, .. } => expr_contains_concat(expr),
         Expr::Cast { expr, .. } => expr_contains_concat(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_concat),
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => expr_contains_concat(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1841,6 +1867,11 @@ fn expr_contains_div_or_mod(e: &Expr) -> bool {
         // String scalar functions can't contain Div/Mod themselves, but
         // their arguments are arbitrary scalar expressions, so recurse.
         Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_div_or_mod),
+        // EXTRACT / DATE_TRUNC lower to pure integer arithmetic with no
+        // user-visible divide; recurse into the operand for completeness.
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
+            expr_contains_div_or_mod(expr)
+        }
     }
 }
 
@@ -1880,6 +1911,9 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
         // operand of the *function call*, but the arguments themselves
         // might contain the unsafe pattern, so recurse.
         Expr::ScalarFn { args, .. } => args.iter().any(expr_has_unsafe_eager_shortcircuit),
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
+            expr_has_unsafe_eager_shortcircuit(expr)
+        }
     }
 }
 
@@ -2094,6 +2128,7 @@ fn expr_contains_case(e: &Expr) -> bool {
         Expr::Like { expr, .. } => expr_contains_case(expr),
         Expr::Cast { expr, .. } => expr_contains_case(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_case),
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => expr_contains_case(expr),
     }
 }
 
@@ -2118,6 +2153,7 @@ fn logical_plan_contains_cast(plan: &LogicalPlan) -> bool {
             }
             Expr::Like { expr, .. } => expr_has_cast(expr),
             Expr::ScalarFn { args, .. } => args.iter().any(expr_has_cast),
+            Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => expr_has_cast(expr),
         }
     }
     fn agg_has_cast(a: &AggregateExpr) -> bool {

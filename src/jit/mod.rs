@@ -7,6 +7,13 @@ pub mod jit_compiler;
 /// See [`disk_cache`] module docs for the path-resolution rules.
 pub mod disk_cache;
 pub mod agg_kernels;
+/// PTX codegen for the `SUM(Decimal128)` reduction kernel (atomic-free
+/// two-stage block reduce over `i128` hi/lo halves). See [`decimal_agg`].
+pub mod decimal_agg;
+/// PTX codegen + host reference math for the date/time scalar functions
+/// `EXTRACT(field FROM ts)` and `DATE_TRUNC(unit, ts)`, lowered to integer
+/// arithmetic on `Date32`/`Timestamp` storage. See [`date_scalar`].
+pub mod date_scalar;
 pub mod scan_kernel;
 pub mod hash_kernels;
 pub mod prefix_scan;

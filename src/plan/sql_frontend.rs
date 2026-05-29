@@ -2900,6 +2900,7 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
                     stack.push(a);
                 }
             }
+            Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => stack.push(expr),
         }
     }
     Ok(())
@@ -4946,6 +4947,9 @@ mod wave7_tests {
                             for a in args {
                                 stack.push(a);
                             }
+                        }
+                        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
+                            stack.push(expr)
                         }
                         Expr::Literal(_) => {}
                     }

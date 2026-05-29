@@ -312,6 +312,9 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 collect_column_refs(a, out);
             }
         }
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
+            collect_column_refs(expr, out)
+        }
         Expr::Alias(inner, _) => collect_column_refs(inner, out),
     }
 }
