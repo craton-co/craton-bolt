@@ -16,8 +16,9 @@
 //!   * Division and any non-arithmetic op on Decimal128 (comparisons,
 //!     logical, etc.).
 //!   * CAST involving Decimal128 (source OR target).
-//!   * SUM / MIN / MAX / AVG over Decimal128 (no atomic / per-group
-//!     accumulator wired yet).
+//!   * MIN / MAX / AVG over Decimal128 (no per-group accumulator wired
+//!     yet). `SUM(Decimal128)` is accepted as a host-side reduction in
+//!     v0.7 — see the `sum_decimal128_*` tests below.
 //!
 //! Scenarios below:
 //!
@@ -30,10 +31,16 @@
 //!    the syntax) and is rejected at lowering with the documented
 //!    "CAST to/from Decimal128 not yet lowered" message.
 
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
+use arrow_schema::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema,
 };
-use craton_bolt::BoltError;
+use craton_bolt::{BoltError, Engine};
 
 /// Build a `Schema` with a `Decimal128(18, 2)` value column alongside an
 /// `Int32` key column. Reused by every test below.
@@ -300,5 +307,132 @@ fn decimal128_add_mismatched_scale_rejected() {
     assert!(
         msg.contains("scale") || msg.contains("Decimal128"),
         "scale-mismatch rejection should mention scale / Decimal128; got: {msg}"
+    );
+}
+
+// ---- 5. SUM(Decimal128) host-side reduction (v0.7) -------------------------
+//
+// SUM(Decimal128) is the first aggregate over Decimal128 we support. The
+// path is host-side (no GPU launch): the executor walks the
+// already-host-resident `Decimal128Array`, sums non-NULL `i128` values
+// into a checked accumulator, and packs the result as a single-row
+// `Decimal128(38, s)` array (per the SQL widening convention in
+// `sum_output_dtype`). MIN / MAX / AVG stay rejected as separate scope.
+//
+// Below tests run end-to-end through `Engine::sql` and therefore require
+// the SUM(Decimal128) code path to be reachable from the SQL frontend
+// through to the host-side fold. They do not launch a GPU kernel for the
+// reduction itself, but the engine plumbing (table registration,
+// planning, lowering) is plan-only and works under `cuda-stub`. We mark
+// them `#[ignore = "gpu:tier1"]` to match the rest of the integration
+// suite's gating convention for tests that hit `Engine::sql`.
+
+/// Build a one-column `RecordBatch` named `d` from a `Decimal128Array`.
+/// Uses the Arrow-declared `(precision, scale)` on the array as the field
+/// dtype, so the SUM result widens to `Decimal128(38, scale)` per the
+/// engine's `sum_output_dtype` rule.
+fn decimal_batch(values: Decimal128Array) -> RecordBatch {
+    let dt = values.data_type().clone();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("d", dt, true)]));
+    RecordBatch::try_new(schema, vec![Arc::new(values) as ArrayRef])
+        .expect("single-column Decimal batch")
+}
+
+/// Basic SUM(Decimal128) shape: a handful of small fixed-point values
+/// with no NULLs. The result's `(precision, scale)` widens to
+/// `(38, 2)`.
+#[test]
+#[ignore = "gpu:tier1"]
+fn sum_decimal128_basic() {
+    let arr = Decimal128Array::from(vec![
+        // 1.23, -4.56, 7.89, 0.01, 100.00 (raw i128 values at scale 2)
+        123_i128,
+        -456_i128,
+        789_i128,
+        1_i128,
+        10_000_i128,
+    ])
+    .with_precision_and_scale(18, 2)
+    .expect("valid (p, s)");
+    let expected: i128 = 123 - 456 + 789 + 1 + 10_000;
+
+    let mut engine = Engine::new().expect("engine");
+    engine.register_table("t", decimal_batch(arr)).expect("register");
+    let handle = engine.sql("SELECT SUM(d) FROM t").expect("SUM(Decimal) must execute");
+    let out = handle.record_batch();
+    assert_eq!(out.num_rows(), 1, "scalar SUM is a single-row result");
+
+    // Schema check: SUM(Decimal128(18, 2)) widens precision to 38.
+    let f = out.schema().field(0).clone();
+    assert!(
+        matches!(f.data_type(), ArrowDataType::Decimal128(38, 2)),
+        "SUM(Decimal128) output schema must be Decimal128(38, 2); got {:?}",
+        f.data_type()
+    );
+
+    let arr = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("Decimal128 output");
+    assert!(!arr.is_null(0), "SUM over non-empty input must be non-null");
+    assert_eq!(arr.value(0), expected);
+}
+
+/// SUM(Decimal128) on a column with NULL entries: NULLs are skipped.
+#[test]
+#[ignore = "gpu:tier1"]
+fn sum_decimal128_skips_nulls() {
+    let arr = Decimal128Array::from(vec![
+        Some(100_i128),
+        None,
+        Some(-25_i128),
+        None,
+        Some(75_i128),
+    ])
+    .with_precision_and_scale(10, 2)
+    .expect("valid (p, s)");
+    let expected: i128 = 100 - 25 + 75;
+
+    let mut engine = Engine::new().expect("engine");
+    engine.register_table("t", decimal_batch(arr)).expect("register");
+    let handle = engine.sql("SELECT SUM(d) FROM t").expect("SUM(Decimal) must execute");
+    let out = handle.record_batch();
+
+    let arr = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("Decimal128 output");
+    assert_eq!(arr.value(0), expected);
+}
+
+/// SUM(Decimal128) on values whose `i128` accumulator would overflow
+/// must surface a clear "precision overflow" error rather than wrapping
+/// silently. We use the largest representable value at precision 38
+/// (`10^38 - 1`) twice — `2 * (10^38 - 1)` exceeds `i128::MAX`
+/// (≈ `1.7 * 10^38`), so the second `checked_add` returns `None` and
+/// the executor surfaces the overflow as a `BoltError::Type`.
+#[test]
+#[ignore = "gpu:tier1"]
+fn sum_decimal128_overflow_errors() {
+    // 10^38 - 1 — the largest value Arrow accepts at precision 38.
+    // Two of them sum to `~2 * 10^38`, which exceeds `i128::MAX`
+    // (≈ 1.7 * 10^38) and overflows the host accumulator.
+    let big: i128 = 10_i128.pow(38) - 1;
+    let arr = Decimal128Array::from(vec![big, big])
+        .with_precision_and_scale(38, 0)
+        .expect("10^38 - 1 fits at precision 38");
+
+    let mut engine = Engine::new().expect("engine");
+    engine.register_table("t", decimal_batch(arr)).expect("register");
+    let err = engine
+        .sql("SELECT SUM(d) FROM t")
+        .err()
+        .expect("SUM(Decimal128) on overflowing input must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("overflow") && msg.contains("Decimal128"),
+        "SUM(Decimal128) overflow should name overflow + Decimal128; got: {msg}"
     );
 }
