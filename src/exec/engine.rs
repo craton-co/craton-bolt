@@ -1791,13 +1791,20 @@ impl Engine {
         let plan = tracing::info_span!("plan")
             .in_scope(|| self.dict_registry.rewrite_plan(&plan))?;
         let plan = self.dict_registry.rewrite_plan(&plan)?;
+        // Built-in logical optimizer: run the default pass pipeline
+        // (constant folding, predicate pushdown, filter-into-join, join
+        // reorder, projection pruning) BEFORE any user-registered rewrites.
+        // See `crate::plan::optimizer` for the pipeline and ordering.
+        let plan = crate::plan::default_passes()
+            .iter()
+            .try_fold(plan, |p, r| r.rewrite(p))?;
         // v0.6 / M7: run user-registered PlanRewrite implementations in
         // registration order, threading each rewriter's output into the
-        // next. This runs AFTER the internal dict-rewrite (so user
-        // rewrites see the engine's normalised form with `__idx_<col>`
-        // refs already in place) and BEFORE `lower_physical` (so users
-        // can still target logical-plan structure). See
-        // `crate::plan::rewrite` for the contract.
+        // next. This runs AFTER the built-in optimizer and the internal
+        // dict-rewrite (so user rewrites see the engine's normalised form
+        // with `__idx_<col>` refs already in place) and BEFORE
+        // `lower_physical` (so users can still target logical-plan
+        // structure). See `crate::plan::rewrite` for the contract.
         let plan = self
             .rewrites
             .iter()
@@ -1844,6 +1851,12 @@ impl Engine {
         // integer equality against the corresponding __idx_<col> i32 column —
         // mirrors `sql()`.
         let plan = self.dict_registry.rewrite_plan(plan)?;
+        // Built-in logical optimizer: mirror the `sql()` path so a plan built
+        // via the DataFrame builder gets the same default optimizations before
+        // lowering. See `crate::plan::optimizer`.
+        let plan = crate::plan::default_passes()
+            .iter()
+            .try_fold(plan, |p, r| r.rewrite(p))?;
         let mut phys = crate::plan::lower_physical(&plan)?;
         // PV-stage-d: thread per-column null-bearing into the kernel specs.
         let nb = EngineProvider {

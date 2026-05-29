@@ -9,6 +9,7 @@ pub mod physical_plan;
 pub mod string_literal_rewrite;
 pub mod suggest;
 pub mod rewrite;
+pub mod optimizer;
 
 pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,
@@ -23,3 +24,4 @@ pub use physical_plan::{
     lower as lower_physical, ColumnIO, KernelSpec, Op, PhysicalPlan, Reg, Value,
 };
 pub use rewrite::PlanRewrite;
+pub use optimizer::default_passes;
