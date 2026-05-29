@@ -71,6 +71,9 @@ pub const BLOCK_SIZE: u32 = 256;
 /// Entry-point name for the dictionary-gather `LENGTH` kernel.
 pub const LENGTH_GATHER_ENTRY: &str = "bolt_str_length_gather";
 
+/// Entry-point name for the per-row variable-width `LIKE` matcher kernel.
+pub const LIKE_MATCH_ENTRY: &str = "bolt_str_like_match";
+
 /// Entry-point name prefix for the variable-width length pass. The concrete
 /// name appends the lowercased op (e.g. `bolt_str_len_pass_upper`).
 const LEN_PASS_PREFIX: &str = "bolt_str_len_pass";
@@ -231,6 +234,287 @@ pub fn compile_length_gather_kernel() -> BoltResult<String> {
     // out[tid] = len.
     writeln!(ptx, "\tadd.s64 %rd7, %rd2, %rd3;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u32 [%rd7], %r6;").map_err(write_err)?;
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Per-row variable-width `LIKE` matcher (Bool output).
+// ---------------------------------------------------------------------------
+//
+// ⚠️ UNVALIDATED DEVICE CODE ⚠️
+//
+// `compile_like_match_kernel` emits a real per-row device matcher for the
+// constant single-literal-segment `LIKE` shapes (EXACT / PREFIX / SUFFIX /
+// CONTAINS, plus `NOT LIKE` via inversion). It has NOT been executed on GPU
+// hardware in CI — this engine has no GPU at build/test time. Correctness is
+// established by two host-side proxies only:
+//
+//   * the **host mirror** [`crate::exec::string_like::like_match_row`], which
+//     replicates the exact per-row byte logic the PTX emits and is asserted
+//     equal to [`crate::exec::like::PatternMatcher`] over a sample set, and
+//   * the **PTX-shape tests** in this module, which pin the compare / branch
+//     structure each mode emits.
+//
+// Until a GPU hardware test pass validates it, the executor
+// ([`crate::exec::string_like`]) is conservatively host-fallback-safe: any
+// unsupported layout / shape encountered at run time evaluates the SAME match
+// on the host via `PatternMatcher`, so a latent device bug can only ever cost
+// performance, never correctness.
+
+/// Match mode for [`compile_like_match_kernel`]. Mirrors the four supported
+/// single-literal-segment `LIKE` shapes; the SQL-level `%`-decomposition lives
+/// in [`crate::exec::string_like::decompose_like_pattern`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LikeMode {
+    /// `'lit'` — row matches iff `row_len == L && bytes == lit`.
+    Exact,
+    /// `'lit%'` — row matches iff `row_len >= L && bytes[0..L] == lit`.
+    Prefix,
+    /// `'%lit'` — row matches iff `row_len >= L && bytes[row_len-L..] == lit`.
+    Suffix,
+    /// `'%lit%'` — row matches iff `lit` occurs as a substring (naive scan over
+    /// the `row_len - L + 1` candidate start offsets).
+    Contains,
+}
+
+impl LikeMode {
+    /// Lowercased tag used in PTX comments / debugging.
+    fn tag(self) -> &'static str {
+        match self {
+            LikeMode::Exact => "exact",
+            LikeMode::Prefix => "prefix",
+            LikeMode::Suffix => "suffix",
+            LikeMode::Contains => "contains",
+        }
+    }
+}
+
+/// Compile the per-row variable-width `LIKE` matcher kernel.
+///
+/// One thread per row reads the row's byte slice (via the Arrow-`Utf8`-shaped
+/// `offsets` + `bytes` buffers, exactly like the two-pass producers) and writes
+/// a single `u8` (0 / 1) into `out_mask[tid]`. The literal to match against is
+/// uploaded as a small device buffer (`lit_ptr`, `lit_len` bytes). `mode`
+/// selects the comparison; `negated` inverts the final 0/1.
+///
+/// Per-row logic by mode (`L = lit_len`, `n = row_len`):
+///
+///   * `Exact`    — `match = (n == L) && bytes[i] == lit[i] for i in 0..L`.
+///   * `Prefix`   — `match = (n >= L) && bytes[i] == lit[i] for i in 0..L`.
+///   * `Suffix`   — `match = (n >= L) && bytes[n-L+i] == lit[i] for i in 0..L`.
+///   * `Contains` — `match = exists s in 0..=(n-L) s.t. bytes[s+i]==lit[i] ∀i`.
+///
+/// Empty literal (`L == 0`): `Prefix` / `Suffix` / `Contains` match every row
+/// (`""` is a prefix / suffix / substring of anything); `Exact` matches iff
+/// `n == 0`. The kernel handles `L == 0` by short-circuiting to the right
+/// constant before the per-byte loop, so no out-of-bounds read occurs.
+///
+/// NULL handling lives on the HOST: the row-aligned input has no validity
+/// channel, so NULL rows decode to an empty slice here; the executor re-applies
+/// the input column's validity bitmap to the downloaded mask so a NULL row
+/// surfaces as SQL NULL (dropped by the filter), matching
+/// [`crate::exec::like::host_like`]'s 3VL.
+///
+/// ## ABI
+///
+/// ```text
+/// .visible .entry bolt_str_like_match(
+///     .param .u64 ..._param_0,   // offsets  (i32*, n_rows+1 entries)
+///     .param .u64 ..._param_1,   // bytes    (u8*)
+///     .param .u64 ..._param_2,   // lit      (u8*, lit_len bytes; may be 1-byte pad if lit_len==0)
+///     .param .u64 ..._param_3,   // out_mask (u8*) -- OUTPUT, 0/1 per row
+///     .param .u32 ..._param_4,   // n_rows
+///     .param .u32 ..._param_5    // lit_len  (L)
+/// )
+/// ```
+///
+/// `mode` and `negated` are baked into the emitted code (compile-time), so the
+/// ABI is identical across all four modes. Grid is 1-D, one thread per row,
+/// block size [`BLOCK_SIZE`].
+pub fn compile_like_match_kernel(mode: LikeMode, negated: bool) -> BoltResult<String> {
+    let entry = LIKE_MATCH_ENTRY;
+    let mut ptx = String::new();
+    emit_header(&mut ptx)?;
+
+    writeln!(ptx, "// mode={} negated={}", mode.tag(), negated).map_err(write_err)?;
+    writeln!(ptx, ".visible .entry {}(", entry).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_0,", entry).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_1,", entry).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_2,", entry).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_3,", entry).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {}_param_4,", entry).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {}_param_5", entry).map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    writeln!(ptx, "\t.reg .pred  %p<12>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b16   %rs<4>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<40>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<40>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // gid + n_rows guard.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_4];", entry).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // Globalize offsets / bytes / lit / out_mask.
+    writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_0];", entry).map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd1, [{}_param_1];", entry).map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd2, [{}_param_2];", entry).map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd3, [{}_param_3];", entry).map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+
+    // L = lit_len.
+    writeln!(ptx, "\tld.param.u32 %r5, [{}_param_5];", entry).map_err(write_err)?;
+
+    // Source slice: %r6=begin, %r7=end, %r8=row_len(n), %rd10=row_ptr.
+    emit_load_src_slice(&mut ptx, "%r6", "%r7", "%r8", "%rd10", "%rd0", "%rd1")?;
+
+    // `%r9` accumulates the raw (un-negated) match as 0/1. Default 0; set to 1
+    // on a confirmed match. We branch to MATCH_TRUE / MATCH_FALSE labels and
+    // converge at MATCH_DONE.
+    writeln!(ptx, "\tmov.u32 %r9, 0;").map_err(write_err)?;
+
+    // ---- Empty-literal short circuit (L == 0). -----------------------------
+    // Prefix/Suffix/Contains: "" matches any row → true. Exact: true iff n==0.
+    writeln!(ptx, "\tsetp.ne.u32 %p1, %r5, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra LIT_NONEMPTY;").map_err(write_err)?;
+    match mode {
+        LikeMode::Prefix | LikeMode::Suffix | LikeMode::Contains => {
+            writeln!(ptx, "\tmov.u32 %r9, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tbra MATCH_DONE;").map_err(write_err)?;
+        }
+        LikeMode::Exact => {
+            // match = (n == 0)
+            writeln!(ptx, "\tsetp.eq.u32 %p2, %r8, 0;").map_err(write_err)?;
+            writeln!(ptx, "\tselp.b32 %r9, 1, 0, %p2;").map_err(write_err)?;
+            writeln!(ptx, "\tbra MATCH_DONE;").map_err(write_err)?;
+        }
+    }
+    writeln!(ptx, "LIT_NONEMPTY:").map_err(write_err)?;
+
+    // ---- Length precondition. ----------------------------------------------
+    // Exact: n == L. Prefix/Suffix/Contains: n >= L. On failure → no match.
+    match mode {
+        LikeMode::Exact => {
+            writeln!(ptx, "\tsetp.ne.u32 %p3, %r8, %r5;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p3 bra MATCH_DONE;").map_err(write_err)?;
+        }
+        LikeMode::Prefix | LikeMode::Suffix | LikeMode::Contains => {
+            writeln!(ptx, "\tsetp.lt.u32 %p3, %r8, %r5;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p3 bra MATCH_DONE;").map_err(write_err)?;
+        }
+    }
+
+    match mode {
+        LikeMode::Exact | LikeMode::Prefix => {
+            // Compare bytes[0..L] against lit[0..L]. %r10 = i.
+            writeln!(ptx, "\tmov.u32 %r10, 0;").map_err(write_err)?;
+            writeln!(ptx, "CMP_LOOP:").map_err(write_err)?;
+            writeln!(ptx, "\tsetp.ge.u32 %p4, %r10, %r5;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p4 bra CMP_OK;").map_err(write_err)?;
+            // a = row_ptr[i]
+            writeln!(ptx, "\tmul.wide.u32 %rd11, %r10, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd12, %rd10, %rd11;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd12];").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.u32.u16 %r11, %rs0;").map_err(write_err)?;
+            // b = lit[i]
+            writeln!(ptx, "\tadd.s64 %rd13, %rd2, %rd11;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.nc.u8 %rs1, [%rd13];").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.u32.u16 %r12, %rs1;").map_err(write_err)?;
+            // if a != b → mismatch → MATCH_DONE (r9 still 0).
+            writeln!(ptx, "\tsetp.ne.u32 %p5, %r11, %r12;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p5 bra MATCH_DONE;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s32 %r10, %r10, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tbra CMP_LOOP;").map_err(write_err)?;
+            writeln!(ptx, "CMP_OK:").map_err(write_err)?;
+            writeln!(ptx, "\tmov.u32 %r9, 1;").map_err(write_err)?;
+        }
+        LikeMode::Suffix => {
+            // base = n - L; compare bytes[base+i] against lit[i].
+            writeln!(ptx, "\tsub.s32 %r14, %r8, %r5;").map_err(write_err)?; // base
+            writeln!(ptx, "\tmov.u32 %r10, 0;").map_err(write_err)?;
+            writeln!(ptx, "CMP_LOOP:").map_err(write_err)?;
+            writeln!(ptx, "\tsetp.ge.u32 %p4, %r10, %r5;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p4 bra CMP_OK;").map_err(write_err)?;
+            // a = row_ptr[base + i]
+            writeln!(ptx, "\tadd.s32 %r15, %r14, %r10;").map_err(write_err)?;
+            writeln!(ptx, "\tmul.wide.u32 %rd11, %r15, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd12, %rd10, %rd11;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd12];").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.u32.u16 %r11, %rs0;").map_err(write_err)?;
+            // b = lit[i]
+            writeln!(ptx, "\tmul.wide.u32 %rd14, %r10, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd13, %rd2, %rd14;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.nc.u8 %rs1, [%rd13];").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.u32.u16 %r12, %rs1;").map_err(write_err)?;
+            writeln!(ptx, "\tsetp.ne.u32 %p5, %r11, %r12;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p5 bra MATCH_DONE;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s32 %r10, %r10, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tbra CMP_LOOP;").map_err(write_err)?;
+            writeln!(ptx, "CMP_OK:").map_err(write_err)?;
+            writeln!(ptx, "\tmov.u32 %r9, 1;").map_err(write_err)?;
+        }
+        LikeMode::Contains => {
+            // Naive substring scan. For start s in [0, n-L]:
+            //   if bytes[s..s+L] == lit[0..L] → match.
+            // last_start = n - L (inclusive). %r16 = s (outer), %r10 = i (inner).
+            writeln!(ptx, "\tsub.s32 %r16, %r8, %r5;").map_err(write_err)?; // last_start
+            writeln!(ptx, "\tmov.u32 %r17, 0;").map_err(write_err)?; // s = 0
+            writeln!(ptx, "SCAN_LOOP:").map_err(write_err)?;
+            // if s > last_start → no match left.
+            writeln!(ptx, "\tsetp.gt.s32 %p4, %r17, %r16;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p4 bra MATCH_DONE;").map_err(write_err)?;
+            // inner compare bytes[s+i] vs lit[i].
+            writeln!(ptx, "\tmov.u32 %r10, 0;").map_err(write_err)?;
+            writeln!(ptx, "CMP_LOOP:").map_err(write_err)?;
+            writeln!(ptx, "\tsetp.ge.u32 %p5, %r10, %r5;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p5 bra CMP_OK;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s32 %r15, %r17, %r10;").map_err(write_err)?; // s + i
+            writeln!(ptx, "\tmul.wide.u32 %rd11, %r15, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd12, %rd10, %rd11;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd12];").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.u32.u16 %r11, %rs0;").map_err(write_err)?;
+            writeln!(ptx, "\tmul.wide.u32 %rd14, %r10, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd13, %rd2, %rd14;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.nc.u8 %rs1, [%rd13];").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.u32.u16 %r12, %rs1;").map_err(write_err)?;
+            // mismatch at this start → advance s.
+            writeln!(ptx, "\tsetp.ne.u32 %p6, %r11, %r12;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p6 bra SCAN_NEXT;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s32 %r10, %r10, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tbra CMP_LOOP;").map_err(write_err)?;
+            writeln!(ptx, "SCAN_NEXT:").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s32 %r17, %r17, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tbra SCAN_LOOP;").map_err(write_err)?;
+            writeln!(ptx, "CMP_OK:").map_err(write_err)?;
+            writeln!(ptx, "\tmov.u32 %r9, 1;").map_err(write_err)?;
+        }
+    }
+
+    writeln!(ptx, "MATCH_DONE:").map_err(write_err)?;
+    // Apply negation (NOT LIKE) by XOR-ing the raw 0/1 with 1.
+    if negated {
+        writeln!(ptx, "\txor.b32 %r9, %r9, 1;").map_err(write_err)?;
+    }
+    // out_mask[tid] = r9 (as u8).
+    writeln!(ptx, "\tmul.wide.u32 %rd15, %r3, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd16, %rd3, %rd15;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u16.u32 %rs2, %r9;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u8 [%rd16], %rs2;").map_err(write_err)?;
 
     writeln!(ptx, "DONE:").map_err(write_err)?;
     writeln!(ptx, "\tret;").map_err(write_err)?;
@@ -737,5 +1021,92 @@ mod tests {
     fn entry_name_helpers_reject_length_and_concat() {
         assert!(len_pass_entry(ScalarFnKind::Length).is_err());
         assert!(write_pass_entry(ScalarFnKind::Concat).is_err());
+    }
+
+    // ---- LIKE matcher kernel (UNVALIDATED device path) --------------------
+
+    #[test]
+    fn like_match_header_and_abi() {
+        let ptx = compile_like_match_kernel(LikeMode::Prefix, false).expect("compile");
+        assert!(ptx.contains(".version 7.5"), "{ptx}");
+        assert!(ptx.contains(".target sm_70"), "{ptx}");
+        // 6-param ABI: offsets, bytes, lit, out_mask, n_rows, lit_len.
+        assert!(ptx.contains(".visible .entry bolt_str_like_match("), "{ptx}");
+        assert!(ptx.contains(".param .u64 bolt_str_like_match_param_0,"), "{ptx}");
+        assert!(ptx.contains(".param .u64 bolt_str_like_match_param_3,"), "{ptx}");
+        assert!(ptx.contains(".param .u32 bolt_str_like_match_param_4,"), "{ptx}");
+        assert!(ptx.contains(".param .u32 bolt_str_like_match_param_5"), "{ptx}");
+        // Output is a single u8 store per row.
+        assert!(ptx.contains("st.global.u8"), "missing mask store\n{ptx}");
+        // n_rows guard precedes the store.
+        let guard = ptx.find("bra DONE").expect("guard");
+        let store = ptx.find("st.global.u8").expect("store");
+        assert!(guard < store, "n_rows guard must precede store\n{ptx}");
+    }
+
+    #[test]
+    fn like_exact_emits_eq_length_check() {
+        let ptx = compile_like_match_kernel(LikeMode::Exact, false).expect("compile");
+        // Exact requires n == L: a `setp.ne.u32 %p3, %r8, %r5` (row_len vs L)
+        // that branches away on inequality.
+        assert!(ptx.contains("setp.ne.u32 %p3, %r8, %r5"), "exact length-eq check\n{ptx}");
+        // Byte compare loop present.
+        assert!(ptx.contains("CMP_LOOP:"), "{ptx}");
+        assert!(ptx.contains("CMP_OK:"), "{ptx}");
+        // Exact is not a substring scan.
+        assert!(!ptx.contains("SCAN_LOOP:"), "exact must not scan\n{ptx}");
+    }
+
+    #[test]
+    fn like_prefix_emits_ge_length_check_and_no_scan() {
+        let ptx = compile_like_match_kernel(LikeMode::Prefix, false).expect("compile");
+        // Prefix requires n >= L: a `setp.lt.u32 %p3, %r8, %r5` (fail if n<L).
+        assert!(ptx.contains("setp.lt.u32 %p3, %r8, %r5"), "prefix length-ge check\n{ptx}");
+        assert!(ptx.contains("CMP_LOOP:"), "{ptx}");
+        assert!(!ptx.contains("SCAN_LOOP:"), "prefix must not scan\n{ptx}");
+        // Prefix compares from offset 0 — no suffix base subtraction of n-L.
+        assert!(!ptx.contains("sub.s32 %r14, %r8, %r5"), "prefix has no suffix base\n{ptx}");
+    }
+
+    #[test]
+    fn like_suffix_emits_tail_base_offset() {
+        let ptx = compile_like_match_kernel(LikeMode::Suffix, false).expect("compile");
+        // Suffix computes base = n - L then compares the tail.
+        assert!(ptx.contains("sub.s32 %r14, %r8, %r5"), "suffix base = n - L\n{ptx}");
+        assert!(ptx.contains("CMP_LOOP:"), "{ptx}");
+        assert!(!ptx.contains("SCAN_LOOP:"), "suffix must not scan\n{ptx}");
+    }
+
+    #[test]
+    fn like_contains_emits_substring_scan() {
+        let ptx = compile_like_match_kernel(LikeMode::Contains, false).expect("compile");
+        // Contains is the naive double loop: outer SCAN over start offsets,
+        // inner CMP over literal bytes.
+        assert!(ptx.contains("SCAN_LOOP:"), "contains outer scan\n{ptx}");
+        assert!(ptx.contains("SCAN_NEXT:"), "contains advances start\n{ptx}");
+        assert!(ptx.contains("CMP_LOOP:"), "contains inner compare\n{ptx}");
+        // last_start = n - L.
+        assert!(ptx.contains("sub.s32 %r16, %r8, %r5"), "contains last_start = n - L\n{ptx}");
+    }
+
+    #[test]
+    fn like_negated_xors_the_result() {
+        let plain = compile_like_match_kernel(LikeMode::Prefix, false).expect("compile");
+        let negated = compile_like_match_kernel(LikeMode::Prefix, true).expect("compile");
+        assert!(!plain.contains("xor.b32 %r9, %r9, 1"), "non-negated must not XOR\n{plain}");
+        assert!(negated.contains("xor.b32 %r9, %r9, 1"), "NOT LIKE must XOR the 0/1\n{negated}");
+    }
+
+    #[test]
+    fn like_all_modes_handle_empty_literal() {
+        // Every mode short-circuits L==0 before the per-byte loop (no OOB read).
+        for mode in [LikeMode::Exact, LikeMode::Prefix, LikeMode::Suffix, LikeMode::Contains] {
+            let ptx = compile_like_match_kernel(mode, false).expect("compile");
+            assert!(
+                ptx.contains("setp.ne.u32 %p1, %r5, 0"),
+                "mode {mode:?} must test lit_len==0 first\n{ptx}"
+            );
+            assert!(ptx.contains("LIT_NONEMPTY:"), "mode {mode:?}\n{ptx}");
+        }
     }
 }
