@@ -1839,6 +1839,26 @@ impl Engine {
                 let h = self.execute(input)?;
                 crate::exec::sort::execute_sort(h, sort_exprs)
             }
+            PhysicalPlan::Window {
+                input,
+                window_exprs,
+                partition_by,
+                order_by,
+                output_schema,
+            } => {
+                // Host-side window-function executor: materialise the input,
+                // partition + order within partition, compute each window
+                // output column, and append it. GPU offload is a follow-up;
+                // see `crate::exec::window`.
+                let h = self.execute(input)?;
+                crate::exec::window::execute_window(
+                    h,
+                    window_exprs,
+                    partition_by,
+                    order_by,
+                    output_schema,
+                )
+            }
             PhysicalPlan::Union { inputs } => {
                 // UNION ALL: execute each input, concat the result batches.
                 // (Deduplication would happen via a Distinct wrapping the Union

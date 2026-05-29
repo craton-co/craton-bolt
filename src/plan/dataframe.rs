@@ -332,6 +332,7 @@ fn check_no_empty_union(plan: &LogicalPlan) -> BoltResult<()> {
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. } => check_no_empty_union(input),
         LogicalPlan::Union { inputs } => {
             if inputs.is_empty() {
