@@ -14,6 +14,16 @@
 //!   * `col = 'lit'`  → `__idx_col = <dict index of lit>` (Int32 or Int64,
 //!     matching the dictionary variant's index width)
 //!   * `col <> 'lit'` → `__idx_col <> <dict index of lit>`
+//!   * `col LIKE 'pattern'` (constant pattern, no `ESCAPE`, not negated) over
+//!     a dict-encoded Utf8 column → an OR-of-equalities on `__idx_col` against
+//!     the dictionary indices whose entries match the pattern. The pattern is
+//!     evaluated HOST-side once against each dictionary entry (reusing
+//!     [`crate::exec::like::PatternMatcher`]) to build the per-dict-entry match
+//!     set — the "dictionary-precompute" — so the GPU only ever does integer-
+//!     index compares, never device-side string scanning. An empty match set
+//!     folds to `Bool(false)`. See [`LiteralResolver::like_match_indices`] and
+//!     [`build_index_membership`]. `NOT LIKE`, `LIKE ... ESCAPE`, non-constant
+//!     patterns, and non-dict Utf8 columns keep the host `LIKE` fallback.
 //!   * Reversed shape (literal on the left) is normalised before rewrite.
 //!   * If `'lit'` is not in the dictionary AND the dictionary is known-complete
 //!     for that column (it observed every distinct value of the column at build
@@ -883,6 +893,11 @@ mod tests {
         /// absent-literal constant fold — finding PL-M6). Empty by default, so
         /// the mock mirrors the production "incomplete unless proven" stance.
         complete: std::collections::HashSet<String>,
+        /// Per-column dictionary entries (real strings only; slot 0 = NULL is
+        /// implicit and never stored). `dict[column][p]` is the string for GPU
+        /// index `p + 1`, mirroring the production `DictionaryColumnAny`
+        /// layout. Used to exercise `like_match_indices` without CUDA.
+        dict_entries: HashMap<String, Vec<String>>,
     }
 
     impl MockResolver {
@@ -891,7 +906,23 @@ mod tests {
                 entries: HashMap::new(),
                 columns: HashMap::new(),
                 complete: std::collections::HashSet::new(),
+                dict_entries: HashMap::new(),
             }
+        }
+
+        /// Attach a dictionary entry list to `col` so `like_match_indices` can
+        /// scan it. Entries are real strings (slot 0 / NULL is implicit); the
+        /// GPU index of `entries[p]` is `p + 1`. Registers the column as known
+        /// (i32-indexed) if it isn't already.
+        fn with_dict(mut self, col: &str, entries: &[&str]) -> Self {
+            self.columns
+                .entry(col.to_string())
+                .or_insert(MockWidth::I32);
+            self.dict_entries.insert(
+                col.to_string(),
+                entries.iter().map(|s| s.to_string()).collect(),
+            );
+            self
         }
 
         /// Mark `col`'s dictionary as known-complete so absent literals are
@@ -950,6 +981,28 @@ mod tests {
 
         fn knows(&self, column: &str) -> bool {
             self.columns.contains_key(column)
+        }
+
+        fn like_match_indices(
+            &self,
+            column: &str,
+            pattern: &str,
+            escape: Option<char>,
+        ) -> Option<Vec<LiteralIndex>> {
+            let entries = self.dict_entries.get(column)?;
+            let width = self.columns.get(column).copied()?;
+            let matcher = crate::exec::like::PatternMatcher::compile(pattern, escape).ok()?;
+            let mut out = Vec::new();
+            for (p, s) in entries.iter().enumerate() {
+                if matcher.matches(s) {
+                    let idx = (p + 1) as i64;
+                    out.push(match width {
+                        MockWidth::I32 => LiteralIndex::I32(idx as i32),
+                        MockWidth::I64 => LiteralIndex::I64(idx),
+                    });
+                }
+            }
+            Some(out)
         }
 
         fn is_complete(&self, column: &str) -> bool {
@@ -1603,5 +1656,322 @@ mod tests {
             }
             other => panic!("expected Binary, got {other:?}"),
         }
+    }
+
+    // ---- GPU LIKE via dictionary-precompute ----
+
+    /// Collect the `Int32` index literals out of an OR-of-equalities tree
+    /// produced by `build_index_membership`, asserting the column name and
+    /// `Eq`/`Or` shape along the way. Returns the indices in left-to-right
+    /// (emission) order.
+    fn collect_membership_i32(e: &Expr, column: &str) -> Vec<i32> {
+        match e {
+            // Leaf: `col = Int32(n)`.
+            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+                assert_column(left, column);
+                match right.as_ref() {
+                    Expr::Literal(Literal::Int32(n)) => vec![*n],
+                    other => panic!("expected Int32 index literal, got {other:?}"),
+                }
+            }
+            // Interior: `<acc> OR <eq>`.
+            Expr::Binary { op: BinaryOp::Or, left, right } => {
+                let mut v = collect_membership_i32(left, column);
+                v.extend(collect_membership_i32(right, column));
+                v
+            }
+            other => panic!("expected Eq/Or membership tree, got {other:?}"),
+        }
+    }
+
+    /// A constant prefix `LIKE` over a dict column builds the match table
+    /// host-side and lowers to an OR-of-equalities on `__idx_<col>` — the
+    /// GPU-lowerable integer-index lookup. Dictionary: ["alpha","beta",
+    /// "alps","gamma"] (GPU indices 1..4); `LIKE 'al%'` matches "alpha"(1)
+    /// and "alps"(3).
+    #[test]
+    fn like_prefix_over_dict_lowers_to_index_membership() {
+        let r = MockResolver::new().with_dict("region", &["alpha", "beta", "alps", "gamma"]);
+        let expr = Expr::Like {
+            expr: Box::new(col("region")),
+            pattern: "al%".into(),
+            escape: None,
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        let idxs = collect_membership_i32(&out, "__idx_region");
+        assert_eq!(idxs, vec![1, 3], "al% matches alpha(1) and alps(3)");
+    }
+
+    /// A single-match pattern collapses to one bare `Eq` (no surrounding OR).
+    #[test]
+    fn like_single_match_is_one_equality() {
+        let r = MockResolver::new().with_dict("region", &["alpha", "beta", "gamma"]);
+        let expr = Expr::Like {
+            expr: Box::new(col("region")),
+            pattern: "%eta".into(), // suffix: matches "beta"(2) only
+            escape: None,
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        match out {
+            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+                assert_column(&left, "__idx_region");
+                assert_int32_lit(&right, 2);
+            }
+            other => panic!("expected a single Eq, got {other:?}"),
+        }
+    }
+
+    /// A pattern that matches no dictionary entry folds to `Bool(false)` —
+    /// the predicate is unconditionally false, no GPU work needed.
+    #[test]
+    fn like_no_match_folds_to_false() {
+        let r = MockResolver::new().with_dict("region", &["alpha", "beta"]);
+        let expr = Expr::Like {
+            expr: Box::new(col("region")),
+            pattern: "zzz%".into(),
+            escape: None,
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        assert!(
+            matches!(out, Expr::Literal(Literal::Bool(false))),
+            "no dict entry matches → Bool(false), got {out:?}"
+        );
+    }
+
+    /// `%` alone matches every (non-NULL) dictionary entry: the lowered
+    /// membership set covers all real indices and excludes slot 0 (NULL).
+    #[test]
+    fn like_match_all_covers_every_entry_but_not_null() {
+        let r = MockResolver::new().with_dict("region", &["a", "b", "c"]);
+        let expr = Expr::Like {
+            expr: Box::new(col("region")),
+            pattern: "%".into(),
+            escape: None,
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        let idxs = collect_membership_i32(&out, "__idx_region");
+        // Indices 1,2,3 — slot 0 (NULL) is intentionally never included.
+        assert_eq!(idxs, vec![1, 2, 3]);
+        assert!(!idxs.contains(&0), "NULL slot 0 must be excluded");
+    }
+
+    /// An i64-indexed dict column emits `Int64` index literals so the
+    /// membership predicate matches the `__idx_<col>` column's width.
+    #[test]
+    fn like_over_i64_dict_emits_int64_indices() {
+        let mut r = MockResolver::new();
+        r.columns.insert("uid".into(), MockWidth::I64);
+        r.dict_entries
+            .insert("uid".into(), vec!["bob".into(), "bart".into(), "ann".into()]);
+        let expr = Expr::Like {
+            expr: Box::new(col("uid")),
+            pattern: "b%".into(), // matches bob(1), bart(2)
+            escape: None,
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        // Walk the OR tree collecting Int64 literals.
+        fn collect_i64(e: &Expr) -> Vec<i64> {
+            match e {
+                Expr::Binary { op: BinaryOp::Eq, left, right } => {
+                    assert_column(left, "__idx_uid");
+                    match right.as_ref() {
+                        Expr::Literal(Literal::Int64(n)) => vec![*n],
+                        other => panic!("expected Int64 index, got {other:?}"),
+                    }
+                }
+                Expr::Binary { op: BinaryOp::Or, left, right } => {
+                    let mut v = collect_i64(left);
+                    v.extend(collect_i64(right));
+                    v
+                }
+                other => panic!("expected Eq/Or, got {other:?}"),
+            }
+        }
+        assert_eq!(collect_i64(&out), vec![1, 2]);
+    }
+
+    /// LIKE over a NON-dict (unregistered) column stays an `Expr::Like` —
+    /// the physical planner then routes it to the host filter. No index
+    /// rewrite, no fold.
+    #[test]
+    fn like_over_non_dict_column_stays_host() {
+        let r = MockResolver::new(); // nothing registered
+        let expr = Expr::Like {
+            expr: Box::new(col("name")),
+            pattern: "a%".into(),
+            escape: None,
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        match out {
+            Expr::Like { expr: inner, pattern, escape, negated } => {
+                assert_column(&inner, "name");
+                assert_eq!(pattern, "a%");
+                assert!(escape.is_none());
+                assert!(!negated);
+            }
+            other => panic!("non-dict LIKE must stay host-side, got {other:?}"),
+        }
+    }
+
+    /// `NOT LIKE` stays host-side even over a dict column: the OR-of-
+    /// equalities form can't express SQL three-valued NULL semantics for the
+    /// negated case, so the predicate is preserved for the host filter.
+    #[test]
+    fn not_like_over_dict_stays_host() {
+        let r = MockResolver::new().with_dict("region", &["alpha", "beta"]);
+        let expr = Expr::Like {
+            expr: Box::new(col("region")),
+            pattern: "al%".into(),
+            escape: None,
+            negated: true,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        match out {
+            Expr::Like { negated, .. } => assert!(negated, "NOT LIKE preserved"),
+            other => panic!("NOT LIKE must stay host-side, got {other:?}"),
+        }
+    }
+
+    /// `LIKE ... ESCAPE` stays host-side over a dict column — the precompute
+    /// path is gated to the no-escape shape (the host evaluator owns escape
+    /// semantics).
+    #[test]
+    fn like_with_escape_over_dict_stays_host() {
+        let r = MockResolver::new().with_dict("region", &["a%b", "axb"]);
+        let expr = Expr::Like {
+            expr: Box::new(col("region")),
+            pattern: r"a\%b".into(),
+            escape: Some('\\'),
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        match out {
+            Expr::Like { escape, .. } => {
+                assert_eq!(escape, Some('\\'), "ESCAPE LIKE preserved for host path")
+            }
+            other => panic!("LIKE ESCAPE must stay host-side, got {other:?}"),
+        }
+    }
+
+    /// The dict LIKE rewrite peels `Alias` wrappers off the operand, just
+    /// like the eq-rewrite path, so `(col AS r) LIKE 'al%'` still lowers.
+    #[test]
+    fn like_peels_alias_on_operand() {
+        let r = MockResolver::new().with_dict("region", &["alpha", "beta"]);
+        let expr = Expr::Like {
+            expr: Box::new(col("region").alias("r")),
+            pattern: "al%".into(),
+            escape: None,
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        match out {
+            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+                assert_column(&left, "__idx_region");
+                assert_int32_lit(&right, 1); // alpha(1)
+            }
+            other => panic!("aliased operand should still lower, got {other:?}"),
+        }
+    }
+
+    /// End-to-end through `rewrite_plan_with`: a `Filter { Scan }` whose
+    /// predicate is `region LIKE 'al%'` rewrites the predicate to the index
+    /// membership AND extends the scan schema with `__idx_region`. This is
+    /// the shape the physical planner consumes — the rewritten Filter no
+    /// longer carries an `Expr::Like`, so it is no longer forced to the host
+    /// fallback.
+    #[test]
+    fn filter_like_over_dict_rewrites_predicate_and_extends_scan() {
+        let r = MockResolver::new().with_dict("region", &["alpha", "beta", "alps"]);
+        let schema = Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, false),
+        ]);
+        let scan = LogicalPlan::Scan {
+            table: "orders".into(),
+            projection: None,
+            schema,
+        };
+        let predicate = Expr::Like {
+            expr: Box::new(col("region")),
+            pattern: "al%".into(),
+            escape: None,
+            negated: false,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate,
+        };
+        let out = rewrite_plan_with(&plan, &r, 0).unwrap();
+        let LogicalPlan::Filter { input, predicate } = out else {
+            panic!("expected Filter at root");
+        };
+        // Scan schema gained `__idx_region`.
+        match *input {
+            LogicalPlan::Scan { schema, .. } => {
+                let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+                assert_eq!(names, vec!["region", "price", "__idx_region"]);
+            }
+            other => panic!("expected Scan under Filter, got {other:?}"),
+        }
+        // Predicate is now an integer-index membership — NOT an Expr::Like.
+        assert!(
+            !matches!(predicate, Expr::Like { .. }),
+            "rewritten predicate must not be a LIKE (no host fallback)"
+        );
+        let idxs = collect_membership_i32(&predicate, "__idx_region");
+        assert_eq!(idxs, vec![1, 3], "al% matches alpha(1) and alps(3)");
+    }
+
+    /// Exercise the *production* `StringPredicateRewriter::like_match_indices`
+    /// (not the mock) against a host-only `DictionaryColumnAny`, confirming
+    /// the real precompute scans the dictionary slice and builds the correct
+    /// index set. `new_host_only` builds the wrapper without any GPU upload,
+    /// so this runs on a CUDA-less machine.
+    #[test]
+    fn real_rewriter_builds_like_match_table_from_dictionary() {
+        use crate::cuda::dictionary_any::DictionaryColumnAny;
+
+        // Dictionary holds the real (non-NULL) strings; GPU index of
+        // entry `p` is `p + 1`.  ["apple","banana","apricot"] → 1,2,3.
+        let dict = DictionaryColumnAny::new_host_only(
+            vec!["apple".into(), "banana".into(), "apricot".into()],
+            3,
+        )
+        .expect("host-only dict");
+        let mut rw = StringPredicateRewriter::new();
+        rw.register("fruit", &dict);
+
+        // `ap%` matches apple(1) and apricot(3) but not banana.
+        let idxs = rw
+            .like_match_indices("fruit", "ap%", None)
+            .expect("dict column resolves a match table");
+        assert_eq!(idxs, vec![LiteralIndex::I32(1), LiteralIndex::I32(3)]);
+
+        // End-to-end: the rewriter lowers `fruit LIKE 'ap%'` to the index
+        // membership predicate against `__idx_fruit`.
+        let expr = Expr::Like {
+            expr: Box::new(col("fruit")),
+            pattern: "ap%".into(),
+            escape: None,
+            negated: false,
+        };
+        let out = rewrite_expr_with(&expr, &rw, 0).unwrap();
+        let collected = collect_membership_i32(&out, "__idx_fruit");
+        assert_eq!(collected, vec![1, 3]);
+
+        // A pattern absent from the dictionary yields an empty table → the
+        // rewrite folds to Bool(false).
+        let none = rw.like_match_indices("fruit", "zzz", None).unwrap();
+        assert!(none.is_empty());
+
+        // An unregistered column returns None (host fallback).
+        assert!(rw.like_match_indices("unknown", "a%", None).is_none());
     }
 }
