@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     join_combined_schema, AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal,
-    LogicalPlan, Schema, SortExpr, UnaryOp,
+    LogicalPlan, ScalarFnKind, Schema, SortExpr, UnaryOp,
 };
 
 /// SSA register handle. Just an index into the IR's value table.
@@ -484,11 +484,25 @@ impl<'a> Codegen<'a> {
             Expr::Cast { .. } => Err(BoltError::Plan(
                 "CAST not yet lowered to GPU; coming in a follow-up".into(),
             )),
-            // v0.5: parser + type-check land, execution wiring is a
-            // follow-up. Reject cleanly so callers see a useful message
-            // rather than the kernel emitter producing nonsense PTX.
+            // String scalar functions have no IR op in the fused projection
+            // kernel. `lower_depth`'s `LogicalPlan::Project` arm routes every
+            // ScalarFn-bearing SELECT list to the host-side
+            // `PhysicalPlan::Project` (see `expr_contains_scalar_fn`), so this
+            // arm is unreachable for any plan produced by `lower()`. The
+            // dedicated GPU codegen for these ops lives in
+            // `crate::jit::string_kernel` (fully-GPU LENGTH gather + two-pass
+            // UPPER/LOWER/SUBSTRING) but is not yet wired into the executor's
+            // launch path. Reach this arm only on hand-built plans that bypass
+            // the lowering router; surface a clear error then.
+            //
+            // TODO(string-fn-gpu): when the executor can launch the
+            // `string_kernel` kernels, lower a top-level `LENGTH(<col>)` (and
+            // then UPPER/LOWER/SUBSTRING) into a GPU projection here.
             Expr::ScalarFn { kind, .. } => Err(BoltError::Plan(format!(
-                "string scalar function {} is not yet lowered to GPU; coming in a follow-up",
+                "string scalar function {} is not yet lowered to the fused GPU \
+                 projection kernel; the planner routes it to the host fallback \
+                 (GPU codegen exists in jit::string_kernel but is not yet wired \
+                 into the executor)",
                 kind.sql_name()
             ))),
             Expr::Alias(inner, _) => self.emit_expr(inner),
@@ -1561,6 +1575,71 @@ fn expr_contains_concat(expr: &Expr) -> bool {
     }
 }
 
+/// True if `expr` contains an `Expr::ScalarFn` (string scalar function:
+/// `UPPER`/`LOWER`/`LENGTH`/`SUBSTRING`/`CONCAT`) anywhere in its subtree.
+///
+/// Used by the `LogicalPlan::Project` arm of [`lower_depth`] to route
+/// string-scalar-function projections onto the host-side `PhysicalPlan::Project`
+/// path. The fused GPU codegen kernel ([`Codegen::emit_expr`]) has no IR op for
+/// scalar string functions yet — the GPU codegen lives in
+/// [`crate::jit::string_kernel`] (a fully-GPU fixed-width `LENGTH` gather plus
+/// the two-pass `UPPER`/`LOWER`/`SUBSTRING` producers) but is not yet wired
+/// into the executor's launch path. Until that runtime plumbing lands, routing
+/// here keeps the existing host fallback reachable rather than rejecting the
+/// query outright.
+///
+// TODO(string-fn-gpu): once the executor can (a) build + upload the
+// per-dictionary-entry length table and (b) run the two-pass
+// length/scan/write kernels from `crate::jit::string_kernel`, lower a
+// top-level `LENGTH(<col>)` (and then `UPPER`/`LOWER`/`SUBSTRING`) into a GPU
+// projection here instead of the host-side `PhysicalPlan::Project`. Start with
+// `LENGTH` — it is fixed-width `Int32` output and the lowest-risk path.
+fn expr_contains_scalar_fn(expr: &Expr) -> bool {
+    match expr {
+        Expr::ScalarFn { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_scalar_fn(left) || expr_contains_scalar_fn(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_scalar_fn(operand),
+        Expr::Alias(inner, _) => expr_contains_scalar_fn(inner),
+        Expr::Case { branches, else_branch } => {
+            branches
+                .iter()
+                .any(|(w, t)| expr_contains_scalar_fn(w) || expr_contains_scalar_fn(t))
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_scalar_fn)
+                    .unwrap_or(false)
+        }
+        Expr::Like { expr, .. } => expr_contains_scalar_fn(expr),
+        Expr::Cast { expr, .. } => expr_contains_scalar_fn(expr),
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
+/// Return the [`ScalarFnKind`] of the first `Expr::ScalarFn` found (depth-first)
+/// in `exprs`, or `None` if there is none. Used only to enrich the lowering
+/// rejection message in [`lower_depth`]'s `LogicalPlan::Project` arm with the
+/// offending function name.
+fn first_scalar_fn_kind(exprs: &[Expr]) -> Option<ScalarFnKind> {
+    fn walk(e: &Expr) -> Option<ScalarFnKind> {
+        match e {
+            Expr::ScalarFn { kind, .. } => Some(*kind),
+            Expr::Binary { left, right, .. } => walk(left).or_else(|| walk(right)),
+            Expr::Unary { operand, .. } => walk(operand),
+            Expr::Alias(inner, _) => walk(inner),
+            Expr::Case { branches, else_branch } => branches
+                .iter()
+                .find_map(|(w, t)| walk(w).or_else(|| walk(t)))
+                .or_else(|| else_branch.as_deref().and_then(walk)),
+            Expr::Like { expr, .. } => walk(expr),
+            Expr::Cast { expr, .. } => walk(expr),
+            Expr::Column(_) | Expr::Literal(_) => None,
+        }
+    }
+    exprs.iter().find_map(walk)
+}
+
 /// Walk a `Scan` / `Filter` / `Project` chain and return true if any
 /// `Filter` node carries a predicate that contains a `BinaryOp::Concat`.
 ///
@@ -2262,6 +2341,36 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     exprs: exprs.clone(),
                     output_schema,
                 });
+            }
+            // String scalar functions (UPPER / LOWER / LENGTH / SUBSTRING /
+            // CONCAT) are Utf8-valued (LENGTH excepted, which is Int32) and the
+            // fused GPU codegen kernel has no IR op for them yet. The dedicated
+            // GPU codegen now exists in `crate::jit::string_kernel` — a
+            // fully-GPU fixed-width LENGTH dictionary-gather plus the two-pass
+            // length/scan/write producers for UPPER/LOWER/SUBSTRING — but it is
+            // not yet wired into the executor's kernel-launch path (no buffer
+            // allocation / dictionary length-table upload / two-pass launch),
+            // and the host fallback (`exec::expr_agg::eval_expr`) does not yet
+            // evaluate ScalarFn either. Rather than route to a
+            // `PhysicalPlan::Project` that would fail at *execution* time, we
+            // reject at lowering with a single clear message — the same
+            // contract `lower()` upholds for CASE / CAST. This keeps the
+            // pre-existing behavior (and `tests/string_fns_sql_test.rs`) intact.
+            //
+            // TODO(string-fn-gpu): once the executor can launch the
+            // `string_kernel` kernels, replace this rejection with a GPU
+            // projection that drives `compile_length_gather_kernel` for a
+            // top-level `LENGTH(<col>)` (fixed-width Int32, lowest risk), then
+            // the two-pass UPPER/LOWER/SUBSTRING kernels. See the doc comment
+            // on `expr_contains_scalar_fn`.
+            if exprs.iter().any(expr_contains_scalar_fn) {
+                let kind = first_scalar_fn_kind(exprs);
+                return Err(BoltError::Plan(format!(
+                    "string scalar function{} is not yet lowered to GPU; the GPU \
+                     codegen exists in jit::string_kernel but is not yet wired \
+                     into the executor (coming in a follow-up)",
+                    kind.map(|k| format!(" {}", k.sql_name())).unwrap_or_default()
+                )));
             }
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
