@@ -6,6 +6,7 @@ pub mod logical_plan;
 pub mod dataframe;
 pub mod sql_frontend;
 pub mod physical_plan;
+pub mod explain;
 pub mod string_literal_rewrite;
 pub mod suggest;
 pub mod rewrite;
@@ -23,3 +24,4 @@ pub use physical_plan::{
     lower as lower_physical, ColumnIO, KernelSpec, Op, PhysicalPlan, Reg, Value,
 };
 pub use rewrite::PlanRewrite;
+pub use explain::{format_logical, format_physical};
