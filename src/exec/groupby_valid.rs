@@ -779,9 +779,25 @@ fn pack_keys(
     let n_rows = bit_streams[0].len();
     let mut keys_i64: Vec<i64> = vec![0i64; n_rows];
     for (comp, stream) in components.iter().zip(bit_streams.iter()) {
+        // For single-column keys the per-column width may be 64, in which
+        // case we MUST avoid a shift by 64 — only the bit_offset == 0 case
+        // is relevant for 64-bit widths and the shift is a no-op.
         let shift = comp.bit_offset;
+        let bit_width = key_bit_width(comp.original_dtype)?;
+        debug_assert!(
+            shift + bit_width <= 64,
+            "pack_keys: shift+width must fit i64"
+        );
+        // V-17: use `wrapping_shl` so that a future regression where
+        // `shift == 64` (e.g. a 32-bit dtype appended after a 64-bit field)
+        // produces a deterministic 0 instead of triggering UB / a debug panic
+        // on a bare `<<` overshift. For the supported case (`shift` in 0..=32
+        // with 32-bit widths, or `shift == 0` with a 64-bit width) this is
+        // identical to `raw << shift`. Kept in lockstep with the sibling copy
+        // in `crate::exec::groupby::pack_keys`.
         for (i, &raw) in stream.iter().enumerate() {
-            let packed = (raw << shift) as i64;
+            let packed = raw.wrapping_shl(shift) as i64;
+            // Bitwise OR (preserving any bits already set by earlier streams).
             keys_i64[i] = ((keys_i64[i] as u64) | (packed as u64)) as i64;
         }
     }
@@ -3099,6 +3115,46 @@ mod tests {
         let packed = pack_keys(&agg, &batch).expect("pack ok");
         let mask = packed.key_valid.expect("expected mask");
         assert_eq!(mask, vec![true, false, false, true]);
+    }
+
+    /// V-17: two 32-bit keys pack into a single i64 (low at offset 0, high at
+    /// offset 32) and `decode_key` recovers the originals byte-for-byte. This
+    /// pins the packing semantics for the supported shifts (0 and 32) so the
+    /// `wrapping_shl` hardening can never silently change the encoding.
+    #[test]
+    fn pack_keys_two_i32_round_trips() {
+        let agg = spec(
+            vec![("hi", DataType::Int32), ("lo", DataType::Int32)],
+            vec![0, 1],
+        );
+        // `pack_keys` treats the first group-by column as the high half
+        // (offset 32) and the second as the low half (offset 0).
+        let hi: ArrayRef = Arc::new(Int32Array::from(vec![7i32, -3, 0]));
+        let lo: ArrayRef = Arc::new(Int32Array::from(vec![11i32, 42, -1]));
+        let batch = two_col_batch("hi", hi, "lo", lo);
+        let packed = pack_keys(&agg, &batch).expect("pack ok");
+        assert!(packed.key_valid.is_none(), "null-free input");
+        let expected = [(7i32, 11i32), (-3, 42), (0, -1)];
+        for (row, &(eh, el)) in expected.iter().enumerate() {
+            let decoded = decode_key(packed.keys_i64[row], &packed.components);
+            assert_eq!(decoded.len(), 2, "two components expected");
+            assert_eq!(decoded[0], KeyValue::I32(eh), "high half round-trip");
+            assert_eq!(decoded[1], KeyValue::I32(el), "low half round-trip");
+        }
+    }
+
+    /// V-17: a single 64-bit key uses shift 0 (no overshift) and round-trips.
+    #[test]
+    fn pack_keys_single_i64_round_trips() {
+        let agg = spec(vec![("k", DataType::Int64)], vec![0]);
+        let arr: ArrayRef =
+            Arc::new(Int64Array::from(vec![0i64, -1, i64::MAX, i64::MIN]));
+        let batch = one_col_batch("k", arr);
+        let packed = pack_keys(&agg, &batch).expect("pack ok");
+        for (row, &v) in [0i64, -1, i64::MAX, i64::MIN].iter().enumerate() {
+            let decoded = decode_key(packed.keys_i64[row], &packed.components);
+            assert_eq!(decoded, vec![KeyValue::I64(v)], "i64 round-trip");
+        }
     }
 
     /// `and_masks` honours `None` as all-true.

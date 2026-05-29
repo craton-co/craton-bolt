@@ -278,26 +278,54 @@ impl DictionaryColumn {
         let host_indices: Vec<i32> = self.indices.to_vec()?;
         let mut out: Vec<Option<&str>> = Vec::with_capacity(host_indices.len());
         for &idx in &host_indices {
-            if idx == 0 {
-                out.push(None);
-            } else if idx < 0 {
-                return Err(BoltError::Other(format!(
-                    "dictionary decode: negative index {} (NULL is encoded as 0)",
-                    idx
-                )));
-            } else {
-                let pos = (idx as usize) - 1;
-                let s = self.dictionary.get(pos).ok_or_else(|| {
-                    BoltError::Other(format!(
-                        "dictionary decode: index {} out of range (dictionary size {})",
-                        idx,
-                        self.dictionary.len()
-                    ))
-                })?;
-                out.push(Some(s.as_str()));
-            }
+            out.push(Self::decode_index(&self.dictionary, idx)?);
         }
         Ok(StringArray::from(out))
+    }
+
+    /// Decode a single 1-based dictionary index into the string it names.
+    ///
+    /// `0` decodes to `None` (SQL `NULL`). Negative indices, or indices
+    /// outside `1..=dictionary.len()`, surface as `BoltError::Other`.
+    ///
+    /// V-14 (defense-in-depth, parity with the i64 sibling in
+    /// `dictionary_i64.rs::to_string_array`): width-safe decode. The 1-based
+    /// offset is validated against the dictionary length in `u64` *before*
+    /// narrowing to `usize`. On a 32-bit host a direct `as usize` cast would
+    /// truncate before the bounds check, letting an index that does not fit a
+    /// 32-bit `usize` accidentally hit a valid slot. `.get()` keeps the final
+    /// lookup memory-safe regardless of host width.
+    ///
+    /// Pulled out of `to_string_array` so the guard is exercisable host-only
+    /// (the loop there downloads from a `GpuVec`, which a CUDA-less test host
+    /// cannot populate).
+    fn decode_index(dictionary: &[String], idx: i32) -> BoltResult<Option<&str>> {
+        if idx == 0 {
+            return Ok(None);
+        }
+        if idx < 0 {
+            return Err(BoltError::Other(format!(
+                "dictionary decode: negative index {} (NULL is encoded as 0)",
+                idx
+            )));
+        }
+        let pos_u64 = (idx as u64) - 1;
+        if pos_u64 >= dictionary.len() as u64 {
+            return Err(BoltError::Other(format!(
+                "dictionary decode: index {} out of range (dictionary size {})",
+                idx,
+                dictionary.len()
+            )));
+        }
+        let pos = pos_u64 as usize;
+        let s = dictionary.get(pos).ok_or_else(|| {
+            BoltError::Other(format!(
+                "dictionary decode: index {} out of range (dictionary size {})",
+                idx,
+                dictionary.len()
+            ))
+        })?;
+        Ok(Some(s.as_str()))
     }
 }
 
@@ -460,6 +488,39 @@ mod tests {
         // The placeholder indices vec must have zero length on the host
         // side — it's a stand-in, not real data.
         assert_eq!(col.indices.len(), 0);
+    }
+
+    // ---- V-14: width-safe index decode (host-only) -----------------------
+    //
+    // `decode_index` is the pure host half of `to_string_array`; testing it
+    // directly avoids needing a CUDA device to populate `indices`. Mirrors the
+    // i64 sibling's width-safe guard in `dictionary_i64.rs::to_string_array`.
+
+    #[test]
+    fn decode_index_in_range_returns_correct_slot() {
+        // 1-based indices: slot 0 is NULL, "a"/"b"/"c" live at 1/2/3.
+        let dict = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(DictionaryColumn::decode_index(&dict, 0).unwrap(), None);
+        assert_eq!(DictionaryColumn::decode_index(&dict, 1).unwrap(), Some("a"));
+        assert_eq!(DictionaryColumn::decode_index(&dict, 2).unwrap(), Some("b"));
+        assert_eq!(DictionaryColumn::decode_index(&dict, 3).unwrap(), Some("c"));
+    }
+
+    #[test]
+    fn decode_index_out_of_range_errors_without_panic_or_wrong_slot() {
+        // Just past the end, the largest positive index, and a negative
+        // sentinel must all surface a graceful error — never a panic and never
+        // a stray slot. The V-14 guard compares in u64 before narrowing, so
+        // even an index that wouldn't fit a 32-bit usize is rejected.
+        let dict = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(DictionaryColumn::decode_index(&dict, 4).is_err());
+        assert!(DictionaryColumn::decode_index(&dict, i32::MAX).is_err());
+        assert!(DictionaryColumn::decode_index(&dict, -1).is_err());
+
+        // Empty dictionary: any positive index is out of range, 0 is NULL.
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(DictionaryColumn::decode_index(&empty, 0).unwrap(), None);
+        assert!(DictionaryColumn::decode_index(&empty, 1).is_err());
     }
 
     // ---- GPU-required tests ----------------------------------------------

@@ -2086,7 +2086,9 @@ pub fn compile_string_hash_kernel_with_offsets(
     // pointer scratch + hash accumulator. The hash accumulator lives in
     // `%rh<n>` for clarity; the splitmix finaliser keeps its scratch in
     // `%rl<n>` so the byte-loop register set is small enough to stay
-    // resident.
+    // resident. V-13: the i64/LargeUtf8 path additionally uses %rd9/%rd10
+    // (full-width start/end) and %rd11 (full-width byte cursor); all are
+    // already covered by the %rd<24> declaration below.
     writeln!(p, "\t.reg .pred  %p<8>;").map_err(write_err)?;
     writeln!(p, "\t.reg .b32   %r<24>;").map_err(write_err)?;
     writeln!(p, "\t.reg .b64   %rd<24>;").map_err(write_err)?;
@@ -2107,10 +2109,14 @@ pub fn compile_string_hash_kernel_with_offsets(
     // offset-width parameter selects between Arrow's `Utf8` (i32
     // offsets, 4-byte stride) and `LargeUtf8` (i64 offsets, 8-byte
     // stride). The cursor / end registers stay in `%r5` / `%r6` for
-    // i32 to preserve byte-identical PTX with the original kernel; the
-    // i64 path widens the start/end into `%r5_lo`/`%r6_lo` via a 64→32
-    // narrow (LargeUtf8 strings still fit per-string in u32 in any
-    // sane workload, even if the cumulative byte buffer exceeds 4 GiB).
+    // i32 to preserve byte-identical PTX with the original kernel.
+    //
+    // **V-13** — the i64/LargeUtf8 path is now full-width: start/end are
+    // kept in the 64-bit `%rd9` / `%rd10` scratch regs (no 64→32 narrow),
+    // and the byte loop runs an .s64 cursor with .b64 address math. This
+    // makes a single string >= 4 GiB, or a cumulative offset buffer
+    // exceeding 2^32 bytes, hash the correct byte range instead of
+    // silently truncating the cursor.
     writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     // Offsets and values buffers are both read-only inputs to the hash kernel
@@ -2125,11 +2131,10 @@ pub fn compile_string_hash_kernel_with_offsets(
         StringOffsetWidth::I64 => {
             writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-            // i64 offsets — load into b64 scratch then narrow to b32 cursor.
-            writeln!(p, "\tld.global.nc.s64 %rd9, [%rd2];").map_err(write_err)?;
-            writeln!(p, "\tld.global.nc.s64 %rd10, [%rd2 + 8];").map_err(write_err)?;
-            writeln!(p, "\tcvt.u32.u64 %r5, %rd9;").map_err(write_err)?;   // start
-            writeln!(p, "\tcvt.u32.u64 %r6, %rd10;").map_err(write_err)?;  // end
+            // V-13: i64 offsets — load start/end into b64 scratch and keep
+            // them full-width (%rd9 = start, %rd10 = end). No narrowing.
+            writeln!(p, "\tld.global.nc.s64 %rd9, [%rd2];").map_err(write_err)?;     // start
+            writeln!(p, "\tld.global.nc.s64 %rd10, [%rd2 + 8];").map_err(write_err)?; // end
         }
     }
 
@@ -2141,17 +2146,44 @@ pub fn compile_string_hash_kernel_with_offsets(
     writeln!(p, "\tmov.s64 %rh0, {FNV_OFFSET_LITERAL};").map_err(write_err)?;
     writeln!(p, "\tmov.s64 %rh1, {FNV_PRIME_LITERAL};").map_err(write_err)?;
 
-    // Loop: cursor (%r7) = start, end (%r6) — copy start so the increment
-    // doesn't trample the original offset.
-    writeln!(p, "\tmov.u32 %r7, %r5;").map_err(write_err)?;
+    // Loop: copy start into the cursor so the increment doesn't trample the
+    // original offset.
+    //   - i32/Utf8: cursor in %r7 (32-bit), end in %r6, byte-identical PTX.
+    //   - i64/LargeUtf8 (V-13): cursor in %rd11 (64-bit), end in %rd10, so a
+    //     cursor beyond 2^32 never truncates.
+    match width {
+        StringOffsetWidth::I32 => {
+            writeln!(p, "\tmov.u32 %r7, %r5;").map_err(write_err)?;
+        }
+        StringOffsetWidth::I64 => {
+            writeln!(p, "\tmov.s64 %rd11, %rd9;").map_err(write_err)?;
+        }
+    }
 
     writeln!(p, "BYTE_LOOP:").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.s32 %p1, %r7, %r6;").map_err(write_err)?;
+    match width {
+        StringOffsetWidth::I32 => {
+            writeln!(p, "\tsetp.ge.s32 %p1, %r7, %r6;").map_err(write_err)?;
+        }
+        StringOffsetWidth::I64 => {
+            // V-13: 64-bit loop bound — compare full-width cursor vs end.
+            writeln!(p, "\tsetp.ge.s64 %p1, %rd11, %rd10;").map_err(write_err)?;
+        }
+    }
     writeln!(p, "\t@%p1 bra FINALIZE;").map_err(write_err)?;
 
     // Load one byte: addr = values + cursor, value = ld.global.nc.u8.
     // The string-values buffer is a read-only input.
-    writeln!(p, "\tmul.wide.s32 %rd4, %r7, 1;").map_err(write_err)?;
+    match width {
+        StringOffsetWidth::I32 => {
+            writeln!(p, "\tmul.wide.s32 %rd4, %r7, 1;").map_err(write_err)?;
+        }
+        StringOffsetWidth::I64 => {
+            // V-13: cursor is already 64-bit — use it directly as the byte
+            // offset so base+offset address math stays full-width.
+            writeln!(p, "\tmov.s64 %rd4, %rd11;").map_err(write_err)?;
+        }
+    }
     writeln!(p, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
     writeln!(p, "\tld.global.nc.u8 %r8, [%rd5];").map_err(write_err)?;
     // Widen to b64 with high bits zero so the xor doesn't smear sign.
@@ -2163,7 +2195,15 @@ pub fn compile_string_hash_kernel_with_offsets(
     // half, matching `wrapping_mul` on host.
     writeln!(p, "\tmul.lo.s64 %rh0, %rh0, %rh1;").map_err(write_err)?;
 
-    writeln!(p, "\tadd.s32 %r7, %r7, 1;").map_err(write_err)?;
+    match width {
+        StringOffsetWidth::I32 => {
+            writeln!(p, "\tadd.s32 %r7, %r7, 1;").map_err(write_err)?;
+        }
+        StringOffsetWidth::I64 => {
+            // V-13: full-width cursor increment.
+            writeln!(p, "\tadd.s64 %rd11, %rd11, 1;").map_err(write_err)?;
+        }
+    }
     writeln!(p, "\tbra BYTE_LOOP;").map_err(write_err)?;
 
     // Splitmix-style finaliser — three xor-shifts + two multiplies. Matches
