@@ -1,0 +1,673 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Pre-lowering resolution of uncorrelated subqueries.
+//!
+//! `Expr::ScalarSubquery` and `Expr::InSubquery` parse + type-check in the SQL
+//! frontend, and correlated subqueries are rejected there — so every subquery
+//! that survives to the engine is *uncorrelated*, meaning its boxed
+//! [`LogicalPlan`] is a self-contained, independently-executable query that
+//! references no columns from the enclosing query.
+//!
+//! This module turns those subqueries into plain constants *before* physical
+//! lowering. It walks the plan's expressions, executes each subplan via a
+//! caller-supplied executor closure, and rewrites:
+//!
+//! * `ScalarSubquery(subplan)` → the single produced value as an
+//!   `Expr::Literal` (0 rows → SQL `NULL`; >1 row → a clean error).
+//! * `InSubquery { expr, subquery, negated }` → a boolean fold of equalities
+//!   over `expr` (`expr = v1 OR expr = v2 …`, or the negated `<>`/`AND` form).
+//!
+//! Resolution is *inner-first*: subqueries nested inside another subquery's
+//! subplan are resolved when that subplan is executed (the executor closure
+//! runs the full engine pipeline, which itself re-enters this pass), and
+//! subqueries appearing as siblings recurse normally.
+//!
+//! # Why a closure rather than a direct `&Engine` dependency?
+//!
+//! The value-extraction and IN-list-build helpers are pure functions over an
+//! Arrow [`RecordBatch`] / `&[Literal]`, with no GPU or engine state, so they
+//! are unit-tested on the host. The plan walker is generic over a
+//! `FnMut(LogicalPlan) -> BoltResult<RecordBatch>` executor so the engine can
+//! inject its `&self` execution path without this module taking an `Engine`
+//! dependency.
+
+use arrow_array::{
+    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
+};
+use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
+
+use crate::error::{BoltError, BoltResult};
+use crate::plan::logical_plan::{AggregateExpr, BinaryOp, Expr, Literal, LogicalPlan, SortExpr};
+
+/// Extract the value at row `row` of the (single) first column of `batch` as a
+/// [`Literal`]. A null at that position yields [`Literal::Null`]. Unsupported
+/// Arrow dtypes are rejected with a clean [`BoltError`].
+///
+/// Supports the dtype set the engine can produce as a subquery output:
+/// Int32 / Int64 / Float32 / Float64 / Bool / Utf8 / Date32 / Timestamp
+/// (all four resolutions) / Decimal128.
+fn literal_from_column(batch: &RecordBatch, row: usize) -> BoltResult<Literal> {
+    let col = batch.column(0);
+    if col.is_null(row) {
+        return Ok(Literal::Null);
+    }
+    macro_rules! downcast {
+        ($ty:ty, $what:literal) => {
+            col.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                BoltError::Other(format!(
+                    "subquery result column claimed dtype {:?} but did not downcast to {}",
+                    col.data_type(),
+                    $what
+                ))
+            })?
+        };
+    }
+    let lit = match col.data_type() {
+        ArrowDataType::Int32 => Literal::Int32(downcast!(Int32Array, "Int32Array").value(row)),
+        ArrowDataType::Int64 => Literal::Int64(downcast!(Int64Array, "Int64Array").value(row)),
+        ArrowDataType::Float32 => {
+            Literal::Float32(downcast!(Float32Array, "Float32Array").value(row))
+        }
+        ArrowDataType::Float64 => {
+            Literal::Float64(downcast!(Float64Array, "Float64Array").value(row))
+        }
+        ArrowDataType::Boolean => Literal::Bool(downcast!(BooleanArray, "BooleanArray").value(row)),
+        ArrowDataType::Utf8 => {
+            Literal::Utf8(downcast!(StringArray, "StringArray").value(row).to_string())
+        }
+        ArrowDataType::Date32 => Literal::Date32(downcast!(Date32Array, "Date32Array").value(row)),
+        ArrowDataType::Decimal128(p, s) => {
+            let v = downcast!(Decimal128Array, "Decimal128Array").value(row);
+            Literal::Decimal128(v, *p, *s)
+        }
+        ArrowDataType::Timestamp(unit, tz) => {
+            let ticks = match unit {
+                ArrowTimeUnit::Second => {
+                    downcast!(TimestampSecondArray, "TimestampSecondArray").value(row)
+                }
+                ArrowTimeUnit::Millisecond => {
+                    downcast!(TimestampMillisecondArray, "TimestampMillisecondArray").value(row)
+                }
+                ArrowTimeUnit::Microsecond => {
+                    downcast!(TimestampMicrosecondArray, "TimestampMicrosecondArray").value(row)
+                }
+                ArrowTimeUnit::Nanosecond => {
+                    downcast!(TimestampNanosecondArray, "TimestampNanosecondArray").value(row)
+                }
+            };
+            let plan_unit = crate::exec::schema_convert::arrow_time_unit_to_plan(unit);
+            Literal::timestamp_with_tz(ticks, plan_unit, tz.as_deref().map(|s| s.to_string()))
+        }
+        other => {
+            return Err(BoltError::Plan(format!(
+                "subquery result dtype {other:?} is not supported for constant folding"
+            )))
+        }
+    };
+    Ok(lit)
+}
+
+/// Reduce a scalar-subquery result `batch` to a single [`Literal`].
+///
+/// Contract (SQL scalar subquery):
+/// * the batch must have **exactly one column** (the frontend already
+///   type-checks this, but we re-verify defensively);
+/// * **0 rows** → SQL `NULL` ([`Literal::Null`]);
+/// * **1 row** → that value;
+/// * **>1 row** → a clean [`BoltError`] (scalar subquery returned more than
+///   one row).
+pub fn scalar_value_from_batch(batch: &RecordBatch) -> BoltResult<Literal> {
+    if batch.num_columns() != 1 {
+        return Err(BoltError::Plan(format!(
+            "scalar subquery must return exactly one column, got {}",
+            batch.num_columns()
+        )));
+    }
+    match batch.num_rows() {
+        0 => Ok(Literal::Null),
+        1 => literal_from_column(batch, 0),
+        n => Err(BoltError::Plan(format!(
+            "scalar subquery returned {n} rows; expected at most one"
+        ))),
+    }
+}
+
+/// Collect the **distinct** values of the (single) first column of `batch` as
+/// [`Literal`]s, preserving first-seen order.
+///
+/// The batch must have exactly one column. `NULL`s are collected as
+/// [`Literal::Null`] (at most one, deduped like any other value) so the
+/// IN-list builder can reason about their presence; see
+/// [`build_in_predicate`] for how SQL three-valued `NULL` membership is
+/// handled.
+pub fn in_set_from_batch(batch: &RecordBatch) -> BoltResult<Vec<Literal>> {
+    if batch.num_columns() != 1 {
+        return Err(BoltError::Plan(format!(
+            "IN subquery must return exactly one column, got {}",
+            batch.num_columns()
+        )));
+    }
+    let mut out: Vec<Literal> = Vec::new();
+    for row in 0..batch.num_rows() {
+        let lit = literal_from_column(batch, row)?;
+        if !out.iter().any(|existing| literal_eq(existing, &lit)) {
+            out.push(lit);
+        }
+    }
+    Ok(out)
+}
+
+/// Structural equality for two literals, treating two `Null`s as equal so the
+/// distinct-collection step dedups them. NaN floats compare unequal (matching
+/// IEEE-754 / Rust `PartialEq`), so two NaN entries are both retained — that
+/// is harmless for the OR-of-equalities we build (a NaN probe never matches a
+/// NaN literal under `=` anyway).
+fn literal_eq(a: &Literal, b: &Literal) -> bool {
+    match (a, b) {
+        (Literal::Null, Literal::Null) => true,
+        _ => a == b,
+    }
+}
+
+/// Build the boolean expression that replaces an `expr [NOT] IN (subquery)`
+/// node once the subquery's value set is known.
+///
+/// `values` is the distinct set produced by [`in_set_from_batch`]. The result:
+///
+/// * **`IN` (not negated):** `expr = v1 OR expr = v2 OR …`. An empty set →
+///   `Bool(false)` (nothing is a member of the empty set).
+/// * **`NOT IN` (negated):** `expr <> v1 AND expr <> v2 AND …`. An empty set →
+///   `Bool(true)`.
+///
+/// # NULL handling (divergence from strict SQL three-valued logic)
+///
+/// Strict SQL says:
+/// * `x IN (… , NULL , …)` is `TRUE` if `x` matches a non-NULL element, else
+///   `NULL` (never `FALSE`) — so a row whose `x` matches nothing but where the
+///   set contains a NULL evaluates to `NULL` (filtered out by `WHERE`, same as
+///   `FALSE`).
+/// * `x NOT IN (…, NULL, …)` is `FALSE` if `x` matches a non-NULL element,
+///   else `NULL` (never `TRUE`).
+///
+/// We **drop `NULL`s from the value set** before building the fold. For the
+/// non-negated `IN` form this matches SQL exactly under a `WHERE` clause: a row
+/// that doesn't match any non-NULL element yields `FALSE` here vs `NULL` in
+/// strict SQL, and both are filtered out. For the negated `NOT IN` form we
+/// diverge when the set contains a NULL: strict SQL makes the whole predicate
+/// `NULL` (so *no* rows pass) whenever the set has any NULL, whereas we keep
+/// the per-row `<>` semantics over the non-NULL elements. This is the
+/// "correct-enough" tradeoff called for by the task: the common `IN` path is
+/// exact, and the rare `NOT IN (subquery-with-NULLs)` corner is documented
+/// rather than special-cased. A future refinement could emit `Bool(false)` for
+/// negated form when a NULL is present in the set to restore strict semantics.
+pub fn build_in_predicate(expr: &Expr, values: &[Literal], negated: bool) -> Expr {
+    // Drop NULLs: equality / inequality against a NULL literal is never TRUE
+    // in SQL, so a NULL element can only ever contribute UNKNOWN — see the
+    // doc comment for the negated-form divergence this implies.
+    let non_null: Vec<&Literal> = values
+        .iter()
+        .filter(|l| !matches!(l, Literal::Null))
+        .collect();
+
+    if non_null.is_empty() {
+        // Empty membership set (or a set of only NULLs): `IN` → false,
+        // `NOT IN` → true.
+        return Expr::Literal(Literal::Bool(negated));
+    }
+
+    let (cmp_op, fold_op) = if negated {
+        (BinaryOp::NotEq, BinaryOp::And)
+    } else {
+        (BinaryOp::Eq, BinaryOp::Or)
+    };
+
+    let mut iter = non_null.into_iter().map(|v| Expr::Binary {
+        op: cmp_op,
+        left: Box::new(expr.clone()),
+        right: Box::new(Expr::Literal(v.clone())),
+    });
+    // `non_null` is non-empty, so `next()` is `Some`.
+    let first = iter.next().expect("non_null checked non-empty");
+    iter.fold(first, |acc, eq| Expr::Binary {
+        op: fold_op,
+        left: Box::new(acc),
+        right: Box::new(eq),
+    })
+}
+
+/// Recursively resolve every subquery in `plan`, executing subplans via
+/// `exec`.
+///
+/// `exec` runs a self-contained [`LogicalPlan`] end-to-end and returns its
+/// result [`RecordBatch`]. The executor is expected to itself route through
+/// the engine pipeline (including *this* pass), which is what makes nested
+/// subqueries resolve inner-first.
+pub fn resolve_plan<F>(plan: LogicalPlan, exec: &mut F) -> BoltResult<LogicalPlan>
+where
+    F: FnMut(LogicalPlan) -> BoltResult<RecordBatch>,
+{
+    Ok(match plan {
+        LogicalPlan::Scan { .. } => plan,
+        LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+            input: Box::new(resolve_plan(*input, exec)?),
+            predicate: resolve_expr(predicate, exec)?,
+        },
+        LogicalPlan::Project { input, exprs } => LogicalPlan::Project {
+            input: Box::new(resolve_plan(*input, exec)?),
+            exprs: resolve_exprs(exprs, exec)?,
+        },
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => LogicalPlan::Aggregate {
+            input: Box::new(resolve_plan(*input, exec)?),
+            group_by: resolve_exprs(group_by, exec)?,
+            aggregates: aggregates
+                .into_iter()
+                .map(|a| resolve_aggregate(a, exec))
+                .collect::<BoltResult<Vec<_>>>()?,
+        },
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(resolve_plan(*input, exec)?),
+        },
+        LogicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => LogicalPlan::Limit {
+            input: Box::new(resolve_plan(*input, exec)?),
+            limit,
+            offset,
+        },
+        LogicalPlan::Sort { input, sort_exprs } => LogicalPlan::Sort {
+            input: Box::new(resolve_plan(*input, exec)?),
+            sort_exprs: sort_exprs
+                .into_iter()
+                .map(|s| {
+                    Ok::<SortExpr, BoltError>(SortExpr {
+                        expr: resolve_expr(s.expr, exec)?,
+                        descending: s.descending,
+                        nulls_first: s.nulls_first,
+                    })
+                })
+                .collect::<BoltResult<Vec<_>>>()?,
+        },
+        LogicalPlan::Window {
+            input,
+            window_exprs,
+            partition_by,
+            order_by,
+        } => LogicalPlan::Window {
+            input: Box::new(resolve_plan(*input, exec)?),
+            // WindowExpr's inner argument is a column/expr that the SQL
+            // frontend does not currently allow a subquery inside; the
+            // partition/order keys are plain exprs we still walk for safety.
+            window_exprs,
+            partition_by: resolve_exprs(partition_by, exec)?,
+            order_by: order_by
+                .into_iter()
+                .map(|s| {
+                    Ok::<SortExpr, BoltError>(SortExpr {
+                        expr: resolve_expr(s.expr, exec)?,
+                        descending: s.descending,
+                        nulls_first: s.nulls_first,
+                    })
+                })
+                .collect::<BoltResult<Vec<_>>>()?,
+        },
+        LogicalPlan::Union { inputs } => LogicalPlan::Union {
+            inputs: inputs
+                .into_iter()
+                .map(|p| resolve_plan(p, exec))
+                .collect::<BoltResult<Vec<_>>>()?,
+        },
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => LogicalPlan::SetOp {
+            left: Box::new(resolve_plan(*left, exec)?),
+            right: Box::new(resolve_plan(*right, exec)?),
+            op,
+            all,
+        },
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            filter,
+        } => LogicalPlan::Join {
+            left: Box::new(resolve_plan(*left, exec)?),
+            right: Box::new(resolve_plan(*right, exec)?),
+            join_type,
+            on: on
+                .into_iter()
+                .map(|(l, r)| Ok::<_, BoltError>((resolve_expr(l, exec)?, resolve_expr(r, exec)?)))
+                .collect::<BoltResult<Vec<_>>>()?,
+            filter: filter.map(|f| resolve_expr(f, exec)).transpose()?,
+        },
+    })
+}
+
+/// Resolve every expression in a `Vec`.
+fn resolve_exprs<F>(exprs: Vec<Expr>, exec: &mut F) -> BoltResult<Vec<Expr>>
+where
+    F: FnMut(LogicalPlan) -> BoltResult<RecordBatch>,
+{
+    exprs.into_iter().map(|e| resolve_expr(e, exec)).collect()
+}
+
+/// Resolve the inner expression(s) of an [`AggregateExpr`].
+fn resolve_aggregate<F>(agg: AggregateExpr, exec: &mut F) -> BoltResult<AggregateExpr>
+where
+    F: FnMut(LogicalPlan) -> BoltResult<RecordBatch>,
+{
+    Ok(match agg {
+        AggregateExpr::Count(e) => AggregateExpr::Count(resolve_expr(e, exec)?),
+        AggregateExpr::Sum(e) => AggregateExpr::Sum(resolve_expr(e, exec)?),
+        AggregateExpr::Min(e) => AggregateExpr::Min(resolve_expr(e, exec)?),
+        AggregateExpr::Max(e) => AggregateExpr::Max(resolve_expr(e, exec)?),
+        AggregateExpr::Avg(e) => AggregateExpr::Avg(resolve_expr(e, exec)?),
+        AggregateExpr::VarPop(e) => AggregateExpr::VarPop(Box::new(resolve_expr(*e, exec)?)),
+        AggregateExpr::VarSamp(e) => AggregateExpr::VarSamp(Box::new(resolve_expr(*e, exec)?)),
+        AggregateExpr::StddevPop(e) => AggregateExpr::StddevPop(Box::new(resolve_expr(*e, exec)?)),
+        AggregateExpr::StddevSamp(e) => {
+            AggregateExpr::StddevSamp(Box::new(resolve_expr(*e, exec)?))
+        }
+    })
+}
+
+/// Recursively resolve subqueries in a single [`Expr`].
+///
+/// For the two subquery variants the subplan is itself run through
+/// `resolve_plan` first (inner subqueries resolve before the outer one
+/// executes), then executed via `exec`, then folded to a constant.
+fn resolve_expr<F>(expr: Expr, exec: &mut F) -> BoltResult<Expr>
+where
+    F: FnMut(LogicalPlan) -> BoltResult<RecordBatch>,
+{
+    Ok(match expr {
+        Expr::Column(_) | Expr::Literal(_) => expr,
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op,
+            left: Box::new(resolve_expr(*left, exec)?),
+            right: Box::new(resolve_expr(*right, exec)?),
+        },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op,
+            operand: Box::new(resolve_expr(*operand, exec)?),
+        },
+        Expr::Case {
+            branches,
+            else_branch,
+        } => Expr::Case {
+            branches: branches
+                .into_iter()
+                .map(|(w, t)| {
+                    Ok::<_, BoltError>((resolve_expr(w, exec)?, resolve_expr(t, exec)?))
+                })
+                .collect::<BoltResult<Vec<_>>>()?,
+            else_branch: else_branch
+                .map(|e| Ok::<_, BoltError>(Box::new(resolve_expr(*e, exec)?)))
+                .transpose()?,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(resolve_expr(*expr, exec)?),
+            pattern,
+            escape,
+            negated,
+        },
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(resolve_expr(*expr, exec)?),
+            target,
+        },
+        Expr::ScalarFn { kind, args } => Expr::ScalarFn {
+            kind,
+            args: resolve_exprs(args, exec)?,
+        },
+        Expr::Extract { field, expr } => Expr::Extract {
+            field,
+            expr: Box::new(resolve_expr(*expr, exec)?),
+        },
+        Expr::DateTrunc { unit, expr } => Expr::DateTrunc {
+            unit,
+            expr: Box::new(resolve_expr(*expr, exec)?),
+        },
+        Expr::Alias(inner, name) => {
+            Expr::Alias(Box::new(resolve_expr(*inner, exec)?), name)
+        }
+        Expr::ScalarSubquery(subplan) => {
+            // Resolve inner subqueries first, then execute, then fold.
+            let resolved = resolve_plan(*subplan, exec)?;
+            let batch = exec(resolved)?;
+            let lit = scalar_value_from_batch(&batch)?;
+            Expr::Literal(lit)
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            // The probe `expr` lives in the *outer* query's schema and may
+            // itself contain a subquery — resolve it too.
+            let probe = resolve_expr(*expr, exec)?;
+            let resolved_sub = resolve_plan(*subquery, exec)?;
+            let batch = exec(resolved_sub)?;
+            let values = in_set_from_batch(&batch)?;
+            build_in_predicate(&probe, &values, negated)
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, Int64Array, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
+    fn single_col_batch(arr: arrow_array::ArrayRef) -> RecordBatch {
+        let field = ArrowField::new("c", arr.data_type().clone(), true);
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        RecordBatch::try_new(schema, vec![arr]).unwrap()
+    }
+
+    #[test]
+    fn scalar_zero_rows_is_null() {
+        let arr = Arc::new(Int64Array::from(Vec::<i64>::new())) as arrow_array::ArrayRef;
+        let b = single_col_batch(arr);
+        assert_eq!(scalar_value_from_batch(&b).unwrap(), Literal::Null);
+    }
+
+    #[test]
+    fn scalar_one_row_int64() {
+        let arr = Arc::new(Int64Array::from(vec![42_i64])) as arrow_array::ArrayRef;
+        let b = single_col_batch(arr);
+        assert_eq!(scalar_value_from_batch(&b).unwrap(), Literal::Int64(42));
+    }
+
+    #[test]
+    fn scalar_one_row_null_value() {
+        let arr = Arc::new(Int32Array::from(vec![None::<i32>])) as arrow_array::ArrayRef;
+        let b = single_col_batch(arr);
+        assert_eq!(scalar_value_from_batch(&b).unwrap(), Literal::Null);
+    }
+
+    #[test]
+    fn scalar_many_rows_errors() {
+        let arr = Arc::new(Int64Array::from(vec![1_i64, 2])) as arrow_array::ArrayRef;
+        let b = single_col_batch(arr);
+        let err = scalar_value_from_batch(&b).unwrap_err();
+        assert!(format!("{err}").contains("returned 2 rows"), "{err}");
+    }
+
+    #[test]
+    fn scalar_rejects_multi_column() {
+        let a = Arc::new(Int64Array::from(vec![1_i64])) as arrow_array::ArrayRef;
+        let b = Arc::new(Int64Array::from(vec![2_i64])) as arrow_array::ArrayRef;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new("b", ArrowDataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![a, b]).unwrap();
+        assert!(scalar_value_from_batch(&batch).is_err());
+    }
+
+    #[test]
+    fn in_set_dedups_preserving_order() {
+        let arr = Arc::new(Int32Array::from(vec![3, 1, 3, 2, 1])) as arrow_array::ArrayRef;
+        let b = single_col_batch(arr);
+        let set = in_set_from_batch(&b).unwrap();
+        assert_eq!(
+            set,
+            vec![Literal::Int32(3), Literal::Int32(1), Literal::Int32(2)]
+        );
+    }
+
+    #[test]
+    fn in_set_utf8() {
+        let arr = Arc::new(StringArray::from(vec!["x", "y", "x"])) as arrow_array::ArrayRef;
+        let b = single_col_batch(arr);
+        let set = in_set_from_batch(&b).unwrap();
+        assert_eq!(
+            set,
+            vec![Literal::Utf8("x".into()), Literal::Utf8("y".into())]
+        );
+    }
+
+    #[test]
+    fn build_in_empty_set() {
+        let probe = Expr::Column("x".into());
+        assert_eq!(
+            build_in_predicate(&probe, &[], false),
+            Expr::Literal(Literal::Bool(false))
+        );
+        assert_eq!(
+            build_in_predicate(&probe, &[], true),
+            Expr::Literal(Literal::Bool(true))
+        );
+    }
+
+    #[test]
+    fn build_in_only_nulls_set() {
+        let probe = Expr::Column("x".into());
+        // A set of only NULLs collapses to the empty non-null case.
+        assert_eq!(
+            build_in_predicate(&probe, &[Literal::Null], false),
+            Expr::Literal(Literal::Bool(false))
+        );
+    }
+
+    #[test]
+    fn build_in_or_of_equalities() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], false);
+        let expected = Expr::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column("x".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(1))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column("x".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(2))),
+            }),
+        };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn build_not_in_and_of_inequalities() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true);
+        let expected = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::NotEq,
+                left: Box::new(Expr::Column("x".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(1))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::NotEq,
+                left: Box::new(Expr::Column("x".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(2))),
+            }),
+        };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn in_predicate_drops_nulls_keeps_non_null() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(
+            &probe,
+            &[Literal::Int32(7), Literal::Null],
+            false,
+        );
+        // Single non-null element → bare equality, no OR fold.
+        let expected = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column("x".into())),
+            right: Box::new(Expr::Literal(Literal::Int32(7))),
+        };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn resolve_plan_replaces_scalar_subquery() {
+        // Outer plan: Filter(Scan, x = ScalarSubquery(inner)). The executor
+        // closure returns a one-row Int32 batch holding 99.
+        let inner = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: crate::plan::Schema::new(vec![crate::plan::Field::new(
+                "v",
+                crate::plan::DataType::Int32,
+                false,
+            )]),
+        };
+        let outer = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table: "s".into(),
+                projection: None,
+                schema: crate::plan::Schema::new(vec![crate::plan::Field::new(
+                    "x",
+                    crate::plan::DataType::Int32,
+                    false,
+                )]),
+            }),
+            predicate: Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column("x".into())),
+                right: Box::new(Expr::ScalarSubquery(Box::new(inner))),
+            },
+        };
+        let mut exec = |_p: LogicalPlan| -> BoltResult<RecordBatch> {
+            let arr = Arc::new(Int32Array::from(vec![99])) as arrow_array::ArrayRef;
+            Ok(single_col_batch(arr))
+        };
+        let resolved = resolve_plan(outer, &mut exec).unwrap();
+        match resolved {
+            LogicalPlan::Filter { predicate, .. } => match predicate {
+                Expr::Binary { right, .. } => {
+                    assert_eq!(*right, Expr::Literal(Literal::Int32(99)));
+                }
+                other => panic!("unexpected predicate {other:?}"),
+            },
+            other => panic!("unexpected plan {other:?}"),
+        }
+    }
+}

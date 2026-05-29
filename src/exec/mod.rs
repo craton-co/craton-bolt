@@ -44,6 +44,9 @@ pub mod string_length;
 /// [`crate::jit::string_kernel`], with a clean host-side fallback.
 pub mod string_project;
 pub mod dict_registry;
+// Pre-lowering pass that resolves uncorrelated scalar / IN subqueries to
+// constants before physical lowering. See the module docs.
+pub mod subquery_resolve;
 pub mod groupby_with_pre;
 pub mod groupby_wide;
 pub mod gpu_compact_multipass;
