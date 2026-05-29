@@ -48,6 +48,10 @@ pub mod expr_agg;
 pub mod welford;
 pub mod groupby_valid;
 pub mod gpu_table;
+/// Morsel / chunk streaming + larger-than-VRAM budget orchestration. Pure
+/// host-side scaffolding (no CUDA on the morsel iterator or budget hooks);
+/// device-pinned intermediates are a `cuda`-feature follow-up.
+pub mod streaming;
 pub mod groupby_shmem_dispatch;
 pub mod groupby_shmem_launch;
 pub mod groupby_shmem_exec;
@@ -105,6 +109,9 @@ pub mod like;
 #[doc(hidden)]
 pub use launch::{launch_1d, CudaStream, KernelArgs};
 pub use engine::{Engine, EngineBuilder, QueryHandle};
+pub use streaming::{
+    BatchProducer, BatchStream, MorselPlan, PinnedBudget, TableSource,
+};
 
 /// Convert a host-side row count to the `u32` shape CUDA kernel launches require,
 /// returning a structured error if the count exceeds `u32::MAX`.
