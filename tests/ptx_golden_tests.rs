@@ -36,6 +36,10 @@ use craton_bolt::jit::prefix_scan::{
     compile_prefix_scan_kernel, compile_prefix_scan_kernel_blelloch,
     compile_prefix_scan_kernel_lookback,
 };
+use craton_bolt::jit::string_kernel::{
+    compile_length_gather_kernel, compile_varwidth_len_pass, compile_varwidth_write_pass,
+};
+use craton_bolt::plan::ScalarFnKind;
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
 };
@@ -1514,5 +1518,120 @@ fn normalize_ptx_leaves_register_vector_declarations_alone() {
     // Usages still normalized.
     assert!(out.contains("%rd{0}"), "usage not normalized: {out}");
     assert!(out.contains("%rd{1}"), "usage not normalized: {out}");
+}
+
+// ---- Tests: GPU string kernels (variable-width Utf8 codegen) -----------------
+//
+// These pin the load-bearing PTX shape of `jit::string_kernel`: the fully-GPU
+// fixed-width LENGTH dictionary-gather, and the two-pass (length + write)
+// variable-width producers for UPPER / LOWER / SUBSTRING. The two-pass design
+// reuses the existing prefix-scan kernels between the two passes (the scan is
+// not re-emitted here).
+
+#[test]
+fn golden_string_length_gather_is_double_indirection() {
+    // LENGTH on a dictionary column: out[tid] = length_table[indices[tid]].
+    // The two read-only-cache loads (indices, then the table at that index)
+    // plus a single Int32 store are the contract.
+    let ptx = compile_length_gather_kernel().expect("compile length gather");
+    assert!(
+        ptx.contains(".visible .entry bolt_str_length_gather("),
+        "missing entry name\n{ptx}"
+    );
+    // 4-arg ABI: indices, length_table, out, n_rows.
+    assert!(ptx.contains(".param .u64 bolt_str_length_gather_param_0,"));
+    assert!(ptx.contains(".param .u64 bolt_str_length_gather_param_1,"));
+    assert!(ptx.contains(".param .u64 bolt_str_length_gather_param_2,"));
+    assert!(ptx.contains(".param .u32 bolt_str_length_gather_param_3"));
+    let n_nc = ptx.matches("ld.global.nc.u32").count();
+    assert!(
+        n_nc >= 2,
+        "expected >=2 read-only-cache loads (indices + table), got {n_nc}\n{ptx}"
+    );
+    assert!(ptx.contains("st.global.u32"), "missing Int32 store\n{ptx}");
+    // The n_rows guard must precede the store.
+    assert_appears_before(&ptx, "bra DONE", "st.global.u32");
+}
+
+#[test]
+fn golden_string_upper_len_pass_is_length_preserving() {
+    // Pass 1 for UPPER: out_len == in_len = src_offsets[tid+1]-src_offsets[tid].
+    let ptx = compile_varwidth_len_pass(ScalarFnKind::Upper).expect("compile");
+    assert!(
+        ptx.contains(".visible .entry bolt_str_len_pass_upper("),
+        "missing entry name\n{ptx}"
+    );
+    // 4-arg ABI; UPPER has no start/len params.
+    assert!(ptx.contains(".param .u32 bolt_str_len_pass_upper_param_3"));
+    assert!(
+        !ptx.contains("bolt_str_len_pass_upper_param_4"),
+        "UPPER len pass must have exactly 4 params\n{ptx}"
+    );
+    // The input-length subtraction (end - begin) feeds the row_lens store.
+    assert!(ptx.contains("sub.s32"), "missing end-begin length\n{ptx}");
+    assert!(ptx.contains("st.global.u32"), "missing row_lens store\n{ptx}");
+}
+
+#[test]
+fn golden_string_substring_len_pass_clamps_with_start_len() {
+    // Pass 1 for SUBSTRING takes start + sub_len params and clamps the output
+    // length via max (start clamp) and min (length cap).
+    let ptx = compile_varwidth_len_pass(ScalarFnKind::Substring).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_str_len_pass_substring("));
+    // 6-arg ABI: ..., n_rows, start, sub_len.
+    assert!(ptx.contains(".param .u32 bolt_str_len_pass_substring_param_4,"));
+    assert!(ptx.contains(".param .u32 bolt_str_len_pass_substring_param_5"));
+    assert!(ptx.contains("max.s32"), "missing start clamp\n{ptx}");
+    assert!(ptx.contains("min.s32"), "missing length cap\n{ptx}");
+}
+
+#[test]
+fn golden_string_upper_write_pass_ascii_case_folds_in_loop() {
+    // Pass 2 for UPPER: per-byte copy loop with an ASCII a-z → A-Z fold.
+    let ptx = compile_varwidth_write_pass(ScalarFnKind::Upper).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_str_write_pass_upper("));
+    // The per-byte copy loop is the heart of the write pass.
+    assert!(ptx.contains("WRITE_LOOP:"), "missing loop label\n{ptx}");
+    assert!(ptx.contains("WRITE_DONE:"), "missing loop exit\n{ptx}");
+    // ASCII fold: 'a'(97) / 'z'(122) range test, subtract 32.
+    assert!(ptx.contains("97") && ptx.contains("122"), "missing a-z bounds\n{ptx}");
+    assert!(ptx.contains("sub.s32 %r12, %r11, 32"), "missing -32 fold\n{ptx}");
+    assert!(ptx.contains("st.global.u8"), "missing per-byte store\n{ptx}");
+    // The loop bound check precedes the byte store.
+    assert_appears_before(&ptx, "WRITE_LOOP:", "st.global.u8");
+}
+
+#[test]
+fn golden_string_lower_write_pass_ascii_case_folds_up() {
+    let ptx = compile_varwidth_write_pass(ScalarFnKind::Lower).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_str_write_pass_lower("));
+    // ASCII fold: 'A'(65) / 'Z'(90), add 32.
+    assert!(ptx.contains("65") && ptx.contains("90"), "missing A-Z bounds\n{ptx}");
+    assert!(ptx.contains("add.s32 %r12, %r11, 32"), "missing +32 fold\n{ptx}");
+}
+
+#[test]
+fn golden_string_substring_write_pass_is_plain_copy() {
+    let ptx = compile_varwidth_write_pass(ScalarFnKind::Substring).expect("compile");
+    assert!(ptx.contains(".visible .entry bolt_str_write_pass_substring("));
+    // 7-arg ABI (start + sub_len appended).
+    assert!(ptx.contains(".param .u32 bolt_str_write_pass_substring_param_5,"));
+    assert!(ptx.contains(".param .u32 bolt_str_write_pass_substring_param_6"));
+    // Plain byte copy, no case fold.
+    assert!(ptx.contains("mov.b32 %r13, %r11"), "substring must be a plain copy\n{ptx}");
+    assert!(
+        !ptx.contains("sub.s32 %r12, %r11, 32"),
+        "substring must not case-fold\n{ptx}"
+    );
+}
+
+#[test]
+fn golden_string_concat_two_pass_is_deferred() {
+    // CONCAT is the deferred multi-input two-pass producer; both passes reject
+    // it with a clear message so callers fall back to the host path.
+    let e = compile_varwidth_len_pass(ScalarFnKind::Concat).unwrap_err();
+    assert!(format!("{e}").contains("CONCAT"), "{e}");
+    let e = compile_varwidth_write_pass(ScalarFnKind::Concat).unwrap_err();
+    assert!(format!("{e}").contains("CONCAT"), "{e}");
 }
 

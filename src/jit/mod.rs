@@ -8,6 +8,12 @@ pub mod jit_compiler;
 pub mod disk_cache;
 pub mod agg_kernels;
 pub mod scan_kernel;
+/// PTX codegen for GPU variable-width (`Utf8`) scalar string functions:
+/// fully-GPU fixed-width `LENGTH` (dictionary-index gather) plus the two-pass
+/// (length + prefix-scan + write) variable-width producers for `UPPER` /
+/// `LOWER` / `SUBSTRING`. See [`string_kernel`] for the ABI and the deferred
+/// `CONCAT` path.
+pub mod string_kernel;
 pub mod hash_kernels;
 pub mod prefix_scan;
 pub mod float_atomics;
