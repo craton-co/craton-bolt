@@ -836,6 +836,14 @@ pub(crate) fn radix_dispatch_predicate_multi(keys: &[GpuSortKey<'_>]) -> bool {
 /// direction transform is applied host-side inside
 /// [`sort_indices_on_gpu_radix_multi`] (XOR signed-MSB for ASC, bit-not
 /// for DESC).
+///
+/// Retained as a single-key convenience wrapper around
+/// [`sort_indices_on_gpu_radix_multi`]: production call sites in
+/// `src/exec/sort.rs` now drive the multi-key entry directly (it handles
+/// the single-key case), but the round-trip unit tests in this module
+/// exercise the wrapper to keep the narrow single-key contract pinned.
+/// `#[allow(dead_code)]` because those callers are all `#[cfg(test)]`.
+#[allow(dead_code)]
 pub fn sort_indices_on_gpu_radix(
     arr: &dyn Array,
     dtype: DataType,
