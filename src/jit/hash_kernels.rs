@@ -1079,12 +1079,71 @@ pub struct AggSpec {
 ///
 /// # Note on validity
 ///
-/// This first cut does NOT emit the Stage-C `_with_validity` gate. Adding
-/// per-spec validity bitmaps multiplies the parameter list and forces a
-/// per-spec bit-extract before each atomic; that's a follow-up. The Tier-1
-/// dispatcher should keep the per-agg `_with_validity` path for queries
-/// where ANY agg-input column has validity; fuse only the no-validity case.
+/// This entry point emits the classic (no-validity) fused kernel: every spec
+/// unconditionally issues its atomic. When ANY agg-input column carries nulls,
+/// use [`compile_groupby_agg_kernel_multi_with_validity`] instead — it appends
+/// one packed-bit validity pointer per validity-carrying spec and emits a
+/// per-spec `bfe.u32` null-guard before that spec's atomic, folding NULL rows
+/// to each aggregate's identity (skip the atomic) exactly as the single-agg
+/// [`compile_groupby_agg_kernel_with_validity`] does on the scalar path.
 pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String> {
+    compile_groupby_agg_kernel_multi_inner(specs, &[])
+}
+
+/// Stage C: validity-aware variant of [`compile_groupby_agg_kernel_multi`].
+///
+/// `spec_has_validity[j] == true` means spec `j`'s agg-input column carries a
+/// packed-bit validity bitmap; the kernel appends one trailing `.u64` pointer
+/// per such spec (in spec order) and, before issuing spec `j`'s atomic,
+/// extracts the row's validity bit via `bfe.u32` and skips the atomic when the
+/// bit is `0`. A NULL row therefore folds to that aggregate's identity
+/// (SUM/COUNT contribute nothing, MIN/MAX leave the slot untouched) — matching
+/// SQL aggregate semantics and the single-agg
+/// [`compile_groupby_agg_kernel_with_validity`] gate.
+///
+/// Specs whose flag is `false` emit no extra param and no guard, so a mixed
+/// query (some columns nullable, some not) only pays for the bitmaps it needs.
+///
+/// # ABI
+///
+/// `N = specs.len()`, `V = count of true flags`. Parameter ordering extends
+/// the no-validity ABI: after `group_col_ptr`, the `N` input pointers, the `N`
+/// acc pointers, and the trailing `n_rows` + `k` `.u32` scalars, the kernel
+/// takes `V` further `.u64` validity pointers — one per validity-carrying spec,
+/// in spec order. Appending AFTER the scalars keeps every existing param index
+/// (and therefore the no-validity launch ABI) byte-identical.
+///
+/// # Errors
+///
+/// `spec_has_validity.len()` must equal `specs.len()`. All the per-spec
+/// `atomic_for` / `ptx_type_info` validations from the no-validity path apply
+/// unchanged (float MIN/MAX still rejected — Tier-1 dispatch must keep those
+/// out of the fused path).
+pub fn compile_groupby_agg_kernel_multi_with_validity(
+    specs: &[AggSpec],
+    spec_has_validity: &[bool],
+) -> BoltResult<String> {
+    if spec_has_validity.len() != specs.len() {
+        return Err(BoltError::Other(format!(
+            "compile_groupby_agg_kernel_multi_with_validity: spec_has_validity \
+             len {} must equal specs len {}",
+            spec_has_validity.len(),
+            specs.len()
+        )));
+    }
+    compile_groupby_agg_kernel_multi_inner(specs, spec_has_validity)
+}
+
+/// Shared emitter for the fused multi-aggregate kernel. `spec_has_validity` is
+/// either empty (classic, no validity — emitted by
+/// [`compile_groupby_agg_kernel_multi`]) or one-flag-per-spec (Stage C, emitted
+/// by [`compile_groupby_agg_kernel_multi_with_validity`]). When a flag is set
+/// the kernel takes a trailing packed-bit validity pointer for that spec and
+/// guards its atomic with a `bfe.u32` null-check.
+fn compile_groupby_agg_kernel_multi_inner(
+    specs: &[AggSpec],
+    spec_has_validity: &[bool],
+) -> BoltResult<String> {
     if specs.is_empty() {
         return Err(BoltError::Other(
             "compile_groupby_agg_kernel_multi: specs must be non-empty"
@@ -1092,6 +1151,12 @@ pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String>
         ));
     }
     let n = specs.len();
+    // `true` for spec j iff a per-spec validity bitmap was supplied. The empty
+    // slice (classic path) collapses every entry to `false`, so the no-validity
+    // emission is bit-identical to the historical kernel.
+    let has_validity = |j: usize| spec_has_validity.get(j).copied().unwrap_or(false);
+    // Number of trailing validity pointers = count of validity-carrying specs.
+    let n_validity: usize = (0..n).filter(|&j| has_validity(j)).count();
 
     // Validate every spec up front; collect per-spec PTX type info so the
     // body loop is allocation-free.
@@ -1137,15 +1202,45 @@ pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String>
     //   p[2+n .. 2+2n)         = acc_table_ptr_j
     //   p[2+2n]                = n_rows (u32)
     //   p[3+2n]                = k      (u32)
-    let total_u64_params = 2 + 2 * n;
-    let n_rows_param = total_u64_params;
-    let k_param = total_u64_params + 1;
-    let total_params = total_u64_params + 2;
+    //   p[4+2n .. 4+2n+V)      = validity_ptr   (Stage C only; one .u64 per
+    //                            validity-carrying spec, in spec order)
+    //
+    // The validity pointers are appended AFTER the two scalars so that the
+    // input/acc/n_rows/k param indices are byte-identical to the no-validity
+    // ABI — the classic launch path is unchanged.
+    let core_u64_params = 2 + 2 * n;
+    let n_rows_param = core_u64_params;
+    let k_param = core_u64_params + 1;
+    // First validity pointer (if any) sits right after the two .u32 scalars.
+    let validity_param_base = core_u64_params + 2;
+    let total_params = validity_param_base + n_validity;
+
+    // Map spec index -> its validity-pointer param index. Specs without
+    // validity get `None`; validity-carrying specs are numbered in spec order
+    // starting at `validity_param_base`.
+    let mut validity_param_of: Vec<Option<usize>> = Vec::with_capacity(n);
+    {
+        let mut next = validity_param_base;
+        for j in 0..n {
+            if has_validity(j) {
+                validity_param_of.push(Some(next));
+                next += 1;
+            } else {
+                validity_param_of.push(None);
+            }
+        }
+    }
 
     writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
     for p in 0..total_params {
         let trailing = if p == total_params - 1 { "" } else { "," };
-        let kind = if p < total_u64_params { "u64" } else { "u32" };
+        // .u32 only for the n_rows + k scalars; every pointer (core + validity)
+        // is .u64.
+        let kind = if p == n_rows_param || p == k_param {
+            "u32"
+        } else {
+            "u64"
+        };
         writeln!(ptx, "\t.param .{kind} {entry}_param_{p}{trailing}")
             .map_err(write_err)?;
     }
@@ -1282,6 +1377,39 @@ pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String>
     for (j, p) in per.iter().enumerate() {
         let input_param = 2 + j;
         let acc_param = 2 + n + j;
+
+        // Stage C: per-spec packed-bit validity guard. When spec j carries a
+        // validity bitmap, extract this row's bit and skip the spec's atomic
+        // when it is 0 — folding the NULL row to this aggregate's identity
+        // (SUM/COUNT add nothing; MIN/MAX leave the slot untouched). The other
+        // specs in this fused launch are unaffected. This mirrors the
+        // `bfe.u32` null-guard the single-agg `_with_validity` kernel emits;
+        // here we emit one guard per validity-carrying spec because each
+        // aggregate has its own input column (and therefore its own nulls).
+        //
+        // Register usage is local to this spec's block: %r24/%r25/%r26 +
+        // %rd16/%rd17/%rd18 + %p5 are not live across iterations, so reusing
+        // them per spec is safe.
+        if let Some(vparam) = validity_param_of[j] {
+            // word_idx = tid >> 5 ; bit_off = tid & 31  (tid is in %r3).
+            writeln!(ptx, "\tshr.u32 %r24, %r3, 5;").map_err(write_err)?;
+            writeln!(ptx, "\tand.b32 %r25, %r3, 31;").map_err(write_err)?;
+            // base = validity_ptr_j (read-only input → .nc).
+            writeln!(
+                ptx,
+                "\tld.param.u64 %rd16, [{entry}_param_{vparam}];"
+            )
+            .map_err(write_err)?;
+            writeln!(ptx, "\tcvta.to.global.u64 %rd16, %rd16;").map_err(write_err)?;
+            writeln!(ptx, "\tmul.wide.u32 %rd17, %r24, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd18, %rd16, %rd17;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.nc.u32 %r26, [%rd18];").map_err(write_err)?;
+            // bit = (word >> bit_off) & 1 ; skip this spec's atomic if 0.
+            writeln!(ptx, "\tbfe.u32 %r27, %r26, %r25, 1;").map_err(write_err)?;
+            writeln!(ptx, "\tsetp.eq.s32 %p5, %r27, 0;").map_err(write_err)?;
+            writeln!(ptx, "\t@%p5 bra SPEC_SKIP_{j};").map_err(write_err)?;
+        }
+
         // Scratch %rd index pool: reuse %rd10..%rd13 per j — each spec owns
         // them only between its load and its atom; nothing carries across.
         // Load input_j[tid].
@@ -1334,6 +1462,14 @@ pub fn compile_groupby_agg_kernel_multi(specs: &[AggSpec]) -> BoltResult<String>
             vi = val_idx,
         )
         .map_err(write_err)?;
+
+        // Stage C: landing pad for this spec's null-guard. A NULL row branches
+        // here, skipping the load + atomic above and falling through to the
+        // next spec (or DONE). Emitted only when spec j carries validity so
+        // the no-validity PTX is byte-identical to the classic kernel.
+        if validity_param_of[j].is_some() {
+            writeln!(ptx, "SPEC_SKIP_{j}:").map_err(write_err)?;
+        }
     }
 
     writeln!(ptx, "DONE:").map_err(write_err)?;
@@ -1553,6 +1689,167 @@ mod ptx_shape_tests {
     #[test]
     fn agg_multi_rejects_empty_specs() {
         assert!(compile_groupby_agg_kernel_multi(&[]).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Stage C: validity-aware fused multi-aggregate kernel.
+    // -----------------------------------------------------------------
+
+    /// The classic fused multi kernel must NOT emit any validity machinery:
+    /// no `bfe.u32`, no `SPEC_SKIP` label, and no validity pointer param.
+    /// This pins the "no-validity PTX is byte-identical" contract.
+    #[test]
+    fn agg_multi_classic_has_no_validity_machinery() {
+        let specs = [
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int32 },
+        ];
+        let ptx = compile_groupby_agg_kernel_multi(&specs).expect("classic multi");
+        assert!(!ptx.contains("bfe.u32"), "classic multi must not extract validity bits");
+        assert!(!ptx.contains("SPEC_SKIP_"), "classic multi must not emit skip labels");
+        // 2 + 2*n = 6 .u64 params, no validity pointers appended.
+        assert_eq!(ptx.matches(".param .u64 ").count(), 6);
+        assert_eq!(ptx.matches(".param .u32 ").count(), 2);
+    }
+
+    /// The empty-mask convenience: passing an all-false mask to the
+    /// `_with_validity` entry point produces PTX identical to the classic
+    /// emitter (no guards, no extra params).
+    #[test]
+    fn agg_multi_all_false_mask_matches_classic() {
+        let specs = [
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
+            AggSpec { op: ReduceOp::Count, input_dtype: DataType::Int64 },
+        ];
+        let classic = compile_groupby_agg_kernel_multi(&specs).unwrap();
+        let masked = compile_groupby_agg_kernel_multi_with_validity(
+            &specs,
+            &[false, false],
+        )
+        .unwrap();
+        assert_eq!(classic, masked, "all-false validity mask must match classic PTX");
+    }
+
+    /// `spec_has_validity` length must equal `specs` length.
+    #[test]
+    fn agg_multi_validity_rejects_length_mismatch() {
+        let specs = [AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 }];
+        assert!(
+            compile_groupby_agg_kernel_multi_with_validity(&specs, &[]).is_err(),
+            "mismatched mask length must error"
+        );
+        assert!(
+            compile_groupby_agg_kernel_multi_with_validity(&specs, &[true, false]).is_err(),
+            "mismatched mask length must error"
+        );
+    }
+
+    /// When every spec carries validity, the kernel appends one validity
+    /// pointer per spec and emits one `bfe.u32` null-guard + one `SPEC_SKIP`
+    /// landing pad per spec. The hash block is still emitted exactly once
+    /// (fusion preserved).
+    #[test]
+    fn agg_multi_with_validity_emits_per_spec_guard() {
+        let specs = [
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int32 },
+            AggSpec { op: ReduceOp::Count, input_dtype: DataType::Int64 },
+        ];
+        let ptx = compile_groupby_agg_kernel_multi_with_validity(
+            &specs,
+            &[true, true, true],
+        )
+        .expect("validity multi");
+
+        // Core 2 + 2*3 = 8 .u64 params + 3 validity pointers = 11 .u64 params.
+        assert_eq!(
+            ptx.matches(".param .u64 ").count(),
+            8 + 3,
+            "expected 8 core + 3 validity .u64 params\n{ptx}"
+        );
+        // Still exactly two .u32 scalars (n_rows, k).
+        assert_eq!(ptx.matches(".param .u32 ").count(), 2);
+
+        // One bit-extract guard per validity-carrying spec.
+        assert_eq!(
+            ptx.matches("bfe.u32 %r27, %r26, %r25, 1;").count(),
+            3,
+            "expected 3 per-spec bfe.u32 null-guards\n{ptx}"
+        );
+        // Skip-on-null branch + landing pad, one per guarded spec.
+        assert_eq!(ptx.matches("@%p5 bra SPEC_SKIP_").count(), 3);
+        for j in 0..3 {
+            assert!(
+                ptx.contains(&format!("SPEC_SKIP_{j}:")),
+                "missing landing pad SPEC_SKIP_{j}\n{ptx}"
+            );
+        }
+
+        // Three atomic updates remain (one per spec, after its guard).
+        assert_eq!(ptx.matches("atom.global.add").count(), 3);
+
+        // Fusion preserved: the splitmix multiplier (hash block) is still
+        // emitted exactly once even with the guards present.
+        let mul_literal = format!("mov.s64 %rl1, {};", FX_MUL);
+        assert_eq!(
+            ptx.matches(mul_literal.as_str()).count(),
+            1,
+            "validity guards must not duplicate the hash block\n{ptx}"
+        );
+    }
+
+    /// A mixed query (some columns nullable, some not) only guards the
+    /// flagged specs and only appends pointers for those — the non-nullable
+    /// specs stay on the cheap unconditional-atomic path.
+    #[test]
+    fn agg_multi_with_validity_mixed_mask_guards_only_flagged() {
+        let specs = [
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 }, // nullable
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int32 }, // not null
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 }, // nullable
+        ];
+        let ptx = compile_groupby_agg_kernel_multi_with_validity(
+            &specs,
+            &[true, false, true],
+        )
+        .expect("mixed validity multi");
+
+        // 8 core + 2 validity pointers (specs 0 and 2 only).
+        assert_eq!(ptx.matches(".param .u64 ").count(), 8 + 2);
+
+        // Exactly two guards (specs 0 and 2).
+        assert_eq!(ptx.matches("bfe.u32 %r27, %r26, %r25, 1;").count(), 2);
+        // Landing pads for the flagged specs only.
+        assert!(ptx.contains("SPEC_SKIP_0:"));
+        assert!(!ptx.contains("SPEC_SKIP_1:"), "spec 1 is not nullable — no guard");
+        assert!(ptx.contains("SPEC_SKIP_2:"));
+
+        // All three atomics still present.
+        assert_eq!(ptx.matches("atom.global.add").count(), 3);
+    }
+
+    /// The validity-pointer params are appended AFTER the n_rows + k scalars,
+    /// so the input/acc/n_rows/k indices match the classic ABI byte-for-byte.
+    /// We assert the first validity pointer is param index `core + 2` for a
+    /// 2-spec kernel (core = 2 + 2*2 = 6; scalars at 6,7; validity at 8).
+    #[test]
+    fn agg_multi_validity_pointers_follow_scalars() {
+        let specs = [
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
+            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
+        ];
+        let ptx = compile_groupby_agg_kernel_multi_with_validity(
+            &specs,
+            &[true, true],
+        )
+        .unwrap();
+        // n_rows = param_6, k = param_7 stay .u32; validity = param_8, param_9.
+        assert!(ptx.contains(".u32 bolt_groupby_agg_multi_param_6"));
+        assert!(ptx.contains(".u32 bolt_groupby_agg_multi_param_7"));
+        assert!(ptx.contains(".u64 bolt_groupby_agg_multi_param_8"));
+        assert!(ptx.contains(".u64 bolt_groupby_agg_multi_param_9"));
+        // And the load of the first validity pointer reads param_8.
+        assert!(ptx.contains("ld.param.u64 %rd16, [bolt_groupby_agg_multi_param_8];"));
     }
 
     /// The fused kernel's `.param .u64` count is `2 + 2 * n_specs`
