@@ -346,6 +346,21 @@ fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
         PhysicalPlan::StringProject { table, .. } => {
             let _ = writeln!(out, "StringProject: table={table}");
         }
+        PhysicalPlan::StringLikeFilter {
+            input,
+            table,
+            column,
+            mode,
+            negated,
+            ..
+        } => {
+            let kw = if *negated { "NOT LIKE" } else { "LIKE" };
+            let _ = writeln!(
+                out,
+                "StringLikeFilter: table={table} {column} {kw} [{mode:?}] (GPU, unvalidated)"
+            );
+            format_physical_into(input, depth + 1, out);
+        }
         PhysicalPlan::Window { input, .. } => {
             let _ = writeln!(out, "Window");
             format_physical_into(input, depth + 1, out);
