@@ -84,7 +84,7 @@ use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
 use arrow_schema::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Schema as ArrowSchema,
 };
 use bytemuck::Pod;
 
@@ -2546,49 +2546,12 @@ fn downcast_err(role: &str, expected: &str) -> BoltError {
 
 /// Map Arrow `DataType` to our plan `DataType`.
 fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
-    match d {
-        ArrowDataType::Int32 => Ok(DataType::Int32),
-        ArrowDataType::Int64 => Ok(DataType::Int64),
-        ArrowDataType::Float32 => Ok(DataType::Float32),
-        ArrowDataType::Float64 => Ok(DataType::Float64),
-        ArrowDataType::Boolean => Ok(DataType::Bool),
-        ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        ArrowDataType::Decimal128(precision, scale) => {
-            Ok(DataType::Decimal128(*precision, *scale))
-        }
-        other => Err(BoltError::Type(format!(
-            "unsupported Arrow dtype {:?}",
-            other
-        ))),
-    }
-}
-
-/// Map our plan `DataType` to Arrow `DataType`.
-fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
-    match d {
-        DataType::Int32 => Ok(ArrowDataType::Int32),
-        DataType::Int64 => Ok(ArrowDataType::Int64),
-        DataType::Float32 => Ok(ArrowDataType::Float32),
-        DataType::Float64 => Ok(ArrowDataType::Float64),
-        DataType::Bool => Ok(ArrowDataType::Boolean),
-        DataType::Utf8 => Ok(ArrowDataType::Utf8),
-        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
-        // v0.6 / M4: Date/Timestamp not yet wired through this aggregate
-        // output helper. Reject so a regression is loud.
-        DataType::Date32 | DataType::Timestamp(_, _) => Err(crate::error::BoltError::Type(
-            format!("Date/Timestamp not yet supported in this aggregate output path: {:?}", d),
-        )),
-    }
+    crate::exec::schema_convert::arrow_dtype_to_plan_basic(d, "")
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    let mut fields = Vec::with_capacity(s.fields.len());
-    for f in &s.fields {
-        let dt = plan_dtype_to_arrow(f.dtype)?;
-        fields.push(ArrowField::new(&f.name, dt, f.nullable));
-    }
-    Ok(Arc::new(ArrowSchema::new(fields)))
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
 }
 
 #[cfg(test)]

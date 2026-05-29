@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -614,31 +614,8 @@ fn run_reduce_phase_i64(
         BoltError::Other(format!("groupby_tier2_minmax_exec(i64): build error: {e}"))
     })
 }
-
-fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
-    match d {
-        DataType::Int32 => Ok(ArrowDataType::Int32),
-        DataType::Int64 => Ok(ArrowDataType::Int64),
-        DataType::Float32 => Ok(ArrowDataType::Float32),
-        DataType::Float64 => Ok(ArrowDataType::Float64),
-        DataType::Bool => Ok(ArrowDataType::Boolean),
-        DataType::Utf8 => Ok(ArrowDataType::Utf8),
-        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
-        // v0.6 / M4: Date/Timestamp not yet wired through this aggregate
-        // output helper. Reject so a regression is loud.
-        DataType::Date32 | DataType::Timestamp(_, _) => Err(crate::error::BoltError::Type(
-            format!("Date/Timestamp not yet supported in this aggregate output path: {:?}", d),
-        )),
-    }
-}
-
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    let mut fields = Vec::with_capacity(s.fields.len());
-    for f in &s.fields {
-        let dt = plan_dtype_to_arrow(f.dtype)?;
-        fields.push(ArrowField::new(&f.name, dt, f.nullable));
-    }
-    Ok(Arc::new(ArrowSchema::new(fields)))
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
 }
 
 // ---------------------------------------------------------------------------

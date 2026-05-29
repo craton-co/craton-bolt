@@ -66,7 +66,7 @@ use arrow_array::{
 };
 use arrow_array::types::{Int32Type as ArrowInt32Type, Int64Type as ArrowInt64Type};
 use arrow_schema::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Schema as ArrowSchema,
 };
 
 use crate::error::{BoltError, BoltResult};
@@ -1053,35 +1053,8 @@ fn arrow_err(e: arrow::error::ArrowError) -> BoltError {
 /// and duplicating it here keeps the join executor self-contained without
 /// pulling that helper out into a shared module just for one call site.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    let mut fields = Vec::with_capacity(s.fields.len());
-    for f in &s.fields {
-        let dt = plan_dtype_to_arrow(f.dtype)?;
-        fields.push(ArrowField::new(&f.name, dt, f.nullable));
-    }
-    Ok(Arc::new(ArrowSchema::new(fields)))
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "join output path")
 }
-
-fn plan_dtype_to_arrow(d: crate::plan::logical_plan::DataType) -> BoltResult<ArrowDataType> {
-    use crate::plan::logical_plan::DataType as D;
-    Ok(match d {
-        D::Int32 => ArrowDataType::Int32,
-        D::Int64 => ArrowDataType::Int64,
-        D::Float32 => ArrowDataType::Float32,
-        D::Float64 => ArrowDataType::Float64,
-        D::Bool => ArrowDataType::Boolean,
-        D::Utf8 => ArrowDataType::Utf8,
-        D::Decimal128(p, s) => ArrowDataType::Decimal128(p, s),
-        // v0.6 / M4: Date/Timestamp are not yet wired through the join
-        // output path; reject so a regression is loud.
-        D::Date32 | D::Timestamp(_, _) => {
-            return Err(crate::error::BoltError::Type(format!(
-                "Date/Timestamp not yet supported in join output path: {:?}",
-                d
-            )));
-        }
-    })
-}
-
 // ---------- GPU INNER fast path -----------------------------------------
 
 /// Try the GPU INNER-join fast path. Returns:

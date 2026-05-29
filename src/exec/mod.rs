@@ -14,6 +14,10 @@ pub mod module_cache;
 /// without each rolling their own `cfg(feature = "cuda-stub")` branch.
 #[doc(hidden)]
 pub(crate) mod gpu_upload;
+/// Single-source-of-truth plan<->Arrow `DataType`/`Schema` converters.
+/// Replaces ~25 copy-pasted `plan_dtype_to_arrow` / `arrow_dtype_to_plan` /
+/// `plan_schema_to_arrow_schema` definitions across the executors.
+pub(crate) mod schema_convert;
 pub mod aggregate;
 pub mod compact;
 pub mod string_col;

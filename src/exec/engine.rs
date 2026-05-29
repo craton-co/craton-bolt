@@ -2768,49 +2768,6 @@ impl<T: bytemuck::Pod> StagedDownload<T> {
     }
 }
 
-/// Map our plan `DataType` to Arrow `DataType`.
-fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
-    match d {
-        DataType::Int32 => Ok(ArrowDataType::Int32),
-        DataType::Int64 => Ok(ArrowDataType::Int64),
-        DataType::Float32 => Ok(ArrowDataType::Float32),
-        DataType::Float64 => Ok(ArrowDataType::Float64),
-        DataType::Bool => Ok(ArrowDataType::Boolean),
-        DataType::Utf8 => Ok(ArrowDataType::Utf8),
-        DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
-        // v0.6 / M4: Date32 maps to Arrow `Date32`; Timestamp carries unit + tz.
-        DataType::Date32 => Ok(ArrowDataType::Date32),
-        DataType::Timestamp(unit, tz) => Ok(ArrowDataType::Timestamp(
-            plan_time_unit_to_arrow(unit),
-            tz.map(|s| Arc::from(s)),
-        )),
-    }
-}
-
-/// Map our plan `TimeUnit` to Arrow's `TimeUnit`.
-fn plan_time_unit_to_arrow(u: crate::plan::logical_plan::TimeUnit) -> arrow_schema::TimeUnit {
-    use crate::plan::logical_plan::TimeUnit as PlanU;
-    use arrow_schema::TimeUnit as ArrowU;
-    match u {
-        PlanU::Second => ArrowU::Second,
-        PlanU::Millisecond => ArrowU::Millisecond,
-        PlanU::Microsecond => ArrowU::Microsecond,
-        PlanU::Nanosecond => ArrowU::Nanosecond,
-    }
-}
-
-/// Map Arrow's `TimeUnit` to our plan `TimeUnit`.
-fn arrow_time_unit_to_plan(u: &arrow_schema::TimeUnit) -> crate::plan::logical_plan::TimeUnit {
-    use crate::plan::logical_plan::TimeUnit as PlanU;
-    use arrow_schema::TimeUnit as ArrowU;
-    match u {
-        ArrowU::Second => PlanU::Second,
-        ArrowU::Millisecond => PlanU::Millisecond,
-        ArrowU::Microsecond => PlanU::Microsecond,
-        ArrowU::Nanosecond => PlanU::Nanosecond,
-    }
-}
-
 /// Map Arrow `DataType` to our plan `DataType`. Errors on unsupported types.
 ///
 /// **Stage 4 / Stage 6** — `Dictionary(_, Utf8)` is accepted as a register-table
@@ -2826,44 +2783,7 @@ fn arrow_time_unit_to_plan(u: &arrow_schema::TimeUnit) -> crate::plan::logical_p
 /// dict layout reaches the GPU table directly). Int64-keyed dicts still take
 /// the legacy path through `GpuColumn::upload`.
 fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
-    match d {
-        ArrowDataType::Int32 => Ok(DataType::Int32),
-        ArrowDataType::Int64 => Ok(DataType::Int64),
-        ArrowDataType::Float32 => Ok(DataType::Float32),
-        ArrowDataType::Float64 => Ok(DataType::Float64),
-        ArrowDataType::Boolean => Ok(DataType::Bool),
-        ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        // v0.6 / M4: round-trip Arrow's `Decimal128(precision, scale)` into
-        // our plan's `DataType::Decimal128(precision, scale)`. Plan-level
-        // only — GPU codegen rejects this with
-        // "Decimal128 not yet lowered to GPU".
-        ArrowDataType::Decimal128(precision, scale) => {
-            Ok(DataType::Decimal128(*precision, *scale))
-        }
-        ArrowDataType::Date32 => Ok(DataType::Date32),
-        ArrowDataType::Timestamp(unit, tz) => {
-            let interned: Option<&'static str> = tz
-                .as_deref()
-                .map(crate::plan::logical_plan::intern_timezone);
-            Ok(DataType::Timestamp(arrow_time_unit_to_plan(unit), interned))
-        }
-        // Stage 4 / Stage 6: dictionary-encoded Utf8. Only string-valued
-        // dicts map to `Utf8`; numeric-valued dicts are intentionally
-        // rejected because the caller should hand the inner numeric column
-        // directly through the normal path. Both Int32 and Int64 keys are
-        // accepted: Int32 takes the Stage-6 native ingest in
-        // `GpuTable::from_record_batch`, Int64 falls through to the legacy
-        // `GpuColumn::upload` path (which still emits a `DictUtf8` variant).
-        ArrowDataType::Dictionary(_key, value)
-            if matches!(value.as_ref(), ArrowDataType::Utf8) =>
-        {
-            Ok(DataType::Utf8)
-        }
-        other => Err(BoltError::Type(format!(
-            "unsupported Arrow dtype {:?}",
-            other
-        ))),
-    }
+    crate::exec::schema_convert::arrow_dtype_to_plan(d)
 }
 
 /// Stage 4 — rewrite every `Dictionary(_, Utf8)` column in `batch` into a
@@ -3117,12 +3037,7 @@ fn arrow_schema_to_plan_schema(s: &ArrowSchema) -> BoltResult<Schema> {
 
 /// Convert our plan `Schema` to an `arrow_schema::Schema` (used for output `RecordBatch`).
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    let mut fields = Vec::with_capacity(s.fields.len());
-    for f in &s.fields {
-        let dt = plan_dtype_to_arrow(f.dtype)?;
-        fields.push(ArrowField::new(&f.name, dt, f.nullable));
-    }
-    Ok(Arc::new(ArrowSchema::new(fields)))
+    crate::exec::schema_convert::plan_schema_to_arrow_schema(s)
 }
 
 /// Convert a host-side computed `HostColumn` into an `ArrayRef`.
