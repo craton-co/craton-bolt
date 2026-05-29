@@ -17,9 +17,10 @@
 //!   * The `lower_physical` rejection error message (a single
 //!     representative case is enough — the rejection lives in one place).
 
+use craton_bolt::exec::string_project::StringTransform;
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider, PhysicalPlan,
-    ScalarFnKind, Schema, StringLengthOutput,
+    ScalarFnKind, Schema, StringLengthOutput, StringProjectOutput,
 };
 
 // ---- Fixture ----------------------------------------------------------------
@@ -325,13 +326,69 @@ fn length_with_passthrough_column_lowers_to_string_length() {
     }
 }
 
+// ---- GPU UPPER/LOWER: lowered to the fully-GPU StringProject variant -------
+
 #[test]
-fn upper_still_rejected_not_string_length() {
-    // Only LENGTH is wired to the GPU; UPPER (a variable-width producer) must
-    // still reject at the lowering boundary rather than route to StringLength.
+fn upper_lowers_to_gpu_string_project_variant() {
+    // `SELECT UPPER(s) FROM txt` over a bare scan now lowers to the fully-GPU
+    // two-pass `PhysicalPlan::StringProject` producer (was rejected before the
+    // variable-width path was wired). Output column is `Utf8`.
     let plan = parse("SELECT UPPER(s) FROM txt").expect("UPPER(s) parses");
+    let phys = lower_physical(&plan).expect("UPPER(s) must lower to a GPU StringProject");
+    match phys {
+        PhysicalPlan::StringProject {
+            ref table,
+            ref outputs,
+            ref output_schema,
+        } => {
+            assert_eq!(table, "txt");
+            assert_eq!(outputs.len(), 1);
+            assert!(
+                matches!(
+                    &outputs[0],
+                    StringProjectOutput::Transform { source, transform }
+                        if source == "s" && *transform == StringTransform::Upper
+                ),
+                "expected a single UPPER(s) transform output, got {:?}",
+                outputs[0]
+            );
+            assert_eq!(output_schema.fields.len(), 1);
+            assert_eq!(output_schema.fields[0].dtype, DataType::Utf8);
+        }
+        other => panic!("expected PhysicalPlan::StringProject, got {other:?}"),
+    }
+}
+
+#[test]
+fn lower_with_passthrough_column_lowers_to_string_project() {
+    // A mix of `LOWER(s)` and a non-Utf8 passthrough column routes to the GPU
+    // two-pass producer (the passthrough is lifted from the host batch).
+    let plan = parse("SELECT n, LOWER(s) FROM txt").expect("n, LOWER(s) parses");
+    let phys = lower_physical(&plan).expect("must lower to StringProject");
+    match phys {
+        PhysicalPlan::StringProject { outputs, .. } => {
+            assert_eq!(outputs.len(), 2);
+            assert!(matches!(
+                &outputs[0],
+                StringProjectOutput::Passthrough { source } if source == "n"
+            ));
+            assert!(matches!(
+                &outputs[1],
+                StringProjectOutput::Transform { source, transform }
+                    if source == "s" && *transform == StringTransform::Lower
+            ));
+        }
+        other => panic!("expected StringProject, got {other:?}"),
+    }
+}
+
+#[test]
+fn substring_still_rejected_not_string_project() {
+    // SUBSTRING is a variable-width producer left on the host fallback with a
+    // TODO; it must NOT route to the GPU StringProject (only UPPER/LOWER do).
+    let plan = parse("SELECT SUBSTRING(s, 1, 2) FROM txt").expect("SUBSTRING parses");
     let res = lower_physical(&plan);
-    assert!(res.is_err(), "UPPER must still be rejected at lowering");
+    assert!(res.is_err(), "SUBSTRING must still be rejected at lowering");
 }
 
 // ---- Unknown function names still rejected ---------------------------------
@@ -431,4 +488,117 @@ fn length_runs_on_gpu_for_dict_encoded_column() {
     let got: Vec<i64> = (0..lens.len()).map(|i| lens.value(i)).collect();
     // byte lengths: "us"=2, "eu"=2, "us"=2, "canada"=6
     assert_eq!(got, vec![2, 2, 2, 6]);
+}
+
+// ---- GPU end-to-end: UPPER / LOWER run on the device (two-pass) -------------
+
+#[test]
+#[ignore = "gpu:string"]
+fn upper_runs_on_gpu_for_plain_utf8_column() {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("CUDA ctx");
+    // Plain (ASCII) StringArray → engine `Utf8` variant (slot-0-NULL, 1-based).
+    let s = StringArray::from(vec!["alpha", "Bb!", "gamMa", "alpha"]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(s)]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT UPPER(s) FROM t")
+        .expect("execute SELECT UPPER(s)");
+    let out = h.record_batch();
+    let col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("UPPER output is Utf8");
+    let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    // ASCII upper-case, length-preserving.
+    assert_eq!(got, vec!["ALPHA", "BB!", "GAMMA", "ALPHA"]);
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn lower_runs_on_gpu_for_dict_encoded_column() {
+    use std::sync::Arc;
+
+    use arrow_array::builder::StringDictionaryBuilder;
+    use arrow_array::types::Int32Type;
+    use arrow_array::{Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("CUDA ctx");
+    // Dictionary-encoded (no nulls) → native `DictUtf8` (ZeroBased) layout.
+    let mut b: StringDictionaryBuilder<Int32Type> = StringDictionaryBuilder::new();
+    for v in ["US", "Eu", "US", "CaNaDa"] {
+        b.append_value(v);
+    }
+    let dict = b.finish();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "region",
+        ArrowDataType::Dictionary(
+            Box::new(ArrowDataType::Int32),
+            Box::new(ArrowDataType::Utf8),
+        ),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(dict)]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT LOWER(region) FROM t")
+        .expect("execute SELECT LOWER(region)");
+    let out = h.record_batch();
+    let col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("LOWER output is Utf8");
+    let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert_eq!(got, vec!["us", "eu", "us", "canada"]);
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn upper_preserves_nulls_on_gpu() {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("CUDA ctx");
+    // NULL row must surface as Arrow NULL (not "").
+    let s = StringArray::from(vec![Some("ab"), None, Some("cD")]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(s)]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT UPPER(s) FROM t")
+        .expect("execute SELECT UPPER(s)");
+    let out = h.record_batch();
+    let col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("UPPER output is Utf8");
+    assert_eq!(col.len(), 3);
+    assert_eq!(col.value(0), "AB");
+    assert!(col.is_null(1), "NULL row must stay NULL");
+    assert_eq!(col.value(2), "CD");
 }
