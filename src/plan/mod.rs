@@ -10,6 +10,7 @@ pub mod string_literal_rewrite;
 pub mod suggest;
 pub mod rewrite;
 pub mod optimizer;
+pub mod statistics;
 
 pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,
