@@ -32,10 +32,13 @@
 //!    is the simplest way to flip the cache on for a benchmark run or
 //!    a serverless deployment.
 //!
-//! 2. **Engine::Builder::persistent_cache(path)** — when wired up,
-//!    overrides the env var. (The builder is owned by a parallel agent;
-//!    this module exposes [`set_override_dir`] so the builder can
-//!    install its path at construction time.)
+//! 2. **Engine::Builder::persistent_cache(path)** — overrides the env
+//!    var. `EngineBuilder::build()` calls [`set_override_dir`] with the
+//!    configured path, so a builder-configured engine reads/writes
+//!    cubins at that directory through the JIT compile path
+//!    (`Engine::get_or_build_module` → [`disk_cache`]) without the env
+//!    var being set. A default-built engine installs `None`, which
+//!    clears any prior override and re-falls-back to the env var.
 //!
 //! If neither mechanism is active, [`disk_cache`] returns `None` and
 //! all lookups / stores are zero-cost no-ops.
