@@ -524,6 +524,14 @@ fn emit_op(
             b_lo,
             b_hi,
         } => emit_mul_128(b, *dst_lo, *dst_hi, *a_lo, *a_hi, *b_lo, *b_hi),
+        Op::Cmp128 {
+            dst,
+            op,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_cmp_128(b, *dst, *op, *a_lo, *a_hi, *b_lo, *b_hi),
     }
 }
 
@@ -749,6 +757,200 @@ fn emit_mul_128(
         "add.u64 {}, {}, {};",
         dst_hi_name, hi_acc, cross2
     ))?;
+    Ok(())
+}
+
+/// Emit `Op::Cmp128` — split-register 128-bit signed comparison producing
+/// a Bool (0/1) in `dst`. The PTX side has no native 128-bit `setp`, so
+/// we emit the standard high-half / low-half decomposition documented in
+/// the PTX ISA reference under "Integer Compare Operations".
+///
+/// Per-op wire shape (signed-high, unsigned-low):
+///
+/// ```text
+///   eq: setp.eq.u64 p_lo, a_lo, b_lo
+///       setp.eq.s64 p_hi, a_hi, b_hi
+///       and.pred    p,    p_lo, p_hi
+///
+///   ne: setp.ne.u64 p_lo, a_lo, b_lo
+///       setp.ne.s64 p_hi, a_hi, b_hi
+///       or.pred     p,    p_lo, p_hi
+///
+///   lt: setp.lt.s64 p_hi_lt, a_hi, b_hi
+///       setp.eq.s64 p_hi_eq, a_hi, b_hi
+///       setp.lt.u64 p_lo_lt, a_lo, b_lo
+///       and.pred    p_eq_lt, p_hi_eq, p_lo_lt
+///       or.pred     p,       p_hi_lt, p_eq_lt
+///
+///   gt: same as lt with .lt -> .gt on the high-half compares
+///       and .lt -> .gt on the low-half compare.
+///
+///   le: same as lt with the low-half compare promoted to `<=`
+///       (setp.le.u64) so the equal-low path also fires.
+///
+///   ge: same as gt with the low-half compare promoted to `>=`.
+/// ```
+///
+/// Why signed on the high half and unsigned on the low half: the i128's
+/// sign lives in bit 127, which is the top bit of the *high* half. The
+/// low half always carries plain magnitude bits — its raw u64 ordering
+/// IS the within-equal-high-half ordering of the full i128 (negatives
+/// have all-set high halves but arbitrary low halves; once the high
+/// halves are equal the low halves can be compared as unsigned).
+///
+/// Materialising the result: a single `selp.s32 dst, 1, 0, p` turns the
+/// final predicate into the canonical Bool (0/1) `b32` representation
+/// matching every other comparison emitter in this file.
+fn emit_cmp_128(
+    b: &mut PtxBuilder,
+    dst: Reg,
+    op: BinaryOp,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    let a_lo_name = b.alloc.get(a_lo)?.to_string();
+    let a_hi_name = b.alloc.get(a_hi)?.to_string();
+    let b_lo_name = b.alloc.get(b_lo)?.to_string();
+    let b_hi_name = b.alloc.get(b_hi)?.to_string();
+    let dst_name = b.alloc.assign(dst, DataType::Bool)?;
+
+    use BinaryOp::*;
+    match op {
+        Eq => {
+            // Both halves must match.
+            let p_lo = b.alloc.alloc("p");
+            let p_hi = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.eq.u64 {}, {}, {};",
+                p_lo, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p, p_lo, p_hi))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        NotEq => {
+            // Either half differs.
+            let p_lo = b.alloc.alloc("p");
+            let p_hi = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.ne.u64 {}, {}, {};",
+                p_lo, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!(
+                "setp.ne.s64 {}, {}, {};",
+                p_hi, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_lo, p_hi))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        Lt => {
+            // a < b  <=>  (a_hi <s b_hi) || (a_hi == b_hi && a_lo <u b_lo)
+            let p_hi_lt = b.alloc.alloc("p");
+            let p_hi_eq = b.alloc.alloc("p");
+            let p_lo_lt = b.alloc.alloc("p");
+            let p_eq_lt = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.lt.s64 {}, {}, {};",
+                p_hi_lt, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi_eq, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.lt.u64 {}, {}, {};",
+                p_lo_lt, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p_eq_lt, p_hi_eq, p_lo_lt))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_lt, p_eq_lt))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        Gt => {
+            // a > b  <=>  (a_hi >s b_hi) || (a_hi == b_hi && a_lo >u b_lo)
+            let p_hi_gt = b.alloc.alloc("p");
+            let p_hi_eq = b.alloc.alloc("p");
+            let p_lo_gt = b.alloc.alloc("p");
+            let p_eq_gt = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.gt.s64 {}, {}, {};",
+                p_hi_gt, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi_eq, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.gt.u64 {}, {}, {};",
+                p_lo_gt, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p_eq_gt, p_hi_eq, p_lo_gt))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_gt, p_eq_gt))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        LtEq => {
+            // a <= b  <=>  (a_hi <s b_hi) || (a_hi == b_hi && a_lo <=u b_lo)
+            let p_hi_lt = b.alloc.alloc("p");
+            let p_hi_eq = b.alloc.alloc("p");
+            let p_lo_le = b.alloc.alloc("p");
+            let p_eq_le = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.lt.s64 {}, {}, {};",
+                p_hi_lt, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi_eq, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.le.u64 {}, {}, {};",
+                p_lo_le, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p_eq_le, p_hi_eq, p_lo_le))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_lt, p_eq_le))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        GtEq => {
+            // a >= b  <=>  (a_hi >s b_hi) || (a_hi == b_hi && a_lo >=u b_lo)
+            let p_hi_gt = b.alloc.alloc("p");
+            let p_hi_eq = b.alloc.alloc("p");
+            let p_lo_ge = b.alloc.alloc("p");
+            let p_eq_ge = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.gt.s64 {}, {}, {};",
+                p_hi_gt, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi_eq, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.ge.u64 {}, {}, {};",
+                p_lo_ge, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p_eq_ge, p_hi_eq, p_lo_ge))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_gt, p_eq_ge))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        _ => {
+            return Err(BoltError::Other(format!(
+                "ptx_gen: Op::Cmp128 with non-comparison op {:?} — planner bug \
+                 (Codegen::emit_binary_decimal128_cmp must reject non-comparison \
+                 ops before emitting Op::Cmp128)",
+                op
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2960,6 +3162,234 @@ mod decimal128_ir_tests {
         // Class counter advanced by 2.
         assert_eq!(alloc.count("rl"), 2);
     }
+
+    // -------- Op::Cmp128 PTX shape tests (v0.7 follow-up to Sub-task B) ----
+    //
+    // Each test below builds a 6-op kernel:
+    //
+    //   ld lhs.lo/hi  -> r0/r1
+    //   ld rhs.lo/hi  -> r2/r3
+    //   cmp128(op, r0,r1, r2,r3) -> r4  (Bool 0/1)
+    //   store r4 -> output Bool column
+    //
+    // and inspects the emitted PTX for the expected `setp` / `and.pred` /
+    // `or.pred` / `selp.s32` mnemonics matching the per-op wire shape
+    // documented on `Op::Cmp128`. The kernels do NOT execute on a GPU
+    // here — these are textual PTX-shape regression tests, mirroring the
+    // pattern used by every other op in this module.
+
+    /// Build a 6-op `KernelSpec` that compares two Decimal128 columns
+    /// with `op` and stores the Bool result. Shared helper across the
+    /// per-operator Cmp128 tests below.
+    fn cmp128_spec(op: BinaryOp) -> KernelSpec {
+        KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: dec(18, 2),
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: dec(18, 2),
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "r".into(),
+                dtype: DataType::Bool,
+            }],
+            ops: vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::LoadColumn128 {
+                    dst_lo: Reg(2),
+                    dst_hi: Reg(3),
+                    col_idx: 1,
+                },
+                Op::Cmp128 {
+                    dst: Reg(4),
+                    op,
+                    a_lo: Reg(0),
+                    a_hi: Reg(1),
+                    b_lo: Reg(2),
+                    b_hi: Reg(3),
+                },
+                Op::Store {
+                    src: Reg(4),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+            ],
+            predicate: None,
+            register_count: 5,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        }
+    }
+
+    /// `Op::Cmp128 { op: Eq }` lowers to:
+    ///
+    ///   `setp.eq.u64 p_lo, a_lo, b_lo` + `setp.eq.s64 p_hi, a_hi, b_hi`
+    ///   + `and.pred p, p_lo, p_hi` + `selp.s32 dst, 1, 0, p`.
+    #[test]
+    fn cmp_128_eq_emits_setp_eq_with_and_pred() {
+        let spec = cmp128_spec(BinaryOp::Eq);
+        let ptx = compile(&spec, "bolt_dec128_cmp_eq").expect("compile");
+        assert!(
+            ptx.contains("setp.eq.u64"),
+            "expected setp.eq.u64 for low-half equality\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s64"),
+            "expected setp.eq.s64 for high-half equality (signed)\n{ptx}"
+        );
+        assert!(
+            ptx.contains("and.pred"),
+            "expected and.pred to combine low + high equality predicates\n{ptx}"
+        );
+        assert!(
+            ptx.contains("selp.s32"),
+            "expected selp.s32 to materialise the 0/1 Bool result\n{ptx}"
+        );
+        // No `or.pred` for Eq — that's the NotEq shape.
+        assert!(
+            !ptx.contains("or.pred"),
+            "Eq must not use or.pred (that's NotEq's combiner)\n{ptx}"
+        );
+    }
+
+    /// `Op::Cmp128 { op: NotEq }` lowers to setp.ne on both halves
+    /// combined with `or.pred`.
+    #[test]
+    fn cmp_128_ne_emits_setp_ne_with_or_pred() {
+        let spec = cmp128_spec(BinaryOp::NotEq);
+        let ptx = compile(&spec, "bolt_dec128_cmp_ne").expect("compile");
+        assert!(
+            ptx.contains("setp.ne.u64"),
+            "expected setp.ne.u64 for low-half inequality\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.ne.s64"),
+            "expected setp.ne.s64 for high-half inequality (signed)\n{ptx}"
+        );
+        assert!(
+            ptx.contains("or.pred"),
+            "expected or.pred to combine low + high inequality predicates\n{ptx}"
+        );
+        assert!(
+            ptx.contains("selp.s32"),
+            "expected selp.s32 to materialise the 0/1 Bool result\n{ptx}"
+        );
+        // No `and.pred` for NotEq.
+        assert!(
+            !ptx.contains("and.pred"),
+            "NotEq must not use and.pred (that's Eq's combiner)\n{ptx}"
+        );
+    }
+
+    /// `Op::Cmp128 { op: Lt }` lowers to:
+    ///
+    ///   `setp.lt.s64` (hi_lt) + `setp.eq.s64` (hi_eq) + `setp.lt.u64` (lo_lt)
+    ///   + `and.pred p_eq_lt, hi_eq, lo_lt` + `or.pred p, hi_lt, p_eq_lt`
+    ///   + `selp.s32 dst, 1, 0, p`.
+    ///
+    /// Signed-high / unsigned-low because the i128's sign lives in the top
+    /// bit of the high half; once the high halves are equal the low half's
+    /// raw u64 ordering IS the within-equal-high-half ordering.
+    #[test]
+    fn cmp_128_lt_emits_split_signed_high_unsigned_low_pattern() {
+        let spec = cmp128_spec(BinaryOp::Lt);
+        let ptx = compile(&spec, "bolt_dec128_cmp_lt").expect("compile");
+        assert!(
+            ptx.contains("setp.lt.s64"),
+            "expected setp.lt.s64 for high-half signed compare\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s64"),
+            "expected setp.eq.s64 for high-half tie-break\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.lt.u64"),
+            "expected setp.lt.u64 for low-half unsigned compare\n{ptx}"
+        );
+        assert!(
+            ptx.contains("and.pred"),
+            "expected and.pred to combine (hi_eq AND lo_lt)\n{ptx}"
+        );
+        assert!(
+            ptx.contains("or.pred"),
+            "expected or.pred to combine (hi_lt OR (hi_eq AND lo_lt))\n{ptx}"
+        );
+        assert!(
+            ptx.contains("selp.s32"),
+            "expected selp.s32 to materialise the 0/1 Bool result\n{ptx}"
+        );
+    }
+
+    /// `Op::Cmp128 { op: Gt }` mirrors `Lt` with `.gt` on both halves.
+    #[test]
+    fn cmp_128_gt_emits_split_signed_high_unsigned_low_pattern() {
+        let spec = cmp128_spec(BinaryOp::Gt);
+        let ptx = compile(&spec, "bolt_dec128_cmp_gt").expect("compile");
+        assert!(
+            ptx.contains("setp.gt.s64"),
+            "expected setp.gt.s64 for high-half signed compare\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s64"),
+            "expected setp.eq.s64 for high-half tie-break\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.gt.u64"),
+            "expected setp.gt.u64 for low-half unsigned compare\n{ptx}"
+        );
+        assert!(
+            ptx.contains("and.pred") && ptx.contains("or.pred"),
+            "expected and.pred + or.pred combining the three predicates\n{ptx}"
+        );
+    }
+
+    /// `Op::Cmp128 { op: LtEq }` — high `lt` plus low `le` for the
+    /// equal-high-half tie path.
+    #[test]
+    fn cmp_128_le_emits_setp_lt_high_setp_le_low() {
+        let spec = cmp128_spec(BinaryOp::LtEq);
+        let ptx = compile(&spec, "bolt_dec128_cmp_le").expect("compile");
+        assert!(
+            ptx.contains("setp.lt.s64"),
+            "expected setp.lt.s64 for high-half signed compare\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s64"),
+            "expected setp.eq.s64 for high-half tie-break\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.le.u64"),
+            "expected setp.le.u64 for low-half unsigned <= so equal-low fires\n{ptx}"
+        );
+    }
+
+    /// `Op::Cmp128 { op: GtEq }` — high `gt` plus low `ge` for the
+    /// equal-high-half tie path.
+    #[test]
+    fn cmp_128_ge_emits_setp_gt_high_setp_ge_low() {
+        let spec = cmp128_spec(BinaryOp::GtEq);
+        let ptx = compile(&spec, "bolt_dec128_cmp_ge").expect("compile");
+        assert!(
+            ptx.contains("setp.gt.s64"),
+            "expected setp.gt.s64 for high-half signed compare\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s64"),
+            "expected setp.eq.s64 for high-half tie-break\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.ge.u64"),
+            "expected setp.ge.u64 for low-half unsigned >= so equal-low fires\n{ptx}"
+        );
+    }
 }
 
 
@@ -3066,7 +3496,19 @@ fn walk_store_deps(
                 b_lo,
                 b_hi,
                 ..
+            }
+            | Op::Cmp128 {
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                ..
             } => {
+                // Cmp128 produces a single Bool dst (not a 128-bit pair),
+                // but the operand-half structure is the same as the other
+                // 128-bit ops: four halves to walk back through. The Bool
+                // result is whatever a downstream Store / Cmp / etc. consumes
+                // via `dst`.
                 stack.push(a_lo.id());
                 stack.push(a_hi.id());
                 stack.push(b_lo.id());
@@ -3131,6 +3573,12 @@ pub fn output_input_dependencies(
             | Op::Binary { dst, .. }
             | Op::IsNullCheck { dst, .. }
             | Op::Select { dst, .. } => {
+                reg_to_op.insert(dst.id(), op);
+            }
+            // Cmp128 collapses the (lo, hi, lo, hi) operand quartet to a
+            // single Bool dst — register it as a single-register producer
+            // exactly like Op::Binary's comparison shape.
+            Op::Cmp128 { dst, .. } => {
                 reg_to_op.insert(dst.id(), op);
             }
             Op::Store { .. } | Op::Store128 { .. } => { /* no dst */ }

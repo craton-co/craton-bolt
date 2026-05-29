@@ -302,3 +302,136 @@ fn decimal128_add_mismatched_scale_rejected() {
         "scale-mismatch rejection should mention scale / Decimal128; got: {msg}"
     );
 }
+
+// ---- 5. Decimal128 comparisons (v0.7 GPU lowering) -------------------------
+
+/// Build a provider whose schema carries two Decimal128 columns with
+/// *matching* precision + scale (so the comparison lowerer accepts) and
+/// one BIGINT companion column used by the mixed-type rejection tests.
+fn provider_with_matching_decimals_and_bigint() -> MemTableProvider {
+    let schema = Schema::new(vec![
+        Field {
+            name: "d1".into(),
+            dtype: DataType::Decimal128(10, 2),
+            nullable: true,
+        },
+        Field {
+            name: "d2".into(),
+            dtype: DataType::Decimal128(10, 2),
+            nullable: true,
+        },
+        Field {
+            name: "n".into(),
+            dtype: DataType::Int64,
+            nullable: true,
+        },
+    ]);
+    MemTableProvider::new().with_table("t", schema)
+}
+
+/// `WHERE d1 = d2` between two matching-precision matching-scale
+/// Decimal128 columns lowers cleanly through the v0.7 physical-plan
+/// codegen. The comparison emits `Op::Cmp128 { op: Eq, ... }` which the
+/// PTX layer lowers to the split-register `setp.eq.u64` / `setp.eq.s64`
+/// + `and.pred` + `selp.s32` pattern (see `ptx_gen::emit_cmp_128`).
+#[test]
+fn decimal128_eq_two_matching_columns_lowers_in_v07() {
+    let provider = provider_with_matching_decimals_and_bigint();
+    let plan = parse_sql("SELECT d1 FROM t WHERE d1 = d2", &provider)
+        .expect("Decimal128 = Decimal128 must parse + type-check");
+    lower_physical(&plan)
+        .expect("WHERE d1 = d2 must lower in v0.7 (Op::Cmp128 wired)");
+}
+
+/// `WHERE d1 < d2` lowers cleanly. The PTX layer emits the
+/// signed-high / unsigned-low pattern (`setp.lt.s64` on the high half,
+/// `setp.eq.s64` for the tie-break, `setp.lt.u64` on the low half,
+/// combined with `and.pred` + `or.pred`).
+#[test]
+fn decimal128_lt_two_matching_columns_lowers_in_v07() {
+    let provider = provider_with_matching_decimals_and_bigint();
+    let plan = parse_sql("SELECT d1 FROM t WHERE d1 < d2", &provider)
+        .expect("Decimal128 < Decimal128 must parse + type-check");
+    lower_physical(&plan)
+        .expect("WHERE d1 < d2 must lower in v0.7 (Op::Cmp128 wired)");
+}
+
+/// Every comparison operator (`=`, `!=`, `<`, `>`, `<=`, `>=`) lowers
+/// through the v0.7 codegen path. Iterates so a regression in one
+/// operator surfaces cleanly without forcing six separate tests.
+#[test]
+fn decimal128_all_comparison_ops_lower_in_v07() {
+    let provider = provider_with_matching_decimals_and_bigint();
+    for op in &["=", "<>", "<", ">", "<=", ">="] {
+        let sql = format!("SELECT d1 FROM t WHERE d1 {op} d2");
+        let plan = parse_sql(&sql, &provider)
+            .unwrap_or_else(|e| panic!("`{sql}` must parse + type-check, got: {e}"));
+        lower_physical(&plan).unwrap_or_else(|e| {
+            panic!("`{sql}` must lower in v0.7 (Op::Cmp128 wired), got: {e}")
+        });
+    }
+}
+
+/// Mixed Decimal128 / BIGINT comparison stays rejected: the lowering
+/// has no auto-rescale path (comparing 1.00 vs `1` raises the question
+/// of what scale to coerce to), and the v0.7 envelope requires the user
+/// to wire an explicit CAST first. The rejection message must mention
+/// Decimal128 and the matching-scale contract.
+#[test]
+fn decimal128_eq_bigint_rejects_in_v07() {
+    let provider = provider_with_matching_decimals_and_bigint();
+    let r = parse_sql("SELECT d1 FROM t WHERE d1 = n", &provider);
+    let msg = match r {
+        Ok(plan) => format!(
+            "{}",
+            lower_physical(&plan).expect_err(
+                "Decimal128 = BIGINT must reject (no auto-coerce path)"
+            )
+        ),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        msg.contains("Decimal128"),
+        "Decimal128 / non-Decimal comparison rejection should mention Decimal128; \
+         got: {msg}"
+    );
+    assert!(
+        msg.contains("scale") || msg.contains("CAST") || msg.contains("Decimal128"),
+        "rejection should mention the matching-scale contract or CAST; got: {msg}"
+    );
+}
+
+/// Decimal128 / Decimal128 with mismatched scale stays rejected. Same
+/// rationale as the BIGINT case: comparing values of different scales
+/// (1.00 vs 1.000) would compare different raw i128 bit-patterns.
+#[test]
+fn decimal128_eq_mismatched_scale_rejected_in_v07() {
+    let schema = Schema::new(vec![
+        Field {
+            name: "a".into(),
+            dtype: DataType::Decimal128(10, 2),
+            nullable: true,
+        },
+        Field {
+            name: "b".into(),
+            dtype: DataType::Decimal128(10, 3),
+            nullable: true,
+        },
+    ]);
+    let provider = MemTableProvider::new().with_table("d", schema);
+    let r = parse_sql("SELECT a FROM d WHERE a = b", &provider);
+    let msg = match r {
+        Ok(plan) => format!(
+            "{}",
+            lower_physical(&plan).expect_err(
+                "Decimal128 cmp with mismatched scale must reject"
+            )
+        ),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        msg.contains("scale") || msg.contains("Decimal128"),
+        "scale-mismatch comparison rejection should mention scale / Decimal128; \
+         got: {msg}"
+    );
+}
