@@ -120,6 +120,22 @@ fn varwidth_tag(kind: ScalarFnKind) -> BoltResult<&'static str> {
     }
 }
 
+/// Entry-point name of the variable-width **length pass** for `kind` (e.g.
+/// `bolt_str_len_pass_upper`). Errors for ops with no two-pass producer
+/// (`LENGTH` / `CONCAT`), matching [`compile_varwidth_len_pass`].
+///
+/// Host launchers use this to look up the compiled function by name rather than
+/// re-deriving the mangling, so the entry-point convention stays owned here.
+pub fn len_pass_entry(kind: ScalarFnKind) -> BoltResult<String> {
+    Ok(format!("{}_{}", LEN_PASS_PREFIX, varwidth_tag(kind)?))
+}
+
+/// Entry-point name of the variable-width **write pass** for `kind` (e.g.
+/// `bolt_str_write_pass_upper`). See [`len_pass_entry`].
+pub fn write_pass_entry(kind: ScalarFnKind) -> BoltResult<String> {
+    Ok(format!("{}_{}", WRITE_PASS_PREFIX, varwidth_tag(kind)?))
+}
+
 // ---------------------------------------------------------------------------
 // 1. Fixed-output-width: LENGTH via dictionary-index gather.
 // ---------------------------------------------------------------------------

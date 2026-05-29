@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
@@ -2263,6 +2263,11 @@ impl Engine {
                 outputs,
                 output_schema,
             } => self.execute_string_length(table, outputs, output_schema),
+            PhysicalPlan::StringProject {
+                table,
+                outputs,
+                output_schema,
+            } => self.execute_string_project(table, outputs, output_schema),
             PhysicalPlan::Aggregate {
                 table,
                 pre,
@@ -3015,6 +3020,267 @@ impl Engine {
         check_len(lens_i32.len(), n_rows)?;
         let lens_i64: Vec<i64> = lens_i32.into_iter().map(|v| v as i64).collect();
         Ok(Arc::new(Int64Array::from(lens_i64)) as ArrayRef)
+    }
+
+    /// Execute a [`PhysicalPlan::StringProject`]: a `SELECT UPPER(<utf8_col>)` /
+    /// `LOWER(<utf8_col>)` projection (plus passthrough columns) over a bare
+    /// scan, with the transform outputs produced on the GPU via the two-pass
+    /// length/scan/write kernels in [`crate::jit::string_kernel`] (see
+    /// [`crate::exec::string_project`]).
+    ///
+    /// Passthrough columns are lifted directly from the host source batch.
+    /// Each `UPPER`/`LOWER(col)` output runs the two-pass GPU producer against a
+    /// row-aligned offsets+bytes input materialised from the dictionary-encoded
+    /// column — but only when the column's dictionary is pure ASCII (the kernels
+    /// ASCII-fold byte-wise; non-ASCII Unicode case mapping can change byte
+    /// length, e.g. `'ß'` → `"SS"`). Non-ASCII dictionaries, or columns with no
+    /// supported GPU storage, fall back to a full-Unicode host transform. Both
+    /// paths produce a `StringArray`.
+    fn execute_string_project(
+        &self,
+        table: &str,
+        outputs: &[crate::plan::physical_plan::StringProjectOutput],
+        output_schema: &Schema,
+    ) -> BoltResult<QueryHandle> {
+        use crate::plan::physical_plan::StringProjectOutput;
+
+        let src_batch = self.materialize_table(table)?;
+        let src_schema = src_batch.schema();
+        let n_rows = src_batch.num_rows();
+
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(outputs.len());
+        for out in outputs {
+            match out {
+                StringProjectOutput::Passthrough { source } => {
+                    let idx = src_schema.index_of(source).map_err(|_| {
+                        BoltError::Plan(format!(
+                            "StringProject: passthrough column '{source}' not found in \
+                             table '{table}'"
+                        ))
+                    })?;
+                    arrays.push(src_batch.column(idx).clone());
+                }
+                StringProjectOutput::Transform { source, transform } => {
+                    arrays.push(self.string_transform_column(table, source, *transform, n_rows)?);
+                }
+            }
+        }
+
+        let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+        let batch_out = RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
+            BoltError::Other(format!(
+                "StringProject: failed to build output RecordBatch: {e}"
+            ))
+        })?;
+        Ok(QueryHandle { batch: batch_out })
+    }
+
+    /// Compute `UPPER`/`LOWER(<source>)` for the GPU-resident `Utf8` column
+    /// `source` of `table`, returning a `Utf8` `ArrayRef` of `n_rows` rows.
+    ///
+    /// GPU path (ASCII dictionaries): materialise a row-aligned offsets+bytes
+    /// input from the column's dictionary + device keys, upload, run the length
+    /// pass → host exclusive scan of `row_lens` → allocate output bytes → run
+    /// the write pass → download → rebuild the `StringArray` (re-applying NULLs).
+    /// Host fallback (non-ASCII dictionary, or unsupported GPU storage): apply
+    /// the full-Unicode transform host-side. Both paths preserve NULLs as Arrow
+    /// NULLs.
+    fn string_transform_column(
+        &self,
+        table: &str,
+        source: &str,
+        transform: crate::exec::string_project::StringTransform,
+        n_rows: usize,
+    ) -> BoltResult<ArrayRef> {
+        use crate::exec::string_project::{
+            build_row_aligned_input, dict_is_ascii, exclusive_scan_lens, host_transform_strings,
+            string_array_from_offsets, KeyLayout,
+        };
+
+        let gpu_table_ref = self.ensure_gpu_table(table)?;
+        let gpu_table: &crate::exec::gpu_table::GpuTable = &gpu_table_ref;
+        let column = gpu_table.column(source).ok_or_else(|| {
+            BoltError::Plan(format!(
+                "StringProject: column '{source}' not in GPU table '{table}'"
+            ))
+        })?;
+        let dict = column.utf8_dictionary().ok_or_else(|| {
+            BoltError::Plan(format!(
+                "StringProject: column '{source}' is not a Utf8 column"
+            ))
+        })?;
+
+        // Resolve the host-side keys + layout + per-row validity for this
+        // column. For the engine-managed `Utf8` layout NULL is encoded as key 0
+        // (1-based dict); for native `DictUtf8` NULL lives on `valid_mask`.
+        let (keys_host, layout, validity): (Vec<i32>, KeyLayout, Option<Vec<bool>>) =
+            match &column.data {
+                crate::exec::gpu_table::GpuColumnData::Utf8 { indices, .. } => {
+                    let keys = indices.to_vec()?;
+                    // Validity = key != 0 (slot 0 is the NULL sentinel).
+                    let valid: Vec<bool> = keys.iter().map(|&k| k != 0).collect();
+                    (keys, KeyLayout::OneBasedNullSlot0, Some(valid))
+                }
+                crate::exec::gpu_table::GpuColumnData::DictUtf8 {
+                    keys, valid_mask, ..
+                } => {
+                    let keys = keys.to_vec()?;
+                    let valid = match valid_mask {
+                        None => None,
+                        Some(mask) => {
+                            let bits = mask.to_vec()?;
+                            let v: Vec<bool> = (0..keys.len())
+                                .map(|row| {
+                                    let byte = bits.get(row / 8).copied().unwrap_or(0);
+                                    (byte >> (row % 8)) & 1 == 1
+                                })
+                                .collect();
+                            Some(v)
+                        }
+                    };
+                    (keys, KeyLayout::ZeroBased, valid)
+                }
+                _ => {
+                    return Err(BoltError::Plan(format!(
+                        "StringProject: column '{source}' has non-Utf8 GPU storage"
+                    )))
+                }
+            };
+
+        check_len(keys_host.len(), n_rows)?;
+        let validity_slice = validity.as_deref();
+
+        // Host fallback for non-ASCII dictionaries: the byte-wise GPU fold is
+        // only correct for ASCII (Unicode case mapping can change byte length).
+        if !dict_is_ascii(dict) {
+            let arr =
+                host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
+            return Ok(Arc::new(arr) as ArrayRef);
+        }
+
+        // ---- GPU two-pass path -------------------------------------------
+        // Pass 0 (host): materialise the row-aligned offsets+bytes input.
+        let (src_offsets, src_bytes) =
+            build_row_aligned_input(dict, &keys_host, layout, validity_slice)?;
+
+        // Empty input (no rows, or all-empty bytes): skip the launch and build
+        // the result directly. `from_slice` on an empty slice is brittle and a
+        // zero-thread launch is pointless.
+        if n_rows == 0 {
+            let arr = string_array_from_offsets(&src_offsets, &src_bytes, validity_slice)?;
+            return Ok(Arc::new(arr) as ArrayRef);
+        }
+
+        let kind = transform.scalar_fn_kind();
+        let src_offsets_gpu = GpuVec::<i32>::from_slice(&src_offsets)?;
+        // `src_bytes` may be empty (all rows empty/NULL); allocate at least one
+        // byte so the device pointer is valid even though no thread reads it.
+        let src_bytes_gpu = if src_bytes.is_empty() {
+            GpuVec::<u8>::zeros(1)?
+        } else {
+            GpuVec::<u8>::from_slice(&src_bytes)?
+        };
+        let row_lens_gpu = GpuVec::<u32>::zeros(n_rows)?;
+
+        let n_rows_u32 = n_rows_to_u32(n_rows)?;
+        let stream = CudaStream::null_or_default();
+        let grid_x = grid_x_for(n_rows_u32, BLOCK_SIZE);
+
+        // ---- Pass 1: length pass → row_lens. ABI (UPPER/LOWER, 4 params):
+        //      (src_offsets, src_bytes, row_lens, n_rows).
+        {
+            let module = CudaModule::from_ptx(
+                &crate::jit::string_kernel::compile_varwidth_len_pass(kind)?,
+            )?;
+            let entry = crate::jit::string_kernel::len_pass_entry(kind)?;
+            let function = module.function(&entry)?;
+
+            let mut p_off = src_offsets_gpu.device_ptr();
+            let mut p_bytes = src_bytes_gpu.device_ptr();
+            let mut p_lens = row_lens_gpu.device_ptr();
+            let mut p_n = n_rows_u32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_off as *mut CUdeviceptr as *mut c_void,
+                &mut p_bytes as *mut CUdeviceptr as *mut c_void,
+                &mut p_lens as *mut CUdeviceptr as *mut c_void,
+                &mut p_n as *mut u32 as *mut c_void,
+            ];
+            unsafe {
+                cuda_sys::check(cuda_sys::cuLaunchKernel(
+                    function.raw(),
+                    grid_x,
+                    1,
+                    1,
+                    BLOCK_SIZE,
+                    1,
+                    1,
+                    0,
+                    stream.raw(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ))?;
+            }
+            debug_sync_check()?;
+            stream.synchronize()?;
+        }
+
+        // ---- Pass 2 (host): exclusive-scan row_lens → out_offsets + total.
+        let row_lens = row_lens_gpu.to_vec()?;
+        check_len(row_lens.len(), n_rows)?;
+        let (out_offsets, total_bytes) = exclusive_scan_lens(&row_lens)?;
+        let out_offsets_gpu = GpuVec::<i32>::from_slice(&out_offsets)?;
+        let out_bytes_gpu = if total_bytes == 0 {
+            GpuVec::<u8>::zeros(1)?
+        } else {
+            GpuVec::<u8>::zeros(total_bytes)?
+        };
+
+        // ---- Pass 3: write pass → out_bytes. ABI (UPPER/LOWER, 5 params):
+        //      (src_offsets, src_bytes, out_offsets, out_bytes, n_rows).
+        {
+            let module = CudaModule::from_ptx(
+                &crate::jit::string_kernel::compile_varwidth_write_pass(kind)?,
+            )?;
+            let entry = crate::jit::string_kernel::write_pass_entry(kind)?;
+            let function = module.function(&entry)?;
+
+            let mut p_off = src_offsets_gpu.device_ptr();
+            let mut p_bytes = src_bytes_gpu.device_ptr();
+            let mut p_out_off = out_offsets_gpu.device_ptr();
+            let mut p_out_bytes = out_bytes_gpu.device_ptr();
+            let mut p_n = n_rows_u32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_off as *mut CUdeviceptr as *mut c_void,
+                &mut p_bytes as *mut CUdeviceptr as *mut c_void,
+                &mut p_out_off as *mut CUdeviceptr as *mut c_void,
+                &mut p_out_bytes as *mut CUdeviceptr as *mut c_void,
+                &mut p_n as *mut u32 as *mut c_void,
+            ];
+            unsafe {
+                cuda_sys::check(cuda_sys::cuLaunchKernel(
+                    function.raw(),
+                    grid_x,
+                    1,
+                    1,
+                    BLOCK_SIZE,
+                    1,
+                    1,
+                    0,
+                    stream.raw(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ))?;
+            }
+            debug_sync_check()?;
+            stream.synchronize()?;
+        }
+
+        // ---- Download + rebuild StringArray (re-applying NULLs).
+        let out_bytes = out_bytes_gpu.to_vec()?;
+        // `out_bytes_gpu` was padded to >= 1 byte; truncate to the real total.
+        let out_bytes = &out_bytes[..total_bytes.min(out_bytes.len())];
+        let arr = string_array_from_offsets(&out_offsets, out_bytes, validity_slice)?;
+        Ok(Arc::new(arr) as ArrayRef)
     }
 }
 
