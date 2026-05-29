@@ -7,15 +7,11 @@ is the v0.6 / M7 staging ground for the public-API freeze that ships with
 contract. At 1.0 each entry in the **stable** tier becomes binding under
 the semver rules listed below.
 
-> Crate version when this document was generated: `0.7.0` (from
-> `Cargo.toml`). The document was drafted for the v0.6 / M7 freeze track —
-> if the crate version no longer matches, re-run the enumeration in
-> `src/lib.rs` before relying on this list.
->
-> **Re-enumeration note:** the symbol lists below have not been
-> machine-regenerated against the current `src/lib.rs`; treat them as the
-> last-enumerated snapshot and re-run the enumeration before the 1.0
-> freeze (and whenever the public surface changes).
+> Crate version this document was enumerated against: `0.7.0` (from
+> `Cargo.toml`). The document was drafted for the v0.6 / M7 freeze track. The
+> symbol lists below were reconciled against `src/lib.rs` and the modules it
+> re-exports; re-run the enumeration whenever the public surface changes (and
+> before the 1.0 freeze).
 
 ## Stability tiers and semver contract
 
@@ -84,8 +80,9 @@ forced by this document.
 
 | Symbol | Kind | Notes |
 |---|---|---|
-| `BoltError` | enum (re-exported from `error`) | Public error type. **Not** `#[non_exhaustive]` — adding a new variant is breaking until the attribute is added (consider doing so before 1.0). Variants `Cuda`, `CudaWithCode { code, message }`, `Sql`, `Plan`, `Type`, `Memory`, `Io`, `GpuCapacity`, `Other`. Removing or renaming any variant, or changing the field shape of `CudaWithCode`, is breaking. New variants of `BoltError` are breaking until `#[non_exhaustive]` is added. |
+| `BoltError` | enum (re-exported from `error`) | Public error type. Carries `#[non_exhaustive]` (added v0.6 / M5), so adding a new variant is non-breaking and downstream `match`es must use a wildcard arm. Variants `Cuda(String)`, `CudaWithCode { code, message }`, `Sql(String)`, `SqlWithSpan { msg, span }`, `Plan(String)`, `Type(String)`, `Memory(String)`, `Io(std::io::Error)`, `GpuCapacity(String)`, `Other(String)`. Removing or renaming any variant, or changing the field shape of `CudaWithCode` / `SqlWithSpan`, is breaking. Inherent method `span(&self) -> Option<Range<usize>>` is part of the surface (returns the byte-range for `SqlWithSpan`, `None` otherwise). `impl From<std::io::Error>` and `impl From<sqlparser::parser::ParserError>` are also public. |
 | `BoltResult<T>` | type alias | `= Result<T, BoltError>`. Changing the alias target is breaking. |
+| `tracing` | crate re-export (`pub use ::tracing`) | The `tracing` crate is re-exported at the crate root so downstream users can install a subscriber and reference span/event APIs without depending on `tracing` directly. Per the lib.rs docs the *major version* of `tracing` is part of the SemVer contract; bumping it across a major is breaking. |
 | `GpuBuffer<T: Pod>` | struct (`cuda::buffer`) | RAII device buffer. Fields are private; adding a new field is non-breaking. Changing the `T: Pod` bound is breaking. |
 | `GpuVec<T: Pod>` | struct (`cuda::smart_ptrs`) | Owned, growable device vector. Fields are private. The `T: Pod` bound is part of the public contract. |
 | `GpuView<'a, T: Pod>` | struct (`cuda::smart_ptrs`) | Shared device-side borrow handle. Lifetime parameter is part of the signature. |
@@ -93,8 +90,10 @@ forced by this document.
 | `DataFrame` | struct (`plan::dataframe`) | Builder-style DataFrame API. Fields are private. |
 | `LogicalPlan` | enum (`plan::logical_plan`) | Logical-plan IR root. Each variant carries planner-internal payloads. **Not** `#[non_exhaustive]` — adding variants is breaking until the attribute is added. |
 | `Expr` | enum (`plan::logical_plan`) | Logical scalar expression. Same caveat as `LogicalPlan` re: `#[non_exhaustive]`. |
-| `Engine` | struct (`exec::engine`) | Top-level query engine. Fields are private; new fields are non-breaking. `new()`, `new_with_device(i32)`, `register_table(...)`, `replace_table(...)`, `register_batch(...)`, `sql(&str)`, `execute(&PhysicalPlan)` are the stable inherent methods. Changing any of those signatures is breaking. |
-| `QueryHandle` | struct (`exec::engine`) | Query-result handle wrapping a `RecordBatch`. Stable inherent methods: `record_batch(&self)`, `into_record_batch(self)`, `num_rows(&self)`. |
+| `Engine` | struct (`exec::engine`) | Top-level query engine. Re-exported at the crate root via `pub use exec::{Engine, EngineBuilder}`. Fields are private; new fields are non-breaking. Stable inherent methods: `new() -> BoltResult<Self>`, `new_with_device(i32) -> BoltResult<Self>`, `builder() -> EngineBuilder`, `device(&self) -> i32`, `memory_budget_bytes(&self) -> Option<usize>`, `persistent_cache_path(&self) -> Option<&Path>`, `tracing_enabled(&self) -> bool`, `with_rewrite(self, Box<dyn PlanRewrite>) -> Self`, `rewrite_count(&self) -> usize`, `register_table(...)`, `register_table_stream(...)`, `replace_table(...)`, `register_batch(&mut self, name, RecordBatch) -> BoltResult<()>`, `sql(&str) -> BoltResult<QueryHandle>`, `run_logical_plan(&mut self, &LogicalPlan) -> BoltResult<QueryHandle>`, `execute(&PhysicalPlan) -> BoltResult<QueryHandle>`. Changing any of those signatures is breaking. |
+| `EngineBuilder` | struct (`exec::engine`) | Builder for `Engine`, re-exported at the crate root alongside `Engine`. Stable inherent methods: `new()`, `device(self, i32)`, `memory_budget(self, usize)`, `persistent_cache(self, PathBuf)`, `enable_tracing(self)`, `build(self) -> BoltResult<Engine>`. Fields are private; new fields are non-breaking. |
+| `QueryHandle` | struct (`exec::engine`) | Query-result handle wrapping a `RecordBatch`. Reachable as `craton_bolt::exec::QueryHandle` (re-exported from `exec`, but not at the crate root). Stable inherent methods: `record_batch(&self)`, `into_record_batch(self)`, `num_rows(&self)`. |
+| `PlanRewrite` | trait (`plan::rewrite`) | Re-exported at `plan::PlanRewrite`. Supertrait-bounded `Send + Sync`; consumed by `Engine::with_rewrite`. Required method(s) define the logical-plan rewrite hook; changing any existing signature or tightening the supertrait bound is breaking. |
 | `plan::TableProvider` | trait (`plan::sql_frontend`) | Frontend trait for resolving table schemas and per-column null-bearing. Required method: `schema(&self, name: &str) -> BoltResult<Schema>`. Default-impl methods: `has_nulls`, `null_count`, `schema_version`. Adding a new method WITH a default is non-breaking; adding a required method is breaking. Changing any existing signature is breaking. |
 | `plan::MemTableProvider` | struct (`plan::sql_frontend`) | Default in-memory `TableProvider` impl. Inherent methods `new`, `with_table`, `register`, `unregister_table`, `set_column_nullability`, `has_nulls` are part of the surface. |
 | `plan::parse_sql` | fn (`plan::sql_frontend::parse`) | `fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan>`. Re-exported at `plan::parse_sql`. Changing the signature or accepted SQL dialect compatibility envelope is breaking. |
@@ -105,6 +104,8 @@ forced by this document.
 | `plan::BinaryOp` | enum (`plan::logical_plan`) | Binary operator enum. |
 | `plan::UnaryOp` | enum (`plan::logical_plan`) | Unary operator enum. |
 | `plan::AggregateExpr` | enum (`plan::logical_plan`) | Aggregate expression carried in `LogicalPlan::Aggregate`. |
+| `plan::ScalarFnKind` | enum (`plan::logical_plan`) | Scalar-function kind carried in `Expr`. Re-exported at `plan::ScalarFnKind`. **Not** `#[non_exhaustive]` — adding variants is breaking until the attribute is added. |
+| `plan::TimeUnit` | enum (`plan::logical_plan`) | Time-unit qualifier for temporal `DataType`s. Re-exported at `plan::TimeUnit`. Same `#[non_exhaustive]` caveat. |
 | `plan::col` | fn (`plan::logical_plan`) | `fn col(name: impl Into<String>) -> Expr`. |
 | `plan::lit` | fn (`plan::logical_plan`) | `fn lit<T: Into<Literal>>(v: T) -> Expr`. Changing the generic bound is breaking. |
 | `plan::dataframe::GroupedDataFrame` | struct | Intermediate DataFrame builder for grouped operations. |
@@ -113,6 +114,10 @@ forced by this document.
 | `plan::dataframe::min` | fn | `fn min(e: Expr) -> AggregateExpr`. |
 | `plan::dataframe::max` | fn | `fn max(e: Expr) -> AggregateExpr`. |
 | `plan::dataframe::avg` | fn | `fn avg(e: Expr) -> AggregateExpr`. |
+| `plan::dataframe::var_pop` | fn | `fn var_pop(e: Expr) -> AggregateExpr`. Also re-exported at `plan::var_pop`. |
+| `plan::dataframe::var_samp` | fn | `fn var_samp(e: Expr) -> AggregateExpr`. Also re-exported at `plan::var_samp`. |
+| `plan::dataframe::stddev_pop` | fn | `fn stddev_pop(e: Expr) -> AggregateExpr`. Also re-exported at `plan::stddev_pop`. |
+| `plan::dataframe::stddev_samp` | fn | `fn stddev_samp(e: Expr) -> AggregateExpr`. Also re-exported at `plan::stddev_samp`. |
 
 ## experimental
 
@@ -124,13 +129,16 @@ team expects to iterate.
 |---|---|---|
 | `pool_stats` | fn (`cuda::mem_pool`) | `fn pool_stats() -> PoolStats`. Observability hook for the process-wide device-memory pool. The function signature is stable, but `PoolStats` is itself experimental (new fields expected). |
 | `PoolStats` | struct (`cuda::mem_pool`) | Snapshot of pool telemetry: `total_pooled_bytes: usize`, `bucket_count: usize`, `oom_recovery_count: u64`, `proactive_eviction_count: u64`. Lib-rs docs declare new fields non-breaking ("**new fields may be added (non-breaking) but existing ones keep their semantics**"). Reaching 1.0 SHOULD either mark this `#[non_exhaustive]` or freeze the field set; until then callers must use `..` in struct patterns. |
-| `install_pool_stats_observer` | fn (`observability`) | `fn install_pool_stats_observer(f: Box<dyn Fn(PoolStats) + Send + Sync + 'static>)`. Single-slot process-wide observer. The single-slot semantics (second install overwrites first) are intentional but considered experimental until used by at least one downstream exporter. |
+| `install_pool_stats_observer` | fn (`observability`) | `fn install_pool_stats_observer(f: Box<dyn Fn(PoolStats) + Send + Sync + 'static>)`. Re-exported at the crate root. Single-slot process-wide observer. The single-slot semantics (second install overwrites first) are intentional but considered experimental until used by at least one downstream exporter. |
+| `observability::PoolStatsObserver` | type alias (`observability`) | `= Box<dyn Fn(PoolStats) + Send + Sync + 'static>`. The boxed-callback type for the pool-stats observer. Reachable as `craton_bolt::observability::PoolStatsObserver` (not re-exported at the crate root; `install_pool_stats_observer` spells the type out inline rather than using the alias). Experimental — tied to the observer surface above. |
 | `jit::ptx_cache_stats` | fn (`jit::jit_compiler`) | `fn ptx_cache_stats() -> (usize, usize, usize)`. Returns `(hits, misses, evictions)`. Tuple-return is experimental — at 1.0 this should likely be a named struct (`PtxCacheStats`) for forward-compatibility, since today adding a fourth counter is breaking. |
 | `plan::sql_frontend::plan_cache_stats` | fn | `fn plan_cache_stats() -> (usize, usize, usize)`. Same shape-evolution caveat as `ptx_cache_stats` — tuple return is breaking-to-extend. Not re-exported at the crate root, only reachable as `craton_bolt::plan::sql_frontend::plan_cache_stats`. |
 | `cuda::CudaContext` | struct (`cuda::cuda_sys`) | Re-exported at `craton_bolt::cuda::CudaContext`. Wraps a CUDA driver context. Public today because `Engine::new_with_device` returns one transitively, but the inherent API is in flux. |
 | `cuda::CUdevice`, `cuda::CUdeviceptr`, `cuda::CUfunction`, `cuda::CUmodule`, `cuda::CUresult`, `cuda::CUstream` | type aliases (`cuda::cuda_sys`) | Raw driver-binding type aliases (`i32`, `u64`, `*mut c_void`). Re-exported at `craton_bolt::cuda::*` for callers that need to bridge to other CUDA crates. Considered experimental because their stability depends on the CUDA driver ABI we choose to track. |
 | `cuda::buffer::primitive_to_gpu` | fn | `fn primitive_to_gpu<P>(...)`. Re-exported at `craton_bolt::cuda::primitive_to_gpu`. Helper for uploading primitive Arrow arrays. Experimental because the input shape will likely generalise. |
 | `cuda::PinnedHostBuffer<T: Pod>` | struct (`cuda::buffer`) | Page-locked host buffer for async H2D / D2H transfers. |
+| `jit::set_disk_ptx_cache_dir` | fn (`jit::disk_cache::set_override_dir`) | `fn set_override_dir(dir: Option<PathBuf>)`, re-exported at `jit::set_disk_ptx_cache_dir`. Points the process-wide disk-PTX cache at a directory, overriding `BOLT_PTX_CACHE_DIR`; `None` clears the override. Experimental builder hook (v0.6 / M6 disk-cache opt-in). |
+| `jit::current_disk_ptx_cache_dir` | fn (`jit::disk_cache::current_override_dir`) | `fn current_override_dir() -> Option<PathBuf>`, re-exported at `jit::current_disk_ptx_cache_dir`. Read-back accessor mirroring `set_disk_ptx_cache_dir`. Experimental — exposed primarily for `EngineBuilder` integration tests. |
 | `plan::sort_by` / sort-related `plan` items | (none stable today) | — |
 | (M7 decision note) | — | The plan-cache and ptx-cache stats functions are the two strongest candidates for "promote to stable as a named-struct API in v0.7." All other experimental items should soak for one more release before promotion. |
 
@@ -186,6 +194,7 @@ All non-contractual.
 | `__test_only_env_vars::STREAMING_INTERN_ENV_VAR` | `const &str` (`exec::gpu_join`) | `= "BOLT_GPU_JOIN_STREAMING_INTERN"`. Internal. |
 | `__test_only_env_vars::parse_ptx_cache_cap` | fn (`jit::jit_compiler::parse_cap`) | Internal env-var parser. Internal. |
 | `__test_only_env_vars::PTX_CACHE_CAP_ENV` | `const &str` (`jit::jit_compiler`) | `= "CRATON_BOLT_PTX_CACHE_CAP"`. Internal. |
+| `__test_only_env_vars::DISK_PTX_CACHE_ENV` | `const &str` (`jit::disk_cache`) | `= "BOLT_PTX_CACHE_DIR"`. v0.6 / M6 disk-PTX-cache opt-in env var; re-exported so the env-var smoke test can assert the canonical name. Internal. |
 
 ### Other `#[doc(hidden)]` re-exports
 

@@ -238,15 +238,23 @@ Source: `src/exec/engine.rs::execute_projection` and the per-shape executors.
 
 Each output `GpuVec` is round-tripped to a host `Vec<T>` via `cuMemcpyDtoH`, wrapped in the matching Arrow primitive array (`Int32Array`, `Float64Array`, etc.) or decoded back through a `DictionaryColumn` for Utf8 outputs. The arrays plus the schema build a `RecordBatch`, which the engine wraps in a `QueryHandle` and returns to the caller.
 
-> **Async transfer status (Stage 1 → Stage 2).** The download path above is
-> still synchronous in 0.3.x. Stage 1 of the async-memcpy work has landed:
-> safe wrappers `memcpy_h2d_async` / `memcpy_d2h_async` / `memset_d8_async`
-> sit alongside a typed `PinnedHostBuffer<T>` and additive
-> `GpuBuffer::copy_from_async` / `copy_to_async` entry points. Executors
-> still call the synchronous `from_slice` / `to_vec` helpers — Stage 2
-> threads the new surface through the per-shape executors so that the
-> Ingest → kernel → Download pipeline overlaps on an explicit stream
-> rather than serializing on the NULL stream.
+> **Async transfer status (as of 0.7.0).** Async memcpy has landed and is
+> partially wired into the executors. The safe wrappers `memcpy_h2d_async` /
+> `memcpy_d2h_async` / `memset_d8_async` sit alongside a typed
+> `PinnedHostBuffer<T>` and additive `GpuBuffer::copy_from_async` /
+> `copy_to_async` entry points; pinned-host alloc/free itself remains
+> hand-rolled `cuMemAllocHost_v2` / `cuMemFreeHost` FFI (cudarc 0.13 does not
+> expose those cleanly). The async path is now live on several executors:
+> `execute_projection` runs a pinned async D2H via `StagedDownload`, the
+> scalar-aggregate executor uploads via `upload_primitive_values_async`
+> (piloted in 0.6, see `src/exec/aggregate.rs`), and 0.7 rolled async memcpy
+> out to the GROUP BY variants (tier2 / shmem / wide / valid) plus the
+> `WHERE`-filter D2H in `compact::download_mask`. Coverage is still partial:
+> the join executor issues most of its H2D uploads through the synchronous
+> `from_slice` helpers, and broadening the async surface across every
+> remaining executor — so the full Ingest → kernel → Download pipeline
+> overlaps on an explicit stream rather than serializing on the NULL stream
+> — is still open.
 
 ## Fusing aggregates with projections
 

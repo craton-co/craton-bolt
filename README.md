@@ -184,9 +184,13 @@ craton-bolt/
 ├── CHANGELOG.md
 ├── ROADMAP.md
 ├── docs/
+│   ├── INSTALL.md            # prerequisites, build configs, troubleshooting
+│   ├── USER_GUIDE.md         # end-to-end usage walkthrough
 │   ├── ARCHITECTURE.md       # the layer cake and module map
 │   ├── JIT_PIPELINE.md       # SQL → PTX, step by step
 │   ├── SQL_REFERENCE.md      # what works, what doesn't
+│   ├── API_SURFACE.md        # public API reference
+│   ├── ENV_VARS.md           # environment variables and tuning knobs
 │   ├── DEVELOPMENT.md        # building, testing, benchmarking
 │   ├── FAQ.md                # frequently asked questions
 │   ├── BENCHMARKS.md         # measured numbers and methodology
@@ -194,6 +198,7 @@ craton-bolt/
 │   ├── GROUPBY_PERF.md       # GROUP BY kernel design and analysis
 │   ├── CUDARC_ADOPTION.md    # cudarc migration plan
 │   ├── CUDA_OXIDE_SWEEP.md   # CUDA-Oxide refactor status
+│   ├── MIGRATION_GUIDE.md    # upgrading across breaking changes
 │   └── PATH_TO_1.0.md        # detailed 1.0 milestone plan
 ├── src/
 │   ├── lib.rs                # crate root, public re-exports

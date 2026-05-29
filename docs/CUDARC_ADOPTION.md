@@ -1,5 +1,7 @@
 # cudarc adoption design doc
 
+> **Status: internal design note / in-progress migration spike.** This document describes the optional, experimental `cudarc` backend (`--features cudarc`) and a staged migration plan of which only Stage 1 / Stage 1.5 (the allocation and async-memcpy surface) has landed as of v0.7.0 — Stages 2–4 (PTX module loading, context, pinned-host alloc) are not done, and the cudarc path has not been validated against a live GPU. It is engineering working notes, not a stable feature description or usage guide. Default builds do not use this path. For supported behavior see [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`../README.md`](../README.md).
+
 ## TL;DR
 
 Replace Craton Bolt's hand-rolled CUDA Driver API FFI in `src/cuda/cuda_sys.rs`

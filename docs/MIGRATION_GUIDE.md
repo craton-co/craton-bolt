@@ -1,12 +1,14 @@
 # Craton Bolt Migration Guide
 
-This guide covers the user-visible API deltas across the two non-trivial
+This guide covers the user-visible API deltas across the non-trivial
 version jumps in Craton Bolt's history so far:
 
 - **0.3.0 -> 0.5.0** — M2 SQL scalar completeness. `0.4` was skipped (see
   `CHANGELOG.md` for the rationale on skipped versions).
 - **0.5.0 -> 0.6.0** — M1 foundation finishing plus the M3-M8 milestone
-  work. `0.6` is the current series.
+  work.
+- **0.6.0 -> 0.7.0** — the v0.6 carry-overs become live GPU code paths.
+  `0.7.0` is the current series.
 
 Each section follows the same shape:
 
@@ -24,6 +26,13 @@ If you only need the headline:
   `Engine::new_with_device` going forward. `DataFrame::collect` is being
   re-purposed from a deprecated alias into a real materializing call —
   read the section before you upgrade.
+- 0.6 -> 0.7: no API moved. Queries that parsed and type-checked in 0.6
+  but rejected at the GPU lowering boundary with "not yet lowered to GPU"
+  now execute — `Decimal128` / `Date` / `Timestamp` arithmetic, grouped
+  `STDDEV` / `VAR`, and GPU-side `ORDER BY`. The one change that can alter
+  an existing result is the `DESC` radix-sort fix; the one change that can
+  turn a previously-accepted query into an error is WHERE type-checking
+  catching `LIKE` on a non-`Utf8` column.
 
 ---
 
@@ -434,6 +443,123 @@ CUDA / kernel / IO error messages are unchanged.
 
 ---
 
+## 0.6.0 -> 0.7.0 migration
+
+0.7 adds almost no new public surface. Its job is to turn the v0.6
+carry-overs — the features that parsed and type-checked but rejected at
+the GPU lowering boundary with a "not yet lowered to GPU" message — into
+live execution paths. For most callers this is invisible: SQL you could
+already write but not run now runs. The two items worth reading before you
+upgrade are the `DESC` radix-sort correctness fix (it can change a result)
+and the new WHERE-clause type-check (it can turn a previously-accepted
+query into a clear error).
+
+### `Decimal128` arithmetic, comparisons, and `SUM` now execute
+
+**What changed.** `Decimal128` columns are now reachable through GPU
+lowering. Arithmetic (`+`, `-`, `*`) and comparisons (`=`, `!=`, `<`,
+`>`, `<=`, `>=`) lower to the GPU, the latter being usable from `WHERE`
+predicates; `SUM(Decimal128)` is supported via a host-side reduction. In
+0.6, `DataType::Decimal128(p, s)` plumbed through the logical plan and
+Arrow round-trip and `CAST(int AS DECIMAL(p, s))` parsed, but physical
+lowering rejected with `"Decimal128 not yet lowered to GPU"`.
+
+**Classification: Additive** for the surface — no API moved, and the SQL
+itself was already accepted by the parser / type-checker in 0.6.
+**Behavioural** in the narrow sense that a query which previously returned
+the `"Decimal128 not yet lowered to GPU"` error now executes instead.
+
+```sql
+-- Before (0.6): parses and type-checks, then errors at lowering with
+--   "Decimal128 not yet lowered to GPU"
+SELECT SUM(price) FROM line_items WHERE price > 0;   -- price is DECIMAL(p, s)
+
+-- After (0.7): lowers and executes.
+SELECT SUM(price) FROM line_items WHERE price > 0;
+```
+
+### `Date32` / `Timestamp` arithmetic now executes
+
+**What changed.** `Date32` and `Timestamp` subtraction lowers to the GPU:
+`Date − Date` and `Timestamp − Timestamp`, plus Day-`INTERVAL` arithmetic
+only. The literal and type plumbing shipped in 0.6 (`DATE '...'` /
+`TIMESTAMP '...'`); 0.7 wires the runtime path.
+
+**Classification: Additive / Behavioural**, same shape as the
+`Decimal128` item above — previously-rejected lowering now succeeds for
+the supported operations.
+
+```sql
+-- Before (0.6): parses and type-checks, rejected at GPU lowering.
+SELECT shipped_at - ordered_at FROM orders;          -- Timestamp - Timestamp
+
+-- After (0.7): lowers and executes (Day-INTERVAL granularity).
+SELECT shipped_at - ordered_at FROM orders;
+```
+
+Operations beyond Date−Date / Timestamp−Timestamp and Day-`INTERVAL` are
+still out of scope for this release.
+
+### Grouped `STDDEV` / `VAR` under `GROUP BY`
+
+**What changed.** `STDDEV` / `VAR` aggregates are now supported under a
+`GROUP BY`, computed with a per-group host-side Welford pass. 0.5 added
+the scalar (no-`GROUP BY`) variants; the grouped form was an explicit v0.6
+carry-over.
+
+**Classification: Additive.** Scalar `STDDEV` / `VAR` queries are
+unaffected; the grouped form is new surface that previously rejected.
+
+```sql
+-- Before (0.6): scalar form worked; the grouped form rejected.
+SELECT user_id, STDDEV_POP(latency_ms) FROM events GROUP BY user_id;
+
+-- After (0.7): grouped STDDEV / VAR supported.
+SELECT user_id, STDDEV_POP(latency_ms) FROM events GROUP BY user_id;
+```
+
+### GPU radix sort for `ORDER BY` (plus a `DESC` correctness fix)
+
+**What changed.** `ORDER BY` now dispatches to the GPU radix sort in
+`src/exec/sort.rs` for single-key `Int32` / `Int64` ascending, with
+multi-key and `DESC` support. In 0.6 the radix-sort kernel existed only as
+a scaffold, gated behind `BOLT_GPU_SORT=1` and not selected by the
+planner; the host-side sort was the default path. This release also fixes
+the `DESC` pre-transform to use `!(val ^ MIN)` instead of a bare `!val`.
+
+**Classification: Additive** for the dispatch (the SQL surface is
+unchanged — `ORDER BY` already worked host-side). **Behavioural — read
+carefully** for the `DESC` fix: a `DESC` sort that exercised the buggy
+pre-transform could previously return rows in the wrong order. The result
+ordering, not the API, is what changes.
+
+The change is internal to the executor — there is no before/after code at
+the SQL or Rust API level. If you have golden-result fixtures that pinned
+the *previous* (incorrect) `DESC` ordering, re-baseline them after the
+upgrade.
+
+### WHERE-clause predicate type-checking
+
+**What changed.** SQL lowering now type-checks `WHERE` predicates. The
+motivating fix is `LIKE` applied to a non-`Utf8` column: this previously
+slipped past lowering and is now rejected with a type error at plan time.
+
+**Classification: Soft-breaking** for queries that relied on the missing
+check. A `WHERE` predicate that was malformed (e.g. `LIKE` against a
+numeric column) and previously reached execution now fails earlier, with a
+type error, rather than misbehaving downstream. Well-typed predicates are
+unaffected.
+
+```sql
+-- Before (0.6): LIKE on a non-Utf8 column was not caught during lowering.
+SELECT * FROM events WHERE latency_ms LIKE '1%';   -- latency_ms is numeric
+
+-- After (0.7): rejected with a type error during SQL lowering.
+SELECT * FROM events WHERE latency_ms LIKE '1%';   -- type error
+```
+
+---
+
 ## Quick upgrade checklist
 
 If you are jumping straight from 0.3 -> 0.6 (skipping a 0.5 stop):
@@ -449,3 +575,12 @@ If you are jumping straight from 0.3 -> 0.6 (skipping a 0.5 stop):
    unless you need a builder-only knob.
 5. Update any `assert_eq!` on error message strings to
    `contains(...)` to accommodate did-you-mean hints.
+
+Additionally, if you are coming from 0.6 -> 0.7:
+
+6. Audit any `WHERE` predicate using `LIKE` against a non-`Utf8` column —
+   it now fails with a type error at plan time instead of slipping
+   through lowering.
+7. Re-baseline any golden-result fixtures that pinned a `DESC` ordering;
+   the radix-sort `DESC` pre-transform fix can change the row order a
+   previously-buggy sort produced.

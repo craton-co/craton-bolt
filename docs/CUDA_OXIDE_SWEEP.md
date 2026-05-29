@@ -1,5 +1,7 @@
 # CUDA-Oxide refactor sweep — status
 
+> **Status: internal refactor tracker / working notes.** This document tracks the in-progress "CUDA-Oxide" sweep that migrates GPU memory access to the borrow-checked `GpuVec` / `GpuView` / `GpuViewMut` types. It is an engineering checklist reflecting work as of v0.7.0 — roughly half the executors are migrated and several Tier-2 orchestrators remain `todo`. It is not a stable design reference; for the shipped memory-safety design see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 The borrow-checked GPU-memory layer (`GpuVec` / `GpuView` / `GpuViewMut`,
 see [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md#memory-safety-cuda-oxide))
 is the project's headline design. Several executors landed with the
