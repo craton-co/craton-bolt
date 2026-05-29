@@ -88,6 +88,7 @@ fn format_dtype(dt: DataType) -> String {
 /// expressions are always fully parenthesised so precedence is unambiguous.
 pub fn format_expr(expr: &Expr) -> String {
     match expr {
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => format!("{expr:?}"),
         Expr::Column(name) => name.clone(),
         Expr::Literal(lit) => format_literal(lit),
         Expr::Binary { op, left, right } => {
@@ -214,6 +215,10 @@ pub fn format_logical(plan: &LogicalPlan) -> String {
 fn format_logical_into(plan: &LogicalPlan, depth: usize, out: &mut String) {
     indent(out, depth);
     match plan {
+        LogicalPlan::Window { input, .. } => {
+            let _ = writeln!(out, "Window");
+            format_logical_into(input, depth + 1, out);
+        }
         LogicalPlan::Scan {
             table, projection, ..
         } => {
@@ -329,6 +334,10 @@ fn format_kernel(kernel: &KernelSpec) -> String {
 fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
     indent(out, depth);
     match plan {
+        PhysicalPlan::Window { input, .. } => {
+            let _ = writeln!(out, "Window");
+            format_physical_into(input, depth + 1, out);
+        }
         PhysicalPlan::Projection { table, kernel, .. } => {
             let _ = writeln!(
                 out,

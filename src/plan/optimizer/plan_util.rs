@@ -20,6 +20,12 @@ where
     A: Fn(AggregateExpr) -> AggregateExpr,
 {
     match plan {
+        LogicalPlan::Window { input, window_exprs, partition_by, order_by } => LogicalPlan::Window {
+            input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
+            window_exprs,
+            partition_by: partition_by.into_iter().map(map_expr).collect(),
+            order_by,
+        },
         LogicalPlan::Scan { .. } => plan,
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),

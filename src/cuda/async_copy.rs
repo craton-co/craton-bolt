@@ -129,7 +129,9 @@ impl<T: Pod> PinnedBuffer<T> {
         if len == 0 {
             return Ok(Self::empty_inner());
         }
-        let byte_len = checked_byte_len(len)?;
+        let byte_len = len
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or_else(|| BoltError::Memory("PinnedBuffer: byte length overflow".into()))?;
 
         #[cfg(not(feature = "cuda-stub"))]
         {

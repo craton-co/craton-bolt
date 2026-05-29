@@ -52,6 +52,12 @@ impl PlanRewrite for FilterIntoJoin {
 /// Recursively rewrite `plan`, folding eligible post-join filters into joins.
 fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
     match plan {
+        LogicalPlan::Window { input, window_exprs, partition_by, order_by } => LogicalPlan::Window {
+            input: Box::new(rewrite_plan(*input)),
+            window_exprs,
+            partition_by,
+            order_by,
+        },
         LogicalPlan::Filter { input, predicate } => {
             let input = rewrite_plan(*input);
             match input {

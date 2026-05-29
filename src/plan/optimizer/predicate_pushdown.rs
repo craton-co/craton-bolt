@@ -68,6 +68,12 @@ fn push_plan(plan: LogicalPlan) -> LogicalPlan {
 /// only needs to cover the remaining variants' children.
 fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
     match plan {
+        LogicalPlan::Window { input, window_exprs, partition_by, order_by } => LogicalPlan::Window {
+            input: Box::new(push_plan(*input)),
+            window_exprs,
+            partition_by,
+            order_by,
+        },
         LogicalPlan::Scan { .. } => plan,
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(push_plan(*input)),
@@ -369,6 +375,10 @@ fn rename_columns(
     map: &std::collections::HashMap<String, String>,
 ) -> Expr {
     match expr {
+        Expr::Extract { field, expr } => Expr::Extract { field: *field, expr: Box::new(rename_columns(expr, map)) },
+        Expr::DateTrunc { unit, expr } => Expr::DateTrunc { unit: *unit, expr: Box::new(rename_columns(expr, map)) },
+        Expr::InSubquery { expr, subquery, negated } => Expr::InSubquery { expr: Box::new(rename_columns(expr, map)), subquery: subquery.clone(), negated: *negated },
+        Expr::ScalarSubquery(_) => expr.clone(),
         Expr::Column(c) => Expr::Column(map.get(c).cloned().unwrap_or_else(|| c.clone())),
         Expr::Literal(_) => expr.clone(),
         Expr::Binary { op, left, right } => Expr::Binary {

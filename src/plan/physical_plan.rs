@@ -1211,6 +1211,9 @@ impl<'a> Codegen<'a> {
     fn emit_expr(&mut self, e: &Expr) -> BoltResult<Value> {
         match e {
             Expr::Column(name) => self.emit_column(name),
+            Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => Err(BoltError::Plan(
+                "GPU codegen: EXTRACT/DATE_TRUNC/subquery not lowered to the fused projection kernel".into(),
+            )),
             Expr::Literal(lit) => self.emit_literal(lit),
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
             Expr::Unary { op, operand } => self.emit_unary(*op, operand),
@@ -2388,6 +2391,7 @@ fn substitute_one_depth(
         return expr.clone();
     }
     match expr {
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => expr.clone(),
         Expr::Column(name) => match map.get(name) {
             Some(replacement) => replacement.clone(),
             None => expr.clone(),
@@ -2819,6 +2823,7 @@ fn lower_aggregate(
 /// naturally — "does the predicate contain a Unary we can't handle?".
 fn predicate_contains_unary(expr: &Expr) -> bool {
     match expr {
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
         Expr::Unary { op, operand } => {
             // `NOT` always routes to the host fallback — the GPU codegen
             // does not lower it yet (see `Codegen::emit_unary`).
@@ -2895,6 +2900,7 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
 /// `PhysicalPlan::Project` fallback rather than emitting wrong GPU code.
 fn case_needs_null_output(expr: &Expr) -> bool {
     match expr {
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
         Expr::Case {
             branches,
             else_branch,
@@ -2986,6 +2992,7 @@ fn scan_chain_has_unsafe_shortcircuit_filter(plan: &LogicalPlan) -> bool {
 /// the `LogicalPlan::Project` arm in `lower_depth`.
 fn expr_contains_concat(expr: &Expr) -> bool {
     match expr {
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
         Expr::Binary { op, left, right } => {
             matches!(op, BinaryOp::Concat)
                 || expr_contains_concat(left)
@@ -3289,6 +3296,7 @@ fn populate_aggregate_spec(
 /// rather than "silently eager on GPU".
 fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
     match e {
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
         // Column refs and literals never fault.
         Expr::Column(_) | Expr::Literal(_) => true,
         Expr::Binary { op, left, right } => {
@@ -3360,6 +3368,7 @@ fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
 /// results.
 fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
     match e {
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
         Expr::Column(_) | Expr::Literal(_) => false,
         Expr::Binary { op, left, right } => {
             if matches!(op, BinaryOp::And | BinaryOp::Or)
@@ -3614,6 +3623,7 @@ fn logical_plan_contains_unsupported_cast_target(plan: &LogicalPlan) -> Option<D
     }
     fn expr_bad_cast(e: &Expr) -> Option<DataType> {
         match e {
+            Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => None,
             Expr::Cast { expr, target } => {
                 if cast_target_unsupported(*target) {
                     return Some(*target);
@@ -3654,6 +3664,7 @@ fn logical_plan_contains_unsupported_cast_target(plan: &LogicalPlan) -> Option<D
             return None;
         }
         match plan {
+            LogicalPlan::Window { input, .. } => walk(input, depth + 1),
             LogicalPlan::Scan { .. } => None,
             LogicalPlan::Filter { input, predicate } => {
                 expr_bad_cast(predicate).or_else(|| walk(input, depth + 1))

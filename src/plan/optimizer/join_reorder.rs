@@ -125,6 +125,12 @@ impl JoinReorder {
 
     fn recurse_children(&self, plan: LogicalPlan) -> LogicalPlan {
         match plan {
+            LogicalPlan::Window { input, window_exprs, partition_by, order_by } => LogicalPlan::Window {
+                input: Box::new(self.rewrite_plan(*input)),
+                window_exprs,
+                partition_by,
+                order_by,
+            },
             LogicalPlan::Scan { .. } => plan,
             LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
                 input: Box::new(self.rewrite_plan(*input)),

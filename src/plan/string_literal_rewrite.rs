@@ -525,6 +525,8 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             Ok(Expr::DateTrunc {
                 unit: *unit,
                 expr: Box::new(new_inner),
+            })
+        }
         // Subquery nodes carry a self-contained `LogicalPlan` against a
         // *different* schema; this resolver `r` is keyed to the enclosing
         // query's Utf8 columns, so descending into the subplan here would be

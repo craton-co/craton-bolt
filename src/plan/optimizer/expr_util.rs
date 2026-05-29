@@ -19,6 +19,9 @@ use crate::plan::logical_plan::{AggregateExpr, BinaryOp, Expr, Literal};
 /// reaching the optimizer is within depth.
 pub fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
     match expr {
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => collect_columns(expr, out),
+        Expr::InSubquery { expr, .. } => collect_columns(expr, out),
+        Expr::ScalarSubquery(_) => {}
         Expr::Column(name) => out.push(name.clone()),
         Expr::Literal(_) => {}
         Expr::Binary { left, right, .. } => {

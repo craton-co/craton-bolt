@@ -171,6 +171,7 @@ pub fn estimate_rows(plan: &LogicalPlan, stats: &dyn StatsProvider) -> Option<us
 /// public [`estimate_rows`] clamps the final value back to `usize`.
 fn estimate_rows_f64(plan: &LogicalPlan, stats: &dyn StatsProvider) -> Option<f64> {
     match plan {
+        LogicalPlan::Window { input, .. } => estimate_rows_f64(input, stats),
         LogicalPlan::Scan { table, .. } => {
             let ts = stats.table_stats(table)?;
             Some(ts.row_count as f64)
@@ -462,6 +463,7 @@ fn scan_ndv_for_column(
     stats: &dyn StatsProvider,
 ) -> Option<usize> {
     match plan {
+        LogicalPlan::Window { input, .. } => scan_ndv_for_column(input, column, stats),
         LogicalPlan::Scan { table, .. } => stats.table_stats(table)?.ndv(column),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }

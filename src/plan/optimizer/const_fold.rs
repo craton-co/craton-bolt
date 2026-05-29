@@ -65,6 +65,7 @@ fn fold_agg(agg: AggregateExpr) -> AggregateExpr {
 /// Bottom-up fold of a single expression tree.
 pub fn fold_expr(expr: Expr) -> Expr {
     match expr {
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => expr,
         // Leaves are already folded.
         Expr::Column(_) | Expr::Literal(_) => expr,
         Expr::Binary { op, left, right } => {

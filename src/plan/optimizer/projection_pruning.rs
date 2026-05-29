@@ -67,6 +67,18 @@ impl PlanRewrite for ProjectionPruning {
 /// column names the parent still needs from `plan`'s output.
 fn prune(plan: LogicalPlan, required: &BTreeSet<String>) -> LogicalPlan {
     match plan {
+        LogicalPlan::Window { input, window_exprs, partition_by, order_by } => {
+            let mut child_req = required.clone();
+            for e in &partition_by { add_expr_cols(e, &mut child_req); }
+            for se in &order_by { add_expr_cols(&se.expr, &mut child_req); }
+            for we in &window_exprs { if let Some(a) = we.func.arg() { add_expr_cols(a, &mut child_req); } }
+            LogicalPlan::Window {
+                input: Box::new(prune(*input, &child_req)),
+                window_exprs,
+                partition_by,
+                order_by,
+            }
+        }
         LogicalPlan::Scan {
             table,
             projection,
