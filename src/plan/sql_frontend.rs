@@ -1425,23 +1425,26 @@ fn plan_select(
                 "unsupported: GLOBAL JOIN (ClickHouse extension)".into(),
             ));
         }
-        // Pick out the (join_type, optional ON expr) pair. CROSS JOIN
-        // has no ON clause — sqlparser models it with its own variant.
-        let (join_type, on_expr) = match &join.join_operator {
-            JoinOperator::Inner(c) => (JoinType::Inner, lower_join_constraint(c, "INNER")?),
-            JoinOperator::LeftOuter(c) => (JoinType::LeftOuter, lower_join_constraint(c, "LEFT")?),
-            JoinOperator::RightOuter(c) => {
-                (JoinType::RightOuter, lower_join_constraint(c, "RIGHT")?)
-            }
-            JoinOperator::FullOuter(c) => (JoinType::FullOuter, lower_join_constraint(c, "FULL")?),
-            JoinOperator::CrossJoin => (JoinType::Cross, None),
-            other => {
-                return Err(BoltError::Sql(format!(
-                    "unsupported join kind: {other:?}; \
-                     supported: INNER, LEFT, RIGHT, FULL OUTER, CROSS"
-                )));
-            }
-        };
+        // Pick out the (join_type, join constraint) pair. CROSS JOIN has no
+        // constraint — sqlparser models it with its own variant. We keep the
+        // raw `&JoinConstraint` (rather than eagerly extracting an ON expr) so
+        // the `USING (...)` / `NATURAL` desugaring below can run *after* the
+        // RHS schema is in scope; an ON predicate still routes through
+        // `lower_join_on` exactly as before.
+        let (join_type, constraint): (JoinType, Option<&JoinConstraint>) =
+            match &join.join_operator {
+                JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
+                JoinOperator::LeftOuter(c) => (JoinType::LeftOuter, Some(c)),
+                JoinOperator::RightOuter(c) => (JoinType::RightOuter, Some(c)),
+                JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
+                JoinOperator::CrossJoin => (JoinType::Cross, None),
+                other => {
+                    return Err(BoltError::Sql(format!(
+                        "unsupported join kind: {other:?}; \
+                         supported: INNER, LEFT, RIGHT, FULL OUTER, CROSS"
+                    )));
+                }
+            };
         let (rhs_plan, rhs_qualifier, rhs_schema) =
             lower_table_factor(&join.relation, provider, ctes)?;
         // Extend the resolver before we move `rhs_*` into the right-side
@@ -1449,24 +1452,41 @@ fn plan_select(
         // applies to the actual plan output. The resolver records the
         // *qualifier* (alias if any) so user-typed `t.col` references in
         // WHERE / SELECT / ON resolve against the alias-name the user
-        // wrote, not the underlying table name.
+        // wrote, not the underlying table name. The USING / NATURAL
+        // desugaring below also consults the just-pushed RHS scope.
         resolver.push_join(rhs_qualifier.clone(), &rhs_schema);
         // Keep the qualifier available after the move into `right_plan` so
         // the ON-clause validator can distinguish "right side" (the
         // just-pushed qualifier) from "left side" (any earlier scope).
         let rhs_qualifier_for_on = rhs_qualifier;
         let right_plan = rhs_plan;
-        // CROSS has no ON predicate; everything else does. `lower_join_on`
-        // is reused for the rest so non-equi forms keep a single
-        // rejection path. The validator uses `resolver` + `rhs_table_for_on`
-        // to reject `t1.a = t1.a` style same-side equalities and references
-        // to tables not in scope (see `lower_join_on`).
-        // Splits the ON clause into equi-join pairs (fast path) and an
-        // optional non-equi residual filter (nested-loop path).
-        let (on_pairs, filter) = match on_expr {
-            Some(e) => {
+        // Resolve the join constraint into `(equi_pairs, residual_filter)`:
+        //   * `ON <expr>`        — `lower_join_on` splits equi pairs from a
+        //     non-equi residual (single rejection path for unsupported forms);
+        //   * `USING (c1, ...)`  — each named column is desugared to an
+        //     equi-pair `left.c = right.c` (see `desugar_using_columns`);
+        //   * `NATURAL`          — every column common to both sides becomes
+        //     such an equi-pair (see `desugar_natural_columns`);
+        //   * CROSS / no clause  — no predicate.
+        // USING / NATURAL never produce a residual filter — they are pure
+        // equalities — so the nested-loop path is reserved for ON residuals.
+        let (on_pairs, filter) = match constraint {
+            Some(JoinConstraint::On(e)) => {
                 let lowered = lower_join_on(e, &resolver, &rhs_qualifier_for_on)?;
                 (lowered.equi_pairs, lowered.filter)
+            }
+            Some(JoinConstraint::Using(cols)) => {
+                let pairs = desugar_using_columns(cols, &resolver)?;
+                (pairs, None)
+            }
+            Some(JoinConstraint::Natural) => {
+                let pairs = desugar_natural_columns(&resolver)?;
+                (pairs, None)
+            }
+            Some(JoinConstraint::None) => {
+                return Err(BoltError::Sql(
+                    "JOIN requires an ON, USING, or NATURAL clause".into(),
+                ));
             }
             None => (Vec::new(), None),
         };
@@ -2041,26 +2061,152 @@ fn lower_table_factor(
     }
 }
 
-/// Pull the ON expression out of a `JoinConstraint` for non-CROSS joins.
-/// USING / NATURAL get explicit rejections; an absent constraint is an
-/// error for INNER/LEFT/RIGHT/FULL (all four require ON). CROSS doesn't
-/// flow through this helper — the caller handles its `None` arm directly.
-fn lower_join_constraint<'a>(
-    c: &'a JoinConstraint,
-    kind: &'static str,
-) -> BoltResult<Option<&'a SqlExpr>> {
-    match c {
-        JoinConstraint::On(e) => Ok(Some(e)),
-        JoinConstraint::Using(_) => Err(BoltError::Sql(format!(
-            "unsupported: {kind} JOIN ... USING; rewrite as ON"
-        ))),
-        JoinConstraint::Natural => Err(BoltError::Sql(format!(
-            "unsupported: NATURAL {kind} JOIN"
-        ))),
-        JoinConstraint::None => Err(BoltError::Sql(format!(
-            "{kind} JOIN requires an ON clause"
-        ))),
+/// Whether a column (by its qualifier-local `original` name) is present on
+/// the *left* side of the current join — i.e. in any of `resolver.tables`
+/// except the last, which is the just-pushed RHS.
+///
+/// SQL-standard case folding (mirrors [`NameResolver::resolve_compound`]): an
+/// exact match is tried first; if the lookup name is all-ASCII-lowercase
+/// (i.e. an unquoted identifier), a case-insensitive fallback is attempted.
+///
+/// * `Ok(true)`  — present in exactly one left table.
+/// * `Ok(false)` — not present on the left side at all.
+/// * `Err(_)`    — present in more than one left table (ambiguous), so a
+///   USING / NATURAL column cannot be unambiguously resolved.
+fn left_join_column_present(
+    resolver: &NameResolver<'_>,
+    col: &str,
+) -> BoltResult<bool> {
+    let col_lc = !col.chars().any(|c| c.is_ascii_uppercase());
+    // All scopes left of the RHS (which is always the last pushed scope).
+    let left_scopes = &resolver.tables[..resolver.tables.len() - 1];
+    let mut hits = 0usize;
+    for scope in left_scopes {
+        let matched = scope
+            .cols
+            .iter()
+            .find(|c| c.original == col)
+            .or_else(|| {
+                if !col_lc {
+                    return None;
+                }
+                scope.cols.iter().find(|c| c.original.eq_ignore_ascii_case(col))
+            });
+        if matched.is_some() {
+            hits += 1;
+        }
     }
+    if hits > 1 {
+        return Err(BoltError::Sql(format!(
+            "JOIN column '{col}' is ambiguous: it appears in more than one \
+             table on the left side of the join"
+        )));
+    }
+    Ok(hits == 1)
+}
+
+/// Whether a column (by `original` name) is present in the RHS scope (the
+/// last pushed table). Same case-folding rule as [`left_join_column_present`].
+fn rhs_join_column_present(resolver: &NameResolver<'_>, col: &str) -> bool {
+    let col_lc = !col.chars().any(|c| c.is_ascii_uppercase());
+    let rhs = resolver
+        .tables
+        .last()
+        .expect("RHS scope was pushed before constraint resolution");
+    rhs.cols
+        .iter()
+        .any(|c| c.original == col || (col_lc && c.original.eq_ignore_ascii_case(col)))
+}
+
+/// Build the equi-pair for a join column shared by both sides.
+///
+/// USING / NATURAL join columns have the *same* name on each side, so the
+/// pair is `(Column(col), Column(col))` — exactly the shape [`lower_join_on`]
+/// produces for an explicit `left.c = right.c` ON clause: a bare (original)
+/// column name on each side. The join executor resolves the left name against
+/// the left input batch and the right name against the (un-renamed) right
+/// input batch (see [`crate::exec::join`]), so the un-renamed original name is
+/// the correct key for both — the `join_combined_schema` rename only applies
+/// to the *output* schema, never to the key lookups.
+fn join_column_equi_pair(col: &str) -> (Expr, Expr) {
+    (Expr::Column(col.to_string()), Expr::Column(col.to_string()))
+}
+
+/// Desugar a `JOIN ... USING (c1, c2, ...)` clause into equi-join pairs.
+///
+/// Each named column must exist on exactly one left table and on the RHS.
+/// Missing, ambiguous, or duplicate USING columns are rejected with a clear
+/// message.
+fn desugar_using_columns(
+    cols: &[Ident],
+    resolver: &NameResolver<'_>,
+) -> BoltResult<Vec<(Expr, Expr)>> {
+    if cols.is_empty() {
+        return Err(BoltError::Sql(
+            "JOIN ... USING (...) requires at least one column".into(),
+        ));
+    }
+    let mut pairs = Vec::with_capacity(cols.len());
+    let mut seen: Vec<String> = Vec::with_capacity(cols.len());
+    for ident in cols {
+        let name = ident_to_name(ident);
+        // A repeated column in the USING list is a user error.
+        if seen.iter().any(|s| s == &name) {
+            return Err(BoltError::Sql(format!(
+                "JOIN ... USING lists column '{name}' more than once"
+            )));
+        }
+        seen.push(name.clone());
+
+        if !left_join_column_present(resolver, &name)? {
+            return Err(BoltError::Sql(format!(
+                "JOIN ... USING column '{name}' is not present on the left side of the join"
+            )));
+        }
+        if !rhs_join_column_present(resolver, &name) {
+            return Err(BoltError::Sql(format!(
+                "JOIN ... USING column '{name}' is not present in the right table"
+            )));
+        }
+        pairs.push(join_column_equi_pair(&name));
+    }
+    Ok(pairs)
+}
+
+/// Desugar a `NATURAL JOIN` into equi-join pairs over every column common to
+/// both sides.
+///
+/// The common set is every RHS column (by `original` name) that also resolves
+/// on the left side. A `NATURAL JOIN` with no common column is rejected (it
+/// would silently degenerate to a CROSS join, which is almost never the
+/// intent), as is one whose common column is ambiguous on the left (surfaced
+/// by [`left_join_column_present`]).
+fn desugar_natural_columns(
+    resolver: &NameResolver<'_>,
+) -> BoltResult<Vec<(Expr, Expr)>> {
+    // Snapshot the RHS column names first so we don't hold a borrow of
+    // `resolver` across the `left_join_column_present` calls below.
+    let rhs_cols: Vec<String> = resolver
+        .tables
+        .last()
+        .expect("RHS scope was pushed before constraint resolution")
+        .cols
+        .iter()
+        .map(|tc| tc.original.clone())
+        .collect();
+    let mut pairs = Vec::new();
+    for col in &rhs_cols {
+        // Match RHS columns against the left side by their original name.
+        if left_join_column_present(resolver, col)? {
+            pairs.push(join_column_equi_pair(col));
+        }
+    }
+    if pairs.is_empty() {
+        return Err(BoltError::Sql(
+            "NATURAL JOIN has no common column between the two sides".into(),
+        ));
+    }
+    Ok(pairs)
 }
 
 /// Which side of the current join an ON-clause column reference belongs to.

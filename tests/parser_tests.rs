@@ -1016,3 +1016,100 @@ fn except_by_name_rejected() {
     // The BY NAME variant is rejected for every set operator.
     assert_err(res, "EXCEPT BY NAME");
 }
+
+// ---- JOIN ... USING / NATURAL JOIN ------------------------------------------
+
+/// `emp(id, dept_id, name)`, `dept(dept_id, dname)` (share `dept_id`), and
+/// `widget(wid, color)` (disjoint from `emp`) for the USING / NATURAL tests.
+fn join_fixture() -> MemTableProvider {
+    let i32f = |n: &str| Field { name: n.into(), dtype: DataType::Int32, nullable: false };
+    let emp = Schema::new(vec![i32f("id"), i32f("dept_id"), i32f("name")]);
+    let dept = Schema::new(vec![i32f("dept_id"), i32f("dname")]);
+    let widget = Schema::new(vec![i32f("wid"), i32f("color")]);
+    MemTableProvider::new()
+        .with_table("emp", emp)
+        .with_table("dept", dept)
+        .with_table("widget", widget)
+}
+
+/// Pull the equi-pairs out of a top-level `Join` node.
+fn join_on_pairs(plan: &LogicalPlan) -> &[(Expr, Expr)] {
+    match plan {
+        LogicalPlan::Join { on, .. } => on,
+        other => panic!("expected Join at root, got {other:?}"),
+    }
+}
+
+#[test]
+fn join_using_single_column_desugars_to_equi_pair() {
+    let provider = join_fixture();
+    let plan = plan_ok(
+        "SELECT id FROM emp JOIN dept USING (dept_id)",
+        &provider,
+    );
+    let on = join_on_pairs(&plan);
+    assert_eq!(on.len(), 1, "one USING column -> one equi pair");
+    // Both sides reference the (un-renamed) `dept_id` column.
+    assert_eq!(on[0].0, Expr::Column("dept_id".into()));
+    assert_eq!(on[0].1, Expr::Column("dept_id".into()));
+    plan.schema().expect("type-check");
+}
+
+#[test]
+fn join_using_lowers_physically() {
+    let provider = join_fixture();
+    let res = try_plan("SELECT id FROM emp JOIN dept USING (dept_id)", &provider);
+    assert!(res.is_ok(), "JOIN ... USING should parse and lower: {res:?}");
+}
+
+#[test]
+fn natural_join_desugars_to_common_columns() {
+    let provider = join_fixture();
+    // emp and dept share exactly `dept_id`.
+    let plan = plan_ok("SELECT id FROM emp NATURAL JOIN dept", &provider);
+    let on = join_on_pairs(&plan);
+    assert_eq!(on.len(), 1, "one common column -> one equi pair");
+    assert_eq!(on[0].0, Expr::Column("dept_id".into()));
+    assert_eq!(on[0].1, Expr::Column("dept_id".into()));
+}
+
+#[test]
+fn natural_left_join_uses_common_column() {
+    let provider = join_fixture();
+    // NATURAL applies to outer joins too: `NATURAL LEFT JOIN` desugars the
+    // common column into the equi-pair while keeping the LEFT join type.
+    let plan = plan_ok("SELECT id FROM emp NATURAL LEFT JOIN dept", &provider);
+    let on = join_on_pairs(&plan);
+    assert_eq!(on.len(), 1, "one common column -> one equi pair");
+    assert_eq!(on[0].0, Expr::Column("dept_id".into()));
+}
+
+#[test]
+fn join_using_unknown_column_rejected() {
+    let provider = join_fixture();
+    let res = try_plan("SELECT id FROM emp JOIN dept USING (nope)", &provider);
+    assert_err(res, "USING column 'nope'");
+}
+
+#[test]
+fn natural_join_no_common_column_rejected() {
+    let provider = join_fixture();
+    // emp(id, dept_id, name) vs widget(wid, color) share nothing.
+    let res = try_plan("SELECT id FROM emp NATURAL JOIN widget", &provider);
+    assert_err_contains(res, "no common column");
+}
+
+#[test]
+fn join_using_ambiguous_left_column_rejected() {
+    let provider = join_fixture();
+    // After `emp JOIN dept USING(dept_id)`, the accumulated left side has
+    // `dept_id` in BOTH emp and dept; a second join USING(dept_id) is then
+    // ambiguous on the left.
+    let res = try_plan(
+        "SELECT id FROM emp \
+         JOIN dept USING (dept_id) \
+         JOIN dept AS d2 USING (dept_id)",
+        &provider,
+    );
+    assert_err_contains(res, "ambiguous");
+}
