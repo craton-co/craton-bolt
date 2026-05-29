@@ -75,7 +75,9 @@
 //! roundtrip on the pre outputs; the per-aggregate hash-table launches
 //! still run on the GPU.
 
-use std::collections::{HashMap, HashSet};
+// dedup (groupby_common): `HashSet` was used only by the now-relocated
+// `unique_count`; the shared copy lives in `crate::exec::groupby_common`.
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -194,44 +196,17 @@ fn dispatch_native_validity(
     }
 }
 
-// ---------------------------------------------------------------------------
-// v0.7 async memcpy helpers (Stage-3 pattern lifted from `groupby.rs`).
-//
-// Each accumulator-download site previously called `gpu_vec.to_vec()?`,
-// which uses a synchronous `cuMemcpyDtoH_v2`. These helpers swap that for
-// the pinned `to_pinned_async` + `stream.synchronize()` + host-host copy
-// sequence so the D2H chains naturally with the upstream kernel launches
-// on the same stream. They are monomorphised on the element type so they
-// can land directly in an `AccDownload` variant without further casts.
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn download_pinned_i32(v: &GpuVec<i32>, stream: &CudaStream) -> BoltResult<Vec<i32>> {
-    let pinned = v.to_pinned_async(stream.raw())?;
-    stream.synchronize()?;
-    Ok(pinned.as_slice().to_vec())
-}
-
-#[inline]
-fn download_pinned_i64(v: &GpuVec<i64>, stream: &CudaStream) -> BoltResult<Vec<i64>> {
-    let pinned = v.to_pinned_async(stream.raw())?;
-    stream.synchronize()?;
-    Ok(pinned.as_slice().to_vec())
-}
-
-#[inline]
-fn download_pinned_f32(v: &GpuVec<f32>, stream: &CudaStream) -> BoltResult<Vec<f32>> {
-    let pinned = v.to_pinned_async(stream.raw())?;
-    stream.synchronize()?;
-    Ok(pinned.as_slice().to_vec())
-}
-
-#[inline]
-fn download_pinned_f64(v: &GpuVec<f64>, stream: &CudaStream) -> BoltResult<Vec<f64>> {
-    let pinned = v.to_pinned_async(stream.raw())?;
-    stream.synchronize()?;
-    Ok(pinned.as_slice().to_vec())
-}
+// dedup (groupby_common): the Stage-3 pinned D2H helpers
+// (`download_pinned_{i32,i64,f32,f64}`) and the `unique_count` / `next_pow2`
+// scan helpers used to be defined locally here (copies of the `groupby.rs`
+// originals). They now live in the single canonical module
+// `crate::exec::groupby_common`. This executor consumes host vectors from the
+// pre stage, so it does NOT share the key-packing functions (`pack_keys` etc.)
+// — those stay specific to the no-pre executors. Call sites are unchanged.
+use crate::exec::groupby_common::{
+    download_pinned_f32, download_pinned_f64, download_pinned_i32, download_pinned_i64,
+    next_pow2, unique_count,
+};
 
 /// Execute an `Aggregate` plan that has BOTH a pre kernel AND a non-empty
 /// `group_by`. Single-column GROUP BY only; Int32 / Int64 keys only.
@@ -2512,29 +2487,9 @@ fn identity_f64(op: ReduceOp) -> f64 {
 // Misc helpers.
 // ===========================================================================
 
-/// Count of distinct values in `keys`. Linear, O(n) using a HashSet.
-fn unique_count(keys: &[i64]) -> usize {
-    let mut set: HashSet<i64> = HashSet::with_capacity(keys.len().min(1 << 20));
-    for &k in keys {
-        set.insert(k);
-    }
-    set.len()
-}
-
-/// Smallest power of two >= `n`.
-fn next_pow2(n: usize) -> usize {
-    if n <= 1 {
-        return 1;
-    }
-    let mut p: usize = 1;
-    while p < n {
-        match p.checked_mul(2) {
-            Some(v) => p = v,
-            None => return p,
-        }
-    }
-    p
-}
+// dedup (groupby_common): `unique_count` and `next_pow2` were copies of the
+// `groupby.rs` originals; they now live in `crate::exec::groupby_common`
+// (imported at the top of this module). Call sites are unchanged.
 
 /// Build a `Type` error for a failed Arrow downcast.
 fn downcast_err(role: &str, expected: &str) -> BoltError {

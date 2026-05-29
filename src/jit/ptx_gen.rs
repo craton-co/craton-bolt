@@ -1661,6 +1661,12 @@ pub(crate) fn validate_kernel_name(name: &str) -> BoltResult<()> {
 }
 
 /// Write the `.visible .entry` signature, one parameter per line.
+///
+/// dedup (ptx_common): intentionally NOT shared with
+/// `scan_kernel::write_signature`. They emit different bytes — this one uses
+/// the `inputs + outputs + extra` param formula and `.param .u64 .ptr .global
+/// .align 16` pointer attributes; the scan variant uses `n_inputs + 1 + K`
+/// (mask output) with plain `.param .u64`. Both shapes are pinned by goldens.
 fn write_signature(
     out: &mut String,
     b: &PtxBuilder,
@@ -1700,6 +1706,11 @@ fn write_signature(
 }
 
 /// Emit the `.reg` declaration block sized to each class's used count.
+///
+/// dedup (ptx_common): intentionally NOT shared with
+/// `scan_kernel::write_reg_decls`, which declares an extra `("rs", "b16")`
+/// class (7 vs 6) for its narrowed mask byte. Different `decls` => different
+/// emitted block.
 fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> BoltResult<()> {
     // (class, ptx_type) pairs in deterministic emission order.
     let decls: [(&str, &str); 6] = [
@@ -1720,6 +1731,10 @@ fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> BoltResult<()> {
 }
 
 /// Adapt a `std::fmt::Error` into a `BoltError`.
+///
+/// dedup (ptx_common): intentionally NOT shared. Every JIT codegen module
+/// keeps its own one-liner so the `write failed` error is prefixed with the
+/// owning module name (here `ptx_gen:`). Sharing would change that text.
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("ptx_gen: write failed: {}", e))
 }

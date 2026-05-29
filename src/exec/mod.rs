@@ -22,6 +22,9 @@ pub mod aggregate;
 pub mod compact;
 pub mod string_col;
 pub mod groupby;
+// dedup (groupby_common): single home for the host-side key-packing +
+// pinned-D2H helpers shared by groupby / groupby_valid / groupby_with_pre.
+pub(crate) mod groupby_common;
 pub mod agg_with_pre;
 pub mod gpu_compact;
 pub mod string_ops;

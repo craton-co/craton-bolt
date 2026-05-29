@@ -40,6 +40,20 @@
 //! pieces we need (compute-op lowering + register allocator) so the two
 //! modules can evolve independently. The cost is ~250 lines of duplication
 //! for full module independence.
+//!
+//! ## dedup (ptx_common) — audit outcome
+//!
+//! A dedup pass evaluated whether the emission scaffolding shared with
+//! `ptx_gen.rs` (the validity-param wiring, [`write_signature`],
+//! [`write_reg_decls`], [`write_err`]) could be hoisted into a shared
+//! `ptx_common` module. Conclusion: **none of these are byte-for-byte
+//! identical** — each was deliberately adapted for the predicate-kernel ABI,
+//! so hoisting them would change emitted PTX (breaking the golden/snapshot
+//! tests in `tests/ptx_golden_tests.rs`) or change error text. They are left
+//! local on purpose; see the per-fn `dedup (ptx_common)` notes for the exact
+//! divergence. The one helper that WAS genuinely identical —
+//! `validate_kernel_name` — is already unified (V-12): this module imports
+//! `ptx_gen::validate_kernel_name` rather than keeping a copy.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -231,6 +245,15 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     //          historical PTX shape (no extra params, no validity loads) so
     //          every legacy caller continues to work bit-for-bit. When set,
     //          it MUST be parallel to `inputs`.
+    //
+    // dedup (ptx_common): NOT hoisted. This is the INPUT-only half of the
+    // validity wiring; `ptx_gen::compile` additionally computes `output_valid`
+    // / `n_output_validity` / `n_extra_validity_params` (the predicate kernel
+    // has no value outputs, only a mask), and its error string is prefixed
+    // `ptx_gen:` per the per-module `write failed`/error convention. Extracting
+    // just this block would yield a thin wrapper that still differs in error
+    // text and would not cover ptx_gen's output path, increasing coupling for
+    // no real reuse — so it stays local.
     let input_valid: Vec<bool> = if spec.input_has_validity.is_empty() {
         vec![false; spec.inputs.len()]
     } else {
@@ -1324,6 +1347,13 @@ fn byte_width(dtype: DataType) -> BoltResult<usize> {
 
 /// Write the `.visible .entry` signature: N input ptrs, mask output ptr, K
 /// input-validity ptrs (one per flagged input), n_rows.
+///
+/// dedup (ptx_common): NOT hoisted. Emits a DIFFERENT byte sequence from
+/// `ptx_gen::write_signature`: the param count is `n_inputs + 1 + K` (the `+1`
+/// is the mask output, which has no analogue in ptx_gen's `inputs + outputs +
+/// extra` formula), the pointer params are plain `.param .u64` (ptx_gen adds
+/// `.ptr .global .align 16`), and `n_rows_param_name` here is the 2-arg scan
+/// variant. The golden tests pin this exact text — merging would break them.
 fn write_signature(
     out: &mut String,
     b: &PtxBuilder,
@@ -1352,6 +1382,11 @@ fn write_signature(
 }
 
 /// Emit the `.reg` declaration block sized to each class's used count.
+///
+/// dedup (ptx_common): NOT hoisted. Diverges from `ptx_gen::write_reg_decls`,
+/// which declares 6 classes; this path declares 7 — it adds `("rs", "b16")`
+/// for the narrowed mask-byte source unique to the predicate kernel. Different
+/// `decls` table => different emitted `.reg` block => stays local.
 fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> BoltResult<()> {
     // (class, ptx_type) pairs in deterministic emission order. `rs` is the
     // 16-bit register class we use for the narrowed mask byte source.
@@ -1374,6 +1409,12 @@ fn write_reg_decls(out: &mut String, alloc: &RegAlloc) -> BoltResult<()> {
 }
 
 /// Adapt a `std::fmt::Error` into a `BoltError`.
+///
+/// dedup (ptx_common): NOT hoisted. The `write failed` message is prefixed
+/// with the owning module name (`scan_kernel:`) — a convention every JIT
+/// codegen module follows (ptx_gen, sort_kernel, agg_kernels, ...). A shared
+/// helper would have to pick one prefix and would silently change this path's
+/// error text, so each module keeps its own one-liner.
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("scan_kernel: write failed: {}", e))
 }
