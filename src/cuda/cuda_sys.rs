@@ -92,6 +92,13 @@ extern "C" {
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
     pub fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> CUresult;
+    /// Page-locked host allocation with explicit behavior flags (e.g.
+    /// `CU_MEMHOSTALLOC_PORTABLE`, `_DEVICEMAP`, `_WRITECOMBINED`). The
+    /// flagless `cuMemAllocHost_v2` above is equivalent to passing
+    /// `flags = 0`; this entry point is bound for
+    /// [`crate::cuda::async_copy::PinnedBuffer`] so callers can opt into
+    /// portable / write-combined pinned memory for async H2D/D2H DMA.
+    pub fn cuMemHostAlloc(pp: *mut *mut c_void, bytesize: usize, flags: c_uint) -> CUresult;
     pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
@@ -216,6 +223,7 @@ mod stubs {
     pub unsafe fn cuMemAlloc_v2(_dptr: *mut CUdeviceptr, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemFree_v2(_dptr: CUdeviceptr) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemAllocHost_v2(_pp: *mut *mut c_void, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuMemHostAlloc(_pp: *mut *mut c_void, _bytesize: usize, _flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemFreeHost(_p: *mut c_void) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemcpyHtoD_v2(_dst: CUdeviceptr, _src: *const c_void, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuMemcpyDtoH_v2(_dst: *mut c_void, _src: CUdeviceptr, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
@@ -664,6 +672,33 @@ pub unsafe fn memcpy_d2d<T>(dst: CUdeviceptr, src: CUdeviceptr, count: usize) ->
 pub unsafe fn mem_alloc_host(bytes: usize) -> BoltResult<*mut c_void> {
     let mut ptr: *mut c_void = std::ptr::null_mut();
     check(cuMemAllocHost_v2(&mut ptr, bytes))?;
+    Ok(ptr)
+}
+
+/// `cuMemHostAlloc` flag: the allocation is *portable*, i.e. considered
+/// page-locked by every CUDA context in the process, not just the one
+/// current at allocation time. Mirrors the C macro `CU_MEMHOSTALLOC_PORTABLE`.
+pub const CU_MEMHOSTALLOC_PORTABLE: c_uint = 0x01;
+/// `cuMemHostAlloc` flag: map the allocation into the CUDA address space
+/// (unified-addressing devices can then dereference it directly). Mirrors
+/// `CU_MEMHOSTALLOC_DEVICEMAP`.
+pub const CU_MEMHOSTALLOC_DEVICEMAP: c_uint = 0x02;
+/// `cuMemHostAlloc` flag: allocate write-combined memory — faster for the
+/// CPU to *write* and for the GPU to read over PCIe, but slow for the CPU to
+/// read back. Mirrors `CU_MEMHOSTALLOC_WRITECOMBINED`.
+pub const CU_MEMHOSTALLOC_WRITECOMBINED: c_uint = 0x04;
+
+/// Allocate `bytes` of page-locked (pinned) host memory via `cuMemHostAlloc`,
+/// passing the driver `flags` verbatim (a bitwise-OR of the
+/// `CU_MEMHOSTALLOC_*` constants, or `0` for the same behavior as
+/// [`mem_alloc_host`]).
+///
+/// # Safety
+/// The returned pointer must be freed with [`mem_free_host`]; never with
+/// `free`/`Box::from_raw`/etc. The driver determines validity and alignment.
+pub unsafe fn mem_host_alloc(bytes: usize, flags: c_uint) -> BoltResult<*mut c_void> {
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    check(cuMemHostAlloc(&mut ptr, bytes, flags))?;
     Ok(ptr)
 }
 
