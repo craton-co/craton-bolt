@@ -122,9 +122,13 @@ where
     {
         let cache = GLOBAL_MODULE_CACHE.lock();
         if let Some(m) = cache.get(&(namespace, spec_id.clone())) {
+            // M5 metrics: warm module-cache hit (codegen + load skipped).
+            crate::metrics::metrics().inc(crate::metrics::Counter::PtxCacheHits);
             return Ok(m.clone());
         }
     }
+    // M5 metrics: miss — we are about to compile + load this module.
+    crate::metrics::metrics().inc(crate::metrics::Counter::PtxCacheMisses);
     // Miss: compile + load WITHOUT the cache lock held. PTX generation and
     // `cuModuleLoadDataEx` can be slow; we don't want unrelated cache
     // misses serialising behind one ongoing compile. The jit PTX-text-hash
