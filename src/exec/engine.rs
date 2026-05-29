@@ -2110,6 +2110,16 @@ impl Engine {
             .rewrites
             .iter()
             .try_fold(plan, |p, r| r.rewrite(p))?;
+        // Resolve uncorrelated scalar / IN subqueries to constants BEFORE
+        // lowering. Each subplan is uncorrelated (the frontend rejects
+        // correlation) and so independently executable; we run it here and
+        // fold the result into the enclosing plan as a literal (scalar) or a
+        // boolean OR/AND fold (IN). After this pass no `ScalarSubquery` /
+        // `InSubquery` node survives, so the physical reject-arms for them
+        // are unreachable for `sql()`-produced plans (they stay as a safety
+        // net for hand-built physical plans). See
+        // `crate::exec::subquery_resolve`.
+        let plan = self.resolve_subqueries(plan)?;
         // Time the lower phase (LogicalPlan → PhysicalPlan) into the Lower
         // histogram; mirrors the `lower` tracing span in `observability`.
         let lower_start = Instant::now();
@@ -2210,6 +2220,9 @@ impl Engine {
         let plan = crate::plan::default_passes_with_estimator(self.row_estimator())
             .iter()
             .try_fold(plan, |p, r| r.rewrite(p))?;
+        // Mirror `sql()`: resolve uncorrelated subqueries to constants before
+        // lowering so a DataFrame-built plan carrying a subquery executes too.
+        let plan = self.resolve_subqueries(plan)?;
         let mut phys = crate::plan::lower_physical(&plan)?;
         // Mirror `sql()`: collapse lazy streaming sources before probing.
         self.ensure_streaming_materialized()?;
@@ -2224,6 +2237,67 @@ impl Engine {
         let result = self.execute(&phys);
         self.maybe_emit_pool_stats(Instant::now());
         result
+    }
+
+    /// Pre-lowering pass: resolve every uncorrelated scalar / IN subquery in
+    /// `plan` to a constant.
+    ///
+    /// Walks the plan's expressions (recursively, inner-subqueries-first via
+    /// [`crate::exec::subquery_resolve::resolve_plan`]) and:
+    ///
+    /// * `Expr::ScalarSubquery(subplan)` → executes `subplan`, requires
+    ///   exactly one output column, and folds the result to an
+    ///   `Expr::Literal` (0 rows → SQL `NULL`; >1 row → a clean error).
+    /// * `Expr::InSubquery { expr, subquery, negated }` → executes `subquery`,
+    ///   collects the distinct values, and rewrites to an OR-of-equalities
+    ///   (or AND-of-inequalities for `NOT IN`) over `expr`.
+    ///
+    /// The subplans are executed through [`Engine::run_subplan`], which routes
+    /// the full pipeline (dict-rewrite → optimizer → *this pass* → lower →
+    /// execute) over `&self` — so nested subqueries inside a subplan resolve
+    /// when that subplan runs. Correlation is impossible here (rejected at the
+    /// frontend), so each subplan is self-contained and independently
+    /// executable.
+    ///
+    /// Takes `&self` because [`Engine::sql`] is `&self`; the only state mutated
+    /// by executing a subplan is the interior-mutable GpuTable cache and the
+    /// pool-stats throttle, neither of which needs `&mut`.
+    fn resolve_subqueries(&self, plan: LogicalPlan) -> BoltResult<LogicalPlan> {
+        let mut exec = |subplan: LogicalPlan| -> BoltResult<RecordBatch> {
+            self.run_subplan(subplan)
+        };
+        crate::exec::subquery_resolve::resolve_plan(plan, &mut exec)
+    }
+
+    /// Execute a self-contained (uncorrelated) subquery [`LogicalPlan`] over
+    /// `&self` and return its result `RecordBatch`.
+    ///
+    /// This is the `&self` twin of [`Engine::run_logical_plan`]: it runs the
+    /// same dict-rewrite → optimizer → subquery-resolve → lower →
+    /// validity-propagate → execute pipeline, but without the `&mut self`
+    /// receiver (so it can be called from inside [`Engine::resolve_subqueries`]
+    /// during the `&self` `sql()` path). Re-entering `resolve_subqueries` here
+    /// is what makes nested subqueries resolve inner-first.
+    fn run_subplan(&self, plan: LogicalPlan) -> BoltResult<RecordBatch> {
+        let plan = self.dict_registry.rewrite_plan(&plan)?;
+        let plan = crate::plan::default_passes_with_estimator(self.row_estimator())
+            .iter()
+            .try_fold(plan, |p, r| r.rewrite(p))?;
+        let plan = self.resolve_subqueries(plan)?;
+        let mut phys = crate::plan::lower_physical(&plan)?;
+        // The outer `sql()` / `run_logical_plan` has already collapsed any
+        // lazy streaming sources before this point, but a subplan may be the
+        // first reader of one — collapse again (idempotent) to be safe.
+        self.ensure_streaming_materialized()?;
+        let nb = EngineProvider {
+            base: &self.provider,
+            tables: &self.tables,
+            streaming: self.streaming_sources.borrow(),
+        };
+        crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
+        drop(nb);
+        let handle = self.execute(&phys)?;
+        Ok(handle.into_record_batch())
     }
 
     /// Emit a periodic pool-stats log line + observer notification if

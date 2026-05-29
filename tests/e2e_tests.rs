@@ -1772,3 +1772,103 @@ fn e2e_groupby_variance_returns_clear_error() {
         "error must mention the rejected aggregate; got: {msg}"
     );
 }
+
+// ---- Uncorrelated subquery resolution (engine pre-lowering pass) ------------
+//
+// These exercise `Engine::resolve_subqueries`: an uncorrelated scalar
+// subquery is folded to a literal, and an uncorrelated `IN (subquery)` is
+// rewritten to an OR-of-equalities, both BEFORE physical lowering. Small
+// in-memory `sales` / `other` tables, full GPU execute.
+
+/// Build a 2-column `sales(region_id Int32, qty Int32)` batch.
+fn sales_qty_batch(regions: &[i32], qtys: &[i32]) -> RecordBatch {
+    assert_eq!(regions.len(), qtys.len());
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("region_id", ArrowDataType::Int32, false),
+        ArrowField::new("qty", ArrowDataType::Int32, false),
+    ]));
+    let region = Int32Array::from(regions.to_vec());
+    let qty = Int32Array::from(qtys.to_vec());
+    RecordBatch::try_new(schema, vec![Arc::new(region), Arc::new(qty)]).unwrap()
+}
+
+/// Build a 2-column `other(id Int32, val Int32)` batch.
+fn other_batch(ids: &[i32], vals: &[i32]) -> RecordBatch {
+    assert_eq!(ids.len(), vals.len());
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("val", ArrowDataType::Int32, false),
+    ]));
+    let id = Int32Array::from(ids.to_vec());
+    let val = Int32Array::from(vals.to_vec());
+    RecordBatch::try_new(schema, vec![Arc::new(id), Arc::new(val)]).unwrap()
+}
+
+/// `SELECT region_id FROM sales WHERE qty > (SELECT MAX(val) FROM other)`.
+///
+/// The scalar subquery `MAX(val)` over `other = {3, 7, 5}` folds to the
+/// literal `7`; the surviving predicate is `qty > 7`. The engine's filter
+/// path does not compact, so masked rows retain the zero-init projected
+/// value — we assert per-row using the original `qty` to decide membership.
+#[test]
+#[ignore = "gpu:e2e"]
+fn e2e_scalar_subquery_in_filter() {
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("ctx");
+    let sales = sales_qty_batch(&[10, 20, 30, 40], &[5, 8, 7, 9]);
+    let other = other_batch(&[0, 1, 2], &[3, 7, 5]); // MAX(val) = 7
+    engine.register_table("sales", sales).unwrap();
+    engine.register_table("other", other).unwrap();
+
+    let h = engine
+        .sql("SELECT region_id FROM sales WHERE qty > (SELECT MAX(val) FROM other)")
+        .expect("execute");
+    let out = h.record_batch();
+    // qty > 7 holds for rows with qty in {8, 9} → region_id 20 and 40.
+    let region = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("Int32 region");
+    // Row qty = {5, 8, 7, 9}; predicate qty > 7 → mask {F, T, F, T}.
+    // Filter path leaves masked rows at zero-init (0), unmasked at region_id.
+    assert_eq!(out.num_rows(), 4);
+    assert_eq!(region.value(0), 0, "row 0 masked (qty 5)");
+    assert_eq!(region.value(1), 20, "row 1 kept (qty 8)");
+    assert_eq!(region.value(2), 0, "row 2 masked (qty 7)");
+    assert_eq!(region.value(3), 40, "row 3 kept (qty 9)");
+}
+
+/// `SELECT region_id FROM sales WHERE region_id IN (SELECT id FROM other)`.
+///
+/// The IN-subquery over `other.id = {20, 40}` rewrites to
+/// `region_id = 20 OR region_id = 40`. Rows whose `region_id` is in that set
+/// survive the mask.
+#[test]
+#[ignore = "gpu:e2e"]
+fn e2e_in_subquery_in_filter() {
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("ctx");
+    let sales = sales_qty_batch(&[10, 20, 30, 40], &[1, 2, 3, 4]);
+    let other = other_batch(&[20, 40], &[0, 0]); // membership set {20, 40}
+    engine.register_table("sales", sales).unwrap();
+    engine.register_table("other", other).unwrap();
+
+    let h = engine
+        .sql("SELECT region_id FROM sales WHERE region_id IN (SELECT id FROM other)")
+        .expect("execute");
+    let out = h.record_batch();
+    let region = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("Int32 region");
+    assert_eq!(out.num_rows(), 4);
+    // region_id in {20, 40} survives; {10, 30} are masked to 0.
+    assert_eq!(region.value(0), 0, "10 not in set");
+    assert_eq!(region.value(1), 20, "20 in set");
+    assert_eq!(region.value(2), 0, "30 not in set");
+    assert_eq!(region.value(3), 40, "40 in set");
+}
