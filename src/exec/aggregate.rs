@@ -1518,9 +1518,54 @@ impl ReduceScalar for i32 {
 }
 
 impl ReduceScalar for i64 {
+    /// V-10: Integer SUM overflow contract (host-side ReduceScalar finalize).
+    ///
+    /// This i64 finalize backs the host SUM result for BOTH native SUM(Int64)
+    /// and the widened SUM(Int32->i64) path (see `reduce_gpu_vec_widened::<i32,
+    /// i64>` at the SUM(Int32) dispatch site, which finalizes through this impl
+    /// at the widened i64 accumulator dtype). Previously this path used
+    /// `i64::wrapping_add`, so an integer SUM that exceeded `i64::MAX` silently
+    /// produced a wrapped (often negative) answer.
+    ///
+    /// The engine's stated invariant is "never silently wrong", and the
+    /// SUM(Decimal128) path already errors loudly via `BoltError::Type` on
+    /// accumulator overflow (see the `checked_add` fold around line 586). To
+    /// make the integer SUM contract CONSISTENT and EXPLICIT with that path,
+    /// integer SUM now ERRORS on overflow rather than wrapping: it accumulates
+    /// with `checked_add` and returns a `BoltError::Type` whose message mirrors
+    /// the Decimal128 "accumulator exceeds <range>" form. There is no silent
+    /// wrap on the host path anymore.
+    ///
+    /// COUNT (synthesized as a SUM over ones) deliberately retains
+    /// `wrapping_add`: a row count cannot realistically exceed `i64::MAX`, and
+    /// turning COUNT into a fallible operation would be a gratuitous semantic
+    /// change unrelated to V-10. MIN/MAX are non-arithmetic and never overflow.
+    ///
+    /// NOTE: the GPU group-by SUM accumulates with `atom.add.u64` in
+    /// `groupby.rs` and has its own wrapping-on-overflow behavior; that atomic
+    /// path is out of this file's scope and is tracked separately (V-10).
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
-            ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0i64, i64::wrapping_add),
+            // V-10: integer SUM errors loudly on i64 overflow (consistent with
+            // the SUM(Decimal128) checked_add path) — no silent wrap.
+            ReduceOp::Sum => {
+                let mut sum: i64 = 0;
+                for &v in host {
+                    sum = match sum.checked_add(v) {
+                        Some(s) => s,
+                        None => {
+                            return Err(BoltError::Type(
+                                "SUM(integer) overflow: accumulator exceeds i64 range"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                }
+                sum
+            }
+            // V-10: COUNT (sum-over-ones) keeps wrapping_add — a row count
+            // cannot realistically overflow i64 and COUNT stays infallible.
+            ReduceOp::Count => host.iter().copied().fold(0i64, i64::wrapping_add),
             ReduceOp::Min => host.iter().copied().fold(i64::MAX, i64::min),
             ReduceOp::Max => host.iter().copied().fold(i64::MIN, i64::max),
         };
@@ -1684,6 +1729,39 @@ mod tests {
         let arr = Int64Array::from(vec![10i64, 20, 30]);
         let host = filter_primitive_to_vec::<arrow_array::types::Int64Type>(&arr);
         assert_eq!(host, vec![10, 20, 30]);
+    }
+
+    /// V-10: integer SUM that overflows `i64::MAX` must error loudly with a
+    /// `BoltError::Type` (consistent with the SUM(Decimal128) checked path),
+    /// never silently wrap to a negative value.
+    #[test]
+    fn i64_sum_finalize_overflow_errors_not_wraps() {
+        // Two halves of i64::MAX plus a final +2 tips the accumulator past
+        // i64::MAX. A wrapping_add fold would have produced a negative result.
+        let host = vec![i64::MAX, 1i64, 1i64];
+        let res = <i64 as ReduceScalar>::finalize(ReduceOp::Sum, DataType::Int64, &host);
+        match res {
+            Err(BoltError::Type(msg)) => {
+                assert!(
+                    msg.contains("SUM(integer) overflow"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected BoltError::Type on SUM overflow, got {other:?}"),
+        }
+    }
+
+    /// V-10: a normal in-range integer SUM still finalizes to the correct
+    /// (non-wrapped) total.
+    #[test]
+    fn i64_sum_finalize_in_range_is_correct() {
+        let host = vec![10i64, 20, 30, -5];
+        let res = <i64 as ReduceScalar>::finalize(ReduceOp::Sum, DataType::Int64, &host)
+            .expect("in-range SUM must succeed");
+        match res {
+            Scalar::I64(v) => assert_eq!(v, 55),
+            other => panic!("expected Scalar::I64, got {other:?}"),
+        }
     }
 
     /// `non_null_count_for_input` returns the count of non-null cells. This

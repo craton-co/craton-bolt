@@ -8,6 +8,7 @@
 use std::ffi::c_void;
 use std::ptr;
 
+use crate::cuda::buffer::{tag_stream_set, StreamSetRef};
 use crate::cuda::cuda_sys::{self, CUdeviceptr, CUstream};
 use crate::cuda::{GpuView, GpuViewMut};
 use crate::error::BoltResult;
@@ -130,9 +131,26 @@ unsafe impl Send for CudaStream {}
 ///
 /// The `'a` lifetime ties this struct to the borrowed views, so the underlying
 /// `GpuVec` cannot be dropped while a launch is in flight.
+///
+/// ## Stream-tagging is centralized here (review finding V-1)
+///
+/// In addition to each view's raw device pointer, this list retains the
+/// view's stream-set back-reference ([`StreamSetRef`]). The launch entry
+/// points ([`launch_1d`] / [`launch_with_geometry`]) walk those back-refs and
+/// tag the launch stream into every parent buffer's stream set *as part of
+/// issuing the launch* — so `GpuBuffer::Drop` fences the launch stream by
+/// construction, with no per-call-site `mark_launch_use` and no reliance on
+/// the post-launch `synchronize()` staying in place. See [`KernelArgs::tag_launch_stream`].
 pub struct KernelArgs<'a> {
     /// Device pointers, kept alive (and at stable addresses) for the launch.
     ptrs: Vec<CUdeviceptr>,
+    /// Parallel set of stream-set back-references, one per view pushed via
+    /// [`push_input`](Self::push_input) / [`push_output`](Self::push_output).
+    /// Null entries (views over empty/placeholder buffers) are retained too;
+    /// [`tag_stream_set`] no-ops on them. The launch entry points tag the
+    /// launch stream into each of these so the parent buffer's `Drop` fences
+    /// it — the single enforcement point for review finding V-1.
+    stream_sets: Vec<StreamSetRef>,
     /// Row count passed as the final `.u32` kernel parameter.
     ///
     /// Used by [`launch_1d`] only — kernels that take additional trailing
@@ -152,6 +170,7 @@ impl<'a> KernelArgs<'a> {
     pub fn new(n_rows: u32) -> Self {
         Self {
             ptrs: Vec::new(),
+            stream_sets: Vec::new(),
             n_rows,
             scalars: Vec::new(),
             _marker: std::marker::PhantomData,
@@ -165,6 +184,7 @@ impl<'a> KernelArgs<'a> {
     pub fn empty() -> Self {
         Self {
             ptrs: Vec::new(),
+            stream_sets: Vec::new(),
             n_rows: 0,
             scalars: Vec::new(),
             _marker: std::marker::PhantomData,
@@ -183,6 +203,12 @@ impl<'a> KernelArgs<'a> {
         'a: 'b,
     {
         self.ptrs.push(view.device_ptr());
+        // V-1: retain the parent buffer's stream-set back-reference alongside
+        // the bare pointer, so the launch entry point can tag the launch
+        // stream centrally (see `tag_launch_stream`). The `'a` borrow keeps
+        // the parent buffer alive for the whole launch, so this raw pointer
+        // stays valid until `KernelArgs` is dropped.
+        self.stream_sets.push(view.stream_set_ref());
     }
 
     /// Append an output column's device pointer to the arg list.
@@ -195,6 +221,11 @@ impl<'a> KernelArgs<'a> {
         'a: 'b,
     {
         self.ptrs.push(view.device_ptr());
+        // V-1: same central-tagging retention as `push_input`. The output
+        // view writes through the parent buffer, so its launch stream must be
+        // fenced at `Drop` too; retaining the back-ref lets the launch entry
+        // point tag it without a per-call-site `mark_launch_use`.
+        self.stream_sets.push(view.stream_set_ref());
     }
 
     /// Append a `u32` scalar to the arg list. Pushed after all device-ptr
@@ -202,17 +233,54 @@ impl<'a> KernelArgs<'a> {
     pub fn push_scalar_u32(&mut self, value: u32) {
         self.scalars.push(value);
     }
+
+    /// Tag `stream` into the stream set of every buffer whose view was pushed
+    /// into this arg list (review finding V-1).
+    ///
+    /// This is the single, central enforcement point that makes the
+    /// `StreamSet`/`Drop`-fence machinery sound *by construction*: once a
+    /// buffer's pointer has been forwarded into `cuLaunchKernel`, the launch
+    /// stream is recorded in that buffer's set, so `GpuBuffer::Drop` fences it
+    /// before the block returns to the pool — even if a future caller deletes
+    /// the post-launch `synchronize()`. Called by [`launch_1d`] and
+    /// [`launch_with_geometry`] right after enqueueing the kernel.
+    ///
+    /// Idempotent and cheap: the underlying `StreamSet` dedups, and null
+    /// back-refs (views over empty/placeholder buffers) are skipped by
+    /// [`tag_stream_set`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream forwarded, not deref'd
+    fn tag_launch_stream(&self, stream: CUstream) {
+        for &cell in &self.stream_sets {
+            // SAFETY: each `cell` was minted from a view whose `'a` borrow of
+            // the parent `GpuVec` outlives this `KernelArgs`, so the pointee
+            // is a live `RefCell<StreamSet>` for the whole launch. The cells
+            // belong to `!Sync` buffers touched only from this thread, and
+            // `tag_stream_set` null-checks before dereferencing.
+            unsafe { tag_stream_set(cell, stream) }
+        }
+    }
 }
 
 /// Launch with caller-controlled grid + block geometry and any number of
 /// trailing `u32` scalars (registered via
-/// [`KernelArgs::push_scalar_u32`]). Synchronizes the stream before
-/// returning.
+/// [`KernelArgs::push_scalar_u32`]).
 ///
 /// This is the entry point for kernels whose launch geometry isn't
 /// "one thread per row" — shared-memory GROUP BY, partition kernels,
 /// scatter, per-partition reduce — and which take more than one trailing
 /// scalar.
+///
+/// ## Stream-fence safety (review finding V-1)
+///
+/// After enqueueing the kernel this records the launch stream into every
+/// buffer whose view was pushed into `args` (via
+/// [`KernelArgs::tag_launch_stream`]). That is what keeps the
+/// [`GpuBuffer`](crate::cuda::buffer::GpuBuffer) `Drop`-fence sound: a buffer
+/// dropped while this kernel is still in flight will fence the launch stream
+/// before its block returns to the pool. The `synchronize()` below is a
+/// convenience (it makes results host-visible and turns the eventual `Drop`
+/// fence into a cheap no-op) — it is **no longer** the thing that makes the
+/// launch safe, so removing it would not reintroduce the use-after-free.
 #[tracing::instrument(
     name = "launch",
     level = "info",
@@ -252,12 +320,24 @@ pub fn launch_with_geometry(
         ))?;
     }
 
+    // V-1: now that every buffer pointer has been forwarded into the launch,
+    // record the launch stream in each parent buffer's stream set so its
+    // `Drop` fences this stream before recycling the block. This is the
+    // single enforcement point — it makes the safety hold even if the
+    // `synchronize()` below is ever removed.
+    args.tag_launch_stream(stream.raw());
+
     stream.synchronize()?;
     Ok(())
 }
 
 /// Launch the kernel with one thread per row, block size 256, on `stream`.
-/// Synchronizes before returning.
+///
+/// Like [`launch_with_geometry`], this records the launch stream into every
+/// buffer pushed into `args` after enqueueing the kernel (review finding
+/// V-1), so the [`GpuBuffer`](crate::cuda::buffer::GpuBuffer) `Drop` fence is
+/// sound by construction; the `synchronize()` before returning is a
+/// host-visibility/perf convenience, not the safety mechanism.
 #[tracing::instrument(
     name = "launch",
     level = "info",
@@ -294,6 +374,11 @@ pub fn launch_1d(
             ptr::null_mut(),
         ))?;
     }
+
+    // V-1: tag the launch stream into every buffer this launch touched (see
+    // `launch_with_geometry` for the rationale). Single enforcement point;
+    // does not depend on the `synchronize()` below staying in place.
+    args.tag_launch_stream(stream.raw());
 
     stream.synchronize()?;
     Ok(())

@@ -98,6 +98,27 @@ const PREDICATE_ENTRY: &str = "bolt_predicate";
 /// an adversarial preimage attack. The two-hash domain-separation byte
 /// (`0x01` vs `0x02`) makes the two streams independent enough that a
 /// 128-bit collision requires a simultaneous collision in both halves.
+///
+/// # Correctness invariant (finding V-15)
+///
+/// This key derives entirely from `format!("{:?}", spec)` (see
+/// [`ModuleCacheKey::new`]). Its correctness therefore rests on a single
+/// invariant:
+///
+/// > **distinct specs => distinct `Debug` output.**
+///
+/// The default, `#[derive(Debug)]`-generated formatting on the `KernelSpec`
+/// IR satisfies this because the derive emits every field and enum
+/// discriminant. **Do not** add a hand-written `Debug` impl to `KernelSpec`
+/// or any type it transitively contains that elides, abbreviates, or
+/// otherwise collapses a discriminating field (e.g. printing only a summary,
+/// hiding a "default" variant, or rounding a numeric literal). Two specs that
+/// differ only in an elided field would then format identically, hash to the
+/// same key, and the cache would silently serve the WRONG compiled
+/// `CudaModule` for one of them — a silent-wrong-result failure mode that no
+/// test of this module would catch. If a custom `Debug` is ever required for
+/// readability, route this cache key through a dedicated, exhaustive
+/// fingerprint instead of reusing `Debug`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ModuleCacheKey {
     /// Upper 64 bits of the 128-bit content hash (domain byte `0x01`).
@@ -2873,7 +2894,29 @@ pub(crate) fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<
                             if keys.is_null(i) {
                                 out.push(None);
                             } else {
-                                decode_into(&mut out, keys.value(i) as usize, sa);
+                                // Finding V-5: validate every key before it
+                                // indexes the dictionary. A negative or
+                                // out-of-range key would make `sa.value(..)`
+                                // panic on OOB inside `decode_into`. Reject it
+                                // with a clean error instead, mirroring the
+                                // strict bounds checks in `string_ops`.
+                                let key = keys.value(i);
+                                if key < 0 {
+                                    return Err(BoltError::Type(format!(
+                                        "register_table: negative dict<i32,utf8> key {} at row {}",
+                                        key, i
+                                    )));
+                                }
+                                let pos = key as usize;
+                                if pos >= sa.len() {
+                                    return Err(BoltError::Type(format!(
+                                        "register_table: dict<i32,utf8> key {} at row {} out of range (dictionary size {})",
+                                        key,
+                                        i,
+                                        sa.len()
+                                    )));
+                                }
+                                decode_into(&mut out, pos, sa);
                             }
                         }
                     }
@@ -2900,7 +2943,37 @@ pub(crate) fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<
                             if keys.is_null(i) {
                                 out.push(None);
                             } else {
-                                decode_into(&mut out, keys.value(i) as usize, sa);
+                                // Finding V-5: validate every key before it
+                                // indexes the dictionary. The original `as
+                                // usize` cast could feed a negative key (after
+                                // sign extension) or an out-of-range key to
+                                // `sa.value(..)`, panicking on OOB. Reject
+                                // negative, out-of-range, and (for parity with
+                                // the upload path's i32 device buffer) keys
+                                // above `i32::MAX`.
+                                let key = keys.value(i);
+                                if key < 0 {
+                                    return Err(BoltError::Type(format!(
+                                        "register_table: negative dict<i64,utf8> key {} at row {}",
+                                        key, i
+                                    )));
+                                }
+                                if key > i32::MAX as i64 {
+                                    return Err(BoltError::Type(format!(
+                                        "register_table: dict<i64,utf8> key {} at row {} exceeds i32 capacity",
+                                        key, i
+                                    )));
+                                }
+                                let pos = key as usize;
+                                if pos >= sa.len() {
+                                    return Err(BoltError::Type(format!(
+                                        "register_table: dict<i64,utf8> key {} at row {} out of range (dictionary size {})",
+                                        key,
+                                        i,
+                                        sa.len()
+                                    )));
+                                }
+                                decode_into(&mut out, pos, sa);
                             }
                         }
                     }

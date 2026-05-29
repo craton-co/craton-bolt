@@ -343,8 +343,38 @@ pub struct DiskPtxCache {
 impl DiskPtxCache {
     /// Open (creating if needed) a cache rooted at `dir`. Returns an
     /// error if the directory cannot be created.
+    ///
+    /// # Directory hardening (V-7)
+    ///
+    /// After `create_dir_all`, on Unix we tighten the root directory's
+    /// permissions to `0o700` (owner-only rwx) via
+    /// `PermissionsExt::set_mode`. The cache stores PTX that is read back
+    /// and *launched*, so a world-writable cache dir would let any local
+    /// user plant or tamper with kernels for another user; `0o700` makes
+    /// the directory owner the only writer (and reader), which is the real
+    /// integrity boundary for the on-disk cache.
+    ///
+    /// The `set_permissions` call is best-effort: if it fails (e.g. the
+    /// directory is owned by another user on a shared cache path) we do
+    /// **not** abort `open` — the cache stays usable and the worst case is
+    /// the pre-existing permissions, which is no worse than today. We only
+    /// propagate a hard error from `create_dir_all` itself.
+    ///
+    /// On Windows there is no portable `0o700` analogue in std; the
+    /// per-user `%LOCALAPPDATA%` default root already lives under the
+    /// user's profile ACL, so we leave permissions as created and note it
+    /// here. Tightening Windows ACLs would require the `windows`/`winapi`
+    /// crates, which the task budget excludes.
     pub fn open(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
+        // V-7: restrict the cache root to owner-only on Unix. Best-effort.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // 0o700 = rwx for owner, nothing for group/other.
+            let perms = std::fs::Permissions::from_mode(0o700);
+            let _ = fs::set_permissions(&dir, perms);
+        }
         Ok(Self {
             root: std::sync::Arc::new(dir),
         })
@@ -356,14 +386,25 @@ impl DiskPtxCache {
         self.root.as_path()
     }
 
-    /// Compose the on-disk path for a given content-hash key.
-    /// `key` should be a printable identifier (typically a hex digest
-    /// of the spec hash); we sanitise nothing because the caller is
-    /// expected to hand us a hex string.
-    fn entry_path(&self, key: &str) -> PathBuf {
+    /// Compose the on-disk path for a given content-hash key, validating
+    /// the key first (fixes V-3, path traversal).
+    ///
+    /// Returns `Some(path)` only when `key` passes [`valid_key`] — a
+    /// strict filename-safe charset with no path separators, no `..`, and
+    /// no NUL. Returns `None` for any key that could escape the cache
+    /// root; callers turn that into a cache miss / store no-op.
+    ///
+    /// We validate here (rather than trusting the upstream key composer)
+    /// because the key-composition helpers are `pub(crate)` and
+    /// contractually accept arbitrary `entry` strings — the trust boundary
+    /// is the moment the string becomes a filename, which is right here.
+    fn entry_path(&self, key: &str) -> Option<PathBuf> {
+        if !valid_key(key) {
+            return None;
+        }
         let mut p = (*self.root).clone();
         p.push(format!("{key}.ptx"));
-        p
+        Some(p)
     }
 
     /// Look up `key` on disk. Returns `Some(ptx_text)` on a hit,
@@ -374,20 +415,44 @@ impl DiskPtxCache {
     ///
     /// # Freshness (JIT-M1)
     ///
-    /// This deliberately returns the on-disk bytes *verbatim* with no
-    /// content re-validation (unlike the in-process PTX-text-hash
-    /// cache). Freshness across binary/codegen changes is guaranteed
-    /// upstream by the codegen-version salt folded into the key (see
-    /// [`codegen_salt`] / [`disk_key`]): when PTX emission changes,
-    /// [`CODEGEN_VERSION`] (or the crate version) is bumped, the `key`
-    /// rotates, and a stale entry written by the old binary simply
-    /// misses here rather than being served as wrong PTX.
+    /// Freshness across binary/codegen changes is guaranteed upstream by
+    /// the codegen-version salt folded into the key (see [`codegen_salt`]
+    /// / [`disk_key`]): when PTX emission changes, [`CODEGEN_VERSION`] (or
+    /// the crate version) is bumped, the `key` rotates, and a stale entry
+    /// written by the old binary simply misses here rather than being
+    /// served as wrong PTX.
+    ///
+    /// # Path-traversal hardening (V-3)
+    ///
+    /// An invalid `key` (one that could escape the cache root — see
+    /// [`valid_key`]) is treated as an immediate miss:
+    /// [`Self::entry_path`] returns `None` and we never touch the
+    /// filesystem with an unsanitised path.
+    ///
+    /// # Content-integrity check (V-7)
+    ///
+    /// The cache file carries a `#bolt-ptx-cache v1 <digest>` header line
+    /// (see [`CACHE_HEADER_MAGIC`]). We parse that header, recompute
+    /// [`body_digest`] over the body, and return the body **only** if the
+    /// digests match. This catches accidental corruption / partial writes
+    /// and trips on naive tampering. A file with no/old/garbled header
+    /// (e.g. a raw-PTX entry from an older binary, or a digest mismatch)
+    /// is treated as a miss so the caller recompiles and rewrites it in
+    /// the current format. See [`Self::store`] for the write side.
     #[must_use]
     pub fn lookup(&self, key: &str) -> Option<String> {
-        match fs::read_to_string(self.entry_path(key)) {
-            Ok(s) => Some(s),
-            Err(_) => None,
+        // V-3: refuse to read through an unsanitised key.
+        let path = self.entry_path(key)?;
+        let raw = fs::read_to_string(path).ok()?;
+        // V-7: require a well-formed integrity header, else miss.
+        let (header_line, body) = split_header(&raw)?;
+        let stored_digest = header_line.strip_prefix(CACHE_HEADER_MAGIC)?.trim();
+        if stored_digest != body_digest(body) {
+            // Corrupt or tampered body -> treat as a miss so the caller
+            // recompiles rather than launching untrusted PTX.
+            return None;
         }
+        Some(body.to_string())
     }
 
     /// Persist `ptx` under `key` using a tempfile-then-rename to keep
@@ -405,8 +470,31 @@ impl DiskPtxCache {
     /// returned `Ok(())` when the content already landed at the target;
     /// no such fallback was implemented, so the doc is corrected here to
     /// match the actual propagate-the-error behavior.)
+    ///
+    /// # Path-traversal hardening (V-3)
+    ///
+    /// An invalid `key` (see [`valid_key`]) is a silent no-op: we return
+    /// `Ok(())` without writing anything, so a traversal key can never
+    /// clobber a file outside the cache root. `Ok(())` (rather than `Err`)
+    /// keeps the best-effort contract — a refused store is indistinguishable
+    /// to the caller from a successful one that a future process simply
+    /// won't find.
+    ///
+    /// # Content-integrity header (V-7)
+    ///
+    /// The file is written as a `#bolt-ptx-cache v1 <digest>\n` header line
+    /// (the digest of `ptx` per [`body_digest`]) followed by the verbatim
+    /// PTX body, so [`Self::lookup`] can verify the body on read.
     pub fn store(&self, key: &str, ptx: &str) -> io::Result<()> {
-        let target = self.entry_path(key);
+        // V-3: refuse to write through an unsanitised key. Best-effort
+        // contract: a refused store is a silent no-op, not an error.
+        let Some(target) = self.entry_path(key) else {
+            return Ok(());
+        };
+        // V-7: prepend the integrity header. `body_digest` is computed over
+        // the body only, so the header line is self-describing and `lookup`
+        // re-derives the same digest from the bytes after the first `\n`.
+        let contents = format!("{}{}\n{}", CACHE_HEADER_MAGIC, body_digest(ptx), ptx);
         // Tempfile name: same directory, suffixed with the OS PID and a
         // process-monotonic counter so concurrent writers in the same
         // process don't collide. We use a counter (not a random number)
@@ -416,8 +504,8 @@ impl DiskPtxCache {
         let mut tmp = (*self.root).clone();
         let pid = std::process::id();
         tmp.push(format!("{key}.ptx.tmp.{pid}.{suffix}"));
-        // Write the full body to the tempfile first.
-        fs::write(&tmp, ptx)?;
+        // Write the full header+body to the tempfile first.
+        fs::write(&tmp, &contents)?;
         // Atomic rename. On Windows `fs::rename` already implements
         // `MOVEFILE_REPLACE_EXISTING` semantics in stable std.
         match fs::rename(&tmp, &target) {
@@ -451,6 +539,143 @@ fn next_temp_suffix() -> u64 {
 #[must_use]
 pub fn hash_to_key(hi: u64, lo: u64) -> String {
     format!("{:016x}{:016x}", hi, lo)
+}
+
+/// Validate that `key` is a safe single path component (fixes V-3,
+/// path traversal).
+///
+/// # Why this exists (V-3, HIGH — path traversal)
+///
+/// [`DiskPtxCache::entry_path`] historically interpolated the caller's
+/// `key` straight into `root.join(format!("{key}.ptx"))` with **zero
+/// sanitisation** (the old doc-comment even said so). But the key is
+/// composed upstream by `pub(crate)` helpers
+/// ([`disk_key`] here, `compose_disk_key` in
+/// `exec::module_cache`) that contractually accept *arbitrary* `entry`
+/// strings — and the entry symbol ultimately traces back to planner IR.
+/// A `key` containing a path separator (`/` or `\`), a parent-dir
+/// component (`..`), a NUL byte, or an absolute-looking prefix (a leading
+/// `/`, or a Windows drive like `C:`) would let the composed path escape
+/// the cache root. The blast radius is severe in both directions:
+///
+///   * **Arbitrary read** — `lookup` does `fs::read_to_string(path)` and
+///     the returned text is assembled by `CudaModule::from_ptx` and
+///     *launched as PTX*. A traversal key could exfiltrate an arbitrary
+///     file's contents into a kernel.
+///   * **Arbitrary write** — `store` does `fs::write` + `fs::rename`, so a
+///     traversal key could clobber an arbitrary file the process can
+///     write.
+///
+/// # Contract
+///
+/// We refuse to trust the caller and validate the key *independent of
+/// caller trust* right where it becomes a filename. A key is accepted
+/// **iff** it is non-empty and every byte is in the strict filename-safe
+/// charset `^[0-9A-Za-z._-]+$`. That charset:
+///
+///   * contains no path separators (`/`, `\`), so the key can never name a
+///     subdirectory or escape via a separator;
+///   * contains no `:` (NTFS alternate-data-stream / drive-letter syntax
+///     on Windows) — this is *why* the `exec::module_cache` family
+///     prefixes use `__` rather than `::` as their separator (see V-3
+///     note on `SCALAR_AGG_DISK_PREFIX`);
+///   * contains no NUL or other control bytes;
+///   * cannot equal `.` or `..` *as a whole component*, because while `.`
+///     and `-` are allowed bytes, the produced on-disk name is always
+///     `"{key}.ptx"` — never a bare `.`/`..` — AND we additionally reject
+///     a key that is exactly `.` or `..` (or any all-dots run) below as
+///     defence in depth.
+///
+/// All legitimate keys pass: the codegen salt (`cg1-v0.7.0` →
+/// `[0-9A-Za-z.-]`), the family prefixes (`scalar_agg__` etc. →
+/// `[a-z_]`), the entry symbols (`bolt_*` → `[a-z0-9_]`), and the 32-char
+/// lowercase hex content hash.
+///
+/// On an invalid key the cache treats the operation as a **miss**
+/// (`lookup` → `None`) or a **no-op** (`store` → silently does nothing):
+/// the cache is best-effort, so we never panic and never fall back to an
+/// unsanitised path.
+#[must_use]
+pub(crate) fn valid_key(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    // Defence in depth: reject a key that is entirely dots (`.`, `..`,
+    // `...`). None of these is a legitimate cache key, and `..` is the
+    // canonical traversal token.
+    if key.bytes().all(|b| b == b'.') {
+        return false;
+    }
+    key.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// Compute the content-integrity digest of a PTX body (fixes V-7).
+///
+/// Returns a fixed-width 32-char lowercase hex string — the same shape as
+/// [`hash_to_key`] — derived from the body via two domain-separated
+/// `DefaultHasher` instances packed into 128 bits. This deliberately
+/// reuses the crate's existing `DefaultHasher`-based 128-bit hashing
+/// convention (the same shape `exec::module_cache::hash128` and the
+/// `ModuleCacheKey` use for content keys) so we pull in **no new
+/// dependency** for a hash.
+///
+/// This is NOT a cryptographic MAC — the cache file and any future header
+/// live in the same attacker-writable directory, so a determined attacker
+/// who can write the cache dir can also recompute and rewrite the digest.
+/// Its purpose is *integrity against accidental corruption and partial
+/// writes*, and a tripwire against naive tampering, consistent with the
+/// best-effort threat model of an opt-in build cache (the real
+/// confidentiality/integrity boundary for V-7 is the 0o700 dir perms on
+/// Unix; see [`DiskPtxCache::open`]).
+#[must_use]
+fn body_digest(body: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+
+    // Domain bytes (0xD1 / 0xD2) distinct from the key-hash domains used in
+    // `exec::module_cache` so a digest can never be confused with a key.
+    let mut hi = DefaultHasher::new();
+    hi.write_u8(0xD1);
+    hi.write(body.as_bytes());
+
+    let mut lo = DefaultHasher::new();
+    lo.write_u8(0xD2);
+    lo.write(body.as_bytes());
+
+    hash_to_key(hi.finish(), lo.finish())
+}
+
+/// Header-line prefix written ahead of the PTX body in every cache file
+/// (V-7 content-integrity check).
+///
+/// Format of a v0.7-and-later cache file:
+/// ```text
+/// #bolt-ptx-cache v1 <32-char-hex-digest>\n
+/// <ptx body bytes...>
+/// ```
+/// The header is a single `\n`-terminated line. On lookup we parse the
+/// first line, recompute [`body_digest`] over everything after it, and
+/// serve the body only if the digests match. The format is
+/// **backward-tolerant**: a file whose first line is not a well-formed
+/// header (e.g. an entry written by an older binary, which is just raw
+/// PTX) is treated as a **miss** rather than served unchecked — the old
+/// raw entry simply gets recompiled and rewritten in the new format.
+const CACHE_HEADER_MAGIC: &str = "#bolt-ptx-cache v1 ";
+
+/// Split a cache-file's contents into `(header_line, body)` (V-7).
+///
+/// The header is the first `\n`-terminated line; the body is everything
+/// after that newline. Returns `None` when there is no newline at all
+/// (a degenerate/old file with no header line) so the caller treats it as
+/// a miss. The header line is returned WITHOUT its trailing `\n`; the body
+/// is returned verbatim (so a round-trip of `store` → `lookup` reproduces
+/// the original PTX byte-for-byte).
+fn split_header(raw: &str) -> Option<(&str, &str)> {
+    let nl = raw.find('\n')?;
+    let header = &raw[..nl];
+    let body = &raw[nl + 1..];
+    Some((header, body))
 }
 
 // ---------------------------------------------------------------------------
@@ -710,5 +935,162 @@ mod tests {
         if let Some(v) = prev_env {
             std::env::set_var(DISK_PTX_CACHE_ENV, v);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // V-3: path-traversal hardening.
+    // -----------------------------------------------------------------
+
+    /// `valid_key` must reject every shape that could escape the cache
+    /// root and accept the legitimate filename-safe shapes.
+    #[test]
+    fn valid_key_rejects_traversal_and_accepts_safe() {
+        // Traversal / separator / absolute / NUL / empty — all rejected.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "...",
+            "../../evil",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "C:\\windows\\system32",
+            "a:b",            // Windows ADS / drive separator
+            "a\0b",           // embedded NUL
+            "foo bar",        // space
+            "scalar_agg::x",  // the old `::` separator must NOT pass
+        ] {
+            assert!(!valid_key(bad), "key must be rejected: {bad:?}");
+        }
+        // Legitimate shapes — accepted.
+        for good in [
+            "abc",
+            "deadbeef",
+            "cg1-v0.7.0-scalar_agg__bolt_reduce-00112233445566778899aabbccddeeff",
+            hash_to_key(0xdead_beef, 0xcafe_babe).as_str(),
+            "a.b_c-d",
+        ] {
+            assert!(valid_key(good), "key must be accepted: {good:?}");
+        }
+    }
+
+    /// A traversal key must produce no on-disk path: `lookup` misses and
+    /// `store` is a no-op that writes nothing anywhere (not under the root,
+    /// and crucially not outside it).
+    #[test]
+    fn traversal_key_is_lookup_miss_and_store_noop() {
+        let dir = fresh_tempdir("traversal");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+
+        for bad in ["../../evil", "a/b", "a\\b", "..", "/abs"] {
+            // Lookup must be a miss, never an out-of-root read.
+            assert!(cache.lookup(bad).is_none(), "lookup must miss for {bad:?}");
+            // Store must be a silent no-op (Ok, but nothing written).
+            assert!(cache.store(bad, "payload").is_ok(), "store must be Ok no-op for {bad:?}");
+        }
+        // Nothing — no .ptx, no .tmp — landed in the cache root.
+        let mut any = false;
+        for entry in fs::read_dir(&dir).expect("readdir") {
+            let _ = entry.expect("dirent");
+            any = true;
+        }
+        assert!(!any, "traversal store must not create any file in the cache root");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A normal hex key still round-trips after the validation gate.
+    #[test]
+    fn normal_hex_key_still_round_trips_after_validation() {
+        let dir = fresh_tempdir("validrt");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let key = hash_to_key(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        let ptx = ".version 7.0\n.target sm_70\n";
+        cache.store(&key, ptx).expect("store");
+        assert_eq!(cache.lookup(&key).as_deref(), Some(ptx));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // V-7: content-integrity check + header round-trip.
+    // -----------------------------------------------------------------
+
+    /// Round-trip: a stored entry carries the integrity header on disk and
+    /// `lookup` returns the exact body (header stripped).
+    #[test]
+    fn store_writes_header_and_lookup_strips_it() {
+        let dir = fresh_tempdir("v7header");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let key = hash_to_key(1, 1);
+        let ptx = "// body\n.version 7.0\n";
+        cache.store(&key, ptx).expect("store");
+
+        // On disk the file begins with the magic header line.
+        let on_disk = fs::read_to_string(dir.join(format!("{key}.ptx"))).expect("read raw");
+        assert!(
+            on_disk.starts_with(CACHE_HEADER_MAGIC),
+            "cache file must begin with the integrity header"
+        );
+        // lookup hands back the body verbatim, header stripped.
+        assert_eq!(cache.lookup(&key).as_deref(), Some(ptx));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A tampered body (digest no longer matches the header) must be a
+    /// miss so the caller recompiles rather than launching altered PTX.
+    #[test]
+    fn tampered_body_is_a_miss() {
+        let dir = fresh_tempdir("v7tamper");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let key = hash_to_key(2, 2);
+        cache.store(&key, "original").expect("store");
+
+        // Rewrite the file keeping the (now-stale) header line but
+        // swapping the body. The recomputed digest won't match.
+        let p = dir.join(format!("{key}.ptx"));
+        let raw = fs::read_to_string(&p).expect("read");
+        let header_line = raw.split('\n').next().expect("header");
+        fs::write(&p, format!("{header_line}\nEVIL PAYLOAD")).expect("tamper");
+
+        assert!(cache.lookup(&key).is_none(), "tampered body must miss");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy/headerless raw-PTX file (as an older binary would have
+    /// written) is treated as a miss rather than served unchecked.
+    #[test]
+    fn headerless_legacy_entry_is_a_miss() {
+        let dir = fresh_tempdir("v7legacy");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let key = hash_to_key(3, 3);
+        // No header, no newline at all -> split_header returns None -> miss.
+        fs::write(dir.join(format!("{key}.ptx")), "raw legacy ptx with no header").expect("write");
+        assert!(cache.lookup(&key).is_none(), "headerless entry must miss");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `body_digest` is deterministic and content-sensitive: identical
+    /// bodies hash equal, different bodies (almost surely) differ.
+    #[test]
+    fn body_digest_is_deterministic_and_content_sensitive() {
+        assert_eq!(body_digest("abc"), body_digest("abc"));
+        assert_ne!(body_digest("abc"), body_digest("abd"));
+        assert_eq!(body_digest("abc").len(), 32);
+    }
+
+    /// V-7 (Unix only): the cache root is created with owner-only `0o700`
+    /// permissions. Gated to `cfg(unix)` because Windows has no portable
+    /// std equivalent (see [`DiskPtxCache::open`]).
+    #[cfg(unix)]
+    #[test]
+    fn open_sets_owner_only_perms_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_tempdir("v7perms");
+        let _cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let mode = fs::metadata(&dir).expect("metadata").permissions().mode();
+        // Compare the low 9 permission bits; the file-type bits above are
+        // irrelevant here.
+        assert_eq!(mode & 0o777, 0o700, "cache root must be owner-only (0o700)");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

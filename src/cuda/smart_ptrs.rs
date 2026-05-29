@@ -212,6 +212,15 @@ impl<T: Pod> GpuVec<T> {
     pub fn to_pinned_async(&self, stream: CUstream) -> BoltResult<PinnedHostBuffer<T>> {
         let mut pinned = PinnedHostBuffer::<T>::new(self.len())?;
         self.buffer.copy_to_slice_async(pinned.as_mut_slice(), stream)?;
+        // V-2: the pinned buffer is the *host* destination of this async D2H,
+        // so its page-locked pages are read/written by `stream` until the copy
+        // completes. Record the stream in the pinned buffer's `StreamSet` so
+        // its `Drop` fences `stream` before `cuMemFreeHost` — otherwise an
+        // in-flight DMA could land in freed pages (host-side use-after-free).
+        // (The `GpuBuffer` source is tagged separately by
+        // `copy_to_slice_async`.) `mark_stream_use` dedups, so multi-stream
+        // reuse of the same pinned buffer accumulates rather than clobbers.
+        pinned.mark_stream_use(stream);
         Ok(pinned)
     }
 }
@@ -289,6 +298,19 @@ impl<'a, T: Pod> GpuView<'a, T> {
         // null-checks and only mutates a `!Sync` cell from this one thread.
         unsafe { tag_stream_set(self.streams, stream) }
     }
+
+    /// Hand the parent buffer's stream-set back-reference to the launch glue
+    /// so it can centrally tag the launch stream at `cuLaunchKernel` time
+    /// (review finding V-1). This is the same `StreamSetRef` that backs
+    /// [`mark_launch_use`](Self::mark_launch_use); exposing it lets
+    /// [`KernelArgs::push_input`](crate::exec::launch::KernelArgs::push_input)
+    /// retain it after the view's device pointer has been copied out, so the
+    /// launch entry point — not every one of the ~250 call sites — becomes
+    /// the single tagging point. Crate-internal; never handed to FFI.
+    #[inline]
+    pub(crate) fn stream_set_ref(&self) -> StreamSetRef {
+        self.streams
+    }
 }
 
 // SAFETY: a `GpuView` is a device pointer, a length, and a raw back-pointer
@@ -357,6 +379,16 @@ impl<'a, T: Pod> GpuViewMut<'a, T> {
         // life; `tag_stream_set` null-checks and only touches a `!Sync`
         // cell on this thread.
         unsafe { tag_stream_set(self.streams, stream) }
+    }
+
+    /// Mutable-view counterpart to [`GpuView::stream_set_ref`]: hand the
+    /// parent buffer's stream-set back-reference to the launch glue so
+    /// [`KernelArgs::push_output`](crate::exec::launch::KernelArgs::push_output)
+    /// can retain it and the launch entry point can centrally tag the launch
+    /// stream (review finding V-1). Crate-internal; never handed to FFI.
+    #[inline]
+    pub(crate) fn stream_set_ref(&self) -> StreamSetRef {
+        self.streams
     }
 
     /// Re-borrow the exclusive view as a shared view for the remaining scope.

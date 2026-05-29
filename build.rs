@@ -28,6 +28,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
     // Check CUDA_PATH environment variable first.
+    //
+    // V-16: CUDA_PATH is a TRUSTED build-environment input. We use it verbatim
+    // to add a linker search path (`-L`), which is the standard contract for
+    // `*-sys` crates. Pointing CUDA_PATH at an attacker-controlled directory
+    // is equivalent to build-host compromise (it can make the linker pick up
+    // malicious import libraries), so we do not attempt to sandbox or validate
+    // it beyond the exists() gating below — securing the build environment is a
+    // prerequisite, not something build.rs can enforce.
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let path = std::path::PathBuf::from(cuda_path);
         if cfg!(target_os = "windows") {
@@ -53,13 +61,31 @@ fn main() {
         if cfg!(target_os = "windows") {
             // Check default installation directory structure.
             // On Windows, the standard path is C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\vX.Y\lib\x64.
-            // Collect all matching entries and sort by name descending so the
+            // Collect all matching entries and sort by version descending so the
             // highest-version install (e.g. v12.6 beats v12.4 beats v11.8) wins.
+            //
+            // V-16: parse the "vMAJOR.MINOR" directory name into numeric
+            // (major, minor) and sort by that, NOT lexicographically. A plain
+            // string sort puts "v9.0" above "v12.0" (because '9' > '1'),
+            // selecting an older CUDA. Directories that don't parse sort lowest
+            // ((0, 0)) rather than panicking, preserving the exists()-gating
+            // behavior below.
+            fn parse_cuda_version(name: &std::ffi::OsStr) -> (u32, u32) {
+                let s = name.to_string_lossy();
+                let digits = s.strip_prefix('v').unwrap_or(&s);
+                let mut parts = digits.split('.');
+                let major = parts.next().and_then(|p| p.parse::<u32>().ok());
+                let minor = parts.next().and_then(|p| p.parse::<u32>().ok());
+                match major {
+                    Some(major) => (major, minor.unwrap_or(0)),
+                    None => (0, 0),
+                }
+            }
             let base_dir = std::path::Path::new(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
             if base_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(base_dir) {
                     let mut entries: Vec<_> = entries.flatten().collect();
-                    entries.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
+                    entries.sort_by_key(|b| std::cmp::Reverse(parse_cuda_version(&b.file_name())));
                     for entry in entries {
                         let path = entry.path();
                         let lib_path = path.join("lib").join("x64");
@@ -102,6 +128,25 @@ fn main() {
 // (the host code under `#[cfg(not(feature = "rust-cuda"))]` never reads it
 // — see src/jit/partition_kernel.rs).
 
+// ===========================================================================
+// V-4 (HIGH) — SECURITY NOTE: build-time network fetch + external toolchain.
+// ===========================================================================
+//
+// Enabling `--features rust-cuda` makes cuda_builder / rustc_codegen_nvvm
+// DOWNLOAD and UNPACK an LLVM/libNVVM toolchain at build time and then RUN it
+// as a codegen plugin during this build. There is currently NO in-repo
+// integrity verification (no pinned checksum / signature) of the fetched
+// toolchain — trusting it is equivalent to trusting whatever the upstream
+// crate's downloader pulls onto the build host.
+//
+// This feature is intentionally OFF BY DEFAULT. Build it only on:
+//   * network-isolated / egress-controlled CI runners, AND
+//   * runners where the NVVM/LLVM toolchain artifacts are pre-pinned (vendored
+//     or fetched from a checksum-verified internal mirror).
+//
+// Do NOT enable rust-cuda on developer laptops or shared CI without the above.
+// Re-architecting the download to add integrity checks is tracked separately;
+// this comment is the documented hardening guidance (see ci.yml V-4 note).
 #[cfg(feature = "rust-cuda")]
 fn compile_rust_cuda_kernels() {
     use cuda_builder::{CudaBuilder, NvvmArch};

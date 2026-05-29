@@ -357,7 +357,8 @@ impl<K: CacheKey> SpecCache<K> {
 ///   difference is that path has no per-family `disk_prefix`.
 /// * The `{disk_prefix}{entry}-{hex(hash128)}` tail is the historical
 ///   domain-separated shape, preserved byte-for-byte: the prefix distinguishes
-///   kernel families (`scalar_agg::`, `hash_join::`, …), `entry` distinguishes
+///   kernel families (`scalar_agg__`, `hash_join__`, …; V-3: `__` not `::`,
+///   so composed keys stay inside the filename-safe charset), `entry` distinguishes
 ///   symbols, and the spec hash distinguishes IR. Only the salt is prepended.
 ///
 /// The disk key string is internal to [`get_or_build_with_disk`]; no other
@@ -570,7 +571,7 @@ where
 //
 // This layer keys on the `ScalarAggSpec` IR itself (a `(op, dtype)` pair),
 // uses the same 128-bit content-hash shape as `KernelSpecKey`, and stamps
-// the disk-cache key with a `"scalar_agg::"` prefix so a hand inspection of
+// the disk-cache key with a `"scalar_agg__"` prefix so a hand inspection of
 // the cache directory shows immediately which family produced each entry.
 // The in-memory cache is independent from `KERNELSPEC_CACHE` — splitting them
 // keeps the FIFO eviction policies of the two families from competing.
@@ -631,7 +632,20 @@ static SCALARAGG_CACHE: Lazy<Mutex<ScalarAggCache>> =
 /// which kernel family produced each `.ptx` file, and so the projection
 /// path's `<entry>-<hex>` shape can't ever collide with a scalar-aggregate
 /// entry (different prefix string, different overall key shape).
-pub(crate) const SCALAR_AGG_DISK_PREFIX: &str = "scalar_agg::";
+///
+/// V-3 (path-traversal hardening): the separator is `__` (double
+/// underscore), NOT `::`. The disk-cache layer now validates every key
+/// against a strict filename-safe charset (`^[0-9A-Za-z._-]+$`, see
+/// `jit::disk_cache::valid_key`) and rejects anything else as a cache
+/// miss / store no-op. A `:` is not in that charset (and is actively
+/// dangerous on Windows — drive-letter / NTFS alternate-data-stream
+/// syntax), so a `::`-separated prefix would make every scalar-agg entry
+/// fail validation and silently disable this family's disk cache. `__`
+/// keeps the directory listing just as human-greppable while staying
+/// inside the allowed charset. Changing the separator rotates the on-disk
+/// key shape, which is harmless: stale `::` entries (if any) simply miss
+/// and codegen re-runs (same contract as the codegen salt).
+pub(crate) const SCALAR_AGG_DISK_PREFIX: &str = "scalar_agg__";
 
 /// Test- and observability-facing snapshot of `(hits, misses)` for the
 /// ScalarAggSpec cache. Parallel to [`kernelspec_cache_stats`].
@@ -659,7 +673,7 @@ pub fn scalar_agg_cache_stats() -> (usize, usize) {
 /// or builder override), a miss in the in-memory cache consults the disk
 /// cache *before* paying the codegen cost. The disk key is composed as
 /// `"{codegen_salt}-{SCALAR_AGG_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
-///   1. The `"scalar_agg::"` prefix domain-separates these entries from the
+///   1. The `"scalar_agg__"` prefix domain-separates these entries from the
 ///      projection-path entries that share the disk directory.
 ///   2. The `entry` suffix distinguishes `bolt_reduce` from `bolt_avg_reduce`.
 ///   3. The 128-bit hex content hash makes the key collision-resistant
@@ -702,7 +716,7 @@ where
 // existing [`CudaModule::from_ptx`] pipeline.
 //
 // As with `ScalarAggSpec`, we domain-separate the disk-cache key with a
-// `"hash_join::"` prefix so a hand inspection of the cache directory shows
+// `"hash_join__"` prefix so a hand inspection of the cache directory shows
 // immediately which family produced each entry, and we keep the in-memory
 // cache independent from `KERNELSPEC_CACHE` / `SCALARAGG_CACHE` so the FIFO
 // eviction policies of the three families don't compete.
@@ -764,7 +778,11 @@ static HASHJOIN_CACHE: Lazy<Mutex<HashJoinCache>> =
 /// kernel family produced each `.ptx` file, and so the projection /
 /// scalar-aggregate paths' key shapes can't ever collide with a hash-join
 /// entry.
-pub(crate) const HASH_JOIN_DISK_PREFIX: &str = "hash_join::";
+///
+/// V-3: `__` separator (not `::`) — see [`SCALAR_AGG_DISK_PREFIX`] for the
+/// path-traversal-hardening rationale (`:` is outside the validated
+/// filename-safe charset).
+pub(crate) const HASH_JOIN_DISK_PREFIX: &str = "hash_join__";
 
 /// Test- and observability-facing snapshot of `(hits, misses)` for the
 /// HashJoinKernelSpec cache. Parallel to [`scalar_agg_cache_stats`].
@@ -791,7 +809,7 @@ pub fn hash_join_cache_stats() -> (usize, usize) {
 /// or builder override), a miss in the in-memory cache consults the disk
 /// cache *before* paying the codegen cost. The disk key is composed as
 /// `"{codegen_salt}-{HASH_JOIN_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
-///   1. The `"hash_join::"` prefix domain-separates these entries from the
+///   1. The `"hash_join__"` prefix domain-separates these entries from the
 ///      projection-path and scalar-aggregate entries sharing the directory.
 ///   2. The `entry` suffix distinguishes `bolt_build`, `bolt_probe`,
 ///      `bolt_build_aos`, `bolt_string_hash`, etc.
@@ -834,7 +852,7 @@ where
 // resulting PTX through the existing [`CudaModule::from_ptx`] pipeline.
 //
 // As with the sibling caches, we domain-separate the disk-cache key with
-// a `"radix_sort::"` prefix so a hand inspection of the cache directory
+// a `"radix_sort__"` prefix so a hand inspection of the cache directory
 // shows immediately which family produced each entry, and we keep the
 // in-memory cache independent from `KERNELSPEC_CACHE` / `SCALARAGG_CACHE`
 // / `HASHJOIN_CACHE` so the FIFO eviction policies of the four families
@@ -913,7 +931,11 @@ static RADIXSORT_CACHE: Lazy<Mutex<RadixSortCache>> =
 /// kernel family produced each `.ptx` file, and so the projection /
 /// scalar-aggregate / hash-join paths' key shapes can't ever collide with
 /// a radix-sort entry.
-pub(crate) const RADIX_SORT_DISK_PREFIX: &str = "radix_sort::";
+///
+/// V-3: `__` separator (not `::`) — see [`SCALAR_AGG_DISK_PREFIX`] for the
+/// path-traversal-hardening rationale (`:` is outside the validated
+/// filename-safe charset).
+pub(crate) const RADIX_SORT_DISK_PREFIX: &str = "radix_sort__";
 
 /// Test- and observability-facing snapshot of `(hits, misses)` for the
 /// RadixSortKernelSpec cache. Parallel to [`hash_join_cache_stats`].
@@ -940,7 +962,7 @@ pub fn radix_sort_cache_stats() -> (usize, usize) {
 /// or builder override), a miss in the in-memory cache consults the disk
 /// cache *before* paying the codegen cost. The disk key is composed as
 /// `"{codegen_salt}-{RADIX_SORT_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
-///   1. The `"radix_sort::"` prefix domain-separates these entries from
+///   1. The `"radix_sort__"` prefix domain-separates these entries from
 ///      the projection-path, scalar-aggregate, and hash-join entries that
 ///      share the disk directory.
 ///   2. The `entry` suffix distinguishes
@@ -1029,7 +1051,11 @@ const COMPACTION_CACHE_CAP: usize = 64;
 /// and so the projection / scalar-aggregate / hash-join /
 /// radix-sort paths' key shapes can't ever collide with a compaction
 /// entry.
-pub(crate) const COMPACTION_DISK_PREFIX: &str = "compaction::";
+///
+/// V-3: `__` separator (not `::`) — see [`SCALAR_AGG_DISK_PREFIX`] for the
+/// path-traversal-hardening rationale (`:` is outside the validated
+/// filename-safe charset).
+pub(crate) const COMPACTION_DISK_PREFIX: &str = "compaction__";
 
 /// 128-bit content fingerprint of a `CompactionKernelSpec` plus its
 /// entry-point tag. Domain bytes `0x41` / `0x42` distinguish this
@@ -1108,7 +1134,7 @@ pub fn compaction_cache_stats() -> (usize, usize) {
 /// cache consults the disk cache *before* paying the codegen cost. The
 /// disk key is composed as
 /// `"{codegen_salt}-{COMPACTION_DISK_PREFIX}{entry}-{hex(hash128)}"`; the
-/// `"compaction::"` prefix keeps these entries human-greppable in a
+/// `"compaction__"` prefix keeps these entries human-greppable in a
 /// shared cache directory.
 ///
 /// # Concurrency
@@ -1705,13 +1731,19 @@ mod scalar_agg_cache_tests {
         );
     }
 
-    /// The disk-cache key prefix must start with `"scalar_agg::"` so a
+    /// The disk-cache key prefix must start with `"scalar_agg__"` so a
     /// hand inspection of the cache directory distinguishes scalar-agg
     /// entries from projection-path entries. Pins the prefix contract
     /// against accidental drift.
+    ///
+    /// V-3: the separator is `__` (not `::`) so the composed key stays
+    /// inside the filename-safe charset enforced by
+    /// `jit::disk_cache::valid_key`; this test also asserts the composed
+    /// key passes that validator (otherwise the family's disk cache would
+    /// silently be a no-op).
     #[test]
     fn scalar_agg_disk_prefix_is_visibly_namespaced() {
-        assert_eq!(SCALAR_AGG_DISK_PREFIX, "scalar_agg::");
+        assert_eq!(SCALAR_AGG_DISK_PREFIX, "scalar_agg__");
         // The full disk key shape is now `"{codegen_salt}-{PREFIX}{entry}-{hex}"`
         // (JIT-M1 salt prepended). Confirm the family prefix lands immediately
         // after the salt so a hand inspection of the cache dir still
@@ -1719,8 +1751,14 @@ mod scalar_agg_cache_tests {
         let salt = crate::jit::disk_cache::codegen_salt();
         let composed = compose_disk_key(SCALAR_AGG_DISK_PREFIX, "bolt_reduce", 0xdead_beef, 0xcafe_babe);
         assert!(
-            composed.starts_with(&format!("{salt}-scalar_agg::")),
+            composed.starts_with(&format!("{salt}-scalar_agg__")),
             "composed disk key must carry the salt then the scalar_agg prefix: {composed}"
+        );
+        // V-3: composed key must survive the disk-cache key validator,
+        // otherwise this family's disk cache is dead on arrival.
+        assert!(
+            crate::jit::disk_cache::valid_key(&composed),
+            "composed scalar_agg disk key must pass the filename-safe validator: {composed}"
         );
     }
 
@@ -1733,19 +1771,20 @@ mod scalar_agg_cache_tests {
     fn compose_disk_key_salts_and_separates_domains() {
         use crate::jit::disk_cache::{codegen_salt, hash_to_key};
         let salt = codegen_salt();
-        let k = compose_disk_key("scalar_agg::", "bolt_reduce", 0xABCD, 0x1234);
+        let k = compose_disk_key("scalar_agg__", "bolt_reduce", 0xABCD, 0x1234);
 
         // (1) salt is the leading component.
         assert!(k.starts_with(&format!("{salt}-")), "missing salt prefix: {k}");
-        // (2) the historical tail is preserved byte-for-byte after the salt.
-        let tail = format!("scalar_agg::bolt_reduce-{}", hash_to_key(0xABCD, 0x1234));
+        // (2) the historical tail is preserved byte-for-byte after the salt
+        //     (V-3: `__` separator in place of the old `::`).
+        let tail = format!("scalar_agg__bolt_reduce-{}", hash_to_key(0xABCD, 0x1234));
         assert_eq!(k, format!("{salt}-{tail}"), "tail must be salt + historical shape");
         // (3) a different spec hash yields a different key.
-        assert_ne!(k, compose_disk_key("scalar_agg::", "bolt_reduce", 0xABCD, 0x9999));
+        assert_ne!(k, compose_disk_key("scalar_agg__", "bolt_reduce", 0xABCD, 0x9999));
         // (4) a different family prefix yields a different key (no aliasing).
-        assert_ne!(k, compose_disk_key("hash_join::", "bolt_reduce", 0xABCD, 0x1234));
+        assert_ne!(k, compose_disk_key("hash_join__", "bolt_reduce", 0xABCD, 0x1234));
         // ...and a different entry symbol too.
-        assert_ne!(k, compose_disk_key("scalar_agg::", "bolt_other", 0xABCD, 0x1234));
+        assert_ne!(k, compose_disk_key("scalar_agg__", "bolt_other", 0xABCD, 0x1234));
     }
 
     /// The key fingerprint is stable across `Clone` of the same spec —
@@ -1981,19 +2020,27 @@ mod hash_join_cache_tests {
         );
     }
 
-    /// The disk-cache key prefix must start with `"hash_join::"` so a
+    /// The disk-cache key prefix must start with `"hash_join__"` so a
     /// hand inspection of the cache directory distinguishes hash-join
     /// entries from projection-path and scalar-agg entries. Pins the
     /// prefix contract against accidental drift.
+    ///
+    /// V-3: `__` separator (not `::`) keeps the composed key inside the
+    /// filename-safe charset enforced by `jit::disk_cache::valid_key`.
     #[test]
     fn hash_join_disk_prefix_is_visibly_namespaced() {
-        assert_eq!(HASH_JOIN_DISK_PREFIX, "hash_join::");
+        assert_eq!(HASH_JOIN_DISK_PREFIX, "hash_join__");
         // Shape: `"{codegen_salt}-{PREFIX}{entry}-{hex}"` (JIT-M1 salt prepended).
         let salt = crate::jit::disk_cache::codegen_salt();
         let composed = compose_disk_key(HASH_JOIN_DISK_PREFIX, "bolt_build", 0xdead_beef, 0xcafe_babe);
         assert!(
-            composed.starts_with(&format!("{salt}-hash_join::")),
+            composed.starts_with(&format!("{salt}-hash_join__")),
             "composed disk key must carry the salt then the hash_join prefix: {composed}"
+        );
+        // V-3: composed key must survive the disk-cache key validator.
+        assert!(
+            crate::jit::disk_cache::valid_key(&composed),
+            "composed hash_join disk key must pass the filename-safe validator: {composed}"
         );
     }
 
@@ -2211,20 +2258,28 @@ mod radix_sort_cache_tests {
         );
     }
 
-    /// The disk-cache key prefix must start with `"radix_sort::"` so a
+    /// The disk-cache key prefix must start with `"radix_sort__"` so a
     /// hand inspection of the cache directory distinguishes radix-sort
     /// entries from projection-path, scalar-agg, and hash-join entries.
     /// Pins the prefix contract against accidental drift.
+    ///
+    /// V-3: `__` separator (not `::`) keeps the composed key inside the
+    /// filename-safe charset enforced by `jit::disk_cache::valid_key`.
     #[test]
     fn radix_sort_disk_prefix_is_visibly_namespaced() {
-        assert_eq!(RADIX_SORT_DISK_PREFIX, "radix_sort::");
+        assert_eq!(RADIX_SORT_DISK_PREFIX, "radix_sort__");
         // Shape: `"{codegen_salt}-{PREFIX}{entry}-{hex}"` (JIT-M1 salt prepended).
         let salt = crate::jit::disk_cache::codegen_salt();
         let composed =
             compose_disk_key(RADIX_SORT_DISK_PREFIX, "bolt_radix_histogram_i32", 0xdead_beef, 0xcafe_babe);
         assert!(
-            composed.starts_with(&format!("{salt}-radix_sort::")),
+            composed.starts_with(&format!("{salt}-radix_sort__")),
             "composed disk key must carry the salt then the radix_sort prefix: {composed}"
+        );
+        // V-3: composed key must survive the disk-cache key validator.
+        assert!(
+            crate::jit::disk_cache::valid_key(&composed),
+            "composed radix_sort disk key must pass the filename-safe validator: {composed}"
         );
     }
 

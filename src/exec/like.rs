@@ -280,82 +280,113 @@ fn tokenise(pattern: &str, escape: Option<char>) -> BoltResult<Vec<Token>> {
     Ok(out)
 }
 
-/// Generic LIKE matcher: char-level backtracking over `s` against
-/// `tokens`. Returns `true` iff the whole string matches the whole
+/// Generic LIKE matcher: non-recursive char-level matching over `s`
+/// against `tokens`. Returns `true` iff the whole string matches the whole
 /// pattern.
 ///
-/// Walks `tokens` in order, consuming characters from `s`:
+/// Token semantics (unchanged from the previous implementation):
 ///
 ///   * `Literal(t)` — must match `t` exactly at the current position
 ///     (case-sensitive — SQL `LIKE` is case-sensitive by default; the
 ///     case-insensitive `ILIKE` variant is a separate code path).
 ///   * `One`        — consume exactly one char from `s` (fails if `s`
 ///     is exhausted).
-///   * `Any`        — consume zero-or-more chars; the matcher tries
-///     successive split points and recurses on the remainder. The classic
-///     LIKE algorithm; runs in O(|s| * |pattern|) worst case which is
-///     plenty for the dashboard-sized inputs the host fallback targets.
+///   * `Any` (`%`)  — match zero-or-more chars.
+///
+/// ## Complexity (V-6)
+///
+/// The previous implementation recursed on every `%` split point, which is
+/// **exponential** for multi-`%` patterns (e.g. `'%a%a%a%a%a%b'` over a
+/// long non-matching string — a ReDoS / catastrophic-backtracking DoS,
+/// since LIKE patterns are user-supplied). The old doc-comment's
+/// `O(|s| * |pattern|)` claim was therefore false.
+///
+/// We now use the standard **non-recursive greedy two-pointer** LIKE
+/// algorithm with a single backtrack pointer. It walks `s` and `tokens`
+/// in lockstep; on a `%` it records a resume point (`star_tok` / `star_s`)
+/// and greedily assumes the `%` matches the empty string. On any later
+/// literal/`_` mismatch it backtracks: advance `star_s` by one char,
+/// resume matching the tokens right after the recorded `%`. Because each
+/// `%` is recorded only once and `star_s` only ever advances, the total
+/// work is bounded by `O(|s| * |pattern|)` — now a genuinely true bound,
+/// with no recursion and no exponential blowup.
 ///
 /// We work in Rust `char` units (Unicode scalar values) so `_` matches
 /// exactly one Unicode character — same as SQL standard, and the obvious
 /// expectation for users supplying patterns over Utf8 columns.
 fn generic_match(s: &str, tokens: &[Token]) -> bool {
-    // Operate on `Vec<char>` slices for O(1) length checks and indexing.
-    // Strings in this engine are dashboard-sized, so the allocation cost
-    // is dwarfed by the per-row Arrow access; if we ever profile this
-    // we can revisit a byte-level matcher.
+    // Collect the input once into `Vec<char>` for O(1) indexing / length;
+    // literal tokens are compared char-by-char directly off their `&str`
+    // (no per-token `Vec<char>` allocation — V-6 cleanup).
     let chars: Vec<char> = s.chars().collect();
-    match_chars(&chars, tokens)
-}
+    let n = chars.len();
 
-/// Recursive helper for [`generic_match`]. Splits on `Token::Any` to do
-/// the LIKE backtracking; for `Literal`/`One` runs we consume linearly.
-fn match_chars(s: &[char], tokens: &[Token]) -> bool {
+    // Two pointers: position in the input (`s_idx`) and position in the
+    // token stream (`t_idx`). Backtrack state: `star_tok` is the index of
+    // the token *after* the most recent `Any`, and `star_s` is the input
+    // position to resume from if the greedy assumption fails.
     let mut s_idx = 0usize;
-    for (i, tok) in tokens.iter().enumerate() {
-        match tok {
-            Token::Literal(lit) => {
-                // Compare `lit`'s chars against `s[s_idx..]`.
-                let lit_chars: Vec<char> = lit.chars().collect();
-                if s_idx + lit_chars.len() > s.len() {
-                    return false;
+    let mut t_idx = 0usize;
+    let mut star_tok: Option<usize> = None;
+    let mut star_s = 0usize;
+
+    loop {
+        if t_idx < tokens.len() {
+            match &tokens[t_idx] {
+                Token::Any => {
+                    // Record a backtrack point: assume `%` matches empty
+                    // for now, and remember where to resume if that fails.
+                    star_tok = Some(t_idx + 1);
+                    star_s = s_idx;
+                    t_idx += 1;
+                    continue;
                 }
-                for (j, lc) in lit_chars.iter().enumerate() {
-                    if s[s_idx + j] != *lc {
-                        return false;
+                Token::One => {
+                    if s_idx < n {
+                        s_idx += 1;
+                        t_idx += 1;
+                        continue;
                     }
+                    // else fall through to backtrack / fail below.
                 }
-                s_idx += lit_chars.len();
-            }
-            Token::One => {
-                if s_idx >= s.len() {
-                    return false;
-                }
-                s_idx += 1;
-            }
-            Token::Any => {
-                // Try every split point of `s[s_idx..]` against the tail of
-                // `tokens`. Trailing `%` after the last meaningful token
-                // (no remaining tokens) just consumes the rest.
-                let rest = &tokens[i + 1..];
-                if rest.is_empty() {
-                    return true;
-                }
-                let mut k = s_idx;
-                loop {
-                    if match_chars(&s[k..], rest) {
-                        return true;
+                Token::Literal(lit) => {
+                    // Match `lit`'s chars against `chars[s_idx..]` without
+                    // allocating a `Vec<char>` for the literal.
+                    let mut k = s_idx;
+                    let mut ok = true;
+                    for lc in lit.chars() {
+                        if k < n && chars[k] == lc {
+                            k += 1;
+                        } else {
+                            ok = false;
+                            break;
+                        }
                     }
-                    if k >= s.len() {
-                        return false;
+                    if ok {
+                        s_idx = k;
+                        t_idx += 1;
+                        continue;
                     }
-                    k += 1;
+                    // else fall through to backtrack / fail below.
                 }
             }
+        } else if s_idx == n {
+            // All tokens consumed and the whole string consumed → match.
+            return true;
+        }
+        // Reached here because either: a literal/`_` failed to match, or
+        // tokens ran out before the input did. Backtrack to the last `%`
+        // if there was one — advance the resume position by one char and
+        // retry the post-`%` tokens. Otherwise no match.
+        match star_tok {
+            Some(tok) if star_s < n => {
+                star_s += 1;
+                s_idx = star_s;
+                t_idx = tok;
+            }
+            _ => return false,
         }
     }
-    // All tokens consumed; we match iff the whole string was consumed too.
-    s_idx == s.len()
 }
 
 /// Apply a SQL `LIKE` / `NOT LIKE` predicate to a Utf8 column, producing
@@ -637,5 +668,100 @@ mod tests {
         assert!(m("fo%o", "fobaro"));
         assert!(!m("fo%o", "bar"));
         assert!(!m("fo%o", "foob"));
+    }
+
+    // ─── V-6: linear generic matcher (no catastrophic backtracking) ──────
+
+    /// Regression test for finding V-6 (ReDoS / catastrophic backtracking).
+    ///
+    /// The pathological multi-`%` pattern `%a%a%a%a%a%a%a%a%b` against a
+    /// long all-`a` string forced the old *recursive* matcher into
+    /// exponential blowup. With the non-recursive two-pointer matcher this
+    /// resolves in linear time. The string ends in `a` (not `b`), so the
+    /// final literal `b` can never match → correct result is `false`.
+    ///
+    /// If this test ever hangs (rather than failing), the exponential
+    /// matcher has regressed back in.
+    #[test]
+    fn v6_pathological_multi_percent_is_linear() {
+        let pat = "%a%a%a%a%a%a%a%a%b";
+        let s: String = std::iter::repeat('a').take(10_000).collect();
+        assert!(!m(pat, &s), "no 'b' in the input → must not match");
+
+        // Same pattern, but the input *does* end in `b` → must match,
+        // also resolved quickly.
+        let mut s2: String = std::iter::repeat('a').take(10_000).collect();
+        s2.push('b');
+        assert!(m(pat, &s2), "input ends in 'b' → must match");
+    }
+
+    /// `%` at start, end, and middle in a single generic pattern, plus the
+    /// degenerate empty cases — exercise the two-pointer backtrack pointer.
+    #[test]
+    fn v6_percent_positions_and_empties() {
+        // Leading `%`.
+        assert!(m("%bar", "foobar"));
+        assert!(!m("%bar", "barfoo"));
+        // Trailing `%`.
+        assert!(m("foo%", "foobar"));
+        assert!(!m("foo%", "xfoo"));
+        // Middle `%`.
+        assert!(m("a%z", "az"));
+        assert!(m("a%z", "abcz"));
+        assert!(!m("a%z", "abc"));
+        // Multiple internal `%` (generic path).
+        assert!(m("a%b%c", "aXbYc"));
+        assert!(m("a%b%c", "abc"));
+        assert!(!m("a%b%c", "acb"));
+        // Empty pattern matches only the empty string.
+        assert!(m("", ""));
+        assert!(!m("", "x"));
+        // `%` alone matches everything including empty.
+        assert!(m("%", ""));
+        assert!(m("%", "anything"));
+        // Empty string against a non-trivial generic pattern.
+        assert!(!m("a%b", ""));
+        // Generic pattern that reduces to all-`%`/`_` over empty input.
+        assert!(!m("_", ""));
+    }
+
+    /// `_` (single-char wildcard) interleaved with `%` in the generic
+    /// matcher, including trailing `_` after a `%`.
+    #[test]
+    fn v6_underscore_with_percent_generic() {
+        assert!(m("a%_c", "abXc")); // `%`=>"b", `_`=>"X"
+        assert!(m("a%_c", "aXc")); // `%`=>"", `_`=>"X"
+        assert!(!m("a%_c", "ac")); // `_` needs one char between a and c
+        assert!(m("%_", "x")); // at least one char
+        assert!(!m("%_", "")); // empty fails the `_`
+        assert!(m("_%", "x"));
+        assert!(m("__", "ab"));
+        assert!(!m("__", "a"));
+    }
+
+    /// Cross-check: the new matcher agrees with the documented LIKE
+    /// semantics (and thus the previous implementation) on a handful of
+    /// mixed cases routed through the generic matcher.
+    #[test]
+    fn v6_semantics_match_previous_on_samples() {
+        // (pattern, input, expected) — all chosen to hit Shape::Generic
+        // (internal `%`, or `_` present) so they exercise generic_match.
+        let cases: &[(&str, &str, bool)] = &[
+            ("a%a%b", "aaab", true),
+            ("a%a%b", "aaa", false),
+            ("%a%a%", "xaya", true),
+            ("%a%a%", "a", false),
+            ("f_o%", "foobar", true),
+            ("f_o%", "fo", false),
+            ("%_%", "x", true),
+            ("%_%", "", false),
+            ("a_%_b", "aXYb", true),
+            ("a_%_b", "aXb", false),
+            ("h_l%o", "héllxo", true),
+            ("h_l%o", "hello", true),
+        ];
+        for (pat, s, want) in cases {
+            assert_eq!(m(pat, s), *want, "pattern={pat:?} input={s:?}");
+        }
     }
 }

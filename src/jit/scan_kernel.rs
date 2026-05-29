@@ -45,6 +45,10 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::error::{BoltError, BoltResult};
+// V-12: reuse the canonical, thorough kernel-name validator from `ptx_gen`
+// instead of a weaker local duplicate, so the scan path gets the same
+// hardening (reserved words, `__` prefix, `_param_` substring).
+use crate::jit::ptx_gen::validate_kernel_name;
 use crate::plan::logical_plan::{BinaryOp, DataType, Literal};
 use crate::plan::physical_plan::{KernelSpec, Op, Reg};
 
@@ -1312,30 +1316,11 @@ fn byte_width(dtype: DataType) -> BoltResult<usize> {
     })
 }
 
-/// Reject empty / whitespace-bearing kernel names that would break the PTX grammar.
-fn validate_kernel_name(name: &str) -> BoltResult<()> {
-    if name.is_empty() {
-        return Err(BoltError::Other(
-            "scan_kernel: kernel name must not be empty".into(),
-        ));
-    }
-    let first = name.chars().next().unwrap_or('\0');
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(BoltError::Other(format!(
-            "scan_kernel: kernel name '{}' must start with a letter or underscore",
-            name
-        )));
-    }
-    for c in name.chars() {
-        if !(c.is_ascii_alphanumeric() || c == '_') {
-            return Err(BoltError::Other(format!(
-                "scan_kernel: kernel name '{}' contains illegal character '{}'",
-                name, c
-            )));
-        }
-    }
-    Ok(())
-}
+// V-12: the previous weaker local `validate_kernel_name` (only empty /
+// leading-char / charset checks) has been removed. `scan_kernel::compile`
+// now calls the canonical `ptx_gen::validate_kernel_name` (imported above),
+// which additionally rejects PTX reserved words, the `__` prefix, and the
+// `_param_` substring — closing the validation gap on the scan path.
 
 /// Write the `.visible .entry` signature: N input ptrs, mask output ptr, K
 /// input-validity ptrs (one per flagged input), n_rows.
@@ -1491,5 +1476,38 @@ mod tests {
         let err = compile_predicate_kernel(&spec, "1bad")
             .expect_err("must reject kernel names that don't start with letter/underscore");
         assert!(format!("{}", err).contains("must start with"));
+    }
+
+    /// V-12: the scan path now delegates to the canonical
+    /// `ptx_gen::validate_kernel_name`, so the checks that the old weaker
+    /// local copy lacked (PTX reserved word, `__` prefix, `_param_`
+    /// substring) must be enforced here too.
+    #[test]
+    fn rejects_reserved_and_compiler_reserved_names_on_scan_path() {
+        let spec = region_eq_1_spec();
+
+        // PTX reserved identifier.
+        let err = compile_predicate_kernel(&spec, "mov")
+            .expect_err("must reject PTX reserved identifier as kernel name");
+        assert!(
+            format!("{}", err).contains("reserved identifier"),
+            "got: {err}"
+        );
+
+        // Compiler-reserved `__` prefix.
+        let err = compile_predicate_kernel(&spec, "__bolt_kernel")
+            .expect_err("must reject `__`-prefixed (compiler-reserved) kernel name");
+        assert!(
+            format!("{}", err).contains("compiler-reserved"),
+            "got: {err}"
+        );
+
+        // `_param_` substring would collide with synthesised parameter names.
+        let err = compile_predicate_kernel(&spec, "bolt_param_evil")
+            .expect_err("must reject kernel name containing `_param_`");
+        assert!(
+            format!("{}", err).contains("_param_"),
+            "got: {err}"
+        );
     }
 }

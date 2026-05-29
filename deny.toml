@@ -60,12 +60,29 @@ skip-tree = []
 
 [advisories]
 version = 2
-# vulnerability advisories: deny. unmaintained / unsound: warn.
+# vulnerability advisories: deny (cargo-deny v2 default).
 # (cargo-deny v2 reads RUSTSEC database from the cargo-deny database mirror.)
+#
+# V-11: explicitly set unmaintained/unsound policy rather than relying on
+# defaults. The default host graph (all-features=false) is clean, so we make
+# these strict. NOTE: the rust-cuda / NVVM build-dependency tree (curl/tar/
+# xz 0.1.0/nvvm/rustc_codegen_nvvm) pulls in the known-unmaintained `xz 0.1.0`
+# crate; that tree is only scanned by the informational all-features
+# cargo-deny job in CI (see .github/workflows/ci.yml), which is
+# continue-on-error so this "deny" does not block CI for the rust-cuda graph.
+unmaintained = "deny"
+unsound = "deny"
 yanked = "warn"
 ignore = [
     # Add RUSTSEC-XXXX-YYYY ids here only with justification + tracking
     # GH issue. Default is empty.
+    #
+    # V-11: the rust-cuda build tree contains the unmaintained `xz 0.1.0`
+    # crate. We deliberately do NOT add a (possibly fabricated) RUSTSEC id
+    # here; instead the all-features cargo-deny CI job is non-blocking
+    # (continue-on-error). If/when we want the rust-cuda scan to be blocking,
+    # add the confirmed advisory id below.
+    # TODO: confirm RUSTSEC id for xz 0.1.0 before ignoring it explicitly.
 ]
 
 [sources]

@@ -3199,52 +3199,113 @@ fn populate_aggregate_spec(
     aggregate.input_has_validity = flags;
 }
 
-/// True if `e` contains a divide (or modulo, once `BinaryOp::Mod` lands)
-/// anywhere in its subtree. Used to detect predicates whose correctness
-/// relies on SQL's standard short-circuit semantics — see
-/// [`warn_if_eager_shortcircuit_unsafe`].
-fn expr_contains_div_or_mod(e: &Expr) -> bool {
+/// V-8: conservative ALLOWLIST of operators/expressions that are safe to
+/// evaluate *eagerly* under an AND/OR operand on the GPU.
+///
+/// Background: craton-bolt's GPU codegen evaluates BOTH operands of AND/OR
+/// before the logical op fires (it is a register machine — see the AND/OR
+/// arm of `Codegen::emit_binary`). SQL semantics, by contrast, short-circuit
+/// and skip the second operand when the first decides the result. The only
+/// way this divergence produces *wrong results* (rather than just wasted
+/// work) is when the eagerly-evaluated operand can fault, poison, or
+/// otherwise observably misbehave on inputs that short-circuit would have
+/// skipped — the canonical case being a guarded trap like
+/// `WHERE b<>0 AND a/b>5`, where eager `a/b` divides by zero.
+///
+/// The previous detector was a DENYLIST (`expr_contains_div_or_mod`) that
+/// returned `true` only for `BinaryOp::Div`. That is fragile: any *new*
+/// trap-capable operator (modulo, a trapping cast, a data-dependent
+/// fault/UB or NULL-poison op) added to the IR without also updating the
+/// denylist would silently fall through to "looks safe" and reintroduce the
+/// V-8 wrong-results bug on the GPU.
+///
+/// This function inverts the polarity to an ALLOWLIST. A sub-expression is
+/// eager-safe ONLY if every node in it is on the explicitly-enumerated set
+/// of pure, total, side-effect-free, fault-free constructs below. Anything
+/// not provably safe — `Div` (and `Mod` if/when it lands), `Cast` (numeric
+/// narrowing / float→int truncation can trap or be UB), `ScalarFn`, or any
+/// future `Expr` / `BinaryOp` / `UnaryOp` variant added later — defaults to
+/// `false` ("unsafe") and therefore forces the host fallback. The key
+/// property: a NEW operator variant defaults to "unsafe → host fallback"
+/// rather than "silently eager on GPU".
+fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
     match e {
-        Expr::Column(_) | Expr::Literal(_) => false,
+        // Column refs and literals never fault.
+        Expr::Column(_) | Expr::Literal(_) => true,
         Expr::Binary { op, left, right } => {
-            // `BinaryOp::Mod` is not yet a variant; once it lands the matcher
-            // below will pick it up automatically. Today only `Div` exists.
-            if matches!(op, BinaryOp::Div) {
-                return true;
-            }
-            expr_contains_div_or_mod(left) || expr_contains_div_or_mod(right)
+            // Allowlisted total/fault-free binary ops. Division-class ops
+            // (`Div`, and `Mod` once it exists) are deliberately EXCLUDED:
+            // they trap on a zero divisor. `Concat` is excluded because it is
+            // Utf8-valued and never reaches a GPU AND/OR kernel anyway (it is
+            // routed host-side earlier); leaving it off the allowlist keeps
+            // the rule conservative. Any binary op not matched here is treated
+            // as unsafe.
+            let op_is_safe = matches!(
+                op,
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::And
+                    | BinaryOp::Or
+            );
+            op_is_safe
+                && expr_eager_safe_under_shortcircuit(left)
+                && expr_eager_safe_under_shortcircuit(right)
         }
-        Expr::Alias(inner, _) => expr_contains_div_or_mod(inner),
-        Expr::Unary { operand, .. } => expr_contains_div_or_mod(operand),
+        // `IS NULL` / `IS NOT NULL` / `NOT` are pure boolean predicates over
+        // an already-evaluated operand; safe iff the operand is.
+        Expr::Unary { operand, .. } => expr_eager_safe_under_shortcircuit(operand),
+        // CASE itself is pure, but its WHEN/THEN/ELSE children are arbitrary
+        // exprs; safe iff every child is.
         Expr::Case {
             branches,
             else_branch,
         } => {
-            branches.iter().any(|(w, t)| {
-                expr_contains_div_or_mod(w) || expr_contains_div_or_mod(t)
-            }) || else_branch
+            branches.iter().all(|(w, t)| {
+                expr_eager_safe_under_shortcircuit(w)
+                    && expr_eager_safe_under_shortcircuit(t)
+            }) && else_branch
                 .as_deref()
-                .is_some_and(expr_contains_div_or_mod)
+                .map_or(true, expr_eager_safe_under_shortcircuit)
         }
-        Expr::Like { expr, .. } => expr_contains_div_or_mod(expr),
-        Expr::Cast { expr, .. } => expr_contains_div_or_mod(expr),
-        // String scalar functions can't contain Div/Mod themselves, but
-        // their arguments are arbitrary scalar expressions, so recurse.
-        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_div_or_mod),
+        // LIKE against a constant pattern is total; safe iff the operand is.
+        Expr::Like { expr, .. } => expr_eager_safe_under_shortcircuit(expr),
+        // CAST is NOT on the allowlist: numeric narrowing and float→int
+        // truncation can trap / be UB on out-of-range inputs that a
+        // short-circuit would have skipped. Conservatively unsafe.
+        Expr::Cast { .. } => false,
+        // Scalar string functions are not provably fault-free here (and don't
+        // reach GPU AND/OR kernels), so treat them as unsafe.
+        Expr::ScalarFn { .. } => false,
+        // Alias is a transparent rename; safe iff the inner expr is.
+        Expr::Alias(inner, _) => expr_eager_safe_under_shortcircuit(inner),
     }
 }
 
 /// True if `e` contains a `BinaryOp::And` or `BinaryOp::Or` whose left or
-/// right subtree contains a divide / modulo. This is the unsafe pattern
-/// described on the AND/OR arm of `Codegen::emit_binary`: standard
-/// SQL would short-circuit and skip the divide when the guard fails, but
+/// right subtree is NOT eager-safe (see
+/// [`expr_eager_safe_under_shortcircuit`]). This is the unsafe pattern
+/// described on the AND/OR arm of `Codegen::emit_binary`: standard SQL would
+/// short-circuit and skip the trap-capable operand when the guard fails, but
 /// craton-bolt's GPU codegen evaluates both operands eagerly.
+///
+/// V-8: the guard now uses the conservative allowlist (an operand is unsafe
+/// unless *provably* fault-free) rather than the old `Div`-only denylist, so
+/// new trap-capable ops default to host fallback instead of silent wrong
+/// results.
 fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
     match e {
         Expr::Column(_) | Expr::Literal(_) => false,
         Expr::Binary { op, left, right } => {
             if matches!(op, BinaryOp::And | BinaryOp::Or)
-                && (expr_contains_div_or_mod(left) || expr_contains_div_or_mod(right))
+                && (!expr_eager_safe_under_shortcircuit(left)
+                    || !expr_eager_safe_under_shortcircuit(right))
             {
                 return true;
             }
@@ -3273,32 +3334,75 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
     }
 }
 
-/// True if any `Expr::Binary { op: Div, .. }` reachable from `op` lives
-/// underneath an `Op::Binary { op: And/Or }` in the linear IR. The IR is a
-/// register machine (operands are already evaluated before the binary op
-/// fires), so the eager-evaluation hazard is intrinsic to the IR shape:
-/// the presence of *any* Div op alongside *any* And/Or op in the same
-/// kernel means the divide ran unconditionally.
+/// True if the kernel's linear IR contains a logical `Op::Binary { op:
+/// And/Or }` *and* at least one op that is not provably eager-safe. The IR
+/// is a register machine (every operand is evaluated before the op that
+/// consumes it fires), so the eager-evaluation hazard is intrinsic to the IR
+/// shape: a trap-capable op (e.g. `Div`) co-resident in a kernel with an
+/// And/Or means that op ran unconditionally, regardless of the guard.
+///
+/// V-8: like its expr-level sibling [`expr_eager_safe_under_shortcircuit`],
+/// this is now an ALLOWLIST. We enumerate the IR ops that are pure / total /
+/// fault-free; anything NOT on that list (`Op::Cast`, `Op::Binary { Div }`,
+/// or any future op variant added later) is treated as unsafe when it shares
+/// a kernel with a logical op. The previous denylist matched only
+/// `BinaryOp::Div`, so a new trap-capable op would have slipped through; the
+/// allowlist defaults new ops to "unsafe → flagged" instead.
 fn kernel_has_unsafe_eager_shortcircuit(kernel: &KernelSpec) -> bool {
-    let mut has_div = false;
-    let mut has_logical = false;
-    for op in &kernel.ops {
-        if let Op::Binary { op, .. } = op {
-            if matches!(op, BinaryOp::Div) {
-                has_div = true;
-            }
-            if matches!(op, BinaryOp::And | BinaryOp::Or) {
-                has_logical = true;
-            }
+    /// Is a single IR op provably eager-safe (cannot fault / poison)?
+    fn op_eager_safe(op: &Op) -> bool {
+        match op {
+            // Loads, constants, stores, validity checks, and predicated
+            // selects are all total and side-effect-free.
+            Op::LoadColumn { .. }
+            | Op::Const { .. }
+            | Op::Store { .. }
+            | Op::IsNullCheck { .. }
+            | Op::Select { .. }
+            | Op::LoadColumn128 { .. }
+            | Op::Const128 { .. }
+            | Op::Store128 { .. }
+            | Op::Add128 { .. }
+            | Op::Sub128 { .. }
+            | Op::Mul128 { .. }
+            | Op::Cmp128 { .. } => true,
+            // Scalar binary ops are safe ONLY for the total/fault-free
+            // operators. `Div` (and any future trapping op) is excluded.
+            Op::Binary { op, .. } => matches!(
+                op,
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::And
+                    | BinaryOp::Or
+            ),
+            // `Cast` can trap / be UB on out-of-range narrowing; conservatively
+            // unsafe. New op variants fall here too and default to unsafe.
+            Op::Cast { .. } => false,
         }
     }
-    has_div && has_logical
+    let has_logical = kernel.ops.iter().any(|op| {
+        matches!(op, Op::Binary { op: BinaryOp::And | BinaryOp::Or, .. })
+    });
+    let has_unsafe = kernel.ops.iter().any(|op| !op_eager_safe(op));
+    has_logical && has_unsafe
 }
 
 /// Walk `plan` and emit a `log::warn!` if any *GPU kernel's* linear IR
-/// contains `BinaryOp::And` / `BinaryOp::Or` whose subtree also includes
-/// `BinaryOp::Div` (or `Mod`, once that variant exists) — the eager
-/// short-circuit hazard described on the AND/OR arm of `emit_binary`.
+/// contains `BinaryOp::And` / `BinaryOp::Or` alongside any op that is not
+/// provably eager-safe (`Div`, a trapping `Cast`, or any future trap-capable
+/// op — see the allowlist in [`kernel_has_unsafe_eager_shortcircuit`]) — the
+/// eager short-circuit hazard described on the AND/OR arm of `emit_binary`.
+///
+/// V-8: the hazard test is an allowlist now, so newly-added trap-capable ops
+/// are flagged by default rather than silently slipping past a `Div`-only
+/// denylist.
 ///
 /// As of the PL-C2 fix, scan-chain `WHERE` predicates and SELECT-list
 /// expressions carrying that pattern are routed to the host-side
@@ -5073,6 +5177,143 @@ mod tests {
         assert!(
             matches!(phys, PhysicalPlan::Projection { .. }),
             "simple WHERE must stay on GPU Projection, got {phys:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // V-8: the eager-short-circuit gate is now an ALLOWLIST. These tests pin
+    // the two existing public behaviors (guarded-div → host fallback; pure
+    // comparison → GPU) AND the new conservative default: a construct that is
+    // not provably eager-safe (here a trap-capable `Cast`) forces the host
+    // fallback even though it is neither `Div` nor `Mod`.
+    // ----------------------------------------------------------------------
+
+    /// Allowlist helper: a pure comparison/boolean predicate is eager-safe.
+    #[test]
+    fn eager_safe_allows_pure_comparison() {
+        let e = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("x".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(0))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Lt,
+                left: Box::new(Expr::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int32(1))),
+                }),
+                right: Box::new(Expr::Literal(Literal::Int32(10))),
+            }),
+        };
+        assert!(
+            expr_eager_safe_under_shortcircuit(&e),
+            "pure comparison/add/boolean tree must be eager-safe"
+        );
+        assert!(
+            !expr_has_unsafe_eager_shortcircuit(&e),
+            "pure predicate must NOT trigger host fallback"
+        );
+    }
+
+    /// Allowlist helper: a divide is NOT eager-safe, and an AND guarding it is
+    /// flagged unsafe (the legacy `Div` denylist behavior, preserved).
+    #[test]
+    fn eager_safe_rejects_divide() {
+        let div = Expr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(Expr::Column("x".into())),
+            right: Box::new(Expr::Column("y".into())),
+        };
+        assert!(
+            !expr_eager_safe_under_shortcircuit(&div),
+            "divide must NOT be eager-safe"
+        );
+        let guarded = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::NotEq,
+                left: Box::new(Expr::Column("y".into())),
+                right: Box::new(Expr::Literal(Literal::Int64(0))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(div),
+                right: Box::new(Expr::Literal(Literal::Int32(5))),
+            }),
+        };
+        assert!(
+            expr_has_unsafe_eager_shortcircuit(&guarded),
+            "AND-guarded divide must trigger host fallback"
+        );
+    }
+
+    /// V-8 key property: a construct that is neither `Div` nor `Mod` but is
+    /// also not provably fault-free — here a trap-capable `Cast` (float→int
+    /// narrowing can be UB on out-of-range inputs) — is treated as unsafe
+    /// under an AND/OR. This is exactly the case the old `Div`-only denylist
+    /// would have mis-classified as "safe" and run eagerly on the GPU.
+    #[test]
+    fn eager_safe_rejects_unknown_unsafe_cast() {
+        let trap_cast = Expr::Cast {
+            expr: Box::new(Expr::Column("x".into())),
+            target: DataType::Int32,
+        };
+        assert!(
+            !expr_eager_safe_under_shortcircuit(&trap_cast),
+            "a Cast must be treated as not-eager-safe (conservative default)"
+        );
+        let guarded = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("y".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(0))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(trap_cast),
+                right: Box::new(Expr::Literal(Literal::Int32(5))),
+            }),
+        };
+        assert!(
+            expr_has_unsafe_eager_shortcircuit(&guarded),
+            "AND guarding a trap-capable Cast must force host fallback (V-8)"
+        );
+    }
+
+    /// End-to-end: `WHERE y>0 AND CAST(x AS INT)>5` must route to the
+    /// host-side `PhysicalPlan::Filter` (not a GPU Projection) because the
+    /// cast under the AND is not eager-safe. Mirrors
+    /// `where_and_with_divide_routes_to_host_filter` for a non-`Div` op.
+    #[test]
+    fn where_and_with_trap_cast_routes_to_host_filter() {
+        let predicate = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("y".into())),
+                right: Box::new(Expr::Literal(Literal::Int64(0))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Cast {
+                    expr: Box::new(Expr::Column("x".into())),
+                    target: DataType::Int64,
+                }),
+                right: Box::new(Expr::Literal(Literal::Int64(5))),
+            }),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(xy_scan()),
+            predicate,
+        };
+        let phys = lower(&plan).expect("lower must succeed via host fallback");
+        assert!(
+            matches!(phys, PhysicalPlan::Filter { .. }),
+            "AND-with-trap-cast WHERE must route to host PhysicalPlan::Filter, got {phys:?}"
         );
     }
 }

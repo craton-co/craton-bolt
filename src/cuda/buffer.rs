@@ -7,7 +7,14 @@
 //! primitive on which the typed, lifetime-tracked `GpuVec<T>` (Step 3) will be
 //! built.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
+// `Cell` is only used by the test-only `DROP_FENCE_OVERRIDE` thread-local
+// (the production `StreamSet` tracking on both `GpuBuffer` and
+// `PinnedHostBuffer` uses `RefCell<StreamSet>` after review finding V-2
+// removed the single-stream `Cell<Option<CUstream>>`); gate the import so a
+// non-test build doesn't warn on an unused import.
+#[cfg(test)]
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
 
@@ -338,13 +345,22 @@ impl<T: Pod> GpuBuffer<T> {
     /// use-after-free / data corruption).
     ///
     /// `device_ptr()` itself **cannot** record the stream because it does
-    /// not know which stream the launch will target. Therefore any caller
-    /// that forwards this pointer into async FFI **MUST** record the launch
-    /// stream by calling [`mark_stream_use`](Self::mark_stream_use)
-    /// (or, when working through a borrowed view, the view's
-    /// [`mark_launch_use`](crate::cuda::smart_ptrs::GpuView::mark_launch_use),
-    /// which forwards into this buffer's stream set). The async DMA helpers
-    /// on this type do this for you automatically.
+    /// not know which stream the launch will target. Recording therefore
+    /// happens at the point that *does* know the stream:
+    ///
+    /// * **Async DMA helpers on this type** (`copy_from_async`,
+    ///   `copy_to_async`, `copy_to_slice_async`, `zeros_async`) call
+    ///   [`mark_stream_use`](Self::mark_stream_use) automatically.
+    /// * **Kernel launches** go through the launch glue in
+    ///   [`crate::exec::launch`]. As of review finding V-1 the launch entry
+    ///   points ([`launch_1d`](crate::exec::launch::launch_1d) /
+    ///   [`launch_with_geometry`](crate::exec::launch::launch_with_geometry))
+    ///   tag the launch stream into every buffer whose view was pushed into
+    ///   the `KernelArgs`, *centrally* — so a kernel launched off
+    ///   `device_ptr()` / a view's `device_ptr()` records its stream by
+    ///   construction, with no per-call-site bookkeeping. The view's
+    ///   [`mark_launch_use`](crate::cuda::smart_ptrs::GpuView::mark_launch_use)
+    ///   remains available for any launch path that bypasses `KernelArgs`.
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.ptr
     }
@@ -363,12 +379,15 @@ impl<T: Pod> GpuBuffer<T> {
     /// * **C-2:** every distinct stream is remembered and fenced (not just
     ///   the last one), so an independent op on an earlier stream can no
     ///   longer race the recycled block.
-    /// * **C-1:** call this after every `cuMemcpy*Async` / `cuMemset*Async`
-    ///   / `cuLaunchKernel` that touches `device_ptr()`. The async helpers
-    ///   on this type (`copy_from_async`, `copy_to_async`,
-    ///   `copy_to_slice_async`, `zeros_async`) call it automatically;
-    ///   kernel-launch glue that forwards `device_ptr()` must call it (or
-    ///   the view-level `mark_launch_use`) explicitly.
+    /// * **C-1:** the async helpers on this type (`copy_from_async`,
+    ///   `copy_to_async`, `copy_to_slice_async`, `zeros_async`) call this
+    ///   automatically after every `cuMemcpy*Async` / `cuMemset*Async`.
+    ///   `cuLaunchKernel` is tagged centrally at the launch entry point
+    ///   (review finding V-1): the `KernelArgs` machinery in
+    ///   [`crate::exec::launch`] retains each pushed view's stream-set
+    ///   back-reference and tags the launch stream into it after the launch,
+    ///   so launch sites need no explicit call. The view-level
+    ///   `mark_launch_use` remains for launch paths that bypass `KernelArgs`.
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream is forwarded, not deref'd
     pub fn mark_stream_use(&self, stream: CUstream) {
         // `&self` (not `&mut self`) because the buffer's read-only async
@@ -748,10 +767,16 @@ fn current_drop_fence() -> StreamFenceFn {
 /// * **C-1 (kernel launches went untracked).** `device_ptr()` /
 ///   `GpuView::device_ptr()` hand the raw pointer to kernel-launch FFI.
 ///   Nothing in `device_ptr()` can know the launch stream, so the launch
-///   site must tag it — via [`GpuBuffer::mark_stream_use`] or the view's
-///   `mark_launch_use`, both of which feed this same set. With the launch
-///   stream in the set, dropping a buffer that a kernel is still reading
-///   fences that kernel's stream before recycling the block.
+///   *entry point* tags it. As of review finding V-1 this is done centrally
+///   in [`launch_1d`](crate::exec::launch::launch_1d) /
+///   [`launch_with_geometry`](crate::exec::launch::launch_with_geometry):
+///   `KernelArgs` retains each pushed view's stream-set back-reference and
+///   the launch tags the stream into all of them after `cuLaunchKernel`, so
+///   every buffer a kernel touches records that kernel's stream by
+///   construction (the view's `mark_launch_use` remains for launch paths
+///   that bypass `KernelArgs`). With the launch stream in the set, dropping
+///   a buffer that a kernel is still reading fences that kernel's stream
+///   before recycling the block.
 ///
 /// ## What is tagged automatically
 ///
@@ -762,9 +787,15 @@ fn current_drop_fence() -> StreamFenceFn {
 ///   (device→host DMA)
 /// * [`GpuBuffer::zeros_async`] (device-side `cuMemsetD8Async`)
 ///
-/// Kernel launches that forward `device_ptr()` / a view's `device_ptr()`
-/// MUST tag the launch stream explicitly (see the invariant on
-/// [`GpuBuffer::device_ptr`]). Over-tagging is harmless — the set dedups.
+/// Kernel launches are tagged centrally at the launch entry point (review
+/// finding V-1): [`launch_1d`](crate::exec::launch::launch_1d) and
+/// [`launch_with_geometry`](crate::exec::launch::launch_with_geometry) record
+/// the launch stream into the set of every buffer whose view was pushed into
+/// the `KernelArgs`, so a kernel that reads/writes `device_ptr()` records its
+/// stream by construction — no per-call-site bookkeeping, and the guarantee
+/// does not rely on the post-launch `synchronize()` staying in place. Launch
+/// paths that bypass `KernelArgs` should call the view's `mark_launch_use`.
+/// Over-tagging is harmless — the set dedups.
 ///
 /// ## Caller discipline (still preferred)
 ///
@@ -869,20 +900,32 @@ pub struct PinnedHostBuffer<T: Pod> {
     /// have to recompute (and so a future power-of-two-bucketed pool can
     /// hook in cleanly later).
     byte_len: usize,
-    /// Last stream this buffer was used on, if any. Callers that enqueue
-    /// async work referencing `self.ptr` (H2D / D2H DMA, kernels that
-    /// touch the pinned region, etc.) should call
-    /// [`PinnedHostBuffer::mark_stream_use`] after enqueueing so `Drop`
-    /// can fence against an in-flight transfer before `cuMemFreeHost`
+    /// The set of streams this buffer's pinned pages have been enqueued on
+    /// (via [`PinnedHostBuffer::mark_stream_use`]). Callers that enqueue
+    /// async work referencing `self.ptr` (H2D / D2H DMA, kernels that touch
+    /// the pinned region, etc.) call that helper after enqueueing so `Drop`
+    /// can fence against every in-flight transfer before `cuMemFreeHost`
     /// reclaims the pages. See the `Drop` impl below for the rationale.
     ///
-    /// `Cell<_>` rather than a plain field so `mark_stream_use` can take
-    /// `&self`: typical async copy helpers borrow the pinned buffer
-    /// shared (`as_ptr()` reads through `&self`), and forcing them to
-    /// `&mut self` here would ripple needlessly through the call sites.
-    /// The cell is single-threaded (the struct is `!Sync`), so no atomic
-    /// is required.
-    last_use_stream: Cell<Option<CUstream>>,
+    /// ## Why a *set*, not a single "last stream" (review finding V-2)
+    ///
+    /// The pre-V-2 design tracked only the most-recently-used stream
+    /// (`Cell<Option<CUstream>>`) and fenced just that one at `Drop`. A
+    /// pinned buffer DMA'd on stream A and then stream B fenced only B, so an
+    /// independent transfer still draining on A could read/write the
+    /// page-locked region *after* `cuMemFreeHost` handed the pages back to
+    /// the kernel — a host-side use-after-free. This is the exact host-side
+    /// analogue of the device-side multi-stream race C-2 that `GpuBuffer`
+    /// already fixed, so we reuse the same [`StreamSet`] machinery here:
+    /// track every distinct stream and fence all of them at `Drop`.
+    ///
+    /// `RefCell<StreamSet>` (mirroring `GpuBuffer::used_streams`) so
+    /// `mark_stream_use` can take `&self`: typical async copy helpers borrow
+    /// the pinned buffer shared (`as_ptr()` reads through `&self`), and
+    /// forcing them to `&mut self` here would ripple needlessly through the
+    /// call sites. The cell is single-threaded (the struct is `!Sync`), so
+    /// no atomic is required.
+    used_streams: RefCell<StreamSet>,
 }
 
 impl<T: Pod> PinnedHostBuffer<T> {
@@ -899,7 +942,7 @@ impl<T: Pod> PinnedHostBuffer<T> {
                 ptr: std::ptr::null_mut(),
                 len: 0,
                 byte_len: 0,
-                last_use_stream: Cell::new(None),
+                used_streams: RefCell::new(StreamSet::default()),
             });
         }
         let byte_len = len.checked_mul(size_of::<T>()).ok_or_else(|| {
@@ -923,7 +966,7 @@ impl<T: Pod> PinnedHostBuffer<T> {
             ptr: raw as *mut T,
             len,
             byte_len,
-            last_use_stream: Cell::new(None),
+            used_streams: RefCell::new(StreamSet::default()),
         })
     }
 
@@ -999,46 +1042,53 @@ impl<T: Pod> PinnedHostBuffer<T> {
     }
 
     /// Record that `stream` has enqueued (or is about to enqueue) work
-    /// that references this buffer's pinned host pages. The recorded
-    /// stream is the one `Drop` will `cuStreamSynchronize` against
-    /// before calling `cuMemFreeHost`, so the driver can't be still
-    /// DMA-ing into freed pages.
+    /// that references this buffer's pinned host pages. `Drop` will
+    /// `cuStreamSynchronize` against **every** recorded stream before
+    /// calling `cuMemFreeHost`, so the driver can't still be DMA-ing into
+    /// freed pages on any stream that ever touched them.
     ///
     /// Mirrors the `mark_stream_use` contract on `GpuBuffer` (review
-    /// finding C13). Callers MUST invoke this on the pinned source of
+    /// findings C-2 / V-2). Callers MUST invoke this on the pinned source of
     /// `cuMemcpyHtoDAsync_v2`, the pinned destination of
     /// `cuMemcpyDtoHAsync_v2`, or any kernel parameter that holds
     /// `as_ptr()` / `as_mut_ptr()`, after enqueueing the async work.
     ///
-    /// Only the most recent stream is remembered. If a buffer is used
-    /// across multiple streams, the caller is responsible for the
-    /// cross-stream barriers (events, joins) that make a single
-    /// final-stream sync sufficient — or for explicitly synchronising
-    /// the buffer before drop.
+    /// ## Every distinct stream is remembered (review finding V-2)
     ///
-    /// Takes `&self` (interior mutability via `Cell`) so call sites
+    /// Unlike the pre-V-2 design (which kept only the last stream), this
+    /// accumulates the full deduped [`StreamSet`], so a pinned buffer used
+    /// across multiple streams fences all of them at `Drop`. The caller no
+    /// longer has to arrange cross-stream barriers purely to make a single
+    /// final-stream sync sufficient — though doing so is still cheaper, as
+    /// the eventual per-stream sync on a completed stream is a no-op.
+    /// Recording the same stream twice is a no-op (the set dedups).
+    ///
+    /// Takes `&self` (interior mutability via `RefCell`) so call sites
     /// holding a shared borrow — typical for an async helper that only
     /// reads `as_ptr()` — don't have to be rewritten to `&mut self`.
     /// The cell is single-threaded (the struct is `!Sync`) so no atomic
-    /// is required.
+    /// is required, and the borrow is held only for the `insert` call so it
+    /// cannot overlap the `borrow()` taken in `Drop`.
     // `stream` is an opaque CUstream handle; we just store it. No deref,
     // no FFI. The outer fn stays safe to keep the call-site ergonomics
     // identical to the analogous helper on `GpuBuffer`.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     #[inline]
     pub fn mark_stream_use(&self, stream: CUstream) {
-        self.last_use_stream.set(Some(stream));
+        self.used_streams.borrow_mut().insert(stream);
     }
 
-    /// Read back the stream most recently recorded via
-    /// [`mark_stream_use`](Self::mark_stream_use), or `None` if the
-    /// buffer has never participated in async work.
+    /// Number of distinct streams currently recorded for this buffer.
     ///
-    /// Primarily for tests; production code rarely needs to query this
-    /// because `Drop` consumes it directly.
+    /// Test / diagnostic hook (mirrors
+    /// [`GpuBuffer::recorded_stream_count`]): lets host-only tests assert the
+    /// stream-set bookkeeping (dedup, multi-stream accumulation) without a
+    /// GPU. Production code rarely needs it because `Drop` consumes the set
+    /// directly.
+    #[doc(hidden)]
     #[inline]
-    pub fn last_use_stream(&self) -> Option<CUstream> {
-        self.last_use_stream.get()
+    pub fn recorded_stream_count(&self) -> usize {
+        self.used_streams.borrow().len()
     }
 
     /// Override the logical length — used after an async D2H that filled
@@ -1073,7 +1123,7 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
     fn drop(&mut self) {
         if self.ptr.is_null() {
             // Zero-length / never-allocated path: nothing to free and
-            // nothing to fence against. `last_use_stream` is meaningless
+            // nothing to fence against. The stream set is meaningless
             // here (callers shouldn't `mark_stream_use` on an empty
             // buffer, but if they do we silently ignore it).
             return;
@@ -1087,17 +1137,32 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
         // particularly nasty one because the DMA engine has no notion
         // of Rust ownership.
         //
-        // TODO(perf): a blanket sync is the safe default but it
-        // serialises every pinned-buffer release against the recorded
+        // ## Fence EVERY recorded stream (review finding V-2)
+        //
+        // We synchronize each distinct stream in `used_streams`, not just
+        // the last one. A pinned buffer DMA'd on stream A then stream B
+        // could otherwise have an independent transfer still draining on A
+        // when `cuMemFreeHost` runs; fencing the whole set closes that
+        // host-side multi-stream UAF, exactly as `GpuBuffer`'s `Drop` does
+        // for the device side. The set is deduped, so each stream is fenced
+        // at most once.
+        //
+        // The borrow is short-lived and cannot alias: `Drop` runs with
+        // exclusive ownership of `self`, so no `&self` method (which is what
+        // takes `borrow_mut` in `mark_stream_use`) can run concurrently.
+        //
+        // TODO(perf): a blanket per-stream sync is the safe default but it
+        // serialises every pinned-buffer release against each recorded
         // stream's full queue, which can stall pipelined H2D / kernel /
-        // D2H overlap if the caller has already arranged a
-        // cross-stream barrier (event-record + wait) elsewhere. A
-        // future optimisation could replace this with a per-buffer
-        // `cuEventRecord` + `cuEventSynchronize` on a tiny event
-        // attached at `mark_stream_use` time, so we wait only on the
-        // specific point in the stream's history that actually touched
-        // this buffer, not the entire trailing tail of the stream.
-        if let Some(stream) = self.last_use_stream.get() {
+        // D2H overlap if the caller has already arranged a cross-stream
+        // barrier (event-record + wait) elsewhere. A future optimisation
+        // could replace this with a per-buffer `cuEventRecord` +
+        // `cuEventSynchronize` on a tiny event attached at
+        // `mark_stream_use` time, so we wait only on the specific point in
+        // each stream's history that actually touched this buffer, not the
+        // entire trailing tail of the stream.
+        let streams = self.used_streams.borrow();
+        for &stream in &streams.streams {
             // SAFETY: `stream` is an opaque CUstream handle handed to
             // us by the caller; we just forward it. If the stream has
             // already been destroyed, `cuStreamSynchronize` returns an
@@ -1112,6 +1177,7 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
                 );
             }
         }
+        drop(streams);
         // SAFETY: `self.ptr` came from `cuMemAllocHost_v2` and we have
         // unique ownership (move-only, `!Sync`). The stream sync above
         // is best-effort; the caller is still responsible for the
@@ -1369,10 +1435,10 @@ mod pinned_safety_tests {
         // not call into the driver, and must not attempt to
         // `cuStreamSynchronize` against a stream that was never recorded.
         // We exercise the path by going out of scope at the end of the
-        // block: if `Drop` tried to fence with a `last_use_stream` of
-        // `None`, the `if let Some(stream) = ...` guard catches it; if
-        // the ptr-null short-circuit failed and we reached the FFI, the
-        // cuda-stub build would panic with `CUDA_ERROR_STUB`.
+        // block: the null-ptr short-circuit in `Drop` returns before the
+        // fence loop, so an empty `used_streams` set is never even reached;
+        // if that short-circuit failed and we hit the FFI, the cuda-stub
+        // build would panic with `CUDA_ERROR_STUB`.
         for _ in 0..8 {
             let _b: PinnedHostBuffer<i64> =
                 PinnedHostBuffer::new(0).expect("zero-len alloc");
@@ -1381,10 +1447,10 @@ mod pinned_safety_tests {
 
     #[test]
     fn mark_stream_use_is_preserved_across_method_calls() {
-        // The stream-tracking cell must survive arbitrary `&self` method
-        // calls — only an explicit second `mark_stream_use` (or Drop)
-        // should replace it. We use a fabricated non-null sentinel
-        // pointer for the stream handle; we never deref it.
+        // The stream-tracking set must survive arbitrary `&self` method
+        // calls — only an explicit `mark_stream_use` (or Drop) should
+        // touch it. We use fabricated non-null sentinel pointers for the
+        // stream handles; we never deref them.
         //
         // This buffer is empty, so its `Drop` will skip the FFI free and
         // also skip the stream sync (the ptr-null short-circuit runs
@@ -1392,32 +1458,38 @@ mod pinned_safety_tests {
         let buf: PinnedHostBuffer<u32> =
             PinnedHostBuffer::new(0).expect("zero-len alloc");
         let fake_stream: CUstream = 0xDEAD_BEEF_usize as CUstream;
-        assert!(buf.last_use_stream().is_none());
+        assert_eq!(buf.recorded_stream_count(), 0);
         buf.mark_stream_use(fake_stream);
-        assert_eq!(buf.last_use_stream(), Some(fake_stream));
+        assert_eq!(buf.recorded_stream_count(), 1);
 
-        // Hit a few `&self`-receiver methods and re-check.
+        // Hit a few `&self`-receiver methods and re-check the set is intact.
         let _ = buf.len();
         let _ = buf.is_empty();
         let _ = buf.byte_len();
         let _ = buf.as_ptr();
         let _ = buf.as_slice();
         assert_eq!(
-            buf.last_use_stream(),
-            Some(fake_stream),
-            "method calls must not clobber the recorded stream"
+            buf.recorded_stream_count(),
+            1,
+            "method calls must not clobber the recorded stream set"
         );
 
-        // A second `mark_stream_use` replaces the recorded stream
-        // (last-wins, matching the documented contract).
+        // V-2: re-recording the same stream dedups (no growth), and a new
+        // stream accumulates rather than replacing the previous one.
+        buf.mark_stream_use(fake_stream);
+        assert_eq!(buf.recorded_stream_count(), 1, "re-record must dedup");
         let other_stream: CUstream = 0xCAFE_F00D_usize as CUstream;
         buf.mark_stream_use(other_stream);
-        assert_eq!(buf.last_use_stream(), Some(other_stream));
+        assert_eq!(
+            buf.recorded_stream_count(),
+            2,
+            "V-2: distinct streams must accumulate, not overwrite"
+        );
 
-        // And a null stream is a perfectly legal value (the default
-        // stream is the null handle).
+        // A null stream is a perfectly legal value (the default stream is
+        // the null handle) and counts as a distinct member of the set.
         buf.mark_stream_use(ptr::null_mut());
-        assert_eq!(buf.last_use_stream(), Some(ptr::null_mut::<()>() as CUstream));
+        assert_eq!(buf.recorded_stream_count(), 3);
     }
 }
 

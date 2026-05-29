@@ -1217,14 +1217,22 @@ impl Default for DeviceMemPool {
 
 impl Drop for DeviceMemPool {
     fn drop(&mut self) {
-        // Stage 4: signal the background watcher (if any) to exit before
-        // we drain — once the pool is gone any `evict_above_high_water`
-        // call from the watcher races with us. The watcher polls the
-        // shutdown flag every `SHUTDOWN_QUANTUM` (~50 ms) so it exits
-        // well within the global-static destruction window. No-op when
-        // the `pool-watcher` feature is off.
+        // Stage 4 / V-9: signal the background watcher (if any) to exit
+        // AND join it before we drain. Once the pool is being drained, any
+        // `evict_above_high_water` call still running on the watcher races
+        // with us — and merely flipping the shutdown flag is not enough,
+        // because the watcher observes it only every `SHUTDOWN_QUANTUM`
+        // (~50 ms) and may be mid-eviction (touching pool internals and
+        // the captured `CUcontext`) at that instant. `request_shutdown_and_join`
+        // therefore sets the flag, then blocks on the watcher's
+        // `JoinHandle`, so no watcher activity can overlap the drain or the
+        // teardown of the `Lazy<DeviceMemPool>` static.
+        //
+        // Ordering is load-bearing: request_shutdown -> join -> drain.
+        // No-op when the `pool-watcher` feature is off (the whole watcher
+        // module is compiled out, so this call site disappears).
         #[cfg(all(feature = "pool-watcher", not(test)))]
-        pool_watcher::request_shutdown();
+        pool_watcher::request_shutdown_and_join();
         self.drain();
     }
 }
@@ -1250,8 +1258,13 @@ pub fn __test_pool() -> &'static DeviceMemPool {
 // fraction drops below `BOLT_POOL_WATCH_LOW_WATER_FRAC` (default 0.10)
 // the watcher calls `POOL.evict_above_high_water()` and bumps
 // `PROACTIVE_EVICTION_COUNT`. The thread shuts down cleanly on process
-// exit via the `WATCHER_SHUTDOWN` flag — `DeviceMemPool::Drop` flips
-// the flag and `join`s when the global `POOL` is finalised.
+// exit: `DeviceMemPool::Drop` flips the `SHUTDOWN` flag AND `join`s the
+// watcher's `JoinHandle` before draining the pool, when the global `POOL`
+// is finalised. The join is what actually closes the V-9 teardown race —
+// flipping the flag alone left a ~50 ms window in which the watcher could
+// still be inside `evict_above_high_water` touching pool internals / the
+// captured `CUcontext` while Drop drained underneath it. See
+// `pool_watcher::request_shutdown_and_join`.
 //
 // Default (and `#[cfg(test)]`) builds compile out the entire module and
 // `ensure_watcher_started` is a no-op `#[inline(always)]` shim, so the
@@ -1300,8 +1313,9 @@ fn ensure_watcher_started() {}
 
 #[cfg(feature = "pool-watcher")]
 // Under `cfg(test)` the tests drive `watcher_loop` directly against a
-// local pool and never reach for `ensure_started` / `request_shutdown` /
-// the singleton statics. Allow dead_code at the module level so the
+// local pool and never reach for `ensure_started` /
+// `request_shutdown_and_join` / the singleton statics. Allow dead_code at
+// the module level so the
 // `cargo test --features pool-watcher` build stays warning-free
 // without an attribute on every helper.
 #[cfg_attr(test, allow(dead_code))]
@@ -1310,11 +1324,14 @@ pub(super) mod pool_watcher {
     //! triggers `evict_above_high_water` when free device memory falls
     //! below a configurable threshold. Lifetime is tied to the process —
     //! `DeviceMemPool::Drop` (when the global `POOL` is finalised on
-    //! shutdown) trips `SHUTDOWN` so the thread exits cleanly.
+    //! shutdown) trips `SHUTDOWN` and then `join`s the watcher thread via
+    //! `request_shutdown_and_join` so the thread is fully quiescent before
+    //! the pool is drained (V-9: the join, not just the flag, is what
+    //! prevents the watcher from racing the teardown).
     use super::{DeviceMemPool, POOL, PROACTIVE_EVICTION_COUNT};
     use crate::error::BoltResult;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
@@ -1347,7 +1364,26 @@ pub(super) mod pool_watcher {
     /// poll is skipped, never propagated past the watcher.
     pub(super) type CtxAttachFn = fn() -> BoltResult<()>;
 
-    static HANDLE: OnceLock<JoinHandle<()>> = OnceLock::new();
+    /// Join handle for the single watcher thread, stored inside a
+    /// `Mutex<Option<..>>` rather than a `OnceLock<JoinHandle<..>>`.
+    ///
+    /// V-9 (MEDIUM — teardown data race): `DeviceMemPool::Drop` must
+    /// genuinely `join()` the watcher before draining the pool and letting
+    /// the `Lazy<DeviceMemPool>` static tear down — otherwise the watcher
+    /// can still be inside `watcher_loop -> evict_above_high_water ->
+    /// evict_one`, touching pool internals and the captured `CUcontext`,
+    /// while we drain underneath it. A `OnceLock` only ever hands out a
+    /// shared `&JoinHandle`, and `JoinHandle::join` consumes `self` by
+    /// value, so Drop could never actually join. Keeping the handle in a
+    /// `Mutex<Option<..>>` lets `request_shutdown_and_join` `.take()` it
+    /// and perform exactly one clean join.
+    ///
+    /// `STARTED` preserves the once-only spawn semantics that `OnceLock`
+    /// previously provided: it is checked and set under the `HANDLE` lock,
+    /// so two threads racing `ensure_started` spawn the watcher at most
+    /// once even though the `Option` is emptied again by the join at Drop.
+    static HANDLE: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+    static STARTED: AtomicBool = AtomicBool::new(false);
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
     /// Stage 5: capture of the engine thread's CUDA context, taken at
@@ -1393,7 +1429,9 @@ pub(super) mod pool_watcher {
     }
 
     /// Spawn the watcher exactly once (idempotent). Subsequent calls are
-    /// a cheap `OnceLock::get_or_init` check.
+    /// a cheap `STARTED` flag check under the `HANDLE` lock (V-9: the
+    /// handle lives in a `Mutex<Option<JoinHandle>>` so `Drop` can take and
+    /// join it; `STARTED` keeps the spawn once-only).
     ///
     /// Stage 5 (M3L5): on the first call, captures the current CUDA
     /// context on the calling thread (via `cuCtxGetCurrent`) and stashes
@@ -1405,53 +1443,93 @@ pub(super) mod pool_watcher {
     /// watcher still spawns (it'll just keep failing polls until an
     /// engine call binds a context that real_ctx_attach can later use).
     pub(super) fn ensure_started() {
-        HANDLE.get_or_init(|| {
-            // Capture the engine thread's context BEFORE spawning the
-            // background thread (otherwise we'd capture the new thread's
-            // empty context).
-            match crate::cuda::cuda_sys::ctx_get_current() {
-                Ok(Some(ctx)) => {
-                    // `ctx` is `*mut c_void` (CUcontext) — store directly
-                    // into the typed `AtomicPtr` so provenance is preserved.
-                    CAPTURED_CTX.store(ctx, Ordering::Release);
-                }
-                Ok(None) => {
-                    log::debug!(
-                        "craton-bolt: pool-watcher spawning with no current \
-                         context; polls will retry until a context is bound"
-                    );
-                }
-                Err(e) => {
-                    log::debug!(
-                        "craton-bolt: pool-watcher cuCtxGetCurrent failed at \
-                         spawn: {}",
-                        e
-                    );
-                }
+        // Hold the `HANDLE` lock across the whole check-spawn-store so two
+        // threads racing first-touch cannot both spawn (V-9: this lock is
+        // also what `request_shutdown_and_join` takes to extract the handle
+        // for the join, so spawn and join are mutually exclusive).
+        let mut guard = HANDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if STARTED.swap(true, Ordering::AcqRel) {
+            // Already spawned (or already torn down by Drop) — nothing to do.
+            return;
+        }
+        // Capture the engine thread's context BEFORE spawning the
+        // background thread (otherwise we'd capture the new thread's
+        // empty context).
+        match crate::cuda::cuda_sys::ctx_get_current() {
+            Ok(Some(ctx)) => {
+                // `ctx` is `*mut c_void` (CUcontext) — store directly
+                // into the typed `AtomicPtr` so provenance is preserved.
+                CAPTURED_CTX.store(ctx, Ordering::Release);
             }
-            let interval = read_interval();
-            let low_water = read_low_water();
-            thread::Builder::new()
-                .name("craton-bolt-pool-watcher".into())
-                .spawn(move || {
-                    watcher_loop(
-                        &POOL,
-                        interval,
-                        low_water,
-                        real_mem_info,
-                        real_ctx_attach,
-                        &SHUTDOWN,
-                    )
-                })
-                .expect("spawn pool-watcher thread")
-        });
+            Ok(None) => {
+                log::debug!(
+                    "craton-bolt: pool-watcher spawning with no current \
+                     context; polls will retry until a context is bound"
+                );
+            }
+            Err(e) => {
+                log::debug!(
+                    "craton-bolt: pool-watcher cuCtxGetCurrent failed at \
+                     spawn: {}",
+                    e
+                );
+            }
+        }
+        let interval = read_interval();
+        let low_water = read_low_water();
+        let handle = thread::Builder::new()
+            .name("craton-bolt-pool-watcher".into())
+            .spawn(move || {
+                watcher_loop(
+                    &POOL,
+                    interval,
+                    low_water,
+                    real_mem_info,
+                    real_ctx_attach,
+                    &SHUTDOWN,
+                )
+            })
+            .expect("spawn pool-watcher thread");
+        *guard = Some(handle);
     }
 
-    /// Signal the watcher to exit. Called from `DeviceMemPool::Drop` —
-    /// the watcher polls `SHUTDOWN` between sleeps and exits within
-    /// `SHUTDOWN_QUANTUM`. Safe to call multiple times.
-    pub(super) fn request_shutdown() {
+    /// Signal the watcher to exit **and block until it has**. Called from
+    /// `DeviceMemPool::Drop`.
+    ///
+    /// V-9 (MEDIUM — teardown data race): flipping `SHUTDOWN` alone does
+    /// not close the race — the watcher polls the flag only every
+    /// `SHUTDOWN_QUANTUM` (~50 ms), so without a join the thread may still
+    /// be mid-`evict_above_high_water` (touching pool internals and the
+    /// captured `CUcontext`) when Drop proceeds to drain and the
+    /// `Lazy<DeviceMemPool>` static is finalised. We therefore set the
+    /// flag, then `.take()` the `JoinHandle` out of `HANDLE` and `join()`
+    /// it, guaranteeing no watcher activity overlaps the subsequent drain.
+    ///
+    /// Drop must never panic, so a poisoned-join (watcher thread panicked)
+    /// is logged and swallowed rather than propagated. Safe to call
+    /// multiple times: the handle is consumed on the first call, so later
+    /// calls find `None` and simply ensure the flag is set.
+    pub(super) fn request_shutdown_and_join() {
         SHUTDOWN.store(true, Ordering::Release);
+        // Take the handle under the same lock `ensure_started` uses, so a
+        // concurrent first-touch spawn cannot interleave with the join.
+        let handle = {
+            let mut guard = HANDLE.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(handle) = handle {
+            // `join()` returns promptly once the watcher observes
+            // `SHUTDOWN` on its next quantum poll (≤ `SHUTDOWN_QUANTUM`).
+            if let Err(e) = handle.join() {
+                // The watcher panicked. Don't re-panic inside Drop —
+                // just record it; we're tearing the process down anyway.
+                log::error!(
+                    "craton-bolt: pool-watcher thread panicked during \
+                     shutdown join (V-9): {:?}",
+                    e
+                );
+            }
+        }
     }
 
     /// **Stage 6 (M3L5)** — retry-on-first-engine-call hook.

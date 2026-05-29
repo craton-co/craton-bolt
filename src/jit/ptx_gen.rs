@@ -1581,7 +1581,13 @@ fn byte_width(dtype: DataType) -> BoltResult<usize> {
 /// and any name containing `_param_` (would collide with synthesised parameter
 /// names from `PtxBuilder::param_name`). PTX is case-sensitive, so the reject
 /// list is matched case-sensitively.
-fn validate_kernel_name(name: &str) -> BoltResult<()> {
+///
+/// V-12: this is the single source of truth for kernel-name validation. The
+/// scan-kernel codegen path (`scan_kernel::compile`) calls this same function
+/// rather than maintaining a weaker duplicate, so both external-name consumers
+/// share identical hardening (charset, leading char, PTX reserved words, `__`
+/// prefix, and the `_param_` substring check).
+pub(crate) fn validate_kernel_name(name: &str) -> BoltResult<()> {
     if name.is_empty() {
         return Err(BoltError::Other(
             "ptx_gen: kernel name must not be empty".into(),

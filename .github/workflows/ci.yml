@@ -61,6 +61,11 @@ jobs:
       # TODO(ci): --features rust-cuda requires nightly + libNVVM + LLVM
       # toolchain — not feasible on github-hosted runners without a custom
       # container. Track in https://github.com/craton-co/craton-bolt/issues/?
+      #
+      # V-4: enabling rust-cuda makes rustc_codegen_nvvm download & execute an
+      # external LLVM/libNVVM toolchain at build time (network fetch + plugin
+      # execution, no in-repo integrity check). Off by default; build it only
+      # on network-isolated, artifact-pinned runners. See build.rs.
 
       - name: cargo test (lib + integration)
         run: cargo test --lib --tests --features cuda-stub --no-default-features
@@ -96,5 +101,46 @@ jobs:
 
       # `cargo deny check` runs all sections (advisories, licenses, bans,
       # sources) configured in deny.toml at the repo root.
+      #
+      # V-11: this is the STRICT/BLOCKING gate. It scans the default host
+      # graph (deny.toml graph.all-features=false), which is clean, so
+      # advisories.unmaintained = "deny" holds here without breaking CI.
       - name: cargo deny check
         run: cargo deny check advisories licenses bans
+
+  # V-11: informational supply-chain scan of the FULL feature graph, including
+  # the `rust-cuda` / rustc_codegen_nvvm build-dependency tree (curl/tar/
+  # xz 0.1.0/nvvm/...) that the default graph (all-features=false) never sees.
+  # This tree contains the known-unmaintained `xz 0.1.0` crate, which would
+  # fail under advisories.unmaintained = "deny", so this job is intentionally
+  # NON-BLOCKING (continue-on-error: true). Treat its output as advisory: it
+  # surfaces NVVM-toolchain dep issues without gating merges. If we ever pin
+  # and ignore the specific advisory, this job can be made blocking.
+  cargo-deny-all-features:
+    name: cargo deny (all-features, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-deny-all-${{ hashFiles('**/Cargo.lock', 'deny.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-deny-all-
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      # `--all-features` overrides deny.toml graph.all-features=false so the
+      # rust-cuda / NVVM build-dep tree is included in the scan.
+      - name: cargo deny check (all features)
+        run: cargo deny --all-features check advisories licenses bans

@@ -324,15 +324,37 @@ impl GpuColumn {
                                         dict_strings.push(sa.value(i).to_string());
                                     }
                                 }
+                                // Finding V-5: validate every key before it is
+                                // copied to the device index buffer. An
+                                // unvalidated negative or out-of-range key
+                                // would later index the dictionary inside the
+                                // GPU kernel -> OOB device read. Null slots are
+                                // encoded as 0 (validity handled separately by
+                                // `upload_dict_utf8`); mirror the strict bounds
+                                // checks in `string_ops`.
+                                let dict_len = sa.len();
                                 let keys: Vec<i32> = (0..n)
                                     .map(|i| {
                                         if da.keys().is_null(i) {
-                                            0
+                                            Ok(0)
                                         } else {
-                                            da.keys().value(i)
+                                            let key = da.keys().value(i);
+                                            if key < 0 {
+                                                return Err(BoltError::Type(format!(
+                                                    "GpuColumn: negative dict<i32,Utf8> key {} at row {}",
+                                                    key, i
+                                                )));
+                                            }
+                                            if (key as usize) >= dict_len {
+                                                return Err(BoltError::Type(format!(
+                                                    "GpuColumn: dict<i32,Utf8> key {} at row {} out of range (dictionary size {})",
+                                                    key, i, dict_len
+                                                )));
+                                            }
+                                            Ok(key)
                                         }
                                     })
-                                    .collect();
+                                    .collect::<BoltResult<Vec<i32>>>()?;
                                 (keys, dict_strings)
                             }
                             A::Int64 => {
@@ -370,15 +392,47 @@ impl GpuColumn {
                                         sa.len()
                                     )));
                                 }
+                                // Finding V-5: validate every key before the
+                                // i64 -> i32 narrowing. The previous `as i32`
+                                // cast SILENTLY truncated/wrapped large keys,
+                                // and only the dictionary *size* was checked
+                                // against i32::MAX above — never the per-key
+                                // values. An unvalidated key later indexes the
+                                // dictionary inside the GPU kernel -> OOB
+                                // device read. Reject negative, out-of-range,
+                                // and `> i32::MAX` keys so the `as i32` cast
+                                // can never truncate a value that is actually
+                                // used. Null slots are encoded as 0 (validity
+                                // handled separately by `upload_dict_utf8`).
+                                let dict_len = sa.len();
                                 let keys: Vec<i32> = (0..n)
                                     .map(|i| {
                                         if da.keys().is_null(i) {
-                                            0
+                                            Ok(0)
                                         } else {
-                                            da.keys().value(i) as i32
+                                            let key = da.keys().value(i);
+                                            if key < 0 {
+                                                return Err(BoltError::Type(format!(
+                                                    "GpuColumn: negative dict<i64,Utf8> key {} at row {}",
+                                                    key, i
+                                                )));
+                                            }
+                                            if key > i32::MAX as i64 {
+                                                return Err(BoltError::Type(format!(
+                                                    "GpuColumn: dict<i64,Utf8> key {} at row {} exceeds i32 capacity",
+                                                    key, i
+                                                )));
+                                            }
+                                            if (key as usize) >= dict_len {
+                                                return Err(BoltError::Type(format!(
+                                                    "GpuColumn: dict<i64,Utf8> key {} at row {} out of range (dictionary size {})",
+                                                    key, i, dict_len
+                                                )));
+                                            }
+                                            Ok(key as i32)
                                         }
                                     })
-                                    .collect();
+                                    .collect::<BoltResult<Vec<i32>>>()?;
                                 (keys, dict_strings)
                             }
                             other => {
