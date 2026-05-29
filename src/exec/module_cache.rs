@@ -253,7 +253,8 @@ fn hash128<S: std::fmt::Debug + ?Sized>(spec: &S, hi_byte: u8, lo_byte: u8) -> (
 /// Trait implemented by every per-family content-hash key
 /// (`KernelSpecKey`, `ScalarAggKey`, …). Exposes the 128-bit fingerprint
 /// and the PTX entry name so the shared disk-cache key composer can build
-/// `"{prefix}{entry}-{hex(hash128)}"` without knowing the concrete family.
+/// `"{codegen_salt}-{prefix}{entry}-{hex(hash128)}"` without knowing the
+/// concrete family.
 trait CacheKey: Copy + Eq + std::hash::Hash {
     fn hi(&self) -> u64;
     fn lo(&self) -> u64;
@@ -342,14 +343,45 @@ impl<K: CacheKey> SpecCache<K> {
     }
 }
 
+/// Compose the on-disk PTX cache key for a disk-backed kernel family.
+///
+/// Shape: `"{codegen_salt}-{disk_prefix}{entry}-{hex(hash128)}"`.
+///
+/// * The leading [`codegen_salt`](crate::jit::disk_cache::codegen_salt) is the
+///   JIT-M1 guard: it folds in `CODEGEN_VERSION` + the crate version so any
+///   codegen change rotates the key. A populated cache dir written by an older
+///   binary then *misses* (forcing a recompile) instead of serving stale PTX
+///   whose `KernelSpec` hash happens to be unchanged. This matches the
+///   engine.rs scalar/projection path, which uses
+///   [`disk_cache::disk_key`](crate::jit::disk_cache::disk_key) — the only
+///   difference is that path has no per-family `disk_prefix`.
+/// * The `{disk_prefix}{entry}-{hex(hash128)}` tail is the historical
+///   domain-separated shape, preserved byte-for-byte: the prefix distinguishes
+///   kernel families (`scalar_agg::`, `hash_join::`, …), `entry` distinguishes
+///   symbols, and the spec hash distinguishes IR. Only the salt is prepended.
+///
+/// The disk key string is internal to [`get_or_build_with_disk`]; no other
+/// caller depends on its shape, so prepending the salt only rotates which
+/// on-disk entries are considered fresh.
+fn compose_disk_key(disk_prefix: &str, entry: &str, hi: u64, lo: u64) -> String {
+    format!(
+        "{}-{}{}-{}",
+        crate::jit::disk_cache::codegen_salt(),
+        disk_prefix,
+        entry,
+        crate::jit::disk_cache::hash_to_key(hi, lo),
+    )
+}
+
 /// Shared in-memory-then-disk fall-through used by every disk-backed
 /// family's `get_or_build_module_for_*`. On a hit in `cache` we return the
 /// cached module; on a miss we consult the optional on-disk PTX cache
-/// (keyed `"{disk_prefix}{entry}-{hex(hash128)}"`) before paying for
+/// (keyed by [`compose_disk_key`]:
+/// `"{codegen_salt}-{disk_prefix}{entry}-{hex(hash128)}"`) before paying for
 /// codegen, write-through any freshly compiled PTX, load it via the real
 /// `CudaModule::from_ptx`, and store the result. Behaviour (lock scope,
-/// disk key shape, write-through, insert idempotence) is byte-for-byte what
-/// each family open-coded before this consolidation.
+/// write-through, insert idempotence) is what each family open-coded before
+/// this consolidation; the codegen salt was added for JIT-M1.
 fn get_or_build_with_disk<K, F>(
     cache: &Lazy<Mutex<SpecCache<K>>>,
     key: K,
@@ -366,14 +398,9 @@ where
     }
     // In-memory miss: try the optional on-disk cache before paying for codegen.
     let disk = crate::jit::disk_cache::disk_cache();
-    let disk_key = disk.as_ref().map(|_| {
-        format!(
-            "{}{}-{}",
-            disk_prefix,
-            key.entry(),
-            crate::jit::disk_cache::hash_to_key(key.hi(), key.lo()),
-        )
-    });
+    let disk_key = disk
+        .as_ref()
+        .map(|_| compose_disk_key(disk_prefix, key.entry(), key.hi(), key.lo()));
     let ptx = match (&disk, &disk_key) {
         (Some(dcache), Some(k)) => match dcache.lookup(k) {
             Some(text) => text,
@@ -631,7 +658,7 @@ pub fn scalar_agg_cache_stats() -> (usize, usize) {
 /// When the disk-backed PTX cache is enabled (env var `BOLT_PTX_CACHE_DIR`
 /// or builder override), a miss in the in-memory cache consults the disk
 /// cache *before* paying the codegen cost. The disk key is composed as
-/// `"{SCALAR_AGG_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
+/// `"{codegen_salt}-{SCALAR_AGG_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
 ///   1. The `"scalar_agg::"` prefix domain-separates these entries from the
 ///      projection-path entries that share the disk directory.
 ///   2. The `entry` suffix distinguishes `bolt_reduce` from `bolt_avg_reduce`.
@@ -763,7 +790,7 @@ pub fn hash_join_cache_stats() -> (usize, usize) {
 /// When the disk-backed PTX cache is enabled (env var `BOLT_PTX_CACHE_DIR`
 /// or builder override), a miss in the in-memory cache consults the disk
 /// cache *before* paying the codegen cost. The disk key is composed as
-/// `"{HASH_JOIN_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
+/// `"{codegen_salt}-{HASH_JOIN_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
 ///   1. The `"hash_join::"` prefix domain-separates these entries from the
 ///      projection-path and scalar-aggregate entries sharing the directory.
 ///   2. The `entry` suffix distinguishes `bolt_build`, `bolt_probe`,
@@ -912,7 +939,7 @@ pub fn radix_sort_cache_stats() -> (usize, usize) {
 /// When the disk-backed PTX cache is enabled (env var `BOLT_PTX_CACHE_DIR`
 /// or builder override), a miss in the in-memory cache consults the disk
 /// cache *before* paying the codegen cost. The disk key is composed as
-/// `"{RADIX_SORT_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
+/// `"{codegen_salt}-{RADIX_SORT_DISK_PREFIX}{entry}-{hex(hash128)}"` so:
 ///   1. The `"radix_sort::"` prefix domain-separates these entries from
 ///      the projection-path, scalar-aggregate, and hash-join entries that
 ///      share the disk directory.
@@ -1080,7 +1107,7 @@ pub fn compaction_cache_stats() -> (usize, usize) {
 /// `BOLT_PTX_CACHE_DIR` or builder override), a miss in the in-memory
 /// cache consults the disk cache *before* paying the codegen cost. The
 /// disk key is composed as
-/// `"{COMPACTION_DISK_PREFIX}{entry}-{hex(hash128)}"`; the
+/// `"{codegen_salt}-{COMPACTION_DISK_PREFIX}{entry}-{hex(hash128)}"`; the
 /// `"compaction::"` prefix keeps these entries human-greppable in a
 /// shared cache directory.
 ///
@@ -1685,18 +1712,40 @@ mod scalar_agg_cache_tests {
     #[test]
     fn scalar_agg_disk_prefix_is_visibly_namespaced() {
         assert_eq!(SCALAR_AGG_DISK_PREFIX, "scalar_agg::");
-        // The full disk key shape is `"<PREFIX><entry>-<hex>"` — confirm
-        // the prefix lands at the start of a composed key.
-        let composed = format!(
-            "{}{}-{}",
-            SCALAR_AGG_DISK_PREFIX,
-            "bolt_reduce",
-            "deadbeefcafebabe1234567890abcdef",
-        );
+        // The full disk key shape is now `"{codegen_salt}-{PREFIX}{entry}-{hex}"`
+        // (JIT-M1 salt prepended). Confirm the family prefix lands immediately
+        // after the salt so a hand inspection of the cache dir still
+        // distinguishes scalar-agg entries from projection-path entries.
+        let salt = crate::jit::disk_cache::codegen_salt();
+        let composed = compose_disk_key(SCALAR_AGG_DISK_PREFIX, "bolt_reduce", 0xdead_beef, 0xcafe_babe);
         assert!(
-            composed.starts_with("scalar_agg::"),
-            "composed disk key must carry the scalar_agg prefix: {composed}"
+            composed.starts_with(&format!("{salt}-scalar_agg::")),
+            "composed disk key must carry the salt then the scalar_agg prefix: {composed}"
         );
+    }
+
+    /// JIT-M1: `compose_disk_key` must (1) prepend the codegen salt, (2)
+    /// preserve the `{prefix}{entry}-{hash}` domain-separated tail, (3) rotate
+    /// when the spec hash changes, and (4) keep distinct kernel families in
+    /// distinct keys. This is the disk-backed twin of the engine.rs
+    /// `disk_cache::disk_key` salt fix.
+    #[test]
+    fn compose_disk_key_salts_and_separates_domains() {
+        use crate::jit::disk_cache::{codegen_salt, hash_to_key};
+        let salt = codegen_salt();
+        let k = compose_disk_key("scalar_agg::", "bolt_reduce", 0xABCD, 0x1234);
+
+        // (1) salt is the leading component.
+        assert!(k.starts_with(&format!("{salt}-")), "missing salt prefix: {k}");
+        // (2) the historical tail is preserved byte-for-byte after the salt.
+        let tail = format!("scalar_agg::bolt_reduce-{}", hash_to_key(0xABCD, 0x1234));
+        assert_eq!(k, format!("{salt}-{tail}"), "tail must be salt + historical shape");
+        // (3) a different spec hash yields a different key.
+        assert_ne!(k, compose_disk_key("scalar_agg::", "bolt_reduce", 0xABCD, 0x9999));
+        // (4) a different family prefix yields a different key (no aliasing).
+        assert_ne!(k, compose_disk_key("hash_join::", "bolt_reduce", 0xABCD, 0x1234));
+        // ...and a different entry symbol too.
+        assert_ne!(k, compose_disk_key("scalar_agg::", "bolt_other", 0xABCD, 0x1234));
     }
 
     /// The key fingerprint is stable across `Clone` of the same spec —
@@ -1939,15 +1988,12 @@ mod hash_join_cache_tests {
     #[test]
     fn hash_join_disk_prefix_is_visibly_namespaced() {
         assert_eq!(HASH_JOIN_DISK_PREFIX, "hash_join::");
-        let composed = format!(
-            "{}{}-{}",
-            HASH_JOIN_DISK_PREFIX,
-            "bolt_build",
-            "deadbeefcafebabe1234567890abcdef",
-        );
+        // Shape: `"{codegen_salt}-{PREFIX}{entry}-{hex}"` (JIT-M1 salt prepended).
+        let salt = crate::jit::disk_cache::codegen_salt();
+        let composed = compose_disk_key(HASH_JOIN_DISK_PREFIX, "bolt_build", 0xdead_beef, 0xcafe_babe);
         assert!(
-            composed.starts_with("hash_join::"),
-            "composed disk key must carry the hash_join prefix: {composed}"
+            composed.starts_with(&format!("{salt}-hash_join::")),
+            "composed disk key must carry the salt then the hash_join prefix: {composed}"
         );
     }
 
@@ -2172,15 +2218,13 @@ mod radix_sort_cache_tests {
     #[test]
     fn radix_sort_disk_prefix_is_visibly_namespaced() {
         assert_eq!(RADIX_SORT_DISK_PREFIX, "radix_sort::");
-        let composed = format!(
-            "{}{}-{}",
-            RADIX_SORT_DISK_PREFIX,
-            "bolt_radix_histogram_i32",
-            "deadbeefcafebabe1234567890abcdef",
-        );
+        // Shape: `"{codegen_salt}-{PREFIX}{entry}-{hex}"` (JIT-M1 salt prepended).
+        let salt = crate::jit::disk_cache::codegen_salt();
+        let composed =
+            compose_disk_key(RADIX_SORT_DISK_PREFIX, "bolt_radix_histogram_i32", 0xdead_beef, 0xcafe_babe);
         assert!(
-            composed.starts_with("radix_sort::"),
-            "composed disk key must carry the radix_sort prefix: {composed}"
+            composed.starts_with(&format!("{salt}-radix_sort::")),
+            "composed disk key must carry the salt then the radix_sort prefix: {composed}"
         );
     }
 

@@ -561,6 +561,12 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 //   * two specs that differ only in `n_vals` are distinct cache keys
 //     (separate miss + subsequent hit).
 // ---------------------------------------------------------------------------
+// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// below; the non-test schema conversion now lives in exec::schema_convert.
+// cfg(test)-gated so normal builds don't see an unused import.
+#[cfg(test)]
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;

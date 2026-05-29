@@ -2994,6 +2994,12 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // checks that a NULL row in the same batch as a `-0.0` row produces the
 // correct (post-mask) key vector with the `-0.0` row preserved.
 // ---------------------------------------------------------------------------
+// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// below; the non-test schema conversion now lives in exec::schema_convert.
+// cfg(test)-gated so normal builds don't see an unused import.
+#[cfg(test)]
+use arrow_schema::{Field as ArrowField};
+
 #[cfg(test)]
 mod tests {
     use super::*;

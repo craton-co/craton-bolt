@@ -1,0 +1,1907 @@
+   Compiling craton-bolt v0.7.0 (C:\Projects\bolt)
+error[E0004]: non-exhaustive patterns: `&Expr::Like { .. }` not covered
+   --> tests\is_null_test.rs:462:11
+    |
+462 |     match expr {
+    |           ^^^^ pattern `&Expr::Like { .. }` not covered
+    |
+note: `Expr` defined here
+   --> src\plan\logical_plan.rs:444:1
+    |
+444 | pub enum Expr {
+    | ^^^^^^^^^^^^^
+...
+486 |     Like {
+    |     ---- not covered
+    = note: the matched value is of type `&Expr`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+477 ~         Expr::Column(_) | Expr::Literal(_) => false,
+478 ~         &Expr::Like { .. } => todo!(),
+    |
+
+error[E0716]: temporary value dropped while borrowed
+   --> tests\aggregate_aliasing_test.rs:246:34
+    |
+246 |       let field_names: Vec<&str> = out
+    |  __________________________________^
+247 | |         .schema()
+    | |_________________^ creates a temporary value which is freed while still in use
+...
+251 |           .collect();
+    |                     - temporary value is freed at the end of this statement
+252 |       assert!(
+253 |           field_names.contains(&"total"),
+    |           ----------- borrow later used here
+    |
+help: consider using a `let` binding to create a longer lived value
+    |
+246 ~     let binding = out
+247 +         .schema();
+248 ~     let field_names: Vec<&str> = binding
+    |
+
+For more information about this error, try `rustc --explain E0004`.
+For more information about this error, try `rustc --explain E0716`.
+error: could not compile `craton-bolt` (test "aggregate_aliasing_test") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `craton-bolt` (test "is_null_test") due to 1 previous error
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\aggregate.rs:1645:53
+     |
+1645 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(name, dt, true)]));
+     |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1640 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\aggregate.rs:1887:53
+     |
+1887 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+     |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1640 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\aggregate.rs:1922:53
+     |
+1922 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+     |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1640 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:2582:53
+     |
+2582 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+     |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:2595:13
+     |
+2595 |             ArrowField::new(n1, a1.data_type().clone(), true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:2596:13
+     |
+2596 |             ArrowField::new(n2, a2.data_type().clone(), true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:2722:17
+     |
+2722 |                 ArrowField::new("a", ArrowDataType::Int32, false),
+     |                 ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:2723:17
+     |
+2723 |                 ArrowField::new("b", ArrowDataType::Int32, false),
+     |                 ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:2724:17
+     |
+2724 |                 ArrowField::new("c", ArrowDataType::Int32, false),
+     |                 ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:2918:13
+     |
+2918 |             ArrowField::new("k", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:2919:13
+     |
+2919 |             ArrowField::new("v", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:3036:13
+     |
+3036 |             ArrowField::new("k", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:3037:13
+     |
+3037 |             ArrowField::new("v", ArrowDataType::Float64, true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:3100:13
+     |
+3100 |             ArrowField::new("k", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby.rs:3101:13
+     |
+3101 |             ArrowField::new("v", ArrowDataType::Int32, true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2556 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_with_pre.rs:2826:13
+     |
+2826 |             ArrowField::new("k", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2565 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_with_pre.rs:2827:13
+     |
+2827 |             ArrowField::new("v", ArrowDataType::Int64, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2565 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1317:13
+     |
+1317 |             ArrowField::new("a", ArrowDataType::Int64, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1318:13
+     |
+1318 |             ArrowField::new("b", ArrowDataType::Int64, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1319:13
+     |
+1319 |             ArrowField::new("v", ArrowDataType::Int64, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1570:13
+     |
+1570 |             ArrowField::new("a", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1571:13
+     |
+1571 |             ArrowField::new("b", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1572:13
+     |
+1572 |             ArrowField::new("c", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1573:13
+     |
+1573 |             ArrowField::new("v", ArrowDataType::Int32, false),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1672:44
+     |
+1672 |             Arc::new(ArrowSchema::new(vec![ArrowField::new(
+     |                                            ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1708:44
+     |
+1708 |             Arc::new(ArrowSchema::new(vec![ArrowField::new(
+     |                                            ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1757:17
+     |
+1757 |                 ArrowField::new("a", ArrowDataType::Int64, false),
+     |                 ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1758:17
+     |
+1758 |                 ArrowField::new("v", ArrowDataType::Int64, false),
+     |                 ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1836:13
+     |
+1836 |             ArrowField::new("a", ArrowDataType::Int64, true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1837:13
+     |
+1837 |             ArrowField::new("b", ArrowDataType::Int64, true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_wide.rs:1838:13
+     |
+1838 |             ArrowField::new("v", ArrowDataType::Int64, true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+1277 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_valid.rs:3025:53
+     |
+3025 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+     |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2999 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_valid.rs:3038:13
+     |
+3038 |             ArrowField::new(n1, a1.data_type().clone(), true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2999 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_valid.rs:3039:13
+     |
+3039 |             ArrowField::new(n2, a2.data_type().clone(), true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2999 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_valid.rs:3362:13
+     |
+3362 |             ArrowField::new("k", ArrowDataType::Int32, true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2999 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+    --> src\exec\groupby_valid.rs:3363:13
+     |
+3363 |             ArrowField::new("v", ArrowDataType::Int64, true),
+     |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+     |
+help: consider importing this struct
+     |
+2999 +     use polars::prelude::ArrowField;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_exec.rs:349:13
+    |
+349 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+316 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_shmem_exec.rs:349:34
+    |
+349 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+316 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_exec.rs:350:13
+    |
+350 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+316 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_shmem_exec.rs:350:34
+    |
+350 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+316 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_multi_exec.rs:416:13
+    |
+416 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+375 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_multi_exec.rs:417:13
+    |
+417 |             ArrowField::new("v1", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+375 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_multi_exec.rs:418:13
+    |
+418 |             ArrowField::new("v2", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+375 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_avg_exec.rs:512:13
+    |
+512 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+477 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_shmem_avg_exec.rs:512:34
+    |
+512 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+477 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_avg_exec.rs:513:13
+    |
+513 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+477 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_shmem_avg_exec.rs:513:34
+    |
+513 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+477 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0425]: cannot find type `ArrowField` in this scope
+   --> src\exec\groupby_shmem_avg_exec.rs:620:29
+    |
+620 |         let mut fields: Vec<ArrowField> =
+    |                             ^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this struct
+    |
+549 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_avg_exec.rs:621:18
+    |
+621 |             vec![ArrowField::new("k", ArrowDataType::Int32, false)];
+    |                  ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+549 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_shmem_avg_exec.rs:621:39
+    |
+621 |             vec![ArrowField::new("k", ArrowDataType::Int32, false)];
+    |                                       ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+549 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_avg_exec.rs:623:25
+    |
+623 |             fields.push(ArrowField::new(
+    |                         ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+549 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_shmem_avg_exec.rs:625:17
+    |
+625 |                 ArrowDataType::Float64,
+    |                 ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+549 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_avg_exec.rs:698:13
+    |
+698 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+549 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_shmem_avg_exec.rs:698:34
+    |
+698 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+549 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_avg_exec.rs:699:13
+    |
+699 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+549 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_shmem_avg_exec.rs:699:34
+    |
+699 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+549 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_merge.rs:197:56
+    |
+197 |         assert_eq!(arrow_schema.field(0).data_type(), &ArrowDataType::Int32);
+    |                                                        ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+114 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_merge.rs:199:56
+    |
+199 |         assert_eq!(arrow_schema.field(1).data_type(), &ArrowDataType::Float64);
+    |                                                        ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+114 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_avg_exec.rs:650:13
+    |
+650 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+615 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_avg_exec.rs:650:34
+    |
+650 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+615 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_avg_exec.rs:651:13
+    |
+651 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+615 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_avg_exec.rs:651:34
+    |
+651 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+615 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_count_exec.rs:408:53
+    |
+408 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+    |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+378 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_count_exec.rs:410:13
+    |
+410 |             ArrowDataType::Int32,
+    |             ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+378 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_count_exec.rs:446:13
+    |
+446 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+378 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_count_exec.rs:446:34
+    |
+446 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+378 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_count_exec.rs:447:13
+    |
+447 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+378 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_count_exec.rs:447:35
+    |
+447 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+378 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_count_exec.rs:464:53
+    |
+464 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+    |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+378 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_count_exec.rs:466:13
+    |
+466 |             ArrowDataType::Int64,
+    |             ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+378 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_count_exec.rs:506:53
+    |
+506 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+    |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+378 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_count_exec.rs:508:13
+    |
+508 |             ArrowDataType::Int32,
+    |             ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+378 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_count_exec.rs:527:53
+    |
+527 |         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+    |                                                     ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+378 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_count_exec.rs:529:13
+    |
+529 |             ArrowDataType::Int32,
+    |             ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+378 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_count_exec.rs:660:13
+    |
+660 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+629 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_count_exec.rs:660:34
+    |
+660 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+629 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_minmax_exec.rs:800:13
+    |
+800 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+765 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_minmax_exec.rs:801:13
+    |
+801 |             ArrowField::new("v", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+765 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_minmax_exec.rs:383:13
+    |
+383 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+348 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_shmem_minmax_exec.rs:384:13
+    |
+384 |             ArrowField::new("v", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+348 +     use polars::prelude::ArrowField;
+    |
+
+error[E0425]: cannot find type `ArrowField` in this scope
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:453:29
+    |
+453 |         let mut fields: Vec<ArrowField> = vec![
+    |                             ^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this struct
+    |
+407 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:454:13
+    |
+454 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+407 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:454:35
+    |
+454 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+407 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:455:13
+    |
+455 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+407 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:455:35
+    |
+455 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+407 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:462:25
+    |
+462 |             fields.push(ArrowField::new(
+    |                         ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+407 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:464:17
+    |
+464 |                 ArrowDataType::Float64,
+    |                 ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+407 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:631:13
+    |
+631 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+594 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:631:35
+    |
+631 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+594 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:632:13
+    |
+632 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+594 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:632:35
+    |
+632 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+594 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:633:13
+    |
+633 |             ArrowField::new("v1", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+594 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:633:35
+    |
+633 |             ArrowField::new("v1", ArrowDataType::Float64, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+594 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:634:13
+    |
+634 |             ArrowField::new("v2", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+594 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_multi_exec.rs:634:35
+    |
+634 |             ArrowField::new("v2", ArrowDataType::Float64, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+594 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_minmax_float_exec.rs:452:13
+    |
+452 |             ArrowField::new("k", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+417 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_minmax_float_exec.rs:453:13
+    |
+453 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+417 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_multi_merge.rs:283:56
+    |
+283 |         assert_eq!(arrow_schema.field(0).data_type(), &ArrowDataType::Int32);
+    |                                                        ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+152 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_multi_merge.rs:287:18
+    |
+287 |                 &ArrowDataType::Float64
+    |                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+152 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `DataType`
+   --> src\exec\groupby_tier2_twokey_merge.rs:159:31
+    |
+159 |             Field::new("id1", DataType::Int32, false),
+    |                               ^^^^^^^^ use of undeclared type `DataType`
+    |
+help: consider importing one of these enums
+    |
+153 +     use crate::__test_only_logical_plan::DataType;
+    |
+153 +     use arrow::datatypes::DataType;
+    |
+153 +     use arrow_schema::DataType;
+    |
+153 +     use polars::datatypes::DataType;
+    |
+    = and 1 other candidate
+
+error[E0433]: failed to resolve: use of undeclared type `DataType`
+   --> src\exec\groupby_tier2_twokey_merge.rs:160:31
+    |
+160 |             Field::new("id2", DataType::Int32, false),
+    |                               ^^^^^^^^ use of undeclared type `DataType`
+    |
+help: consider importing one of these enums
+    |
+153 +     use crate::__test_only_logical_plan::DataType;
+    |
+153 +     use arrow::datatypes::DataType;
+    |
+153 +     use arrow_schema::DataType;
+    |
+153 +     use polars::datatypes::DataType;
+    |
+    = and 1 other candidate
+
+error[E0433]: failed to resolve: use of undeclared type `DataType`
+   --> src\exec\groupby_tier2_twokey_merge.rs:161:33
+    |
+161 |             Field::new("sum_v", DataType::Float64, false),
+    |                                 ^^^^^^^^ use of undeclared type `DataType`
+    |
+help: consider importing one of these enums
+    |
+153 +     use crate::__test_only_logical_plan::DataType;
+    |
+153 +     use arrow::datatypes::DataType;
+    |
+153 +     use arrow_schema::DataType;
+    |
+153 +     use polars::datatypes::DataType;
+    |
+    = and 1 other candidate
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_merge.rs:267:56
+    |
+267 |         assert_eq!(arrow_schema.field(0).data_type(), &ArrowDataType::Int32);
+    |                                                        ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+153 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_merge.rs:268:56
+    |
+268 |         assert_eq!(arrow_schema.field(1).data_type(), &ArrowDataType::Int32);
+    |                                                        ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+153 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_merge.rs:269:56
+    |
+269 |         assert_eq!(arrow_schema.field(2).data_type(), &ArrowDataType::Float64);
+    |                                                        ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+153 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `DataType`
+   --> src\exec\groupby_tier2_twokey_merge.rs:275:31
+    |
+275 |             Field::new("id1", DataType::Int32, false),
+    |                               ^^^^^^^^ use of undeclared type `DataType`
+    |
+help: consider importing one of these enums
+    |
+153 +     use crate::__test_only_logical_plan::DataType;
+    |
+153 +     use arrow::datatypes::DataType;
+    |
+153 +     use arrow_schema::DataType;
+    |
+153 +     use polars::datatypes::DataType;
+    |
+    = and 1 other candidate
+
+error[E0433]: failed to resolve: use of undeclared type `DataType`
+   --> src\exec\groupby_tier2_twokey_merge.rs:276:33
+    |
+276 |             Field::new("sum_v", DataType::Float64, false),
+    |                                 ^^^^^^^^ use of undeclared type `DataType`
+    |
+help: consider importing one of these enums
+    |
+153 +     use crate::__test_only_logical_plan::DataType;
+    |
+153 +     use arrow::datatypes::DataType;
+    |
+153 +     use arrow_schema::DataType;
+    |
+153 +     use polars::datatypes::DataType;
+    |
+    = and 1 other candidate
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_count_exec.rs:444:13
+    |
+444 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+406 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_count_exec.rs:444:35
+    |
+444 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+406 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_count_exec.rs:445:13
+    |
+445 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+406 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_count_exec.rs:445:35
+    |
+445 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+406 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_count_exec.rs:608:13
+    |
+608 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+579 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_count_exec.rs:608:35
+    |
+608 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+579 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_count_exec.rs:609:13
+    |
+609 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+579 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_count_exec.rs:609:35
+    |
+609 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+579 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0425]: cannot find type `ArrowField` in this scope
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:561:29
+    |
+561 |         let mut fields: Vec<ArrowField> = vec![
+    |                             ^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this struct
+    |
+514 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:562:13
+    |
+562 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+514 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:562:35
+    |
+562 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+514 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:563:13
+    |
+563 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+514 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:563:35
+    |
+563 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+514 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:570:25
+    |
+570 |             fields.push(ArrowField::new(
+    |                         ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+514 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:572:17
+    |
+572 |                 ArrowDataType::Float64,
+    |                 ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+514 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:639:13
+    |
+639 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+514 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:639:35
+    |
+639 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+514 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:640:13
+    |
+640 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+514 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:640:35
+    |
+640 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+514 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:641:13
+    |
+641 |             ArrowField::new("v0", ArrowDataType::Int64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+514 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:641:35
+    |
+641 |             ArrowField::new("v0", ArrowDataType::Int64, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+514 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:752:13
+    |
+752 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+721 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:752:35
+    |
+752 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+721 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:753:13
+    |
+753 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+721 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:753:35
+    |
+753 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |                                   ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+721 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:754:13
+    |
+754 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+721 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowDataType`
+   --> src\exec\groupby_tier2_twokey_avg_exec.rs:754:34
+    |
+754 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |                                  ^^^^^^^^^^^^^ use of undeclared type `ArrowDataType`
+    |
+    = note: enum `crate::exec::groupby_tier2_twokey_minmax_float_exec::stage4_tests::ArrowDataType` exists but is inaccessible
+help: consider importing this enum
+    |
+721 +     use polars::datatypes::ArrowDataType;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:736:13
+    |
+736 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+686 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:737:13
+    |
+737 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+686 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:738:13
+    |
+738 |             ArrowField::new("v", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+686 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:800:13
+    |
+800 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+686 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:801:13
+    |
+801 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+686 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:802:13
+    |
+802 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+686 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:940:13
+    |
+940 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+909 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:941:13
+    |
+941 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+909 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_exec.rs:942:13
+    |
+942 |             ArrowField::new("v", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+909 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:444:13
+    |
+444 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:445:13
+    |
+445 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:446:13
+    |
+446 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:510:13
+    |
+510 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:511:13
+    |
+511 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:512:13
+    |
+512 |             ArrowField::new("v", ArrowDataType::Int64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:534:13
+    |
+534 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:535:13
+    |
+535 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:536:13
+    |
+536 |             ArrowField::new("v", ArrowDataType::Float32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+394 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:654:13
+    |
+654 |             ArrowField::new("k1", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+623 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:655:13
+    |
+655 |             ArrowField::new("k2", ArrowDataType::Int32, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+623 +     use polars::prelude::ArrowField;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `ArrowField`
+   --> src\exec\groupby_tier2_twokey_minmax_float_exec.rs:656:13
+    |
+656 |             ArrowField::new("v", ArrowDataType::Float64, false),
+    |             ^^^^^^^^^^ use of undeclared type `ArrowField`
+    |
+help: consider importing this struct
+    |
+623 +     use polars::prelude::ArrowField;
+    |
+
+warning: unused doc comment
+   --> src\cuda\buffer.rs:696:1
+    |
+696 | / /// Test seam: when set, `Drop` fences through this stub instead of the real
+697 | | /// `cuStreamSynchronize`. Host-only tests install a recorder here to assert
+698 | | /// the *number of distinct streams fenced* without a GPU, then clear it.
+699 | | ///
+...   |
+702 | | /// touches it. Production never sets it, so the hot path is one `Cell`
+703 | | /// read returning `None`.
+    | |_-------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+error: linking with `link.exe` failed: exit code: 1318
+  |
+  = note: "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\HostX64\\x64\\link.exe" "/NOLOGO" "C:\\Projects\\bolt\\target\\debug\\deps\\rustcnwtt2K\\symbols.o" "<57 object files omitted>" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libtest-*,libgetopts-*,librustc_std_workspace_std-*}.rlib" "C:\\Projects\\bolt\\target\\debug\\deps/{libcraton_bolt-149872a4255d7d71,libtracing-cf216df287596bc6,libpin_project_lite-53ba8b2f4c52301c,libtracing_core-e6398222dc95e3b1,libthiserror-4786a781ce9595eb,libarrow-8332c31ec51f269f,libarrow_row-bca9841c314b3d8a,libarrow_json-ece16309f5f23fe1,libserde_json-8c5b1f5fdfb1ee41,libzmij-edb27c4d6462c5c0,libindexmap-a85a508917827654,libequivalent-dc36cde4901cc6a6,libhashbrown-f97180b2118d8d05,libarrow_ipc-34dc9f59b231d6fa,libflatbuffers-b5042cf22ef32709,libbitflags-9140dbc4a75465d8,libarrow_csv-799a9bfd2d6966df,liblazy_static-9fac0106aed43c0e,libcsv-aa5ae6370371f350,libitoa-35525c49b7e45c6c,libcsv_core-1efc10b03ddc1c90,libarrow_string-8486c57a17034961,libregex-039c5209c9ae8a04,libregex_automata-70f5f29be286b54a,libaho_corasick-83aecfd9df0ec687,libregex_syntax-a10934fb780db29a,libmemchr-3d7b66307f89874c,libarrow_cast-7872d1d2aebeb546,libatoi-e1353f8eb150ae53,libryu-319f509a7d8a8133,libbase64-00384957a60007b4,liblexical_core-ee09cad7d9f9fb5e,liblexical_write_float-91e3dce8f098c683,liblexical_write_integer-d4161611f5095db2,liblexical_parse_float-680b2d63ce4d5803,liblexical_parse_integer-a7deca38491b7ad3,liblexical_util-5a51a42c42f8f67c,libarrow_arith-2985e2afcd4b4715,libarrow_ord-5ce480f1923ff812,libarrow_select-f882011056a23933,libsqlparser-8df96c51c052e808,liblog-43b7e1f97519c667,libparking_lot-806f1c54fdaf9220,libdashmap-80a5ea7b1e9daf27,liblock_api-a52a2fbddb4ed2a4,libscopeguard-bbf2bc2b401ee9c7,libparking_lot_core-065a8bb5fd0068a2,libwindows_link-bc01748f223d1f99,libsmallvec-d60f9d7d700fa23c,libhashbrown-fb825c7f0ffa5d73,libserde-18b4ccf793208f11,libserde_core-14759b862f5d666a,librayon-3a4fea084b6b19b6,librayon_core-fd8addfe50f8cfa2,libcrossbeam_deque-8c1383e1c4600c98,libcrossbeam_epoch-05b3f58eb30d65eb,libcrossbeam_utils-3bfa44903d5927af,libeither-6c18eb88db5c3291,liballocator_api2-690a0e1c79bef924,liblibc-fa44e902a1086a4b,libbytemuck-0a32ae725fb50342,libarrow_array-d14381198e48e317,libahash-ad70260e77667e4b,libgetrandom-106ac132bf4366a8,libonce_cell-c74ed1f5792c849f,libhashbrown-a7497165f9c1f79e,libchrono-68088c0c2b424dd1,libwindows_targets-c5947a7efeb48f22,libarrow_data-38f51612f6963026,libarrow_schema-213e8c47ecfb8415,libarrow_buffer-c5846ccdb6ebac43,libbytes-094af595bf028992,libhalf-9bccfad089e48569,libcfg_if-709781a0f9096a35,libzerocopy-18e245f4ea70160b,libnum-09c4264a0347a550,libnum_iter-73e2891532dc27b5,libnum_rational-80e52fa07b7103e7,libnum_complex-0cf6239bcecc011b,libnum_bigint-83af85d2d2050129,libnum_integer-f287336e33d6e8d2,libnum_traits-1d3c66aa44588acf}.rlib" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libstd-*,libpanic_unwind-*,libcfg_if-*,libwindows_targets-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libunwind-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "kernel32.lib" "legacy_stdio_definitions.lib" "C:\\Users\\Admin\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "kernel32.lib" "kernel32.lib" "kernel32.lib" "ntdll.lib" "userenv.lib" "ws2_32.lib" "dbghelp.lib" "/defaultlib:msvcrt" "/NXCOMPAT" "/LIBPATH:C:\\Projects\\bolt\\target\\debug\\build\\libduckdb-sys-2d6586e9977fbea6\\out" "/LIBPATH:C:\\Projects\\bolt\\target\\debug\\build\\stacker-2479669bde28db69\\out" "/LIBPATH:C:\\Projects\\bolt\\target\\debug\\build\\psm-914c9def8d022ade\\out" "/LIBPATH:C:\\Users\\Admin\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib" "/LIBPATH:C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\atlmfc\\lib\\x64" "/OUT:C:\\Projects\\bolt\\target\\debug\\deps\\having_test-136138e88e7fd36c.exe" "/OPT:REF,NOICF" "/DEBUG" "/PDBALTPATH:%_PDB%" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\intrinsic.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\liballoc.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libcore.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libstd.natvis"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: LINK : fatal error LNK1318: Unexpected PDB error; LIMIT (12) 'C:\Projects\bolt\target\debug\deps\having_test-136138e88e7fd36c.pdb'
+          
+
+error: linking with `link.exe` failed: exit code: 1318
+  |
+  = note: "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\HostX64\\x64\\link.exe" "/NOLOGO" "C:\\Projects\\bolt\\target\\debug\\deps\\rustcOl2Ziz\\symbols.o" "<61 object files omitted>" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libtest-*,libgetopts-*,librustc_std_workspace_std-*}.rlib" "C:\\Projects\\bolt\\target\\debug\\deps/{libcraton_bolt-149872a4255d7d71,libtracing-cf216df287596bc6,libpin_project_lite-53ba8b2f4c52301c,libtracing_core-e6398222dc95e3b1,libthiserror-4786a781ce9595eb,libarrow-8332c31ec51f269f,libarrow_row-bca9841c314b3d8a,libarrow_json-ece16309f5f23fe1,libserde_json-8c5b1f5fdfb1ee41,libzmij-edb27c4d6462c5c0,libindexmap-a85a508917827654,libequivalent-dc36cde4901cc6a6,libhashbrown-f97180b2118d8d05,libarrow_ipc-34dc9f59b231d6fa,libflatbuffers-b5042cf22ef32709,libbitflags-9140dbc4a75465d8,libarrow_csv-799a9bfd2d6966df,liblazy_static-9fac0106aed43c0e,libcsv-aa5ae6370371f350,libitoa-35525c49b7e45c6c,libcsv_core-1efc10b03ddc1c90,libarrow_string-8486c57a17034961,libregex-039c5209c9ae8a04,libregex_automata-70f5f29be286b54a,libaho_corasick-83aecfd9df0ec687,libregex_syntax-a10934fb780db29a,libmemchr-3d7b66307f89874c,libarrow_cast-7872d1d2aebeb546,libatoi-e1353f8eb150ae53,libryu-319f509a7d8a8133,libbase64-00384957a60007b4,liblexical_core-ee09cad7d9f9fb5e,liblexical_write_float-91e3dce8f098c683,liblexical_write_integer-d4161611f5095db2,liblexical_parse_float-680b2d63ce4d5803,liblexical_parse_integer-a7deca38491b7ad3,liblexical_util-5a51a42c42f8f67c,libarrow_arith-2985e2afcd4b4715,libarrow_ord-5ce480f1923ff812,libarrow_select-f882011056a23933,libsqlparser-8df96c51c052e808,liblog-43b7e1f97519c667,libparking_lot-806f1c54fdaf9220,libdashmap-80a5ea7b1e9daf27,liblock_api-a52a2fbddb4ed2a4,libscopeguard-bbf2bc2b401ee9c7,libparking_lot_core-065a8bb5fd0068a2,libwindows_link-bc01748f223d1f99,libsmallvec-d60f9d7d700fa23c,libhashbrown-fb825c7f0ffa5d73,libserde-18b4ccf793208f11,libserde_core-14759b862f5d666a,librayon-3a4fea084b6b19b6,librayon_core-fd8addfe50f8cfa2,libcrossbeam_deque-8c1383e1c4600c98,libcrossbeam_epoch-05b3f58eb30d65eb,libcrossbeam_utils-3bfa44903d5927af,libeither-6c18eb88db5c3291,liballocator_api2-690a0e1c79bef924,liblibc-fa44e902a1086a4b,libbytemuck-0a32ae725fb50342,libarrow_array-d14381198e48e317,libahash-ad70260e77667e4b,libgetrandom-106ac132bf4366a8,libonce_cell-c74ed1f5792c849f,libhashbrown-a7497165f9c1f79e,libchrono-68088c0c2b424dd1,libwindows_targets-c5947a7efeb48f22,libarrow_data-38f51612f6963026,libarrow_schema-213e8c47ecfb8415,libarrow_buffer-c5846ccdb6ebac43,libbytes-094af595bf028992,libhalf-9bccfad089e48569,libcfg_if-709781a0f9096a35,libzerocopy-18e245f4ea70160b,libnum-09c4264a0347a550,libnum_iter-73e2891532dc27b5,libnum_rational-80e52fa07b7103e7,libnum_complex-0cf6239bcecc011b,libnum_bigint-83af85d2d2050129,libnum_integer-f287336e33d6e8d2,libnum_traits-1d3c66aa44588acf}.rlib" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libstd-*,libpanic_unwind-*,libcfg_if-*,libwindows_targets-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libunwind-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "kernel32.lib" "legacy_stdio_definitions.lib" "C:\\Users\\Admin\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "kernel32.lib" "kernel32.lib" "kernel32.lib" "ntdll.lib" "userenv.lib" "ws2_32.lib" "dbghelp.lib" "/defaultlib:msvcrt" "/NXCOMPAT" "/LIBPATH:C:\\Projects\\bolt\\target\\debug\\build\\libduckdb-sys-2d6586e9977fbea6\\out" "/LIBPATH:C:\\Projects\\bolt\\target\\debug\\build\\stacker-2479669bde28db69\\out" "/LIBPATH:C:\\Projects\\bolt\\target\\debug\\build\\psm-914c9def8d022ade\\out" "/LIBPATH:C:\\Users\\Admin\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib" "/LIBPATH:C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\atlmfc\\lib\\x64" "/OUT:C:\\Projects\\bolt\\target\\debug\\deps\\gpu_join_e2e-4621fc70be898ed7.exe" "/OPT:REF,NOICF" "/DEBUG" "/PDBALTPATH:%_PDB%" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\intrinsic.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\liballoc.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libcore.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libstd.natvis"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: LINK : fatal error LNK1318: Unexpected PDB error; LIMIT (12) 'C:\Projects\bolt\target\debug\deps\gpu_join_e2e-4621fc70be898ed7.pdb'
+          
+
+error: could not compile `craton-bolt` (test "gpu_join_e2e") due to 1 previous error
+error: could not compile `craton-bolt` (test "having_test") due to 1 previous error
+error[E0369]: binary operation `==` cannot be applied to type `logical_plan::Expr`
+    --> src\plan\physical_plan.rs:5046:17
+     |
+5046 |                 assert_eq!(p, predicate, "predicate must be preserved verbatim");
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |                 |
+     |                 logical_plan::Expr
+     |                 logical_plan::Expr
+     |
+note: an implementation of `PartialEq` might be missing for `logical_plan::Expr`
+    --> src\plan\logical_plan.rs:444:1
+     |
+ 444 | pub enum Expr {
+     | ^^^^^^^^^^^^^ must implement `PartialEq`
+     = note: this error originates in the macro `assert_eq` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `logical_plan::Expr` with `#[derive(PartialEq)]`
+    -->  src\plan\logical_plan.rs:444:1
+     |
+ 444 + #[derive(PartialEq)]
+ 445 | pub enum Expr {
+     |
+
+error[E0277]: `engine::QueryHandle` doesn't implement `std::fmt::Debug`
+    --> src\exec\join.rs:1958:14
+     |
+1958 |             .expect_err("CROSS product over u32::MAX must error");
+     |              ^^^^^^^^^^ the trait `std::fmt::Debug` is not implemented for `engine::QueryHandle`
+     |
+     = note: add `#[derive(Debug)]` to `engine::QueryHandle` or manually `impl std::fmt::Debug for engine::QueryHandle`
+note: required by a bound in `Result::<T, E>::expect_err`
+    --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\core\src\result.rs:1293:4
+help: consider annotating `engine::QueryHandle` with `#[derive(Debug)]`
+    -->  src\exec\engine.rs:2395:1
+     |
+2395 + #[derive(Debug)]
+2396 | pub struct QueryHandle {
+     |
+
+Some errors have detailed explanations: E0277, E0369, E0425, E0433.
+For more information about an error, try `rustc --explain E0277`.
+warning: `craton-bolt` (lib test) generated 1 warning
+error: could not compile `craton-bolt` (lib test) due to 157 previous errors; 1 warning emitted

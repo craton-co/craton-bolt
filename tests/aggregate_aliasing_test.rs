@@ -243,8 +243,10 @@ fn e2e_aggregate_alias_round_trips() {
         .expect("execute");
     let out = h.record_batch();
     // The schema must expose the alias literally.
-    let field_names: Vec<&str> = out
-        .schema()
+    // Bind the schema so the `&str` borrows outlive the statement (the
+    // `SchemaRef` returned by `schema()` is otherwise a dropped temporary).
+    let schema = out.schema();
+    let field_names: Vec<&str> = schema
         .fields()
         .iter()
         .map(|f| f.name().as_str())

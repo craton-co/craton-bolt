@@ -341,9 +341,11 @@ fn e2e_nested_loop_inner_cap_exceeded_errors() {
 
     // Both sides have 1500 rows > 1024 cap, so the inner-side check
     // refuses the plan with the documented hint.
-    let err = engine
-        .sql("SELECT * FROM t1 INNER JOIN t2 ON t1.a < t2.a")
-        .expect_err("oversized non-equi join must be rejected");
+    // `QueryHandle` is not `Debug`, so match rather than `.expect_err()`.
+    let err = match engine.sql("SELECT * FROM t1 INNER JOIN t2 ON t1.a < t2.a") {
+        Ok(_) => panic!("oversized non-equi join must be rejected"),
+        Err(e) => e,
+    };
     let msg = format!("{err}");
     assert!(
         msg.contains("non-equi join inner side"),
@@ -372,9 +374,11 @@ fn e2e_left_outer_non_equi_is_rejected() {
     engine.register_table("t1", t1).unwrap();
     engine.register_table("t2", t2).unwrap();
 
-    let err = engine
-        .sql("SELECT * FROM t1 LEFT JOIN t2 ON t1.a < t2.lo")
-        .expect_err("LEFT + non-equi must surface a clear error");
+    // `QueryHandle` is not `Debug`, so match rather than `.expect_err()`.
+    let err = match engine.sql("SELECT * FROM t1 LEFT JOIN t2 ON t1.a < t2.lo") {
+        Ok(_) => panic!("LEFT + non-equi must surface a clear error"),
+        Err(e) => e,
+    };
     let msg = format!("{err}");
     assert!(
         msg.contains("not yet supported"),

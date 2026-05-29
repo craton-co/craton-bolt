@@ -5043,7 +5043,12 @@ mod tests {
         let phys = lower(&plan).expect("lower must succeed via host fallback");
         match phys {
             PhysicalPlan::Filter { predicate: p, .. } => {
-                assert_eq!(p, predicate, "predicate must be preserved verbatim");
+                // `Expr` has no `PartialEq`; compare via its `Debug` form.
+                assert_eq!(
+                    format!("{p:?}"),
+                    format!("{predicate:?}"),
+                    "predicate must be preserved verbatim"
+                );
             }
             other => panic!(
                 "AND-with-divide WHERE must route to host PhysicalPlan::Filter, got {other:?}"

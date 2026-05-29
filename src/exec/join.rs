@@ -1954,9 +1954,12 @@ mod nested_loop_streaming_tests {
             Field::new("rx", DataType::Int32, false),
         ]);
 
-        let err = execute_cross_join(left, right, &out_schema)
-            .expect_err("CROSS product over u32::MAX must error");
-        let msg = format!("{err:?}");
+        // Use a match rather than `.expect_err()` so the Ok type need not be
+        // `Debug`.
+        let msg = match execute_cross_join(left, right, &out_schema) {
+            Ok(_) => panic!("CROSS product over u32::MAX must error"),
+            Err(e) => format!("{e:?}"),
+        };
         assert!(
             msg.contains("too large") || msg.contains("limit"),
             "expected a cross-cap error, got: {msg}"

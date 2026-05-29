@@ -3874,13 +3874,14 @@ mod date_validation_tests {
 
     #[test]
     fn year_range_is_bounded_without_panic() {
-        // Inside the accepted year window but outside the Date32 day range:
-        // structurally fine, rejected by `parse_date_literal`/`days_since_epoch`
-        // rather than panicking.
+        // Inside the accepted year window: structurally fine and, since the
+        // day count for year 999_999 (~365M days) still fits in i32, it yields
+        // a valid `Some(_)` WITHOUT panicking (overflowing the i32 day range
+        // would require a year past ~5.9M, which the parse step rejects first).
         assert_eq!(parse_ymd("999999-12-31"), Some((999_999, 12, 31)));
         assert!(
-            days_since_epoch(999_999, 12, 31).is_none(),
-            "extreme valid year overflows the i32 day range and must return None"
+            days_since_epoch(999_999, 12, 31).is_some(),
+            "extreme-but-bounded year must produce a valid day count without panicking"
         );
         // Beyond the accepted window: rejected at the parse step.
         assert!(

@@ -474,6 +474,10 @@ fn contains_unary(expr: &Expr) -> bool {
         }
         Expr::Cast { expr, .. } => contains_unary(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(contains_unary),
+        // LIKE's operand can itself contain a unary; recurse into it (the
+        // pattern is a literal). Mirrors the wrapper-recursion of the arms
+        // above for the purpose of unary detection.
+        Expr::Like { expr, .. } => contains_unary(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }

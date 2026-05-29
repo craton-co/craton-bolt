@@ -148,6 +148,14 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // ---------------------------------------------------------------------------
 // Host-only tests — no CUDA needed.
 // ---------------------------------------------------------------------------
+// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// below; the non-test schema conversion now lives in exec::schema_convert.
+// cfg(test)-gated so normal builds don't see an unused import.
+#[cfg(test)]
+use arrow_schema::{DataType as ArrowDataType};
+#[cfg(test)]
+use crate::plan::logical_plan::DataType;
+
 #[cfg(test)]
 mod tests {
     use super::*;

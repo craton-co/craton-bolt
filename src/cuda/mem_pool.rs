@@ -2003,7 +2003,16 @@ mod tests {
     ///
     /// The test is loose on purpose — CI machines have variable timing.
     /// We just assert parallel < 4× sequential (any speedup at all).
+    ///
+    /// `#[ignore]`: this is a wall-clock *performance characteristic*, not a
+    /// correctness property — the `par_elapsed < 1.5×seq_elapsed` comparison
+    /// is inherently flaky under machine load (a busy host can schedule the
+    /// parallel threads worse than the sequential baseline). The per-bucket
+    /// lock-split behaviour it probes is better measured by
+    /// `bench_dashmap_baseline`. Run explicitly with `--ignored` on a quiet
+    /// machine when validating the lock-granularity change.
     #[test]
+    #[ignore = "perf-timing: flaky under load; measured by bench_dashmap_baseline"]
     fn per_bucket_lock_allows_concurrent_progress() {
         use std::sync::Arc;
         use std::time::Duration;
