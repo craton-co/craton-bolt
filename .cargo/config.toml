@@ -1,0 +1,22 @@
+# Use LLVM's lld-link instead of MSVC link.exe on Windows.
+#
+# Why: the `duckdb` dev-dependency uses the `bundled` feature, compiling DuckDB
+# in-tree into a large static library that is then linked into each of the ~39
+# integration-test binaries. MSVC's link.exe spawns mspdbsrv.exe to build PDB
+# debug info, and mspdbsrv enforces a hard concurrent-session/type-server limit.
+# Linking that many DuckDB-embedding binaries blows past it, producing
+#   LNK1318: Unexpected PDB error; LIMIT (12)
+# (and, under memory pressure, LNK1180/LNK1106). The failure is environmental,
+# not a code defect, and historically prevented the integration suite from
+# linking at all.
+#
+# lld-link generates PDBs in-process with no mspdbsrv and no such limit, so the
+# full test suite links cleanly. This only changes the *link* step; compiled
+# rlibs are unaffected and reused.
+#
+# Requires LLVM's lld-link on PATH (e.g. `scoop install llvm`, or any LLVM
+# toolchain). The toolchain also ships a copy at
+#   <sysroot>/lib/rustlib/x86_64-pc-windows-msvc/bin/gcc-ld/lld-link.exe
+# if a system LLVM is not desired.
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"

@@ -48,7 +48,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::plan::{parse_sql, DataType, Field, MemTableProvider, Schema};

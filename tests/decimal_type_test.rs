@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Decimal128Array, RecordBatch};
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -154,21 +154,23 @@ fn cast_int_to_decimal_parses_then_rejects_at_lower() {
                 "CAST rejection should name CAST or Decimal128; got: {msg}",
             );
         }
-        // The frontend may also surface this as a Type error if a future
-        // refactor moves the rejection earlier — accept that too, but
-        // require the message still mentions CAST / DECIMAL so the user
-        // can find the source of the error.
-        BoltError::Type(msg) => {
+        // The frontend may also surface this earlier as a Type or Sql error
+        // (the SQL parses, but the CAST target type is unsupported). The
+        // unsupported-target arm in `sql_frontend::convert_sql_type` rejects
+        // at the frontend with `BoltError::Sql("CAST target type not
+        // supported: DECIMAL(..)")`. Accept any of these variants, but
+        // require the message still mentions CAST / DECIMAL so the user can
+        // find the source of the error.
+        BoltError::Type(msg) | BoltError::Sql(msg) => {
             assert!(
                 msg.contains("CAST")
                     || msg.contains("DECIMAL")
                     || msg.contains("Decimal128"),
-                "Type-based CAST rejection should still mention CAST/DECIMAL; \
-                 got: {msg}",
+                "CAST rejection should still mention CAST/DECIMAL; got: {msg}",
             );
         }
         other => panic!(
-            "expected BoltError::Plan (or Type) naming CAST/Decimal128, got {other:?}"
+            "expected BoltError::Plan/Type/Sql naming CAST/Decimal128, got {other:?}"
         ),
     }
 }

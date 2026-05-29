@@ -34,7 +34,7 @@ use std::sync::Arc;
 use arrow_array::{
     ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::Engine;
 
@@ -65,7 +65,7 @@ fn run_single_row_query(sql: &str, batch: RecordBatch) -> RecordBatch {
         out.num_rows(),
         sql
     );
-    out
+    out.clone()
 }
 
 fn out_i64(out: &RecordBatch) -> i64 {
