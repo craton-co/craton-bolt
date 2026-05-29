@@ -124,6 +124,44 @@ pub trait LiteralResolver {
     /// True if `column` is a registered Utf8 column with a dictionary.
     fn knows(&self, column: &str) -> bool;
 
+    /// Evaluate a constant LIKE `pattern` against every entry of `column`'s
+    /// dictionary, host-side, and return the [`LiteralIndex`]es (matching the
+    /// dictionary's index width) of the entries that match.
+    ///
+    /// This is the dictionary-precompute step that lets a `col LIKE 'pat'`
+    /// predicate over a dict-encoded Utf8 column be lowered to a GPU
+    /// integer-index lookup: the host compiles the pattern once (reusing
+    /// [`crate::exec::like::PatternMatcher`]), scans the dictionary, and the
+    /// rewriter turns the returned index set into an OR-of-equalities on the
+    /// `__idx_<col>` column. The GPU then only ever does integer-index
+    /// compares — no device-side string scanning.
+    ///
+    /// The NULL slot (dictionary index `0`) is never included: a NULL row
+    /// must yield SQL NULL, not a LIKE match, and the OR-of-equalities form
+    /// the rewriter emits would turn a slot-0 hit into `true`. Excluding it
+    /// keeps the lowered predicate correct for the non-negated `LIKE` shape
+    /// the rewriter targets.
+    ///
+    /// Returns `None` when:
+    ///   * `column` is not a registered dictionary column (caller keeps the
+    ///     original host-evaluated `LIKE`), or
+    ///   * the pattern fails to compile (e.g. a malformed ESCAPE sequence) —
+    ///     the caller leaves the predicate intact so the host path surfaces
+    ///     the same error / behaviour.
+    ///
+    /// `escape` mirrors [`crate::exec::like::PatternMatcher::compile`]'s
+    /// escape parameter. The default implementation returns `None` (no
+    /// dictionary), so non-dict resolvers transparently keep the host path.
+    fn like_match_indices(
+        &self,
+        column: &str,
+        pattern: &str,
+        escape: Option<char>,
+    ) -> Option<Vec<LiteralIndex>> {
+        let _ = (column, pattern, escape);
+        None
+    }
+
     /// True iff `column`'s dictionary is *known-complete*: it observed every
     /// distinct value the column can hold at build time (full scan, not a
     /// sample / partial batch, and with no `""`→NULL coalescing that would
@@ -267,6 +305,36 @@ impl<'a> LiteralResolver for StringPredicateRewriter<'a> {
         self.dicts.contains_key(column)
     }
 
+    fn like_match_indices(
+        &self,
+        column: &str,
+        pattern: &str,
+        escape: Option<char>,
+    ) -> Option<Vec<LiteralIndex>> {
+        let dict = self.dicts.get(column)?;
+        // Compile the pattern host-side once. A compile error (e.g. a
+        // dangling ESCAPE) means we can't precompute the table — leave the
+        // predicate to the host path, which surfaces the same error.
+        let matcher = crate::exec::like::PatternMatcher::compile(pattern, escape).ok()?;
+        // `dictionary()[p]` is the string for GPU index `p + 1` (slot 0 is
+        // reserved for NULL and is intentionally never tested — see the
+        // trait doc). Width of the emitted index follows the variant.
+        let entries = dict.dictionary();
+        let is_i32 = dict.is_i32();
+        let mut out: Vec<LiteralIndex> = Vec::new();
+        for (p, s) in entries.iter().enumerate() {
+            if matcher.matches(s) {
+                let idx = (p + 1) as i64;
+                out.push(if is_i32 {
+                    LiteralIndex::I32(idx as i32)
+                } else {
+                    LiteralIndex::I64(idx)
+                });
+            }
+        }
+        Some(out)
+    }
+
     fn is_complete(&self, column: &str) -> bool {
         // Only columns explicitly opted in via `mark_complete` are trusted as
         // having observed every distinct value. A `DictionaryColumnAny` alone
@@ -328,6 +396,42 @@ fn extract_col_and_string_lit(left: &Expr, right: &Expr) -> Option<(String, Stri
         (Expr::Literal(Literal::Utf8(s)), Expr::Column(c)) => Some((c.clone(), s.clone(), true)),
         _ => None,
     }
+}
+
+/// Build a Bool predicate that is true iff `column` (an integer index
+/// column, e.g. `__idx_<col>`) equals one of `indices`.
+///
+/// Emitted as a left-deep OR of equalities: `(col = i0) OR (col = i1) OR …`.
+/// Every operand is a GPU-lowerable integer compare (`Op::Eq`) combined with
+/// `Op::Or`, so the whole tree lowers to the fused predicate kernel — this is
+/// the "integer-index → Bool match table" lookup expressed in the existing
+/// IR, with no new op or kernel. (Mirrors the deferred `IN ('a','b',…)`
+/// note in the module docs: a membership test reduces to OR-of-equalities.)
+///
+/// An empty index set means the pattern matched no dictionary entry, so the
+/// predicate is unconditionally `false` for every non-NULL row (and NULL
+/// rows, whose index is slot 0, are likewise excluded by construction):
+/// fold straight to `Bool(false)`.
+fn build_index_membership(column: &str, indices: &[LiteralIndex]) -> Expr {
+    let mut iter = indices.iter().copied();
+    let first = match iter.next() {
+        Some(idx) => idx,
+        None => return Expr::Literal(Literal::Bool(false)),
+    };
+    let eq = |idx: LiteralIndex| Expr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(Expr::Column(column.to_string())),
+        right: Box::new(Expr::Literal(idx.into_literal())),
+    };
+    let mut acc = eq(first);
+    for idx in iter {
+        acc = Expr::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(acc),
+            right: Box::new(eq(idx)),
+        };
+    }
+    acc
 }
 
 /// Recursive expression rewrite, post-order: children first, then `self`.
@@ -487,6 +591,38 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             negated,
         } => {
             let new_inner = rewrite_expr_with(like_expr, r, depth + 1)?;
+
+            // Dictionary-precompute lowering: `col LIKE 'pat'` over a
+            // dict-encoded Utf8 column becomes an OR-of-equalities on the
+            // `__idx_<col>` integer index against the set of dictionary
+            // entries that match the (constant) pattern. The match table is
+            // built host-side via `PatternMatcher`; the GPU only ever sees
+            // integer-index compares, so the predicate no longer forces the
+            // whole filter onto the host. See `LiteralResolver::like_match_indices`.
+            //
+            // Gated to the lowest-risk shape:
+            //   * non-negated `LIKE` (NOT LIKE has SQL-NULL 3VL semantics the
+            //     OR-of-equalities form can't express, so it stays host-side);
+            //   * no `ESCAPE` clause (kept host per the task — the host path
+            //     already handles escape and the precompute would otherwise
+            //     duplicate that logic at the rewrite boundary);
+            //   * the operand is a bare `Column` of a registered dict column
+            //     (after peeling any `Alias` wrappers).
+            // Anything else falls through to the preserved `Expr::Like` below,
+            // which the physical planner routes to the host filter.
+            if !*negated && escape.is_none() {
+                if let Expr::Column(col_name) = strip_alias(&new_inner) {
+                    if r.knows(col_name) {
+                        if let Some(indices) =
+                            r.like_match_indices(col_name, pattern, *escape)
+                        {
+                            let mangled = r.index_column_name(col_name);
+                            return Ok(build_index_membership(&mangled, &indices));
+                        }
+                    }
+                }
+            }
+
             Ok(Expr::Like {
                 expr: Box::new(new_inner),
                 pattern: pattern.clone(),
