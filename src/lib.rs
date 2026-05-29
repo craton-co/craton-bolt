@@ -43,6 +43,7 @@ pub use ::tracing;
 pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
 pub use plan::{DataFrame, LogicalPlan, PhysicalPlan, Expr};
 pub use exec::{Engine, EngineBuilder};
+pub use exec::streaming::{BatchProducer, BatchStream, MorselPlan, PinnedBudget, TableSource};
 
 /// Stage 4 (pool telemetry): public re-exports for downstream
 /// observability. [`pool_stats`] returns a [`PoolStats`] snapshot of

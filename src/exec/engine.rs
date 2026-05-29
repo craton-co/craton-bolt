@@ -500,6 +500,27 @@ pub struct Engine {
     /// large multi-batch tables pay a full materialisation cost on every
     /// `sql()` call. Keep the per-table batch count modest until then.
     tables: HashMap<String, Vec<RecordBatch>>,
+    /// Lazily-registered streaming table sources, keyed by name.
+    ///
+    /// Tables registered through [`Engine::register_table_stream_lazy`] are
+    /// stored here as a replayable producer ([`TableSource::Streaming`])
+    /// rather than being drained into `tables` at registration time. The
+    /// producer is invoked the first time the table is read (see
+    /// [`Engine::streaming_batches`]), at which point the entry is collapsed
+    /// in place to [`TableSource::Materialized`] so subsequent reads skip the
+    /// producer.
+    ///
+    /// This is an *overlay* over `tables`: a name lives in exactly one of the
+    /// two maps. The read helpers ([`Engine::materialize_table`] and the
+    /// provider null probes) consult `tables` first and fall back to draining
+    /// the streaming overlay. Keeping the lazy data out of `tables` is what
+    /// makes registration cheap (no host materialisation) while leaving every
+    /// eager code path untouched.
+    ///
+    /// `RefCell` because the lazy materialisation happens from `&self`
+    /// (`Engine::sql` takes `&self`), mirroring the interior mutability
+    /// already used for `gpu_tables`.
+    streaming_sources: RefCell<HashMap<String, crate::exec::streaming::TableSource>>,
     /// Name → Schema provider, kept in sync with `tables`. The schema is
     /// EXTENDED with `__idx_<col>` Int32 columns for every registered Utf8
     /// column so the SQL frontend resolves rewriter-produced column refs.
@@ -750,6 +771,7 @@ impl EngineBuilder {
 
         Ok(Engine {
             tables: HashMap::new(),
+            streaming_sources: RefCell::new(HashMap::new()),
             provider: MemTableProvider::new(),
             dict_registry: crate::exec::dict_registry::DictRegistry::new(),
             gpu_tables: RefCell::new(HashMap::new()),
@@ -1001,7 +1023,9 @@ impl Engine {
         batch: RecordBatch,
     ) -> BoltResult<()> {
         let name = name.into();
-        if self.tables.contains_key(&name) {
+        if self.tables.contains_key(&name)
+            || self.streaming_sources.borrow().contains_key(&name)
+        {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — use register_batch to append \
                  additional batches to an existing table"
@@ -1079,6 +1103,11 @@ impl Engine {
     /// the full table in host memory. The signature here is
     /// future-compatible with that change.
     ///
+    /// For a registration path that does NOT drain the producer up front,
+    /// see [`Engine::register_table_stream_lazy`], which stores a replayable
+    /// producer and only materialises it on first query — the lazy seam that
+    /// backs morsel/larger-than-VRAM execution.
+    ///
     /// # Errors
     /// - The iterator is empty (a table must contain at least one batch
     ///   for `materialize_table` to succeed).
@@ -1096,7 +1125,9 @@ impl Engine {
         I: IntoIterator<Item = BoltResult<RecordBatch>>,
     {
         let name = name.into();
-        if self.tables.contains_key(&name) {
+        if self.tables.contains_key(&name)
+            || self.streaming_sources.borrow().contains_key(&name)
+        {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — register_table_stream \
                  cannot append to an existing table; use register_batch instead"
@@ -1187,10 +1218,164 @@ impl Engine {
     /// state touched by `register_table` / `register_batch`.
     fn unregister_table_best_effort(&mut self, name: &str) {
         self.tables.remove(name);
+        self.streaming_sources.borrow_mut().remove(name);
         self.dict_registry.unregister_table(name);
         self.provider.unregister_table(name);
         self.host_revisions.remove(name);
         self.gpu_tables.borrow_mut().remove(name);
+    }
+
+    /// Register a table from a producer that yields batches lazily, WITHOUT
+    /// draining the producer at registration time (truly lazy path).
+    ///
+    /// Unlike [`Engine::register_table_stream`] — which drains the iterator
+    /// eagerly into the engine's in-memory `Vec<RecordBatch>` representation
+    /// the moment it is called — this method stores a *replayable producer*
+    /// ([`crate::exec::streaming::TableSource::Streaming`]) and only registers
+    /// the table's schema with the SQL frontend. The producer is not invoked
+    /// until the first query that references the table, at which point the
+    /// source is collapsed into the canonical materialised representation (see
+    /// [`Engine::ensure_streaming_materialized`]).
+    ///
+    /// This keeps registration O(1) for large streams and is the seam through
+    /// which larger-than-VRAM, morsel-at-a-time execution will be threaded:
+    /// the budget hook ([`Engine::morsel_plan_for_table`]) inspects the
+    /// materialised batches against [`Engine::memory_budget_bytes`] and decides
+    /// whether to upload the table whole or process it in bounded morsels.
+    ///
+    /// `producer` is a factory: each call must return a fresh iterator over
+    /// the same logical batch sequence (so the source can be re-drained if the
+    /// engine ever re-derives the table). Producer-side errors surface as
+    /// `Err` items and abort the first materialisation.
+    ///
+    /// # Errors
+    /// - A table named `name` is already registered (eager or lazy).
+    /// - Note: schema/content validation and the empty-stream check are
+    ///   deferred to first query (when the producer is actually drained),
+    ///   matching the lazy contract. The eager
+    ///   [`Engine::register_table_stream`] validates up front instead.
+    pub fn register_table_stream_lazy(
+        &mut self,
+        name: impl Into<String>,
+        schema: Schema,
+        producer: crate::exec::streaming::BatchProducer,
+    ) -> BoltResult<()> {
+        let name = name.into();
+        if self.tables.contains_key(&name)
+            || self.streaming_sources.borrow().contains_key(&name)
+        {
+            return Err(BoltError::Plan(format!(
+                "table '{name}' is already registered — register_table_stream_lazy \
+                 cannot append to an existing table"
+            )));
+        }
+        // Register the declared schema with the SQL frontend so planning can
+        // resolve column references before the producer is ever drained. We do
+        // NOT extend it with dictionary `__idx_<col>` columns here — string
+        // dictionaries are built when the source is materialised on first
+        // query (see `ensure_streaming_materialized`).
+        self.provider.register(name.clone(), schema);
+        self.streaming_sources.borrow_mut().insert(
+            name,
+            crate::exec::streaming::TableSource::Streaming(producer),
+        );
+        Ok(())
+    }
+
+    /// Collapse every still-streaming overlay entry into its materialised
+    /// batches by draining the producer once.
+    ///
+    /// Called from [`Engine::sql`] / [`Engine::run_logical_plan`] before the
+    /// validity-probe provider is built. Idempotent: an entry that is already
+    /// [`TableSource::Materialized`](crate::exec::streaming::TableSource::Materialized)
+    /// is skipped, and a fully-eager engine pays only a single `RefCell::borrow`
+    /// + emptiness check.
+    ///
+    /// The drained batches are staged back into the overlay as
+    /// `Materialized` (not moved into `tables`), because `sql` only holds
+    /// `&self` and `tables` is not interior-mutable. The eager read paths
+    /// ([`Engine::materialize_table`] and [`EngineProvider`]) consult the
+    /// overlay as a fall-back, so a streaming table is fully queryable from
+    /// there. Dictionary `__idx_<col>` rewriting and the incremental GPU cache
+    /// are not wired for overlay tables in this cut — primitive columns query
+    /// end-to-end; string-literal predicates fall to the host filter path
+    /// rather than the dict-fold fast path. Promoting an overlay table into the
+    /// fully-wired `tables` store (dictionaries + revisions + GPU cache) is a
+    /// follow-up that needs a `&mut self` seam.
+    fn ensure_streaming_materialized(&self) -> BoltResult<()> {
+        // Fast path: nothing streaming.
+        let pending: Vec<String> = {
+            let overlay = self.streaming_sources.borrow();
+            overlay
+                .iter()
+                .filter(|(_, src)| src.is_streaming())
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // `register_table` needs `&mut self`, but `sql` only holds `&self`.
+        // We collapse the producer to concatenated host batches here (which
+        // only needs `&self` interior mutability on the overlay), then stage
+        // the materialised batch back into the overlay as `Materialized`. The
+        // eager read paths (`materialize_table`, `EngineProvider`) consult the
+        // overlay, so the table is fully queryable without ever touching
+        // `tables`. Dictionary / GPU-cache wiring is built lazily by
+        // `ensure_gpu_table` and the dict rewriter on demand, mirroring how
+        // `register_batch` defers GPU work.
+        for name in pending {
+            let batches = {
+                let overlay = self.streaming_sources.borrow();
+                match overlay.get(&name) {
+                    Some(src) => src.drain_to_batches(&name)?,
+                    None => continue,
+                }
+            };
+            self.streaming_sources.borrow_mut().insert(
+                name,
+                crate::exec::streaming::TableSource::Materialized(batches),
+            );
+        }
+        Ok(())
+    }
+
+    /// Budget hook: decide whether the table named `name` can be uploaded to
+    /// the device whole, or must be processed in bounded morsels because its
+    /// estimated footprint exceeds this engine's
+    /// [`memory_budget_bytes`](Engine::memory_budget_bytes).
+    ///
+    /// Returns [`crate::exec::streaming::MorselPlan::Whole`] when no budget is
+    /// configured (the default) or the table fits; otherwise
+    /// [`crate::exec::streaming::MorselPlan::Morsels`] with a row count sized
+    /// so each morsel's working set stays under budget. The actual
+    /// morsel-at-a-time upload loop — which would iterate
+    /// [`crate::exec::streaming::BatchStream`] morsels and stage intermediates
+    /// in [`crate::exec::streaming::PinnedBudget`] host-pinned space — is the
+    /// device-side follow-up; this method is the host-side decision the
+    /// orchestrator consults.
+    ///
+    /// Resolves the table through both the eager `tables` store and the
+    /// streaming overlay (materialising the latter on demand), so it works
+    /// for streaming-registered tables too.
+    pub fn morsel_plan_for_table(
+        &self,
+        name: &str,
+    ) -> BoltResult<crate::exec::streaming::MorselPlan> {
+        use crate::exec::streaming::{estimate_batches_bytes, plan_upload};
+        let budget = self.memory_budget_bytes;
+        let plan = |batches: &[RecordBatch]| {
+            let total_rows = batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .fold(0usize, |a, n| a.saturating_add(n));
+            let total_bytes = estimate_batches_bytes(batches);
+            Ok(plan_upload(total_bytes, total_rows, budget))
+        };
+        if let Some(batches) = self.tables.get(name) {
+            return plan(batches.as_slice());
+        }
+        self.streaming_batches(name, plan)
     }
 
     /// Replace any existing table named `name` with a single-batch table
@@ -1213,6 +1398,11 @@ impl Engine {
         batch: RecordBatch,
     ) -> BoltResult<()> {
         let name = name.into();
+        // Drop any lazy streaming overlay entry under this name — a replace
+        // installs an eager `tables` entry, and `materialize_table` prefers
+        // `tables`, so a lingering overlay entry would just be stale dead
+        // weight (and would block a future `register_table` overlay guard).
+        self.streaming_sources.borrow_mut().remove(&name);
         // Stage 6: see `register_table` — the flatten step is gone from the
         // hot path. Dict ingest is native through `DictRegistry::register_table`
         // and `GpuTable::from_record_batch::upload_dict_utf8`.
@@ -1629,23 +1819,64 @@ impl Engine {
     /// `arrow::compute::concat_batches`, which copies every column — the
     /// 0.2 perf cost the field doc on `tables` warns about.
     fn materialize_table(&self, name: &str) -> BoltResult<RecordBatch> {
-        let batches = self.tables.get(name).ok_or_else(|| {
-            BoltError::Plan(format!("table '{name}' is not registered with the engine"))
-        })?;
-        match batches.len() {
-            0 => Err(BoltError::Plan(format!(
-                "table '{name}' is registered but contains zero batches"
-            ))),
-            1 => Ok(batches[0].clone()),
-            _ => {
-                let schema = batches[0].schema();
-                arrow::compute::concat_batches(&schema, batches.iter()).map_err(|e| {
-                    BoltError::Other(format!(
-                        "failed to concatenate {} batches for table '{name}': {e}",
-                        batches.len()
-                    ))
-                })
+        // Eager tables first; fall back to the lazy streaming overlay.
+        if let Some(batches) = self.tables.get(name) {
+            return concat_table_batches(name, batches);
+        }
+        // Streaming overlay: collapse the source to materialised on first
+        // read, then concat its batches.
+        self.streaming_batches(name, |batches| concat_table_batches(name, batches))
+    }
+
+    /// Ensure the streaming source for `name` is drained, then run `f` over its
+    /// materialised batches while holding the overlay borrow.
+    ///
+    /// On first call for a `Streaming` entry this invokes the producer,
+    /// collapsing the entry in place to [`TableSource::Materialized`] so
+    /// subsequent reads skip the producer. Returns a `Plan` error if `name` is
+    /// not in the streaming overlay at all.
+    fn streaming_batches<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&[RecordBatch]) -> BoltResult<R>,
+    ) -> BoltResult<R> {
+        use crate::exec::streaming::TableSource;
+        // Phase 1: if the entry is still a producer, drain it (without holding
+        // a borrow across the producer call) and swap in the materialised
+        // form. Borrow is dropped before re-borrowing for the read.
+        let needs_drain = matches!(
+            self.streaming_sources.borrow().get(name),
+            Some(src) if src.is_streaming()
+        );
+        if needs_drain {
+            let drained = {
+                let overlay = self.streaming_sources.borrow();
+                match overlay.get(name) {
+                    Some(src) => src.drain_to_batches(name)?,
+                    None => {
+                        return Err(BoltError::Plan(format!(
+                            "table '{name}' is not registered with the engine"
+                        )))
+                    }
+                }
+            };
+            self.streaming_sources
+                .borrow_mut()
+                .insert(name.to_string(), TableSource::Materialized(drained));
+        }
+        // Phase 2: read the (now materialised) batches.
+        let overlay = self.streaming_sources.borrow();
+        match overlay.get(name) {
+            Some(TableSource::Materialized(batches)) => f(batches),
+            Some(TableSource::Streaming(_)) => {
+                // Unreachable: we just collapsed it above.
+                Err(BoltError::Other(format!(
+                    "streaming source for table '{name}' was not collapsed after drain"
+                )))
             }
+            None => Err(BoltError::Plan(format!(
+                "table '{name}' is not registered with the engine"
+            ))),
         }
     }
 
@@ -1685,6 +1916,11 @@ impl Engine {
             .iter()
             .try_fold(plan, |p, r| r.rewrite(p))?;
         let mut phys = crate::plan::lower_physical(&plan)?;
+        // Collapse any lazily-registered streaming sources to materialised
+        // batches so the validity probes below (and `execute`'s
+        // `materialize_table`) see real data. Idempotent and a no-op when no
+        // streaming tables are registered.
+        self.ensure_streaming_materialized()?;
         // PV-stage-d: populate `KernelSpec::input_has_validity` for every
         // input column by consulting the engine-backed provider, which
         // looks straight at `RecordBatch::column(col).null_count()` for
@@ -1694,8 +1930,14 @@ impl Engine {
         let nb = EngineProvider {
             base: &self.provider,
             tables: &self.tables,
+            streaming: self.streaming_sources.borrow(),
         };
         crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
+        // Release the streaming-overlay borrow held by `nb` before `execute`,
+        // whose `ensure_gpu_table`/`materialize_table` path may re-borrow the
+        // overlay (immutably; mutably only for an un-collapsed source, which
+        // `ensure_streaming_materialized` above has already ruled out).
+        drop(nb);
         let result = self.execute(&phys);
         // Stage 7: periodic pool-stats emit. Runs whether the query
         // succeeded or failed (an OOM-failed query is itself a signal
@@ -1727,12 +1969,16 @@ impl Engine {
         // mirrors `sql()`.
         let plan = self.dict_registry.rewrite_plan(plan)?;
         let mut phys = crate::plan::lower_physical(&plan)?;
+        // Mirror `sql()`: collapse lazy streaming sources before probing.
+        self.ensure_streaming_materialized()?;
         // PV-stage-d: thread per-column null-bearing into the kernel specs.
         let nb = EngineProvider {
             base: &self.provider,
             tables: &self.tables,
+            streaming: self.streaming_sources.borrow(),
         };
         crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
+        drop(nb);
         let result = self.execute(&phys);
         self.maybe_emit_pool_stats(Instant::now());
         result
@@ -2890,6 +3136,31 @@ fn should_emit_pool_stats(
     should
 }
 
+/// Concatenate a table's host-side batches into a single `RecordBatch`.
+///
+/// Shared by [`Engine::materialize_table`]'s eager and streaming-overlay
+/// paths. Zero batches errors, one batch is cloned cheaply (Arrow arrays are
+/// `Arc`-backed), two or more go through `arrow::compute::concat_batches`
+/// (which copies every column — the perf cost the field doc on `tables`
+/// warns about).
+fn concat_table_batches(name: &str, batches: &[RecordBatch]) -> BoltResult<RecordBatch> {
+    match batches.len() {
+        0 => Err(BoltError::Plan(format!(
+            "table '{name}' is registered but contains zero batches"
+        ))),
+        1 => Ok(batches[0].clone()),
+        _ => {
+            let schema = batches[0].schema();
+            arrow::compute::concat_batches(&schema, batches.iter()).map_err(|e| {
+                BoltError::Other(format!(
+                    "failed to concatenate {} batches for table '{name}': {e}",
+                    batches.len()
+                ))
+            })
+        }
+    }
+}
+
 /// Stage 6 — walk `batch` and inform `provider` of each column's actual
 /// runtime nullability (i.e. whether the source array had any nulls). For
 /// `DictionaryArray<_, Utf8>` columns the per-row nullability lives on the
@@ -2990,6 +3261,28 @@ fn host_column_to_arrow_array(col: crate::exec::expr_agg::HostColumn) -> BoltRes
 struct EngineProvider<'a> {
     base: &'a MemTableProvider,
     tables: &'a HashMap<String, Vec<RecordBatch>>,
+    /// Borrow of the lazy streaming overlay. By the time an `EngineProvider`
+    /// is built, any streaming source referenced by the plan has already been
+    /// collapsed to [`TableSource::Materialized`] (see
+    /// [`Engine::ensure_streaming_materialized`]), so the null probes below
+    /// can read its batches the same way they read `tables`.
+    streaming: Ref<'a, HashMap<String, crate::exec::streaming::TableSource>>,
+}
+
+impl<'a> EngineProvider<'a> {
+    /// Resolve a table name to its host-side batches, consulting `tables`
+    /// first and the (already-materialised) streaming overlay second.
+    fn batches_for(&self, table_name: &str) -> Option<&[RecordBatch]> {
+        if let Some(b) = self.tables.get(table_name) {
+            return Some(b.as_slice());
+        }
+        match self.streaming.get(table_name) {
+            Some(crate::exec::streaming::TableSource::Materialized(b)) => Some(b.as_slice()),
+            // A still-streaming source means the caller forgot to materialise
+            // it before building the provider; treat as absent (safe-false).
+            _ => None,
+        }
+    }
 }
 
 impl<'a> crate::plan::TableProvider for EngineProvider<'a> {
@@ -3008,7 +3301,7 @@ impl<'a> crate::plan::TableProvider for EngineProvider<'a> {
         //
         // Safe-false on any miss — the executor's host-strip fallback still
         // handles the row filtering, so an under-flag is correctness-safe.
-        let batches = match self.tables.get(table_name) {
+        let batches = match self.batches_for(table_name) {
             Some(b) => b,
             None => return false,
         };
@@ -3027,7 +3320,7 @@ impl<'a> crate::plan::TableProvider for EngineProvider<'a> {
     }
 
     fn null_count(&self, table_name: &str, col_idx: usize) -> Option<usize> {
-        let batches = self.tables.get(table_name)?;
+        let batches = self.batches_for(table_name)?;
         let mut total: usize = 0;
         for batch in batches {
             if col_idx >= batch.num_columns() {
@@ -3468,6 +3761,7 @@ mod tests {
         let provider = EngineProvider {
             base: &engine.provider,
             tables: &engine.tables,
+            streaming: engine.streaming_sources.borrow(),
         };
         assert!(
             provider.has_nulls("t", 0),
@@ -3568,6 +3862,7 @@ mod tests {
         let provider = EngineProvider {
             base: &engine.provider,
             tables: &engine.tables,
+            streaming: engine.streaming_sources.borrow(),
         };
         assert!(
             !provider.has_nulls("t", 0),
