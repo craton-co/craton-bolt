@@ -65,6 +65,19 @@
 //!       swap(indices[tid], indices[partner])
 //! ```
 //!
+//! ## Stability (EXEC-H1)
+//!
+//! The comparator is **stable**: when every sort key compares equal it breaks
+//! the tie on the *original row index* (carried in the indices buffer). The
+//! index acts as an implicit final ASCending key — the tiebreak is always
+//! ascending, independent of each key's ASC/DESC direction — so equal-key rows
+//! keep their input order. This matches the host fallback
+//! `arrow::compute::lexsort_to_indices`, so `ORDER BY non_unique_key [LIMIT k]`
+//! returns the same rows in the same order whether the sort runs on the GPU or
+//! the host, regardless of input size. (Indices are a permutation, hence always
+//! distinct, so the tiebreak fully determines the order of an equal-key group.)
+//! See `emit_index_tiebreak_global` / `emit_index_tiebreak_shmem`.
+//!
 //! `global_desc` is baked into the emitted PTX at compile time (the kernel
 //! is monomorphised per direction) so the inner branch is just a single
 //! `setp.lt` / `setp.gt`. Stage `j` and substage-mask `k_mask` are passed as
@@ -550,7 +563,25 @@ fn emit_multikey_multilaunch(
     for (ki, k) in spec.keys.iter().enumerate() {
         emit_key_compare(p, entry, ki, k, /*shmem=*/ false)?;
     }
-    // After last key: if we got here all keys equal, no swap. Fall through.
+    // ---- STABILITY TIEBREAK (EXEC-H1) -------------------------------
+    //
+    // After the last key: every key compared equal. Instead of falling
+    // through with %r10=0 (no swap — the old NON-STABLE behaviour where
+    // equal-key rows could end up in any order), break the tie on the
+    // ORIGINAL row index so the bitonic sort becomes STABLE: among rows
+    // with equal keys the one with the smaller original index sorts first.
+    //
+    // The indices buffer holds each cell's original row index (it is
+    // permuted in lock-step with the keys throughout the sort, so for the
+    // current pair it still carries the two rows' source positions). We
+    // treat the index as an implicit final ASCending key — note the
+    // tiebreak is ASC *regardless* of any key's ASC/DESC direction, so the
+    // relative order of equal-key rows is always their input order. In
+    // bitonic terms that means we reuse the ASC-key polarity: swap iff
+    //   p2 (asc_block) ? idx_self > idx_partner : idx_self < idx_partner
+    // — the same selp wiring `emit_key_compare` uses for an ASC key, with
+    // the index operands in place of the value operands.
+    emit_index_tiebreak_global(p, entry, indices_param_idx)?;
     writeln!(p, "\tbra DECIDED;").map_err(write_err)?;
 
     // SWAP_YES / SWAP_NO labels jumped to from emit_key_compare.
@@ -832,6 +863,62 @@ fn emit_padded_route_global(p: &mut String, entry: &str, padded_param_idx: usize
     Ok(())
 }
 
+/// **EXEC-H1** — emit the stability index-tiebreak block for the multi-launch
+/// kernel.
+///
+/// Reached only when every sort key compared equal. Loads the original row
+/// index for `self` (cell `tid`, `%r3`) and `partner` (cell `%r7`) from the
+/// indices buffer and decides the swap exactly like an ASCending key compare
+/// would on the index operand:
+///
+/// ```text
+///   idx_self    = indices[tid]
+///   idx_partner = indices[partner]
+///   if idx_self == idx_partner: leave %r10 = 0   (cannot happen — indices
+///                                                  are a permutation, so all
+///                                                  distinct; defensive)
+///   %r10 = p2 ? (idx_self > idx_partner) : (idx_self < idx_partner)
+/// ```
+///
+/// The ASC polarity is used unconditionally (independent of every key's
+/// ASC/DESC `direction`) so equal-key rows keep their original relative order
+/// — this is what makes the bitonic sort STABLE and matches the host
+/// `lexsort_to_indices` fallback. We don't `bra DECIDED` here: control falls
+/// through to the caller's `bra DECIDED`, carrying the computed `%r10`.
+///
+/// Registers: indices are u32, loaded into `%r13`/`%r14`; address scratch in
+/// `%rd43`. These are dead at this point (the per-key compare blocks have all
+/// branched away or fallen through past their own scratch). `%r29`/`%r30` are
+/// reused as the selp scratch — the last `emit_key_compare` already consumed
+/// its uses of them.
+fn emit_index_tiebreak_global(
+    p: &mut String,
+    entry: &str,
+    indices_param_idx: usize,
+) -> BoltResult<()> {
+    writeln!(p, "// ---- EXEC-H1: stability tiebreak on original row index ----")
+        .map_err(write_err)?;
+    writeln!(p, "\tld.param.u64 %rd43, [{entry}_param_{}];", indices_param_idx)
+        .map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd43, %rd43;").map_err(write_err)?;
+    // idx_self = indices[tid]
+    writeln!(p, "\tmul.wide.u32 %rd44, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd44, %rd43, %rd44;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u32 %r13, [%rd44];").map_err(write_err)?;
+    // idx_partner = indices[partner]
+    writeln!(p, "\tmul.wide.u32 %rd45, %r7, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd45, %rd43, %rd45;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u32 %r14, [%rd45];").map_err(write_err)?;
+    // ASC-polarity decision on the (always-distinct) index operands. Indices
+    // are an unsigned permutation, so we use the unsigned compares.
+    writeln!(p, "\tsetp.gt.u32 %p_gt, %r13, %r14;").map_err(write_err)?;
+    writeln!(p, "\tsetp.lt.u32 %p_lt, %r13, %r14;").map_err(write_err)?;
+    writeln!(p, "\tselp.b32 %r29, 1, 0, %p_gt;").map_err(write_err)?;
+    writeln!(p, "\tselp.b32 %r30, 1, 0, %p_lt;").map_err(write_err)?;
+    writeln!(p, "\tselp.b32 %r10, %r29, %r30, %p2;").map_err(write_err)?;
+    Ok(())
+}
+
 /// Emit a load from global memory for key `ki` (self & partner).
 fn emit_global_key_load(
     p: &mut String,
@@ -1103,6 +1190,9 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
             for (ki, k) in spec.keys.iter().enumerate() {
                 emit_shmem_key_compare(p, ki, k, stage, substage)?;
             }
+            // EXEC-H1: all keys equal -> break the tie on the original row
+            // index for a STABLE sort (see `emit_index_tiebreak_shmem`).
+            emit_index_tiebreak_shmem(p, stage, substage)?;
             writeln!(p, "\tbra SH_S{}_T{}_DECIDED;", stage, substage).map_err(write_err)?;
             writeln!(p, "SH_S{}_T{}_DECIDED:", stage, substage).map_err(write_err)?;
 
@@ -1203,6 +1293,43 @@ fn emit_padded_route_shmem(p: &mut String, stage: u32, substage: u32) -> BoltRes
     writeln!(p, "\t@%p_partner_pad selp.b32 %r34, 0, 1, %p2;").map_err(write_err)?;
     writeln!(p, "\t@%p_partner_pad mov.b32 %r10, %r34;").map_err(write_err)?;
     writeln!(p, "\t@%p_partner_pad bra SH_S{}_T{}_DECIDED;", stage, substage).map_err(write_err)?;
+    Ok(())
+}
+
+/// **EXEC-H1** — emit the stability index-tiebreak block for the shmem kernel.
+///
+/// Reached when every key compared equal within a (stage, substage) wave.
+/// The original row indices live in `sh_idx[cell]` (permuted in lock-step
+/// with the keys), so `sh_idx[self_cell]` / `sh_idx[partner_cell]` are the two
+/// rows' source positions. We decide the swap with ASCending polarity on the
+/// index — unconditionally, regardless of any key's ASC/DESC direction — so
+/// equal-key rows keep their input order:
+///
+/// ```text
+///   idx_self    = sh_idx[tid]
+///   idx_partner = sh_idx[partner]
+///   %r10 = p2 ? (idx_self > idx_partner) : (idx_self < idx_partner)
+/// ```
+///
+/// Falls through (no `bra`) so the caller's `bra SH_..._DECIDED` carries the
+/// computed `%r10`. Scratch: `%rd28`/`%rd29`/`%rd30` for addresses, `%r35`/
+/// `%r36` for the loaded indices, `%r29`/`%r30` for selp (same scratch the
+/// per-key shmem compare uses — dead here).
+fn emit_index_tiebreak_shmem(p: &mut String, _stage: u32, _substage: u32) -> BoltResult<()> {
+    writeln!(p, "// ---- EXEC-H1 shmem: stability tiebreak on original row index ----")
+        .map_err(write_err)?;
+    writeln!(p, "\tmov.u64 %rd28, sh_idx;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd29, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd29, %rd28, %rd29;").map_err(write_err)?;
+    writeln!(p, "\tld.shared.u32 %r35, [%rd29];").map_err(write_err)?; // idx_self
+    writeln!(p, "\tmul.wide.u32 %rd30, %r7, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd30, %rd28, %rd30;").map_err(write_err)?;
+    writeln!(p, "\tld.shared.u32 %r36, [%rd30];").map_err(write_err)?; // idx_partner
+    writeln!(p, "\tsetp.gt.u32 %p_gt, %r35, %r36;").map_err(write_err)?;
+    writeln!(p, "\tsetp.lt.u32 %p_lt, %r35, %r36;").map_err(write_err)?;
+    writeln!(p, "\tselp.b32 %r29, 1, 0, %p_gt;").map_err(write_err)?;
+    writeln!(p, "\tselp.b32 %r30, 1, 0, %p_lt;").map_err(write_err)?;
+    writeln!(p, "\tselp.b32 %r10, %r29, %r30, %p2;").map_err(write_err)?;
     Ok(())
 }
 
@@ -1859,6 +1986,58 @@ mod tests {
         assert!(
             ptx.contains("sh_pad"),
             "Stage 3 shmem must declare sh_pad packed-bit array; PTX:\n{ptx}"
+        );
+    }
+
+    /// **EXEC-H1** — the bitonic comparator must be STABLE: when all keys
+    /// compare equal it breaks the tie on the original row index. This pins
+    /// the index-tiebreak block in BOTH the multi-launch and shmem kernels so
+    /// the stability guarantee can't silently regress. The tiebreak is an
+    /// unsigned ASC compare on the index operands (`setp.gt.u32` /
+    /// `setp.lt.u32`) folded into `%r10` via the `%p2` block-direction selp —
+    /// always ASC, so equal-key rows keep their input order for both ASC and
+    /// DESC key sorts.
+    #[test]
+    fn ptx_comparator_is_stable_index_tiebreak() {
+        // Multi-launch: the marker comment + the index unsigned compares must
+        // appear after the per-key compares.
+        for dir in [SortDirection::Asc, SortDirection::Desc] {
+            let ptx = compile_sort_kernel_spec(&single_key_spec(DataType::Int32, dir)).unwrap();
+            assert!(
+                ptx.contains("stability tiebreak on original row index"),
+                "multi-launch ({:?}) must emit the EXEC-H1 index-tiebreak block; PTX:\n{ptx}",
+                dir
+            );
+            // Unsigned index compares feeding the %p2 selp (the tiebreak).
+            assert!(
+                ptx.contains("setp.gt.u32") && ptx.contains("setp.lt.u32"),
+                "index tiebreak must compare indices unsigned; PTX:\n{ptx}"
+            );
+            assert!(
+                ptx.contains("selp.b32 %r10, %r29, %r30, %p2;"),
+                "index tiebreak must fold into %r10 via the %p2 block-direction selp; PTX:\n{ptx}"
+            );
+        }
+
+        // Shmem: the tiebreak reads sh_idx for self & partner and folds the
+        // same ASC-polarity decision into %r10.
+        let sh = compile_sort_kernel_spec(&SortKernelSpec {
+            keys: vec![key(DataType::Int32, SortDirection::Desc, false, false)],
+            layout: SortLayout::Shmem,
+            shmem_n_pow2: 128,
+        })
+        .unwrap();
+        assert!(
+            sh.contains("shmem: stability tiebreak on original row index"),
+            "shmem kernel must emit the EXEC-H1 index-tiebreak block; PTX:\n{sh}"
+        );
+        assert!(
+            sh.contains("setp.gt.u32") && sh.contains("setp.lt.u32"),
+            "shmem index tiebreak must compare indices unsigned; PTX:\n{sh}"
+        );
+        assert!(
+            sh.contains("selp.b32 %r10, %r29, %r30, %p2;"),
+            "shmem index tiebreak must fold into %r10 via the %p2 selp; PTX:\n{sh}"
         );
     }
 

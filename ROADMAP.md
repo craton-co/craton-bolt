@@ -1,17 +1,35 @@
 # Craton Bolt Roadmap
 
-This document tracks intentional gaps in the 0.6.0 release and the milestones
-planned for 0.7+. For day-to-day progress, see `CHANGELOG.md`. For supported
+This document tracks intentional gaps in the current release and the milestones
+planned beyond it. For day-to-day progress, see `CHANGELOG.md`. For supported
 SQL today, see `docs/SQL_REFERENCE.md`. For the full 1.0 plan, see
-`docs/PATH_TO_1.0.md`.
+`docs/PATH_TO_1.0.md`. To install and build, see `docs/INSTALL.md`.
 
-## 0.6.0 (current — pre-production, API stabilising)
+## 0.7.0 (current — pre-production, API stabilising)
 
-This release covers milestones M1 (foundation), M3 (join + sort), M4 (types),
-M5 (observability + ergonomics), M6 (performance), M7 (API stabilization), and
-M8 (freeze prep) from `docs/PATH_TO_1.0.md`. Where v0.5 brought the SQL surface
-up to "table stakes", v0.6 turns to the execution-layer plumbing, the type
-system, and the public-API shape that 1.0 will freeze.
+v0.7 turns the v0.6 carry-overs into live code paths: it lights up the
+`Decimal128` / `Date` / `Timestamp` GPU lowering boundaries, wires the
+`KernelSpec` module cache into real call sites, and lands the GPU radix-sort
+dispatch in the executor. Highlights (see `CHANGELOG.md` for the full list):
+
+- **`Decimal128` GPU arithmetic** (`+`, `-`, `*`) and comparisons (`=`, `!=`,
+  `<`, `>`, `<=`, `>=`, reachable from `WHERE`); `SUM(Decimal128)` via
+  host-side reduction.
+- **`Date32` / `Timestamp` arithmetic** (Date−Date, Timestamp−Timestamp,
+  Day-INTERVAL only) lowered to GPU.
+- **Grouped `STDDEV` / `VAR`** under `GROUP BY` via per-group host-side
+  Welford.
+- **GPU radix sort integrated** into `src/exec/sort.rs` — single-key
+  `Int32` / `Int64` ASC plus multi-key and `DESC`. Still opt-in via
+  `BOLT_GPU_SORT=1` (see `docs/ENV_VARS.md`); not yet planner-selected by
+  default.
+- **`KernelSpec` module cache wired into call sites** — scalar aggregate,
+  hash-join, radix-sort, and compaction kernels now hit the cache (skipping
+  both codegen and PTXAS); async memcpy rolled out to the remaining
+  `GROUP BY` variants and the `WHERE` filter D2H path.
+- **WHERE-predicate type-checking** during SQL lowering.
+
+### What works (carried forward)
 
 ### What works (carried forward from 0.5)
 
@@ -27,8 +45,11 @@ system, and the public-API shape that 1.0 will freeze.
   aliasing across kernel boundaries are compile-time errors.
 - The full v0.5 SQL scalar surface (`NOT`, `IN`, `BETWEEN`, `CASE`,
   `CAST`, `COALESCE` / `NULLIF`, `LIKE`, `||`, `STDDEV` / `VAR`,
-  scalar string fns) — parsed and type-checked; physical lowering
-  rejects cleanly for the items still pending a GPU runtime path.
+  scalar string fns) — parsed and type-checked. v0.7 landed GPU
+  execution for grouped `STDDEV` / `VAR`, `Decimal128` arithmetic and
+  comparisons, and `Date` / `Timestamp` arithmetic; the remaining items
+  (e.g. `CASE` / `CAST` / scalar string funcs on the GPU, `LIKE` with
+  `ESCAPE`, `||` in `WHERE`) still reject cleanly at physical lowering.
 - Dictionary-encoded Utf8, float GROUP BY with sentinel-free fallback,
   GPU-side filter compaction, process-wide PTX module cache,
   `--features cuda-stub` for CI / `docs.rs`.
@@ -102,41 +123,38 @@ system, and the public-API shape that 1.0 will freeze.
 - `docs/MIGRATION_GUIDE.md` covers the 0.3 → 0.5 → 0.6 upgrade path.
 - `docs/USER_GUIDE.md` ships as a 10-minute tutorial.
 
-### Known limitations (not bugs)
+### Known limitations (not bugs) — as of 0.7.0
 
-- The v0.5 SQL scalar items that parse but reject at the physical
-  layer still do so in v0.6 (carried over to v0.7 — see below).
-- `Decimal128`, `Date32`, and `Timestamp` parse and type-check, but
-  arithmetic and the GPU lowering paths reject cleanly.
-- The async-memcpy and `KernelSpec`-cache improvements ship as the
-  pilot + library only; the broader executor wiring is a v0.7 task.
-- The GPU radix-sort kernel is gated behind `BOLT_GPU_SORT=1` and not
-  yet selected by the planner.
+v0.7 closed most of the v0.6 carry-overs. What remains:
+
+- Several v0.5 SQL scalar items still parse / type-check but reject at
+  the physical layer: GPU lowering for `CASE` / `CAST` / scalar string
+  funcs, `LIKE` with `ESCAPE`, and `||` in `WHERE`. (v0.7 *did* land
+  `Decimal128` arithmetic + comparisons, `Date` / `Timestamp`
+  arithmetic, and grouped `STDDEV` / `VAR`.)
+- The GPU radix sort is integrated into `src/exec/sort.rs` but is still
+  opt-in via `BOLT_GPU_SORT=1` rather than planner-selected by default.
 - The disk PTX cache honours `BOLT_PTX_CACHE_DIR`; the
   `EngineBuilder::persistent_cache` knob is wired through the builder
   surface but does not yet drive `EngineBuilder::build`.
+- The lazy streaming executor behind `Engine::register_table_stream` is
+  still the eager drain implementation (the signature is
+  future-compatible).
 
-## 0.7+ — execution catch-up (next)
+## Beyond 0.7 — toward 1.0 (next)
 
-Most of the v0.6 work was either type-system, observability, or
-infrastructure (cache, builder, rewrite trait, regression bench). The
-v0.7 cycle is about turning the new surfaces into running GPU code:
+With the v0.6 execution carry-overs largely landed in v0.7, the
+remaining pre-1.0 work is the last GPU-lowering gaps, planner-driven
+dispatch, and the freeze checklist:
 
 ### Goals
 
-- **GPU lowering for the deferred scalar items**: `CASE WHEN ... END`
-  (predicated select), `CAST` over documented primitive pairs, scalar
-  string functions (`UPPER` / `LOWER` / `LENGTH` / `SUBSTRING`),
-  `Decimal128` arithmetic (`+` `-` `*`), and `Date` / `Timestamp`
-  arithmetic.
-- **`STDDEV` / `VAR` under `GROUP BY`** via per-group Welford state.
-- **Per-shape async memcpy wiring** — extend the scalar-aggregate
-  pilot to filter, GROUP BY, and join executors on explicit streams +
-  pinned host buffers.
-- **`KernelSpec` cache integration** at the call sites that still
-  rebuild PTX on every query.
-- **GPU radix sort integration** in `src/exec/sort.rs` — promote the
-  v0.6 scaffold from env-var gated to planner-driven dispatch.
+- **GPU lowering for the still-deferred scalar items**: `CASE WHEN ... END`
+  (predicated select), `CAST` over documented primitive pairs, and the
+  scalar string functions (`UPPER` / `LOWER` / `LENGTH` / `SUBSTRING`).
+- **Planner-driven radix-sort dispatch** — promote the integrated
+  `src/exec/sort.rs` radix path from `BOLT_GPU_SORT=1` opt-in to a
+  default selected on size / dtype.
 - **`EngineBuilder::persistent_cache` wiring** through
   `EngineBuilder::build` (today the env-var path is the only
   honoured surface).

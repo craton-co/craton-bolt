@@ -130,10 +130,46 @@ pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
 
 /// Free a device pointer. Mirrors `cuda_sys::mem_free`.
 ///
+/// # Context-currency invariant
+/// Every freed pointer belongs to cudarc's primary context, so
+/// `cuMemFree_v2` must run with that context current on the *calling*
+/// thread. We therefore establish currency by calling [`device()`]
+/// first — exactly as [`mem_alloc`] does before `malloc_sync` — rather
+/// than assuming the caller already made the context current. This
+/// matters because frees originate from threads that never touched the
+/// alloc path: a worker thread dropping a `GpuBuffer`, or the
+/// process-wide pool drain in `CudaContext::Drop` (see
+/// `cuda_sys.rs`). Without this guard a free on such a thread would hit
+/// `cuMemFree_v2` against the wrong (or no) context, producing either a
+/// swallowed error (a silent leak) or a context-mismatch free.
+/// Self-guarding here keeps the alloc/free pair symmetric and makes the
+/// `Drop`-drain path correct regardless of which thread runs it.
+///
+/// `get_or_try_init` makes the `device()` call idempotent and cheap on
+/// the common path (the cell is already latched after the first
+/// `ensure_device`/`mem_alloc`), so this adds no FFI — only an
+/// `Arc::clone` that is dropped immediately.
+///
 /// # Safety
 /// `ptr` must have been returned by `mem_alloc` (or by
 /// `cuda_sys::mem_alloc` — both call into the same `cuMemAlloc_v2`).
 pub unsafe fn mem_free(ptr: CUdeviceptr) -> BoltResult<()> {
+    // Ensure the primary context is current on this thread before the free.
+    // Mirrors `mem_alloc`'s `let _dev = device()?;` guard.
+    // PERF-NOTE: Arc::clone on the free path; matches mem_alloc, defer to Stage 2.
+    let _dev = match device() {
+        Ok(dev) => dev,
+        Err(e) => {
+            // The device could not be made current — the pointer cannot be
+            // freed safely against the right context. Surface the error
+            // rather than calling `free_sync` against the wrong/no context.
+            log::debug!(
+                "cudarc mem_free: primary context unavailable on this thread \
+                 ({e:?}); skipping free to avoid a context-mismatch free"
+            );
+            return Err(e);
+        }
+    };
     result::free_sync(ptr as cudarc::driver::sys::CUdeviceptr)
         .map_err(|e| cudarc_err("cudarc free_sync", e))
 }

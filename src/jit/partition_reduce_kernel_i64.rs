@@ -119,10 +119,7 @@ pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
     let set_bytes = BLOCK_GROUPS * 4;
     let max_probes = MAX_PROBES;
 
-    writeln!(ptx, ".version 7.5").map_err(write_err)?;
-    writeln!(ptx, ".target sm_70").map_err(write_err)?;
-    writeln!(ptx, ".address_size 64").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     // Shared-memory open-addressing table. block_keys is i64-aligned
     // (8 bytes per slot); the others match the i32 variant.
@@ -169,9 +166,7 @@ pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
     // %r0 = blockIdx.x = partition id
     // %r1 = blockDim.x
     // %r2 = threadIdx.x
-    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_thread_block_ids(&mut ptx)?;
 
     // Shared-memory base addresses.
     writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf;").map_err(write_err)?;
@@ -310,13 +305,7 @@ pub fn compile_partition_reduce_kernel_i64() -> BoltResult<String> {
     .map_err(write_err)?;
     // Occupancy-friendly back-off on the collision-advance path
     // (sm_70+). See partition_reduce_kernel.rs for full rationale.
-    writeln!(
-        ptx,
-        "\tmov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     writeln!(ptx, "CLAIM:").map_err(write_err)?;

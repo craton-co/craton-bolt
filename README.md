@@ -13,7 +13,7 @@ The project's two distinguishing ideas:
 
 ## Status
 
-**Active development — v0.3.0.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (multi-tier shared-memory + hash-partitioned), joins (`INNER` on GPU, `LEFT [OUTER]` / `RIGHT [OUTER]` / `FULL [OUTER]` / `CROSS` host-side or GPU as applicable), `DISTINCT`, `ORDER BY`, `LIMIT`, `HAVING`, and `UNION [ALL]` are implemented. String predicates (`=`, `!=`, `IN` over dictionary-encoded literals) and a small set of host-callable string operations (`UPPER`, `LOWER`, `LENGTH`, `CONCAT`) are available; string functions are not yet reachable via SQL. Production use is **not** recommended — the public API is unstable pre-1.0.
+**Active development — v0.7.0.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (multi-tier shared-memory + hash-partitioned), joins (`INNER` / `LEFT [OUTER]` / `RIGHT [OUTER]` / `FULL [OUTER]` on GPU when the shape qualifies, host-side hash join otherwise; `CROSS` on GPU or host; plus small-cardinality non-equi joins via a host nested-loop fallback), `DISTINCT`, `ORDER BY` (GPU bitonic sort integrated, plus an env-gated GPU radix path; host `lexsort` fallback), `LIMIT`, `HAVING`, and `UNION [ALL]` are implemented. The scalar surface includes `IN`, `BETWEEN`, `CASE`, `CAST`, `COALESCE` / `NULLIF`, and `LIKE` (numeric/Bool results lower to GPU; `Decimal128` / `Date32` / `Timestamp` parse and partially lower — see [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md)). String predicates (`=`, `!=`, `IN` over dictionary-encoded literals) plus host-callable `UPPER` / `LOWER` / `LENGTH` / `CONCAT` / `SUBSTRING` are available. Production use is **not** recommended — the public API is unstable pre-1.0.
 
 See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported subset.
 
@@ -23,8 +23,8 @@ See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported sub
 |------------------|-------------------------------------------------------------------------------|
 | `src/cuda/`      | Raw CUDA driver FFI, Arrow-aligned device buffers, borrow-checked `GpuVec`, host-side dictionary encoders (i32 and i64 indices). |
 | `src/plan/`      | Logical plan AST, lazy `DataFrame` builder, SQL frontend (sqlparser), physical-plan lowering with SSA-shaped IR, string-literal predicate rewriting. |
-| `src/jit/`       | PTX codegen — projection kernels, predicate-only kernels, scalar reductions, GROUP BY hash kernels (sentinel-based and valid-flag), float-atomic MIN/MAX via CAS loop, single-pass and multi-pass prefix scan, gather. The NVRTC-equivalent driver path (`cuModuleLoadData`) is also here. |
-| `src/exec/`      | Top-level engine; per-shape executors (scalar / GROUP BY / pre-projection / pre+GROUP BY / wide keys / sentinel-free); GPU and host filter compaction; dictionary registry; host-side aggregate fallbacks for Bool / Utf8. |
+| `src/jit/`       | PTX codegen — projection kernels, predicate-only kernels, scalar reductions, GROUP BY hash kernels (sentinel-based and valid-flag), float-atomic MIN/MAX via CAS loop, single-pass and multi-pass prefix scan, gather, hash-join build/probe kernels, and bitonic + radix sort kernels. The NVRTC-equivalent driver path (`cuModuleLoadData`) and the `KernelSpec`-keyed module cache are also here. |
+| `src/exec/`      | Top-level engine; per-shape executors (scalar / GROUP BY / pre-projection / pre+GROUP BY / wide keys / sentinel-free); GPU and host hash-join executors; GPU and host ORDER BY; GPU and host filter compaction; dictionary registry; host-side aggregate fallbacks for Bool / Utf8. |
 
 ## Quick start
 
@@ -194,7 +194,6 @@ craton-bolt/
 │   ├── GROUPBY_PERF.md       # GROUP BY kernel design and analysis
 │   ├── CUDARC_ADOPTION.md    # cudarc migration plan
 │   ├── CUDA_OXIDE_SWEEP.md   # CUDA-Oxide refactor status
-│   ├── MILESTONE_0_4.md      # 0.4 milestone proposal
 │   └── PATH_TO_1.0.md        # detailed 1.0 milestone plan
 ├── src/
 │   ├── lib.rs                # crate root, public re-exports

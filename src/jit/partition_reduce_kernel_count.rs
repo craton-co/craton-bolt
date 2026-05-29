@@ -88,10 +88,7 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     let set_bytes = BLOCK_GROUPS * 4;
     let max_probes = MAX_PROBES;
 
-    writeln!(ptx, ".version 7.5").map_err(write_err)?;
-    writeln!(ptx, ".target sm_70").map_err(write_err)?;
-    writeln!(ptx, ".address_size 64").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     writeln!(
         ptx,
@@ -130,9 +127,7 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_thread_block_ids(&mut ptx)?;
 
     writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u64 %rd1, block_counts_buf;").map_err(write_err)?;
@@ -260,13 +255,7 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     .map_err(write_err)?;
     // Occupancy-friendly back-off on the collision-advance path
     // (sm_70+). See partition_reduce_kernel.rs for full rationale.
-    writeln!(
-        ptx,
-        "\tmov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     // CLAIM: publish the key, fence so racing readers see it, then
@@ -610,6 +599,19 @@ mod tests {
         // CLAIM + MATCH paths each issue one atom.shared.add.u64.
         let count = ptx.matches("atom.shared.add.u64").count();
         assert!(count >= 2, "expected ≥ 2 atom.shared.add.u64, got {count}");
+    }
+
+    /// Byte-stable refactor guard: the header / thread-id / spin-back-off
+    /// fragments now come from the shared `spill_common` helpers. Assert the
+    /// exact bytes they previously emitted inline are unchanged.
+    #[test]
+    fn shared_fragment_bytes_are_byte_stable() {
+        let ptx = compile_partition_reduce_kernel_count().unwrap();
+        assert!(ptx.starts_with(".version 7.5\n.target sm_70\n.address_size 64\n\n"));
+        assert!(ptx.contains(
+            "\tmov.u32 %r0, %ctaid.x;\n\tmov.u32 %r1, %ntid.x;\n\tmov.u32 %r2, %tid.x;\n"
+        ));
+        assert!(ptx.contains("\tmov.u32 %nstime, 32;\n\tnanosleep.u32 %nstime;\n"));
     }
 
     #[test]

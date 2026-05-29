@@ -997,18 +997,21 @@ impl Engine {
                 // them here (mirrors the legacy per-engine miss path).
                 let disk = crate::jit::disk_cache::disk_cache();
                 let disk_key = disk.as_ref().map(|_| {
-                    // Compose a disk key that domain-separates
-                    // entry-point names: two kernels with identical
-                    // KernelSpec content but different entry symbols
-                    // (KERNEL_ENTRY vs PREDICATE_ENTRY) must NOT alias
-                    // to the same .ptx file.
-                    format!(
-                        "{}-{}",
+                    // Compose a disk key that (a) folds in the
+                    // codegen-version salt so a PTX-emission change
+                    // invalidates stale on-disk entries (JIT-M1), and
+                    // (b) domain-separates entry-point names: two
+                    // kernels with identical KernelSpec content but
+                    // different entry symbols (KERNEL_ENTRY vs
+                    // PREDICATE_ENTRY) must NOT alias to the same .ptx
+                    // file. See `disk_cache::disk_key` for the canonical
+                    // key shape; the in-process KernelSpecCache key is
+                    // intentionally left unsalted (it re-validates PTX
+                    // content on every hit).
+                    crate::jit::disk_cache::disk_key(
                         entry,
-                        crate::jit::disk_cache::hash_to_key(
-                            spec_hash_hi,
-                            spec_hash_lo,
-                        ),
+                        spec_hash_hi,
+                        spec_hash_lo,
                     )
                 });
                 let ptx = match (&disk, &disk_key) {

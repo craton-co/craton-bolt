@@ -4,6 +4,12 @@ How to build, test, benchmark, and extend Craton Bolt.
 
 ## Prerequisites
 
+For full install instructions — supported CUDA Toolkit version, the Cargo
+feature matrix, GPU-less builds, and build/link troubleshooting (including the
+Windows CUDA v13.2 `__imp_*` linker workaround) — see
+[`INSTALL.md`](./INSTALL.md). The summary below is enough to get a contributor
+building.
+
 | Tool                     | Why                                                                     |
 |--------------------------|-------------------------------------------------------------------------|
 | Rust 1.74+               | The crate uses 2021 edition; nothing newer is required.                 |

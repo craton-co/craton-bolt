@@ -1,9 +1,19 @@
 ﻿# Path to 1.0
 
-A proposal for how Craton Bolt gets from 0.3.0 (current) to a stable, semver-bound
-1.0. This document is **strategic, not contractual** — version numbers and dates
-are illustrative, milestone *ordering* and *acceptance criteria* are the
-substance.
+A proposal for how Craton Bolt gets to a stable, semver-bound 1.0. The current
+baseline is **0.7.0**; this document is **strategic, not contractual** — version
+numbers and dates are illustrative, milestone *ordering* and *acceptance
+criteria* are the substance.
+
+> **Baseline note.** This plan was first drafted against a 0.3.0 baseline. Much
+> of the *Foundation* and *Coverage* work below has since landed across
+> 0.5 → 0.7 (multi-batch tables, the full join family, GPU sort, the expanded
+> scalar/type surface, `tracing`, the disk-backed PTX cache, the
+> `KernelSpec`-keyed module cache, and the `EngineBuilder`). The "today" column
+> in §2 therefore reflects the *original* 0.3.0 starting point and is kept for
+> historical contrast — consult [`CHANGELOG.md`](../CHANGELOG.md) for what has
+> already shipped. The milestone *ordering* and *acceptance criteria* remain the
+> substance of the plan.
 
 The existing [`ROADMAP.md`](../ROADMAP.md) is the index of where we are and what
 we're skipping for the current 0.x line. This doc is the depth behind its "1.0"
@@ -55,9 +65,12 @@ inclusions.
 
 ## 2. The gap, at a glance
 
-Where 0.3.0 sits and what stands between it and 1.0:
+Where the 0.3.0 baseline sat and what stands between the project and 1.0. The
+"today" column is the **original 0.3.0** starting point preserved for contrast;
+many of these rows have since closed across 0.5 → 0.7 (see
+[`CHANGELOG.md`](../CHANGELOG.md)):
 
-| Axis              | 0.3.0 today                                   | 1.0 target                                              |
+| Axis              | 0.3.0 baseline                                | 1.0 target                                              |
 | ----------------- | --------------------------------------------- | ------------------------------------------------------- |
 | API stability     | All IR types `#[doc(hidden)]`. Frequent breaks | Public surface enumerated; semver-bound                 |
 | Table model       | Multi-batch in-memory tables; no streaming / spill | Multi-batch streaming, larger-than-VRAM via spill       |

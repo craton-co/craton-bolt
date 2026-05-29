@@ -10,7 +10,7 @@ that any future numbers should follow.
 
 ## TL;DR
 
-- Craton Bolt 0.3.0 is a single-node, multi-batch in-memory GPU SQL engine. Pick
+- Craton Bolt 0.7.0 is a single-node, multi-batch in-memory GPU SQL engine. Pick
   competitors that occupy the same niche; treat cross-niche comparisons as
   illustrative, not damning.
 - Use **ClickBench** as your primary suite: it's single-table, aggregation-heavy,
@@ -26,7 +26,7 @@ that any future numbers should follow.
 
 ## 1. What category is Craton Bolt in?
 
-Be specific about the contest before you measure. Craton Bolt 0.3.0 is:
+Be specific about the contest before you measure. Craton Bolt 0.7.0 is:
 
 - **Single-node** (one process, one GPU).
 - **Single-batch in-memory** (no streaming, no larger-than-VRAM tables, no
@@ -66,11 +66,11 @@ buying anything *on that workload*, full stop.
 
 ### 3.1 Standard suites, ranked by fit
 
-| Suite | Tables | Queries | Fits Craton Bolt 0.3.0?       | Comment |
+| Suite | Tables | Queries | Fits Craton Bolt 0.7.0?       | Comment |
 | ----- | ------ | ------- | ------------------------- | ------- |
 | **ClickBench**     | 1 (`hits`)   | 43 | Yes (most queries)     | Aggregation-heavy single-table. Ideal. |
-| **SSB** (denormalised flat) | 1 | 13 | Yes              | Star Schema Benchmark; "denorm" form fits 0.3.0. |
-| **SSB** (joined)   | 5            | 13 | Partial (needs INNER) | The 0.3.0 INNER hash join handles SSB joins. |
+| **SSB** (denormalised flat) | 1 | 13 | Yes              | Star Schema Benchmark; "denorm" form fits 0.7.0. |
+| **SSB** (joined)   | 5            | 13 | Partial (needs INNER) | The 0.7.0 hash join (INNER on GPU; LEFT/RIGHT/FULL/CROSS on GPU or host) handles SSB joins. |
 | **TPC-H** SF1      | 8            | 22 | Partial (~6 queries)  | Many queries need LEFT JOIN, subqueries, CTEs. |
 | **TPC-H** SF10+    | 8            | 22 | No                     | Multi-batch / streaming needed. |
 | **TPC-DS**         | 24           | 99 | No                     | Out of scope until 0.4+.               |
@@ -176,7 +176,7 @@ the values in your writeup.
 
 ## 6. What Craton Bolt will likely win and lose at
 
-Setting reader expectations honestly is part of the deliverable. As of 0.3.0:
+Setting reader expectations honestly is part of the deliverable. As of 0.7.0:
 
 **Likely wins**
 - Warm scalar arithmetic at ≥ 10M rows (GPU FLOPs + bandwidth ratio).
@@ -188,12 +188,15 @@ Setting reader expectations honestly is part of the deliverable. As of 0.3.0:
 - Cold-start queries: parse + JIT + first H2D often exceeds DuckDB's entire
   warm run on small data.
 - Sub-million-row workloads: launch + transfer overhead dominates.
-- Queries dominated by string operations: 0.3.0 only does dictionary equality;
-  `LIKE` / `SUBSTRING` / `CONCAT` aren't routed through SQL.
-- Multi-table joins beyond the single equi-INNER pattern: 0.3.0 rejects them
-  at the parser.
-- Anything that requires `IS NULL`, `IN`, `BETWEEN`, `CASE`, `NULLIF`,
-  `COALESCE`, or `CAST` — these are unimplemented and will fail.
+- Queries dominated by string operations: string predicates run as
+  dictionary equality, and `UPPER` / `LOWER` / `LENGTH` / `CONCAT` /
+  `SUBSTRING` run host-side — see `SQL_REFERENCE.md` for the exact routing.
+- Joins are supported (`INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS`,
+  plus small-cardinality non-equi via the nested-loop fallback), but
+  many-table query plans still pay host-side materialisation between joins.
+- For the authoritative list of supported scalar operators (`IN`,
+  `BETWEEN`, `CASE`, `NULLIF`, `COALESCE`, `CAST`, etc.) and what still
+  rejects at the physical layer, see `SQL_REFERENCE.md` and `CHANGELOG.md`.
 
 **Likely losses (by design, until 0.4+)**
 - Streaming / multi-batch tables.

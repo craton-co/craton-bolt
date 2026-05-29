@@ -20,16 +20,17 @@ recent CUDA toolkit for any Apple-shipped GPU. You can still type-check
 the crate on macOS with `cargo check --features cuda-stub`, but you
 cannot run a kernel.
 
-## Q3. Why no async memcpy yet?
+## Q3. What's the status of async memcpy?
 
-The FFI bindings for `cuMemcpyAsync` and pinned host allocation landed
-in 0.3.0. **Stage 1** (safe wrappers — `memcpy_h2d_async`,
+It's shipped. The FFI bindings for `cuMemcpyAsync` and pinned host
+allocation landed in 0.3.0, and the safe wrappers (`memcpy_h2d_async`,
 `memcpy_d2h_async`, `memset_d8_async`, `PinnedHostBuffer<T>`,
-`GpuBuffer::copy_{from,to}_async`) is in place on the path to 0.4, but
-the executors still call the synchronous `from_slice` / `to_vec`
-helpers. Threading the new async surface through the per-shape
-executors (and the matching stream-and-event accounting) is the
-remaining 0.4 task — see `docs/JIT_PIPELINE.md` for the staging plan.
+`GpuBuffer::copy_{from,to}_async`) followed. The scalar-aggregate
+executor was the 0.6 pilot
+(`upload_primitive_values_async`); 0.7 rolled async memcpy out to the
+remaining `GROUP BY` variants (tier2 / shmem / wide / valid) and added
+async D2H for `compact::download_mask` (the `WHERE` filter path). See
+`docs/JIT_PIPELINE.md` for the staging history.
 
 ## Q4. Can I share a `GpuVec` between threads?
 
@@ -59,11 +60,18 @@ columns; `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The
 widening is applied consistently in the scalar and GROUP BY paths via
 `crate::plan::logical_plan::sum_output_dtype`.
 
-## Q8. Why are `SELECT t.col FROM t` and `SELECT COL FROM t` (uppercase) rejected?
+## Q8. Are `SELECT t.col FROM t` and `SELECT COL FROM t` (uppercase) accepted?
 
-Identifiers are case-sensitive and qualified column references are not
-yet supported — the SQL frontend only accepts bare unqualified names
-that match a registered column exactly. Both are current 0.3.0 limitations tracked in [`../ROADMAP.md`](../ROADMAP.md).
+Yes — both work as of 0.5. Single-level qualified column references
+(`t.col`, `alias.col`) resolve against the FROM-tree, including JOIN
+aliases, in SELECT / WHERE / GROUP BY / HAVING / `JOIN ... ON`; only the
+resolved column name survives lowering. Deeper qualifications
+(`db.t.col`, struct-field access) are still rejected.
+
+Identifiers are also case-insensitive: an unquoted SQL ident folds to
+lowercase at parse time, and schema lookup falls back to a
+case-insensitive match, so `SELECT COL` resolves to a column named
+`col`. Quoted identifiers (`"MyCol"`) preserve case and match verbatim.
 
 ## Q9. Why is the CHANGELOG / NOTICE attribution "Craton Software Company"?
 

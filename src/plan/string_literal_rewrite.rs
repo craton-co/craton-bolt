@@ -15,8 +15,32 @@
 //!     matching the dictionary variant's index width)
 //!   * `col <> 'lit'` → `__idx_col <> <dict index of lit>`
 //!   * Reversed shape (literal on the left) is normalised before rewrite.
-//!   * If `'lit'` is not in the dictionary, the predicate is constant-folded:
-//!     `=` → `Bool(false)`, `<>` → `Bool(true)`.
+//!   * If `'lit'` is not in the dictionary AND the dictionary is known-complete
+//!     for that column (it observed every distinct value of the column at build
+//!     time), the predicate is constant-folded: `=` → `Bool(false)`,
+//!     `<>` → `Bool(true)`.
+//!   * If `'lit'` is not in the dictionary and completeness is NOT guaranteed,
+//!     the predicate is left as the original `col <op> 'lit'` string
+//!     comparison (no dictionary-index rewrite, no constant fold) so the host
+//!     path evaluates it against the actual decoded strings. See finding
+//!     PL-M6 below.
+//!
+//! ## Completeness invariant (finding PL-M6)
+//!
+//! The "literal absent ⇒ `Bool(false)`" fold is only sound when the
+//! dictionary observed *every distinct value* of the column. If the dictionary
+//! was built from a sampled / partial batch — or the upload path coalesces
+//! `""`→NULL differently from the source — a value that legitimately exists in
+//! the column but was absent from the dictionary snapshot would make
+//! `col = 'thatvalue'` fold to `false`: a silent wrong result. (The
+//! closely-related union-dictionary bug is exercised by the C10 test below.)
+//!
+//! The resolver therefore exposes a [`LiteralResolver::is_complete`] signal,
+//! which defaults to `false` (the safe assumption). The false-fold is gated on
+//! it: only a column whose dictionary is *provably* complete folds an absent
+//! literal to a constant; otherwise the rewriter falls back to the always-
+//! correct host string comparison. A literal that IS in the dictionary always
+//! folds to its index regardless of completeness — that fast path is exact.
 //!
 //! Unsupported (returns `BoltError::Plan`):
 //!   * `< <= > >=` on Utf8 columns with Utf8 literals — dictionary indices
@@ -100,6 +124,27 @@ pub trait LiteralResolver {
     /// True if `column` is a registered Utf8 column with a dictionary.
     fn knows(&self, column: &str) -> bool;
 
+    /// True iff `column`'s dictionary is *known-complete*: it observed every
+    /// distinct value the column can hold at build time (full scan, not a
+    /// sample / partial batch, and with no `""`→NULL coalescing that would
+    /// drop an observable value).
+    ///
+    /// This gates the "literal absent ⇒ constant fold" optimisation (finding
+    /// PL-M6). When it returns `false`, an absent literal must NOT be folded to
+    /// `Bool(false)` / `Bool(true)`, because the column may legitimately
+    /// contain a value the dictionary never saw; the rewriter instead leaves
+    /// the predicate as the original string comparison for correct host-side
+    /// evaluation.
+    ///
+    /// Defaults to `false` — the safe assumption. Resolvers that can *prove*
+    /// completeness (e.g. the dictionary was built from the full column in a
+    /// single pass) override this to return `true` for those columns. A literal
+    /// that IS present still folds to its index regardless of this signal.
+    fn is_complete(&self, column: &str) -> bool {
+        let _ = column;
+        false
+    }
+
     /// Plan dtype of `column`'s index column (`__idx_<col>`). Used by the
     /// scan-schema extension to declare the correct integer width when no
     /// upstream pass has already added the field. Defaults to
@@ -126,6 +171,14 @@ pub struct StringPredicateRewriter<'a> {
     /// Optional override: original-name → mangled-index-column-name.
     /// If not set, defaults to `__idx_<original>`.
     name_map: HashMap<String, String>,
+    /// Columns whose dictionary is known-complete (observed every distinct
+    /// value of the column). Membership gates the "absent literal ⇒ constant
+    /// fold" optimisation; a column not in this set is treated as possibly
+    /// incomplete (the safe default — see finding PL-M6). Registration helpers
+    /// do NOT add to this set, because a [`DictionaryColumnAny`] carries no
+    /// completeness guarantee on its own; callers that built the dictionary
+    /// from a full single-pass scan opt in via [`Self::mark_complete`].
+    complete: std::collections::HashSet<String>,
 }
 
 impl<'a> Default for StringPredicateRewriter<'a> {
@@ -140,7 +193,18 @@ impl<'a> StringPredicateRewriter<'a> {
         Self {
             dicts: HashMap::new(),
             name_map: HashMap::new(),
+            complete: std::collections::HashSet::new(),
         }
+    }
+
+    /// Mark `column`'s dictionary as known-complete: it observed every distinct
+    /// value the column can hold (built from a full single-pass scan, not a
+    /// sample / partial batch). Only call this when completeness is provable —
+    /// it re-enables the "absent literal ⇒ constant fold" fast path for the
+    /// column (finding PL-M6). Columns left unmarked are treated as possibly
+    /// incomplete and fall back to host string comparison for absent literals.
+    pub fn mark_complete(&mut self, column: impl Into<String>) {
+        self.complete.insert(column.into());
     }
 
     /// Register a Utf8 column's dictionary. The mangled index-column name
@@ -201,6 +265,14 @@ impl<'a> LiteralResolver for StringPredicateRewriter<'a> {
 
     fn knows(&self, column: &str) -> bool {
         self.dicts.contains_key(column)
+    }
+
+    fn is_complete(&self, column: &str) -> bool {
+        // Only columns explicitly opted in via `mark_complete` are trusted as
+        // having observed every distinct value. A `DictionaryColumnAny` alone
+        // carries no such guarantee (it may have been built from a sample or
+        // an early batch), so the default is "incomplete" — see finding PL-M6.
+        self.complete.contains(column)
     }
 
     fn index_dtype(&self, column: &str) -> DataType {
@@ -324,30 +396,48 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                                 });
                             }
                             None => {
-                                // Literal not in the dictionary: `=` is
-                                // trivially false, `<>` is trivially true.
+                                // Literal not in the dictionary. Folding `=`
+                                // to `Bool(false)` / `<>` to `Bool(true)` is
+                                // ONLY sound when the dictionary observed every
+                                // distinct value of the column at build time —
+                                // i.e. it is known-complete. See finding PL-M6
+                                // and the "Completeness invariant" section in
+                                // the module docs.
                                 //
-                                // Edge case: the empty string `""` is treated
-                                // like any other literal here. If the
-                                // registered dictionary never observed `""`
-                                // at build time, then `WHERE col = ''` folds
-                                // to `Bool(false)` and `WHERE col <> ''`
-                                // folds to `Bool(true)` — i.e. we assume no
-                                // row holds an empty string. This matches the
-                                // dictionary's `index_of` semantics (only
-                                // observed literals are present; NULL lives
-                                // at slot 0, not `""`), and is correct as
-                                // long as the upload path never silently
-                                // coalesces `""` into NULL. Callers that
-                                // need `''` to match real empty-string rows
-                                // must ensure `""` is in the source array
-                                // when the dictionary is built.
-                                let folded = match op {
-                                    BinaryOp::Eq => false,
-                                    BinaryOp::NotEq => true,
-                                    _ => unreachable!("is_eq_or_neq gated this branch"),
-                                };
-                                return Ok(Expr::Literal(Literal::Bool(folded)));
+                                // If completeness is NOT guaranteed, the column
+                                // may legitimately hold `lit_str` even though
+                                // the dictionary snapshot missed it (sampled /
+                                // partial batch, or `""`→NULL coalescing
+                                // mismatch). Folding to a constant there is a
+                                // silent wrong result. So we fall through and
+                                // emit the ORIGINAL `col <op> 'lit'` string
+                                // comparison — no index rewrite, no fold — and
+                                // let the host path evaluate it against the
+                                // actual decoded strings, which is always
+                                // correct.
+                                //
+                                // Edge case: the empty string `""` is just
+                                // another literal here. With a complete
+                                // dictionary, `WHERE col = ''` folds to false
+                                // iff no observed row held `""` (NULL lives at
+                                // slot 0, not `""`). Without completeness it is
+                                // left to the host path, so `''` still matches
+                                // real empty-string rows even if the dictionary
+                                // snapshot never saw one.
+                                if r.is_complete(&col_name) {
+                                    let folded = match op {
+                                        BinaryOp::Eq => false,
+                                        BinaryOp::NotEq => true,
+                                        _ => unreachable!("is_eq_or_neq gated this branch"),
+                                    };
+                                    return Ok(Expr::Literal(Literal::Bool(folded)));
+                                }
+                                // Incomplete dictionary: fall through to the
+                                // post-match `Ok(Expr::Binary { .. })` below,
+                                // which reconstructs the original (recursively
+                                // rewritten) `col <op> 'lit'` comparison. The
+                                // string literal is preserved verbatim, so the
+                                // host string-comparison path stays correct.
                             }
                         }
                     } else if is_ordering(*op) {
@@ -598,6 +688,10 @@ mod tests {
         /// columns the resolver "knows" (has a dictionary for), keyed to
         /// their index width.
         columns: HashMap<String, MockWidth>,
+        /// columns whose dictionary is marked known-complete (gates the
+        /// absent-literal constant fold — finding PL-M6). Empty by default, so
+        /// the mock mirrors the production "incomplete unless proven" stance.
+        complete: std::collections::HashSet<String>,
     }
 
     impl MockResolver {
@@ -605,7 +699,16 @@ mod tests {
             Self {
                 entries: HashMap::new(),
                 columns: HashMap::new(),
+                complete: std::collections::HashSet::new(),
             }
+        }
+
+        /// Mark `col`'s dictionary as known-complete so absent literals are
+        /// allowed to constant-fold. Mirrors
+        /// `StringPredicateRewriter::mark_complete`.
+        fn complete(mut self, col: &str) -> Self {
+            self.complete.insert(col.to_string());
+            self
         }
 
         /// Register `col` as i32-indexed and map `lit` → `idx`.
@@ -656,6 +759,10 @@ mod tests {
 
         fn knows(&self, column: &str) -> bool {
             self.columns.contains_key(column)
+        }
+
+        fn is_complete(&self, column: &str) -> bool {
+            self.complete.contains(column)
         }
 
         fn index_dtype(&self, column: &str) -> DataType {
@@ -791,8 +898,9 @@ mod tests {
 
     #[test]
     fn rewrite_eq_with_unknown_literal_folds_to_false() {
-        // Column is known but literal not in the dictionary.
-        let r = MockResolver::new().known_i32("region");
+        // Column is known, literal not in the dictionary, AND the dictionary
+        // is marked known-complete — so the absent-literal fold is sound.
+        let r = MockResolver::new().known_i32("region").complete("region");
         let expr = col("region").eq(lit("ZZ"));
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
@@ -805,15 +913,16 @@ mod tests {
     /// agnostic — an i64-indexed column folds the same way.
     #[test]
     fn unknown_literal_still_folds_to_bool() {
-        // i32 side.
-        let r32 = MockResolver::new().known_i32("region");
+        // i32 side. Both columns are marked known-complete so the absent-
+        // literal fold is sound.
+        let r32 = MockResolver::new().known_i32("region").complete("region");
         let eq = rewrite_expr_with(&col("region").eq(lit("ZZ")), &r32, 0).unwrap();
         assert!(matches!(eq, Expr::Literal(Literal::Bool(false))));
         let neq = rewrite_expr_with(&col("region").neq(lit("ZZ")), &r32, 0).unwrap();
         assert!(matches!(neq, Expr::Literal(Literal::Bool(true))));
 
         // i64 side: same behaviour.
-        let r64 = MockResolver::new().known_i64("user_id");
+        let r64 = MockResolver::new().known_i64("user_id").complete("user_id");
         let eq64 = rewrite_expr_with(&col("user_id").eq(lit("ghost")), &r64, 0).unwrap();
         assert!(matches!(eq64, Expr::Literal(Literal::Bool(false))));
         let neq64 = rewrite_expr_with(&col("user_id").neq(lit("ghost")), &r64, 0).unwrap();
@@ -822,7 +931,7 @@ mod tests {
 
     #[test]
     fn rewrite_neq_with_unknown_literal_folds_to_true() {
-        let r = MockResolver::new().known_i32("region");
+        let r = MockResolver::new().known_i32("region").complete("region");
         let expr = col("region").neq(lit("ZZ"));
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
@@ -1049,17 +1158,32 @@ mod tests {
     #[test]
     fn c10_rewriter_resolves_literal_from_unioned_dict() {
         // Pre-fix engine state: registry holds only batch 0 → resolver
-        // knows {"a": 1, "b": 2}. Demonstrates the broken behaviour:
-        // `s = 'c'` folds to `Bool(false)`.
+        // knows {"a": 1, "b": 2}. This dictionary is NOT complete (batch 1's
+        // "c" was never observed). With the PL-M6 fix the rewriter no longer
+        // folds the absent literal to `Bool(false)` — instead it preserves the
+        // original `s = 'c'` string comparison so the host path can still match
+        // real "c" rows. (Before PL-M6 this folded to `Bool(false)`: a silent
+        // wrong result whenever batch 0 was a partial snapshot.)
         let pre_fix = MockResolver::new()
             .with_i32("s", "a", 1)
             .with_i32("s", "b", 2);
-        let folded =
+        let unfolded =
             rewrite_expr_with(&col("s").eq(lit("c")), &pre_fix, 0).unwrap();
-        assert!(
-            matches!(folded, Expr::Literal(Literal::Bool(false))),
-            "pre-fix: missing union dict folds to Bool(false) — silent-wrong-result"
-        );
+        match unfolded {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Eq);
+                // Original Utf8 comparison preserved — NOT an index rewrite and
+                // NOT a constant fold.
+                assert_column(&left, "s");
+                match *right {
+                    Expr::Literal(Literal::Utf8(s)) => assert_eq!(s, "c"),
+                    other => panic!("expected preserved Utf8 literal 'c', got {other:?}"),
+                }
+            }
+            other => panic!(
+                "incomplete dict must NOT fold absent literal to a constant, got {other:?}"
+            ),
+        }
 
         // Post-fix engine state: registry rebuilt from union of batch 0
         // (dict {"a","b"}) and batch 1 (dict {"a","b","c"}); resolver
@@ -1079,6 +1203,106 @@ mod tests {
             other => panic!(
                 "post-fix: union dict must resolve 'c' to its index, got {other:?}"
             ),
+        }
+    }
+
+    // ---- finding PL-M6: completeness-gated absent-literal fold ----
+
+    /// PL-M6: a literal that IS in the dictionary folds to its index
+    /// regardless of completeness. The fast path is exact and must be
+    /// unaffected by the gating. (Here the column is deliberately left
+    /// *incomplete*.)
+    #[test]
+    fn plm6_present_literal_still_folds_to_index_when_incomplete() {
+        let r = MockResolver::new().with_i32("region", "US", 5); // not complete
+        assert!(!r.is_complete("region"));
+        let out = rewrite_expr_with(&col("region").eq(lit("US")), &r, 0).unwrap();
+        match out {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Eq);
+                assert_column(&left, "__idx_region");
+                assert_int32_lit(&right, 5);
+            }
+            other => panic!("expected index fold for present literal, got {other:?}"),
+        }
+    }
+
+    /// PL-M6: a literal that is absent from a *known-complete* dictionary
+    /// folds to a constant (`=`→false, `<>`→true). The optimisation is kept
+    /// where it is provably sound.
+    #[test]
+    fn plm6_absent_literal_with_complete_dict_folds_to_constant() {
+        let r = MockResolver::new()
+            .with_i32("region", "US", 5)
+            .complete("region");
+        let eq = rewrite_expr_with(&col("region").eq(lit("ZZ")), &r, 0).unwrap();
+        assert!(
+            matches!(eq, Expr::Literal(Literal::Bool(false))),
+            "absent literal on a complete dict: `=` folds to false, got {eq:?}"
+        );
+        let neq = rewrite_expr_with(&col("region").neq(lit("ZZ")), &r, 0).unwrap();
+        assert!(
+            matches!(neq, Expr::Literal(Literal::Bool(true))),
+            "absent literal on a complete dict: `<>` folds to true, got {neq:?}"
+        );
+    }
+
+    /// PL-M6 (the bug fix): a literal absent from a dictionary that is NOT
+    /// known-complete must NOT fold to a constant — it could be a real value
+    /// the partial/sampled dictionary never observed. The rewriter leaves the
+    /// original `col <op> 'lit'` Utf8 comparison intact for correct host-side
+    /// evaluation (no index rewrite, no fold).
+    #[test]
+    fn plm6_absent_literal_without_completeness_is_not_folded() {
+        let r = MockResolver::new().with_i32("region", "US", 5); // not complete
+        assert!(!r.is_complete("region"));
+
+        // `=` is preserved as a Utf8 comparison.
+        let eq = rewrite_expr_with(&col("region").eq(lit("ZZ")), &r, 0).unwrap();
+        match eq {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Eq);
+                assert_column(&left, "region");
+                match *right {
+                    Expr::Literal(Literal::Utf8(s)) => assert_eq!(s, "ZZ"),
+                    other => panic!("expected preserved Utf8 literal, got {other:?}"),
+                }
+            }
+            other => panic!("absent literal w/o completeness must NOT fold, got {other:?}"),
+        }
+
+        // `<>` likewise preserved (it must not become Bool(true)).
+        let neq = rewrite_expr_with(&col("region").neq(lit("ZZ")), &r, 0).unwrap();
+        match neq {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::NotEq);
+                assert_column(&left, "region");
+                match *right {
+                    Expr::Literal(Literal::Utf8(s)) => assert_eq!(s, "ZZ"),
+                    other => panic!("expected preserved Utf8 literal, got {other:?}"),
+                }
+            }
+            other => panic!("absent literal w/o completeness must NOT fold, got {other:?}"),
+        }
+    }
+
+    /// PL-M6: the empty-string edge case. Without a completeness guarantee,
+    /// `col = ''` must be left for the host path rather than folded away, so a
+    /// real empty-string row the dictionary never saw still matches.
+    #[test]
+    fn plm6_empty_string_not_folded_without_completeness() {
+        let r = MockResolver::new().with_i32("name", "Alice", 1); // "" absent, not complete
+        let out = rewrite_expr_with(&col("name").eq(lit("")), &r, 0).unwrap();
+        match out {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Eq);
+                assert_column(&left, "name");
+                match *right {
+                    Expr::Literal(Literal::Utf8(s)) => assert_eq!(s, ""),
+                    other => panic!("expected preserved empty Utf8 literal, got {other:?}"),
+                }
+            }
+            other => panic!("empty-string eq must not fold without completeness, got {other:?}"),
         }
     }
 

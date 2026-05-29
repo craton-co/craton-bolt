@@ -75,6 +75,85 @@ use parking_lot::Mutex;
 /// disabled.
 pub const DISK_PTX_CACHE_ENV: &str = "BOLT_PTX_CACHE_DIR";
 
+/// Codegen-version salt for the **on-disk** PTX cache key (fixes
+/// JIT-M1).
+///
+/// # Why this exists
+///
+/// The disk key is derived from the [`KernelSpec`] content hash, which
+/// captures *what query plan* a kernel implements but NOT *how the PTX
+/// was emitted*. The in-process PTX-text-hash cache re-validates the
+/// full PTX string on every hit, so it can never serve stale text; the
+/// disk cache, by contrast, returns the on-disk bytes verbatim. That
+/// means a populated cache directory written by an OLD binary — one
+/// with different PTX emission but an unchanged `KernelSpec` hash —
+/// would be loaded as-is by a NEW binary, yielding wrong kernels.
+///
+/// Folding this constant into the disk key (see the key composition in
+/// `engine.rs`) guarantees that any change to PTX emission rotates the
+/// on-disk filename, so the stale entry simply misses and the new
+/// binary re-runs codegen.
+///
+/// # MAINTAINERS: bump this on ANY change to PTX emission
+///
+/// Increment `CODEGEN_VERSION` whenever you change anything that alters
+/// the emitted PTX *text* for an otherwise-identical `KernelSpec`,
+/// including but not limited to:
+///   - `PTX_VERSION` / `PTX_TARGET` in `ptx_gen.rs`,
+///   - any instruction mnemonic, modifier, or rounding mode,
+///   - register naming / layout / allocation strategy,
+///   - kernel signature, parameter order, or overall kernel structure,
+///   - constant-folding or lowering changes that reshape the output.
+///
+/// Forgetting to bump it re-introduces JIT-M1. When in doubt, bump.
+/// The crate version is also folded into the salt (see
+/// [`codegen_salt`]) as a cheap cross-release guard, but that only
+/// protects across published releases — `CODEGEN_VERSION` is what
+/// protects within a release / between local dev builds.
+pub(crate) const CODEGEN_VERSION: u32 = 1;
+
+/// Compose the codegen-version salt component for the disk cache key.
+///
+/// Combines [`CODEGEN_VERSION`] with the crate version
+/// (`CARGO_PKG_VERSION`). The crate version is a cheap extra guard so
+/// two different published releases that happen to share a
+/// `CODEGEN_VERSION` value still land in distinct on-disk keys.
+///
+/// Returned as a short, filename-safe string (no path separators, no
+/// shell metacharacters — the crate version is `MAJOR.MINOR.PATCH[-pre]`
+/// which contains only `[0-9A-Za-z.\-+]`). Callers prepend this to the
+/// spec-hash portion of the disk key.
+#[must_use]
+pub(crate) fn codegen_salt() -> String {
+    format!("cg{}-v{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"))
+}
+
+/// Compose the full on-disk cache key for a kernel.
+///
+/// The key has three domain-separated components joined by `-`:
+///   1. [`codegen_salt`] — the codegen-version + crate-version salt that
+///      fixes JIT-M1 (a codegen change rotates the key, so stale entries
+///      miss and codegen re-runs).
+///   2. `entry` — the kernel entry-point symbol, so two kernels with
+///      identical `KernelSpec` content but different entry symbols
+///      (e.g. `KERNEL_ENTRY` vs `PREDICATE_ENTRY`) never alias.
+///   3. The 128-bit `KernelSpec` content hash, hex-encoded.
+///
+/// This is the single source of truth for disk-key composition; callers
+/// (currently `engine.rs`) should route through here so the salt is
+/// applied consistently. It deliberately does NOT touch the in-process
+/// `KernelSpecCache` key — that cache re-validates PTX content on every
+/// hit, so it needs no salt and its domain bytes must stay unchanged.
+#[must_use]
+pub(crate) fn disk_key(entry: &str, spec_hash_hi: u64, spec_hash_lo: u64) -> String {
+    format!(
+        "{}-{}-{}",
+        codegen_salt(),
+        entry,
+        hash_to_key(spec_hash_hi, spec_hash_lo),
+    )
+}
+
 /// Subdirectory under the platform cache root used when the env var
 /// is unset but a builder override sets a non-absolute path, or when
 /// future revisions opt into auto-resolution.
@@ -292,6 +371,17 @@ impl DiskPtxCache {
     /// surface read errors as `Err`: a corrupt or unreadable cache
     /// entry should silently fall through to the codegen path so the
     /// caller still gets a correct result.
+    ///
+    /// # Freshness (JIT-M1)
+    ///
+    /// This deliberately returns the on-disk bytes *verbatim* with no
+    /// content re-validation (unlike the in-process PTX-text-hash
+    /// cache). Freshness across binary/codegen changes is guaranteed
+    /// upstream by the codegen-version salt folded into the key (see
+    /// [`codegen_salt`] / [`disk_key`]): when PTX emission changes,
+    /// [`CODEGEN_VERSION`] (or the crate version) is bumped, the `key`
+    /// rotates, and a stale entry written by the old binary simply
+    /// misses here rather than being served as wrong PTX.
     #[must_use]
     pub fn lookup(&self, key: &str) -> Option<String> {
         match fs::read_to_string(self.entry_path(key)) {
@@ -303,11 +393,18 @@ impl DiskPtxCache {
     /// Persist `ptx` under `key` using a tempfile-then-rename to keep
     /// concurrent readers from ever observing a partial file.
     ///
-    /// Returns `Ok(())` even on rename failure if the *content* ended
-    /// up at the target path (this can happen on Windows when another
-    /// thread won the rename race with identical bytes — the codegen
-    /// is deterministic so the outcome is correct either way). Any
-    /// other I/O error is propagated.
+    /// On a successful rename returns `Ok(())`. On a rename failure the
+    /// stray tempfile is cleaned up best-effort and the underlying I/O
+    /// error is propagated to the caller (`Err`). Callers treat a store
+    /// error as non-fatal — the codegen pipeline is deterministic, so a
+    /// concurrent writer racing on the same key produces identical
+    /// bytes, and a failed write only means future processes re-run
+    /// codegen rather than getting wrong results.
+    ///
+    /// (JIT-M2: the previous doc claimed a stat-the-target fallback that
+    /// returned `Ok(())` when the content already landed at the target;
+    /// no such fallback was implemented, so the doc is corrected here to
+    /// match the actual propagate-the-error behavior.)
     pub fn store(&self, key: &str, ptx: &str) -> io::Result<()> {
         let target = self.entry_path(key);
         // Tempfile name: same directory, suffixed with the OS PID and a
@@ -538,6 +635,64 @@ mod tests {
         if let Some(v) = prev_env {
             std::env::set_var(DISK_PTX_CACHE_ENV, v);
         }
+    }
+
+    #[test]
+    fn codegen_version_change_changes_disk_key() {
+        // JIT-M1: for an identical spec + entry, a different
+        // CODEGEN_VERSION must produce a different on-disk key so a
+        // codegen change can never serve stale PTX. We can't mutate the
+        // const, so we reconstruct the salt shape with a bumped version
+        // and assert the keys differ in exactly the salt component.
+        let entry = "kernel_main";
+        let (hi, lo) = (0xabcd_ef01_2345_6789u64, 0x0011_2233_4455_6677u64);
+        let k_now = disk_key(entry, hi, lo);
+        let salt_now = codegen_salt();
+        let salt_bumped = format!("cg{}-v{}", CODEGEN_VERSION + 1, env!("CARGO_PKG_VERSION"));
+        let k_bumped = format!("{}-{}-{}", salt_bumped, entry, hash_to_key(hi, lo));
+        assert_ne!(
+            k_now, k_bumped,
+            "bumping CODEGEN_VERSION must rotate the disk key"
+        );
+        assert!(
+            k_now.starts_with(&salt_now),
+            "disk key must begin with the codegen salt"
+        );
+    }
+
+    #[test]
+    fn disk_key_is_stable_for_same_inputs() {
+        // Same spec + entry ⇒ byte-identical key (deterministic), so a
+        // hit lands on the same .ptx file across processes.
+        let a = disk_key("kernel_main", 1, 2);
+        let b = disk_key("kernel_main", 1, 2);
+        assert_eq!(a, b);
+        // The spec-hash tail is the canonical 32-char hex digest.
+        assert!(a.ends_with(&hash_to_key(1, 2)));
+    }
+
+    #[test]
+    fn disk_key_domain_separates_entry_and_spec() {
+        // Different entry symbols must not alias under the same key.
+        assert_ne!(disk_key("entry_a", 1, 2), disk_key("entry_b", 1, 2));
+        // Different spec hashes must not alias either.
+        assert_ne!(disk_key("entry_a", 1, 2), disk_key("entry_a", 9, 9));
+    }
+
+    #[test]
+    fn codegen_salt_includes_crate_version() {
+        // The crate version is folded in as a cross-release guard.
+        let salt = codegen_salt();
+        assert!(
+            salt.contains(env!("CARGO_PKG_VERSION")),
+            "codegen salt must embed the crate version"
+        );
+        assert!(
+            salt.contains(&format!("cg{}", CODEGEN_VERSION)),
+            "codegen salt must embed CODEGEN_VERSION"
+        );
+        // And the salt is the leading component of every disk key.
+        assert!(disk_key("e", 0, 0).starts_with(&salt));
     }
 
     #[test]

@@ -17,7 +17,7 @@ Add the crate:
 
 ```toml
 [dependencies]
-craton-bolt = "0.3"
+craton-bolt = "0.7"
 arrow-array  = "53"
 arrow-schema = "53"
 ```
@@ -131,14 +131,16 @@ Dictionaries are **unioned across all registered batches**: a string
 literal that appears only in batch 2 still resolves correctly in
 `WHERE col = 'literal'`.
 
-### Streaming — not yet shipped
+### Streaming — `register_table_stream`
 
-Lazy / out-of-core ingestion of a `RecordBatch` iterator is an M1
-deliverable on the path to 0.4 (see
-[`PATH_TO_1.0.md`](PATH_TO_1.0.md)). Until then, materialise the
-iterator into a sequence of `RecordBatch` values and feed them through
-`register_batch` — the per-column delta-upload path means you only pay
-for new rows on each subsequent query.
+`Engine::register_table_stream(name, schema, iter)` accepts a
+`RecordBatch` iterator (0.6). The current implementation is **eager** —
+it drains the iterator into the existing in-memory table representation
+— but the signature is future-compatible with a truly-lazy / out-of-core
+executor, so callers won't need to rewrite when the lazy path lands (see
+[`PATH_TO_1.0.md`](PATH_TO_1.0.md)). The per-column delta-upload path
+behind `register_batch` still applies, so you only pay for new rows on
+each subsequent query.
 
 ---
 
@@ -150,17 +152,29 @@ accepts a precisely-bounded subset of SQL. The authoritative list lives
 in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
 
 - `SELECT [DISTINCT] ... FROM <table> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`.
-- Aggregates: `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`. `SUM(Int32)` widens
-  to `Int64` to prevent silent wraparound.
+- Aggregates: `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (GPU), plus host-side
+  `STDDEV` / `VAR` (scalar and grouped) and `SUM(Decimal128)`.
+  `SUM(Int32)` widens to `Int64` to prevent silent wraparound.
+- Scalar expressions: arithmetic and comparisons (GPU), `IN` / `BETWEEN`
+  (desugar to GPU comparison chains), `CASE` / `CAST` / `COALESCE` /
+  `NULLIF` (GPU for numeric/Bool results; rejected at GPU lowering for
+  string/Decimal/Date/Timestamp results), `LIKE` and `||` (host-side),
+  `NOT` (host-side).
 - Joins: one `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS` JOIN
-  per `SELECT`, equi-`ON` predicates only. `INNER` takes the GPU
-  hash-join path; the rest fall back to a host executor.
+  per `SELECT`, equi-`ON` predicates only. Each shape has a gated GPU
+  fast path that falls back to a host executor on a gate miss.
 - Set ops: `UNION` (dedups), `UNION ALL` (concatenates).
+- `ORDER BY`: single-key `Int32`/`Int64` orderings (and multi-key /
+  `DESC`) run on the GPU radix sort; other shapes sort host-side.
 - Types: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`, dictionary-
-  encoded `Utf8`. No Date / Time / Decimal yet.
-- Utf8 predicates: equality and inequality against string literals
-  (folded to integer comparisons on the dictionary index at plan
-  time). `LIKE`, `IN`, `BETWEEN`, ordering on Utf8 — not yet.
+  encoded `Utf8`, plus `Decimal128`, `Date32`, and `Timestamp` (with the
+  per-type GPU-lowering caveats in `SQL_REFERENCE.md`).
+- Utf8 predicates: equality / inequality against string literals (folded
+  to integer comparisons on the dictionary index at plan time, GPU) and
+  `LIKE` (host-side). `IN` against Utf8 and ordering comparisons on Utf8
+  are still rejected.
+- Qualified column refs (`t.col`) and case-insensitive identifiers are
+  supported.
 
 A representative query that exercises most of the working surface:
 
@@ -178,9 +192,14 @@ let result = engine.sql(
 
 Anything outside the supported surface returns a structured
 `BoltError::Sql(...)` or `BoltError::Plan(...)` with the unsupported
-construct quoted in the message. There is no silent CPU fallback for
-unsupported SQL — Craton Bolt is a GPU engine, and a query the GPU
-path can't run is an error, not a slow query.
+construct quoted in the message. Some *supported* constructs execute on
+a host-side code path rather than the GPU — `LIKE`, the `||` concat
+operator, `NOT`, `STDDEV` / `VAR`, `SUM(Decimal128)`, host-side join /
+sort fallbacks — and a few constructs parse and type-check but are
+rejected at the GPU lowering boundary with a clear `"… not yet lowered
+to GPU"` message (e.g. `CAST` to/from Decimal/Date/Timestamp, `CASE` over
+those result types). `SQL_REFERENCE.md` tags every feature with its
+execution tier (GPU / host-side / GPU lowering pending).
 
 ---
 
@@ -262,10 +281,13 @@ install_pool_stats_observer(Box::new(|s: PoolStats| {
 }));
 ```
 
-Structured per-phase tracing spans (parse / plan / lower / launch) are
-an M5 deliverable and not yet shipped — see
-[`PATH_TO_1.0.md`](PATH_TO_1.0.md). Today, `log`-level diagnostics plus
-the pool-stats observer cover most needs.
+Structured per-phase tracing spans (parse / plan / lower / codegen /
+ptx_load / launch / transfer / materialize) shipped in 0.6 via the
+[`tracing`](https://crates.io/crates/tracing) crate. They are off by
+default and opt-in: install a `tracing_subscriber` in your binary and
+the spans appear automatically (span names are catalogued in
+`src/observability.rs`). The `log`-level diagnostics and the pool-stats
+observer remain available alongside the spans.
 
 ---
 
@@ -302,7 +324,7 @@ lifetime; setting them mid-run has no effect.
 
 ```toml
 [dependencies]
-craton-bolt = { version = "0.3", features = ["pool-sharded"] }
+craton-bolt = { version = "0.7", features = ["pool-sharded"] }
 ```
 
 | Feature        | Default | What it does                                                            |
@@ -322,9 +344,16 @@ shape. The cache is in-process, FIFO, capped at
 workload that cycles through a bounded set of query shapes, every
 query after the first warm-up issues zero PTX compiles.
 
-A **disk-backed** persistent PTX cache (so cold-start is fast after
-the first run of a process) is an M6 deliverable, not yet shipped.
-The in-process cache covers the steady-state case today.
+A **disk-backed** persistent PTX cache (so cold-start is fast after the
+first run of a process) shipped in 0.6. It is opt-in via the
+`BOLT_PTX_CACHE_DIR=/path` env var (or the
+`Engine::Builder::persistent_cache(path)` hook); on a miss in the
+in-process cache the engine reads a `.ptx` entry from disk before
+re-running codegen, and writes freshly-generated PTX back atomically
+(tempfile + rename) for the next process. Set it on benchmark harnesses,
+CLI tools, and per-request workers that never benefit from the
+in-process cache alone. See [`ENV_VARS.md`](ENV_VARS.md) for the path
+conventions. The in-process cache still covers the steady-state case.
 
 ### Multi-GPU
 

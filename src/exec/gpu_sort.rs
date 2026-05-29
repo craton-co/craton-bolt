@@ -64,10 +64,20 @@
 //! - DESC: pad with `-INF`-equivalent (`i32::MIN`, `i64::MIN`,
 //!   `f32::NEG_INFINITY`, `f64::NEG_INFINITY`).
 //!
-//! Real-data ties with the sentinel value are not a correctness issue: bitonic
-//! sort is stable enough for our purposes — equal keys may end up in any
-//! order relative to each other, but the padded indices (>= n_rows) are
-//! filtered out by the final truncation step, never returned to the caller.
+//! Real-data ties with the sentinel value are not a correctness issue: the
+//! padded indices (>= n_rows) are filtered out by the final truncation step,
+//! never returned to the caller.
+//!
+//! ## Stability (EXEC-H1)
+//!
+//! The bitonic sort is **stable**: the comparator breaks ties on the original
+//! row index (see `crate::jit::sort_kernel` — the index is an implicit final
+//! ASCending key, applied for both ASC and DESC key orders so equal-key rows
+//! keep their input order). This matches the host fallback
+//! `arrow::compute::lexsort_to_indices` in `crate::exec::sort`, so an
+//! `ORDER BY non_unique_key [LIMIT k]` returns the same rows in the same order
+//! regardless of whether the GPU or host path runs and regardless of input
+//! size.
 
 use std::collections::HashSet;
 use std::collections::HashMap;

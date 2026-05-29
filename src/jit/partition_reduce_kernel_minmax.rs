@@ -157,10 +157,7 @@ pub fn compile_partition_reduce_kernel_minmax(
     let max_probes = MAX_PROBES;
     let atom_op = format!("atom.shared.{}.{}", op.name(), dtype.ptx_atom_suffix());
 
-    writeln!(ptx, ".version 7.5").map_err(write_err)?;
-    writeln!(ptx, ".target sm_70").map_err(write_err)?;
-    writeln!(ptx, ".address_size 64").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     writeln!(
         ptx,
@@ -199,9 +196,7 @@ pub fn compile_partition_reduce_kernel_minmax(
     writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_thread_block_ids(&mut ptx)?;
     writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u64 %rd1, block_vals_buf;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u64 %rd2, block_set_buf;").map_err(write_err)?;
@@ -340,13 +335,7 @@ pub fn compile_partition_reduce_kernel_minmax(
     )
     .map_err(write_err)?;
     // Occupancy-friendly back-off on the collision-advance path.
-    writeln!(
-        ptx,
-        "\tmov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     // CLAIM: publish key, fence, then atom.<op> the val.
@@ -788,6 +777,20 @@ mod tests {
             compile_partition_reduce_kernel_minmax(MinMaxOp::Min, MinMaxDtype::Int32).unwrap();
         let count = ptx.matches(".param .u64 ").count();
         assert_eq!(count, 6, "expected 6 .u64 params, got {count}");
+    }
+
+    /// Byte-stable refactor guard: header / thread-id / spin-back-off
+    /// fragments are now emitted via the shared `spill_common` helpers; the
+    /// exact bytes must match what was previously inlined here.
+    #[test]
+    fn shared_fragment_bytes_are_byte_stable() {
+        let ptx =
+            compile_partition_reduce_kernel_minmax(MinMaxOp::Max, MinMaxDtype::Int64).unwrap();
+        assert!(ptx.starts_with(".version 7.5\n.target sm_70\n.address_size 64\n\n"));
+        assert!(ptx.contains(
+            "\tmov.u32 %r0, %ctaid.x;\n\tmov.u32 %r1, %ntid.x;\n\tmov.u32 %r2, %tid.x;\n"
+        ));
+        assert!(ptx.contains("\tmov.u32 %nstime, 32;\n\tnanosleep.u32 %nstime;\n"));
     }
 
     // ----- _with_spill variant shape tests ---------------------------------

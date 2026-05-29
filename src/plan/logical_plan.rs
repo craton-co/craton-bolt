@@ -1061,7 +1061,12 @@ pub(crate) fn cast_is_supported(src: DataType, target: DataType) -> bool {
 /// INTERVAL-based arithmetic (`Date + INTERVAL n DAY`) is intentionally not
 /// recognised here: the SQL frontend does not yet parse INTERVAL into an
 /// `Expr::Literal`, so there is no in-tree producer for the typed expression.
-fn date_or_timestamp_arith_result(
+///
+/// SINGLE SOURCE OF TRUTH for temporal arithmetic typing. The physical
+/// plane's `temporal_arith_result_dtype` is a thin wrapper that delegates
+/// here and re-shapes `Option<Result<_>>` into `Result<Option<_>>`; do not
+/// re-derive the rule there. `pub(crate)` so physical_plan can call it.
+pub(crate) fn date_or_timestamp_arith_result(
     op: BinaryOp,
     l: DataType,
     r: DataType,
@@ -1112,7 +1117,13 @@ fn date_or_timestamp_arith_result(
 /// "either side is Decimal128 but the shape isn't supported" cases
 /// (Decimal vs non-Decimal, scale mismatch on Add/Sub, precision
 /// overflow on the result, etc.).
-fn decimal128_arith_result(
+///
+/// SINGLE SOURCE OF TRUTH for Decimal128 arithmetic typing. The physical
+/// plane's `decimal128_arith_result_dtype` is a thin wrapper that delegates
+/// here (passing pre-extracted `(p, s)` pairs as `Decimal128` dtypes); do
+/// not re-derive the promotion/overflow rule there. `pub(crate)` so
+/// physical_plan can call it.
+pub(crate) fn decimal128_arith_result(
     op: BinaryOp,
     l: DataType,
     r: DataType,
@@ -1193,7 +1204,14 @@ fn decimal128_arith_result(
 }
 
 /// Promote two numeric types to the wider one (float beats int, 64 beats 32).
-fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
+///
+/// SINGLE SOURCE OF TRUTH for numeric type promotion. The physical plane's
+/// `unify_numeric` is a thin wrapper that delegates here for every numeric
+/// pair (and only keeps a local `a == b` short-circuit so that already-equal
+/// non-numeric dtypes — e.g. `Utf8`/`Bool` arms reachable from its codegen
+/// call sites — round-trip unchanged). `pub(crate)` so physical_plan can
+/// call it.
+pub(crate) fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
     use DataType::*;
     if !a.is_numeric() || !b.is_numeric() {
         return Err(BoltError::Type(format!(

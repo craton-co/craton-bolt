@@ -110,10 +110,7 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
         (MinMaxOp::Max, FloatDtype::Float64) => "0xFFF0000000000000".to_string(),
     };
 
-    writeln!(ptx, ".version 7.5").map_err(write_err)?;
-    writeln!(ptx, ".target sm_70").map_err(write_err)?;
-    writeln!(ptx, ".address_size 64").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     let val_align = val_bytes_per_slot;
     // Keys are 8-byte aligned (i64).
@@ -156,9 +153,7 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_thread_block_ids(&mut ptx)?;
     writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u64 %rd1, block_vals_buf;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u64 %rd2, block_set_buf;").map_err(write_err)?;
@@ -287,13 +282,7 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     )
     .map_err(write_err)?;
     // Occupancy-friendly back-off on the collision-advance path.
-    writeln!(
-        ptx,
-        "\tmov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     // CLAIM: publish key (i64), fence, then CAS-loop the val.

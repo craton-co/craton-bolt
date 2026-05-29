@@ -22,6 +22,7 @@ variable.
 | `BOLT_GPU_JOIN_TABLE_CAP_MB`     | driver-detected      | `64..=4096` | Override hash-table byte cap (MiB)              |
 | `BOLT_GPU_JOIN_STREAMING_INTERN` | off                  | `1`         | Streaming Utf8 intern for high-cardinality keys |
 | `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root (v0.6 / M6)   |
+| `BOLT_GPU_SORT`                  | off                  | `1`         | Opt into the GPU radix-sort path for `ORDER BY` |
 | `BOLT_BENCH_GPU`                 | off                  | `1`         | Enable GPU paths in `cargo bench`               |
 | `BOLT_BENCH_THRESHOLD`           | off                  | `1`         | Enable the Utf8-sort threshold bench            |
 | `CUDA_PATH`                      | toolkit-default      | path        | Build-time CUDA toolkit location (build.rs)     |
@@ -148,6 +149,31 @@ variable.
   strings) where the default path is faster.
 - **Source**: `src/exec/gpu_join.rs::streaming_intern_enabled`
   (env var name constant: `STREAMING_INTERN_ENV_VAR`, line 2132).
+
+## GPU sort
+
+### `BOLT_GPU_SORT`
+- **Default**: off (treats unset / anything other than exactly `"1"` as
+  disabled; the value is trimmed before the comparison)
+- **Type**: must equal exactly `"1"` to enable — `"true"` / `"yes"` / `"on"`
+  are deliberately **not** accepted so the gate stays unambiguous
+- **What**: Opts the `ORDER BY` executor into the GPU radix-sort path
+  (v0.7). When set, the executor *may* route a sort through the radix kernel
+  for supported key dtypes (`Int32` / `Int64`, ASC or DESC, including
+  multi-key); when unset (the default) the historical bitonic / host sort
+  paths run instead. Nullable key columns and unsupported dtypes
+  (`Float*` / `Bool` / `Utf8`) always fall back regardless of this var.
+- **When**: Enable to exercise or benchmark the radix path on large
+  single- or multi-key integer `ORDER BY`s. Left off by default because the
+  bitonic / host paths are the bake-tested steady-state until the radix path
+  has more production mileage.
+- **Notes**: Latched lazily on first read into a process-wide atomic, so the
+  value is effectively frozen for the process lifetime once a sort runs. The
+  dtype-support check is consulted before the env var, so an unsupported sort
+  never even reads it.
+- **Source**: `src/jit/sort_kernel_radix.rs` (env var name constant
+  `BOLT_GPU_SORT_ENV`, line 150); dispatch gate in `src/exec/sort.rs`
+  (`try_gpu_sort_radix`).
 
 ## JIT module cache
 

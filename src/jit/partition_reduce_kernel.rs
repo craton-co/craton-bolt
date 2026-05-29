@@ -210,10 +210,7 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     let set_bytes = BLOCK_GROUPS * 4;
     let max_probes = MAX_PROBES;
 
-    writeln!(ptx, ".version 7.5").map_err(write_err)?;
-    writeln!(ptx, ".target sm_70").map_err(write_err)?;
-    writeln!(ptx, ".address_size 64").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     // Shared-memory open-addressing table. Three parallel arrays so each
     // is naturally aligned; the alternative AoS layout would force 8-byte
@@ -265,9 +262,7 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     // %r0 = blockIdx.x = partition id
     // %r1 = blockDim.x
     // %r2 = threadIdx.x
-    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_thread_block_ids(&mut ptx)?;
 
     // --- shared-memory base addresses --------------------------------------
     writeln!(ptx, "\tmov.u64 %rd0, block_keys_buf;").map_err(write_err)?;
@@ -435,13 +430,7 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     // scheduler run peer warps that may be claiming or publishing other
     // slots, rather than hot-spinning probe walks across this block's
     // shared table. CLAIM and MATCH paths skip this via early branches.
-    writeln!(
-        ptx,
-        "\tmov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     // CLAIM: this thread won the slot. Publish the key, then fence so
@@ -936,6 +925,32 @@ mod tests {
             ptx.contains(&needle),
             "PTX must declare .visible .entry {}(  — got:\n{ptx}",
             KERNEL_ENTRY
+        );
+    }
+
+    /// Byte-stable refactor guard: the header + thread-id prefix produced
+    /// via the shared `spill_common` helpers must match the exact bytes the
+    /// previously-inlined `writeln!` calls emitted. If the helper bytes
+    /// drift, this catches it without needing a GPU or a full snapshot.
+    #[test]
+    fn header_and_thread_id_prefix_is_byte_stable() {
+        let ptx = compile_partition_reduce_kernel().expect("kernel compiles");
+        assert!(
+            ptx.starts_with(".version 7.5\n.target sm_70\n.address_size 64\n\n"),
+            "header bytes drifted:\n{ptx}"
+        );
+        // Thread-id setup appears verbatim immediately after the shared base
+        // movs; assert the exact 3-line block is present in order.
+        assert!(
+            ptx.contains(
+                "\tmov.u32 %r0, %ctaid.x;\n\tmov.u32 %r1, %ntid.x;\n\tmov.u32 %r2, %tid.x;\n"
+            ),
+            "thread-id prefix bytes drifted:\n{ptx}"
+        );
+        // The collision-advance back-off pair must still appear verbatim.
+        assert!(
+            ptx.contains("\tmov.u32 %nstime, 32;\n\tnanosleep.u32 %nstime;\n"),
+            "spin back-off bytes drifted:\n{ptx}"
         );
     }
 

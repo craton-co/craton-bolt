@@ -7,7 +7,7 @@ preserves the wave-by-wave progression for context.
 
 ---
 
-## Section 1 — Current benchmark results (0.3.0, RTX 2060)
+## Section 1 — Current benchmark results (0.7.0, RTX 2060)
 
 All GPU numbers were captured on **NVIDIA GeForce RTX 2060**, driver
 591.86 (WDDM), CUDA 12.6 toolkit, with the `BOLT_BENCH_GPU=1` environment

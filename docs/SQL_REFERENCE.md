@@ -2,7 +2,19 @@
 
 The exact subset of SQL Craton Bolt's frontend accepts. The grammar is built on top of [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs); anything outside this surface produces a clear `BoltError::Sql(...)` or `BoltError::Plan(...)` with the unsupported construct.
 
-This document tracks the 0.3.0 release. For the JIT pipeline that lowers and executes these queries, see [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the gap to 0.4 / 1.0, see [`../ROADMAP.md`](../ROADMAP.md).
+This document tracks the 0.7.0 release. For the JIT pipeline that lowers and executes these queries, see [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the gap to 1.0, see [`../ROADMAP.md`](../ROADMAP.md).
+
+A note on execution tiers. The SQL surface below is wider than the set of
+constructs that run end-to-end on the GPU. Throughout this document each
+feature is tagged with where it actually executes:
+
+- **GPU** — lowered to a PTX kernel and run on the device.
+- **host-side** — parses, type-checks, and *executes* correctly, but on a
+  host (CPU) code path rather than the GPU.
+- **parses; GPU lowering pending** — accepted by the frontend and
+  type-checker, but the physical layer rejects it at the GPU lowering
+  boundary with a clear `"… not yet lowered to GPU"` message. The query
+  fails rather than running on a slow fallback.
 
 ## Supported query shape
 
@@ -22,7 +34,7 @@ Two queries can be combined with `UNION` or `UNION ALL`; the optional `ORDER BY`
 
 **Hard restrictions** (everything else returns a `BoltError`):
 
-- Exactly one base table in `FROM`, optionally widened by **one** JOIN per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an equi `ON` predicate, or `CROSS JOIN` (no `ON`). `INNER` takes the GPU hash-join path; the OUTER and CROSS shapes execute on the host-side fallback. `JOIN USING`, `NATURAL JOIN`, non-equi predicates, computed join keys, and chaining more than one JOIN per `SELECT` are rejected at the parser. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities.
+- Exactly one base table in `FROM`, optionally widened by **one** JOIN per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an equi `ON` predicate, or `CROSS JOIN` (no `ON`). Every shape has a gated GPU fast path with a host-side fallback (see the [JOIN](#join) section). `JOIN USING`, `NATURAL JOIN`, computed join keys, and chaining more than one JOIN per `SELECT` are rejected at the parser. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities (a small-cardinality non-equi INNER predicate is handled by a capped host nested-loop).
 - No CTEs (`WITH`), no subqueries in `FROM` or `WHERE`, no correlated subqueries, no `EXISTS`.
 - No `EXCEPT`, `INTERSECT`, `UNION BY NAME`.
 - No `WINDOW`, `OVER`, `QUALIFY`, `LATERAL`, table-valued functions, `PREWHERE` (ClickHouse-ism), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `FETCH`, `FOR UPDATE/SHARE`, `INTO`.
@@ -42,8 +54,14 @@ The plan's `DataType` enum is intentionally small.
 | `Float32`  | `Float32`       |                                                          |
 | `Float64`  | `Float64`       |                                                          |
 | `Utf8`     | `Utf8`          | Dictionary-encoded on register; i32 or i64 indices.      |
+| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, `*` lower to GPU (dual-register IR); comparisons lower to GPU in WHERE; `SUM` is host-side. Div / CAST to-or-from decimal: parses; GPU lowering pending. |
+| `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. CAST to/from Date32: parses; GPU lowering pending. |
+| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. CAST to/from Timestamp: parses; GPU lowering pending. |
 
-Date, time, timestamp, decimal, interval, list, struct, map — none yet.
+`Decimal128`, `Date32`, and `Timestamp` arrived in 0.6 (plan + parser +
+type-check) and gained their GPU lowering in 0.7 (see the per-type notes
+above). Interval (beyond Day-INTERVAL on dates), time-of-day, list,
+struct, and map are still not modelled.
 
 ## Literals
 
@@ -72,15 +90,35 @@ Integer division by zero produces `NULL` (host evaluator) or undefined behaviour
 
 ### Comparison
 
-`=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above.
+`=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above. Numeric comparisons run on the **GPU**. `Decimal128` comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to the **GPU** in `WHERE` predicates as of 0.7 (decimals must share the same scale).
 
-For `Utf8` columns, only equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time. `IN (...)` lists are *not* yet wired through the frontend (no `InList` arm in `lower_expr`); use an explicit `OR` chain of equalities for now. Ordering comparisons (`<`, `>`, `<=`, `>=`) on Utf8 columns are rejected, because dictionary indices reflect insertion order, not lex order. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
+For `Utf8` columns, only equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time (**GPU**). Ordering comparisons (`<`, `>`, `<=`, `>=`) on Utf8 columns are rejected, because dictionary indices reflect insertion order, not lex order. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
+
+### IN and BETWEEN
+
+`<expr> [NOT] IN (v1, v2, …)` is supported (0.5). It desugars to an OR/AND chain of element-wise comparisons, so it executes wherever the underlying comparisons do — on the **GPU** for numeric columns. Capped at 64 values; a large-list hash probe is a follow-up. `IN` against a `Utf8` column is still not wired through the dictionary rewriter — use an explicit `OR` chain of literal equalities.
+
+`<expr> [NOT] BETWEEN low AND high` is supported (0.5), desugared to `(expr >= low) AND (expr <= high)` (or the DeMorgan inverse), and likewise runs on the **GPU** for numeric operands.
 
 ### Logical
 
-`AND`, `OR`. Both operands must be `Bool`. Result is `Bool`.
+`AND`, `OR`. Both operands must be `Bool`. Result is `Bool`. **GPU**.
 
-`NOT` is not yet supported — it would need a unary op in the AST.
+`NOT <bool-expr>` is supported (0.5) via `UnaryOp::Not`, routed through the **host-side** filter path. GPU lowering of `NOT` is pending (it is rejected with `"NOT not yet lowered to GPU; requires host fallback"` on the GPU path).
+
+### String concatenation
+
+`a || b` (`BinaryOp::Concat`) is supported (0.5). In a SELECT position it runs through the **host-side** `Project` executor. In a `WHERE` predicate the whole filter is routed to the **host-side** filter path.
+
+### CASE / CAST / COALESCE / NULLIF
+
+- `CASE WHEN cond THEN val [WHEN…] [ELSE val] END` (both the plain and simple/with-operand forms) is supported (0.5) and, as of 0.7, **lowers to the GPU** when the unified result dtype is numeric or `Bool` (emitted as a fold of PTX `selp.*`). A CASE whose result dtype is `Utf8`, `Decimal128`, `Date32`, or `Timestamp` parses but **GPU lowering is pending** (rejected with a `"CASE over … not yet lowered to GPU"` message).
+- `CAST(expr AS type)` is supported (0.5) for primitive numeric and `Bool` pairs, lowered to a PTX `cvt.*` on the **GPU**. CAST to or from `Decimal128`, `Date32`, `Timestamp`, or `String` parses but **GPU lowering is pending** (`"CAST to/from … not yet lowered to GPU"`).
+- `COALESCE(a, b, …)` and `NULLIF(a, b)` are supported (0.5), desugared to `CASE`, so they execute on the **GPU** under the same numeric/Bool result-dtype rule as CASE.
+
+### LIKE
+
+`<expr> [NOT] LIKE 'pattern'` is supported (0.5) for constant patterns with `%` and `_` wildcards (with prefix / suffix / contains / exact fast paths). It executes on the **host-side** `host_like` evaluator; a `LIKE` predicate forces the whole filter onto the host path (`"LIKE requires host fallback"` on the GPU path). `LIKE` with `ESCAPE` parses but the escape handling is a follow-up. WHERE-predicate `LIKE` is type-checked against the column dtype during lowering (must be `Utf8`).
 
 ## SELECT list
 
@@ -95,14 +133,14 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 
 - Every non-aggregate SELECT item must appear in `GROUP BY` (verified via structural equality).
 - Aggregate inputs that aren't bare columns are routed through the `pre` kernel (which materialises the expression) then the standard reduction.
-- Post-aggregate scalar expressions are accepted by the SQL frontend: `SUM(price) + 1`, `AVG(qty) * 2`, `(SUM(a) + SUM(b)) / 2`, and `SUM(x) + 1 AS total` (alias). The aggregates nested inside the expression are extracted as feed inputs (deduplicated by output name across the SELECT list), and the surface expression is rewritten with `Column("<aggregate_output_name>")` at each aggregate position — then evaluated by the post-Aggregate `Project`. End-to-end execution of the rewritten Project lands in a follow-up: the physical `Project` executor still only handles bare column references / aliases; computed projections currently surface a `BoltError::Plan` at execute time.
+- Post-aggregate scalar expressions are accepted by the SQL frontend (0.5): `SUM(price) + 1`, `AVG(qty) * 2`, `(SUM(a) + SUM(b)) / 2`, and `SUM(x) + 1 AS total` (alias). The aggregates nested inside the expression are extracted as feed inputs (deduplicated by output name across the SELECT list), and the surface expression is rewritten with `Column("<aggregate_output_name>")` at each aggregate position — then evaluated by the post-Aggregate `Project`.
 
 ## Aggregate functions
 
 | Function       | Output dtype                  | Notes                                                      |
 |----------------|-------------------------------|------------------------------------------------------------|
-| `COUNT(*)`     | `Int64`                       | Counts every row. No NULL exclusion yet.                   |
-| `COUNT(expr)`  | `Int64`                       | Currently same as `COUNT(*)` for primitive inputs.         |
+| `COUNT(*)`     | `Int64`                       | Counts every row.                                          |
+| `COUNT(expr)`  | `Int64`                       | Excludes NULLs via the validity bitmap (0.5).              |
 | `COUNT(bool)`  | `Int64`                       | Honours nulls (host-side path).                            |
 | `COUNT(utf8)`  | `Int64`                       | Honours nulls (host-side path).                            |
 | `SUM(int|float)` | Same dtype as input         | `SUM(Int32) -> Int64` widening; SUM(Int64), SUM(Float*) unchanged. |
@@ -115,8 +153,11 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `MAX(utf8)`    | `Utf8`                        | NULL if all-null group.                                    |
 | `AVG(numeric)` | `Float64`                     | Split into `SUM + COUNT` on host.                          |
 | `AVG(bool)`    | `Float64`                     | Fraction of `TRUE` rows. NULL if all-null group.           |
+| `SUM(decimal)` | `Decimal128`                  | **Host-side** reduction (0.7).                             |
+| `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP` | `Float64`  | **Host-side** Welford (0.5 scalar; 0.7 adds `GROUP BY` via per-group Welford). |
+| `VARIANCE`, `VAR_POP`, `VAR_SAMP`     | `Float64`  | **Host-side** Welford, shared state with STDDEV. Scalar (0.5) + grouped (0.7). |
 
-Aggregates over an all-NULL group (Bool/Utf8 inputs, which thread validity through `extended_agg`) return SQL `NULL` in both the scalar and GROUP BY paths. Primitive aggregates do not yet read a validity bitmap, so `SUM`/`MIN`/`MAX`/`AVG` over `Int*`/`Float*` treat every row as non-null (see "What's NOT supported"; tracked for 0.4).
+Aggregates over an all-NULL group (Bool/Utf8 inputs, which thread validity through `extended_agg`) return SQL `NULL` in both the scalar and GROUP BY paths. As of 0.5, scalar primitive aggregates also honour validity: `COUNT(col)` excludes NULLs via the bitmap and `SUM`/`MIN`/`MAX`/`AVG` over `Int*`/`Float*` host-strip NULL positions before the GPU reduction (with a zero-copy fast path when `null_count == 0`).
 
 `SUM` widens narrow integer inputs to the corresponding 64-bit type to prevent silent overflow: `SUM(Int32) -> Int64`. `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The widening is applied consistently in both the scalar and GROUP BY paths via `crate::plan::logical_plan::sum_output_dtype`.
 
@@ -158,7 +199,7 @@ Output ordering: groups are sorted by encoded key for determinism. (Float bit-pa
 - Direction defaults to `ASC`.
 - NULL placement defaults to `NULLS FIRST` for `ASC` and `NULLS LAST` for `DESC` (SQL convention).
 
-`ORDER BY ... WITH FILL` is rejected. The 0.3.0 executor is host-side; a GPU sort kernel is a 0.4 stretch goal.
+`ORDER BY ... WITH FILL` is rejected. As of 0.7 a **GPU** radix sort backs single-key `Int32` / `Int64` orderings (ASC, plus multi-key and `DESC`); other key shapes and dtypes fall back to the **host-side** sort executor (`src/exec/sort.rs`).
 
 ## LIMIT and OFFSET
 
@@ -188,7 +229,13 @@ Supported:
 - `NULL` keys never match (`NULL = NULL → UNKNOWN`, per SQL).
 - The combined output schema is left's columns followed by right's columns, with collision-safe naming: a clashing right-side `c` becomes `right.c` (and gets a `__2`, `__3`, … suffix if that itself collides).
 
-`INNER JOIN` is the only shape that takes the GPU hash-join path (see `src/exec/gpu_join.rs`); `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS JOIN` are accepted by the frontend and execute on the host-side fallback in `src/exec/join.rs` (see the broader [JOIN](#join) section below). Still rejected: `NATURAL JOIN`, `JOIN ... USING`, `INNER JOIN` without `ON`, non-equi predicates (`>`, `<`, function calls), and any join graph wider than one join per `SELECT`. A GPU-resident outer-join path is a 0.4 stretch goal.
+All join shapes have a GPU fast path *and* a host fallback. The dispatch lives in `src/exec/join.rs`, which tries `src/exec/gpu_join.rs` first and falls through to a host hash-join on any gate miss or kernel decline:
+
+- `INNER` — GPU path requires a single `Int32`/`Int64` equi-key, both sides large enough, no NULL keys, unique build keys (`try_gpu_inner_join`); otherwise host hash join. A non-equi INNER predicate (small cardinality) runs through `execute_nested_loop_join` (host, inner side capped at 1024 rows).
+- `LEFT` / `RIGHT` / `FULL [OUTER]` — Stage-2 GPU fast path (`try_gpu_outer_join`); host hash join on a gate miss.
+- `CROSS` — Stage-3 GPU fast path for cell counts within a bounded window (`execute_cross_join_on_gpu`); host cartesian product otherwise.
+
+Still rejected at the parser: `NATURAL JOIN`, `JOIN ... USING`, `INNER JOIN` without `ON`, non-equi `ON` predicates with arbitrary cardinality, computed join keys, and any join graph wider than one join per `SELECT`.
 
 ## Dictionary-encoded Utf8 predicates
 
@@ -197,7 +244,7 @@ For every `Utf8` column registered on a table, the engine builds a dictionary (i
 - `WHERE col = 'X'`  →  `WHERE __idx_col = i32/i64(idx_of_X)`
 - `WHERE col != 'X'` →  the same with `!=`
 
-After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `IN (...)` against a Utf8 column is *not* yet supported (the SQL frontend has no `InList` lowering arm and the rewriter explicitly defers it — see `src/plan/string_literal_rewrite.rs`); rewrite as an `OR` chain of equalities. `LIKE`, `BETWEEN`, prefix / substring matching, and ordering comparisons on Utf8 are also not supported.
+After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `IN (...)` against a Utf8 column is still *not* folded through the dictionary rewriter (it defers this shape — see `src/plan/string_literal_rewrite.rs`); rewrite as an `OR` chain of literal equalities. `LIKE` on a Utf8 column *is* supported but runs on the **host-side** `host_like` evaluator (see the LIKE section above), not through the dictionary index. Ordering comparisons (`<`, `>`) on Utf8 columns are still rejected.
 
 ## SELECT DISTINCT
 
@@ -219,7 +266,12 @@ SELECT price FROM sales WHERE region_id = 1;
 SELECT price * tax FROM sales WHERE region_id = 1 AND price > 100.0;
 SELECT * FROM sales;
 SELECT region, price FROM sales WHERE region = 'US';
-SELECT region, price FROM sales WHERE region = 'US' OR region = 'CA';  -- IN not yet lowered; use OR chain
+SELECT region_id, price FROM sales WHERE region_id IN (1, 2, 3);       -- desugars to OR chain (GPU)
+SELECT price FROM sales WHERE price BETWEEN 10.0 AND 100.0;            -- desugars to >= AND <= (GPU)
+SELECT CASE WHEN price > 100 THEN 1 ELSE 0 END FROM sales;            -- numeric CASE (GPU)
+SELECT CAST(region_id AS FLOAT8) FROM sales;                         -- numeric CAST (GPU)
+SELECT region || '-' || CAST(region_id AS VARCHAR) FROM sales;       -- || concat (host-side Project)
+SELECT name FROM sales WHERE name LIKE 'A%';                         -- LIKE (host-side filter)
 SELECT * FROM sales WHERE active;
 
 -- Scalar aggregates
@@ -276,7 +328,7 @@ SELECT ... FROM <table>
 - Right-side column names that collide with a left-side name are prefixed with `right.` (e.g. left `id` and right `id` → output has `id` and `right.id`).
 - Both sides of an equi-join key must have the same dtype; cross-dtype equi-joins (e.g. `Int32 = Int64`) are rejected.
 - SQL NULL semantics on keys: `NULL = NULL` is `UNKNOWN`, so NULL-keyed rows never match. For OUTER joins they still emit on the preserved side with the opposite side NULL-padded.
-- `INNER` executes on the GPU hash-join path (`src/exec/gpu_join.rs` — build → probe on device, then `take`-materialise). `LEFT`/`RIGHT`/`FULL`/`CROSS` fall back to a host-side executor (`src/exec/join.rs`: HashMap build/probe; for CROSS a host cartesian product). A GPU-resident OUTER-join probe is a 0.4 target.
+- Every shape has a GPU fast path with a host fallback (`src/exec/join.rs` dispatches to `src/exec/gpu_join.rs`): `INNER` (`try_gpu_inner_join`), `LEFT`/`RIGHT`/`FULL` (`try_gpu_outer_join`), and `CROSS` (`execute_cross_join_on_gpu`). The GPU paths are gated (dtype, NULL-freedom, cardinality / cell-count windows); a gate miss or kernel decline transparently falls back to the host hash-join (or host cartesian product for CROSS).
 
 ## What's NOT supported
 
@@ -296,20 +348,35 @@ These produce explicit errors at parse / plan time:
 - Window functions (`OVER`), `QUALIFY`.
 
 ### Expressions
-- `CAST(... AS ...)` — the planner does implicit numeric promotion only.
-- `CASE ... WHEN`, `NULLIF`, `COALESCE`, `IFNULL`, `IIF`.
-- `LIKE`, `BETWEEN`, `IS NULL`, `IS NOT NULL`.
-- `IN (...)` lists (any column type) — no `InList` arm in `sql_frontend::lower_expr`; rewrite as an `OR` chain of equalities. The dictionary-string rewriter explicitly defers this shape (see `src/plan/string_literal_rewrite.rs`).
-- `NOT` (no `UnaryOperator::Not` arm in `sql_frontend::lower_expr` — would need a unary-not node in the AST).
-- String concatenation operator `||`.
+
+The following are supported now (see the Operators section above for the
+execution tier of each) and are no longer in this list: `CAST`, `CASE`,
+`COALESCE`, `NULLIF`, `IN (...)`, `BETWEEN`, `LIKE`, `IS NULL` / `IS NOT
+NULL`, `NOT`, the `||` concat operator, qualified column references
+(`t.col`), and post-aggregate expressions (`SUM(price) + 1`,
+`SUM(a) / SUM(b)`).
+
+Still rejected (or only partially lowered):
+
+- `IFNULL`, `IIF` — not parsed (use `COALESCE` / `CASE`).
+- `IN (...)` against a `Utf8` column — not folded through the dictionary rewriter; rewrite as an `OR` chain of literal equalities.
 - Ordering comparisons on Utf8 columns (`WHERE name < 'M'`).
 - Schema- or multi-level qualified column references (`db.t.col`, struct-field access). Single-level `t.col` *is* supported — see "Hard restrictions" above.
-- Post-aggregate expressions (`SUM(price) + 1`, `SUM(a) / SUM(b)`).
 - `COUNT(DISTINCT col)`.
+- The "parses; GPU lowering pending" cases below.
+
+### Parses but GPU lowering pending
+
+These type-check but the physical layer rejects them at the GPU lowering boundary (a clear `"… not yet lowered to GPU"` error, not a silent fallback):
+
+- `CAST` to or from `Decimal128`, `Date32`, `Timestamp`, or `String`.
+- `CASE` whose unified result dtype is `Utf8`, `Decimal128`, `Date32`, or `Timestamp`.
+- `Decimal128` division (`/`); only `+`, `-`, `*` and the comparisons lower to GPU.
+- GPU lowering of `NOT` in a predicate (runs host-side instead).
+- Scalar string functions through the SQL surface (`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`) — see "Not yet supported (planned)" below.
 
 ### Types and values
-- Date / time / timestamp / interval literals and arithmetic.
-- Decimal / fixed-point arithmetic.
+- Time-of-day / general interval (beyond Day-`INTERVAL` on dates) literals and arithmetic. `Date32`, `Timestamp`, and `Decimal128` *are* supported (see Data types).
 - Array / list / struct / map types.
 
 ### Clauses and statements
@@ -321,20 +388,16 @@ These produce explicit errors at parse / plan time:
 - DML (`INSERT`, `UPDATE`, `DELETE`).
 
 ### Validity propagation
-- Primitive aggregate kernels (`SUM`/`MIN`/`MAX`/`AVG` over `Int*`/`Float*`) do not yet read a validity bitmap; every row is treated as non-null. The Bool/Utf8 `extended_agg` path *does* honour nulls. Tracked for 0.4.
+- Scalar primitive aggregates honour validity as of 0.5: `COUNT(col)` excludes NULLs via the bitmap, and `SUM`/`MIN`/`MAX`/`AVG` host-strip NULL positions before the GPU reduction (the zero-null fast path stays a zero-copy upload). The Bool/Utf8 `extended_agg` path also honours nulls. Full per-row NULL propagation through `CASE` branches on the GPU is still a follow-up (a CASE that fires no WHEN currently yields a deterministic zero rather than SQL NULL).
 
 ## Not yet supported (planned)
 
 ### String functions
 
-`UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTRING` are reachable only from the executor-level `src/exec/string_ops` / `src/exec/string_ops_extended` Rust API; no SQL or DataFrame surface exposes them yet. They run as pure-host dictionary transformations because variable-width device writes remain unsupported by the codegen path. Wiring them through the SQL frontend would mean teaching `sql_frontend::lower_expr` to recognise `Expr::FunctionCall` and routing it to a per-function host-side projection executor. Listed as a 0.4 stretch goal in `ROADMAP.md`.
+`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT` are surfaced through the SQL frontend as of 0.5 via `Expr::ScalarFn` (parser + type-check), but **GPU lowering is pending**: the physical layer rejects each with a `"string scalar function … not yet lowered to GPU"` message because variable-width device writes remain unsupported by the codegen path. The underlying host transformations live in the executor-level `src/exec/string_ops` / `src/exec/string_ops_extended` Rust API; routing the SQL surface through a per-function host-side projection executor is the remaining step.
 
-### GPU-resident OUTER / CROSS JOIN
+### Wider GPU sort coverage
 
-`INNER JOIN` already runs on the GPU hash-join path (`src/exec/gpu_join.rs`). The OUTER (LEFT/RIGHT/FULL) and CROSS shapes still round-trip through the host-side executor in `src/exec/join.rs`; a device-resident probe for those is the natural next step (0.4 stretch goal).
-
-### GPU sort kernel
-
-`ORDER BY` and the dedup step of `UNION` / `DISTINCT` currently round-trip through host code. A GPU sort kernel would back all three (0.4 stretch goal).
+As of 0.7 a GPU radix sort backs `ORDER BY` for single-key `Int32` / `Int64` orderings (ASC, plus multi-key and `DESC`). Other key dtypes — and the dedup step of `UNION` / `DISTINCT` — still round-trip through the host-side executors. Extending the radix path to more dtypes and backing DISTINCT/UNION dedup with it is the natural next step.
 
 If you need any of the above for your use case, please open an issue describing the query and the use case.

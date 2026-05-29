@@ -511,11 +511,26 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
 ///
 /// `offsets[]` is initialised on the host to the exclusive-scan of the
 /// histogram; each thread then atomic-bumps its digit's offset and writes
-/// the key at the bumped position. Note this is **not stable** under the
-/// atomic-bump strategy — two threads with the same digit race for the same
-/// pair of slots. For ORDER BY semantics that's fine (SQL ORDER BY is not
-/// required to be stable). If we ever need a stable radix sort the standard
-/// trick is the per-warp prefix-scan within each block; defer that with the
+/// the key at the bumped position.
+///
+/// **EXEC-H1 / stability — read this.** Unlike the bitonic kernel (which was
+/// made stable by an original-row-index tiebreak in the comparator — see
+/// `crate::jit::sort_kernel`), this radix scatter is **NOT stable**: two
+/// threads whose keys share a digit race on the same `atomicAdd`, so their
+/// relative output order is non-deterministic. The bitonic fix does not
+/// transfer here — there is no pairwise comparator to add a tiebreak to;
+/// making the radix sort stable requires a structurally different scheme (a
+/// deterministic per-block stable partition / per-warp prefix-scan that
+/// assigns slots in input order within each digit bucket). That rewrite is
+/// out of scope for EXEC-H1 and is deferred.
+///
+/// This is currently acceptable only because the radix path is **gated behind
+/// `BOLT_GPU_SORT=1` (default OFF)** and is therefore not the path EXEC-H1
+/// targets (the default-on bitonic path at `n_rows >= GPU_SORT_MIN_ROWS`).
+/// Before the radix path is promoted to default-on it must be made stable to
+/// keep `ORDER BY non_unique_key [LIMIT k]` consistent with the host fallback.
+/// The standard trick is the per-warp prefix-scan within each block; defer
+/// that with the
 /// float transform.
 pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
@@ -626,11 +641,18 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
 /// **same** slot, so we capture `out_idx` once and reuse it for both stores.
 /// Two `atomicAdd`s would race and break the pairing.
 ///
-/// Like the keys-only scatter this is not stable — for ORDER BY semantics
-/// that's fine (SQL ORDER BY is not required to be stable, and adding stable
-/// row-index breaks ties in the natural per-thread order anyway because the
+/// **EXEC-H1 / stability — read this.** Like the keys-only scatter, this path
+/// is **NOT stable**: the `atomicAdd` slot claim races between threads whose
+/// keys share a digit, so equal-key rows can land in any relative order ("the
 /// kernel processes rows in `tid` order within each digit bucket modulo
-/// scheduling jitter).
+/// scheduling jitter" is a hope, not a guarantee). The bitonic kernel was made
+/// stable for EXEC-H1 via an original-row-index tiebreak in its pairwise
+/// comparator (see `crate::jit::sort_kernel`); that fix has no analogue in a
+/// race-based radix scatter and a stable rewrite (deterministic per-block
+/// stable partition) is deferred. This is tolerated only because the radix
+/// path is gated behind `BOLT_GPU_SORT=1` (default OFF); it must be made stable
+/// before being promoted to default-on so `ORDER BY non_unique_key [LIMIT k]`
+/// stays consistent with the host `lexsort_to_indices` fallback.
 pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     let entry = radix_scatter_with_indices_entry(dtype)?;

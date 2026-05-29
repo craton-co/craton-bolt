@@ -77,11 +77,32 @@ pub(crate) fn emit_ptx_header(ptx: &mut String) -> BoltResult<()> {
 /// \tmov.u32 %r2, %tid.x;
 /// ```
 ///
-/// Identical across all 10 `_with_spill` kernels.
+/// Identical across all 11 `partition_reduce_kernel*` emitters (both the
+/// non-spill base kernels and their `_with_spill` siblings).
 pub(crate) fn emit_thread_block_ids(ptx: &mut String) -> BoltResult<()> {
     writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit the per-collision occupancy back-off pair on the probe
+/// collision-advance path:
+///
+/// ```text
+/// \tmov.u32 %nstime, 32;
+/// \tnanosleep.u32 %nstime;
+/// ```
+///
+/// `ns` is the `SPIN_BACKOFF_NS` constant (32 in every current emitter).
+/// This pair is emitted byte-for-byte identically by every non-spill
+/// integer/SUM/COUNT/MIN-MAX emitter right after the collision-advance
+/// `and.b32` and before the `bra PROBE_TOP`. The spill siblings drop the
+/// back-off (their collision path jumps straight back to `PROBE_TOP`), so
+/// this helper is only used by the non-spill base kernels.
+pub(crate) fn emit_spin_backoff(ptx: &mut String, ns: u32) -> BoltResult<()> {
+    writeln!(ptx, "\tmov.u32 %nstime, {ns};").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     Ok(())
 }
 
@@ -229,6 +250,13 @@ mod tests {
             "SPILL_BUMP:\n\
              \tatom.global.add.u32 %r36, [%rd9], 1;\n"
         );
+    }
+
+    #[test]
+    fn spin_backoff_emits_expected_bytes() {
+        let mut s = String::new();
+        emit_spin_backoff(&mut s, 32).unwrap();
+        assert_eq!(s, "\tmov.u32 %nstime, 32;\n\tnanosleep.u32 %nstime;\n");
     }
 
     #[test]

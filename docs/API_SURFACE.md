@@ -7,10 +7,15 @@ is the v0.6 / M7 staging ground for the public-API freeze that ships with
 contract. At 1.0 each entry in the **stable** tier becomes binding under
 the semver rules listed below.
 
-> Crate version when this document was generated: `0.3.0` (from
+> Crate version when this document was generated: `0.7.0` (from
 > `Cargo.toml`). The document was drafted for the v0.6 / M7 freeze track —
 > if the crate version no longer matches, re-run the enumeration in
 > `src/lib.rs` before relying on this list.
+>
+> **Re-enumeration note:** the symbol lists below have not been
+> machine-regenerated against the current `src/lib.rs`; treat them as the
+> last-enumerated snapshot and re-run the enumeration before the 1.0
+> freeze (and whenever the public surface changes).
 
 ## Stability tiers and semver contract
 

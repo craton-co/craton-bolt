@@ -9,15 +9,14 @@ release line** receives security fixes — older minor lines are not
 backported. This is standard practice for pre-1.0 crates and keeps the
 maintenance surface narrow while the IR and public API are still moving.
 
-The current supported line is `0.3.x`. `0.1.x` is no longer supported;
-users on `0.1.x` should upgrade to `0.3.x` (note that `0.2.0` was skipped —
-see `CHANGELOG.md`).
+The current supported line is `0.7.x`. Older minor lines (`0.6.x` and
+earlier) are no longer supported; users should upgrade to `0.7.x` (note
+that `0.2.0` and `0.4.0` were skipped — see `CHANGELOG.md`).
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.3.x   | :white_check_mark: |
-| 0.1.x   | :x:                |
-| < 0.1   | :x:                |
+| 0.7.x   | :white_check_mark: |
+| < 0.7   | :x:                |
 
 ## Reporting a vulnerability
 

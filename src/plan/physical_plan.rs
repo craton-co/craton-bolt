@@ -6,8 +6,10 @@ use std::collections::HashMap;
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    join_combined_schema, AggregateExpr, BinaryOp, DataType, Expr, Field, JoinType, Literal,
-    LogicalPlan, Schema, SortExpr, UnaryOp,
+    date_or_timestamp_arith_result as logical_temporal_arith_result,
+    decimal128_arith_result as logical_decimal128_arith_result, join_combined_schema,
+    unify_numeric as logical_unify_numeric, AggregateExpr, BinaryOp, DataType, Expr, Field,
+    JoinType, Literal, LogicalPlan, Schema, SortExpr, UnaryOp,
 };
 
 /// SSA register handle. Just an index into the IR's value table.
@@ -972,92 +974,62 @@ impl PhysicalPlan {
 }
 
 /// Promote two numeric types to the wider one (float beats int, 64 beats 32).
+///
+/// Thin wrapper over [`logical_unify_numeric`] (the single source of the
+/// numeric-promotion rule). Behaviour preserved exactly versus the previous
+/// hand-coded version:
+///   * `a == b` short-circuits to `Ok(a)` here so already-equal **non-numeric**
+///     dtypes (`Utf8`/`Bool`/`Decimal128`/temporal) that some codegen call
+///     sites pass round-trip unchanged — the logical helper rejects those.
+///     For every *numeric* pair the logical helper produces the identical
+///     result, so the short-circuit is purely a superset for non-numerics.
+///   * For unequal operands we delegate; the logical helper's non-numeric
+///     rejection message is translated back to this module's original
+///     `"cannot unify {a:?} and {b:?}"` wording so observable error text is
+///     unchanged.
 fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
-    use DataType::*;
-    match (a, b) {
-        (x, y) if x == y => Ok(x),
-        (Float64, _) | (_, Float64) => Ok(Float64),
-        (Float32, Int64) | (Int64, Float32) => Ok(Float64),
-        (Float32, _) | (_, Float32) => Ok(Float32),
-        (Int64, _) | (_, Int64) => Ok(Int64),
-        (Int32, _) | (_, Int32) => Ok(Int32),
-        _ => Err(BoltError::Type(format!(
-            "cannot unify {:?} and {:?}",
-            a, b
-        ))),
+    if a == b {
+        return Ok(a);
     }
+    logical_unify_numeric(a, b).map_err(|_| {
+        BoltError::Type(format!("cannot unify {:?} and {:?}", a, b))
+    })
 }
 
-/// Maximum supported Decimal128 precision. Matches Arrow's Decimal128
-/// ceiling — an `i128` holds at most 38 significant decimal digits.
-const DECIMAL128_MAX_PRECISION: u8 = 38;
-
 /// v0.7 sub-task B: result dtype for `Decimal128(p1, s1) op Decimal128(p2, s2)`
-/// per SQL convention. Only `Add` / `Sub` / `Mul` are wired (the kernel-
-/// level codegen rejects every other op anyway).
+/// per SQL convention. Only `Add` / `Sub` / `Mul` are wired.
 ///
-///   * `Add` / `Sub`: requires `s1 == s2`. Result is
-///     `Decimal128(max(p1, p2) + 1, s1)` — the +1 absorbs the carry from
-///     the worst-case widening add.
-///   * `Mul`: result is `Decimal128(p1 + p2, s1 + s2)` (the raw
-///     wrapping-i128 multiply leaves the result at the SUM of operand
-///     scales, no rescale).
+/// Thin wrapper over the single-source rule
+/// [`logical_decimal128_arith_result`]. The logical helper gates on whether
+/// an operand is `Decimal128` and returns `Option<Result<_>>`; both operands
+/// here are Decimal128 by construction (the caller already destructured their
+/// precision/scale), so the logical helper always returns `Some(..)` — the
+/// `None` branch is unreachable and surfaces as a `BoltError::Plan` producer
+/// bug if it ever fires.
 ///
-/// Result precision exceeding `DECIMAL128_MAX_PRECISION` is rejected.
+/// RECONCILIATION (documented behaviour change, success-typing preserved):
+/// the success result (`Decimal128(max(p1,p2)+1, s1)` for Add/Sub,
+/// `Decimal128(p1+p2, s1+s2)` for Mul) and the *conditions* under which an
+/// error is raised (scale mismatch, precision/scale overflow, unsupported op)
+/// are byte-for-byte identical to the previous hand-coded body. Only the
+/// error *message wording* now converges on the logical helper's text
+/// (e.g. the precision-cap message and the Div/other-op message). No call
+/// site asserts on this text, and the Ok/Err discriminant for every input is
+/// unchanged.
 fn decimal128_arith_result_dtype(
     op: BinaryOp,
     (p1, s1): (u8, i8),
     (p2, s2): (u8, i8),
 ) -> BoltResult<DataType> {
-    match op {
-        BinaryOp::Add | BinaryOp::Sub => {
-            if s1 != s2 {
-                return Err(BoltError::Type(format!(
-                    "Decimal128 {op:?} requires matching scale, \
-                     got Decimal128({p1}, {s1}) and Decimal128({p2}, {s2}); \
-                     wire an explicit CAST to align the scales"
-                )));
-            }
-            let p_max = p1.max(p2);
-            let new_p = p_max.checked_add(1).ok_or_else(|| {
-                BoltError::Type(format!(
-                    "Decimal128 {op:?} precision overflow: max({p1}, {p2}) + 1 \
-                     does not fit in u8"
-                ))
-            })?;
-            if new_p > DECIMAL128_MAX_PRECISION {
-                return Err(BoltError::Type(format!(
-                    "Decimal128 {op:?} result precision {new_p} exceeds \
-                     Arrow Decimal128 limit ({DECIMAL128_MAX_PRECISION}); \
-                     reduce input precision or rescale before adding"
-                )));
-            }
-            Ok(DataType::Decimal128(new_p, s1))
-        }
-        BinaryOp::Mul => {
-            let new_p = p1.checked_add(p2).ok_or_else(|| {
-                BoltError::Type(format!(
-                    "Decimal128 Mul precision overflow: {p1} + {p2} \
-                     does not fit in u8"
-                ))
-            })?;
-            if new_p > DECIMAL128_MAX_PRECISION {
-                return Err(BoltError::Type(format!(
-                    "Decimal128 Mul result precision {new_p} exceeds \
-                     Arrow Decimal128 limit ({DECIMAL128_MAX_PRECISION}); \
-                     reduce input precisions or split the product"
-                )));
-            }
-            let new_s = s1.checked_add(s2).ok_or_else(|| {
-                BoltError::Type(format!(
-                    "Decimal128 Mul scale overflow: {s1} + {s2} does not fit in i8"
-                ))
-            })?;
-            Ok(DataType::Decimal128(new_p, new_s))
-        }
-        other => Err(BoltError::Plan(format!(
-            "Decimal128 {other:?} not supported at result-dtype resolution; \
-             only Add/Sub/Mul are wired in v0.7"
+    match logical_decimal128_arith_result(
+        op,
+        DataType::Decimal128(p1, s1),
+        DataType::Decimal128(p2, s2),
+    ) {
+        Some(result) => result,
+        None => Err(BoltError::Plan(format!(
+            "Decimal128 {op:?} result-dtype resolution: logical helper returned \
+             None for two Decimal128 operands — producer bug"
         ))),
     }
 }
@@ -1121,54 +1093,26 @@ fn cast_target_is_supported(target: DataType) -> BoltResult<()> {
 
 /// v0.7: result dtype for an arithmetic op on Date32 / Timestamp operands.
 ///
-/// Mirrors the logical-plane helper of the same intent
-/// (`date_or_timestamp_arith_result` in `logical_plan.rs`) but returns
-/// errors and `Option<DataType>` instead of `Option<Result>` so the
-/// codegen caller can fall through to `unify_numeric` for the
-/// no-temporal case.
+/// Thin wrapper over the single-source rule
+/// [`logical_temporal_arith_result`] (`date_or_timestamp_arith_result` in
+/// `logical_plan.rs`). The logical helper returns `Option<Result<DataType>>`;
+/// this wrapper re-shapes it into `Result<Option<DataType>>` so the codegen
+/// caller can fall through to `unify_numeric` for the no-temporal case:
+///   * `None`        → `Ok(None)`   (neither operand temporal — fall through)
+///   * `Some(Ok(d))` → `Ok(Some(d))`
+///   * `Some(Err(e))`→ `Err(e)`
 ///
-///   * `Sub, Date32, Date32`                          → `Some(Int32)`
-///   * `Sub, Timestamp(u, tz), Timestamp(u, tz)`      → `Some(Int64)`
-///   * `Add/Mul/Div on Date/Timestamp`                → `Err` with tight msg
-///   * `Sub, Timestamp(u1, _), Timestamp(u2, _)` with `u1 != u2` → `Err`
-///   * neither operand is Date/Timestamp                → `None` (fall through)
-///
-/// INTERVAL-day arithmetic on Date/Timestamp is intentionally not handled:
-/// the SQL frontend has no INTERVAL expression literal yet, so there is no
-/// path to produce a typed `Expr::Binary` with that shape.
+/// The match arms, success dtypes, and error message text are all owned by
+/// the logical helper; nothing is re-derived here.
 fn temporal_arith_result_dtype(
     op: BinaryOp,
     l: DataType,
     r: DataType,
 ) -> BoltResult<Option<DataType>> {
-    use DataType::*;
-    let l_is_temporal = matches!(l, Date32 | Timestamp(_, _));
-    let r_is_temporal = matches!(r, Date32 | Timestamp(_, _));
-    if !l_is_temporal && !r_is_temporal {
-        return Ok(None);
-    }
-    match (op, l, r) {
-        (BinaryOp::Sub, Date32, Date32) => Ok(Some(Int32)),
-        (BinaryOp::Sub, Timestamp(lu, ltz), Timestamp(ru, rtz)) => {
-            if lu != ru {
-                return Err(BoltError::Type(format!(
-                    "Timestamp subtraction requires matching TimeUnit, \
-                     got {lu:?} and {ru:?}"
-                )));
-            }
-            if ltz != rtz {
-                return Err(BoltError::Type(format!(
-                    "Timestamp subtraction requires matching time zones, \
-                     got {ltz:?} and {rtz:?}"
-                )));
-            }
-            Ok(Some(Int64))
-        }
-        _ => Err(BoltError::Type(format!(
-            "arithmetic {op:?} on Date/Timestamp operands ({l:?}, {r:?}) is not \
-             supported; only Date32 - Date32 and Timestamp - Timestamp \
-             (matching unit and tz) are wired in v0.7"
-        ))),
+    match logical_temporal_arith_result(op, l, r) {
+        None => Ok(None),
+        Some(Ok(dt)) => Ok(Some(dt)),
+        Some(Err(e)) => Err(e),
     }
 }
 
@@ -3921,6 +3865,169 @@ mod tests {
     use crate::plan::logical_plan::{
         AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema,
     };
+
+    /// Anti-drift guards: the physical-plane type-rule helpers
+    /// (`unify_numeric`, `decimal128_arith_result_dtype`,
+    /// `temporal_arith_result_dtype`) are thin wrappers over the
+    /// single-source logical-plane rules. These tests sweep the full relevant
+    /// type matrix and assert the physical wrapper and the logical source
+    /// agree on every input, so any future edit that re-introduces a divergent
+    /// hand-coded copy fails here.
+    mod type_rule_drift {
+        use super::super::{
+            decimal128_arith_result_dtype, temporal_arith_result_dtype,
+            unify_numeric as physical_unify_numeric,
+        };
+        use crate::plan::logical_plan::{
+            date_or_timestamp_arith_result as logical_temporal,
+            decimal128_arith_result as logical_decimal, intern_timezone,
+            unify_numeric as logical_unify, BinaryOp, DataType, TimeUnit,
+        };
+
+        /// Every dtype the planner can hand a type rule. Covers numerics,
+        /// `Utf8`/`Bool`, a couple of `Decimal128` shapes, and both temporal
+        /// types (with and without a tz).
+        fn all_dtypes() -> Vec<DataType> {
+            vec![
+                DataType::Bool,
+                DataType::Int32,
+                DataType::Int64,
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Utf8,
+                DataType::Decimal128(10, 2),
+                DataType::Decimal128(38, 0),
+                DataType::Date32,
+                DataType::Timestamp(TimeUnit::Second, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Second, Some(intern_timezone("UTC"))),
+            ]
+        }
+
+        /// `unify_numeric`: physical wrapper must match the logical source on
+        /// every dtype pair. The wrapper keeps an `a == b` short-circuit that
+        /// is a *superset* of the logical rule (it also accepts equal
+        /// non-numeric pairs), so we only assert equality where they overlap:
+        /// for unequal pairs the Ok/Err discriminant and the Ok value must be
+        /// identical; for equal pairs both must yield `Ok(a)` whenever the
+        /// logical rule accepts it.
+        #[test]
+        fn unify_numeric_matches_logical_across_matrix() {
+            for a in all_dtypes() {
+                for b in all_dtypes() {
+                    let phys = physical_unify_numeric(a, b);
+                    let logi = logical_unify(a, b);
+                    if a == b {
+                        // Physical short-circuits to Ok(a). Where logical also
+                        // accepts (numeric equal pairs) the values must match.
+                        assert_eq!(phys.as_ref().ok(), Some(&a));
+                        if let Ok(v) = logi {
+                            assert_eq!(v, a, "equal numeric pair {a:?} disagrees");
+                        }
+                    } else {
+                        // Unequal pairs delegate fully: same Ok/Err and value.
+                        assert_eq!(
+                            phys.is_ok(),
+                            logi.is_ok(),
+                            "unify_numeric({a:?}, {b:?}) Ok/Err discriminant drift"
+                        );
+                        if let (Ok(p), Ok(l)) = (&phys, &logi) {
+                            assert_eq!(p, l, "unify_numeric({a:?}, {b:?}) value drift");
+                        }
+                    }
+                }
+            }
+        }
+
+        /// `decimal128_arith_result_dtype` (physical) vs
+        /// `decimal128_arith_result` (logical) across a precision/scale grid
+        /// and all arithmetic ops. Both operands are Decimal128, matching the
+        /// physical caller's contract. Success dtype and Ok/Err discriminant
+        /// must be identical.
+        #[test]
+        fn decimal_arith_matches_logical_across_matrix() {
+            let precisions: [u8; 5] = [1, 5, 19, 37, 38];
+            let scales: [i8; 4] = [0, 2, 18, 38];
+            let ops = [
+                BinaryOp::Add,
+                BinaryOp::Sub,
+                BinaryOp::Mul,
+                BinaryOp::Div,
+            ];
+            for &op in &ops {
+                for &p1 in &precisions {
+                    for &s1 in &scales {
+                        for &p2 in &precisions {
+                            for &s2 in &scales {
+                                let phys =
+                                    decimal128_arith_result_dtype(op, (p1, s1), (p2, s2));
+                                let logi = logical_decimal(
+                                    op,
+                                    DataType::Decimal128(p1, s1),
+                                    DataType::Decimal128(p2, s2),
+                                );
+                                // Logical always returns Some(..) for two
+                                // Decimal128 operands.
+                                let logi = logi.expect(
+                                    "logical_decimal returned None for two Decimal128 operands",
+                                );
+                                assert_eq!(
+                                    phys.is_ok(),
+                                    logi.is_ok(),
+                                    "decimal {op:?} ({p1},{s1})/({p2},{s2}) discriminant drift"
+                                );
+                                if let (Ok(p), Ok(l)) = (&phys, &logi) {
+                                    assert_eq!(
+                                        p, l,
+                                        "decimal {op:?} ({p1},{s1})/({p2},{s2}) value drift"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// `temporal_arith_result_dtype` (physical, `Result<Option<_>>`) vs
+        /// `date_or_timestamp_arith_result` (logical, `Option<Result<_>>`)
+        /// across all dtype pairs and all binary ops. The two return shapes
+        /// must encode the same outcome:
+        ///   logical `None`        ⇔ physical `Ok(None)`
+        ///   logical `Some(Ok(d))` ⇔ physical `Ok(Some(d))`
+        ///   logical `Some(Err)`   ⇔ physical `Err`
+        #[test]
+        fn temporal_arith_matches_logical_across_matrix() {
+            let ops = [
+                BinaryOp::Add,
+                BinaryOp::Sub,
+                BinaryOp::Mul,
+                BinaryOp::Div,
+                BinaryOp::Eq,
+                BinaryOp::Lt,
+            ];
+            for &op in &ops {
+                for l in all_dtypes() {
+                    for r in all_dtypes() {
+                        let phys = temporal_arith_result_dtype(op, l, r);
+                        let logi = logical_temporal(op, l, r);
+                        match (phys, logi) {
+                            (Ok(None), None) => {}
+                            (Ok(Some(pd)), Some(Ok(ld))) => assert_eq!(
+                                pd, ld,
+                                "temporal {op:?} ({l:?},{r:?}) value drift"
+                            ),
+                            (Err(_), Some(Err(_))) => {}
+                            (phys, logi) => panic!(
+                                "temporal {op:?} ({l:?},{r:?}) shape drift: \
+                                 physical={phys:?} logical={logi:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Regression: HAVING produces `Filter { Project { Aggregate { .. } } }` in
     /// the logical plan. Before the fix the lowerer silently dropped the outer

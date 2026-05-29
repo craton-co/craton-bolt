@@ -125,10 +125,7 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     let set_bytes = BLOCK_GROUPS * 4;
     let max_probes = MAX_PROBES;
 
-    writeln!(ptx, ".version 7.5").map_err(write_err)?;
-    writeln!(ptx, ".target sm_70").map_err(write_err)?;
-    writeln!(ptx, ".address_size 64").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     // Shared-memory tables: block_keys (i32) + n_vals × block_vals (f64) +
     // block_set (u32). One declaration per array.
@@ -177,9 +174,7 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     writeln!(ptx).map_err(write_err)?;
 
     // Thread coordinates.
-    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_thread_block_ids(&mut ptx)?;
 
     // Shared base addresses:
     //   %rd0 = block_keys_buf
@@ -361,13 +356,7 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     )
     .map_err(write_err)?;
     // Occupancy-friendly back-off on the collision-advance path.
-    writeln!(
-        ptx,
-        "\tmov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
     // CLAIM: this thread won the slot. Write the key, fence, then sum
