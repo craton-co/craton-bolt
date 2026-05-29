@@ -2072,7 +2072,17 @@ impl Engine {
         // calling thread — so it's safe to invoke unconditionally.
         crate::cuda::mem_pool::pool_watcher_retry_context_capture();
 
+        // M5 metrics: count every accepted query (success or failure). The
+        // matching `QueriesFailed` bump happens at the single error-return
+        // below so the `?`-chain stays intact.
+        crate::metrics::metrics().inc(crate::metrics::Counter::QueriesTotal);
+
+        // Time the parse phase (SQL text → LogicalPlan) into the Parse
+        // histogram; mirrors the `parse` tracing span in `observability`.
+        let parse_start = Instant::now();
         let plan: LogicalPlan = parse_sql(query, &self.provider)?;
+        crate::metrics::metrics()
+            .observe_duration(crate::metrics::Phase::Parse, parse_start.elapsed());
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding __idx_<col> i32 column.
         let plan = tracing::info_span!("plan")
@@ -2100,7 +2110,12 @@ impl Engine {
             .rewrites
             .iter()
             .try_fold(plan, |p, r| r.rewrite(p))?;
+        // Time the lower phase (LogicalPlan → PhysicalPlan) into the Lower
+        // histogram; mirrors the `lower` tracing span in `observability`.
+        let lower_start = Instant::now();
         let mut phys = crate::plan::lower_physical(&plan)?;
+        crate::metrics::metrics()
+            .observe_duration(crate::metrics::Phase::Lower, lower_start.elapsed());
         // Collapse any lazily-registered streaming sources to materialised
         // batches so the validity probes below (and `execute`'s
         // `materialize_table`) see real data. Idempotent and a no-op when no
@@ -2124,6 +2139,14 @@ impl Engine {
         // `ensure_streaming_materialized` above has already ruled out).
         drop(nb);
         let result = self.execute(&phys);
+        // M5 metrics: a failed execution bumps `QueriesFailed`. We only
+        // observe the bind here (no `?`-chain restructuring); the early
+        // parse/rewrite/lower `?`-returns above are rare developer-time
+        // errors, while `execute` is the latency-critical phase whose
+        // failures (OOM, kernel fault) are the ones worth a dashboard counter.
+        if result.is_err() {
+            crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+        }
         // Stage 7: periodic pool-stats emit. Runs whether the query
         // succeeded or failed (an OOM-failed query is itself a signal
         // worth surfacing alongside the pool snapshot). Internal errors
@@ -2729,6 +2752,9 @@ impl Engine {
 
             let has_utf8_output = kernel.outputs.iter().any(|c| c.dtype == DataType::Utf8);
             if has_utf8_output {
+                // M5 metrics: Utf8 outputs can't be gathered on-device, so
+                // this projection takes the documented host-side filter path.
+                crate::metrics::metrics().inc(crate::metrics::Counter::HostFallbacksTotal);
                 // Host-side fallback: download mask + outputs, then filter.
                 let host_mask =
                     crate::exec::compact::download_mask(mask.device_ptr(), n_rows, &stream)?;
