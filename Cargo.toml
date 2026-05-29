@@ -180,6 +180,16 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+# The integration-test suite links ~40 binaries that each embed the bundled
+# DuckDB dev-dependency. With full debuginfo every test binary writes a ~130 MB
+# PDB (~5 GB total), which exhausts disk on constrained machines and makes any
+# library-level change — which relinks every test binary — impractical to
+# verify. `line-tables-only` keeps file:line in panic backtraces while
+# shrinking PDBs ~5-10x. Pair with lld-link (see .cargo/config.toml), which
+# avoids MSVC link.exe's mspdbsrv PDB-session limit (LNK1318).
+[profile.test]
+debug = "line-tables-only"
+
 [package.metadata.docs.rs]
 features = ["cuda-stub"]
 rustdoc-args = ["--cfg", "docsrs"]

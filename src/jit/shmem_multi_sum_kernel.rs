@@ -23,10 +23,8 @@
 //!            global atomics, same as the single-SUM kernel).
 //! * Width:   `1..=MAX_VALS` value columns. `MAX_VALS=4` keeps the worst-case
 //!            shared-mem footprint comfortably under the sm_70 48 KiB static
-//!            limit:
-//!
-//!            `n_vals * BLOCK_GROUPS * 8 + BLOCK_GROUPS`
-//!            = 4 * 1024 * 8 + 1024 = 33 KiB at the cap.
+//!            limit: `n_vals * BLOCK_GROUPS * 8 + BLOCK_GROUPS` =
+//!            `4 * 1024 * 8 + 1024` = 33 KiB at the cap.
 //!
 //! ## Algorithm
 //!
