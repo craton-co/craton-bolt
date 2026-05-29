@@ -684,8 +684,16 @@ impl EngineBuilder {
     /// disabled (the existing in-memory PTX cache in `jit::jit_compiler`
     /// is unaffected either way).
     ///
-    /// The path is stored verbatim — it is the caller's responsibility to
-    /// ensure the directory exists and is writable.
+    /// [`build`](Self::build) threads this path into the process-wide disk
+    /// PTX cache (via [`crate::jit::disk_cache::set_override_dir`]), so the
+    /// JIT compile path reads/writes cubins at `path` even when the
+    /// `BOLT_PTX_CACHE_DIR` env var is unset. The builder path takes
+    /// precedence over that env var, which remains the fallback for
+    /// engines built without this knob.
+    ///
+    /// The path is stored verbatim — `DiskPtxCache::open` creates the
+    /// directory if it does not already exist, but it is the caller's
+    /// responsibility to ensure the location is writable.
     pub fn persistent_cache(mut self, path: std::path::PathBuf) -> Self {
         self.persistent_cache_path = Some(path);
         self
@@ -736,6 +744,17 @@ impl EngineBuilder {
         }
         let ctx = CudaContext::new(device_idx)?;
         let pool_stats_interval = pool_stats_interval_from_env();
+
+        // v0.6 / M6: thread the builder's `persistent_cache(path)` knob
+        // into the process-wide disk PTX cache so the JIT compile path
+        // (`get_or_build_module` → `disk_cache::disk_cache()`) reads and
+        // writes cubins at the configured directory — not only when the
+        // `BOLT_PTX_CACHE_DIR` env var is set. Opt-in: a `None` path
+        // clears any prior builder override and re-falls-back to the env
+        // var, preserving the historical "no path → no disk cache"
+        // behaviour. See `install_persistent_cache_override` for the
+        // precedence contract.
+        install_persistent_cache_override(self.persistent_cache_path.as_deref());
 
         if self.enable_tracing {
             // Best-effort subscriber init. `log::set_max_level` is
@@ -2855,6 +2874,30 @@ pub fn pool_stats_interval_from_env() -> Duration {
     }
 }
 
+/// Install (or clear) the builder's `persistent_cache(path)` directory on
+/// the process-wide disk PTX cache.
+///
+/// This is the single bridge between [`EngineBuilder::persistent_cache`]
+/// and the JIT compile path's disk-cache lookup
+/// ([`Engine::get_or_build_module`] → [`crate::jit::disk_cache::disk_cache`]).
+/// Pulled out of [`EngineBuilder::build`] as a free function so the
+/// builder → cache-layer plumbing can be exercised host-side without a
+/// live CUDA context (the rest of `build` needs one).
+///
+/// Semantics, mirroring [`crate::jit::disk_cache::set_override_dir`]:
+///   * `Some(path)` — subsequent `disk_cache()` lookups resolve to
+///     `path` regardless of the `BOLT_PTX_CACHE_DIR` env var (the
+///     builder knob takes precedence; the env var remains the fallback
+///     when no builder path is configured).
+///   * `None` — clears any prior builder override so the cache
+///     re-falls-back to the env var, and stays disabled if that too is
+///     unset. This preserves the opt-in "no path → unchanged behaviour"
+///     contract: a default-built engine never enables the disk cache on
+///     its own.
+fn install_persistent_cache_override(path: Option<&std::path::Path>) {
+    crate::jit::disk_cache::set_override_dir(path.map(|p| p.to_path_buf()));
+}
+
 /// Decide whether to emit a pool-stats snapshot at time `now`, advancing
 /// the throttle state on a positive decision.
 ///
@@ -3876,5 +3919,158 @@ mod tests {
             "second projection on a different column must miss and compile \
              its own module — otherwise the cache is over-keying"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Builder → engine → disk-cache plumbing (host-side, no GPU).
+    //
+    // These exercise the `persistent_cache(path)` knob's effect on the
+    // process-wide disk PTX cache WITHOUT constructing an `Engine`
+    // (`build()` needs a CUDA context). We drive the same bridge `build()`
+    // uses — `install_persistent_cache_override` — and observe the
+    // resolved cache directory through the public
+    // `disk_cache::disk_cache()` / `DiskPtxCache::root()` surface that the
+    // JIT compile path consults in `get_or_build_module`.
+    // -------------------------------------------------------------------
+
+    /// Serialises the disk-cache tests below: they mutate the process-wide
+    /// override slot and the `BOLT_PTX_CACHE_DIR` env var, both of which
+    /// are global. Cargo runs `#[test]`s in parallel by default, so an
+    /// unguarded mutation would race a sibling test.
+    static DISK_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Fresh, unique temp directory under the OS tempdir for a disk-cache
+    /// plumbing test. Not created on disk here — `DiskPtxCache::open`
+    /// (invoked transitively by `disk_cache()`) creates it.
+    fn fresh_cache_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "craton-bolt-engine-cache-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            n,
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// Snapshot + restore the global override slot and the env var around a
+    /// test body so disk-cache tests stay independent of ordering.
+    fn with_clean_disk_cache_state<R>(f: impl FnOnce() -> R) -> R {
+        use crate::jit::disk_cache::DISK_PTX_CACHE_ENV;
+        let _guard = DISK_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev_env = std::env::var(DISK_PTX_CACHE_ENV).ok();
+        // Start from a known-clean slate: no builder override, no env var.
+        install_persistent_cache_override(None);
+        std::env::remove_var(DISK_PTX_CACHE_ENV);
+
+        let out = f();
+
+        // Restore: clear our override and put the env var back the way we
+        // found it so sibling tests / the rest of the process see no drift.
+        install_persistent_cache_override(None);
+        match prev_env {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_ENV),
+        }
+        out
+    }
+
+    #[test]
+    fn persistent_cache_path_drives_disk_cache_root() {
+        // The builder knob, once installed via the same bridge `build()`
+        // uses, must make the JIT compile path's `disk_cache()` resolve to
+        // that exact directory — proving the path is plumbed all the way
+        // from builder → cache layer, not merely stored on the engine.
+        with_clean_disk_cache_state(|| {
+            let dir = fresh_cache_dir("plumbed");
+            install_persistent_cache_override(Some(dir.as_path()));
+
+            let cache = crate::jit::disk_cache::disk_cache()
+                .expect("builder path must enable the disk cache");
+            assert_eq!(
+                cache.root(),
+                dir.as_path(),
+                "disk cache root must match the persistent_cache(path) directory"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn no_persistent_cache_path_keeps_disk_cache_disabled() {
+        // Opt-in contract: with neither a builder path nor the env var set,
+        // the JIT compile path sees `disk_cache() == None` — unchanged,
+        // zero-side-effect behaviour.
+        with_clean_disk_cache_state(|| {
+            // `with_clean_disk_cache_state` already installed `None` +
+            // cleared the env var; assert the resulting disabled state.
+            assert!(
+                crate::jit::disk_cache::disk_cache().is_none(),
+                "no builder path and no env var must leave the disk cache disabled"
+            );
+        });
+    }
+
+    #[test]
+    fn builder_persistent_cache_takes_precedence_over_env() {
+        // When both the builder path and `BOLT_PTX_CACHE_DIR` are set, the
+        // builder knob wins (the env var stays a fallback for the no-path
+        // case). Confirms the plumbed override out-ranks the env var at the
+        // resolution point the compile path reads.
+        use crate::jit::disk_cache::DISK_PTX_CACHE_ENV;
+        with_clean_disk_cache_state(|| {
+            let builder_dir = fresh_cache_dir("builder");
+            let env_dir = fresh_cache_dir("env");
+            std::env::set_var(DISK_PTX_CACHE_ENV, env_dir.to_string_lossy().to_string());
+            install_persistent_cache_override(Some(builder_dir.as_path()));
+
+            let cache = crate::jit::disk_cache::disk_cache().expect("cache enabled");
+            assert_eq!(
+                cache.root(),
+                builder_dir.as_path(),
+                "builder persistent_cache(path) must take precedence over the env var"
+            );
+            let _ = std::fs::remove_dir_all(&builder_dir);
+            let _ = std::fs::remove_dir_all(&env_dir);
+        });
+    }
+
+    #[test]
+    fn clearing_persistent_cache_falls_back_to_env() {
+        // Installing `None` (a default-built engine) must clear a prior
+        // builder override and re-expose the env-var fallback — so a later
+        // default `build()` doesn't accidentally pin a stale directory.
+        use crate::jit::disk_cache::DISK_PTX_CACHE_ENV;
+        with_clean_disk_cache_state(|| {
+            let builder_dir = fresh_cache_dir("stale");
+            let env_dir = fresh_cache_dir("fallback");
+            // First: a builder path is in effect.
+            install_persistent_cache_override(Some(builder_dir.as_path()));
+            assert_eq!(
+                crate::jit::disk_cache::disk_cache()
+                    .expect("cache enabled")
+                    .root(),
+                builder_dir.as_path(),
+            );
+            // Now a default build clears the override; the env var should
+            // take over.
+            std::env::set_var(DISK_PTX_CACHE_ENV, env_dir.to_string_lossy().to_string());
+            install_persistent_cache_override(None);
+            assert_eq!(
+                crate::jit::disk_cache::disk_cache()
+                    .expect("env fallback enables the cache")
+                    .root(),
+                env_dir.as_path(),
+                "clearing the builder override must re-fall-back to BOLT_PTX_CACHE_DIR"
+            );
+            let _ = std::fs::remove_dir_all(&builder_dir);
+            let _ = std::fs::remove_dir_all(&env_dir);
+        });
     }
 }
