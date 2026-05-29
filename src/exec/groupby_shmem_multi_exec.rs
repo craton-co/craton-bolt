@@ -128,15 +128,10 @@ pub fn try_execute(
     // Same host-side scan as the single-SUM executor — cheap (~5 ms for
     // 10 M Int32) and bounds the kernel's output slot count to n_groups so
     // we can build the result row-by-row with slot index == key value.
-    let mut max_key: i32 = -1;
-    for &k in key_arr.values() {
-        if k < 0 {
-            return None;
-        }
-        if k > max_key {
-            max_key = k;
-        }
-    }
+    // dedup (tier2/shmem): max-nonneg-key scan extracted to
+    // `groupby_tier2_common`. `None` (negative key) declines; `Some(-1)`
+    // (empty) is handled by the branch below.
+    let max_key = crate::exec::groupby_tier2_common::scan_max_nonneg_key(key_arr.values())?;
     if max_key < 0 {
         return Some(build_empty_result(plan));
     }

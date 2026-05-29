@@ -559,6 +559,14 @@ pub fn execute_groupby(
             k_u32,
             &stream,
             key_valid.as_deref(),
+            // PERF (filtered-keys round-trip): hoist the invariant key-column
+            // host image OUT of the per-aggregate loop. `host_keys` is the
+            // exact vec we uploaded into `key_col_gpu` above; every aggregate
+            // shares that same device column, so its host image is identical
+            // across the whole query. Passing it by reference lets
+            // `prepare_filtered_keys` host-filter value-NULLs without a
+            // per-aggregate D2H re-download of `key_col_gpu`.
+            &host_keys,
             any_input_has_validity,
         )?;
         acc_results.push(acc);
@@ -905,6 +913,11 @@ fn run_one_aggregate(
     k_u32: u32,
     stream: &CudaStream,
     key_valid: Option<&[bool]>,
+    // PERF (filtered-keys round-trip): per-query host image of the shared key
+    // column (`execute_groupby`'s `host_keys`). Invariant across every
+    // aggregate, so it is hoisted out of the per-aggregate loop and threaded
+    // here to feed `prepare_filtered_keys` without a per-aggregate D2H.
+    cached_host_keys: &[i64],
     any_input_has_validity: bool,
 ) -> BoltResult<AccDownload> {
     match agg {
@@ -916,7 +929,7 @@ fn run_one_aggregate(
             let col_io = resolve_input(inputs, col_name)?;
             run_typed_agg(
                 op, col_io, group_col, keys_table, batch, n_rows, k, k_u32, stream,
-                key_valid, any_input_has_validity,
+                key_valid, cached_host_keys, any_input_has_validity,
             )
         }
 
@@ -934,7 +947,14 @@ fn run_one_aggregate(
                 None => None,
             };
 
-            let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref(), stream)?;
+            let filtered = prepare_filtered_keys(
+                group_col,
+                n_rows,
+                key_valid,
+                value_valid.as_deref(),
+                cached_host_keys,
+                stream,
+            )?;
             let count_n_rows = filtered.n_rows();
 
             let ones: Vec<i64> = vec![1i64; count_n_rows];
@@ -998,7 +1018,14 @@ fn run_one_aggregate(
             let col_io = resolve_input(inputs, col_name)?;
 
             let value_valid = column_null_mask(col_io, batch)?;
-            let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref(), stream)?;
+            let filtered = prepare_filtered_keys(
+                group_col,
+                n_rows,
+                key_valid,
+                value_valid.as_deref(),
+                cached_host_keys,
+                stream,
+            )?;
             let avg_n_rows = filtered.n_rows();
 
             // --- SUM(expr) cast to f64. We upcast the input host-side and
@@ -1254,20 +1281,37 @@ impl<'a> FilteredKeys<'a> {
 /// shrinks the row set further) or upload a freshly-filtered key column for
 /// this aggregate. The shared `group_col` was built from a `host_keys` that
 /// already had the `key_valid` rows kept; if `value_valid` is `None` we can
-/// reuse it directly. Otherwise we re-download once and refilter against
-/// the joint mask, then upload a fresh i64 column.
+/// reuse it directly. Otherwise we refilter against the joint mask on the host
+/// and upload a fresh i64 column.
 ///
-/// v0.7 async-memcpy: the DtoH of the shared key column and the HtoD of the
-/// freshly-filtered keys both ride `stream` via the pinned-D2H +
-/// `from_slice_async` pair, mirroring the per-aggregate buffer plumbing in
-/// `run_typed_agg`. This keeps the entire per-aggregate launch on a single
-/// ordering domain so the driver can chain the upload behind the previous
-/// kernel's D2H and overlap with unrelated stream activity.
+/// PERF (filtered-keys round-trip): the host image of the shared key column is
+/// INVARIANT across every aggregate in a query — they all reuse the same
+/// `key_col_gpu`, which `execute_groupby` uploaded from the per-query
+/// `host_keys` vec. Previously this function re-downloaded that identical
+/// column (one D2H per NULL-bearing aggregate) only to host-filter it; that
+/// extra D2H+H2D round-trip was redundant work re-done for the SAME keys. We
+/// now thread the already-resident `host_keys` slice in via `cached_host_keys`
+/// and host-filter directly off it, so the per-query D2H of the key column
+/// happens ZERO times here (it never needed to leave the host in the first
+/// place). The genuinely per-aggregate part — projecting the value-column NULL
+/// mask through `key_valid` and compacting the keys against it — is unchanged
+/// and still produces a per-aggregate `Owned` column with exactly the same
+/// rows as before.
+///
+/// `cached_host_keys` MUST be the same host vec that produced `group_col`
+/// (i.e. `execute_groupby`'s post-key-filter `host_keys`); it is therefore
+/// length `n_rows` and bit-identical to what a D2H of `group_col` would yield.
+///
+/// v0.7 async-memcpy: the HtoD of the freshly-filtered keys still rides
+/// `stream` via `from_slice_async`, mirroring the per-aggregate buffer
+/// plumbing in `run_typed_agg`, so the upload chains behind the previous
+/// kernel's D2H and overlaps with unrelated stream activity.
 fn prepare_filtered_keys<'a>(
     group_col: &'a GpuVec<i64>,
     n_rows: usize,
     key_valid: Option<&[bool]>,
     value_valid: Option<&[bool]>,
+    cached_host_keys: &[i64],
     stream: &CudaStream,
 ) -> BoltResult<FilteredKeys<'a>> {
     if value_valid.is_none() {
@@ -1287,14 +1331,17 @@ fn prepare_filtered_keys<'a>(
     };
     debug_assert_eq!(value_valid_filtered.len(), n_rows);
 
-    // v0.7 async DtoH of the shared key column via the pinned-buffer
-    // helper. The pinned hop lets the driver DMA into host memory without
-    // staging through a bounce buffer; the trailing `to_vec()` is the one
-    // unavoidable host-host copy. Routes through `download_pinned_i64` so
-    // the per-aggregate plumbing shares one D2H code path.
-    let host_keys: Vec<i64> = download_pinned_i64(group_col, stream)?;
-    debug_assert_eq!(host_keys.len(), n_rows);
-    let filtered: Vec<i64> = host_keys
+    // PERF (filtered-keys round-trip): host-filter directly off the cached,
+    // already-resident `host_keys` slice instead of re-downloading the shared
+    // key column from the device. `cached_host_keys` is the very vec
+    // `execute_groupby` uploaded into `group_col`, so it is bit-identical to a
+    // D2H of `group_col` would-be result — we just skip the trip. This elides
+    // the per-aggregate D2H (and the prior pinned-buffer hop) entirely; only
+    // the genuinely per-aggregate H2D of the freshly-compacted column below
+    // remains. The debug assert pins the invariant that the cache matches the
+    // device column's length (== post-key-filter `n_rows`).
+    debug_assert_eq!(cached_host_keys.len(), n_rows);
+    let filtered: Vec<i64> = cached_host_keys
         .iter()
         .zip(value_valid_filtered.iter())
         .filter_map(|(&k, &v)| if v { Some(k) } else { None })
@@ -1329,6 +1376,10 @@ fn run_typed_agg(
     k_u32: u32,
     stream: &CudaStream,
     key_valid: Option<&[bool]>,
+    // PERF (filtered-keys round-trip): per-query host image of the shared key
+    // column, forwarded straight to `prepare_filtered_keys` so the value-NULL
+    // host-filter reuses it instead of re-downloading `group_col`.
+    cached_host_keys: &[i64],
     any_input_has_validity: bool,
 ) -> BoltResult<AccDownload> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
@@ -1383,7 +1434,14 @@ fn run_typed_agg(
         );
     }
 
-    let filtered = prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref(), stream)?;
+    let filtered = prepare_filtered_keys(
+        group_col,
+        n_rows,
+        key_valid,
+        value_valid.as_deref(),
+        cached_host_keys,
+        stream,
+    )?;
     let n = filtered.n_rows();
 
     match col_io.dtype {

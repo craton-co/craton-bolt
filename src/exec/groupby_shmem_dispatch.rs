@@ -25,6 +25,24 @@
 //! 5. `key_dtype == Int32`                — first cut targets Int32 keys.
 //!
 //! Otherwise fall back to `GlobalAtomic`, which is always correct.
+//!
+//! # dedup (tier2/shmem): shared vs intentionally-specialized boilerplate
+//!
+//! The Tier-1 (`groupby_shmem_*`) and Tier-2 (`groupby_tier2_*`)
+//! `try_execute` variants share exactly one genuinely-identical block: the
+//! host-side max-nonneg-key scan in
+//! [`crate::exec::groupby_tier2_common::scan_max_nonneg_key`], which every
+//! single-key executor here now calls. The empty-input handling stays local
+//! (the shmem-SUM family emit an empty-schema result via
+//! `build_empty_result`; the others decline with `None`).
+//!
+//! Everything else that looks duplicated is adapted per variant and was
+//! deliberately NOT consolidated — see the matching note in
+//! [`crate::exec::groupby_tier2_dispatch`] for the full rationale
+//! (divergent eligibility tails, non-interchangeable kernel ABIs, and the
+//! cross-module `partition_reduce spill:` sentinel string matched by
+//! `groupby.rs`'s GB-S2 path). A blind merge behind flags would be unsafe
+//! and cannot be verified without GPU hardware.
 
 use crate::plan::DataType;
 

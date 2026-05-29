@@ -87,15 +87,11 @@ pub fn try_execute(
     // max key + 1 as an upper bound when keys are dense from 0, OR if max
     // exceeds Tier-2's cap, immediately reject. h2o.ai's id3 is well-bounded
     // (1M distinct values in [0, 1M)), so max-based estimate is fine.
-    let mut max_key: i32 = -1;
-    for &k in key_arr.values() {
-        if k < 0 {
-            return None;
-        }
-        if k > max_key {
-            max_key = k;
-        }
-    }
+    // dedup (tier2/shmem): the max-nonneg-key scan now lives in
+    // `groupby_tier2_common`. `None` = saw a negative key → decline;
+    // `Some(-1)` = empty input → decline (this executor's historical
+    // empty-input behaviour).
+    let max_key = crate::exec::groupby_tier2_common::scan_max_nonneg_key(key_arr.values())?;
     if max_key < 0 {
         return None;
     }

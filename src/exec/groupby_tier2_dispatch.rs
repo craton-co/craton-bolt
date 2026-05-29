@@ -40,6 +40,38 @@
 //!
 //! Queries that fail the common precondition set (multi-key, non-SUM
 //! ops, non-`f64` values, non-`i32` keys) always go to `GlobalAtomic`.
+//!
+//! # dedup (tier2/shmem): what is and isn't shared across the variants
+//!
+//! The ~20 `groupby_tier2_*` / `groupby_shmem_*` `try_execute` variants look
+//! superficially duplicative, but only one block is genuinely identical and
+//! safe to share: the host-side max-nonneg-key scan, now in
+//! [`crate::exec::groupby_tier2_common::scan_max_nonneg_key`]. Every
+//! single-key executor calls it; the per-variant empty-input handling
+//! (`None` to decline vs an empty-schema result batch) and `n_groups`
+//! arithmetic stay local.
+//!
+//! The rest is *intentionally specialized* and a blind consolidation would
+//! be unsafe (and unverifiable without GPU hardware):
+//!
+//! * **Eligibility tails diverge** — single-key SUM gates on
+//!   `group_by.len() == 1 && aggregates.len() == 1`; AVG/multi gate on an
+//!   `n_vals` range; the two-key shim gates on `group_by.len() == 2` and
+//!   does NOT use `dispatch_v2` (which rejects `n_key_cols != 1`); MIN/MAX
+//!   branch on the value dtype.
+//! * **Upload/scatter/reduce ABIs diverge** — SUM defers to an orchestrator;
+//!   COUNT inlines a keys-only partition→scatter→reduce; AVG runs a
+//!   deterministic `dest_idx` scatter plus *two* reduces (multi-SUM + COUNT)
+//!   then divides host-side; MIN/MAX specializes the scatter and reduce on
+//!   Int32 vs Int64 atomics. The kernel parameter lists are not
+//!   interchangeable.
+//! * **The spill-counter error string is a cross-module contract.** Its
+//!   prefix is matched by `groupby.rs`'s GB-S2 soft-fallback path and
+//!   exported as
+//!   [`crate::exec::groupby_tier2_orchestrator::PARTITION_REDUCE_SPILL_PREFIX`];
+//!   the single-counter and multi-counter messages differ by design
+//!   (`"… {n} rows …"` vs `"… multi={a} count={b} …"`). Folding these behind
+//!   one helper risks the sentinel and was deliberately left local.
 
 use crate::plan::logical_plan::DataType;
 

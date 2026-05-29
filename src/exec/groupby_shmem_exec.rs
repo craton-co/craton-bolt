@@ -108,15 +108,11 @@ pub fn try_execute(
     // and we can build the result with the slot index == key.
     //
     // Host-side scan: ~5 ms for 10 M Int32 with the default loop. Fine.
-    let mut max_key: i32 = -1;
-    for &k in key_arr.values() {
-        if k < 0 {
-            return None; // negative keys never hash to a valid slot
-        }
-        if k > max_key {
-            max_key = k;
-        }
-    }
+    // dedup (tier2/shmem): max-nonneg-key scan extracted to
+    // `groupby_tier2_common`. `None` (negative key) declines the fast path
+    // exactly as the inline loop's `return None` did; `Some(-1)` means the
+    // input was empty and is handled by the branch below.
+    let max_key = crate::exec::groupby_tier2_common::scan_max_nonneg_key(key_arr.values())?;
     if max_key < 0 {
         // Empty input: emit empty output to match SQL semantics.
         return Some(build_empty_result(plan));

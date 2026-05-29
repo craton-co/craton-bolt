@@ -50,6 +50,11 @@ pub mod groupby_shmem_exec;
 pub mod groupby_shmem_multi_exec;
 pub mod groupby_shmem_avg_exec;
 pub mod groupby_tier2_dispatch;
+// dedup (tier2/shmem): single home for the genuinely-identical host-side
+// key-range scan shared by the Tier-1 (shmem) and Tier-2 single-key
+// executors. See the module docs for why only this loop — and not the
+// per-variant launch/dispatch boilerplate — is safe to share.
+pub(crate) mod groupby_tier2_common;
 pub mod partition_offsets;
 pub mod groupby_tier2_merge;
 pub mod groupby_tier2_orchestrator;

@@ -162,15 +162,10 @@ pub fn try_execute(
     // route through the kernel's overflow path which still works but
     // erodes the AVG-fast-path's reason for existing. The threshold is
     // identical to the SUM executor's so behaviour stays predictable.
-    let mut max_key: i32 = -1;
-    for &k in key_arr.values() {
-        if k < 0 {
-            return None;
-        }
-        if k > max_key {
-            max_key = k;
-        }
-    }
+    // dedup (tier2/shmem): max-nonneg-key scan extracted to
+    // `groupby_tier2_common`. `None` (negative key) declines; `Some(-1)`
+    // (empty) is handled by the branch below.
+    let max_key = crate::exec::groupby_tier2_common::scan_max_nonneg_key(key_arr.values())?;
     if max_key < 0 {
         // Empty / no rows: produce an empty matching-schema batch.
         return Some(build_empty_result(plan));

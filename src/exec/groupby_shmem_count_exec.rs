@@ -96,15 +96,10 @@ pub fn try_execute(
 
     // max(key) must fit in the BLOCK_GROUPS slot map (Tier-1's whole
     // premise). Above that, the Tier-2.1 COUNT executor handles it.
-    let mut max_key: i32 = -1;
-    for &k in key_arr.values() {
-        if k < 0 {
-            return None;
-        }
-        if k > max_key {
-            max_key = k;
-        }
-    }
+    // dedup (tier2/shmem): max-nonneg-key scan extracted to
+    // `groupby_tier2_common`. `None` (negative key) and `Some(-1)` (empty)
+    // both decline, matching the prior inline behaviour.
+    let max_key = crate::exec::groupby_tier2_common::scan_max_nonneg_key(key_arr.values())?;
     if max_key < 0 {
         return None;
     }
