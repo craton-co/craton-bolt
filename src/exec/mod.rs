@@ -46,10 +46,6 @@ pub mod expr_agg;
 /// Shared between STDDEV_* (this crate's v0.5 surface) and the upcoming
 /// VAR_* aggregates.
 pub mod welford;
-/// Documentation-only audit of NULL/validity consumption across the GROUP BY
-/// executor paths (which honour nulls natively on the device vs host-strip).
-#[doc(hidden)]
-pub mod validity_audit;
 pub mod groupby_valid;
 pub mod gpu_table;
 /// Morsel / chunk streaming + larger-than-VRAM budget orchestration. Pure
