@@ -12,6 +12,7 @@ pub mod suggest;
 pub mod rewrite;
 pub mod optimizer;
 pub mod statistics;
+pub mod subquery;
 
 pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,

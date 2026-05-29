@@ -364,6 +364,15 @@ fn eval_inner(
              coming in a follow-up",
             unit.sql_name()
         ))),
+        // Subqueries have no host evaluator yet; the physical-plan boundary
+        // rejects any plan carrying one (see `physical_plan::Codegen::emit_expr`),
+        // so reaching here means a future caller bypassed `lower()`. Surface a
+        // clear `Plan` error rather than silently producing wrong output.
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => Err(BoltError::Plan(
+            "expr_agg: subqueries are not yet evaluated host-side; \
+             coming in a follow-up"
+                .into(),
+        )),
     }
 }
 

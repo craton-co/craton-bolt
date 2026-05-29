@@ -2444,6 +2444,21 @@ fn substitute_one_depth(
         Expr::Alias(inner, name) => {
             Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
         }
+        // Subquery nodes hold a self-contained plan over their own schema;
+        // the substitution `map` rewrites *this* query's column names, which
+        // do not appear inside the subplan. Clone the subquery as-is. The
+        // `InSubquery` probe expression, however, lives in this query's
+        // namespace, so it IS subject to substitution.
+        Expr::ScalarSubquery(_) => expr.clone(),
+        Expr::InSubquery {
+            expr: probe,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(substitute_one_depth(probe, map, depth + 1)),
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
     }
 }
 
@@ -2845,6 +2860,12 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
         // future host-fallback wires ScalarFn through Filter, this keeps
         // the routing correct.
         Expr::ScalarFn { args, .. } => args.iter().any(predicate_contains_unary),
+        // Subqueries have no GPU path at all (rejected in `emit_expr`); they
+        // never carry the GPU-unsupported *unary-over-non-column* shape this
+        // helper detects, so they do not, by themselves, force the host
+        // routing decision. The `InSubquery` probe might, so recurse into it.
+        Expr::ScalarSubquery(_) => false,
+        Expr::InSubquery { expr, .. } => predicate_contains_unary(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -2979,6 +3000,11 @@ fn expr_contains_concat(expr: &Expr) -> bool {
         Expr::Like { expr, .. } => expr_contains_concat(expr),
         Expr::Cast { expr, .. } => expr_contains_concat(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_concat),
+        // The subquery subplan is a separate query; its internal `||` (if any)
+        // is that plan's own concern. Only the `InSubquery` probe is in this
+        // query's expression namespace.
+        Expr::ScalarSubquery(_) => false,
+        Expr::InSubquery { expr, .. } => expr_contains_concat(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -3364,6 +3390,10 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
         // operand of the *function call*, but the arguments themselves
         // might contain the unsafe pattern, so recurse.
         Expr::ScalarFn { args, .. } => args.iter().any(expr_has_unsafe_eager_shortcircuit),
+        // Subplan internals run in a separate kernel; only the `InSubquery`
+        // probe shares this expression's evaluation context.
+        Expr::ScalarSubquery(_) => false,
+        Expr::InSubquery { expr, .. } => expr_has_unsafe_eager_shortcircuit(expr),
     }
 }
 

@@ -166,10 +166,45 @@ pub trait TableProvider {
 /// The resolver intentionally borrows nothing from the FROM-tree plan — it
 /// owns its own (table_name, output_col) mapping so it remains valid after
 /// the planner moves the plan into `LogicalPlan::Join` boxes.
-#[derive(Debug, Default)]
-struct NameResolver {
+#[derive(Default)]
+struct NameResolver<'a> {
     /// One scope per table in FROM order (base first, then joined tables).
     tables: Vec<TableScope>,
+    /// Lowering context for nested subqueries: the table provider (to resolve
+    /// a subquery's own FROM tables) and the in-scope CTE definitions. Both
+    /// are `None` for resolvers built in contexts where a subquery cannot
+    /// appear (e.g. [`NameResolver::empty`] used by ORDER BY lowering). When
+    /// present, `lower_expr` uses them to lower `(SELECT ...)` /
+    /// `IN (SELECT ...)` expressions and to reject correlated subqueries.
+    ///
+    /// The fields are borrowed for the resolver's (short) lifetime — the
+    /// resolver never outlives the `plan_select` call that builds it.
+    ctx: Option<SubqueryCtx<'a>>,
+}
+
+/// Borrowed lowering context threaded into [`NameResolver`] so the scalar /
+/// IN subquery arms of [`lower_expr`] can lower their nested `LogicalPlan`
+/// without widening every `lower_expr` call-site signature. Carries the
+/// provider (for the subquery's own table-schema lookups) and the CTE scope
+/// (so a subquery may reference a CTE just like the outer query).
+#[derive(Clone, Copy)]
+struct SubqueryCtx<'a> {
+    /// Table provider used to resolve the subquery's own FROM tables.
+    provider: &'a dyn TableProvider,
+    /// CTE definitions in scope at the subquery's lexical position.
+    ctes: &'a CteScope,
+}
+
+impl std::fmt::Debug for NameResolver<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `SubqueryCtx` holds a `&dyn TableProvider` which is not `Debug`;
+        // elide it so `NameResolver` keeps a `Debug` impl for the existing
+        // `{resolver:?}`-style diagnostics.
+        f.debug_struct("NameResolver")
+            .field("tables", &self.tables)
+            .field("has_subquery_ctx", &self.ctx.is_some())
+            .finish()
+    }
 }
 
 /// One table's contribution to a [`NameResolver`].
@@ -200,7 +235,7 @@ struct TableCol {
     output: String,
 }
 
-impl NameResolver {
+impl<'a> NameResolver<'a> {
     /// Empty resolver (no tables in scope). Used by `lower_order_by`, where
     /// expressions run *after* projection so the FROM-tree's table qualifiers
     /// are no longer meaningful. With no tables, `Identifier` still lowers to
@@ -327,6 +362,21 @@ impl NameResolver {
                 ))
             })?;
         Ok(resolved.output.clone())
+    }
+
+    /// The set of (ASCII-lowercased) column names available in this resolver's
+    /// FROM scope, across every in-scope table. Used by the subquery
+    /// correlation detector to recognise an outer-column reference inside a
+    /// nested subquery (see [`crate::plan::subquery::reject_if_correlated`]).
+    fn outer_column_names(&self) -> std::collections::HashSet<String> {
+        self.tables
+            .iter()
+            .flat_map(|t| {
+                t.cols
+                    .iter()
+                    .map(|c| c.original.to_ascii_lowercase())
+            })
+            .collect()
     }
 }
 
@@ -584,7 +634,7 @@ fn parse_uncached(sql: &str, provider: &dyn TableProvider) -> BoltResult<Logical
             )));
         }
     };
-    plan_query(&query, provider, 0)
+    plan_query(&query, provider, &CteScope::new(), 0)
 }
 
 /// v0.6 / M5: convert a `sqlparser` [`ParserError`] into a [`BoltError`],
@@ -929,14 +979,123 @@ pub fn plan_cache_stats() -> (usize, usize, usize) {
     )
 }
 
+/// A `WITH` common-table-expression scope: maps a (case-folded) CTE name to
+/// its already-lowered [`LogicalPlan`].
+///
+/// CTEs are **inlined**: when a later CTE or the main query references a CTE
+/// by name in its FROM clause, the registered plan is substituted (cloned) at
+/// the reference site. There is no shared/materialised CTE node in the IR.
+///
+/// Scoping rules implemented here mirror standard non-recursive SQL:
+///   * CTEs are visible to *later* CTEs in the same `WITH` list and to the
+///     main query — i.e. a CTE may reference any CTE declared before it.
+///   * A CTE may **not** reference itself (no `WITH RECURSIVE`).
+///   * Nested queries (subqueries, derived tables) inherit the enclosing CTE
+///     scope, so they too may reference any in-scope CTE.
+///
+/// The scope is built incrementally as the `WITH` list is lowered (see
+/// [`register_ctes`]); each CTE is lowered against the scope accumulated so
+/// far, then added to it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CteScope {
+    /// Case-folded CTE name → its inlined logical plan.
+    defs: HashMap<String, LogicalPlan>,
+}
+
+impl CteScope {
+    /// Empty scope (no CTEs in scope).
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up a CTE by (case-folded) name. The lookup tries an exact match
+    /// first, then an ASCII case-insensitive fallback — the same folding
+    /// convention the rest of the frontend uses for unquoted identifiers.
+    fn get(&self, name: &str) -> Option<&LogicalPlan> {
+        if let Some(p) = self.defs.get(name) {
+            return Some(p);
+        }
+        if !name.chars().any(|c| c.is_ascii_uppercase()) {
+            return self
+                .defs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v);
+        }
+        None
+    }
+}
+
+/// Lower a `WITH` clause into a [`CteScope`], rejecting `WITH RECURSIVE`.
+///
+/// Each CTE in the list is lowered against the scope accumulated from the
+/// CTEs that precede it (standard left-to-right visibility), then registered.
+/// Column-list aliases on a CTE (`WITH c (a, b) AS (...)`) are rejected since
+/// they would require renaming the lowered plan's output schema, which the
+/// frontend does not implement. A duplicate CTE name is rejected.
+///
+/// `base` is the CTE scope inherited from any enclosing query (so a subquery's
+/// own `WITH` can shadow / extend the outer scope).
+fn register_ctes(
+    with: &sqlparser::ast::With,
+    provider: &dyn TableProvider,
+    base: &CteScope,
+    depth: usize,
+) -> BoltResult<CteScope> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    if with.recursive {
+        return Err(BoltError::Sql(
+            "unsupported: WITH RECURSIVE (only non-recursive CTEs are supported)".into(),
+        ));
+    }
+    let mut scope = base.clone();
+    for cte in &with.cte_tables {
+        // `cte.alias` is the CTE's name plus an optional column list.
+        if !cte.alias.columns.is_empty() {
+            return Err(BoltError::Sql(format!(
+                "unsupported: CTE column-list alias on '{}' (WITH {} (..) AS ...)",
+                cte.alias.name.value, cte.alias.name.value
+            )));
+        }
+        if cte.from.is_some() {
+            return Err(BoltError::Sql(
+                "unsupported: CTE materialization hint (FROM)".into(),
+            ));
+        }
+        let name = ident_to_name(&cte.alias.name);
+        if scope.defs.contains_key(&name) {
+            return Err(BoltError::Sql(format!(
+                "duplicate CTE name '{name}' in WITH clause"
+            )));
+        }
+        // Lower the CTE body against the scope built so far (earlier CTEs are
+        // visible; the CTE itself is NOT yet in scope, so a self-reference
+        // surfaces as an unknown-table error — there is no recursion).
+        let plan = plan_query(&cte.query, provider, &scope, depth + 1)?;
+        // Type-check eagerly so a malformed CTE is reported at its definition
+        // site rather than at the (possibly distant) reference site.
+        let _ = plan.schema()?;
+        scope.defs.insert(name, plan);
+    }
+    Ok(scope)
+}
+
 /// Lower a top-level `Query`. Supports SELECT, UNION [ALL], ORDER BY, LIMIT,
-/// and OFFSET. Rejects CTEs, FETCH, locks, EXCEPT/INTERSECT, and dialect
-/// extensions outside our subset.
+/// OFFSET, and non-recursive `WITH` / CTEs. Rejects `WITH RECURSIVE`, FETCH,
+/// locks, EXCEPT/INTERSECT, and dialect extensions outside our subset.
+///
+/// `ctes` is the CTE scope inherited from any enclosing query; a `WITH` clause
+/// on `query` extends it for the duration of this query's lowering.
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
 fn plan_query(
     query: &Query,
     provider: &dyn TableProvider,
+    ctes: &CteScope,
     depth: usize,
 ) -> BoltResult<LogicalPlan> {
     if depth > MAX_RECURSION_DEPTH {
@@ -944,9 +1103,17 @@ fn plan_query(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
         )));
     }
-    if query.with.is_some() {
-        return Err(BoltError::Sql("unsupported: WITH / CTEs".into()));
-    }
+    // WITH / CTEs: lower the CTE list into a scope (extending any inherited
+    // scope), then lower the body against it. `register_ctes` rejects
+    // WITH RECURSIVE cleanly.
+    let local_ctes;
+    let active_ctes = match &query.with {
+        Some(with) => {
+            local_ctes = register_ctes(with, provider, ctes, depth + 1)?;
+            &local_ctes
+        }
+        None => ctes,
+    };
     if !query.limit_by.is_empty() {
         return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
     }
@@ -969,7 +1136,7 @@ fn plan_query(
     // Lower the body into a base plan; UNION/UNION ALL builds a `Union` (and
     // optionally a `Distinct` wrapper) here, so the ORDER BY / LIMIT layers
     // below apply to the *combined* result, matching SQL semantics.
-    let mut plan = lower_set_expr(query.body.as_ref(), provider, depth + 1)?;
+    let mut plan = lower_set_expr(query.body.as_ref(), provider, active_ctes, depth + 1)?;
 
     // ORDER BY: appended *outside* the body so it sees the final schema.
     if let Some(order_by) = &query.order_by {
@@ -1013,6 +1180,7 @@ fn plan_query(
 fn lower_set_expr(
     expr: &SetExpr,
     provider: &dyn TableProvider,
+    ctes: &CteScope,
     depth: usize,
 ) -> BoltResult<LogicalPlan> {
     if depth > MAX_RECURSION_DEPTH {
@@ -1021,8 +1189,8 @@ fn lower_set_expr(
         )));
     }
     match expr {
-        SetExpr::Select(s) => plan_select(s.as_ref(), provider),
-        SetExpr::Query(q) => plan_query(q.as_ref(), provider, depth + 1),
+        SetExpr::Select(s) => plan_select(s.as_ref(), provider, ctes),
+        SetExpr::Query(q) => plan_query(q.as_ref(), provider, ctes, depth + 1),
         SetExpr::SetOperation {
             op,
             set_quantifier,
@@ -1051,8 +1219,8 @@ fn lower_set_expr(
             // than a nested binary tree. UNION (dedup) does NOT flatten across
             // UNION ALL boundaries: their semantics differ.
             let mut inputs: Vec<LogicalPlan> = Vec::new();
-            collect_union_branches(left, provider, dedup, &mut inputs, depth + 1)?;
-            collect_union_branches(right, provider, dedup, &mut inputs, depth + 1)?;
+            collect_union_branches(left, provider, ctes, dedup, &mut inputs, depth + 1)?;
+            collect_union_branches(right, provider, ctes, dedup, &mut inputs, depth + 1)?;
             let union = LogicalPlan::Union { inputs };
             Ok(if dedup {
                 LogicalPlan::Distinct {
@@ -1079,6 +1247,7 @@ fn lower_set_expr(
 fn collect_union_branches(
     expr: &SetExpr,
     provider: &dyn TableProvider,
+    ctes: &CteScope,
     parent_dedup: bool,
     out: &mut Vec<LogicalPlan>,
     depth: usize,
@@ -1102,17 +1271,17 @@ fn collect_union_branches(
             SetQuantifier::ByName
             | SetQuantifier::AllByName
             | SetQuantifier::DistinctByName => {
-                out.push(lower_set_expr(expr, provider, depth + 1)?);
+                out.push(lower_set_expr(expr, provider, ctes, depth + 1)?);
                 return Ok(());
             }
         };
         if child_dedup == parent_dedup {
-            collect_union_branches(left, provider, parent_dedup, out, depth + 1)?;
-            collect_union_branches(right, provider, parent_dedup, out, depth + 1)?;
+            collect_union_branches(left, provider, ctes, parent_dedup, out, depth + 1)?;
+            collect_union_branches(right, provider, ctes, parent_dedup, out, depth + 1)?;
             return Ok(());
         }
     }
-    out.push(lower_set_expr(expr, provider, depth + 1)?);
+    out.push(lower_set_expr(expr, provider, ctes, depth + 1)?);
     Ok(())
 }
 
@@ -1184,7 +1353,11 @@ fn usize_from_literal(e: &SqlExpr, kind: &str) -> BoltResult<usize> {
 /// Lower a `Select` into Scan [→ Filter] → (Project | Aggregate), optionally
 /// wrapped in `Filter` (for HAVING) and/or `Distinct` (for SELECT DISTINCT).
 /// Supports a single INNER JOIN in FROM.
-fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
+fn plan_select(
+    select: &Select,
+    provider: &dyn TableProvider,
+    ctes: &CteScope,
+) -> BoltResult<LogicalPlan> {
     reject_unsupported_select(select)?;
 
     // FROM: exactly one base table reference. JOINs hang off `twj.joins`.
@@ -1196,24 +1369,25 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     }
     let twj = &select.from[0];
 
-    // Build the base Scan from the first table reference. `scan_table` is
-    // the physical table name fed to the executor; `base_qualifier` is the
+    // Build the base plan from the first table reference. A plain table
+    // reference lowers to a `Scan`; a reference that names an in-scope CTE
+    // inlines (clones) the CTE's already-lowered plan. `base_qualifier` is the
     // alias (if any) the user-typed `qualifier.col` references must match.
-    let (scan_table, base_qualifier, scan_schema) =
-        lower_table_factor(&twj.relation, provider)?;
-    let schema = scan_schema.clone();
+    let (base_plan, base_qualifier, scan_schema) =
+        lower_table_factor(&twj.relation, provider, ctes)?;
     // The name resolver tracks the FROM-tree's `table.col` namespace so we
     // can resolve qualified references in WHERE / SELECT / GROUP BY / HAVING.
     // The ON-clause lowerer also consults the resolver (see `lower_join_on`
     // / `lower_join_side`) to reject same-side and unknown-table qualifiers
     // before the executor ever runs.
+    //
+    // The resolver also carries the subquery lowering context (provider + CTE
+    // scope) so a `(SELECT ...)` / `IN (SELECT ...)` in WHERE / SELECT can
+    // lower its own nested plan; see [`SubqueryCtx`].
     let mut resolver = NameResolver::empty();
+    resolver.ctx = Some(SubqueryCtx { provider, ctes });
     resolver.push_base(base_qualifier, &scan_schema);
-    let mut plan = LogicalPlan::Scan {
-        table: scan_table,
-        projection: None,
-        schema,
-    };
+    let mut plan = base_plan;
 
     // JOIN handling. Supports INNER / LEFT / RIGHT / FULL with an
     // ON predicate, plus CROSS (no ON clause). The join's right side must
@@ -1245,10 +1419,10 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
                 )));
             }
         };
-        let (rhs_scan_table, rhs_qualifier, rhs_schema) =
-            lower_table_factor(&join.relation, provider)?;
+        let (rhs_plan, rhs_qualifier, rhs_schema) =
+            lower_table_factor(&join.relation, provider, ctes)?;
         // Extend the resolver before we move `rhs_*` into the right-side
-        // Scan, so it sees the same rename rule as `join_combined_schema`
+        // plan, so it sees the same rename rule as `join_combined_schema`
         // applies to the actual plan output. The resolver records the
         // *qualifier* (alias if any) so user-typed `t.col` references in
         // WHERE / SELECT / ON resolve against the alias-name the user
@@ -1258,11 +1432,7 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
         // the ON-clause validator can distinguish "right side" (the
         // just-pushed qualifier) from "left side" (any earlier scope).
         let rhs_qualifier_for_on = rhs_qualifier;
-        let right_plan = LogicalPlan::Scan {
-            table: rhs_scan_table,
-            projection: None,
-            schema: rhs_schema,
-        };
+        let right_plan = rhs_plan;
         // CROSS has no ON predicate; everything else does. `lower_join_on`
         // is reused for the rest so non-equi forms keep a single
         // rejection path. The validator uses `resolver` + `rhs_table_for_on`
@@ -1663,24 +1833,30 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
     Ok(plan)
 }
 
-/// Lower a single `TableFactor` into `(scan_table, qualifier, schema)`.
+/// Lower a single `TableFactor` into `(base_plan, qualifier, schema)`.
 ///
-///   * `scan_table` is the underlying table name used for `LogicalPlan::Scan`
-///     and the provider's `schema(...)` lookup — i.e. the physical-side name.
+///   * `base_plan` is the [`LogicalPlan`] that produces the table's rows: a
+///     `LogicalPlan::Scan` for a registered base table, or the inlined
+///     (cloned) plan of an in-scope CTE when the reference names one.
 ///   * `qualifier` is the name that user-typed `qualifier.col` references
 ///     must match in the SELECT / WHERE / ON tree. When the user wrote
-///     `FROM mytable AS t` it is `t`; with no alias it equals `scan_table`.
-///     Once an alias shadows the underlying table, the bare table name is
+///     `FROM mytable AS t` it is `t`; with no alias it equals the table /
+///     CTE name. Once an alias shadows the underlying name, the bare name is
 ///     no longer in scope as a qualifier (standard SQL semantics).
+///   * `schema` is the `base_plan`'s output schema.
 ///
-/// Only bare table references are accepted (TVFs, version, hints, etc.
-/// remain rejected). Column-list aliases (`AS t (c1, c2)`) are rejected
-/// because they would also require renaming the table's schema fields,
-/// which the v0.5 frontend does not implement.
+/// Resolution order for a bare `TableFactor::Table` name: an in-scope CTE
+/// shadows a registered base table of the same name (standard SQL — the
+/// `WITH`-defined name wins within its scope). Only bare references are
+/// accepted (TVFs, version, hints, derived-table subqueries, etc. remain
+/// rejected). Column-list aliases (`AS t (c1, c2)`) are rejected because they
+/// would also require renaming the schema fields, which the frontend does not
+/// implement.
 fn lower_table_factor(
     tf: &TableFactor,
     provider: &dyn TableProvider,
-) -> BoltResult<(String, String, Schema)> {
+    ctes: &CteScope,
+) -> BoltResult<(LogicalPlan, String, Schema)> {
     match tf {
         TableFactor::Table {
             name,
@@ -1707,7 +1883,6 @@ fn lower_table_factor(
                 return Err(BoltError::Sql("unsupported: PARTITION".into()));
             }
             let table_name = single_ident_from_object_name(name)?;
-            let schema = provider.schema(&table_name)?;
             // Table aliases: accept `AS t` (or just `t`) but reject the
             // column-list form `AS t (c1, c2)` — we do not implement the
             // column renaming that would require.
@@ -1722,8 +1897,23 @@ fn lower_table_factor(
                     a.name.value.clone()
                 }
             };
-            Ok((table_name, qualifier, schema))
+            // CTE reference: inline the CTE's lowered plan. An in-scope CTE
+            // shadows a registered base table of the same name.
+            if let Some(cte_plan) = ctes.get(&table_name) {
+                let schema = cte_plan.schema()?;
+                return Ok((cte_plan.clone(), qualifier, schema));
+            }
+            let schema = provider.schema(&table_name)?;
+            let base_plan = LogicalPlan::Scan {
+                table: table_name,
+                projection: None,
+                schema: schema.clone(),
+            };
+            Ok((base_plan, qualifier, schema))
         }
+        TableFactor::Derived { .. } => Err(BoltError::Sql(
+            "unsupported: subquery in FROM (derived table); use a WITH/CTE instead".into(),
+        )),
         _ => Err(BoltError::Sql(
             "unsupported: only bare table references are allowed in FROM".into(),
         )),
@@ -1805,7 +1995,7 @@ struct JoinOnLowered {
 /// (route through WHERE instead) when both sides are qualified.
 fn lower_join_on(
     e: &SqlExpr,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     rhs_table: &str,
 ) -> BoltResult<JoinOnLowered> {
     let mut out = JoinOnLowered {
@@ -1846,7 +2036,7 @@ fn and_into_filter(slot: &mut Option<Expr>, conjunct: Expr) {
 fn collect_join_eq(
     e: &SqlExpr,
     out: &mut JoinOnLowered,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     rhs_table: &str,
     depth: usize,
 ) -> BoltResult<()> {
@@ -1993,7 +2183,7 @@ fn collect_join_eq(
 ///     pre-validation lenient behaviour.
 fn lower_join_side(
     e: &SqlExpr,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     rhs_table: &str,
 ) -> BoltResult<(Expr, JoinSide)> {
     match e {
@@ -2088,7 +2278,7 @@ fn lower_join_side(
 /// `lower_join_side` shape conflated both with `Err`.
 fn classify_join_side(
     e: &SqlExpr,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     rhs_table: &str,
 ) -> BoltResult<Option<(Expr, JoinSide)>> {
     match e {
@@ -2169,7 +2359,7 @@ fn single_ident_from_object_name(name: &ObjectName) -> BoltResult<String> {
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
 fn try_aggregate(
     e: &SqlExpr,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     depth: usize,
 ) -> BoltResult<Option<AggregateExpr>> {
     if depth > MAX_RECURSION_DEPTH {
@@ -2696,7 +2886,7 @@ fn single_window_arg(
 /// plan's schema is queried; we don't pre-check here.
 fn try_string_scalar_fn(
     func: &sqlparser::ast::Function,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     depth: usize,
 ) -> BoltResult<Option<Expr>> {
     if depth > MAX_RECURSION_DEPTH {
@@ -2809,7 +2999,7 @@ fn try_string_scalar_fn(
 /// True if `e` contains any aggregate function call (anywhere in the tree).
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
-fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<bool> {
+fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltResult<bool> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(BoltError::Sql(format!(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
@@ -2960,7 +3150,7 @@ fn push_aggregate_dedup(aggregates: &mut Vec<AggregateExpr>, agg: AggregateExpr)
 /// `MAX_RECURSION_DEPTH` is exceeded.
 fn extract_and_rewrite_aggregates(
     e: &SqlExpr,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     aggregates: &mut Vec<AggregateExpr>,
     depth: usize,
 ) -> BoltResult<Expr> {
@@ -3047,7 +3237,7 @@ fn extract_and_rewrite_aggregates(
 /// SQL nesting.
 fn lower_expr_in_having(
     e: &SqlExpr,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     agg_aliases: &HashMap<String, String>,
     depth: usize,
 ) -> BoltResult<Expr> {
@@ -3359,9 +3549,47 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
                 }
             }
             Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => stack.push(expr),
+            // A subquery references its own schema's columns, not HAVING's
+            // post-aggregate projection schema, so do not walk into it. The
+            // `InSubquery` probe is in HAVING's namespace, so check it.
+            Expr::ScalarSubquery(_) => {}
+            Expr::InSubquery { expr, .. } => stack.push(expr),
         }
     }
     Ok(())
+}
+
+/// Lower an uncorrelated subquery `query` into its own [`LogicalPlan`].
+///
+/// Pulls the subquery lowering context (provider + CTE scope) off `resolver`;
+/// a `resolver` built without that context (e.g. ORDER BY lowering) rejects
+/// subqueries with a clear message rather than panicking. Before lowering, the
+/// query is checked for correlation against the outer scope's columns and
+/// rejected if any outer column is referenced (see
+/// [`crate::plan::subquery::reject_if_correlated`]).
+fn lower_uncorrelated_subquery(
+    query: &Query,
+    resolver: &NameResolver<'_>,
+    depth: usize,
+) -> BoltResult<LogicalPlan> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    let ctx = resolver.ctx.ok_or_else(|| {
+        BoltError::Sql(
+            "subqueries are not supported in this position (only WHERE / SELECT)".into(),
+        )
+    })?;
+    // Reject correlated subqueries before lowering. The outer scope's column
+    // names let the detector name a precise offending reference.
+    let outer_columns = resolver.outer_column_names();
+    crate::plan::subquery::reject_if_correlated(query, &outer_columns, ctx.provider)?;
+    // Lower the subquery as a standalone query against the same provider and
+    // (inherited) CTE scope. It is uncorrelated, so it needs none of the outer
+    // resolver's table scopes.
+    plan_query(query, ctx.provider, ctx.ctes, depth + 1)
 }
 
 /// Lower a scalar SQL expression into our `Expr`. Aggregates are rejected here —
@@ -3375,7 +3603,7 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
 /// enforced by [`join_combined_schema`](crate::plan::logical_plan::join_combined_schema).
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
-fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<Expr> {
+fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltResult<Expr> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(BoltError::Sql(format!(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
@@ -3488,6 +3716,34 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<
         SqlExpr::InList { expr, list, negated } => {
             lower_in_list(expr, list, *negated, resolver, depth + 1)
         }
+        // Uncorrelated scalar subquery: `(SELECT max(y) FROM t2)`. Lower the
+        // subquery to its own `LogicalPlan` (rejecting correlation) and wrap
+        // it in `Expr::ScalarSubquery`. Type-checking (single output column)
+        // happens later in `Expr::dtype`.
+        SqlExpr::Subquery(query) => {
+            let plan = lower_uncorrelated_subquery(query, resolver, depth + 1)?;
+            Ok(Expr::ScalarSubquery(Box::new(plan)))
+        }
+        // Uncorrelated `x [NOT] IN (SELECT ...)`. The probe `expr` lowers
+        // against the outer scope; the subquery lowers to its own plan.
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let probe = lower_expr(expr, resolver, depth + 1)?;
+            let plan = lower_uncorrelated_subquery(subquery, resolver, depth + 1)?;
+            Ok(Expr::InSubquery {
+                expr: Box::new(probe),
+                subquery: Box::new(plan),
+                negated: *negated,
+            })
+        }
+        // EXISTS / NOT EXISTS would need a dedicated boolean-existence node;
+        // not yet supported. Reject cleanly rather than mis-lowering.
+        SqlExpr::Exists { .. } => Err(BoltError::Sql(
+            "unsupported: EXISTS subquery (only scalar and IN subqueries are supported)".into(),
+        )),
         // `expr BETWEEN low AND high`  →  `(expr >= low) AND (expr <= high)`
         // `expr NOT BETWEEN low AND high`  →  `(expr <  low) OR  (expr >  high)`
         SqlExpr::Between {
@@ -3810,7 +4066,7 @@ fn collect_scalar_function_args<'a>(
 ///   * `COALESCE(a, b)` (two args) → one WHEN/THEN branch + ELSE.
 fn lower_coalesce(
     args: &[&SqlExpr],
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     depth: usize,
 ) -> BoltResult<Expr> {
     if depth > MAX_RECURSION_DEPTH {
@@ -3864,7 +4120,7 @@ fn lower_coalesce(
 /// failure later.
 fn lower_nullif(
     args: &[&SqlExpr],
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     depth: usize,
 ) -> BoltResult<Expr> {
     if depth > MAX_RECURSION_DEPTH {
@@ -3905,7 +4161,7 @@ fn lower_in_list(
     expr: &SqlExpr,
     list: &[SqlExpr],
     negated: bool,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     depth: usize,
 ) -> BoltResult<Expr> {
     if depth > MAX_RECURSION_DEPTH {
@@ -3957,7 +4213,7 @@ fn lower_case(
     conditions: &[SqlExpr],
     results: &[SqlExpr],
     else_result: Option<&SqlExpr>,
-    resolver: &NameResolver,
+    resolver: &NameResolver<'_>,
     depth: usize,
 ) -> BoltResult<Expr> {
     if depth > MAX_RECURSION_DEPTH {
@@ -4393,7 +4649,7 @@ fn parse_number(n: &str) -> BoltResult<Expr> {
 /// even though `2^63` does not fit in a positive `i64`.
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
-fn negate_expr(e: &SqlExpr, resolver: &NameResolver, depth: usize) -> BoltResult<Expr> {
+fn negate_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltResult<Expr> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(BoltError::Sql(format!(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
@@ -5505,6 +5761,8 @@ mod wave7_tests {
                         Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
                             stack.push(expr)
                         }
+                        Expr::ScalarSubquery(_) => {}
+                        Expr::InSubquery { expr, .. } => stack.push(expr),
                         Expr::Literal(_) => {}
                     }
                 }
