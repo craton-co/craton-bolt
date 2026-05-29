@@ -804,6 +804,8 @@ pub enum KernelSpecKind {
     /// One of the compaction-pipeline kernels; see
     /// [`CompactionKernelSpec`].
     Compaction(CompactionKernelSpec),
+}
+
 /// One output column of a [`PhysicalPlan::StringLength`] projection: either a
 /// passthrough of a source column or the byte length of a (dictionary-encoded)
 /// Utf8 column.
@@ -3075,6 +3077,8 @@ fn expr_contains_concat(expr: &Expr) -> bool {
 // `LENGTH` — it is fixed-width `Int32` output and the lowest-risk path.
 fn expr_contains_scalar_fn(expr: &Expr) -> bool {
     match expr {
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => expr_contains_scalar_fn(expr),
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
         Expr::ScalarFn { .. } => true,
         Expr::Binary { left, right, .. } => {
             expr_contains_scalar_fn(left) || expr_contains_scalar_fn(right)
@@ -3103,6 +3107,8 @@ fn expr_contains_scalar_fn(expr: &Expr) -> bool {
 fn first_scalar_fn_kind(exprs: &[Expr]) -> Option<ScalarFnKind> {
     fn walk(e: &Expr) -> Option<ScalarFnKind> {
         match e {
+            Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => walk(expr),
+            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => None,
             Expr::ScalarFn { kind, .. } => Some(*kind),
             Expr::Binary { left, right, .. } => walk(left).or_else(|| walk(right)),
             Expr::Unary { operand, .. } => walk(operand),

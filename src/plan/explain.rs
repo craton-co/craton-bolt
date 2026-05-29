@@ -334,6 +334,9 @@ fn format_kernel(kernel: &KernelSpec) -> String {
 fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
     indent(out, depth);
     match plan {
+        PhysicalPlan::StringLength { table, .. } => {
+            let _ = writeln!(out, "StringLength: table={table}");
+        }
         PhysicalPlan::Window { input, .. } => {
             let _ = writeln!(out, "Window");
             format_physical_into(input, depth + 1, out);
