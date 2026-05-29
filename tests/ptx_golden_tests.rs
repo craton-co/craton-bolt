@@ -949,22 +949,6 @@ fn golden_hash_join_probe_kernel_smoke() {
 // (the entire point), the SCALAR_STEP wrap-edge handler (obstacle 1), and
 // the empty-check-before-second-lane ordering (obstacle 3).
 
-/// Local helper: assert `needle_a` appears strictly before `needle_b` in
-/// `haystack`. (Tiled-probe variant.)
-fn assert_pre_before_post(haystack: &str, needle_a: &str, needle_b: &str) {
-    let pos_a = haystack.find(needle_a).unwrap_or_else(|| {
-        panic!("needle_a `{needle_a}` not found in:\n{haystack}")
-    });
-    let pos_b = haystack.find(needle_b).unwrap_or_else(|| {
-        panic!("needle_b `{needle_b}` not found in:\n{haystack}")
-    });
-    assert!(
-        pos_a < pos_b,
-        "expected `{needle_a}` before `{needle_b}` \
-         (pos_a={pos_a}, pos_b={pos_b})\n{haystack}"
-    );
-}
-
 #[test]
 fn golden_hash_join_probe_tiled_kernel_smoke() {
     use craton_bolt::jit::hash_join_kernel::compile_probe_kernel_tiled;
@@ -1106,8 +1090,22 @@ fn probe_soa_ptx_speculative_load_before_atom_add() {
         "SoA probe must emit speculative ld.acquire.gpu.u32 before atom.add\n{ptx}"
     );
     assert_appears_before(&ptx, "ld.acquire.gpu.u32", "atom.global.add.u32");
-    // The pre-check's branch must hit a bail label (DONE).
-    assert_appears_before(&ptx, "ld.acquire.gpu.u32", "bra DONE");
+    // The pre-check's OWN branch must bail to DONE: a `bra DONE` must appear
+    // between the speculative load and the atom.add it guards. (Asserting the
+    // load merely precedes *some* `bra DONE` would wrongly match the earlier
+    // `tid >= n_probe` thread-bounds early-exit, which always sits before the
+    // probe loop — making the check vacuous.)
+    let load = ptx
+        .find("ld.acquire.gpu.u32")
+        .expect("missing speculative load");
+    let atom = ptx
+        .find("atom.global.add.u32")
+        .expect("missing atom.global.add.u32");
+    assert!(
+        ptx[load..atom].contains("bra DONE"),
+        "pre-check must branch to DONE between the speculative load and the \
+         atom.global.add.u32 it guards\n{ptx}"
+    );
 }
 
 #[test]
