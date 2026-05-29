@@ -4334,6 +4334,50 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
                 args,
             })
         }
+        // `TRIM([BOTH|LEADING|TRAILING] [chars] FROM s)` and `TRIM(s)`:
+        // sqlparser surfaces these as the dedicated `SqlExpr::Trim` variant
+        // (not a `Function`). We map the trim side to one of the three
+        // `ScalarFnKind::Trim*` variants (default BOTH) and lower the source
+        // plus optional trim-characters string into the `ScalarFn` args. The
+        // comma form `TRIM(s, 'chars')` populates `trim_characters`; we accept
+        // a single trim-string there for parity with the `... FROM s` form.
+        SqlExpr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            use sqlparser::ast::TrimWhereField;
+            let kind = match trim_where {
+                None | Some(TrimWhereField::Both) => ScalarFnKind::TrimBoth,
+                Some(TrimWhereField::Leading) => ScalarFnKind::TrimLeading,
+                Some(TrimWhereField::Trailing) => ScalarFnKind::TrimTrailing,
+            };
+            let s = lower_expr(expr, resolver, depth + 1)?;
+            let mut args = vec![s];
+            // `TRIM(chars FROM s)` form.
+            if let Some(chars) = trim_what {
+                args.push(lower_expr(chars, resolver, depth + 1)?);
+            }
+            // `TRIM(s, 'chars')` (BigQuery/Snowflake) form: a list of trim
+            // strings. We support exactly one; more than one is rejected.
+            if let Some(chars_list) = trim_characters {
+                if trim_what.is_some() {
+                    return Err(BoltError::Sql(
+                        "TRIM: cannot combine `chars FROM s` with the comma `(s, chars)` form"
+                            .into(),
+                    ));
+                }
+                if chars_list.len() != 1 {
+                    return Err(BoltError::Sql(format!(
+                        "TRIM: expected exactly one trim-characters argument, got {}",
+                        chars_list.len()
+                    )));
+                }
+                args.push(lower_expr(&chars_list[0], resolver, depth + 1)?);
+            }
+            Ok(Expr::ScalarFn { kind, args })
+        }
         // v0.6 / M4: typed-string literals — `DATE '2024-01-01'`,
         // `TIMESTAMP '2024-01-01 00:00:00'`. Other typed strings (TIME,
         // INTERVAL, ...) are not yet supported and surface the generic
@@ -6660,5 +6704,140 @@ mod like_tests {
             }
             other => panic!("expected Expr::Like, got {other:?}"),
         }
+    }
+}
+
+/// SUBSTRING / TRIM frontend parse + lower coverage. Execution is covered by
+/// the host-eval unit tests in `exec::string_ops_extended` / `exec::expr_agg`
+/// and the `#[ignore]` e2e tests in `tests/e2e_tests.rs`.
+#[cfg(test)]
+mod string_fn_tests {
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field, ScalarFnKind};
+
+    fn s_provider() -> MemTableProvider {
+        let t = Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]);
+        MemTableProvider::new().with_table("t", t)
+    }
+
+    /// First SELECT-list expr of a top-level `Project`, peeled of aliases.
+    fn first_select_expr(plan: &LogicalPlan) -> Expr {
+        let exprs = match plan {
+            LogicalPlan::Project { exprs, .. } => exprs,
+            other => panic!("expected Project at top, got {other:?}"),
+        };
+        let mut e = &exprs[0];
+        while let Expr::Alias(inner, _) = e {
+            e = inner;
+        }
+        e.clone()
+    }
+
+    #[test]
+    fn substring_from_for_parses_to_scalar_fn() {
+        let plan = parse("SELECT SUBSTRING(s FROM 2 FOR 3) FROM t", &s_provider())
+            .expect("SUBSTRING ... FROM ... FOR must parse");
+        match first_select_expr(&plan) {
+            Expr::ScalarFn { kind, args } => {
+                assert_eq!(kind, ScalarFnKind::Substring);
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected ScalarFn(Substring), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substring_comma_two_arg_parses() {
+        let plan = parse("SELECT SUBSTRING(s, 2) FROM t", &s_provider())
+            .expect("SUBSTRING(s, i) must parse");
+        match first_select_expr(&plan) {
+            Expr::ScalarFn { kind, args } => {
+                assert_eq!(kind, ScalarFnKind::Substring);
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ScalarFn(Substring), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trim_default_is_both() {
+        let plan =
+            parse("SELECT TRIM(s) FROM t", &s_provider()).expect("TRIM(s) must parse");
+        match first_select_expr(&plan) {
+            Expr::ScalarFn { kind, args } => {
+                assert_eq!(kind, ScalarFnKind::TrimBoth);
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected ScalarFn(TrimBoth), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trim_leading_trailing_both_sides() {
+        for (sql, expect) in [
+            ("SELECT TRIM(LEADING FROM s) FROM t", ScalarFnKind::TrimLeading),
+            (
+                "SELECT TRIM(TRAILING FROM s) FROM t",
+                ScalarFnKind::TrimTrailing,
+            ),
+            ("SELECT TRIM(BOTH FROM s) FROM t", ScalarFnKind::TrimBoth),
+        ] {
+            let plan = parse(sql, &s_provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            match first_select_expr(&plan) {
+                Expr::ScalarFn { kind, args } => {
+                    assert_eq!(kind, expect, "for {sql}");
+                    assert_eq!(args.len(), 1, "for {sql}");
+                }
+                other => panic!("expected ScalarFn, got {other:?} for {sql}"),
+            }
+        }
+    }
+
+    #[test]
+    fn trim_custom_chars_from_form() {
+        let plan = parse("SELECT TRIM(LEADING 'xy' FROM s) FROM t", &s_provider())
+            .expect("TRIM(LEADING 'xy' FROM s) must parse");
+        match first_select_expr(&plan) {
+            Expr::ScalarFn { kind, args } => {
+                assert_eq!(kind, ScalarFnKind::TrimLeading);
+                assert_eq!(args.len(), 2, "source + trim chars");
+                assert!(matches!(args[1], Expr::Literal(Literal::Utf8(ref s)) if s == "xy"));
+            }
+            other => panic!("expected ScalarFn(TrimLeading), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substring_and_trim_lower_to_host_project() {
+        // Both functions have no GPU producer; they must lower to the
+        // host-side PhysicalPlan::Project (not be rejected).
+        for sql in [
+            "SELECT SUBSTRING(s, 2, 3) FROM t",
+            "SELECT TRIM(s) FROM t",
+            "SELECT TRIM(TRAILING '-' FROM s) FROM t",
+        ] {
+            let plan = parse(sql, &s_provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let phys = lower(&plan).unwrap_or_else(|e| panic!("lower {sql}: {e}"));
+            assert!(
+                matches!(phys, PhysicalPlan::Project { .. }),
+                "expected host PhysicalPlan::Project for {sql}, got {phys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trim_type_error_on_non_utf8() {
+        // TRIM over an Int64 column must surface a Type error at schema check.
+        let plan = parse("SELECT TRIM(v) FROM t", &s_provider())
+            .expect("TRIM(v) parses; type-check happens on schema()");
+        let err = plan.schema().expect_err("TRIM(Int64) must type-error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("TRIM") && msg.contains("Utf8"),
+            "expected TRIM Utf8 type error, got: {msg}"
+        );
     }
 }

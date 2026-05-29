@@ -3,11 +3,13 @@
 //! Parser + type-check tests for the v0.5 SQL string scalar functions:
 //! `UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`.
 //!
-//! Scope (v0.5 MVP): the SQL frontend recognises these calls and lowers
-//! them into `Expr::ScalarFn`; the logical plan's type-checker validates
-//! their argument shapes; the physical-plan boundary rejects them cleanly
-//! with a `Plan` error ("string scalar function ... is not yet lowered to
-//! GPU"). Execution wiring is a follow-up.
+//! Scope: the SQL frontend recognises these calls and lowers them into
+//! `Expr::ScalarFn`; the logical plan's type-checker validates their argument
+//! shapes. Lowering then routes each to its execution path: LENGTH →
+//! `StringLength` (GPU), UPPER/LOWER → `StringProject` (GPU), and
+//! SUBSTRING/TRIM → the host-side `PhysicalPlan::Project`
+//! (`expr_agg::eval_expr`). CONCAT and any not-yet-wired shape are still
+//! rejected at the physical-plan boundary with a `Plan` error.
 //!
 //! These tests pin:
 //!   * Successful parse+lower of each function (logical-plan shape only —
@@ -383,12 +385,28 @@ fn lower_with_passthrough_column_lowers_to_string_project() {
 }
 
 #[test]
-fn substring_still_rejected_not_string_project() {
-    // SUBSTRING is a variable-width producer left on the host fallback with a
-    // TODO; it must NOT route to the GPU StringProject (only UPPER/LOWER do).
+fn substring_lowers_to_host_project_not_gpu() {
+    // SUBSTRING is a variable-width producer with no GPU kernel wired into the
+    // executor yet; it must NOT route to the GPU StringProject (only UPPER/LOWER
+    // do). Instead it now lowers to the host-side `PhysicalPlan::Project` whose
+    // executor evaluates it via `expr_agg::eval_expr`.
     let plan = parse("SELECT SUBSTRING(s, 1, 2) FROM txt").expect("SUBSTRING parses");
-    let res = lower_physical(&plan);
-    assert!(res.is_err(), "SUBSTRING must still be rejected at lowering");
+    let phys = lower_physical(&plan).expect("SUBSTRING must lower to a host Project");
+    assert!(
+        matches!(phys, PhysicalPlan::Project { .. }),
+        "SUBSTRING must lower to host PhysicalPlan::Project, got {phys:?}"
+    );
+}
+
+#[test]
+fn trim_lowers_to_host_project() {
+    // TRIM has no GPU kernel; like SUBSTRING it routes to the host Project.
+    let plan = parse("SELECT TRIM(s) FROM txt").expect("TRIM parses");
+    let phys = lower_physical(&plan).expect("TRIM must lower to a host Project");
+    assert!(
+        matches!(phys, PhysicalPlan::Project { .. }),
+        "TRIM must lower to host PhysicalPlan::Project, got {phys:?}"
+    );
 }
 
 // ---- Unknown function names still rejected ---------------------------------
@@ -601,4 +619,77 @@ fn upper_preserves_nulls_on_gpu() {
     assert_eq!(col.value(0), "AB");
     assert!(col.is_null(1), "NULL row must stay NULL");
     assert_eq!(col.value(2), "CD");
+}
+
+// ---- SUBSTRING / TRIM end-to-end (host-side projection) --------------------
+//
+// SUBSTRING and TRIM have no GPU producer wired into the executor yet (see the
+// TODO(string-fn-gpu) markers); they lower to the host-side
+// `PhysicalPlan::Project` whose executor evaluates them via
+// `expr_agg::eval_expr`. These tests still need a registered table (and thus a
+// CUDA context for the scan), so they are gated like the rest of the suite.
+
+#[test]
+#[ignore = "gpu:string"]
+fn substring_runs_end_to_end() {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("CUDA ctx");
+    let s = StringArray::from(vec!["hello", "world", "abcdef"]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(s)]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT SUBSTRING(s, 2, 3) FROM t")
+        .expect("execute SELECT SUBSTRING(s,2,3)");
+    let out = h.record_batch();
+    let col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("SUBSTRING output is Utf8");
+    let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    // 1-based start=2, length=3.
+    assert_eq!(got, vec!["ell", "orl", "bcd"]);
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn trim_runs_end_to_end() {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("CUDA ctx");
+    let s = StringArray::from(vec!["  hi  ", "nochange", "  pad"]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(s)]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let h = engine
+        .sql("SELECT TRIM(s) FROM t")
+        .expect("execute SELECT TRIM(s)");
+    let out = h.record_batch();
+    let col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("TRIM output is Utf8");
+    let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert_eq!(got, vec!["hi", "nochange", "pad"]);
 }

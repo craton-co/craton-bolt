@@ -423,6 +423,15 @@ pub enum ScalarFnKind {
     Substring,
     /// `CONCAT(s1, s2, ...)` — concatenate two or more strings.
     Concat,
+    /// `TRIM([BOTH] [chars] FROM s)` — strip `chars` (default: whitespace)
+    /// from BOTH ends of `s`. Args: `[s]` or `[s, chars]`.
+    TrimBoth,
+    /// `TRIM(LEADING [chars] FROM s)` — strip `chars` (default: whitespace)
+    /// from the START of `s`. Args: `[s]` or `[s, chars]`.
+    TrimLeading,
+    /// `TRIM(TRAILING [chars] FROM s)` — strip `chars` (default: whitespace)
+    /// from the END of `s`. Args: `[s]` or `[s, chars]`.
+    TrimTrailing,
 }
 
 impl ScalarFnKind {
@@ -435,6 +444,9 @@ impl ScalarFnKind {
             ScalarFnKind::Length => "LENGTH",
             ScalarFnKind::Substring => "SUBSTRING",
             ScalarFnKind::Concat => "CONCAT",
+            ScalarFnKind::TrimBoth
+            | ScalarFnKind::TrimLeading
+            | ScalarFnKind::TrimTrailing => "TRIM",
         }
     }
 }
@@ -1226,6 +1238,25 @@ fn scalar_fn_dtype(
             if arg_types.len() < 2 {
                 return Err(BoltError::Type(format!(
                     "{name} expects at least 2 arguments, got {}",
+                    arg_types.len()
+                )));
+            }
+            for (i, t) in arg_types.iter().enumerate() {
+                if *t != DataType::Utf8 {
+                    return Err(BoltError::Type(format!(
+                        "{name} argument {} must be Utf8, got {:?}",
+                        i + 1,
+                        t
+                    )));
+                }
+            }
+            Ok(DataType::Utf8)
+        }
+        ScalarFnKind::TrimBoth | ScalarFnKind::TrimLeading | ScalarFnKind::TrimTrailing => {
+            // TRIM(s) or TRIM([side] chars FROM s): 1 or 2 Utf8 args -> Utf8.
+            if arg_types.len() != 1 && arg_types.len() != 2 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects 1 or 2 Utf8 arguments (string [, trim chars]), got {}",
                     arg_types.len()
                 )));
             }

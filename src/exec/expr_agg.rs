@@ -130,7 +130,9 @@
 use std::collections::HashMap;
 
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{AggregateExpr, BinaryOp, DataType, Expr, Literal, UnaryOp};
+use crate::plan::logical_plan::{
+    AggregateExpr, BinaryOp, DataType, Expr, Literal, ScalarFnKind, UnaryOp,
+};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -337,19 +339,13 @@ fn eval_inner(
              plan-time lowering should have rejected this expression"
                 .into(),
         )),
-        // v0.5/v0.7: parser + type-check land, host-side execution wiring
-        // is a follow-up. The physical-plan boundary (`lower_depth`) rejects
-        // any plan containing `Expr::ScalarFn` outright with a per-kind
-        // "not yet lowered to GPU: <blocker>" Plan error, so reaching this
-        // arm means a future caller built a Filter / Project whose tree
-        // contains a ScalarFn without going through `lower()`. Surface a
-        // clear `Plan` error mirroring the boundary message rather than
-        // silently producing wrong output.
-        Expr::ScalarFn { kind, .. } => Err(BoltError::Plan(format!(
-            "expr_agg: string scalar function {} is not yet evaluated host-side; \
-             the physical-plan boundary rejects it before lowering",
-            kind.sql_name()
-        ))),
+        // String scalar functions evaluated host-side. SUBSTRING and TRIM are
+        // wired here (the physical-plan boundary routes Projects carrying them
+        // to `PhysicalPlan::Project`, whose executor calls `eval_expr`).
+        // UPPER/LOWER/LENGTH have dedicated GPU producers and CONCAT is handled
+        // as `BinaryOp::Concat`; if one of those reaches here it means a caller
+        // bypassed lowering, so we surface a clear `Plan` error.
+        Expr::ScalarFn { kind, args } => eval_scalar_fn(*kind, args, env, n_rows),
         // v0.7 date-scalar-fns: EXTRACT / DATE_TRUNC have a standalone GPU
         // codegen module but no host evaluator yet. The physical-plan boundary
         // rejects them before execution; reaching here means a future caller
@@ -426,6 +422,155 @@ fn eval_like(
         })
         .collect();
     Ok(HostColumn::Bool(out))
+}
+
+/// Evaluate a string scalar function host-side.
+///
+/// Currently wired: `SUBSTRING` (`ScalarFnKind::Substring`) and `TRIM`
+/// (`ScalarFnKind::Trim{Both,Leading,Trailing}`). UPPER/LOWER/LENGTH have
+/// dedicated GPU producers and CONCAT is lowered to `BinaryOp::Concat`; if one
+/// of those reaches here, lowering was bypassed and we surface a `Plan` error.
+///
+/// All operands are evaluated to per-row columns so column-valued arguments
+/// (e.g. `SUBSTRING(s, start_col, len_col)`) work uniformly with the common
+/// literal case. NULL in the source string (and, for SUBSTRING, NULL in a
+/// position argument) propagates as NULL.
+fn eval_scalar_fn(
+    kind: ScalarFnKind,
+    args: &[Expr],
+    env: &ColumnEnv<'_>,
+    n_rows: usize,
+) -> BoltResult<HostColumn> {
+    use crate::exec::string_ops_extended::{substring_str, trim_str, TrimSide};
+    match kind {
+        ScalarFnKind::Substring => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(BoltError::Plan(format!(
+                    "expr_agg: SUBSTRING expects 2 or 3 args, got {}",
+                    args.len()
+                )));
+            }
+            let src = eval_utf8_arg(&args[0], env, n_rows, "SUBSTRING")?;
+            let start = eval_i64_arg(&args[1], env, n_rows, "SUBSTRING")?;
+            // Length defaults to "to the end" (i32::MAX) when the 2-arg form
+            // is used. Each row's length is the per-row value, clamped to i32.
+            let length: Vec<Option<i64>> = if args.len() == 3 {
+                eval_i64_arg(&args[2], env, n_rows, "SUBSTRING")?
+            } else {
+                vec![Some(i32::MAX as i64); n_rows]
+            };
+            let mut out: Vec<Option<String>> = Vec::with_capacity(n_rows);
+            for i in 0..n_rows {
+                // NULL source OR NULL position -> NULL.
+                match (&src[i], start[i], length[i]) {
+                    (Some(s), Some(st), Some(ln)) => {
+                        let st_i32 = clamp_i64_to_i32(st);
+                        let ln_i32 = clamp_i64_to_i32(ln);
+                        out.push(Some(substring_str(s, st_i32, ln_i32)));
+                    }
+                    _ => out.push(None),
+                }
+            }
+            Ok(HostColumn::Utf8(out))
+        }
+        ScalarFnKind::TrimBoth | ScalarFnKind::TrimLeading | ScalarFnKind::TrimTrailing => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(BoltError::Plan(format!(
+                    "expr_agg: TRIM expects 1 or 2 args, got {}",
+                    args.len()
+                )));
+            }
+            let side = match kind {
+                ScalarFnKind::TrimLeading => TrimSide::Leading,
+                ScalarFnKind::TrimTrailing => TrimSide::Trailing,
+                _ => TrimSide::Both,
+            };
+            let src = eval_utf8_arg(&args[0], env, n_rows, "TRIM")?;
+            let chars: Option<Vec<Option<String>>> = if args.len() == 2 {
+                Some(eval_utf8_arg(&args[1], env, n_rows, "TRIM")?)
+            } else {
+                None
+            };
+            let mut out: Vec<Option<String>> = Vec::with_capacity(n_rows);
+            for i in 0..n_rows {
+                let s = match &src[i] {
+                    Some(s) => s,
+                    None => {
+                        out.push(None);
+                        continue;
+                    }
+                };
+                match &chars {
+                    // A NULL trim-character set yields NULL (standard SQL: any
+                    // NULL operand to the scalar function propagates).
+                    Some(c) => match &c[i] {
+                        Some(cset) => out.push(Some(trim_str(s, side, Some(cset)))),
+                        None => out.push(None),
+                    },
+                    None => out.push(Some(trim_str(s, side, None))),
+                }
+            }
+            Ok(HostColumn::Utf8(out))
+        }
+        // These never legitimately reach the host evaluator (see fn docs).
+        ScalarFnKind::Upper
+        | ScalarFnKind::Lower
+        | ScalarFnKind::Length
+        | ScalarFnKind::Concat => Err(BoltError::Plan(format!(
+            "expr_agg: string scalar function {} is not evaluated host-side; \
+             it has a dedicated lowering path",
+            kind.sql_name()
+        ))),
+    }
+}
+
+/// Evaluate `arg` to a `Utf8` column of length `n_rows`. Errors if the result
+/// is not Utf8. `fname` is the SQL function name used in error messages.
+fn eval_utf8_arg(
+    arg: &Expr,
+    env: &ColumnEnv<'_>,
+    n_rows: usize,
+    fname: &str,
+) -> BoltResult<Vec<Option<String>>> {
+    match eval_inner(arg, env, n_rows)? {
+        HostColumn::Utf8(v) => Ok(v),
+        other => Err(BoltError::Type(format!(
+            "expr_agg: {fname} requires a Utf8 argument, got {:?}",
+            other.dtype()
+        ))),
+    }
+}
+
+/// Evaluate `arg` to an `i64`-valued column of length `n_rows`, widening
+/// narrower integer columns. Errors on non-integer dtypes.
+fn eval_i64_arg(
+    arg: &Expr,
+    env: &ColumnEnv<'_>,
+    n_rows: usize,
+    fname: &str,
+) -> BoltResult<Vec<Option<i64>>> {
+    match eval_inner(arg, env, n_rows)? {
+        HostColumn::I64(v) => Ok(v),
+        HostColumn::I32(v) => Ok(v.into_iter().map(|c| c.map(|x| x as i64)).collect()),
+        other => Err(BoltError::Type(format!(
+            "expr_agg: {fname} position argument must be an integer, got {:?}",
+            other.dtype()
+        ))),
+    }
+}
+
+/// Saturating cast of an `i64` position/length to `i32` (the domain the
+/// byte-substring helper works in). Values outside the `i32` range clamp to
+/// the nearest bound, which is benign: a huge positive length means "to the
+/// end" and a huge negative one means "empty".
+fn clamp_i64_to_i32(v: i64) -> i32 {
+    if v > i32::MAX as i64 {
+        i32::MAX
+    } else if v < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        v as i32
+    }
 }
 
 /// Look up `name` in `env` and clone the referenced column. Validates the
@@ -1683,5 +1828,126 @@ mod tests {
             HostColumn::Bool(v) => assert_eq!(v, vec![Some(false), Some(false)]),
             other => panic!("expected Bool, got {:?}", other.dtype()),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // SUBSTRING / TRIM host evaluation (Expr::ScalarFn).
+    // -----------------------------------------------------------------
+
+    use crate::plan::logical_plan::ScalarFnKind;
+
+    fn scalar_fn(kind: ScalarFnKind, args: Vec<Expr>) -> Expr {
+        Expr::ScalarFn { kind, args }
+    }
+
+    fn utf8(strs: &[Option<&str>]) -> HostColumn {
+        HostColumn::Utf8(strs.iter().map(|o| o.map(|s| s.to_string())).collect())
+    }
+
+    #[test]
+    fn substring_three_arg_over_column() {
+        let s = utf8(&[Some("hello"), Some("world"), None]);
+        let env = env_of(&[("s", &s)]);
+        let expr = scalar_fn(
+            ScalarFnKind::Substring,
+            vec![col("s"), lit(2i64), lit(3i64)],
+        );
+        let out = eval_expr(&expr, &env, DataType::Utf8, 3).unwrap();
+        match out {
+            HostColumn::Utf8(v) => assert_eq!(
+                v,
+                vec![Some("ell".to_string()), Some("orl".to_string()), None]
+            ),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    #[test]
+    fn substring_two_arg_goes_to_end() {
+        let s = utf8(&[Some("hello")]);
+        let env = env_of(&[("s", &s)]);
+        let expr = scalar_fn(ScalarFnKind::Substring, vec![col("s"), lit(3i64)]);
+        let out = eval_expr(&expr, &env, DataType::Utf8, 1).unwrap();
+        match out {
+            HostColumn::Utf8(v) => assert_eq!(v, vec![Some("llo".to_string())]),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    #[test]
+    fn substring_null_position_is_null() {
+        let s = utf8(&[Some("hello")]);
+        let env = env_of(&[("s", &s)]);
+        let expr = scalar_fn(
+            ScalarFnKind::Substring,
+            vec![col("s"), Expr::Literal(Literal::Null), lit(2i64)],
+        );
+        let out = eval_expr(&expr, &env, DataType::Utf8, 1).unwrap();
+        match out {
+            HostColumn::Utf8(v) => assert_eq!(v, vec![None]),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    #[test]
+    fn trim_both_default_whitespace() {
+        let s = utf8(&[Some("  hi  "), Some("nope"), None]);
+        let env = env_of(&[("s", &s)]);
+        let expr = scalar_fn(ScalarFnKind::TrimBoth, vec![col("s")]);
+        let out = eval_expr(&expr, &env, DataType::Utf8, 3).unwrap();
+        match out {
+            HostColumn::Utf8(v) => assert_eq!(
+                v,
+                vec![Some("hi".to_string()), Some("nope".to_string()), None]
+            ),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    #[test]
+    fn trim_leading_and_trailing_custom_chars() {
+        let s = utf8(&[Some("xxhixx")]);
+        let env = env_of(&[("s", &s)]);
+
+        let lead = eval_expr(
+            &scalar_fn(ScalarFnKind::TrimLeading, vec![col("s"), lit_str("x")]),
+            &env,
+            DataType::Utf8,
+            1,
+        )
+        .unwrap();
+        match lead {
+            HostColumn::Utf8(v) => assert_eq!(v, vec![Some("hixx".to_string())]),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+
+        let trail = eval_expr(
+            &scalar_fn(ScalarFnKind::TrimTrailing, vec![col("s"), lit_str("x")]),
+            &env,
+            DataType::Utf8,
+            1,
+        )
+        .unwrap();
+        match trail {
+            HostColumn::Utf8(v) => assert_eq!(v, vec![Some("xxhi".to_string())]),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    #[test]
+    fn trim_null_source_is_null() {
+        let s = utf8(&[None]);
+        let env = env_of(&[("s", &s)]);
+        let expr = scalar_fn(ScalarFnKind::TrimBoth, vec![col("s")]);
+        let out = eval_expr(&expr, &env, DataType::Utf8, 1).unwrap();
+        match out {
+            HostColumn::Utf8(v) => assert_eq!(v, vec![None]),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Helper: build a Utf8 literal expression.
+    fn lit_str(s: &str) -> Expr {
+        Expr::Literal(Literal::Utf8(s.to_string()))
     }
 }

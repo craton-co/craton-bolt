@@ -157,6 +157,65 @@ fn sql_substring(s: &str, start_1based: i32, length: i32) -> String {
     s[byte_start..byte_end].to_string()
 }
 
+/// Per-string `SUBSTRING(s, start, length)` over BYTES — public wrapper around
+/// the internal `sql_substring` helper so the host expression evaluator
+/// (`expr_agg::eval_expr`) can apply SUBSTRING directly to a `Vec<Option<String>>`
+/// column without round-tripping through a `DictionaryColumn`. See module docs
+/// for the byte/UTF-8 boundary semantics.
+///
+/// TODO(string-fn-gpu): the GPU two-pass SUBSTRING producer exists in
+/// `jit::string_kernel` but is not wired into the executor; this host path is
+/// the supported one.
+pub fn substring_str(s: &str, start_1based: i32, length: i32) -> String {
+    sql_substring(s, start_1based, length)
+}
+
+/// Which end(s) a TRIM operation strips from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimSide {
+    /// Strip from BOTH ends (default for `TRIM`).
+    Both,
+    /// Strip from the START only (`TRIM(LEADING ...)`).
+    Leading,
+    /// Strip from the END only (`TRIM(TRAILING ...)`).
+    Trailing,
+}
+
+/// Pure-host `TRIM`. Strips `side` end(s) of `s`.
+///
+/// * `chars = None`: strip ASCII/Unicode whitespace (Rust's `char::is_whitespace`,
+///   matching the conventional SQL default).
+/// * `chars = Some(set)`: strip any leading/trailing character that appears in
+///   `set` (the set is a bag of individual characters, per SQL `TRIM('xy' FROM s)`
+///   which removes any of `x`/`y`, NOT the literal substring `"xy"`).
+///
+/// Operates on `char`s so multi-byte trim characters and multi-byte input both
+/// behave correctly. An empty `chars` set (e.g. `TRIM('' FROM s)`) strips
+/// nothing and returns `s` unchanged.
+///
+/// TODO(string-fn-gpu): no GPU kernel yet; this host path is the supported one.
+pub fn trim_str(s: &str, side: TrimSide, chars: Option<&str>) -> String {
+    match chars {
+        None => match side {
+            TrimSide::Both => s.trim().to_string(),
+            TrimSide::Leading => s.trim_start().to_string(),
+            TrimSide::Trailing => s.trim_end().to_string(),
+        },
+        Some(set) => {
+            // Empty set: nothing to strip.
+            if set.is_empty() {
+                return s.to_string();
+            }
+            let in_set = |c: char| set.chars().any(|t| t == c);
+            match side {
+                TrimSide::Both => s.trim_matches(in_set).to_string(),
+                TrimSide::Leading => s.trim_start_matches(in_set).to_string(),
+                TrimSide::Trailing => s.trim_end_matches(in_set).to_string(),
+            }
+        }
+    }
+}
+
 /// Round `byte_idx` down to the nearest `is_char_boundary`. `byte_idx` must be
 /// `<= s.len()`; this is the case at every caller.
 fn round_down_to_char_boundary(s: &str, mut byte_idx: usize) -> usize {
@@ -829,5 +888,58 @@ mod tests {
         // i32::MAX as usize is huge but never wraps because we add it via
         // saturating_add and clamp to s.len().
         assert_eq!(sql_substring("abc", 1, i32::MAX), "abc");
+    }
+
+    #[test]
+    fn substring_str_public_wrapper_matches_internal() {
+        assert_eq!(substring_str("hello", 2, 3), "ell");
+        assert_eq!(substring_str("héllo", 1, 3), "hé");
+    }
+
+    // ----- TRIM ----------------------------------------------------------
+
+    #[test]
+    fn trim_default_whitespace_both() {
+        assert_eq!(trim_str("  hi  ", TrimSide::Both, None), "hi");
+        assert_eq!(trim_str("\t\nhi \n", TrimSide::Both, None), "hi");
+        assert_eq!(trim_str("nospace", TrimSide::Both, None), "nospace");
+    }
+
+    #[test]
+    fn trim_leading_and_trailing_whitespace() {
+        assert_eq!(trim_str("  hi  ", TrimSide::Leading, None), "hi  ");
+        assert_eq!(trim_str("  hi  ", TrimSide::Trailing, None), "  hi");
+    }
+
+    #[test]
+    fn trim_custom_chars_is_a_char_set_not_substring() {
+        // TRIM('xy' FROM ...) strips any leading/trailing 'x' or 'y'.
+        assert_eq!(trim_str("xyxabcyx", TrimSide::Both, Some("xy")), "abc");
+        assert_eq!(trim_str("xyxabcyx", TrimSide::Leading, Some("xy")), "abcyx");
+        assert_eq!(trim_str("xyxabcyx", TrimSide::Trailing, Some("xy")), "xyxabc");
+    }
+
+    #[test]
+    fn trim_custom_chars_single_char() {
+        assert_eq!(trim_str("---val---", TrimSide::Both, Some("-")), "val");
+    }
+
+    #[test]
+    fn trim_empty_char_set_strips_nothing() {
+        assert_eq!(trim_str("  hi  ", TrimSide::Both, Some("")), "  hi  ");
+    }
+
+    #[test]
+    fn trim_all_chars_collapses_to_empty() {
+        assert_eq!(trim_str("aaaa", TrimSide::Both, Some("a")), "");
+        assert_eq!(trim_str("   ", TrimSide::Both, None), "");
+    }
+
+    #[test]
+    fn trim_unicode_chars() {
+        // Multi-byte trim character.
+        assert_eq!(trim_str("→→go→", TrimSide::Both, Some("→")), "go");
+        // Multi-byte content preserved.
+        assert_eq!(trim_str("  héllo  ", TrimSide::Both, None), "héllo");
     }
 }
