@@ -41,7 +41,7 @@ use craton_bolt::jit::string_kernel::{
 };
 use craton_bolt::plan::ScalarFnKind;
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
+    lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema, TimeUnit,
 };
 
 // ---- PTX normalization (for `insta` snapshots) ------------------------------
@@ -1633,5 +1633,100 @@ fn golden_string_concat_two_pass_is_deferred() {
     assert!(format!("{e}").contains("CONCAT"), "{e}");
     let e = compile_varwidth_write_pass(ScalarFnKind::Concat).unwrap_err();
     assert!(format!("{e}").contains("CONCAT"), "{e}");
+}
+
+// ---- Tests: CASE over Date32 / Timestamp result types ----------------------
+//
+// v0.7: `Codegen::emit_case` accepts Date32 (i32 storage) and Timestamp (i64
+// storage) as CASE result dtypes — they are fixed-width integers that fold
+// cleanly through `selp` exactly like Int32 / Int64. The bit-copy nature of
+// `selp` means we emit the untyped class suffixes `selp.b32` (Date32) and
+// `selp.b64` (Timestamp); no arithmetic interpretation of the value is
+// needed. Decimal128 (i128) stays rejected at the plan layer — there is no
+// `selp.b128`. These goldens pin the suffix contract end-to-end from SQL.
+
+/// Fixture provider carrying a Date32 column (`d`) and a Timestamp column
+/// (`ts`) alongside an i32 key (`id`) so a SQL CASE over the temporal columns
+/// types as Date32 / Timestamp and reaches the projection codegen path.
+fn temporal_provider() -> MemTableProvider {
+    let schema = Schema::new(vec![
+        Field {
+            name: "id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "d".into(),
+            dtype: DataType::Date32,
+            nullable: false,
+        },
+        Field {
+            name: "ts".into(),
+            dtype: DataType::Timestamp(TimeUnit::Nanosecond, None),
+            nullable: false,
+        },
+    ]);
+    MemTableProvider::new().with_table("events", schema)
+}
+
+/// Build PTX for a CASE-bearing SQL query over the `temporal_provider`
+/// fixture. Mirrors `build_ptx_for` but with the temporal schema; panics if
+/// the plan isn't a single projection kernel.
+fn build_temporal_ptx_for(sql: &str) -> String {
+    let provider = temporal_provider();
+    let plan = parse_sql(sql, &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let kernel = match &phys {
+        PhysicalPlan::Projection { kernel, .. } => kernel,
+        other => panic!(
+            "build_temporal_ptx_for: expected Projection plan for `{sql}`, got {other:?}"
+        ),
+    };
+    compile_ptx(kernel, "bolt_test_kernel").expect("compile_ptx")
+}
+
+/// CASE producing a Date32 result must fold to `selp.b32` — Date32 is i32
+/// days-since-epoch, a plain 32-bit bit-copy through the `selp` else-slot.
+/// The Bool cond -> predicate materialisation is the same `setp.ne.s32`
+/// used by every other value dtype.
+#[test]
+fn golden_case_date32_emits_selp_b32() {
+    let ptx = build_temporal_ptx_for("SELECT CASE WHEN id > 0 THEN d ELSE d END AS r FROM events");
+    assert!(
+        ptx.contains("setp.ne.s32"),
+        "Bool cond -> predicate materialisation should be setp.ne.s32\n{ptx}"
+    );
+    assert!(
+        ptx.contains("selp.b32"),
+        "Date32 CASE result must fold to selp.b32 (i32 bit-copy)\n{ptx}"
+    );
+    // Must NOT mis-emit a 64-bit select (would alias an adjacent register
+    // word) for an i32-storage temporal type.
+    assert!(
+        !ptx.contains("selp.b64"),
+        "Date32 CASE must not emit selp.b64\n{ptx}"
+    );
+}
+
+/// CASE producing a Timestamp result must fold to `selp.b64` — Timestamp is
+/// i64 ticks-since-epoch, a plain 64-bit bit-copy. The predicate setup is
+/// unchanged from the Int32 / Date32 paths.
+#[test]
+fn golden_case_timestamp_emits_selp_b64() {
+    let ptx =
+        build_temporal_ptx_for("SELECT CASE WHEN id > 0 THEN ts ELSE ts END AS r FROM events");
+    assert!(
+        ptx.contains("setp.ne.s32"),
+        "Bool cond -> predicate materialisation should be setp.ne.s32\n{ptx}"
+    );
+    assert!(
+        ptx.contains("selp.b64"),
+        "Timestamp CASE result must fold to selp.b64 (i64 bit-copy)\n{ptx}"
+    );
+    // Must NOT truncate an i64-storage temporal type to a 32-bit select.
+    assert!(
+        !ptx.contains("selp.b32"),
+        "Timestamp CASE must not emit selp.b32 (would truncate i64 ticks)\n{ptx}"
+    );
 }
 

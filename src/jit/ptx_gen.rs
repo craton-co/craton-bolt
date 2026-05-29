@@ -1038,10 +1038,12 @@ fn emit_is_null_check(
 /// * `Int64`          -> `selp.s64`
 /// * `Float32`        -> `selp.f32`
 /// * `Float64`        -> `selp.f64`
+/// * `Date32`         -> `selp.b32`  (i32 storage, bit-copy)
+/// * `Timestamp`      -> `selp.b64`  (i64 storage, bit-copy)
 ///
-/// `Codegen::emit_case` rejects Utf8 / Decimal128 / Date / Timestamp at
-/// the plan layer with a tighter message, so by the time we get here
-/// the dtype envelope is guaranteed.
+/// `Codegen::emit_case` rejects Utf8 / Decimal128 at the plan layer with a
+/// tighter message (Decimal128 is i128 — no `selp.b128`), so by the time we
+/// get here the dtype envelope is guaranteed.
 fn emit_select(
     b: &mut PtxBuilder,
     dst: Reg,
@@ -1059,6 +1061,14 @@ fn emit_select(
         DataType::Int64 => "s64",
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
+        // v0.7: Date32 (i32 storage) and Timestamp (i64 storage) are plain
+        // fixed-width integers. `selp` just copies the chosen operand's bits,
+        // so the untyped bit-class suffixes `b32` / `b64` are the natural fit
+        // — no arithmetic interpretation of the value is needed. They live in
+        // the same `r` / `rl` register classes as Int32 / Int64 (see
+        // `RegAlloc::class_for`), so the operand registers are already correct.
+        DataType::Date32 => "b32",
+        DataType::Timestamp(_, _) => "b64",
         DataType::Utf8 => {
             return Err(BoltError::Other(
                 "ptx_gen: Select over Utf8 not supported \
@@ -1069,11 +1079,6 @@ fn emit_select(
         DataType::Decimal128(_, _) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-            ))
-        }
-        DataType::Date32 | DataType::Timestamp(_, _) => {
-            return Err(BoltError::Other(
-                "Date/Timestamp not yet lowered to GPU".into(),
             ))
         }
     };

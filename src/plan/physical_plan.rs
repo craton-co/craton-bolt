@@ -1959,11 +1959,14 @@ impl<'a> Codegen<'a> {
         };
         let result_dtype = case_expr.dtype(self.scan_schema)?;
 
-        // (2) v0.7 dtype envelope. PTX `selp` only supports the b32/b64
-        //     register classes (Bool/Int32/Int64/Float32/Float64). Utf8
-        //     CASE is a heap-aware ABI we don't have; Decimal128 and
-        //     Date/Timestamp share the same "not yet lowered to GPU"
-        //     story as the other scalar code paths.
+        // (2) v0.7 dtype envelope. PTX `selp` supports the b32/b64 register
+        //     classes, so any fixed-width value that lives in those classes
+        //     folds cleanly: Bool/Int32/Float32 + Date32 (i32 storage) in
+        //     b32, Int64/Float64 + Timestamp (i64 storage) in b64. Date32 /
+        //     Timestamp are plain bit-copies through `selp.b32` / `selp.b64`
+        //     — the logical temporal dtype rides along on the IR `Value`.
+        //     Utf8 CASE is a heap-aware ABI we don't have; Decimal128 (i128)
+        //     has no `selp.b128`, so both stay rejected.
         match result_dtype {
             DataType::Utf8 => {
                 return Err(BoltError::Plan(
@@ -1979,18 +1982,13 @@ impl<'a> Codegen<'a> {
                         .into(),
                 ))
             }
-            DataType::Date32 | DataType::Timestamp(_, _) => {
-                return Err(BoltError::Plan(
-                    "CASE over Date/Timestamp types not yet lowered to GPU; \
-                     coming in a follow-up"
-                        .into(),
-                ))
-            }
             DataType::Bool
             | DataType::Int32
             | DataType::Int64
             | DataType::Float32
-            | DataType::Float64 => {}
+            | DataType::Float64
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {}
         }
 
         // (3) ELSE seed — guarded by the SQL-NULL safety check below. Only a

@@ -9,12 +9,14 @@
 //! type-checks correctly, and the lowered shape matches what downstream
 //! stages expect.
 //!
-//! v0.7 GPU lowering: CASE over numeric / Bool branches is now lowered to
-//! GPU via the `Op::Select` IR op (see `src/plan/physical_plan.rs` and
-//! `src/jit/ptx_gen.rs`). CASE over Utf8 / Decimal128 / Date / Timestamp
-//! is still rejected at the codegen boundary with a tighter dtype-specific
-//! message; see the `case_over_strings_rejected_with_tighter_message`
-//! test for the contract.
+//! v0.7 GPU lowering: CASE over numeric / Bool / Date32 / Timestamp
+//! branches is now lowered to GPU via the `Op::Select` IR op (see
+//! `src/plan/physical_plan.rs` and `src/jit/ptx_gen.rs`). Date32 (i32
+//! storage) folds to `selp.b32` and Timestamp (i64 storage) to `selp.b64`,
+//! exactly like Int32 / Int64. CASE over Utf8 / Decimal128 is still rejected
+//! at the codegen boundary with a tighter dtype-specific message (Decimal128
+//! is i128 — there is no `selp.b128`); see the
+//! `case_over_strings_rejected_with_tighter_message` test for the contract.
 
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Expr, Field, Literal, LogicalPlan, MemTableProvider,
