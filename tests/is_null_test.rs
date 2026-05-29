@@ -417,6 +417,106 @@ fn scan_kernel_ptx_is_null_shape() {
     );
 }
 
+/// `WHERE NOT (id > 1)` now lowers `NOT` to the GPU: the comparison
+/// `id > 1` emits a Bool register and `Op::Not` negates it. The whole
+/// predicate folds into the fused projection kernel — no host fallback.
+/// Pins the new `Codegen::emit_unary` NOT arm + `predicate_contains_unary`
+/// recursion (a regression that re-forced the host path for NOT would
+/// fail to find a `Projection` here).
+#[test]
+fn not_comparison_lowers_to_fused_projection_with_op_not() {
+    let sql = "SELECT id FROM t WHERE NOT (id > 1)";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+
+    let (kernel, _table) = unwrap_projection(&phys);
+
+    let n_not = kernel
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::Not { .. }))
+        .count();
+    assert_eq!(
+        n_not, 1,
+        "expected exactly one Op::Not for `NOT (id > 1)`, got {n_not}: ops = {:?}",
+        kernel.ops
+    );
+    assert!(
+        kernel.predicate.is_some(),
+        "expected predicate reg on fused projection, got None"
+    );
+}
+
+/// `NOT ((x + 1) IS NULL)` must still take the host fallback: the operand
+/// `(x + 1) IS NULL` is a compound-unary the GPU can't lower, so
+/// `predicate_contains_unary` recurses into it and reports `true`.
+/// Pins that the NOT recursion does NOT blindly accept every operand.
+#[test]
+fn not_over_compound_unary_takes_host_fallback() {
+    let sql = "SELECT id FROM t WHERE NOT ((x + 1) IS NULL)";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    assert!(
+        find_unary_filter_predicate(&phys).is_some(),
+        "NOT over a compound-unary operand must surface as a host-side \
+         PhysicalPlan::Filter, got {phys:?}"
+    );
+}
+
+/// PTX-shape coverage for the projection-kernel `Op::Not` path. The fused
+/// projection PTX for `WHERE NOT (id > 1)` over a non-nullable column must
+/// contain the inner comparison (`setp.gt.s64`, since `1` widens to Int64)
+/// and the negation (`xor.b32`).
+#[test]
+fn projection_kernel_ptx_not_shape() {
+    use craton_bolt::jit::compile_ptx;
+
+    let sql = "SELECT id FROM t WHERE NOT (id > 1)";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let (kernel, _) = unwrap_projection(&phys);
+
+    let ptx = compile_ptx(kernel, "bolt_kernel").expect("PTX codegen");
+    assert!(
+        ptx.contains("setp.gt.s64"),
+        "expected inner `id > 1` comparison `setp.gt.s64` in PTX, got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("xor.b32"),
+        "expected `xor.b32` from the NOT negation in PTX, got:\n{ptx}"
+    );
+}
+
+/// Matching scan-kernel (predicate-only) PTX path for `Op::Not`. A
+/// regression that taught `ptx_gen.rs` but not `scan_kernel.rs` to emit
+/// the negation would surface here.
+#[test]
+fn scan_kernel_ptx_not_shape() {
+    use craton_bolt::jit::scan_kernel::compile_predicate_kernel;
+
+    let sql = "SELECT id FROM t WHERE NOT (id > 1)";
+    let plan = parse_sql(sql, &t_provider()).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let (kernel, _) = unwrap_projection(&phys);
+
+    assert!(
+        kernel.predicate.is_some(),
+        "fixture must have a predicate; got ops = {:?}",
+        kernel.ops
+    );
+
+    let ptx = compile_predicate_kernel(kernel, "bolt_predicate")
+        .expect("scan_kernel PTX codegen");
+    assert!(
+        ptx.contains("setp.gt.s64"),
+        "expected inner comparison `setp.gt.s64` in scan-kernel PTX, got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("xor.b32"),
+        "expected `xor.b32` from the NOT negation in scan-kernel PTX, got:\n{ptx}"
+    );
+}
+
 /// Helper: descend past any `PhysicalPlan::Project` rename layer and
 /// return the underlying `Projection`'s `(KernelSpec, table)`. Panics if
 /// the plan is not a (Project over) Projection.

@@ -340,6 +340,32 @@ fn golden_predicate_filter_and_or() {
     );
 }
 
+#[test]
+fn golden_predicate_filter_not_comparison() {
+    // `WHERE NOT (int_col > 1)` lowers `NOT` to `Op::Not`, which emits a
+    // single `xor.b32 dst, src, 1` over the comparison's Bool register.
+    // The comparison itself widens to s64 (int literal `1` is Int64).
+    let ptx = build_ptx_for("SELECT int_col FROM t WHERE NOT (int_col > 1)");
+    // The inner comparison must still be present.
+    assert!(
+        ptx.contains("setp.gt.s64"),
+        "expected the inner `int_col > 1` comparison `setp.gt.s64`\n{ptx}"
+    );
+    // The negation is the load-bearing assertion: `xor.b32 %r, %r, 1`.
+    assert!(
+        ptx.contains("xor.b32"),
+        "expected `xor.b32` from the NOT negation\n{ptx}"
+    );
+    // The negated Bool is the predicate, so the kernel still gates the
+    // store behind a `bra DONE` placed before any store.
+    let gate_pos = ptx.find("bra DONE").expect("missing conditional bra DONE");
+    let store_pos = ptx.find("st.global").expect("missing store");
+    assert!(
+        gate_pos < store_pos,
+        "predicate gate must precede the store\n{ptx}"
+    );
+}
+
 // ---- Tests: reduction-kernel widening (wave-3 regression) ------------------
 
 #[test]

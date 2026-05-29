@@ -196,6 +196,27 @@ pub enum Op {
         /// Common dtype of `then_val` / `else_val` and of `dst`.
         dtype: DataType,
     },
+    /// Logical negation of a Bool register: `dst = !src`.
+    ///
+    /// Used to lower SQL `NOT <bool-expr>` (`Codegen::emit_unary`'s `Not`
+    /// arm). `src` must be a Bool register holding 0 or 1 — every Bool
+    /// value lives in the b32 (`r`) register class with canonical {0, 1}
+    /// values (see `RegAlloc::class_for` and the `Op::Select` / comparison
+    /// emitters that produce Bools), so the negation lowers to a single
+    /// `xor.b32 dst, src, 1` (flipping the low bit). The result is again a
+    /// canonical {0, 1} Bool in `dst`.
+    ///
+    /// `Codegen::emit_unary` recursively emits the operand and type-checks
+    /// it as Bool before pushing this op; compound Bool operands (e.g.
+    /// `NOT (a > b)`) lower fine, while non-Bool or GPU-unsupported operands
+    /// (e.g. `NOT (a LIKE 'x')`) surface a host fallback via the operand's
+    /// own emit error and `predicate_contains_unary`.
+    Not {
+        /// Destination register holding the negated Bool (0/1) result.
+        dst: Reg,
+        /// Source Bool register (0/1) to negate.
+        src: Reg,
+    },
     // ---------------------------------------------------------------------
     // Decimal128 / i128 dual-register ops (v0.7 Sub-task A).
     //
@@ -1346,10 +1367,12 @@ impl<'a> Codegen<'a> {
     /// fallback — see [`predicate_contains_unary`] for the routing
     /// invariant.
     ///
-    /// `UnaryOp::Not` is not yet lowered to the GPU at all; it is rejected
-    /// here with a clear error so [`predicate_contains_unary`] can route
-    /// every `NOT`-bearing predicate through the host-side filter path
-    /// (which dispatches to `crate::exec::expr_agg::eval_unary`).
+    /// `UnaryOp::Not` lowers to a single `Op::Not` (`xor.b32 dst, src, 1`)
+    /// over the recursively-emitted operand, which must be a Bool. So
+    /// `NOT (a > b)` is GPU-lowered; an operand the codegen can't emit
+    /// (e.g. `NOT (a LIKE 'x')`) surfaces a `Plan` error from the operand's
+    /// own emit path, which [`predicate_contains_unary`] routes to the
+    /// host-side filter (`crate::exec::expr_agg::eval_unary`).
     ///
     /// The emitted IR shape:
     /// * Non-nullable input schema → `Op::Const { Bool(false_or_true) }`,
@@ -1361,13 +1384,26 @@ impl<'a> Codegen<'a> {
     ///   `KernelSpec::input_has_validity` will request the validity
     ///   pointer at kernel-launch time.
     fn emit_unary(&mut self, op: UnaryOp, operand: &Expr) -> BoltResult<Value> {
-        // NOT is not yet lowered to GPU. Surface a Plan error so the planner
-        // regression surfaces clearly if the route is ever miswired —
-        // `predicate_contains_unary` routes every `NOT` to the host fallback.
+        // NOT lowers to a single `xor.b32 dst, src, 1` over the operand's
+        // Bool register. We recursively emit the operand (so `NOT (a > b)`
+        // works just like any other compound Bool expression) and require
+        // the result dtype to be Bool. GPU-unsupported operands (e.g.
+        // `NOT (a LIKE 'x')`) surface their own emit error, which routes the
+        // predicate to the host fallback; see `predicate_contains_unary`.
         if matches!(op, UnaryOp::Not) {
-            return Err(BoltError::Plan(
-                "GPU codegen: NOT not yet lowered to GPU; requires host fallback".into(),
-            ));
+            let value = self.emit_expr(operand)?;
+            if value.dtype != DataType::Bool {
+                return Err(BoltError::Plan(format!(
+                    "GPU codegen: NOT requires a Bool operand, got {:?}",
+                    value.dtype
+                )));
+            }
+            let dst = self.fresh();
+            self.ops.push(Op::Not {
+                dst,
+                src: value.reg,
+            });
+            return Ok(Value::single(dst, DataType::Bool));
         }
         // Peel through any `Alias` wrappers so `x AS y IS NULL` lowers the
         // same as `x IS NULL`.
@@ -2865,10 +2901,14 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
     match expr {
         Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
         Expr::Unary { op, operand } => {
-            // `NOT` always routes to the host fallback — the GPU codegen
-            // does not lower it yet (see `Codegen::emit_unary`).
+            // `NOT` lowers to `Op::Not` over its recursively-emitted Bool
+            // operand (see `Codegen::emit_unary`). So `NOT (a > b)` stays on
+            // the GPU; the host fallback is forced only when the operand
+            // *itself* contains a GPU-unsupported shape (e.g.
+            // `NOT (a LIKE 'x')`). Recurse into the operand to make that
+            // decision instead of unconditionally forcing the host path.
             if matches!(op, UnaryOp::Not) {
-                return true;
+                return predicate_contains_unary(operand);
             }
             // Peel through any Alias wrappers — `x AS y IS NULL` is
             // still a bare-column unary that the codegen can lower.
@@ -3651,6 +3691,8 @@ fn kernel_has_unsafe_eager_shortcircuit(kernel: &KernelSpec) -> bool {
             | Op::Store { .. }
             | Op::IsNullCheck { .. }
             | Op::Select { .. }
+            // `Not` is a pure `xor.b32` over a Bool — total, fault-free.
+            | Op::Not { .. }
             | Op::LoadColumn128 { .. }
             | Op::Const128 { .. }
             | Op::Store128 { .. }
