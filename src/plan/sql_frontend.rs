@@ -1535,6 +1535,104 @@ fn plan_select(
         }
     }
 
+    // `COUNT(DISTINCT col)` — the one DISTINCT-quantified aggregate form we
+    // support. It is only handled as the *sole* SELECT item with *no* GROUP BY;
+    // anything richer (multiple SELECT items, a GROUP BY, or DISTINCT on a
+    // non-COUNT aggregate) is rejected with a precise message so the user is
+    // not left guessing. We lower it to
+    //   Aggregate(COUNT(*)) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)
+    // which gives the SQL-standard NULL-excluding distinct count: the
+    // pre-Distinct Filter drops NULL rows, Distinct dedupes the surviving
+    // values (reusing the row-key / NULL canonicalisation in
+    // `crate::exec::distinct`), and COUNT(*) over a single-column projection
+    // tallies them.
+    {
+        // Detect COUNT(DISTINCT ...) anywhere in the SELECT list so we can
+        // either special-case the sole-item form or reject the unsupported
+        // combinations clearly.
+        let mut count_distinct_positions: Vec<usize> = Vec::new();
+        for (i, (sql_expr, _)) in items.iter().enumerate() {
+            if try_count_distinct(sql_expr, &resolver)?.is_some() {
+                count_distinct_positions.push(i);
+            }
+        }
+        if !count_distinct_positions.is_empty() {
+            if items.len() != 1 {
+                return Err(BoltError::Sql(
+                    "COUNT(DISTINCT col) is only supported as the sole SELECT item \
+                     (no other columns or aggregates alongside it)"
+                        .into(),
+                ));
+            }
+            if !group_by_sql.is_empty() {
+                return Err(BoltError::Sql(
+                    "COUNT(DISTINCT col) with GROUP BY is not supported".into(),
+                ));
+            }
+            if select.having.is_some() {
+                return Err(BoltError::Sql(
+                    "COUNT(DISTINCT col) with HAVING is not supported".into(),
+                ));
+            }
+            if matches!(select.distinct, Some(Distinct::Distinct)) {
+                return Err(BoltError::Sql(
+                    "SELECT DISTINCT COUNT(DISTINCT col) is not supported".into(),
+                ));
+            }
+            let (sql_expr, alias) = &items[0];
+            // Safe to unwrap: the position scan above already confirmed this.
+            let inner = try_count_distinct(sql_expr, &resolver)?
+                .expect("count_distinct_positions implies this item matches");
+            let col = lower_expr(inner, &resolver, 0)?;
+            // Type-check the argument against the current plan's schema so a
+            // misnamed column surfaces here, not at execution time.
+            let _ = col.dtype(&plan.schema()?)?;
+
+            // Filter(col IS NOT NULL): exclude NULLs per SQL DISTINCT semantics.
+            let not_null = Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(col.clone()),
+            };
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: not_null,
+            };
+            // Project([col]) — narrow to the single distinct-counted column.
+            plan = LogicalPlan::Project {
+                input: Box::new(plan),
+                exprs: vec![col],
+            };
+            // Distinct — dedupe the surviving non-NULL values.
+            plan = LogicalPlan::Distinct {
+                input: Box::new(plan),
+            };
+            // Aggregate(COUNT(*)) — tally the distinct values. COUNT(*) uses
+            // the literal-1 sentinel mirroring `try_aggregate`'s COUNT(*) path.
+            let aggregates = vec![AggregateExpr::Count(Expr::Literal(Literal::Int64(1)))];
+            let aggregate_plan = LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_by: Vec::new(),
+                aggregates,
+            };
+            // Re-project to honour any SELECT alias on the result column,
+            // matching the post-aggregate Project the ordinary aggregate path
+            // builds (so downstream stages see the user-friendly name).
+            let out_name = aggregate_output_name(&AggregateExpr::Count(Expr::Literal(
+                Literal::Int64(1),
+            )));
+            let col_ref = Expr::Column(out_name);
+            let proj = match alias {
+                Some(a) => col_ref.alias(a.clone()),
+                None => col_ref,
+            };
+            plan = LogicalPlan::Project {
+                input: Box::new(aggregate_plan),
+                exprs: vec![proj],
+            };
+            return Ok(plan);
+        }
+    }
+
     // Use `contains_aggregate` (not `try_aggregate`) so that SELECT items
     // with aggregates *nested inside a scalar expression* — e.g.
     // `SUM(price) + 1` with no GROUP BY and no bare top-level aggregate —
@@ -2512,6 +2610,92 @@ fn try_aggregate(
         "STDDEV_SAMP" => AggregateExpr::StddevSamp(Box::new(inner)),
         _ => unreachable!("kind already filtered above"),
     }))
+}
+
+/// Recognise the special `COUNT(DISTINCT <expr>)` SELECT item.
+///
+/// `COUNT(DISTINCT col)` is the one aggregate form where the `DISTINCT`
+/// argument-quantifier is meaningful to us: it counts the number of distinct
+/// *non-NULL* values of `col` (standard SQL — `DISTINCT` inside an aggregate
+/// excludes NULLs just like the bare aggregate does). [`plan_select`] lowers a
+/// sole, GROUP-BY-free `COUNT(DISTINCT col)` to
+/// `Aggregate(COUNT) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)`;
+/// see that call site for the wiring.
+///
+/// Returns:
+///   * `Ok(Some(expr))` — `e` is `COUNT(DISTINCT <expr>)`; `expr` is the
+///     *unlowered* SQL argument (the caller lowers it against the resolver).
+///   * `Ok(None)`        — `e` is not a `COUNT(DISTINCT ...)` call (could be a
+///     plain aggregate, a window, or a scalar expression).
+///   * `Err(_)`          — `e` is a malformed / unsupported `COUNT(DISTINCT)`
+///     shape that must surface a clear message rather than fall through:
+///     `COUNT(DISTINCT *)`, `COUNT(DISTINCT a, b)`, `DISTINCT` on a windowed
+///     `COUNT`, or `DISTINCT` on any aggregate other than `COUNT` (the latter
+///     two are detected here so the error names the exact unsupported form).
+fn try_count_distinct<'a>(
+    e: &'a SqlExpr,
+    _resolver: &NameResolver<'_>,
+) -> BoltResult<Option<&'a SqlExpr>> {
+    let func = match e {
+        SqlExpr::Function(f) => f,
+        _ => return Ok(None),
+    };
+    if func.name.0.len() != 1 {
+        return Ok(None);
+    }
+    let fname = func.name.0[0].value.to_ascii_uppercase();
+    let arg_list = match &func.args {
+        FunctionArguments::List(list) => list,
+        // No argument list at all (`COUNT`/`COUNT()`); not a DISTINCT form.
+        FunctionArguments::None | FunctionArguments::Subquery(_) => return Ok(None),
+    };
+    // Only the `DISTINCT` quantifier concerns us here. `ALL` (or absent)
+    // routes through the ordinary aggregate path.
+    if !matches!(
+        arg_list.duplicate_treatment,
+        Some(sqlparser::ast::DuplicateTreatment::Distinct)
+    ) {
+        return Ok(None);
+    }
+    // From here on we KNOW the user wrote `<AGG>(DISTINCT ...)`. Anything we
+    // can't lower must produce a precise error (rather than `Ok(None)`, which
+    // would let `try_aggregate`'s generic "DISTINCT inside {kind}" rejection
+    // fire and lose the specificity these messages provide).
+
+    // DISTINCT is only supported inside COUNT.
+    if fname != "COUNT" {
+        return Err(BoltError::Sql(format!(
+            "unsupported: DISTINCT inside {fname}; only COUNT(DISTINCT col) is supported"
+        )));
+    }
+    // A windowed `COUNT(DISTINCT col) OVER (...)` is out of scope.
+    if func.over.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: COUNT(DISTINCT ...) OVER (window)".into(),
+        ));
+    }
+    if func.filter.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: FILTER on COUNT(DISTINCT ...)".into(),
+        ));
+    }
+    if arg_list.args.len() != 1 {
+        return Err(BoltError::Sql(format!(
+            "COUNT(DISTINCT ...) expects exactly one argument, got {}",
+            arg_list.args.len()
+        )));
+    }
+    match &arg_list.args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Ok(Some(inner)),
+        // `COUNT(DISTINCT *)` is meaningless (and ambiguous) — reject clearly.
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+        | FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => Err(BoltError::Sql(
+            "COUNT(DISTINCT *) is not supported; use COUNT(DISTINCT <column>)".into(),
+        )),
+        FunctionArg::Named { .. } => Err(BoltError::Sql(
+            "unsupported: named argument to COUNT(DISTINCT ...)".into(),
+        )),
+    }
 }
 
 /// A window function call recognised in a SELECT item: the function plus its

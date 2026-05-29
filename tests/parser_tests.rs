@@ -810,3 +810,88 @@ fn subquery_physical_lowering_rejected_cleanly() {
         "physical lowering of a subquery plan should be rejected, got Ok"
     );
 }
+
+// ---- COUNT(DISTINCT col) ----------------------------------------------------
+
+#[test]
+fn count_distinct_lowers_to_distinct_over_project() {
+    let provider = fixture_table();
+    // Sole SELECT item, no GROUP BY: lowers to
+    //   Project(count) <- Aggregate(COUNT(*)) <- Distinct <- Project([col]) <- Filter(IS NOT NULL)
+    let plan = plan_ok("SELECT COUNT(DISTINCT region_id) FROM sales", &provider);
+    // Top is the SELECT-order Project producing a single `count` column.
+    let LogicalPlan::Project { input, exprs } = &plan else {
+        panic!("expected top-level Project, got {plan:?}");
+    };
+    assert_eq!(exprs.len(), 1);
+    // Below it: Aggregate(COUNT) over a Distinct.
+    let LogicalPlan::Aggregate { input, aggregates, group_by } = input.as_ref() else {
+        panic!("expected Aggregate under Project, got {input:?}");
+    };
+    assert!(group_by.is_empty(), "COUNT(DISTINCT) must have no group keys");
+    assert_eq!(aggregates.len(), 1);
+    let LogicalPlan::Distinct { input } = input.as_ref() else {
+        panic!("expected Distinct under Aggregate, got {input:?}");
+    };
+    // Distinct's child narrows to the single counted column.
+    let LogicalPlan::Project { input, exprs } = input.as_ref() else {
+        panic!("expected Project under Distinct, got {input:?}");
+    };
+    assert_eq!(exprs.len(), 1, "distinct project must be the single column");
+    // And below that a NULL-excluding Filter (SQL DISTINCT excludes NULLs).
+    assert!(
+        matches!(input.as_ref(), LogicalPlan::Filter { .. }),
+        "expected NULL-excluding Filter under the distinct Project, got {input:?}"
+    );
+    // Output column is named `count`.
+    let schema = plan.schema().expect("type-check");
+    assert_eq!(schema.fields.len(), 1);
+    assert_eq!(schema.fields[0].name, "count");
+}
+
+#[test]
+fn count_distinct_with_alias_renames_output() {
+    let provider = fixture_table();
+    let plan = plan_ok(
+        "SELECT COUNT(DISTINCT region_id) AS n FROM sales",
+        &provider,
+    );
+    let schema = plan.schema().expect("type-check");
+    assert_eq!(schema.fields.len(), 1);
+    assert_eq!(schema.fields[0].name, "n");
+}
+
+#[test]
+fn count_distinct_star_rejected() {
+    let provider = fixture_table();
+    let res = try_plan("SELECT COUNT(DISTINCT *) FROM sales", &provider);
+    assert_err_contains(res, "COUNT(DISTINCT *)");
+}
+
+#[test]
+fn distinct_in_non_count_aggregate_rejected() {
+    let provider = fixture_table();
+    let res = try_plan("SELECT SUM(DISTINCT qty) FROM sales", &provider);
+    assert_err_contains(res, "DISTINCT inside SUM");
+}
+
+#[test]
+fn count_distinct_not_sole_item_rejected() {
+    let provider = fixture_table();
+    let res = try_plan(
+        "SELECT COUNT(DISTINCT region_id), region_id FROM sales",
+        &provider,
+    );
+    assert_err_contains(res, "sole SELECT item");
+}
+
+#[test]
+fn count_distinct_with_group_by_rejected() {
+    let provider = fixture_table();
+    let res = try_plan(
+        "SELECT COUNT(DISTINCT region_id) FROM sales GROUP BY qty",
+        &provider,
+    );
+    // Either the "not sole item"/"GROUP BY" guard fires; both are clear.
+    assert_err(res, "COUNT(DISTINCT) with GROUP BY");
+}
