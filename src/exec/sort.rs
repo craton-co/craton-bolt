@@ -458,8 +458,43 @@ mod tests {
         radix_dispatch_predicate, radix_dispatch_predicate_multi, GpuSortKey, RADIX_DISPATCH_COUNT,
     };
     use crate::jit::sort_kernel::SortDirection;
+    use crate::jit::sort_kernel_radix::set_radix_dispatch_for_tests;
     use crate::plan::logical_plan::DataType as PlanDataType;
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// Serializes every test that pins the radix dispatch gate. The gate
+    /// (`RADIX_DISPATCH_STATE` in `sort_kernel_radix`) is process-global, so
+    /// two tests pinning it to different values in parallel would race. The
+    /// [`RadixGateGuard`] RAII helper acquires this lock, forces the gate to
+    /// the requested state, and resets it to "uninitialised" on drop — so no
+    /// test leaks gate state into a sibling. Replaces the old
+    /// `std::env::set_var("BOLT_GPU_SORT", ...)` dance, which was both racy
+    /// AND ineffective once the gate latched into its atomic cache.
+    static RADIX_GATE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard: locks [`RADIX_GATE_LOCK`] and forces the radix dispatch
+    /// gate ON (`true`) or OFF (`false`) for the duration of the test, then
+    /// resets the gate to "re-read from env" on drop.
+    struct RadixGateGuard<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+    }
+
+    impl RadixGateGuard<'_> {
+        fn new(enabled: bool) -> Self {
+            // Recover from a poisoned lock: a panicking sibling test should
+            // not wedge the rest of the gate-dependent suite.
+            let lock = RADIX_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            set_radix_dispatch_for_tests(Some(enabled));
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for RadixGateGuard<'_> {
+        fn drop(&mut self) {
+            set_radix_dispatch_for_tests(None);
+        }
+    }
 
     /// Build an Int32 batch with the given non-null values and the
     /// minimum row count needed to pass the `GPU_SORT_MIN_ROWS` gate.
@@ -627,18 +662,11 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
     fn radix_dispatch_engages_on_int32_asc() {
-        // Save and restore env state around the test. Tests in
-        // `cargo test` share a process; another concurrent test could
-        // see `BOLT_GPU_SORT=1` if we didn't restore — but the gate is
-        // strict ("1"), and any concurrent test of unsorted-input
-        // semantics is robust to either gate state because the predicate
-        // is a function of the inputs.
-        let prev = std::env::var("BOLT_GPU_SORT").ok();
-        // SAFETY: set_var is unsafe on edition-2024 nightly but stable in
-        // current edition; the test harness is single-threaded enough
-        // that the env mutation here doesn't cross any other gate read
-        // — only `gpu_sort_env_enabled` consults it.
-        std::env::set_var("BOLT_GPU_SORT", "1");
+        // Pin the gate ON deterministically via the serialized override —
+        // see [`RadixGateGuard`]. The old `std::env::set_var` approach both
+        // raced with sibling gate tests and was a no-op once the gate
+        // latched into its atomic cache.
+        let _gate = RadixGateGuard::new(true);
 
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
@@ -655,22 +683,15 @@ mod tests {
             before,
             after
         );
-
-        // Restore env state.
-        match prev {
-            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
-            None => std::env::remove_var("BOLT_GPU_SORT"),
-        }
     }
 
-    /// Sanity check the other side of the gate: with the env var
-    /// **unset**, `try_gpu_sort_radix` returns `Ok(None)` without
+    /// Sanity check the other side of the gate: with the gate forced
+    /// **off**, `try_gpu_sort_radix` returns `Ok(None)` without
     /// bumping the dispatch counter. This is the default production
     /// behaviour — the radix path is opt-in until benched in.
     #[test]
     fn radix_dispatch_skipped_when_env_off() {
-        let prev = std::env::var("BOLT_GPU_SORT").ok();
-        std::env::remove_var("BOLT_GPU_SORT");
+        let _gate = RadixGateGuard::new(false);
 
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
@@ -683,10 +704,6 @@ mod tests {
             before, after,
             "counter must not bump when env gate is off"
         );
-
-        if let Some(v) = prev {
-            std::env::set_var("BOLT_GPU_SORT", v);
-        }
     }
 
     /// The dispatch also rejects when row count is below the threshold,
@@ -694,8 +711,7 @@ mod tests {
     /// kernel launch worse than the host sort.
     #[test]
     fn radix_dispatch_skipped_when_too_small() {
-        let prev = std::env::var("BOLT_GPU_SORT").ok();
-        std::env::set_var("BOLT_GPU_SORT", "1");
+        let _gate = RadixGateGuard::new(true);
 
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
@@ -707,10 +723,6 @@ mod tests {
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert_eq!(before, after, "small-input gate must short-circuit");
 
-        match prev {
-            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
-            None => std::env::remove_var("BOLT_GPU_SORT"),
-        }
     }
 
     /// #19: single-key DESC engages the radix path (the v0.7 gate would
@@ -719,8 +731,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
     fn radix_dispatch_engages_on_int32_desc() {
-        let prev = std::env::var("BOLT_GPU_SORT").ok();
-        std::env::set_var("BOLT_GPU_SORT", "1");
+        let _gate = RadixGateGuard::new(true);
 
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
@@ -735,18 +746,13 @@ mod tests {
             after,
         );
 
-        match prev {
-            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
-            None => std::env::remove_var("BOLT_GPU_SORT"),
-        }
     }
 
     /// #19: multi-key ASC ASC engages the radix path.
     #[test]
     #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
     fn radix_dispatch_engages_on_two_key_asc_asc() {
-        let prev = std::env::var("BOLT_GPU_SORT").ok();
-        std::env::set_var("BOLT_GPU_SORT", "1");
+        let _gate = RadixGateGuard::new(true);
 
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
@@ -764,10 +770,6 @@ mod tests {
             after,
         );
 
-        match prev {
-            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
-            None => std::env::remove_var("BOLT_GPU_SORT"),
-        }
     }
 
     /// #19: mixed ASC DESC across keys is handled — the per-key direction
@@ -776,8 +778,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
     fn radix_dispatch_engages_on_two_key_asc_desc() {
-        let prev = std::env::var("BOLT_GPU_SORT").ok();
-        std::env::set_var("BOLT_GPU_SORT", "1");
+        let _gate = RadixGateGuard::new(true);
 
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
@@ -795,10 +796,6 @@ mod tests {
             after,
         );
 
-        match prev {
-            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
-            None => std::env::remove_var("BOLT_GPU_SORT"),
-        }
     }
 
     /// #19: a mixed (Int32, Float64) multi-key sort falls through to the
@@ -806,8 +803,7 @@ mod tests {
     /// radix counter never bumps.
     #[test]
     fn radix_dispatch_skipped_on_int_plus_float() {
-        let prev = std::env::var("BOLT_GPU_SORT").ok();
-        std::env::set_var("BOLT_GPU_SORT", "1");
+        let _gate = RadixGateGuard::new(true);
 
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
@@ -841,10 +837,5 @@ mod tests {
             before, after,
             "predicate must reject mixed int+float without bumping"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("BOLT_GPU_SORT", v),
-            None => std::env::remove_var("BOLT_GPU_SORT"),
-        }
     }
 }
