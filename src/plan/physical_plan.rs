@@ -309,6 +309,67 @@ pub enum Op {
         /// Right operand high half.
         b_hi: Reg,
     },
+    /// 128-bit signed comparison.
+    ///
+    /// Compares two `i128` values, each carried as a `(lo, hi)` pair of
+    /// `u64` registers (little-endian: `value == ((hi as i128) << 64) |
+    /// (lo as u128 as i128)`), and produces a single-register `Bool`
+    /// result in `dst`. `op` must be one of `Eq / NotEq / Lt / LtEq / Gt
+    /// / GtEq`; any other op surfaces as an "internal" codegen error in
+    /// the PTX emitter.
+    ///
+    /// The PTX lowering is the canonical "signed-high, unsigned-low"
+    /// pattern documented in the PTX ISA for split-register 128-bit
+    /// compares (CUDA C++ Programming Guide, Integer Compare Operations):
+    ///
+    /// ```text
+    ///   eq: setp.eq.u64 p_lo, a_lo, b_lo
+    ///       setp.eq.s64 p_hi, a_hi, b_hi
+    ///       and.pred    p,    p_lo, p_hi
+    ///       selp.s32    dst,  1, 0, p
+    ///
+    ///   ne: setp.ne.u64 p_lo, a_lo, b_lo
+    ///       setp.ne.s64 p_hi, a_hi, b_hi
+    ///       or.pred     p,    p_lo, p_hi
+    ///       selp.s32    dst,  1, 0, p
+    ///
+    ///   lt: setp.lt.s64 p_hi_lt, a_hi, b_hi          ; high half wins (signed)
+    ///       setp.eq.s64 p_hi_eq, a_hi, b_hi
+    ///       setp.lt.u64 p_lo_lt, a_lo, b_lo          ; ties broken by low (unsigned)
+    ///       and.pred    p_eq_and_lt, p_hi_eq, p_lo_lt
+    ///       or.pred     p,    p_hi_lt, p_eq_and_lt
+    ///       selp.s32    dst,  1, 0, p
+    ///
+    ///   gt, le, ge: symmetric (swap setp / and/or polarity).
+    /// ```
+    ///
+    /// The high-half compare is **signed** (`setp.*.s64`) so two's-complement
+    /// negatives sort below positives; the low-half compare is **unsigned**
+    /// (`setp.*.u64`) because once the high halves are equal the low half's
+    /// raw bit-pattern determines magnitude (negatives have the high bit
+    /// set on the *high* half, never on the low half once high halves
+    /// agree). Equal high halves with equal low halves means equal value.
+    ///
+    /// `Codegen::emit_binary` only emits this op for `(Decimal128(p, s),
+    /// op, Decimal128(p, s))` operand pairs with matching precision **and**
+    /// matching scale. Mixed Decimal128 / non-Decimal comparisons stay
+    /// rejected at lowering — comparing two decimals with different scales
+    /// would compare different values (1.00 vs 1.000 have different raw
+    /// `i128` bit-patterns), and we don't auto-rescale.
+    Cmp128 {
+        /// Destination register holding the Bool (0/1) result.
+        dst: Reg,
+        /// The comparison operator (`Eq / NotEq / Lt / LtEq / Gt / GtEq`).
+        op: BinaryOp,
+        /// Left operand low half.
+        a_lo: Reg,
+        /// Left operand high half.
+        a_hi: Reg,
+        /// Right operand low half.
+        b_lo: Reg,
+        /// Right operand high half.
+        b_hi: Reg,
+    },
 }
 
 /// Description of an input column the kernel consumes.
@@ -1573,18 +1634,33 @@ impl<'a> Codegen<'a> {
         {
             return self.emit_binary_decimal128(op, l, r);
         }
-        // Reject the non-arithmetic Decimal128 ops (Div is rejected by
-        // the same arm above via `emit_binary_decimal128` since it's
-        // arithmetic — the catch-all below covers comparisons, logical,
-        // etc.).
+        // v0.7 follow-up to sub-task B: Decimal128 comparisons (= != < >
+        // <= >=) lower through `emit_binary_decimal128_cmp` to a single
+        // `Op::Cmp128` that produces a Bool register. Both sides must be
+        // `Decimal128(p, s)` with matching precision AND matching scale —
+        // mixed Decimal128 / non-Decimal comparisons (and scale-mismatched
+        // Decimal128 / Decimal128) stay rejected. Comparing decimals with
+        // different scales would compare different values (1.00 vs 1.000
+        // have different raw `i128` bit-patterns), and we don't
+        // auto-rescale.
+        if op_is_comparison(op)
+            && (matches!(l.dtype, DataType::Decimal128(_, _))
+                || matches!(r.dtype, DataType::Decimal128(_, _)))
+        {
+            return self.emit_binary_decimal128_cmp(op, l, r);
+        }
+        // Reject the remaining Decimal128 op shapes (Div is rejected by
+        // `emit_binary_decimal128` since it's arithmetic; arithmetic and
+        // comparisons are handled above. The catch-all covers logical,
+        // Concat, etc.).
         if matches!(l.dtype, DataType::Decimal128(_, _))
             || matches!(r.dtype, DataType::Decimal128(_, _))
         {
             return Err(BoltError::Plan(format!(
                 "Decimal128 {op:?} not yet lowered to GPU; only Add/Sub/Mul \
-                 on Decimal128 are wired in v0.7 (comparisons, Div, logical \
-                 ops, and CAST involving Decimal128 stay on the host fallback \
-                 — coming in a follow-up)"
+                 and comparisons (=, !=, <, >, <=, >=) on Decimal128 are \
+                 wired in v0.7 (Div, logical ops, and CAST involving \
+                 Decimal128 stay on the host fallback — coming in a follow-up)"
             )));
         }
 
@@ -1754,6 +1830,100 @@ impl<'a> Codegen<'a> {
         };
         self.ops.push(new_op);
         Ok(Value::pair(dst_lo, dst_hi, result_dtype))
+    }
+
+    /// Lower a comparison op (`Eq / NotEq / Lt / LtEq / Gt / GtEq`) over a
+    /// pair of Decimal128 operands to an `Op::Cmp128` that produces a
+    /// single-register Bool result.
+    ///
+    /// Rejects:
+    ///
+    ///   * Mixed Decimal128 / non-Decimal128 operand pairs — there is no
+    ///     auto-coercion path (a Decimal128 value and an Int64 value have
+    ///     different storage widths and would need an explicit rescale).
+    ///   * Decimal128 / Decimal128 pairs with mismatched precision or
+    ///     scale — comparing decimals with different scales would compare
+    ///     different values (`1.00` vs `1.000` have different raw `i128`
+    ///     bit-patterns). The caller must wire an explicit cast first.
+    ///
+    /// The `op` is forwarded to `Op::Cmp128`; the PTX emitter dispatches on
+    /// the operator and emits the appropriate split-register `setp` /
+    /// `and.pred` / `or.pred` chain (see `Op::Cmp128`'s rustdoc for the
+    /// per-op PTX shape).
+    fn emit_binary_decimal128_cmp(
+        &mut self,
+        op: BinaryOp,
+        l: Value,
+        r: Value,
+    ) -> BoltResult<Value> {
+        let (l_p, l_s) = match l.dtype {
+            DataType::Decimal128(p, s) => (p, s),
+            other => {
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 {op:?}: left operand must be Decimal128, got {other:?}; \
+                     Decimal128 comparison requires matching scale, so mixed \
+                     Decimal128 / non-Decimal comparisons are not lowered to GPU \
+                     (wire an explicit CAST first)"
+                )));
+            }
+        };
+        let (r_p, r_s) = match r.dtype {
+            DataType::Decimal128(p, s) => (p, s),
+            other => {
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 {op:?}: right operand must be Decimal128, got {other:?}; \
+                     Decimal128 comparison requires matching scale, so mixed \
+                     Decimal128 / non-Decimal comparisons are not lowered to GPU \
+                     (wire an explicit CAST first)"
+                )));
+            }
+        };
+        if l_p != r_p || l_s != r_s {
+            return Err(BoltError::Type(format!(
+                "Decimal128 comparison requires matching scale, \
+                 got Decimal128({l_p}, {l_s}) and Decimal128({r_p}, {r_s}); \
+                 wire an explicit CAST to align precision and scale before comparing"
+            )));
+        }
+        // Pair-validity guard: every Decimal128 `Value` MUST carry a
+        // `hi_reg`. If it doesn't, the producer (column / literal / cast)
+        // forgot to call `Value::pair`, and `Op::Cmp128` would otherwise
+        // silently address the same register for both halves.
+        let l_hi = l.hi_reg.ok_or_else(|| {
+            BoltError::Other(
+                "physical_plan: Decimal128 cmp lhs has no hi_reg — producer bug".into(),
+            )
+        })?;
+        let r_hi = r.hi_reg.ok_or_else(|| {
+            BoltError::Other(
+                "physical_plan: Decimal128 cmp rhs has no hi_reg — producer bug".into(),
+            )
+        })?;
+        // Comparison must be one of the six recognised ops.
+        if !matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        ) {
+            return Err(BoltError::Plan(format!(
+                "Decimal128 {op:?} is not a comparison op; only =, !=, <, >, <=, >= \
+                 are wired through `Op::Cmp128`"
+            )));
+        }
+        let dst = self.fresh();
+        self.ops.push(Op::Cmp128 {
+            dst,
+            op,
+            a_lo: l.reg,
+            a_hi: l_hi,
+            b_lo: r.reg,
+            b_hi: r_hi,
+        });
+        Ok(Value::single(dst, DataType::Bool))
     }
 
     /// Lower a `CASE WHEN c1 THEN v1 [WHEN c2 THEN v2 ...] [ELSE e] END`

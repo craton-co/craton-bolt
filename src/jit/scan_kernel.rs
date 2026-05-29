@@ -94,6 +94,24 @@ impl RegAlloc {
         Ok(name)
     }
 
+    /// Allocate a pair of adjacent `rl` (b64) registers for a 128-bit
+    /// (Decimal128 / i128) value split into `lo` / `hi` halves. Mirrors
+    /// `ptx_gen::RegAlloc::assign_pair` — see that function for the
+    /// rationale (no native 128-bit class; both halves tracked
+    /// independently in `mapping`).
+    ///
+    /// Used by the predicate-kernel emitters for `Op::LoadColumn128`,
+    /// `Op::Const128`, and the dual-register arithmetic / compare ops
+    /// that can appear inside a `WHERE` predicate over Decimal128 columns
+    /// (e.g. `WHERE d1 = d2`).
+    fn assign_pair(&mut self, reg_lo: Reg, reg_hi: Reg) -> BoltResult<(String, String)> {
+        let lo_name = self.alloc("rl");
+        let hi_name = self.alloc("rl");
+        self.mapping.insert(reg_lo, lo_name.clone());
+        self.mapping.insert(reg_hi, hi_name.clone());
+        Ok((lo_name, hi_name))
+    }
+
     /// Look up the physical register name previously assigned to `reg`.
     fn get(&self, reg: Reg) -> BoltResult<&str> {
         self.mapping.get(&reg).map(|s| s.as_str()).ok_or_else(|| {
@@ -102,6 +120,13 @@ impl RegAlloc {
     }
 
     /// Map a logical dtype to a PTX register class string.
+    ///
+    /// Note: `Decimal128` does NOT resolve here — its halves go through
+    /// `assign_pair` directly because the IR carries an explicit `(lo,
+    /// hi)` register pair rather than a single logical register with a
+    /// 128-bit class. The arm below stays as an explicit reject so any
+    /// stray single-Reg path tripping over a Decimal128 dtype gets a
+    /// loud planner-bug error rather than silently mis-classifying.
     fn class_for(dtype: DataType) -> BoltResult<RegClass> {
         Ok(match dtype {
             DataType::Bool => "r",
@@ -120,8 +145,10 @@ impl RegAlloc {
                 ))
             }
             DataType::Decimal128(_, _) => {
-                return Err(BoltError::Plan(
-                    "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+                return Err(BoltError::Other(
+                    "scan_kernel: Decimal128 uses split (lo, hi) register pair \
+                     via assign_pair, not class_for — planner bug if this fires"
+                        .into(),
                 ))
             }
         })
@@ -410,22 +437,70 @@ fn emit_op(
             else_val,
             dtype,
         } => emit_select(b, *dst, *cond, *then_val, *else_val, *dtype),
-        // Decimal128 / i128 dual-register ops (v0.7 Sub-task A) are not
-        // valid in a predicate kernel: a WHERE clause produces a Bool,
-        // never a 128-bit value, and the scan kernel's `RegAlloc`
-        // doesn't track i128 register classes. The mainline lowering
-        // (`Codegen::emit_binary`) still rejects every Decimal128
-        // expression with a Plan error, so these arms are unreachable
-        // through `lower()` today. Surface a clear error if a future
-        // planner regression routes one in.
-        Op::LoadColumn128 { .. }
-        | Op::Const128 { .. }
-        | Op::Store128 { .. }
-        | Op::Add128 { .. }
-        | Op::Sub128 { .. }
-        | Op::Mul128 { .. } => Err(BoltError::Other(
-            "scan_kernel: Decimal128 / i128 ops are not valid in a predicate kernel \
-             (predicates produce Bool, never i128); planner bug if this fires"
+        // Decimal128 / i128 dual-register ops (v0.7 Sub-task A). A WHERE
+        // predicate over Decimal128 columns (e.g. `WHERE d1 = d2`,
+        // `WHERE d1 + d2 > d3`) flows through this kernel via:
+        //
+        //   * `Op::LoadColumn128` — load the i128 row into a (lo, hi)
+        //     register pair, mirroring `ptx_gen::emit_load_128`.
+        //   * `Op::Const128`     — Decimal128 literal in the predicate.
+        //   * `Op::Add128 / Sub128 / Mul128` — Decimal128 arithmetic
+        //     nested inside the predicate.
+        //   * `Op::Cmp128`       — Decimal128 comparison producing the
+        //     Bool predicate value.
+        //
+        // `Op::Store128` remains invalid in a predicate kernel because
+        // predicates never produce 128-bit values for downstream consumers
+        // (the only sink is the 1-byte mask).
+        Op::LoadColumn128 {
+            dst_lo,
+            dst_hi,
+            col_idx,
+        } => emit_load_128(b, *dst_lo, *dst_hi, *col_idx, input_ptrs, tid),
+        Op::Const128 {
+            dst_lo,
+            dst_hi,
+            lo,
+            hi,
+        } => emit_const_128(b, *dst_lo, *dst_hi, *lo, *hi),
+        Op::Add128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_add_128(b, *dst_lo, *dst_hi, *a_lo, *a_hi, *b_lo, *b_hi),
+        Op::Sub128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_sub_128(b, *dst_lo, *dst_hi, *a_lo, *a_hi, *b_lo, *b_hi),
+        Op::Mul128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_mul_128(b, *dst_lo, *dst_hi, *a_lo, *a_hi, *b_lo, *b_hi),
+        Op::Cmp128 {
+            dst,
+            op,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_cmp_128(b, *dst, *op, *a_lo, *a_hi, *b_lo, *b_hi),
+        // Store128 sinks an i128 into an output column — predicates only
+        // emit a 1-byte mask, so a Store128 in a predicate kernel is a
+        // planner bug.
+        Op::Store128 { .. } => Err(BoltError::Other(
+            "scan_kernel: Op::Store128 is not valid in a predicate kernel \
+             (predicates write 1-byte mask, never i128); planner bug if this fires"
                 .into(),
         )),
     }
@@ -812,6 +887,311 @@ fn emit_binary(
             ))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Decimal128 / i128 dual-register ops inside a WHERE predicate.
+//
+// These mirror `ptx_gen::emit_{load,const,add,sub,mul,cmp}_128` exactly —
+// the only reason for the duplication is the same module-independence
+// rationale documented at the top of this file (the scan kernel ABI
+// evolves independently from the projection kernel ABI). Bug fixes to
+// either should propagate to both.
+// ---------------------------------------------------------------------------
+
+/// Emit `Op::LoadColumn128` — two `ld.global.nc.u64` reads at byte offsets
+/// `tid * 16` (lo) and `tid * 16 + 8` (hi) from input column `col_idx`'s
+/// base pointer. Mirrors `ptx_gen::emit_load_128`.
+fn emit_load_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    col_idx: usize,
+    input_ptrs: &[String],
+    tid: &str,
+) -> BoltResult<()> {
+    if col_idx >= input_ptrs.len() {
+        return Err(BoltError::Other(format!(
+            "scan_kernel: LoadColumn128 col_idx {} out of range (have {} inputs)",
+            col_idx,
+            input_ptrs.len()
+        )));
+    }
+    let off = b.alloc.alloc("rd");
+    let addr_lo = b.alloc.alloc("rd");
+    let addr_hi = b.alloc.alloc("rd");
+    b.emit(&format!("mul.wide.u32 {}, {}, 16;", off, tid))?;
+    b.emit(&format!(
+        "add.s64 {}, {}, {};",
+        addr_lo, input_ptrs[col_idx], off
+    ))?;
+    b.emit(&format!("add.s64 {}, {}, 8;", addr_hi, addr_lo))?;
+    let (lo_name, hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    b.emit(&format!("ld.global.nc.u64 {}, [{}];", lo_name, addr_lo))?;
+    b.emit(&format!("ld.global.nc.u64 {}, [{}];", hi_name, addr_hi))?;
+    Ok(())
+}
+
+/// Emit `Op::Const128` — two `mov.u64`s of the hex bit-patterns. Mirrors
+/// `ptx_gen::emit_const_128`.
+fn emit_const_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    lo: u64,
+    hi: u64,
+) -> BoltResult<()> {
+    let (lo_name, hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    b.emit(&format!("mov.u64 {}, 0x{:016X};", lo_name, lo))?;
+    b.emit(&format!("mov.u64 {}, 0x{:016X};", hi_name, hi))?;
+    Ok(())
+}
+
+/// Emit `Op::Add128` — `add.cc.u64` (low) then `addc.u64` (high). Mirrors
+/// `ptx_gen::emit_add_128`.
+fn emit_add_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    let a_lo_name = b.alloc.get(a_lo)?.to_string();
+    let a_hi_name = b.alloc.get(a_hi)?.to_string();
+    let b_lo_name = b.alloc.get(b_lo)?.to_string();
+    let b_hi_name = b.alloc.get(b_hi)?.to_string();
+    let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    b.emit(&format!(
+        "add.cc.u64 {}, {}, {};",
+        dst_lo_name, a_lo_name, b_lo_name
+    ))?;
+    b.emit(&format!(
+        "addc.u64 {}, {}, {};",
+        dst_hi_name, a_hi_name, b_hi_name
+    ))?;
+    Ok(())
+}
+
+/// Emit `Op::Sub128` — `sub.cc.u64` (low) then `subc.u64` (high). Mirrors
+/// `ptx_gen::emit_sub_128`.
+fn emit_sub_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    let a_lo_name = b.alloc.get(a_lo)?.to_string();
+    let a_hi_name = b.alloc.get(a_hi)?.to_string();
+    let b_lo_name = b.alloc.get(b_lo)?.to_string();
+    let b_hi_name = b.alloc.get(b_hi)?.to_string();
+    let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    b.emit(&format!(
+        "sub.cc.u64 {}, {}, {};",
+        dst_lo_name, a_lo_name, b_lo_name
+    ))?;
+    b.emit(&format!(
+        "subc.u64 {}, {}, {};",
+        dst_hi_name, a_hi_name, b_hi_name
+    ))?;
+    Ok(())
+}
+
+/// Emit `Op::Mul128` — schoolbook cross-multiply, low and high halves.
+/// Mirrors `ptx_gen::emit_mul_128`.
+fn emit_mul_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    let a_lo_name = b.alloc.get(a_lo)?.to_string();
+    let a_hi_name = b.alloc.get(a_hi)?.to_string();
+    let b_lo_name = b.alloc.get(b_lo)?.to_string();
+    let b_hi_name = b.alloc.get(b_hi)?.to_string();
+    let hi_acc = b.alloc.alloc("rl");
+    let cross1 = b.alloc.alloc("rl");
+    let cross2 = b.alloc.alloc("rl");
+    let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    b.emit(&format!(
+        "mul.lo.u64 {}, {}, {};",
+        dst_lo_name, a_lo_name, b_lo_name
+    ))?;
+    b.emit(&format!(
+        "mul.hi.u64 {}, {}, {};",
+        hi_acc, a_lo_name, b_lo_name
+    ))?;
+    b.emit(&format!(
+        "mul.lo.u64 {}, {}, {};",
+        cross1, a_lo_name, b_hi_name
+    ))?;
+    b.emit(&format!(
+        "mul.lo.u64 {}, {}, {};",
+        cross2, a_hi_name, b_lo_name
+    ))?;
+    b.emit(&format!("add.u64 {}, {}, {};", hi_acc, hi_acc, cross1))?;
+    b.emit(&format!(
+        "add.u64 {}, {}, {};",
+        dst_hi_name, hi_acc, cross2
+    ))?;
+    Ok(())
+}
+
+/// Emit `Op::Cmp128` — signed 128-bit comparison producing a single
+/// `b32` Bool (0/1). Mirrors `ptx_gen::emit_cmp_128`; see that
+/// function's rustdoc for the per-op PTX wire shape.
+fn emit_cmp_128(
+    b: &mut PtxBuilder,
+    dst: Reg,
+    op: BinaryOp,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    let a_lo_name = b.alloc.get(a_lo)?.to_string();
+    let a_hi_name = b.alloc.get(a_hi)?.to_string();
+    let b_lo_name = b.alloc.get(b_lo)?.to_string();
+    let b_hi_name = b.alloc.get(b_hi)?.to_string();
+    let dst_name = b.alloc.assign(dst, DataType::Bool)?;
+
+    use BinaryOp::*;
+    match op {
+        Eq => {
+            let p_lo = b.alloc.alloc("p");
+            let p_hi = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.eq.u64 {}, {}, {};",
+                p_lo, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p, p_lo, p_hi))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        NotEq => {
+            let p_lo = b.alloc.alloc("p");
+            let p_hi = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.ne.u64 {}, {}, {};",
+                p_lo, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!(
+                "setp.ne.s64 {}, {}, {};",
+                p_hi, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_lo, p_hi))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        Lt => {
+            let p_hi_lt = b.alloc.alloc("p");
+            let p_hi_eq = b.alloc.alloc("p");
+            let p_lo_lt = b.alloc.alloc("p");
+            let p_eq_lt = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.lt.s64 {}, {}, {};",
+                p_hi_lt, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi_eq, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.lt.u64 {}, {}, {};",
+                p_lo_lt, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p_eq_lt, p_hi_eq, p_lo_lt))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_lt, p_eq_lt))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        Gt => {
+            let p_hi_gt = b.alloc.alloc("p");
+            let p_hi_eq = b.alloc.alloc("p");
+            let p_lo_gt = b.alloc.alloc("p");
+            let p_eq_gt = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.gt.s64 {}, {}, {};",
+                p_hi_gt, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi_eq, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.gt.u64 {}, {}, {};",
+                p_lo_gt, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p_eq_gt, p_hi_eq, p_lo_gt))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_gt, p_eq_gt))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        LtEq => {
+            let p_hi_lt = b.alloc.alloc("p");
+            let p_hi_eq = b.alloc.alloc("p");
+            let p_lo_le = b.alloc.alloc("p");
+            let p_eq_le = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.lt.s64 {}, {}, {};",
+                p_hi_lt, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi_eq, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.le.u64 {}, {}, {};",
+                p_lo_le, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p_eq_le, p_hi_eq, p_lo_le))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_lt, p_eq_le))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        GtEq => {
+            let p_hi_gt = b.alloc.alloc("p");
+            let p_hi_eq = b.alloc.alloc("p");
+            let p_lo_ge = b.alloc.alloc("p");
+            let p_eq_ge = b.alloc.alloc("p");
+            let p = b.alloc.alloc("p");
+            b.emit(&format!(
+                "setp.gt.s64 {}, {}, {};",
+                p_hi_gt, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.eq.s64 {}, {}, {};",
+                p_hi_eq, a_hi_name, b_hi_name
+            ))?;
+            b.emit(&format!(
+                "setp.ge.u64 {}, {}, {};",
+                p_lo_ge, a_lo_name, b_lo_name
+            ))?;
+            b.emit(&format!("and.pred {}, {}, {};", p_eq_ge, p_hi_eq, p_lo_ge))?;
+            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_gt, p_eq_ge))?;
+            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+        }
+        _ => {
+            return Err(BoltError::Other(format!(
+                "scan_kernel: Op::Cmp128 with non-comparison op {:?} — planner bug \
+                 (Codegen::emit_binary_decimal128_cmp must reject non-comparison \
+                 ops before emitting Op::Cmp128)",
+                op
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Mnemonic string for an arithmetic op at a given dtype.
