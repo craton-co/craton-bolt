@@ -845,6 +845,27 @@ pub enum StringLengthOutput {
     },
 }
 
+/// One output column of a [`PhysicalPlan::StringProject`] projection: either a
+/// passthrough of a non-Utf8 source column, or a variable-width string
+/// transform (`UPPER` / `LOWER`) of a Utf8 column.
+#[derive(Debug, Clone)]
+pub enum StringProjectOutput {
+    /// Pass the named source column through unchanged.
+    Passthrough {
+        /// Source column name in the scanned table.
+        source: String,
+    },
+    /// `UPPER(source)` / `LOWER(source)` — produced on the GPU via the two-pass
+    /// length/scan/write kernels (ASCII fold), with a full-Unicode host
+    /// fallback. Output dtype is `Utf8`.
+    Transform {
+        /// Source Utf8 column name in the scanned table.
+        source: String,
+        /// Which case transform to apply.
+        transform: crate::exec::string_project::StringTransform,
+    },
+}
+
 /// The top-level physical plan: a small ordered pipeline of kernels.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
@@ -947,6 +968,29 @@ pub enum PhysicalPlan {
         outputs: Vec<StringLengthOutput>,
         /// Output schema (`LENGTH` columns are `Int64`; passthroughs keep their
         /// source dtype).
+        output_schema: Schema,
+    },
+    /// Fully-GPU `SELECT UPPER(<utf8_col>)` / `LOWER(<utf8_col>)` (plus
+    /// passthrough columns) over a bare table scan.
+    ///
+    /// This is the variable-width sibling of [`PhysicalPlan::StringLength`]:
+    /// unlike `LENGTH` (a fixed-width `Int32` gather), `UPPER`/`LOWER` produce a
+    /// brand-new `Utf8` array whose per-row byte widths are data-dependent, so
+    /// the executor drives the two-pass length/scan/write kernels in
+    /// [`crate::jit::string_kernel`] (see [`crate::exec::string_project`]). The
+    /// GPU path ASCII-folds byte-wise; columns whose dictionary holds any
+    /// non-ASCII byte fall back to a full-Unicode host transform (no panic).
+    /// The lowering router only produces this variant for the lowest-risk
+    /// shape (a `Project` directly over a `Scan`, every output expr a
+    /// bare/aliased `Column` or `UPPER`/`LOWER(Column)`); `SUBSTRING`/`CONCAT`
+    /// and `LENGTH` still route elsewhere.
+    StringProject {
+        /// Source table name.
+        table: String,
+        /// One spec per output column, in `output_schema` order.
+        outputs: Vec<StringProjectOutput>,
+        /// Output schema (`UPPER`/`LOWER` columns are `Utf8`; passthroughs keep
+        /// their source dtype).
         output_schema: Schema,
     },
     /// Host-side post-aggregate (or other non-scan-chain) filter layer.
@@ -1062,6 +1106,7 @@ impl PhysicalPlan {
             PhysicalPlan::Project { output_schema, .. } => output_schema,
             PhysicalPlan::Window { output_schema, .. } => output_schema,
             PhysicalPlan::StringLength { output_schema, .. } => output_schema,
+            PhysicalPlan::StringProject { output_schema, .. } => output_schema,
             PhysicalPlan::Join { output_schema, .. } => output_schema,
         }
     }
@@ -3272,6 +3317,99 @@ fn try_lower_string_length(
     }))
 }
 
+/// Try to lower a SELECT list of bare-column / `UPPER(<column>)` /
+/// `LOWER(<column>)` outputs over a **bare table `Scan`** into the fully-GPU
+/// [`PhysicalPlan::StringProject`] variant (the variable-width sibling of
+/// [`try_lower_string_length`]). Returns `Ok(None)` when the shape is not the
+/// supported one — the caller then falls back to its existing routing.
+///
+/// We keep the accepted shape narrow, mirroring the LENGTH lowering. Every
+/// output must be either:
+///
+///   * a bare `Column(name)` (optionally aliased) that is **not** a `Utf8`
+///     column — a Utf8 passthrough would need to materialise the
+///     dictionary-encoded source back into a plain `Utf8` array, out of scope
+///     for this path (bail so the dtype-faithful host projection handles it), or
+///   * `UPPER(Column(name))` / `LOWER(Column(name))` (optionally aliased) where
+///     `name` is a `Utf8` column of the scanned table.
+///
+/// At least one output must be an `UPPER`/`LOWER` (otherwise this is a plain
+/// projection the existing codegen path handles). Anything else — `SUBSTRING` /
+/// `CONCAT` / `LENGTH`, a transform over a non-column argument, a computed
+/// expression, a Filter in the chain — returns `Ok(None)`.
+fn try_lower_string_project(
+    plan: &LogicalPlan,
+    input: &LogicalPlan,
+    exprs: &[Expr],
+) -> BoltResult<Option<PhysicalPlan>> {
+    use crate::exec::string_project::StringTransform;
+
+    // Only a bare `Scan` underneath (no Filter / Project chain).
+    let (table, scan_schema) = match input {
+        LogicalPlan::Scan { table, schema, .. } => (table.as_str(), schema),
+        _ => return Ok(None),
+    };
+
+    let mut outputs: Vec<StringProjectOutput> = Vec::with_capacity(exprs.len());
+    let mut any_transform = false;
+
+    for e in exprs {
+        let body = peel_aliases(e);
+        match body {
+            Expr::Column(name) => {
+                let idx = scan_schema.index_of(name)?;
+                // Utf8 passthrough is out of scope (see doc comment): bail.
+                if scan_schema.fields[idx].dtype == DataType::Utf8 {
+                    return Ok(None);
+                }
+                outputs.push(StringProjectOutput::Passthrough {
+                    source: name.clone(),
+                });
+            }
+            Expr::ScalarFn { kind, args }
+                if matches!(kind, ScalarFnKind::Upper | ScalarFnKind::Lower) =>
+            {
+                if args.len() != 1 {
+                    return Ok(None);
+                }
+                let src = match peel_aliases(&args[0]) {
+                    Expr::Column(name) => name.clone(),
+                    _ => return Ok(None),
+                };
+                let idx = scan_schema.index_of(&src)?;
+                if scan_schema.fields[idx].dtype != DataType::Utf8 {
+                    return Ok(None);
+                }
+                let transform = match kind {
+                    ScalarFnKind::Upper => StringTransform::Upper,
+                    ScalarFnKind::Lower => StringTransform::Lower,
+                    // unreachable: the guard restricts `kind` to Upper/Lower.
+                    _ => return Ok(None),
+                };
+                any_transform = true;
+                outputs.push(StringProjectOutput::Transform {
+                    source: src,
+                    transform,
+                });
+            }
+            // Anything else (LENGTH/SUBSTRING/CONCAT, computed exprs, a
+            // transform over a non-column, literals, ...) is out of scope.
+            _ => return Ok(None),
+        }
+    }
+
+    if !any_transform {
+        return Ok(None);
+    }
+
+    let output_schema = plan.schema()?;
+    Ok(Some(PhysicalPlan::StringProject {
+        table: table.to_string(),
+        outputs,
+        output_schema,
+    }))
+}
+
 /// Walk a `Scan` / `Filter` / `Project` chain and return true if any
 /// `Filter` node carries a predicate that contains a `BinaryOp::Concat`.
 ///
@@ -3443,6 +3581,10 @@ pub fn populate_input_validity(
         // the dictionary index column (never a value-validity bitmap) and
         // NULL rows are handled by the length-table's slot-0 sentinel.
         PhysicalPlan::StringLength { .. } => {}
+        // No fused `KernelSpec` to flag: the two-pass UPPER/LOWER kernels read
+        // a row-aligned offsets+bytes input the executor materialises; NULL
+        // rows are decoded to empty slices and re-NULLed on download.
+        PhysicalPlan::StringProject { .. } => {}
     }
 }
 
@@ -3784,6 +3926,8 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
             // No expression IR to inspect: outputs are bare passthrough /
             // LENGTH gathers with no Div / And / Or anywhere.
             PhysicalPlan::StringLength { .. } => false,
+            // Same — UPPER/LOWER outputs carry no Div / And / Or IR.
+            PhysicalPlan::StringProject { .. } => false,
         }
     }
     if walk(plan) {
@@ -4143,6 +4287,12 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 // stays intact.
                 if let Some(string_len) = try_lower_string_length(plan, input, exprs)? {
                     return Ok(string_len);
+                }
+                // UPPER/LOWER (plus passthroughs) over a bare scan lowers to the
+                // fully-GPU two-pass `PhysicalPlan::StringProject` (see
+                // `crate::exec::string_project`).
+                if let Some(string_proj) = try_lower_string_project(plan, input, exprs)? {
+                    return Ok(string_proj);
                 }
                 let kind = first_scalar_fn_kind(exprs);
                 return Err(BoltError::Plan(format!(
