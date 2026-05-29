@@ -1174,7 +1174,9 @@ fn plan_query(
 
 /// Lower a `SetExpr` (SELECT body or UNION/EXCEPT/INTERSECT node) into a
 /// `LogicalPlan`. UNION ALL becomes `Union { inputs }`; plain UNION becomes
-/// `Distinct(Union { inputs })`. EXCEPT/INTERSECT are rejected.
+/// `Distinct(Union { inputs })`; EXCEPT / INTERSECT (with optional ALL) become
+/// a binary `LogicalPlan::SetOp` node (executed host-side by
+/// [`crate::exec::setops`]).
 ///
 /// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH is exceeded.
 fn lower_set_expr(
