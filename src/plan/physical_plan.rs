@@ -1418,6 +1418,13 @@ impl<'a> Codegen<'a> {
                     crate::plan::logical_plan::ScalarFnKind::Concat => {
                         "GPU codegen has no Utf8 support (Concat routes through host fallback)"
                     }
+                    // TODO(string-fn-gpu): TRIM has no GPU kernel; it routes
+                    // through the host fallback (`expr_agg::eval_expr`).
+                    crate::plan::logical_plan::ScalarFnKind::TrimBoth
+                    | crate::plan::logical_plan::ScalarFnKind::TrimLeading
+                    | crate::plan::logical_plan::ScalarFnKind::TrimTrailing => {
+                        "GPU codegen has no Utf8 support (TRIM routes through host fallback)"
+                    }
                 };
                 Err(BoltError::Plan(format!(
                     "string scalar function {} is not yet lowered to GPU: {}; \
@@ -3255,6 +3262,48 @@ fn expr_contains_scalar_fn(expr: &Expr) -> bool {
     }
 }
 
+/// True if EVERY `Expr::ScalarFn` in `exprs` is host-evaluable by
+/// [`crate::exec::expr_agg::eval_scalar_fn`] — i.e. `SUBSTRING` or `TRIM`.
+///
+/// These two functions have no GPU producer wired into the executor yet, so
+/// (like SQL `||`) they route to the host-side `PhysicalPlan::Project` whose
+/// executor materialises them via `expr_agg::eval_expr`. UPPER/LOWER/LENGTH
+/// have their own GPU lowering (`StringProject` / `StringLength`) and CONCAT is
+/// the binary-op path; a SELECT mixing one of those with a non-bare-scan shape
+/// still hits the explicit rejection below rather than this host route.
+///
+/// Returns `true` for an `exprs` slice containing no scalar functions at all
+/// (vacuously), so callers must gate on `expr_contains_scalar_fn` first.
+fn all_scalar_fns_host_evaluable(exprs: &[Expr]) -> bool {
+    fn walk(e: &Expr) -> bool {
+        match e {
+            Expr::ScalarFn { kind, args } => {
+                let ok = matches!(
+                    kind,
+                    ScalarFnKind::Substring
+                        | ScalarFnKind::TrimBoth
+                        | ScalarFnKind::TrimLeading
+                        | ScalarFnKind::TrimTrailing
+                );
+                ok && args.iter().all(walk)
+            }
+            Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => walk(expr),
+            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => true,
+            Expr::Binary { left, right, .. } => walk(left) && walk(right),
+            Expr::Unary { operand, .. } => walk(operand),
+            Expr::Alias(inner, _) => walk(inner),
+            Expr::Case { branches, else_branch } => {
+                branches.iter().all(|(w, t)| walk(w) && walk(t))
+                    && else_branch.as_deref().map(walk).unwrap_or(true)
+            }
+            Expr::Like { expr, .. } => walk(expr),
+            Expr::Cast { expr, .. } => walk(expr),
+            Expr::Column(_) | Expr::Literal(_) => true,
+        }
+    }
+    exprs.iter().all(walk)
+}
+
 /// Return the [`ScalarFnKind`] of the first `Expr::ScalarFn` found (depth-first)
 /// in `exprs`, or `None` if there is none. Used only to enrich the lowering
 /// rejection message in [`lower_depth`]'s `LogicalPlan::Project` arm with the
@@ -4373,6 +4422,30 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 // `crate::exec::string_project`).
                 if let Some(string_proj) = try_lower_string_project(plan, input, exprs)? {
                     return Ok(string_proj);
+                }
+                // SUBSTRING / TRIM have no GPU producer wired into the executor
+                // yet, so — exactly like SQL `||` (Concat) above — route them to
+                // the host-side `PhysicalPlan::Project`, whose executor
+                // evaluates each expr via `expr_agg::eval_expr` over a
+                // `HostColumn` env. We lower the inner plan with NO projection
+                // override so every scan column the function args reference is
+                // surfaced for the host evaluator to pull.
+                //
+                // TODO(string-fn-gpu): replace with a GPU two-pass SUBSTRING /
+                // TRIM producer once the executor can launch the
+                // `jit::string_kernel` kernels.
+                if all_scalar_fns_host_evaluable(exprs) {
+                    log::debug!(
+                        "physical_plan: SUBSTRING/TRIM in Project; lowering to \
+                         host-side PhysicalPlan::Project (no GPU producer yet)"
+                    );
+                    let inner = lower(input)?;
+                    let output_schema = plan.schema()?;
+                    return Ok(PhysicalPlan::Project {
+                        input: Box::new(inner),
+                        exprs: exprs.clone(),
+                        output_schema,
+                    });
                 }
                 let kind = first_scalar_fn_kind(exprs);
                 return Err(BoltError::Plan(format!(

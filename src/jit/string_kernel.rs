@@ -117,6 +117,15 @@ fn varwidth_tag(kind: ScalarFnKind) -> BoltResult<&'static str> {
              host fallback remains reachable"
                 .into(),
         )),
+        // TODO(string-fn-gpu): TRIM has no GPU two-pass producer yet; the
+        // host fallback in `exec::string_ops_extended` is the supported path.
+        ScalarFnKind::TrimBoth | ScalarFnKind::TrimLeading | ScalarFnKind::TrimTrailing => {
+            Err(BoltError::Plan(
+                "string_kernel: TRIM GPU codegen not yet implemented; \
+                 host fallback remains reachable"
+                    .into(),
+            ))
+        }
     }
 }
 
