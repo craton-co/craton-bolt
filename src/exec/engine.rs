@@ -2073,6 +2073,33 @@ impl Engine {
         result
     }
 
+    /// Parse, plan, and *render* `query` without executing it — an
+    /// `EXPLAIN`-style introspection hook.
+    ///
+    /// Reuses the same logical-plan path as [`Engine::sql`] (parse +
+    /// dict-rewrite + user [`PlanRewrite`]s) but stops short of lowering to
+    /// GPU kernels or touching the device. The returned string contains the
+    /// tree-indented logical plan (via
+    /// [`crate::plan::format_logical`]); when the plan also lowers cleanly to
+    /// a physical plan it appends the physical rendering (via
+    /// [`crate::plan::format_physical`]). Plans that the GPU codegen does not
+    /// yet support (e.g. `CASE`, `CAST`) still return their logical plan, with
+    /// the lowering error noted in place of the physical section.
+    pub fn explain_sql(&self, query: &str) -> BoltResult<String> {
+        let plan: LogicalPlan = parse_sql(query, &self.provider)?;
+        let plan = self.dict_registry.rewrite_plan(&plan)?;
+        let plan = self.rewrites.iter().try_fold(plan, |p, r| r.rewrite(p))?;
+
+        let mut out = String::from("Logical plan:\n");
+        out.push_str(&crate::plan::format_logical(&plan));
+        out.push_str("\nPhysical plan:\n");
+        match crate::plan::lower_physical(&plan) {
+            Ok(phys) => out.push_str(&crate::plan::format_physical(&phys)),
+            Err(e) => out.push_str(&format!("  <not lowered: {e}>\n")),
+        }
+        Ok(out)
+    }
+
     /// Execute an already-built [`LogicalPlan`] and return a [`QueryHandle`].
     ///
     /// This is the post-parse half of [`Engine::sql`]: it skips SQL parsing
