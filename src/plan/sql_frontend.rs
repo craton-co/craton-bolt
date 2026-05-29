@@ -2340,18 +2340,34 @@ fn reject_unsupported_select(select: &Select) -> BoltResult<()> {
     Ok(())
 }
 
-/// Pull a single-part identifier out of an `ObjectName`, rejecting schema-qualified names.
+/// Pull the table name out of an `ObjectName`, accepting an optional single
+/// schema/catalog qualifier.
+///
+/// The engine is single-catalog, so a leading qualifier carries no semantic
+/// weight — `main.sales` and `sales` name the same table. We therefore accept
+/// the common `schema.table` shape by treating the *trailing* identifier as
+/// the table name and discarding the qualifier. A bare `table` is the
+/// one-part case. Three or more parts (`catalog.schema.table`) are still
+/// rejected: there is no second level of namespacing to collapse them into.
 ///
 /// SQL-standard case folding (v0.5): unquoted table names are folded to
 /// lowercase; quoted names (`"MyTable"`) keep their case verbatim. See
-/// [`ident_to_name`] for the rule.
+/// [`ident_to_name`] for the rule. Folding applies to the trailing (table)
+/// part only — the discarded qualifier never reaches the lowered IR.
 fn single_ident_from_object_name(name: &ObjectName) -> BoltResult<String> {
-    if name.0.len() != 1 {
-        return Err(BoltError::Sql(format!(
-            "qualified table names not supported: {name}"
-        )));
+    match name.0.len() {
+        // `table` — the common bare case.
+        1 => Ok(ident_to_name(&name.0[0])),
+        // `schema.table` / `catalog.table` — single-catalog engine, so the
+        // qualifier is accepted and dropped; the table is resolved by its
+        // base (trailing) name.
+        2 => Ok(ident_to_name(&name.0[1])),
+        // `catalog.schema.table` and deeper: no namespace to fold these into.
+        _ => Err(BoltError::Sql(format!(
+            "qualified table names support at most one schema/catalog \
+             qualifier (e.g. `schema.table`); got: {name}"
+        ))),
     }
-    Ok(ident_to_name(&name.0[0]))
 }
 
 /// Recognize a top-level aggregate function call. Returns `Ok(None)` for non-aggregates.
@@ -3619,10 +3635,14 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
             Ok(Expr::Column(ident_to_name(ident)))
         }
         SqlExpr::CompoundIdentifier(parts) => {
-            // We support the two-part `table.col` form. The three-part
-            // `schema.table.col` form is rejected with a dedicated message
-            // (the frontend has no schema/database concept). Anything
-            // deeper is rejected as "deeply qualified".
+            // We support `table.col` and the schema-qualified `schema.table.col`
+            // (or `alias`-qualified) form. The engine is single-catalog, so the
+            // leading schema/catalog part of a three-segment reference carries
+            // no meaning — the reference resolves by its trailing `table.col`
+            // pair exactly as the two-part form does (and is rejected the same
+            // way if that table/alias is not in scope). Four or more segments
+            // have no namespace to collapse into and are rejected as "deeply
+            // qualified".
             //
             // Cap the reflected fragment so adversarial input (very long
             // identifiers, deeply nested chains) can't flood logs. 200
@@ -3642,20 +3662,27 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
                 }
             };
             match parts.len() {
+                // `table.col` / `alias.col`. Per-part case folding via
+                // ident_to_name: each segment is folded independently.
+                // `T1.Name` and `t1.name` resolve to the same column;
+                // `"T1"."Name"` (both quoted) is verbatim.
                 2 => {
-                    // Per-part case folding via ident_to_name: each segment is
-                    // folded independently. `T1.Name` and `t1.name` resolve to
-                    // the same column; `"T1"."Name"` (both quoted) is verbatim.
                     let qualifier = ident_to_name(&parts[0]);
                     let col = ident_to_name(&parts[1]);
                     let resolved = resolver.resolve_compound(&qualifier, &col)?;
                     Ok(Expr::Column(resolved))
                 }
-                3 => Err(BoltError::Sql(format!(
-                    "schema-qualified names not supported: '{}' \
-                     (only `table.col` / `alias.col` is accepted)",
-                    display()
-                ))),
+                // `schema.table.col`. Drop the leading single-catalog
+                // qualifier and resolve the trailing `table.col` pair; an
+                // unknown table/alias in the middle slot still produces the
+                // standard "unknown table qualifier" error from
+                // resolve_compound.
+                3 => {
+                    let qualifier = ident_to_name(&parts[1]);
+                    let col = ident_to_name(&parts[2]);
+                    let resolved = resolver.resolve_compound(&qualifier, &col)?;
+                    Ok(Expr::Column(resolved))
+                }
                 _ => Err(BoltError::Sql(format!(
                     "unsupported: deeply qualified column reference '{}'",
                     display()
@@ -5568,6 +5595,112 @@ mod wave7_tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
+    }
+
+    // ---- Schema-qualified names (single-catalog) ---------------------------
+
+    #[test]
+    fn schema_qualified_from_scans_base_table() {
+        // `FROM main.t1` is the same table as `FROM t1`: the leading
+        // schema/catalog qualifier is accepted and dropped, and the lowered
+        // Scan names the *base* table.
+        let plan = lp("SELECT a FROM main.t1");
+        let scan = match plan {
+            LogicalPlan::Project { input, .. } => *input,
+            other => other,
+        };
+        match scan {
+            LogicalPlan::Scan { table, .. } => {
+                assert_eq!(table, "t1", "qualifier must be dropped, base scanned");
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_qualified_unknown_base_table_errors() {
+        // The qualifier is dropped, but the base table must still exist.
+        let err = parse("SELECT a FROM main.nope", &provider())
+            .expect_err("unknown base table must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown table 'nope'"),
+            "expected unknown-base-table error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn three_part_column_ref_resolves_to_bare_column() {
+        // `SELECT main.t1.a` drops `main` and resolves the trailing `t1.a`
+        // pair to the same `Column("a")` the two-part form produces.
+        let plan = lp("SELECT main.t1.a FROM main.t1");
+        match plan {
+            LogicalPlan::Project { exprs, .. } => {
+                assert_eq!(exprs.len(), 1);
+                match &exprs[0] {
+                    Expr::Column(name) => assert_eq!(name, "a"),
+                    other => panic!("expected Column, got {other:?}"),
+                }
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn three_part_column_ref_respects_join_rename() {
+        // The middle slot is the table qualifier; the leading schema part is
+        // dropped. `cat.t2.a` resolves to the post-join-rename `right.a`,
+        // exactly as the two-part `t2.a` would.
+        let plan = lp(
+            "SELECT cat.t1.a, cat.t2.a FROM t1 INNER JOIN t2 ON t1.a = t2.a",
+        );
+        match plan {
+            LogicalPlan::Project { exprs, .. } => match (&exprs[0], &exprs[1]) {
+                (Expr::Column(left), Expr::Column(right)) => {
+                    assert_eq!(left, "a", "cat.t1.a keeps bare name");
+                    assert_eq!(right, "right.a", "cat.t2.a uses post-rename name");
+                }
+                other => panic!("expected two Column refs, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn three_part_column_ref_unknown_table_errors() {
+        // The middle (table) slot must be in scope; the leading schema part
+        // is irrelevant to resolution.
+        let err = parse("SELECT cat.bogus.a FROM t1", &provider())
+            .expect_err("unknown table qualifier must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown table qualifier"),
+            "expected unknown-table-qualifier error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn four_part_column_ref_rejected_as_deeply_qualified() {
+        // No second namespace level to fold a 4-part reference into.
+        let err = parse("SELECT a.b.c.d FROM t1", &provider())
+            .expect_err("4-part reference must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("deeply qualified"),
+            "expected deeply-qualified error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn four_part_table_name_in_from_rejected() {
+        // `cat.schema.table` (and deeper) has no namespace to collapse into.
+        let err = parse("SELECT a FROM cat.schema.t1", &provider())
+            .expect_err("3-part table name must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("at most one schema/catalog qualifier"),
+            "expected one-qualifier-limit error, got: {msg}"
+        );
     }
 
     /// Three-column fixture for the HAVING/alias stress tests: `t(k, v)`

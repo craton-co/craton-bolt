@@ -5,10 +5,13 @@
 //! Covers:
 //!   * single-table FROM with a `table.col` prefix
 //!   * single-table FROM with an `AS alias` and `alias.col` references
+//!   * schema-qualified FROM (`FROM schema.table`) and column refs
+//!     (`SELECT schema.table.col`) — the single-catalog engine accepts and
+//!     drops the leading qualifier, resolving by the trailing table name
 //!   * JOIN with `table.col` prefixes in WHERE / SELECT (disambiguation)
 //!   * JOIN with aliases on both sides (`FROM t1 AS a JOIN t2 AS b ON ...`)
 //!   * unknown table prefix → clear "unknown table qualifier" error
-//!   * 3-part identifier `schema.table.col` → "schema-qualified names not supported"
+//!   * 4-part identifier `cat.schema.table.col` → "deeply qualified"
 //!
 //! These tests only assert that parse + lower succeed (or fail with the
 //! expected message); the executor-side correctness of the resolved column
@@ -239,14 +242,62 @@ fn unknown_table_prefix_lists_candidate_tables() {
     );
 }
 
+// ---- Schema-qualified names (single-catalog: qualifier accepted & dropped) --
+
 #[test]
-fn three_part_identifier_rejected_with_schema_message() {
-    // `schema.table.col` — the frontend has no database/schema concept.
-    // Reject with a dedicated "schema-qualified names not supported" message
-    // rather than the generic "deeply qualified" fallback.
+fn schema_qualified_table_in_from_resolves() {
+    // `FROM main.orders` names the same table as `FROM orders`: the leading
+    // schema/catalog qualifier is accepted and dropped.
     let provider = two_tables();
-    let res = try_plan("SELECT public.orders.id FROM orders", &provider);
-    assert_err_contains(res, "schema-qualified names not supported");
+    let res = try_plan("SELECT id FROM main.orders", &provider);
+    assert!(res.is_ok(), "schema-qualified FROM should resolve: {res:?}");
+}
+
+#[test]
+fn schema_qualified_unknown_base_table_errors() {
+    // The qualifier is dropped, but the *base* table must still exist —
+    // `main.nope` resolves to base `nope`, which isn't registered.
+    let provider = two_tables();
+    let res = try_plan("SELECT id FROM main.nope", &provider);
+    assert_err_contains(res, "unknown table 'nope'");
+}
+
+#[test]
+fn three_part_column_ref_resolves_by_table_and_column() {
+    // `SELECT main.orders.id` — drop the leading `main`, resolve the trailing
+    // `orders.id` pair exactly as the two-part `orders.id` form would.
+    let provider = two_tables();
+    let res = try_plan("SELECT main.orders.id FROM main.orders", &provider);
+    assert!(
+        res.is_ok(),
+        "schema-qualified column ref should resolve: {res:?}"
+    );
+}
+
+#[test]
+fn three_part_column_ref_unknown_table_errors() {
+    // The middle (table) slot must be in scope. `main.bogus.id` resolves the
+    // trailing `bogus.id`, and `bogus` is not a FROM table → standard
+    // "unknown table qualifier" error (the leading `main` is irrelevant).
+    let provider = two_tables();
+    let res = try_plan("SELECT main.bogus.id FROM orders", &provider);
+    assert_err_contains(res, "unknown table qualifier");
+}
+
+#[test]
+fn three_part_column_ref_respects_alias_precedence() {
+    // When the table is aliased, the *alias* is the only valid middle-slot
+    // qualifier (the underlying table name is shadowed), and the leading
+    // schema part is still dropped. `any_schema.t.x` resolves via alias `t`;
+    // the underlying `mytable` does not.
+    let provider = one_table();
+    assert!(
+        try_plan("SELECT any_schema.t.x FROM mytable AS t", &provider).is_ok(),
+        "schema-qualified ref via alias should resolve"
+    );
+    let shadowed =
+        try_plan("SELECT any_schema.mytable.x FROM mytable AS t", &provider);
+    assert_err_contains(shadowed, "unknown table qualifier");
 }
 
 #[test]
