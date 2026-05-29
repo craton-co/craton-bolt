@@ -19,6 +19,10 @@ pub(crate) mod gpu_upload;
 /// `plan_schema_to_arrow_schema` definitions across the executors.
 pub(crate) mod schema_convert;
 pub mod aggregate;
+/// NULL / validity propagation audit matrix + shared validity helpers
+/// (Arrow-LE packed-bit bitmap construction). See the module docs for the
+/// per-executor propagation matrix.
+pub mod validity_audit;
 pub mod compact;
 pub mod string_col;
 pub mod groupby;

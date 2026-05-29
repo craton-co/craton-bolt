@@ -117,9 +117,11 @@ use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
-    compile_avg_reduction_kernel, compile_reduction_kernel, ReduceOp, AVG_KERNEL_ENTRY,
-    BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
+    compile_avg_reduction_kernel, compile_reduction_kernel,
+    compile_reduction_kernel_with_validity, ReduceOp, AVG_KERNEL_ENTRY, BLOCK_SIZE,
+    REDUCTION_KERNEL_ENTRY, REDUCTION_KERNEL_WITH_VALIDITY_ENTRY,
 };
+use crate::exec::validity_audit::packed_validity_for;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 
 // `CudaModule` import dropped: every load site now routes through
@@ -136,6 +138,15 @@ use crate::plan::physical_plan::{
 // path uses it through the canonical name so the migration is a
 // drop-in import swap — no semantic change.
 use crate::exec::gpu_upload::upload_primitive_values_async;
+
+/// Build the packed-bit validity bitmap for `arr` and upload it as a
+/// `GpuVec<u8>` on `stream`, ready to feed the `_with_validity` reduction
+/// kernel. Mirrors [`upload_primitive_values_async`]'s `cuda-stub` fallback.
+#[inline]
+fn upload_validity_async(arr: &dyn Array, stream: &CudaStream) -> BoltResult<GpuVec<u8>> {
+    let packed = packed_validity_for(arr);
+    upload_primitive_values_async::<u8>(&packed, stream)
+}
 
 /// Execute an aggregate physical plan against a host-side RecordBatch.
 ///
@@ -802,18 +813,19 @@ fn reduce_column_from_batch(
             // buffer and host-side finalization must also be i64. MIN/MAX
             // preserve the input dtype and use the i32 path.
             if has_nulls {
-                let host: Vec<i32> = filter_primitive_to_vec(pa);
-                let len = host.len();
+                // Native-validity path: upload the RAW value buffer plus a
+                // packed validity bitmap and let the kernel fold NULL rows to
+                // the identity — no host strip.
+                let validity_gpu = upload_validity_async(arr, &stream)?;
+                let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
                 if matches!(op, ReduceOp::Sum) {
-                    // Widened SUM path: replicate the upload-async shape that
-                    // `reduce_host_slice` would have used, since that helper is
-                    // monomorphic over a single accumulator type.
-                    let dev = upload_primitive_values_async::<i32>(&host, &stream)?;
-                    reduce_gpu_vec_widened::<i32, i64>(
-                        op, col_io.dtype, &dev, len, &stream,
+                    reduce_gpu_vec_widened_with_validity::<i32, i64>(
+                        op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
                     )
                 } else {
-                    reduce_host_slice::<i32>(op, col_io.dtype, &host)
+                    reduce_gpu_vec_with_validity::<i32>(
+                        op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                    )
                 }
             } else {
                 // No-null fast path: async H2D of Arrow's value buffer on
@@ -836,8 +848,11 @@ fn reduce_column_from_batch(
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
             if has_nulls {
-                let host: Vec<i64> = filter_primitive_to_vec(pa);
-                reduce_host_slice::<i64>(op, col_io.dtype, &host)
+                let validity_gpu = upload_validity_async(arr, &stream)?;
+                let dev = upload_primitive_values_async::<i64>(pa.values(), &stream)?;
+                reduce_gpu_vec_with_validity::<i64>(
+                    op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                )
             } else {
                 let dev = upload_primitive_values_async::<i64>(pa.values(), &stream)?;
                 reduce_gpu_vec::<i64>(op, col_io.dtype, &dev, n_rows, &stream)
@@ -849,8 +864,11 @@ fn reduce_column_from_batch(
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
             if has_nulls {
-                let host: Vec<f32> = filter_primitive_to_vec(pa);
-                reduce_host_slice::<f32>(op, col_io.dtype, &host)
+                let validity_gpu = upload_validity_async(arr, &stream)?;
+                let dev = upload_primitive_values_async::<f32>(pa.values(), &stream)?;
+                reduce_gpu_vec_with_validity::<f32>(
+                    op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                )
             } else {
                 let dev = upload_primitive_values_async::<f32>(pa.values(), &stream)?;
                 reduce_gpu_vec::<f32>(op, col_io.dtype, &dev, n_rows, &stream)
@@ -862,8 +880,11 @@ fn reduce_column_from_batch(
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
             if has_nulls {
-                let host: Vec<f64> = filter_primitive_to_vec(pa);
-                reduce_host_slice::<f64>(op, col_io.dtype, &host)
+                let validity_gpu = upload_validity_async(arr, &stream)?;
+                let dev = upload_primitive_values_async::<f64>(pa.values(), &stream)?;
+                reduce_gpu_vec_with_validity::<f64>(
+                    op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                )
             } else {
                 let dev = upload_primitive_values_async::<f64>(pa.values(), &stream)?;
                 reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows, &stream)
@@ -1256,6 +1277,12 @@ where
 /// stream so the H2D and the partials D2H overlap with the kernel where
 /// the driver allows it. Routes through [`upload_primitive_values_async`]
 /// so the `cuda-stub` graceful fallback lives in one place.
+///
+/// Retained as a host-strip fallback helper after the scalar SUM/MIN/MAX
+/// has-nulls path migrated to the native `_with_validity` reduction kernel
+/// (see [`reduce_gpu_vec_with_validity`]); kept available for callers that
+/// already hold a dense, NULL-free host slice.
+#[allow(dead_code)]
 fn reduce_host_slice<T>(op: ReduceOp, dtype: DataType, host: &[T]) -> BoltResult<Scalar>
 where
     T: Pod + ReduceScalar,
@@ -1478,6 +1505,171 @@ where
     drop(pinned);
     drop(partials);
     // Finalize at the accumulator dtype.
+    let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);
+    TAcc::finalize(op, acc_dtype, &host_partials)
+}
+
+// ---------------------------------------------------------------------------
+// Native-validity reduction path.
+//
+// Instead of host-stripping NULL rows into a dense `Vec` and uploading the
+// stripped slice, these launchers upload the RAW Arrow value buffer plus a
+// packed-bit validity bitmap and dispatch to
+// `compile_reduction_kernel_with_validity`. The kernel folds NULL rows to the
+// reduction identity on the GPU, so SUM/MIN/MAX skip them and a COUNT(expr)
+// (driven by an all-ones value column) contributes 0 per NULL row. This keeps
+// the launch zero-host-strip when the planner / runtime says the column
+// carries validity, matching the native `_with_validity` dispatch the GROUP BY
+// executors already use (see `crate::exec::groupby_valid`).
+// ---------------------------------------------------------------------------
+
+/// Native-validity sibling of [`reduce_gpu_vec`]: launches
+/// `bolt_reduce_with_validity` against an already-uploaded RAW value buffer
+/// (NULL positions still hold garbage) plus the packed validity bitmap
+/// `validity_gpu`. The kernel folds NULL rows to the identity, so the host
+/// finalize is identical to the no-null path.
+fn reduce_gpu_vec_with_validity<T>(
+    op: ReduceOp,
+    dtype: DataType,
+    input: &GpuVec<T>,
+    validity_gpu: &GpuVec<u8>,
+    n_rows: usize,
+    stream: &CudaStream,
+) -> BoltResult<Scalar>
+where
+    T: Pod + ReduceScalar,
+{
+    if n_rows == 0 {
+        stream.synchronize()?;
+        return T::identity_scalar(op, dtype);
+    }
+
+    let block = BLOCK_SIZE;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let grid_x = grid_x_for(n_rows_u32, block);
+    let partials = GpuVec::<T>::zeros_async(grid_x as usize, stream.raw())?;
+
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("reduction_validity:{:?}:{:?}", op, dtype),
+        None,
+        || compile_reduction_kernel_with_validity(op, dtype),
+    )?;
+    let function = module.function(REDUCTION_KERNEL_WITH_VALIDITY_ENTRY)?;
+
+    let mut input_ptr: CUdeviceptr = input.device_ptr();
+    let mut output_ptr: CUdeviceptr = partials.device_ptr();
+    let mut validity_ptr: CUdeviceptr = validity_gpu.device_ptr();
+
+    // ABI: (input_ptr, output_ptr, n_rows, validity_ptr).
+    let mut kernel_params: [*mut c_void; 4] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut output_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+        &mut validity_ptr as *mut CUdeviceptr as *mut c_void,
+    ];
+
+    // SAFETY: `function` is borrowed from a live module; every param points
+    // at a stack local that outlives the synchronize below.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+
+    let _ = input_ptr;
+    let _ = output_ptr;
+    let _ = validity_ptr;
+
+    let pinned = partials.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_partials: Vec<T> = pinned.as_slice().to_vec();
+    drop(pinned);
+    drop(partials);
+    T::finalize(op, dtype, &host_partials)
+}
+
+/// Native-validity sibling of [`reduce_gpu_vec_widened`]: the widened SUM path
+/// (narrow signed integer accumulating into a wider dtype) with a packed
+/// validity bitmap. The kernel sign-extends each in-range, non-NULL value and
+/// folds NULL rows to the (zero) additive identity.
+fn reduce_gpu_vec_widened_with_validity<TIn, TAcc>(
+    op: ReduceOp,
+    dtype: DataType,
+    input: &GpuVec<TIn>,
+    validity_gpu: &GpuVec<u8>,
+    n_rows: usize,
+    stream: &CudaStream,
+) -> BoltResult<Scalar>
+where
+    TIn: Pod,
+    TAcc: Pod + ReduceScalar,
+{
+    if n_rows == 0 {
+        let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);
+        stream.synchronize()?;
+        return TAcc::identity_scalar(op, acc_dtype);
+    }
+
+    let block = BLOCK_SIZE;
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let grid_x = grid_x_for(n_rows_u32, block);
+    let partials = GpuVec::<TAcc>::zeros_async(grid_x as usize, stream.raw())?;
+
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("reduction_validity:{:?}:{:?}", op, dtype),
+        None,
+        || compile_reduction_kernel_with_validity(op, dtype),
+    )?;
+    let function = module.function(REDUCTION_KERNEL_WITH_VALIDITY_ENTRY)?;
+
+    let mut input_ptr: CUdeviceptr = input.device_ptr();
+    let mut output_ptr: CUdeviceptr = partials.device_ptr();
+    let mut validity_ptr: CUdeviceptr = validity_gpu.device_ptr();
+
+    let mut kernel_params: [*mut c_void; 4] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut output_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+        &mut validity_ptr as *mut CUdeviceptr as *mut c_void,
+    ];
+
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+
+    let _ = input_ptr;
+    let _ = output_ptr;
+    let _ = validity_ptr;
+
+    let pinned = partials.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_partials: Vec<TAcc> = pinned.as_slice().to_vec();
+    drop(pinned);
+    drop(partials);
     let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);
     TAcc::finalize(op, acc_dtype, &host_partials)
 }
@@ -1960,6 +2152,97 @@ mod tests {
         let err =
             minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &bad_field).unwrap_err();
         assert!(matches!(err, BoltError::Type(_)));
+    }
+
+    /// `packed_validity_for` produces the Arrow-LE packed-bit bitmap the
+    /// `_with_validity` reduction kernel reads: bit `i` of byte `i/8` is 1
+    /// iff row `i` is present (non-NULL).
+    #[test]
+    fn packed_validity_for_matches_arrow_le_bits() {
+        // Rows: present, null, present, null, present, null, present, null
+        // -> bits 0,2,4,6 set, 1,3,5,7 clear -> 0b0101_0101 = 0x55.
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(10),
+            None,
+            Some(20),
+            None,
+            Some(30),
+            None,
+            Some(40),
+            None,
+        ]));
+        let packed = packed_validity_for(arr.as_ref());
+        assert_eq!(packed, vec![0x55u8]);
+
+        // A NULL-free column packs to all-ones in every full byte.
+        let arr2: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(packed_validity_for(arr2.as_ref()), vec![0xFFu8]);
+    }
+
+    /// COUNT(col) on the primitive scalar path counts ONLY non-NULL rows —
+    /// the same SQL semantic the Bool/Utf8 path honours. Exercised host-only
+    /// through `build_one_aggregate` (the COUNT arm computes the result from
+    /// the Arrow null bitmap without a GPU launch).
+    #[test]
+    fn count_col_primitive_excludes_nulls() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+            None,
+            Some(5),
+        ]));
+        let batch = batch_one("v", arr);
+        let inputs = vec![ColumnIO {
+            name: "v".to_string(),
+            dtype: DataType::Int32,
+        }];
+        let agg = AggregateExpr::Count(Expr::Column("v".to_string()));
+        let out_field = Field {
+            name: "cnt".to_string(),
+            dtype: DataType::Int64,
+            nullable: false,
+        };
+        let arr_out =
+            build_one_aggregate(&agg, &out_field, &inputs, &batch, batch.num_rows())
+                .expect("count ok");
+        let col = arr_out
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT output is Int64");
+        assert_eq!(col.len(), 1);
+        // 3 non-NULL rows out of 5.
+        assert_eq!(col.value(0), 3);
+    }
+
+    /// COUNT(*) (an expression that is not a bare column reference) counts
+    /// EVERY row, NULLs included — the complement of `count_col_primitive_*`.
+    #[test]
+    fn count_star_counts_all_rows_including_nulls() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let batch = batch_one("v", arr);
+        let inputs = vec![ColumnIO {
+            name: "v".to_string(),
+            dtype: DataType::Int32,
+        }];
+        // COUNT(*) lowers to a literal-ish expression that doesn't resolve to
+        // a column, so the COUNT arm returns the full row count.
+        let agg = AggregateExpr::Count(Expr::Literal(
+            crate::plan::logical_plan::Literal::Int64(1),
+        ));
+        let out_field = Field {
+            name: "cnt".to_string(),
+            dtype: DataType::Int64,
+            nullable: false,
+        };
+        let arr_out =
+            build_one_aggregate(&agg, &out_field, &inputs, &batch, batch.num_rows())
+                .expect("count ok");
+        let col = arr_out
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT output is Int64");
+        assert_eq!(col.value(0), 3);
     }
 
     // -------- Stage-3 round-trip tests (require GPU) --------

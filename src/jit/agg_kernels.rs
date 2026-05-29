@@ -69,6 +69,14 @@ const _: () = assert!(BLOCK_SIZE <= 1024, "CUDA hard limit");
 /// PTX kernel entry-point name.
 pub const REDUCTION_KERNEL_ENTRY: &str = "bolt_reduce";
 
+/// PTX entry-point name of the validity-aware per-block reduction kernel
+/// emitted by [`compile_reduction_kernel_with_validity`].
+///
+/// Distinct from [`REDUCTION_KERNEL_ENTRY`] so the host launcher can pick the
+/// right symbol by name when it decides (at run time, from the input column's
+/// Arrow null buffer) whether to route through the NULL-skipping variant.
+pub const REDUCTION_KERNEL_WITH_VALIDITY_ENTRY: &str = "bolt_reduce_with_validity";
+
 /// Reduction operator the codegen needs to emit identity + combine for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReduceOp {
@@ -182,6 +190,58 @@ impl ReduceOp {
 /// kernel sign-extends each loaded value before accumulating. See
 /// `crate::plan::logical_plan::sum_output_dtype` for the widening contract.
 pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<String> {
+    emit_reduction_kernel(op, dtype, /* with_validity = */ false)
+}
+
+/// Generate PTX for a per-block reduction kernel that **honours an Arrow
+/// validity bitmap**: NULL rows (validity bit 0) contribute the reduction's
+/// identity instead of the garbage value sitting at the masked slot, so the
+/// host no longer has to strip NULLs into a dense `Vec` before upload.
+///
+/// ## ABI
+///
+/// ```text
+/// .visible .entry bolt_reduce_with_validity(
+///     .param .u64 input_ptr,      // T, length n_rows
+///     .param .u64 output_ptr,     // accumulator dtype, length grid_x
+///     .param .u32 n_rows,
+///     .param .u64 validity_ptr    // u8, length ceil(n_rows/8), Arrow LE bits
+/// )
+/// ```
+///
+/// The only delta versus [`compile_reduction_kernel`] is a packed-bit
+/// validity gate inserted into the per-thread load: a thread whose row is in
+/// range but whose validity bit is 0 takes the `LOAD_IDENTITY` path, exactly
+/// as an out-of-range thread does. Because NULL rows fold to the identity,
+/// SUM/MIN/MAX skip them and a COUNT(expr) (driven by an all-ones value
+/// column) sees a 0 contribution for every NULL — matching SQL's
+/// "COUNT of non-null" semantics without a host-side strip pass.
+///
+/// `dtype` is the *input* column dtype; the accumulator / output dtype is
+/// [`reduction_output_dtype`] as in the no-validity variant.
+pub fn compile_reduction_kernel_with_validity(
+    op: ReduceOp,
+    dtype: DataType,
+) -> BoltResult<String> {
+    emit_reduction_kernel(op, dtype, /* with_validity = */ true)
+}
+
+/// Shared emitter for the no-validity ([`compile_reduction_kernel`]) and
+/// validity-aware ([`compile_reduction_kernel_with_validity`]) per-block
+/// reduction kernels. `with_validity = true` appends a trailing
+/// `.param .u64 validity_ptr` (Arrow LE packed-bit bitmap, one bit per row)
+/// and emits a bit-test in the per-thread load that routes NULL rows to the
+/// identity.
+fn emit_reduction_kernel(
+    op: ReduceOp,
+    dtype: DataType,
+    with_validity: bool,
+) -> BoltResult<String> {
+    let entry = if with_validity {
+        REDUCTION_KERNEL_WITH_VALIDITY_ENTRY
+    } else {
+        REDUCTION_KERNEL_ENTRY
+    };
     // Input-side PTX info governs the global load from the source column.
     let (input_load_suffix, _input_store_suffix, input_reg_class, input_reg_ty, _input_imm_ty) =
         ptx_type_info(dtype)?;
@@ -230,10 +290,16 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
     .map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, ".visible .entry {}(", REDUCTION_KERNEL_ENTRY).map_err(write_err)?;
-    writeln!(ptx, "\t.param .u64 {}_param_0,", REDUCTION_KERNEL_ENTRY).map_err(write_err)?;
-    writeln!(ptx, "\t.param .u64 {}_param_1,", REDUCTION_KERNEL_ENTRY).map_err(write_err)?;
-    writeln!(ptx, "\t.param .u32 {}_param_2", REDUCTION_KERNEL_ENTRY).map_err(write_err)?;
+    writeln!(ptx, ".visible .entry {}(", entry).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_0,", entry).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_1,", entry).map_err(write_err)?;
+    if with_validity {
+        writeln!(ptx, "\t.param .u32 {}_param_2,", entry).map_err(write_err)?;
+        // Trailing validity_ptr (Arrow LE packed bits, one bit per row).
+        writeln!(ptx, "\t.param .u64 {}_param_3", entry).map_err(write_err)?;
+    } else {
+        writeln!(ptx, "\t.param .u32 {}_param_2", entry).map_err(write_err)?;
+    }
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -261,7 +327,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
     writeln!(
         ptx,
         "\tld.param.u32 %r4, [{}_param_2];",
-        REDUCTION_KERNEL_ENTRY
+        entry
     )
     .map_err(write_err)?;
 
@@ -269,12 +335,35 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
     writeln!(
         ptx,
         "\tld.param.u64 %rd0, [{}_param_0];",
-        REDUCTION_KERNEL_ENTRY
+        entry
     )
     .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra LOAD_IDENTITY;").map_err(write_err)?;
+
+    // Validity gate (only in the `_with_validity` variant): an in-range row
+    // whose Arrow validity bit is 0 is NULL — fold it to the identity rather
+    // than reading garbage at the masked slot. The bitmap is Arrow LE packed
+    // bits (bit `tid % 8` of byte `tid / 8`). Uses high registers / %p7 to
+    // stay clear of the reduction body's namespace.
+    if with_validity {
+        writeln!(ptx, "\tld.param.u64 %rd15, [{}_param_3];", entry)
+            .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd15, %rd15;").map_err(write_err)?;
+        // byte_idx = tid >> 3 ; bit_off = tid & 7
+        writeln!(ptx, "\tshr.u32 %r12, %r3, 3;").map_err(write_err)?;
+        writeln!(ptx, "\tand.b32 %r13, %r3, 7;").map_err(write_err)?;
+        // addr = validity_ptr + byte_idx
+        writeln!(ptx, "\tmul.wide.u32 %rd16, %r12, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd15, %rd15, %rd16;").map_err(write_err)?;
+        // byte = ld.global.u8 ; bit = bfe.u32(byte, bit_off, 1)
+        writeln!(ptx, "\tld.global.u8 %r14, [%rd15];").map_err(write_err)?;
+        writeln!(ptx, "\tbfe.u32 %r15, %r14, %r13, 1;").map_err(write_err)?;
+        // NULL (bit == 0) -> identity.
+        writeln!(ptx, "\tsetp.eq.s32 %p7, %r15, 0;").map_err(write_err)?;
+        writeln!(ptx, "\t@%p7 bra LOAD_IDENTITY;").map_err(write_err)?;
+    }
     // Address arithmetic for the source-column load uses the *input* element
     // size (the source array is laid out at input dtype, not accumulator).
     writeln!(
@@ -538,7 +627,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
     writeln!(
         ptx,
         "\tld.param.u64 %rd8, [{}_param_1];",
-        REDUCTION_KERNEL_ENTRY
+        entry
     )
     .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
@@ -896,4 +985,123 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
     writeln!(ptx, "}}").map_err(write_err)?;
 
     Ok(ptx)
+}
+
+// ---------------------------------------------------------------------------
+// PTX-shape tests (host-only — no CUDA required).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod validity_reduction_tests {
+    use super::*;
+
+    /// The no-validity reduction kernel must NOT emit the validity gate:
+    /// no trailing `validity_ptr` param, no `bfe.u32` bit-extract, and the
+    /// classic 3-parameter ABI.
+    #[test]
+    fn no_validity_variant_has_no_bit_gate() {
+        let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Int64)
+            .expect("kernel should compile");
+        assert!(
+            ptx.contains(REDUCTION_KERNEL_ENTRY),
+            "expected the classic entry name:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("bfe.u32"),
+            "no-validity kernel must not emit a validity bit-extract:\n{ptx}"
+        );
+        // Classic ABI: 3 `.param ` declarations (input, output, n_rows).
+        let param_count = ptx.matches(".param ").count();
+        assert_eq!(
+            param_count, 3,
+            "expected 3 `.param ` decls in the no-validity variant, got {param_count}:\n{ptx}"
+        );
+    }
+
+    /// The validity-aware reduction kernel must emit a 4-param ABI with a
+    /// trailing `validity_ptr`, the `bfe.u32` bit-extract on the loaded
+    /// validity byte, and a guarded branch to `LOAD_IDENTITY` so a NULL row
+    /// folds to the reduction identity. The branch must precede the
+    /// `LOAD_IDENTITY` label so it genuinely skips the value load.
+    #[test]
+    fn validity_variant_emits_null_guard_branch() {
+        let ptx = compile_reduction_kernel_with_validity(ReduceOp::Sum, DataType::Int64)
+            .expect("kernel should compile");
+        assert!(
+            ptx.contains(REDUCTION_KERNEL_WITH_VALIDITY_ENTRY),
+            "expected the `_with_validity` entry name:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains(".visible .entry bolt_reduce("),
+            "validity kernel must not re-emit the no-validity entry name:\n{ptx}"
+        );
+        // Validity-gate shape: byte load + bit-extract + branch-to-identity.
+        assert!(
+            ptx.contains("ld.global.u8 %r14, [%rd15];"),
+            "expected validity byte load:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("bfe.u32 %r15, %r14, %r13, 1;"),
+            "expected `bfe.u32` 1-bit extract of the validity bit:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.s32 %p7, %r15, 0;"),
+            "expected `setp.eq` testing the extracted validity bit against 0:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("@%p7 bra LOAD_IDENTITY;"),
+            "expected NULL rows to branch to LOAD_IDENTITY (fold to identity):\n{ptx}"
+        );
+        // The guard must come BEFORE the LOAD_IDENTITY label.
+        let guard_pos = ptx.find("@%p7 bra LOAD_IDENTITY;").unwrap();
+        let label_pos = ptx.find("LOAD_IDENTITY:").unwrap();
+        assert!(
+            guard_pos < label_pos,
+            "validity guard must precede the LOAD_IDENTITY label:\n{ptx}"
+        );
+        // 4-param ABI: the trailing validity_ptr is param_3.
+        let param_count = ptx.matches(".param ").count();
+        assert_eq!(
+            param_count, 4,
+            "expected 4 `.param ` decls (added validity_ptr), got {param_count}:\n{ptx}"
+        );
+        assert!(
+            ptx.contains(&format!("{}_param_3", REDUCTION_KERNEL_WITH_VALIDITY_ENTRY)),
+            "expected param_3 (validity_ptr) in the emitted PTX:\n{ptx}"
+        );
+    }
+
+    /// The widening SUM(Int32)->Int64 validity kernel must still carry the
+    /// validity gate AND the `cvt.s64.s32` widening cvt: the two features are
+    /// orthogonal and must compose.
+    #[test]
+    fn validity_variant_widening_sum_int32_keeps_gate_and_cvt() {
+        let ptx = compile_reduction_kernel_with_validity(ReduceOp::Sum, DataType::Int32)
+            .expect("kernel should compile");
+        assert!(
+            ptx.contains("bfe.u32 %r15, %r14, %r13, 1;"),
+            "widening validity kernel must keep the bit-extract gate:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("cvt.s64.s32"),
+            "SUM(Int32) must sign-extend into the s64 accumulator:\n{ptx}"
+        );
+    }
+
+    /// MIN/Float32 with validity must fold NULL rows to the +inf identity
+    /// (so they never win the MIN) — assert both the identity literal and the
+    /// gate are present.
+    #[test]
+    fn validity_variant_min_f32_uses_inf_identity() {
+        let ptx = compile_reduction_kernel_with_validity(ReduceOp::Min, DataType::Float32)
+            .expect("kernel should compile");
+        let inf = format!("0f{:08X}", f32::INFINITY.to_bits());
+        assert!(
+            ptx.contains(&inf),
+            "MIN(Float32) identity must be +inf ({inf}):\n{ptx}"
+        );
+        assert!(
+            ptx.contains("@%p7 bra LOAD_IDENTITY;"),
+            "MIN(Float32) validity kernel must guard NULL rows:\n{ptx}"
+        );
+    }
 }
