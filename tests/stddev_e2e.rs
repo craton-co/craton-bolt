@@ -141,8 +141,13 @@ fn stddev_over_non_numeric_column_is_rejected() {
         nullable: true,
     }]);
     let provider = MemTableProvider::new().with_table("t", schema);
-    let err = parse_sql("SELECT STDDEV_POP(name) FROM t", &provider)
-        .expect_err("STDDEV over Utf8 must error");
+    // Parsing succeeds — the numeric-operand check lives in
+    // `AggregateExpr::output_dtype`, which runs when the plan's schema is
+    // resolved during lowering (`lower_physical` → `plan.schema()`), not at
+    // the SQL-frontend / parse stage.
+    let plan = parse_sql("SELECT STDDEV_POP(name) FROM t", &provider)
+        .expect("parse is structural; type-check happens at schema resolution");
+    let err = lower_physical(&plan).expect_err("STDDEV over Utf8 must error");
     let msg = format!("{err}");
     assert!(
         msg.contains("STDDEV") || msg.contains("numeric"),

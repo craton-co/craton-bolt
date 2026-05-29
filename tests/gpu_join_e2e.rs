@@ -784,6 +784,7 @@ fn lossy_twoi64_host_verify_drops_false_positives() {
 /// Note: because the cache latches process-wide we don't assert the
 /// *runtime* effect via Engine::sql — that would race with other tests.
 #[test]
+#[ignore = "gpu:join"]
 fn env_var_overrides_cap() {
     // Save prior value to restore.
     let prev = std::env::var("BOLT_GPU_JOIN_TABLE_CAP_MB").ok();
