@@ -760,6 +760,15 @@ impl DeviceMemPool {
     /// OOM-recovery slow path. Drops pooled headroom and retries the
     /// driver alloc exactly once. Separated from `alloc` so the common
     /// (success) case stays cold-jump-free.
+    ///
+    /// Behavioral trade-off (deliberate): this calls
+    /// `evict_above_high_water()` followed by `drain()`, which releases
+    /// EVERY pooled block on any single OOM — discarding the warm cache
+    /// shared by all concurrent queries, not just the allocation that
+    /// triggered recovery. This is intentional: once the driver can't
+    /// satisfy us, maximizing the room handed back for the retry takes
+    /// priority over preserving reuse headroom. Expect a cold-cache
+    /// penalty for in-flight work after a recovery.
     #[cold]
     fn recover_from_oom(
         &self,
@@ -781,11 +790,12 @@ impl DeviceMemPool {
         match driver_mem_alloc(alloc_bytes) {
             Ok(ptr) => {
                 OOM_RECOVERY_COUNT.fetch_add(1, Ordering::Relaxed);
-                // Best-effort logging via `eprintln!` rather than a
-                // structured logger, matching the rest of mem_pool.rs.
-                // Downstream telemetry layers can read
+                // Use `log::warn!` for consistency with the rest of the
+                // module (driver_free, pool_watcher). `eprintln!` bypasses
+                // the crate's structured logging and is harder to silence
+                // in tests. Downstream telemetry layers can read
                 // `oom_recovery_count()` instead.
-                eprintln!(
+                log::warn!(
                     "craton-bolt: DeviceMemPool recovered from driver OOM (alloc_bytes={})",
                     alloc_bytes
                 );

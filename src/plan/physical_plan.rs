@@ -956,16 +956,30 @@ impl PhysicalPlan {
                 // The only remaining way to reach this branch with no inputs
                 // is hand-constructing `PhysicalPlan::Union { inputs: vec![] }`
                 // directly — a clearly malformed plan that this crate does
-                // not produce. The `expect` documents that contract.
-                inputs
-                    .first()
-                    .expect(
-                        "PhysicalPlan::Union { inputs: vec![] } is malformed; \
+                // not produce.
+                //
+                // Code-review finding (latent panic): the previous form used
+                // `inputs.first().expect(..)`, which panics for an empty
+                // `inputs`. Because `output_schema` returns a borrowed
+                // `&Schema` (not a `Result` and not an owned value), we cannot
+                // surface a `BoltError` here without rippling a signature
+                // change through every call site and recursive call; and a
+                // Union has no meaningful schema with zero branches, so
+                // returning `Schema::empty()` would be semantically wrong (and
+                // is impossible to return by borrow anyway). We therefore keep
+                // the documented invariant but express the empty case as an
+                // `unreachable!` with an explanation rather than a bare
+                // `.expect()`. Non-empty unions are unaffected: we still return
+                // the first branch's schema exactly as before.
+                match inputs.first() {
+                    Some(first) => first.output_schema(),
+                    None => unreachable!(
+                        "PhysicalPlan::Union {{ inputs: vec![] }} is malformed; \
                          construction sites (sql_frontend, DataFrame::from_plan, \
                          lower) all reject empty Union before this accessor is \
-                         reached",
-                    )
-                    .output_schema()
+                         reached"
+                    ),
+                }
             }
             PhysicalPlan::Project { output_schema, .. } => output_schema,
             PhysicalPlan::Join { output_schema, .. } => output_schema,
