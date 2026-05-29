@@ -1050,6 +1050,24 @@ pub enum PhysicalPlan {
         /// [`join_combined_schema`].
         output_schema: Schema,
     },
+    /// Scalar `COUNT(...)` over an already-materialised child plan whose input
+    /// is **not** a Scan/Filter/Project chain — most importantly
+    /// `COUNT(DISTINCT col)`, which lowers to a `Count` aggregate over a
+    /// [`PhysicalPlan::Distinct`]. The fused scalar-aggregate executor folds
+    /// only a Scan/Filter/Project chain (see `resolve_source`), so it cannot
+    /// run a `Count` over a `Distinct`. Instead the executor runs `input`
+    /// (the Distinct executor materialises the deduped rows) and emits a
+    /// single-row `Int64` batch holding `input`'s row count.
+    ///
+    /// Scope: only the no-GROUP-BY, single-`COUNT` shape lowers here. Any
+    /// GROUP BY or additional aggregates over a non-scan-chain input are
+    /// rejected at lowering time (out of scope).
+    CountRows {
+        /// Already-lowered child plan whose output rows are counted.
+        input: Box<PhysicalPlan>,
+        /// Output schema: a single `Int64` column (the count).
+        output_schema: Schema,
+    },
 }
 
 impl PhysicalPlan {
@@ -1117,6 +1135,7 @@ impl PhysicalPlan {
                 }
             }
             PhysicalPlan::Project { output_schema, .. } => output_schema,
+            PhysicalPlan::CountRows { output_schema, .. } => output_schema,
             PhysicalPlan::Window { output_schema, .. } => output_schema,
             PhysicalPlan::StringLength { output_schema, .. } => output_schema,
             PhysicalPlan::StringProject { output_schema, .. } => output_schema,
@@ -2767,7 +2786,40 @@ fn lower_aggregate(
     input: &LogicalPlan,
     group_by: &[Expr],
     aggregates: &[AggregateExpr],
+    depth: usize,
 ) -> BoltResult<PhysicalPlan> {
+    // Non-scan-chain input (e.g. `COUNT(DISTINCT col)`, which lowers to
+    // `Count` over a `Distinct`). The fused scalar-aggregate path below calls
+    // `resolve_source`, which only folds a Scan/Filter/Project chain and would
+    // error on a `Distinct` (or any other operator) input. For the narrow
+    // no-GROUP-BY single-`COUNT` shape we instead lower the child plan
+    // recursively and wrap it in a `CountRows` node: the executor runs the
+    // child (the Distinct executor materialises the deduped rows) and emits the
+    // row count. Any GROUP BY or extra aggregates over a non-scan-chain input
+    // are out of scope and rejected cleanly here.
+    if !is_scan_chain(input) {
+        if group_by.is_empty()
+            && aggregates.len() == 1
+            && matches!(aggregates[0], AggregateExpr::Count(_))
+        {
+            let child = lower_depth(input, depth + 1)?;
+            // `plan.schema()` is the Aggregate node's schema: a single Int64
+            // count column (named per `aggregate_output_name`, honouring any
+            // upstream alias). Reuse it verbatim as the CountRows output.
+            let output_schema = plan.schema()?;
+            return Ok(PhysicalPlan::CountRows {
+                input: Box::new(child),
+                output_schema,
+            });
+        }
+        return Err(BoltError::Plan(format!(
+            "unsupported aggregate over non-scan-chain input: only \
+             scalar COUNT(...) (e.g. COUNT(DISTINCT col)) is supported here, \
+             got group_by={} aggregates={}",
+            group_by.len(),
+            aggregates.len(),
+        )));
+    }
     let resolved = resolve_source(input)?;
     let table = resolved.table;
     let scan_schema = resolved.scan_schema;
@@ -3583,6 +3635,7 @@ pub fn populate_input_validity(
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::Window { input, .. }
         | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::CountRows { input, .. }
         | PhysicalPlan::Filter { input, .. } => {
             populate_input_validity(input.as_mut(), provider);
         }
@@ -3932,6 +3985,7 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
             PhysicalPlan::Distinct { input }
             | PhysicalPlan::Limit { input, .. }
             | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::CountRows { input, .. }
             | PhysicalPlan::Window { input, .. } => walk(input),
             PhysicalPlan::Union { inputs } => inputs.iter().any(walk),
             PhysicalPlan::SetOp { left, right, .. } => walk(left) || walk(right),
@@ -4450,7 +4504,7 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             input,
             group_by,
             aggregates,
-        } => lower_aggregate(plan, input, group_by, aggregates),
+        } => lower_aggregate(plan, input, group_by, aggregates, depth),
         LogicalPlan::Distinct { input } => {
             let inner = lower_depth(input, depth + 1)?;
             Ok(PhysicalPlan::Distinct {
@@ -5920,6 +5974,88 @@ mod tests {
         assert!(
             matches!(phys, PhysicalPlan::Filter { .. }),
             "AND-with-trap-cast WHERE must route to host PhysicalPlan::Filter, got {phys:?}"
+        );
+    }
+
+    /// `COUNT(DISTINCT col)` desugars to a `Count` aggregate over a `Distinct`
+    /// (a non-scan-chain input). The fused scalar-aggregate path can't fold a
+    /// Distinct, so the lowerer must emit `CountRows` wrapping a `Distinct`,
+    /// and the output must be the single Int64 count column.
+    #[test]
+    fn count_over_distinct_lowers_to_countrows() {
+        // Build the same logical shape the SQL frontend's `try_count_distinct`
+        // produces:
+        //   Aggregate(COUNT(1)) <- Distinct <- Project([region_id])
+        //     <- Filter(region_id IS NOT NULL) <- Scan
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("region_id", DataType::Int64, true)]),
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: Expr::Unary {
+                op: crate::plan::logical_plan::UnaryOp::IsNotNull,
+                operand: Box::new(Expr::Column("region_id".into())),
+            },
+        };
+        let project = LogicalPlan::Project {
+            input: Box::new(filter),
+            exprs: vec![Expr::Column("region_id".into())],
+        };
+        let distinct = LogicalPlan::Distinct {
+            input: Box::new(project),
+        };
+        let agg = LogicalPlan::Aggregate {
+            input: Box::new(distinct),
+            group_by: Vec::new(),
+            aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Int64(1)))],
+        };
+
+        let phys = lower(&agg).expect("COUNT(DISTINCT) must lower");
+        match phys {
+            PhysicalPlan::CountRows {
+                input,
+                output_schema,
+            } => {
+                assert!(
+                    matches!(*input, PhysicalPlan::Distinct { .. }),
+                    "CountRows must wrap a Distinct, got {input:?}"
+                );
+                assert_eq!(
+                    output_schema.fields.len(),
+                    1,
+                    "count output is a single column"
+                );
+                assert_eq!(output_schema.fields[0].dtype, DataType::Int64);
+            }
+            other => panic!("expected CountRows over Distinct, got {other:?}"),
+        }
+    }
+
+    /// A non-COUNT aggregate (or any GROUP BY) over a non-scan-chain input is
+    /// out of scope and must be rejected cleanly (a `BoltError::Plan`), not
+    /// reach `resolve_source` and emit its generic "expected Scan/Filter/
+    /// Project chain" message.
+    #[test]
+    fn non_count_aggregate_over_distinct_is_rejected() {
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("v", DataType::Int64, true)]),
+        };
+        let distinct = LogicalPlan::Distinct {
+            input: Box::new(scan),
+        };
+        let agg = LogicalPlan::Aggregate {
+            input: Box::new(distinct),
+            group_by: Vec::new(),
+            aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+        };
+        let err = lower(&agg).expect_err("SUM over Distinct must be rejected");
+        assert!(
+            matches!(err, BoltError::Plan(_)),
+            "expected BoltError::Plan, got {err:?}"
         );
     }
 }

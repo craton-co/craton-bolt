@@ -77,6 +77,43 @@ fn parses_simple_select() {
     assert!(kernel.predicate.is_none());
 }
 
+/// `COUNT(DISTINCT col)` must lower end-to-end: the SQL frontend desugars it to
+/// a `Count` aggregate over a `Distinct`, and the physical lowerer wraps that in
+/// a `CountRows` node (the fused scalar-aggregate path can't fold a Distinct).
+#[test]
+fn count_distinct_lowers_to_countrows() {
+    let provider = sales_provider();
+    let plan =
+        parse_sql("SELECT COUNT(DISTINCT region_id) FROM sales", &provider).expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    // The top SELECT-order Project is identity over the single count column, so
+    // the lowerer may collapse it; accept either a bare CountRows or a Project
+    // wrapping one. Walk down to find the CountRows and assert it wraps a
+    // Distinct.
+    fn find_count_rows(p: &PhysicalPlan) -> Option<&PhysicalPlan> {
+        match p {
+            PhysicalPlan::CountRows { .. } => Some(p),
+            PhysicalPlan::Project { input, .. } => find_count_rows(input),
+            _ => None,
+        }
+    }
+    let cr = find_count_rows(&phys)
+        .unwrap_or_else(|| panic!("expected CountRows in plan, got {phys:?}"));
+    let PhysicalPlan::CountRows {
+        input,
+        output_schema,
+    } = cr
+    else {
+        unreachable!()
+    };
+    assert!(
+        matches!(input.as_ref(), PhysicalPlan::Distinct { .. }),
+        "CountRows must wrap a Distinct, got {input:?}"
+    );
+    assert_eq!(output_schema.fields.len(), 1);
+    assert_eq!(output_schema.fields[0].dtype, DataType::Int64);
+}
+
 #[test]
 fn parses_filtered_arithmetic_select() {
     let provider = sales_provider();
@@ -511,6 +548,32 @@ fn e2e_simple_projection() {
     for i in 0..1024 {
         assert_eq!(actual.value(i), expected.value(i), "row {i}");
     }
+}
+
+/// `COUNT(DISTINCT region_id)` over the `sales` fixture. `sales_batch` sets
+/// `region_id = i % 4`, so for any `n >= 4` there are exactly 4 distinct
+/// region ids (0,1,2,3). The CountRows executor runs the Distinct (GPU dedupe)
+/// and emits the row count of the deduped result.
+#[test]
+#[ignore = "gpu:e2e"]
+fn e2e_count_distinct() {
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("ctx");
+    let batch = sales_batch(1024);
+    engine.register_table("sales", batch).unwrap();
+
+    let h = engine
+        .sql("SELECT COUNT(DISTINCT region_id) FROM sales")
+        .expect("execute");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), 1);
+    let actual = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64 count");
+    assert_eq!(actual.value(0), 4, "4 distinct region ids (0,1,2,3)");
 }
 
 #[test]
