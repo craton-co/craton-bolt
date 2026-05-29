@@ -37,6 +37,12 @@ pub mod string_ops;
 /// [`crate::jit::string_kernel::compile_length_gather_kernel`]), with a clean
 /// host-side fallback for non-dict / null-bearing inputs.
 pub mod string_length;
+/// Executor for the GPU variable-width string projection
+/// ([`crate::plan::physical_plan::PhysicalPlan::StringProject`]): `UPPER` /
+/// `LOWER` over a Utf8 column, produced on the device via the two-pass
+/// length/scan/write kernels in
+/// [`crate::jit::string_kernel`], with a clean host-side fallback.
+pub mod string_project;
 pub mod dict_registry;
 pub mod groupby_with_pre;
 pub mod groupby_wide;

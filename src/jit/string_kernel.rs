@@ -120,6 +120,22 @@ fn varwidth_tag(kind: ScalarFnKind) -> BoltResult<&'static str> {
     }
 }
 
+/// Entry-point name of the variable-width **length pass** for `kind` (e.g.
+/// `bolt_str_len_pass_upper`). Errors for ops with no two-pass producer
+/// (`LENGTH` / `CONCAT`), matching [`compile_varwidth_len_pass`].
+///
+/// Host launchers use this to look up the compiled function by name rather than
+/// re-deriving the mangling, so the entry-point convention stays owned here.
+pub fn len_pass_entry(kind: ScalarFnKind) -> BoltResult<String> {
+    Ok(format!("{}_{}", LEN_PASS_PREFIX, varwidth_tag(kind)?))
+}
+
+/// Entry-point name of the variable-width **write pass** for `kind` (e.g.
+/// `bolt_str_write_pass_upper`). See [`len_pass_entry`].
+pub fn write_pass_entry(kind: ScalarFnKind) -> BoltResult<String> {
+    Ok(format!("{}_{}", WRITE_PASS_PREFIX, varwidth_tag(kind)?))
+}
+
 // ---------------------------------------------------------------------------
 // 1. Fixed-output-width: LENGTH via dictionary-index gather.
 // ---------------------------------------------------------------------------
@@ -676,5 +692,41 @@ mod tests {
         assert!(format!("{e}").contains("fixed-width"), "{e}");
         let e = compile_varwidth_write_pass(ScalarFnKind::Concat).unwrap_err();
         assert!(format!("{e}").contains("CONCAT"), "{e}");
+    }
+
+    // ---- Entry-point name helpers ----------------------------------------
+
+    #[test]
+    fn entry_name_helpers_match_emitted_entries() {
+        // The host launcher looks functions up by these names; they MUST equal
+        // the `.visible .entry` the corresponding compiler emits.
+        for (kind, len_name, write_name) in [
+            (ScalarFnKind::Upper, "bolt_str_len_pass_upper", "bolt_str_write_pass_upper"),
+            (ScalarFnKind::Lower, "bolt_str_len_pass_lower", "bolt_str_write_pass_lower"),
+            (
+                ScalarFnKind::Substring,
+                "bolt_str_len_pass_substring",
+                "bolt_str_write_pass_substring",
+            ),
+        ] {
+            assert_eq!(len_pass_entry(kind).unwrap(), len_name);
+            assert_eq!(write_pass_entry(kind).unwrap(), write_name);
+            let len_ptx = compile_varwidth_len_pass(kind).unwrap();
+            assert!(
+                len_ptx.contains(&format!(".visible .entry {len_name}(")),
+                "len pass entry mismatch for {kind:?}\n{len_ptx}"
+            );
+            let write_ptx = compile_varwidth_write_pass(kind).unwrap();
+            assert!(
+                write_ptx.contains(&format!(".visible .entry {write_name}(")),
+                "write pass entry mismatch for {kind:?}\n{write_ptx}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_name_helpers_reject_length_and_concat() {
+        assert!(len_pass_entry(ScalarFnKind::Length).is_err());
+        assert!(write_pass_entry(ScalarFnKind::Concat).is_err());
     }
 }
