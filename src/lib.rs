@@ -27,6 +27,7 @@ pub mod plan;
 pub mod jit;
 pub mod exec;
 pub mod observability;
+pub mod metrics;
 
 mod error;
 pub use error::{BoltError, BoltResult};
@@ -88,6 +89,39 @@ pub use cuda::mem_pool::{pool_stats, PoolStats};
 /// }));
 /// ```
 pub use observability::install_pool_stats_observer;
+
+/// M5 metrics registry: process-wide atomic counters + per-phase latency
+/// histograms, dependency-free.
+///
+/// Where [`pool_stats`] / [`install_pool_stats_observer`] cover the
+/// device-memory pool and the `tracing` span catalogue (see
+/// [`observability`]) covers per-query latency *traces*, this surface covers
+/// monotone process-wide *aggregates*: query counts, PTX cache hit/miss,
+/// launch counts, host fallbacks, PCIe byte totals, and power-of-two latency
+/// histograms per query phase.
+///
+/// [`metrics()`](metrics::metrics) hands back the `&'static` registry for
+/// inline bumps; [`metrics_snapshot`] returns an owned, plain-data
+/// [`MetricsSnapshot`](metrics::MetricsSnapshot) for a scraper — mirroring how
+/// [`pool_stats`] returns a [`PoolStats`] value. See the [`metrics`] module
+/// docs for the Prometheus / structured-log scraping recipes.
+///
+/// ```ignore
+/// use craton_bolt::{metrics, metrics_snapshot, Counter, Phase};
+/// metrics().inc(Counter::QueriesTotal);
+/// metrics().observe(Phase::Parse, 42); // 42 µs
+/// let s = metrics_snapshot();
+/// for (name, value) in s.counters() {
+///     println!("bolt_{name} {value}");
+/// }
+/// ```
+pub use metrics::{metrics, Counter, MetricsSnapshot, Phase};
+
+/// Owned, plain-data metrics snapshot for export. Re-exported from
+/// [`metrics::snapshot`] under a disambiguated name (the pool surface and the
+/// metrics surface both have a "snapshot" concept). See the [`metrics`]
+/// module docs.
+pub use metrics::snapshot as metrics_snapshot;
 
 /// Test-only re-exports of the multi-key GPU sort entry points. NOT a stable
 /// API surface — exists so the E2E test in `tests/sort_e2e.rs` can drive the
