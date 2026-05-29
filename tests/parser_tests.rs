@@ -584,3 +584,229 @@ fn not_unary_on_non_bool_operand_errors() {
     let res = try_plan("SELECT * FROM sales WHERE NOT region_id", &provider);
     assert_err_contains(res, "NOT requires a Bool operand");
 }
+
+// ---- Uncorrelated subqueries + CTEs ----------------------------------------
+//
+// These pin the new frontend surface added for non-recursive WITH/CTEs and
+// uncorrelated scalar / IN subqueries. Physical execution is a follow-up, so
+// the positive cases assert only that parsing + logical lowering (and
+// type-checking via `plan.schema()`) succeed; the negative cases pin the
+// rejection messages.
+
+/// `sales` (region_id, qty, price, ...) plus a sibling `other` table with an
+/// `id`/`val` shape so subqueries have a second relation to read from.
+fn subquery_provider() -> MemTableProvider {
+    let mut provider = fixture_table();
+    let other = Schema::new(vec![
+        Field {
+            name: "id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "val".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+    ]);
+    provider.register("other", other);
+    provider
+}
+
+/// Parse + lower (logical only) helper for the positive subquery/CTE cases.
+/// Returns the type-checked `LogicalPlan`, panicking with context on error.
+fn plan_ok(sql: &str, provider: &MemTableProvider) -> LogicalPlan {
+    let plan = parse_sql(sql, provider).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
+    plan.schema()
+        .unwrap_or_else(|e| panic!("type-check {sql:?}: {e}"));
+    plan
+}
+
+#[test]
+fn simple_with_cte_parses_and_resolves() {
+    let provider = subquery_provider();
+    // The CTE `r` selects from `sales`; the main query reads the CTE.
+    let plan = plan_ok(
+        "WITH r AS (SELECT region_id, qty FROM sales) SELECT region_id FROM r",
+        &provider,
+    );
+    // The CTE is inlined: there must be no dangling reference to a table
+    // named `r` (the provider has no such table), which `plan.schema()`
+    // already proved by type-checking. Sanity-check the output schema shape.
+    let schema = plan.schema().expect("type-check");
+    assert_eq!(schema.fields.len(), 1);
+    assert_eq!(schema.fields[0].name, "region_id");
+}
+
+#[test]
+fn chained_with_ctes_reference_earlier_cte() {
+    let provider = subquery_provider();
+    // `b` references the earlier CTE `a` — standard left-to-right visibility.
+    let plan = plan_ok(
+        "WITH a AS (SELECT region_id, qty FROM sales), \
+              b AS (SELECT region_id FROM a) \
+         SELECT region_id FROM b",
+        &provider,
+    );
+    let schema = plan.schema().expect("type-check");
+    assert_eq!(schema.fields.len(), 1);
+    assert_eq!(schema.fields[0].name, "region_id");
+}
+
+#[test]
+fn cte_shadows_base_table() {
+    let provider = subquery_provider();
+    // A CTE named `other` shadows the registered base table `other`; the main
+    // query's `FROM other` resolves to the CTE (one column), not the base
+    // table (two columns).
+    let plan = plan_ok(
+        "WITH other AS (SELECT region_id FROM sales) SELECT region_id FROM other",
+        &provider,
+    );
+    let schema = plan.schema().expect("type-check");
+    assert_eq!(schema.fields.len(), 1, "should see the CTE's single column");
+    assert_eq!(schema.fields[0].name, "region_id");
+}
+
+#[test]
+fn scalar_subquery_in_where_parses() {
+    let provider = subquery_provider();
+    // `WHERE qty > (SELECT MAX(val) FROM other)` — uncorrelated scalar
+    // subquery on the RHS of a comparison.
+    let plan = plan_ok(
+        "SELECT region_id FROM sales WHERE qty > (SELECT MAX(val) FROM other)",
+        &provider,
+    );
+    let pred = find_filter_predicate(&plan).expect("Filter on the plan spine");
+    // The predicate is `qty > <scalar subquery>`.
+    match pred {
+        Expr::Binary { right, .. } => assert!(
+            matches!(right.as_ref(), Expr::ScalarSubquery(_)),
+            "expected ScalarSubquery on RHS of comparison, got {right:?}"
+        ),
+        other => panic!("expected Binary comparison at Filter, got {other:?}"),
+    }
+}
+
+#[test]
+fn in_subquery_in_where_parses() {
+    let provider = subquery_provider();
+    let plan = plan_ok(
+        "SELECT region_id FROM sales WHERE region_id IN (SELECT id FROM other)",
+        &provider,
+    );
+    let pred = find_filter_predicate(&plan).expect("Filter on the plan spine");
+    match pred {
+        Expr::InSubquery { negated, .. } => assert!(!negated, "IN must not be negated"),
+        other => panic!("expected InSubquery at Filter predicate, got {other:?}"),
+    }
+}
+
+#[test]
+fn not_in_subquery_in_where_parses() {
+    let provider = subquery_provider();
+    let plan = plan_ok(
+        "SELECT region_id FROM sales WHERE region_id NOT IN (SELECT id FROM other)",
+        &provider,
+    );
+    let pred = find_filter_predicate(&plan).expect("Filter on the plan spine");
+    match pred {
+        Expr::InSubquery { negated, .. } => assert!(*negated, "NOT IN must be negated"),
+        other => panic!("expected InSubquery at Filter predicate, got {other:?}"),
+    }
+}
+
+#[test]
+fn correlated_scalar_subquery_rejected() {
+    let provider = subquery_provider();
+    // The subquery references `sales.region_id` (an outer table) — correlated.
+    let res = try_plan(
+        "SELECT region_id FROM sales \
+         WHERE qty > (SELECT MAX(val) FROM other WHERE sales.region_id = other.id)",
+        &provider,
+    );
+    assert_err_contains(res, "correlated subquery");
+}
+
+#[test]
+fn correlated_in_subquery_bare_column_rejected() {
+    let provider = subquery_provider();
+    // The subquery's WHERE references the bare outer column `qty` (a `sales`
+    // column not present in `other`) — correlation via a bare name.
+    let res = try_plan(
+        "SELECT region_id FROM sales \
+         WHERE region_id IN (SELECT id FROM other WHERE qty > 0)",
+        &provider,
+    );
+    assert_err_contains(res, "correlated subquery");
+}
+
+#[test]
+fn with_recursive_rejected() {
+    let provider = subquery_provider();
+    let res = try_plan(
+        "WITH RECURSIVE r AS (SELECT region_id FROM sales) SELECT region_id FROM r",
+        &provider,
+    );
+    assert_err_contains(res, "recursive");
+}
+
+#[test]
+fn scalar_subquery_multi_column_rejected() {
+    let provider = subquery_provider();
+    // A scalar subquery must return exactly one column. The arity error is a
+    // *logical* type-check failure, so assert it via `plan.schema()` — the
+    // physical layer would otherwise short-circuit with its own
+    // "subqueries not yet lowered" rejection before the arity check runs.
+    let plan = parse_sql(
+        "SELECT region_id FROM sales WHERE qty > (SELECT id, val FROM other)",
+        &provider,
+    )
+    .expect("parse should succeed (arity is a type-check concern)");
+    let err = plan
+        .schema()
+        .expect_err("multi-column scalar subquery must fail type-check");
+    assert!(
+        format!("{err}").to_ascii_lowercase().contains("exactly one column"),
+        "expected arity error, got: {err}"
+    );
+}
+
+#[test]
+fn exists_subquery_rejected() {
+    let provider = subquery_provider();
+    let res = try_plan(
+        "SELECT region_id FROM sales WHERE EXISTS (SELECT id FROM other)",
+        &provider,
+    );
+    assert_err_contains(res, "EXISTS");
+}
+
+#[test]
+fn duplicate_cte_name_rejected() {
+    let provider = subquery_provider();
+    let res = try_plan(
+        "WITH a AS (SELECT region_id FROM sales), a AS (SELECT id FROM other) \
+         SELECT region_id FROM a",
+        &provider,
+    );
+    assert_err_contains(res, "duplicate CTE");
+}
+
+#[test]
+fn subquery_physical_lowering_rejected_cleanly() {
+    let provider = subquery_provider();
+    // Physical execution is deferred: the logical plan is well-typed, but
+    // `lower_physical` must reject it with a clear message rather than
+    // mis-lowering.
+    let plan = parse_sql(
+        "SELECT region_id FROM sales WHERE region_id IN (SELECT id FROM other)",
+        &provider,
+    )
+    .expect("parse + lower logical");
+    let res = lower_physical(&plan);
+    assert!(
+        res.is_err(),
+        "physical lowering of a subquery plan should be rejected, got Ok"
+    );
+}

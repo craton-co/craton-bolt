@@ -518,6 +518,37 @@ pub enum Expr {
     },
     /// Rename an expression in the output schema.
     Alias(Box<Expr>, String),
+    /// Uncorrelated scalar subquery: `(SELECT max(y) FROM t2)`.
+    ///
+    /// The boxed [`LogicalPlan`] is a self-contained query that references no
+    /// columns from the enclosing query (correlation is rejected at the SQL
+    /// frontend — see [`crate::plan::subquery::reject_if_correlated`]). The
+    /// subplan must produce **exactly one output column**; the scalar
+    /// subquery's static type is that column's dtype.
+    ///
+    /// Runtime semantics (single-row contract) are deferred to the physical
+    /// layer, which currently rejects any plan carrying a subquery node with
+    /// a clear "subqueries are not yet lowered" message. The logical plane
+    /// stops at producing a correct, type-checked tree.
+    ScalarSubquery(Box<LogicalPlan>),
+    /// Uncorrelated `IN` / `NOT IN` subquery: `x IN (SELECT id FROM t2)`.
+    ///
+    /// `expr` is the probe value evaluated against the enclosing query's
+    /// schema. `subquery` is a self-contained, uncorrelated [`LogicalPlan`]
+    /// producing **exactly one output column** whose dtype must be
+    /// comparable with `expr`'s dtype. `negated` distinguishes `NOT IN` from
+    /// `IN`. The expression type-checks to `Bool`.
+    ///
+    /// As with [`Expr::ScalarSubquery`], execution is deferred — the physical
+    /// layer rejects the node for now.
+    InSubquery {
+        /// Probe value evaluated against the outer query's schema.
+        expr: Box<Expr>,
+        /// Single-column, uncorrelated subquery supplying the membership set.
+        subquery: Box<LogicalPlan>,
+        /// `true` for `NOT IN`, `false` for `IN`.
+        negated: bool,
+    },
 }
 
 /// Build a column reference expression.
@@ -828,6 +859,56 @@ impl Expr {
             }
             Expr::ScalarFn { kind, args } => scalar_fn_dtype(*kind, args, schema, depth + 1),
             Expr::Alias(inner, _) => inner.dtype_depth(schema, depth + 1),
+            // A scalar subquery's type is the (single) output column dtype of
+            // its self-contained plan. The plan is type-checked here so a
+            // malformed subquery surfaces at the enclosing query's type-check
+            // rather than being silently deferred. The enclosing `schema` is
+            // intentionally NOT consulted: the subquery is uncorrelated, so
+            // its schema derives solely from its own FROM tree.
+            Expr::ScalarSubquery(plan) => {
+                let s = plan.schema_depth(depth + 1)?;
+                if s.fields.len() != 1 {
+                    return Err(BoltError::Type(format!(
+                        "scalar subquery must return exactly one column, got {}",
+                        s.fields.len()
+                    )));
+                }
+                Ok(s.fields[0].dtype)
+            }
+            // `x [NOT] IN (subquery)` is always Bool. We resolve the probe
+            // expression against the enclosing schema and the subquery's
+            // single output column against its own schema, then require the
+            // two dtypes to be comparable (same type, or both numeric — the
+            // same rule `Expr::Binary` comparisons use). An untyped
+            // `Literal::Null` probe is tolerated (its membership is NULL at
+            // runtime, but that is an execution concern).
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated: _,
+            } => {
+                let sub_schema = subquery.schema_depth(depth + 1)?;
+                if sub_schema.fields.len() != 1 {
+                    return Err(BoltError::Type(format!(
+                        "IN subquery must return exactly one column, got {}",
+                        sub_schema.fields.len()
+                    )));
+                }
+                let sub_dtype = sub_schema.fields[0].dtype;
+                // Tolerate a bare NULL probe (no static type to compare).
+                if !matches!(expr.as_ref(), Expr::Literal(Literal::Null)) {
+                    let probe = expr.dtype_depth(schema, depth + 1)?;
+                    let comparable = probe == sub_dtype
+                        || (probe.is_numeric() && sub_dtype.is_numeric());
+                    if !comparable {
+                        return Err(BoltError::Type(format!(
+                            "IN subquery: cannot compare {probe:?} with subquery \
+                             column type {sub_dtype:?}"
+                        )));
+                    }
+                }
+                Ok(DataType::Bool)
+            }
         }
     }
 }
@@ -2143,5 +2224,121 @@ mod naming_consistency_tests {
         let out = join_combined_schema(&left, &right, JoinType::Inner);
         assert!(!out.fields[0].nullable);
         assert!(!out.fields[1].nullable);
+    }
+}
+
+#[cfg(test)]
+mod subquery_node_tests {
+    //! Type-check + Debug coverage for the [`Expr::ScalarSubquery`] and
+    //! [`Expr::InSubquery`] logical nodes. These pin the single-output-column
+    //! contract and the comparability rule independent of the SQL frontend
+    //! (which has its own integration coverage in `tests/parser_tests.rs`).
+    use super::*;
+
+    /// Outer query schema (the enclosing query the subquery sits inside).
+    fn outer_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("region_id", DataType::Int32, false),
+            Field::new("qty", DataType::Int32, false),
+        ])
+    }
+
+    /// A single-column subquery plan: `Scan(other) -> Project(id)`.
+    fn one_col_subquery() -> LogicalPlan {
+        let scan = LogicalPlan::Scan {
+            table: "other".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("val", DataType::Int32, false),
+            ]),
+        };
+        LogicalPlan::Project {
+            input: Box::new(scan),
+            exprs: vec![Expr::Column("id".into())],
+        }
+    }
+
+    /// A two-column subquery plan (illegal for scalar / IN positions).
+    fn two_col_subquery() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "other".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("val", DataType::Int32, false),
+            ]),
+        }
+    }
+
+    #[test]
+    fn scalar_subquery_takes_single_output_column_dtype() {
+        let e = Expr::ScalarSubquery(Box::new(one_col_subquery()));
+        assert_eq!(e.dtype(&outer_schema()).unwrap(), DataType::Int32);
+    }
+
+    #[test]
+    fn scalar_subquery_multi_column_errors() {
+        let e = Expr::ScalarSubquery(Box::new(two_col_subquery()));
+        let err = e.dtype(&outer_schema()).expect_err("multi-column scalar");
+        assert!(
+            format!("{err}").contains("exactly one column"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn in_subquery_typechecks_to_bool() {
+        let e = Expr::InSubquery {
+            expr: Box::new(Expr::Column("region_id".into())),
+            subquery: Box::new(one_col_subquery()),
+            negated: false,
+        };
+        assert_eq!(e.dtype(&outer_schema()).unwrap(), DataType::Bool);
+    }
+
+    #[test]
+    fn in_subquery_incomparable_probe_errors() {
+        // Probe is Bool-typed via a comparison; the subquery column is Int32 —
+        // Bool vs Int32 is not comparable.
+        let e = Expr::InSubquery {
+            expr: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("qty".into())),
+                right: Box::new(Expr::Literal(Literal::Int64(0))),
+            }),
+            subquery: Box::new(one_col_subquery()),
+            negated: false,
+        };
+        let err = e.dtype(&outer_schema()).expect_err("Bool vs Int32 probe");
+        assert!(format!("{err}").contains("cannot compare"), "got: {err}");
+    }
+
+    #[test]
+    fn in_subquery_multi_column_errors() {
+        let e = Expr::InSubquery {
+            expr: Box::new(Expr::Column("region_id".into())),
+            subquery: Box::new(two_col_subquery()),
+            negated: true,
+        };
+        let err = e.dtype(&outer_schema()).expect_err("multi-column IN");
+        assert!(
+            format!("{err}").contains("exactly one column"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn subquery_nodes_are_debug() {
+        // `Debug` is required for the `{plan:?}` diagnostics used across the
+        // planner; exercise it so a missing derive can't slip through.
+        let scalar = Expr::ScalarSubquery(Box::new(one_col_subquery()));
+        let in_sq = Expr::InSubquery {
+            expr: Box::new(Expr::Column("region_id".into())),
+            subquery: Box::new(one_col_subquery()),
+            negated: false,
+        };
+        assert!(!format!("{scalar:?}").is_empty());
+        assert!(!format!("{in_sq:?}").is_empty());
     }
 }

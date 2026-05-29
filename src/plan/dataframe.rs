@@ -313,6 +313,11 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
             }
         }
         Expr::Alias(inner, _) => collect_column_refs(inner, out),
+        // A subquery references columns of its *own* schema, not the
+        // enclosing query's, so do not collect them here. The `InSubquery`
+        // probe is in the enclosing namespace, so recurse into it.
+        Expr::ScalarSubquery(_) => {}
+        Expr::InSubquery { expr, .. } => collect_column_refs(expr, out),
     }
 }
 

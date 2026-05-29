@@ -420,6 +420,26 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 args: new_args,
             })
         }
+        // Subquery nodes carry a self-contained `LogicalPlan` against a
+        // *different* schema; this resolver `r` is keyed to the enclosing
+        // query's Utf8 columns, so descending into the subplan here would be
+        // both incorrect and unnecessary. The subquery is lowered/rejected at
+        // the physical-plan boundary as a unit. Pass through unchanged.
+        Expr::ScalarSubquery(_) => Ok(expr.clone()),
+        Expr::InSubquery {
+            expr: probe,
+            subquery,
+            negated,
+        } => {
+            // The probe expression *is* in the enclosing query's schema, so
+            // normalise it; the subquery plan is left untouched (see above).
+            let new_probe = rewrite_expr_with(probe, r, depth + 1)?;
+            Ok(Expr::InSubquery {
+                expr: Box::new(new_probe),
+                subquery: subquery.clone(),
+                negated: *negated,
+            })
+        }
     }
 }
 
