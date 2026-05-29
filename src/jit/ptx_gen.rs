@@ -489,6 +489,8 @@ fn emit_op(
             else_val,
             dtype,
         } => emit_select(b, *dst, *cond, *then_val, *else_val, *dtype),
+        // Logical NOT over a Bool register — `xor.b32 dst, src, 1`.
+        Op::Not { dst, src } => emit_not(b, *dst, *src),
         // ---- Decimal128 / i128 dual-register ops (v0.7 Sub-task A) ----
         // v0.7 Sub-task B wired these through `Codegen::emit_column` /
         // `emit_literal` / `emit_binary` (Add/Sub/Mul only) — see
@@ -1094,6 +1096,26 @@ fn emit_select(
         b.alloc.get(else_val)?,
         pred
     )
+}
+
+/// Emit PTX for `Op::Not`: logical negation of a Bool register.
+///
+/// Every Bool value is a canonical {0, 1} in the b32 (`r`) register class
+/// (see `RegAlloc::class_for` and the comparison / `Op::Select` emitters
+/// that produce them), so negation is a single low-bit flip:
+///
+/// ```text
+///   xor.b32 %dst, %src, 1;
+/// ```
+///
+/// `1` toggles bit 0, mapping 0 -> 1 and 1 -> 0; the result stays a
+/// canonical {0, 1} Bool. `Codegen::emit_unary` guarantees `src` is a Bool
+/// register before pushing this op.
+fn emit_not(b: &mut PtxBuilder, dst: Reg, src: Reg) -> BoltResult<()> {
+    // PERF (codegen alloc): assign the destination, then reference `src`
+    // inline at the write site (no `.to_string()` temporary).
+    let dst_name = b.alloc.assign(dst, DataType::Bool)?;
+    emit_fmt!(b, "xor.b32 {}, {}, 1;", dst_name, b.alloc.get(src)?)
 }
 
 /// Emit a `ld.global.nc.<type>` of input column `col_idx` at row `tid` into a fresh register.
@@ -3468,6 +3490,11 @@ fn walk_store_deps(
             Op::Cast { src, .. } => {
                 stack.push(src.id());
             }
+            Op::Not { src, .. } => {
+                // Logical NOT forwards its single Bool operand's validity:
+                // `NOT x` is NULL iff `x` is NULL. Walk back through `src`.
+                stack.push(src.id());
+            }
             Op::Binary { lhs, rhs, .. } => {
                 stack.push(lhs.id());
                 stack.push(rhs.id());
@@ -3608,7 +3635,8 @@ pub fn output_input_dependencies(
             | Op::Cast { dst, .. }
             | Op::Binary { dst, .. }
             | Op::IsNullCheck { dst, .. }
-            | Op::Select { dst, .. } => {
+            | Op::Select { dst, .. }
+            | Op::Not { dst, .. } => {
                 reg_to_op.insert(dst.id(), op);
             }
             // Cmp128 collapses the (lo, hi, lo, hi) operand quartet to a

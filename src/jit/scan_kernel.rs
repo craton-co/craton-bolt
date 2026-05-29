@@ -464,6 +464,10 @@ fn emit_op(
             else_val,
             dtype,
         } => emit_select(b, *dst, *cond, *then_val, *else_val, *dtype),
+        // Logical NOT over a Bool predicate operand — `xor.b32 dst, src, 1`.
+        // A `WHERE NOT (a > b)` predicate lowers to one `Op::Not` over the
+        // comparison's Bool result. Mirrors `ptx_gen::emit_not`.
+        Op::Not { dst, src } => emit_not(b, *dst, *src),
         // Decimal128 / i128 dual-register ops (v0.7 Sub-task A). A WHERE
         // predicate over Decimal128 columns (e.g. `WHERE d1 = d2`,
         // `WHERE d1 + d2 > d3`) flows through this kernel via:
@@ -639,6 +643,22 @@ fn emit_select(
         "selp.{} {}, {}, {}, {};",
         selp_ty, dst_name, then_name, else_name, pred
     ))
+}
+
+/// Emit PTX for `Op::Not`: logical negation of a Bool predicate register.
+/// Mirrors `ptx_gen::emit_not` — every Bool is a canonical {0, 1} in the
+/// b32 (`r`) register class, so the negation is a single low-bit flip:
+///
+/// ```text
+///   xor.b32 %dst, %src, 1;
+/// ```
+///
+/// Used for `WHERE NOT (<bool-expr>)` predicates whose Bool result feeds
+/// the mask byte. `Codegen::emit_unary` guarantees `src` is a Bool.
+fn emit_not(b: &mut PtxBuilder, dst: Reg, src: Reg) -> BoltResult<()> {
+    let src_name = b.alloc.get(src)?.to_string();
+    let dst_name = b.alloc.assign(dst, DataType::Bool)?;
+    b.emit(&format!("xor.b32 {}, {}, 1;", dst_name, src_name))
 }
 
 /// Emit a typed `ld.global.<ty>` of input column `col_idx` at row `tid`.
