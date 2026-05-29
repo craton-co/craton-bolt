@@ -60,6 +60,9 @@ use crate::jit::prefix_scan_multipass::{
     compile_add_block_bases_kernel, compile_prefix_scan_u32_kernel, ADD_BASES_KERNEL_ENTRY,
     SCAN_U32_KERNEL_ENTRY,
 };
+use crate::plan::physical_plan::{
+    CompactionKernelKind, CompactionKernelSpec, PrefixScanAlgoTag,
+};
 
 // Same `ScanResult` shape callers already consume from `gpu_compact`. The
 // engine's `prefix_scan_mask` dispatches between single-pass and multipass
@@ -214,14 +217,18 @@ fn run_u8_scan(
     n_rows: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    // Share the `prefix_scan` cache slot with `gpu_compact::prefix_scan_mask`:
-    // both call sites compile the SAME unparameterised PTX. Namespacing on the
-    // sibling module path keeps lookups uniform without re-loading the cubin.
-    let module = module_cache::get_or_build_module(
-        "craton_bolt::exec::gpu_compact",
-        "prefix_scan".to_string(),
-        None,
-        || compile_prefix_scan_kernel(),
+    // v0.7: route through the `CompactionKernelSpec`-keyed cache.
+    // Both this call site and `gpu_compact::prefix_scan_mask` build a
+    // `PrefixScan(HillisSteele)` spec with entry `SCAN_KERNEL_ENTRY`,
+    // so the spec hashes to the same cache slot — neither call site
+    // re-loads the cubin.
+    let spec = CompactionKernelSpec {
+        kind: CompactionKernelKind::PrefixScan(PrefixScanAlgoTag::HillisSteele),
+    };
+    let module = module_cache::get_or_build_module_for_compaction(
+        &spec,
+        SCAN_KERNEL_ENTRY,
+        |_s| compile_prefix_scan_kernel(),
     )?;
     let function = module.function(SCAN_KERNEL_ENTRY)?;
 
@@ -277,11 +284,16 @@ fn run_u32_scan(
     n: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "prefix_scan_u32".to_string(),
-        None,
-        || compile_prefix_scan_u32_kernel(),
+    // v0.7: `PrefixScanU32` owns its own `CompactionKernelKind`
+    // variant so the recursive u32-scan kernel doesn't collide with
+    // the u8-mask scan in the cache.
+    let spec = CompactionKernelSpec {
+        kind: CompactionKernelKind::PrefixScanU32,
+    };
+    let module = module_cache::get_or_build_module_for_compaction(
+        &spec,
+        SCAN_U32_KERNEL_ENTRY,
+        |_s| compile_prefix_scan_u32_kernel(),
     )?;
     let function = module.function(SCAN_U32_KERNEL_ENTRY)?;
 
@@ -328,11 +340,17 @@ fn run_add_block_bases(
     n: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "add_block_bases".to_string(),
-        None,
-        || compile_add_block_bases_kernel(),
+    // v0.7: `AddBlockBases` owns its own `CompactionKernelKind`
+    // variant. Each recursion level launches this once to fold the
+    // parent bases into the child indices; the second and subsequent
+    // launches hit the warm cache slot.
+    let spec = CompactionKernelSpec {
+        kind: CompactionKernelKind::AddBlockBases,
+    };
+    let module = module_cache::get_or_build_module_for_compaction(
+        &spec,
+        ADD_BASES_KERNEL_ENTRY,
+        |_s| compile_add_block_bases_kernel(),
     )?;
     let function = module.function(ADD_BASES_KERNEL_ENTRY)?;
 

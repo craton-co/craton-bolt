@@ -61,7 +61,7 @@ use parking_lot::Mutex;
 use crate::error::BoltResult;
 use crate::jit::CudaModule;
 use crate::plan::physical_plan::{
-    HashJoinKernelSpec, KernelSpec, RadixSortKernelSpec, ScalarAggSpec,
+    CompactionKernelSpec, HashJoinKernelSpec, KernelSpec, RadixSortKernelSpec, ScalarAggSpec,
 };
 
 /// Composite cache key: `(namespace, spec_id)`.
@@ -1154,6 +1154,239 @@ where
     RADIXSORT_CACHE.lock().insert(
         key,
         RadixSortEntry {
+            ptx,
+            module: module.clone(),
+        },
+    );
+    Ok(module)
+}
+// ---------------------------------------------------------------------------
+// CompactionKernelSpec-keyed cache (v0.7). Mirror of the other spec-keyed
+// caches above.
+// ---------------------------------------------------------------------------
+
+// 128-bit fingerprint as a defence-in-depth: if a future variant
+// keeps the same `kind` but flips the PTX entry name (e.g. a
+// keys-only vs. with-payload variant), the cache slots stay distinct
+// without requiring an IR-enum change.
+
+/// FIFO cap on the CompactionKernelSpec→`CudaModule` cache.
+/// 64 matches the sibling spec-keyed caches (scalar-agg / hash-join /
+/// radix-sort). The compaction family is small (3 scan algos + 5
+/// gather dtypes + 2 multipass helpers + 1 bool-nullable reservation
+/// = ~11 entries in practice), so 64 leaves substantial headroom.
+const COMPACTION_CACHE_CAP: usize = 64;
+
+/// Disk-cache key prefix for the compaction PTX family.
+///
+/// Stamped onto every disk-cache write/read so a directory listing
+/// shows immediately which kernel family produced each `.ptx` file,
+/// and so the projection / scalar-aggregate / hash-join /
+/// radix-sort paths' key shapes can't ever collide with a compaction
+/// entry.
+pub(crate) const COMPACTION_DISK_PREFIX: &str = "compaction::";
+
+/// 128-bit content fingerprint of a `CompactionKernelSpec` plus its
+/// entry-point tag. Domain bytes `0x41` / `0x42` distinguish this
+/// family from the KernelSpec (`0x01` / `0x02`) family already in
+/// this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CompactionKey {
+    /// Upper 64 bits of the 128-bit content hash (domain byte `0x41`).
+    hi: u64,
+    /// Lower 64 bits of the 128-bit content hash (domain byte `0x42`).
+    lo: u64,
+    /// PTX entry-point name (e.g. `"bolt_prefix_scan"`,
+    /// `"bolt_gather_i32"`). Participates in the key so two specs
+    /// that share `kind` but emit PTX with different entry names
+    /// occupy distinct cache slots.
+    entry: &'static str,
+}
+
+impl CompactionKey {
+    /// Compute the key for `(spec, entry)`. The 128-bit hash is built
+    /// from `Debug` output of the spec with domain-separating prefix
+    /// bytes distinct from `KernelSpecKey`'s (`0x01` / `0x02`) so a
+    /// hypothetical hash collision between the Debug shapes of the
+    /// two spec types can't alias keys.
+    fn new(spec: &CompactionKernelSpec, entry: &'static str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::fmt::Write as _;
+        use std::hash::Hasher;
+
+        let mut hi = DefaultHasher::new();
+        hi.write_u8(0x41);
+        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
+
+        let mut lo = DefaultHasher::new();
+        lo.write_u8(0x42);
+        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
+
+        Self {
+            hi: hi.finish(),
+            lo: lo.finish(),
+            entry,
+        }
+    }
+}
+
+/// Cached payload for one CompactionKernelSpec key. Same shape as
+/// `KernelSpecEntry`: PTX text retained for observability, module
+/// for the fast-path return.
+#[derive(Clone)]
+struct CompactionEntry {
+    /// Emitted PTX text. Retained for observability; the production
+    /// lookup path only needs `module`.
+    #[allow(dead_code)]
+    ptx: String,
+    module: CudaModule,
+}
+
+/// State of the CompactionKernelSpec-keyed cache. FIFO eviction with
+/// the same shape as `KernelSpecCache` — see those docs.
+struct CompactionCache {
+    by_key: HashMap<CompactionKey, CompactionEntry>,
+    order: VecDeque<CompactionKey>,
+    cap: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl CompactionCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_key: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, key: &CompactionKey) -> Option<CompactionEntry> {
+        if let Some(entry) = self.by_key.get(key) {
+            self.hits = self.hits.saturating_add(1);
+            Some(entry.clone())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    fn insert(&mut self, key: CompactionKey, entry: CompactionEntry) {
+        if self.by_key.contains_key(&key) {
+            return;
+        }
+        while self.by_key.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_key.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.by_key.insert(key, entry);
+    }
+}
+
+/// Process-wide CompactionKernelSpec→`CudaModule` cache. Initialised lazily.
+static COMPACTION_CACHE: Lazy<Mutex<CompactionCache>> =
+    Lazy::new(|| Mutex::new(CompactionCache::new(COMPACTION_CACHE_CAP)));
+
+/// Test- and observability-facing snapshot of `(hits, misses)` for
+/// the CompactionKernelSpec cache. Parallel to
+/// [`kernelspec_cache_stats`].
+#[doc(hidden)]
+#[must_use]
+pub fn compaction_cache_stats() -> (usize, usize) {
+    let c = COMPACTION_CACHE.lock();
+    (c.hits as usize, c.misses as usize)
+}
+
+/// Compose the on-disk PTX cache key for a CompactionKernelSpec
+/// lookup.
+///
+/// The shape is `"{COMPACTION_DISK_PREFIX}{entry}-{hex(hash128)}"`:
+///   1. The `"compaction::"` prefix domain-separates these entries
+///      from any other PTX family that may share the disk-cache
+///      directory.
+///   2. The `entry` suffix distinguishes the per-`kind` PTX entry
+///      points (e.g. `bolt_prefix_scan` vs
+///      `bolt_prefix_scan_blelloch` vs `bolt_gather_i32`).
+///   3. The 128-bit hex content hash makes the key
+///      collision-resistant against unrelated specs that happen to
+///      share the same `kind` shape.
+fn compaction_disk_key(key: &CompactionKey) -> String {
+    format!(
+        "{}{}-{}",
+        COMPACTION_DISK_PREFIX,
+        key.entry,
+        crate::jit::disk_cache::hash_to_key(key.hi, key.lo),
+    )
+}
+
+/// Look up (or compile-and-load) the `CudaModule` for `(spec, entry)`.
+///
+/// This is the compaction-family analogue of
+/// [`get_or_build_module_for_spec`]. On a **cache hit** we return the
+/// cached `CudaModule` clone immediately — no codegen, no PTX text
+/// generation, no `cuModuleLoadDataEx`. On a **cache miss** we run
+/// `compile(spec)` to get the PTX text and hand it to
+/// `CudaModule::from_ptx`. The resulting `(ptx, module)` pair is
+/// stored under the CompactionKernelSpec key so subsequent calls with
+/// the same spec hit the fast path.
+///
+/// # Disk-cache integration
+///
+/// When the disk-backed PTX cache is enabled (env var
+/// `BOLT_PTX_CACHE_DIR` or builder override), a miss in the in-memory
+/// cache consults the disk cache *before* paying the codegen cost.
+/// See [`compaction_disk_key`] for the key shape; the
+/// `"compaction::"` prefix keeps these entries human-greppable in a
+/// shared cache directory.
+///
+/// # Concurrency
+///
+/// The cache lock is held only long enough to look up or insert; the
+/// slow `compile` + `from_ptx` work runs outside the lock. If two
+/// threads race on the same miss they will each compile once and the
+/// second insert is dropped by `insert`'s idempotence check.
+pub(crate) fn get_or_build_module_for_compaction<F>(
+    spec: &CompactionKernelSpec,
+    entry: &'static str,
+    compile: F,
+) -> BoltResult<CudaModule>
+where
+    F: FnOnce(&CompactionKernelSpec) -> BoltResult<String>,
+{
+    let key = CompactionKey::new(spec, entry);
+    // Fast path: in-memory hit. Hold the lock just long enough to clone.
+    if let Some(cached) = COMPACTION_CACHE.lock().get(&key) {
+        return Ok(cached.module);
+    }
+    // In-memory miss: try the optional on-disk cache before paying
+    // for codegen.
+    let disk = crate::jit::disk_cache::disk_cache();
+    let disk_key = disk.as_ref().map(|_| compaction_disk_key(&key));
+    let ptx = match (&disk, &disk_key) {
+        (Some(cache), Some(k)) => match cache.lookup(k) {
+            Some(text) => text,
+            None => {
+                let text = compile(spec)?;
+                // Write-through to disk. Errors here are non-fatal: a
+                // failed write just means future processes won't
+                // benefit, the current process still loads the module
+                // successfully.
+                let _ = cache.store(k, &text);
+                text
+            }
+        },
+        _ => compile(spec)?,
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    COMPACTION_CACHE.lock().insert(
+        key,
+        CompactionEntry {
             ptx,
             module: module.clone(),
         },

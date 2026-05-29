@@ -49,6 +49,33 @@ use crate::jit::prefix_scan::{
     SCAN_KERNEL_ENTRY_BLELLOCH, SCAN_KERNEL_ENTRY_LOOKBACK,
 };
 use crate::plan::logical_plan::DataType;
+use crate::plan::physical_plan::{
+    CompactionKernelKind, CompactionKernelSpec, PrefixScanAlgoTag,
+};
+
+/// Build the `CompactionKernelSpec` for a `PrefixScan(algo)` cache
+/// lookup. Inline `kind: ..` construction at each call site reads
+/// noisy; this helper keeps the spec build at the launch site
+/// readable.
+fn prefix_scan_spec(algo: PrefixScanAlgoTag) -> CompactionKernelSpec {
+    CompactionKernelSpec {
+        kind: CompactionKernelKind::PrefixScan(algo),
+    }
+}
+
+/// Map the runtime algorithm selector to its `PrefixScanAlgoTag`.
+/// The two enums carry the same set of variants intentionally —
+/// `PrefixScanAlgo` is the local executor-side dispatch tag while
+/// `PrefixScanAlgoTag` is the IR-side cache-key tag. Keeping them as
+/// distinct types lets the IR live in `plan::physical_plan` without
+/// leaking the local `PrefixScanAlgo` dispatch enum out of `exec`.
+fn algo_to_tag(algo: PrefixScanAlgo) -> PrefixScanAlgoTag {
+    match algo {
+        PrefixScanAlgo::HillisSteele => PrefixScanAlgoTag::HillisSteele,
+        PrefixScanAlgo::Blelloch => PrefixScanAlgoTag::Blelloch,
+        PrefixScanAlgo::Lookback => PrefixScanAlgoTag::Lookback,
+    }
+}
 
 /// Outputs of [`prefix_scan_mask`]: the per-row exclusive prefixes, the
 /// per-block bases (already exclusive-summed on the host and re-uploaded), and
@@ -260,7 +287,7 @@ pub fn prefix_scan_mask(
     // Decoupled-lookback takes a 5th `partial_status` argument and bakes the
     // global prefix into `local_indices` in one launch, so it has its own
     // launcher. Hillis-Steele / Blelloch share the 4-arg launcher below.
-    let (algo, spec_id, entry) = prefix_scan_algo_selection();
+    let (algo, _spec_id, entry) = prefix_scan_algo_selection();
     if algo == PrefixScanAlgo::Lookback {
         return prefix_scan_mask_lookback(mask_ptr, n_rows, stream);
     }
@@ -272,21 +299,20 @@ pub fn prefix_scan_mask(
     let local_indices = GpuVec::<u32>::zeros(n_rows)?;
     let block_sums = GpuVec::<u32>::zeros(n_blocks)?;
 
-    // JIT-compile and load the scan kernel via the consolidated module cache.
-    // Algorithm selected by `BOLT_PREFIX_SCAN_ALGO` env var:
+    // JIT-compile and load the scan kernel via the v0.7
+    // `CompactionKernelSpec`-keyed cache. On a warm hit the codegen +
+    // PTX-load round-trip is skipped — the cached `CudaModule` clone
+    // returns in sub-microsecond time. Algorithm selected by
+    // `BOLT_PREFIX_SCAN_ALGO` env var:
     //   * unset / "hillis" / "hillis-steele" -> Hillis-Steele (default, O(n log n))
     //   * "blelloch"                         -> Blelloch upsweep+downsweep (O(n))
-    // Both kernels expose the same 4-arg ABI.
-    let _ = algo;
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        spec_id.to_string(),
-        None,
-        || {
-            let (ptx, _e) = compile_prefix_scan_for_algo()?;
-            Ok(ptx)
-        },
-    )?;
+    // Both kernels expose the same 4-arg ABI; only the PTX entry name
+    // and the kind tag inside the cache key change between them.
+    let spec = prefix_scan_spec(algo_to_tag(algo));
+    let module = module_cache::get_or_build_module_for_compaction(&spec, entry, |_s| {
+        let (ptx, _e) = compile_prefix_scan_for_algo()?;
+        Ok(ptx)
+    })?;
     let function = module.function(entry)?;
 
     // Launch. cuLaunchKernel ABI: pointer-to-each-arg in a *mut c_void array.
@@ -439,11 +465,15 @@ fn prefix_scan_mask_lookback(
     // as a stale AGGREGATE/INCLUSIVE by a peer block.
     let partial_status = GpuVec::<u32>::zeros(n_blocks)?;
 
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "prefix_scan_lookback".to_string(),
-        None,
-        || compile_prefix_scan_kernel_lookback(),
+    // v0.7: route through the `CompactionKernelSpec`-keyed cache.
+    // Lookback owns its own `PrefixScanAlgoTag::Lookback` slot so
+    // re-entering this function on the warm path skips codegen
+    // entirely.
+    let spec = prefix_scan_spec(PrefixScanAlgoTag::Lookback);
+    let module = module_cache::get_or_build_module_for_compaction(
+        &spec,
+        SCAN_KERNEL_ENTRY_LOOKBACK,
+        |_s| compile_prefix_scan_kernel_lookback(),
     )?;
     let function = module.function(SCAN_KERNEL_ENTRY_LOOKBACK)?;
 
@@ -606,13 +636,29 @@ pub fn gather_one_async(
         return Ok(col);
     }
 
-    // JIT-compile + load the gather kernel for this dtype. The PTX is keyed
-    // by `dtype` only; consolidated cache lookup skips PTX gen on repeats.
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        format!("gather:{:?}", dtype),
-        None,
-        || compile_gather_kernel(dtype),
+    // JIT-compile + load the gather kernel for this dtype via the
+    // v0.7 `CompactionKernelSpec`-keyed cache. The PTX is keyed by
+    // `dtype` only; the `Gather(dtype)` variant of
+    // `CompactionKernelKind` owns one cache slot per supported
+    // dtype so back-to-back gather launches over a wide projection
+    // hit the warm path after the first launch.
+    let spec = CompactionKernelSpec {
+        kind: CompactionKernelKind::Gather(dtype),
+    };
+    let module = module_cache::get_or_build_module_for_compaction(
+        &spec,
+        gather_kernel_entry(dtype),
+        |s| match s.kind {
+            CompactionKernelKind::Gather(d) => compile_gather_kernel(d),
+            // Other variants never reach this closure because the
+            // `spec` we built above has `Gather(dtype)` baked in;
+            // surface a structured error rather than panic if a
+            // future refactor accidentally widens the spec.
+            other => Err(BoltError::Other(format!(
+                "gpu_compact: gather closure invoked on non-Gather spec {:?}",
+                other
+            ))),
+        },
     )?;
     let function = module.function(gather_kernel_entry(dtype))?;
 

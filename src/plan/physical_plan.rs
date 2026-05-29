@@ -662,15 +662,25 @@ pub enum PrefixScanAlgoTag {
 }
 
 /// Which compaction-pipeline kernel this spec compiles. The compaction
-/// pipeline in `crate::exec::gpu_compact` has three distinct PTX shapes
-/// — prefix scan over a `u8` mask, per-dtype gather, and a Bool-nullable
-/// gather — each with its own knobs.
+/// pipeline in `crate::exec::gpu_compact` / `gpu_compact_multipass` has
+/// five distinct PTX shapes — prefix scan over a `u8` mask, scan over a
+/// `u32` array (multipass intermediate level), block-bases fold,
+/// per-dtype gather, and a Bool-nullable gather — each with its own
+/// knobs.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompactionKernelKind {
     /// Prefix-scan over the keep-mask, parameterised by which algorithm
     /// implementation is selected (see [`PrefixScanAlgoTag`]).
     PrefixScan(PrefixScanAlgoTag),
+    /// Scan a `u32` array — multipass recursion's intermediate level
+    /// (`bolt_prefix_scan_u32`). Same Hillis-Steele body but reads a
+    /// `u32` count instead of a `u8` mask byte.
+    PrefixScanU32,
+    /// Fold per-block bases into per-row local indices — the multipass
+    /// fold step (`bolt_add_block_bases`) that injects the parent-level
+    /// bases into a child-level local index array.
+    AddBlockBases,
     /// Per-dtype gather kernel from `compile_gather_kernel(dtype)`.
     Gather(DataType),
     /// Bool-with-validity gather variant — used by
