@@ -81,10 +81,12 @@ use crate::plan::physical_plan::PhysicalPlan;
 const MAX_CROSS_ROWS: u64 = u32::MAX as u64;
 
 /// Hard cap on the inner-side row count of a non-equi (nested-loop) join.
-/// The nested-loop fallback walks the full cartesian product and applies
-/// a host-side predicate; cost is `O(outer × inner)`. We cap the *inner*
-/// side at 1024 rows to keep the host-side blow-up bounded and surface a
-/// clear "rewrite as equi if possible" hint past that.
+/// The nested-loop fallback walks the cartesian product chunk-by-chunk and
+/// applies a host-side predicate; cost is `O(outer × inner)` time but only
+/// `O(chunk × inner + output)` peak memory (see
+/// [`execute_nested_loop_join`]). We cap the *inner* side at 1024 rows so
+/// the per-outer-row scan is cheap and surface a clear "rewrite as equi if
+/// possible" hint past that.
 ///
 /// Sized for the v0.6 stretch goal: small-side non-equi joins (e.g. a
 /// dimension table of buckets / ranges against a fact table) work cleanly,
@@ -92,16 +94,36 @@ const MAX_CROSS_ROWS: u64 = u32::MAX as u64;
 /// `const` so it's easy to find and tune.
 pub(crate) const MAX_NESTED_LOOP_INNER_ROWS: usize = 1024;
 
+/// Target ceiling on the number of cartesian cells (`chunk × inner`)
+/// materialised at once inside the nested-loop join's streaming loop.
+///
+/// The non-equi executor (EXEC-M3 fix) no longer materialises the whole
+/// `outer × inner` product before filtering — instead it slices the larger
+/// side into chunks sized so each chunk's `chunk × inner` cross stays at or
+/// under this bound, filters each chunk, and concatenates the (small)
+/// matched results. This keeps peak memory at `O(chunk × inner + output)`
+/// rather than `O(outer × inner)`, so a large-fact / tiny-dim non-equi join
+/// succeeds instead of tripping [`MAX_CROSS_ROWS`].
+///
+/// `1 << 20` (≈1M cells) is small enough to stay well under
+/// [`MAX_CROSS_ROWS`] for any `inner ≤ MAX_NESTED_LOOP_INNER_ROWS`, yet
+/// large enough that the per-chunk overhead (one cross + one filter call)
+/// is amortised across many outer rows.
+const NESTED_LOOP_CHUNK_CELLS: u64 = 1 << 20;
+
 /// Execute a JOIN. Dispatches per `join_type` to one of:
 ///   * `execute_inner_join` — existing INNER path (smaller side builds).
 ///   * `execute_outer_join` — LEFT / RIGHT / FULL (build side is fixed
 ///      by the join kind so unmatched-row tracking is straightforward).
 ///   * `execute_cross_join` — cartesian product with a row-count cap.
 ///   * `execute_nested_loop_join` — v0.6 non-equi fallback. Activated when
-///     `filter` is `Some(_)`: every (left, right) pair is materialised
-///     via CROSS and then the predicate is evaluated host-side via
-///     [`crate::exec::filter::execute_filter`]. The inner side is capped
-///     at [`MAX_NESTED_LOOP_INNER_ROWS`] to keep the explosion bounded.
+///     `filter` is `Some(_)`: the larger side is STREAMED in chunks (the
+///     EXEC-M3 fix), each chunk crossed against the held-whole smaller side
+///     and filtered host-side via [`crate::exec::filter::execute_filter`],
+///     then the matched chunks are concatenated. The inner (smaller) side
+///     is capped at [`MAX_NESTED_LOOP_INNER_ROWS`]; peak memory is bounded
+///     by `chunk × inner + output`, NOT `outer × inner`, so a large-fact /
+///     tiny-dim non-equi join no longer trips the `MAX_CROSS_ROWS` cap.
 ///
 /// `output_schema` is the disambiguated combined schema produced by
 /// `join_combined_schema` and stored on `PhysicalPlan::Join`; the engine
@@ -510,16 +532,29 @@ fn execute_cross_join(
 ///      smaller side because the cartesian explosion is `outer × inner`;
 ///      capping the smaller side bounds the host-side work without
 ///      arbitrarily limiting the larger fact-table side.
-///   2. Materialise the full cartesian product via `execute_cross_join`,
-///      which already produces a `RecordBatch` over the join's combined
-///      output schema (with right-side rename rules applied). The cross
-///      cap [`MAX_CROSS_ROWS`] still applies — `outer × inner` cannot
-///      exceed `u32::MAX` regardless.
-///   3. Apply `predicate` to that cartesian batch via
+///   2. STREAM the cartesian product in chunks instead of materialising the
+///      whole `outer × inner` batch up front (EXEC-M3 fix). The larger side
+///      is sliced into row-blocks sized so each block's `block × inner`
+///      cross stays at or under [`NESTED_LOOP_CHUNK_CELLS`]; the smaller
+///      (≤1024-row) side is held whole. For each block we build *only that
+///      block's* cross via `execute_cross_join` (which produces a
+///      `RecordBatch` over the join's combined output schema, with
+///      right-side rename rules applied), filter it (step 3), and push the
+///      matched rows into an accumulator. This bounds peak memory at
+///      `O(block × inner + output)` rather than `O(outer × inner)`, so a
+///      large-fact / tiny-dim non-equi join no longer trips the
+///      [`MAX_CROSS_ROWS`] cap on the *outer* size. (That cap still guards
+///      the genuine CROSS-JOIN path verbatim — see `execute_cross_join` —
+///      and each per-block cross trivially satisfies it because
+///      `block × inner ≤ NESTED_LOOP_CHUNK_CELLS ≪ MAX_CROSS_ROWS`.)
+///   3. Apply `predicate` to each per-block cartesian batch via
 ///      [`crate::exec::filter::execute_filter`], which evaluates the
 ///      expression against the combined-schema columns and drops rows
 ///      where the predicate is `false` or NULL (standard SQL WHERE
-///      semantics — matches the v0.6 INNER-non-equi contract).
+///      semantics — matches the v0.6 INNER-non-equi contract). Identical
+///      to the pre-fix post-cross filter, just applied per block; the
+///      matched blocks are concatenated with `concat_batches`, preserving
+///      output schema and column order exactly.
 ///   4. For OUTER variants (LEFT/RIGHT/FULL), the nested-loop path with
 ///      a non-equi predicate would need to track unmatched preserved-side
 ///      rows and emit them NULL-padded. v0.6 ships the INNER-non-equi
@@ -545,6 +580,31 @@ fn execute_nested_loop_join(
     predicate: &Expr,
     output_schema: &Schema,
 ) -> BoltResult<QueryHandle> {
+    // Production entry point: stream with the tuned chunk-cell ceiling. The
+    // body lives in `execute_nested_loop_join_chunked` so tests can drive a
+    // tiny `chunk_cells` and exercise the multi-chunk concatenation path
+    // without building a multi-million-row fixture (behaviour is identical
+    // for any positive `chunk_cells`).
+    execute_nested_loop_join_chunked(
+        lhs,
+        rhs,
+        join_type,
+        on,
+        predicate,
+        output_schema,
+        NESTED_LOOP_CHUNK_CELLS,
+    )
+}
+
+fn execute_nested_loop_join_chunked(
+    lhs: RecordBatch,
+    rhs: RecordBatch,
+    join_type: JoinType,
+    on: &[(Expr, Expr)],
+    predicate: &Expr,
+    output_schema: &Schema,
+    chunk_cells: u64,
+) -> BoltResult<QueryHandle> {
     // OUTER + non-equi is a planned follow-up; surface a clear message
     // rather than silently dropping the preserved-side semantics.
     if matches!(
@@ -559,9 +619,9 @@ fn execute_nested_loop_join(
     }
 
     // Inner-side cap. We pick the *smaller* side as the inner (the side we
-    // walk per outer row); that's the side whose row count drives the
-    // host-side explosion. Pre-flight the cap before materialising the
-    // cross output so a bad shape fails fast.
+    // hold whole and scan per outer-block); that's the side whose row count
+    // drives the per-block cross size. Pre-flight the cap before doing any
+    // work so a bad shape fails fast.
     let inner_rows = lhs.num_rows().min(rhs.num_rows());
     if inner_rows > MAX_NESTED_LOOP_INNER_ROWS {
         return Err(BoltError::Plan(format!(
@@ -570,17 +630,22 @@ fn execute_nested_loop_join(
         )));
     }
 
-    // Build the cartesian batch. `execute_cross_join` already handles the
-    // empty-side short-circuit, name disambiguation, and the
-    // `MAX_CROSS_ROWS` overflow cap; we reuse it verbatim.
-    let cross_handle = execute_cross_join(lhs, rhs, output_schema)?;
+    let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+
+    // Empty either side ⇒ empty INNER result. (`execute_cross_join` would
+    // also short-circuit, but bailing here avoids the chunk-loop setup and
+    // a divide-by-zero when computing the chunk size below.)
+    if lhs.num_rows() == 0 || rhs.num_rows() == 0 {
+        return empty_output(arrow_schema);
+    }
 
     // If the SQL frontend extracted equi pairs alongside a residual filter,
     // fold them into one composite predicate so they're enforced too. This
     // arm isn't reachable from v0.6's `lower_join_on` (which puts the whole
     // equality into the filter when any non-equi sibling is present), but
     // future planner improvements (e.g. extracting equi pairs even when a
-    // non-equi sibling exists) need not change this executor.
+    // non-equi sibling exists) need not change this executor. Computed once
+    // and reused across every chunk so per-block work is just cross+filter.
     let composite: Expr;
     let pred_ref: &Expr = if on.is_empty() {
         predicate
@@ -589,11 +654,71 @@ fn execute_nested_loop_join(
         &composite
     };
 
-    // Apply the residual predicate host-side. `execute_filter` uses
-    // `expr_agg::eval_expr` against the combined-schema columns, so the
-    // predicate is evaluated row-by-row in SQL three-valued logic
-    // (predicate result of NULL drops the row, matching WHERE semantics).
-    crate::exec::filter::execute_filter(cross_handle, pred_ref)
+    // Streaming (chunked) evaluation — the EXEC-M3 fix. Slice the LARGER
+    // side into row-blocks sized so each block's `block × inner` cross stays
+    // at or under `NESTED_LOOP_CHUNK_CELLS`, then for each block:
+    //   * build only that block's cross product (left-cols ++ right-cols,
+    //     preserving the combined output schema), and
+    //   * filter it with `execute_filter` — identical to the pre-fix
+    //     post-cross filter, just per block.
+    // The matched per-block batches are concatenated at the end. Because we
+    // always pass the chunk slot in its original (left, right) position to
+    // `execute_cross_join`, column order is identical to the full-cross
+    // path; only the row blocking changes.
+    //
+    // `chunk_rows` is derived from the *inner* (held-whole) side so the
+    // per-block cross is bounded regardless of which physical side is the
+    // larger one. `inner_rows ≥ 1` here (empty sides bailed above), and
+    // `inner_rows ≤ MAX_NESTED_LOOP_INNER_ROWS`, so `chunk_rows ≥ 1` and
+    // `chunk_rows × inner_rows ≤ NESTED_LOOP_CHUNK_CELLS ≪ MAX_CROSS_ROWS`.
+    let chunk_rows: usize = (chunk_cells / inner_rows as u64).max(1) as usize;
+
+    // The larger side is the one we chunk; the smaller side is held whole.
+    // `lhs` and `rhs` keep their (left, right) identity throughout so the
+    // cross output column order never changes.
+    let chunk_left = lhs.num_rows() >= rhs.num_rows();
+    let outer_rows = if chunk_left { lhs.num_rows() } else { rhs.num_rows() };
+
+    let mut matched: Vec<RecordBatch> = Vec::new();
+    let mut start = 0usize;
+    while start < outer_rows {
+        let len = chunk_rows.min(outer_rows - start);
+        // Slice only the larger side; hold the smaller side whole. Arrow's
+        // `RecordBatch::slice` is a zero-copy view, so the only allocation
+        // per block is the cross materialisation itself.
+        let (block_lhs, block_rhs) = if chunk_left {
+            (lhs.slice(start, len), rhs.clone())
+        } else {
+            (lhs.clone(), rhs.slice(start, len))
+        };
+
+        // Per-block cross. `execute_cross_join` handles name disambiguation
+        // and the (here trivially-satisfied) `MAX_CROSS_ROWS` cap.
+        let cross_handle = execute_cross_join(block_lhs, block_rhs, output_schema)?;
+
+        // Apply the residual predicate host-side. `execute_filter` uses
+        // `expr_agg::eval_expr` against the combined-schema columns, so the
+        // predicate is evaluated row-by-row in SQL three-valued logic
+        // (predicate result of NULL drops the row, matching WHERE semantics).
+        let filtered = crate::exec::filter::execute_filter(cross_handle, pred_ref)?
+            .into_record_batch();
+        if filtered.num_rows() > 0 {
+            matched.push(filtered);
+        }
+
+        start += len;
+    }
+
+    if matched.is_empty() {
+        return empty_output(arrow_schema);
+    }
+
+    // Concatenate the matched blocks. Every block carries the identical
+    // combined schema (`arrow_schema`), so `concat_batches` simply stacks
+    // them; column order is preserved exactly.
+    let out = arrow::compute::concat_batches(&arrow_schema, matched.iter())
+        .map_err(arrow_err)?;
+    Ok(QueryHandle::from_record_batch(out))
 }
 
 /// Conjunct every equi pair (lowered as `l = r`) into `predicate` with AND
@@ -1631,5 +1756,210 @@ mod build_slot_tests {
         assert_eq!(s.len(), 3);
         assert_eq!(s.as_slice(), &[1, 2, 3]);
         assert!(matches!(s, BuildSlot::Heap(_)));
+    }
+}
+
+#[cfg(test)]
+mod nested_loop_streaming_tests {
+    //! Tests for the EXEC-M3 streaming (chunked) non-equi join fix.
+    //!
+    //! The bug: the old `execute_nested_loop_join` materialised the WHOLE
+    //! `outer × inner` cartesian product via `execute_cross_join` before
+    //! filtering, so a large fact table joined to a tiny dimension table
+    //! tripped `MAX_CROSS_ROWS` (u32::MAX) and ERRORED — even though the
+    //! inner side is tiny and the result is small. The fix chunks the larger
+    //! side so peak memory is `O(chunk × inner + output)`, never the full
+    //! product. These tests pin: (a) a large-outer / tiny-inner non-equi
+    //! join now succeeds with the correct matched count across multiple
+    //! chunks, (b) empty matches yield an empty (schema-preserving) result,
+    //! and (c) the genuine CROSS path still honours its row-count cap.
+    use super::*;
+    use crate::plan::logical_plan::{BinaryOp, DataType, Field, Literal};
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    /// Single Int32 column batch.
+    fn i32_batch(name: &str, values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            name,
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let arr: Arc<dyn Array> = Arc::new(Int32Array::from(values));
+        RecordBatch::try_new(schema, vec![arr]).unwrap()
+    }
+
+    /// Two-Int32-column batch (dimension table: `lo`, `hi`).
+    fn dim_batch(los: Vec<i32>, his: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("lo", ArrowDataType::Int32, false),
+            ArrowField::new("hi", ArrowDataType::Int32, false),
+        ]));
+        let lo: Arc<dyn Array> = Arc::new(Int32Array::from(los));
+        let hi: Arc<dyn Array> = Arc::new(Int32Array::from(his));
+        RecordBatch::try_new(schema, vec![lo, hi]).unwrap()
+    }
+
+    /// Plan-level combined output schema: `[fx, lo, hi]` — left (fact) then
+    /// right (dim), matching the cross-join column order.
+    fn combined_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("fx", DataType::Int32, false),
+            Field::new("lo", DataType::Int32, false),
+            Field::new("hi", DataType::Int32, false),
+        ])
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(name.to_string())
+    }
+    fn lit_i32(v: i32) -> Expr {
+        Expr::Literal(Literal::Int32(v))
+    }
+    fn bin(op: BinaryOp, l: Expr, r: Expr) -> Expr {
+        Expr::Binary {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+
+    /// `fx BETWEEN lo AND hi` == `fx >= lo AND fx <= hi`.
+    fn between_predicate() -> Expr {
+        bin(
+            BinaryOp::And,
+            bin(BinaryOp::GtEq, col("fx"), col("lo")),
+            bin(BinaryOp::LtEq, col("fx"), col("hi")),
+        )
+    }
+
+    /// Pull the single output `fx` column out as a Vec for assertions.
+    fn fx_values(h: QueryHandle) -> Vec<i32> {
+        let batch = h.into_record_batch();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..arr.len()).map(|i| arr.value(i)).collect()
+    }
+
+    #[test]
+    fn large_outer_tiny_inner_succeeds_with_correct_count() {
+        // Fact table: fx = 0..N. Dim: one bucket [10, 19] inclusive.
+        // Expected matches: fx in 10..=19 => exactly 10 rows.
+        //
+        // We drive a *tiny* chunk_cells (4) so the N-row outer is split into
+        // many blocks — exercising the streaming concatenation path that the
+        // old full-materialise code lacked. With the old code this whole
+        // shape only worked because N is small here; the point of the tiny
+        // chunk_cells is to prove the chunk loop stitches blocks correctly.
+        const N: i32 = 1000;
+        let fact = i32_batch("fx", (0..N).collect());
+        let dim = dim_batch(vec![10], vec![19]);
+        let schema = combined_schema();
+
+        let handle = execute_nested_loop_join_chunked(
+            fact,
+            dim,
+            JoinType::Inner,
+            &[],
+            &between_predicate(),
+            &schema,
+            4, // tiny chunk-cell ceiling: forces many chunks
+        )
+        .expect("large-outer / tiny-inner non-equi join must succeed");
+
+        let mut got = fx_values(handle);
+        got.sort_unstable();
+        let expected: Vec<i32> = (10..=19).collect();
+        assert_eq!(got, expected, "matched rows must be fx in [10, 19]");
+    }
+
+    #[test]
+    fn empty_matches_yield_empty_schema_preserving_result() {
+        // Dim bucket [10_000, 20_000] cannot match any fx in 0..1000.
+        let fact = i32_batch("fx", (0..1000).collect());
+        let dim = dim_batch(vec![10_000], vec![20_000]);
+        let schema = combined_schema();
+
+        let handle = execute_nested_loop_join_chunked(
+            fact,
+            dim,
+            JoinType::Inner,
+            &[],
+            &between_predicate(),
+            &schema,
+            8,
+        )
+        .expect("non-equi join with no matches must still succeed");
+
+        let batch = handle.into_record_batch();
+        assert_eq!(batch.num_rows(), 0, "no rows should match");
+        // Schema preserved exactly: 3 columns in [fx, lo, hi] order.
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.schema().field(0).name().as_str(), "fx");
+        assert_eq!(batch.schema().field(1).name().as_str(), "lo");
+        assert_eq!(batch.schema().field(2).name().as_str(), "hi");
+    }
+
+    #[test]
+    fn small_inner_on_the_left_side_also_streams() {
+        // Symmetry check: put the tiny side on the LEFT and the large side on
+        // the RIGHT. The chunker must chunk the RIGHT (larger) side while
+        // holding the LEFT whole, and column order (left ++ right) must be
+        // preserved. Here left = dim-as-fact is awkward, so instead we keep
+        // the combined schema [fx, lo, hi] but make the *dim* (right) larger
+        // than the *fact* (left): fact has 3 rows, dim has 300 buckets.
+        //
+        // fact fx = [5, 15, 25]. Dim bucket i covers [i*10, i*10+9]:
+        //   fx=5  -> bucket 0  [0,9]
+        //   fx=15 -> bucket 1  [10,19]
+        //   fx=25 -> bucket 2  [20,29]
+        // Each fact row matches exactly one bucket => 3 matched rows.
+        let fact = i32_batch("fx", vec![5, 15, 25]);
+        let los: Vec<i32> = (0..300).map(|i| i * 10).collect();
+        let his: Vec<i32> = (0..300).map(|i| i * 10 + 9).collect();
+        let dim = dim_batch(los, his);
+        let schema = combined_schema();
+
+        let handle = execute_nested_loop_join_chunked(
+            fact,
+            dim,
+            JoinType::Inner,
+            &[],
+            &between_predicate(),
+            &schema,
+            4, // forces the larger (right) side to chunk
+        )
+        .expect("tiny-left / large-right non-equi join must succeed");
+
+        let mut got = fx_values(handle);
+        got.sort_unstable();
+        assert_eq!(got, vec![5, 15, 25]);
+    }
+
+    #[test]
+    fn cross_join_still_respects_max_cross_rows_cap() {
+        // The genuine CROSS path must still reject products over u32::MAX.
+        // 70_000 × 70_000 = 4.9e9 > u32::MAX (4.29e9). The cap is checked
+        // BEFORE materialisation, so this allocates only two 70k-row Int32
+        // columns (~280 KB each) and errors fast.
+        const SIDE: i32 = 70_000;
+        let left = i32_batch("fx", (0..SIDE).collect());
+        let right = i32_batch("rx", (0..SIDE).collect());
+        let out_schema = Schema::new(vec![
+            Field::new("fx", DataType::Int32, false),
+            Field::new("rx", DataType::Int32, false),
+        ]);
+
+        let err = execute_cross_join(left, right, &out_schema)
+            .expect_err("CROSS product over u32::MAX must error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("too large") || msg.contains("limit"),
+            "expected a cross-cap error, got: {msg}"
+        );
     }
 }

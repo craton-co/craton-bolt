@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Craton Bolt groupby example: synthesise 100K rows, run a SUM/COUNT.
 //!
 //! Run with:

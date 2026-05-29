@@ -2015,50 +2015,72 @@ impl<'a> Codegen<'a> {
             | DataType::Float64 => {}
         }
 
-        // (3) ELSE seed. If ELSE is omitted, materialise a zero literal of
-        //     the result dtype as the "missed every WHEN" sentinel.
-        //     Validity-aware SQL-NULL propagation through CASE is a v0.7
-        //     follow-up; the SQL frontend's COALESCE / NULLIF desugar
-        //     always supplies an explicit ELSE so this branch is dead for
-        //     those common entry points.
+        // (3) ELSE seed — guarded by the SQL-NULL safety check below. Only a
+        //     CASE with an explicit, non-NULL ELSE and no bare-NULL THEN arm
+        //     reaches the `selp` fold; the result dtype is non-nullable on the
+        //     GPU path, so the ELSE value is the well-defined "no WHEN fired"
+        //     result. NULL-output CASE shapes are rejected up front.
+        //
+        // SQL-NULL SAFETY GUARD (PL-C1 / PL-H2 — defense in depth).
+        //
+        // The PTX `selp`-based lowering below cannot represent SQL NULL: there
+        // is no validity register, and the emitter rejects an
+        // `Op::Const { Literal::Null }`. So two CASE shapes would compute the
+        // WRONG value on the GPU:
+        //
+        //   * No ELSE (PL-C1): the "no WHEN fired" row must be SQL NULL, but
+        //     the only thing we can put in the `selp` else-slot is a typed
+        //     ZERO — silently wrong (`CASE WHEN x>0 THEN 1 END` → 0, not NULL).
+        //
+        //   * A bare `Literal::Null` THEN/ELSE arm (PL-H2, includes NULLIF's
+        //     `CASE WHEN a=b THEN NULL ELSE a END`): typing it via
+        //     `emit_null_as` produces a const the PTX emitter rejects.
+        //
+        // The normal entry points (SELECT-list / WHERE) are routed to the
+        // host fallback *before* reaching codegen by the `Project` / `Filter`
+        // arms of `lower_depth` (see `case_needs_null_output`). Any *other*
+        // caller that still reaches here (e.g. a CASE feeding an aggregate
+        // pre-kernel, for which no projection-level host fallback exists)
+        // MUST fail loudly rather than emit a wrong value — per the engine's
+        // "never silently wrong" invariant.
+        let then_has_null = branches
+            .iter()
+            .any(|(_, t)| matches!(t, Expr::Literal(Literal::Null)));
+        let else_has_null = matches!(else_branch, Some(Expr::Literal(Literal::Null)));
+        if else_branch.is_none() || then_has_null || else_has_null {
+            return Err(BoltError::Plan(
+                "CASE requiring SQL NULL output (no ELSE branch, or a bare-NULL \
+                 THEN/ELSE arm such as NULLIF) is not supported on the GPU path: \
+                 the PTX selp lowering has no NULL representation. SELECT-list and \
+                 WHERE positions are routed to the host fallback; this CASE appears \
+                 in a position with no host fallback (e.g. an aggregate input). \
+                 Rewrite with an explicit non-NULL ELSE or move it to a SELECT \
+                 projection — coming in a follow-up."
+                    .into(),
+            ));
+        }
+
         let mut cur = match else_branch {
             Some(e) => {
-                // NULL-arm typing (mirrors `emit_binary`'s NULL-peer rule):
-                // a bare `Literal::Null` arm carries no static type. Type it
-                // as the unified result dtype so the downstream Select op
-                // sees a register typed compatibly with the other arms. The
-                // current PTX emitter still rejects a `Literal::Null` Const,
-                // so an ELSE-only-NULL CASE remains best-effort — but
-                // NULLIF's `CASE WHEN a = b THEN NULL ELSE a END` always
-                // populates ELSE with `a`, so this arm is exercised in
-                // practice for typed (non-NULL) ELSEs.
-                let v = if matches!(e, Expr::Literal(Literal::Null)) {
-                    self.emit_null_as(result_dtype)
-                } else {
-                    self.emit_expr(e)?
-                };
+                // ELSE is guaranteed non-NULL here (the guard above rejected a
+                // bare `Literal::Null` ELSE). Evaluate and cast to the result
+                // dtype so the downstream Select op sees a compatibly-typed
+                // register. NULLIF/COALESCE supply an explicit ELSE; COALESCE's
+                // ELSE is its last (non-NULL-literal) operand, so it reaches
+                // this typed path.
+                let v = self.emit_expr(e)?;
                 self.emit_cast(v, result_dtype)
             }
             None => {
-                // Synthesise a zero literal of the result dtype as the
-                // "missed every WHEN" sentinel. Validity-aware NULL
-                // propagation through CASE is a v0.7 follow-up.
-                let lit = match result_dtype {
-                    DataType::Bool => Literal::Bool(false),
-                    DataType::Int32 => Literal::Int32(0),
-                    DataType::Int64 => Literal::Int64(0),
-                    DataType::Float32 => Literal::Float32(0.0),
-                    DataType::Float64 => Literal::Float64(0.0),
-                    // The envelope check above already rejected every
-                    // non-numeric/non-Bool dtype.
-                    other => {
-                        return Err(BoltError::Other(format!(
-                            "physical_plan: CASE without ELSE: unexpected \
-                             result dtype {other:?} survived the envelope check"
-                        )))
-                    }
-                };
-                self.emit_literal(&lit)?
+                // Unreachable: the SQL-NULL safety guard above already returned
+                // an error for the no-ELSE case. Kept as a defensive arm so a
+                // future edit to the guard can't silently fall back to the
+                // wrong ZERO sentinel.
+                return Err(BoltError::Plan(
+                    "physical_plan: CASE without ELSE reached selp lowering after \
+                     the SQL-NULL safety guard — this is a bug"
+                        .into(),
+                ));
             }
         };
 
@@ -2079,14 +2101,12 @@ impl<'a> Codegen<'a> {
                     cond_v.dtype
                 )));
             }
-            // NULL-arm typing for THEN: same rule as the ELSE arm above. A
-            // bare `Literal::Null` THEN inherits the result dtype so the
-            // Op::Cast / Op::Select stack sees a typed register.
-            let then_v = if matches!(then_expr, Expr::Literal(Literal::Null)) {
-                self.emit_null_as(result_dtype)
-            } else {
-                self.emit_expr(then_expr)?
-            };
+            // THEN is guaranteed non-NULL here: the SQL-NULL safety guard at
+            // the top of this function rejected any CASE with a bare
+            // `Literal::Null` THEN arm (PL-H2), routing it to the host
+            // fallback. So we never emit the PTX-rejected `emit_null_as`
+            // const on this path.
+            let then_v = self.emit_expr(then_expr)?;
             let then_cast = self.emit_cast(then_v, result_dtype);
             let dst = self.fresh();
             self.ops.push(Op::Select {
@@ -2853,6 +2873,114 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
     }
 }
 
+/// True if `expr` contains a CASE whose GPU lowering would produce a
+/// SQL-incorrect value — i.e. a CASE that needs NULL output but the PTX
+/// `selp`-based `Codegen::emit_case` cannot represent NULL.
+///
+/// Two shapes are unsafe (see bugs PL-C1 / PL-H2):
+///
+///   * **No ELSE** (PL-C1): `SELECT CASE WHEN x>0 THEN 1 END`. SQL requires
+///     NULL on the "no WHEN fired" path, but `emit_case` materialises a typed
+///     ZERO sentinel (Int32(0)/Float64(0.0)/Bool(false)) — silently wrong.
+///
+///   * **A bare `Literal::Null` THEN/ELSE arm** (PL-H2): `CASE WHEN c THEN
+///     NULL ELSE x END`. `emit_case` types the NULL arm via `emit_null_as`,
+///     but the PTX emitter rejects the resulting `Op::Const { Null }`, so the
+///     projection can miscompile / fail. This also covers NULLIF, whose
+///     desugaring is `CASE WHEN a = b THEN NULL ELSE a END` — its THEN is
+///     always a bare NULL, so NULLIF in a SELECT projection routes to the
+///     host fallback here and is evaluated correctly by `expr_agg::eval_expr`
+///     end-to-end (the host evaluator returns SQL NULL for the matched arm).
+///     COALESCE desugars to a CASE whose THEN arms are the (non-NULL) operands
+///     and whose ELSE is the last operand, so COALESCE is *not* flagged.
+///
+/// Used by `lower()` to route such projections to the host-side
+/// `PhysicalPlan::Project` fallback rather than emitting wrong GPU code.
+fn case_needs_null_output(expr: &Expr) -> bool {
+    match expr {
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            // PL-C1: no ELSE → "no WHEN fired" must yield SQL NULL.
+            if else_branch.is_none() {
+                return true;
+            }
+            // PL-H2: any bare-NULL THEN arm or a bare-NULL ELSE arm.
+            let then_null = branches
+                .iter()
+                .any(|(_, t)| matches!(t, Expr::Literal(Literal::Null)));
+            let else_null = else_branch
+                .as_deref()
+                .is_some_and(|e| matches!(e, Expr::Literal(Literal::Null)));
+            if then_null || else_null {
+                return true;
+            }
+            // Recurse into the arms — a nested CASE may itself be unsafe.
+            branches
+                .iter()
+                .any(|(w, t)| case_needs_null_output(w) || case_needs_null_output(t))
+                || else_branch
+                    .as_deref()
+                    .is_some_and(case_needs_null_output)
+        }
+        Expr::Binary { left, right, .. } => {
+            case_needs_null_output(left) || case_needs_null_output(right)
+        }
+        Expr::Unary { operand, .. } => case_needs_null_output(operand),
+        Expr::Alias(inner, _) => case_needs_null_output(inner),
+        Expr::Like { expr, .. } => case_needs_null_output(expr),
+        Expr::Cast { expr, .. } => case_needs_null_output(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(case_needs_null_output),
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
+/// Walk a Scan / Filter / Project chain and return true if any Filter node
+/// carries a predicate containing a NULL-output CASE (see
+/// [`case_needs_null_output`]). Mirrors [`scan_chain_has_unary_filter`].
+fn scan_chain_has_null_case_filter(plan: &LogicalPlan) -> bool {
+    let mut cur = plan;
+    loop {
+        match cur {
+            LogicalPlan::Filter { input, predicate } => {
+                if case_needs_null_output(predicate) {
+                    return true;
+                }
+                cur = input.as_ref();
+            }
+            LogicalPlan::Project { input, .. } => {
+                cur = input.as_ref();
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Walk a Scan / Filter / Project chain and return true if any Filter node
+/// carries a predicate with the unsafe eager-short-circuit pattern (an
+/// AND/OR whose subtree contains a divide/modulo — see
+/// [`expr_has_unsafe_eager_shortcircuit`]). Mirrors
+/// [`scan_chain_has_unary_filter`]. Used to route such predicates to the
+/// host fallback so SQL short-circuit semantics (PL-C2) are preserved.
+fn scan_chain_has_unsafe_shortcircuit_filter(plan: &LogicalPlan) -> bool {
+    let mut cur = plan;
+    loop {
+        match cur {
+            LogicalPlan::Filter { input, predicate } => {
+                if expr_has_unsafe_eager_shortcircuit(predicate) {
+                    return true;
+                }
+                cur = input.as_ref();
+            }
+            LogicalPlan::Project { input, .. } => {
+                cur = input.as_ref();
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// True if `expr` contains a `BinaryOp::Concat` subexpression anywhere.
 ///
 /// String `||` is Utf8-valued and lives entirely on the host (the GPU
@@ -3223,15 +3351,22 @@ fn kernel_has_unsafe_eager_shortcircuit(kernel: &KernelSpec) -> bool {
     has_div && has_logical
 }
 
-/// Walk `plan` and emit a `log::warn!` if any predicate / projection
-/// expression — or any compiled kernel's linear IR — contains `BinaryOp::And`
-/// or `BinaryOp::Or` whose subtree includes `BinaryOp::Div` (or `Mod`, once
-/// that variant exists).
+/// Walk `plan` and emit a `log::warn!` if any *GPU kernel's* linear IR
+/// contains `BinaryOp::And` / `BinaryOp::Or` whose subtree also includes
+/// `BinaryOp::Div` (or `Mod`, once that variant exists) — the eager
+/// short-circuit hazard described on the AND/OR arm of `emit_binary`.
 ///
-/// This is a discoverability safety net for the documented divergence from
-/// SQL short-circuit semantics; see the doc block on the AND/OR arm of
-/// `Codegen::emit_binary`. The warning is non-fatal — the plan still
-/// executes, just with eager evaluation of both operands.
+/// As of the PL-C2 fix, scan-chain `WHERE` predicates and SELECT-list
+/// expressions carrying that pattern are routed to the host-side
+/// `PhysicalPlan::Filter` / `PhysicalPlan::Project` fallbacks *before*
+/// codegen (see the `Filter` / `Project` arms of `lower_depth`), where
+/// row-by-row evaluation honours SQL short-circuit semantics. So we no
+/// longer inspect host-side `Filter` / `Project` exprs here — those are
+/// correct. We only flag the residual GPU positions: compiled
+/// `Projection` / `Aggregate.pre` kernels (defense-in-depth) and `Join`
+/// equi-keys, which still lower through GPU codegen. The warning is a
+/// non-fatal discoverability net; any genuinely unsafe GPU kernel that
+/// reaches execution would have been caught by the routing first.
 fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
     fn check_kernel(kernel: &KernelSpec) -> bool {
         kernel_has_unsafe_eager_shortcircuit(kernel)
@@ -3242,12 +3377,12 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
             PhysicalPlan::Aggregate { pre, .. } => {
                 pre.as_ref().map(check_kernel).unwrap_or(false)
             }
-            PhysicalPlan::Filter { input, predicate } => {
-                expr_has_unsafe_eager_shortcircuit(predicate) || walk(input)
-            }
-            PhysicalPlan::Project { input, exprs, .. } => {
-                exprs.iter().any(expr_has_unsafe_eager_shortcircuit) || walk(input)
-            }
+            // Host-side Filter / Project (the PL-C2 fallback target) evaluate
+            // their exprs row-by-row with correct short-circuit semantics, so
+            // their predicate / SELECT exprs are NOT flagged. Still recurse to
+            // catch any GPU kernel deeper in the tree.
+            PhysicalPlan::Filter { input, .. } => walk(input),
+            PhysicalPlan::Project { input, .. } => walk(input),
             PhysicalPlan::Distinct { input }
             | PhysicalPlan::Limit { input, .. }
             | PhysicalPlan::Sort { input, .. } => walk(input),
@@ -3500,6 +3635,60 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     output_schema,
                 });
             }
+            // PL-C1 / PL-H2: a SELECT-list CASE (or a chain Filter's CASE)
+            // that needs SQL NULL output cannot be produced by the PTX
+            // `selp`-based `Codegen::emit_case` — it would emit a typed ZERO
+            // sentinel (no-ELSE) or a rejected `Op::Const { Null }` (bare-NULL
+            // arm / NULLIF). Route the whole Project stack to the host-side
+            // fallback: lower the inner plan (a Scan / Filter / Project chain
+            // the codegen still handles for the non-CASE columns) and wrap a
+            // `PhysicalPlan::Project` whose executor evaluates each expr via
+            // `expr_agg::eval_expr`, which returns correct SQL NULLs.
+            if exprs.iter().any(case_needs_null_output)
+                || (is_scan_chain(input) && scan_chain_has_null_case_filter(input))
+            {
+                log::debug!(
+                    "physical_plan: NULL-output CASE (no ELSE / bare-NULL arm / \
+                     NULLIF) in Project or chain Filter; lowering to host-side \
+                     PhysicalPlan::Project (GPU CASE cannot represent SQL NULL)"
+                );
+                let inner = lower(input)?;
+                let output_schema = plan.schema()?;
+                if project_is_identity(exprs, inner.output_schema(), &output_schema) {
+                    return Ok(inner);
+                }
+                return Ok(PhysicalPlan::Project {
+                    input: Box::new(inner),
+                    exprs: exprs.clone(),
+                    output_schema,
+                });
+            }
+            // PL-C2: SQL short-circuit semantics. An AND/OR whose subtree
+            // contains a divide/modulo (e.g. `WHERE b<>0 AND a/b>5`) must NOT
+            // evaluate the trap-capable operand when the guard fails. The GPU
+            // codegen evaluates both operands eagerly, so route any such
+            // SELECT-list expr — or chain Filter predicate — to the host-side
+            // `PhysicalPlan::Project`, whose row-by-row `expr_agg::eval_expr`
+            // honours short-circuit evaluation.
+            if exprs.iter().any(expr_has_unsafe_eager_shortcircuit)
+                || (is_scan_chain(input) && scan_chain_has_unsafe_shortcircuit_filter(input))
+            {
+                log::debug!(
+                    "physical_plan: AND/OR with divide/modulo child in Project or \
+                     chain Filter; lowering to host-side PhysicalPlan::Project \
+                     to preserve SQL short-circuit semantics (PL-C2)"
+                );
+                let inner = lower(input)?;
+                let output_schema = plan.schema()?;
+                if project_is_identity(exprs, inner.output_schema(), &output_schema) {
+                    return Ok(inner);
+                }
+                return Ok(PhysicalPlan::Project {
+                    input: Box::new(inner),
+                    exprs: exprs.clone(),
+                    output_schema,
+                });
+            }
             // v0.5: SQL `||` (BinaryOp::Concat) is Utf8-valued and lives
             // host-side. If any SELECT-list expression contains Concat —
             // or any chain Filter does — we cannot fold the Project into
@@ -3587,6 +3776,41 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     "physical_plan: Expr::Unary in Filter predicate; \
                      lowering to host-side PhysicalPlan::Filter \
                      (GPU codegen for IS NULL is deferred)"
+                );
+                let inner = lower(input)?;
+                return Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                });
+            }
+            // PL-C1 / PL-H2: a NULL-output CASE inside a WHERE predicate cannot
+            // be lowered correctly by the PTX `selp`-based `emit_case` (typed
+            // ZERO sentinel / rejected `Op::Const { Null }`). Route to the
+            // host-side `PhysicalPlan::Filter`, whose `expr_agg::eval_expr`
+            // returns correct SQL NULLs (and treats a NULL predicate as
+            // "row excluded", per SQL three-valued logic).
+            if case_needs_null_output(predicate) {
+                log::debug!(
+                    "physical_plan: NULL-output CASE in Filter predicate; \
+                     lowering to host-side PhysicalPlan::Filter \
+                     (GPU CASE cannot represent SQL NULL)"
+                );
+                let inner = lower(input)?;
+                return Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                });
+            }
+            // PL-C2: SQL short-circuit. `WHERE b<>0 AND a/b>5` must not divide
+            // when `b=0`; the GPU kernel evaluates both AND operands eagerly.
+            // Route any predicate with an AND/OR-guarded divide/modulo to the
+            // host-side `PhysicalPlan::Filter`, whose row-by-row evaluation
+            // honours short-circuit semantics.
+            if expr_has_unsafe_eager_shortcircuit(predicate) {
+                log::debug!(
+                    "physical_plan: AND/OR with divide/modulo child in Filter \
+                     predicate; lowering to host-side PhysicalPlan::Filter to \
+                     preserve SQL short-circuit semantics (PL-C2)"
                 );
                 let inner = lower(input)?;
                 return Ok(PhysicalPlan::Filter {
@@ -4561,5 +4785,182 @@ mod tests {
             );
         }
         assert_eq!(keys.len(), variants.len());
+    }
+
+    // ---- PL-C1 / PL-H2 / PL-C2: SQL-semantics routing in lowering ----
+
+    /// A scan with two non-null integer columns, used by the routing tests
+    /// below. `x` (Int32) and `y` (Int64).
+    fn xy_scan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("x", DataType::Int32, false),
+                Field::new("y", DataType::Int64, false),
+            ]),
+        }
+    }
+
+    /// PL-C1: `SELECT CASE WHEN x>0 THEN 1 END` has no ELSE, so the "no WHEN
+    /// fired" row must be SQL NULL. The PTX `selp` lowering can only produce a
+    /// typed ZERO there, so the projection must route to the host-side
+    /// `PhysicalPlan::Project` (NOT a GPU `Projection`), where
+    /// `expr_agg::eval_expr` returns correct NULLs.
+    #[test]
+    fn select_case_without_else_routes_to_host_project() {
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int32(0))),
+                },
+                Expr::Literal(Literal::Int32(1)),
+            )],
+            else_branch: None,
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(xy_scan()),
+            exprs: vec![Expr::Alias(Box::new(case), "c".into())],
+        };
+        let phys = lower(&plan).expect("lower must succeed via host fallback");
+        assert!(
+            matches!(phys, PhysicalPlan::Project { .. }),
+            "no-ELSE CASE must route to host-side PhysicalPlan::Project, got {phys:?}"
+        );
+    }
+
+    /// PL-H2: `SELECT CASE WHEN x>0 THEN NULL ELSE y END` has a bare-NULL THEN
+    /// arm. The PTX emitter rejects the resulting `Op::Const { Null }`, so the
+    /// projection must route to the host-side `PhysicalPlan::Project`.
+    #[test]
+    fn select_case_with_null_then_routes_to_host_project() {
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int32(0))),
+                },
+                Expr::Literal(Literal::Null),
+            )],
+            else_branch: Some(Box::new(Expr::Column("y".into()))),
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(xy_scan()),
+            exprs: vec![Expr::Alias(Box::new(case), "c".into())],
+        };
+        let phys = lower(&plan).expect("lower must succeed via host fallback");
+        assert!(
+            matches!(phys, PhysicalPlan::Project { .. }),
+            "bare-NULL THEN arm must route to host-side PhysicalPlan::Project, got {phys:?}"
+        );
+    }
+
+    /// PL-H2 / NULLIF: NULLIF desugars to `CASE WHEN a=b THEN NULL ELSE a END`,
+    /// whose THEN is always a bare NULL. Building that shape directly, the
+    /// projection must route to the host-side `PhysicalPlan::Project` so the
+    /// host evaluator returns SQL NULL when `a = b`.
+    #[test]
+    fn select_nullif_shape_routes_to_host_project() {
+        // NULLIF(x, 0) → CASE WHEN x = 0 THEN NULL ELSE x END
+        let case = Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int32(0))),
+                },
+                Expr::Literal(Literal::Null),
+            )],
+            else_branch: Some(Box::new(Expr::Column("x".into()))),
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(xy_scan()),
+            exprs: vec![Expr::Alias(Box::new(case), "nz".into())],
+        };
+        let phys = lower(&plan).expect("lower must succeed via host fallback");
+        assert!(
+            matches!(phys, PhysicalPlan::Project { .. }),
+            "NULLIF-shaped CASE must route to host-side PhysicalPlan::Project, got {phys:?}"
+        );
+    }
+
+    /// Control: a CASE *with* an explicit non-NULL ELSE and no NULL arms (the
+    /// shape COALESCE desugars to) is NOT flagged by `case_needs_null_output`,
+    /// so it stays on the GPU `Projection` path.
+    #[test]
+    fn select_case_with_nonnull_else_stays_on_gpu() {
+        assert!(!case_needs_null_output(&Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int32(0))),
+                },
+                Expr::Literal(Literal::Int32(1)),
+            )],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Int32(0)))),
+        }));
+    }
+
+    /// PL-C2: `WHERE y<>0 AND x/y>5` relies on SQL short-circuit so `x/y` is
+    /// never evaluated when `y=0`. The GPU kernel evaluates both AND operands
+    /// eagerly (divide-by-zero hazard), so the Filter must route to the
+    /// host-side `PhysicalPlan::Filter`, whose row-by-row evaluation honours
+    /// short-circuit semantics.
+    #[test]
+    fn where_and_with_divide_routes_to_host_filter() {
+        let predicate = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::NotEq,
+                left: Box::new(Expr::Column("y".into())),
+                right: Box::new(Expr::Literal(Literal::Int64(0))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Binary {
+                    op: BinaryOp::Div,
+                    left: Box::new(Expr::Column("x".into())),
+                    right: Box::new(Expr::Column("y".into())),
+                }),
+                right: Box::new(Expr::Literal(Literal::Int32(5))),
+            }),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(xy_scan()),
+            predicate: predicate.clone(),
+        };
+        let phys = lower(&plan).expect("lower must succeed via host fallback");
+        match phys {
+            PhysicalPlan::Filter { predicate: p, .. } => {
+                assert_eq!(p, predicate, "predicate must be preserved verbatim");
+            }
+            other => panic!(
+                "AND-with-divide WHERE must route to host PhysicalPlan::Filter, got {other:?}"
+            ),
+        }
+    }
+
+    /// Control: `WHERE x > 5` (no divide under AND/OR) stays on the GPU path
+    /// (a `PhysicalPlan::Projection` carrying the predicate), NOT host Filter.
+    #[test]
+    fn where_simple_comparison_stays_on_gpu() {
+        let predicate = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Column("x".into())),
+            right: Box::new(Expr::Literal(Literal::Int32(5))),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(xy_scan()),
+            predicate,
+        };
+        let phys = lower(&plan).expect("lower must succeed");
+        assert!(
+            matches!(phys, PhysicalPlan::Projection { .. }),
+            "simple WHERE must stay on GPU Projection, got {phys:?}"
+        );
     }
 }

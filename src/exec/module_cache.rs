@@ -213,6 +213,194 @@ impl LoadCounter {
 /// `PTX_CACHE_CAP_DEFAULT` in `jit::jit_compiler`.
 const KERNELSPEC_CACHE_CAP: usize = 256;
 
+/// `fmt::Write` → `Hasher` adapter so we can stream `Debug` output of a
+/// spec directly into a hasher with zero heap allocation.
+struct HasherWrite<'a, H: std::hash::Hasher>(&'a mut H);
+
+impl<H: std::hash::Hasher> std::fmt::Write for HasherWrite<'_, H> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Compute the 128-bit content fingerprint `(hi, lo)` of a spec's `Debug`
+/// shape, domain-separated by a pair of leading bytes.
+///
+/// This is the shared body of every `*Key::new` below: each family passes
+/// its own domain bytes (`0x01`/`0x02`, `0x11`/`0x12`, …) so that a
+/// hypothetical collision between the `Debug` shapes of two different spec
+/// types can never alias cache keys across families. The per-family domain
+/// bytes are part of the on-disk cache key contract and MUST NOT change.
+fn hash128<S: std::fmt::Debug + ?Sized>(spec: &S, hi_byte: u8, lo_byte: u8) -> (u64, u64) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::fmt::Write as _;
+    use std::hash::Hasher;
+
+    let mut hi = DefaultHasher::new();
+    hi.write_u8(hi_byte);
+    // Both arms are unreachable in practice; degrade to a benign cache miss
+    // rather than panic if Debug formatting ever fails.
+    let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
+
+    let mut lo = DefaultHasher::new();
+    lo.write_u8(lo_byte);
+    let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
+
+    (hi.finish(), lo.finish())
+}
+
+/// Trait implemented by every per-family content-hash key
+/// (`KernelSpecKey`, `ScalarAggKey`, …). Exposes the 128-bit fingerprint
+/// and the PTX entry name so the shared disk-cache key composer can build
+/// `"{prefix}{entry}-{hex(hash128)}"` without knowing the concrete family.
+trait CacheKey: Copy + Eq + std::hash::Hash {
+    fn hi(&self) -> u64;
+    fn lo(&self) -> u64;
+    fn entry(&self) -> &'static str;
+}
+
+/// Cached payload for one spec key: the emitted PTX text and the loaded
+/// module. The PTX text is retained so callers that want to inspect it
+/// (e.g. for tracing) can do so without re-running codegen, and so a
+/// future hit-collision-detection path can compare-by-content if needed.
+#[derive(Clone)]
+struct CacheEntry {
+    /// Emitted PTX text. Retained for observability / future
+    /// hit-collision-detection. `#[allow(dead_code)]` because the
+    /// production lookup path only needs `module` — but storing the PTX
+    /// here is part of the cache contract, so we don't want a future
+    /// refactor to drop the field by mistake.
+    #[allow(dead_code)]
+    ptx: String,
+    module: CudaModule,
+}
+
+/// Generic process-wide spec→`(PTX, CudaModule)` cache with FIFO eviction.
+///
+/// One instance backs each kernel family (`KernelSpecCache`,
+/// `ScalarAggCache`, …) via the per-family type aliases below; the only
+/// per-family difference is the key type `K`, the capacity, and (for the
+/// disk-backed families) the disk-cache prefix supplied at the call site.
+///
+/// `by_key` is the primary lookup; `order` is a parallel FIFO log used for
+/// eviction. The two are kept in sync by `insert` (the only mutator). On
+/// eviction we pop the front of `order` and remove the matching map entry.
+struct SpecCache<K: CacheKey> {
+    by_key: HashMap<K, CacheEntry>,
+    order: VecDeque<K>,
+    /// Cap on the number of cached entries before FIFO eviction kicks in.
+    /// Stored on the struct (rather than read as a const) so tests can
+    /// drive eviction with a small cap without polluting the global.
+    cap: usize,
+    /// Cumulative count of cache hits (fast-path returns). Tests observe
+    /// this to confirm the hit path is wired up.
+    hits: u64,
+    /// Cumulative count of cache misses (codegen + module-load round trips).
+    misses: u64,
+}
+
+impl<K: CacheKey> SpecCache<K> {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_key: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Look up `key`; on a hit, return the cached entry (cheap clone — the
+    /// inner `CudaModule` is `Arc`-shared and `String` is one allocation).
+    fn get(&mut self, key: &K) -> Option<CacheEntry> {
+        if let Some(entry) = self.by_key.get(key) {
+            self.hits = self.hits.saturating_add(1);
+            Some(entry.clone())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    /// Insert `(key, entry)`, evicting the oldest entry if we are at cap.
+    /// Idempotent: re-inserting an existing key is a no-op (preserves the
+    /// existing FIFO position rather than re-aging it).
+    fn insert(&mut self, key: K, entry: CacheEntry) {
+        if self.by_key.contains_key(&key) {
+            return;
+        }
+        while self.by_key.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_key.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.by_key.insert(key, entry);
+    }
+}
+
+/// Shared in-memory-then-disk fall-through used by every disk-backed
+/// family's `get_or_build_module_for_*`. On a hit in `cache` we return the
+/// cached module; on a miss we consult the optional on-disk PTX cache
+/// (keyed `"{disk_prefix}{entry}-{hex(hash128)}"`) before paying for
+/// codegen, write-through any freshly compiled PTX, load it via the real
+/// `CudaModule::from_ptx`, and store the result. Behaviour (lock scope,
+/// disk key shape, write-through, insert idempotence) is byte-for-byte what
+/// each family open-coded before this consolidation.
+fn get_or_build_with_disk<K, F>(
+    cache: &Lazy<Mutex<SpecCache<K>>>,
+    key: K,
+    disk_prefix: &str,
+    compile: F,
+) -> BoltResult<CudaModule>
+where
+    K: CacheKey,
+    F: FnOnce() -> BoltResult<String>,
+{
+    // Fast path: in-memory hit. Hold the lock just long enough to clone.
+    if let Some(cached) = cache.lock().get(&key) {
+        return Ok(cached.module);
+    }
+    // In-memory miss: try the optional on-disk cache before paying for codegen.
+    let disk = crate::jit::disk_cache::disk_cache();
+    let disk_key = disk.as_ref().map(|_| {
+        format!(
+            "{}{}-{}",
+            disk_prefix,
+            key.entry(),
+            crate::jit::disk_cache::hash_to_key(key.hi(), key.lo()),
+        )
+    });
+    let ptx = match (&disk, &disk_key) {
+        (Some(dcache), Some(k)) => match dcache.lookup(k) {
+            Some(text) => text,
+            None => {
+                let text = compile()?;
+                // Write-through to disk. Errors here are non-fatal: a failed
+                // write just means future processes won't benefit, the
+                // current process still loads the module successfully.
+                let _ = dcache.store(k, &text);
+                text
+            }
+        },
+        _ => compile()?,
+    };
+    let module = CudaModule::from_ptx(&ptx)?;
+    // Insert and hand back a clone. Concurrent winners are tolerated by
+    // `insert`'s idempotence check.
+    cache.lock().insert(
+        key,
+        CacheEntry {
+            ptx,
+            module: module.clone(),
+        },
+    );
+    Ok(module)
+}
+
 /// 128-bit content fingerprint of a `KernelSpec` plus its entry-point tag.
 ///
 /// The tag distinguishes between the multiple PTX shapes a single spec can
@@ -228,118 +416,29 @@ struct KernelSpecKey {
     entry: &'static str,
 }
 
-/// `fmt::Write` → `Hasher` adapter so we can stream `Debug` output of a
-/// `KernelSpec` directly into a hasher with zero heap allocation.
-struct HasherWrite<'a, H: std::hash::Hasher>(&'a mut H);
-
-impl<H: std::hash::Hasher> std::fmt::Write for HasherWrite<'_, H> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.0.write(s.as_bytes());
-        Ok(())
-    }
-}
-
 impl KernelSpecKey {
     /// Compute the key for `(spec, entry)`. See type docs for rationale.
     fn new(spec: &KernelSpec, entry: &'static str) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::fmt::Write as _;
-        use std::hash::Hasher;
-
-        let mut hi = DefaultHasher::new();
-        hi.write_u8(0x01);
-        // Both arms are unreachable in practice; degrade to a benign cache
-        // miss rather than panic if Debug formatting ever fails.
-        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
-
-        let mut lo = DefaultHasher::new();
-        lo.write_u8(0x02);
-        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
-
-        Self {
-            hi: hi.finish(),
-            lo: lo.finish(),
-            entry,
-        }
+        let (hi, lo) = hash128(spec, 0x01, 0x02);
+        Self { hi, lo, entry }
     }
 }
 
-/// Cached payload for one KernelSpec key: the emitted PTX text and the
-/// loaded module. The PTX text is retained so callers that want to inspect
-/// it (e.g. for tracing) can do so without re-running codegen, and so a
-/// future hit-collision-detection path can compare-by-content if needed.
-#[derive(Clone)]
-struct KernelSpecEntry {
-    /// Emitted PTX text. Retained for observability / future
-    /// hit-collision-detection. `#[allow(dead_code)]` because the
-    /// production lookup path only needs `module` — but storing the PTX
-    /// here is part of the cache contract per the v0.6 task brief, so we
-    /// don't want a future refactor to drop the field by mistake.
-    #[allow(dead_code)]
-    ptx: String,
-    module: CudaModule,
-}
-
-/// State of the KernelSpec-keyed cache.
-///
-/// `by_key` is the primary lookup; `order` is a parallel FIFO log used for
-/// eviction. The two are kept in sync by `insert` (the only mutator). On
-/// eviction we pop the front of `order` and remove the matching map entry.
-struct KernelSpecCache {
-    by_key: HashMap<KernelSpecKey, KernelSpecEntry>,
-    order: VecDeque<KernelSpecKey>,
-    /// Cap on the number of cached entries before FIFO eviction kicks in.
-    /// Stored on the struct (rather than read as a const) so tests can
-    /// drive eviction with a small cap without polluting the global.
-    cap: usize,
-    /// Cumulative count of cache hits (fast-path returns). Tests observe
-    /// this to confirm the hit path is wired up.
-    hits: u64,
-    /// Cumulative count of cache misses (codegen + module-load round trips).
-    misses: u64,
-}
-
-impl KernelSpecCache {
-    fn new(cap: usize) -> Self {
-        Self {
-            by_key: HashMap::with_capacity(cap),
-            order: VecDeque::with_capacity(cap),
-            cap,
-            hits: 0,
-            misses: 0,
-        }
+impl CacheKey for KernelSpecKey {
+    fn hi(&self) -> u64 {
+        self.hi
     }
-
-    /// Look up `key`; on a hit, return the cached entry (cheap clone — the
-    /// inner `CudaModule` is `Arc`-shared and `String` is one allocation).
-    fn get(&mut self, key: &KernelSpecKey) -> Option<KernelSpecEntry> {
-        if let Some(entry) = self.by_key.get(key) {
-            self.hits = self.hits.saturating_add(1);
-            Some(entry.clone())
-        } else {
-            self.misses = self.misses.saturating_add(1);
-            None
-        }
+    fn lo(&self) -> u64 {
+        self.lo
     }
-
-    /// Insert `(key, entry)`, evicting the oldest entry if we are at cap.
-    /// Idempotent: re-inserting an existing key is a no-op (preserves the
-    /// existing FIFO position rather than re-aging it).
-    fn insert(&mut self, key: KernelSpecKey, entry: KernelSpecEntry) {
-        if self.by_key.contains_key(&key) {
-            return;
-        }
-        while self.by_key.len() >= self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.by_key.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        self.order.push_back(key);
-        self.by_key.insert(key, entry);
+    fn entry(&self) -> &'static str {
+        self.entry
     }
 }
+
+/// State of the KernelSpec-keyed cache. See [`SpecCache`] for the FIFO
+/// eviction invariants.
+type KernelSpecCache = SpecCache<KernelSpecKey>;
 
 /// Process-wide KernelSpec→(PTX, CudaModule) cache. Initialised lazily.
 static KERNELSPEC_CACHE: Lazy<Mutex<KernelSpecCache>> =
@@ -415,7 +514,7 @@ where
     // Store under the KernelSpec key so the next call skips codegen.
     KERNELSPEC_CACHE.lock().insert(
         key,
-        KernelSpecEntry {
+        CacheEntry {
             ptx,
             module: module.clone(),
         },
@@ -472,86 +571,29 @@ struct ScalarAggKey {
 
 impl ScalarAggKey {
     fn new(spec: &ScalarAggSpec, entry: &'static str) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::fmt::Write as _;
-        use std::hash::Hasher;
-
         // Domain-separating prefix bytes distinct from `KernelSpecKey`'s
         // (`0x01` / `0x02`) so a hypothetical hash collision between the
         // Debug shapes of `KernelSpec` and `ScalarAggSpec` can't alias keys.
-        let mut hi = DefaultHasher::new();
-        hi.write_u8(0x11);
-        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
-
-        let mut lo = DefaultHasher::new();
-        lo.write_u8(0x12);
-        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
-
-        Self {
-            hi: hi.finish(),
-            lo: lo.finish(),
-            entry,
-        }
+        let (hi, lo) = hash128(spec, 0x11, 0x12);
+        Self { hi, lo, entry }
     }
 }
 
-/// Cached payload for one ScalarAggSpec key. Mirrors `KernelSpecEntry`.
-#[derive(Clone)]
-struct ScalarAggEntry {
-    /// Emitted PTX text. Retained for observability / future
-    /// hit-collision-detection. The production lookup path only needs
-    /// `module`.
-    #[allow(dead_code)]
-    ptx: String,
-    module: CudaModule,
-}
-
-/// State of the ScalarAggSpec-keyed cache. Same FIFO eviction shape as
-/// [`KernelSpecCache`]; see those docs for the invariants.
-struct ScalarAggCache {
-    by_key: HashMap<ScalarAggKey, ScalarAggEntry>,
-    order: VecDeque<ScalarAggKey>,
-    cap: usize,
-    hits: u64,
-    misses: u64,
-}
-
-impl ScalarAggCache {
-    fn new(cap: usize) -> Self {
-        Self {
-            by_key: HashMap::with_capacity(cap),
-            order: VecDeque::with_capacity(cap),
-            cap,
-            hits: 0,
-            misses: 0,
-        }
+impl CacheKey for ScalarAggKey {
+    fn hi(&self) -> u64 {
+        self.hi
     }
-
-    fn get(&mut self, key: &ScalarAggKey) -> Option<ScalarAggEntry> {
-        if let Some(entry) = self.by_key.get(key) {
-            self.hits = self.hits.saturating_add(1);
-            Some(entry.clone())
-        } else {
-            self.misses = self.misses.saturating_add(1);
-            None
-        }
+    fn lo(&self) -> u64 {
+        self.lo
     }
-
-    fn insert(&mut self, key: ScalarAggKey, entry: ScalarAggEntry) {
-        if self.by_key.contains_key(&key) {
-            return;
-        }
-        while self.by_key.len() >= self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.by_key.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        self.order.push_back(key);
-        self.by_key.insert(key, entry);
+    fn entry(&self) -> &'static str {
+        self.entry
     }
 }
+
+/// State of the ScalarAggSpec-keyed cache. See [`SpecCache`] for the FIFO
+/// eviction invariants.
+type ScalarAggCache = SpecCache<ScalarAggKey>;
 
 /// Process-wide ScalarAggSpec→`CudaModule` cache. Initialised lazily.
 static SCALARAGG_CACHE: Lazy<Mutex<ScalarAggCache>> =
@@ -615,45 +657,9 @@ where
     F: FnOnce(&ScalarAggSpec) -> BoltResult<String>,
 {
     let key = ScalarAggKey::new(spec, entry);
-    // Fast path: in-memory hit. Hold the lock just long enough to clone.
-    if let Some(cached) = SCALARAGG_CACHE.lock().get(&key) {
-        return Ok(cached.module);
-    }
-    // In-memory miss: try the optional on-disk cache before paying for codegen.
-    let disk = crate::jit::disk_cache::disk_cache();
-    let disk_key = disk.as_ref().map(|_| {
-        format!(
-            "{}{}-{}",
-            SCALAR_AGG_DISK_PREFIX,
-            entry,
-            crate::jit::disk_cache::hash_to_key(key.hi, key.lo),
-        )
-    });
-    let ptx = match (&disk, &disk_key) {
-        (Some(cache), Some(k)) => match cache.lookup(k) {
-            Some(text) => text,
-            None => {
-                let text = compile(spec)?;
-                // Write-through to disk. Errors here are non-fatal: a
-                // failed write just means future processes won't benefit,
-                // the current process still loads the module successfully.
-                let _ = cache.store(k, &text);
-                text
-            }
-        },
-        _ => compile(spec)?,
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
-    // Insert and hand back a clone. Concurrent winners are tolerated by
-    // `insert`'s idempotence check.
-    SCALARAGG_CACHE.lock().insert(
-        key,
-        ScalarAggEntry {
-            ptx,
-            module: module.clone(),
-        },
-    );
-    Ok(module)
+    get_or_build_with_disk(&SCALARAGG_CACHE, key, SCALAR_AGG_DISK_PREFIX, || {
+        compile(spec)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -697,87 +703,30 @@ struct HashJoinKey {
 
 impl HashJoinKey {
     fn new(spec: &HashJoinKernelSpec, entry: &'static str) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::fmt::Write as _;
-        use std::hash::Hasher;
-
         // Domain-separating prefix bytes distinct from `KernelSpecKey`'s
         // (`0x01` / `0x02`) and `ScalarAggKey`'s (`0x11` / `0x12`) so a
         // hypothetical hash collision between the Debug shapes of the three
         // spec types can't alias keys.
-        let mut hi = DefaultHasher::new();
-        hi.write_u8(0x21);
-        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
-
-        let mut lo = DefaultHasher::new();
-        lo.write_u8(0x22);
-        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
-
-        Self {
-            hi: hi.finish(),
-            lo: lo.finish(),
-            entry,
-        }
+        let (hi, lo) = hash128(spec, 0x21, 0x22);
+        Self { hi, lo, entry }
     }
 }
 
-/// Cached payload for one HashJoinKernelSpec key. Mirrors `ScalarAggEntry`.
-#[derive(Clone)]
-struct HashJoinEntry {
-    /// Emitted PTX text. Retained for observability / future
-    /// hit-collision-detection. The production lookup path only needs
-    /// `module`.
-    #[allow(dead_code)]
-    ptx: String,
-    module: CudaModule,
-}
-
-/// State of the HashJoinKernelSpec-keyed cache. Same FIFO eviction shape as
-/// [`ScalarAggCache`]; see those docs for the invariants.
-struct HashJoinCache {
-    by_key: HashMap<HashJoinKey, HashJoinEntry>,
-    order: VecDeque<HashJoinKey>,
-    cap: usize,
-    hits: u64,
-    misses: u64,
-}
-
-impl HashJoinCache {
-    fn new(cap: usize) -> Self {
-        Self {
-            by_key: HashMap::with_capacity(cap),
-            order: VecDeque::with_capacity(cap),
-            cap,
-            hits: 0,
-            misses: 0,
-        }
+impl CacheKey for HashJoinKey {
+    fn hi(&self) -> u64 {
+        self.hi
     }
-
-    fn get(&mut self, key: &HashJoinKey) -> Option<HashJoinEntry> {
-        if let Some(entry) = self.by_key.get(key) {
-            self.hits = self.hits.saturating_add(1);
-            Some(entry.clone())
-        } else {
-            self.misses = self.misses.saturating_add(1);
-            None
-        }
+    fn lo(&self) -> u64 {
+        self.lo
     }
-
-    fn insert(&mut self, key: HashJoinKey, entry: HashJoinEntry) {
-        if self.by_key.contains_key(&key) {
-            return;
-        }
-        while self.by_key.len() >= self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.by_key.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        self.order.push_back(key);
-        self.by_key.insert(key, entry);
+    fn entry(&self) -> &'static str {
+        self.entry
     }
 }
+
+/// State of the HashJoinKernelSpec-keyed cache. See [`SpecCache`] for the
+/// FIFO eviction invariants.
+type HashJoinCache = SpecCache<HashJoinKey>;
 
 /// Process-wide HashJoinKernelSpec→`CudaModule` cache. Initialised lazily.
 static HASHJOIN_CACHE: Lazy<Mutex<HashJoinCache>> =
@@ -841,45 +790,7 @@ where
     F: FnOnce(&HashJoinKernelSpec) -> BoltResult<String>,
 {
     let key = HashJoinKey::new(spec, entry);
-    // Fast path: in-memory hit. Hold the lock just long enough to clone.
-    if let Some(cached) = HASHJOIN_CACHE.lock().get(&key) {
-        return Ok(cached.module);
-    }
-    // In-memory miss: try the optional on-disk cache before paying for codegen.
-    let disk = crate::jit::disk_cache::disk_cache();
-    let disk_key = disk.as_ref().map(|_| {
-        format!(
-            "{}{}-{}",
-            HASH_JOIN_DISK_PREFIX,
-            entry,
-            crate::jit::disk_cache::hash_to_key(key.hi, key.lo),
-        )
-    });
-    let ptx = match (&disk, &disk_key) {
-        (Some(cache), Some(k)) => match cache.lookup(k) {
-            Some(text) => text,
-            None => {
-                let text = compile(spec)?;
-                // Write-through to disk. Errors here are non-fatal: a
-                // failed write just means future processes won't benefit,
-                // the current process still loads the module successfully.
-                let _ = cache.store(k, &text);
-                text
-            }
-        },
-        _ => compile(spec)?,
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
-    // Insert and hand back a clone. Concurrent winners are tolerated by
-    // `insert`'s idempotence check.
-    HASHJOIN_CACHE.lock().insert(
-        key,
-        HashJoinEntry {
-            ptx,
-            module: module.clone(),
-        },
-    );
-    Ok(module)
+    get_or_build_with_disk(&HASHJOIN_CACHE, key, HASH_JOIN_DISK_PREFIX, || compile(spec))
 }
 
 // ---------------------------------------------------------------------------
@@ -940,88 +851,31 @@ struct RadixSortKey {
 
 impl RadixSortKey {
     fn new(spec: &RadixSortKernelSpec, entry: &'static str) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::fmt::Write as _;
-        use std::hash::Hasher;
-
         // Domain-separating prefix bytes distinct from `KernelSpecKey`'s
         // (`0x01` / `0x02`), `ScalarAggKey`'s (`0x11` / `0x12`), and
         // `HashJoinKey`'s (`0x21` / `0x22`) so a hypothetical hash
         // collision between the Debug shapes of the four spec types
         // can't alias keys.
-        let mut hi = DefaultHasher::new();
-        hi.write_u8(0x31);
-        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
-
-        let mut lo = DefaultHasher::new();
-        lo.write_u8(0x32);
-        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
-
-        Self {
-            hi: hi.finish(),
-            lo: lo.finish(),
-            entry,
-        }
+        let (hi, lo) = hash128(spec, 0x31, 0x32);
+        Self { hi, lo, entry }
     }
 }
 
-/// Cached payload for one RadixSortKernelSpec key. Mirrors `HashJoinEntry`.
-#[derive(Clone)]
-struct RadixSortEntry {
-    /// Emitted PTX text. Retained for observability / future
-    /// hit-collision-detection. The production lookup path only needs
-    /// `module`.
-    #[allow(dead_code)]
-    ptx: String,
-    module: CudaModule,
-}
-
-/// State of the RadixSortKernelSpec-keyed cache. Same FIFO eviction shape
-/// as [`HashJoinCache`]; see those docs for the invariants.
-struct RadixSortCache {
-    by_key: HashMap<RadixSortKey, RadixSortEntry>,
-    order: VecDeque<RadixSortKey>,
-    cap: usize,
-    hits: u64,
-    misses: u64,
-}
-
-impl RadixSortCache {
-    fn new(cap: usize) -> Self {
-        Self {
-            by_key: HashMap::with_capacity(cap),
-            order: VecDeque::with_capacity(cap),
-            cap,
-            hits: 0,
-            misses: 0,
-        }
+impl CacheKey for RadixSortKey {
+    fn hi(&self) -> u64 {
+        self.hi
     }
-
-    fn get(&mut self, key: &RadixSortKey) -> Option<RadixSortEntry> {
-        if let Some(entry) = self.by_key.get(key) {
-            self.hits = self.hits.saturating_add(1);
-            Some(entry.clone())
-        } else {
-            self.misses = self.misses.saturating_add(1);
-            None
-        }
+    fn lo(&self) -> u64 {
+        self.lo
     }
-
-    fn insert(&mut self, key: RadixSortKey, entry: RadixSortEntry) {
-        if self.by_key.contains_key(&key) {
-            return;
-        }
-        while self.by_key.len() >= self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.by_key.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        self.order.push_back(key);
-        self.by_key.insert(key, entry);
+    fn entry(&self) -> &'static str {
+        self.entry
     }
 }
+
+/// State of the RadixSortKernelSpec-keyed cache. See [`SpecCache`] for the
+/// FIFO eviction invariants.
+type RadixSortCache = SpecCache<RadixSortKey>;
 
 /// Process-wide RadixSortKernelSpec→`CudaModule` cache. Initialised lazily.
 static RADIXSORT_CACHE: Lazy<Mutex<RadixSortCache>> =
@@ -1089,45 +943,9 @@ where
     F: FnOnce(&RadixSortKernelSpec) -> BoltResult<String>,
 {
     let key = RadixSortKey::new(spec, entry);
-    // Fast path: in-memory hit. Hold the lock just long enough to clone.
-    if let Some(cached) = RADIXSORT_CACHE.lock().get(&key) {
-        return Ok(cached.module);
-    }
-    // In-memory miss: try the optional on-disk cache before paying for codegen.
-    let disk = crate::jit::disk_cache::disk_cache();
-    let disk_key = disk.as_ref().map(|_| {
-        format!(
-            "{}{}-{}",
-            RADIX_SORT_DISK_PREFIX,
-            entry,
-            crate::jit::disk_cache::hash_to_key(key.hi, key.lo),
-        )
-    });
-    let ptx = match (&disk, &disk_key) {
-        (Some(cache), Some(k)) => match cache.lookup(k) {
-            Some(text) => text,
-            None => {
-                let text = compile(spec)?;
-                // Write-through to disk. Errors here are non-fatal: a
-                // failed write just means future processes won't benefit,
-                // the current process still loads the module successfully.
-                let _ = cache.store(k, &text);
-                text
-            }
-        },
-        _ => compile(spec)?,
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
-    // Insert and hand back a clone. Concurrent winners are tolerated by
-    // `insert`'s idempotence check.
-    RADIXSORT_CACHE.lock().insert(
-        key,
-        RadixSortEntry {
-            ptx,
-            module: module.clone(),
-        },
-    );
-    Ok(module)
+    get_or_build_with_disk(&RADIXSORT_CACHE, key, RADIX_SORT_DISK_PREFIX, || {
+        compile(spec)
+    })
 }
 
 /// Test-friendly variant of [`get_or_build_module_for_radix_sort`] that
@@ -1153,7 +971,7 @@ where
     let module = loader(&ptx)?;
     RADIXSORT_CACHE.lock().insert(
         key,
-        RadixSortEntry {
+        CacheEntry {
             ptx,
             module: module.clone(),
         },
@@ -1210,84 +1028,26 @@ impl CompactionKey {
     /// hypothetical hash collision between the Debug shapes of the
     /// two spec types can't alias keys.
     fn new(spec: &CompactionKernelSpec, entry: &'static str) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::fmt::Write as _;
-        use std::hash::Hasher;
-
-        let mut hi = DefaultHasher::new();
-        hi.write_u8(0x41);
-        let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
-
-        let mut lo = DefaultHasher::new();
-        lo.write_u8(0x42);
-        let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
-
-        Self {
-            hi: hi.finish(),
-            lo: lo.finish(),
-            entry,
-        }
+        let (hi, lo) = hash128(spec, 0x41, 0x42);
+        Self { hi, lo, entry }
     }
 }
 
-/// Cached payload for one CompactionKernelSpec key. Same shape as
-/// `KernelSpecEntry`: PTX text retained for observability, module
-/// for the fast-path return.
-#[derive(Clone)]
-struct CompactionEntry {
-    /// Emitted PTX text. Retained for observability; the production
-    /// lookup path only needs `module`.
-    #[allow(dead_code)]
-    ptx: String,
-    module: CudaModule,
-}
-
-/// State of the CompactionKernelSpec-keyed cache. FIFO eviction with
-/// the same shape as `KernelSpecCache` — see those docs.
-struct CompactionCache {
-    by_key: HashMap<CompactionKey, CompactionEntry>,
-    order: VecDeque<CompactionKey>,
-    cap: usize,
-    hits: u64,
-    misses: u64,
-}
-
-impl CompactionCache {
-    fn new(cap: usize) -> Self {
-        Self {
-            by_key: HashMap::with_capacity(cap),
-            order: VecDeque::with_capacity(cap),
-            cap,
-            hits: 0,
-            misses: 0,
-        }
+impl CacheKey for CompactionKey {
+    fn hi(&self) -> u64 {
+        self.hi
     }
-
-    fn get(&mut self, key: &CompactionKey) -> Option<CompactionEntry> {
-        if let Some(entry) = self.by_key.get(key) {
-            self.hits = self.hits.saturating_add(1);
-            Some(entry.clone())
-        } else {
-            self.misses = self.misses.saturating_add(1);
-            None
-        }
+    fn lo(&self) -> u64 {
+        self.lo
     }
-
-    fn insert(&mut self, key: CompactionKey, entry: CompactionEntry) {
-        if self.by_key.contains_key(&key) {
-            return;
-        }
-        while self.by_key.len() >= self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.by_key.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        self.order.push_back(key);
-        self.by_key.insert(key, entry);
+    fn entry(&self) -> &'static str {
+        self.entry
     }
 }
+
+/// State of the CompactionKernelSpec-keyed cache. See [`SpecCache`] for the
+/// FIFO eviction invariants.
+type CompactionCache = SpecCache<CompactionKey>;
 
 /// Process-wide CompactionKernelSpec→`CudaModule` cache. Initialised lazily.
 static COMPACTION_CACHE: Lazy<Mutex<CompactionCache>> =
@@ -1301,28 +1061,6 @@ static COMPACTION_CACHE: Lazy<Mutex<CompactionCache>> =
 pub fn compaction_cache_stats() -> (usize, usize) {
     let c = COMPACTION_CACHE.lock();
     (c.hits as usize, c.misses as usize)
-}
-
-/// Compose the on-disk PTX cache key for a CompactionKernelSpec
-/// lookup.
-///
-/// The shape is `"{COMPACTION_DISK_PREFIX}{entry}-{hex(hash128)}"`:
-///   1. The `"compaction::"` prefix domain-separates these entries
-///      from any other PTX family that may share the disk-cache
-///      directory.
-///   2. The `entry` suffix distinguishes the per-`kind` PTX entry
-///      points (e.g. `bolt_prefix_scan` vs
-///      `bolt_prefix_scan_blelloch` vs `bolt_gather_i32`).
-///   3. The 128-bit hex content hash makes the key
-///      collision-resistant against unrelated specs that happen to
-///      share the same `kind` shape.
-fn compaction_disk_key(key: &CompactionKey) -> String {
-    format!(
-        "{}{}-{}",
-        COMPACTION_DISK_PREFIX,
-        key.entry,
-        crate::jit::disk_cache::hash_to_key(key.hi, key.lo),
-    )
 }
 
 /// Look up (or compile-and-load) the `CudaModule` for `(spec, entry)`.
@@ -1340,8 +1078,9 @@ fn compaction_disk_key(key: &CompactionKey) -> String {
 ///
 /// When the disk-backed PTX cache is enabled (env var
 /// `BOLT_PTX_CACHE_DIR` or builder override), a miss in the in-memory
-/// cache consults the disk cache *before* paying the codegen cost.
-/// See [`compaction_disk_key`] for the key shape; the
+/// cache consults the disk cache *before* paying the codegen cost. The
+/// disk key is composed as
+/// `"{COMPACTION_DISK_PREFIX}{entry}-{hex(hash128)}"`; the
 /// `"compaction::"` prefix keeps these entries human-greppable in a
 /// shared cache directory.
 ///
@@ -1360,38 +1099,109 @@ where
     F: FnOnce(&CompactionKernelSpec) -> BoltResult<String>,
 {
     let key = CompactionKey::new(spec, entry);
-    // Fast path: in-memory hit. Hold the lock just long enough to clone.
-    if let Some(cached) = COMPACTION_CACHE.lock().get(&key) {
-        return Ok(cached.module);
+    get_or_build_with_disk(&COMPACTION_CACHE, key, COMPACTION_DISK_PREFIX, || {
+        compile(spec)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the generic `SpecCache<K>` (FIFO eviction + hit/miss stats).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod spec_cache_tests {
+    use super::*;
+
+    /// Minimal `CacheKey` for driving the generic cache in isolation. The
+    /// `(hi, lo)` pair doubles as the identity so we can enumerate distinct
+    /// keys without depending on any planner IR type.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct TestKey {
+        hi: u64,
+        lo: u64,
     }
-    // In-memory miss: try the optional on-disk cache before paying
-    // for codegen.
-    let disk = crate::jit::disk_cache::disk_cache();
-    let disk_key = disk.as_ref().map(|_| compaction_disk_key(&key));
-    let ptx = match (&disk, &disk_key) {
-        (Some(cache), Some(k)) => match cache.lookup(k) {
-            Some(text) => text,
-            None => {
-                let text = compile(spec)?;
-                // Write-through to disk. Errors here are non-fatal: a
-                // failed write just means future processes won't
-                // benefit, the current process still loads the module
-                // successfully.
-                let _ = cache.store(k, &text);
-                text
-            }
-        },
-        _ => compile(spec)?,
-    };
-    let module = CudaModule::from_ptx(&ptx)?;
-    COMPACTION_CACHE.lock().insert(
-        key,
-        CompactionEntry {
-            ptx,
-            module: module.clone(),
-        },
-    );
-    Ok(module)
+
+    impl CacheKey for TestKey {
+        fn hi(&self) -> u64 {
+            self.hi
+        }
+        fn lo(&self) -> u64 {
+            self.lo
+        }
+        fn entry(&self) -> &'static str {
+            "bolt_test_entry"
+        }
+    }
+
+    fn key(n: u64) -> TestKey {
+        TestKey { hi: n, lo: !n }
+    }
+
+    fn entry() -> CacheEntry {
+        CacheEntry {
+            ptx: String::new(),
+            module: crate::jit::CudaModule::stub_for_tests(),
+        }
+    }
+
+    /// FIFO eviction: inserting past the cap drops the *oldest* key first
+    /// (insertion order), not the most-recently-touched one, and the map
+    /// never exceeds `cap` live entries.
+    #[test]
+    fn spec_cache_evicts_in_fifo_order() {
+        let mut cache: SpecCache<TestKey> = SpecCache::new(2);
+
+        cache.insert(key(1), entry());
+        cache.insert(key(2), entry());
+        // At cap. Inserting key(3) must evict key(1) (the front of the FIFO).
+        cache.insert(key(3), entry());
+
+        assert!(cache.get(&key(1)).is_none(), "oldest key must be evicted");
+        assert!(cache.get(&key(2)).is_some(), "key(2) must survive");
+        assert!(cache.get(&key(3)).is_some(), "freshly inserted key present");
+        assert!(cache.by_key.len() <= 2, "live entries must not exceed cap");
+    }
+
+    /// Re-inserting an existing key is idempotent: it neither grows the map
+    /// nor re-ages the key in the FIFO order. After re-inserting key(1) we
+    /// add key(3); key(1) (still at the front) must be the one evicted.
+    #[test]
+    fn spec_cache_insert_is_idempotent_and_preserves_fifo_position() {
+        let mut cache: SpecCache<TestKey> = SpecCache::new(2);
+
+        cache.insert(key(1), entry());
+        cache.insert(key(2), entry());
+        // Re-insert key(1): no-op, must NOT move it to the back.
+        cache.insert(key(1), entry());
+        assert_eq!(cache.by_key.len(), 2, "idempotent insert must not grow map");
+
+        cache.insert(key(3), entry());
+        assert!(
+            cache.get(&key(1)).is_none(),
+            "key(1) kept its original FIFO position and was evicted first"
+        );
+        assert!(cache.get(&key(2)).is_some());
+        assert!(cache.get(&key(3)).is_some());
+    }
+
+    /// Hit/miss accounting: `get` bumps `misses` on a cold key and `hits`
+    /// on a warm one. (Note: each `get` above also mutates the counters, so
+    /// this test uses a fresh cache to pin the exact semantics.)
+    #[test]
+    fn spec_cache_get_tracks_hits_and_misses() {
+        let mut cache: SpecCache<TestKey> = SpecCache::new(4);
+
+        // Cold lookup: miss.
+        assert!(cache.get(&key(1)).is_none());
+        assert_eq!(cache.misses, 1);
+        assert_eq!(cache.hits, 0);
+
+        // Seed then warm lookup: hit.
+        cache.insert(key(1), entry());
+        assert!(cache.get(&key(1)).is_some());
+        assert_eq!(cache.hits, 1);
+        assert_eq!(cache.misses, 1, "a hit must not bump the miss counter");
+    }
 }
 
 // ---------------------------------------------------------------------------

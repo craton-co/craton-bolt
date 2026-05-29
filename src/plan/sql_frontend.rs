@@ -3705,10 +3705,58 @@ fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
     let m: u32 = parts[1].parse().ok()?;
     let d: u32 = parts[2].parse().ok()?;
     let y = y_abs.checked_mul(year_sign)?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if !(1..=12).contains(&m) || d < 1 {
+        return None;
+    }
+    // Bound the accepted year range. `days_since_epoch` only carries an
+    // `i32` day count anyway (roughly +/- 5.8M years), but we clamp to a
+    // conservative window so the intermediate arithmetic in
+    // `days_since_epoch` (and `era * 146_097`) can never wrap or panic in
+    // debug builds for extreme but structurally-valid years. Dates outside
+    // the `Date32` day range are still caught precisely by
+    // `days_since_epoch` returning `None`.
+    if !(MIN_SUPPORTED_YEAR..=MAX_SUPPORTED_YEAR).contains(&y) {
+        return None;
+    }
+    // Validate the day against the real length of this month, accounting
+    // for Gregorian leap years, so e.g. `2024-02-31`, `2024-04-31`, and
+    // `2023-02-29` are rejected rather than silently producing a bogus
+    // Date32.
+    if d > days_in_month(y, m) {
         return None;
     }
     Some((y, m, d))
+}
+
+/// Smallest/largest proleptic-Gregorian year `parse_ymd` will accept.
+/// Far wider than any `Date32`-representable date, but narrow enough that
+/// the `era * 146_097` term in `days_since_epoch` stays well inside `i64`
+/// and cannot overflow/panic in debug builds. Anything inside this window
+/// that still falls outside the `i32` day range is rejected downstream by
+/// `days_since_epoch`.
+const MIN_SUPPORTED_YEAR: i32 = -999_999;
+const MAX_SUPPORTED_YEAR: i32 = 999_999;
+
+/// True for a proleptic-Gregorian leap year.
+fn is_leap_year(y: i32) -> bool {
+    (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0)
+}
+
+/// Number of days in month `m` (1..=12) of year `y`. Caller must pass a
+/// month already validated to be in `1..=12`.
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
 }
 
 /// Split a timestamp string into `(date, time)` on the first `' '` or `'T'`.
@@ -3737,8 +3785,12 @@ fn parse_hms_fraction(s: &str) -> Option<(u32, u32, u32, u32)> {
     let hh: u32 = parts[0].parse().ok()?;
     let mm: u32 = parts[1].parse().ok()?;
     let ss: u32 = parts[2].parse().ok()?;
-    if hh > 23 || mm > 59 || ss > 60 {
-        return None; // 60 allowed for leap seconds; rejected here is fine
+    // Reject `ss == 60`: we do not model leap seconds, and accepting 60
+    // would silently roll over into the next minute when the literal is
+    // converted to seconds-since-epoch. Strict rejection avoids surprising
+    // round-trips. (No existing test pins the 60-accepting behaviour.)
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
     }
     let nanos: u32 = if frac.is_empty() {
         0
@@ -3772,6 +3824,94 @@ fn days_since_epoch(y: i32, m: u32, d: u32) -> Option<i32> {
     let doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days: i64 = (era as i64) * 146_097 + (doe as i64) - 719_468;
     i32::try_from(days).ok()
+}
+
+#[cfg(test)]
+mod date_validation_tests {
+    //! Pure host-side tests for calendar validation in `parse_ymd` /
+    //! `days_since_epoch` (PL-H1). No GPU involved.
+    use super::*;
+
+    #[test]
+    fn rejects_impossible_days() {
+        // 31 days in months that only have 30, and Feb overflow.
+        assert!(parse_ymd("2024-02-31").is_none(), "Feb 31 must be rejected");
+        assert!(parse_ymd("2024-04-31").is_none(), "Apr 31 must be rejected");
+        assert!(parse_ymd("2024-06-31").is_none(), "Jun 31 must be rejected");
+        // Feb 29 in a non-leap year.
+        assert!(
+            parse_ymd("2023-02-29").is_none(),
+            "Feb 29 on a non-leap year must be rejected"
+        );
+        // Day zero is also invalid.
+        assert!(parse_ymd("2024-01-00").is_none(), "day 0 must be rejected");
+    }
+
+    #[test]
+    fn accepts_leap_day_on_leap_year() {
+        // 2024 is divisible by 4 and not by 100 -> leap.
+        assert_eq!(parse_ymd("2024-02-29"), Some((2024, 2, 29)));
+        // 2000 is divisible by 400 -> leap.
+        assert_eq!(parse_ymd("2000-02-29"), Some((2000, 2, 29)));
+        // 1900 is divisible by 100 but not 400 -> NOT leap.
+        assert!(
+            parse_ymd("1900-02-29").is_none(),
+            "1900 is not a leap year"
+        );
+    }
+
+    #[test]
+    fn valid_dates_pass_and_round_trip() {
+        assert_eq!(parse_ymd("2024-04-30"), Some((2024, 4, 30)));
+        assert_eq!(parse_ymd("2024-12-31"), Some((2024, 12, 31)));
+        // The Unix epoch is day 0; one day later is day 1.
+        assert_eq!(days_since_epoch(1970, 1, 1), Some(0));
+        assert_eq!(days_since_epoch(1970, 1, 2), Some(1));
+        assert_eq!(days_since_epoch(1969, 12, 31), Some(-1));
+        // A known reference value: 2000-01-01 is 10957 days after epoch.
+        assert_eq!(days_since_epoch(2000, 1, 1), Some(10_957));
+    }
+
+    #[test]
+    fn year_range_is_bounded_without_panic() {
+        // Inside the accepted year window but outside the Date32 day range:
+        // structurally fine, rejected by `parse_date_literal`/`days_since_epoch`
+        // rather than panicking.
+        assert_eq!(parse_ymd("999999-12-31"), Some((999_999, 12, 31)));
+        assert!(
+            days_since_epoch(999_999, 12, 31).is_none(),
+            "extreme valid year overflows the i32 day range and must return None"
+        );
+        // Beyond the accepted window: rejected at the parse step.
+        assert!(
+            parse_ymd("1000000-01-01").is_none(),
+            "year past MAX_SUPPORTED_YEAR must be rejected"
+        );
+        // The boundary years themselves do not panic.
+        assert_eq!(
+            parse_ymd("-999999-01-01"),
+            Some((MIN_SUPPORTED_YEAR, 1, 1))
+        );
+    }
+
+    #[test]
+    fn parse_date_literal_rejects_bad_calendar_dates() {
+        assert!(parse_date_literal("2024-02-31").is_err());
+        assert!(parse_date_literal("2023-02-29").is_err());
+        assert!(parse_date_literal("2024-02-29").is_ok());
+        assert!(parse_date_literal("2024-04-30").is_ok());
+    }
+
+    #[test]
+    fn rejects_second_value_sixty() {
+        // Leap second `:60` is rejected for strictness.
+        assert!(parse_hms_fraction("00:00:60").is_none());
+        assert!(parse_hms_fraction("23:59:59").is_some());
+        assert!(
+            parse_timestamp_literal("2024-01-01 00:00:60").is_err(),
+            ":60 seconds must be rejected"
+        );
+    }
 }
 
 /// True if `s` is written as a pure integer (no decimal point, no exponent).

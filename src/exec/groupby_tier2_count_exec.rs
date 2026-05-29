@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
@@ -39,7 +39,7 @@ use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel, partition_reduce_kernel_count, scatter_kernel, CudaModule,
 };
-use crate::plan::logical_plan::{AggregateExpr, DataType, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
@@ -111,11 +111,17 @@ pub fn try_execute(
     // Exactly one COUNT aggregate. We accept COUNT(<anything>) by
     // semantics: SQL COUNT(*) and COUNT(non_null_col) on a NOT NULL
     // schema produce the same result. The kernel doesn't read a value
-    // column anyway, so the argument is decorative.
-    match &aggregate.aggregates[0] {
-        AggregateExpr::Count(_) => {}
+    // column anyway, so the argument is decorative — EXCEPT for NULL
+    // skipping (see GB-S1 guard below): COUNT(col) must NOT count rows
+    // where `col` is NULL, but this kernel counts every row. We capture
+    // the counted column name (if the argument is a bare column) so the
+    // guard can defer NULL-bearing counted columns to the global-atomic
+    // path.
+    let count_col_name: Option<&str> = match &aggregate.aggregates[0] {
+        AggregateExpr::Count(Expr::Column(n)) => Some(n.as_str()),
+        AggregateExpr::Count(_) => None,
         _ => return None,
-    }
+    };
 
     // Single Int32 key.
     let key_io_idx = aggregate.group_by[0];
@@ -127,6 +133,24 @@ pub fn try_execute(
     let key_arr = batch
         .column_by_name(&key_io.name)
         .and_then(|c| c.as_any().downcast_ref::<Int32Array>())?;
+
+    // GB-S1: NULL handling. The key column is read via `key_arr.values()`
+    // off the raw Arrow buffer, so a NULL key would synthesize a group-0;
+    // and this kernel counts EVERY row, so a NULL in the counted column
+    // would be over-counted (SQL `COUNT(col)` skips NULLs). Defer
+    // NULL-bearing batches back to `groupby::execute_groupby` → the
+    // global-atomic path, which consults validity. Mirrors the guard in
+    // `groupby_tier2_twokey_exec::try_execute`.
+    if key_arr.null_count() > 0 {
+        return None;
+    }
+    if let Some(name) = count_col_name {
+        if let Some(col) = batch.column_by_name(name) {
+            if col.null_count() > 0 {
+                return None;
+            }
+        }
+    }
 
     let n_rows = key_arr.len();
     if n_rows < 256 * 1024 {

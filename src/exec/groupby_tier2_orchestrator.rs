@@ -61,6 +61,20 @@ use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
 use crate::jit::CudaModule;
 
+/// Stable prefix of the structured error returned by the Tier-2 reduce
+/// orchestrators when the open-addressing hash table overflows
+/// `MAX_PROBES` (a row's linear probe wrapped without finding a slot, so
+/// its contribution was dropped and the result is incorrect).
+///
+/// This is a *soft-miss sentinel*, not a hard failure: `groupby.rs::
+/// execute_groupby` matches on this prefix via `starts_with` and falls
+/// through to the next strategy / the global-atomic path rather than
+/// propagating the error to the caller. Every orchestrator that emits a
+/// spill error (single-key SUM/AVG/COUNT/MIN/MAX and their two-key twins)
+/// formats its message starting with this exact prefix so the dispatcher's
+/// match stays robust to wording changes in the trailing detail.
+pub(crate) const PARTITION_REDUCE_SPILL_PREFIX: &str = "partition_reduce spill:";
+
 // ---------------------------------------------------------------------------
 // Sibling-agent stubs.
 //

@@ -503,6 +503,16 @@ pub struct DeviceMemPool {
     /// `Instant`. Value is `(size_class, ptr)` so eviction can locate
     /// the owning bucket without a scan. See module doc for the race-
     /// handling protocol.
+    //
+    // TODO(perf) P-1: this single global `lru_index` mutex is taken on
+    // *every* `alloc` hit and *every* `free` insert (on top of the
+    // per-bucket lock), so under many-stream concurrent churn it is the
+    // pool's central contention point even though the per-bucket `DashMap`
+    // split removed the old global bucket lock. Left untouched on purpose —
+    // a fix (sharded LRU clocks, or an approximate CLOCK / second-chance
+    // scheme that needs no globally-ordered structure) is a separate change
+    // with its own benchmarking. No behaviour change is intended here; the
+    // DashMap/LRU design is deliberately not altered in this commit.
     lru_index: Mutex<BTreeMap<(Instant, u64), (usize, CUdeviceptr)>>,
     /// Process-wide monotonic counter feeding `PooledBlock::tick`.
     /// `Relaxed` is sufficient: we only need uniqueness, not ordering

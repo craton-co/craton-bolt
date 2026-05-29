@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,3 +68,33 @@ jobs:
       - name: cargo test (doctests)
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo test --doc --features cuda-stub --no-default-features
+
+  # Supply-chain gate: advisories + licenses + bans, per deny.toml.
+  # RELEASING.md documents this as a CI gate, so wire it explicitly here.
+  cargo-deny:
+    name: cargo deny (advisories + licenses + bans)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-deny-${{ hashFiles('**/Cargo.lock', 'deny.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-deny-
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      # `cargo deny check` runs all sections (advisories, licenses, bans,
+      # sources) configured in deny.toml at the repo root.
+      - name: cargo deny check
+        run: cargo deny check advisories licenses bans

@@ -146,6 +146,17 @@ pub fn try_execute(
         val_arrs.push(arr);
     }
 
+    // GB-S1: NULL handling — this fast path reads `key_arr.values()` /
+    // `arr.values()` straight off the Arrow data buffers, which carry
+    // garbage bytes at NULL positions (NULL values fold in as 0 and inflate
+    // the AVG denominator; a NULL key synthesizes a group-0). Defer
+    // NULL-bearing batches back to `groupby::execute_groupby` → the
+    // global-atomic path, which consults the validity bitmap. Mirrors the
+    // guard in `groupby_tier2_twokey_exec::try_execute`.
+    if key_arr.null_count() > 0 || val_arrs.iter().any(|a| a.null_count() > 0) {
+        return None;
+    }
+
     // --- Key range check (matches groupby_shmem_exec) --------------------
     // Reject negative keys and any key >= BLOCK_GROUPS: the latter would
     // route through the kernel's overflow path which still works but

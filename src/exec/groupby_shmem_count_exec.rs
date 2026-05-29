@@ -22,7 +22,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{Schema as ArrowSchema};
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
@@ -34,7 +34,7 @@ use crate::exec::module_cache;
 use crate::jit::shmem_count_kernel::{
     compile_shmem_count_kernel, BLOCK_GROUPS, KERNEL_ENTRY,
 };
-use crate::plan::logical_plan::{AggregateExpr, DataType, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const MIN_ROWS_FAST_PATH: usize = 64 * 1024;
@@ -53,10 +53,15 @@ pub fn try_execute(
     if aggregate.group_by.len() != 1 || aggregate.aggregates.len() != 1 {
         return None;
     }
-    match &aggregate.aggregates[0] {
-        AggregateExpr::Count(_) => {}
+    // Capture the counted column name (if the COUNT argument is a bare
+    // column) so the GB-S1 guard below can defer NULL-bearing counted
+    // columns — this kernel counts every row, but SQL `COUNT(col)` skips
+    // NULLs.
+    let count_col_name: Option<&str> = match &aggregate.aggregates[0] {
+        AggregateExpr::Count(Expr::Column(n)) => Some(n.as_str()),
+        AggregateExpr::Count(_) => None,
         _ => return None,
-    }
+    };
 
     let key_io_idx = aggregate.group_by[0];
     let key_io = match aggregate.inputs.get(key_io_idx) {
@@ -67,6 +72,22 @@ pub fn try_execute(
     let key_arr = batch
         .column_by_name(&key_io.name)
         .and_then(|c| c.as_any().downcast_ref::<Int32Array>())?;
+
+    // GB-S1: NULL handling. NULL keys are read off the raw Arrow buffer and
+    // would synthesize a group-0; a NULL in the counted column would be
+    // over-counted. Defer NULL-bearing batches back to
+    // `groupby::execute_groupby` → the global-atomic path, which consults
+    // validity. Mirrors the guard in `groupby_tier2_twokey_exec::try_execute`.
+    if key_arr.null_count() > 0 {
+        return None;
+    }
+    if let Some(name) = count_col_name {
+        if let Some(col) = batch.column_by_name(name) {
+            if col.null_count() > 0 {
+                return None;
+            }
+        }
+    }
 
     let n_rows = key_arr.len();
     if n_rows < MIN_ROWS_FAST_PATH {

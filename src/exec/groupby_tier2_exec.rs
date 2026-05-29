@@ -12,7 +12,7 @@
 //! uniformly: each returns `None` on eligibility miss; the first to return
 //! `Some(_)` wins.
 
-use arrow_array::{Float64Array, Int32Array, RecordBatch};
+use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -62,6 +62,18 @@ pub fn try_execute(
     if key_arr.len() != val_arr.len() {
         return None;
     }
+
+    // GB-S1: NULL handling — this fast path reads `key_arr.values()` /
+    // `val_arr.values()` straight off the Arrow data buffer, which carries
+    // garbage bytes at NULL positions (folding in as 0 / synthesizing a
+    // group-0 key). Defer NULL-bearing batches back to
+    // `groupby::execute_groupby` → the global-atomic path, which consults
+    // the validity bitmap. Mirrors the guard in
+    // `groupby_tier2_twokey_exec::try_execute`.
+    if key_arr.null_count() > 0 || val_arr.null_count() > 0 {
+        return None;
+    }
+
     let n_rows = key_arr.len();
 
     // Cheap host-side n_groups estimator: distinct keys via bitset. For
@@ -202,5 +214,73 @@ mod stage4_tests {
             let v = vs.value(i);
             assert_eq!(v, expected[k as usize], "key={} mismatch", k);
         }
+    }
+
+    /// GB-S1: a NULL-bearing input (in the key OR the value column) must
+    /// make `try_execute` return `None` so the dispatcher falls through to
+    /// `groupby::execute_groupby`'s validity-aware global-atomic path,
+    /// rather than reading garbage bytes at NULL positions off the raw
+    /// Arrow data buffer. This is a host-only test — the guard fires before
+    /// any GPU work, so it runs without CUDA. Mirrors the NULL-defer
+    /// contract enforced in `groupby_tier2_twokey_exec`.
+    #[test]
+    fn try_execute_defers_null_bearing_input() {
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        fn plan() -> PhysicalPlan {
+            PhysicalPlan::Aggregate {
+                table: "t".into(),
+                pre: None,
+                aggregate: AggregateSpec {
+                    inputs: vec![
+                        ColumnIO {
+                            name: "k".into(),
+                            dtype: DataType::Int32,
+                        },
+                        ColumnIO {
+                            name: "v".into(),
+                            dtype: DataType::Float64,
+                        },
+                    ],
+                    group_by: vec![0],
+                    aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+                    output_schema: Schema::new(vec![
+                        Field::new("k", DataType::Int32, false),
+                        Field::new("sum_v", DataType::Float64, true),
+                    ]),
+                    input_has_validity: Vec::new(),
+                },
+            }
+        }
+
+        fn batch(keys: Int32Array, vals: Float64Array) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("k", arrow_schema::DataType::Int32, true),
+                ArrowField::new("v", arrow_schema::DataType::Float64, true),
+            ]));
+            RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(vals)])
+                .expect("null-bearing test batch")
+        }
+
+        // NULL in the value column.
+        let null_val = batch(
+            Int32Array::from(vec![0, 1, 2]),
+            Float64Array::from(vec![Some(1.0), None, Some(3.0)]),
+        );
+        assert!(
+            try_execute(&plan(), &null_val).is_none(),
+            "NULL value must defer to the global-atomic path"
+        );
+
+        // NULL in the key column.
+        let null_key = batch(
+            Int32Array::from(vec![Some(0), None, Some(2)]),
+            Float64Array::from(vec![1.0, 2.0, 3.0]),
+        );
+        assert!(
+            try_execute(&plan(), &null_key).is_none(),
+            "NULL key must defer to the global-atomic path"
+        );
     }
 }

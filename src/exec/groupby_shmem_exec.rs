@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Float64Array, Int32Array, RecordBatch};
+use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
 
 use arrow_schema::{Schema as ArrowSchema};
 
@@ -85,6 +85,18 @@ pub fn try_execute(
     if key_arr.len() != val_arr.len() {
         return None;
     }
+
+    // GB-S1: NULL handling — this fast path reads `key_arr.values()` /
+    // `val_arr.values()` straight off the Arrow data buffer, which carries
+    // garbage bytes at NULL positions (folding in as 0 / synthesizing a
+    // group-0 key). Defer NULL-bearing batches back to
+    // `groupby::execute_groupby` → the global-atomic path, which consults
+    // the validity bitmap. Mirrors the guard in
+    // `groupby_tier2_twokey_exec::try_execute`.
+    if key_arr.null_count() > 0 || val_arr.null_count() > 0 {
+        return None;
+    }
+
     let n_rows = key_arr.len();
 
     // --- Range check on keys ---------------------------------------------

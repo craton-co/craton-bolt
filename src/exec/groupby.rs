@@ -290,127 +290,95 @@ pub fn execute_groupby(
     //   Tier-1 AVG             — single Int32 key, 1..=4 AVGs(Float64), small n_groups
     //   Tier-2 hash-partitioned — single Int32 key, ONE SUM(Float64), large n_groups
     //   GlobalAtomic (below)   — everything else
-    if let Some(result) =
-        crate::exec::groupby_shmem_exec::try_execute(plan, table_batch)
-    {
-        return result;
+    //
+    // GB-S2: a fast path may return `Some(Err(_))` where the error is the
+    // Tier-2 reduce `partition_reduce spill` sentinel — the open-addressing
+    // hash table overflowed MAX_PROBES and dropped rows, so its result is
+    // incorrect. That is a *soft miss*, not a hard failure: the
+    // global-atomic fallthrough below recomputes correctly. The
+    // `try_fast_path!` macro recognises the sentinel (via the orchestrator's
+    // `PARTITION_REDUCE_SPILL_PREFIX` const), logs a warning, and continues
+    // to the next strategy. Every other `Err` propagates unchanged, and
+    // `Ok` returns immediately.
+    macro_rules! try_fast_path {
+        ($call:expr) => {
+            match $call {
+                Some(Ok(batch)) => return Ok(batch),
+                Some(Err(e)) => {
+                    let is_spill = matches!(
+                        &e,
+                        BoltError::Other(msg)
+                            if msg.starts_with(
+                                crate::exec::groupby_tier2_orchestrator
+                                    ::PARTITION_REDUCE_SPILL_PREFIX
+                            )
+                    );
+                    if is_spill {
+                        log::warn!(
+                            "execute_groupby: fast path hit MAX_PROBES spill \
+                             ({e}); falling through to global-atomic path"
+                        );
+                    } else {
+                        return Err(e);
+                    }
+                }
+                None => {}
+            }
+        };
     }
-    if let Some(result) =
-        crate::exec::groupby_shmem_multi_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
-    if let Some(result) =
-        crate::exec::groupby_shmem_avg_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
-    if let Some(result) =
-        crate::exec::groupby_tier2_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_shmem_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_shmem_multi_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_shmem_avg_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_exec::try_execute(plan, table_batch));
     // Multi-SUM Tier-2: enabled with `MULTI_SUM_MIN_GROUPS = 100_000` floor
     // in the executor itself. Below 100K groups the global-atomic baseline
     // wins (q2 / 10K groups regressed 444 ms → 1.05 s when this path was
     // unconditional); the gate now lets q2 fall through cleanly while
     // capturing future workloads with more groups.
-    if let Some(result) =
-        crate::exec::groupby_tier2_multi_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_multi_exec::try_execute(plan, table_batch));
     // Two-key Tier-2: enabled now that `partition_reduce_kernel_i64`
     // replaces the host-HashMap pass-2 (Tier 2.1 for two-key).
-    if let Some(result) =
-        crate::exec::groupby_tier2_twokey_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_twokey_exec::try_execute(plan, table_batch));
     // Two-key MULTI-aggregate Tier-2.1: `SELECT a, b, SUM(v1), SUM(v2)
     // FROM x GROUP BY a, b` — combines i64 partitioning with
     // multi-value reduce. Two-key single-SUM falls through to the line
     // above first.
-    if let Some(result) =
-        crate::exec::groupby_tier2_twokey_multi_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_twokey_multi_exec::try_execute(plan, table_batch));
     // AVG-at-Tier-2.1: SUM (via multi-SUM reduce) + COUNT (via count
     // reduce) → divide host-side. High-cardinality AVG over Float64.
-    if let Some(result) =
-        crate::exec::groupby_tier2_avg_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_avg_exec::try_execute(plan, table_batch));
     // Two-key multi-AVG Tier-2.1: `SELECT a, b, AVG(v1), AVG(v2), ...
     // FROM x GROUP BY a, b`. Same shape as the single-key AVG path but
     // with i64-packed (Int32, Int32) keys.
-    if let Some(result) =
-        crate::exec::groupby_tier2_twokey_avg_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_twokey_avg_exec::try_execute(plan, table_batch));
     // COUNT(*) at Tier-2.1: high-cardinality `SELECT k, COUNT(*) FROM x
     // GROUP BY k`. Reuses partition + scatter; one COUNT reduce launch.
-    if let Some(result) =
-        crate::exec::groupby_tier2_count_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_count_exec::try_execute(plan, table_batch));
     // Two-key COUNT(*) Tier-2.1: `SELECT a, b, COUNT(*) FROM x GROUP BY
     // a, b`. Same shape as the single-key COUNT path but with i64-packed
     // (Int32, Int32) keys.
-    if let Some(result) =
-        crate::exec::groupby_tier2_twokey_count_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_twokey_count_exec::try_execute(plan, table_batch));
     // Two-key integer MIN/MAX at Tier-2.1: `SELECT a, b, {MIN,MAX}(v)
     // FROM x GROUP BY a, b` with Int32 / Int64 value column. Routes
     // through partition_reduce_kernel_minmax_i64. Must come before the
     // single-key minmax path so the two-key shape isn't mishandled.
-    if let Some(result) =
-        crate::exec::groupby_tier2_twokey_minmax_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_twokey_minmax_exec::try_execute(plan, table_batch));
     // Two-key float MIN/MAX at Tier-2.1: same shape, Float64 value
     // column, CAS-loop kernel (partition_reduce_kernel_minmax_float_i64).
-    if let Some(result) =
-        crate::exec::groupby_tier2_twokey_minmax_float_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_twokey_minmax_float_exec::try_execute(plan, table_batch));
     // MIN/MAX at Tier-2.1: high-cardinality integer MIN/MAX. Float
     // MIN/MAX is deferred — needs a CAS-loop kernel and no workload
     // demands it yet.
-    if let Some(result) =
-        crate::exec::groupby_tier2_minmax_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_minmax_exec::try_execute(plan, table_batch));
     // Float MIN/MAX: routes through partition_reduce_kernel_minmax_float
     // (CAS-loop kernel). Integer MIN/MAX above catches first; this
     // handles the float-value-column path.
-    if let Some(result) =
-        crate::exec::groupby_tier2_minmax_float_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_tier2_minmax_float_exec::try_execute(plan, table_batch));
     // Tier-1 COUNT(*): low-cardinality COUNT GROUP BY.
-    if let Some(result) =
-        crate::exec::groupby_shmem_count_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_shmem_count_exec::try_execute(plan, table_batch));
     // Tier-1 MIN/MAX: low-cardinality integer MIN/MAX. Float MIN/MAX
     // is deferred — needs a CAS-loop kernel.
-    if let Some(result) =
-        crate::exec::groupby_shmem_minmax_exec::try_execute(plan, table_batch)
-    {
-        return result;
-    }
+    try_fast_path!(crate::exec::groupby_shmem_minmax_exec::try_execute(plan, table_batch));
 
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -3342,5 +3310,46 @@ mod tests {
             &out_field,
         );
         assert!(r.is_err(), "non-Float64 output dtype must be rejected");
+    }
+
+    /// GB-S2: the `partition_reduce spill` sentinel is recognised as a soft
+    /// miss. `execute_groupby` matches a fast path's `Some(Err(spill))`
+    /// against `PARTITION_REDUCE_SPILL_PREFIX` and falls through instead of
+    /// aborting dispatch. This test exercises the exact recognition
+    /// predicate the `try_fast_path!` macro uses, and confirms an unrelated
+    /// `Other` error is NOT treated as a spill (so it would still
+    /// propagate).
+    #[test]
+    fn spill_sentinel_is_recognized_as_soft_miss() {
+        use crate::exec::groupby_tier2_orchestrator::PARTITION_REDUCE_SPILL_PREFIX;
+
+        // Mirror the literal each orchestrator formats on MAX_PROBES overflow.
+        let spill = BoltError::Other(format!(
+            "partition_reduce spill: {} rows exceeded MAX_PROBES; result may be incorrect",
+            42
+        ));
+        let is_spill = matches!(
+            &spill,
+            BoltError::Other(msg) if msg.starts_with(PARTITION_REDUCE_SPILL_PREFIX)
+        );
+        assert!(is_spill, "spill error must match the soft-miss sentinel prefix");
+
+        // The two-key AVG variant uses a different trailing detail but the
+        // same prefix — still recognised.
+        let spill_avg = BoltError::Other(format!(
+            "partition_reduce spill: multi-sum={} count={} rows exceeded MAX_PROBES; result may be incorrect",
+            1, 2
+        ));
+        assert!(matches!(
+            &spill_avg,
+            BoltError::Other(msg) if msg.starts_with(PARTITION_REDUCE_SPILL_PREFIX)
+        ));
+
+        // An unrelated error must NOT be swallowed (it would propagate).
+        let other = BoltError::Other("tier2: reduce-kernel output buffers".to_string());
+        assert!(!matches!(
+            &other,
+            BoltError::Other(msg) if msg.starts_with(PARTITION_REDUCE_SPILL_PREFIX)
+        ));
     }
 }

@@ -234,12 +234,26 @@ fn build_one_aggregate(
             // multi-word reduction — both are follow-up optimisations. For
             // v0.7 we route SUM(Decimal128) through a host-side fold over the
             // already-decoded `Decimal128Array` values, mirroring the
-            // (very similar) i64 host-strip fold below. MIN/MAX over
-            // Decimal128 stay rejected and fall through to
-            // `reduce_column_from_batch` (which rejects them as before).
-            if matches!(op, ReduceOp::Sum) {
-                if let DataType::Decimal128(p, s) = col_io.dtype {
-                    return sum_decimal128_from_batch(col_io, table_batch, p, s, out_field);
+            // (very similar) i64 host-strip fold below.
+            //
+            // MIN/MAX(Decimal128) are likewise routed host-side: the GPU
+            // reduction kernels only know 32/64-bit primitives, and the
+            // raw i128 ordering equals decimal ordering (scale is uniform
+            // per column), so a host fold over the decoded `Decimal128Array`
+            // gives the correct result without a 128-bit kernel. Without
+            // these arms MIN/MAX(Decimal128) would fall through to
+            // `reduce_column_from_batch`, which rejects Decimal128.
+            if let DataType::Decimal128(p, s) = col_io.dtype {
+                match op {
+                    ReduceOp::Sum => {
+                        return sum_decimal128_from_batch(col_io, table_batch, p, s, out_field);
+                    }
+                    ReduceOp::Min | ReduceOp::Max => {
+                        return minmax_decimal128_from_batch(
+                            op, col_io, table_batch, p, s, out_field,
+                        );
+                    }
+                    ReduceOp::Count => {}
                 }
             }
             let scalar = reduce_column_from_batch(op, col_io, table_batch, n_rows)?;
@@ -609,6 +623,128 @@ fn sum_decimal128_from_batch(
         .map_err(|e| {
             BoltError::Type(format!(
                 "SUM(Decimal128) result: precision/scale ({out_p}, {out_s}) \
+                 rejected by Arrow: {e}"
+            ))
+        })?;
+    Ok(Arc::new(arr) as ArrayRef)
+}
+
+/// Host-side MIN/MAX over a `Decimal128` aggregate input.
+///
+/// Like `sum_decimal128_from_batch`, this exists because the GPU reduction
+/// kernels only handle 32/64-bit primitives — a 128-bit MIN/MAX kernel is a
+/// follow-up optimisation. We fold over the already-decoded
+/// `Decimal128Array` on the host. Because the scale is uniform across every
+/// row of a column, the raw `i128` ordering is identical to the decimal
+/// ordering, so we compare the underlying `i128` values directly.
+///
+/// NULL handling mirrors the SUM path: NULL rows are skipped (validity is
+/// respected). Unlike SUM — whose empty/all-NULL identity is 0 — MIN/MAX of
+/// an empty or all-NULL input is SQL NULL, so we pack a single NULL row in
+/// that case (matching the `out_field.nullable` contract the planner
+/// declares for MIN/MAX).
+///
+/// MIN/MAX preserve the input column's `(precision, scale)` (the planner's
+/// `AggregateExpr::output_dtype` rule for MIN/MAX is identity — no widening,
+/// unlike SUM which goes to `Decimal128(38, s)`). We pack with the input
+/// `(precision, scale)` and validate that `out_field.dtype` agrees, surfacing
+/// a loud Type error on any planner/executor mismatch.
+fn minmax_decimal128_from_batch(
+    op: ReduceOp,
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+    precision: u8,
+    scale: i8,
+    out_field: &Field,
+) -> BoltResult<ArrayRef> {
+    debug_assert!(
+        matches!(op, ReduceOp::Min | ReduceOp::Max),
+        "minmax_decimal128_from_batch called with non-MIN/MAX op"
+    );
+
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "aggregate input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+
+    let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
+    if arr_dtype != col_io.dtype {
+        return Err(BoltError::Type(format!(
+            "aggregate input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
+            col_io.name, col_io.dtype, arr_dtype
+        )));
+    }
+
+    let da = arr
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| downcast_err(&col_io.name, "Decimal128"))?;
+
+    // The Arrow `Decimal128Array` carries its own (p, s); if it disagrees
+    // with the column's plan-level dtype the schema is internally
+    // inconsistent and any downstream consumer would mis-interpret the
+    // values. Mirror the guard in `sum_decimal128_from_batch`.
+    if let ArrowDataType::Decimal128(ap, as_) = da.data_type() {
+        if *ap != precision || *as_ != scale {
+            return Err(BoltError::Type(format!(
+                "MIN/MAX(Decimal128) column '{}': plan dtype Decimal128({precision}, {scale}) \
+                 disagrees with Arrow dtype Decimal128({ap}, {as_})",
+                col_io.name
+            )));
+        }
+    }
+
+    // Host-side fold: walk every row, skip NULLs, track the running
+    // extremum by raw i128 value. The seed is `None` so that an empty or
+    // all-NULL input yields SQL NULL (rather than a sentinel ±inf), matching
+    // the MIN/MAX semantics the planner declares (`out_field.nullable`).
+    let mut acc: Option<i128> = None;
+    for i in 0..da.len() {
+        if da.is_null(i) {
+            continue;
+        }
+        let v: i128 = da.value(i);
+        acc = Some(match acc {
+            None => v,
+            Some(cur) => match op {
+                ReduceOp::Min => cur.min(v),
+                ReduceOp::Max => cur.max(v),
+                // Unreachable: guarded by the debug_assert and the caller's
+                // dispatch, which only routes Min/Max here.
+                _ => cur,
+            },
+        });
+    }
+
+    // MIN/MAX preserve the input (p, s); the planner declares the output
+    // dtype as the column's own Decimal128(p, s). Validate the declared
+    // output field agrees so a planner/executor mismatch is loud.
+    let (out_p, out_s) = match out_field.dtype {
+        DataType::Decimal128(p, s) => (p, s),
+        ref other => {
+            return Err(BoltError::Type(format!(
+                "MIN/MAX(Decimal128) output field dtype must be Decimal128, got {:?}",
+                other
+            )));
+        }
+    };
+    if out_p != precision || out_s != scale {
+        return Err(BoltError::Type(format!(
+            "MIN/MAX(Decimal128) output dtype Decimal128({out_p}, {out_s}) disagrees with \
+             input dtype Decimal128({precision}, {scale})"
+        )));
+    }
+
+    // `Decimal128Array::from(vec![Option<i128>])` packs a single row whose
+    // validity bit follows the `Option`: `None` => SQL NULL.
+    let arr = Decimal128Array::from(vec![acc])
+        .with_precision_and_scale(out_p, out_s)
+        .map_err(|e| {
+            BoltError::Type(format!(
+                "MIN/MAX(Decimal128) result: precision/scale ({out_p}, {out_s}) \
                  rejected by Arrow: {e}"
             ))
         })?;
@@ -1588,6 +1724,158 @@ mod tests {
             dtype: DataType::Float32,
         };
         assert_eq!(non_null_count_for_input(&col_io, &batch).unwrap(), 4);
+    }
+
+    // -------- MIN/MAX(Decimal128) host-side fold (no GPU) --------
+    //
+    // These exercise `minmax_decimal128_from_batch` directly: NULL-skipping,
+    // the all-NULL/empty => NULL identity, negatives, single value, and that
+    // the output preserves the input (precision, scale).
+
+    /// Build a single-column `Decimal128(p, s)` batch from `Option<i128>`
+    /// values, mirroring the construction used elsewhere for the SUM path.
+    fn dec128_batch(name: &str, p: u8, s: i8, values: Vec<Option<i128>>) -> RecordBatch {
+        let arr = Decimal128Array::from(values)
+            .with_precision_and_scale(p, s)
+            .expect("valid decimal128 array");
+        batch_one(name, Arc::new(arr) as ArrayRef)
+    }
+
+    fn dec128_col(name: &str, p: u8, s: i8) -> ColumnIO {
+        ColumnIO {
+            name: name.to_string(),
+            dtype: DataType::Decimal128(p, s),
+        }
+    }
+
+    /// Pull the (validity, value) of the single result row out of an
+    /// aggregate output array for assertions.
+    fn single_dec128(out: &ArrayRef) -> (bool, i128, u8, i8) {
+        let da = out
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal128 result");
+        assert_eq!(da.len(), 1, "scalar aggregate emits exactly one row");
+        let (p, s) = match da.data_type() {
+            ArrowDataType::Decimal128(p, s) => (*p, *s),
+            other => panic!("expected Decimal128 result dtype, got {other:?}"),
+        };
+        if da.is_null(0) {
+            (false, 0, p, s)
+        } else {
+            (true, da.value(0), p, s)
+        }
+    }
+
+    #[test]
+    fn minmax_decimal128_with_nulls() {
+        // Underlying NULL positions must be skipped, not folded in.
+        let batch = dec128_batch(
+            "price",
+            10,
+            2,
+            vec![Some(500i128), None, Some(125), None, Some(999)],
+        );
+        let col = dec128_col("price", 10, 2);
+        let out_field = Field::new("m", DataType::Decimal128(10, 2), true);
+
+        let min_out =
+            minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &out_field).unwrap();
+        let (valid, v, p, s) = single_dec128(&min_out);
+        assert!(valid);
+        assert_eq!(v, 125);
+        // Precision/scale preserved on the MIN output.
+        assert_eq!((p, s), (10, 2));
+
+        let max_out =
+            minmax_decimal128_from_batch(ReduceOp::Max, &col, &batch, 10, 2, &out_field).unwrap();
+        let (valid, v, p, s) = single_dec128(&max_out);
+        assert!(valid);
+        assert_eq!(v, 999);
+        assert_eq!((p, s), (10, 2));
+    }
+
+    #[test]
+    fn minmax_decimal128_all_null_is_null() {
+        let batch = dec128_batch("price", 10, 2, vec![None, None, None]);
+        let col = dec128_col("price", 10, 2);
+        let out_field = Field::new("m", DataType::Decimal128(10, 2), true);
+
+        let min_out =
+            minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &out_field).unwrap();
+        let (valid, _, _, _) = single_dec128(&min_out);
+        assert!(!valid, "MIN over all-NULL input is SQL NULL");
+
+        let max_out =
+            minmax_decimal128_from_batch(ReduceOp::Max, &col, &batch, 10, 2, &out_field).unwrap();
+        let (valid, _, _, _) = single_dec128(&max_out);
+        assert!(!valid, "MAX over all-NULL input is SQL NULL");
+    }
+
+    #[test]
+    fn minmax_decimal128_empty_is_null() {
+        let batch = dec128_batch("price", 10, 2, Vec::<Option<i128>>::new());
+        let col = dec128_col("price", 10, 2);
+        let out_field = Field::new("m", DataType::Decimal128(10, 2), true);
+
+        let min_out =
+            minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &out_field).unwrap();
+        assert!(!single_dec128(&min_out).0, "MIN over empty input is NULL");
+
+        let max_out =
+            minmax_decimal128_from_batch(ReduceOp::Max, &col, &batch, 10, 2, &out_field).unwrap();
+        assert!(!single_dec128(&max_out).0, "MAX over empty input is NULL");
+    }
+
+    #[test]
+    fn minmax_decimal128_single_value() {
+        let batch = dec128_batch("price", 12, 4, vec![Some(42_0000i128)]);
+        let col = dec128_col("price", 12, 4);
+        let out_field = Field::new("m", DataType::Decimal128(12, 4), true);
+
+        let min_out =
+            minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 12, 4, &out_field).unwrap();
+        let (valid, v, p, s) = single_dec128(&min_out);
+        assert!(valid);
+        assert_eq!(v, 42_0000);
+        assert_eq!((p, s), (12, 4));
+
+        let max_out =
+            minmax_decimal128_from_batch(ReduceOp::Max, &col, &batch, 12, 4, &out_field).unwrap();
+        assert_eq!(single_dec128(&max_out).1, 42_0000);
+    }
+
+    #[test]
+    fn minmax_decimal128_negative_values() {
+        // Raw i128 ordering must equal decimal ordering across the sign
+        // boundary: MIN picks the most-negative, MAX the most-positive.
+        let batch = dec128_batch(
+            "bal",
+            10,
+            2,
+            vec![Some(-300i128), Some(50), Some(-1000), Some(0)],
+        );
+        let col = dec128_col("bal", 10, 2);
+        let out_field = Field::new("m", DataType::Decimal128(10, 2), true);
+
+        let min_out =
+            minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &out_field).unwrap();
+        assert_eq!(single_dec128(&min_out).1, -1000);
+
+        let max_out =
+            minmax_decimal128_from_batch(ReduceOp::Max, &col, &batch, 10, 2, &out_field).unwrap();
+        assert_eq!(single_dec128(&max_out).1, 50);
+    }
+
+    #[test]
+    fn minmax_decimal128_rejects_non_decimal_output_field() {
+        let batch = dec128_batch("price", 10, 2, vec![Some(1i128)]);
+        let col = dec128_col("price", 10, 2);
+        // Wrong declared output dtype must surface a loud Type error.
+        let bad_field = Field::new("m", DataType::Int64, true);
+        let err =
+            minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &bad_field).unwrap_err();
+        assert!(matches!(err, BoltError::Type(_)));
     }
 
     // -------- Stage-3 round-trip tests (require GPU) --------

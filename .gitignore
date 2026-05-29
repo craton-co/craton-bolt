@@ -4,6 +4,9 @@
 # Claude Code worktrees and session state
 .claude/
 
+# Internal AI-orchestration handoff doc — never ship publicly
+continue_prompt.md
+
 # Editor / IDE
 .idea
 .vscode/

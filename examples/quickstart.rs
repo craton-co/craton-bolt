@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Craton Bolt quickstart: build a RecordBatch, register it, run a SELECT.
 //!
 //! Run with:

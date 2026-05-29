@@ -1,4 +1,5 @@
-﻿fn main() {
+﻿// SPDX-License-Identifier: Apache-2.0
+fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA_STUB");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RUST_CUDA");
@@ -15,7 +16,7 @@
     // doesn't fail to find the file. The host code under
     // `#[cfg(not(feature = "rust-cuda"))]` never reads it.
     //
-    // See docs/rust_cuda/04_build_integration.md §6 for the stub pattern.
+    // See docs/JIT_PIPELINE.md for the rust-cuda build hook and stub pattern.
     compile_rust_cuda_kernels();
 
     // Skip CUDA discovery when building with the `cuda-stub` feature
@@ -116,7 +117,7 @@ fn compile_rust_cuda_kernels() {
     println!("cargo:rerun-if-changed=kernels/rust-toolchain.toml");
 
     // sm_70 matches Craton Bolt's hand-emit `.target sm_70` line so the PTX is
-    // co-loadable with the other kernels (see docs/rust_cuda/05_ptx_loader_compat.md).
+    // co-loadable with the other kernels (see docs/JIT_PIPELINE.md).
     CudaBuilder::new(&kernels_dir)
         .copy_to(&ptx_out)
         .arch(NvvmArch::Compute70)

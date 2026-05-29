@@ -506,18 +506,17 @@ impl CudaModule {
                 Some(Err(())) => Slot::Collision,
                 None => Slot::Miss,
             };
-            // Counter updates live inside the same critical section as the
-            // classification above so a concurrent reader of
-            // `ptx_cache_stats` cannot observe a half-updated triple. A
-            // collision still counts as a miss for stats purposes — the
-            // caller pays the full compile cost on this path.
+            // Hit/miss accounting is owned entirely by `get_and_touch`,
+            // which bumps exactly one counter for each of the three
+            // outcomes (hit / collision-miss / absent-miss) inside this
+            // same critical section. We must NOT re-increment here or the
+            // counters would be double-counted and `ptx_cache_stats` would
+            // report mutually inconsistent numbers. A collision still
+            // counts as a miss for stats purposes — the caller pays the
+            // full compile cost on this path.
             match slot {
-                Slot::Reuse(cell) => {
-                    cache.hits += 1;
-                    cell
-                }
+                Slot::Reuse(cell) => cell,
                 Slot::Collision => {
-                    cache.misses += 1;
                     // 64-bit hash collision against a different PTX string —
                     // astronomically rare at our cache sizes. Drop the lock
                     // and serve this caller from a one-shot uncached load.
@@ -919,6 +918,61 @@ mod tests {
 
         let miss = cache.get_and_touch(k(43), "anything");
         assert!(miss.is_none());
+    }
+
+    /// JIT-H1 regression: `get_and_touch` is the SINGLE source of truth for
+    /// hit/miss accounting, and each of the three outcomes (hit /
+    /// hash-collision-miss / absent-miss) must bump EXACTLY one counter by
+    /// EXACTLY one. We assert exact equalities (not `>=` lower bounds) by
+    /// operating on a fresh, private `PtxCache` — `insert_empty` never
+    /// touches hits/misses, so the only counter mutations come from
+    /// `get_and_touch`, making the absolute counts fully deterministic and
+    /// immune to the parallel-test interference that forces the global
+    /// `ptx_cache_stats_reports_hits_misses_evictions` test to use deltas.
+    #[test]
+    fn get_and_touch_counts_each_outcome_exactly_once() {
+        let mut cache = PtxCache::new();
+        let cap = 8usize;
+        let k = |i: u64| (i, 0u64);
+
+        // Seeding entries via `insert_empty` must NOT move hit/miss counters.
+        cache.insert_empty(k(1), "ptx-1".to_owned(), cap);
+        cache.insert_empty(k(2), "ptx-2".to_owned(), cap);
+        assert_eq!(cache.hits, 0, "insert_empty must not bump hits");
+        assert_eq!(cache.misses, 0, "insert_empty must not bump misses");
+
+        // One hit ⇒ hits == 1 (exact, not >=), misses unchanged.
+        let hit = cache.get_and_touch(k(1), "ptx-1");
+        assert!(matches!(hit, Some(Ok(_))));
+        assert_eq!(cache.hits, 1, "one hit ⇒ exactly one hit (no double-count)");
+        assert_eq!(cache.misses, 0);
+
+        // One absent-miss (key not present) ⇒ misses == 1 (exact).
+        let miss = cache.get_and_touch(k(99), "absent");
+        assert!(miss.is_none());
+        assert_eq!(cache.hits, 1, "an absent miss must not touch hits");
+        assert_eq!(cache.misses, 1, "one absent miss ⇒ exactly one miss");
+
+        // One hash-collision (key present, PTX text differs) ⇒ exactly one
+        // additional miss, no hit.
+        let collision = cache.get_and_touch(k(2), "DIFFERENT ptx");
+        assert!(matches!(collision, Some(Err(()))));
+        assert_eq!(cache.hits, 1, "a collision is a miss, not a hit");
+        assert_eq!(cache.misses, 2, "one collision ⇒ exactly one more miss");
+
+        // Repeated identical hits accumulate by exactly one each — proving
+        // the hit path is counted once per access, never twice.
+        for expected in 2..=6u64 {
+            let again = cache.get_and_touch(k(1), "ptx-1");
+            assert!(matches!(again, Some(Ok(_))));
+            assert_eq!(
+                cache.hits, expected,
+                "each warm hit must bump hits by exactly one"
+            );
+        }
+        // Misses stayed put across the repeated-hit loop.
+        assert_eq!(cache.misses, 2);
+        assert_eq!(cache.hits, 6);
     }
 
     // -- from_ptx_with concurrency (H3, no redundant compile on miss) ------

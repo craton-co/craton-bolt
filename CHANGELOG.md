@@ -8,6 +8,58 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-29
+
+v0.7 turns the v0.6 carry-overs into live code paths. The themes are
+the same three the v0.6 closing notes scheduled for "v0.7+": wiring the
+`KernelSpec` module cache into real call sites, lighting up the
+`Decimal128` / `Date` / `Timestamp` GPU lowering boundaries, and landing
+the GPU radix sort dispatch in the executor. Items are grouped to mirror
+the v0.6 milestone headings.
+
+### Added — Types (Decimal128 / Date / Timestamp)
+- **`Decimal128` GPU arithmetic** — dual-register IR (`Op::*128` +
+  `RegAlloc::assign_pair`), `GpuColumnData` ingest, and `Codegen` wiring
+  so `+`, `-`, `*` are reachable from lowering.
+- **`Decimal128` comparisons** (`=`, `!=`, `<`, `>`, `<=`, `>=`) lowered
+  to GPU and reachable from `WHERE` predicates.
+- **`SUM(Decimal128)`** via host-side reduction.
+- **`Date32` / `Timestamp` arithmetic** (Date−Date and
+  Timestamp−Timestamp; Day-INTERVAL only) lowered to GPU.
+
+### Added — Aggregates
+- **Grouped `STDDEV` / `VAR`** under `GROUP BY` via per-group host-side
+  Welford.
+
+### Added — Join + Sort
+- **GPU radix sort integration** in `src/exec/sort.rs` — single-key
+  `Int32` / `Int64` ASC, plus multi-key and `DESC` support. Fixes the
+  `DESC` pre-transform to use `!(val ^ MIN)` rather than a bare `!val`.
+
+### Changed — KernelSpec module cache wiring
+- **`KernelSpec` extended** to model aggregate / join / sort /
+  compaction kernel kinds (sibling spec types).
+- **Cache wired into call sites**: `ScalarAggSpec` (scalar reduction),
+  `HashJoinKernelSpec` (10 `gpu_join` call sites), `RadixSortKernelSpec`
+  (4 `gpu_sort` call sites), and `CompactionKernelSpec` (6 compaction
+  kernels: prefix-scan + gather). Cache hits skip both codegen and
+  PTXAS.
+- **Async memcpy** rolled out to the remaining `GROUP BY` variants
+  (tier2 / shmem / wide / valid) and async D2H for
+  `compact::download_mask` (the `WHERE` filter path).
+
+### Changed — Lowering / validation
+- **WHERE predicate type-checking** during SQL lowering (fixes `LIKE` on
+  a non-`Utf8` column).
+
+### Internal
+- **Schema-converter consolidation** — the plan↔Arrow schema converters
+  are unified into `exec::schema_convert`.
+- **`ScalarAggSpec` dedup** (collision between two sibling-spec
+  additions); field references updated (`dtype` → `input_dtype`).
+- Radix dispatch gate tests serialized via an override hook to remove
+  env-var test contention; dead single-key wrapper / warning cleanup.
+
 ## [0.6.0] - 2026-05-28
 
 This release covers milestones M1 (foundation), M3 (join + sort), M4

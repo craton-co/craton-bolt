@@ -1,6 +1,6 @@
 [package]
 name = "craton-bolt"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "JIT-compiled GPU SQL engine — runtime PTX codegen with Rust-tracked CUDA memory safety"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
 categories   = ["database", "compilers"]
 rust-version = "1.74"
-exclude      = ["target/*", ".idea/*", ".github/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "docs/rust_cuda/*"]
+exclude      = ["target/*", ".idea/*", ".github/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*"]
 
 # --- Workspace shim ---------------------------------------------------------
 #

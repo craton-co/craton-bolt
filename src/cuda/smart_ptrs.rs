@@ -28,7 +28,7 @@ use std::marker::PhantomData;
 
 use bytemuck::Pod;
 
-use crate::cuda::buffer::{GpuBuffer, PinnedHostBuffer};
+use crate::cuda::buffer::{tag_stream_set, GpuBuffer, PinnedHostBuffer, StreamSetRef};
 use crate::cuda::cuda_sys::{CUdeviceptr, CUstream};
 use crate::error::BoltResult;
 
@@ -137,21 +137,32 @@ impl<T: Pod> GpuVec<T> {
     }
 
     /// Borrow as a shared GPU view; many such views may coexist.
+    ///
+    /// The view carries a back-reference to this vec's buffer stream set so
+    /// that a kernel launch driven off the view can tag the launch stream
+    /// via [`GpuView::mark_launch_use`] — closing C-1 (see that method and
+    /// the `Drop` invariant on [`GpuBuffer`]).
     #[inline]
     pub fn view(&self) -> GpuView<'_, T> {
         GpuView {
             ptr: self.buffer.device_ptr(),
             len: self.buffer.len(),
+            streams: self.buffer.used_streams_cell(),
             _marker: PhantomData,
         }
     }
 
     /// Borrow as an exclusive GPU view; only one such view may exist.
+    ///
+    /// Carries the same stream-set back-reference as [`view`](Self::view);
+    /// kernel launches that write through the view should tag the launch
+    /// stream with [`GpuViewMut::mark_launch_use`].
     #[inline]
     pub fn view_mut(&mut self) -> GpuViewMut<'_, T> {
         GpuViewMut {
             ptr: self.buffer.device_ptr(),
             len: self.buffer.len(),
+            streams: self.buffer.used_streams_cell(),
             _marker: PhantomData,
         }
     }
@@ -214,6 +225,12 @@ impl<T: Pod> GpuVec<T> {
 pub struct GpuView<'a, T: Pod> {
     ptr: CUdeviceptr,
     len: usize,
+    /// Back-reference to the parent buffer's stream set, so a launch driven
+    /// off this view can tag the launch stream (C-1). `null` for views over
+    /// empty / placeholder buffers, in which case tagging is a no-op. The
+    /// `'a` borrow keeps the parent buffer alive for the view's lifetime, so
+    /// this raw pointer is always valid to dereference while the view lives.
+    streams: StreamSetRef,
     _marker: PhantomData<(&'a [T], std::cell::Cell<()>)>,
 }
 
@@ -231,6 +248,10 @@ impl<'a, T: Pod> GpuView<'a, T> {
     }
 
     /// Raw device pointer for FFI / kernel launches.
+    ///
+    /// See [`mark_launch_use`](Self::mark_launch_use): a caller that forwards
+    /// this pointer into a kernel launch MUST tag the launch stream so the
+    /// parent buffer's `Drop` fences it (review finding C-1).
     #[inline]
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.ptr
@@ -241,10 +262,44 @@ impl<'a, T: Pod> GpuView<'a, T> {
     pub fn byte_len(&self) -> usize {
         self.len * std::mem::size_of::<T>()
     }
+
+    /// Record that `stream` has a kernel launch (or other async op) in
+    /// flight that reads through this view, forwarding into the parent
+    /// buffer's stream set. The parent's `Drop` then fences `stream` before
+    /// the block returns to the pool.
+    ///
+    /// ## Why this is the C-1 closure
+    ///
+    /// A `GpuView` is a detached `Copy` snapshot (pointer + length); it does
+    /// not borrow the `GpuVec` mutably, so it cannot call
+    /// `GpuBuffer::mark_stream_use` directly. Instead it carries a raw
+    /// back-reference (`streams`) to the parent buffer's stream-set cell.
+    /// Kernel-launch glue that pushes `self.device_ptr()` into a launch MUST
+    /// call this immediately after enqueueing on `stream`. Over-calling is
+    /// safe — the set dedups.
+    ///
+    /// Idempotent and cheap; a no-op for a view over an empty buffer (null
+    /// back-reference).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream forwarded, not deref'd
+    #[inline]
+    pub fn mark_launch_use(&self, stream: CUstream) {
+        // SAFETY: `self.streams` was minted by `GpuVec::view` from the live
+        // parent buffer, whose lifetime is `>= 'a` (the view borrows it), so
+        // the cell is valid for the whole life of `self`. `tag_stream_set`
+        // null-checks and only mutates a `!Sync` cell from this one thread.
+        unsafe { tag_stream_set(self.streams, stream) }
+    }
 }
 
-// SAFETY: a `GpuView` is a device pointer plus a length; like `&[u8]` over
-// opaque memory, sharing or moving it across threads cannot race on host state.
+// SAFETY: a `GpuView` is a device pointer, a length, and a raw back-pointer
+// to the parent buffer's stream-set cell. Like `&[u8]` over opaque memory,
+// moving it across threads cannot race on host state. The added raw pointer
+// (`streams`) makes the auto-derived `Send` go away, hence this explicit
+// impl. Soundness of moving it: the pointee outlives the view (the `'a`
+// borrow keeps the parent buffer alive), and `mark_launch_use` only ever
+// `borrow_mut`s the cell from the current thread. Craton Bolt serializes GPU
+// launches per thread, so two threads never tag the same buffer's set at the
+// same instant; even if they did, `RefCell` would panic rather than UB.
 unsafe impl<'a, T: Pod> Send for GpuView<'a, T> {}
 // Intentionally NOT `Sync`: under Craton Bolt's launch model a kernel can write
 // through the parent `GpuVec` while another thread reads through the view
@@ -254,6 +309,9 @@ unsafe impl<'a, T: Pod> Send for GpuView<'a, T> {}
 pub struct GpuViewMut<'a, T: Pod> {
     ptr: CUdeviceptr,
     len: usize,
+    /// Back-reference to the parent buffer's stream set; see the field of
+    /// the same name on [`GpuView`] and [`GpuViewMut::mark_launch_use`].
+    streams: StreamSetRef,
     _marker: PhantomData<&'a mut [T]>,
 }
 
@@ -271,6 +329,10 @@ impl<'a, T: Pod> GpuViewMut<'a, T> {
     }
 
     /// Raw device pointer for FFI / kernel launches.
+    ///
+    /// See [`mark_launch_use`](Self::mark_launch_use): a caller that forwards
+    /// this pointer into a kernel launch MUST tag the launch stream so the
+    /// parent buffer's `Drop` fences it (review finding C-1).
     #[inline]
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.ptr
@@ -282,12 +344,30 @@ impl<'a, T: Pod> GpuViewMut<'a, T> {
         self.len * std::mem::size_of::<T>()
     }
 
+    /// Record that `stream` has a kernel launch (or other async op) writing
+    /// through this view, forwarding into the parent buffer's stream set so
+    /// `Drop` fences it before recycling the block. See
+    /// [`GpuView::mark_launch_use`] for the full C-1 rationale; this is the
+    /// mutable-view counterpart. Idempotent; no-op for an empty buffer.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // CUstream forwarded, not deref'd
+    #[inline]
+    pub fn mark_launch_use(&self, stream: CUstream) {
+        // SAFETY: identical to `GpuView::mark_launch_use` — the parent
+        // buffer outlives `'a`, so `self.streams` is valid for the view's
+        // life; `tag_stream_set` null-checks and only touches a `!Sync`
+        // cell on this thread.
+        unsafe { tag_stream_set(self.streams, stream) }
+    }
+
     /// Re-borrow the exclusive view as a shared view for the remaining scope.
+    /// The shared view inherits the same stream-set back-reference, so a
+    /// launch driven off it still tags the parent buffer.
     #[inline]
     pub fn as_view(&self) -> GpuView<'_, T> {
         GpuView {
             ptr: self.ptr,
             len: self.len,
+            streams: self.streams,
             _marker: PhantomData,
         }
     }
@@ -295,6 +375,9 @@ impl<'a, T: Pod> GpuViewMut<'a, T> {
 
 // SAFETY: ownership of a `GpuViewMut` may move between threads; the underlying
 // device memory is reachable only via this single handle for its lifetime.
+// The `streams` raw back-pointer carries the same soundness argument as the
+// `GpuView` `Send` impl above (pointee outlives the view; `mark_launch_use`
+// touches the `!Sync` cell only from the current thread).
 unsafe impl<'a, T: Pod> Send for GpuViewMut<'a, T> {}
 // Intentionally NOT `Sync`: concurrent mutation through shared references
 // would race on device memory just as `&mut [T]` would on host memory.
@@ -374,5 +457,65 @@ mod tests {
         let mut v2 = GpuVec::<u64>::empty();
         let vm = v2.view_mut();
         assert_eq!(vm.byte_len(), vm.len() * std::mem::size_of::<u64>());
+    }
+
+    // ---- C-1: view-level launch tagging forwards to the parent buffer ----
+    //
+    // These host-only tests verify that tagging through a view's
+    // `mark_launch_use` lands in the *parent buffer's* stream set — the
+    // mechanism by which a kernel launch keyed off `view.device_ptr()` makes
+    // the parent's `Drop` fence the launch stream (closing C-1). They use
+    // `GpuVec::empty()` (null device ptr, no driver calls) and reach the
+    // private `buffer` field, which is in scope inside this child module.
+
+    fn fake_stream(bits: usize) -> CUstream {
+        bits as CUstream
+    }
+
+    #[test]
+    fn shared_view_mark_launch_use_tags_parent_buffer() {
+        let v = GpuVec::<i32>::empty();
+        assert_eq!(v.buffer.recorded_stream_count(), 0);
+        let view = v.view();
+        let s = fake_stream(0x5151);
+        view.mark_launch_use(s);
+        view.mark_launch_use(s); // dedup through the parent set
+        assert_eq!(
+            v.buffer.recorded_stream_count(),
+            1,
+            "C-1: a launch tagged via the shared view must register on the \
+             parent buffer's stream set (deduped)"
+        );
+    }
+
+    #[test]
+    fn mut_view_and_reborrow_share_one_parent_set() {
+        let mut v = GpuVec::<i32>::empty();
+        let a = fake_stream(0xAA);
+        let b = fake_stream(0xBB);
+        {
+            let vm = v.view_mut();
+            vm.mark_launch_use(a);
+            // A reborrow as a shared view must point at the SAME parent set,
+            // so tagging through it accumulates rather than forking.
+            let shared = vm.as_view();
+            shared.mark_launch_use(b);
+            shared.mark_launch_use(a); // dedup across view + reborrow
+        }
+        assert_eq!(
+            v.buffer.recorded_stream_count(),
+            2,
+            "C-1: mutable view and its `as_view` reborrow must feed the same \
+             parent stream set"
+        );
+    }
+
+    #[test]
+    fn views_send_compile_check_still_holds_with_back_ref() {
+        // The added raw back-pointer must not have silently dropped `Send`
+        // (we re-assert the existing explicit impls cover it).
+        fn assert_send<T: Send>() {}
+        assert_send::<GpuView<'static, i32>>();
+        assert_send::<GpuViewMut<'static, i32>>();
     }
 }
