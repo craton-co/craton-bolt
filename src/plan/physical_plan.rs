@@ -849,6 +849,22 @@ pub enum PhysicalPlan {
         /// Sort keys, most-significant first.
         sort_exprs: Vec<SortExpr>,
     },
+    /// Window functions over `input`. Appends one column per `window_exprs`
+    /// entry; the partition / ordering is shared. Output schema is stored on
+    /// the variant (`input` schema ++ the appended window columns). Executed
+    /// host-side — see [`crate::exec::window`].
+    Window {
+        /// Source plan.
+        input: Box<PhysicalPlan>,
+        /// One output column per window function sharing this spec.
+        window_exprs: Vec<crate::plan::logical_plan::WindowExpr>,
+        /// `PARTITION BY` keys (empty = single partition).
+        partition_by: Vec<Expr>,
+        /// `ORDER BY` keys within each partition.
+        order_by: Vec<SortExpr>,
+        /// Output schema: `input.output_schema()` ++ appended window columns.
+        output_schema: Schema,
+    },
     /// UNION ALL: concatenate `inputs` in order. Schema is the first input's.
     /// (Dedup UNION is `Distinct(Union { ... })` in the logical plan.)
     Union {
@@ -982,6 +998,7 @@ impl PhysicalPlan {
                 }
             }
             PhysicalPlan::Project { output_schema, .. } => output_schema,
+            PhysicalPlan::Window { output_schema, .. } => output_schema,
             PhysicalPlan::Join { output_schema, .. } => output_schema,
         }
     }
@@ -2456,6 +2473,7 @@ fn shape(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Distinct { .. } => "Distinct",
         LogicalPlan::Limit { .. } => "Limit",
         LogicalPlan::Sort { .. } => "Sort",
+        LogicalPlan::Window { .. } => "Window",
         LogicalPlan::Union { .. } => "Union",
         LogicalPlan::Join { .. } => "Join",
     }
@@ -3118,6 +3136,7 @@ pub fn populate_input_validity(
         PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Window { input, .. }
         | PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Filter { input, .. } => {
             populate_input_validity(input.as_mut(), provider);
@@ -3447,7 +3466,8 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
             PhysicalPlan::Project { input, .. } => walk(input),
             PhysicalPlan::Distinct { input }
             | PhysicalPlan::Limit { input, .. }
-            | PhysicalPlan::Sort { input, .. } => walk(input),
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Window { input, .. } => walk(input),
             PhysicalPlan::Union { inputs } => inputs.iter().any(walk),
             PhysicalPlan::Join {
                 left, right, on, ..
@@ -3929,6 +3949,35 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             Ok(PhysicalPlan::Sort {
                 input: Box::new(inner),
                 sort_exprs: sort_exprs.clone(),
+            })
+        }
+        LogicalPlan::Window {
+            input,
+            window_exprs,
+            partition_by,
+            order_by,
+        } => {
+            let inner = lower_depth(input, depth + 1)?;
+            // Output schema = inner's schema ++ one appended field per window
+            // expression. Recompute from the *physical* input so the stored
+            // schema stays in lock-step with what the executor sees, mirroring
+            // the rule in `LogicalPlan::Window::schema`.
+            let in_schema = inner.output_schema().clone();
+            let mut fields = in_schema.fields.clone();
+            for we in window_exprs {
+                let dtype = we.func.output_dtype(&in_schema)?;
+                fields.push(crate::plan::logical_plan::Field::new(
+                    we.output_name.clone(),
+                    dtype,
+                    true,
+                ));
+            }
+            Ok(PhysicalPlan::Window {
+                input: Box::new(inner),
+                window_exprs: window_exprs.clone(),
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                output_schema: Schema::new(fields),
             })
         }
         LogicalPlan::Union { inputs } => {

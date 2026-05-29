@@ -21,7 +21,9 @@ use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     aggregate_output_name, group_key_output_name, join_rename, AggregateExpr, BinaryOp, DataType,
     Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SortExpr, TimeUnit, UnaryOp,
+    WindowExpr, WindowFunc,
 };
+use sqlparser::ast::{WindowFrameBound, WindowFrameUnits, WindowType};
 
 /// Maximum recursion depth allowed when walking attacker-controlled SQL
 /// AST / `LogicalPlan` trees. Pathological inputs (e.g. `SELECT
@@ -1564,18 +1566,86 @@ fn plan_select(select: &Select, provider: &dyn TableProvider) -> BoltResult<Logi
                 "HAVING requires GROUP BY or aggregate functions in SELECT".into(),
             ));
         }
-        let mut exprs = Vec::with_capacity(items.len());
-        for (sql_expr, alias) in items {
-            let lowered = lower_expr(&sql_expr, &resolver, 0)?;
-            let lowered = match alias {
-                Some(name) => lowered.alias(name),
-                None => lowered,
-            };
-            exprs.push(lowered);
+
+        // Window-function pass. A SELECT item may be a top-level window call
+        // (optionally aliased): `ROW_NUMBER() OVER (...)`,
+        // `SUM(x) OVER (...) AS s`. We collect every such item, build one
+        // `LogicalPlan::Window` node per distinct window spec (stacked over
+        // `plan`), and rewrite the projection to reference the generated
+        // window output column. Window functions nested inside larger
+        // expressions are rejected cleanly for now.
+        //
+        // `window_groups` keys a spec (partition_by + order_by) to the list
+        // of (output_name, WindowFunc) it contributes; insertion order is
+        // preserved so the lowered plan is deterministic.
+        struct WindowGroup {
+            partition_by: Vec<Expr>,
+            order_by: Vec<SortExpr>,
+            exprs: Vec<WindowExpr>,
         }
+        let mut window_groups: Vec<WindowGroup> = Vec::new();
+        let mut next_window_id: usize = 0;
+
+        // First, lower each SELECT item to a projection expr. For window
+        // items the expr becomes `Column("__window_N")` referencing the
+        // appended window column.
+        let mut proj_exprs: Vec<Expr> = Vec::with_capacity(items.len());
+        for (sql_expr, alias) in &items {
+            if let Some(pw) = try_window(sql_expr, &resolver, 0)? {
+                let out_name = format!("__window_{next_window_id}");
+                next_window_id += 1;
+                let we = WindowExpr {
+                    func: pw.func,
+                    output_name: out_name.clone(),
+                };
+                // Find (or create) the group with a matching spec.
+                let group_idx = window_groups.iter().position(|g| {
+                    window_specs_eq(&g.partition_by, &g.order_by, &pw.partition_by, &pw.order_by)
+                });
+                match group_idx {
+                    Some(i) => window_groups[i].exprs.push(we),
+                    None => window_groups.push(WindowGroup {
+                        partition_by: pw.partition_by,
+                        order_by: pw.order_by,
+                        exprs: vec![we],
+                    }),
+                }
+                let col_ref = Expr::Column(out_name);
+                proj_exprs.push(match alias {
+                    Some(name) => col_ref.alias(name.clone()),
+                    None => col_ref,
+                });
+                continue;
+            }
+            // Non-window item: reject any window function nested inside it so
+            // the user gets a clear message rather than a silent miss.
+            if sql_expr_contains_window(sql_expr, &resolver, 0)? {
+                return Err(BoltError::Sql(
+                    "window functions are only supported as a top-level SELECT item \
+                     (optionally aliased), not nested inside a larger expression"
+                        .into(),
+                ));
+            }
+            let lowered = lower_expr(sql_expr, &resolver, 0)?;
+            proj_exprs.push(match alias {
+                Some(name) => lowered.alias(name.clone()),
+                None => lowered,
+            });
+        }
+
+        // Stack the Window nodes (if any) over the current plan.
+        for g in window_groups {
+            plan = LogicalPlan::Window {
+                input: Box::new(plan),
+                window_exprs: g.exprs,
+                partition_by: g.partition_by,
+                order_by: g.order_by,
+            };
+        }
+
         plan = LogicalPlan::Project {
             input: Box::new(plan),
-            exprs,
+            exprs: proj_exprs,
         };
     }
 
@@ -2145,11 +2215,11 @@ fn try_aggregate(
         }
     };
 
-    // Disallow OVER (window), FILTER, ORDER BY, WITHIN GROUP, parameters.
+    // An OVER clause makes this a *window* function, not a plain aggregate.
+    // Defer to the window-lowering path (`try_window`) by reporting "not an
+    // aggregate" here so the caller routes it correctly.
     if func.over.is_some() {
-        return Err(BoltError::Sql(
-            "unsupported: window functions (OVER)".into(),
-        ));
+        return Ok(None);
     }
     if func.filter.is_some() {
         return Err(BoltError::Sql("unsupported: FILTER on aggregate".into()));
@@ -2236,6 +2306,374 @@ fn try_aggregate(
         "STDDEV_SAMP" => AggregateExpr::StddevSamp(Box::new(inner)),
         _ => unreachable!("kind already filtered above"),
     }))
+}
+
+/// A window function call recognised in a SELECT item: the function plus its
+/// parsed `OVER (...)` spec. Produced by [`try_window`] and consumed by the
+/// window-lowering block in [`plan_select`].
+struct ParsedWindow {
+    /// The window function (ranking or aggregate).
+    func: WindowFunc,
+    /// `PARTITION BY` keys (lowered).
+    partition_by: Vec<Expr>,
+    /// `ORDER BY` keys within the partition (lowered).
+    order_by: Vec<SortExpr>,
+}
+
+/// Recognise a top-level window-function call: `func(...) OVER (...)`.
+///
+/// Supports the ranking functions `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`
+/// and the aggregate windows `SUM/AVG/MIN/MAX/COUNT(expr) OVER (...)`.
+/// Returns `Ok(None)` if `e` is not a function call carrying an `OVER`
+/// clause; returns an error for an OVER clause we recognise the *shape* of
+/// but can't support (named windows, explicit non-default frames, etc.).
+///
+/// `depth` is the current recursion depth; returns Err if MAX_RECURSION_DEPTH
+/// is exceeded.
+fn try_window(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Option<ParsedWindow>> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    let func = match e {
+        SqlExpr::Function(f) => f,
+        _ => return Ok(None),
+    };
+    // No OVER clause => not a window function; let the aggregate / scalar
+    // paths handle it.
+    let over = match &func.over {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    if func.name.0.len() != 1 {
+        return Ok(None);
+    }
+    let fname = func.name.0[0].value.to_ascii_uppercase();
+
+    // Reject extension clauses we don't support on window functions, mirroring
+    // the aggregate guard set.
+    if func.filter.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: FILTER on window function".into(),
+        ));
+    }
+    if func.null_treatment.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: IGNORE/RESPECT NULLS on window function".into(),
+        ));
+    }
+    if !func.within_group.is_empty() {
+        return Err(BoltError::Sql(
+            "unsupported: WITHIN GROUP on window function".into(),
+        ));
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return Err(BoltError::Sql(
+            "unsupported: parametric window function".into(),
+        ));
+    }
+
+    // Parse the OVER (...) spec.
+    let spec = match over {
+        WindowType::WindowSpec(s) => s,
+        WindowType::NamedWindow(name) => {
+            return Err(BoltError::Sql(format!(
+                "unsupported: named window reference 'OVER {name}'"
+            )));
+        }
+    };
+    if spec.window_name.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: named window in OVER (...)".into(),
+        ));
+    }
+    // Frame handling: only the SQL default frame is supported (RANGE/ROWS
+    // UNBOUNDED PRECEDING [AND CURRENT ROW]). Anything else is rejected
+    // cleanly so we never silently compute the wrong frame.
+    if let Some(frame) = &spec.window_frame {
+        reject_non_default_frame(frame, &fname)?;
+    }
+
+    let partition_by = spec
+        .partition_by
+        .iter()
+        .map(|e| lower_expr(e, resolver, depth + 1))
+        .collect::<BoltResult<Vec<_>>>()?;
+    let order_by = lower_window_order_by(&spec.order_by, resolver, depth + 1)?;
+
+    // Build the function. Ranking functions take no argument; aggregate
+    // windows take exactly one.
+    let func = match fname.as_str() {
+        "ROW_NUMBER" => {
+            reject_window_args(func, "ROW_NUMBER")?;
+            WindowFunc::RowNumber
+        }
+        "RANK" => {
+            reject_window_args(func, "RANK")?;
+            WindowFunc::Rank
+        }
+        "DENSE_RANK" => {
+            reject_window_args(func, "DENSE_RANK")?;
+            WindowFunc::DenseRank
+        }
+        "SUM" | "AVG" | "MIN" | "MAX" | "COUNT" => {
+            let inner = single_window_arg(func, &fname, resolver, depth + 1)?;
+            match fname.as_str() {
+                "SUM" => WindowFunc::Sum(inner),
+                "AVG" => WindowFunc::Avg(inner),
+                "MIN" => WindowFunc::Min(inner),
+                "MAX" => WindowFunc::Max(inner),
+                "COUNT" => WindowFunc::Count(inner),
+                _ => unreachable!(),
+            }
+        }
+        other => {
+            return Err(BoltError::Sql(format!(
+                "unsupported window function '{other}'; supported: ROW_NUMBER, RANK, \
+                 DENSE_RANK, SUM, AVG, MIN, MAX, COUNT"
+            )));
+        }
+    };
+
+    Ok(Some(ParsedWindow {
+        func,
+        partition_by,
+        order_by,
+    }))
+}
+
+/// Structural equality of two lowered window specs (partition + ordering),
+/// so multiple window functions sharing a spec collapse into a single
+/// `LogicalPlan::Window` node. Compares partition keys by `expr_eq` and order
+/// keys by `(expr_eq, descending, nulls_first)`.
+fn window_specs_eq(
+    a_part: &[Expr],
+    a_order: &[SortExpr],
+    b_part: &[Expr],
+    b_order: &[SortExpr],
+) -> bool {
+    if a_part.len() != b_part.len() || a_order.len() != b_order.len() {
+        return false;
+    }
+    if !a_part.iter().zip(b_part).all(|(x, y)| expr_eq(x, y)) {
+        return false;
+    }
+    a_order.iter().zip(b_order).all(|(x, y)| {
+        x.descending == y.descending
+            && x.nulls_first == y.nulls_first
+            && expr_eq(&x.expr, &y.expr)
+    })
+}
+
+/// True if `e` contains a window function call (a `Function` with an `OVER`
+/// clause) anywhere in its tree. Used to reject window functions nested
+/// inside a larger SELECT expression, which the host executor does not lower
+/// yet.
+fn sql_expr_contains_window(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<bool> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    // A function with an OVER clause is a window function regardless of name.
+    if let SqlExpr::Function(f) = e {
+        if f.over.is_some() {
+            return Ok(true);
+        }
+    }
+    // Recurse into the common composite expression shapes.
+    let any = match e {
+        SqlExpr::BinaryOp { left, right, .. } => {
+            sql_expr_contains_window(left, resolver, depth + 1)?
+                || sql_expr_contains_window(right, resolver, depth + 1)?
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::Nested(expr)
+        | SqlExpr::Cast { expr, .. } => sql_expr_contains_window(expr, resolver, depth + 1)?,
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            sql_expr_contains_window(expr, resolver, depth + 1)?
+                || sql_expr_contains_window(low, resolver, depth + 1)?
+                || sql_expr_contains_window(high, resolver, depth + 1)?
+        }
+        SqlExpr::Function(f) => {
+            let mut found = false;
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = arg {
+                        if sql_expr_contains_window(inner, resolver, depth + 1)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        }
+        _ => false,
+    };
+    Ok(any)
+}
+
+/// Reject any window frame that isn't the SQL default
+/// (`RANGE/ROWS [BETWEEN] UNBOUNDED PRECEDING [AND CURRENT ROW]`). The
+/// executor only implements the default `RANGE UNBOUNDED PRECEDING AND
+/// CURRENT ROW` frame, so an explicit exotic frame must error rather than be
+/// silently mis-evaluated.
+fn reject_non_default_frame(
+    frame: &sqlparser::ast::WindowFrame,
+    fname: &str,
+) -> BoltResult<()> {
+    // Units may be ROWS or RANGE; both collapse to the same default-frame
+    // behaviour here because the only start bound we accept is UNBOUNDED
+    // PRECEDING (under which ROWS and RANGE agree). GROUPS is rejected.
+    if matches!(frame.units, WindowFrameUnits::Groups) {
+        return Err(BoltError::Sql(format!(
+            "unsupported: GROUPS frame on window function {fname}"
+        )));
+    }
+    // start_bound must be UNBOUNDED PRECEDING (`Preceding(None)`).
+    if !matches!(frame.start_bound, WindowFrameBound::Preceding(None)) {
+        return Err(BoltError::Sql(format!(
+            "unsupported window frame on {fname}: only the default \
+             'UNBOUNDED PRECEDING [AND CURRENT ROW]' frame is supported"
+        )));
+    }
+    // end_bound, if present, must be CURRENT ROW (the default).
+    match &frame.end_bound {
+        None => {}
+        Some(WindowFrameBound::CurrentRow) => {}
+        Some(_) => {
+            return Err(BoltError::Sql(format!(
+                "unsupported window frame on {fname}: only 'UNBOUNDED PRECEDING \
+                 AND CURRENT ROW' is supported"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Lower a window-spec ORDER BY list into our `SortExpr`s. Identical default
+/// rules to [`lower_order_by`] but resolves against the in-scope resolver
+/// (window specs are evaluated in the FROM-tree's namespace, not the
+/// post-projection one).
+fn lower_window_order_by(
+    exprs: &[OrderByExpr],
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Vec<SortExpr>> {
+    let mut out = Vec::with_capacity(exprs.len());
+    for OrderByExpr {
+        expr,
+        asc,
+        nulls_first,
+        with_fill,
+    } in exprs
+    {
+        if with_fill.is_some() {
+            return Err(BoltError::Sql(
+                "unsupported: window ORDER BY ... WITH FILL".into(),
+            ));
+        }
+        let descending = matches!(asc, Some(false));
+        let nulls_first = match nulls_first {
+            Some(b) => *b,
+            None => !descending,
+        };
+        out.push(SortExpr {
+            expr: lower_expr(expr, resolver, depth + 1)?,
+            descending,
+            nulls_first,
+        });
+    }
+    Ok(out)
+}
+
+/// Reject arguments on an argument-less ranking window function
+/// (`ROW_NUMBER`, `RANK`, `DENSE_RANK`).
+fn reject_window_args(
+    func: &sqlparser::ast::Function,
+    name: &str,
+) -> BoltResult<()> {
+    let empty = match &func.args {
+        FunctionArguments::None => true,
+        FunctionArguments::List(list) => list.args.is_empty(),
+        FunctionArguments::Subquery(_) => false,
+    };
+    if !empty {
+        return Err(BoltError::Sql(format!(
+            "{name}() is a ranking window function and takes no arguments"
+        )));
+    }
+    Ok(())
+}
+
+/// Extract the single argument expression of an aggregate window function,
+/// lowering it. `COUNT(*)` is accepted as a count of all rows (lowered to a
+/// constant `1` sentinel, matching the scalar-aggregate convention).
+fn single_window_arg(
+    func: &sqlparser::ast::Function,
+    name: &str,
+    resolver: &NameResolver,
+    depth: usize,
+) -> BoltResult<Expr> {
+    let arg_list = match &func.args {
+        FunctionArguments::List(list) => list,
+        FunctionArguments::None => {
+            return Err(BoltError::Sql(format!(
+                "{name}(...) OVER (...) requires an argument"
+            )));
+        }
+        FunctionArguments::Subquery(_) => {
+            return Err(BoltError::Sql(format!(
+                "unsupported: subquery argument to window {name}"
+            )));
+        }
+    };
+    if arg_list.duplicate_treatment.is_some() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: DISTINCT/ALL inside window {name}"
+        )));
+    }
+    if !arg_list.clauses.is_empty() {
+        return Err(BoltError::Sql(format!(
+            "unsupported: argument clauses on window {name}"
+        )));
+    }
+    if arg_list.args.len() != 1 {
+        return Err(BoltError::Sql(format!(
+            "window {name} expects exactly one argument, got {}",
+            arg_list.args.len()
+        )));
+    }
+    match &arg_list.args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => lower_expr(e, resolver, depth + 1),
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+            if name != "COUNT" {
+                return Err(BoltError::Sql(format!("{name}(*) is not supported")));
+            }
+            // COUNT(*) sentinel: a literal 1 (counts rows regardless of value).
+            Ok(Expr::Literal(Literal::Int64(1)))
+        }
+        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => Err(BoltError::Sql(
+            format!("unsupported: qualified wildcard in window {name}"),
+        )),
+        FunctionArg::Named { .. } => Err(BoltError::Sql(format!(
+            "unsupported: named argument to window {name}"
+        ))),
+    }
 }
 
 /// Recognise a string scalar function call (UPPER / LOWER / LENGTH / CONCAT)
@@ -5182,6 +5620,112 @@ mod wave7_tests {
             msg.contains("both sides reference the same table"),
             "expected same-side message, got: {msg}"
         );
+    }
+
+    // ----- Window function frontend lowering (v0.x) -----
+
+    /// `ROW_NUMBER() OVER (PARTITION BY a ORDER BY b)` lowers to a Project
+    /// over a single-expr `Window` node carrying the parsed spec.
+    #[test]
+    fn window_row_number_lowers_to_window_node() {
+        let plan = lp("SELECT ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) FROM t1");
+        let input = match plan {
+            LogicalPlan::Project { input, .. } => input,
+            other => panic!("expected Project at top, got {other:?}"),
+        };
+        match *input {
+            LogicalPlan::Window {
+                window_exprs,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                assert_eq!(window_exprs.len(), 1);
+                assert!(matches!(window_exprs[0].func, WindowFunc::RowNumber));
+                assert_eq!(partition_by.len(), 1);
+                assert_eq!(order_by.len(), 1);
+            }
+            other => panic!("expected Window under Project, got {other:?}"),
+        }
+    }
+
+    /// `SUM(b) OVER (PARTITION BY a)` lowers to an aggregate window whose
+    /// output schema appends a `sum` column to the input.
+    #[test]
+    fn window_sum_over_partition_schema() {
+        let plan = lp("SELECT a, SUM(b) OVER (PARTITION BY a) AS rs FROM t1");
+        let schema = plan.schema().expect("window plan must type-check");
+        // Output is the projection: a, rs.
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.fields[1].name, "rs");
+        // SUM(Int64) stays Int64.
+        assert_eq!(schema.fields[1].dtype, DataType::Int64);
+    }
+
+    /// Multiple window functions sharing one spec collapse into a single
+    /// `Window` node with two output exprs.
+    #[test]
+    fn window_shared_spec_collapses() {
+        let plan = lp(
+            "SELECT RANK() OVER (ORDER BY b), DENSE_RANK() OVER (ORDER BY b) FROM t1",
+        );
+        let input = match plan {
+            LogicalPlan::Project { input, .. } => input,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        match *input {
+            LogicalPlan::Window { window_exprs, .. } => {
+                assert_eq!(window_exprs.len(), 2, "shared spec should produce one node");
+            }
+            other => panic!("expected single Window, got {other:?}"),
+        }
+    }
+
+    /// An explicit non-default frame is rejected cleanly.
+    #[test]
+    fn window_explicit_frame_rejected() {
+        let err = parse(
+            "SELECT SUM(b) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t1",
+            &provider(),
+        )
+        .expect_err("explicit non-default frame must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("frame"),
+            "expected a frame-related rejection, got: {msg}"
+        );
+    }
+
+    /// A window function nested inside a larger expression is rejected
+    /// (top-level-only support for now).
+    #[test]
+    fn window_nested_in_expression_rejected() {
+        let err = parse(
+            "SELECT ROW_NUMBER() OVER (ORDER BY b) + 1 FROM t1",
+            &provider(),
+        )
+        .expect_err("nested window must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("top-level SELECT item"),
+            "expected top-level-only message, got: {msg}"
+        );
+    }
+
+    /// The window path lowers through to a `PhysicalPlan::Window`.
+    #[test]
+    fn window_lowers_to_physical_window() {
+        let phys = pp("SELECT ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) FROM t1");
+        // Project over Window over the scan-projection.
+        match phys {
+            PhysicalPlan::Project { input, .. } => {
+                assert!(
+                    matches!(*input, PhysicalPlan::Window { .. }),
+                    "expected Window under Project"
+                );
+            }
+            other => panic!("expected Project at top, got {other:?}"),
+        }
     }
 }
 

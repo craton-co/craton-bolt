@@ -319,6 +319,7 @@ fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Window { input, .. }
             | LogicalPlan::Sort { input, .. } => walk(input, out),
             LogicalPlan::Union { inputs } => {
                 for inp in inputs {

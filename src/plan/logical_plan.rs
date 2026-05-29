@@ -1566,6 +1566,118 @@ fn suffix(e: &Expr) -> String {
     }
 }
 
+/// A window function applied over a partition / ordering.
+///
+/// Two families are supported (host-side only — see
+/// [`crate::exec::window`]):
+///
+/// * **Ranking functions** — [`WindowFunc::RowNumber`],
+///   [`WindowFunc::Rank`], [`WindowFunc::DenseRank`]. These take no
+///   argument and depend only on the row's position within its partition
+///   under the window's ORDER BY. All three output `Int64`.
+/// * **Aggregate windows** — [`WindowFunc::Sum`], [`WindowFunc::Avg`],
+///   [`WindowFunc::Min`], [`WindowFunc::Max`], [`WindowFunc::Count`]. These
+///   carry an inner [`Expr`] and compute a running (cumulative) aggregate
+///   over the default frame `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+///   ROW`. With an ORDER BY the value at each row is the aggregate of all
+///   peer-or-earlier rows; without an ORDER BY every row in the partition
+///   sees the full-partition aggregate (the standard SQL behaviour).
+///
+/// Output dtypes mirror the scalar-aggregate contract in
+/// [`AggregateExpr::output_dtype`]: `COUNT` → `Int64`, `AVG` → `Float64`,
+/// `SUM` widens narrow integers via [`sum_output_dtype`], `MIN`/`MAX`
+/// preserve the input dtype.
+#[derive(Debug, Clone)]
+pub enum WindowFunc {
+    /// `ROW_NUMBER()` — 1-based sequential index within the partition,
+    /// ties broken by row order. Output `Int64`.
+    RowNumber,
+    /// `RANK()` — 1-based rank with gaps: tied rows (equal ORDER BY keys)
+    /// share the lowest rank, and the next distinct key skips the tied
+    /// count. Output `Int64`.
+    Rank,
+    /// `DENSE_RANK()` — 1-based rank without gaps: tied rows share a rank
+    /// and the next distinct key is exactly one greater. Output `Int64`.
+    DenseRank,
+    /// `SUM(expr) OVER (...)` — running sum. Output follows
+    /// [`sum_output_dtype`].
+    Sum(Expr),
+    /// `AVG(expr) OVER (...)` — running average. Output `Float64`.
+    Avg(Expr),
+    /// `MIN(expr) OVER (...)` — running minimum. Output preserves the
+    /// input dtype.
+    Min(Expr),
+    /// `MAX(expr) OVER (...)` — running maximum. Output preserves the
+    /// input dtype.
+    Max(Expr),
+    /// `COUNT(expr) OVER (...)` — running count of non-NULL inputs.
+    /// Output `Int64`.
+    Count(Expr),
+}
+
+impl WindowFunc {
+    /// Canonical SQL name of the function (for error messages / default
+    /// output naming).
+    pub fn sql_name(&self) -> &'static str {
+        match self {
+            WindowFunc::RowNumber => "ROW_NUMBER",
+            WindowFunc::Rank => "RANK",
+            WindowFunc::DenseRank => "DENSE_RANK",
+            WindowFunc::Sum(_) => "SUM",
+            WindowFunc::Avg(_) => "AVG",
+            WindowFunc::Min(_) => "MIN",
+            WindowFunc::Max(_) => "MAX",
+            WindowFunc::Count(_) => "COUNT",
+        }
+    }
+
+    /// The inner argument expression, if this is an aggregate window
+    /// (`None` for the argument-less ranking functions).
+    pub fn arg(&self) -> Option<&Expr> {
+        match self {
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
+            WindowFunc::Sum(e)
+            | WindowFunc::Avg(e)
+            | WindowFunc::Min(e)
+            | WindowFunc::Max(e)
+            | WindowFunc::Count(e) => Some(e),
+        }
+    }
+
+    /// Output dtype of this window function against the input schema.
+    ///
+    /// Mirrors [`AggregateExpr::output_dtype`] for the aggregate family;
+    /// the ranking functions are always `Int64`.
+    pub fn output_dtype(&self, input: &Schema) -> BoltResult<DataType> {
+        match self {
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+                Ok(DataType::Int64)
+            }
+            WindowFunc::Count(_) => Ok(DataType::Int64),
+            WindowFunc::Avg(e) => {
+                let _ = e.dtype(input)?;
+                Ok(DataType::Float64)
+            }
+            WindowFunc::Sum(e) => Ok(sum_output_dtype(e.dtype(input)?)),
+            WindowFunc::Min(e) | WindowFunc::Max(e) => e.dtype(input),
+        }
+    }
+}
+
+/// A single window-function output column: the function plus the name the
+/// computed column receives in the [`LogicalPlan::Window`] output schema.
+///
+/// The partition / ordering is shared across every `WindowExpr` in a
+/// [`LogicalPlan::Window`] node (one node per distinct window spec), so it
+/// lives on the node rather than here.
+#[derive(Debug, Clone)]
+pub struct WindowExpr {
+    /// The window function to compute.
+    pub func: WindowFunc,
+    /// Output column name appended to the input schema.
+    pub output_name: String,
+}
+
 /// A single ORDER BY entry: an expression plus direction / null placement.
 #[derive(Debug, Clone)]
 pub struct SortExpr {
@@ -1673,6 +1785,27 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         /// Sort keys, evaluated in order (first is most significant).
         sort_exprs: Vec<SortExpr>,
+    },
+    /// SQL window functions: `func(...) OVER (PARTITION BY ... ORDER BY
+    /// ...)`. Each [`WindowExpr`] appends one computed column to the input's
+    /// schema; the partition / ordering is shared across every expr in the
+    /// node (one node per distinct window spec). Schema =
+    /// `input.schema() ++ [one field per window_expr]`.
+    ///
+    /// **Host-only (v0.x):** the default frame (`RANGE UNBOUNDED PRECEDING`)
+    /// is the only frame supported; the SQL frontend rejects explicit exotic
+    /// frames. Execution is host-side — see [`crate::exec::window`].
+    Window {
+        /// Source.
+        input: Box<LogicalPlan>,
+        /// One output column per window function sharing this spec.
+        window_exprs: Vec<WindowExpr>,
+        /// `PARTITION BY` keys (empty = single partition over all rows).
+        partition_by: Vec<Expr>,
+        /// `ORDER BY` keys within each partition (empty = no ordering, so
+        /// aggregate windows see the whole partition and ranking functions
+        /// fall back to physical row order).
+        order_by: Vec<SortExpr>,
     },
     /// SQL UNION ALL — concatenation without dedup. UNION (with dedup) is
     /// parsed and lowered to `Distinct(Union { ... })`. All inputs must share
@@ -1812,6 +1945,36 @@ impl LogicalPlan {
                     }
                 }
                 Ok(s)
+            }
+            LogicalPlan::Window {
+                input,
+                window_exprs,
+                partition_by,
+                order_by,
+            } => {
+                let s = input.schema_depth(depth + 1)?;
+                // Type-check the partition / ordering keys against the input
+                // schema so misnamed columns surface here rather than at
+                // execution time. We don't constrain their dtype (any
+                // orderable scalar is fine).
+                for p in partition_by {
+                    let _ = p.dtype(&s)?;
+                }
+                for se in order_by {
+                    let _ = se.expr.dtype(&s)?;
+                }
+                // Output schema = input fields, then one appended field per
+                // window expression. Each window output is nullable (running
+                // aggregates over an all-NULL prefix yield NULL; ranking
+                // functions never emit NULL but a uniform nullable=true keeps
+                // the appended-column contract simple).
+                let mut fields = s.fields.clone();
+                fields.reserve(window_exprs.len());
+                for we in window_exprs {
+                    let dtype = we.func.output_dtype(&s)?;
+                    fields.push(Field::new(we.output_name.clone(), dtype, true));
+                }
+                Ok(Schema::new(fields))
             }
             LogicalPlan::Union { inputs } => {
                 if inputs.is_empty() {

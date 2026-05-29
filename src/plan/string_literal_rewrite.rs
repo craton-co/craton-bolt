@@ -658,6 +658,24 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 sort_exprs: sort_exprs.clone(),
             })
         }
+        LogicalPlan::Window {
+            input,
+            window_exprs,
+            partition_by,
+            order_by,
+        } => {
+            // Transparent wrapper for the dictionary-rewrite pass: descend
+            // into the input but leave the window spec untouched (window
+            // functions over Utf8 columns aren't part of the dictionary
+            // codegen path — this executor is host-side).
+            let new_input = rewrite_plan_with(input, r, depth + 1)?;
+            Ok(LogicalPlan::Window {
+                input: Box::new(new_input),
+                window_exprs: window_exprs.clone(),
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+            })
+        }
         LogicalPlan::Union { inputs } => {
             let new_inputs = inputs
                 .iter()

@@ -91,6 +91,10 @@ pub mod groupby_tier2_twokey_minmax_float_exec;
 pub mod distinct;
 #[doc(hidden)]
 pub mod sort;
+/// Host-side window-function executor (`func(...) OVER (...)`). Lowered from
+/// `LogicalPlan::Window` / `PhysicalPlan::Window`. Host-only for now.
+#[doc(hidden)]
+pub mod window;
 #[doc(hidden)]
 pub(crate) mod gpu_sort;
 #[doc(hidden)]
