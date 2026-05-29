@@ -899,6 +899,9 @@ impl Engine {
             .map_err(|_| BoltError::Other("module_cache mutex poisoned".to_string()))?
             .get(&key)
         {
+            // M5 metrics: warm in-process module cache hit. One Relaxed
+            // atomic add; does not change control flow.
+            crate::metrics::metrics().inc(crate::metrics::Counter::PtxCacheHits);
             return Ok(m.clone());
         }
         // Miss in the in-process cache. Before paying the codegen cost,
@@ -940,6 +943,10 @@ impl Engine {
             _ => compile(spec)?,
         };
         let module = CudaModule::from_ptx(&ptx)?;
+        // M5 metrics: in-process module cache miss — we paid the PTX
+        // codegen (or disk-cache lookup) plus `cuModuleLoadDataEx`. One
+        // Relaxed atomic add, mirroring `module_cache_loads` below.
+        crate::metrics::metrics().inc(crate::metrics::Counter::PtxCacheMisses);
         self.module_cache_loads
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Insert and hand back a clone. If a concurrent thread raced us to
@@ -1667,36 +1674,63 @@ impl Engine {
         // calling thread — so it's safe to invoke unconditionally.
         crate::cuda::mem_pool::pool_watcher_retry_context_capture();
 
-        let plan: LogicalPlan = parse_sql(query, &self.provider)?;
-        // String-literal predicates against Utf8 columns are folded into
-        // integer equality against the corresponding __idx_<col> i32 column.
-        let plan = tracing::info_span!("plan")
-            .in_scope(|| self.dict_registry.rewrite_plan(&plan))?;
-        let plan = self.dict_registry.rewrite_plan(&plan)?;
-        // v0.6 / M7: run user-registered PlanRewrite implementations in
-        // registration order, threading each rewriter's output into the
-        // next. This runs AFTER the internal dict-rewrite (so user
-        // rewrites see the engine's normalised form with `__idx_<col>`
-        // refs already in place) and BEFORE `lower_physical` (so users
-        // can still target logical-plan structure). See
-        // `crate::plan::rewrite` for the contract.
-        let plan = self
-            .rewrites
-            .iter()
-            .try_fold(plan, |p, r| r.rewrite(p))?;
-        let mut phys = crate::plan::lower_physical(&plan)?;
-        // PV-stage-d: populate `KernelSpec::input_has_validity` for every
-        // input column by consulting the engine-backed provider, which
-        // looks straight at `RecordBatch::column(col).null_count()` for
-        // each registered table. This is the plan-time signal that lets
-        // the codegen emit native-validity kernels instead of leaning on
-        // the run-time host-strip fallback in `groupby_with_pre` etc.
-        let nb = EngineProvider {
-            base: &self.provider,
-            tables: &self.tables,
+        // M5 metrics: every accepted query bumps `queries_total` on entry
+        // (success or failure). The whole parse → lower → execute pipeline
+        // runs inside an inner closure so a single `is_err()` check at the
+        // end can bump `queries_failed` for *any* error-return path without
+        // re-spelling the book-keeping at each `?`. Both bumps are single
+        // Relaxed atomic adds — cheap and panic-free; the closure does not
+        // alter the control flow of the original `?`-chain.
+        crate::metrics::metrics().inc(crate::metrics::Counter::QueriesTotal);
+
+        let pipeline = || -> BoltResult<QueryHandle> {
+            // Parse phase: time the SQL → LogicalPlan step with the same
+            // boundary the `parse` tracing span marks (see observability.rs).
+            // `Instant` is monotonic and allocation-free.
+            let parse_start = Instant::now();
+            let plan: LogicalPlan = parse_sql(query, &self.provider)?;
+            crate::metrics::metrics()
+                .observe_duration(crate::metrics::Phase::Parse, parse_start.elapsed());
+            // String-literal predicates against Utf8 columns are folded into
+            // integer equality against the corresponding __idx_<col> i32 column.
+            let plan = tracing::info_span!("plan")
+                .in_scope(|| self.dict_registry.rewrite_plan(&plan))?;
+            let plan = self.dict_registry.rewrite_plan(&plan)?;
+            // v0.6 / M7: run user-registered PlanRewrite implementations in
+            // registration order, threading each rewriter's output into the
+            // next. This runs AFTER the internal dict-rewrite (so user
+            // rewrites see the engine's normalised form with `__idx_<col>`
+            // refs already in place) and BEFORE `lower_physical` (so users
+            // can still target logical-plan structure). See
+            // `crate::plan::rewrite` for the contract.
+            let plan = self
+                .rewrites
+                .iter()
+                .try_fold(plan, |p, r| r.rewrite(p))?;
+            // Lower phase: LogicalPlan → PhysicalPlan, timed with the same
+            // boundary the `lower` tracing span marks (observability.rs).
+            let lower_start = Instant::now();
+            let mut phys = crate::plan::lower_physical(&plan)?;
+            crate::metrics::metrics()
+                .observe_duration(crate::metrics::Phase::Lower, lower_start.elapsed());
+            // PV-stage-d: populate `KernelSpec::input_has_validity` for every
+            // input column by consulting the engine-backed provider, which
+            // looks straight at `RecordBatch::column(col).null_count()` for
+            // each registered table. This is the plan-time signal that lets
+            // the codegen emit native-validity kernels instead of leaning on
+            // the run-time host-strip fallback in `groupby_with_pre` etc.
+            let nb = EngineProvider {
+                base: &self.provider,
+                tables: &self.tables,
+            };
+            crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
+            self.execute(&phys)
         };
-        crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
-        let result = self.execute(&phys);
+        let result = pipeline();
+        // M5 metrics: bump `queries_failed` on any error-return path.
+        if result.is_err() {
+            crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+        }
         // Stage 7: periodic pool-stats emit. Runs whether the query
         // succeeded or failed (an OOM-failed query is itself a signal
         // worth surfacing alongside the pool snapshot). Internal errors
@@ -2252,6 +2286,12 @@ impl Engine {
 
             let has_utf8_output = kernel.outputs.iter().any(|c| c.dtype == DataType::Utf8);
             if has_utf8_output {
+                // M5 metrics: documented host fallback — the GPU gather
+                // kernel can't relocate variable-width Utf8, so we download
+                // mask + outputs and filter on the host. One Relaxed atomic
+                // add; does not change control flow.
+                crate::metrics::metrics()
+                    .inc(crate::metrics::Counter::HostFallbacksTotal);
                 // Host-side fallback: download mask + outputs, then filter.
                 let host_mask =
                     crate::exec::compact::download_mask(mask.device_ptr(), n_rows)?;
@@ -3875,6 +3915,54 @@ mod tests {
             1,
             "second projection on a different column must miss and compile \
              its own module — otherwise the cache is over-keying"
+        );
+    }
+
+    /// M5 metrics: a query routed through `Engine::sql` bumps the
+    /// process-wide `queries_total` counter, and a query that fails on the
+    /// **host-side plan path** (an unknown table errors inside `parse_sql`,
+    /// before any kernel launch) bumps `queries_failed` too.
+    ///
+    /// This deliberately exercises the host-plan path — the unknown-table
+    /// error never reaches the GPU, so the only reason it carries the
+    /// `gpu` ignore tag is that constructing an `Engine` requires a CUDA
+    /// context. The counter wiring under test lives entirely on the host
+    /// entry/exit of `sql`.
+    ///
+    /// The metrics registry is process-wide and shared across all tests in
+    /// the binary, so we assert on *deltas* (counter moved by at least the
+    /// amount this test caused) rather than absolute values — concurrent
+    /// tests may have bumped the same counters.
+    #[test]
+    #[ignore = "gpu:ctx — needs a CUDA context to construct Engine; query path is host-only"]
+    fn sql_bumps_query_metrics_on_host_plan_path() {
+        use crate::metrics::{metrics, Counter};
+
+        let engine = Engine::new().expect("ctx");
+
+        let total_before = metrics().counter(Counter::QueriesTotal).get();
+        let failed_before = metrics().counter(Counter::QueriesFailed).get();
+
+        // Unknown table: `parse_sql` rejects this on the host before any
+        // physical plan / kernel launch — a pure host-plan-path failure.
+        let result = engine.sql("SELECT x FROM does_not_exist");
+        assert!(
+            result.is_err(),
+            "query against an unregistered table must fail on the host plan path"
+        );
+
+        let total_after = metrics().counter(Counter::QueriesTotal).get();
+        let failed_after = metrics().counter(Counter::QueriesFailed).get();
+
+        assert!(
+            total_after >= total_before + 1,
+            "queries_total must increase by at least 1 after a query \
+             (before={total_before}, after={total_after})"
+        );
+        assert!(
+            failed_after >= failed_before + 1,
+            "queries_failed must increase by at least 1 after a host-plan-path \
+             failure (before={failed_before}, after={failed_after})"
         );
     }
 }
