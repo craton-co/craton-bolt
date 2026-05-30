@@ -167,11 +167,13 @@ fn host_like_not_like_inverts_and_preserves_nulls() {
 // access yet, so this is the correct lowering for v0.5).
 // ===========================================================================
 
-/// `SELECT s FROM t WHERE s LIKE 'foo'` must lower to a plan with a
-/// host-side `PhysicalPlan::Filter` carrying the `Expr::Like` predicate
-/// — the GPU path is gated until Utf8 column access lands.
+/// `SELECT s FROM t WHERE s LIKE 'foo%'` over a NON-dict Utf8 column now
+/// lowers to the GPU `PhysicalPlan::StringLikeFilter` (UNVALIDATED device
+/// path), not the host `Expr::Like` filter. The supported single-literal-
+/// segment shapes (EXACT/PREFIX/SUFFIX/CONTAINS) take the GPU path; everything
+/// else (`_`, ESCAPE, interior `%`) stays on the host filter.
 #[test]
-fn like_lowers_to_host_filter() {
+fn like_lowers_to_gpu_string_like_filter() {
     let plan = parse_sql(
         "SELECT s FROM t WHERE s LIKE 'foo%'",
         &s_provider(),
@@ -185,24 +187,21 @@ fn like_lowers_to_host_filter() {
         other => other,
     };
 
-    let predicate = match inner {
-        PhysicalPlan::Filter { predicate, .. } => predicate,
-        other => panic!("expected PhysicalPlan::Filter under Project, got {other:?}"),
-    };
-    match predicate {
-        Expr::Like {
-            pattern, negated, ..
+    match inner {
+        PhysicalPlan::StringLikeFilter {
+            column, negated, ..
         } => {
-            assert_eq!(pattern, "foo%");
+            assert_eq!(column, "s");
             assert!(!negated, "LIKE without NOT must produce negated=false");
         }
-        other => panic!("expected Expr::Like predicate, got {other:?}"),
+        other => panic!("expected PhysicalPlan::StringLikeFilter, got {other:?}"),
     }
 }
 
-/// Same for `NOT LIKE` — the predicate captures `negated: true`.
+/// `NOT LIKE '%foo%'` (CONTAINS, negated) over a non-dict Utf8 column lowers
+/// to the GPU `StringLikeFilter` with `negated: true`.
 #[test]
-fn not_like_lowers_with_negated_true() {
+fn not_like_lowers_to_gpu_string_like_filter() {
     let plan = parse_sql(
         "SELECT s FROM t WHERE s NOT LIKE '%foo%'",
         &s_provider(),
@@ -213,38 +212,53 @@ fn not_like_lowers_with_negated_true() {
         PhysicalPlan::Project { input, .. } => input.as_ref(),
         other => other,
     };
-    let predicate = match inner {
-        PhysicalPlan::Filter { predicate, .. } => predicate,
-        other => panic!("expected Filter, got {other:?}"),
-    };
-    match predicate {
-        Expr::Like {
-            pattern, negated, ..
+    match inner {
+        PhysicalPlan::StringLikeFilter {
+            column, negated, ..
         } => {
-            assert_eq!(pattern, "%foo%");
+            assert_eq!(column, "s");
             assert!(*negated);
         }
-        other => panic!("expected Expr::Like, got {other:?}"),
+        other => panic!("expected StringLikeFilter, got {other:?}"),
     }
 }
 
-/// `LIKE` with each of the four shape fast paths must parse, type-check,
-/// and lower without error. The actual matcher behaviour is covered by
-/// the host-evaluator block above.
+/// The four GPU-supported shapes lower to `StringLikeFilter`; the `_`-bearing
+/// generic shape stays on the host `Expr::Like` filter (host fallback).
 #[test]
-fn like_lowers_for_each_shape() {
+fn like_lowers_each_shape_to_expected_path() {
+    // GPU-accelerated shapes.
     for sql in [
         "SELECT s FROM t WHERE s LIKE 'foo'",   // exact
         "SELECT s FROM t WHERE s LIKE 'foo%'",  // prefix
         "SELECT s FROM t WHERE s LIKE '%foo'",  // suffix
         "SELECT s FROM t WHERE s LIKE '%foo%'", // contains
-        "SELECT s FROM t WHERE s LIKE 'f_o'",   // generic (underscore)
     ] {
         let plan = parse_sql(sql, &s_provider())
             .unwrap_or_else(|e| panic!("parse failed for {sql}: {e}"));
-        let _ = lower_physical(&plan)
+        let phys = lower_physical(&plan)
             .unwrap_or_else(|e| panic!("lower failed for {sql}: {e}"));
+        let inner = match &phys {
+            PhysicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        assert!(
+            matches!(inner, PhysicalPlan::StringLikeFilter { .. }),
+            "{sql} should lower to StringLikeFilter, got {inner:?}"
+        );
     }
+    // `_` forces the host fallback.
+    let plan = parse_sql("SELECT s FROM t WHERE s LIKE 'f_o'", &s_provider())
+        .expect("parse");
+    let phys = lower_physical(&plan).expect("lower");
+    let inner = match &phys {
+        PhysicalPlan::Project { input, .. } => input.as_ref(),
+        other => other,
+    };
+    assert!(
+        matches!(inner, PhysicalPlan::Filter { .. }),
+        "`_` pattern must stay on the host Filter, got {inner:?}"
+    );
 }
 
 /// Sanity-check that the SQL frontend correctly rejects unsupported
@@ -327,13 +341,19 @@ fn like_predicate_is_not_folded_into_projection_kernel() {
                 saw_filter = true;
                 cur = input.as_ref();
             }
+            // The GPU LIKE filter is a separate plan node too — the LIKE was
+            // NOT folded into the fused projection kernel.
+            PhysicalPlan::StringLikeFilter { input, .. } => {
+                saw_filter = true;
+                cur = input.as_ref();
+            }
             PhysicalPlan::Project { input, .. } => cur = input.as_ref(),
             _ => break,
         }
     }
     assert!(
         saw_filter,
-        "expected a host-side Filter wrapping the projection, got plan: {phys:?}"
+        "expected a Filter / StringLikeFilter wrapping the projection, got plan: {phys:?}"
     );
 
     // Also walk to a leaf Projection / Scan and verify any KernelSpec

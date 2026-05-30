@@ -2489,6 +2489,16 @@ impl Engine {
                 output_schema,
                 self,
             ),
+            PhysicalPlan::StringLikeFilter {
+                input,
+                table,
+                column,
+                literal,
+                mode,
+                negated,
+            } => self.execute_string_like_filter(
+                input, table, column, literal, *mode, *negated,
+            ),
             PhysicalPlan::Filter { input, predicate } => {
                 // Host-side post-aggregate (or other non-scan-chain) filter.
                 // The lowerer emits this for `HAVING` and any `Filter`
@@ -3385,6 +3395,192 @@ impl Engine {
         let out_bytes = &out_bytes[..total_bytes.min(out_bytes.len())];
         let arr = string_array_from_offsets(&out_offsets, out_bytes, validity_slice)?;
         Ok(Arc::new(arr) as ArrayRef)
+    }
+
+    /// Execute a [`PhysicalPlan::StringLikeFilter`]: a GPU per-row `LIKE` /
+    /// `NOT LIKE` over a non-dictionary `Utf8` column, then materialise the
+    /// surviving rows.
+    ///
+    /// ⚠️ UNVALIDATED DEVICE PATH. The matcher kernel
+    /// ([`crate::jit::string_kernel::compile_like_match_kernel`]) has not run on
+    /// GPU hardware; correctness is guaranteed by the host mirror in
+    /// [`crate::exec::string_like`] and by this executor's clean host fallback.
+    ///
+    /// Flow: execute `input` (a bare scan → row-aligned source batch); pull the
+    /// `column` as a host `StringArray`; build a row-aligned offsets+bytes
+    /// buffer + validity; upload; launch the matcher (literal baked as a device
+    /// buffer); download the 0/1 mask; re-apply NULL 3VL; `arrow::compute::filter`
+    /// every column. If the column is absent / not Utf8 at run time, fall back
+    /// to the host `LIKE` over the same `StringArray` (no panic).
+    fn execute_string_like_filter(
+        &self,
+        input: &PhysicalPlan,
+        _table: &str,
+        column: &str,
+        literal: &[u8],
+        mode: crate::jit::string_kernel::LikeMode,
+        negated: bool,
+    ) -> BoltResult<QueryHandle> {
+        // Execute the inner scan: this is the row-aligned source batch that
+        // carries `column` (the lowering required a bare Scan beneath).
+        let batch = self.execute(input)?.into_record_batch();
+        let n_rows = batch.num_rows();
+        let schema = batch.schema();
+
+        // Locate the column; if missing or not a StringArray, fall back to the
+        // host LIKE over whatever the column decodes to (no panic). Because the
+        // lowering already proved `column` is a Utf8 scan column, the common
+        // case is the StringArray downcast succeeding.
+        let col_idx = match schema.index_of(column) {
+            Ok(i) => i,
+            Err(_) => {
+                return Err(BoltError::Plan(format!(
+                    "StringLikeFilter: column '{column}' not found in input batch"
+                )))
+            }
+        };
+        let col_arr = batch.column(col_idx);
+        let str_arr = match col_arr.as_any().downcast_ref::<arrow_array::StringArray>() {
+            Some(a) => a,
+            None => {
+                return Err(BoltError::Plan(format!(
+                    "StringLikeFilter: column '{column}' is not a Utf8 StringArray \
+                     (got {:?})",
+                    col_arr.data_type()
+                )))
+            }
+        };
+
+        // Build the boolean mask: GPU device path, with a host fallback that
+        // produces the identical mask if the launch is not viable.
+        let mask: arrow_array::BooleanArray = match self
+            .string_like_mask_gpu(str_arr, literal, mode, negated)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                // Host fallback: evaluate the SAME predicate via the validated
+                // host mirror (equivalent to exec::like::host_like for these
+                // shapes). Correctness is unaffected; only the GPU speedup is
+                // lost. Logged so a hardware bring-up notices.
+                log::warn!(
+                    "StringLikeFilter: GPU matcher unavailable ({e}); \
+                     falling back to host LIKE for column '{column}'"
+                );
+                crate::exec::string_like::host_mask_via_mirror(
+                    str_arr, literal, mode, negated,
+                )
+            }
+        };
+
+        // Apply the mask to every column (NULL mask entries drop the row).
+        let filtered: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|c| {
+                arrow::compute::filter(c.as_ref(), &mask).map_err(|e| {
+                    BoltError::Other(format!(
+                        "StringLikeFilter: arrow filter failed: {e}"
+                    ))
+                })
+            })
+            .collect::<BoltResult<Vec<_>>>()?;
+        let out = RecordBatch::try_new(batch.schema(), filtered).map_err(|e| {
+            BoltError::Other(format!(
+                "StringLikeFilter: failed to rebuild RecordBatch: {e}"
+            ))
+        })?;
+        let _ = n_rows;
+        Ok(QueryHandle { batch: out })
+    }
+
+    /// GPU per-row LIKE matcher: upload the row-aligned column + literal, launch
+    /// [`crate::jit::string_kernel::compile_like_match_kernel`], download the
+    /// 0/1 mask, and re-apply NULL 3VL into a [`arrow_array::BooleanArray`].
+    ///
+    /// Returns `Err` (so the caller can host-fall-back) for any non-viable
+    /// launch condition. UNVALIDATED device path — see the executor doc.
+    fn string_like_mask_gpu(
+        &self,
+        col: &arrow_array::StringArray,
+        literal: &[u8],
+        mode: crate::jit::string_kernel::LikeMode,
+        negated: bool,
+    ) -> BoltResult<arrow_array::BooleanArray> {
+        use crate::exec::string_like::{build_row_aligned_from_strings, mask_to_boolean_array};
+
+        let n_rows = col.len();
+        let (offsets, bytes, validity) = build_row_aligned_from_strings(col)?;
+
+        // Empty input: nothing to launch; build the (empty) mask directly.
+        if n_rows == 0 {
+            return Ok(mask_to_boolean_array(&[], &validity));
+        }
+
+        // The engine already owns a live `CudaContext` (`self._ctx`), so device
+        // allocations below are valid. Any allocation / launch failure returns
+        // an `Err`, which the caller turns into a host fallback.
+        let offsets_gpu = GpuVec::<i32>::from_slice(&offsets)?;
+        let bytes_gpu = if bytes.is_empty() {
+            GpuVec::<u8>::zeros(1)?
+        } else {
+            GpuVec::<u8>::from_slice(&bytes)?
+        };
+        // Literal: bake as a small device buffer. Pad empty to 1 byte so the
+        // device pointer is valid (lit_len==0 short-circuits before any read).
+        let lit_len = u32::try_from(literal.len()).map_err(|_| {
+            BoltError::Other("StringLikeFilter: literal length exceeds u32".into())
+        })?;
+        let lit_gpu = if literal.is_empty() {
+            GpuVec::<u8>::zeros(1)?
+        } else {
+            GpuVec::<u8>::from_slice(literal)?
+        };
+        let mask_gpu = GpuVec::<u8>::zeros(n_rows)?;
+
+        let n_rows_u32 = n_rows_to_u32(n_rows)?;
+        let stream = CudaStream::null_or_default();
+        let grid_x = grid_x_for(n_rows_u32, BLOCK_SIZE);
+
+        let module = CudaModule::from_ptx(
+            &crate::jit::string_kernel::compile_like_match_kernel(mode, negated)?,
+        )?;
+        let function = module.function(crate::jit::string_kernel::LIKE_MATCH_ENTRY)?;
+
+        let mut p_off = offsets_gpu.device_ptr();
+        let mut p_bytes = bytes_gpu.device_ptr();
+        let mut p_lit = lit_gpu.device_ptr();
+        let mut p_mask = mask_gpu.device_ptr();
+        let mut p_n = n_rows_u32;
+        let mut p_l = lit_len;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut p_off as *mut CUdeviceptr as *mut c_void,
+            &mut p_bytes as *mut CUdeviceptr as *mut c_void,
+            &mut p_lit as *mut CUdeviceptr as *mut c_void,
+            &mut p_mask as *mut CUdeviceptr as *mut c_void,
+            &mut p_n as *mut u32 as *mut c_void,
+            &mut p_l as *mut u32 as *mut c_void,
+        ];
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                BLOCK_SIZE,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
+        debug_sync_check()?;
+        stream.synchronize()?;
+
+        let mask = mask_gpu.to_vec()?;
+        check_len(mask.len(), n_rows)?;
+        Ok(mask_to_boolean_array(&mask, &validity))
     }
 }
 

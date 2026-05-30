@@ -3623,22 +3623,24 @@ fn try_lower_string_like_filter(
             Some(d) => d,
             None => return Ok(None),
         };
-    // Resolve the underlying scan + confirm `column` is a Utf8 scan column.
-    // (Non-scan-chain inputs keep the host path.)
-    if !is_scan_chain(input) {
-        return Ok(None);
-    }
-    let resolved = resolve_source(input)?;
-    let field = match resolved.scan_schema.field(&column) {
+    // Require a BARE `Scan` underneath (no intervening Filter / Project that
+    // could drop or reorder rows). This guarantees the executed input batch is
+    // row-aligned with the source table the executor materialises to fetch the
+    // `column` bytes, and that `column` is present. Anything richer keeps the
+    // host `Expr::Like` path.
+    let (table, scan_schema) = match input {
+        LogicalPlan::Scan { table, schema, .. } => (table.clone(), schema),
+        _ => return Ok(None),
+    };
+    let field = match scan_schema.field(&column) {
         Some(f) => f,
         None => return Ok(None),
     };
     if field.dtype != DataType::Utf8 {
         return Ok(None);
     }
-    let table = resolved.table.to_string();
 
-    // Lower the inner plan so its output batch surfaces `column`.
+    // Lower the inner scan so its output batch is the row-aligned source.
     let inner = lower_depth(input, depth + 1)?;
     Ok(Some(PhysicalPlan::StringLikeFilter {
         input: Box::new(inner),
