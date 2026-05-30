@@ -289,6 +289,21 @@ pub fn prefix_scan_mask(
     // launcher. Hillis-Steele / Blelloch share the 4-arg launcher below.
     let (algo, _spec_id, entry) = prefix_scan_algo_selection();
     if algo == PrefixScanAlgo::Lookback {
+        // C-7: the decoupled-lookback scan bakes a 30-bit running prefix and
+        // indexes rows as i32, so it requires `n_rows < LOOKBACK_MAX_ROWS`
+        // (and `<= i32::MAX`). The single-pass cap above already guarantees
+        // this today, but guard explicitly so a future change to `max_rows`
+        // can't silently feed the lookback kernel an out-of-budget row count —
+        // route oversized inputs to the recursive multipass path instead.
+        // (The single-wave occupancy/forward-progress bound is upheld by the
+        // launcher's grid sizing; see the `prefix_scan` lookback contract.)
+        if (n_rows as u64) >= crate::jit::prefix_scan::LOOKBACK_MAX_ROWS as u64
+            || n_rows > i32::MAX as usize
+        {
+            return crate::exec::gpu_compact_multipass::prefix_scan_mask_multipass(
+                mask_ptr, n_rows, stream,
+            );
+        }
         return prefix_scan_mask_lookback(mask_ptr, n_rows, stream);
     }
 
