@@ -689,7 +689,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:string"]
     fn rewrite_plan_poisons_conflicting_same_name_column() {
-        use crate::plan::logical_plan::Literal;
+        use crate::plan::logical_plan::{BinaryOp, Literal};
 
         let mut reg = DictRegistry::new();
         // Two tables, same column name `region`, DIFFERENT dictionary content.
@@ -746,7 +746,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:string"]
     fn rewrite_plan_folds_identical_same_name_column() {
-        use crate::plan::logical_plan::Literal;
+        use crate::plan::logical_plan::{BinaryOp, Literal};
 
         let mut reg = DictRegistry::new();
         reg.register_table("a", &utf8_batch("region", &["US", "EU"]))
