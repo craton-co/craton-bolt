@@ -2095,10 +2095,13 @@ impl Engine {
         // estimator snapshotted from the registered tables, so left-deep
         // INNER chains are reordered smallest-input-first (it stays a no-op
         // for chains whose leaves the snapshot can't cost). See
-        // `crate::plan::optimizer` for the pipeline and ordering.
-        let plan = crate::plan::default_passes_with_estimator(self.row_estimator())
-            .iter()
-            .try_fold(plan, |p, r| r.rewrite(p))?;
+        // `crate::plan::optimizer` for the pipeline and ordering. The
+        // pipeline is driven to a bounded fixpoint (re-running the same
+        // pass set/order until the plan stabilises or the iteration cap is
+        // hit) so a conjunct exposed by one sweep — e.g. a now-constant
+        // predicate moved by pushdown — gets folded/pushed on the next.
+        let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
+        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
         // v0.6 / M7: run user-registered PlanRewrite implementations in
         // registration order, threading each rewriter's output into the
         // next. This runs AFTER the built-in optimizer and the internal
@@ -2216,10 +2219,11 @@ impl Engine {
         // Built-in logical optimizer: mirror the `sql()` path so a plan built
         // via the DataFrame builder gets the same default optimizations before
         // lowering — including statistics-driven join reordering. See
-        // `crate::plan::optimizer`.
-        let plan = crate::plan::default_passes_with_estimator(self.row_estimator())
-            .iter()
-            .try_fold(plan, |p, r| r.rewrite(p))?;
+        // `crate::plan::optimizer`. Driven to a bounded fixpoint exactly as
+        // `sql()` does, so DataFrame-built plans get the same thorough
+        // fold/push convergence.
+        let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
+        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
         // Mirror `sql()`: resolve uncorrelated subqueries to constants before
         // lowering so a DataFrame-built plan carrying a subquery executes too.
         let plan = self.resolve_subqueries(plan)?;
@@ -2280,9 +2284,10 @@ impl Engine {
     /// is what makes nested subqueries resolve inner-first.
     fn run_subplan(&self, plan: LogicalPlan) -> BoltResult<RecordBatch> {
         let plan = self.dict_registry.rewrite_plan(&plan)?;
-        let plan = crate::plan::default_passes_with_estimator(self.row_estimator())
-            .iter()
-            .try_fold(plan, |p, r| r.rewrite(p))?;
+        // Bounded-fixpoint optimizer, mirroring the `sql()` / `run_logical_plan`
+        // paths so a subplan is optimized to the same convergence.
+        let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
+        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
         let plan = self.resolve_subqueries(plan)?;
         let mut phys = crate::plan::lower_physical(&plan)?;
         // The outer `sql()` / `run_logical_plan` has already collapsed any

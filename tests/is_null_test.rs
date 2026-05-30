@@ -578,6 +578,14 @@ fn contains_unary(expr: &Expr) -> bool {
         // pattern is a literal). Mirrors the wrapper-recursion of the arms
         // above for the purpose of unary detection.
         Expr::Like { expr, .. } => contains_unary(expr),
+        // Date scalar fns wrap an inner operand but carry no unary themselves;
+        // they have no GPU unary-over-non-column shape, so they don't force the
+        // host path on their own. Mirror `predicate_contains_unary` (false).
+        Expr::Extract { .. } | Expr::DateTrunc { .. } => false,
+        // Subqueries have no GPU path; the `InSubquery` probe lives in this
+        // query's namespace, so recurse into it (matches the in-crate helper).
+        Expr::ScalarSubquery(_) => false,
+        Expr::InSubquery { expr, .. } => contains_unary(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }

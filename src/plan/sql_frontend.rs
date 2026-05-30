@@ -634,7 +634,37 @@ fn parse_uncached(sql: &str, provider: &dyn TableProvider) -> BoltResult<Logical
             )));
         }
     };
-    plan_query(&query, provider, &CteScope::new(), 0)
+    let plan = plan_query(&query, provider, &CteScope::new(), 0)?;
+    // A root UNION / EXCEPT / INTERSECT lowers to a `Union` / `SetOp` node
+    // (UNION as `Distinct(Union { .. })`) WITHOUT validating that the branches
+    // share a compatible schema — that check lives in `LogicalPlan::schema()`
+    // and was never triggered for a root set-op, so an incompatible-arity
+    // EXCEPT/INTERSECT/UNION parsed as `Ok`. We eagerly compute the schema
+    // ONLY for a set-op root so the existing descriptive `BoltError::Plan`
+    // (which names the offending op) surfaces at parse time.
+    //
+    // We deliberately do NOT force a full schema computation for non-set-op
+    // roots: type-checking of ordinary SELECTs (CAST/CASE/string-fn/aggregate
+    // type errors, ...) is contracted to happen lazily at `schema()` /
+    // lowering, and callers/tests rely on `parse` succeeding for a plan that
+    // only fails its later type-check. Scoping the eager check to set-ops adds
+    // the missing arity/type rejection without changing that contract.
+    if is_set_op_root(&plan) {
+        let _ = plan.schema()?;
+    }
+    Ok(plan)
+}
+
+/// True if the root of `plan` is a set operation (`UNION` / `EXCEPT` /
+/// `INTERSECT`), including a `UNION` lowered as `Distinct(Union { .. })`.
+/// Used to scope the eager parse-time schema validation to set-ops, whose
+/// branch-compatibility check would otherwise never run at parse time.
+fn is_set_op_root(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Union { .. } | LogicalPlan::SetOp { .. } => true,
+        LogicalPlan::Distinct { input } => is_set_op_root(input),
+        _ => false,
+    }
 }
 
 /// v0.6 / M5: convert a `sqlparser` [`ParserError`] into a [`BoltError`],
@@ -6875,6 +6905,8 @@ mod string_fn_tests {
     #[test]
     fn trim_type_error_on_non_utf8() {
         // TRIM over an Int64 column must surface a Type error at schema check.
+        // (The eager parse-time validation is scoped to set-op roots, so an
+        // ordinary SELECT still type-checks lazily at `schema()`.)
         let plan = parse("SELECT TRIM(v) FROM t", &s_provider())
             .expect("TRIM(v) parses; type-check happens on schema()");
         let err = plan.schema().expect_err("TRIM(Int64) must type-error");
@@ -6883,5 +6915,88 @@ mod string_fn_tests {
             msg.contains("TRIM") && msg.contains("Utf8"),
             "expected TRIM Utf8 type error, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod root_setop_schema_tests {
+    //! Regression tests for eager schema validation of the *top-level* plan in
+    //! `parse_uncached`. A root UNION / EXCEPT / INTERSECT with incompatible
+    //! branches (mismatched column count or per-field dtypes) must be rejected
+    //! at parse time with the existing descriptive error that names the op,
+    //! while compatible set-ops still parse cleanly.
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    /// A table with a wide enough schema to slice differently-shaped SELECTs
+    /// out of it: `region_id` (1 col) vs `region_id, qty` (2 cols).
+    fn provider() -> MemTableProvider {
+        let sales = Schema::new(vec![
+            Field::new("region_id", DataType::Int64, false),
+            Field::new("qty", DataType::Int64, false),
+        ]);
+        MemTableProvider::new().with_table("sales", sales)
+    }
+
+    #[test]
+    fn except_incompatible_arity_rejected() {
+        let p = provider();
+        let err = parse(
+            "SELECT region_id FROM sales EXCEPT SELECT region_id, qty FROM sales",
+            &p,
+        )
+        .expect_err("incompatible-arity EXCEPT must be rejected at parse time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("EXCEPT"),
+            "expected error naming EXCEPT, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn intersect_incompatible_arity_rejected() {
+        let p = provider();
+        let err = parse(
+            "SELECT region_id FROM sales INTERSECT SELECT region_id, qty FROM sales",
+            &p,
+        )
+        .expect_err("incompatible-arity INTERSECT must be rejected at parse time");
+        assert!(
+            err.to_string().contains("INTERSECT"),
+            "expected error naming INTERSECT, got: {err}"
+        );
+    }
+
+    #[test]
+    fn union_incompatible_arity_rejected() {
+        let p = provider();
+        let err = parse(
+            "SELECT region_id FROM sales UNION SELECT region_id, qty FROM sales",
+            &p,
+        )
+        .expect_err("incompatible-arity UNION must be rejected at parse time");
+        // The Union schema-check error mentions "UNION branch".
+        assert!(
+            err.to_string().contains("UNION"),
+            "expected error naming UNION, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compatible_setops_still_parse() {
+        let p = provider();
+        for sql in [
+            "SELECT region_id, qty FROM sales EXCEPT SELECT region_id, qty FROM sales",
+            "SELECT region_id, qty FROM sales INTERSECT SELECT region_id, qty FROM sales",
+            "SELECT region_id, qty FROM sales UNION SELECT region_id, qty FROM sales",
+            "SELECT region_id FROM sales", // a plain root SELECT is unaffected
+        ] {
+            let plan = parse(sql, &p).unwrap_or_else(|e| panic!("compatible {sql:?}: {e}"));
+            // The eager check computed a schema; recomputing must agree.
+            assert!(
+                plan.schema().is_ok(),
+                "valid plan schema must recompute cleanly for {sql:?}"
+            );
+        }
     }
 }

@@ -289,19 +289,19 @@ fn parse_like_constant_pattern_supported_v05() {
 }
 
 #[test]
-fn parse_trim_rejected_by_frontend() {
-    // TODO(post-0.3): TRIM not yet supported (review H7). No host
-    // implementation exists yet either — listed for symmetry with the
-    // review's checklist. sqlparser parses TRIM as a special-form
-    // `SqlExpr::Trim { .. }`, not a function call, so the catch-all
-    // "unsupported expression" arm fires.
+fn parse_trim_supported_by_frontend() {
+    // TRIM is now supported: sqlparser surfaces it as the special-form
+    // `SqlExpr::Trim { .. }`, which the frontend maps to a `ScalarFnKind::Trim*`
+    // and lowers to a host-side `PhysicalPlan::Project` (a GPU TRIM kernel also
+    // exists, but the scalar string fn routes through the host path at lowering).
+    use craton_bolt::plan::{lower_physical, PhysicalPlan};
     let provider = s_provider();
-    let err = parse_sql("SELECT TRIM(s) FROM t", &provider)
-        .expect_err("TRIM must reject at the frontend until trim ops land");
-    let msg = format!("{err}");
+    let plan = parse_sql("SELECT TRIM(s) FROM t", &provider)
+        .expect("TRIM(s) now parses at the frontend");
+    let phys = lower_physical(&plan).expect("TRIM(s) lowers to a host Project");
     assert!(
-        msg.contains("unsupported") || msg.contains("function"),
-        "unexpected error for TRIM: {msg}"
+        matches!(phys, PhysicalPlan::Project { .. }),
+        "expected host PhysicalPlan::Project for TRIM(s), got {phys:?}"
     );
 }
 

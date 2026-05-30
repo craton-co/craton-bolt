@@ -265,24 +265,6 @@ fn concat_rejects_single_argument() {
     assert_err_contains(res, "CONCAT");
 }
 
-// ---- Physical-plan boundary: rejected with a clear error -------------------
-
-#[test]
-fn upper_rejected_at_lower_with_followup_marker() {
-    let plan = parse("SELECT UPPER(s) FROM txt").expect("UPPER(s) parses");
-    let err = lower_physical(&plan).expect_err("lower_physical must reject ScalarFn for v0.5");
-    let msg = format!("{err}");
-    let lower = msg.to_ascii_lowercase();
-    assert!(
-        lower.contains("upper") || lower.contains("scalar function"),
-        "rejection message should mention the function or 'scalar function', got: {msg}"
-    );
-    assert!(
-        lower.contains("follow-up") || lower.contains("not yet"),
-        "rejection should flag this as a follow-up; got: {msg}"
-    );
-}
-
 // ---- GPU LENGTH: now lowered to the fully-GPU StringLength variant ---------
 
 #[test]

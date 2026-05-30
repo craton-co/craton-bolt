@@ -475,9 +475,10 @@ fn integer_literal_i64_min_parses() {
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Window { input, .. }
             | LogicalPlan::Sort { input, .. } => find_filter_predicate(input),
             LogicalPlan::Union { inputs } => inputs.iter().find_map(find_filter_predicate),
-            LogicalPlan::Join { left, right, .. } => {
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
                 find_filter_predicate(left).or_else(|| find_filter_predicate(right))
             }
             LogicalPlan::Scan { .. } => None,

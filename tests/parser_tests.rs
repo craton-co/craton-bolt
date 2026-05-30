@@ -263,11 +263,25 @@ fn non_equi_join_now_supported() {
 }
 
 #[test]
-fn cte_unsupported() {
+fn cte_is_supported() {
+    // Non-recursive `WITH` / CTEs are now supported: the frontend lowers the
+    // CTE body and inlines it at each reference site. A simple single-CTE
+    // query must therefore parse, lower, and type-check cleanly. (The still-
+    // unsupported `WITH RECURSIVE` form is pinned by `with_recursive_rejected`.)
     let provider = fixture_table();
     let res = try_plan("WITH t AS (SELECT * FROM sales) SELECT * FROM t", &provider);
-    // Frontend says "unsupported: WITH / CTEs".
-    assert_err_contains(res, "with");
+    assert!(res.is_ok(), "non-recursive WITH/CTE should parse and lower: {res:?}");
+
+    // The CTE is inlined, so the plan type-checks and exposes the CTE body's
+    // schema (the full `sales` row, since the body is `SELECT *`).
+    let plan = parse_sql("WITH t AS (SELECT * FROM sales) SELECT * FROM t", &provider)
+        .expect("CTE query must parse");
+    let schema = plan.schema().expect("CTE query must type-check");
+    assert!(
+        schema.fields.iter().any(|f| f.name == "region_id"),
+        "inlined CTE must expose the sales columns, got: {:?}",
+        schema.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -754,18 +768,16 @@ fn with_recursive_rejected() {
 #[test]
 fn scalar_subquery_multi_column_rejected() {
     let provider = subquery_provider();
-    // A scalar subquery must return exactly one column. The arity error is a
-    // *logical* type-check failure, so assert it via `plan.schema()` — the
-    // physical layer would otherwise short-circuit with its own
-    // "subqueries not yet lowered" rejection before the arity check runs.
-    let plan = parse_sql(
+    // A scalar subquery must return exactly one column. The frontend now
+    // type-checks the WHERE predicate during `parse_sql` (it walks the
+    // predicate's `dtype`, which recurses into the scalar subquery), so the
+    // arity violation is rejected fail-fast at parse time rather than being
+    // deferred to a later `plan.schema()` call.
+    let err = parse_sql(
         "SELECT region_id FROM sales WHERE qty > (SELECT id, val FROM other)",
         &provider,
     )
-    .expect("parse should succeed (arity is a type-check concern)");
-    let err = plan
-        .schema()
-        .expect_err("multi-column scalar subquery must fail type-check");
+    .expect_err("multi-column scalar subquery must be rejected at parse time");
     assert!(
         format!("{err}").to_ascii_lowercase().contains("exactly one column"),
         "expected arity error, got: {err}"
@@ -1032,11 +1044,19 @@ fn join_fixture() -> MemTableProvider {
         .with_table("widget", widget)
 }
 
-/// Pull the equi-pairs out of a top-level `Join` node.
+/// Pull the equi-pairs out of the `Join` node feeding a query.
+///
+/// A `SELECT <list> FROM a JOIN b ...` always wraps the join in a `Project`
+/// (the SELECT list), so the `Join` is the project's input rather than the
+/// root. Look through a single root `Project` before extracting the pairs.
 fn join_on_pairs(plan: &LogicalPlan) -> &[(Expr, Expr)] {
-    match plan {
+    let inner = match plan {
+        LogicalPlan::Project { input, .. } => input.as_ref(),
+        other => other,
+    };
+    match inner {
         LogicalPlan::Join { on, .. } => on,
-        other => panic!("expected Join at root, got {other:?}"),
+        other => panic!("expected Join (optionally under a root Project), got {other:?}"),
     }
 }
 
@@ -1049,9 +1069,18 @@ fn join_using_single_column_desugars_to_equi_pair() {
     );
     let on = join_on_pairs(&plan);
     assert_eq!(on.len(), 1, "one USING column -> one equi pair");
-    // Both sides reference the (un-renamed) `dept_id` column.
-    assert_eq!(on[0].0, Expr::Column("dept_id".into()));
-    assert_eq!(on[0].1, Expr::Column("dept_id".into()));
+    // Both sides reference the (un-renamed) `dept_id` column. `Expr` has no
+    // `PartialEq`, so match the inner column name instead of `assert_eq!`.
+    assert!(
+        matches!(&on[0].0, Expr::Column(n) if n == "dept_id"),
+        "left equi-side must be Column(dept_id), got {:?}",
+        on[0].0
+    );
+    assert!(
+        matches!(&on[0].1, Expr::Column(n) if n == "dept_id"),
+        "right equi-side must be Column(dept_id), got {:?}",
+        on[0].1
+    );
     plan.schema().expect("type-check");
 }
 
@@ -1069,8 +1098,17 @@ fn natural_join_desugars_to_common_columns() {
     let plan = plan_ok("SELECT id FROM emp NATURAL JOIN dept", &provider);
     let on = join_on_pairs(&plan);
     assert_eq!(on.len(), 1, "one common column -> one equi pair");
-    assert_eq!(on[0].0, Expr::Column("dept_id".into()));
-    assert_eq!(on[0].1, Expr::Column("dept_id".into()));
+    // `Expr` has no `PartialEq`; match the inner column name instead.
+    assert!(
+        matches!(&on[0].0, Expr::Column(n) if n == "dept_id"),
+        "left equi-side must be Column(dept_id), got {:?}",
+        on[0].0
+    );
+    assert!(
+        matches!(&on[0].1, Expr::Column(n) if n == "dept_id"),
+        "right equi-side must be Column(dept_id), got {:?}",
+        on[0].1
+    );
 }
 
 #[test]
@@ -1081,7 +1119,12 @@ fn natural_left_join_uses_common_column() {
     let plan = plan_ok("SELECT id FROM emp NATURAL LEFT JOIN dept", &provider);
     let on = join_on_pairs(&plan);
     assert_eq!(on.len(), 1, "one common column -> one equi pair");
-    assert_eq!(on[0].0, Expr::Column("dept_id".into()));
+    // `Expr` has no `PartialEq`; match the inner column name instead.
+    assert!(
+        matches!(&on[0].0, Expr::Column(n) if n == "dept_id"),
+        "left equi-side must be Column(dept_id), got {:?}",
+        on[0].0
+    );
 }
 
 #[test]
