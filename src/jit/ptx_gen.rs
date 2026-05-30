@@ -2574,50 +2574,56 @@ mod validity_emission_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Scalar string functions: substrate-blocker coverage.
+// Scalar string functions: substrate + lowering-status coverage.
 //
-// v0.7: SQL `UPPER(s)`, `LOWER(s)`, `LENGTH(s)`, `SUBSTRING(s, start [, len])`
-// parse + type-check (see `crate::plan::logical_plan::ScalarFnKind`), but the
-// physical-plan boundary (`Codegen::emit_expr`) rejects every variant before
-// any `KernelSpec` is built. The per-kind rejection messages now name the
-// concrete substrate blocker:
+// Two distinct boundaries are exercised here; keep them separate:
 //
-//   * UPPER / LOWER / SUBSTRING → "no GPU output-string-buffer allocation in
-//     the scalar emitter" — the kernel IR has no variable-width output op,
-//     and `write_signature` has no way to size a Utf8 output buffer at
-//     launch time.
-//   * LENGTH → "no GPU Utf8 input support — dictionary lengths sidecar /
-//     Op::GatherInt32 not yet wired" — strings on the device are stored as
-//     `GpuColumnData::DictUtf8` (an integer index column plus a host-side
-//     dictionary), so even a "trivial" `LENGTH` would need a precomputed
-//     lengths-by-dict-index sidecar buffer threaded through `ColumnIO`, plus
-//     a new IR op to gather from it.
+//   1. The *fused PTX codegen* (`compile` in this file) still has no Utf8
+//      register class: it rejects any `KernelSpec` carrying a Utf8 input or
+//      output column eagerly at the parameter walk with "Utf8 not supported in
+//      PTX codegen yet" (see the `inputs` / `outputs` loops near the top of
+//      `compile`). This is unchanged and unrelated to whether a SQL string
+//      function can run on the GPU — the GPU string path does NOT go through
+//      this fused kernel.
 //
-// The tests below directly attempt to build a `KernelSpec` that would hold a
-// Utf8 input or output and assert the codegen rejects it. This pins both
-// halves of the substrate gap so a future "wire LENGTH end-to-end" PR has to
-// update these tests deliberately rather than silently regressing the
-// rejection path.
+//   2. The *physical-plan lowering* (`crate::plan::physical_plan::lower`) has
+//      since grown dedicated GPU string producers, so the scalar string
+//      functions are no longer uniformly rejected. Current status per
+//      `ScalarFnKind` (verified against `lower`'s `LogicalPlan::Project` arm):
+//
+//        * UPPER / LOWER         → GPU `PhysicalPlan::StringProject`
+//                                  (`try_lower_string_project`). lower() OK.
+//        * LENGTH(<bare col>)    → GPU `PhysicalPlan::StringLength`
+//                                  (`try_lower_string_length`). lower() OK.
+//        * SUBSTRING / TRIM*     → host-side `PhysicalPlan::Project`
+//                                  (`all_scalar_fns_host_evaluable`). lower() OK.
+//        * CONCAT (as ScalarFn)  → STILL rejected at lowering with
+//                                  "string scalar function CONCAT is not yet
+//                                  lowered to GPU ... (coming in a follow-up)".
+//
+// The first two `compile`-preflight tests below pin boundary (1) (the PTX
+// emitter refuses Utf8 IO). The integration test pins boundary (2): the
+// supported kinds lower without error and CONCAT — the one kind still
+// rejected — names the function in its actionable rejection message.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod scalar_string_fn_substrate_tests {
     use super::*;
     use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
 
-    /// `UPPER` / `LOWER` / `SUBSTRING` all produce a fresh Utf8 column.
-    /// A `KernelSpec` declaring a Utf8 output is rejected by `compile` at
-    /// the parameter-emission preflight (see `write_signature` and the
-    /// loop in `compile` over `spec.outputs`).
+    /// The *fused PTX codegen* (`compile`) has no Utf8 register class: a
+    /// `KernelSpec` declaring a Utf8 output is rejected at the
+    /// parameter-emission preflight (the loop in `compile` over
+    /// `spec.outputs`) with "Utf8 not supported in PTX codegen yet".
     ///
-    /// This is the substrate blocker that keeps UPPER / LOWER / SUBSTRING
-    /// off the GPU: the IR has no op for variable-width output buffers
-    /// and the kernel-param layout has no slot for a `(values, offsets)`
-    /// pair. Until that lands, `Codegen::emit_expr` rejects every
-    /// `Expr::ScalarFn { Upper | Lower | Substring }` with a per-kind
-    /// "no GPU output-string-buffer allocation" message — see
-    /// `crate::plan::physical_plan` for the rejection arm.
+    /// NOTE: this is a property of the fused kernel only. The GPU string
+    /// functions (UPPER / LOWER via `PhysicalPlan::StringProject`, LENGTH via
+    /// `PhysicalPlan::StringLength`) do NOT route through this `compile` path —
+    /// they have their own dedicated producers in `crate::exec::string_project`
+    /// / `string_length`. So this test pins the fused-kernel Utf8-output gate,
+    /// not the (now-supported) high-level lowering of those SQL functions.
     #[test]
-    fn utf8_output_rejected_blocks_upper_lower_substring() {
+    fn utf8_output_rejected_by_fused_ptx_codegen() {
         // Hand-build a `KernelSpec` whose single output is Utf8. The
         // body is intentionally trivial — we only care that the preflight
         // refuses to emit kernel params for a Utf8 output buffer. The
@@ -2652,7 +2658,7 @@ mod scalar_string_fn_substrate_tests {
         };
 
         let err = compile(&spec, "bolt_utf8_out_blocker").expect_err(
-            "compile must reject Utf8 output — substrate blocker for UPPER/LOWER/SUBSTRING",
+            "fused PTX codegen must reject a Utf8 output column",
         );
         let msg = format!("{err}");
         assert!(
@@ -2661,19 +2667,18 @@ mod scalar_string_fn_substrate_tests {
         );
     }
 
-    /// `LENGTH(s)` would consume a Utf8 column and produce Int32 — the
-    /// output dtype is friendly, but the *input* is the blocker. Strings
-    /// on the GPU are dictionary-encoded (only an Int32/Int64 key column
-    /// crosses the kernel boundary; the dictionary lives host-side) so the
-    /// IR has no way to "load the byte length at row tid" without a new
-    /// op + sidecar buffer.
+    /// The *fused PTX codegen* (`compile`) rejects any `KernelSpec` whose
+    /// `inputs` carry a `Utf8` slot — even before any `Op` references it —
+    /// with "Utf8 not supported in PTX codegen yet".
     ///
-    /// Until that substrate lands, `compile` rejects any `KernelSpec`
-    /// whose `inputs` carry a `Utf8` slot — even before any `Op`
-    /// references it. This pins the rejection so a future LENGTH wiring
-    /// has to update this test along with the substrate change.
+    /// NOTE: GPU `LENGTH` is wired end-to-end via `PhysicalPlan::StringLength`
+    /// (`crate::exec::string_length` / `jit::string_kernel::
+    /// compile_length_gather_kernel`), which does NOT use this fused `compile`
+    /// path. This test therefore pins only the fused-kernel Utf8-input gate,
+    /// which remains a real constraint for the fused arithmetic/predicate
+    /// codegen.
     #[test]
-    fn utf8_input_rejected_blocks_length() {
+    fn utf8_input_rejected_by_fused_ptx_codegen() {
         let spec = KernelSpec {
             inputs: vec![ColumnIO {
                 name: "s".into(),
@@ -2692,7 +2697,7 @@ mod scalar_string_fn_substrate_tests {
         };
 
         let err = compile(&spec, "bolt_utf8_in_blocker").expect_err(
-            "compile must reject Utf8 input — substrate blocker for LENGTH",
+            "fused PTX codegen must reject a Utf8 input column",
         );
         let msg = format!("{err}");
         assert!(
@@ -2701,28 +2706,32 @@ mod scalar_string_fn_substrate_tests {
         );
     }
 
-    /// Per-kind rejection: `Codegen::emit_expr` in `physical_plan.rs` now
-    /// emits a per-kind blocker message rather than a generic "not yet
-    /// lowered" string. We exercise the integration path end-to-end (SQL
-    /// → logical plan → `lower_physical`) to pin the message shape for
-    /// each of the four scalar string functions in scope.
+    /// Current scalar-string-fn lowering contract (repurposed from a stale
+    /// "every kind is rejected" test). The GPU string producers have landed,
+    /// so `lower()` no longer rejects UPPER/LOWER/LENGTH/SUBSTRING/TRIM. We
+    /// pin BOTH halves of the live contract end-to-end (logical plan →
+    /// `lower`):
     ///
-    /// The check is intentionally permissive on the exact wording (we
-    /// assert the function name + "not yet lowered to GPU" appear) so
-    /// the message can evolve as the substrate gap narrows. The per-kind
-    /// blocker phrase (`output-string-buffer` for UPPER/LOWER/SUBSTRING,
-    /// `Utf8 input` for LENGTH) is asserted separately so a regression
-    /// that flattens every kind back to a generic string is caught.
+    ///   * the now-SUPPORTED kinds lower WITHOUT error to the expected
+    ///     physical node (UPPER/LOWER → `StringProject`, LENGTH → `StringLength`,
+    ///     SUBSTRING/TRIM → host-side `Project`), and
+    ///   * the one kind STILL rejected at GPU lowering — `CONCAT` in
+    ///     `Expr::ScalarFn` form — produces an *actionable* rejection that NAMES
+    ///     the function (the original test's purpose) plus the shared follow-up
+    ///     marker.
+    ///
+    /// This keeps the assertion meaningful (not a tautology) while matching the
+    /// behavior the code actually has now.
     #[test]
-    fn per_kind_rejection_messages_name_the_substrate_blocker() {
+    fn scalar_string_fn_lowering_matches_current_contract() {
         use crate::plan::logical_plan::{
             DataType as PlanDt, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,
         };
-        use crate::plan::physical_plan::lower;
+        use crate::plan::physical_plan::{lower, PhysicalPlan};
 
-        // Minimal single-Utf8-column fixture; mirrors the SQL-frontend test
-        // fixture in `tests/string_fns_sql_test.rs`. We only need the Utf8
-        // column `s` — Substring's start / length literals are inline.
+        // Minimal single-Utf8-column fixture over a *bare scan* — the shape the
+        // GPU string producers (`try_lower_string_length` /
+        // `try_lower_string_project`) accept.
         let schema = Schema::new(vec![Field {
             name: "s".into(),
             dtype: PlanDt::Utf8,
@@ -2733,115 +2742,93 @@ mod scalar_string_fn_substrate_tests {
             projection: None,
             schema,
         };
-
-        // Build `Project { ScalarFn }` plans directly so the test doesn't
-        // depend on the SQL frontend. Each variant uses the per-kind
-        // argument shape `ScalarFnKind`'s type-check contract documents.
         let s_col = Expr::Column("s".into());
 
-        let cases: &[(ScalarFnKind, Expr, &str)] = &[
-            (
-                ScalarFnKind::Upper,
-                Expr::ScalarFn {
-                    kind: ScalarFnKind::Upper,
-                    args: vec![s_col.clone()],
-                },
-                "output-string-buffer",
-            ),
-            (
-                ScalarFnKind::Lower,
-                Expr::ScalarFn {
-                    kind: ScalarFnKind::Lower,
-                    args: vec![s_col.clone()],
-                },
-                "output-string-buffer",
-            ),
-            (
-                ScalarFnKind::Length,
-                Expr::ScalarFn {
-                    kind: ScalarFnKind::Length,
-                    args: vec![s_col.clone()],
-                },
-                "Utf8 input",
-            ),
-            (
-                ScalarFnKind::Substring,
-                Expr::ScalarFn {
-                    kind: ScalarFnKind::Substring,
-                    args: vec![
-                        s_col.clone(),
-                        Expr::Literal(Literal::Int64(1)),
-                        Expr::Literal(Literal::Int64(2)),
-                    ],
-                },
-                "output-string-buffer",
-            ),
-        ];
+        let project = |expr: Expr| LogicalPlan::Project {
+            input: Box::new(scan.clone()),
+            exprs: vec![expr],
+        };
 
-        for (kind, expr, blocker_phrase) in cases {
-            let plan = LogicalPlan::Project {
-                input: Box::new(scan.clone()),
-                exprs: vec![expr.clone()],
-            };
-            let err =
-                lower(&plan).expect_err(&format!("{} must be rejected at GPU lowering", kind.sql_name()));
-            let msg = format!("{err}");
-
-            // The function's SQL name must be in the message — caller's
-            // SQL has a concrete `UPPER` / `LOWER` / etc. and a generic
-            // "scalar function" wouldn't be actionable.
+        // ---- Now-SUPPORTED: UPPER / LOWER lower to GPU `StringProject`. ----
+        for kind in [ScalarFnKind::Upper, ScalarFnKind::Lower] {
+            let plan = project(Expr::ScalarFn {
+                kind,
+                args: vec![s_col.clone()],
+            });
+            let phys = lower(&plan)
+                .unwrap_or_else(|e| panic!("{} should lower to GPU now, got Err: {e}", kind.sql_name()));
             assert!(
-                msg.contains(kind.sql_name()),
-                "rejection for {} should name the function in the error; got: {msg}",
+                matches!(phys, PhysicalPlan::StringProject { .. }),
+                "{} should lower to PhysicalPlan::StringProject; got: {phys:?}",
                 kind.sql_name()
-            );
-            // Standard "follow-up" marker shared with the broader v0.5
-            // rejection family (CAST, CASE, Date/Timestamp, Decimal128).
-            // The `string_fns_sql_test.rs::upper_rejected_at_lower_with_followup_marker`
-            // test pins this; keep it stable here so a regression that
-            // drops the marker fails both tests.
-            assert!(
-                msg.to_ascii_lowercase().contains("not yet lowered to gpu")
-                    || msg.to_ascii_lowercase().contains("follow-up"),
-                "rejection for {} should be flagged as a follow-up; got: {msg}",
-                kind.sql_name()
-            );
-            // Per-kind blocker phrase: a regression that flattens every
-            // kind to the same generic message would drop this.
-            assert!(
-                msg.contains(blocker_phrase),
-                "rejection for {} should name the substrate blocker {:?}; got: {msg}",
-                kind.sql_name(),
-                blocker_phrase
             );
         }
 
-        // `ScalarFnKind::Concat` (SQL `CONCAT(a, b)`) is the fifth member
-        // of `ScalarFnKind` and shares the rejection arm. It's not in the
-        // task's wiring scope (UPPER / LOWER / LENGTH / SUBSTRING), so we
-        // only check the basics: the per-kind branch returns a Concat-
-        // specific blocker phrase rather than collapsing to a generic one.
-        // We don't exercise the full Project lowering here because the
-        // SQL `||` (`BinaryOp::Concat`) lives on a different code path
-        // (`expr_contains_concat`) and the host-fallback routing for that
-        // op is already covered by the broader Project tests; we just
-        // confirm the per-kind message survives in the function-call form.
-        let concat_plan = LogicalPlan::Project {
-            input: Box::new(scan.clone()),
-            exprs: vec![Expr::ScalarFn {
-                kind: ScalarFnKind::Concat,
-                args: vec![s_col.clone(), s_col.clone()],
-            }],
-        };
-        let err = lower(&concat_plan).expect_err("CONCAT must be rejected at GPU lowering");
+        // ---- Now-SUPPORTED: LENGTH(<bare col>) lowers to GPU `StringLength`. ----
+        {
+            let plan = project(Expr::ScalarFn {
+                kind: ScalarFnKind::Length,
+                args: vec![s_col.clone()],
+            });
+            let phys = lower(&plan).expect("LENGTH(<col>) should lower to GPU now");
+            assert!(
+                matches!(phys, PhysicalPlan::StringLength { .. }),
+                "LENGTH should lower to PhysicalPlan::StringLength; got: {phys:?}"
+            );
+        }
+
+        // ---- Now-SUPPORTED via host fallback: SUBSTRING / TRIM route to a
+        // host-side `PhysicalPlan::Project` (no Err — `all_scalar_fns_host_evaluable`). ----
+        {
+            let plan = project(Expr::ScalarFn {
+                kind: ScalarFnKind::Substring,
+                args: vec![
+                    s_col.clone(),
+                    Expr::Literal(Literal::Int64(1)),
+                    Expr::Literal(Literal::Int64(2)),
+                ],
+            });
+            let phys = lower(&plan)
+                .expect("SUBSTRING should route to a host-side Project now (not an Err)");
+            assert!(
+                matches!(phys, PhysicalPlan::Project { .. }),
+                "SUBSTRING should route to a host-side PhysicalPlan::Project; got: {phys:?}"
+            );
+        }
+        {
+            let plan = project(Expr::ScalarFn {
+                kind: ScalarFnKind::TrimBoth,
+                args: vec![s_col.clone()],
+            });
+            let phys =
+                lower(&plan).expect("TRIM should route to a host-side Project now (not an Err)");
+            assert!(
+                matches!(phys, PhysicalPlan::Project { .. }),
+                "TRIM should route to a host-side PhysicalPlan::Project; got: {phys:?}"
+            );
+        }
+
+        // ---- STILL REJECTED: CONCAT in `Expr::ScalarFn` form is the one kind
+        // that has no GPU producer and is not host-evaluable here, so `lower()`
+        // returns an actionable Err that NAMES the function — the original
+        // test's purpose, preserved against the kind that still exercises it. ----
+        let concat_plan = project(Expr::ScalarFn {
+            kind: ScalarFnKind::Concat,
+            args: vec![s_col.clone(), s_col.clone()],
+        });
+        let err = lower(&concat_plan).expect_err("CONCAT(ScalarFn) must still be rejected at GPU lowering");
         let msg = format!("{err}");
+        // The function's SQL name must be in the message — a generic "scalar
+        // function" rejection wouldn't be actionable for the caller.
         assert!(
             msg.contains("CONCAT"),
             "rejection for CONCAT should name the function; got: {msg}"
         );
+        // Shared follow-up marker (same family as CAST / CASE / Date rejections).
         assert!(
-            msg.contains("Utf8"),
-            "rejection for CONCAT should name the Utf8 substrate blocker; got: {msg}"
+            msg.to_ascii_lowercase().contains("not yet lowered to gpu")
+                || msg.to_ascii_lowercase().contains("follow-up"),
+            "rejection for CONCAT should be flagged as a follow-up; got: {msg}"
         );
     }
 }

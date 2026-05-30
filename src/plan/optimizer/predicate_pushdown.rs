@@ -14,6 +14,17 @@
 //!   pushed below the project. Conjuncts referencing computed columns stay put.
 //! * **through `Sort`, `Distinct`** — always safe (these are row-preserving and
 //!   value-preserving; a row passes the filter iff it would after sort/dedup).
+//! * **through `Union` / `SetOp`** — the whole predicate is replicated into
+//!   every branch: `Filter(p, Union(A, B))` => `Union(Filter(p', A),
+//!   Filter(p', B))`, and likewise for `EXCEPT` / `INTERSECT`. Because the
+//!   predicate is deterministic and evaluated row-wise, filtering the rows of
+//!   each branch *before* the set/multiset op produces exactly the rows that
+//!   survive filtering *after* it (see the soundness note on [`push_into_union`]
+//!   / [`push_into_setop`]). The filter's column references are by the op's
+//!   *output* schema (which UNION/SetOp take from their first / left branch),
+//!   while a non-leading branch may use *different* column names for the same
+//!   positions; the predicate is therefore remapped to each branch's schema
+//!   **by position** before being attached — see [`remap_to_branch`].
 //! * **into `Join`** — a conjunct referencing only the left side becomes a
 //!   `Filter` on the left input; only the right side, a `Filter` on the right
 //!   input. Conjuncts referencing *both* sides remain above the join (the
@@ -22,18 +33,17 @@
 //!   *non-preserved* side would change NULL-padding semantics, so it is only
 //!   pushed into the preserved side(s) — see [`can_push_into_join_side`].
 //!
-//! `Limit`, `Aggregate`, and `Union` are *not* descended through for pushdown:
-//! a filter below a `Limit` changes which rows survive the limit; a filter
-//! referencing aggregate outputs cannot move below the aggregate; and a filter
-//! over a union would need to be replicated per branch (left as a future
-//! refinement). In all of those cases the conjunct is kept above the node.
+//! `Limit` and `Aggregate` are *not* descended through for pushdown: a filter
+//! below a `Limit` changes which rows survive the limit, and a filter
+//! referencing aggregate outputs cannot move below the aggregate. In those
+//! cases the conjunct is kept above the node.
 //!
 //! Every conjunct that cannot be pushed is re-attached in a single `Filter`
 //! immediately above the (possibly rewritten) input, so the output schema and
 //! semantics are unchanged.
 
 use crate::error::BoltResult;
-use crate::plan::logical_plan::{Expr, JoinType, LogicalPlan, Schema};
+use crate::plan::logical_plan::{Expr, JoinType, LogicalPlan, Schema, SetOpKind};
 use crate::plan::rewrite::PlanRewrite;
 
 use super::expr_util::{collect_columns, combine_conjuncts, split_conjuncts};
@@ -197,6 +207,16 @@ fn push_conjuncts(input: LogicalPlan, conjuncts: Vec<Expr>) -> LogicalPlan {
             }
         }
 
+        // Through a UNION ALL: replicate the (per-branch remapped) predicate
+        // into every branch.
+        LogicalPlan::Union { inputs } => push_into_union(inputs, conjuncts),
+
+        // Through EXCEPT / INTERSECT (incl. their ALL variants): replicate the
+        // (per-branch remapped) predicate into both inputs.
+        LogicalPlan::SetOp { left, right, op, all } => {
+            push_into_setop(left, right, op, all, conjuncts)
+        }
+
         // Into a join: route single-side conjuncts to the owning input.
         LogicalPlan::Join {
             left,
@@ -268,6 +288,149 @@ fn push_into_join(
         filter,
     };
     wrap_filter(join, kept)
+}
+
+/// Push `conjuncts` into every branch of a `UNION ALL`.
+///
+/// **Soundness.** A `UNION ALL` is a row-wise concatenation: the bag of output
+/// rows is the multiset sum of the branch bags. A deterministic, row-wise
+/// predicate `p` partitions rows independently of which branch they came from,
+/// so `σ_p(A ⊎ B) = σ_p(A) ⊎ σ_p(B)`. Replicating `p` into each branch is
+/// therefore exact (no rows gained or lost), with the only subtlety being
+/// column-name alignment, handled by [`remap_to_branch`].
+///
+/// If the predicate cannot be remapped onto a branch (a malformed plan whose
+/// branch schemas don't line up, which schema validation would already reject),
+/// we leave the whole filter above the union rather than emit an invalid plan.
+fn push_into_union(inputs: Vec<LogicalPlan>, conjuncts: Vec<Expr>) -> LogicalPlan {
+    // The union's output schema is its first branch's schema; the filter's
+    // column references are resolved against that. Each branch is remapped from
+    // those output names to the branch's own names by position.
+    let out_schema = match inputs.first().map(LogicalPlan::schema) {
+        Some(Ok(s)) => s,
+        // Empty union (rejected by schema validation) or an un-typecheckable
+        // first branch: stay safe and keep the filter above.
+        _ => return wrap_filter(LogicalPlan::Union { inputs }, conjuncts),
+    };
+
+    // Pre-flight: every branch must accept the remap. If any branch can't be
+    // remapped, abandon the pushdown wholesale and keep the filter above.
+    let mut remapped: Vec<Vec<Expr>> = Vec::with_capacity(inputs.len());
+    for branch in &inputs {
+        match remap_to_branch(&conjuncts, &out_schema, branch) {
+            Some(cs) => remapped.push(cs),
+            None => return wrap_filter(LogicalPlan::Union { inputs }, conjuncts),
+        }
+    }
+
+    let new_inputs = inputs
+        .into_iter()
+        .zip(remapped)
+        .map(|(branch, cs)| push_conjuncts(branch, cs))
+        .collect();
+    LogicalPlan::Union { inputs: new_inputs }
+}
+
+/// Push `conjuncts` into both inputs of an `EXCEPT` / `INTERSECT` node.
+///
+/// **Soundness, per variant** (let `lc(r)` / `rc(r)` be a row's multiplicity in
+/// the left / right input, and `p` the deterministic row-wise predicate):
+///
+/// * `INTERSECT` (set) — output is the set of rows with `lc > 0 ∧ rc > 0`.
+///   Filtering removes rows failing `p` from both inputs identically, and a row
+///   passing `p` keeps its presence on each side, so the surviving-on-both set
+///   is unchanged. Pushing `p` into both sides is exact.
+/// * `INTERSECT ALL` (multiset) — output multiplicity is `min(lc, rc)`. For a
+///   row failing `p`, both `lc` and `rc` drop to 0 → `min` is 0 either way; for
+///   a row passing `p`, both counts are preserved → `min` unchanged. Exact.
+/// * `EXCEPT` (set) — output is rows with `lc > 0 ∧ rc == 0`. `p` is applied to
+///   both sides, so a row's presence/absence on each side is preserved for rows
+///   passing `p`, and rows failing `p` vanish from both (and from the output).
+///   Exact.
+/// * `EXCEPT ALL` (multiset) — output multiplicity is `max(0, lc - rc)`. A row
+///   failing `p` has `lc = rc = 0` → `max(0, 0) = 0`; a row passing `p` keeps
+///   both counts → `max(0, lc - rc)` unchanged. Exact.
+///
+/// In every case the predicate is deterministic and evaluated per row, so it
+/// commutes with the multiset arithmetic above — pushing into both branches is
+/// sound for all four (`EXCEPT`, `EXCEPT ALL`, `INTERSECT`, `INTERSECT ALL`).
+/// Column-name alignment is handled by [`remap_to_branch`]; if either branch
+/// can't be remapped we keep the filter above the node.
+fn push_into_setop(
+    left: Box<LogicalPlan>,
+    right: Box<LogicalPlan>,
+    op: SetOpKind,
+    all: bool,
+    conjuncts: Vec<Expr>,
+) -> LogicalPlan {
+    // The result schema is the left input's; the right branch may name the same
+    // positions differently and so is remapped by position too.
+    let out_schema = match left.schema() {
+        Ok(s) => s,
+        Err(_) => {
+            let set_op = LogicalPlan::SetOp { left, right, op, all };
+            return wrap_filter(set_op, conjuncts);
+        }
+    };
+
+    let left_conjuncts = remap_to_branch(&conjuncts, &out_schema, &left);
+    let right_conjuncts = remap_to_branch(&conjuncts, &out_schema, &right);
+    let (left_conjuncts, right_conjuncts) = match (left_conjuncts, right_conjuncts) {
+        (Some(l), Some(r)) => (l, r),
+        // A branch we can't remap (malformed plan): keep the filter above.
+        _ => {
+            let set_op = LogicalPlan::SetOp { left, right, op, all };
+            return wrap_filter(set_op, conjuncts);
+        }
+    };
+
+    let new_left = Box::new(push_conjuncts(*left, left_conjuncts));
+    let new_right = Box::new(push_conjuncts(*right, right_conjuncts));
+    LogicalPlan::SetOp {
+        left: new_left,
+        right: new_right,
+        op,
+        all,
+    }
+}
+
+/// Rewrite each conjunct in `conjuncts` from the set/union *output* schema
+/// (`out_schema`) onto `branch`'s own schema **by position**, returning the
+/// remapped conjuncts.
+///
+/// UNION / SetOp align their inputs positionally and take the output column
+/// *names* from the leading (first / left) branch, so a non-leading branch may
+/// use a different name for the same column position. The filter's references
+/// are by the output names, so we map each output name to the branch name that
+/// occupies the same index and rewrite the predicate accordingly (reusing
+/// [`rename_columns`]).
+///
+/// Returns `None` (caller leaves the filter above the node) if the branch can't
+/// be type-checked or has fewer fields than the output schema — i.e. when a
+/// referenced output position has no counterpart in the branch. Such a plan is
+/// already rejected by schema validation; the guard is defensive so we never
+/// synthesise a column reference the branch can't resolve.
+fn remap_to_branch(
+    conjuncts: &[Expr],
+    out_schema: &Schema,
+    branch: &LogicalPlan,
+) -> Option<Vec<Expr>> {
+    let branch_schema = branch.schema().ok()?;
+    // A well-formed union/set-op guarantees equal field counts; bail out
+    // defensively if the branch is short so we never index past its fields.
+    if branch_schema.fields.len() < out_schema.fields.len() {
+        return None;
+    }
+
+    // Output-name -> branch-name, position by position. When the names already
+    // match (the common case, and always so for the leading branch) the entry
+    // is an identity and `rename_columns` leaves the reference untouched.
+    let mut map = std::collections::HashMap::new();
+    for (out_field, branch_field) in out_schema.fields.iter().zip(branch_schema.fields.iter()) {
+        map.insert(out_field.name.clone(), branch_field.name.clone());
+    }
+
+    Some(conjuncts.iter().map(|c| rename_columns(c, &map)).collect())
 }
 
 /// Which join input a conjunct's columns belong to.
@@ -607,6 +770,150 @@ mod tests {
                 assert!(matches!(*input, LogicalPlan::Filter { .. }));
             }
             other => panic!("expected Sort on top, got {other:?}"),
+        }
+    }
+
+    /// Collect every column name referenced in `e` (test helper, since `Expr`
+    /// has no `PartialEq`).
+    fn cols_of(e: &Expr) -> Vec<String> {
+        let mut out = Vec::new();
+        collect_columns(e, &mut out);
+        out
+    }
+
+    #[test]
+    fn pushes_filter_into_both_union_branches() {
+        // Filter(Union(scan a/b, scan a/b), a > 0)
+        //   => Union(Filter(scan, a > 0), Filter(scan, a > 0))
+        // Both branches gain a Filter; the outer Filter disappears.
+        let union = LogicalPlan::Union {
+            inputs: vec![t(), t()],
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(union),
+            predicate: col("a").gt(lit(0_i64)),
+        };
+        let before = plan.schema().expect("typecheck");
+        let out = PredicatePushdown.rewrite(plan).expect("push");
+        let after = out.schema().expect("typecheck after");
+        assert_eq!(before.fields.len(), after.fields.len());
+        match out {
+            LogicalPlan::Union { inputs } => {
+                assert_eq!(inputs.len(), 2);
+                for branch in &inputs {
+                    assert!(matches!(branch, LogicalPlan::Filter { .. }),
+                        "each union branch should now carry the pushed Filter");
+                }
+            }
+            other => panic!("expected Union on top with no residual Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remaps_predicate_to_branch_names_by_position() {
+        // Branch 0 outputs column `a`; branch 1 renames its column to `x` via a
+        // projection. The union's output schema takes names from branch 0, so a
+        // filter on `a` must be remapped to `x` when pushed into branch 1.
+        let branch0 = scan("t0", vec![Field::new("a", DataType::Int64, false)]);
+        let branch1 = LogicalPlan::Project {
+            input: Box::new(scan("t1", vec![Field::new("x", DataType::Int64, false)])),
+            exprs: vec![col("x")],
+        };
+        let union = LogicalPlan::Union {
+            inputs: vec![branch0, branch1],
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(union),
+            predicate: col("a").gt(lit(0_i64)),
+        };
+        // Sanity: the union output column is `a` (from branch 0).
+        assert_eq!(plan.schema().expect("typecheck").fields[0].name, "a");
+
+        let out = PredicatePushdown.rewrite(plan).expect("push");
+        match out {
+            LogicalPlan::Union { inputs } => {
+                // Branch 0: filter references `a` (identity remap).
+                match &inputs[0] {
+                    LogicalPlan::Filter { predicate, .. } => {
+                        assert_eq!(cols_of(predicate), vec!["a".to_string()]);
+                    }
+                    other => panic!("branch 0 should be Filter, got {other:?}"),
+                }
+                // Branch 1: the pushdown descends through the project, so the
+                // surviving Filter (below the project) references the branch's
+                // own column name `x`, not the union output name `a`.
+                let mut found_x = false;
+                let mut node = &inputs[1];
+                loop {
+                    match node {
+                        LogicalPlan::Filter { predicate, input } => {
+                            assert_eq!(cols_of(predicate), vec!["x".to_string()],
+                                "branch 1 predicate must be remapped to `x` by position");
+                            found_x = true;
+                            node = input.as_ref();
+                        }
+                        LogicalPlan::Project { input, .. } => node = input.as_ref(),
+                        _ => break,
+                    }
+                }
+                assert!(found_x, "expected a remapped Filter in branch 1");
+            }
+            other => panic!("expected Union on top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pushes_filter_into_both_except_branches() {
+        // EXCEPT: the filter is replicated into both inputs.
+        let left = scan("l", vec![Field::new("a", DataType::Int64, false)]);
+        let right = scan("r", vec![Field::new("a", DataType::Int64, false)]);
+        let set_op = LogicalPlan::SetOp {
+            left: Box::new(left),
+            right: Box::new(right),
+            op: SetOpKind::Except,
+            all: false,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(set_op),
+            predicate: col("a").gt(lit(0_i64)),
+        };
+        let out = PredicatePushdown.rewrite(plan).expect("push");
+        match out {
+            LogicalPlan::SetOp { left, right, op, .. } => {
+                assert_eq!(op, SetOpKind::Except);
+                assert!(matches!(*left, LogicalPlan::Filter { .. }),
+                    "EXCEPT left input should carry the pushed Filter");
+                assert!(matches!(*right, LogicalPlan::Filter { .. }),
+                    "EXCEPT right input should carry the pushed Filter");
+            }
+            other => panic!("expected SetOp on top with no residual Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pushes_filter_into_both_intersect_all_branches() {
+        // INTERSECT ALL: same replication into both inputs.
+        let left = scan("l", vec![Field::new("a", DataType::Int64, false)]);
+        let right = scan("r", vec![Field::new("a", DataType::Int64, false)]);
+        let set_op = LogicalPlan::SetOp {
+            left: Box::new(left),
+            right: Box::new(right),
+            op: SetOpKind::Intersect,
+            all: true,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(set_op),
+            predicate: col("a").lt(lit(10_i64)),
+        };
+        let out = PredicatePushdown.rewrite(plan).expect("push");
+        match out {
+            LogicalPlan::SetOp { left, right, op, all } => {
+                assert_eq!(op, SetOpKind::Intersect);
+                assert!(all, "ALL flag must be preserved");
+                assert!(matches!(*left, LogicalPlan::Filter { .. }));
+                assert!(matches!(*right, LogicalPlan::Filter { .. }));
+            }
+            other => panic!("expected SetOp on top, got {other:?}"),
         }
     }
 

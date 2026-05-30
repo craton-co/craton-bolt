@@ -32,11 +32,41 @@
 //! Every pass preserves the plan's external output schema (field set, dtypes,
 //! and — except for the documented column-*order* caveat on [`JoinReorder`] —
 //! order) and semantics, per the [`PlanRewrite`] trait contract. Passes are
-//! single-pass (no internal fixpoint loop); the pipeline is run once.
+//! single-pass (no internal fixpoint loop); the pipeline itself is driven to a
+//! **bounded fixpoint** by [`run_to_fixpoint`].
+//!
+//! ## Bounded fixpoint
+//!
+//! A single sweep of the pipeline can *expose* new optimization opportunities
+//! that an earlier pass would have taken: e.g. predicate pushdown / filter-
+//! into-join can move a now-constant conjunct into a position where constant
+//! folding (which already ran) would collapse it. [`run_to_fixpoint`] therefore
+//! re-runs the *same* pass list (same set, same order — only the iteration is
+//! added) until the plan stops changing, detecting "changed" with a cheap
+//! structural signal: the `{:?}` (`Debug`) rendering of the plan before vs.
+//! after each full sweep. Iteration is hard-capped at [`MAX_FIXPOINT_ITERS`]
+//! so the loop always terminates even if a (hypothetical) oscillating pass
+//! never reaches a stable string. Because every pass is individually
+//! semantics-preserving, running them more times can only fold/push *more* —
+//! never change results — so the cap only ever trades a missed optimization
+//! for guaranteed termination, never correctness.
 
 use std::sync::Arc;
 
+use crate::error::BoltResult;
+use crate::plan::logical_plan::LogicalPlan;
 use crate::plan::rewrite::PlanRewrite;
+
+/// Hard cap on bounded-fixpoint sweeps in [`run_to_fixpoint`].
+///
+/// In practice the pipeline reaches a fixpoint in one or two sweeps (one to
+/// fold, one to confirm nothing else changed); a small cap guarantees
+/// termination regardless. Picked at the low end of the "3–5" guidance: each
+/// extra sweep re-walks the whole plan, and any pass that needed more than a
+/// couple of sweeps to converge would be a latent oscillation bug we'd rather
+/// surface than mask. Correctness never depends on this value — see the
+/// module-level "Bounded fixpoint" note.
+pub const MAX_FIXPOINT_ITERS: usize = 4;
 
 pub mod const_fold;
 pub mod expr_util;
@@ -89,6 +119,43 @@ pub fn default_passes_with_estimator(
     ]
 }
 
+/// Drive `passes` over `plan` to a **bounded fixpoint**.
+///
+/// Runs the full pass list in order, repeatedly, until a complete sweep leaves
+/// the plan structurally unchanged or [`MAX_FIXPOINT_ITERS`] sweeps have run —
+/// whichever comes first. This is the canonical way to run the optimizer: a
+/// single sweep can expose new constant-foldable / pushable expressions (e.g. a
+/// conjunct that only becomes constant after pushdown moves it), and the extra
+/// sweeps let an earlier pass take them on the next pass round.
+///
+/// "Changed" is detected with the plan's `{:?}` rendering — a cheap structural
+/// signal that needs no extra machinery on [`PlanRewrite`] and exactly tracks
+/// the only thing that matters here (did any node change?). The hard iteration
+/// cap guarantees termination even if some pass were to oscillate. The set and
+/// order of `passes` is never altered — only the iteration is added — and every
+/// pass is individually semantics-preserving, so this can only ever fold/push
+/// *more*, never change query results.
+///
+/// Idempotent: handed an already-optimized plan, the first sweep produces an
+/// identical string and the loop exits immediately.
+pub fn run_to_fixpoint(
+    passes: &[Box<dyn PlanRewrite>],
+    plan: LogicalPlan,
+) -> BoltResult<LogicalPlan> {
+    let mut plan = plan;
+    for _ in 0..MAX_FIXPOINT_ITERS {
+        let before = format!("{plan:?}");
+        for pass in passes {
+            plan = pass.rewrite(plan)?;
+        }
+        // Fixpoint reached: a full sweep left the plan structurally identical.
+        if format!("{plan:?}") == before {
+            break;
+        }
+    }
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,13 +164,10 @@ mod tests {
     };
     use crate::plan::{col, lit};
 
-    /// Run the full default pipeline over `plan`.
+    /// Run the full default pipeline over `plan`, driven to a bounded
+    /// fixpoint.
     fn run(plan: LogicalPlan) -> LogicalPlan {
-        let mut p = plan;
-        for pass in default_passes() {
-            p = pass.rewrite(p).expect("pass must succeed");
-        }
-        p
+        run_to_fixpoint(&default_passes(), plan).expect("pipeline must succeed")
     }
 
     #[test]
@@ -388,5 +452,121 @@ mod tests {
             left: Box::new(l),
             right: Box::new(r),
         }
+    }
+
+    #[test]
+    fn fixpoint_is_idempotent_on_optimized_plan() {
+        // Running the fixpoint over an already-optimized plan must terminate
+        // and leave it byte-for-byte identical (the first sweep is a no-op, so
+        // the change-detector exits immediately).
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ]),
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan),
+                predicate: col("b").gt(lit(0_i64)),
+            }),
+            exprs: vec![col("a")],
+        };
+        let once = run(plan);
+        let twice = run(once.clone());
+        assert_eq!(format!("{once:?}"), format!("{twice:?}"));
+    }
+
+    #[test]
+    fn fixpoint_matches_single_sweep_when_nothing_new_exposed() {
+        // When a single sweep already reaches a fixpoint, the bounded driver
+        // must produce exactly the same plan as one manual sweep — i.e. the
+        // loop adds nothing but the convergence check.
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+                Field::new("c", DataType::Int64, false),
+            ]),
+        };
+        let make = || LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan.clone()),
+                predicate: lit(1_i64).eq(lit(1_i64)).and(col("b").gt(lit(0_i64))),
+            }),
+            exprs: vec![col("a")],
+        };
+
+        let mut single = make();
+        for pass in default_passes() {
+            single = pass.rewrite(single).expect("pass");
+        }
+        let fixpoint = run(make());
+        assert_eq!(format!("{single:?}"), format!("{fixpoint:?}"));
+    }
+
+    #[test]
+    fn fixpoint_folds_cast_constant_through_pipeline() {
+        // A constant `CAST(2_i32 AS Int64) = 2` conjunct must fold away (the
+        // cast folds to Int64(2), then `2 = 2` to true, then `true AND p` to
+        // `p`) and the surviving `b > 0` lands on the scan — exercising the
+        // new cast fold reached via the pipeline driver.
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ]),
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan),
+                predicate: crate::plan::Expr::Cast {
+                    expr: Box::new(lit(2_i32)),
+                    target: DataType::Int64,
+                }
+                .eq(lit(2_i64))
+                .and(col("b").gt(lit(0_i64))),
+            }),
+            exprs: vec![col("a")],
+        };
+        let out = run(plan);
+        let filter = match out {
+            LogicalPlan::Project { input, .. } => *input,
+            other => panic!("expected Project on top, got {other:?}"),
+        };
+        match filter {
+            LogicalPlan::Filter { predicate, .. } => {
+                // Only `b > 0` survives; the cast/equality conjunct folded out.
+                assert!(
+                    matches!(predicate, crate::plan::Expr::Binary { op: BinaryOp::Gt, .. }),
+                    "expected the folded predicate to be just `b > 0`, got {predicate:?}"
+                );
+            }
+            other => panic!("expected Filter below project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixpoint_terminates() {
+        // The driver is a counted `for 0..MAX_FIXPOINT_ITERS`, so it always
+        // returns even if a sweep never reached a stable string. Smoke-test
+        // that a real plan returns (does not hang) and the cap is sane.
+        assert!(MAX_FIXPOINT_ITERS >= 1, "cap must allow at least one sweep");
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("a", DataType::Int64, false)]),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: col("a").gt(lit(0_i64)),
+        };
+        let _ = run(plan);
     }
 }

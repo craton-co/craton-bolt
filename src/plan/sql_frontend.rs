@@ -6778,22 +6778,65 @@ mod string_fn_tests {
 
     #[test]
     fn trim_leading_trailing_both_sides() {
+        // NOTE: sqlparser 0.52's `parse_trim_expr` unconditionally parses an
+        // expression after the `BOTH|LEADING|TRAILING` keyword *before* it
+        // looks for `FROM`. That means the bare standard-SQL form
+        // `TRIM(LEADING FROM s)` (a trim side with NO trim-characters between
+        // the keyword and `FROM`) is NOT accepted by this version of the
+        // parser, regardless of the configured `Dialect` (the relevant code
+        // path is dialect-independent). It fails at the sqlparser stage with
+        // an "Expected: ), found: s" parse error. The frontend's
+        // `SqlExpr::Trim` -> `ScalarFnKind::Trim*` mapping is correct and
+        // would handle this case fine; the limitation is purely upstream in
+        // the pinned sqlparser version. See `trim_bare_side_from_unsupported`
+        // below for the assertion that this form is currently rejected.
+        //
+        // We therefore exercise the three trim sides through the
+        // `TRIM(<side> 'chars' FROM s)` form, which DOES parse and drives the
+        // exact same `trim_where` -> `ScalarFnKind::Trim*` mapping branch.
         for (sql, expect) in [
-            ("SELECT TRIM(LEADING FROM s) FROM t", ScalarFnKind::TrimLeading),
             (
-                "SELECT TRIM(TRAILING FROM s) FROM t",
+                "SELECT TRIM(LEADING 'x' FROM s) FROM t",
+                ScalarFnKind::TrimLeading,
+            ),
+            (
+                "SELECT TRIM(TRAILING 'x' FROM s) FROM t",
                 ScalarFnKind::TrimTrailing,
             ),
-            ("SELECT TRIM(BOTH FROM s) FROM t", ScalarFnKind::TrimBoth),
+            ("SELECT TRIM(BOTH 'x' FROM s) FROM t", ScalarFnKind::TrimBoth),
         ] {
             let plan = parse(sql, &s_provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
             match first_select_expr(&plan) {
                 Expr::ScalarFn { kind, args } => {
                     assert_eq!(kind, expect, "for {sql}");
-                    assert_eq!(args.len(), 1, "for {sql}");
+                    // source + trim-characters
+                    assert_eq!(args.len(), 2, "for {sql}");
                 }
                 other => panic!("expected ScalarFn, got {other:?} for {sql}"),
             }
+        }
+    }
+
+    #[test]
+    fn trim_bare_side_from_unsupported() {
+        // The bare `TRIM(<side> FROM s)` form (no trim-characters) is not
+        // parseable by sqlparser 0.52 — see the NOTE on
+        // `trim_leading_trailing_both_sides`. Assert it is currently rejected
+        // with a clear SQL parse error rather than silently mis-parsing. If a
+        // future sqlparser upgrade starts accepting this form, this test will
+        // fail and is the signal to re-enable the bare-form assertions above.
+        for sql in [
+            "SELECT TRIM(LEADING FROM s) FROM t",
+            "SELECT TRIM(TRAILING FROM s) FROM t",
+            "SELECT TRIM(BOTH FROM s) FROM t",
+        ] {
+            let err = parse(sql, &s_provider())
+                .expect_err("bare TRIM(<side> FROM s) is unsupported in sqlparser 0.52");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("parse"),
+                "expected a parse error for {sql}, got: {msg}"
+            );
         }
     }
 

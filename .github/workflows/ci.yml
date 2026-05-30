@@ -74,6 +74,76 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo test --doc --features cuda-stub --no-default-features
 
+  # Host-side coverage (informational, non-blocking for tooling hiccups).
+  # Measures HOST coverage under the same --no-default-features --features
+  # cuda-stub config the test job uses. We MEASURE and REPORT only: there is
+  # intentionally NO minimum-threshold gate — GPU code paths are dark on
+  # github-hosted runners (no CUDA device), so a blanket coverage floor would
+  # be unrealistic. The lcov report is uploaded as an artifact for inspection.
+  #
+  # NOTE: `continue-on-error: true` keeps coverage-tooling failures from
+  # blocking the pipeline, but the underlying `cargo llvm-cov` run executes
+  # the test suite, so a genuine TEST failure still surfaces (red job).
+  #
+  # FUTURE(ci): a dedicated GPU-runner lane could run
+  #   cargo test --features cudarc --no-default-features -- --ignored
+  # to exercise the `#[ignore]`-gated GPU tests. No GPU runner exists yet, so
+  # this remains a comment rather than a job.
+  coverage:
+    name: coverage (host, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.6.16
+
+      # Run the suite once and emit both an lcov file (for upload) and a
+      # human-readable summary in the job log.
+      - name: cargo llvm-cov (lcov + summary)
+        run: |
+          cargo llvm-cov --no-default-features --features cuda-stub --lib --lcov --output-path lcov.info
+          cargo llvm-cov --no-default-features --features cuda-stub --lib --summary-only
+
+      - name: Upload coverage report (lcov)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: warn
+
+      # Optional, non-blocking Codecov upload. Guarded so it is skipped on
+      # forks / when no CODECOV_TOKEN secret is configured, and never fails CI.
+      - name: Upload to Codecov (optional, non-blocking)
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
   # Supply-chain gate: advisories + licenses + bans, per deny.toml.
   # RELEASING.md documents this as a CI gate, so wire it explicitly here.
   cargo-deny:

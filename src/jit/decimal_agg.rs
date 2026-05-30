@@ -348,7 +348,13 @@ mod tests {
             !ptx.contains("atom."),
             "decimal SUM kernel must be atomic-free; found an atom.* instruction"
         );
-        assert!(!ptx.contains("red."), "must not use red.* reduction atomics");
+        // Anchor on the instruction boundary (every instruction is emitted
+        // tab-indented) so this does not false-match the `red.` substring inside
+        // `st.shared.`/`ld.shared.` memory ops, which are not reduction atomics.
+        assert!(
+            !ptx.contains("\tred.") && !ptx.contains("red.global") && !ptx.contains("red.shared"),
+            "must not use red.* reduction atomics"
+        );
     }
 
     /// Phase-1 tree (bar.sync) + phase-2 warp shuffle must both be present.

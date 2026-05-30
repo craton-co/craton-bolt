@@ -108,28 +108,176 @@ fn varwidth_tag(kind: ScalarFnKind) -> BoltResult<&'static str> {
         ScalarFnKind::Upper => Ok("upper"),
         ScalarFnKind::Lower => Ok("lower"),
         ScalarFnKind::Substring => Ok("substring"),
+        // TRIM is a single-input, length-reducing transform whose output
+        // boundaries (leading/trailing ASCII-whitespace skip) are computed
+        // identically in the length pass and the write pass — structurally the
+        // same shape as SUBSTRING but with data-dependent (rather than
+        // parameter-driven) start/end. ASCII-whitespace-only; see
+        // [`TrimMode`] and [`compile_varwidth_len_pass`] for the byte rule and
+        // why it is UTF-8-safe.
+        ScalarFnKind::TrimBoth => Ok("trim_both"),
+        ScalarFnKind::TrimLeading => Ok("trim_leading"),
+        ScalarFnKind::TrimTrailing => Ok("trim_trailing"),
         ScalarFnKind::Length => Err(BoltError::Plan(
             "string_kernel: LENGTH is fixed-width; use compile_length_gather_kernel".into(),
         )),
         ScalarFnKind::Concat => Err(BoltError::Plan(
             // TODO(string-concat-gpu): CONCAT is a multi-input two-pass
-            // producer (sum of N input lengths per row). Deferred — the
-            // host fallback in `exec::string_ops` remains the supported
-            // path; see `physical_plan.rs` lowering branch.
+            // producer and is intentionally still deferred. Precise design
+            // note for a future implementation:
+            //
+            //   * ABI differs from the single-input passes — the length pass
+            //     needs TWO source-slice descriptors (offsets+bytes per input
+            //     arg, N of them for variadic CONCAT; start with N=2 binary
+            //     CONCAT), plus a per-row NULL channel. SQL CONCAT returns NULL
+            //     if ANY arg is NULL, so the kernel needs each input's validity
+            //     (e.g. an `i8* null_mask` per arg, or the row-aligned encoding
+            //     the executor already uses) to emit `row_lens[tid] = 0` AND a
+            //     side `is_null[tid] = 1` for NULL rows.
+            //   * Length pass: `row_lens[tid] = sum_k in_len_k(tid)` for
+            //     non-NULL rows (reuse `emit_load_src_slice` once per input arg,
+            //     summing the `len` outputs); `0` for NULL rows.
+            //   * Prefix scan (`jit::prefix_scan`, reused as-is) over `row_lens`
+            //     to produce `out_offsets` and the total `out_bytes` size.
+            //   * Write pass: `dst = out_bytes + out_offsets[tid]`; for each
+            //     input arg k in order, byte-copy its slice into `dst` advancing
+            //     a running cursor (a sequence of inner WRITE_LOOPs mirroring
+            //     the single-input copy loop). NULL rows write nothing (their
+            //     out_len is 0). The executor must still rebuild the output
+            //     dictionary / validity from the downloaded offsets+bytes.
+            //   * The host fallback in `exec::string_ops_extended::concat`
+            //     remains the supported path until the above is implemented and
+            //     GPU-validated.
             "string_kernel: CONCAT GPU two-pass codegen not yet implemented; \
              host fallback remains reachable"
                 .into(),
         )),
-        // TODO(string-fn-gpu): TRIM has no GPU two-pass producer yet; the
-        // host fallback in `exec::string_ops_extended` is the supported path.
-        ScalarFnKind::TrimBoth | ScalarFnKind::TrimLeading | ScalarFnKind::TrimTrailing => {
-            Err(BoltError::Plan(
-                "string_kernel: TRIM GPU codegen not yet implemented; \
-                 host fallback remains reachable"
-                    .into(),
-            ))
-        }
     }
+}
+
+/// Which end(s) a GPU `TRIM` strips. Mirrors
+/// [`crate::exec::string_ops_extended::TrimSide`] but lives here so the codegen
+/// has no dependency on the exec module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrimMode {
+    /// `TRIM(BOTH ...)` — strip leading and trailing whitespace.
+    Both,
+    /// `TRIM(LEADING ...)` — strip leading whitespace only.
+    Leading,
+    /// `TRIM(TRAILING ...)` — strip trailing whitespace only.
+    Trailing,
+}
+
+/// Map a `ScalarFnKind` trim variant to its [`TrimMode`]. Returns `None` for
+/// non-trim ops so the two-pass emitters can branch on "is this a TRIM".
+fn trim_mode(kind: ScalarFnKind) -> Option<TrimMode> {
+    match kind {
+        ScalarFnKind::TrimBoth => Some(TrimMode::Both),
+        ScalarFnKind::TrimLeading => Some(TrimMode::Leading),
+        ScalarFnKind::TrimTrailing => Some(TrimMode::Trailing),
+        _ => None,
+    }
+}
+
+/// Emit a predicate `%p_out` that is TRUE when the byte in `%r_byte` is an
+/// ASCII whitespace character, matching the bytes Rust's `str::trim` strips
+/// from ASCII text: HT/LF/VT/FF/CR (0x09..=0x0D) and SPACE (0x20).
+///
+/// We test `(b >= 0x09 && b <= 0x0D) || b == 0x20`. All of these are
+/// single-byte ASCII; a whitespace byte can never be a UTF-8 lead or
+/// continuation byte (those are all >= 0x80), so trimming on these byte
+/// boundaries can never split a multi-byte codepoint — the produced slice is
+/// always valid UTF-8. The `%p_a`/`%p_b` scratch predicates are clobbered.
+fn emit_is_ascii_ws(
+    ptx: &mut String,
+    p_out: &str,
+    p_a: &str,
+    p_b: &str,
+    r_byte: &str,
+) -> BoltResult<()> {
+    // ws_range = (b >= 0x09) && (b <= 0x0D)
+    writeln!(ptx, "\tsetp.ge.u32 {pa}, {b}, 9;", pa = p_a, b = r_byte).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.le.u32 {pb}, {b}, 13;", pb = p_b, b = r_byte).map_err(write_err)?;
+    writeln!(ptx, "\tand.pred {po}, {pa}, {pb};", po = p_out, pa = p_a, pb = p_b)
+        .map_err(write_err)?;
+    // is_space = (b == 0x20)
+    writeln!(ptx, "\tsetp.eq.u32 {pa}, {b}, 32;", pa = p_a, b = r_byte).map_err(write_err)?;
+    // p_out = ws_range || is_space
+    writeln!(ptx, "\tor.pred {po}, {po}, {pa};", po = p_out, pa = p_a).map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit the TRIM boundary computation shared by the length pass and the write
+/// pass, so the two passes agree byte-for-byte on the trimmed window.
+///
+/// Inputs (already materialised by [`emit_load_src_slice`]):
+/// * `r_inlen` — input byte length (`end - begin`).
+/// * `rd_slice` — pointer to the first input byte.
+///
+/// Outputs:
+/// * `r_tbegin` — index of the first KEPT byte (0 for LEADING-noop / TRAILING).
+/// * `r_outlen` — number of kept bytes (`t_end - t_begin`).
+///
+/// The leading scan advances `t_begin` while `slice[t_begin]` is ASCII
+/// whitespace and `t_begin < in_len` (skipped for TRAILING). The trailing scan
+/// retreats `t_end` while `slice[t_end-1]` is whitespace and `t_end > t_begin`
+/// (skipped for LEADING). Uses fixed scratch registers `%r30..%r35`, predicates
+/// `%p4..%p7`, and `%rs0`/`%rd30..%rd31`; callers must not rely on those across
+/// this call.
+fn emit_trim_bounds(
+    ptx: &mut String,
+    mode: TrimMode,
+    r_inlen: &str,
+    rd_slice: &str,
+    r_tbegin: &str,
+    r_outlen: &str,
+) -> BoltResult<()> {
+    // t_begin = 0; t_end = in_len.
+    writeln!(ptx, "\tmov.u32 {tb}, 0;", tb = r_tbegin).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r31, {inl};", inl = r_inlen).map_err(write_err)?; // t_end
+
+    // ---- Leading scan: advance t_begin past whitespace. ----
+    if matches!(mode, TrimMode::Both | TrimMode::Leading) {
+        writeln!(ptx, "TRIM_LEAD:").map_err(write_err)?;
+        // stop if t_begin >= t_end (string is all whitespace / empty).
+        writeln!(ptx, "\tsetp.ge.s32 %p4, {tb}, %r31;", tb = r_tbegin).map_err(write_err)?;
+        writeln!(ptx, "\t@%p4 bra TRIM_LEAD_DONE;").map_err(write_err)?;
+        // b = slice[t_begin]
+        writeln!(ptx, "\tmul.wide.u32 %rd30, {tb}, 1;", tb = r_tbegin).map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd31, {sl}, %rd30;", sl = rd_slice).map_err(write_err)?;
+        writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd31];").map_err(write_err)?;
+        writeln!(ptx, "\tcvt.u32.u16 %r30, %rs0;").map_err(write_err)?;
+        emit_is_ascii_ws(ptx, "%p5", "%p6", "%p7", "%r30")?;
+        // if not whitespace -> done.
+        writeln!(ptx, "\t@!%p5 bra TRIM_LEAD_DONE;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s32 {tb}, {tb}, 1;", tb = r_tbegin).map_err(write_err)?;
+        writeln!(ptx, "\tbra TRIM_LEAD;").map_err(write_err)?;
+        writeln!(ptx, "TRIM_LEAD_DONE:").map_err(write_err)?;
+    }
+
+    // ---- Trailing scan: retreat t_end past whitespace. ----
+    if matches!(mode, TrimMode::Both | TrimMode::Trailing) {
+        writeln!(ptx, "TRIM_TRAIL:").map_err(write_err)?;
+        // stop if t_end <= t_begin.
+        writeln!(ptx, "\tsetp.le.s32 %p4, %r31, {tb};", tb = r_tbegin).map_err(write_err)?;
+        writeln!(ptx, "\t@%p4 bra TRIM_TRAIL_DONE;").map_err(write_err)?;
+        // b = slice[t_end - 1]
+        writeln!(ptx, "\tsub.s32 %r32, %r31, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tmul.wide.u32 %rd30, %r32, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd31, {sl}, %rd30;", sl = rd_slice).map_err(write_err)?;
+        writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd31];").map_err(write_err)?;
+        writeln!(ptx, "\tcvt.u32.u16 %r30, %rs0;").map_err(write_err)?;
+        emit_is_ascii_ws(ptx, "%p5", "%p6", "%p7", "%r30")?;
+        writeln!(ptx, "\t@!%p5 bra TRIM_TRAIL_DONE;").map_err(write_err)?;
+        writeln!(ptx, "\tmov.u32 %r31, %r32;").map_err(write_err)?; // t_end -= 1
+        writeln!(ptx, "\tbra TRIM_TRAIL;").map_err(write_err)?;
+        writeln!(ptx, "TRIM_TRAIL_DONE:").map_err(write_err)?;
+    }
+
+    // out_len = t_end - t_begin.
+    writeln!(ptx, "\tsub.s32 {ol}, %r31, {tb};", ol = r_outlen, tb = r_tbegin)
+        .map_err(write_err)?;
+    Ok(())
 }
 
 /// Entry-point name of the variable-width **length pass** for `kind` (e.g.
@@ -613,10 +761,19 @@ fn emit_load_src_slice(
 ///     .param .u32 start
 ///     .param .u32 sub_len
 /// ```
+///
+/// ## ABI (TRIM `BOTH`/`LEADING`/`TRAILING` — 4-arg shape, same as UPPER)
+///
+/// TRIM takes no extra parameters; the side is baked into the entry name /
+/// emitted scan. The output length is `in_len` minus the leading and/or
+/// trailing ASCII-whitespace run (see [`emit_trim_bounds`]). Restricted to the
+/// ASCII-whitespace default; custom trim-character sets and Unicode whitespace
+/// stay on the host fallback ([`crate::exec::string_ops_extended::trim_str`]).
 pub fn compile_varwidth_len_pass(kind: ScalarFnKind) -> BoltResult<String> {
     let tag = varwidth_tag(kind)?;
     let entry = format!("{}_{}", LEN_PASS_PREFIX, tag);
     let is_substring = matches!(kind, ScalarFnKind::Substring);
+    let trim = trim_mode(kind);
 
     let mut ptx = String::new();
     emit_header(&mut ptx)?;
@@ -635,8 +792,11 @@ pub fn compile_varwidth_len_pass(kind: ScalarFnKind) -> BoltResult<String> {
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
+    // TRIM's scan helper (`emit_trim_bounds`) uses scratch up to %r35 / %p7;
+    // the other ops stay within the original budget.
     writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
-    writeln!(ptx, "\t.reg .b32   %r<24>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b16   %rs<4>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<36>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<32>;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
@@ -661,7 +821,12 @@ pub fn compile_varwidth_len_pass(kind: ScalarFnKind) -> BoltResult<String> {
     emit_load_src_slice(&mut ptx, "%r5", "%r6", "%r7", "%rd10", "%rd0", "%rd1")?;
 
     // out_len computation.
-    if is_substring {
+    if let Some(mode) = trim {
+        // TRIM: out_len = (trailing-trimmed end) - (leading-trimmed begin).
+        // %r14 = t_begin (unused further here), %r13 = out_len. The write pass
+        // recomputes the SAME bounds, so the two passes always agree.
+        emit_trim_bounds(&mut ptx, mode, "%r7", "%rd10", "%r14", "%r13")?;
+    } else if is_substring {
         // start (1-based), sub_len in params 4/5.
         writeln!(ptx, "\tld.param.u32 %r8, [{}_param_4];", entry).map_err(write_err)?;
         writeln!(ptx, "\tld.param.u32 %r9, [{}_param_5];", entry).map_err(write_err)?;
@@ -728,10 +893,21 @@ pub fn compile_varwidth_len_pass(kind: ScalarFnKind) -> BoltResult<String> {
 /// ## ABI (SUBSTRING — 7-arg shape)
 ///
 /// Same plus `..._param_5 = start (u32)` and `..._param_6 = sub_len (u32)`.
+///
+/// ## ABI (TRIM — 5-arg shape, identical to UPPER/LOWER)
+///
+/// TRIM takes no extra parameters. It recomputes the SAME leading/trailing
+/// ASCII-whitespace bounds as the length pass ([`emit_trim_bounds`]), advances
+/// the source pointer to the first kept byte, sets `copy_len = out_len`, and
+/// then runs the shared per-byte copy loop with no case transform (a plain
+/// byte copy, like SUBSTRING). Because both passes derive the window from the
+/// identical byte scan, the bytes written here exactly fill the region the
+/// scanned `out_offsets` reserved.
 pub fn compile_varwidth_write_pass(kind: ScalarFnKind) -> BoltResult<String> {
     let tag = varwidth_tag(kind)?;
     let entry = format!("{}_{}", WRITE_PASS_PREFIX, tag);
     let is_substring = matches!(kind, ScalarFnKind::Substring);
+    let trim = trim_mode(kind);
 
     let mut ptx = String::new();
     emit_header(&mut ptx)?;
@@ -751,9 +927,11 @@ pub fn compile_varwidth_write_pass(kind: ScalarFnKind) -> BoltResult<String> {
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
+    // TRIM's scan helper (`emit_trim_bounds`) uses scratch up to %r35 / %p7 /
+    // %rd31; bump the b32 budget accordingly (the others already fit).
     writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b16   %rs<4>;").map_err(write_err)?;
-    writeln!(ptx, "\t.reg .b32   %r<32>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<36>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<40>;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
@@ -787,8 +965,15 @@ pub fn compile_varwidth_write_pass(kind: ScalarFnKind) -> BoltResult<String> {
     writeln!(ptx, "\tadd.s64 %rd16, %rd3, %rd15;").map_err(write_err)?; // dst base
 
     // Determine the copy length (%r9) and adjust the source pointer for
-    // SUBSTRING's start offset.
-    if is_substring {
+    // SUBSTRING's start offset / TRIM's leading-whitespace skip.
+    if let Some(mode) = trim {
+        // Recompute the trim window: %r24 = t_begin, %r9 = out_len (copy_len).
+        // These MUST match the length pass byte-for-byte (same scan helper).
+        emit_trim_bounds(&mut ptx, mode, "%r7", "%rd10", "%r24", "%r9")?;
+        // src_ptr += t_begin so the copy loop starts at the first kept byte.
+        writeln!(ptx, "\tmul.wide.u32 %rd17, %r24, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd10, %rd10, %rd17;").map_err(write_err)?;
+    } else if is_substring {
         writeln!(ptx, "\tld.param.u32 %r20, [{}_param_5];", entry).map_err(write_err)?; // start (1-based)
         writeln!(ptx, "\tld.param.u32 %r21, [{}_param_6];", entry).map_err(write_err)?; // sub_len
         // start0 = max(start - 1, 0)
@@ -835,8 +1020,12 @@ pub fn compile_varwidth_write_pass(kind: ScalarFnKind) -> BoltResult<String> {
             writeln!(ptx, "\tadd.s32 %r12, %r11, 32;").map_err(write_err)?;
             writeln!(ptx, "\tselp.b32 %r13, %r11, %r12, %p4;").map_err(write_err)?;
         }
-        ScalarFnKind::Substring => {
-            // Byte-for-byte copy (no case transform).
+        ScalarFnKind::Substring
+        | ScalarFnKind::TrimBoth
+        | ScalarFnKind::TrimLeading
+        | ScalarFnKind::TrimTrailing => {
+            // Byte-for-byte copy (no case transform). For TRIM the source
+            // pointer and copy length already select the kept window.
             writeln!(ptx, "\tmov.b32 %r13, %r11;").map_err(write_err)?;
         }
         // varwidth_tag already rejected Length / Concat above.
@@ -939,6 +1128,45 @@ mod tests {
         assert!(format!("{e}").contains("CONCAT"), "{e}");
     }
 
+    // ---- TRIM length pass (single-input, length-reducing) -----------------
+
+    #[test]
+    fn trim_both_len_pass_scans_both_ends() {
+        let ptx = compile_varwidth_len_pass(ScalarFnKind::TrimBoth).expect("compile");
+        assert!(ptx.contains(".visible .entry bolt_str_len_pass_trim_both("), "{ptx}");
+        // 4-param ABI (no start/len): TRIM takes no extra params.
+        assert!(ptx.contains(".param .u32 bolt_str_len_pass_trim_both_param_3"), "{ptx}");
+        assert!(
+            !ptx.contains("bolt_str_len_pass_trim_both_param_4"),
+            "TRIM len pass must NOT have a 5th param\n{ptx}"
+        );
+        // BOTH emits both the leading and the trailing scan loops.
+        assert!(ptx.contains("TRIM_LEAD:"), "missing leading scan\n{ptx}");
+        assert!(ptx.contains("TRIM_TRAIL:"), "missing trailing scan\n{ptx}");
+        // ASCII-whitespace byte test: HT..CR range (9..=13) plus SPACE (32).
+        assert!(ptx.contains("setp.ge.u32 %p6, %r30, 9"), "missing ws low bound 9\n{ptx}");
+        assert!(ptx.contains("setp.le.u32 %p7, %r30, 13"), "missing ws high bound 13\n{ptx}");
+        assert!(ptx.contains("setp.eq.u32 %p6, %r30, 32"), "missing SPACE test 32\n{ptx}");
+        // out_len store still happens.
+        assert!(ptx.contains("st.global.u32"), "missing row_lens store\n{ptx}");
+    }
+
+    #[test]
+    fn trim_leading_len_pass_scans_only_lead() {
+        let ptx = compile_varwidth_len_pass(ScalarFnKind::TrimLeading).expect("compile");
+        assert!(ptx.contains(".visible .entry bolt_str_len_pass_trim_leading("), "{ptx}");
+        assert!(ptx.contains("TRIM_LEAD:"), "leading must scan front\n{ptx}");
+        assert!(!ptx.contains("TRIM_TRAIL:"), "leading must NOT scan tail\n{ptx}");
+    }
+
+    #[test]
+    fn trim_trailing_len_pass_scans_only_trail() {
+        let ptx = compile_varwidth_len_pass(ScalarFnKind::TrimTrailing).expect("compile");
+        assert!(ptx.contains(".visible .entry bolt_str_len_pass_trim_trailing("), "{ptx}");
+        assert!(ptx.contains("TRIM_TRAIL:"), "trailing must scan tail\n{ptx}");
+        assert!(!ptx.contains("TRIM_LEAD:"), "trailing must NOT scan front\n{ptx}");
+    }
+
     // ---- Variable-width write pass ---------------------------------------
 
     #[test]
@@ -985,6 +1213,80 @@ mod tests {
         assert!(format!("{e}").contains("fixed-width"), "{e}");
         let e = compile_varwidth_write_pass(ScalarFnKind::Concat).unwrap_err();
         assert!(format!("{e}").contains("CONCAT"), "{e}");
+    }
+
+    // ---- TRIM write pass --------------------------------------------------
+
+    #[test]
+    fn trim_both_write_pass_copies_kept_window() {
+        let ptx = compile_varwidth_write_pass(ScalarFnKind::TrimBoth).expect("compile");
+        assert!(ptx.contains(".visible .entry bolt_str_write_pass_trim_both("), "{ptx}");
+        // 5-param ABI, identical to UPPER/LOWER (no start/len params).
+        assert!(ptx.contains(".param .u32 bolt_str_write_pass_trim_both_param_4"), "{ptx}");
+        assert!(
+            !ptx.contains("bolt_str_write_pass_trim_both_param_5"),
+            "TRIM write pass must NOT have a 6th param\n{ptx}"
+        );
+        // Recomputes the same window scan as the length pass.
+        assert!(ptx.contains("TRIM_LEAD:"), "missing leading scan\n{ptx}");
+        assert!(ptx.contains("TRIM_TRAIL:"), "missing trailing scan\n{ptx}");
+        // Plain byte copy (no case fold).
+        assert!(ptx.contains("mov.b32 %r13, %r11"), "TRIM must be a plain copy\n{ptx}");
+        assert!(!ptx.contains("sub.s32 %r12, %r11, 32"), "TRIM must not case-fold\n{ptx}");
+        // Shared per-byte copy loop.
+        assert!(ptx.contains("WRITE_LOOP:"), "{ptx}");
+        assert!(ptx.contains("WRITE_DONE:"), "{ptx}");
+        // Source pointer is advanced by t_begin (%r24) before the copy loop.
+        assert!(
+            ptx.contains("mul.wide.u32 %rd17, %r24, 1"),
+            "TRIM must advance src by t_begin\n{ptx}"
+        );
+    }
+
+    #[test]
+    fn trim_leading_write_pass_only_scans_front() {
+        let ptx = compile_varwidth_write_pass(ScalarFnKind::TrimLeading).expect("compile");
+        assert!(ptx.contains(".visible .entry bolt_str_write_pass_trim_leading("), "{ptx}");
+        assert!(ptx.contains("TRIM_LEAD:"), "{ptx}");
+        assert!(!ptx.contains("TRIM_TRAIL:"), "leading must not scan tail\n{ptx}");
+    }
+
+    #[test]
+    fn trim_trailing_write_pass_only_scans_tail() {
+        let ptx = compile_varwidth_write_pass(ScalarFnKind::TrimTrailing).expect("compile");
+        assert!(ptx.contains(".visible .entry bolt_str_write_pass_trim_trailing("), "{ptx}");
+        assert!(ptx.contains("TRIM_TRAIL:"), "{ptx}");
+        assert!(!ptx.contains("TRIM_LEAD:"), "trailing must not scan front\n{ptx}");
+    }
+
+    #[test]
+    fn trim_entry_name_helpers_match_emitted_entries() {
+        for (kind, len_name, write_name) in [
+            (ScalarFnKind::TrimBoth, "bolt_str_len_pass_trim_both", "bolt_str_write_pass_trim_both"),
+            (
+                ScalarFnKind::TrimLeading,
+                "bolt_str_len_pass_trim_leading",
+                "bolt_str_write_pass_trim_leading",
+            ),
+            (
+                ScalarFnKind::TrimTrailing,
+                "bolt_str_len_pass_trim_trailing",
+                "bolt_str_write_pass_trim_trailing",
+            ),
+        ] {
+            assert_eq!(len_pass_entry(kind).unwrap(), len_name);
+            assert_eq!(write_pass_entry(kind).unwrap(), write_name);
+            let len_ptx = compile_varwidth_len_pass(kind).unwrap();
+            assert!(
+                len_ptx.contains(&format!(".visible .entry {len_name}(")),
+                "len pass entry mismatch for {kind:?}\n{len_ptx}"
+            );
+            let write_ptx = compile_varwidth_write_pass(kind).unwrap();
+            assert!(
+                write_ptx.contains(&format!(".visible .entry {write_name}(")),
+                "write pass entry mismatch for {kind:?}\n{write_ptx}"
+            );
+        }
     }
 
     // ---- Entry-point name helpers ----------------------------------------

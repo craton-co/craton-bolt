@@ -22,7 +22,7 @@
 
 use crate::error::BoltResult;
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, Expr, Literal, LogicalPlan, UnaryOp,
+    AggregateExpr, BinaryOp, DataType, Expr, Literal, LogicalPlan, UnaryOp,
 };
 use crate::plan::rewrite::PlanRewrite;
 
@@ -98,10 +98,10 @@ pub fn fold_expr(expr: Expr) -> Expr {
             escape,
             negated,
         },
-        Expr::Cast { expr, target } => Expr::Cast {
-            expr: Box::new(fold_expr(*expr)),
-            target,
-        },
+        Expr::Cast { expr, target } => {
+            let inner = fold_expr(*expr);
+            fold_cast(inner, target)
+        }
         Expr::ScalarFn { kind, args } => Expr::ScalarFn {
             kind,
             args: args.into_iter().map(fold_expr).collect(),
@@ -213,6 +213,74 @@ fn fold_unary(op: UnaryOp, operand: Expr) -> Expr {
                 operand: Box::new(operand),
             },
         },
+    }
+}
+
+/// Fold a `CAST(expr AS target)` whose child is already folded.
+///
+/// Only fires when `expr` is a concrete (non-NULL) literal *and* the
+/// conversion is provably exact for that value — otherwise the `Cast` node is
+/// rebuilt and left for the runtime, honouring the pass's "when in doubt,
+/// don't fold" rule. The set of folded conversions is intentionally a strict
+/// subset of [`cast_is_supported`]:
+///
+/// * **Identity** (`src == target`): the literal already has the target dtype,
+///   so the cast is a no-op and the literal is returned unchanged.
+/// * **`Int32 -> Int64`**: widening is exact for every `i32`.
+/// * **`Int64 -> Int32`**: narrowing folds ONLY when the value fits in `i32`
+///   (range check, mirroring the `fold_literal_binary` Int32-overflow guard);
+///   otherwise left unfolded so the runtime decides the out-of-range result.
+/// * **`Float32 -> Float64`**: widening is exact (every `f32`, incl.
+///   NaN/inf/±0, has an exact `f64` representation).
+///
+/// Everything else is deliberately left for the runtime:
+/// * **Int <-> Float** — can lose precision (e.g. an `i64` beyond the
+///   53-bit `f64` mantissa, or any `i32` beyond `f32`'s 24-bit mantissa).
+/// * **`Float64 -> Float32`** — narrowing rounds / can overflow to `inf`.
+/// * **Bool <-> Int** — well-defined 0/1, but the GPU cast kernel's exact
+///   semantics aren't pinned down here, so we stay conservative.
+/// * **Decimal / Date32 / Timestamp / Utf8 and any NULL** — out of scope;
+///   `Literal::Null` is untyped, so folding a NULL cast would drop the target
+///   type annotation. Leave unfolded.
+fn fold_cast(expr: Expr, target: DataType) -> Expr {
+    if let Expr::Literal(lit) = &expr {
+        if let Some(folded) = fold_literal_cast(lit, target) {
+            return Expr::Literal(folded);
+        }
+    }
+    Expr::Cast {
+        expr: Box::new(expr),
+        target,
+    }
+}
+
+/// Cast a single concrete literal to `target`, returning `Some` only for the
+/// provably-exact conversions documented on [`fold_cast`]. Returns `None`
+/// (leave unfolded) for NULL, lossy/ambiguous, and unsupported pairs.
+fn fold_literal_cast(lit: &Literal, target: DataType) -> Option<Literal> {
+    // Identity cast: the literal already carries `target` as its dtype.
+    if lit.dtype() == Some(target) {
+        return Some(lit.clone());
+    }
+    match (lit, target) {
+        // Integer widening is exact for every i32.
+        (Literal::Int32(v), DataType::Int64) => Some(Literal::Int64(*v as i64)),
+        // Integer narrowing: fold only when the value fits in i32 (mirrors the
+        // i32-overflow guard in `fold_literal_binary`); otherwise leave for
+        // the runtime so we never silently wrap.
+        (Literal::Int64(v), DataType::Int32) => {
+            if (i32::MIN as i64..=i32::MAX as i64).contains(v) {
+                Some(Literal::Int32(*v as i32))
+            } else {
+                None
+            }
+        }
+        // Float widening is exact: every f32 value (including NaN / ±inf / ±0)
+        // round-trips losslessly into f64.
+        (Literal::Float32(v), DataType::Float64) => Some(Literal::Float64(*v as f64)),
+        // Everything else (int<->float, f64->f32, bool<->int, decimal/date/
+        // timestamp/utf8, NULL) is potentially lossy or ambiguous: don't fold.
+        _ => None,
     }
 }
 
@@ -474,5 +542,86 @@ mod tests {
             Expr::Literal(Literal::Float32(v)) => assert_eq!(v, 6.0),
             other => panic!("expected Float32 literal, got {other:?}"),
         }
+    }
+
+    fn cast(e: Expr, target: DataType) -> Expr {
+        Expr::Cast {
+            expr: Box::new(e),
+            target,
+        }
+    }
+
+    #[test]
+    fn folds_int32_to_int64_cast() {
+        // CAST(7_i32 AS Int64) => Int64(7): widening is exact.
+        let e = cast(Expr::Literal(Literal::Int32(7)), DataType::Int64);
+        assert!(matches!(fold_expr(e), Expr::Literal(Literal::Int64(7))));
+    }
+
+    #[test]
+    fn folds_in_range_int64_to_int32_cast() {
+        // CAST(7_i64 AS Int32) => Int32(7): in range, narrows exactly.
+        let e = cast(Expr::Literal(Literal::Int64(7)), DataType::Int32);
+        assert!(matches!(fold_expr(e), Expr::Literal(Literal::Int32(7))));
+    }
+
+    #[test]
+    fn does_not_fold_out_of_range_int64_to_int32_cast() {
+        // CAST((i32::MAX + 1) AS Int32): out of i32 range, must NOT fold to a
+        // wrapped value — stays a Cast for the runtime to evaluate.
+        let e = cast(
+            Expr::Literal(Literal::Int64(i32::MAX as i64 + 1)),
+            DataType::Int32,
+        );
+        assert!(matches!(fold_expr(e), Expr::Cast { .. }));
+    }
+
+    #[test]
+    fn folds_float32_to_float64_cast() {
+        // CAST(1.5_f32 AS Float64) => Float64(1.5): widening is exact.
+        let e = cast(Expr::Literal(Literal::Float32(1.5)), DataType::Float64);
+        match fold_expr(e) {
+            Expr::Literal(Literal::Float64(v)) => assert_eq!(v, 1.5),
+            other => panic!("expected Float64 literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_fold_lossy_int_to_float_cast() {
+        // CAST(i64 AS Float64) can lose precision beyond f64's 53-bit mantissa,
+        // so this ambiguous/lossy conversion is left for the runtime.
+        let e = cast(
+            Expr::Literal(Literal::Int64(9_007_199_254_740_993)),
+            DataType::Float64,
+        );
+        assert!(matches!(fold_expr(e), Expr::Cast { .. }));
+    }
+
+    #[test]
+    fn does_not_fold_narrowing_float_cast() {
+        // CAST(f64 AS Float32) rounds / can overflow to inf: don't fold.
+        let e = cast(Expr::Literal(Literal::Float64(1.5)), DataType::Float32);
+        assert!(matches!(fold_expr(e), Expr::Cast { .. }));
+    }
+
+    #[test]
+    fn does_not_fold_null_cast() {
+        // Literal::Null is untyped; folding would drop the target annotation.
+        let e = cast(Expr::Literal(Literal::Null), DataType::Int64);
+        assert!(matches!(fold_expr(e), Expr::Cast { .. }));
+    }
+
+    #[test]
+    fn folds_identity_cast() {
+        // CAST(5_i64 AS Int64) is a no-op: collapse to the literal.
+        let e = cast(Expr::Literal(Literal::Int64(5)), DataType::Int64);
+        assert!(matches!(fold_expr(e), Expr::Literal(Literal::Int64(5))));
+    }
+
+    #[test]
+    fn does_not_fold_cast_of_non_literal() {
+        // CAST(col(a) AS Int64): nothing constant to fold — left intact.
+        let e = cast(col("a"), DataType::Int64);
+        assert!(matches!(fold_expr(e), Expr::Cast { .. }));
     }
 }

@@ -368,10 +368,28 @@ fn execute_inner(
     }
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
     let mut out_counts_gpu: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_out_slots, stream.raw())?;
-    // The count kernel writes its own out_keys + out_set; we only consume
-    // its out_counts. Output dedup keys / set come from the SUM reduce.
-    let mut count_out_keys_gpu: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_out_slots, stream.raw())?;
-    let mut count_out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
+    // Perf (redundant-buffer elision): the COUNT reduce's kernel signature
+    // mandates an `out_keys` and an `out_set` output, but we only consume its
+    // `out_counts`. The SUM and COUNT reduces both consume the SAME
+    // `scatter_keys` buffer with the SAME `slot = key & mask` hash and the
+    // same deterministic probe sequence over the same per-partition row range,
+    // so for every (partition, slot) they agree byte-for-byte on whether the
+    // slot is populated and on the key it holds. We therefore point the COUNT
+    // launch's out_keys / out_set params straight at the SUM reduce's
+    // `out_keys_gpu` / `out_set_gpu`: COUNT re-stores the identical key/set
+    // bytes SUM already wrote (a value-preserving overwrite, ordered after the
+    // SUM launch on this single stream), and the final result is unchanged.
+    // This drops two zero-initialised `n_out_slots` scratch buffers
+    // (`count_out_keys` / `count_out_set`) that the old code allocated only to
+    // discard. See the post-launch download comment for why this is sound.
+    //
+    // TODO(perf, cross-file): the truly minimal pass would be a fused
+    // sum+count reduce kernel emitting per-group SUMs and the u64 COUNT in one
+    // launch over `scatter_keys` (one hash/probe pass instead of two). That
+    // requires adding an entry point in `jit::partition_reduce_kernel_multi`
+    // (extra `out_counts` output + an `atom.shared.add.u64` on the shared
+    // count slot alongside the existing value adds) and is out of scope here.
+    //
     // Spill counters for the multi-SUM and COUNT reduces. AVG = sum/count,
     // so EITHER reduce dropping a row on MAX_PROBES overflow silently
     // corrupts the per-key average. We allocate one counter per kernel and
@@ -425,9 +443,12 @@ fn execute_inner(
 
         let view_keys = scatter_keys.view();
         let view_offsets = offsets_kp1_gpu.view();
-        let mut view_ok = count_out_keys_gpu.view_mut();
+        // Reuse the SUM reduce's key/set buffers (see allocation comment): the
+        // COUNT kernel re-writes the identical key/set bytes into the same
+        // slots, so this overwrite is value-preserving and saves two buffers.
+        let mut view_ok = out_keys_gpu.view_mut();
         let mut view_oc = out_counts_gpu.view_mut();
-        let mut view_os = count_out_set_gpu.view_mut();
+        let mut view_os = out_set_gpu.view_mut();
         let mut view_sp = spill_count.view_mut();
 
         let mut args = KernelArgs::empty();
@@ -454,10 +475,13 @@ fn execute_inner(
     // by the single atomic-claim pass above) and hash with the same slot
     // function, so for a given (partition, slot) both kernels write either
     // both populated or both empty, and both populate with the same key.
-    // We use the SUM-side out_keys / out_set and the COUNT-side
-    // out_counts. (Strictly speaking the count_out_keys / count_out_set
-    // are redundant, but allocating them is cheaper than special-casing
-    // the kernel signature.)
+    // We use the SUM-side out_keys / out_set and the COUNT-side out_counts.
+    // Because that key/set agreement is byte-exact, the COUNT launch wrote
+    // its (identical) keys / set DIRECTLY into `out_keys_gpu` / `out_set_gpu`
+    // (see the allocation comment) — the separate count_out_keys /
+    // count_out_set scratch buffers no longer exist. `out_keys_gpu` /
+    // `out_set_gpu` therefore carry the SUM kernel's values, last overwritten
+    // by the COUNT kernel with the same bytes.
     // Stage-4 (P1b): pinned D2H for every output buffer; sync once
     // after all are queued so the driver overlaps them.
     let pinned_keys = out_keys_gpu.to_pinned_async(stream.raw())?;

@@ -193,7 +193,18 @@ pub enum TrimSide {
 /// behave correctly. An empty `chars` set (e.g. `TRIM('' FROM s)`) strips
 /// nothing and returns `s` unchanged.
 ///
-/// TODO(string-fn-gpu): no GPU kernel yet; this host path is the supported one.
+/// GPU status: a two-pass GPU producer for the *ASCII-whitespace-default* case
+/// (`chars = None`, BOTH/LEADING/TRAILING) now exists in
+/// [`crate::jit::string_kernel`] — see `compile_varwidth_len_pass` /
+/// `compile_varwidth_write_pass` for `ScalarFnKind::Trim*` and
+/// `string_kernel::emit_trim_bounds`. It is restricted to ASCII whitespace
+/// (HT/LF/VT/FF/CR/SPACE), which is UTF-8-safe because none of those bytes can
+/// appear inside a multi-byte codepoint. This host path remains the supported
+/// fallback and the ONLY path for: (a) custom trim-character sets
+/// (`chars = Some(..)`), and (b) Unicode (non-ASCII) whitespace, which the GPU
+/// scan deliberately does not strip. Whatever routes TRIM to the GPU must keep
+/// this host fallback for those cases and on any kernel/launch error, so
+/// results never change.
 pub fn trim_str(s: &str, side: TrimSide, chars: Option<&str>) -> String {
     match chars {
         None => match side {
@@ -941,5 +952,69 @@ mod tests {
         assert_eq!(trim_str("→→go→", TrimSide::Both, Some("→")), "go");
         // Multi-byte content preserved.
         assert_eq!(trim_str("  héllo  ", TrimSide::Both, None), "héllo");
+    }
+
+    // ----- GPU TRIM byte-rule mirror -------------------------------------
+    //
+    // The GPU two-pass TRIM kernel (jit::string_kernel) strips only the SIX
+    // ASCII whitespace bytes HT/LF/VT/FF/CR (0x09..=0x0D) and SPACE (0x20).
+    // This host mirror replicates that exact byte rule so we can assert the
+    // restricted GPU semantics agree with `trim_str` on ASCII-whitespace
+    // input (the only input the executor is allowed to route to the GPU).
+
+    /// Byte-for-byte mirror of the GPU kernel's ASCII-whitespace trim.
+    fn gpu_ascii_trim(s: &str, side: TrimSide) -> String {
+        let is_ws = |b: u8| (0x09..=0x0D).contains(&b) || b == 0x20;
+        let bytes = s.as_bytes();
+        let mut begin = 0usize;
+        let mut end = bytes.len();
+        if matches!(side, TrimSide::Both | TrimSide::Leading) {
+            while begin < end && is_ws(bytes[begin]) {
+                begin += 1;
+            }
+        }
+        if matches!(side, TrimSide::Both | TrimSide::Trailing) {
+            while end > begin && is_ws(bytes[end - 1]) {
+                end -= 1;
+            }
+        }
+        // The kept window is always valid UTF-8: only single-byte ASCII
+        // whitespace was removed, never a continuation/lead byte.
+        std::str::from_utf8(&bytes[begin..end]).unwrap().to_string()
+    }
+
+    #[test]
+    fn gpu_ascii_trim_matches_host_on_ascii_whitespace() {
+        // For ASCII-whitespace-delimited input the GPU's restricted byte rule
+        // must produce the SAME result as the host `trim_str` default path.
+        let cases = [
+            "  hi  ",
+            "\t\nhi \r",
+            "nospace",
+            "   ",
+            "",
+            " a b c ",
+            "\x0b\x0cmid\x0c\x0b",
+        ];
+        for s in cases {
+            for side in [TrimSide::Both, TrimSide::Leading, TrimSide::Trailing] {
+                assert_eq!(
+                    gpu_ascii_trim(s, side),
+                    trim_str(s, side, None),
+                    "GPU/host TRIM divergence for {s:?} side {side:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_ascii_trim_preserves_multibyte_content() {
+        // Multi-byte content with ASCII whitespace padding: the GPU rule trims
+        // only the ASCII spaces and leaves the codepoints intact.
+        assert_eq!(gpu_ascii_trim("  héllo  ", TrimSide::Both), "héllo");
+        // A non-ASCII whitespace (NBSP, U+00A0 = 0xC2 0xA0) is NOT stripped by
+        // the GPU rule — confirming why such input stays on the host path.
+        let nbsp = "\u{00A0}x\u{00A0}";
+        assert_eq!(gpu_ascii_trim(nbsp, TrimSide::Both), nbsp);
     }
 }
