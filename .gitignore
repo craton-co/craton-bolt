@@ -5,7 +5,7 @@
 .claude/
 
 # Internal AI-orchestration handoff doc — never ship publicly
-continue_prompt.md
+#continue_prompt.md
 
 # Editor / IDE
 .idea
