@@ -439,4 +439,54 @@ mod tests {
         let anames: Vec<_> = after.fields.iter().map(|f| &f.name).collect();
         assert_eq!(bnames, anames);
     }
+
+    // REVIEW PROBE: join with colliding column names, select only the
+    // renamed right-side column. Does pruning drop the needed right column?
+    #[test]
+    fn review_probe_join_collision_rename() {
+        use crate::plan::logical_plan::JoinType;
+        // t1(k, a), t2(k, a). SELECT right.a FROM t1 JOIN t2 ON t1.k=t2.k
+        let left = LogicalPlan::Scan {
+            table: "t1".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("a", DataType::Int64, false),
+            ]),
+        };
+        let right = LogicalPlan::Scan {
+            table: "t2".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("a", DataType::Int64, false),
+            ]),
+        };
+        let join = LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            // on uses child (bare) names
+            on: vec![(col("k"), col("k"))],
+            filter: None,
+        };
+        // combined schema is [k, a, right.k, right.a]; select right.a
+        let plan = LogicalPlan::Project {
+            input: Box::new(join),
+            exprs: vec![col("right.a")],
+        };
+        let before = plan.schema().expect("typecheck");
+        eprintln!("BEFORE cols: {:?}", before.fields.iter().map(|f| &f.name).collect::<Vec<_>>());
+        let out = ProjectionPruning.rewrite(plan).expect("prune");
+        // Inspect the right scan's projection.
+        if let LogicalPlan::Project { input, .. } = &out {
+            if let LogicalPlan::Join { right, .. } = input.as_ref() {
+                if let LogicalPlan::Scan { projection, .. } = right.as_ref() {
+                    eprintln!("RIGHT scan projection after prune: {:?}", projection);
+                }
+            }
+        }
+        let after = out.schema();
+        eprintln!("AFTER schema ok? {:?}", after.as_ref().map(|s| s.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>()));
+    }
 }
