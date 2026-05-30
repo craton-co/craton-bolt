@@ -2359,8 +2359,181 @@ impl Engine {
         crate::observability::notify_observers(s);
     }
 
+    /// If `phys` is a **streamable leaf scan** — a plan whose output rows are an
+    /// independent, row-wise function of a single base table's scan rows, so
+    /// that processing the table morsel-by-morsel and concatenating the
+    /// per-morsel results yields the *byte-for-byte identical* batch as
+    /// processing the whole table at once — return that table's name.
+    ///
+    /// The streamable shapes are exactly the three scan-leaf executors that take
+    /// a `table: String` directly (no child sub-plan) and emit one output row
+    /// per surviving input row:
+    ///
+    /// * [`PhysicalPlan::Projection`] — fused project/filter kernel. A `WHERE`
+    ///   only *drops* rows; the surviving rows are unchanged and order-preserved
+    ///   within each morsel, and morsels are produced in table order, so
+    ///   `concat(project(morsel_i)) == project(concat(morsel_i))`.
+    /// * [`PhysicalPlan::StringLength`] — `LENGTH(col)` + passthroughs.
+    /// * [`PhysicalPlan::StringProject`] — `UPPER`/`LOWER`/passthroughs.
+    ///
+    /// Every *other* variant is **not** returned here and therefore drains the
+    /// whole table (status quo): `Aggregate` (global/grouped fold crosses all
+    /// rows), `Sort`/`Distinct`/`SetOp`/`Union`/`Window` (cross-row ordering or
+    /// dedup), `Join` (build side must be resident), `Limit`/`Filter`/`Project`/
+    /// `CountRows`/`StringLikeFilter` (wrap a child sub-plan whose own scan would
+    /// have to be threaded — out of scope for this minimal, correctness-first
+    /// cut). Those keep the existing materialise-whole-table behaviour exactly.
+    fn streamable_leaf_scan<'p>(phys: &'p PhysicalPlan) -> Option<&'p str> {
+        match phys {
+            PhysicalPlan::Projection { table, .. }
+            | PhysicalPlan::StringLength { table, .. }
+            | PhysicalPlan::StringProject { table, .. } => Some(table.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Drive a streamable leaf scan morsel-by-morsel instead of materialising
+    /// the whole table on the device at once.
+    ///
+    /// Precondition: `table` is a streaming-registered overlay table (present in
+    /// `streaming_sources`, **not** in the eager `tables` store) — the only
+    /// shape whose data this method can swap per-morsel under `&self`, because
+    /// the overlay is interior-mutable (`RefCell`) while `tables` is not. The
+    /// caller ([`Engine::execute`]) enforces this.
+    ///
+    /// For each morsel the table's overlay entry is temporarily replaced with a
+    /// single-batch `Materialized` view of just that morsel, the per-morsel leaf
+    /// executor runs (rebuilding a small, bounded GPU table for the morsel), and
+    /// the result batch is collected. The original whole-table overlay entry is
+    /// always restored afterwards — including on the error path — so a producer
+    /// or kernel fault leaves no torn state. The per-morsel results are
+    /// concatenated into the final batch, which is identical to the whole-table
+    /// result because the leaf shapes are row-wise (see
+    /// [`Engine::streamable_leaf_scan`]).
+    ///
+    /// `run_morsel` is the existing per-morsel dispatch (the same executor the
+    /// whole-table path uses); it is invoked while the morsel is installed.
+    fn execute_streaming_leaf(
+        &self,
+        table: &str,
+        morsel_rows: usize,
+        run_morsel: impl Fn() -> BoltResult<QueryHandle>,
+        output_schema: &Schema,
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::streaming::{BatchStream, TableSource};
+
+        // Snapshot the whole-table batches (cheap Arc clones) and the original
+        // overlay entry so we can restore it. We must NOT hold the overlay
+        // borrow across `run_morsel` (which re-borrows the overlay through
+        // `materialize_table`/`ensure_gpu_table`), so we take owned batches.
+        let whole: Vec<RecordBatch> = {
+            let overlay = self.streaming_sources.borrow();
+            match overlay.get(table) {
+                Some(TableSource::Materialized(b)) => b.clone(),
+                // The caller guarantees an overlay table; a still-`Streaming`
+                // entry should have been collapsed by
+                // `ensure_streaming_materialized` before `execute`.
+                _ => {
+                    return Err(BoltError::Other(format!(
+                        "execute_streaming_leaf: table '{table}' is not a \
+                         materialised streaming-overlay table"
+                    )))
+                }
+            }
+        };
+
+        let mut results: Vec<RecordBatch> = Vec::new();
+
+        // Run the morsels, restoring the whole-table overlay entry no matter
+        // how the loop exits. The `BatchStream` (which borrows `whole`) is
+        // built and fully consumed INSIDE this closure, so its borrow ends
+        // before we move `whole` back into the overlay below.
+        let loop_result: BoltResult<()> = (|| {
+            let stream = BatchStream::new(&whole, morsel_rows)?;
+            for morsel in stream.morsels() {
+                // Install just this morsel as the table's data.
+                self.streaming_sources
+                    .borrow_mut()
+                    .insert(table.to_string(), TableSource::Materialized(vec![morsel]));
+                // A streaming-overlay table carries no `host_revisions` entry,
+                // so `ensure_gpu_table` always rebuilds a fresh (small) GPU
+                // table from the installed morsel — no stale-cache hazard.
+                let handle = run_morsel()?;
+                results.push(handle.batch);
+            }
+            Ok(())
+        })();
+
+        // Always restore the whole-table view (the source is re-iterable, so a
+        // subsequent query sees the full table again).
+        self.streaming_sources
+            .borrow_mut()
+            .insert(table.to_string(), TableSource::Materialized(whole));
+
+        loop_result?;
+
+        // Concatenate the per-morsel results. Zero morsels (an all-empty table)
+        // yields an empty batch shaped by the output schema.
+        let batch = if results.is_empty() {
+            let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+            RecordBatch::new_empty(arrow_schema)
+        } else {
+            let schema = results[0].schema();
+            arrow::compute::concat_batches(&schema, results.iter()).map_err(|e| {
+                BoltError::Other(format!(
+                    "execute_streaming_leaf: failed to concatenate {} morsel \
+                     results for table '{table}': {e}",
+                    results.len()
+                ))
+            })?
+        };
+        Ok(QueryHandle { batch })
+    }
+
     /// Execute a pre-built `PhysicalPlan`.
     pub fn execute(&self, phys: &PhysicalPlan) -> BoltResult<QueryHandle> {
+        // Streaming / morsel opt-in. The whole-table path below is the default
+        // and is byte-for-byte preserved: this hook fires ONLY when (a) a memory
+        // budget is configured (default is `None` → uncapped → never fires),
+        // (b) the plan is a streamable row-wise leaf scan
+        // (`Projection`/`StringLength`/`StringProject` — see
+        // `streamable_leaf_scan`), (c) the scan table is a streaming-registered
+        // overlay table (the only data we can swap per-morsel under `&self`),
+        // and (d) the table's footprint exceeds the budget so
+        // `morsel_plan_for_table` actually calls for chunking. Any miss falls
+        // straight through to the unchanged whole-table dispatch.
+        if self.memory_budget_bytes.is_some() {
+            if let Some(table) = Self::streamable_leaf_scan(phys) {
+                // Only overlay (streaming-registered) tables are morsel-driven;
+                // eager `tables` entries can't be swapped under `&self` and keep
+                // the whole-table path.
+                let is_overlay_only = !self.tables.contains_key(table)
+                    && self.streaming_sources.borrow().contains_key(table);
+                if is_overlay_only {
+                    if let Some(morsel_rows) =
+                        self.morsel_plan_for_table(table)?.morsel_rows()
+                    {
+                        let output_schema = phys.output_schema().clone();
+                        return self.execute_streaming_leaf(
+                            table,
+                            morsel_rows,
+                            || self.execute_leaf_whole(phys),
+                            &output_schema,
+                        );
+                    }
+                }
+            }
+        }
+        self.execute_leaf_whole(phys)
+    }
+
+    /// The whole-table dispatch — the original body of [`Engine::execute`].
+    ///
+    /// Split out so the streaming/morsel orchestrator
+    /// ([`Engine::execute_streaming_leaf`]) can invoke the *exact same*
+    /// per-shape executor on a single installed morsel, guaranteeing the
+    /// morsel-by-morsel result is identical to the whole-table result.
+    fn execute_leaf_whole(&self, phys: &PhysicalPlan) -> BoltResult<QueryHandle> {
         match phys {
             PhysicalPlan::Projection {
                 table,
@@ -6364,5 +6537,185 @@ mod tests {
         let mask = GpuVec::<u8>::zeros(1).expect("mask");
         dec.set_decimal128_valid_mask(Some(mask));
         dec.mark_launch_stream(s);
+    }
+
+    // ----- Streaming / morsel wiring (agent J) -------------------------
+    //
+    // These cover the *classification* half of the streaming hook
+    // (`streamable_leaf_scan`) host-side — no CUDA context, no device. The
+    // end-to-end morsel-vs-whole equivalence tests below are GPU-gated
+    // (`#[ignore = "gpu:..."]`) per repo convention, because they build an
+    // `Engine` (which binds a real CUDA context) and launch the projection
+    // kernel per morsel.
+
+    /// A bare `Schema` over one Int64 column named `x`, matching `int64_batch`.
+    fn x_schema() -> Schema {
+        Schema::new(vec![Field::new("x", DataType::Int64, false)])
+    }
+
+    /// A trivial identity-passthrough `Projection` over table `t`
+    /// (`SELECT x FROM t` shape): `LoadColumn`→`Store` of column 0.
+    fn passthrough_projection(table: &str) -> PhysicalPlan {
+        let kernel = spec_with(
+            vec![col_io("x", DataType::Int64)],
+            vec![col_io("x", DataType::Int64)],
+            vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+            ],
+        );
+        PhysicalPlan::Projection {
+            table: table.to_string(),
+            kernel,
+            output_schema: x_schema(),
+        }
+    }
+
+    #[test]
+    fn streamable_leaf_scan_recognises_projection() {
+        let p = passthrough_projection("t");
+        assert_eq!(Engine::streamable_leaf_scan(&p), Some("t"));
+    }
+
+    #[test]
+    fn streamable_leaf_scan_recognises_string_leaves() {
+        let sl = PhysicalPlan::StringLength {
+            table: "t".to_string(),
+            outputs: Vec::new(),
+            output_schema: x_schema(),
+        };
+        assert_eq!(Engine::streamable_leaf_scan(&sl), Some("t"));
+        let sp = PhysicalPlan::StringProject {
+            table: "u".to_string(),
+            outputs: Vec::new(),
+            output_schema: x_schema(),
+        };
+        assert_eq!(Engine::streamable_leaf_scan(&sp), Some("u"));
+    }
+
+    #[test]
+    fn streamable_leaf_scan_rejects_non_leaf_shapes() {
+        // Anything wrapping a child sub-plan, or any cross-row operator, must
+        // drain (status quo). A `Distinct`/`Limit` over a Projection are the
+        // canonical "wraps a child" shapes; their scan must NOT be streamed by
+        // the leaf hook (the child is executed via `self.execute`, which gets
+        // its own streaming opportunity, but the *outer* op is not a leaf).
+        let distinct = PhysicalPlan::Distinct {
+            input: Box::new(passthrough_projection("t")),
+        };
+        assert_eq!(Engine::streamable_leaf_scan(&distinct), None);
+        let limit = PhysicalPlan::Limit {
+            input: Box::new(passthrough_projection("t")),
+            limit: 5,
+            offset: 0,
+        };
+        assert_eq!(Engine::streamable_leaf_scan(&limit), None);
+    }
+
+    /// Build a replayable single-batch producer for an `int64_batch`-shaped
+    /// table holding `[start, start+n)`.
+    fn int64_producer(start: i64, n: usize) -> crate::exec::streaming::BatchProducer {
+        Box::new(move || Box::new(std::iter::once(Ok(int64_batch(start, n)))))
+    }
+
+    /// End-to-end equivalence: a streaming-registered table queried under a
+    /// memory budget small enough to force morsel chunking must produce a
+    /// result byte-for-byte identical to the same data materialised whole. The
+    /// morsel path concatenates per-morsel projection outputs; the row-wise
+    /// projection makes that equal to the whole-table projection.
+    ///
+    /// GPU-gated: builds an `Engine` and launches the projection kernel.
+    #[test]
+    #[ignore = "gpu:projection — streaming morsel equivalence launches kernels"]
+    fn streaming_morsel_matches_materialized_projection() {
+        let total = 1000usize;
+
+        // Baseline: whole table materialised, no budget.
+        let mut whole = Engine::new().expect("ctx");
+        whole.register_table("t", int64_batch(0, total)).expect("register whole");
+        let h_whole = whole.sql("SELECT x FROM t WHERE x >= 100").expect("whole query");
+        let want = h_whole.record_batch().clone();
+
+        // Streaming source + a budget far below the table footprint, so
+        // `morsel_plan_for_table` returns `Morsels` and the streaming hook
+        // fires. ~4 KiB budget over an 8 KB+ Int64 table → many morsels.
+        let mut streamed = Engine::builder()
+            .memory_budget(4096)
+            .build()
+            .expect("ctx with budget");
+        streamed
+            .register_table_stream_lazy("t", x_schema(), int64_producer(0, total))
+            .expect("register stream");
+        let h_stream = streamed.sql("SELECT x FROM t WHERE x >= 100").expect("stream query");
+        let got = h_stream.record_batch().clone();
+
+        assert_eq!(got.num_rows(), want.num_rows(), "row counts must match");
+        let want_col = want.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got_col = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let want_v: Vec<i64> = (0..want_col.len()).map(|i| want_col.value(i)).collect();
+        let got_v: Vec<i64> = (0..got_col.len()).map(|i| got_col.value(i)).collect();
+        assert_eq!(got_v, want_v, "morsel-streamed values must equal whole-table values");
+    }
+
+    /// The drain-fallback path: an operator whose result is NOT a row-wise leaf
+    /// scan (here a global `SUM` aggregate) drains the streaming source to a
+    /// whole table and produces the correct global result even under a small
+    /// budget. This documents that "anything not safely streamable drains".
+    ///
+    /// GPU-gated: builds an `Engine` and runs the aggregate kernel.
+    #[test]
+    #[ignore = "gpu:aggregate — drain-fallback aggregate over streaming source"]
+    fn streaming_drain_fallback_global_aggregate() {
+        let total = 500usize;
+        let mut engine = Engine::builder()
+            .memory_budget(4096)
+            .build()
+            .expect("ctx with budget");
+        engine
+            .register_table_stream_lazy("t", x_schema(), int64_producer(0, total))
+            .expect("register stream");
+        // SUM is a global fold — `streamable_leaf_scan` returns None for
+        // `Aggregate`, so the whole table is drained (status quo) and summed.
+        let h = engine.sql("SELECT SUM(x) FROM t").expect("aggregate query");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 1, "scalar aggregate yields one row");
+        let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let expected: i64 = (0..total as i64).sum();
+        assert_eq!(col.value(0), expected, "global SUM over the drained stream");
+    }
+
+    /// After a morsel-streamed query the whole-table overlay entry must be
+    /// restored, so a *second* query (e.g. without a budget effect, or a
+    /// drain-fallback aggregate) still sees the full table. Exercises the
+    /// always-restore guarantee of `execute_streaming_leaf`.
+    ///
+    /// GPU-gated: builds an `Engine`.
+    #[test]
+    #[ignore = "gpu:projection — overlay restoration across queries"]
+    fn streaming_overlay_restored_after_morsel_query() {
+        let total = 300usize;
+        let mut engine = Engine::builder()
+            .memory_budget(4096)
+            .build()
+            .expect("ctx with budget");
+        engine
+            .register_table_stream_lazy("t", x_schema(), int64_producer(0, total))
+            .expect("register stream");
+        // First query streams morsel-by-morsel.
+        let h1 = engine.sql("SELECT x FROM t").expect("first (streamed) query");
+        assert_eq!(h1.record_batch().num_rows(), total, "first query sees all rows");
+        // Second query (drain-fallback aggregate) must still see the full
+        // table — the overlay was restored to the whole-table view.
+        let h2 = engine.sql("SELECT COUNT(x) FROM t").expect("second query");
+        let c = h2.record_batch().column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(c.value(0), total as i64, "overlay restored: full table visible");
     }
 }

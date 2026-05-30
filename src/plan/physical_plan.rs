@@ -1463,6 +1463,20 @@ impl<'a> Codegen<'a> {
                     | crate::plan::logical_plan::ScalarFnKind::TrimTrailing => {
                         "GPU codegen has no Utf8 support (TRIM routes through host fallback)"
                     }
+                    // New scalar string fns (OCTET_LENGTH/POSITION/REPLACE/
+                    // LEFT/RIGHT/LPAD/RPAD/REVERSE/INITCAP): host-only, routed
+                    // through the host PhysicalPlan::Project fallback.
+                    crate::plan::logical_plan::ScalarFnKind::OctetLength
+                    | crate::plan::logical_plan::ScalarFnKind::Position
+                    | crate::plan::logical_plan::ScalarFnKind::Replace
+                    | crate::plan::logical_plan::ScalarFnKind::Left
+                    | crate::plan::logical_plan::ScalarFnKind::Right
+                    | crate::plan::logical_plan::ScalarFnKind::Lpad
+                    | crate::plan::logical_plan::ScalarFnKind::Rpad
+                    | crate::plan::logical_plan::ScalarFnKind::Reverse
+                    | crate::plan::logical_plan::ScalarFnKind::Initcap => {
+                        "no GPU producer; routes through the host fallback"
+                    }
                 };
                 Err(BoltError::Plan(format!(
                     "string scalar function {} is not yet lowered to GPU: {}; \
@@ -3342,6 +3356,15 @@ fn all_scalar_fns_host_evaluable(exprs: &[Expr]) -> bool {
                         | ScalarFnKind::TrimBoth
                         | ScalarFnKind::TrimLeading
                         | ScalarFnKind::TrimTrailing
+                        | ScalarFnKind::OctetLength
+                        | ScalarFnKind::Position
+                        | ScalarFnKind::Replace
+                        | ScalarFnKind::Left
+                        | ScalarFnKind::Right
+                        | ScalarFnKind::Lpad
+                        | ScalarFnKind::Rpad
+                        | ScalarFnKind::Reverse
+                        | ScalarFnKind::Initcap
                 );
                 ok && args.iter().all(walk)
             }

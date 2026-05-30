@@ -432,6 +432,34 @@ pub enum ScalarFnKind {
     /// `TRIM(TRAILING [chars] FROM s)` — strip `chars` (default: whitespace)
     /// from the END of `s`. Args: `[s]` or `[s, chars]`.
     TrimTrailing,
+    /// `OCTET_LENGTH(s)` — UTF-8 byte length of `s`, as `Int64`.
+    OctetLength,
+    /// `POSITION(substr IN s)` / `STRPOS(s, substr)` — 1-based character index
+    /// of the first occurrence of `substr` in `s` (0 if absent), as `Int64`.
+    /// Args are always `[s, substr]` (the frontend normalises POSITION's
+    /// `substr IN s` spelling into this order).
+    Position,
+    /// `REPLACE(s, from, to)` — replace every occurrence of `from` in `s` with
+    /// `to`. Args: `[s, from, to]`; returns `Utf8`.
+    Replace,
+    /// `LEFT(s, n)` — first `n` characters of `s` (negative `n` drops from the
+    /// end). Args: `[s, n]`; returns `Utf8`.
+    Left,
+    /// `RIGHT(s, n)` — last `n` characters of `s` (negative `n` drops from the
+    /// front). Args: `[s, n]`; returns `Utf8`.
+    Right,
+    /// `LPAD(s, len, pad)` — left-pad/truncate `s` to `len` characters using
+    /// `pad`. Args: `[s, len, pad]`; returns `Utf8`.
+    Lpad,
+    /// `RPAD(s, len, pad)` — right-pad/truncate `s` to `len` characters using
+    /// `pad`. Args: `[s, len, pad]`; returns `Utf8`.
+    Rpad,
+    /// `REVERSE(s)` — reverse the characters of `s`. Args: `[s]`; returns
+    /// `Utf8`.
+    Reverse,
+    /// `INITCAP(s)` — capitalise the first letter of each word. Args: `[s]`;
+    /// returns `Utf8`.
+    Initcap,
 }
 
 impl ScalarFnKind {
@@ -447,6 +475,15 @@ impl ScalarFnKind {
             ScalarFnKind::TrimBoth
             | ScalarFnKind::TrimLeading
             | ScalarFnKind::TrimTrailing => "TRIM",
+            ScalarFnKind::OctetLength => "OCTET_LENGTH",
+            ScalarFnKind::Position => "POSITION",
+            ScalarFnKind::Replace => "REPLACE",
+            ScalarFnKind::Left => "LEFT",
+            ScalarFnKind::Right => "RIGHT",
+            ScalarFnKind::Lpad => "LPAD",
+            ScalarFnKind::Rpad => "RPAD",
+            ScalarFnKind::Reverse => "REVERSE",
+            ScalarFnKind::Initcap => "INITCAP",
         }
     }
 }
@@ -1268,6 +1305,126 @@ fn scalar_fn_dtype(
                         t
                     )));
                 }
+            }
+            Ok(DataType::Utf8)
+        }
+        ScalarFnKind::OctetLength => {
+            // OCTET_LENGTH(s): 1 Utf8 arg -> Int64 (byte length).
+            if arg_types.len() != 1 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects exactly 1 argument, got {}",
+                    arg_types.len()
+                )));
+            }
+            if arg_types[0] != DataType::Utf8 {
+                return Err(BoltError::Type(format!(
+                    "{name} requires a Utf8 argument, got {:?}",
+                    arg_types[0]
+                )));
+            }
+            Ok(DataType::Int64)
+        }
+        ScalarFnKind::Position => {
+            // POSITION(substr IN s) / STRPOS(s, substr): 2 Utf8 args -> Int64.
+            if arg_types.len() != 2 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects exactly 2 arguments (string, substring), got {}",
+                    arg_types.len()
+                )));
+            }
+            for (i, t) in arg_types.iter().enumerate() {
+                if *t != DataType::Utf8 {
+                    return Err(BoltError::Type(format!(
+                        "{name} argument {} must be Utf8, got {:?}",
+                        i + 1,
+                        t
+                    )));
+                }
+            }
+            Ok(DataType::Int64)
+        }
+        ScalarFnKind::Replace => {
+            // REPLACE(s, from, to): 3 Utf8 args -> Utf8.
+            if arg_types.len() != 3 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects exactly 3 arguments (string, from, to), got {}",
+                    arg_types.len()
+                )));
+            }
+            for (i, t) in arg_types.iter().enumerate() {
+                if *t != DataType::Utf8 {
+                    return Err(BoltError::Type(format!(
+                        "{name} argument {} must be Utf8, got {:?}",
+                        i + 1,
+                        t
+                    )));
+                }
+            }
+            Ok(DataType::Utf8)
+        }
+        ScalarFnKind::Left | ScalarFnKind::Right => {
+            // LEFT/RIGHT(s, n): first arg Utf8, second Int64 -> Utf8.
+            if arg_types.len() != 2 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects exactly 2 arguments (string, count), got {}",
+                    arg_types.len()
+                )));
+            }
+            if arg_types[0] != DataType::Utf8 {
+                return Err(BoltError::Type(format!(
+                    "{name} first argument must be Utf8, got {:?}",
+                    arg_types[0]
+                )));
+            }
+            if arg_types[1] != DataType::Int64 {
+                return Err(BoltError::Type(format!(
+                    "{name} second argument must be Int64, got {:?}",
+                    arg_types[1]
+                )));
+            }
+            Ok(DataType::Utf8)
+        }
+        ScalarFnKind::Lpad | ScalarFnKind::Rpad => {
+            // LPAD/RPAD(s, len, pad): Utf8, Int64, Utf8 -> Utf8.
+            if arg_types.len() != 3 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects exactly 3 arguments (string, length, pad), got {}",
+                    arg_types.len()
+                )));
+            }
+            if arg_types[0] != DataType::Utf8 {
+                return Err(BoltError::Type(format!(
+                    "{name} first argument must be Utf8, got {:?}",
+                    arg_types[0]
+                )));
+            }
+            if arg_types[1] != DataType::Int64 {
+                return Err(BoltError::Type(format!(
+                    "{name} second argument (length) must be Int64, got {:?}",
+                    arg_types[1]
+                )));
+            }
+            if arg_types[2] != DataType::Utf8 {
+                return Err(BoltError::Type(format!(
+                    "{name} third argument (pad) must be Utf8, got {:?}",
+                    arg_types[2]
+                )));
+            }
+            Ok(DataType::Utf8)
+        }
+        ScalarFnKind::Reverse | ScalarFnKind::Initcap => {
+            // REVERSE(s) / INITCAP(s): 1 Utf8 arg -> Utf8.
+            if arg_types.len() != 1 {
+                return Err(BoltError::Type(format!(
+                    "{name} expects exactly 1 argument, got {}",
+                    arg_types.len()
+                )));
+            }
+            if arg_types[0] != DataType::Utf8 {
+                return Err(BoltError::Type(format!(
+                    "{name} requires a Utf8 argument, got {:?}",
+                    arg_types[0]
+                )));
             }
             Ok(DataType::Utf8)
         }

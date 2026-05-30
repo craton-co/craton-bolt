@@ -3303,7 +3303,22 @@ fn try_string_scalar_fn(
         "UPPER" => ScalarFnKind::Upper,
         "LOWER" => ScalarFnKind::Lower,
         "LENGTH" => ScalarFnKind::Length,
+        // CHAR_LENGTH / CHARACTER_LENGTH are SQL-standard synonyms for the
+        // character-based LENGTH; they lower to the same kind.
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => ScalarFnKind::Length,
+        "OCTET_LENGTH" => ScalarFnKind::OctetLength,
         "CONCAT" => ScalarFnKind::Concat,
+        // STRPOS(s, substr) is the function-call spelling of POSITION; the
+        // dedicated `POSITION(substr IN s)` syntax is handled in `lower_expr`
+        // (sqlparser parses it as `SqlExpr::Position`, not a `Function`).
+        "STRPOS" => ScalarFnKind::Position,
+        "REPLACE" => ScalarFnKind::Replace,
+        "LEFT" => ScalarFnKind::Left,
+        "RIGHT" => ScalarFnKind::Right,
+        "LPAD" => ScalarFnKind::Lpad,
+        "RPAD" => ScalarFnKind::Rpad,
+        "REVERSE" => ScalarFnKind::Reverse,
+        "INITCAP" => ScalarFnKind::Initcap,
         // Note: "SUBSTRING" is parsed by sqlparser as `SqlExpr::Substring`,
         // not `SqlExpr::Function`, so we never see it here. If we ever do
         // (e.g. via a non-standard dialect), explicitly reject so callers
@@ -4362,6 +4377,21 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
             Ok(Expr::ScalarFn {
                 kind: ScalarFnKind::Substring,
                 args,
+            })
+        }
+        // `POSITION(substr IN s)`: sqlparser surfaces this as the dedicated
+        // `SqlExpr::Position { expr, r#in }` variant (`expr` is the substring,
+        // `r#in` is the haystack). The `STRPOS(s, substr)` function spelling is
+        // handled in `try_string_scalar_fn`. We normalise both into the
+        // `ScalarFnKind::Position` argument order `[s, substr]`, so the haystack
+        // is always arg 0 and the needle arg 1. Type-checking (`Utf8`, `Utf8` ->
+        // `Int64`) lives in `scalar_fn_dtype`.
+        SqlExpr::Position { expr, r#in } => {
+            let substr = lower_expr(expr, resolver, depth + 1)?;
+            let s = lower_expr(r#in, resolver, depth + 1)?;
+            Ok(Expr::ScalarFn {
+                kind: ScalarFnKind::Position,
+                args: vec![s, substr],
             })
         }
         // `TRIM([BOTH|LEADING|TRAILING] [chars] FROM s)` and `TRIM(s)`:
@@ -6914,6 +6944,158 @@ mod string_fn_tests {
         assert!(
             msg.contains("TRIM") && msg.contains("Utf8"),
             "expected TRIM Utf8 type error, got: {msg}"
+        );
+    }
+
+    // ===================================================================
+    // New string functions (Agent M): OCTET_LENGTH, CHAR_LENGTH /
+    // CHARACTER_LENGTH, POSITION / STRPOS, REPLACE, LEFT/RIGHT, LPAD/RPAD,
+    // REVERSE, INITCAP. These lower to `Expr::ScalarFn`. Parse-shape and
+    // type-check coverage lives here; the per-string host transforms are
+    // unit-tested in `exec::string_ops_extended`. GPU lowering (`lower()`)
+    // is intentionally NOT exercised: these functions are host-evaluated and
+    // the executor/physical-plan wiring (`expr_agg::eval_scalar_fn`,
+    // `physical_plan::all_scalar_fns_host_evaluable`) is applied by the
+    // orchestrator — see `reviews/done_M.md`.
+    // ===================================================================
+
+    /// Assert `sql`'s first SELECT expr is `Expr::ScalarFn(kind)` with `nargs`.
+    fn assert_scalar_fn(sql: &str, kind: ScalarFnKind, nargs: usize) {
+        let plan = parse(sql, &s_provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        match first_select_expr(&plan) {
+            Expr::ScalarFn { kind: k, args } => {
+                assert_eq!(k, kind, "kind for {sql}");
+                assert_eq!(args.len(), nargs, "arity for {sql}");
+            }
+            other => panic!("expected ScalarFn({kind:?}) for {sql}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn octet_length_parses() {
+        assert_scalar_fn("SELECT OCTET_LENGTH(s) FROM t", ScalarFnKind::OctetLength, 1);
+    }
+
+    #[test]
+    fn char_length_synonyms_lower_to_length() {
+        // CHAR_LENGTH and CHARACTER_LENGTH are synonyms for character LENGTH.
+        assert_scalar_fn("SELECT CHAR_LENGTH(s) FROM t", ScalarFnKind::Length, 1);
+        assert_scalar_fn(
+            "SELECT CHARACTER_LENGTH(s) FROM t",
+            ScalarFnKind::Length,
+            1,
+        );
+    }
+
+    #[test]
+    fn position_in_form_normalises_arg_order() {
+        // POSITION(substr IN s) -> ScalarFn(Position, [s, substr]).
+        let plan = parse("SELECT POSITION('lo' IN s) FROM t", &s_provider())
+            .expect("POSITION(substr IN s) must parse");
+        match first_select_expr(&plan) {
+            Expr::ScalarFn { kind, args } => {
+                assert_eq!(kind, ScalarFnKind::Position);
+                assert_eq!(args.len(), 2);
+                // arg 0 = haystack (the column), arg 1 = needle (the literal).
+                assert!(matches!(args[0], Expr::Column(_)), "arg0 = haystack s");
+                assert!(
+                    matches!(args[1], Expr::Literal(Literal::Utf8(ref n)) if n == "lo"),
+                    "arg1 = needle literal"
+                );
+            }
+            other => panic!("expected ScalarFn(Position), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strpos_function_form_parses() {
+        // STRPOS(s, substr) is the function spelling — same kind, [s, substr].
+        assert_scalar_fn("SELECT STRPOS(s, 'x') FROM t", ScalarFnKind::Position, 2);
+    }
+
+    #[test]
+    fn replace_parses() {
+        assert_scalar_fn("SELECT REPLACE(s, 'a', 'b') FROM t", ScalarFnKind::Replace, 3);
+    }
+
+    #[test]
+    fn left_right_parse() {
+        assert_scalar_fn("SELECT LEFT(s, 3) FROM t", ScalarFnKind::Left, 2);
+        assert_scalar_fn("SELECT RIGHT(s, 3) FROM t", ScalarFnKind::Right, 2);
+    }
+
+    #[test]
+    fn lpad_rpad_parse() {
+        assert_scalar_fn("SELECT LPAD(s, 5, '0') FROM t", ScalarFnKind::Lpad, 3);
+        assert_scalar_fn("SELECT RPAD(s, 5, ' ') FROM t", ScalarFnKind::Rpad, 3);
+    }
+
+    #[test]
+    fn reverse_initcap_parse() {
+        assert_scalar_fn("SELECT REVERSE(s) FROM t", ScalarFnKind::Reverse, 1);
+        assert_scalar_fn("SELECT INITCAP(s) FROM t", ScalarFnKind::Initcap, 1);
+    }
+
+    #[test]
+    fn case_insensitive_function_names() {
+        // SQL identifiers are case-insensitive: lower-case spellings work.
+        assert_scalar_fn("SELECT octet_length(s) FROM t", ScalarFnKind::OctetLength, 1);
+        assert_scalar_fn("SELECT reverse(s) FROM t", ScalarFnKind::Reverse, 1);
+    }
+
+    // ----- type-check (via schema()) -------------------------------------
+
+    #[test]
+    fn octet_length_returns_int64() {
+        let plan = parse("SELECT OCTET_LENGTH(s) FROM t", &s_provider()).unwrap();
+        let schema = plan.schema().expect("OCTET_LENGTH(Utf8) type-checks");
+        assert_eq!(schema.fields[0].dtype, DataType::Int64);
+    }
+
+    #[test]
+    fn position_returns_int64() {
+        let plan = parse("SELECT POSITION('x' IN s) FROM t", &s_provider()).unwrap();
+        let schema = plan.schema().expect("POSITION type-checks");
+        assert_eq!(schema.fields[0].dtype, DataType::Int64);
+    }
+
+    #[test]
+    fn replace_returns_utf8() {
+        let plan = parse("SELECT REPLACE(s, 'a', 'b') FROM t", &s_provider()).unwrap();
+        let schema = plan.schema().expect("REPLACE type-checks");
+        assert_eq!(schema.fields[0].dtype, DataType::Utf8);
+    }
+
+    #[test]
+    fn left_returns_utf8_and_requires_int_count() {
+        let plan = parse("SELECT LEFT(s, 2) FROM t", &s_provider()).unwrap();
+        let schema = plan.schema().expect("LEFT type-checks");
+        assert_eq!(schema.fields[0].dtype, DataType::Utf8);
+        // LEFT(s, <utf8>) must type-error on the count argument.
+        let bad = parse("SELECT LEFT(s, s) FROM t", &s_provider()).unwrap();
+        let err = bad.schema().expect_err("LEFT(s, Utf8) must type-error");
+        assert!(format!("{err}").contains("LEFT"), "{err}");
+    }
+
+    #[test]
+    fn octet_length_type_error_on_non_utf8() {
+        let plan = parse("SELECT OCTET_LENGTH(v) FROM t", &s_provider()).unwrap();
+        let err = plan.schema().expect_err("OCTET_LENGTH(Int64) must type-error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("OCTET_LENGTH") && msg.contains("Utf8"),
+            "expected OCTET_LENGTH Utf8 type error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn replace_arity_error() {
+        // REPLACE needs exactly 3 args.
+        let plan = parse("SELECT REPLACE(s, 'a') FROM t", &s_provider()).unwrap();
+        let err = plan.schema().expect_err("REPLACE/2 must type-error");
+        assert!(
+            format!("{err}").contains("REPLACE"),
+            "expected REPLACE arity error, got: {err}"
         );
     }
 }

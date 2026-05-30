@@ -464,12 +464,34 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 
 ## String functions
 
-`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`, and `TRIM` are surfaced through the SQL frontend via `Expr::ScalarFn` and **execute end-to-end** as of 0.7:
+`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`, and `TRIM` are surfaced through the SQL frontend via `Expr::ScalarFn` and **execute end-to-end** as of 0.7 (see also the "Additional scalar string functions" table below for `CHAR_LENGTH` / `OCTET_LENGTH` / `POSITION` / `REPLACE` / `LEFT` / `RIGHT` / `LPAD` / `RPAD` / `REVERSE` / `INITCAP`):
 
 - **`UPPER` / `LOWER`** lower to the **GPU** via the two-pass `PhysicalPlan::StringProject` executor (variable-width device output).
 - **`LENGTH`** lowers to the **GPU** via `PhysicalPlan::StringLength` (dictionary-gather, `Int64` output).
 - **`SUBSTRING` / `TRIM`** (`TRIM BOTH` / `LEADING` / `TRAILING`) execute **host-side** end-to-end.
 - **`CONCAT`** (and the `||` concat operator) execute **host-side** via the `Project` executor.
+
+### Additional scalar string functions
+
+The following functions are surfaced through the SQL frontend via `Expr::ScalarFn`
+and execute **host-side** (no GPU producer; same path as `SUBSTRING` / `TRIM`).
+All are **character-based** (operate on Unicode codepoints, never bytes) and
+**NULL-propagating** (a NULL in any argument yields a NULL result).
+
+| Function | Result | Semantics |
+|----------|--------|-----------|
+| `CHAR_LENGTH(s)` / `CHARACTER_LENGTH(s)` | `Int64` | Synonym for the character-based `LENGTH`. `CHAR_LENGTH('héllo') = 5`. |
+| `OCTET_LENGTH(s)` | `Int64` | UTF-8 **byte** length. `OCTET_LENGTH('héllo') = 6` (the `é` is two bytes). |
+| `POSITION(substr IN s)` / `STRPOS(s, substr)` | `Int64` | 1-based **character** index of the first occurrence of `substr` in `s`, or `0` if absent. The empty substring is found at position `1`. `POSITION('llo' IN 'héllo') = 3`. |
+| `REPLACE(s, from, to)` | `Utf8` | Replace every occurrence of `from` in `s` with `to`. An empty `from` returns `s` unchanged (PostgreSQL/DuckDB). |
+| `LEFT(s, n)` | `Utf8` | First `n` characters of `s`. Negative `n` drops the last `|n|` characters (`LEFT('abcde', -2) = 'abc'`). |
+| `RIGHT(s, n)` | `Utf8` | Last `n` characters of `s`. Negative `n` drops the first `|n|` characters (`RIGHT('abcde', -2) = 'cde'`). |
+| `LPAD(s, len, pad)` | `Utf8` | Left-pad `s` to `len` characters using `pad`; if `s` is longer than `len` it is truncated to the first `len` characters. An empty `pad` only truncates. |
+| `RPAD(s, len, pad)` | `Utf8` | Right-pad `s` to `len` characters using `pad`; truncation behaviour matches `LPAD`. |
+| `REVERSE(s)` | `Utf8` | Reverse the characters of `s` (multibyte codepoints preserved). `REVERSE('héllo') = 'olléh'`. |
+| `INITCAP(s)` | `Utf8` | Capitalise the first letter of each word and lower-case the rest. A "word" is a maximal run of alphanumeric characters. `INITCAP('hi tHERE-bob') = 'Hi There-Bob'`. |
+
+Case folding (`UPPER` / `LOWER` / `INITCAP`) uses Unicode default case mapping and is locale-invariant.
 
 The underlying transformations live in `src/exec/string_ops` / `src/exec/string_ops_extended` / `src/exec/string_project`.
 

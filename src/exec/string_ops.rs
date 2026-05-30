@@ -155,6 +155,13 @@ fn lengths_table_pure(old_dict: &[String]) -> BoltResult<Vec<i32>> {
 ///
 /// Errors if any individual string's byte length exceeds `i32::MAX` — an absurd
 /// 2 GiB single value.
+///
+/// Reserved for the future GPU `OCTET_LENGTH` producer: today `OCTET_LENGTH`
+/// evaluates on the host via [`crate::exec::string_ops_extended::octet_length_str`]
+/// (mirroring the other new scalar string fns), so this dictionary-table variant
+/// has no caller yet. Kept (not deleted) so the GPU byte-length path can adopt
+/// it the same way SQL `LENGTH` uses the character-count table.
+#[allow(dead_code)]
 fn octet_lengths_table_pure(old_dict: &[String]) -> BoltResult<Vec<i32>> {
     let mut out: Vec<i32> = Vec::with_capacity(old_dict.len() + 1);
     out.push(0); // NULL slot

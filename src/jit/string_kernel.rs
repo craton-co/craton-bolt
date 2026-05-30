@@ -152,6 +152,21 @@ fn varwidth_tag(kind: ScalarFnKind) -> BoltResult<&'static str> {
              host fallback remains reachable"
                 .into(),
         )),
+        // New scalar string fns (OCTET_LENGTH, POSITION, REPLACE, LEFT/RIGHT,
+        // LPAD/RPAD, REVERSE, INITCAP) are host-only — they have no two-pass
+        // GPU producer, so they belong with LENGTH/CONCAT as an Err here and
+        // route through the host fallback (see physical_plan host whitelist).
+        ScalarFnKind::OctetLength
+        | ScalarFnKind::Position
+        | ScalarFnKind::Replace
+        | ScalarFnKind::Left
+        | ScalarFnKind::Right
+        | ScalarFnKind::Lpad
+        | ScalarFnKind::Rpad
+        | ScalarFnKind::Reverse
+        | ScalarFnKind::Initcap => Err(BoltError::Plan(
+            "string_kernel: this string function has no GPU producer; host fallback only".into(),
+        )),
     }
 }
 

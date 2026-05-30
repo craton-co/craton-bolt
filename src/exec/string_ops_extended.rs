@@ -230,6 +230,180 @@ pub fn trim_str(s: &str, side: TrimSide, chars: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Per-string scalar helpers (host evaluator path).
+//
+// These mirror `substring_str` / `trim_str`: pure `&str -> String` (or
+// `-> i64`) transforms the host expression evaluator (`expr_agg::eval_scalar_fn`)
+// applies directly to a `Vec<Option<String>>` column. They are character-based
+// (Unicode codepoints), NULL-propagation is handled by the caller (a NULL input
+// cell never reaches these — see `expr_agg`). No GPU producer is wired for any
+// of them; the host path is the supported one.
+// ---------------------------------------------------------------------------
+
+/// `CHAR_LENGTH(s)` / `CHARACTER_LENGTH(s)` — character (Unicode codepoint)
+/// count, returned as `i64` to match the SQL `LENGTH -> Int64` contract.
+/// Synonym for `LENGTH`; `CHAR_LENGTH('héllo') = 5`.
+pub fn char_length_str(s: &str) -> i64 {
+    s.chars().count() as i64
+}
+
+/// `OCTET_LENGTH(s)` — UTF-8 byte length, returned as `i64`.
+/// `OCTET_LENGTH('héllo') = 6` (the 'é' is two bytes). Byte counterpart of
+/// [`char_length_str`].
+pub fn octet_length_str(s: &str) -> i64 {
+    s.len() as i64
+}
+
+/// `POSITION(substr IN s)` / `STRPOS(s, substr)` — 1-based CHARACTER index of
+/// the first occurrence of `substr` in `s`, or `0` if `substr` is not present.
+///
+/// Per ANSI SQL the empty substring is found at position `1`. The index is a
+/// character (codepoint) position, not a byte offset: searching `"héllo"` for
+/// `"llo"` returns `3`, not `4`.
+pub fn position_str(s: &str, substr: &str) -> i64 {
+    if substr.is_empty() {
+        return 1;
+    }
+    // `find` gives a byte offset; convert it to a 1-based character index by
+    // counting codepoints in the prefix before the match.
+    match s.find(substr) {
+        Some(byte_off) => s[..byte_off].chars().count() as i64 + 1,
+        None => 0,
+    }
+}
+
+/// `REPLACE(s, from, to)` — replace every non-overlapping occurrence of `from`
+/// in `s` with `to`. When `from` is empty, `s` is returned unchanged (matching
+/// PostgreSQL / DuckDB, which never inject `to` into an empty-needle search).
+pub fn replace_str(s: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return s.to_string();
+    }
+    s.replace(from, to)
+}
+
+/// `LEFT(s, n)` — the first `n` CHARACTERS of `s` (ANSI / PostgreSQL).
+///
+/// * `n >= len`  → the whole string.
+/// * `n == 0`    → `""`.
+/// * `n < 0`     → all but the last `|n|` characters (PostgreSQL semantics):
+///   `LEFT('abcde', -2) = "abc"`. If `|n| >= len` the result is `""`.
+pub fn left_str(s: &str, n: i64) -> String {
+    let char_count = s.chars().count() as i64;
+    let take = if n >= 0 {
+        n.min(char_count)
+    } else {
+        // Drop the last |n| chars: keep char_count - |n|, floored at 0.
+        (char_count + n).max(0)
+    };
+    s.chars().take(take as usize).collect()
+}
+
+/// `RIGHT(s, n)` — the last `n` CHARACTERS of `s` (ANSI / PostgreSQL).
+///
+/// * `n >= len`  → the whole string.
+/// * `n == 0`    → `""`.
+/// * `n < 0`     → all but the first `|n|` characters (PostgreSQL semantics):
+///   `RIGHT('abcde', -2) = "cde"`. If `|n| >= len` the result is `""`.
+pub fn right_str(s: &str, n: i64) -> String {
+    let char_count = s.chars().count() as i64;
+    let skip = if n >= 0 {
+        (char_count - n).max(0)
+    } else {
+        // Drop the first |n| chars: skip |n|, capped at char_count.
+        (-n).min(char_count)
+    };
+    s.chars().skip(skip as usize).collect()
+}
+
+/// Which side [`pad_str`] pads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadSide {
+    /// `LPAD` — pad/truncate on the LEFT.
+    Left,
+    /// `RPAD` — pad/truncate on the RIGHT.
+    Right,
+}
+
+/// `LPAD(s, len, pad)` / `RPAD(s, len, pad)` — pad or truncate `s` to exactly
+/// `len` CHARACTERS using `pad` as the fill (ANSI / PostgreSQL).
+///
+/// * If `s` is longer than `len`, it is TRUNCATED to the first `len` characters
+///   (both LPAD and RPAD truncate from the right, keeping the prefix — matching
+///   PostgreSQL).
+/// * If `s` is shorter, `pad` is repeated (and cut mid-`pad` if needed) to fill
+///   the gap on the requested side.
+/// * `len <= 0` → `""`.
+/// * An empty `pad` cannot fill, so `s` is only ever truncated, never padded
+///   (PostgreSQL returns the truncated/verbatim string in that case).
+///
+/// `len` is taken as `i64` and saturated into the character domain; absurd
+/// values just clamp to the string length.
+pub fn pad_str(s: &str, len: i64, pad: &str, side: PadSide) -> String {
+    if len <= 0 {
+        return String::new();
+    }
+    let target = len as usize;
+    let src: Vec<char> = s.chars().collect();
+    if src.len() >= target {
+        // Truncate to the first `target` characters (prefix kept on both sides).
+        return src.into_iter().take(target).collect();
+    }
+    let gap = target - src.len();
+    let pad_chars: Vec<char> = pad.chars().collect();
+    if pad_chars.is_empty() {
+        // Nothing to pad with: return the (shorter) source verbatim.
+        return src.into_iter().collect();
+    }
+    // Build the fill by cycling `pad` until `gap` characters are produced.
+    let fill: String = pad_chars.iter().cycle().take(gap).collect();
+    match side {
+        PadSide::Left => {
+            let mut out = fill;
+            out.extend(src.iter());
+            out
+        }
+        PadSide::Right => {
+            let mut out: String = src.into_iter().collect();
+            out.push_str(&fill);
+            out
+        }
+    }
+}
+
+/// `REVERSE(s)` — reverse the CHARACTERS of `s` (codepoint order, so multibyte
+/// characters are preserved intact). `REVERSE('héllo') = "olléh"`.
+pub fn reverse_str(s: &str) -> String {
+    s.chars().rev().collect()
+}
+
+/// `INITCAP(s)` — upper-case the first character of each word and lower-case the
+/// rest (PostgreSQL semantics). A "word" is a maximal run of alphanumeric
+/// characters; any non-alphanumeric character is a separator and resets the
+/// "start of word" state. `INITCAP('hi tHERE-bob') = "Hi There-Bob"`.
+///
+/// Case folding uses Unicode default case mapping (locale-invariant), matching
+/// `UPPER` / `LOWER`.
+pub fn initcap_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if at_word_start {
+                out.extend(c.to_uppercase());
+            } else {
+                out.extend(c.to_lowercase());
+            }
+            at_word_start = false;
+        } else {
+            out.push(c);
+            at_word_start = true;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Pure helpers (no GPU). The transformation logic lives here so it can be
 // exhaustively unit tested without a CUDA runtime.
 // ---------------------------------------------------------------------------
@@ -1024,6 +1198,214 @@ mod tests {
         assert_eq!(trim_str("→→go→", TrimSide::Both, Some("→")), "go");
         // Multi-byte content preserved.
         assert_eq!(trim_str("  héllo  ", TrimSide::Both, None), "héllo");
+    }
+
+    // ----- CHAR_LENGTH / OCTET_LENGTH ------------------------------------
+
+    #[test]
+    fn char_length_counts_characters() {
+        assert_eq!(char_length_str("héllo"), 5);
+        assert_eq!(char_length_str("日本語"), 3);
+        assert_eq!(char_length_str(""), 0);
+        assert_eq!(char_length_str("abc"), 3);
+    }
+
+    #[test]
+    fn octet_length_counts_bytes() {
+        assert_eq!(octet_length_str("héllo"), 6); // 'é' is 2 bytes
+        assert_eq!(octet_length_str("日本語"), 9); // each char is 3 bytes
+        assert_eq!(octet_length_str(""), 0);
+        assert_eq!(octet_length_str("abc"), 3);
+    }
+
+    // ----- POSITION / STRPOS ---------------------------------------------
+
+    #[test]
+    fn position_basic() {
+        assert_eq!(position_str("hello", "ll"), 3);
+        assert_eq!(position_str("hello", "h"), 1);
+        assert_eq!(position_str("hello", "o"), 5);
+        assert_eq!(position_str("hello", "z"), 0);
+    }
+
+    #[test]
+    fn position_empty_substring_is_one() {
+        // ANSI: empty needle is found at position 1.
+        assert_eq!(position_str("hello", ""), 1);
+        assert_eq!(position_str("", ""), 1);
+    }
+
+    #[test]
+    fn position_is_character_indexed_not_byte() {
+        // "héllo": 'h'(1) 'é'(2) 'l'(3) 'l'(4) 'o'(5). "llo" begins at CHAR 3
+        // even though it begins at BYTE 4 ('é' is two bytes).
+        assert_eq!(position_str("héllo", "llo"), 3);
+        assert_eq!(position_str("héllo", "é"), 2);
+        assert_eq!(position_str("日本語", "語"), 3);
+    }
+
+    #[test]
+    fn position_first_occurrence() {
+        assert_eq!(position_str("abcabc", "bc"), 2);
+    }
+
+    // ----- REPLACE -------------------------------------------------------
+
+    #[test]
+    fn replace_basic() {
+        assert_eq!(replace_str("hello world", "o", "0"), "hell0 w0rld");
+        assert_eq!(replace_str("aaa", "a", "bb"), "bbbbbb");
+        assert_eq!(replace_str("abc", "x", "y"), "abc");
+    }
+
+    #[test]
+    fn replace_substring_not_char_set() {
+        // REPLACE replaces the whole "from" substring, not a char set.
+        assert_eq!(replace_str("a.b.c", ".", "-"), "a-b-c");
+        assert_eq!(replace_str("foofoo", "foo", ""), "");
+    }
+
+    #[test]
+    fn replace_empty_from_returns_unchanged() {
+        // Empty needle: leave the string untouched (Postgres/DuckDB).
+        assert_eq!(replace_str("abc", "", "X"), "abc");
+    }
+
+    #[test]
+    fn replace_unicode() {
+        assert_eq!(replace_str("héllo", "é", "e"), "hello");
+        assert_eq!(replace_str("日本語", "本", "X"), "日X語");
+    }
+
+    // ----- LEFT / RIGHT --------------------------------------------------
+
+    #[test]
+    fn left_basic() {
+        assert_eq!(left_str("abcde", 3), "abc");
+        assert_eq!(left_str("abcde", 0), "");
+        assert_eq!(left_str("abcde", 10), "abcde");
+    }
+
+    #[test]
+    fn left_negative_drops_from_end() {
+        // PostgreSQL: LEFT('abcde', -2) keeps all but the last 2 -> "abc".
+        assert_eq!(left_str("abcde", -2), "abc");
+        assert_eq!(left_str("abcde", -5), "");
+        assert_eq!(left_str("abcde", -10), "");
+    }
+
+    #[test]
+    fn left_character_indexed() {
+        assert_eq!(left_str("héllo", 2), "hé");
+        assert_eq!(left_str("日本語", 2), "日本");
+        assert_eq!(left_str("héllo", -2), "hél");
+    }
+
+    #[test]
+    fn right_basic() {
+        assert_eq!(right_str("abcde", 3), "cde");
+        assert_eq!(right_str("abcde", 0), "");
+        assert_eq!(right_str("abcde", 10), "abcde");
+    }
+
+    #[test]
+    fn right_negative_drops_from_front() {
+        // PostgreSQL: RIGHT('abcde', -2) keeps all but the first 2 -> "cde".
+        assert_eq!(right_str("abcde", -2), "cde");
+        assert_eq!(right_str("abcde", -5), "");
+        assert_eq!(right_str("abcde", -10), "");
+    }
+
+    #[test]
+    fn right_character_indexed() {
+        assert_eq!(right_str("héllo", 3), "llo");
+        assert_eq!(right_str("日本語", 2), "本語");
+        assert_eq!(right_str("héllo", -1), "éllo");
+    }
+
+    // ----- LPAD / RPAD ---------------------------------------------------
+
+    #[test]
+    fn lpad_pads_on_left() {
+        assert_eq!(pad_str("5", 3, "0", PadSide::Left), "005");
+        assert_eq!(pad_str("abc", 5, "xy", PadSide::Left), "xyabc");
+        assert_eq!(pad_str("abc", 6, "xy", PadSide::Left), "xyxabc");
+    }
+
+    #[test]
+    fn rpad_pads_on_right() {
+        assert_eq!(pad_str("5", 3, "0", PadSide::Right), "500");
+        assert_eq!(pad_str("abc", 5, "xy", PadSide::Right), "abcxy");
+        assert_eq!(pad_str("abc", 6, "xy", PadSide::Right), "abcxyx");
+    }
+
+    #[test]
+    fn pad_truncates_when_source_too_long() {
+        // Both LPAD and RPAD truncate to the first `len` chars when source is
+        // longer than the target (Postgres).
+        assert_eq!(pad_str("abcdef", 3, "x", PadSide::Left), "abc");
+        assert_eq!(pad_str("abcdef", 3, "x", PadSide::Right), "abc");
+    }
+
+    #[test]
+    fn pad_zero_or_negative_len_is_empty() {
+        assert_eq!(pad_str("abc", 0, "x", PadSide::Left), "");
+        assert_eq!(pad_str("abc", -3, "x", PadSide::Right), "");
+    }
+
+    #[test]
+    fn pad_empty_pad_string_only_truncates() {
+        // No fill available: shorter source returned verbatim, longer truncated.
+        assert_eq!(pad_str("ab", 5, "", PadSide::Left), "ab");
+        assert_eq!(pad_str("abcdef", 3, "", PadSide::Right), "abc");
+    }
+
+    #[test]
+    fn pad_character_indexed() {
+        // Multibyte pad and source count by characters, not bytes.
+        assert_eq!(pad_str("x", 3, "→", PadSide::Left), "→→x");
+        assert_eq!(pad_str("héllo", 7, "*", PadSide::Right), "héllo**");
+    }
+
+    // ----- REVERSE -------------------------------------------------------
+
+    #[test]
+    fn reverse_basic() {
+        assert_eq!(reverse_str("abc"), "cba");
+        assert_eq!(reverse_str(""), "");
+        assert_eq!(reverse_str("a"), "a");
+    }
+
+    #[test]
+    fn reverse_preserves_multibyte_chars() {
+        assert_eq!(reverse_str("héllo"), "olléh");
+        assert_eq!(reverse_str("日本語"), "語本日");
+        assert_eq!(reverse_str("a😀b"), "b😀a");
+    }
+
+    // ----- INITCAP -------------------------------------------------------
+
+    #[test]
+    fn initcap_basic() {
+        assert_eq!(initcap_str("hello world"), "Hello World");
+        assert_eq!(initcap_str("HELLO WORLD"), "Hello World");
+        assert_eq!(initcap_str(""), "");
+    }
+
+    #[test]
+    fn initcap_word_boundaries_on_non_alphanumeric() {
+        // Hyphen and other punctuation reset the word boundary.
+        assert_eq!(initcap_str("hi tHERE-bob"), "Hi There-Bob");
+        assert_eq!(initcap_str("a.b.c"), "A.B.C");
+        // Digits are alphanumeric: a digit starts a word, the following letter
+        // is mid-word and lower-cased.
+        assert_eq!(initcap_str("1ab 2CD"), "1ab 2cd");
+    }
+
+    #[test]
+    fn initcap_unicode() {
+        // Accented letters are alphanumeric and case-fold via Unicode default.
+        assert_eq!(initcap_str("éric dupont"), "Éric Dupont");
     }
 
     // ----- GPU TRIM byte-rule mirror -------------------------------------

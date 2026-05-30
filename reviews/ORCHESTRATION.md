@@ -53,5 +53,13 @@ After each batch of merges: orchestrator runs `cargo check --no-default-features
 7. [C] string_ops::length dtype Int32->Int64: no in-tree callers, but verify after merge.
 
 ## Completed
-E, I, H, F, G, C done. Running: A, B, D, N.
-Wave 2 (launch after merge+build checkpoint): M (string fns: needs plan/sql_frontend + logical_plan + string executors), J (streaming: engine+streaming), L (tier2 dedup), K (jit kernel dedup). All gated on a clean post-merge tree / golden snapshots.
+Wave 1: A(partial→A2), B, C, D(partial→D2), E, F, G, H, I.
+Wave 2: A2 (critical deferred-free LIVE), D2 (groupby F1-F4), W (cross-file wiring), N2 (tests).
+  Orchestrator fixes: BinaryOp import, observability test-isolation race, lookback row-budget guard.
+  Checkpoints green: 2098 passed / 0 failed / 324 GPU-ignored.
+Wave 3 RUNNING: M=a524045951acf20fd (string fns), J=abf8a96806fc82b6c (streaming wiring).
+
+## Wave 4 (after M/J merge + golden snapshots)
+- Orchestrator: generate & commit insta full-PTX golden snapshots (host-side codegen, no GPU needed) — guards dedup.
+- K (jit partition_reduce_kernel_* dedup) — PTX MUST stay byte-identical to committed goldens.
+- L (groupby_tier2_* dedup) — safe shared-helper extraction only; behavior-identical.

@@ -441,7 +441,10 @@ fn eval_scalar_fn(
     env: &ColumnEnv<'_>,
     n_rows: usize,
 ) -> BoltResult<HostColumn> {
-    use crate::exec::string_ops_extended::{substring_str, trim_str, TrimSide};
+    use crate::exec::string_ops_extended::{
+        initcap_str, left_str, octet_length_str, pad_str, position_str, replace_str, reverse_str,
+        right_str, substring_str, trim_str, PadSide, TrimSide,
+    };
     match kind {
         ScalarFnKind::Substring => {
             if args.len() != 2 && args.len() != 3 {
@@ -510,6 +513,80 @@ fn eval_scalar_fn(
                     None => out.push(Some(trim_str(s, side, None))),
                 }
             }
+            Ok(HostColumn::Utf8(out))
+        }
+        ScalarFnKind::OctetLength => {
+            let src = eval_utf8_arg(&args[0], env, n_rows, "OCTET_LENGTH")?;
+            let out: Vec<Option<i64>> =
+                src.iter().map(|c| c.as_deref().map(octet_length_str)).collect();
+            Ok(HostColumn::I64(out))
+        }
+        ScalarFnKind::Position => {
+            let s = eval_utf8_arg(&args[0], env, n_rows, "POSITION")?;
+            let sub = eval_utf8_arg(&args[1], env, n_rows, "POSITION")?;
+            let mut out = Vec::with_capacity(n_rows);
+            for i in 0..n_rows {
+                out.push(match (&s[i], &sub[i]) {
+                    (Some(s), Some(sub)) => Some(position_str(s, sub)),
+                    _ => None,
+                });
+            }
+            Ok(HostColumn::I64(out))
+        }
+        ScalarFnKind::Replace => {
+            let s = eval_utf8_arg(&args[0], env, n_rows, "REPLACE")?;
+            let from = eval_utf8_arg(&args[1], env, n_rows, "REPLACE")?;
+            let to = eval_utf8_arg(&args[2], env, n_rows, "REPLACE")?;
+            let mut out = Vec::with_capacity(n_rows);
+            for i in 0..n_rows {
+                out.push(match (&s[i], &from[i], &to[i]) {
+                    (Some(s), Some(f), Some(t)) => Some(replace_str(s, f, t)),
+                    _ => None,
+                });
+            }
+            Ok(HostColumn::Utf8(out))
+        }
+        ScalarFnKind::Left | ScalarFnKind::Right => {
+            let s = eval_utf8_arg(&args[0], env, n_rows, kind.sql_name())?;
+            let n = eval_i64_arg(&args[1], env, n_rows, kind.sql_name())?;
+            let is_left = matches!(kind, ScalarFnKind::Left);
+            let mut out = Vec::with_capacity(n_rows);
+            for i in 0..n_rows {
+                out.push(match (&s[i], n[i]) {
+                    (Some(s), Some(n)) => {
+                        Some(if is_left { left_str(s, n) } else { right_str(s, n) })
+                    }
+                    _ => None,
+                });
+            }
+            Ok(HostColumn::Utf8(out))
+        }
+        ScalarFnKind::Lpad | ScalarFnKind::Rpad => {
+            let s = eval_utf8_arg(&args[0], env, n_rows, kind.sql_name())?;
+            let len = eval_i64_arg(&args[1], env, n_rows, kind.sql_name())?;
+            let pad = eval_utf8_arg(&args[2], env, n_rows, kind.sql_name())?;
+            let side = if matches!(kind, ScalarFnKind::Lpad) {
+                PadSide::Left
+            } else {
+                PadSide::Right
+            };
+            let mut out = Vec::with_capacity(n_rows);
+            for i in 0..n_rows {
+                out.push(match (&s[i], len[i], &pad[i]) {
+                    (Some(s), Some(l), Some(p)) => Some(pad_str(s, l, p, side)),
+                    _ => None,
+                });
+            }
+            Ok(HostColumn::Utf8(out))
+        }
+        ScalarFnKind::Reverse => {
+            let s = eval_utf8_arg(&args[0], env, n_rows, "REVERSE")?;
+            let out = s.iter().map(|c| c.as_deref().map(reverse_str)).collect();
+            Ok(HostColumn::Utf8(out))
+        }
+        ScalarFnKind::Initcap => {
+            let s = eval_utf8_arg(&args[0], env, n_rows, "INITCAP")?;
+            let out = s.iter().map(|c| c.as_deref().map(initcap_str)).collect();
             Ok(HostColumn::Utf8(out))
         }
         // These never legitimately reach the host evaluator (see fn docs).
