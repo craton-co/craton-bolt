@@ -3632,9 +3632,10 @@ fn try_lower_string_like_filter(
         LogicalPlan::Scan { table, schema, .. } => (table.clone(), schema),
         _ => return Ok(None),
     };
+    // `column` must be a Utf8 column of the scan. A lookup miss → host fallback.
     let field = match scan_schema.field(&column) {
-        Some(f) => f,
-        None => return Ok(None),
+        Ok(f) => f,
+        Err(_) => return Ok(None),
     };
     if field.dtype != DataType::Utf8 {
         return Ok(None);
