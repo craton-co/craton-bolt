@@ -3441,14 +3441,33 @@ impl Engine {
             }
         };
         let col_arr = batch.column(col_idx);
-        let str_arr = match col_arr.as_any().downcast_ref::<arrow_array::StringArray>() {
+        // Normalise to a `StringArray`. The common case is a direct downcast;
+        // any other Utf8-compatible layout (e.g. a dictionary array that slipped
+        // through un-rewritten) is cast to Utf8 so the path stays host-fallback-
+        // safe (no panic, no hard error) for unexpected run-time layouts.
+        let owned_cast: ArrayRef;
+        let str_arr: &arrow_array::StringArray = match col_arr
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+        {
             Some(a) => a,
             None => {
-                return Err(BoltError::Plan(format!(
-                    "StringLikeFilter: column '{column}' is not a Utf8 StringArray \
-                     (got {:?})",
-                    col_arr.data_type()
-                )))
+                owned_cast = arrow::compute::cast(col_arr.as_ref(), &ArrowDataType::Utf8)
+                    .map_err(|e| {
+                        BoltError::Plan(format!(
+                            "StringLikeFilter: column '{column}' is not Utf8 and could \
+                             not be cast (got {:?}): {e}",
+                            col_arr.data_type()
+                        ))
+                    })?;
+                owned_cast
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| {
+                        BoltError::Plan(format!(
+                            "StringLikeFilter: cast of column '{column}' did not yield Utf8"
+                        ))
+                    })?
             }
         };
 
