@@ -77,7 +77,15 @@ pub const CU_EVENT_DISABLE_TIMING: c_uint = 0x02;
 pub const CUDA_ERROR_STUB: CUresult = 100_000;
 
 #[cfg(not(feature = "cuda-stub"))]
-#[link(name = "cuda")]
+// On Windows the CUDA toolkit ships `cuda.lib` as a *static stub* (CUDA 12+):
+// it exports plain `cu*` symbols backed by `pfn_cu*` function pointers that
+// lazily `LoadLibrary("nvcuda.dll")` on first call — there are no `__imp_`
+// import thunks. Linking it as the default `kind = "dylib"` makes rustc emit
+// `__imp_cu*` dllimport references that the stub can't satisfy (LNK2019).
+// So link it statically on Windows. On Unix, `libcuda.so` is a genuine shared
+// object and must stay a dylib import.
+#[cfg_attr(target_os = "windows", link(name = "cuda", kind = "static"))]
+#[cfg_attr(not(target_os = "windows"), link(name = "cuda"))]
 extern "C" {
     pub fn cuInit(flags: c_uint) -> CUresult;
     pub fn cuDeviceGetCount(count: *mut c_int) -> CUresult;
@@ -556,8 +564,13 @@ impl CudaContext {
 
     /// Bind this context to the calling thread.
     ///
-    /// Under `--features cudarc` this is a no-op: cudarc primary contexts
-    /// are bound automatically when the device handle is used.
+    /// Under `--features cudarc` this binds cudarc's primary context to the
+    /// calling thread via `cuCtxSetCurrent`. This is NOT a no-op: cudarc's
+    /// raw-pointer alloc/memcpy escape hatch (which the engine uses) does not
+    /// auto-bind the way its safe `CudaSlice` API does, and kernel launches /
+    /// module loads route through the hand-rolled FFI, which acts on the
+    /// thread's *current* context. A launch-only worker thread that never
+    /// touched the alloc path would otherwise have no current context.
     pub fn set_current(&self) -> BoltResult<()> {
         #[cfg(not(feature = "cudarc"))]
         {
@@ -565,7 +578,7 @@ impl CudaContext {
         }
         #[cfg(feature = "cudarc")]
         {
-            Ok(())
+            crate::cuda::cudarc_backend::bind_current_thread()
         }
     }
 

@@ -205,6 +205,25 @@ pub trait LiteralResolver {
         let _ = column;
         DataType::Int32
     }
+
+    /// True iff a `col LIKE 'pattern'` predicate over `column` may be folded
+    /// into the GPU integer-index membership form (the dictionary precompute,
+    /// see [`Self::like_match_indices`]).
+    ///
+    /// Defaults to `true`. The engine's [`StringPredicateRewriter`] overrides
+    /// this to return `false` for columns that the query also *projects as a
+    /// bare Utf8 output*. For those, the integer-index filter cannot produce
+    /// the surviving Utf8 rows (the fused GPU scan kernel has no Utf8 register
+    /// class and does not compact), so the predicate must stay a real
+    /// `Expr::Like` — the physical planner then routes it to the per-row GPU
+    /// `StringLikeFilter` (or the host `LIKE`), both of which materialise and
+    /// compact the Utf8 output correctly. `SELECT v FROM t WHERE s LIKE 'p%'`
+    /// (string column NOT projected) is unaffected and keeps the faster
+    /// integer-membership fold.
+    fn like_rewrite_allowed(&self, column: &str) -> bool {
+        let _ = column;
+        true
+    }
 }
 
 /// Maps a Utf8 column name to the dictionary the engine loaded for it, plus
@@ -227,6 +246,11 @@ pub struct StringPredicateRewriter<'a> {
     /// completeness guarantee on its own; callers that built the dictionary
     /// from a full single-pass scan opt in via [`Self::mark_complete`].
     complete: std::collections::HashSet<String>,
+    /// Columns whose `LIKE` predicate must NOT be folded into the integer-index
+    /// membership form because the query projects the column as a bare Utf8
+    /// output (see [`LiteralResolver::like_rewrite_allowed`]). Populated by
+    /// [`Self::protect_like`] from the plan before rewriting.
+    like_protected: std::collections::HashSet<String>,
 }
 
 impl<'a> Default for StringPredicateRewriter<'a> {
@@ -242,7 +266,18 @@ impl<'a> StringPredicateRewriter<'a> {
             dicts: HashMap::new(),
             name_map: HashMap::new(),
             complete: std::collections::HashSet::new(),
+            like_protected: std::collections::HashSet::new(),
         }
+    }
+
+    /// Protect `column`'s `LIKE` predicate from the integer-index membership
+    /// fold (see [`LiteralResolver::like_rewrite_allowed`]). Called for every
+    /// column the query projects as a bare Utf8 output, so the predicate stays
+    /// a real `Expr::Like` and reaches the per-row GPU `StringLikeFilter` (which
+    /// can emit the surviving Utf8 rows) instead of an integer filter that
+    /// cannot.
+    pub fn protect_like(&mut self, column: impl Into<String>) {
+        self.like_protected.insert(column.into());
     }
 
     /// Mark `column`'s dictionary as known-complete: it observed every distinct
@@ -313,6 +348,10 @@ impl<'a> LiteralResolver for StringPredicateRewriter<'a> {
 
     fn knows(&self, column: &str) -> bool {
         self.dicts.contains_key(column)
+    }
+
+    fn like_rewrite_allowed(&self, column: &str) -> bool {
+        !self.like_protected.contains(column)
     }
 
     fn like_match_indices(
@@ -629,7 +668,12 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             // therefore always falls through to the host `Expr::Like` path.
             if !*negated && escape.is_none() && !*case_insensitive {
                 if let Expr::Column(col_name) = strip_alias(&new_inner) {
-                    if r.knows(col_name) {
+                    // `like_rewrite_allowed` is false when the query projects
+                    // this column as a bare Utf8 output: the integer-index
+                    // filter can't emit the surviving Utf8 rows, so keep the
+                    // real `Expr::Like` for the per-row `StringLikeFilter` /
+                    // host path. See the trait method doc.
+                    if r.knows(col_name) && r.like_rewrite_allowed(col_name) {
                         if let Some(indices) =
                             r.like_match_indices(col_name, pattern, *escape)
                         {
