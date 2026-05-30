@@ -161,9 +161,119 @@ pub(crate) enum RowKeyValue {
     Utf8(String),
 }
 
+/// Inline capacity for [`RowKey`]: keys with this many columns or fewer
+/// store their values in a stack array and never touch the heap. Sized for
+/// the common `n_cols <= 4` DISTINCT / set-op shape (see the H9 allocation
+/// note in the module doc-comment). Wider keys spill to a heap `Vec`.
+const ROW_KEY_INLINE: usize = 4;
+
 /// A row's full key — one `RowKeyValue` per column, in column order.
+///
+/// This is an inline-capable small-vector: up to [`ROW_KEY_INLINE`] column
+/// values live in the `Inline` array (no heap allocation — the common
+/// single-/few-column case), and anything wider spills to `Heap(Vec<_>)`.
+/// This replaces the old `type RowKey = Vec<RowKeyValue>` alias, whose
+/// per-row heap `Vec` dominated allocator traffic on narrow DISTINCT / set
+/// ops.
+///
 /// `pub(crate)` so [`crate::exec::setops`] can build matching keys.
-pub(crate) type RowKey = Vec<RowKeyValue>;
+///
+/// # Hash / Eq invariant (load-bearing)
+///
+/// `Hash`, `PartialEq`, and `Eq` are all defined to operate over
+/// `self.as_slice()`, i.e. the ordered sequence of `RowKeyValue`s. This is
+/// byte-for-byte identical to the previous `Vec<RowKeyValue>` semantics
+/// (the old alias derived these the same way and was likewise never `Ord`,
+/// as `RowKeyValue` is not `Ord`):
+///
+///   * `Vec<T>: Hash` writes `len` then hashes each element in order; so
+///     does `[T]: Hash`. Delegating `Hash` to `self.as_slice()` (a `&[T]`)
+///     therefore produces the *exact same* hash stream as the old `Vec`
+///     key, regardless of whether the values sit inline or on the heap.
+///   * `Vec<T>: PartialEq`/`Eq` compare element-by-element in order,
+///     exactly as slice comparison does — so two `RowKey`s compare equal
+///     iff their value sequences are equal, independent of inline-vs-heap
+///     storage. A 3-column inline key and a (hypothetical) 3-column heap
+///     key with equal values hash and compare equal.
+///
+/// The variant (Inline vs Heap) is an internal storage detail and is NEVER
+/// observed by Hash/Eq, so the equivalence relation is unchanged from the
+/// `Vec` alias.
+#[derive(Debug, Clone)]
+pub(crate) enum RowKey {
+    Inline {
+        len: usize,
+        vals: [RowKeyValue; ROW_KEY_INLINE],
+    },
+    Heap(Vec<RowKeyValue>),
+}
+
+impl RowKey {
+    /// Build a `RowKey` from an exact-length iterator of column values.
+    /// Mirrors `Vec::with_capacity` + `push` in a loop, but keeps the
+    /// values inline when `len <= ROW_KEY_INLINE`.
+    #[inline]
+    pub(crate) fn from_values<I: IntoIterator<Item = RowKeyValue>>(
+        n_cols: usize,
+        values: I,
+    ) -> Self {
+        let mut it = values.into_iter();
+        if n_cols <= ROW_KEY_INLINE {
+            // Fill the inline array; unused tail slots hold `Null` and are
+            // never read (Hash/Eq only see the first `len` entries).
+            let mut vals = [
+                RowKeyValue::Null,
+                RowKeyValue::Null,
+                RowKeyValue::Null,
+                RowKeyValue::Null,
+            ];
+            let mut len = 0usize;
+            for slot in vals.iter_mut().take(n_cols) {
+                match it.next() {
+                    Some(v) => {
+                        *slot = v;
+                        len += 1;
+                    }
+                    None => break,
+                }
+            }
+            RowKey::Inline { len, vals }
+        } else {
+            let mut v: Vec<RowKeyValue> = Vec::with_capacity(n_cols);
+            v.extend(it);
+            RowKey::Heap(v)
+        }
+    }
+
+    /// The ordered column values. All of `Hash`/`Eq` go through this, so
+    /// the inline-vs-heap split is invisible to the key relation.
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[RowKeyValue] {
+        match self {
+            RowKey::Inline { len, vals } => &vals[..*len],
+            RowKey::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+impl PartialEq for RowKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for RowKey {}
+
+impl std::hash::Hash for RowKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Delegates to `[RowKeyValue]: Hash`, which writes the length then
+        // each element — byte-for-byte identical to the old
+        // `Vec<RowKeyValue>: Hash`.
+        self.as_slice().hash(state);
+    }
+}
 
 /// Pre-downcast column reader: a typed, zero-cost view into one column of
 /// the input batch. Built once per column up-front so the inner row loop
@@ -294,23 +404,14 @@ fn execute_distinct_with_cap(input: QueryHandle, max_rows: usize) -> BoltResult<
     // set of already-seen keys. `HashSet::insert` returns `true` iff the
     // key was not already present — i.e. iff the row is a first occurrence.
     // The freshly-built `key` is *moved* into `insert`, so on a miss it
-    // lives in the set and on a hit it is dropped — exactly one
-    // `Vec<RowKeyValue>` allocation per input row.
-    //
-    // TODO(perf): for the common `n_cols <= 4` case, swap `RowKey =
-    // Vec<RowKeyValue>` for an inline-then-heap small-vec shape (e.g.
-    // `enum InlineRow { Small([Option<RowKeyValue>; 4]), Heap(Vec<_>) }`).
-    // Skipped here because a custom `Hash`/`Eq` on the enum is fiddly to get
-    // right against the existing column-order semantics, and the immediate
-    // priority is closing the memory-DoS surface. Deferred until the GPU
-    // sort-based variant lands (see module doc-comment).
+    // lives in the set and on a hit it is dropped. For the common
+    // `n_cols <= ROW_KEY_INLINE` case [`RowKey`] keeps the column values
+    // inline (zero heap allocations per row); wider keys spill to a single
+    // heap `Vec` exactly as before.
     let mut seen: HashSet<RowKey> = HashSet::with_capacity(initial_cap);
     let mut mask_bits: Vec<bool> = Vec::with_capacity(n_rows);
     for row in 0..n_rows {
-        let mut key: RowKey = Vec::with_capacity(n_cols);
-        for reader in &readers {
-            key.push(reader.value_at(row));
-        }
+        let key = RowKey::from_values(n_cols, readers.iter().map(|r| r.value_at(row)));
         let was_new = seen.insert(key);
         mask_bits.push(was_new);
         // Resource bound: keep the set from growing without limit on
@@ -735,5 +836,64 @@ mod tests {
         let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
         // {true, false, NULL} — three rows.
         assert_eq!(out.into_record_batch().num_rows(), 3);
+    }
+
+    /// Hash a single value through `std::hash::Hash` with the default hasher.
+    fn hash_of<T: std::hash::Hash>(t: &T) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+        let mut h = DefaultHasher::new();
+        t.hash(&mut h);
+        h.finish()
+    }
+
+    /// The inline `RowKey` must hash/compare byte-for-byte identically to the
+    /// old `Vec<RowKeyValue>` shape it replaced. We pin this by hashing the
+    /// `RowKey` against a plain `Vec<RowKeyValue>` carrying the same values:
+    /// `Vec<T>: Hash` writes the length then each element, and the inline
+    /// key delegates `Hash` to `self.as_slice()` (`[T]: Hash`) which does the
+    /// same, so the two hash streams MUST coincide.
+    #[test]
+    fn row_key_inline_matches_vec_hash_and_eq() {
+        // Single-column (inline) key vs the equivalent Vec.
+        let vals = vec![RowKeyValue::I32(42)];
+        let key = RowKey::from_values(1, vals.iter().cloned());
+        assert_eq!(key.as_slice(), vals.as_slice());
+        assert_eq!(hash_of(&key), hash_of(&vals));
+
+        // Multi-column inline key (within ROW_KEY_INLINE) vs Vec.
+        let vals3 = vec![
+            RowKeyValue::I64(7),
+            RowKeyValue::Null,
+            RowKeyValue::Utf8("x".to_string()),
+        ];
+        let key3 = RowKey::from_values(3, vals3.iter().cloned());
+        assert!(matches!(key3, RowKey::Inline { .. }));
+        assert_eq!(key3.as_slice(), vals3.as_slice());
+        assert_eq!(hash_of(&key3), hash_of(&vals3));
+
+        // Two equal-valued keys compare equal and hash equal.
+        let key3b = RowKey::from_values(3, vals3.iter().cloned());
+        assert_eq!(key3, key3b);
+        assert_eq!(hash_of(&key3), hash_of(&key3b));
+
+        // Differing in one slot ⇒ not equal.
+        let diff = RowKey::from_values(
+            3,
+            vec![
+                RowKeyValue::I64(7),
+                RowKeyValue::Null,
+                RowKeyValue::Utf8("y".to_string()),
+            ],
+        );
+        assert_ne!(key3, diff);
+
+        // Wide key spills to heap but still matches the Vec relation.
+        let wide_vals: Vec<RowKeyValue> =
+            (0..ROW_KEY_INLINE as i32 + 2).map(RowKeyValue::I32).collect();
+        let wide = RowKey::from_values(wide_vals.len(), wide_vals.iter().cloned());
+        assert!(matches!(wide, RowKey::Heap(_)));
+        assert_eq!(wide.as_slice(), wide_vals.as_slice());
+        assert_eq!(hash_of(&wide), hash_of(&wide_vals));
     }
 }

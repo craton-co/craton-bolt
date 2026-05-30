@@ -153,7 +153,7 @@ fn eligible_join(join_type: JoinType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::logical_plan::{BinaryOp, DataType, Field, Schema};
+    use crate::plan::logical_plan::{BinaryOp, DataType, Expr, Field, Schema};
     use crate::plan::{col, lit};
 
     fn scan(name: &str, field: &str) -> LogicalPlan {

@@ -441,6 +441,11 @@ mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
+    // The dispatch heuristic (`should_use_gpu_sort`) and `resolve_key_shape`
+    // operate on the crate's own `logical_plan::DataType`, whereas the batch
+    // builder helpers above need Arrow's `DataType`. Alias the logical one so
+    // both can coexist without the Arrow import shadowing it.
+    use crate::plan::logical_plan::DataType as PlanDataType;
 
     fn int_batch(name: &str, values: Vec<Option<i32>>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, true)]));
@@ -578,12 +583,12 @@ mod tests {
         std::env::remove_var(BOLT_GPU_SORT_ENV);
         assert!(should_use_gpu_sort(
             GPU_SORT_MIN_ROWS,
-            &[DataType::Int32],
+            &[PlanDataType::Int32],
             &dirs(1)
         ));
         assert!(should_use_gpu_sort(
             GPU_SORT_MIN_ROWS + 1,
-            &[DataType::Int64],
+            &[PlanDataType::Int64],
             &dirs(1)
         ));
     }
@@ -594,7 +599,7 @@ mod tests {
         std::env::remove_var(BOLT_GPU_SORT_ENV);
         assert!(should_use_gpu_sort(
             1_000_000,
-            &[DataType::Int32, DataType::Int64, DataType::Int32],
+            &[PlanDataType::Int32, PlanDataType::Int64, PlanDataType::Int32],
             &dirs(3)
         ));
     }
@@ -606,13 +611,13 @@ mod tests {
         // One row below the threshold must decline.
         assert!(!should_use_gpu_sort(
             GPU_SORT_MIN_ROWS - 1,
-            &[DataType::Int32],
+            &[PlanDataType::Int32],
             &dirs(1)
         ));
         // Exactly at the threshold is the boundary that DOES select GPU.
         assert!(should_use_gpu_sort(
             GPU_SORT_MIN_ROWS,
-            &[DataType::Int32],
+            &[PlanDataType::Int32],
             &dirs(1)
         ));
     }
@@ -622,7 +627,12 @@ mod tests {
         let _g = ENV_GATE.lock().unwrap();
         std::env::remove_var(BOLT_GPU_SORT_ENV);
         // Float / Bool / Utf8 keys are not auto-selected even when large.
-        for dt in [DataType::Float64, DataType::Float32, DataType::Bool, DataType::Utf8] {
+        for dt in [
+            PlanDataType::Float64,
+            PlanDataType::Float32,
+            PlanDataType::Bool,
+            PlanDataType::Utf8,
+        ] {
             assert!(
                 !should_use_gpu_sort(1_000_000, &[dt], &dirs(1)),
                 "dtype {dt:?} must not auto-select the GPU path"
@@ -631,7 +641,7 @@ mod tests {
         // A mixed key set with one unsupported dtype declines as a whole.
         assert!(!should_use_gpu_sort(
             1_000_000,
-            &[DataType::Int32, DataType::Float64],
+            &[PlanDataType::Int32, PlanDataType::Float64],
             &dirs(2)
         ));
     }
@@ -650,7 +660,7 @@ mod tests {
         // key_dtypes.len() != directions.len() is a caller bug — decline.
         assert!(!should_use_gpu_sort(
             1_000_000,
-            &[DataType::Int32, DataType::Int32],
+            &[PlanDataType::Int32, PlanDataType::Int32],
             &dirs(1)
         ));
     }
@@ -662,13 +672,13 @@ mod tests {
         // Force ON: GPU is attempted even for a shape the heuristic declines
         // (tiny float-keyed sort).
         std::env::set_var(BOLT_GPU_SORT_ENV, "1");
-        assert!(should_use_gpu_sort(1, &[DataType::Float64], &dirs(1)));
+        assert!(should_use_gpu_sort(1, &[PlanDataType::Float64], &dirs(1)));
 
         // Force OFF: host path even for a shape the heuristic would select.
         std::env::set_var(BOLT_GPU_SORT_ENV, "0");
         assert!(!should_use_gpu_sort(
             1_000_000,
-            &[DataType::Int32],
+            &[PlanDataType::Int32],
             &dirs(1)
         ));
 
@@ -676,10 +686,10 @@ mod tests {
         std::env::set_var(BOLT_GPU_SORT_ENV, "true");
         assert!(should_use_gpu_sort(
             GPU_SORT_MIN_ROWS,
-            &[DataType::Int32],
+            &[PlanDataType::Int32],
             &dirs(1)
         ));
-        assert!(!should_use_gpu_sort(1, &[DataType::Int32], &dirs(1)));
+        assert!(!should_use_gpu_sort(1, &[PlanDataType::Int32], &dirs(1)));
 
         std::env::remove_var(BOLT_GPU_SORT_ENV);
     }
@@ -689,7 +699,7 @@ mod tests {
         let batch = int_batch("a", vec![Some(1), Some(2)]);
         let (dtypes, directions) =
             resolve_key_shape(&batch, &[col("a", true, false)]).expect("bare int col resolves");
-        assert_eq!(dtypes, vec![DataType::Int32]);
+        assert_eq!(dtypes, vec![PlanDataType::Int32]);
         assert_eq!(directions, vec![SortDirection::Desc]);
     }
 
@@ -735,7 +745,8 @@ mod tests {
     };
     use crate::jit::sort_kernel::SortDirection;
     use crate::jit::sort_kernel_radix::set_radix_dispatch_for_tests;
-    use crate::plan::logical_plan::DataType as PlanDataType;
+    // `PlanDataType` (= `logical_plan::DataType`) is already imported at the top
+    // of this `tests` module; it is in scope here without re-importing.
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 

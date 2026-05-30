@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    RecordBatch,
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 

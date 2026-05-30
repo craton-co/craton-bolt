@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, Expr, Literal, LogicalPlan, UnaryOp,
+    BinaryOp, Expr, LogicalPlan, UnaryOp,
 };
 
 /// Default selectivity applied to a single equality conjunct (`col = const`)

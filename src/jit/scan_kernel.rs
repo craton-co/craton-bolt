@@ -76,6 +76,37 @@ const PTX_ADDRESS_SIZE: &str = ".address_size 64";
 /// Register class tag used by the allocator.
 type RegClass = &'static str;
 
+/// Allocation-free instruction emitter — mirrors `ptx_gen::emit_fmt!`.
+///
+/// `b.emit(&format!(...))` allocated a throwaway `String` per emitted
+/// instruction (one heap allocation each); for large predicate specs that is
+/// thousands of tiny allocations on the codegen hot path. This macro
+/// `writeln!`s the formatted instruction *straight into* `b.body`, reusing the
+/// existing buffer and never allocating an intermediate.
+///
+/// Byte-for-byte equivalence with [`PtxBuilder::emit`]: `emit` writes
+/// `"\t{}\n"` where `{}` is the formatted instruction; here
+/// `concat!("\t", $fmt)` prepends the same leading tab to the (always-literal)
+/// format string and `writeln!` appends the same trailing newline. The emitted
+/// text is identical, so the PTX golden/snapshot tests stay valid.
+///
+/// `emit_fmt!` from `ptx_gen` is module-private (a bare `macro_rules!`, neither
+/// `#[macro_export]` nor `pub(crate) use`), so it cannot be imported here; this
+/// is the same definition, kept local — same `self-contained module` rationale
+/// documented at the top of this file.
+///
+/// Because the format arguments are evaluated *inside* the `writeln!`, operand
+/// names can be passed as `b.alloc.get(reg)?` (`&str`) borrows instead of
+/// `.to_string()` clones: `$b.body` and `$b.alloc` are disjoint struct fields,
+/// so the immutable `alloc` borrow coexists with the mutable `body` borrow for
+/// the duration of the single write.
+macro_rules! emit_fmt {
+    ($b:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        writeln!($b.body, concat!("\t", $fmt) $(, $arg)*)
+            .map_err(|e| BoltError::Other(format!("scan_kernel: write failed: {}", e)))
+    };
+}
+
 /// Per-class register counter + logical-to-physical mapping table.
 ///
 /// Mirrors `ptx_gen::RegAlloc` exactly; we duplicate to keep `scan_kernel`
@@ -278,17 +309,17 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     let n_rows = b.alloc.alloc("r");
     let pred_oob = b.alloc.alloc("p");
 
-    b.emit(&format!("mov.u32 {}, %ctaid.x;", ctaid))?;
-    b.emit(&format!("mov.u32 {}, %ntid.x;", ntid))?;
-    b.emit(&format!("mov.u32 {}, %tid.x;", tid_x))?;
-    b.emit(&format!("mad.lo.s32 {}, {}, {}, {};", tid, ctaid, ntid, tid_x))?;
-    b.emit(&format!(
-        "ld.param.u32 {}, [{}];",
-        n_rows,
-        b.n_rows_param_name(spec.inputs.len(), n_input_validity)
-    ))?;
-    b.emit(&format!("setp.ge.u32 {}, {}, {};", pred_oob, tid, n_rows))?;
-    b.emit(&format!("@{} bra DONE;", pred_oob))?;
+    // PERF (codegen alloc): emit straight into `b.body` via `emit_fmt!`.
+    emit_fmt!(b, "mov.u32 {}, %ctaid.x;", ctaid)?;
+    emit_fmt!(b, "mov.u32 {}, %ntid.x;", ntid)?;
+    emit_fmt!(b, "mov.u32 {}, %tid.x;", tid_x)?;
+    emit_fmt!(b, "mad.lo.s32 {}, {}, {}, {};", tid, ctaid, ntid, tid_x)?;
+    // `n_rows_param_name` borrows all of `&b`, which would overlap the
+    // `&mut b.body` inside the macro — compute it into a local first.
+    let n_rows_param = b.n_rows_param_name(spec.inputs.len(), n_input_validity);
+    emit_fmt!(b, "ld.param.u32 {}, [{}];", n_rows, n_rows_param)?;
+    emit_fmt!(b, "setp.ge.u32 {}, {}, {};", pred_oob, tid, n_rows)?;
+    emit_fmt!(b, "@{} bra DONE;", pred_oob)?;
 
     // -------- Load and globalize each input column base pointer.
     let mut input_ptrs: Vec<String> = Vec::with_capacity(spec.inputs.len());
@@ -299,19 +330,17 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
             ));
         }
         let rd = b.alloc.alloc("rd");
-        b.emit(&format!("ld.param.u64 {}, [{}];", rd, b.param_name(i)))?;
-        b.emit(&format!("cvta.to.global.u64 {}, {};", rd, rd))?;
+        let param = b.param_name(i);
+        emit_fmt!(b, "ld.param.u64 {}, [{}];", rd, param)?;
+        emit_fmt!(b, "cvta.to.global.u64 {}, {};", rd, rd)?;
         input_ptrs.push(rd);
     }
 
     // -------- Load + globalize the mask output pointer (at param index N).
     let mask_ptr = b.alloc.alloc("rd");
-    b.emit(&format!(
-        "ld.param.u64 {}, [{}];",
-        mask_ptr,
-        b.param_name(spec.inputs.len())
-    ))?;
-    b.emit(&format!("cvta.to.global.u64 {}, {};", mask_ptr, mask_ptr))?;
+    let mask_param = b.param_name(spec.inputs.len());
+    emit_fmt!(b, "ld.param.u64 {}, [{}];", mask_ptr, mask_param)?;
+    emit_fmt!(b, "cvta.to.global.u64 {}, {};", mask_ptr, mask_ptr)?;
 
     // -------- Load + globalize each flagged-input validity pointer. The
     //          pointers occupy param indices `N+1 .. N+1+K` (mask is at
@@ -323,12 +352,9 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     for (i, has) in input_valid.iter().enumerate() {
         if *has {
             let rd = b.alloc.alloc("rd");
-            b.emit(&format!(
-                "ld.param.u64 {}, [{}];",
-                rd,
-                b.param_name(next_param)
-            ))?;
-            b.emit(&format!("cvta.to.global.u64 {}, {};", rd, rd))?;
+            let param = b.param_name(next_param);
+            emit_fmt!(b, "ld.param.u64 {}, [{}];", rd, param)?;
+            emit_fmt!(b, "cvta.to.global.u64 {}, {};", rd, rd)?;
             input_validity_ptrs[i] = Some(rd);
             next_param += 1;
         }
@@ -368,8 +394,8 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     // simpler than `mul.wide.u32 ..., tid, 1` and avoids a multiplier slot.
     let off = b.alloc.alloc("rd");
     let addr = b.alloc.alloc("rd");
-    b.emit(&format!("cvt.u64.u32 {}, {};", off, tid))?;
-    b.emit(&format!("add.s64 {}, {}, {};", addr, mask_ptr, off))?;
+    emit_fmt!(b, "cvt.u64.u32 {}, {};", off, tid)?;
+    emit_fmt!(b, "add.s64 {}, {}, {};", addr, mask_ptr, off)?;
 
     // Narrow the 0/1 b32 value into a b16 temp, since PTX `st.global.u8`
     // accepts a b16 source register. We use class "r" only for b32 values, so
@@ -382,9 +408,9 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     //   st.global.u8 [addr], %rsY;
     let p_mask = b.alloc.alloc("p");
     let rs_mask = b.alloc.alloc("rs");
-    b.emit(&format!("setp.ne.s32 {}, {}, 0;", p_mask, pred_phys))?;
-    b.emit(&format!("selp.b16 {}, 1, 0, {};", rs_mask, p_mask))?;
-    b.emit(&format!("st.global.u8 [{}], {};", addr, rs_mask))?;
+    emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", p_mask, pred_phys)?;
+    emit_fmt!(b, "selp.b16 {}, 1, 0, {};", rs_mask, p_mask)?;
+    emit_fmt!(b, "st.global.u8 [{}], {};", addr, rs_mask)?;
 
     // -------- DONE label + return.
     b.emit_label("DONE")?;
@@ -586,15 +612,15 @@ fn emit_is_null_check(
     let off = b.alloc.alloc("rd");
     let addr = b.alloc.alloc("rd");
     let byte_reg = b.alloc.alloc("r");
-    b.emit(&format!("cvt.s64.s32 {}, {};", off, tid))?;
-    b.emit(&format!("add.s64 {}, {}, {};", addr, vptr, off))?;
-    b.emit(&format!("ld.global.nc.u8 {}, [{}];", byte_reg, addr))?;
+    emit_fmt!(b, "cvt.s64.s32 {}, {};", off, tid)?;
+    emit_fmt!(b, "add.s64 {}, {}, {};", addr, vptr, off)?;
+    emit_fmt!(b, "ld.global.nc.u8 {}, [{}];", byte_reg, addr)?;
 
     let dst_name = b.alloc.assign(dst, DataType::Bool)?;
     let pred = b.alloc.alloc("p");
     let cmp = if want_null { "setp.eq.u32" } else { "setp.ne.u32" };
-    b.emit(&format!("{} {}, {}, 0;", cmp, pred, byte_reg))?;
-    b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, pred))?;
+    emit_fmt!(b, "{} {}, {}, 0;", cmp, pred, byte_reg)?;
+    emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, pred)?;
     Ok(())
 }
 
@@ -638,11 +664,16 @@ fn emit_select(
     };
     let dst_name = b.alloc.assign(dst, dtype)?;
     let pred = b.alloc.alloc("p");
-    b.emit(&format!("setp.ne.s32 {}, {}, 0;", pred, cond_name))?;
-    b.emit(&format!(
+    emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", pred, cond_name)?;
+    emit_fmt!(
+        b,
         "selp.{} {}, {}, {}, {};",
-        selp_ty, dst_name, then_name, else_name, pred
-    ))
+        selp_ty,
+        dst_name,
+        then_name,
+        else_name,
+        pred
+    )
 }
 
 /// Emit PTX for `Op::Not`: logical negation of a Bool predicate register.
@@ -658,7 +689,7 @@ fn emit_select(
 fn emit_not(b: &mut PtxBuilder, dst: Reg, src: Reg) -> BoltResult<()> {
     let src_name = b.alloc.get(src)?.to_string();
     let dst_name = b.alloc.assign(dst, DataType::Bool)?;
-    b.emit(&format!("xor.b32 {}, {}, 1;", dst_name, src_name))
+    emit_fmt!(b, "xor.b32 {}, {}, 1;", dst_name, src_name)
 }
 
 /// Emit a typed `ld.global.<ty>` of input column `col_idx` at row `tid`.
@@ -680,14 +711,11 @@ fn emit_load(
     let width = byte_width(dtype)?;
     let off = b.alloc.alloc("rd");
     let addr = b.alloc.alloc("rd");
-    b.emit(&format!("mul.wide.u32 {}, {}, {};", off, tid, width))?;
-    b.emit(&format!(
-        "add.s64 {}, {}, {};",
-        addr, input_ptrs[col_idx], off
-    ))?;
+    emit_fmt!(b, "mul.wide.u32 {}, {}, {};", off, tid, width)?;
+    emit_fmt!(b, "add.s64 {}, {}, {};", addr, input_ptrs[col_idx], off)?;
     let dst_name = b.alloc.assign(dst, dtype)?;
     let suffix = ld_st_suffix(dtype)?;
-    b.emit(&format!("ld.global.{} {}, [{}];", suffix, dst_name, addr))?;
+    emit_fmt!(b, "ld.global.{} {}, [{}];", suffix, dst_name, addr)?;
     Ok(())
 }
 
@@ -705,34 +733,53 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
         )),
         // v0.7: Date32 / Timestamp literals lower to integer movs on the
         // underlying days / ticks. Matches `ptx_gen::emit_const`.
+        //
+        // HARDENING (codegen-injection, mirror ptx_gen): emit the integer /
+        // date / timestamp bit-pattern as HEX (`0x{:08X}` for 32-bit,
+        // `0x{:016X}` for 64-bit) rather than a signed decimal literal. PTX
+        // `mov.s32`/`mov.s64` is a bitwise copy, so reading the value back as
+        // signed is sound — `0xFFFFFFFF` into an `.s32` register is `-1`,
+        // identical to the previous decimal `-1`. This restricts the emitted
+        // characters to `[0-9A-FxX]` even if a future planner regression lets
+        // attacker-controlled SQL literals reach this path. Values are typed
+        // integers today so no injection exists, but match the convention.
+        // PERF (codegen alloc): each arm `mov`s straight into `b.body` via
+        // `emit_fmt!`, dropping the per-line `format!` temporary.
         Literal::Date32(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Date32)?;
-            b.emit(&format!("mov.s32 {}, {};", dst_name, *v as i64))
+            emit_fmt!(b, "mov.s32 {}, 0x{:08X};", dst_name, *v as u32)
         }
         Literal::Timestamp(v, unit, tz) => {
             let dst_name = b.alloc.assign(dst, DataType::Timestamp(*unit, *tz))?;
-            b.emit(&format!("mov.s64 {}, {};", dst_name, v))
+            emit_fmt!(b, "mov.s64 {}, 0x{:016X};", dst_name, *v as u64)
         }
         Literal::Bool(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Bool)?;
+            // Value space is {0, 1}; not an injection surface, but keep the
+            // emission consistent with ptx_gen's Bool arm (plain decimal).
             let n: u32 = if *v { 1 } else { 0 };
-            b.emit(&format!("mov.b32 {}, {};", dst_name, n))
+            emit_fmt!(b, "mov.b32 {}, {};", dst_name, n)
         }
         Literal::Int32(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Int32)?;
-            b.emit(&format!("mov.s32 {}, {};", dst_name, *v as i64))
+            // Hex bit-pattern: `mov.s32` is a bitwise copy, so `0xFFFFFFFF`
+            // here is -1, identical to writing `-1`. Removes the codegen-
+            // injection surface (output restricted to `[0-9A-F]`).
+            emit_fmt!(b, "mov.s32 {}, 0x{:08X};", dst_name, *v as u32)
         }
         Literal::Int64(v) => {
             let dst_name = b.alloc.assign(dst, DataType::Int64)?;
-            b.emit(&format!("mov.s64 {}, {};", dst_name, v))
+            emit_fmt!(b, "mov.s64 {}, 0x{:016X};", dst_name, *v as u64)
         }
         Literal::Float32(v) => {
+            // Already hex-encoded via PTX `0f<8 hex>` syntax — no injection surface.
             let dst_name = b.alloc.assign(dst, DataType::Float32)?;
-            b.emit(&format!("mov.f32 {}, 0f{:08X};", dst_name, v.to_bits()))
+            emit_fmt!(b, "mov.f32 {}, 0f{:08X};", dst_name, v.to_bits())
         }
         Literal::Float64(v) => {
+            // Already hex-encoded via PTX `0d<16 hex>` syntax — no injection surface.
             let dst_name = b.alloc.assign(dst, DataType::Float64)?;
-            b.emit(&format!("mov.f64 {}, 0d{:016X};", dst_name, v.to_bits()))
+            emit_fmt!(b, "mov.f64 {}, 0d{:016X};", dst_name, v.to_bits())
         }
     }
 }
@@ -785,25 +832,22 @@ fn emit_cast(
 
         (Int32, Bool) => {
             let p = b.alloc.alloc("p");
-            b.emit(&format!("setp.ne.s32 {}, {}, 0;", p, src_name))?;
+            emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", p, src_name)?;
             format!("selp.s32 {}, 1, 0, {};", dst_name, p)
         }
         (Int64, Bool) => {
             let p = b.alloc.alloc("p");
-            b.emit(&format!("setp.ne.s64 {}, {}, 0;", p, src_name))?;
+            emit_fmt!(b, "setp.ne.s64 {}, {}, 0;", p, src_name)?;
             format!("selp.s32 {}, 1, 0, {};", dst_name, p)
         }
         (Float32, Bool) => {
             let p = b.alloc.alloc("p");
-            b.emit(&format!("setp.ne.f32 {}, {}, 0f00000000;", p, src_name))?;
+            emit_fmt!(b, "setp.ne.f32 {}, {}, 0f00000000;", p, src_name)?;
             format!("selp.s32 {}, 1, 0, {};", dst_name, p)
         }
         (Float64, Bool) => {
             let p = b.alloc.alloc("p");
-            b.emit(&format!(
-                "setp.ne.f64 {}, {}, 0d0000000000000000;",
-                p, src_name
-            ))?;
+            emit_fmt!(b, "setp.ne.f64 {}, {}, 0d0000000000000000;", p, src_name)?;
             format!("selp.s32 {}, 1, 0, {};", dst_name, p)
         }
 
@@ -886,10 +930,7 @@ fn emit_binary(
             }
             let dst_name = b.alloc.assign(dst, result_dtype)?;
             let mnemonic = arith_mnemonic(op, dtype)?;
-            b.emit(&format!(
-                "{} {}, {}, {};",
-                mnemonic, dst_name, lhs_name, rhs_name
-            ))
+            emit_fmt!(b, "{} {}, {}, {};", mnemonic, dst_name, lhs_name, rhs_name)
         }
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
             if result_dtype != DataType::Bool {
@@ -901,8 +942,8 @@ fn emit_binary(
             let dst_name = b.alloc.assign(dst, DataType::Bool)?;
             let p = b.alloc.alloc("p");
             let cmp = cmp_mnemonic(op, dtype)?;
-            b.emit(&format!("{} {}, {}, {};", cmp, p, lhs_name, rhs_name))?;
-            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))
+            emit_fmt!(b, "{} {}, {}, {};", cmp, p, lhs_name, rhs_name)?;
+            emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, p)
         }
         And | Or => {
             if dtype != DataType::Bool || result_dtype != DataType::Bool {
@@ -917,10 +958,7 @@ fn emit_binary(
                 Or => "or.b32",
                 _ => unreachable!(),
             };
-            b.emit(&format!(
-                "{} {}, {}, {};",
-                mnemonic, dst_name, lhs_name, rhs_name
-            ))
+            emit_fmt!(b, "{} {}, {}, {};", mnemonic, dst_name, lhs_name, rhs_name)
         }
         Concat => {
             // String concat is host-only (see ptx_gen.rs for the same
@@ -967,15 +1005,12 @@ fn emit_load_128(
     let off = b.alloc.alloc("rd");
     let addr_lo = b.alloc.alloc("rd");
     let addr_hi = b.alloc.alloc("rd");
-    b.emit(&format!("mul.wide.u32 {}, {}, 16;", off, tid))?;
-    b.emit(&format!(
-        "add.s64 {}, {}, {};",
-        addr_lo, input_ptrs[col_idx], off
-    ))?;
-    b.emit(&format!("add.s64 {}, {}, 8;", addr_hi, addr_lo))?;
+    emit_fmt!(b, "mul.wide.u32 {}, {}, 16;", off, tid)?;
+    emit_fmt!(b, "add.s64 {}, {}, {};", addr_lo, input_ptrs[col_idx], off)?;
+    emit_fmt!(b, "add.s64 {}, {}, 8;", addr_hi, addr_lo)?;
     let (lo_name, hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
-    b.emit(&format!("ld.global.nc.u64 {}, [{}];", lo_name, addr_lo))?;
-    b.emit(&format!("ld.global.nc.u64 {}, [{}];", hi_name, addr_hi))?;
+    emit_fmt!(b, "ld.global.nc.u64 {}, [{}];", lo_name, addr_lo)?;
+    emit_fmt!(b, "ld.global.nc.u64 {}, [{}];", hi_name, addr_hi)?;
     Ok(())
 }
 
@@ -989,8 +1024,8 @@ fn emit_const_128(
     hi: u64,
 ) -> BoltResult<()> {
     let (lo_name, hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
-    b.emit(&format!("mov.u64 {}, 0x{:016X};", lo_name, lo))?;
-    b.emit(&format!("mov.u64 {}, 0x{:016X};", hi_name, hi))?;
+    emit_fmt!(b, "mov.u64 {}, 0x{:016X};", lo_name, lo)?;
+    emit_fmt!(b, "mov.u64 {}, 0x{:016X};", hi_name, hi)?;
     Ok(())
 }
 
@@ -1010,14 +1045,8 @@ fn emit_add_128(
     let b_lo_name = b.alloc.get(b_lo)?.to_string();
     let b_hi_name = b.alloc.get(b_hi)?.to_string();
     let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
-    b.emit(&format!(
-        "add.cc.u64 {}, {}, {};",
-        dst_lo_name, a_lo_name, b_lo_name
-    ))?;
-    b.emit(&format!(
-        "addc.u64 {}, {}, {};",
-        dst_hi_name, a_hi_name, b_hi_name
-    ))?;
+    emit_fmt!(b, "add.cc.u64 {}, {}, {};", dst_lo_name, a_lo_name, b_lo_name)?;
+    emit_fmt!(b, "addc.u64 {}, {}, {};", dst_hi_name, a_hi_name, b_hi_name)?;
     Ok(())
 }
 
@@ -1037,14 +1066,8 @@ fn emit_sub_128(
     let b_lo_name = b.alloc.get(b_lo)?.to_string();
     let b_hi_name = b.alloc.get(b_hi)?.to_string();
     let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
-    b.emit(&format!(
-        "sub.cc.u64 {}, {}, {};",
-        dst_lo_name, a_lo_name, b_lo_name
-    ))?;
-    b.emit(&format!(
-        "subc.u64 {}, {}, {};",
-        dst_hi_name, a_hi_name, b_hi_name
-    ))?;
+    emit_fmt!(b, "sub.cc.u64 {}, {}, {};", dst_lo_name, a_lo_name, b_lo_name)?;
+    emit_fmt!(b, "subc.u64 {}, {}, {};", dst_hi_name, a_hi_name, b_hi_name)?;
     Ok(())
 }
 
@@ -1067,27 +1090,12 @@ fn emit_mul_128(
     let cross1 = b.alloc.alloc("rl");
     let cross2 = b.alloc.alloc("rl");
     let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
-    b.emit(&format!(
-        "mul.lo.u64 {}, {}, {};",
-        dst_lo_name, a_lo_name, b_lo_name
-    ))?;
-    b.emit(&format!(
-        "mul.hi.u64 {}, {}, {};",
-        hi_acc, a_lo_name, b_lo_name
-    ))?;
-    b.emit(&format!(
-        "mul.lo.u64 {}, {}, {};",
-        cross1, a_lo_name, b_hi_name
-    ))?;
-    b.emit(&format!(
-        "mul.lo.u64 {}, {}, {};",
-        cross2, a_hi_name, b_lo_name
-    ))?;
-    b.emit(&format!("add.u64 {}, {}, {};", hi_acc, hi_acc, cross1))?;
-    b.emit(&format!(
-        "add.u64 {}, {}, {};",
-        dst_hi_name, hi_acc, cross2
-    ))?;
+    emit_fmt!(b, "mul.lo.u64 {}, {}, {};", dst_lo_name, a_lo_name, b_lo_name)?;
+    emit_fmt!(b, "mul.hi.u64 {}, {}, {};", hi_acc, a_lo_name, b_lo_name)?;
+    emit_fmt!(b, "mul.lo.u64 {}, {}, {};", cross1, a_lo_name, b_hi_name)?;
+    emit_fmt!(b, "mul.lo.u64 {}, {}, {};", cross2, a_hi_name, b_lo_name)?;
+    emit_fmt!(b, "add.u64 {}, {}, {};", hi_acc, hi_acc, cross1)?;
+    emit_fmt!(b, "add.u64 {}, {}, {};", dst_hi_name, hi_acc, cross2)?;
     Ok(())
 }
 
@@ -1115,31 +1123,19 @@ fn emit_cmp_128(
             let p_lo = b.alloc.alloc("p");
             let p_hi = b.alloc.alloc("p");
             let p = b.alloc.alloc("p");
-            b.emit(&format!(
-                "setp.eq.u64 {}, {}, {};",
-                p_lo, a_lo_name, b_lo_name
-            ))?;
-            b.emit(&format!(
-                "setp.eq.s64 {}, {}, {};",
-                p_hi, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!("and.pred {}, {}, {};", p, p_lo, p_hi))?;
-            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+            emit_fmt!(b, "setp.eq.u64 {}, {}, {};", p_lo, a_lo_name, b_lo_name)?;
+            emit_fmt!(b, "setp.eq.s64 {}, {}, {};", p_hi, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "and.pred {}, {}, {};", p, p_lo, p_hi)?;
+            emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, p)?;
         }
         NotEq => {
             let p_lo = b.alloc.alloc("p");
             let p_hi = b.alloc.alloc("p");
             let p = b.alloc.alloc("p");
-            b.emit(&format!(
-                "setp.ne.u64 {}, {}, {};",
-                p_lo, a_lo_name, b_lo_name
-            ))?;
-            b.emit(&format!(
-                "setp.ne.s64 {}, {}, {};",
-                p_hi, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!("or.pred {}, {}, {};", p, p_lo, p_hi))?;
-            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+            emit_fmt!(b, "setp.ne.u64 {}, {}, {};", p_lo, a_lo_name, b_lo_name)?;
+            emit_fmt!(b, "setp.ne.s64 {}, {}, {};", p_hi, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "or.pred {}, {}, {};", p, p_lo, p_hi)?;
+            emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, p)?;
         }
         Lt => {
             let p_hi_lt = b.alloc.alloc("p");
@@ -1147,21 +1143,12 @@ fn emit_cmp_128(
             let p_lo_lt = b.alloc.alloc("p");
             let p_eq_lt = b.alloc.alloc("p");
             let p = b.alloc.alloc("p");
-            b.emit(&format!(
-                "setp.lt.s64 {}, {}, {};",
-                p_hi_lt, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!(
-                "setp.eq.s64 {}, {}, {};",
-                p_hi_eq, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!(
-                "setp.lt.u64 {}, {}, {};",
-                p_lo_lt, a_lo_name, b_lo_name
-            ))?;
-            b.emit(&format!("and.pred {}, {}, {};", p_eq_lt, p_hi_eq, p_lo_lt))?;
-            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_lt, p_eq_lt))?;
-            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+            emit_fmt!(b, "setp.lt.s64 {}, {}, {};", p_hi_lt, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "setp.eq.s64 {}, {}, {};", p_hi_eq, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "setp.lt.u64 {}, {}, {};", p_lo_lt, a_lo_name, b_lo_name)?;
+            emit_fmt!(b, "and.pred {}, {}, {};", p_eq_lt, p_hi_eq, p_lo_lt)?;
+            emit_fmt!(b, "or.pred {}, {}, {};", p, p_hi_lt, p_eq_lt)?;
+            emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, p)?;
         }
         Gt => {
             let p_hi_gt = b.alloc.alloc("p");
@@ -1169,21 +1156,12 @@ fn emit_cmp_128(
             let p_lo_gt = b.alloc.alloc("p");
             let p_eq_gt = b.alloc.alloc("p");
             let p = b.alloc.alloc("p");
-            b.emit(&format!(
-                "setp.gt.s64 {}, {}, {};",
-                p_hi_gt, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!(
-                "setp.eq.s64 {}, {}, {};",
-                p_hi_eq, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!(
-                "setp.gt.u64 {}, {}, {};",
-                p_lo_gt, a_lo_name, b_lo_name
-            ))?;
-            b.emit(&format!("and.pred {}, {}, {};", p_eq_gt, p_hi_eq, p_lo_gt))?;
-            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_gt, p_eq_gt))?;
-            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+            emit_fmt!(b, "setp.gt.s64 {}, {}, {};", p_hi_gt, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "setp.eq.s64 {}, {}, {};", p_hi_eq, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "setp.gt.u64 {}, {}, {};", p_lo_gt, a_lo_name, b_lo_name)?;
+            emit_fmt!(b, "and.pred {}, {}, {};", p_eq_gt, p_hi_eq, p_lo_gt)?;
+            emit_fmt!(b, "or.pred {}, {}, {};", p, p_hi_gt, p_eq_gt)?;
+            emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, p)?;
         }
         LtEq => {
             let p_hi_lt = b.alloc.alloc("p");
@@ -1191,21 +1169,12 @@ fn emit_cmp_128(
             let p_lo_le = b.alloc.alloc("p");
             let p_eq_le = b.alloc.alloc("p");
             let p = b.alloc.alloc("p");
-            b.emit(&format!(
-                "setp.lt.s64 {}, {}, {};",
-                p_hi_lt, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!(
-                "setp.eq.s64 {}, {}, {};",
-                p_hi_eq, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!(
-                "setp.le.u64 {}, {}, {};",
-                p_lo_le, a_lo_name, b_lo_name
-            ))?;
-            b.emit(&format!("and.pred {}, {}, {};", p_eq_le, p_hi_eq, p_lo_le))?;
-            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_lt, p_eq_le))?;
-            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+            emit_fmt!(b, "setp.lt.s64 {}, {}, {};", p_hi_lt, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "setp.eq.s64 {}, {}, {};", p_hi_eq, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "setp.le.u64 {}, {}, {};", p_lo_le, a_lo_name, b_lo_name)?;
+            emit_fmt!(b, "and.pred {}, {}, {};", p_eq_le, p_hi_eq, p_lo_le)?;
+            emit_fmt!(b, "or.pred {}, {}, {};", p, p_hi_lt, p_eq_le)?;
+            emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, p)?;
         }
         GtEq => {
             let p_hi_gt = b.alloc.alloc("p");
@@ -1213,21 +1182,12 @@ fn emit_cmp_128(
             let p_lo_ge = b.alloc.alloc("p");
             let p_eq_ge = b.alloc.alloc("p");
             let p = b.alloc.alloc("p");
-            b.emit(&format!(
-                "setp.gt.s64 {}, {}, {};",
-                p_hi_gt, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!(
-                "setp.eq.s64 {}, {}, {};",
-                p_hi_eq, a_hi_name, b_hi_name
-            ))?;
-            b.emit(&format!(
-                "setp.ge.u64 {}, {}, {};",
-                p_lo_ge, a_lo_name, b_lo_name
-            ))?;
-            b.emit(&format!("and.pred {}, {}, {};", p_eq_ge, p_hi_eq, p_lo_ge))?;
-            b.emit(&format!("or.pred {}, {}, {};", p, p_hi_gt, p_eq_ge))?;
-            b.emit(&format!("selp.s32 {}, 1, 0, {};", dst_name, p))?;
+            emit_fmt!(b, "setp.gt.s64 {}, {}, {};", p_hi_gt, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "setp.eq.s64 {}, {}, {};", p_hi_eq, a_hi_name, b_hi_name)?;
+            emit_fmt!(b, "setp.ge.u64 {}, {}, {};", p_lo_ge, a_lo_name, b_lo_name)?;
+            emit_fmt!(b, "and.pred {}, {}, {};", p_eq_ge, p_hi_eq, p_lo_ge)?;
+            emit_fmt!(b, "or.pred {}, {}, {};", p, p_hi_gt, p_eq_ge)?;
+            emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, p)?;
         }
         _ => {
             return Err(BoltError::Other(format!(

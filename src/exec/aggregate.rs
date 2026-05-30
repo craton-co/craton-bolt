@@ -505,135 +505,10 @@ fn bare_column_name(expr: &Expr) -> BoltResult<&str> {
     }
 }
 
-/// v0.7: host-side `SUM(Decimal128(p, s))` reduction.
-///
-/// The GPU-side accumulator for a 128-bit SUM would need either a two-phase
-/// per-block reduction with a 16-byte atomicCAS (no native PTX op) or a
-/// custom multi-word merge — both are deferred. For v0.7 we walk the
-/// already-host-resident `Decimal128Array` once and fold every non-NULL
-/// row into an `i128` accumulator with a checked add. On overflow we
-/// return a `BoltError::Type` naming Decimal128 precision overflow rather
-/// than wrapping silently — the SUM result of a precision-p input set
-/// can exceed `i128::MAX` only if the input data is itself near-overflow,
-/// which the user expects to be loud rather than producing a wrong answer.
-///
-/// The result is packed as a single-row `Decimal128Array` carrying the
-/// same `(precision, scale)` as the input column. The plan-level output
-/// dtype rule for `SUM(Decimal128(p, s))` is `Decimal128(38, s)` — the
-/// widest precision Arrow supports — but the host-side checked add above
-/// already enforces the overflow contract, so packing with the input
-/// `(p, s)` and the planner's declared `Decimal128(38, s)` are both
-/// acceptable. We pack with `(38, s)` to match the planner-declared
-/// output schema (see `crate::plan::logical_plan::sum_output_dtype`); the
-/// checked add guarantees the value fits in Arrow's `i128` representation.
-///
-/// `out_field` is the planner's declared output field, used both to
-/// determine the result precision/scale and as the source of truth for
-/// the dtype contract the executor must satisfy. If `out_field.dtype`
-/// is not `Decimal128`, we surface a Type error so the planner / executor
-/// mismatch is loud.
-fn sum_decimal128_from_batch(
-    col_io: &ColumnIO,
-    batch: &RecordBatch,
-    precision: u8,
-    scale: i8,
-    out_field: &Field,
-) -> BoltResult<ArrayRef> {
-    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
-        BoltError::Plan(format!(
-            "aggregate input '{}' not present in table batch: {}",
-            col_io.name, e
-        ))
-    })?;
-    let arr = batch.column(idx);
-
-    let arr_dtype = arrow_dtype_to_plan(arr.data_type())?;
-    if arr_dtype != col_io.dtype {
-        return Err(BoltError::Type(format!(
-            "aggregate input '{}' dtype mismatch: plan says {:?}, batch has {:?}",
-            col_io.name, col_io.dtype, arr_dtype
-        )));
-    }
-
-    let da = arr
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| downcast_err(&col_io.name, "Decimal128"))?;
-
-    // The Arrow `Decimal128Array` carries its own (p, s); if it disagrees
-    // with the column's plan-level dtype the schema is internally
-    // inconsistent and any downstream consumer would mis-interpret the
-    // values. Mirror the upload-side guard in `gpu_table.rs`.
-    if let ArrowDataType::Decimal128(ap, as_) = da.data_type() {
-        if *ap != precision || *as_ != scale {
-            return Err(BoltError::Type(format!(
-                "SUM(Decimal128) column '{}': plan dtype Decimal128({precision}, {scale}) \
-                 disagrees with Arrow dtype Decimal128({ap}, {as_})",
-                col_io.name
-            )));
-        }
-    }
-
-    // Host-side fold: walk every row, skip NULLs, sum non-NULL i128 values
-    // into a checked accumulator. The empty-input identity is 0 — matches
-    // the SQL convention that SUM over an all-NULL (or empty) input is 0
-    // when the output column type is non-nullable, which is how this
-    // scalar-aggregate path packs every other SUM today.
-    let mut acc: i128 = 0;
-    for i in 0..da.len() {
-        if da.is_null(i) {
-            continue;
-        }
-        let v: i128 = da.value(i);
-        acc = match acc.checked_add(v) {
-            Some(s) => s,
-            None => {
-                return Err(BoltError::Type(format!(
-                    "SUM(Decimal128) precision overflow on column '{}': \
-                     accumulator exceeds i128 range",
-                    col_io.name
-                )));
-            }
-        };
-    }
-
-    // The output field's declared dtype is the source of truth. The
-    // planner's `sum_output_dtype` widens `Decimal128(p, s)` to
-    // `Decimal128(38, s)`, but we accept any Decimal128 output dtype as
-    // long as the scale matches; the precision is a digit-count limit
-    // that the checked add above has already verified the bit-pattern
-    // fits in i128 — Arrow's `with_precision_and_scale` enforces the
-    // digit-count limit on the values themselves and will surface an
-    // error if the accumulator's digit count exceeds the declared
-    // precision.
-    let (out_p, out_s) = match out_field.dtype {
-        DataType::Decimal128(p, s) => (p, s),
-        ref other => {
-            return Err(BoltError::Type(format!(
-                "SUM(Decimal128) output field dtype must be Decimal128, got {:?}",
-                other
-            )));
-        }
-    };
-    if out_s != scale {
-        return Err(BoltError::Type(format!(
-            "SUM(Decimal128) output scale {out_s} disagrees with input scale {scale}"
-        )));
-    }
-    let arr = Decimal128Array::from(vec![acc])
-        .with_precision_and_scale(out_p, out_s)
-        .map_err(|e| {
-            BoltError::Type(format!(
-                "SUM(Decimal128) result: precision/scale ({out_p}, {out_s}) \
-                 rejected by Arrow: {e}"
-            ))
-        })?;
-    Ok(Arc::new(arr) as ArrayRef)
-}
-
 /// Host-side MIN/MAX over a `Decimal128` aggregate input.
 ///
-/// Like `sum_decimal128_from_batch`, this exists because the GPU reduction
+/// Like the `SUM(Decimal128)` host fold (`decimal_sum_from_batch` /
+/// `decimal_sum_host`), this exists because the GPU reduction
 /// kernels only handle 32/64-bit primitives — a 128-bit MIN/MAX kernel is a
 /// follow-up optimisation. We fold over the already-decoded
 /// `Decimal128Array` on the host. Because the scale is uniform across every
@@ -688,7 +563,7 @@ fn minmax_decimal128_from_batch(
     // The Arrow `Decimal128Array` carries its own (p, s); if it disagrees
     // with the column's plan-level dtype the schema is internally
     // inconsistent and any downstream consumer would mis-interpret the
-    // values. Mirror the guard in `sum_decimal128_from_batch`.
+    // values. Mirror the guard in `decimal_sum_from_batch`.
     if let ArrowDataType::Decimal128(ap, as_) = da.data_type() {
         if *ap != precision || *as_ != scale {
             return Err(BoltError::Type(format!(
@@ -1169,17 +1044,28 @@ fn decimal_sum_from_batch(
         Some(v) => v,
         // GPU path declined (e.g. empty input) — fold on the host. Correct and
         // cheap; this is the documented graceful fallback.
-        None => decimal_sum_host(&host),
+        None => decimal_sum_host(&host)?,
     };
     let _ = n_rows; // n_rows is the pre-strip row count; we sum the survivors.
     Ok(Scalar::Decimal128(total, precision, scale))
 }
 
-/// Host-side `i128` fold. Wrapping add matches the kernel's modular 128-bit
-/// carry-chain arithmetic, so the GPU and host paths agree bit-for-bit even on
-/// an overflowing sum (SQL leaves decimal overflow semantics to the caller).
-fn decimal_sum_host(host: &[i128]) -> i128 {
-    host.iter().copied().fold(0i128, i128::wrapping_add)
+/// Host-side `i128` fold for `SUM(Decimal128)`. Uses `checked_add` and surfaces
+/// a `BoltError::Type` on overflow rather than wrapping, honouring the engine's
+/// never-silently-wrong invariant — the same contract the integer SUM path
+/// (`SUM(integer) overflow`) and the planner doc in
+/// `crate::plan::logical_plan` (see `sum_output_dtype`) describe. An empty
+/// input folds to the identity 0 (SUM over no rows).
+fn decimal_sum_host(host: &[i128]) -> BoltResult<i128> {
+    let mut acc: i128 = 0;
+    for &v in host {
+        acc = acc.checked_add(v).ok_or_else(|| {
+            BoltError::Type(
+                "SUM(Decimal128) precision overflow: accumulator exceeds i128 range".to_string(),
+            )
+        })?;
+    }
+    Ok(acc)
 }
 
 /// Launch the Decimal128 SUM block-reduce kernel over `host` and fold the
@@ -1248,7 +1134,10 @@ fn decimal_sum_gpu(host: &[i128]) -> BoltResult<Option<i128>> {
     drop(partials);
     drop(dev);
 
-    Ok(Some(decimal_sum_host(&host_partials)))
+    // Fold the per-block partials with the same checked add as the host path,
+    // so a sum that overflows i128 errors loudly whether or not the GPU path
+    // ran (mirrors the never-silently-wrong invariant).
+    Ok(Some(decimal_sum_host(&host_partials)?))
 }
 
 /// Build a Welford `(count, mean, M2)` state by folding the non-NULL values
@@ -1915,12 +1804,85 @@ impl ReduceScalar for i64 {
     }
 }
 
+/// Order two floats under the DuckDB convention: NaN sorts as the *largest*
+/// value (greater than +inf), and all NaN bit-patterns compare equal. This is
+/// the same convention `src/exec/window.rs::float_total_cmp` adopts, so the
+/// scalar and window MIN/MAX agree: MIN skips NaN unless the input is all-NaN
+/// (NaN is the maximum, so any real value beats it), and MAX surfaces NaN
+/// whenever one is present. We delegate to the type's `total_cmp` for the
+/// non-NaN case (which already orders `-0 < +0`) and fold every NaN — including
+/// `total_cmp`'s negative-NaN half — up to the top.
+#[inline]
+fn float_total_cmp<T: FloatTotalCmp>(a: T, b: T) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater, // NaN is the largest
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.total_cmp_native(&b),
+    }
+}
+
+/// Bridge so `float_total_cmp` works over both `f32` and `f64` without
+/// duplicating the NaN-folding logic (each delegates to its own `total_cmp`).
+trait FloatTotalCmp: Copy {
+    fn is_nan(self) -> bool;
+    fn total_cmp_native(&self, other: &Self) -> std::cmp::Ordering;
+}
+impl FloatTotalCmp for f32 {
+    #[inline]
+    fn is_nan(self) -> bool {
+        f32::is_nan(self)
+    }
+    #[inline]
+    fn total_cmp_native(&self, other: &Self) -> std::cmp::Ordering {
+        f32::total_cmp(self, other)
+    }
+}
+impl FloatTotalCmp for f64 {
+    #[inline]
+    fn is_nan(self) -> bool {
+        f64::is_nan(self)
+    }
+    #[inline]
+    fn total_cmp_native(&self, other: &Self) -> std::cmp::Ordering {
+        f64::total_cmp(self, other)
+    }
+}
+
 impl ReduceScalar for f32 {
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
             ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0.0f32, |a, b| a + b),
-            ReduceOp::Min => host.iter().copied().fold(f32::INFINITY, f32::min),
-            ReduceOp::Max => host.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            // MIN/MAX use the DuckDB NaN-as-largest convention (see
+            // `float_total_cmp`) so the scalar path agrees with window.rs.
+            // We seed from the first element (via `reduce`) rather than an
+            // ±inf identity so an all-NaN input yields NaN — exactly what
+            // window.rs does (it seeds its `extreme` from the first value).
+            // The empty slice never reaches here (n_rows == 0 takes the
+            // `identity_scalar` path), but we keep the ±inf identity as a
+            // total fallback.
+            ReduceOp::Min => host
+                .iter()
+                .copied()
+                .reduce(|a, b| {
+                    if float_total_cmp(b, a) == std::cmp::Ordering::Less {
+                        b
+                    } else {
+                        a
+                    }
+                })
+                .unwrap_or(f32::INFINITY),
+            ReduceOp::Max => host
+                .iter()
+                .copied()
+                .reduce(|a, b| {
+                    if float_total_cmp(b, a) == std::cmp::Ordering::Greater {
+                        b
+                    } else {
+                        a
+                    }
+                })
+                .unwrap_or(f32::NEG_INFINITY),
         };
         Ok(Scalar::F32(acc))
     }
@@ -1937,8 +1899,32 @@ impl ReduceScalar for f64 {
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
             ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0.0f64, |a, b| a + b),
-            ReduceOp::Min => host.iter().copied().fold(f64::INFINITY, f64::min),
-            ReduceOp::Max => host.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            // MIN/MAX use the DuckDB NaN-as-largest convention (see
+            // `float_total_cmp`) so the scalar path agrees with window.rs.
+            // Seed from the first element (via `reduce`) so all-NaN yields
+            // NaN, matching window.rs; ±inf is only the empty-slice fallback.
+            ReduceOp::Min => host
+                .iter()
+                .copied()
+                .reduce(|a, b| {
+                    if float_total_cmp(b, a) == std::cmp::Ordering::Less {
+                        b
+                    } else {
+                        a
+                    }
+                })
+                .unwrap_or(f64::INFINITY),
+            ReduceOp::Max => host
+                .iter()
+                .copied()
+                .reduce(|a, b| {
+                    if float_total_cmp(b, a) == std::cmp::Ordering::Greater {
+                        b
+                    } else {
+                        a
+                    }
+                })
+                .unwrap_or(f64::NEG_INFINITY),
         };
         Ok(Scalar::F64(acc))
     }
@@ -2118,6 +2104,79 @@ mod tests {
         }
     }
 
+    /// TASK 1: scalar float MIN/MAX follow the DuckDB NaN-as-largest convention
+    /// (the same one `src/exec/window.rs` uses), so the scalar and window paths
+    /// agree. With a NaN present, MIN skips it (returns the real minimum) and
+    /// MAX returns NaN. Covers both f32 and f64 lanes.
+    #[test]
+    fn f64_min_max_finalize_nan_convention() {
+        let host = vec![f64::NAN, 2.0, -1.0];
+        let min = <f64 as ReduceScalar>::finalize(ReduceOp::Min, DataType::Float64, &host)
+            .expect("min ok");
+        match min {
+            // MIN skips NaN -> the real minimum.
+            Scalar::F64(v) => assert_eq!(v, -1.0),
+            other => panic!("expected Scalar::F64, got {other:?}"),
+        }
+        let max = <f64 as ReduceScalar>::finalize(ReduceOp::Max, DataType::Float64, &host)
+            .expect("max ok");
+        match max {
+            // MAX surfaces NaN (NaN is the largest under the convention).
+            Scalar::F64(v) => assert!(v.is_nan(), "expected NaN MAX, got {v}"),
+            other => panic!("expected Scalar::F64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f32_min_max_finalize_nan_convention() {
+        let host = vec![f32::NAN, 2.0f32, -1.0];
+        let min = <f32 as ReduceScalar>::finalize(ReduceOp::Min, DataType::Float32, &host)
+            .expect("min ok");
+        match min {
+            Scalar::F32(v) => assert_eq!(v, -1.0),
+            other => panic!("expected Scalar::F32, got {other:?}"),
+        }
+        let max = <f32 as ReduceScalar>::finalize(ReduceOp::Max, DataType::Float32, &host)
+            .expect("max ok");
+        match max {
+            Scalar::F32(v) => assert!(v.is_nan(), "expected NaN MAX, got {v}"),
+            other => panic!("expected Scalar::F32, got {other:?}"),
+        }
+    }
+
+    /// TASK 1: an all-NaN float MIN returns NaN (no real value to prefer), and
+    /// MAX also returns NaN — matching window.rs's all-NaN behaviour.
+    #[test]
+    fn f64_min_max_finalize_all_nan_is_nan() {
+        let host = vec![f64::NAN, f64::NAN];
+        let min = <f64 as ReduceScalar>::finalize(ReduceOp::Min, DataType::Float64, &host)
+            .expect("min ok");
+        match min {
+            Scalar::F64(v) => assert!(v.is_nan(), "expected NaN MIN, got {v}"),
+            other => panic!("expected Scalar::F64, got {other:?}"),
+        }
+        let max = <f64 as ReduceScalar>::finalize(ReduceOp::Max, DataType::Float64, &host)
+            .expect("max ok");
+        match max {
+            Scalar::F64(v) => assert!(v.is_nan(), "expected NaN MAX, got {v}"),
+            other => panic!("expected Scalar::F64, got {other:?}"),
+        }
+    }
+
+    /// TASK 1: with no NaN present, float MIN/MAX behave exactly as before
+    /// (ordinary numeric extremes), so the convention change is a no-op for the
+    /// common case.
+    #[test]
+    fn f64_min_max_finalize_no_nan_unchanged() {
+        let host = vec![3.0f64, -2.0, 7.5, 0.0];
+        let min = <f64 as ReduceScalar>::finalize(ReduceOp::Min, DataType::Float64, &host)
+            .expect("min ok");
+        let max = <f64 as ReduceScalar>::finalize(ReduceOp::Max, DataType::Float64, &host)
+            .expect("max ok");
+        assert!(matches!(min, Scalar::F64(v) if v == -2.0));
+        assert!(matches!(max, Scalar::F64(v) if v == 7.5));
+    }
+
     /// `non_null_count_for_input` returns the count of non-null cells. This
     /// drives both COUNT(col) and the AVG denominator.
     #[test]
@@ -2153,19 +2212,44 @@ mod tests {
         assert_eq!(non_null_count_for_input(&col_io, &batch).unwrap(), 0);
     }
 
-    /// `decimal_sum_host` folds an `i128` slice with wrapping add — the same
-    /// modular arithmetic the GPU carry-chain kernel performs, so the two
-    /// paths agree even across the 2^64 boundary.
+    /// `decimal_sum_host` folds an `i128` slice with a CHECKED add: it returns
+    /// the exact sum for non-overflowing inputs (including across the 2^64
+    /// boundary the GPU carry-chain kernel exercises) and errors on i128
+    /// overflow rather than wrapping.
     #[test]
     fn decimal_sum_host_folds_i128() {
-        assert_eq!(decimal_sum_host(&[]), 0);
-        assert_eq!(decimal_sum_host(&[1, 2, 3]), 6);
+        assert_eq!(decimal_sum_host(&[]).unwrap(), 0);
+        assert_eq!(decimal_sum_host(&[1, 2, 3]).unwrap(), 6);
         // Values that individually fit in 64 bits but whose sum crosses 2^64,
         // exercising the carry path the kernel emits (`add.cc`/`addc`).
         let big = u64::MAX as i128; // 2^64 - 1
-        assert_eq!(decimal_sum_host(&[big, big, big]), big * 3);
+        assert_eq!(decimal_sum_host(&[big, big, big]).unwrap(), big * 3);
         // Negative + positive decimal raw values.
-        assert_eq!(decimal_sum_host(&[-5, 10, -2]), 3);
+        assert_eq!(decimal_sum_host(&[-5, 10, -2]).unwrap(), 3);
+    }
+
+    /// TASK 2: `SUM(Decimal128)` must ERROR loudly on i128 overflow, never
+    /// wrap — matching the `SUM(integer) overflow` contract and the
+    /// never-silently-wrong invariant.
+    #[test]
+    fn decimal_sum_host_overflow_errors() {
+        let err = decimal_sum_host(&[i128::MAX, 1]).unwrap_err();
+        match err {
+            BoltError::Type(msg) => {
+                assert!(
+                    msg.contains("SUM(Decimal128) precision overflow"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected BoltError::Type on Decimal128 SUM overflow, got {other:?}"),
+        }
+    }
+
+    /// TASK 2: a normal (non-overflowing) Decimal128 SUM via the live host fold
+    /// still returns the exact sum.
+    #[test]
+    fn decimal_sum_host_normal_ok() {
+        assert_eq!(decimal_sum_host(&[100, 250, 50]).unwrap(), 400);
     }
 
     /// `decimal_sum_from_batch` strips NULL rows and returns the surviving

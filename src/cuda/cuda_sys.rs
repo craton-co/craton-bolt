@@ -577,6 +577,24 @@ impl Drop for CudaContext {
             if self.raw.is_null() {
                 return;
             }
+            // ctx-race fix (multi-Engine / multi-context exposure): the
+            // pool-watcher may have captured THIS context (the per-Engine
+            // context that is about to be destroyed) and re-binds it via
+            // `cuCtxSetCurrent` on every poll. The `POOL.drain()` above only
+            // quiesces the GLOBAL pool; it does NOT join the watcher when a
+            // NON-global `CudaContext` is dropped mid-process, so without the
+            // call below the watcher could keep binding `self.raw` after we
+            // free it here — a use-after-free of the context pointer.
+            //
+            // `pool_watcher_invalidate_ctx` clears the watcher's captured
+            // pointer iff it equals `self.raw` AND blocks until any in-flight
+            // re-bind of that pointer has finished, so the watcher can never
+            // call `cuCtxSetCurrent(self.raw)` once `cuCtxDestroy_v2` runs.
+            // It is a no-op when the `pool-watcher` feature is disabled. We
+            // use the same runtime indirection as `POOL.drain()` to keep the
+            // `cuda_sys -> mem_pool -> cuda_sys` cycle out of the build graph.
+            crate::cuda::mem_pool::pool_watcher_invalidate_ctx(self.raw);
+
             let code = unsafe { cuCtxDestroy_v2(self.raw) };
             if code != CUDA_SUCCESS {
                 log::warn!(
@@ -768,10 +786,16 @@ pub fn ctx_get_current() -> BoltResult<Option<CUcontext>> {
 /// `ctx` must be a live `CUcontext` returned by the driver (e.g.
 /// via [`ctx_get_current`] on a thread that already had one current),
 /// AND it must not have been destroyed by another thread before this
-/// call returns. The watcher pairs the capture and re-bind closely
-/// enough that this holds in practice — the engine's `CudaContext`
-/// outlives the watcher because `DeviceMemPool::Drop` requests
-/// shutdown before context teardown.
+/// call returns.
+///
+/// ctx-race: the global-`POOL` teardown path upholds this because
+/// `DeviceMemPool::Drop` joins the watcher before context teardown. The
+/// previously-missing case is a NON-global per-Engine `CudaContext` being
+/// dropped mid-process: `CudaContext::Drop` now calls
+/// `mem_pool::pool_watcher_invalidate_ctx(self.raw)` BEFORE `cuCtxDestroy_v2`,
+/// which clears the watcher's captured pointer and waits out any in-flight
+/// re-bind under a shared guard, so the watcher cannot pass a destroyed
+/// `ctx` to this function. See `mem_pool::pool_watcher::invalidate_captured_ctx`.
 pub unsafe fn ctx_set_current(ctx: CUcontext) -> BoltResult<()> {
     check(cuCtxSetCurrent(ctx))
 }

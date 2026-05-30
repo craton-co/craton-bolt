@@ -807,16 +807,61 @@ fn current_drop_fence() -> StreamFenceFn {
 ///
 /// ## Follow-up (NOT implemented here — reviewer's recommended design)
 ///
-/// The fully-structural fix the reviewer recommended is an event-based
-/// *pending-free* pool: on `mark_stream_use` record a `cuEventRecord` on the
-/// stream, and on `Drop` hand `(ptr, event)` to the pool's deferred-free
-/// list instead of fencing inline. The pool then reclaims the block only
-/// once `cuEventQuery` reports the event complete (polled on the next
-/// `alloc`/`free`), so a buffer release never *stalls* the dropping thread —
-/// it only defers reuse. That is a larger change (new pool state machine,
-/// event lifecycle management) and is deliberately left as a TODO; the
-/// blanket per-stream sync here is the conservative, correctness-first
-/// interim that needs no new pool machinery.
+/// The fully-structural fix is an event-based *pending-free* pool. It is a
+/// **cross-file** change and is deliberately left as a TODO: it cannot be done
+/// inside `buffer.rs` because the event API it needs does not exist yet, and
+/// the safety-critical state it adds belongs in `mem_pool`.
+///
+/// ### Why it is not implemented in this file
+///
+/// `cuda_sys` today exposes **no** `cuEvent*` bindings — no `cuEventCreate`,
+/// `cuEventRecord`, `cuEventQuery`, `cuEventDestroy`, no `CUevent` type, and no
+/// `CUDA_ERROR_NOT_READY` constant (it has only `cuStreamSynchronize`, a
+/// *blocking* call). Adding those bindings + their `cuda-stub` shims is an edit
+/// to `cuda_sys.rs`, and the deferred-free reclaim state is an edit to
+/// `mem_pool.rs` — both outside this file. Crucially, there is also **no
+/// in-`buffer.rs`-only micro-optimisation** available: a "query the stream and
+/// only sync if still pending" trick is impossible without `cuEventQuery`,
+/// because the sole completion probe we have (`cuStreamSynchronize`) is the
+/// very blocking call we are trying to avoid, and it already no-ops cheaply on
+/// an already-drained stream. So the blanket per-stream sync below is already
+/// the cheapest *correct* thing this file can do on its own. (The only local
+/// change made alongside this note is documentary: the `Drop` already skips the
+/// fence when `used_streams` is empty — the never-async-touched fast path.)
+///
+/// ### The cross-file design (actionable)
+///
+/// 1. **`cuda_sys`:** add `cuEventCreate(&mut CUevent, flags)`,
+///    `cuEventRecord(CUevent, CUstream)`, `cuEventQuery(CUevent) -> CUresult`,
+///    `cuEventDestroy_v2(CUevent)`, the `CUevent` opaque handle, the
+///    `CU_EVENT_DISABLE_TIMING` flag, and the `CUDA_ERROR_NOT_READY` (600)
+///    constant — each with a `cuda-stub` shim returning `CUDA_ERROR_STUB`.
+/// 2. **`mark_stream_use`:** after tagging the stream, `cuEventRecord` a
+///    disable-timing event on it and store `(stream, event)` so the buffer
+///    captures the *exact* point in the stream that referenced this block,
+///    not the stream's whole tail.
+/// 3. **`GpuBuffer::Drop`:** `cuEventQuery` every recorded event. If all are
+///    complete → `POOL.free(ptr, alloc_bytes)` inline (fast path, no stall).
+///    If any returns `CUDA_ERROR_NOT_READY` → hand
+///    `(ptr, alloc_bytes, events)` to a process-global pending-free list in
+///    `mem_pool` instead of fencing, and return without stalling.
+/// 4. **`mem_pool`:** on each `alloc`/`free` (and on shutdown `drain`),
+///    sweep the pending list; an entry whose events all `cuEventQuery`
+///    complete is returned to its bucket (then its events `cuEventDestroy`'d).
+///    Shutdown MUST fence-then-free any still-pending remainder so no block is
+///    leaked or freed early.
+///
+/// ### Safety invariant the deferred path MUST preserve
+///
+/// Exactly the guarantee the synchronous fence gives today: **a block's device
+/// memory is returned to the pool (and thus eligible for reuse) ONLY after
+/// every stream that ever touched it has drained past the recorded event.** A
+/// `cuEventQuery` that is *not* ready DEFERS the free; it never authorises one.
+/// Because the block stays out of the allocator's free list until every event
+/// reports complete, no recycled address can alias an in-flight DMA/kernel —
+/// the same no-premature-reuse property as the blanket sync, minus the stall.
+/// The blanket per-stream sync below is the conservative, correctness-first
+/// interim that needs no event lifecycle and no new pool state.
 impl<T: Pod> Drop for GpuBuffer<T> {
     fn drop(&mut self) {
         if self.ptr == 0 {
@@ -1151,17 +1196,72 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
         // exclusive ownership of `self`, so no `&self` method (which is what
         // takes `borrow_mut` in `mark_stream_use`) can run concurrently.
         //
-        // TODO(perf): a blanket per-stream sync is the safe default but it
-        // serialises every pinned-buffer release against each recorded
-        // stream's full queue, which can stall pipelined H2D / kernel /
-        // D2H overlap if the caller has already arranged a cross-stream
-        // barrier (event-record + wait) elsewhere. A future optimisation
-        // could replace this with a per-buffer `cuEventRecord` +
-        // `cuEventSynchronize` on a tiny event attached at
-        // `mark_stream_use` time, so we wait only on the specific point in
-        // each stream's history that actually touched this buffer, not the
-        // entire trailing tail of the stream.
+        // TODO(perf, cross-file — requires cuEvent FFI in `cuda_sys` + a
+        // pending-free list in `mem_pool`; deliberately NOT done here):
+        //
+        // A blanket per-stream `cuStreamSynchronize` is the safe default but
+        // it stalls the dropping thread against each recorded stream's *entire*
+        // trailing queue — not just the work that touched this buffer. The
+        // structural fix is an event-based deferred free, identical in shape to
+        // the `GpuBuffer` follow-up (see the design note on `impl Drop for
+        // GpuBuffer`). Concretely, for pinned host pages:
+        //
+        //   1. Add `cuEventCreate` / `cuEventRecord` / `cuEventQuery` /
+        //      `cuEventDestroy` bindings + cuda-stub shims + a
+        //      `CUDA_ERROR_NOT_READY` constant to `cuda_sys` (none exist
+        //      today — that is why this cannot be implemented in this file).
+        //   2. On `mark_stream_use`, `cuEventRecord` a lightweight
+        //      (`CU_EVENT_DISABLE_TIMING`) event on that stream and stash it
+        //      alongside the handle, so we capture the *exact* point in the
+        //      stream's history that referenced these pages.
+        //   3. On `Drop`, `cuEventQuery` each event. If all are complete, free
+        //      `cuMemFreeHost` inline (fast path, no stall). If any is
+        //      `CUDA_ERROR_NOT_READY`, hand `(ptr, byte_len, [events])` to a
+        //      process-global pinned-pending-free list instead of fencing.
+        //   4. Reclaim entries from that list opportunistically (on the next
+        //      `PinnedHostBuffer::new`, and on pool drain at shutdown) once
+        //      every event `cuEventQuery`s complete; only then `cuMemFreeHost`.
+        //
+        // Safety contract the deferred path MUST preserve (exactly what the
+        // synchronous fence below guarantees today): the pinned pages are
+        // returned to the driver via `cuMemFreeHost` ONLY after every stream
+        // that ever referenced them has drained past the recorded event, so no
+        // in-flight `cuMemcpy*Async` can read/write freed host memory. Querying
+        // an event (vs. waiting) is sound only because the pages are NOT freed
+        // until the query reports completion; a not-ready query defers the free,
+        // it never authorises it. Shutdown must drain-and-fence any list
+        // remainder so pinned pages are not leaked.
+        //
+        // Why not a query-then-sync micro-opt in this file alone: the only
+        // completion probe `cuda_sys` exposes today is `cuStreamSynchronize`
+        // itself (a blocking call). With no `cuEventQuery`, there is no
+        // non-blocking "is this stream past my work yet?" test to gate the
+        // sync on — and `cuStreamSynchronize` already no-ops cheaply on an
+        // already-drained stream, so a pre-check buys nothing. The win is
+        // strictly the cross-file deferred path above.
+        //
+        // The `is_empty()` guard below mirrors `GpuBuffer::Drop`: a pinned
+        // buffer only ever touched synchronously (never `mark_stream_use`d)
+        // records no streams and skips the fence loop entirely.
         let streams = self.used_streams.borrow();
+        if streams.is_empty() {
+            drop(streams);
+            // No stream ever referenced these pages, so nothing can still be
+            // DMA-ing into them; free directly. (The loop below would also be
+            // a zero-iteration no-op, but the explicit guard documents the
+            // fast path and keeps parity with `GpuBuffer::Drop`.)
+            // SAFETY: see the `cuMemFreeHost` SAFETY note below; here there is
+            // additionally no outstanding async work to fence against.
+            let rc =
+                unsafe { cuda_sys::mem_free_host(self.ptr as *mut std::ffi::c_void) };
+            if let Err(e) = rc {
+                log::warn!(
+                    "craton-bolt: cuMemFreeHost failed ({:?}); pinned host buffer leaked",
+                    e
+                );
+            }
+            return;
+        }
         for &stream in &streams.streams {
             // SAFETY: `stream` is an opaque CUstream handle handed to
             // us by the caller; we just forward it. If the stream has

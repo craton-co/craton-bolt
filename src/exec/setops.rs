@@ -89,7 +89,16 @@ pub fn execute_setop(
     // Multiset of right-side row keys → count of occurrences. For the
     // set-returning (`all == false`) variants only presence matters, but a
     // count map serves both, so we build it once.
-    let right_counts = build_key_counts(&right_batch)?;
+    //
+    // `mut` so the multiset (`ALL`) variants can decrement copies IN PLACE
+    // instead of cloning the whole map into a separate `remaining` working
+    // copy (the old shape paid a full `HashMap` clone on every call, even
+    // for the set variants that never decrement). `all` is constant for the
+    // whole call, so the `ALL` (decrementing) and set (`get`-only) arms
+    // never interleave: in the set arms the counts are read but never
+    // mutated, so consuming `right_counts` as the working multiset for the
+    // `ALL` arms is safe and preserves EXACT multiset semantics.
+    let mut right_counts = build_key_counts(&right_batch)?;
 
     // Pre-downcast the left columns once (mirrors the DISTINCT executor's
     // `ColumnReader` allocation strategy: N·K vtable lookups → K).
@@ -98,25 +107,23 @@ pub fn execute_setop(
         .iter()
         .map(|c| ColumnReader::new(c.as_ref()))
         .collect::<BoltResult<Vec<_>>>()?;
+    let n_cols = left_readers.len();
 
     // Decide, per left row, whether it survives into the output. The decision
     // depends on the operator + the `ALL` flag; see the module docs.
     let mut keep: Vec<bool> = Vec::with_capacity(n_left);
-    // For the multiset (`ALL`) variants we consume right-side copies as we go,
-    // so clone the counts into a mutable working map.
-    let mut remaining = right_counts.clone();
     // For the set (`!all`) variants we must dedupe the left side ourselves so
     // each surviving key appears at most once.
     let mut emitted: HashMap<RowKey, ()> = HashMap::new();
 
     for row in 0..n_left {
-        let key: RowKey = left_readers.iter().map(|r| r.value_at(row)).collect();
-        let in_right = right_counts.get(&key).copied().unwrap_or(0) > 0;
+        let key = RowKey::from_values(n_cols, left_readers.iter().map(|r| r.value_at(row)));
         let survive = match (op, all) {
             // EXCEPT ALL: keep up to max(0, lc - rc) copies — drop a left copy
-            // for each remaining right copy, keep the rest.
+            // for each remaining right copy, keep the rest. Decrements the
+            // right multiset in place (no per-call map clone).
             (SetOpKind::Except, true) => {
-                match remaining.get_mut(&key) {
+                match right_counts.get_mut(&key) {
                     Some(c) if *c > 0 => {
                         *c -= 1;
                         false
@@ -125,8 +132,8 @@ pub fn execute_setop(
                 }
             }
             // INTERSECT ALL: keep min(lc, rc) copies — keep a left copy while
-            // right copies remain, drop the rest.
-            (SetOpKind::Intersect, true) => match remaining.get_mut(&key) {
+            // right copies remain, drop the rest. Decrements in place.
+            (SetOpKind::Intersect, true) => match right_counts.get_mut(&key) {
                 Some(c) if *c > 0 => {
                     *c -= 1;
                     true
@@ -134,12 +141,16 @@ pub fn execute_setop(
                 _ => false,
             },
             // EXCEPT (set): distinct left rows whose key is absent from right.
+            // The set arms only READ `right_counts` (never decrement), so the
+            // multiset is intact for every row.
             (SetOpKind::Except, false) => {
-                !in_right && emitted.insert(key.clone(), ()).is_none()
+                let in_right = right_counts.get(&key).copied().unwrap_or(0) > 0;
+                !in_right && emitted.insert(key, ()).is_none()
             }
             // INTERSECT (set): distinct left rows whose key is present in right.
             (SetOpKind::Intersect, false) => {
-                in_right && emitted.insert(key.clone(), ()).is_none()
+                let in_right = right_counts.get(&key).copied().unwrap_or(0) > 0;
+                in_right && emitted.insert(key, ()).is_none()
             }
         };
         keep.push(survive);
@@ -173,8 +184,9 @@ fn build_key_counts(batch: &RecordBatch) -> BoltResult<HashMap<RowKey, usize>> {
         .iter()
         .map(|c| ColumnReader::new(c.as_ref()))
         .collect::<BoltResult<Vec<_>>>()?;
+    let n_cols = readers.len();
     for row in 0..n_rows {
-        let key: RowKey = readers.iter().map(|r| r.value_at(row)).collect();
+        let key = RowKey::from_values(n_cols, readers.iter().map(|r| r.value_at(row)));
         *counts.entry(key).or_insert(0) += 1;
     }
     Ok(counts)

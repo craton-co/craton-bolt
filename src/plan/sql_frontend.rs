@@ -6714,6 +6714,7 @@ mod like_tests {
 mod string_fn_tests {
     use super::*;
     use crate::plan::logical_plan::{DataType, Field, ScalarFnKind};
+    use crate::plan::physical_plan::{lower, PhysicalPlan};
 
     fn s_provider() -> MemTableProvider {
         let t = Schema::new(vec![

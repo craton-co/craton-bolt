@@ -549,64 +549,69 @@ mod tests {
     #[test]
     fn build_in_empty_set() {
         let probe = Expr::Column("x".into());
-        assert_eq!(
+        assert!(matches!(
             build_in_predicate(&probe, &[], false),
             Expr::Literal(Literal::Bool(false))
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             build_in_predicate(&probe, &[], true),
             Expr::Literal(Literal::Bool(true))
-        );
+        ));
     }
 
     #[test]
     fn build_in_only_nulls_set() {
         let probe = Expr::Column("x".into());
         // A set of only NULLs collapses to the empty non-null case.
-        assert_eq!(
+        assert!(matches!(
             build_in_predicate(&probe, &[Literal::Null], false),
             Expr::Literal(Literal::Bool(false))
-        );
+        ));
     }
 
     #[test]
     fn build_in_or_of_equalities() {
         let probe = Expr::Column("x".into());
         let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], false);
-        let expected = Expr::Binary {
-            op: BinaryOp::Or,
-            left: Box::new(Expr::Binary {
-                op: BinaryOp::Eq,
-                left: Box::new(Expr::Column("x".into())),
-                right: Box::new(Expr::Literal(Literal::Int32(1))),
-            }),
-            right: Box::new(Expr::Binary {
-                op: BinaryOp::Eq,
-                left: Box::new(Expr::Column("x".into())),
-                right: Box::new(Expr::Literal(Literal::Int32(2))),
-            }),
-        };
-        assert_eq!(got, expected);
+        // `Expr` doesn't implement `PartialEq`, so destructure and compare the
+        // structure / scalar leaves (which do) instead of `assert_eq!`.
+        match got {
+            Expr::Binary { op: BinaryOp::Or, left, right } => {
+                check_cmp(&left, "x", BinaryOp::Eq, Literal::Int32(1));
+                check_cmp(&right, "x", BinaryOp::Eq, Literal::Int32(2));
+            }
+            other => panic!("expected OR of equalities, got {other:?}"),
+        }
+    }
+
+    /// Asserts `e` is `Binary { op, Column(col), Literal(lit) }`.
+    fn check_cmp(e: &Expr, col: &str, op: BinaryOp, lit: Literal) {
+        match e {
+            Expr::Binary { op: got_op, left, right } => {
+                assert_eq!(*got_op, op, "binary op");
+                match (&**left, &**right) {
+                    (Expr::Column(name), Expr::Literal(got_lit)) => {
+                        assert_eq!(name.as_str(), col, "column name");
+                        assert_eq!(*got_lit, lit, "literal");
+                    }
+                    other => panic!("expected Column op Literal, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
     }
 
     #[test]
     fn build_not_in_and_of_inequalities() {
         let probe = Expr::Column("x".into());
         let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true);
-        let expected = Expr::Binary {
-            op: BinaryOp::And,
-            left: Box::new(Expr::Binary {
-                op: BinaryOp::NotEq,
-                left: Box::new(Expr::Column("x".into())),
-                right: Box::new(Expr::Literal(Literal::Int32(1))),
-            }),
-            right: Box::new(Expr::Binary {
-                op: BinaryOp::NotEq,
-                left: Box::new(Expr::Column("x".into())),
-                right: Box::new(Expr::Literal(Literal::Int32(2))),
-            }),
-        };
-        assert_eq!(got, expected);
+        match got {
+            Expr::Binary { op: BinaryOp::And, left, right } => {
+                check_cmp(&left, "x", BinaryOp::NotEq, Literal::Int32(1));
+                check_cmp(&right, "x", BinaryOp::NotEq, Literal::Int32(2));
+            }
+            other => panic!("expected AND of inequalities, got {other:?}"),
+        }
     }
 
     #[test]
@@ -618,12 +623,7 @@ mod tests {
             false,
         );
         // Single non-null element → bare equality, no OR fold.
-        let expected = Expr::Binary {
-            op: BinaryOp::Eq,
-            left: Box::new(Expr::Column("x".into())),
-            right: Box::new(Expr::Literal(Literal::Int32(7))),
-        };
-        assert_eq!(got, expected);
+        check_cmp(&got, "x", BinaryOp::Eq, Literal::Int32(7));
     }
 
     #[test]
@@ -662,9 +662,10 @@ mod tests {
         let resolved = resolve_plan(outer, &mut exec).unwrap();
         match resolved {
             LogicalPlan::Filter { predicate, .. } => match predicate {
-                Expr::Binary { right, .. } => {
-                    assert_eq!(*right, Expr::Literal(Literal::Int32(99)));
-                }
+                Expr::Binary { right, .. } => match *right {
+                    Expr::Literal(lit) => assert_eq!(lit, Literal::Int32(99)),
+                    other => panic!("expected folded literal, got {other:?}"),
+                },
                 other => panic!("unexpected predicate {other:?}"),
             },
             other => panic!("unexpected plan {other:?}"),

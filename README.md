@@ -207,22 +207,10 @@ craton-bolt/
 │   ├── plan/                 # AST, DataFrame, SQL frontend, physical IR
 │   ├── jit/                  # PTX codegen + module loader
 │   └── exec/                 # per-shape executors + top-level Engine
-├── tests/
-│   ├── diff_duckdb.rs            # DuckDB cross-check (ignored, live-GPU)
-│   ├── e2e_tests.rs              # parser/plan/PTX-shape + ignored live-GPU
-│   ├── gpu_join_e2e.rs           # GPU INNER JOIN end-to-end
-│   ├── joins_e2e.rs              # host-side join matrix (LEFT/RIGHT/FULL/CROSS)
-│   ├── having_test.rs            # HAVING clause end-to-end
-│   ├── memory_pool_stress.rs     # GpuVec pool allocator stress
-│   ├── memory_tests.rs           # CUDA-Oxide compile-fail proofs
-│   ├── parser_tests.rs           # SQL frontend + sqlparser coverage
-│   ├── ptx_golden_tests.rs       # PTX-string golden snapshots
-│   ├── shmem_groupby_e2e.rs      # shared-memory GROUP BY path
-│   ├── sort_e2e.rs               # ORDER BY end-to-end
-│   ├── sql_proptest.rs           # proptest fuzzing of the SQL frontend
-│   ├── tier2_groupby_e2e.rs      # hash-partitioned GROUP BY path
-│   ├── tier2_multi_sum_e2e.rs    # multi-aggregate hash-partitioned path
-│   └── tier2_twokey_e2e.rs       # two-key hash-partitioned GROUP BY
+├── tests/                   # integration tests: parser, optimizer, aggregates,
+│                            #   joins, sorts, GROUP BY paths, string fns, casts,
+│                            #   datetime/decimal types, set ops, PTX golden
+│                            #   snapshots, proptest fuzzing, DuckDB cross-checks
 └── benches/
     ├── query_benchmarks.rs   # criterion + Polars + CPU-ref (small dataset)
     └── olap_benchmarks.rs    # h2o.ai groupby vs Polars vs DuckDB

@@ -1,4 +1,4 @@
-﻿# Path to 1.0
+# Path to 1.0
 
 A proposal for how Craton Bolt gets to a stable, semver-bound 1.0. The current
 baseline is **0.7.0**; this document is **strategic, not contractual** — version

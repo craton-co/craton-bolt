@@ -1321,7 +1321,12 @@ mod tests {
             output_name: "s".into(),
         }];
         let os = out_schema(&[("v", DataType::Int64)], &[("s", DataType::Int64)]);
-        let err = execute_window(h, &wexprs, &[], &[], &os).unwrap_err();
+        // `QueryHandle` (the Ok variant) does not implement `Debug`, so we
+        // match on the `Result` rather than using `.unwrap_err()`.
+        let err = match execute_window(h, &wexprs, &[], &[], &os) {
+            Ok(_) => panic!("expected SUM(integer) overflow error, got Ok"),
+            Err(e) => e,
+        };
         match err {
             BoltError::Type(msg) => {
                 assert!(

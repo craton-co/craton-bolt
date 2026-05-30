@@ -2593,7 +2593,12 @@ fn substitute_one_depth(
         return expr.clone();
     }
     match expr {
-        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => expr.clone(),
+        // NB: `ScalarSubquery` / `InSubquery` are NOT folded into this combined
+        // arm — they have dedicated arms below. The `InSubquery` probe lives in
+        // *this* query's namespace and must be substituted into (see the arm at
+        // the bottom of this match), so shadowing it here would silently drop
+        // that substitution (a latent correctness bug — fixed).
+        Expr::Extract { .. } | Expr::DateTrunc { .. } => expr.clone(),
         Expr::Column(name) => match map.get(name) {
             Some(replacement) => replacement.clone(),
             None => expr.clone(),
@@ -3059,7 +3064,10 @@ fn lower_aggregate(
 /// naturally — "does the predicate contain a Unary we can't handle?".
 fn predicate_contains_unary(expr: &Expr) -> bool {
     match expr {
-        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
+        // `ScalarSubquery` / `InSubquery` have dedicated arms below so the
+        // `InSubquery` probe (in this query's namespace) is recursed into;
+        // do not fold them into this combined arm or that recursion goes dead.
+        Expr::Extract { .. } | Expr::DateTrunc { .. } => false,
         Expr::Unary { op, operand } => {
             // `NOT` lowers to `Op::Not` over its recursively-emitted Bool
             // operand (see `Codegen::emit_unary`). So `NOT (a > b)` stays on
@@ -3232,7 +3240,10 @@ fn scan_chain_has_unsafe_shortcircuit_filter(plan: &LogicalPlan) -> bool {
 /// the `LogicalPlan::Project` arm in `lower_depth`.
 fn expr_contains_concat(expr: &Expr) -> bool {
     match expr {
-        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
+        // `ScalarSubquery` / `InSubquery` have dedicated arms below so the
+        // `InSubquery` probe (in this query's namespace) is recursed into;
+        // do not fold them into this combined arm or that recursion goes dead.
+        Expr::Extract { .. } | Expr::DateTrunc { .. } => false,
         Expr::Binary { op, left, right } => {
             matches!(op, BinaryOp::Concat)
                 || expr_contains_concat(left)
@@ -4019,7 +4030,10 @@ fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
 /// results.
 fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
     match e {
-        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
+        // `ScalarSubquery` / `InSubquery` have dedicated arms below so the
+        // `InSubquery` probe (in this query's namespace) is recursed into;
+        // do not fold them into this combined arm or that recursion goes dead.
+        Expr::Extract { .. } | Expr::DateTrunc { .. } => false,
         Expr::Column(_) | Expr::Literal(_) => false,
         Expr::Binary { op, left, right } => {
             if matches!(op, BinaryOp::And | BinaryOp::Or)
@@ -6272,5 +6286,112 @@ mod tests {
             matches!(err, BoltError::Plan(_)),
             "expected BoltError::Plan, got {err:?}"
         );
+    }
+
+    /// Regression guards for the `InSubquery`-probe shadowing fix.
+    ///
+    /// Four host-fallback / substitution helpers
+    /// (`substitute_one_depth`, `predicate_contains_unary`,
+    /// `expr_contains_concat`, `expr_has_unsafe_eager_shortcircuit`) each have a
+    /// dedicated `Expr::InSubquery` arm that recurses into the *probe* (which
+    /// lives in the enclosing query's namespace). A combined early arm used to
+    /// fold `InSubquery` into the `Extract | DateTrunc | ScalarSubquery`
+    /// catch-all, shadowing those dedicated arms so the probe was never visited.
+    /// These tests build an `InSubquery` whose probe carries the shape each
+    /// helper is meant to detect/transform and assert the probe is now reached.
+    mod in_subquery_probe_recursion {
+        use crate::plan::logical_plan::{
+            BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema, UnaryOp,
+        };
+        use std::collections::HashMap;
+
+        /// Minimal single-column, uncorrelated subquery plan.
+        fn one_col_subquery() -> LogicalPlan {
+            LogicalPlan::Scan {
+                table: "t2".into(),
+                projection: None,
+                schema: Schema::new(vec![Field::new("id", DataType::Int64, true)]),
+            }
+        }
+
+        fn in_subquery(probe: Expr) -> Expr {
+            Expr::InSubquery {
+                expr: Box::new(probe),
+                subquery: Box::new(one_col_subquery()),
+                negated: false,
+            }
+        }
+
+        /// `substitute_one_depth` must rewrite a `Column` inside the probe.
+        #[test]
+        fn substitute_descends_into_probe() {
+            let mut map = HashMap::new();
+            map.insert("x".to_string(), Expr::Literal(Literal::Int64(7)));
+            let e = in_subquery(Expr::Column("x".into()));
+            let out = super::super::substitute_one(&e, &map);
+            match out {
+                Expr::InSubquery { expr, .. } => {
+                    assert!(
+                        matches!(*expr, Expr::Literal(Literal::Int64(7))),
+                        "probe column should have been substituted, got {expr:?}"
+                    );
+                }
+                other => panic!("expected InSubquery, got {other:?}"),
+            }
+        }
+
+        /// `predicate_contains_unary` must see a GPU-unsupported unary
+        /// (IS NULL over a non-column) inside the probe.
+        #[test]
+        fn unary_detected_in_probe() {
+            // `IS NULL` over a non-bare-column → host-fallback shape.
+            let probe = Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(Expr::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(Expr::Column("a".into())),
+                    right: Box::new(Expr::Literal(Literal::Int64(1))),
+                }),
+            };
+            assert!(super::super::predicate_contains_unary(&in_subquery(probe)));
+            // Bare column probe is GPU-lowerable → not flagged.
+            assert!(!super::super::predicate_contains_unary(&in_subquery(
+                Expr::Column("a".into())
+            )));
+        }
+
+        /// `expr_contains_concat` must see a `||` inside the probe.
+        #[test]
+        fn concat_detected_in_probe() {
+            let probe = Expr::Binary {
+                op: BinaryOp::Concat,
+                left: Box::new(Expr::Column("a".into())),
+                right: Box::new(Expr::Column("b".into())),
+            };
+            assert!(super::super::expr_contains_concat(&in_subquery(probe)));
+            assert!(!super::super::expr_contains_concat(&in_subquery(
+                Expr::Column("a".into())
+            )));
+        }
+
+        /// `expr_has_unsafe_eager_shortcircuit` must see the unsafe AND/OR
+        /// short-circuit pattern inside the probe.
+        #[test]
+        fn unsafe_shortcircuit_detected_in_probe() {
+            // `a AND (b / c)` — Div under an And guard is the unsafe shape.
+            let probe = Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(Expr::Column("a".into())),
+                right: Box::new(Expr::Binary {
+                    op: BinaryOp::Div,
+                    left: Box::new(Expr::Column("b".into())),
+                    right: Box::new(Expr::Column("c".into())),
+                }),
+            };
+            assert!(super::super::expr_has_unsafe_eager_shortcircuit(&in_subquery(probe)));
+            assert!(!super::super::expr_has_unsafe_eager_shortcircuit(&in_subquery(
+                Expr::Column("a".into())
+            )));
+        }
     }
 }

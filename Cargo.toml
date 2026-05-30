@@ -12,7 +12,7 @@ readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
 categories   = ["database", "compilers"]
 rust-version = "1.74"
-exclude      = ["target/*", ".idea/*", ".github/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "continue_prompt.md"]
+exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "continue_prompt.md"]
 
 # --- Workspace shim ---------------------------------------------------------
 #
@@ -29,7 +29,8 @@ exclude      = ["target/*", ".idea/*", ".github/*", "kernels/*", ".claude/*", "t
 # via `cuda_builder` from this crate's `build.rs` when the `rust-cuda`
 # feature is enabled.
 #
-# See the [workspace] block comment above for the rationale.
+# The rationale for the empty-members / kernels-in-exclude setup is the
+# workspace-shim explanation above.
 [workspace]
 members  = []
 exclude  = ["kernels", ".claude/worktrees"]

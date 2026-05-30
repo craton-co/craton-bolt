@@ -23,8 +23,8 @@ required credentials and what needs to be prepared beforehand.
 **Credentials needed:** `push` access to `origin`.
 
 ```bash
-git tag -a v0.3.0 -m "v0.3.0 — <one-line release summary>"
-git push origin v0.3.0
+git tag -a vX.Y.Z -m "vX.Y.Z — <one-line release summary>"
+git push origin vX.Y.Z
 ```
 
 GitHub Actions will pick up the tag; confirm the CI run is green before proceeding.
@@ -115,7 +115,8 @@ over v13.x when both are present.
   `CONTRIBUTING.md`). No CLA is required; a CLA would need legal review before
   adoption.
 - **Third-party license audit**: run `cargo deny check licenses` before each
-  publish (see step 1). A `deny.toml` should be added to automate this in CI.
+  publish (see step 1). A `deny.toml` is present at the repo root and is wired
+  into CI to automate this check.
 
 ## 10. Things to check before any public announcement
 

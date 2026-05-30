@@ -30,30 +30,29 @@
 //!
 //! 1. **Partition pass.** Hash every input row's key into one of
 //!    `NUM_PARTITIONS = 4096` buckets, count rows per bucket, and remember
-//!    the per-row bucket assignment. (`partition_kernel`, sibling agent.)
+//!    the per-row bucket assignment. (`crate::jit::partition_kernel`.)
 //! 2. **Prefix sum.** Exclusive prefix sum over the bucket counts gives the
 //!    write offset for each partition in the scattered output.
-//!    (`partition_offsets`, sibling agent.)
+//!    (`crate::exec::partition_offsets`.)
 //! 3. **Scatter pass.** Each input row writes its (key, value) into the
 //!    scratch buffer at `offset[pid] + per_partition_cursor[pid]++`.
 //!    Output is `n_rows` of i32 keys + `n_rows` of f64 values, contiguous
-//!    by partition. (`scatter_kernel`, sibling agent.)
+//!    by partition. (`crate::jit::scatter_kernel`.)
 //! 4. **Per-partition reduce — GPU.** One CUDA block per partition builds
 //!    a shared-memory open-addressing hash table over the partition's
 //!    `[offsets[pid]..offsets[pid+1])` slice (see
 //!    [`crate::jit::partition_reduce_kernel`]). The host then walks the
 //!    fixed-size output buffer to collect populated slots.
 //!
-//! ## Sibling-agent stubs
+//! ## GPU module wiring
 //!
-//! Three sibling agents own the GPU pieces of this pipeline and write them
-//! in their own worktrees. THEIR files do not exist in mine. The
-//! integrator's merger pass will replace these stub modules with real
-//! `use crate::jit::partition_kernel::*;` (etc.) imports.
-//!
-//! Until then the stubs let this file **compile** in isolation, even if any
-//! actual call to an unimplemented stub would `unimplemented!()` at runtime.
-//! Wiring is the merger's job, not mine.
+//! The GPU pieces of this pipeline live in their own modules and are wired
+//! in directly: the partition pass comes from [`crate::jit::partition_kernel`],
+//! the scatter pass from [`crate::jit::scatter_kernel`], and the prefix-sum /
+//! offset computation from [`crate::exec::partition_offsets`]. This file owns
+//! the per-partition reduce pass ([`crate::jit::partition_reduce_kernel`]).
+//! All of these are real implementations — there are no stub/placeholder
+//! bodies left in this path.
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -76,19 +75,15 @@ use crate::jit::CudaModule;
 pub(crate) const PARTITION_REDUCE_SPILL_PREFIX: &str = "partition_reduce spill:";
 
 // ---------------------------------------------------------------------------
-// Sibling-agent stubs.
+// GPU pipeline modules.
 //
-// These are *placeholders* for the real modules other agents are writing in
-// their own worktrees. The merger swaps `stub_*` for real `use` statements;
-// see module-level docs.
-//
-// We do NOT depend on these stubs being correct at runtime — every body is
-// `unimplemented!()` — but their *signatures* must match the merger's
-// expectations so the swap is a one-line edit. Do not change a signature
-// without coordinating with the sibling agent that owns it.
+// The partition, scatter, and offset-computation pieces live in their own
+// modules and are imported directly below. They are real implementations;
+// see module-level docs for the pipeline overview.
 // ---------------------------------------------------------------------------
 
-// Sibling-agent modules wired in (stubs replaced by real imports):
+// The `stub_` aliases are historical names kept to minimise call-site churn;
+// they bind to the real GPU pipeline modules.
 use crate::jit::partition_kernel as stub_partition_kernel;
 use crate::jit::scatter_kernel as stub_scatter_kernel;
 use crate::exec::partition_offsets as stub_partition_offsets;
@@ -209,8 +204,8 @@ pub(crate) fn validate_offsets_monotonic(offsets: &[u32], tag: &str) -> BoltResu
 /// # Errors
 ///
 /// Surfaces any CUDA driver failure encountered during partition / scatter /
-/// download. Stub sibling functions return `unimplemented!()`, so calling
-/// this *before* the merger pass will panic — that's intentional.
+/// download, plus a structured `partition_reduce spill:` error if the
+/// per-partition hash table overflows `MAX_PROBES`.
 pub fn execute_tier2_sum(
     keys: &GpuVec<i32>,
     vals: &GpuVec<f64>,
@@ -539,14 +534,15 @@ pub fn execute_tier2_sum(
 // ---------------------------------------------------------------------------
 // Host-only sanity tests.
 //
-// We cannot exercise the full pipeline here without (a) a working CUDA
-// context and (b) the sibling-agent kernels, both of which are out of scope
-// for this worktree. What we *can* test cheaply:
+// Exercising the full pipeline here needs a working CUDA context and the
+// JIT toolchain; the GPU-gated tests below are `#[ignore]`d so they only run
+// where those are available. What we test cheaply without a GPU:
 //
 //   * The empty-input early return matches the documented length invariant.
 //   * `Tier2PartialResult` is constructible and inspectable.
 //
-// The integrator's harness (T2G) covers the GPU-end-to-end correctness.
+// End-to-end GPU correctness is covered by the `#[ignore]`d tests in this
+// module and the integration harness.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {

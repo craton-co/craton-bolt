@@ -965,11 +965,98 @@ enum JoinKeyValue {
     DictIdx(i32),
 }
 
-/// A row's join key — small `Vec` because the number of equi columns is
-/// typically 1-3. Single-key joins (the common case) still allocate a
-/// 1-element Vec; allocating a SmallVec or duplicating the type is a
-/// micro-opt left for the 0.4 GPU port.
-type JoinKey = Vec<JoinKeyValue>;
+/// A row's join key — one [`JoinKeyValue`] per equi column.
+///
+/// The number of equi columns is typically 1 (and almost always 1-3), so
+/// this is an inline-capable small-vector rather than a plain
+/// `Vec<JoinKeyValue>`: the single-key case (`One`) stores its sole value
+/// inline and NEVER heap-allocates, which is the overwhelming common path
+/// for both the per-build-row and per-probe-row keys. Multi-column keys
+/// spill to `Many(Vec<_>)` exactly as the old `Vec` alias did.
+///
+/// # Hash / Eq invariant (load-bearing)
+///
+/// `Hash`, `PartialEq`, and `Eq` are defined over `self.as_slice()`, the
+/// ordered sequence of `JoinKeyValue`s — byte-for-byte identical to the old
+/// `Vec<JoinKeyValue>` semantics:
+///
+///   * `Vec<T>: Hash` writes `len` then hashes each element in order; so
+///     does `[T]: Hash`. Delegating `Hash` to `self.as_slice()` produces
+///     the exact same hash stream as the old `Vec` key whether the value
+///     sits inline (`One`) or on the heap (`Many`). In particular a
+///     single-key `One(v)` hashes identically to `Many(vec![v])`.
+///   * `PartialEq`/`Eq` compare the value sequences element-by-element, so
+///     two keys compare equal iff their values match in order, independent
+///     of `One`-vs-`Many` storage.
+///
+/// The variant is an internal storage detail never observed by Hash/Eq, so
+/// the join's key equivalence relation is unchanged.
+#[derive(Debug, Clone)]
+enum JoinKey {
+    One(JoinKeyValue),
+    Many(Vec<JoinKeyValue>),
+}
+
+impl JoinKey {
+    /// The ordered key values. All of `Hash`/`Eq` go through this, so the
+    /// inline-vs-heap split is invisible to the key relation.
+    #[inline]
+    fn as_slice(&self) -> &[JoinKeyValue] {
+        match self {
+            JoinKey::One(v) => std::slice::from_ref(v),
+            JoinKey::Many(vs) => vs.as_slice(),
+        }
+    }
+
+    /// Number of key columns. Mirrors `Vec::len`.
+    #[inline]
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+impl From<Vec<JoinKeyValue>> for JoinKey {
+    /// Build a `JoinKey` from a value vector, keeping the single-key case
+    /// inline (no heap allocation). A 1-element vec collapses to `One`; the
+    /// vec's backing allocation is dropped. The hash/eq relation is
+    /// unaffected (see the type doc-comment).
+    #[inline]
+    fn from(mut vs: Vec<JoinKeyValue>) -> Self {
+        if vs.len() == 1 {
+            // `pop` moves the sole element out; the empty Vec is dropped.
+            JoinKey::One(vs.pop().unwrap())
+        } else {
+            JoinKey::Many(vs)
+        }
+    }
+}
+
+impl std::ops::Index<usize> for JoinKey {
+    type Output = JoinKeyValue;
+    #[inline]
+    fn index(&self, i: usize) -> &JoinKeyValue {
+        &self.as_slice()[i]
+    }
+}
+
+impl PartialEq for JoinKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for JoinKey {}
+
+impl std::hash::Hash for JoinKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Delegates to `[JoinKeyValue]: Hash` (writes len then each element)
+        // — byte-for-byte identical to the old `Vec<JoinKeyValue>: Hash`.
+        self.as_slice().hash(state);
+    }
+}
 
 /// Pull the (build_idx, ...) tuple of values for `row` out of `batch`.
 /// Returns `Ok(None)` if any key column is NULL at that row — the
@@ -979,13 +1066,39 @@ fn extract_key(
     indices: &[usize],
     row: usize,
 ) -> BoltResult<Option<JoinKey>> {
-    let mut key: JoinKey = Vec::with_capacity(indices.len());
+    // Single-key fast path (the overwhelming common case): build `One`
+    // directly with no heap allocation. NULL ⇒ no key (SQL "NULL never
+    // matches"). Multi-column keys fall through to a `Vec`-backed `Many`,
+    // which `JoinKey::from` keeps as-is (a 1-elem vec can't reach here).
+    if indices.len() == 1 {
+        return Ok(extract_key_value(batch, indices[0], row)?.map(JoinKey::One));
+    }
+    let mut vs: Vec<JoinKeyValue> = Vec::with_capacity(indices.len());
     for &idx in indices {
-        let arr = batch.column(idx);
-        if arr.is_null(row) {
-            return Ok(None);
+        match extract_key_value(batch, idx, row)? {
+            Some(v) => vs.push(v),
+            None => return Ok(None),
         }
-        let v = match arr.data_type() {
+    }
+    Ok(Some(JoinKey::Many(vs)))
+}
+
+/// Extract one key column value at `row`. Returns `Ok(None)` if the column
+/// is NULL at that row (the SQL "NULL keys never match" rule). Factored out
+/// of [`extract_key`] so the single-key fast path can build a `JoinKey::One`
+/// without an intermediate `Vec`. The per-dtype dispatch, float
+/// canonicalisation (review C12), and dict-index handling (review L6) are
+/// identical to the inline version it replaced.
+fn extract_key_value(
+    batch: &RecordBatch,
+    idx: usize,
+    row: usize,
+) -> BoltResult<Option<JoinKeyValue>> {
+    let arr = batch.column(idx);
+    if arr.is_null(row) {
+        return Ok(None);
+    }
+    let v = match arr.data_type() {
             ArrowDataType::Int32 => JoinKeyValue::I32(
                 arr.as_any().downcast_ref::<Int32Array>().unwrap().value(row),
             ),
@@ -1082,9 +1195,7 @@ fn extract_key(
                 )));
             }
         };
-        key.push(v);
-    }
-    Ok(Some(key))
+    Ok(Some(v))
 }
 
 /// Canonicalise `-0.0` to `+0.0` so signed-zero pairs key the same
@@ -1717,12 +1828,52 @@ mod tests {
         // Three distinct dict indices => three buckets.
         assert_eq!(map.len(), 3);
         // The "alpha" bucket has both row 0 and row 2.
-        let alpha_key: JoinKey = vec![JoinKeyValue::DictIdx(0)];
+        let alpha_key: JoinKey = JoinKey::from(vec![JoinKeyValue::DictIdx(0)]);
         let alpha_rows = map.get(&alpha_key).expect("alpha bucket present");
         let alpha_slice = alpha_rows.as_slice();
         assert_eq!(alpha_slice.len(), 2);
         assert!(alpha_slice.contains(&0));
         assert!(alpha_slice.contains(&2));
+    }
+
+    /// Hash a single value through `std::hash::Hash` with the default hasher.
+    fn hash_of<T: std::hash::Hash>(t: &T) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+        let mut h = DefaultHasher::new();
+        t.hash(&mut h);
+        h.finish()
+    }
+
+    /// The inline single-key `JoinKey::One` must hash/compare byte-for-byte
+    /// identically to the old `Vec<JoinKeyValue>` shape (and to the `Many`
+    /// fallback carrying the same value). `Vec<T>: Hash` writes len + each
+    /// element; `JoinKey` delegates `Hash` to `self.as_slice()` (`[T]: Hash`)
+    /// which does the same, so the hash streams MUST coincide.
+    #[test]
+    fn join_key_one_matches_vec_hash_and_eq() {
+        let v = vec![JoinKeyValue::I64(99)];
+        let one = JoinKey::from(v.clone()); // collapses to One
+        assert!(matches!(one, JoinKey::One(_)));
+        // Same hash as the plain Vec it replaced.
+        assert_eq!(hash_of(&one), hash_of(&v));
+        // And the same as an explicit Many carrying the identical value.
+        let many = JoinKey::Many(v.clone());
+        assert_eq!(one, many);
+        assert_eq!(hash_of(&one), hash_of(&many));
+
+        // Multi-key path stays a Vec and matches the Vec hash too.
+        let mv = vec![JoinKeyValue::I32(1), JoinKeyValue::DictIdx(2)];
+        let mk = JoinKey::from(mv.clone());
+        assert!(matches!(mk, JoinKey::Many(_)));
+        assert_eq!(hash_of(&mk), hash_of(&mv));
+        assert_eq!(mk.len(), 2);
+        assert_eq!(mk[0], JoinKeyValue::I32(1));
+        assert_eq!(mk[1], JoinKeyValue::DictIdx(2));
+
+        // Distinct single keys differ.
+        let other = JoinKey::One(JoinKeyValue::I64(100));
+        assert_ne!(one, other);
     }
 }
 
