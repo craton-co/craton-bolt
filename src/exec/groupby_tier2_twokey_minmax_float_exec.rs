@@ -196,6 +196,18 @@ pub fn try_execute(
         return None;
     }
 
+    // F2: NaN handling. The CAS-loop float MIN/MAX kernel compares raw IEEE
+    // floats, so NaN's participation is order-dependent and can disagree with
+    // the host scalar path's DuckDB total order (NaN-as-largest; see
+    // `aggregate.rs::float_total_cmp`). Defer NaN-bearing value columns to the
+    // global-atomic / host path so grouped float MIN/MAX matches the scalar
+    // aggregate. Mirrors the single-key float MIN/MAX executor.
+    if let Some(val_arr) = val_col.as_any().downcast_ref::<Float64Array>() {
+        if val_arr.values().iter().any(|v| v.is_nan()) {
+            return None;
+        }
+    }
+
     Some(execute_inner(plan, k1, k2, val_col, op, float_dtype))
 }
 

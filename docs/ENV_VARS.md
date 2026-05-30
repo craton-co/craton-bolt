@@ -23,6 +23,10 @@ variable.
 | `BOLT_GPU_JOIN_STREAMING_INTERN` | off                  | `1`         | Streaming Utf8 intern for high-cardinality keys |
 | `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root (v0.6 / M6)   |
 | `BOLT_GPU_SORT`                  | off                  | `1`         | Opt into the GPU radix-sort path for `ORDER BY` |
+| `BOLT_PREFIX_SCAN_ALGO`          | Hillis-Steele        | `blelloch` / `lookback` | Select the GPU prefix-scan kernel   |
+| `BOLT_HASH_ALGO`                 | linear-probe         | `robin_hood` / `rh` | Select the GROUP BY keys hash kernel    |
+| `BOLT_HASH_PROBE_TILED`          | off                  | `1`         | Opt into the tiled SoA hash-join probe kernel   |
+| `BOLT_SORT_USE_GRAPH`            | off                  | `1`         | Opt into CUDA-graph capture for bitonic sort    |
 | `BOLT_BENCH_GPU`                 | off                  | `1`         | Enable GPU paths in `cargo bench`               |
 | `BOLT_BENCH_THRESHOLD`           | off                  | `1`         | Enable the Utf8-sort threshold bench            |
 | `CUDA_PATH`                      | toolkit-default      | path        | Build-time CUDA toolkit location (build.rs)     |
@@ -251,20 +255,75 @@ variable.
   `cuda-stub` feature is selected.
 - **Source**: `build.rs` (line 23).
 
+## Internal / unstable kernel selectors
+
+These vars are **read at runtime** and switch between alternative GPU
+kernels. They are wired up for shake-out and benchmarking of newer kernel
+variants whose defaults have not yet flipped; treat them as
+**internal/unstable — they may change semantics or be removed** without a
+deprecation cycle. The default (var unset) is the bake-tested steady-state
+path in every case.
+
+### `BOLT_PREFIX_SCAN_ALGO`
+- **Default**: Hillis-Steele (var unset, or any unrecognised value, or
+  `hillis` / `hillis-steele`)
+- **Type**: case-insensitive string; accepted values `blelloch`,
+  `lookback`, `hillis`, `hillis-steele`
+- **What**: Selects the GPU prefix-scan kernel used by the compaction
+  path. `blelloch` routes through the O(n)-work upsweep/downsweep kernel;
+  `lookback` routes through the single-pass decoupled-lookback kernel
+  (`SCAN_KERNEL_ENTRY_LOOKBACK`), which allocates an extra `partial_status`
+  buffer and returns global exclusive prefixes directly. Anything else
+  uses the default Hillis-Steele scan.
+- **Notes**: Read on every scan dispatch (a cheap env lookup), so it can be
+  changed without a process restart for ad-hoc benchmarking. The
+  Hillis-Steele default is intentional while the alternatives are in
+  shake-out.
+- **Source**: `src/exec/gpu_compact.rs::prefix_scan_algo_selection`
+  (line 919).
+
+### `BOLT_HASH_ALGO`
+- **Default**: classic linear-probe keys kernel (var unset or any value
+  other than `robin_hood` / `rh`)
+- **Type**: case-insensitive string; `robin_hood` or `rh` selects the
+  Robin Hood variant
+- **What**: Selects the GROUP BY keys hash kernel. The Robin Hood and
+  linear-probe kernels share an identical 4-parameter ABI; only the entry
+  point (and module-cache spec id) differs, so the two variants are cached
+  separately.
+- **Source**: `src/exec/groupby.rs::launch_keys_kernel` (env read at
+  line 661).
+
+### `BOLT_HASH_PROBE_TILED`
+- **Default**: off (var unset, empty, `0`, or `false` case-insensitive)
+- **Type**: truthy string — any non-empty value other than `0` / `false`
+  (case-insensitive) enables the path
+- **What**: Opts the GPU hash-join probe into the 2-way-unrolled tiled SoA
+  kernel (`PROBE_KERNEL_TILED_ENTRY`) instead of the default probe kernel.
+  The tiled kernel has an identical nine-parameter ABI, so opting in only
+  switches which entry point `launch_probe_kernel` resolves at module load;
+  block size, grid shape, and output sizing are unchanged.
+- **Source**: `src/exec/gpu_join.rs::probe_tiled_enabled`
+  (env var name constant `PROBE_TILED_ENV_VAR`, line 1004).
+
+### `BOLT_SORT_USE_GRAPH`
+- **Default**: off (var unset or anything other than exactly `"1"`;
+  `"0"` / `"true"` / garbage all read as off)
+- **Type**: must equal exactly `"1"` to enable — the strict comparison
+  keeps the gate from tripping on shell quoting or boolean-style strings
+- **What**: Opts the bitonic sort into CUDA-graph capture, replaying a
+  cached `GraphExecHandle` (keyed in `GRAPH_CACHE`) instead of re-issuing
+  the per-substage launches each call. Falls back to ordinary launches when
+  off.
+- **Source**: `src/exec/gpu_sort.rs::sort_uses_graph`
+  (env var name constant `BOLT_SORT_USE_GRAPH_ENV`, line 1722;
+  gate consulted at line 1942).
+
 ## Not present in this build
 
 The following vars appear in some forward-looking design notes but are
 NOT honoured by the current codebase. Setting them has no effect:
 
-- `BOLT_PREFIX_SCAN_ALGO` — only the Hillis-Steele scan is shipped today
-  (see `src/jit/prefix_scan.rs`). A Blelloch variant exists but is wired
-  in unconditionally; there is no runtime selector.
-- `BOLT_HASH_ALGO` — the Robin Hood hashing path lives in
-  `src/jit/hash_kernels` but is selected by host policy, not by env var.
-- `BOLT_HASH_PROBE_TILED` — the tile-aware SoA probe is always on once
-  its host gate fires; no runtime override.
-- `BOLT_SORT_USE_GRAPH` — the CUDA-graph bitonic sort is selected by the
-  sort orchestrator on size, not by env var.
 - `CRATON_DISTINCT_HOST_MAX_ROWS` — the host DISTINCT cap is a compile-
   time constant, not an env var.
 - `CRATON_PLAN_CACHE_SIZE` — the plan cache capacity is a compile-time

@@ -201,6 +201,18 @@ macro_rules! emit_fmt {
 }
 
 /// Compile a `KernelSpec` to a complete PTX module.
+///
+/// # Row-count limit (C-3 / C-4)
+///
+/// The global thread id is computed in **signed 32-bit** arithmetic
+/// (`mad.lo.s32 %tid, %ctaid, %ntid, %tid.x`, see TID setup below), so the
+/// per-launch addressable row space is capped at `i32::MAX` (~2.1 billion
+/// rows). All offset arithmetic — value loads/stores **and** validity-byte
+/// loads/stores — now widens the row index **unsigned** (`mul.wide.u32`), so
+/// addressing is internally consistent and correct for every `tid` the s32
+/// `mad.lo` can produce. The host launch path MUST therefore ensure
+/// `n_rows <= i32::MAX`; larger row counts require migrating the tid math to
+/// 64-bit grid addressing (see review C-4).
 #[tracing::instrument(name = "codegen", level = "info", skip(spec), fields(kernel = kernel_name))]
 pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
     validate_kernel_name(kernel_name)?;
@@ -352,10 +364,17 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
             let Some(vptr) = opt else { continue };
             let _ = i;
             // off = tid (u8 stride => offset = tid).
+            // C-3: widen the row index UNSIGNED (`mul.wide.u32 .. , 1`) so the
+            // validity-byte offset matches the value-load path
+            // (`emit_load`/`emit_load_128` use `mul.wide.u32`). A signed
+            // `cvt.s64.s32` would sign-extend `tid` once it crosses 2^31 and
+            // produce a huge negative offset → OOB validity load, while the
+            // value load at the same row stays correct. `mul.wide.u32 _, 1`
+            // zero-extends the 32-bit tid into the 64-bit offset register.
             let off = b.alloc.alloc("rd");
             let addr = b.alloc.alloc("rd");
             let byte_reg = b.alloc.alloc("r");
-            emit_fmt!(b, "cvt.s64.s32 {}, {};", off, tid)?;
+            emit_fmt!(b, "mul.wide.u32 {}, {}, 1;", off, tid)?;
             emit_fmt!(b, "add.s64 {}, {}, {};", addr, vptr, off)?;
             // Input-validity bytes live in distinct param buffers (host side
             // allocates them as fresh `GpuVec<u8>`). They're read-only here, so
@@ -428,7 +447,9 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
             let addr = b.alloc.alloc("rd");
             // PERF (codegen alloc): emit straight into `b.body` via `emit_fmt!`;
             // `vptr`/`combined` are borrows of locals, not `b`.
-            emit_fmt!(b, "cvt.s64.s32 {}, {};", off, tid)?;
+            // C-3: UNSIGNED widen (`mul.wide.u32 _, 1`) to match the value path
+            // and the AND-of-inputs fold above; see the input-validity comment.
+            emit_fmt!(b, "mul.wide.u32 {}, {}, 1;", off, tid)?;
             emit_fmt!(b, "add.s64 {}, {}, {};", addr, vptr, off)?;
             emit_fmt!(b, "st.global.u8 [{}], {};", addr, combined)?;
         }
@@ -949,7 +970,7 @@ fn emit_cmp_128(
 /// Wire shape:
 ///
 /// ```text
-///   cvt.s64.s32 %off,  %tid                 // widen row index to b64
+///   mul.wide.u32 %off, %tid, 1              // UNSIGNED widen row index to b64
 ///   add.s64     %addr, %vptr, %off          // &validity[tid]
 ///   ld.global.nc.u8 %byte, [%addr]          // 0=null, 1=non-null
 ///   setp.eq.u32 %p,    %byte, 0             // (or setp.ne for IS NOT NULL)
@@ -1003,7 +1024,10 @@ fn emit_is_null_check(
     let off = b.alloc.alloc("rd");
     let addr = b.alloc.alloc("rd");
     let byte_reg = b.alloc.alloc("r");
-    emit_fmt!(b, "cvt.s64.s32 {}, {};", off, tid)?;
+    // C-3: UNSIGNED widen (`mul.wide.u32 _, 1`) so the validity-byte offset
+    // matches the value-load path (`emit_load` uses `mul.wide.u32`). A signed
+    // `cvt.s64.s32` would sign-extend `tid` above 2^31 rows → OOB validity load.
+    emit_fmt!(b, "mul.wide.u32 {}, {}, 1;", off, tid)?;
     emit_fmt!(b, "add.s64 {}, {}, {};", addr, vptr, off)?;
     emit_fmt!(b, "ld.global.nc.u8 {}, [{}];", byte_reg, addr)?;
 
@@ -1877,6 +1901,33 @@ mod validity_emission_tests {
     }
 
     #[test]
+    fn validity_offset_widens_unsigned() {
+        // C-3 regression: validity-byte addressing MUST widen the row index
+        // UNSIGNED (`mul.wide.u32 .., 1`) to match the value-load path
+        // (`emit_load`/`emit_load_128` use `mul.wide.u32`). A signed
+        // `cvt.s64.s32` would sign-extend `tid` once it crosses 2^31 rows and
+        // compute a huge negative validity offset → OOB load/store, while the
+        // value load at the same row stays correct. This test locks down the
+        // signed→unsigned fix on both the input-AND fold and the output store.
+        let spec = mul_with_validity_spec();
+        let ptx = compile(&spec, "bolt_pre_kernel_validity_widen").expect("compile");
+
+        // The validity path uses the unsigned-widen stride-1 form.
+        assert!(
+            ptx.contains("mul.wide.u32") && ptx.contains(", 1;"),
+            "expected `mul.wide.u32 .., 1;` unsigned widen on the validity path\n{ptx}"
+        );
+
+        // And it must NOT use the signed widen for offset arithmetic. The only
+        // legitimate `cvt.s64.s32` is an Int32->Int64 CAST, which this spec
+        // (Mul of two value columns + validity) never emits.
+        assert!(
+            !ptx.contains("cvt.s64.s32"),
+            "validity path must not sign-extend the row index via cvt.s64.s32\n{ptx}"
+        );
+    }
+
+    #[test]
     fn no_validity_emits_original_shape() {
         // Regression guard: when `*_has_validity` is empty the emitter
         // MUST produce the historical PTX shape (no extra params, no u8
@@ -1988,6 +2039,19 @@ mod validity_emission_tests {
         assert!(
             ptx.contains("ld.global.nc.u8"),
             "expected ld.global.nc.u8 for validity byte load\n{ptx}"
+        );
+
+        // C-3: the IsNullCheck validity offset is widened UNSIGNED via
+        // `mul.wide.u32 .., 1` (stride-1 byte addressing) — never the signed
+        // `cvt.s64.s32`, which would mis-address above 2^31 rows. This spec
+        // emits no Int32->Int64 CAST, so `cvt.s64.s32` must be entirely absent.
+        assert!(
+            ptx.contains("mul.wide.u32") && ptx.contains(", 1;"),
+            "expected `mul.wide.u32 .., 1;` unsigned widen for the validity offset\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("cvt.s64.s32"),
+            "IsNullCheck validity offset must not sign-extend via cvt.s64.s32\n{ptx}"
         );
 
         // The IS NULL predicate is `byte == 0`.

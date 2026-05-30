@@ -1,14 +1,43 @@
 # GROUP BY performance — analysis and proposed optimizations
 
 > [!NOTE]
-> **Status: Implemented** (Tiers 1–2 landed; see [BENCHMARKS.md](./BENCHMARKS.md) for results)
+> **Status: Implemented** (Tiers 1–2 landed). The current numbers are
+> reproduced under "Current results" below and are canonical in
+> [BENCHMARKS.md §1](./BENCHMARKS.md). The "Why the baseline lost" and
+> Tier-1/2 sections that follow are the **original design diagnosis** that
+> motivated the work — their numbers are the pre-optimization baseline, not
+> the shipped results.
 
-> **For current performance numbers see [docs/BENCHMARKS.md §1](BENCHMARKS.md).** This document covers algorithm and design rationale.
+## Current results (post-optimization)
 
-## What the measurements say
+The Tier-1 and Tier-2 / Tier-2.1 work described in this document **has
+landed**. The canonical, up-to-date numbers live in
+[`BENCHMARKS.md §1`](BENCHMARKS.md) — reproduced here so this doc does not
+drift (h2o.ai db-benchmark groupby subset, 10 M rows, RTX 2060):
 
-From the h2o.ai db-benchmark groupby subset, three-engine table (10 M rows,
-RTX 2060) in [`BENCHMARKS.md`](./BENCHMARKS.md):
+| Query                   | DuckDB    | Polars     | Craton Bolt    | Result |
+| ----------------------- | --------- | ---------- | -------------- | ------ |
+| q1: SUM by id1 (100)    | 6.9 ms    | 19.0 ms    | 51.4 ms        | trails (low-card atomic contention) |
+| q2: 2-SUM by id2 (10 K) | 46.4 ms   | 99.4 ms    | 384 ms         | trails (multi-SUM path) |
+| q3: SUM by (id1, id2)   | 498 ms    | 385 ms     | **219 ms** ⭐  | **Craton Bolt wins** |
+| q5: SUM by id3 (1 M)    | 623 ms    | 358 ms     | **237 ms** ⭐  | **Craton Bolt wins** |
+
+Craton Bolt now **wins outright on the two highest-cardinality queries**
+(q3, q5) — exactly where the Tier-2.1 hash-partitioned path was designed
+to pay off — and trails the CPU engines only at low / medium cardinality
+(q1, q2), where their per-core L1-resident tables beat GPU atomic
+contention. See [`BENCHMARKS.md`](BENCHMARKS.md) "The honest read" for the
+full analysis.
+
+The rest of this document is the **original design diagnosis** that
+motivated those optimizations. It is preserved for the algorithmic
+rationale; its "we lose on every query" framing reflects the
+**pre-optimization baseline** (q1 ≈ 269 ms, q3 ≈ 704 ms, q5 ≈ 770 ms),
+*not* the current numbers above.
+
+## The pre-optimization baseline (historical)
+
+Before Tiers 1–2 landed, the same three-engine table looked like this:
 
 | Query                   | DuckDB    | Polars     | Craton Bolt    | Craton Bolt gap |
 | ----------------------- | --------- | ---------- | ---------- | ----------- |
@@ -17,11 +46,13 @@ RTX 2060) in [`BENCHMARKS.md`](./BENCHMARKS.md):
 | q3: SUM by (id1, id2)   | 448 ms    | **296 ms** | 704 ms     | **1.6× / 2.4×** |
 | q5: SUM by id3 (1 M)    | 549 ms    | **241 ms** | 770 ms     | **1.4× / 3.2×** |
 
-Craton Bolt loses on every query. The gap is widest at low cardinality (q1, q2)
-and narrowest at high cardinality (q3, q5) — the opposite of what a naive
-"GPUs are good at parallelism" intuition predicts.
+At that baseline Craton Bolt lost on every query. The gap was widest at
+low cardinality (q1, q2) and narrowest at high cardinality (q3, q5) — the
+opposite of what a naive "GPUs are good at parallelism" intuition predicts.
+The analysis below explains why, and the tiers that follow are what closed
+the high-cardinality gap into the wins shown above.
 
-## Why we lose
+## Why the baseline lost
 
 ### Diagnosis at low cardinality (q1, q2)
 
@@ -64,8 +95,10 @@ problem: random DRAM accesses across a 16 MB table.
 
 ## What to do about it
 
-The numbers above are not a bug — they're the cost of the current kernel
-design. Closing the gap needs an algorithmic change, not micro-optimisation.
+The baseline numbers above were not a bug — they were the cost of the
+original single-global-hash-table kernel design. Closing the gap needed an
+algorithmic change, not micro-optimisation. The tiers below are that change
+(now landed); the wins on q3 / q5 in "Current results" are the outcome.
 
 Below is a ranked proposal: tier-1 attacks the **block-level contention**
 that dominates low / medium cardinality, tier-2 attacks the **DRAM-random-

@@ -311,6 +311,212 @@ pub(crate) fn proactive_eviction_count() -> u64 {
     PROACTIVE_EVICTION_COUNT.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// Event-based deferred-free pool (review finding C1 / P1).
+//
+// ## What this gives us
+//
+// A `GpuBuffer`'s `Drop` used to *block* on a per-stream `cuStreamSynchronize`
+// for every stream that ever touched the block before returning it to the
+// pool — correct (no recycled address can alias in-flight work), but it stalls
+// the dropping thread on each stream's entire trailing queue.
+//
+// With CUDA events available (`cuda_sys::event_*`), `mark_stream_use` records
+// a lightweight event at the *exact* point a stream referenced the block.
+// `Drop` then *queries* those events:
+//
+//   * all complete  -> free the block to the pool inline (fast path), or
+//   * any not ready -> hand `(ptr, alloc_bytes, events)` to [`defer_free`]
+//     here instead of blocking. The block stays OUT of the allocatable pool
+//     until a later sweep observes every event complete.
+//
+// ## Safety invariant (identical to the old blanket sync)
+//
+// A block's device memory becomes eligible for reuse ONLY after every stream
+// that touched it has drained past its recorded event. A not-ready query
+// DEFERS the free; it never authorises one. So no recycled address can alias
+// an in-flight DMA/kernel — exactly the no-premature-reuse property the
+// blanket sync provided, without the stall.
+//
+// ## What this does NOT fix (documented limitation, review finding C1)
+//
+// The deferred path only protects work whose stream was *recorded*. A kernel
+// launched directly off `device_ptr()` that never tags its stream (bypassing
+// both the async helpers and `KernelArgs`) records no event, so neither the
+// old blanket sync nor this deferred path can fence it. Closing that hole
+// structurally requires forcing every launch through a tagging chokepoint
+// (`KernelArgs`), which touches launch glue outside this module. The
+// `debug_assert` guard in `GpuBuffer::Drop` (see buffer.rs) makes the
+// suspicious "non-empty buffer dropped with zero recorded streams" case
+// detectable in debug builds so a forgotten tag surfaces in tests.
+// ---------------------------------------------------------------------------
+
+/// Cumulative count of blocks routed through the event-based *deferred* free
+/// path (i.e. dropped while still in flight on some stream). Telemetry only;
+/// a high value relative to total frees means buffers are being dropped before
+/// their streams drain — usually benign, occasionally a sign of a missing
+/// explicit `synchronize` before drop. Never reset.
+static DEFERRED_FREE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the cumulative count of event-deferred frees. Telemetry hook.
+#[allow(dead_code)] // reason: telemetry hook
+pub(crate) fn deferred_free_count() -> u64 {
+    DEFERRED_FREE_COUNT.load(Ordering::Relaxed)
+}
+
+/// A device block whose free was deferred because a recorded stream had not
+/// yet drained past its event. Held in the process-global [`PENDING_FREES`]
+/// list until a sweep observes every `event` complete.
+///
+/// `events` are raw `CUevent` handles. They are context-bound — queried only
+/// while the owning context is current on the sweeping thread, the same
+/// precondition the pool already documents for `cuMemFree_v2`. We never
+/// dereference them; we only forward them to the driver via `cuda_sys::event_*`.
+#[cfg(not(test))]
+struct PendingFree {
+    ptr: CUdeviceptr,
+    alloc_bytes: usize,
+    events: Vec<crate::cuda::cuda_sys::CUevent>,
+}
+
+// SAFETY: `PendingFree` holds raw `CUevent`/`CUdeviceptr` handles. Like the
+// `CUdeviceptr`s the pool already stores and frees across threads, these are
+// opaque driver handles that are valid in any thread that has the owning
+// context current. We only ever forward them to the driver (query / destroy),
+// never dereference them, and access is serialized through the `PENDING_FREES`
+// mutex. Moving them between threads upholds the same context-currency
+// precondition the rest of the pool relies on.
+#[cfg(not(test))]
+unsafe impl Send for PendingFree {}
+
+/// Process-global list of blocks awaiting event completion before reuse.
+/// Empty in the steady state (most buffers are synchronized before drop, so
+/// their events are already complete and they free inline). Guarded by a
+/// `parking_lot::Mutex`; the lock is held only for short list splices, never
+/// across a driver call that could block.
+#[cfg(not(test))]
+static PENDING_FREES: Lazy<Mutex<Vec<PendingFree>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Record a deferred free. Called by `GpuBuffer::Drop` when at least one
+/// recorded event reports not-ready. The block is parked here — OUT of the
+/// allocatable pool — until [`sweep_pending_frees`] observes every event
+/// complete, at which point it is freed to the pool.
+///
+/// `events` must be the full set of events recorded for the block (one per
+/// stream that touched it). Ownership of the events transfers here; the sweep
+/// destroys them once they complete.
+#[cfg(not(test))]
+pub(crate) fn defer_free(
+    ptr: CUdeviceptr,
+    alloc_bytes: usize,
+    events: Vec<crate::cuda::cuda_sys::CUevent>,
+) {
+    if ptr == 0 {
+        return;
+    }
+    DEFERRED_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+    PENDING_FREES.lock().push(PendingFree {
+        ptr,
+        alloc_bytes,
+        events,
+    });
+}
+
+/// Sweep the pending-free list: any block whose events have ALL completed is
+/// returned to the pool (its events destroyed first); blocks with at least one
+/// still-in-flight event are retained for the next sweep.
+///
+/// Called opportunistically at the start of `alloc` and `free` (cheap no-op
+/// when the list is empty, which is the steady state). Never blocks: it only
+/// *queries* events. A query error (e.g. transient driver issue) is treated
+/// conservatively as "not ready yet" so we never free early on a bad probe.
+#[cfg(not(test))]
+pub(crate) fn sweep_pending_frees() {
+    // Fast path: nothing pending. Avoid taking the lock's write section and
+    // doing any driver work in the overwhelmingly common case.
+    {
+        let guard = PENDING_FREES.lock();
+        if guard.is_empty() {
+            return;
+        }
+    }
+    // Drain the list under the lock, decide each entry's fate without holding
+    // the lock across driver calls longer than necessary, then re-park the
+    // not-yet-ready entries. We move the vector out so concurrent `defer_free`
+    // calls append to a fresh empty list rather than contending with us.
+    let pending: Vec<PendingFree> = {
+        let mut guard = PENDING_FREES.lock();
+        std::mem::take(&mut *guard)
+    };
+    let mut still_pending: Vec<PendingFree> = Vec::new();
+    for entry in pending {
+        // An entry is ready iff EVERY recorded event reports complete. A
+        // not-ready or errored query keeps the WHOLE entry parked (we never
+        // partially free).
+        let all_ready = entry.events.iter().all(|&ev| {
+            // SAFETY: `ev` is a live event handle created via
+            // `cuda_sys::event_create` and recorded on a stream; we only query
+            // it. A query error is mapped to `false` (treat as not ready) so a
+            // bad probe defers rather than frees.
+            matches!(unsafe { crate::cuda::cuda_sys::event_query(ev) }, Ok(true))
+        });
+        if all_ready {
+            // Destroy the events, then return the block to the pool. Order
+            // matters only in that the block must not re-enter the allocatable
+            // pool before its events confirm completion — which they have.
+            for ev in &entry.events {
+                // SAFETY: event completed (queried ready above) and is not used
+                // again after destruction.
+                let _ = unsafe { crate::cuda::cuda_sys::event_destroy(*ev) };
+            }
+            POOL.free(entry.ptr, entry.alloc_bytes);
+        } else {
+            still_pending.push(entry);
+        }
+    }
+    if !still_pending.is_empty() {
+        // Re-append the not-ready entries (plus anything `defer_free` pushed
+        // while we were sweeping stays ahead of them — order is irrelevant).
+        PENDING_FREES.lock().extend(still_pending);
+    }
+}
+
+/// Shutdown drain of the pending-free list: BLOCK on every still-pending
+/// entry's events, destroy them, and free the block. Guarantees no deferred
+/// block is leaked or freed early at teardown — the safety invariant the
+/// deferred path must preserve. Called from `DeviceMemPool::drain`.
+#[cfg(not(test))]
+fn drain_pending_frees_blocking() {
+    let pending: Vec<PendingFree> = {
+        let mut guard = PENDING_FREES.lock();
+        std::mem::take(&mut *guard)
+    };
+    for entry in pending {
+        for ev in &entry.events {
+            // SAFETY: live event handle; block until its recorded work
+            // completes so the subsequent free cannot race in-flight work.
+            let _ = unsafe { crate::cuda::cuda_sys::event_synchronize(*ev) };
+            // SAFETY: event is complete (just synchronized) and unused after.
+            let _ = unsafe { crate::cuda::cuda_sys::event_destroy(*ev) };
+        }
+        // Free directly to the driver — at shutdown we are draining the pool,
+        // so re-pooling would be immediately undone.
+        // SAFETY: events synchronized above, so no stream still references the
+        // block; provenance is the same as any pooled pointer.
+        unsafe { driver_free(entry.ptr) };
+    }
+}
+
+/// Test build: the deferred-free machinery is a no-op. Host-only pool tests
+/// run on synthetic pointers with no real events, and `GpuBuffer::Drop` never
+/// creates events under `#[cfg(test)]` (it has no driver), so nothing is ever
+/// deferred. These stubs keep the call sites uniform.
+#[cfg(test)]
+pub(crate) fn sweep_pending_frees() {}
+
+#[cfg(test)]
+fn drain_pending_frees_blocking() {}
+
 /// Snapshot of pool-wide telemetry counters and capacity figures.
 ///
 /// Stage 4 — gives downstream observability layers a single, stable entry
@@ -880,16 +1086,12 @@ impl DeviceMemPool {
     /// must remember `actual_alloc_bytes` and pass it to `free` so we return
     /// to the right bucket.
     ///
-    /// **Driver-OOM recovery (Stage 3).** If the miss-path driver alloc
-    /// returns `CUDA_ERROR_OUT_OF_MEMORY` (code 2), this method first
-    /// calls `evict_above_high_water()` (cheap — releases anything over
-    /// the soft cap), then `drain()` (heavy — releases every pooled
-    /// block), and retries the driver alloc exactly once. On successful
-    /// recovery `OOM_RECOVERY_COUNT` increments; otherwise the original
-    /// error bubbles up. The pool's pooled blocks are independent of the
-    /// driver allocation requested, so this is genuinely a "give back
-    /// reserved headroom" path: a hot pool of cached blocks can be
-    /// holding several hundred MiB that the calling allocation needs.
+    /// **Driver-OOM recovery (review finding M3).** If the miss-path driver
+    /// alloc returns `CUDA_ERROR_OUT_OF_MEMORY` (code 2), this routes to
+    /// `recover_from_oom`, which trims headroom above the soft cap and then
+    /// evicts pooled blocks *incrementally* (oldest first), retrying after each
+    /// eviction until the alloc fits or the pool empties — preserving the warm
+    /// cache shared by concurrent queries instead of draining it wholesale.
     pub fn alloc(&self, bytes: usize) -> BoltResult<(CUdeviceptr, usize)> {
         // Stage 4: ensure the proactive watcher is running, lazily.
         // No-op under default build (feature off) and under #[cfg(test)]
@@ -897,6 +1099,13 @@ impl DeviceMemPool {
         // threads. Idempotent: spawns at most one thread for the
         // lifetime of the process.
         ensure_watcher_started();
+
+        // Reclaim any deferred-free blocks whose stream events have completed
+        // (review finding C1 / P1). Cheap no-op when nothing is pending, which
+        // is the steady state. Doing it here means a fresh allocation can reuse
+        // a block whose in-flight work has since drained, without the dropping
+        // thread ever having blocked.
+        sweep_pending_frees();
 
         let alloc_bytes = bucket_size(bytes);
         // Hit-path: try the pool first.
@@ -934,51 +1143,103 @@ impl DeviceMemPool {
         }
     }
 
-    /// OOM-recovery slow path. Drops pooled headroom and retries the
-    /// driver alloc exactly once. Separated from `alloc` so the common
-    /// (success) case stays cold-jump-free.
+    /// OOM-recovery slow path. Incrementally evicts pooled blocks and
+    /// retries the driver alloc until it succeeds or the pool is empty.
+    /// Separated from `alloc` so the common (success) case stays
+    /// cold-jump-free.
     ///
-    /// Behavioral trade-off (deliberate): this calls
-    /// `evict_above_high_water()` followed by `drain()`, which releases
-    /// EVERY pooled block on any single OOM — discarding the warm cache
-    /// shared by all concurrent queries, not just the allocation that
-    /// triggered recovery. This is intentional: once the driver can't
-    /// satisfy us, maximizing the room handed back for the retry takes
-    /// priority over preserving reuse headroom. Expect a cold-cache
-    /// penalty for in-flight work after a recovery.
+    /// ## Incremental eviction (review finding M3)
+    ///
+    /// The previous implementation called `evict_above_high_water()` then
+    /// `drain()` — releasing EVERY pooled block on any single OOM, discarding
+    /// the warm cache shared by all concurrent in-flight queries on other
+    /// threads. Under a workload hovering near the VRAM cap that turns into a
+    /// thundering herd: every query that OOMs nukes the whole pool, the next
+    /// allocation re-mints from the driver, the next query OOMs and nukes it
+    /// again — inverting the pool's entire purpose (avoiding alloc/free churn).
+    ///
+    /// Instead we evict the globally-oldest block (LRU), free it to the driver,
+    /// and retry the alloc — looping until the retry succeeds or no pooled
+    /// blocks remain. This hands back exactly as much VRAM as the retry needs
+    /// and no more, so concurrent queries keep their warm headroom. In the
+    /// common case where freeing one or two oldest blocks is enough, the bulk
+    /// of the cache survives.
+    ///
+    /// On the *first* retry we evict everything above the soft cap first (one
+    /// `evict_above_high_water`, itself an incremental loop) because a pool that
+    /// has grown past its cap is the most likely cause of the squeeze, and that
+    /// eviction is "free" headroom we were going to reclaim anyway. After that
+    /// the per-block loop handles the fine-grained case.
+    ///
+    /// Returns the *original* OOM error if the pool empties out and the driver
+    /// still can't satisfy the request, so callers see the same error surface
+    /// as before the hook existed.
     #[cold]
     fn recover_from_oom(
         &self,
         alloc_bytes: usize,
         original_err: crate::error::BoltError,
     ) -> BoltResult<(CUdeviceptr, usize)> {
-        // Step 1: drop everything above the soft cap. Cheap if the cap
-        // is already respected (no-op); useful when the workload has
-        // grown well past the cap and the driver is now squeezed.
+        // Step 1: drop everything above the soft cap. Cheap if the cap is
+        // already respected (no-op); useful when the workload has grown well
+        // past the cap and the driver is now squeezed. This is itself an
+        // incremental, LRU-ordered loop (see `evict_above_high_water`), so it
+        // never frees blocks the pool is still allowed to keep.
         let _evicted = self.evict_above_high_water();
-        // Step 2: drain the entire pool. We're already in a "driver
-        // can't satisfy us" state — holding onto pooled blocks for
-        // future reuse is strictly worse than handing them back so
-        // the driver has room to satisfy the retry.
-        self.drain();
-        // Step 3: retry exactly once. On second OOM, give up and
-        // return the *original* error so callers see the same error
-        // surface as before the hook existed.
+        // Retry after the high-water trim before touching any blocks the pool
+        // is allowed to retain.
+        if let Some(ok) = self.try_retry_alloc(alloc_bytes) {
+            return ok;
+        }
+        // Step 2: incremental LRU eviction. Evict one oldest block at a time,
+        // free it to the driver, and retry — preserving the rest of the warm
+        // cache for concurrent queries instead of draining it wholesale.
+        loop {
+            let mut to_free: Vec<CUdeviceptr> = Vec::with_capacity(1);
+            if !self.evict_one(&mut to_free) {
+                // Pool is empty and the driver still can't satisfy us. Give up
+                // and return the original error.
+                break;
+            }
+            for p in to_free {
+                // SAFETY: same provenance argument as `free`/`drain` — every
+                // pointer routed here was pulled out of the pool, originally
+                // minted by the active backend's `mem_alloc`.
+                unsafe { driver_free(p) };
+            }
+            if let Some(ok) = self.try_retry_alloc(alloc_bytes) {
+                return ok;
+            }
+        }
+        Err(original_err)
+    }
+
+    /// Retry the driver alloc once after freeing headroom during OOM recovery.
+    /// Returns `Some(Ok(..))` on success (bumping the recovery counter),
+    /// `None` if the driver is still OOM (so the caller keeps evicting), or
+    /// `Some(Err(..))` if the retry failed with a *non-OOM* error (which we
+    /// surface immediately rather than spinning the eviction loop).
+    #[inline]
+    fn try_retry_alloc(
+        &self,
+        alloc_bytes: usize,
+    ) -> Option<BoltResult<(CUdeviceptr, usize)>> {
         match driver_mem_alloc(alloc_bytes) {
             Ok(ptr) => {
                 OOM_RECOVERY_COUNT.fetch_add(1, Ordering::Relaxed);
                 // Use `log::warn!` for consistency with the rest of the
-                // module (driver_free, pool_watcher). `eprintln!` bypasses
-                // the crate's structured logging and is harder to silence
-                // in tests. Downstream telemetry layers can read
-                // `oom_recovery_count()` instead.
+                // module (driver_free, pool_watcher).
                 log::warn!(
                     "craton-bolt: DeviceMemPool recovered from driver OOM (alloc_bytes={})",
                     alloc_bytes
                 );
-                Ok((ptr, alloc_bytes))
+                Some(Ok((ptr, alloc_bytes)))
             }
-            Err(_retry_err) => Err(original_err),
+            // Still OOM: keep evicting.
+            Err(e) if is_oom_error(&e) => None,
+            // A different driver error on retry — don't spin the eviction
+            // loop on it; surface it to the caller.
+            Err(e) => Some(Err(e)),
         }
     }
 
@@ -996,6 +1257,11 @@ impl DeviceMemPool {
         if ptr == 0 {
             return;
         }
+
+        // Reclaim any deferred-free blocks whose events have completed (review
+        // finding C1 / P1). No-op in the steady state; keeps the pending list
+        // from growing without bound on a free-heavy, alloc-light phase.
+        sweep_pending_frees();
 
         // Pre-size for the common case: 0 or 1 evictions per free. Skips
         // the initial-grow allocation that a default `Vec::new()` would
@@ -1392,6 +1658,14 @@ impl DeviceMemPool {
     /// Release every pooled block back to the driver. Called on `Drop`, and
     /// usable by tests / shutdown paths that want a clean slate.
     pub fn drain(&self) {
+        // Deferred-free pool (review finding C1 / P1): block on and free any
+        // entries still awaiting event completion BEFORE we drain the buckets.
+        // This guarantees no deferred block is leaked or freed early at
+        // shutdown — `event_synchronize` waits out every recorded stream, then
+        // the block goes straight to the driver. Done first so its `driver_free`
+        // calls run while the context is still current (this is invoked from
+        // `CudaContext::Drop` with the context live).
+        drain_pending_frees_blocking();
         let mut drained: Vec<CUdeviceptr> = Vec::new();
         // Iterate over all buckets, draining each under its own lock.
         // The storage-specific `drain_all_into` handles the DashMap
@@ -2873,17 +3147,18 @@ mod tests {
         // The orchestrator compares per_op_ns_median across builds.
     }
 
-    /// Stage 3: cover the OOM-recovery path. The test installs a fault-
-    /// injection latch in `test_support` that returns `BoltError::Cuda`
-    /// with the canonical "CUDA driver error 2: ..." message on the
-    /// first call into `driver_mem_alloc` after the latch is armed,
-    /// then yields a real synthetic ptr on the retry. We verify:
+    /// OOM-recovery path, single-block retry (review finding M3:
+    /// incremental eviction). The latch returns OOM on the first
+    /// `driver_mem_alloc` after arming, then yields a real synthetic ptr on
+    /// the retry. With a generous byte cap the high-water trim is a no-op and
+    /// the single retry after it succeeds, so the warm cache is **preserved**
+    /// — the M3 improvement over the old all-or-nothing drain. We verify:
     ///   1. `alloc` returns Ok (recovery happened),
     ///   2. `OOM_RECOVERY_COUNT` incremented exactly once,
-    ///   3. the pool was drained as a side-effect (every previously
-    ///      pooled block surfaced on the driver-free list).
+    ///   3. the seeded warm blocks were NOT drained (incremental eviction
+    ///      only frees what the retry needs; here, nothing).
     #[test]
-    fn oom_recovery_drains_and_retries() {
+    fn oom_recovery_retries_without_nuking_warm_cache() {
         let _l = ENV_LOCK.lock();
         test_support::reset();
         let _g = with_env(&[
@@ -2892,11 +3167,9 @@ mod tests {
         ]);
         let pool = DeviceMemPool::new();
 
-        // Seed the pool with some blocks so the OOM hook's drain has
-        // visible side-effects. Allocate ALL ptrs first, THEN free —
-        // interleaving alloc/free would just oscillate one block
-        // through the LIFO bucket and never accumulate `seeded`
-        // distinct ptrs.
+        // Seed the pool with some blocks. Allocate ALL ptrs first, THEN free —
+        // interleaving alloc/free would just oscillate one block through the
+        // LIFO bucket and never accumulate `seeded` distinct ptrs.
         let block_bytes = 256usize;
         let seeded = 5usize;
         let mut seeded_ptrs = Vec::new();
@@ -2915,16 +3188,15 @@ mod tests {
             pool.pooled_block_count()
         );
         let pre_recover_count = oom_recovery_count();
-        let freed_before = test_support::drained_ptrs().len();
 
         // Arm the OOM latch: next driver_mem_alloc call returns OOM.
         test_support::arm_oom_once();
 
-        // Allocate a fresh size class so the request misses the pool
-        // and routes to the (now OOM-injected) driver path.
+        // Allocate a fresh size class so the request misses the pool and
+        // routes to the (now OOM-injected) driver path.
         let new_size = 4096usize;
         let (ptr, ab) = pool.alloc(new_size).expect(
-            "OOM recovery should have drained pool and retried successfully",
+            "OOM recovery should have trimmed headroom and retried successfully",
         );
         assert!(ptr != 0);
         assert_eq!(ab, bucket_size(new_size));
@@ -2932,23 +3204,89 @@ mod tests {
         // Counter incremented exactly once.
         assert_eq!(oom_recovery_count(), pre_recover_count + 1);
 
-        // Drain side-effect: the pool is empty and every previously-
-        // pooled block was returned to the (synthetic) driver.
-        assert_eq!(pool.pooled_block_count(), 0);
+        // M3: with a 1 GiB cap the high-water trim freed nothing and the very
+        // first retry succeeded, so the warm cache survives intact — unlike the
+        // old drain-everything behaviour.
+        assert_eq!(
+            pool.pooled_block_count(),
+            seeded,
+            "incremental OOM recovery must preserve the warm cache when the \
+             first retry succeeds; expected {} pooled blocks, got {}",
+            seeded,
+            pool.pooled_block_count()
+        );
+
+        // Latch should be disarmed (one-shot) — a follow-up alloc succeeds
+        // without further recovery events.
+        let (_p, _) = pool.alloc(new_size).unwrap();
+        assert_eq!(oom_recovery_count(), pre_recover_count + 1);
+    }
+
+    /// M3 incremental eviction: when the *first* retry after the high-water
+    /// trim still OOMs, recovery must evict pooled blocks one at a time and
+    /// retry until it fits — freeing only as many as needed, not the whole
+    /// pool. We arm the latch for two consecutive OOMs so the first retry
+    /// (post high-water trim, which evicts nothing under a huge cap) fails and
+    /// the loop must evict at least one block before the next retry succeeds.
+    #[test]
+    fn oom_recovery_evicts_incrementally_until_fit() {
+        let _l = ENV_LOCK.lock();
+        test_support::reset();
+        let _g = with_env(&[
+            ("CRATON_BOLT_POOL_MAX_BYTES", "1073741824"),
+            ("CRATON_BOLT_POOL_BUCKET_CAP", "1024"),
+        ]);
+        let pool = DeviceMemPool::new();
+
+        let block_bytes = 256usize;
+        let seeded = 4usize;
+        let mut seeded_ptrs = Vec::new();
+        for _ in 0..seeded {
+            let (p, _) = pool.alloc(block_bytes).unwrap();
+            seeded_ptrs.push(p);
+        }
+        for p in &seeded_ptrs {
+            pool.free(*p, block_bytes);
+        }
+        assert_eq!(pool.pooled_block_count(), seeded);
+
+        let pre_recover_count = oom_recovery_count();
+        let freed_before = test_support::drained_ptrs().len();
+
+        // Two OOMs: the miss-path alloc consumes one, the first post-trim
+        // retry consumes the second; the loop then evicts a block and the
+        // following retry succeeds.
+        test_support::arm_oom_n(2);
+
+        let new_size = 4096usize;
+        let (ptr, _ab) = pool
+            .alloc(new_size)
+            .expect("incremental eviction should free enough room to retry");
+        assert!(ptr != 0);
+        // Recovery counted exactly once (only the successful retry bumps it).
+        assert_eq!(oom_recovery_count(), pre_recover_count + 1);
+
+        // At least one block was evicted to the driver, but NOT necessarily
+        // all of them — the loop stops as soon as a retry fits.
         let freed_after = test_support::drained_ptrs().len();
         assert!(
-            freed_after >= freed_before + seeded,
-            "drain should have released {} seeded blocks; \
-             freed before={}, freed after={}",
-            seeded,
+            freed_after >= freed_before + 1,
+            "expected at least one incremental eviction; freed before={}, after={}",
             freed_before,
             freed_after
         );
-
-        // Latch should be disarmed (one-shot) — a follow-up alloc
-        // succeeds without further recovery events.
-        let (_p, _) = pool.alloc(new_size).unwrap();
-        assert_eq!(oom_recovery_count(), pre_recover_count + 1);
+        // The pool was not wholesale-drained: at most one block left for each
+        // OOM we had to clear, so some warm blocks should remain.
+        assert!(
+            pool.pooled_block_count() < seeded,
+            "at least one block must have been evicted"
+        );
+        assert!(
+            pool.pooled_block_count() >= 1,
+            "incremental eviction should not drain the entire pool when a \
+             single eviction suffices; pooled={}",
+            pool.pooled_block_count()
+        );
     }
 
     /// Stage 3: OOM hook must bubble the *original* error if the retry

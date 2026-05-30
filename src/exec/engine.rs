@@ -2212,6 +2212,14 @@ impl Engine {
     /// already touched by `sql()`.
     pub fn run_logical_plan(&mut self, plan: &LogicalPlan) -> BoltResult<QueryHandle> {
         crate::cuda::mem_pool::pool_watcher_retry_context_capture();
+        // M5 metrics: the DataFrame `collect` path is a top-level query just
+        // like `sql()`, so count it identically — bump `QueriesTotal` here and
+        // `QueriesFailed` at the single error-observe below. This is the *only*
+        // place the DataFrame path is counted: nested sub-plans resolved during
+        // this call run through `run_subplan`, which deliberately does NOT bump
+        // the counters (so N subqueries inside one top-level plan still count as
+        // exactly one query, matching the `sql()` contract).
+        crate::metrics::metrics().inc(crate::metrics::Counter::QueriesTotal);
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding __idx_<col> i32 column —
         // mirrors `sql()`.
@@ -2239,6 +2247,13 @@ impl Engine {
         crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
         drop(nb);
         let result = self.execute(&phys);
+        // M5 metrics: mirror `sql()` — a failed top-level execution bumps
+        // `QueriesFailed`. We only observe the `execute` bind (the rare early
+        // `?`-returns above are developer-time plan errors, while `execute` is
+        // the latency-critical phase whose OOM/kernel faults warrant a counter).
+        if result.is_err() {
+            crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+        }
         self.maybe_emit_pool_stats(Instant::now());
         result
     }
@@ -2282,6 +2297,14 @@ impl Engine {
     /// receiver (so it can be called from inside [`Engine::resolve_subqueries`]
     /// during the `&self` `sql()` path). Re-entering `resolve_subqueries` here
     /// is what makes nested subqueries resolve inner-first.
+    ///
+    /// **Metrics contract (M5):** this path deliberately does NOT bump
+    /// `QueriesTotal` / `QueriesFailed`. The query counters count *top-level*
+    /// queries only — the enclosing `sql()` / `run_logical_plan` call has
+    /// already counted the whole statement once. A statement containing N
+    /// subqueries therefore counts as one query (and a subquery failure surfaces
+    /// as the top-level query's failure via the `?` below), keeping the
+    /// `sql()` and DataFrame paths symmetric.
     fn run_subplan(&self, plan: LogicalPlan) -> BoltResult<RecordBatch> {
         let plan = self.dict_registry.rewrite_plan(&plan)?;
         // Bounded-fixpoint optimizer, mirroring the `sql()` / `run_logical_plan`
@@ -2310,6 +2333,13 @@ impl Engine {
     ///
     /// `now` is taken as a parameter (rather than calling `Instant::now()`
     /// inside) so the unit test below can drive the throttle deterministically.
+    ///
+    /// **Never-escalate:** this runs after a query has already produced its
+    /// result, so it must not be able to fail that query. The user observer is
+    /// invoked through [`crate::observability::notify_observers`], which catches
+    /// and swallows any panic from the callback (logging it). A panicking
+    /// pool-stats observer therefore cannot unwind out of a successful
+    /// `Engine::sql` / `Engine::run_logical_plan`.
     fn maybe_emit_pool_stats(&self, now: Instant) {
         if !should_emit_pool_stats(&self.pool_stats_last_emit, self.pool_stats_interval, now) {
             return;
@@ -2694,10 +2724,19 @@ impl Engine {
             // Decimal128 NULL fix: for a pure passthrough Decimal128 output
             // (output name + dtype matches an input column), carry the
             // source column's validity bitmap onto the output so the
-            // download path reconstructs NULL rows as NULL, not `0`. We
-            // round-trip the mask through host memory (download + re-upload)
-            // to get an owned device buffer for the output column, mirroring
-            // the dictionary-clone passthrough above.
+            // download path reconstructs NULL rows as NULL, not `0`. The
+            // output column needs an *owned* device buffer (it outlives the
+            // borrow of `src_col`), so we allocate a fresh mask buffer and
+            // copy the bitmap into it.
+            //
+            // P1/F10b: this copy stays on the device — `cuMemcpyDtoD_v2` via
+            // `memcpy_d2d` — instead of the old D2H `to_vec()` + H2D
+            // `from_slice()` host round-trip. The mask is at most one byte
+            // per 8 rows, but a passthrough query did this PCIe bounce every
+            // call; the DtoD copy removes both crossings. The source and the
+            // freshly-`zeros`-allocated destination are distinct device
+            // allocations (non-overlapping), satisfying `memcpy_d2d`'s safety
+            // contract.
             if let DataType::Decimal128(_, _) = io.dtype {
                 if let Some(src_col) = kernel
                     .inputs
@@ -2710,8 +2749,21 @@ impl Engine {
                         ..
                     } = &src_col.data
                     {
-                        let bits = src_mask.to_vec()?;
-                        col.set_decimal128_valid_mask(Some(GpuVec::<u8>::from_slice(&bits)?));
+                        let mask_len = src_mask.len();
+                        let dst_mask = GpuVec::<u8>::zeros(mask_len)?;
+                        // SAFETY: `dst_mask` was just allocated (a distinct
+                        // device pointer from `src_mask`), both are live
+                        // allocations of `mask_len` bytes, and they do not
+                        // overlap — meeting `memcpy_d2d`'s contract. A
+                        // zero-length mask short-circuits inside `memcpy_d2d`.
+                        unsafe {
+                            cuda_sys::memcpy_d2d::<u8>(
+                                dst_mask.device_ptr(),
+                                src_mask.device_ptr(),
+                                mask_len,
+                            )?;
+                        }
+                        col.set_decimal128_valid_mask(Some(dst_mask));
                     }
                 }
             }
@@ -2854,6 +2906,19 @@ impl Engine {
                 kernel_params.as_mut_ptr(),
                 ptr::null_mut(),
             ))?;
+        }
+        // V-1 / F10a: this hand-rolled `cuLaunchKernel` bypasses
+        // `KernelArgs::tag_launch_stream` (the central Drop-fence enforcement
+        // point that `launch_1d` callers get for free). Restore the invariant
+        // for the freshly-allocated output buffers by recording the launch
+        // stream in each one's `StreamSet`, so a buffer dropped while the
+        // kernel is still in flight fences this stream before its block is
+        // recycled — independent of the downstream `synchronize()` in
+        // `download_pinned` / `gpu_compact`. The input columns live in the
+        // persistent GpuTable cache (not recycled across this launch), so the
+        // load-bearing buffers to tag are the outputs.
+        for col in &output_cols {
+            col.mark_launch_stream(stream.raw());
         }
         // Debug-only synchronize: pin any in-kernel fault to THIS launch
         // rather than letting it surface at the next CUDA API call.
@@ -3784,6 +3849,42 @@ impl DeviceCol {
             // the column's single base pointer — PTX `Op::Store128`
             // computes per-row offsets as `tid * 16`.
             DeviceCol::Decimal128 { values, .. } => values.device_ptr(),
+        }
+    }
+
+    /// Record `stream` as having launched a kernel against every device
+    /// buffer this output column owns, so each buffer's `Drop` fences `stream`
+    /// before its block is recycled to the pool.
+    ///
+    /// `execute_projection` assembles its kernel parameters by hand and drives
+    /// a raw `cuLaunchKernel` off `device_ptr()` rather than through
+    /// [`KernelArgs`](crate::exec::launch::KernelArgs)/`launch_1d`, so it does
+    /// not get the central `tag_launch_stream` enforcement that the
+    /// `launch_1d` / `launch_with_geometry` callers rely on (review finding
+    /// V-1 / F10a). Calling this immediately after the launch restores the
+    /// same `Drop`-fence invariant for the freshly-allocated output buffers:
+    /// the launch stream is recorded in each buffer's `StreamSet` exactly as
+    /// `KernelArgs::tag_launch_stream` would, so a buffer dropped while the
+    /// kernel is still in flight fences the stream before recycling — even if
+    /// a future edit removes a downstream `synchronize()`. Delegates to the
+    /// public [`GpuVec::mark_stream_use`], the documented entry point for
+    /// callers that bypass `KernelArgs`.
+    fn mark_launch_stream(&self, stream: crate::cuda::CUstream) {
+        match self {
+            DeviceCol::I32(v) => v.mark_stream_use(stream),
+            DeviceCol::I64(v) => v.mark_stream_use(stream),
+            DeviceCol::F32(v) => v.mark_stream_use(stream),
+            DeviceCol::F64(v) => v.mark_stream_use(stream),
+            DeviceCol::Bool(v) => v.mark_stream_use(stream),
+            DeviceCol::Utf8(d) => d.indices.mark_stream_use(stream),
+            DeviceCol::Decimal128 {
+                values, valid_mask, ..
+            } => {
+                values.mark_stream_use(stream);
+                if let Some(mask) = valid_mask {
+                    mask.mark_stream_use(stream);
+                }
+            }
         }
     }
 
@@ -5741,5 +5842,153 @@ mod tests {
             let _ = std::fs::remove_dir_all(&builder_dir);
             let _ = std::fs::remove_dir_all(&env_dir);
         });
+    }
+
+    // -------------------------------------------------------------------
+    // F2 — query-counter contract for the DataFrame (`run_logical_plan`)
+    // path. These bump the process-global metrics counters, so they
+    // serialise under one lock and assert *monotone deltas* (>=) rather
+    // than exact counts, which would race a sibling `--ignored` test that
+    // also runs a query in parallel.
+    // -------------------------------------------------------------------
+
+    /// Serialises the metrics-counting tests below so their counter-delta
+    /// observations don't interleave with one another.
+    static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Single-column Int64 table fixture for the counter tests.
+    fn metrics_int64_table() -> RecordBatch {
+        int64_batch(0, 4)
+    }
+
+    /// `run_logical_plan` (the DataFrame `collect` path) must bump
+    /// `QueriesTotal` exactly like `sql()` does — previously it bumped
+    /// neither counter, so a DataFrame workload reported `queries_total = 0`
+    /// while doing real work (review F2).
+    #[test]
+    #[ignore = "gpu:metrics — run_logical_plan launches a real kernel"]
+    fn run_logical_plan_bumps_queries_total() {
+        let _g = METRICS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut engine = Engine::new().expect("ctx");
+        engine
+            .register_table("t", metrics_int64_table())
+            .expect("register");
+
+        let plan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("x", DataType::Int64, false)]),
+        };
+
+        let before = crate::metrics::metrics()
+            .counter(crate::metrics::Counter::QueriesTotal)
+            .get();
+        let _ = engine.run_logical_plan(&plan).expect("execute");
+        let after = crate::metrics::metrics()
+            .counter(crate::metrics::Counter::QueriesTotal)
+            .get();
+
+        assert!(
+            after >= before + 1,
+            "run_logical_plan must bump QueriesTotal at least once \
+             (before={before}, after={after})"
+        );
+    }
+
+    /// A *failing* top-level `run_logical_plan` must bump `QueriesFailed`,
+    /// mirroring `sql()`'s error-path book-keeping. We force a failure by
+    /// scanning a table that was never registered, which fails inside
+    /// `execute` (the same phase `sql()` counts).
+    #[test]
+    #[ignore = "gpu:metrics — run_logical_plan initialises the driver"]
+    fn run_logical_plan_failure_bumps_queries_failed() {
+        let _g = METRICS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut engine = Engine::new().expect("ctx");
+
+        // No `register_table` for "missing" → the scan fails at execute time.
+        let plan = LogicalPlan::Scan {
+            table: "missing".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("x", DataType::Int64, false)]),
+        };
+
+        let before_total = crate::metrics::metrics()
+            .counter(crate::metrics::Counter::QueriesTotal)
+            .get();
+        let before_failed = crate::metrics::metrics()
+            .counter(crate::metrics::Counter::QueriesFailed)
+            .get();
+        let result = engine.run_logical_plan(&plan);
+        let after_total = crate::metrics::metrics()
+            .counter(crate::metrics::Counter::QueriesTotal)
+            .get();
+        let after_failed = crate::metrics::metrics()
+            .counter(crate::metrics::Counter::QueriesFailed)
+            .get();
+
+        assert!(result.is_err(), "scan of an unregistered table must fail");
+        assert!(
+            after_total >= before_total + 1,
+            "a failed query still counts toward QueriesTotal"
+        );
+        assert!(
+            after_failed >= before_failed + 1,
+            "a failed run_logical_plan must bump QueriesFailed \
+             (before={before_failed}, after={after_failed})"
+        );
+    }
+
+    /// Host-only sanity: the metrics counter read API used by the contract
+    /// tests above is wired and monotone. Guards against a future rename of
+    /// `Counter::QueriesTotal` / the `counter(..).get()` surface silently
+    /// breaking the (GPU-gated) counting tests. No GPU required.
+    #[test]
+    fn query_counters_are_readable_and_monotone() {
+        let m = crate::metrics::metrics();
+        let t0 = m.counter(crate::metrics::Counter::QueriesTotal).get();
+        m.inc(crate::metrics::Counter::QueriesTotal);
+        let t1 = m.counter(crate::metrics::Counter::QueriesTotal).get();
+        assert!(t1 >= t0 + 1, "QueriesTotal must be monotone under inc()");
+
+        let f0 = m.counter(crate::metrics::Counter::QueriesFailed).get();
+        m.inc(crate::metrics::Counter::QueriesFailed);
+        let f1 = m.counter(crate::metrics::Counter::QueriesFailed).get();
+        assert!(f1 >= f0 + 1, "QueriesFailed must be monotone under inc()");
+    }
+
+    /// F10a — `DeviceCol::mark_launch_stream` must tag the launch stream
+    /// into every device buffer the output column owns (so the buffer's
+    /// `Drop` fences that stream). We can't observe the `StreamSet`
+    /// contents from here (it's `pub(crate)` in `cuda`), but tagging a
+    /// freshly-allocated column with a stream must succeed without panic or
+    /// error for every `DeviceCol` variant, including the Decimal128 mask
+    /// arm. Requires a real allocation, so it is GPU-gated.
+    #[test]
+    #[ignore = "gpu:projection — allocates real device buffers"]
+    fn device_col_mark_launch_stream_tags_all_variants() {
+        let stream = CudaStream::null_or_default();
+        let s = stream.raw();
+
+        // Primitive + Bool + Utf8 columns.
+        for dtype in [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Bool,
+            DataType::Utf8,
+        ] {
+            let col = DeviceCol::alloc_zeros(dtype.clone(), 8).expect("alloc");
+            // Must not panic; idempotent tagging is fine (StreamSet dedups).
+            col.mark_launch_stream(s);
+            col.mark_launch_stream(s);
+        }
+
+        // Decimal128 with a passthrough validity mask installed: both the
+        // values buffer and the mask buffer must be tagged.
+        let mut dec = DeviceCol::alloc_zeros(DataType::Decimal128(38, 0), 8).expect("alloc dec");
+        let mask = GpuVec::<u8>::zeros(1).expect("mask");
+        dec.set_decimal128_valid_mask(Some(mask));
+        dec.mark_launch_stream(s);
     }
 }

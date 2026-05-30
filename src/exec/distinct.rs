@@ -28,12 +28,12 @@
 //!     does, and lines up with the `groupby` and host-side `join`
 //!     executors which apply the same canonicalisation. See
 //!     `canonicalise_f32` / `canonicalise_f64` below.
-//!   * `NaN` bit patterns are LEFT AS-IS. The host-side canonicalisation
-//!     uses `if x == 0.0 { 0.0 } else { x }` which evaluates `false` for
-//!     every NaN (per IEEE) and therefore preserves NaN bit patterns
-//!     verbatim. Documented SQL semantics: `NaN != NaN` (also DuckDB).
-//!     Two `NaN`s with identical bit patterns DO dedupe to one row
-//!     because the row key carries the raw bits and `Eq` is bit-wise.
+//!   * `NaN` bit patterns are CANONICALISED to a single quiet NaN (F3).
+//!     Every NaN — any payload, either sign, quiet or signalling — folds
+//!     to the same key, so all NaN values collapse into one DISTINCT row.
+//!     This matches DuckDB, which treats all NaN as a single GROUP BY /
+//!     DISTINCT key, and keeps DISTINCT and GROUP BY on one float
+//!     equivalence relation. See `canonicalise_f32` / `canonicalise_f64`.
 //!
 //! Allocation strategy (review H9): the inner loop pre-downcasts each
 //! column ONCE into a typed `ColumnReader` enum (a struct-of-arrays view
@@ -151,9 +151,9 @@ pub(crate) enum RowKeyValue {
     Null,
     I32(i32),
     I64(i64),
-    /// `f32` reinterpreted via `to_bits`. NaN-vs-NaN equality is therefore
-    /// bit-wise; `+0.0` and `-0.0` are first canonicalised to `+0.0` via
-    /// [`canonicalise_f32`]. See module doc-comment.
+    /// `f32` reinterpreted via `to_bits`, after canonicalisation via
+    /// [`canonicalise_f32`]: `-0.0 → +0.0`, and every NaN → one canonical
+    /// quiet NaN so all NaN collapse to one key (F3). See module doc-comment.
     F32(u32),
     /// `f64` reinterpreted via `to_bits`. Same bit-wise semantics as `F32`.
     F64(u64),
@@ -438,21 +438,32 @@ fn execute_distinct_with_cap(input: QueryHandle, max_rows: usize) -> BoltResult<
 }
 
 /// Collapse `-0.0` to `+0.0` so that signed-zero pairs hash identically
-/// under DISTINCT. Preserves every other bit pattern, including the full
-/// space of `NaN` payloads (the predicate `x == 0.0` is `false` for any
-/// `NaN`). Mirrors the host-side canonicalisation applied in
-/// `groupby::load_key_column_bits` and `join::extract_key` so that
-/// DISTINCT, GROUP BY, and JOIN share one equivalence relation for
-/// floats.
+/// under DISTINCT. F3: also fold every `NaN` bit pattern (any payload, either
+/// sign) to a single canonical quiet NaN so all NaN values dedupe to one
+/// DISTINCT row, matching DuckDB. Mirrors the host-side canonicalisation
+/// applied in `groupby_common::canonicalise_f64` (and the GROUP BY key path)
+/// so DISTINCT and GROUP BY share one equivalence relation for floats.
 #[inline]
 pub(crate) fn canonicalise_f64(x: f64) -> f64 {
-    if x == 0.0 { 0.0 } else { x }
+    if x.is_nan() {
+        f64::NAN
+    } else if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
 }
 
 /// `f32` analogue of [`canonicalise_f64`]; same shape, same rationale.
 #[inline]
 pub(crate) fn canonicalise_f32(x: f32) -> f32 {
-    if x == 0.0 { 0.0 } else { x }
+    if x.is_nan() {
+        f32::NAN
+    } else if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
 }
 
 fn arrow_err(e: arrow::error::ArrowError) -> BoltError {
@@ -563,20 +574,59 @@ mod tests {
         assert_eq!(out.into_record_batch().num_rows(), 1);
     }
 
-    /// Review C12: `NaN` is left as-is — the canonicalisation only
-    /// touches signed zeros, so two `NaN`s with the SAME bit pattern
-    /// still hash equal (the row carries the raw bits) and dedupe, but
-    /// the canonicalisation does NOT collapse NaN-vs-not-NaN.
+    /// F3: every `NaN` bit pattern (any payload, either sign, quiet or
+    /// signalling) is folded to a single canonical quiet NaN so that all NaN
+    /// values collapse into one DISTINCT key, matching DuckDB. Signed-zero
+    /// canonicalisation is also preserved.
     #[test]
-    fn distinct_nan_canonicalisation_is_noop() {
-        // canonicalise_f64 must preserve NaN bit-for-bit.
-        let nan_in = f64::from_bits(0x7ff8_0000_0000_0001); // a quiet NaN
-        let nan_out = canonicalise_f64(nan_in);
-        assert!(nan_out.is_nan());
-        assert_eq!(nan_in.to_bits(), nan_out.to_bits());
-        // Signed-zero canonicalisation does happen.
+    fn distinct_nan_canonicalisation_collapses_all_nan() {
+        // Distinct NaN payloads + both NaN signs all canonicalise to the
+        // SAME bit pattern.
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0001); // quiet NaN, payload 1
+        let sign_nan = f64::from_bits(0xfff8_0000_0000_0000); // negative NaN
+        let plain_nan = f64::NAN;
+        let canon = canonicalise_f64(f64::NAN).to_bits();
+        assert!(canonicalise_f64(payload_nan).is_nan());
+        assert_eq!(canonicalise_f64(payload_nan).to_bits(), canon);
+        assert_eq!(canonicalise_f64(sign_nan).to_bits(), canon);
+        assert_eq!(canonicalise_f64(plain_nan).to_bits(), canon);
+        // f32 analogue.
+        let f32_canon = canonicalise_f32(f32::NAN).to_bits();
+        assert_eq!(
+            canonicalise_f32(f32::from_bits(0x7fc0_0001)).to_bits(),
+            f32_canon
+        );
+        assert_eq!(
+            canonicalise_f32(f32::from_bits(0xffc0_0000)).to_bits(),
+            f32_canon
+        );
+        // Signed-zero canonicalisation still happens.
         assert_eq!(canonicalise_f64(-0.0_f64).to_bits(), 0.0_f64.to_bits());
         assert_eq!(canonicalise_f32(-0.0_f32).to_bits(), 0.0_f32.to_bits());
+    }
+
+    /// F3 end-to-end: a DISTINCT over a Float64 column containing several
+    /// different NaN payloads collapses them all into one output row.
+    #[test]
+    fn distinct_collapses_multiple_nan_payloads() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "f",
+            DataType::Float64,
+            false,
+        )]));
+        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            f64::from_bits(0x7ff8_0000_0000_0002),
+            f64::from_bits(0xfff8_0000_0000_0000),
+            f64::NAN,
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
+        assert_eq!(
+            out.into_record_batch().num_rows(),
+            1,
+            "all NaN payloads must collapse to one DISTINCT row"
+        );
     }
 
     #[test]

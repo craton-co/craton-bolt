@@ -533,8 +533,29 @@ impl GpuColumn {
                 }
             }
             DataType::Date32 | DataType::Timestamp(_, _) => {
-                return Err(BoltError::Type(format!(
-                    "GpuColumn: Date/Timestamp upload not yet supported (column '{}', dtype {:?})",
+                // F11 fallback-gap fix: Date32 / Timestamp upload is not yet
+                // wired on the GPU. Previously this was a hard `BoltError::Type`
+                // that propagated up through `ensure_gpu_table` and failed the
+                // whole query — inconsistent with every other GPU gate in the
+                // engine, which decline with the typed "retry on host" marker
+                // rather than erroring (see `gpu_join.rs`'s
+                // `BoltError::GpuCapacity` overshoot path, and `window.rs`,
+                // which already supports these temporal dtypes host-side).
+                //
+                // We now emit `BoltError::GpuCapacity` — the typed
+                // capacity-fallback marker (see `error.rs`) whose entire purpose
+                // is to signal "the GPU path declined; the host handles this
+                // input fine, retry there". This makes the projection/upload
+                // path consistent with the join gates: the orchestrator maps
+                // this variant to its host fallback exactly as
+                // `execute_inner_join` / `execute_outer_join` map the join
+                // kernels' `GpuCapacity`. Correctness of the supported dtypes is
+                // unchanged — only this unsupported-dtype arm changes its error
+                // *kind* from a fatal type error to a graceful decline.
+                return Err(BoltError::GpuCapacity(format!(
+                    "GPU upload of temporal column '{}' (dtype {:?}) not yet \
+                     supported; decline to host (window.rs handles temporal \
+                     dtypes host-side)",
                     name, dtype
                 )));
             }
@@ -794,6 +815,36 @@ mod tests {
         let nb = NullBuffer::new(BooleanBuffer::from_iter(bools.iter().copied()));
         let packed = pack_validity_from_arrow(&nb, bools.len());
         assert_eq!(packed, vec![0xCDu8, 0x01u8]);
+    }
+
+    /// F11 fallback-gap fix: uploading a temporal column declines with the
+    /// typed `BoltError::GpuCapacity` "retry on host" marker rather than a hard
+    /// `BoltError::Type`, so the orchestrator routes a projection over a
+    /// Date32 / Timestamp column to the host executor (window.rs already
+    /// supports these dtypes host-side) instead of failing the query.
+    ///
+    /// Pure-host: the temporal match arm returns the decline *before* touching
+    /// the array contents or allocating any device buffer, so this needs no
+    /// CUDA context (no `#[ignore]`). We pass an empty `Int32Array` purely as a
+    /// stand-in `&dyn Array`; the temporal arm never downcasts it.
+    #[test]
+    fn temporal_upload_declines_to_host() {
+        use crate::plan::logical_plan::TimeUnit;
+        let placeholder = Int32Array::from(Vec::<i32>::new());
+        for dtype in [
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ] {
+            let res = GpuColumn::upload("ts".to_string(), &placeholder, dtype);
+            match res {
+                Ok(_) => panic!("{dtype:?} upload should decline, not succeed"),
+                Err(BoltError::GpuCapacity(_)) => { /* expected host-fallback signal */ }
+                Err(other) => panic!(
+                    "{dtype:?} must decline with GpuCapacity (host-fallback marker), \
+                     got a different error kind: {other:?}"
+                ),
+            }
+        }
     }
 
     /// Stage 5 — registering a `DictionaryArray<i32, Utf8>` column produces

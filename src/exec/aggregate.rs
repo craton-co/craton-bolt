@@ -310,21 +310,18 @@ fn build_one_aggregate(
             // implementation generalises cleanly to a future post-pre-stage
             // path where the host doesn't know the post-filter count.
             //
-            // TODO(null): SQL standard returns NULL when COUNT == 0; we
-            // currently return 0.0 to preserve the public AVG return-type
-            // contract (non-nullable Float64). Surfacing NULL would require
-            // making the AVG output schema field nullable across the planner
-            // and downstream consumers — out of scope for this fusion.
+            // F4: SQL returns NULL for AVG over zero matching (non-NULL)
+            // rows. When the planner has marked the AVG output field nullable
+            // we surface that NULL directly; if the field is still
+            // non-nullable (legacy contract — RecordBatch::try_new would
+            // reject a null in a non-nullable column) we fall back to 0.0 to
+            // preserve the build. Making the field unconditionally nullable
+            // remains a planner-side change tracked separately.
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
             let (sum_f64, count_u64) =
                 fused_avg_from_batch(col_io, table_batch, n_rows)?;
-            let avg = if count_u64 == 0 {
-                0.0
-            } else {
-                sum_f64 / count_u64 as f64
-            };
-            scalar_to_array(Scalar::F64(avg), out_field.dtype)
+            Ok(avg_result_array(sum_f64, count_u64, out_field.nullable))
         }
         AggregateExpr::VarPop(expr) | AggregateExpr::VarSamp(expr) => {
             // v0.5 scalar-aggregate path: download the column to the host
@@ -773,6 +770,26 @@ fn reduce_column_from_batch(
 ///
 /// Layout: one GPU launch produces a pair of per-block partial buffers
 /// (`block_sums: f64`, `block_counts: u32`); the host sums each to a single
+/// F4: build the single-row AVG result array from a fused `(sum, count)`
+/// partial. SQL returns NULL for AVG over zero matching (non-NULL) rows;
+/// when the output field is nullable we surface that NULL, otherwise we fall
+/// back to `0.0` (a null in a non-nullable column would be rejected by
+/// `RecordBatch::try_new`). Shared by the scalar and pre-stage AVG paths so
+/// the empty-input semantics stay identical.
+pub(crate) fn avg_result_array(
+    sum_f64: f64,
+    count_u64: u64,
+    out_nullable: bool,
+) -> ArrayRef {
+    if count_u64 == 0 {
+        if out_nullable {
+            return Arc::new(Float64Array::from(vec![Option::<f64>::None])) as ArrayRef;
+        }
+        return Arc::new(Float64Array::from(vec![0.0_f64])) as ArrayRef;
+    }
+    Arc::new(Float64Array::from(vec![sum_f64 / count_u64 as f64])) as ArrayRef
+}
+
 /// `(f64, u64)` pair. This replaces the previous "two kernels (SUM + COUNT) +
 /// host divide" decomposition — one PTX compilation, one launch, one D2H
 /// stream-synchronize.
@@ -2069,6 +2086,49 @@ mod tests {
         let arr = Int64Array::from(vec![10i64, 20, 30]);
         let host = filter_primitive_to_vec::<arrow_array::types::Int64Type>(&arr);
         assert_eq!(host, vec![10, 20, 30]);
+    }
+
+    /// F4: AVG over zero matching rows yields SQL NULL when the output field
+    /// is nullable.
+    #[test]
+    fn avg_empty_input_is_null_when_nullable() {
+        let arr = avg_result_array(0.0, 0, /* out_nullable = */ true);
+        let fa = arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Float64Array");
+        assert_eq!(fa.len(), 1);
+        assert!(fa.is_null(0), "empty AVG over nullable field must be NULL");
+    }
+
+    /// F4: when the output field is (legacy) non-nullable, AVG over zero rows
+    /// falls back to 0.0 so `RecordBatch::try_new` does not reject a null in a
+    /// non-nullable column.
+    #[test]
+    fn avg_empty_input_is_zero_when_non_nullable() {
+        let arr = avg_result_array(0.0, 0, /* out_nullable = */ false);
+        let fa = arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Float64Array");
+        assert_eq!(fa.len(), 1);
+        assert!(!fa.is_null(0));
+        assert_eq!(fa.value(0), 0.0);
+    }
+
+    /// F4: a non-empty AVG still divides sum by count regardless of
+    /// nullability.
+    #[test]
+    fn avg_non_empty_divides() {
+        for nullable in [true, false] {
+            let arr = avg_result_array(10.0, 4, nullable);
+            let fa = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64Array");
+            assert!(!fa.is_null(0));
+            assert_eq!(fa.value(0), 2.5);
+        }
     }
 
     /// V-10: integer SUM that overflows `i64::MAX` must error loudly with a

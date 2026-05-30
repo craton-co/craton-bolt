@@ -125,6 +125,18 @@ For `Utf8` columns, only equality (`=`, `<>`, `!=`) against string *literals* is
 
 `<expr> [NOT] LIKE 'pattern'` is supported (0.5) for constant patterns with `%` and `_` wildcards (with prefix / suffix / contains / exact fast paths). As of 0.7 a `LIKE` / `NOT LIKE` predicate over a `Utf8` column **lowers to the GPU**: dictionary-encoded columns use a dictionary-precompute → index-membership kernel, and non-dictionary `Utf8` columns use the `StringLikeFilter` device matcher (`compile_like_match_kernel`, with EXACT/PREFIX/SUFFIX/CONTAINS specialisations). Both retain a **host-side** `host_like` fallback on a gate miss. `LIKE` with `ESCAPE` parses but the escape handling is a follow-up. WHERE-predicate `LIKE` is type-checked against the column dtype during lowering (must be `Utf8`).
 
+### IS [NOT] NULL
+
+`<expr> IS NULL` and `<expr> IS NOT NULL` are supported (`UnaryOp::IsNull` / `UnaryOp::IsNotNull`). The result dtype is `Bool` and any operand dtype is accepted. Semantics follow SQL: `IS NULL` is `TRUE` exactly for rows whose operand is NULL, and `IS NOT NULL` is its pointwise inverse.
+
+Execution tier:
+
+- **GPU.** When the operand is a **bare, nullable column reference**, the predicate lowers to the GPU `Op::IsNullCheck`, which reads the column's validity bitmap directly (`KernelSpec::input_has_validity` must mark the slot). This is the common `WHERE col IS NULL` / `WHERE col IS NOT NULL` case.
+- **Constant-folded.** When the operand is statically known to be non-nullable (a non-nullable column or a non-null literal), the planner folds the check to a constant Bool at plan time — `IS NULL` becomes all-`FALSE`, `IS NOT NULL` all-`TRUE` — so no kernel work happens. An operand that is `Literal::Null` folds the other way.
+- **Host-side.** A **compound** operand (e.g. `(x + y) IS NULL`, `(expr AS renamed) IS NULL`) takes the host-side filter fallback via `predicate_contains_unary`; the host evaluator (`src/exec/expr_agg.rs`) computes per-row nullness and applies the check.
+
+`IS NULL` / `IS NOT NULL` are not currently wired into the aggregate-`pre` path (so they cannot yet appear as an aggregate input expression). `COUNT(DISTINCT col)` internally lowers through an `IS NOT NULL` filter to exclude NULLs from the distinct count.
+
 ## SELECT list
 
 Each item is one of:

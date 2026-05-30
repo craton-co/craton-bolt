@@ -10,5 +10,13 @@
 # In the interim, see MAINTAINERS.md at the repo root for the human(s) to
 # contact for reviews (currently routed via opensource@cratonsoftware.com).
 # Once the team is created on GitHub, this file works as-is — no edit needed.
+#
+# REQUIRED MANUAL STEP (orchestrator): the @craton-co/craton-bolt-maintainers
+# team MUST be created in the craton-co GitHub org BEFORE enabling branch
+# protection that "requires review from Code Owners." Until that team exists,
+# such a rule is UNSATISFIABLE and will block all merges (no owner can ever be
+# auto-requested or satisfy the rule). Do not enable required-CODEOWNER-review
+# branch protection until the team is provisioned. No real usernames are
+# hard-coded here on purpose — provision the team instead.
 
 * @craton-co/craton-bolt-maintainers

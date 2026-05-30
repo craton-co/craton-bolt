@@ -115,21 +115,45 @@ pub fn install_pool_stats_observer(
 /// The registry lock is **not** held while the observer callback runs:
 /// we acquire the lock, clone the observer handle (a cheap `Arc` bump)
 /// into a local, DROP the guard, and only then invoke the callback.
-/// This matters for two reasons:
+/// This matters for three reasons:
 ///
 /// * **Re-entrancy** — an observer is free to call
 ///   [`install_pool_stats_observer`] (or otherwise touch the registry)
 ///   without self-deadlocking on a non-reentrant mutex.
-/// * **Panics** — if the observer panics, the unwind crosses no held
-///   lock. Combined with the `parking_lot::Mutex` (which never
-///   poisons), a panicking observer cannot disable the surface: the
+/// * **Poisoning** — the `parking_lot::Mutex` never poisons, so a
+///   panicking observer cannot permanently disable the surface: the
 ///   next `notify_observers` / `install_pool_stats_observer` still
-///   works, honouring the documented invariant.
+///   works.
+/// * **Never-escalate** — the observer is a *user* callback invoked from
+///   the engine's periodic-emit path, which runs AFTER a query has
+///   already produced its result. A panic in that callback must never
+///   turn a successful query into a panic (the contract documented at
+///   `Engine::maybe_emit_pool_stats` / `Engine::sql`). We therefore run
+///   the callback inside [`std::panic::catch_unwind`] and log + swallow
+///   any panic here, at the single choke point every emit path funnels
+///   through.
+///
+/// The lock is already released before the callback runs (see above), so
+/// the caught unwind crosses no held lock and the
+/// [`AssertUnwindSafe`](std::panic::AssertUnwindSafe) wrapper is sound:
+/// nothing this function still owns is observed after a panic.
 pub(crate) fn notify_observers(stats: PoolStats) {
     // Clone the handle out under the lock, then release it.
     let observer = registry().lock().clone();
     if let Some(observer) = observer {
-        observer(stats);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer(stats);
+        }));
+        if result.is_err() {
+            // A user pool-stats observer panicked. Swallow it: this runs on
+            // the post-query emit path and must never escalate into the query
+            // result. The `parking_lot` registry is unpoisoned, so the next
+            // emit still fires.
+            log::warn!(
+                "craton-bolt: pool-stats observer panicked; \
+                 panic swallowed (observer callbacks must not escalate)"
+            );
+        }
     }
 }
 
@@ -147,19 +171,24 @@ mod tests {
         }
     }
 
-    /// A panicking observer must not poison/disable the surface:
-    /// after it panics, a subsequently installed observer must still
-    /// receive notifications, and install itself must still work.
+    /// A panicking observer must not poison/disable the surface AND must
+    /// not escalate: `notify_observers` swallows the panic (it runs on the
+    /// post-query emit path), and a subsequently installed observer must
+    /// still receive notifications.
     #[test]
     fn panicking_observer_does_not_disable_surface() {
         // Install an observer that always panics.
         install_pool_stats_observer(Box::new(|_| panic!("boom")));
 
-        // Triggering notify must propagate the panic out of the
-        // callback (the lock is already released by then). Catch the
-        // unwind so the test process survives.
+        // Triggering notify must NOT unwind out of `notify_observers`: the
+        // observer panic is caught and swallowed inside, honouring the
+        // documented "never escalate" contract. `catch_unwind` here only
+        // guards the test harness; we assert it caught nothing.
         let result = std::panic::catch_unwind(|| notify_observers(dummy_stats()));
-        assert!(result.is_err(), "panicking observer should unwind");
+        assert!(
+            result.is_ok(),
+            "observer panic must be swallowed by notify_observers, not propagated"
+        );
 
         // The surface must still be usable: installing a fresh
         // observer must succeed and it must receive notifications.
@@ -180,6 +209,35 @@ mod tests {
 
         // Reset the single-slot registry so we don't leak a live
         // observer into other tests in the process.
+        install_pool_stats_observer(Box::new(|_| ()));
+    }
+
+    /// A panicking observer that stays installed must keep being invoked on
+    /// every subsequent emit (the swallow must not unregister it) and must
+    /// never escalate across repeated emits — modelling the engine's periodic
+    /// emit firing more than once over a long-lived process.
+    #[test]
+    fn panicking_observer_swallowed_on_every_emit() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        install_pool_stats_observer(Box::new(|_| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            panic!("boom");
+        }));
+
+        // None of these emits may unwind out of `notify_observers`.
+        for _ in 0..3 {
+            notify_observers(dummy_stats());
+        }
+
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            3,
+            "panicking observer must still be invoked on each emit (swallow \
+             must not unregister it)"
+        );
+
+        // Reset the single-slot registry so we don't leak a live observer.
         install_pool_stats_observer(Box::new(|_| ()));
     }
 }

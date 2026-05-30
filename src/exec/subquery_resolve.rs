@@ -181,7 +181,7 @@ fn literal_eq(a: &Literal, b: &Literal) -> bool {
 /// * **`NOT IN` (negated):** `expr <> v1 AND expr <> v2 AND …`. An empty set →
 ///   `Bool(true)`.
 ///
-/// # NULL handling (divergence from strict SQL three-valued logic)
+/// # NULL handling (strict SQL three-valued logic — finding F-6)
 ///
 /// Strict SQL says:
 /// * `x IN (… , NULL , …)` is `TRUE` if `x` matches a non-NULL element, else
@@ -189,31 +189,47 @@ fn literal_eq(a: &Literal, b: &Literal) -> bool {
 ///   set contains a NULL evaluates to `NULL` (filtered out by `WHERE`, same as
 ///   `FALSE`).
 /// * `x NOT IN (…, NULL, …)` is `FALSE` if `x` matches a non-NULL element,
-///   else `NULL` (never `TRUE`).
+///   else `NULL` (never `TRUE`) — so when the set contains *any* NULL **no
+///   row can pass**: a match makes it `FALSE`, a non-match makes it `NULL`,
+///   and both are excluded by `WHERE`.
 ///
 /// We **drop `NULL`s from the value set** before building the fold. For the
 /// non-negated `IN` form this matches SQL exactly under a `WHERE` clause: a row
 /// that doesn't match any non-NULL element yields `FALSE` here vs `NULL` in
-/// strict SQL, and both are filtered out. For the negated `NOT IN` form we
-/// diverge when the set contains a NULL: strict SQL makes the whole predicate
-/// `NULL` (so *no* rows pass) whenever the set has any NULL, whereas we keep
-/// the per-row `<>` semantics over the non-NULL elements. This is the
-/// "correct-enough" tradeoff called for by the task: the common `IN` path is
-/// exact, and the rare `NOT IN (subquery-with-NULLs)` corner is documented
-/// rather than special-cased. A future refinement could emit `Bool(false)` for
-/// negated form when a NULL is present in the set to restore strict semantics.
+/// strict SQL, and both are filtered out.
+///
+/// For the negated `NOT IN` form we honour the strict semantics: if the value
+/// set contains **any** NULL, the predicate can never be `TRUE` for any row, so
+/// we fold straight to `Bool(false)` (no rows pass). Only when the set is
+/// NULL-free do we build the per-row `<>`/`AND` fold over the non-NULL
+/// elements. This closes the classic `x NOT IN (SELECT nullable_col …)` footgun
+/// that previously let rows through incorrectly.
 pub fn build_in_predicate(expr: &Expr, values: &[Literal], negated: bool) -> Expr {
+    // Does the value set contain a NULL? Under SQL 3VL, equality / inequality
+    // against a NULL literal yields UNKNOWN, never TRUE.
+    let set_has_null = values.iter().any(|l| matches!(l, Literal::Null));
+
+    // F-6: strict `NOT IN` semantics. If the set contains any NULL, the whole
+    // negated predicate is UNKNOWN for every row (a match → FALSE, a non-match
+    // → NULL), so no row passes. Fold to `Bool(false)`. Note this also subsumes
+    // the "set of only NULLs" case for the negated form below.
+    if negated && set_has_null {
+        return Expr::Literal(Literal::Bool(false));
+    }
+
     // Drop NULLs: equality / inequality against a NULL literal is never TRUE
-    // in SQL, so a NULL element can only ever contribute UNKNOWN — see the
-    // doc comment for the negated-form divergence this implies.
+    // in SQL, so a NULL element can only ever contribute UNKNOWN. For the
+    // negated form we have already returned above when a NULL was present, so
+    // by this point `negated` implies a NULL-free set.
     let non_null: Vec<&Literal> = values
         .iter()
         .filter(|l| !matches!(l, Literal::Null))
         .collect();
 
     if non_null.is_empty() {
-        // Empty membership set (or a set of only NULLs): `IN` → false,
-        // `NOT IN` → true.
+        // Empty membership set: `IN` → false, `NOT IN` → true. (A set of only
+        // NULLs reaches here for the non-negated `IN` form, which is also
+        // `false`; the negated form was already handled above.)
         return Expr::Literal(Literal::Bool(negated));
     }
 
@@ -624,6 +640,96 @@ mod tests {
         );
         // Single non-null element → bare equality, no OR fold.
         check_cmp(&got, "x", BinaryOp::Eq, Literal::Int32(7));
+    }
+
+    // ---- F-6: strict SQL 3VL for `NOT IN (subquery)` ----------------------
+
+    /// `x NOT IN (… , NULL , …)`: with a NULL anywhere in the set, the strict
+    /// SQL semantics make the predicate UNKNOWN for every row, so NO row
+    /// passes. We must fold to `Bool(false)` — never build an `AND` of `<>`
+    /// that would let rows through.
+    #[test]
+    fn not_in_with_null_in_set_excludes_all_rows() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(
+            &probe,
+            &[Literal::Int32(1), Literal::Int32(2), Literal::Null],
+            true,
+        );
+        assert!(
+            matches!(got, Expr::Literal(Literal::Bool(false))),
+            "NOT IN with a NULL in the set must yield Bool(false) (no rows), got {got:?}"
+        );
+    }
+
+    /// A set of *only* NULLs under `NOT IN` is still UNKNOWN for every row →
+    /// `Bool(false)` (this is the same SQL footgun as a set containing one
+    /// non-NULL plus a NULL).
+    #[test]
+    fn not_in_with_only_null_set_excludes_all_rows() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(&probe, &[Literal::Null], true);
+        assert!(
+            matches!(got, Expr::Literal(Literal::Bool(false))),
+            "NOT IN over an all-NULL set must yield Bool(false), got {got:?}"
+        );
+    }
+
+    /// `x NOT IN (1, 2)` with NO NULL in the set keeps the normal strict
+    /// `<>`/`AND` fold over the non-NULL elements.
+    #[test]
+    fn not_in_without_null_builds_and_of_inequalities() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(
+            &probe,
+            &[Literal::Int32(1), Literal::Int32(2)],
+            true,
+        );
+        match got {
+            Expr::Binary { op: BinaryOp::And, left, right } => {
+                check_cmp(&left, "x", BinaryOp::NotEq, Literal::Int32(1));
+                check_cmp(&right, "x", BinaryOp::NotEq, Literal::Int32(2));
+            }
+            other => panic!("expected AND of inequalities, got {other:?}"),
+        }
+    }
+
+    /// `x IN (… , NULL , …)` (NON-negated) is unaffected by F-6: the NULL is
+    /// dropped and the row matches iff it equals a non-NULL element. A NULL in
+    /// the set must NOT collapse the IN form to a constant.
+    #[test]
+    fn in_with_null_in_set_keeps_non_null_membership() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(
+            &probe,
+            &[Literal::Int32(7), Literal::Null],
+            false,
+        );
+        // Single non-null element → bare equality (the NULL is dropped).
+        check_cmp(&got, "x", BinaryOp::Eq, Literal::Int32(7));
+    }
+
+    /// Probe value being NULL is orthogonal to the *set's* NULLs: the predicate
+    /// structure is built over the probe expression as-is. A probe `Column`
+    /// that resolves to NULL at runtime is handled by the downstream `=`/`<>`
+    /// 3VL evaluation, not by `build_in_predicate`. Here we assert the builder
+    /// faithfully embeds the (possibly-NULL-valued) probe expression and does
+    /// not special-case it, for a NULL-free set.
+    #[test]
+    fn probe_expr_preserved_for_null_free_set() {
+        // A probe that is itself a literal NULL — the builder must still emit
+        // the equality fold; runtime 3VL (NULL = v → UNKNOWN) handles exclusion.
+        let probe = Expr::Literal(Literal::Null);
+        let got = build_in_predicate(&probe, &[Literal::Int32(3)], false);
+        match got {
+            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+                match (&*left, &*right) {
+                    (Expr::Literal(Literal::Null), Expr::Literal(Literal::Int32(3))) => {}
+                    other => panic!("expected (NULL = 3), got {other:?}"),
+                }
+            }
+            other => panic!("expected Eq fold over probe, got {other:?}"),
+        }
     }
 
     #[test]

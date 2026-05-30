@@ -121,12 +121,93 @@ fn active_device_id() -> i32 {
     crate::cuda::cuda_sys::current_device().unwrap_or(0)
 }
 
-/// Process-wide module cache.
+/// FIFO cap on the string-keyed [`GLOBAL_MODULE_CACHE`].
+///
+/// MED-fix (F1): historically this cache was an unbounded `HashMap` — the one
+/// exception among the cache families in this file, every other of which is a
+/// FIFO-capped [`SpecCache`]. A workload that JITs many distinct kernel shapes
+/// (wide GROUP BY tiers, many distinct projection specs, multi-GPU — each of
+/// which folds a distinct `spec_id` and/or `\0dev{N}` device suffix into the
+/// key) accumulated `CudaModule` handles forever, slowly leaking host- and
+/// device-side cubin state for the process lifetime. We now cap it with the
+/// same FIFO policy and the same default as the sibling string-cache
+/// convention (`KERNELSPEC_CACHE_CAP`), so the working set is bounded.
+const GLOBAL_MODULE_CACHE_CAP: usize = 256;
+
+/// Process-wide module cache with bounded FIFO eviction.
 ///
 /// `CudaModule` is `Clone` over an internal `Arc<CudaModuleInner>`; storing
 /// owned modules in the map and handing callers clones is cheap.
-static GLOBAL_MODULE_CACHE: Lazy<Mutex<HashMap<Key, CudaModule>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+///
+/// # Safe eviction of in-use modules (F1)
+///
+/// Evicting an entry only drops *this map's* `Arc<CudaModuleInner>` clone. The
+/// actual driver-side `cuModuleUnload` lives in `CudaModuleInner`'s `Drop`
+/// (see `jit::jit_compiler`), which runs only when the **last** `Arc` is
+/// dropped. Any caller that pulled a module out of this cache and is still
+/// using it holds its own `Arc` clone, so an eviction here can never unload a
+/// module that is currently in flight — it merely stops the cache from pinning
+/// that module once every live user has finished with it. This gives us a
+/// bounded cache that transparently retains in-use entries beyond the cap
+/// without any cross-file unload plumbing, satisfying the brief's safety
+/// constraint.
+static GLOBAL_MODULE_CACHE: Lazy<Mutex<GlobalModuleCache>> =
+    Lazy::new(|| Mutex::new(GlobalModuleCache::new(GLOBAL_MODULE_CACHE_CAP)));
+
+/// Bounded string-keyed module cache backing [`GLOBAL_MODULE_CACHE`].
+///
+/// Mirrors the [`SpecCache`] FIFO design (a `HashMap` for lookup plus a
+/// parallel `VecDeque` insertion-order log) but keyed on the composite
+/// `(namespace, spec_id)` string [`Key`] instead of a 128-bit content hash.
+/// The two structures are kept in sync by [`GlobalModuleCache::insert`], the
+/// only mutator: on insert past the cap we pop the front of `order` and remove
+/// the matching map entry (dropping that entry's `Arc` clone — see the safety
+/// note on [`GLOBAL_MODULE_CACHE`]).
+struct GlobalModuleCache {
+    by_key: HashMap<Key, CudaModule>,
+    order: VecDeque<Key>,
+    cap: usize,
+}
+
+impl GlobalModuleCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_key: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+
+    /// Look up `key`, cloning the cached `CudaModule` (a cheap `Arc` bump) on a
+    /// hit. Pure read — does not touch the FIFO order (FIFO, not LRU).
+    fn get(&self, key: &Key) -> Option<CudaModule> {
+        self.by_key.get(key).cloned()
+    }
+
+    /// Insert `(key, module)`, evicting the oldest entry first if at cap.
+    /// Idempotent: if `key` is already present we keep the incumbent (and its
+    /// FIFO position) and return that, so a concurrent miss that raced us still
+    /// sees a single shared `Arc<CudaModuleInner>`. Returns the module that is
+    /// now authoritative for `key`.
+    fn insert(&mut self, key: Key, module: CudaModule) -> CudaModule {
+        if let Some(existing) = self.by_key.get(&key) {
+            return existing.clone();
+        }
+        while self.by_key.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                // Dropping the removed value's `Arc` clone here is safe even if
+                // the module is in use elsewhere: the real unload only fires
+                // when the last `Arc` drops (see [`GLOBAL_MODULE_CACHE`] docs).
+                self.by_key.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.by_key.insert(key, module.clone());
+        module
+    }
+}
 
 /// Test- and observability-facing global miss counter.
 ///
@@ -178,7 +259,7 @@ where
         if let Some(m) = cache.get(&(namespace, spec_id.clone())) {
             // M5 metrics: warm module-cache hit (codegen + load skipped).
             crate::metrics::metrics().inc(crate::metrics::Counter::PtxCacheHits);
-            return Ok(m.clone());
+            return Ok(m);
         }
     }
     // M5 metrics: miss — we are about to compile + load this module.
@@ -194,11 +275,13 @@ where
         c.0.fetch_add(1, Ordering::SeqCst);
     }
     // Insert and hand back a clone. If a concurrent thread raced us to the
-    // same key, `or_insert` keeps the first winner — both threads observe
-    // the same `Arc<CudaModuleInner>`, just one of the two `CudaModule`
-    // wrappers we built gets dropped (cheap: an Arc dec).
+    // same key, `insert` keeps the first winner — both threads observe the
+    // same `Arc<CudaModuleInner>`, just one of the two `CudaModule` wrappers we
+    // built gets dropped (cheap: an Arc dec). Insertion past the FIFO cap
+    // evicts the oldest entry (see [`GlobalModuleCache`]); this is what bounds
+    // the previously-unbounded cache (F1).
     let mut cache = GLOBAL_MODULE_CACHE.lock();
-    Ok(cache.entry((namespace, spec_id)).or_insert(module).clone())
+    Ok(cache.insert((namespace, spec_id), module))
 }
 
 /// Per-executor test helper: a thin newtype around `AtomicUsize` that
@@ -1337,6 +1420,90 @@ where
 // ---------------------------------------------------------------------------
 // Tests for the generic `SpecCache<K>` (FIFO eviction + hit/miss stats).
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Tests for the bounded string-keyed GLOBAL_MODULE_CACHE (F1).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod global_module_cache_tests {
+    use super::*;
+
+    fn k(n: u64) -> Key {
+        // Leak a small static-lived namespace string so the `&'static str`
+        // half of the key is satisfied without depending on a real executor's
+        // `module_path!()`. Test-only; the handful of leaked strings are
+        // bounded by the test's loop count.
+        let ns: &'static str = Box::leak(format!("ns{n}").into_boxed_str());
+        (ns, format!("spec{n}"))
+    }
+
+    fn module() -> CudaModule {
+        crate::jit::CudaModule::stub_for_tests()
+    }
+
+    /// FIFO eviction: inserting past the cap drops the *oldest* key first
+    /// (insertion order) and the live map never exceeds `cap`. Mirrors
+    /// `spec_cache_evicts_in_fifo_order` for the string-keyed global cache.
+    #[test]
+    fn global_cache_evicts_in_fifo_order() {
+        let mut cache = GlobalModuleCache::new(2);
+
+        cache.insert(k(1), module());
+        cache.insert(k(2), module());
+        // At cap. Inserting k(3) must evict k(1) (the front of the FIFO).
+        cache.insert(k(3), module());
+
+        assert!(cache.get(&k(1)).is_none(), "oldest key must be evicted");
+        assert!(cache.get(&k(2)).is_some(), "k(2) must survive");
+        assert!(cache.get(&k(3)).is_some(), "freshly inserted key present");
+        assert!(
+            cache.by_key.len() <= 2,
+            "live entries must not exceed cap (no unbounded growth — F1)"
+        );
+    }
+
+    /// Re-inserting an existing key is idempotent: it neither grows the map nor
+    /// re-ages the key in the FIFO order, and the returned module is the
+    /// incumbent (so a racing miss shares one `Arc<CudaModuleInner>`).
+    #[test]
+    fn global_cache_insert_is_idempotent_and_preserves_fifo_position() {
+        let mut cache = GlobalModuleCache::new(2);
+
+        cache.insert(k(1), module());
+        cache.insert(k(2), module());
+        // Re-insert k(1): no-op, must NOT move it to the back of the FIFO.
+        cache.insert(k(1), module());
+        assert_eq!(cache.by_key.len(), 2, "idempotent insert must not grow map");
+
+        cache.insert(k(3), module());
+        assert!(
+            cache.get(&k(1)).is_none(),
+            "k(1) kept its original FIFO position and was evicted first"
+        );
+        assert!(cache.get(&k(2)).is_some());
+        assert!(cache.get(&k(3)).is_some());
+    }
+
+    /// Eviction of an in-use module does not unload it: the caller's clone (a
+    /// live `Arc`) keeps the underlying `CudaModuleInner` alive past eviction,
+    /// so the handle the caller still holds stays valid. This pins the safety
+    /// contract documented on `GLOBAL_MODULE_CACHE`.
+    #[test]
+    fn global_cache_eviction_retains_in_use_module() {
+        let mut cache = GlobalModuleCache::new(1);
+
+        let in_use = cache.insert(k(1), module());
+        // Force eviction of k(1) by inserting past the cap of 1.
+        cache.insert(k(2), module());
+        assert!(cache.get(&k(1)).is_none(), "k(1) evicted from the map");
+
+        // The caller's clone is still a usable handle — the module was NOT
+        // unloaded by the eviction (the Arc clone the caller holds keeps the
+        // inner alive). We can clone it again without panic / use-after-free.
+        let _still_valid = in_use.clone();
+    }
+}
 
 #[cfg(test)]
 mod spec_cache_tests {

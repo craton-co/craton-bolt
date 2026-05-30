@@ -12,7 +12,7 @@ readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
 categories   = ["database", "compilers"]
 rust-version = "1.74"
-exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "continue_prompt.md"]
+exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "continue_prompt.md", "reviews", "reviews/*"]
 
 # --- Workspace shim ---------------------------------------------------------
 #
@@ -63,8 +63,8 @@ log = "0.4"
 # choice). See `src/observability.rs` for the span-name catalogue.
 tracing = "0.1"
 # cudarc: optional pure-Rust CUDA Driver API binding. Gated on the
-# `cudarc` feature. See docs/CUDARC_ADOPTION.md for the migration plan.
-# v0.13 supports CUDA 12.x with stable Rust. Default features off — we
+# `cudarc` feature. v0.13 supports CUDA 12.x with stable Rust. Default
+# features off — we
 # only need `driver` for Stage 1.
 cudarc = { version = "0.13", optional = true, default-features = false, features = ["driver", "cuda-12060"] }
 
@@ -98,7 +98,7 @@ cuda-stub = []
 # `cudarc` backend (Stage 1, spike): routes a handful of low-level CUDA
 # driver calls through the `cudarc` crate instead of our hand-rolled
 # `extern "C"` FFI. Not the default yet — turn on with
-# `cargo build --features cudarc` to opt in. See docs/CUDARC_ADOPTION.md.
+# `cargo build --features cudarc` to opt in.
 #
 # When `cudarc` is enabled, the engine uses cudarc's primary context
 # (`CudaDevice::new`) as the ONLY CUDA context — the hand-rolled

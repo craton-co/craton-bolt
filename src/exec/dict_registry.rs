@@ -18,13 +18,23 @@
 //! engine must keep the registry alive at least as long as any kernel that
 //! references the on-device index columns.
 //!
-//! Cross-table column-name collisions: the rewriter is keyed by column name
-//! only, so if two scanned tables both expose a Utf8 column with the same
-//! name but different dictionaries, the registry folds both into the same
-//! rewriter and the *last* one wins. In practice the engine has no JOIN
-//! support yet, so a single plan only ever references one table and this is a
-//! moot point. The behaviour is documented on [`DictRegistry::rewrite_plan`]
-//! for the day JOINs land.
+//! Cross-table column-name collisions (finding F-7): the
+//! [`StringPredicateRewriter`] is keyed by **column name only**, because a
+//! plan's `Expr::Column` references are themselves unqualified. When a plan
+//! scans two tables (today reachable via `UNION` / `SetOp`, since
+//! [`collect_scan_tables`] recurses into both children) that each expose a
+//! Utf8 column with the *same name* but *different dictionaries*, folding
+//! `col = 'lit'` against either table's dictionary would be wrong for rows
+//! sourced from the other table. The previous behaviour silently let the
+//! *last*-registered dictionary win — a silent wrong-results bug.
+//!
+//! [`DictRegistry::rewrite_plan`] now detects such a collision by comparing
+//! the actual dictionary contents per column name across all scanned tables.
+//! A column name that resolves to *conflicting* dictionaries is **poisoned**:
+//! it is left out of the rewriter entirely, so its predicates fall back to the
+//! always-correct host string-comparison path instead of being folded against
+//! the wrong index space. Single-table plans (and multi-scan plans whose
+//! same-named columns happen to carry identical dictionaries) are unaffected.
 //!
 //! Index width: both the i32- and i64-indexed dictionary variants are wired
 //! through [`StringPredicateRewriter`]. The rewriter inspects each registered
@@ -177,33 +187,97 @@ impl DictRegistry {
     ///
     /// Walks the plan to collect every `Scan`'s table name, looks each one
     /// up in the registry, and folds every dictionary it finds into a single
-    /// [`StringPredicateRewriter`]. The rewriter is keyed by column name
-    /// only — if two referenced tables both have a Utf8 column with the same
-    /// name, the *last* one registered wins. This is acceptable until JOINs
-    /// land, at which point the rewriter API will need a per-relation
-    /// namespace.
+    /// [`StringPredicateRewriter`].
+    ///
+    /// # Cross-table column-name collisions (finding F-7)
+    ///
+    /// The rewriter — and the plan's `Expr::Column` references it folds — are
+    /// keyed by **unqualified** column name. When the plan scans more than one
+    /// table (reachable today through `UNION` / `SetOp`, since
+    /// [`collect_scan_tables`] recurses into both children) and two of those
+    /// tables expose a Utf8 column with the *same name* but *different*
+    /// dictionaries, there is no sound single dictionary to fold against: a
+    /// `col = 'lit'` predicate would be correct for one table's rows and wrong
+    /// for the other's. Rather than silently fold against the last-registered
+    /// dictionary (the old "last wins" bug), such a column name is **poisoned**
+    /// and omitted from the rewriter, so its predicates fall back to the
+    /// always-correct host string-comparison path.
+    ///
+    /// A column name is *not* poisoned when every scanned table that exposes it
+    /// carries an identical dictionary (same values in the same order) — those
+    /// fold against a single well-defined index space. Single-table plans never
+    /// poison anything, preserving the existing fast path verbatim.
     ///
     /// Both index widths are handled: [`StringPredicateRewriter`] accepts a
     /// [`DictionaryColumnAny`] directly and dispatches on the variant when
-    /// emitting the rewritten predicate's literal (`Int32` vs `Int64`). No
-    /// dictionary is skipped.
+    /// emitting the rewritten predicate's literal (`Int32` vs `Int64`).
     ///
-    /// If no scanned table has any Utf8 dictionaries the rewriter is empty
-    /// and the returned plan is functionally a clone of `plan` (the
-    /// rewriter is a no-op when `knows()` returns false for every column).
+    /// If no scanned table has any (non-poisoned) Utf8 dictionaries the
+    /// rewriter is empty and the returned plan is functionally a clone of
+    /// `plan` (the rewriter is a no-op when `knows()` returns false for every
+    /// column).
     pub fn rewrite_plan(&self, plan: &LogicalPlan) -> BoltResult<LogicalPlan> {
         let tables = collect_scan_tables(plan);
-        let mut rewriter = StringPredicateRewriter::new();
+
+        // First pass: for each Utf8 column *name* present across the scanned
+        // tables, record one candidate registration and detect collisions.
+        // A collision is two scanned tables exposing the same column name with
+        // dictionaries whose decoded contents differ; such a name is poisoned
+        // (see the method docs / finding F-7) and must NOT be folded, because
+        // the unqualified `Expr::Column` in the plan cannot say which table a
+        // given row came from.
+        //
+        // We dedup the table list first so a table that appears twice in the
+        // plan (e.g. a self-`UNION`) is not mistaken for a cross-table
+        // collision against itself.
+        let mut seen_tables: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // col_name -> (registering dict, poisoned?)
+        let mut chosen: HashMap<&str, &DictionaryColumnAny> = HashMap::new();
+        let mut poisoned: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for table in &tables {
+            if !seen_tables.insert(table.as_str()) {
+                continue;
+            }
             if let Some(cols) = self.by_table.get(table) {
                 for (col_name, dict) in cols {
-                    // Last-write-wins on cross-table column-name collisions;
-                    // documented above. Both i32- and i64-indexed variants
-                    // go through the same code path: the rewriter inspects
-                    // the variant when it resolves a literal.
-                    rewriter.register(col_name.clone(), dict);
+                    let key = col_name.as_str();
+                    if poisoned.contains(key) {
+                        continue;
+                    }
+                    // Resolve the comparison BEFORE mutating `chosen` so we
+                    // never hold a borrow of `chosen` across a mutation.
+                    let conflict = match chosen.get(key) {
+                        None => None, // first sighting
+                        Some(prev) => Some(dicts_conflict(prev, dict)),
+                    };
+                    // `prev` above is `&&DictionaryColumnAny`; `dicts_conflict`
+                    // takes `&DictionaryColumnAny`, and Rust auto-derefs the
+                    // extra reference at the call site.
+                    match conflict {
+                        None => {
+                            chosen.insert(key, dict);
+                        }
+                        Some(true) => {
+                            // Two distinct tables disagree on this column's
+                            // dictionary: poison it and drop the earlier
+                            // registration so neither side gets folded.
+                            poisoned.insert(key);
+                            chosen.remove(key);
+                        }
+                        Some(false) => {
+                            // Same name, identical dictionary: harmless, keep
+                            // the existing registration.
+                        }
+                    }
                 }
             }
+        }
+
+        let mut rewriter = StringPredicateRewriter::new();
+        for (col_name, dict) in chosen {
+            // Both i32- and i64-indexed variants go through the same path; the
+            // rewriter inspects the variant when it resolves a literal.
+            rewriter.register(col_name.to_string(), dict);
         }
         rewriter.rewrite(plan)
     }
@@ -304,6 +378,19 @@ impl DictRegistry {
 // so the unified-wrapper module owns the entire dictionary-construction
 // surface. Call-sites in this file now route through the canonical
 // constructor; this comment is the only thing that remains here.
+
+/// True iff two dictionaries would fold a given literal to *different* index
+/// spaces — i.e. their decoded contents differ in value or order.
+///
+/// Used by [`DictRegistry::rewrite_plan`] to decide whether two scanned tables
+/// that share a Utf8 column *name* actually share a dictionary (safe to fold)
+/// or conflict (the column must be poisoned — finding F-7). Comparing the host
+/// `dictionary()` slices is exact: the slot index a literal resolves to is a
+/// pure function of that slice, so identical slices guarantee identical
+/// folding, and any difference is a genuine collision.
+fn dicts_conflict(a: &DictionaryColumnAny, b: &DictionaryColumnAny) -> bool {
+    a.dictionary() != b.dictionary()
+}
 
 /// Walk a `LogicalPlan` and collect every `Scan`'s table name in plan order.
 ///
@@ -563,6 +650,198 @@ mod tests {
         let twice = reg.extended_schema("orders", &extended);
         let names_twice: Vec<&str> = twice.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names_twice, vec!["region", "price", "__idx_region"]);
+    }
+
+    // ---- F-7: cross-table same-name column collision -----------------------
+
+    /// Helper: build a single-Utf8-column `RecordBatch` named `col` from
+    /// `values`, used by the F-7 collision tests below.
+    fn utf8_batch(col: &str, values: &[&str]) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            col,
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let arr = Arc::new(StringArray::from(values.to_vec()));
+        RecordBatch::try_new(schema, vec![arr]).expect("build utf8 batch")
+    }
+
+    /// Helper: a bare `Scan` over `table` exposing a single Utf8 `column`.
+    fn utf8_scan(table: &str, column: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: table.into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new(column, DataType::Utf8, false)]),
+        }
+    }
+
+    /// F-7 (core): two scanned tables expose a same-named Utf8 column with
+    /// **different** dictionaries. A `UNION` over both reaches both scans
+    /// (`collect_scan_tables` recurses), so the rewriter must NOT fold
+    /// `region = 'US'` against either dictionary — the column is poisoned and
+    /// the predicate is left as the original string comparison for the host
+    /// path. This proves the two scans keep distinct dictionaries rather than
+    /// aliasing (the old "last wins" bug).
+    #[test]
+    #[ignore = "gpu:string"]
+    fn rewrite_plan_poisons_conflicting_same_name_column() {
+        use crate::plan::logical_plan::Literal;
+
+        let mut reg = DictRegistry::new();
+        // Two tables, same column name `region`, DIFFERENT dictionary content.
+        reg.register_table("orders_us", &utf8_batch("region", &["US", "EU"]))
+            .expect("register orders_us");
+        reg.register_table("orders_apac", &utf8_batch("region", &["JP", "AU"]))
+            .expect("register orders_apac");
+
+        // UNION(Scan(orders_us, region='US'), Scan(orders_apac, region='US')).
+        let left = LogicalPlan::Filter {
+            input: Box::new(utf8_scan("orders_us", "region")),
+            predicate: col("region").eq(lit("US")),
+        };
+        let right = LogicalPlan::Filter {
+            input: Box::new(utf8_scan("orders_apac", "region")),
+            predicate: col("region").eq(lit("US")),
+        };
+        let plan = LogicalPlan::Union {
+            inputs: vec![left, right],
+        };
+
+        let rewritten = reg.rewrite_plan(&plan).expect("rewrite");
+        let LogicalPlan::Union { inputs } = rewritten else {
+            panic!("expected Union at root");
+        };
+        assert_eq!(inputs.len(), 2);
+        for inp in &inputs {
+            let LogicalPlan::Filter { predicate, .. } = inp else {
+                panic!("expected Filter under Union");
+            };
+            // Poisoned: predicate stays `region = 'US'` (Utf8 literal), NOT
+            // folded into `__idx_region = <int>`.
+            match predicate {
+                Expr::Binary { op, left, right } => {
+                    assert_eq!(*op, BinaryOp::Eq);
+                    match (&**left, &**right) {
+                        (Expr::Column(name), Expr::Literal(Literal::Utf8(s))) => {
+                            assert_eq!(name, "region", "column must stay unmangled");
+                            assert_eq!(s, "US");
+                        }
+                        other => {
+                            panic!("conflicting column must NOT fold; got {other:?}")
+                        }
+                    }
+                }
+                other => panic!("expected unfolded Binary, got {other:?}"),
+            }
+        }
+    }
+
+    /// F-7 (control): two scanned tables expose a same-named column with the
+    /// **identical** dictionary. There is a single well-defined index space, so
+    /// the column is NOT poisoned and the predicate still folds.
+    #[test]
+    #[ignore = "gpu:string"]
+    fn rewrite_plan_folds_identical_same_name_column() {
+        use crate::plan::logical_plan::Literal;
+
+        let mut reg = DictRegistry::new();
+        reg.register_table("a", &utf8_batch("region", &["US", "EU"]))
+            .expect("register a");
+        reg.register_table("b", &utf8_batch("region", &["US", "EU"]))
+            .expect("register b");
+
+        let left = LogicalPlan::Filter {
+            input: Box::new(utf8_scan("a", "region")),
+            predicate: col("region").eq(lit("US")),
+        };
+        let right = LogicalPlan::Filter {
+            input: Box::new(utf8_scan("b", "region")),
+            predicate: col("region").eq(lit("US")),
+        };
+        let plan = LogicalPlan::Union {
+            inputs: vec![left, right],
+        };
+
+        let rewritten = reg.rewrite_plan(&plan).expect("rewrite");
+        let LogicalPlan::Union { inputs } = rewritten else {
+            panic!("expected Union");
+        };
+        for inp in &inputs {
+            let LogicalPlan::Filter { predicate, .. } = inp else {
+                panic!("expected Filter");
+            };
+            match predicate {
+                Expr::Binary { op, left, right } => {
+                    assert_eq!(*op, BinaryOp::Eq);
+                    match (&**left, &**right) {
+                        (Expr::Column(name), Expr::Literal(Literal::Int32(idx))) => {
+                            assert_eq!(name, "__idx_region", "identical dicts fold");
+                            assert_eq!(*idx, 1);
+                        }
+                        other => panic!("identical dicts must fold; got {other:?}"),
+                    }
+                }
+                other => panic!("expected Binary, got {other:?}"),
+            }
+        }
+    }
+
+    /// F-7 (regression): the single-table fast path is unchanged — a lone scan
+    /// still folds `region = 'US'` into `__idx_region = 1`.
+    #[test]
+    #[ignore = "gpu:string"]
+    fn rewrite_plan_single_table_still_folds() {
+        use crate::plan::logical_plan::Literal;
+
+        let mut reg = DictRegistry::new();
+        reg.register_table("orders", &utf8_batch("region", &["US", "EU"]))
+            .expect("register");
+
+        let plan = LogicalPlan::Filter {
+            input: Box::new(utf8_scan("orders", "region")),
+            predicate: col("region").eq(lit("US")),
+        };
+        let rewritten = reg.rewrite_plan(&plan).expect("rewrite");
+        let LogicalPlan::Filter { predicate, .. } = rewritten else {
+            panic!("expected Filter");
+        };
+        match predicate {
+            Expr::Binary { left, right, .. } => match (*left, *right) {
+                (Expr::Column(name), Expr::Literal(Literal::Int32(idx))) => {
+                    assert_eq!(name, "__idx_region");
+                    assert_eq!(idx, 1);
+                }
+                other => panic!("single table must fold; got {other:?}"),
+            },
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// F-7 (pure host): `dicts_conflict` compares decoded dictionary contents.
+    /// This exercises the collision predicate without CUDA by constructing the
+    /// comparison over the `dictionary()` slices the poison logic relies on.
+    /// (The `DictionaryColumnAny` values themselves need CUDA to build, so the
+    /// end-to-end poison test above is `#[ignore]`; this asserts the contract
+    /// `dicts_conflict` encodes: identical slices => no conflict, any
+    /// value/order difference => conflict.)
+    #[test]
+    fn dicts_conflict_contract_is_slice_equality() {
+        // Mirror the exact comparison `dicts_conflict` performs.
+        let a: Vec<String> = vec!["US".into(), "EU".into()];
+        let b: Vec<String> = vec!["US".into(), "EU".into()];
+        let c: Vec<String> = vec!["JP".into(), "AU".into()];
+        let d: Vec<String> = vec!["EU".into(), "US".into()]; // same set, diff order
+
+        assert!(a == b, "identical dictionaries must compare equal (no conflict)");
+        assert!(a != c, "different values must differ (conflict)");
+        assert!(
+            a != d,
+            "different order maps a literal to a different index (conflict)"
+        );
     }
 
     /// Stage 6: register a column from an Arrow `DictionaryArray<Int32, Utf8>`

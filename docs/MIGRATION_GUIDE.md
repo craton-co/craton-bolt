@@ -318,16 +318,22 @@ engine.register_table("orders", first_batch)?;
 engine.register_batch("orders", second_batch)?;
 engine.register_batch("orders", third_batch)?;
 
-// After (0.6): stream batches in through the builder. The engine
-// consumes the iterator at registration time; downstream queries see
-// the same multi-batch table they would have built up via
-// register_batch calls.
-use craton_bolt::Engine;
+// After (0.6): stream batches in via Engine::register_table_stream.
+// It is an `Engine` method (call it after build()), not an
+// EngineBuilder method. The engine consumes the iterator at
+// registration time; downstream queries see the same multi-batch table
+// they would have built up via register_batch calls.
+//
+// The iterator yields `BoltResult<RecordBatch>` (so a fallible source
+// can propagate errors), and a declared `Schema` is required up front.
+use craton_bolt::{Engine, BoltResult};
+use arrow::record_batch::RecordBatch;
 
-let batches = vec![first_batch, second_batch, third_batch];
-let engine = Engine::builder()
-    .register_table_stream("orders", batches.into_iter())
-    .build()?;
+let mut engine = Engine::new()?;
+let schema = first_batch.schema();
+let batches: Vec<BoltResult<RecordBatch>> =
+    vec![Ok(first_batch), Ok(second_batch), Ok(third_batch)];
+engine.register_table_stream("orders", (*schema).clone(), batches)?;
 ```
 
 The classic `register_table` / `register_batch` pair stays the API

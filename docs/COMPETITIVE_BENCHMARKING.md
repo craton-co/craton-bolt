@@ -29,13 +29,20 @@ that any future numbers should follow.
 Be specific about the contest before you measure. Craton Bolt 0.7.0 is:
 
 - **Single-node** (one process, one GPU).
-- **Single-batch in-memory** (no streaming, no larger-than-VRAM tables, no
-  spill).
-- **JIT-compiled per-query** (no plan cache, no kernel cache beyond PTX).
+- **Multi-batch in-memory** (a table may hold many `RecordBatch`es; the
+  whole table is uploaded eagerly — no larger-than-VRAM tables, no spill,
+  no truly-lazy streaming yet).
+- **JIT-compiled**, but with caching: a plan cache (`plan_cache_stats`),
+  a `KernelSpec`-keyed module cache, and the PTX text cache all skip
+  redundant work on repeated query shapes.
 - **Embedded-style API** (Rust crate; no server, no wire protocol).
 - **SQL surface**: projection, filter, scalar arithmetic, `GROUP BY`,
-  `DISTINCT`, `ORDER BY`, `LIMIT`, `HAVING`, `UNION`, `INNER JOIN ... ON
-  <equi>`. See [`SQL_REFERENCE.md`](./SQL_REFERENCE.md) for the exact list.
+  `DISTINCT`, `ORDER BY`, `LIMIT`, `HAVING`, set ops (`UNION [ALL]` /
+  `EXCEPT` / `INTERSECT`), `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` /
+  `CROSS` joins on equi predicates, non-recursive CTEs, uncorrelated
+  subqueries, and window functions. See
+  [`SQL_REFERENCE.md`](./SQL_REFERENCE.md) for the exact list and the
+  per-feature execution tier.
 
 These constraints determine which comparisons are *fair*. A comparison is fair
 when Craton Bolt and the competitor can both execute the workload natively, with

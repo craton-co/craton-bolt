@@ -114,6 +114,28 @@ pub const DISK_PTX_CACHE_ENV: &str = "BOLT_PTX_CACHE_DIR";
 /// protects across published releases — `CODEGEN_VERSION` is what
 /// protects within a release / between local dev builds.
 ///
+/// # C-1: a Rust-std (toolchain) upgrade is ALSO a key-rotation event
+///
+/// The on-disk key and the V-7 integrity digest are derived from
+/// `std::collections::hash_map::DefaultHasher` (SipHash-1-3), whose byte
+/// output is **not contractually stable across Rust std versions**. The
+/// disk cache is safe today only because the crate version is folded into
+/// the salt and a published release bumps that version — but a *local*
+/// toolchain bump (same crate version) could silently change every key
+/// while still re-deriving the digest with the new hasher, so reads simply
+/// miss rather than mis-route (the body is re-hashed on read with the same
+/// toolchain that wrote nothing yet). Treat a `rustc`/std upgrade as a
+/// codegen-freshness event: bump this constant (or wire the `build.rs`
+/// `BOLT_CODEGEN_FINGERPRINT` below) so the key rotates deterministically
+/// instead of relying on `DefaultHasher`'s undocumented stability.
+///
+/// # History
+///   - v1: initial.
+///   - v2: C-3 — validity-byte addressing switched from signed
+///     `cvt.s64.s32` to unsigned `mul.wide.u32` in `ptx_gen.rs`; this
+///     changes emitted PTX text for validity-carrying kernels, so the
+///     disk key MUST rotate to avoid serving the old (mis-addressing) PTX.
+///
 /// Defense-in-depth: [`codegen_salt`] *additionally* folds in an
 /// optional compile-time codegen fingerprint
 /// ([`CODEGEN_FINGERPRINT`], from `BOLT_CODEGEN_FINGERPRINT`) when a
@@ -121,7 +143,7 @@ pub const DISK_PTX_CACHE_ENV: &str = "BOLT_PTX_CACHE_DIR";
 /// salt automatically on any codegen change, so a forgotten bump of this
 /// constant no longer silently serves stale PTX. Until that env var is
 /// wired up, this constant remains the load-bearing in-release guard.
-pub(crate) const CODEGEN_VERSION: u32 = 1;
+pub(crate) const CODEGEN_VERSION: u32 = 2;
 
 /// Optional build-time codegen fingerprint env var.
 ///

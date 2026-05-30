@@ -173,15 +173,29 @@ impl DictionaryColumnAny {
                     arr.values().data_type()
                 ))
             })?;
-        // Copy values into an owned Vec<String>. Dictionary-level NULLs
-        // (rare; means the dict itself has a null entry) become empty
-        // strings — row-level NULLs are tracked through the keys array.
+        // Copy values into an owned Vec<String>.
+        //
+        // Review finding M6: a dictionary-level NULL entry (the dict *value*
+        // itself is null — distinct from a null *key*) must NOT collide with a
+        // genuine empty-string value. The previous code pushed `String::new()`
+        // (`""`) for both, so a row keyed at a null dict slot decoded to `""`
+        // instead of NULL, and was indistinguishable from a row keyed at a real
+        // `""` entry. We instead remember which dict slots are null
+        // (`null_dict_slot[i]`) and remap any key pointing at such a slot to GPU
+        // index 0 (NULL) below — exactly the convention the null-*key* path
+        // already uses (`indices.push(0)`). The placeholder string we store for
+        // a null slot is never referenced after that remap, so its value is
+        // irrelevant; we keep `String::new()` purely so slot indices stay
+        // aligned with `dict_vals`.
         let mut dictionary: Vec<String> = Vec::with_capacity(dict_vals.len());
+        let mut null_dict_slot: Vec<bool> = Vec::with_capacity(dict_vals.len());
         for i in 0..dict_vals.len() {
             if dict_vals.is_null(i) {
                 dictionary.push(String::new());
+                null_dict_slot.push(true);
             } else {
                 dictionary.push(dict_vals.value(i).to_string());
+                null_dict_slot.push(false);
             }
         }
         // i32 ceiling guard — mirrors `DictionaryColumn::from_string_array`.
@@ -207,6 +221,16 @@ impl DictionaryColumnAny {
                          DictionaryArray invariants forbid negative keys",
                         k, i
                     )));
+                }
+                // Review finding M6: if this key points at a dictionary slot
+                // whose *value* is null, the row is semantically NULL — map it
+                // to GPU index 0, never to the `""` placeholder we stored for
+                // that slot. `k` is a valid 0-based dict index here (Arrow
+                // guarantees keys index into the values array), so the bounds
+                // check is defensive against a malformed array.
+                if (k as usize) < null_dict_slot.len() && null_dict_slot[k as usize] {
+                    indices.push(0);
+                    continue;
                 }
                 // `k + 1` on an Arrow key would overflow when `k == i32::MAX`.
                 // The upstream guard a few lines up rejects dictionaries with

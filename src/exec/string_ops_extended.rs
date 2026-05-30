@@ -30,11 +30,12 @@
 //!
 //! ## v1 caveats
 //!
-//! * Byte-indexed `SUBSTRING` (matches the byte-length convention in
-//!   `string_ops::length`). If the requested byte boundary falls inside a
-//!   multi-byte UTF-8 codepoint we round DOWN to the previous valid char
-//!   boundary; the slice never panics on non-ASCII input. A future
-//!   `SUBSTRING_CHAR` would walk codepoints / graphemes.
+//! * Character-indexed `SUBSTRING` (ANSI SQL / DuckDB semantics): positions are
+//!   1-based Unicode codepoints, never bytes. A multibyte codepoint is never
+//!   split, and characters at positions before the requested `start` are never
+//!   leaked into the result. Matches the character-count convention of
+//!   `string_ops::length` (`LENGTH` counts characters; byte length is
+//!   `OCTET_LENGTH`).
 //! * Two-argument `SUBSTRING(col, start)` ("to the end") is not exposed as a
 //!   separate entry point; pass `length = i32::MAX` instead.
 //! * `CONCAT` is binary here. The variadic case is covered by `CONCAT_WS`
@@ -105,63 +106,64 @@ fn dedup_transformed(transformed: Vec<String>) -> BoltResult<(Vec<String>, Vec<i
 }
 
 // ---------------------------------------------------------------------------
-// SUBSTRING byte-slice helper.
+// SUBSTRING character-slice helper.
 // ---------------------------------------------------------------------------
 
-/// Compute `SUBSTRING(s, start_1based, length)` over BYTES, per the v1
-/// byte-semantics caveat documented at the top of the module.
+/// Compute `SUBSTRING(s, start_1based, length)` over CHARACTERS (Unicode
+/// codepoints), per ANSI SQL / DuckDB semantics.
 ///
-/// Semantics:
+/// `SUBSTRING` is defined over characters, not bytes. The window is the set of
+/// 1-based character positions `[start, start + length)`. We never split a
+/// multibyte codepoint and never leak bytes that precede the requested `start`.
 ///
-/// * `start < 1` clamps to `1` (ANSI SQL).
+/// Semantics (matching DuckDB / Postgres):
+///
+/// * Positions are 1-based characters; `start = 1` is the first character.
+/// * `start < 1` is honoured as a real (out-of-range) position: the window
+///   still ends at character `start + length - 1`, so characters that fall at
+///   positions `< 1` simply don't exist and are not emitted. e.g.
+///   `SUBSTRING('abc', 0, 2)` covers char positions `[0, 2)` → only position
+///   `1` exists → `"a"`; `SUBSTRING('abc', -1, 3)` covers `[-1, 2)` → only
+///   position `1` exists → `"a"`.
 /// * `length < 0` is treated as `0` (empty result).
-/// * `length` saturates: `byte_end = min(byte_start + length, s.len())`.
-/// * If `byte_start >= s.len()`, the result is `""`.
-/// * If `byte_start` or `byte_end` falls inside a multi-byte UTF-8 codepoint,
-///   we round DOWN to the nearest preceding `is_char_boundary`. This means
-///   `SUBSTRING("héllo", 1, 2)` returns `"h"` rather than panicking: byte 2
-///   lands inside the two-byte `é`, so we round the end back to byte 1.
+/// * The window saturates against the string's character count.
 ///
-/// The result is always a valid UTF-8 substring of `s`.
+/// The result is always a valid UTF-8 substring of `s` and never contains any
+/// character whose 1-based position is below `start`.
 fn sql_substring(s: &str, start_1based: i32, length: i32) -> String {
-    // ANSI: start < 1 clamps to 1.
-    let start = start_1based.max(1);
-    // ANSI: negative length is 0. We use an i64 intermediate so length =
-    // i32::MAX ("to end") doesn't wrap when added to byte_start.
-    let length = length.max(0);
-    // Convert to usize-domain math. `start` is now >= 1, so `start - 1 >= 0`.
-    let byte_start_raw = (start - 1) as usize;
-    let byte_end_raw = byte_start_raw.saturating_add(length as usize);
-
-    let s_len = s.len();
-    // Fast exit when the requested slice starts past the end of the string.
-    if byte_start_raw >= s_len {
+    // ANSI: negative length is empty.
+    if length <= 0 {
         return String::new();
     }
-    // Clamp end to string length.
-    let byte_end_clamped = byte_end_raw.min(s_len);
+    // The requested character window is the 1-based position range
+    // [start, start + length). Compute it in i64 so `length = i32::MAX`
+    // ("to end") plus a large start cannot overflow.
+    let win_start = start_1based as i64; // first 1-based position included
+    let win_end = win_start.saturating_add(length as i64); // one past the last
 
-    // Round both endpoints DOWN to char boundaries so the slice is valid UTF-8.
-    // `s_len` is always a valid boundary, but we still apply this generically
-    // for the interior case. `is_char_boundary(0)` is true so the loop
-    // terminates immediately for byte_start = 0.
-    let byte_start = round_down_to_char_boundary(s, byte_start_raw);
-    let byte_end = round_down_to_char_boundary(s, byte_end_clamped);
-
-    // After rounding, byte_end could end up below byte_start (e.g. start
-    // rounded up and end rounded down). Guard against that: return empty
-    // rather than panicking on a reversed slice.
-    if byte_end <= byte_start {
+    // Clamp the window's lower edge to the first real character position (1):
+    // characters at positions < 1 do not exist and must never be emitted.
+    let first_pos = win_start.max(1);
+    if win_end <= first_pos {
+        // Window collapses to empty once positions < 1 are excluded.
         return String::new();
     }
-    s[byte_start..byte_end].to_string()
+
+    // Convert 1-based character positions into 0-based char skip / take counts.
+    // `first_pos >= 1`, so `skip` is non-negative.
+    let skip = (first_pos - 1) as usize;
+    // Number of characters to take = win_end - first_pos (both >= 1-based,
+    // win_end > first_pos guaranteed above).
+    let take = (win_end - first_pos) as usize;
+
+    s.chars().skip(skip).take(take).collect()
 }
 
-/// Per-string `SUBSTRING(s, start, length)` over BYTES — public wrapper around
-/// the internal `sql_substring` helper so the host expression evaluator
-/// (`expr_agg::eval_expr`) can apply SUBSTRING directly to a `Vec<Option<String>>`
-/// column without round-tripping through a `DictionaryColumn`. See module docs
-/// for the byte/UTF-8 boundary semantics.
+/// Per-string `SUBSTRING(s, start, length)` over CHARACTERS — public wrapper
+/// around the internal `sql_substring` helper so the host expression evaluator
+/// (`expr_agg::eval_expr`) can apply SUBSTRING directly to a
+/// `Vec<Option<String>>` column without round-tripping through a
+/// `DictionaryColumn`. See module docs for the character/UTF-8 semantics.
 ///
 /// TODO(string-fn-gpu): the GPU two-pass SUBSTRING producer exists in
 /// `jit::string_kernel` but is not wired into the executor; this host path is
@@ -225,16 +227,6 @@ pub fn trim_str(s: &str, side: TrimSide, chars: Option<&str>) -> String {
             }
         }
     }
-}
-
-/// Round `byte_idx` down to the nearest `is_char_boundary`. `byte_idx` must be
-/// `<= s.len()`; this is the case at every caller.
-fn round_down_to_char_boundary(s: &str, mut byte_idx: usize) -> usize {
-    // s.len() and 0 are always char boundaries, so the loop terminates.
-    while !s.is_char_boundary(byte_idx) {
-        byte_idx -= 1;
-    }
-    byte_idx
 }
 
 // ---------------------------------------------------------------------------
@@ -455,16 +447,16 @@ pub fn concat(
     })
 }
 
-/// `SUBSTRING(col, start, length)` over byte indices.
+/// `SUBSTRING(col, start, length)` over character (codepoint) indices.
 ///
-/// `start` is 1-indexed (SQL semantics); `start < 1` clamps to `1` (ANSI).
-/// `length` is required (no two-arg variant); pass `i32::MAX` for "to the
-/// end". Negative `length` is treated as `0`.
+/// `start` is 1-indexed over characters (SQL semantics). `length` is required
+/// (no two-arg variant); pass `i32::MAX` for "to the end". Negative `length`
+/// is treated as `0`. Characters at positions before `start` are never leaked.
 ///
 /// Returns a new dictionary column with `SUBSTRING` applied to each unique
 /// dictionary entry, then re-deduplicated — substrings of different originals
 /// may coincide ("abc" and "abd" both become "ab"). NULL (index 0) is
-/// preserved as NULL. See module docs for UTF-8 boundary behaviour.
+/// preserved as NULL. See module docs for the character/UTF-8 semantics.
 pub fn substring(
     input: &DictionaryColumn,
     start: i32,
@@ -695,30 +687,57 @@ mod tests {
 
     #[test]
     fn substring_unicode_boundary() {
-        // "héllo" is bytes: 'h' | 0xC3 0xA9 ('é') | 'l' 'l' 'o' -> 6 bytes.
-        // SUBSTRING(1, 2) requests bytes [0..2]. Byte 2 lands INSIDE the
-        // two-byte 'é' codepoint, which is not a char boundary. We round
-        // DOWN to byte 1, so the result is "h" — never panics, never produces
-        // invalid UTF-8.
+        // "héllo" is 5 CHARACTERS: 'h' 'é' 'l' 'l' 'o'. SUBSTRING is character-
+        // indexed (ANSI / DuckDB), so positions count codepoints, not bytes.
         let dict = owned(&["héllo"]);
-        let (new_dict, _remap) = substring_pure(&dict, 1, 2).unwrap();
-        assert_eq!(new_dict, vec!["h"]);
 
-        // SUBSTRING(1, 3) requests bytes [0..3], which IS a char boundary
-        // (right after 'é'), so we get "hé".
+        // SUBSTRING(1, 2) → characters 1..=2 → "hé".
+        let (new_dict, _remap) = substring_pure(&dict, 1, 2).unwrap();
+        assert_eq!(new_dict, vec!["hé"]);
+
+        // SUBSTRING(1, 3) → characters 1..=3 → "hél".
         let (new_dict2, _) = substring_pure(&dict, 1, 3).unwrap();
-        assert_eq!(new_dict2, vec!["hé"]);
+        assert_eq!(new_dict2, vec!["hél"]);
     }
 
     #[test]
-    fn substring_start_clamps_to_one() {
-        // ANSI: start < 1 clamps to 1, so SUBSTRING("abc", 0, 2) = "ab",
-        // SUBSTRING("abc", -5, 2) = "ab".
+    fn substring_multibyte_three_byte_chars() {
+        // "日本語" is three 3-byte characters. Character-indexed SUBSTRING
+        // must treat each codepoint as a single position (byte semantics would
+        // have produced "" here).
+        let dict = owned(&["日本語"]);
+        // SUBSTRING(1, 2) → "日本".
+        let (d1, _) = substring_pure(&dict, 1, 2).unwrap();
+        assert_eq!(d1, vec!["日本"]);
+        // SUBSTRING(2, 2) → "本語".
+        let (d2, _) = substring_pure(&dict, 2, 2).unwrap();
+        assert_eq!(d2, vec!["本語"]);
+        // SUBSTRING(3, 5) saturates to the last character → "語".
+        let (d3, _) = substring_pure(&dict, 3, 5).unwrap();
+        assert_eq!(d3, vec!["語"]);
+    }
+
+    #[test]
+    fn substring_emoji_four_byte_chars() {
+        // 4-byte codepoints must also count as one position each.
+        let dict = owned(&["a😀b😀c"]);
+        // characters: 'a' '😀' 'b' '😀' 'c'. SUBSTRING(2, 3) → "😀b😀".
+        let (d, _) = substring_pure(&dict, 2, 3).unwrap();
+        assert_eq!(d, vec!["😀b😀"]);
+    }
+
+    #[test]
+    fn substring_start_below_one_window_semantics() {
+        // DuckDB / ANSI: the window is [start, start+len) over 1-based char
+        // positions; positions < 1 simply don't exist (they are not emitted,
+        // and they DO consume window length).
         let dict = owned(&["abc"]);
+        // SUBSTRING("abc", 0, 2): positions [0,2) → only 1 → "a".
         let (new_dict_0, _) = substring_pure(&dict, 0, 2).unwrap();
-        assert_eq!(new_dict_0, vec!["ab"]);
+        assert_eq!(new_dict_0, vec!["a"]);
+        // SUBSTRING("abc", -5, 2): positions [-5,-3) → none → "".
         let (new_dict_neg, _) = substring_pure(&dict, -5, 2).unwrap();
-        assert_eq!(new_dict_neg, vec!["ab"]);
+        assert_eq!(new_dict_neg, vec![""]);
     }
 
     #[test]
@@ -880,31 +899,84 @@ mod tests {
     }
 
     #[test]
-    fn sql_substring_unicode_round_down_at_start() {
-        // SUBSTRING("héllo", 2, 4): byte_start = 1 (valid: 'h' boundary),
-        // byte_end = 5 (boundary right after second 'l'). 'é' is two bytes
-        // starting at byte 1, so the slice yields bytes [1..5] = "éll".
-        assert_eq!(sql_substring("héllo", 2, 4), "éll");
+    fn sql_substring_unicode_character_indexed() {
+        // SUBSTRING("héllo", 2, 4): characters 2..=5 → 'é' 'l' 'l' 'o' → "éllo".
+        assert_eq!(sql_substring("héllo", 2, 4), "éllo");
 
-        // SUBSTRING("héllo", 3, 2): byte_start_raw = 2 — INSIDE the two-byte
-        // 'é'. We round down to byte 1. byte_end_raw = 4, which IS a char
-        // boundary (right before the second 'l'). After rounding, start = 1,
-        // end = 4 -> bytes [é, l] -> "él". (Documented behaviour: rounding
-        // down can recover bytes left of the requested start.)
-        assert_eq!(sql_substring("héllo", 3, 2), "él");
+        // SUBSTRING("héllo", 3, 2): characters 3..=4 → 'l' 'l' → "ll".
+        // The character at position 2 ('é') must NEVER appear — a character at
+        // a position left of `start` may not leak into the result.
+        assert_eq!(sql_substring("héllo", 3, 2), "ll");
+    }
+
+    #[test]
+    fn sql_substring_no_left_of_start_leak() {
+        // Regression for F-1: the byte-rounding model could pull a character
+        // that begins before the requested start into the result. With
+        // character indexing, the result must never contain any character at a
+        // 1-based position below `start`.
+        //
+        // "héllo": positions 1='h', 2='é', 3='l', 4='l', 5='o'.
+        // For every (start, len), the result chars must equal the slice of the
+        // full char vector at positions [start, start+len) intersected with the
+        // valid 1..=5 range — in particular nothing left of `start`.
+        let chars: Vec<char> = "héllo".chars().collect();
+        for start in 1..=6i32 {
+            for len in 0..=6i32 {
+                let got = sql_substring("héllo", start, len);
+                let got_chars: Vec<char> = got.chars().collect();
+                // Build the expected window directly from char positions.
+                let mut expected: Vec<char> = Vec::new();
+                if len > 0 {
+                    let lo = start.max(1);
+                    let hi = (start as i64 + len as i64).min(chars.len() as i64 + 1);
+                    for pos in lo as i64..hi {
+                        if pos >= 1 && (pos as usize) <= chars.len() {
+                            expected.push(chars[(pos - 1) as usize]);
+                        }
+                    }
+                }
+                assert_eq!(
+                    got_chars, expected,
+                    "SUBSTRING(\"héllo\", {start}, {len}) leaked or dropped chars"
+                );
+                // Explicitly: 'é' (position 2) must not appear when start > 2.
+                if start > 2 {
+                    assert!(
+                        !got.contains('é'),
+                        "left-of-start leak: 'é' in SUBSTRING(\"héllo\", {start}, {len})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn sql_substring_handles_i32_max_length() {
-        // i32::MAX as usize is huge but never wraps because we add it via
-        // saturating_add and clamp to s.len().
+        // i32::MAX is huge but never overflows because the window math is done
+        // in i64 and char-take saturates at the string's character count.
         assert_eq!(sql_substring("abc", 1, i32::MAX), "abc");
+        // "to end" idiom over multibyte input.
+        assert_eq!(sql_substring("héllo", 2, i32::MAX), "éllo");
+    }
+
+    #[test]
+    fn sql_substring_start_below_one_excludes_phantom_positions() {
+        // DuckDB: SUBSTRING('abc', 0, 2) covers positions [0,2) → only 1 exists.
+        assert_eq!(sql_substring("abc", 0, 2), "a");
+        // SUBSTRING('abc', -1, 3) covers positions [-1,2) → only 1 exists.
+        assert_eq!(sql_substring("abc", -1, 3), "a");
+        // SUBSTRING('abc', -1, 5) covers positions [-1,4) → 1,2,3 → "abc".
+        assert_eq!(sql_substring("abc", -1, 5), "abc");
+        // A window entirely left of position 1 yields "".
+        assert_eq!(sql_substring("abc", -5, 3), "");
     }
 
     #[test]
     fn substring_str_public_wrapper_matches_internal() {
         assert_eq!(substring_str("hello", 2, 3), "ell");
-        assert_eq!(substring_str("héllo", 1, 3), "hé");
+        // Character-indexed: characters 1..=3 of "héllo" are 'h' 'é' 'l'.
+        assert_eq!(substring_str("héllo", 1, 3), "hél");
     }
 
     // ----- TRIM ----------------------------------------------------------

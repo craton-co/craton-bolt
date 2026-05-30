@@ -7,8 +7,8 @@
 //!
 //! `LENGTH` on a dictionary-encoded `Utf8` column needs no variable-width
 //! device writes. Each row already stores an `i32` dictionary key on the
-//! device; the per-row byte length is a pure gather of a precomputed
-//! per-dictionary-entry length table:
+//! device; the per-row length is a pure gather of a precomputed
+//! per-dictionary-entry length table (character counts for SQL `LENGTH`):
 //!
 //! ```text
 //! out[row] = length_table[keys[row]]
@@ -16,9 +16,10 @@
 //!
 //! The kernel is [`crate::jit::string_kernel::compile_length_gather_kernel`]
 //! (fixed-width `Int32` output, no offset bookkeeping). This module owns the
-//! host-side plumbing: building the length table that matches the device key
-//! layout, launching the gather, downloading the `Int32` result, and widening
-//! it to the `Int64` the SQL `LENGTH` contract declares.
+//! host-side plumbing: building the (character-count) length table that matches
+//! the device key layout, launching the gather, downloading the `Int32`
+//! result, and widening it to the `Int64` the SQL `LENGTH` contract declares.
+//! Byte length (`OCTET_LENGTH`) is available via [`build_octet_length_table`].
 //!
 //! ## Layout-aware length tables
 //!
@@ -54,36 +55,62 @@ use crate::exec::gpu_table::GpuColumnData;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyLayout {
     /// Engine-managed `Utf8` layout: 1-based keys, slot `0` is the NULL
-    /// sentinel. Length table is `[0, len(d[0]), len(d[1]), ...]`.
+    /// sentinel. Length table is `[0, chars(d[0]), chars(d[1]), ...]`.
     OneBasedNullSlot0,
     /// Native `DictUtf8` layout: 0-based keys into `dict` (no NULL offset).
-    /// Length table is `[len(d[0]), len(d[1]), ...]`.
+    /// Length table is `[chars(d[0]), chars(d[1]), ...]`.
     ZeroBased,
 }
 
-/// Build the per-dictionary-entry `i32` byte-length table the gather kernel
-/// indexes by device key.
+/// Build the per-dictionary-entry `i32` CHARACTER-length table the gather
+/// kernel indexes by device key — SQL `LENGTH` / `CHAR_LENGTH` semantics.
+///
+/// SQL `LENGTH` counts characters (Unicode codepoints), not bytes:
+/// `LENGTH('héllo') = 5`. The gather kernel just reads whatever per-entry value
+/// this table holds, so emitting the character count here makes the GPU LENGTH
+/// path character-correct without any kernel change. Byte length
+/// (`OCTET_LENGTH`) is available via [`build_octet_length_table`].
 ///
 /// For [`KeyLayout::OneBasedNullSlot0`] the table is
-/// `[0, len(d[0]), len(d[1]), ...]` (slot `0` = NULL sentinel = `0` bytes,
-/// matching [`crate::exec::string_ops::length`]). For [`KeyLayout::ZeroBased`]
-/// the table is `[len(d[0]), len(d[1]), ...]` — one slot per dictionary entry,
-/// no NULL offset.
+/// `[0, chars(d[0]), chars(d[1]), ...]` (slot `0` = NULL sentinel, matching
+/// [`crate::exec::string_ops::length`]). For [`KeyLayout::ZeroBased`] the table
+/// is `[chars(d[0]), chars(d[1]), ...]` — one slot per dictionary entry, no
+/// NULL offset.
 ///
-/// Errors if any single string's byte length exceeds `i32::MAX` (an absurd 2
-/// GiB value) — the gather kernel emits `Int32` lengths.
+/// Errors if any single string's character count exceeds `i32::MAX` — the
+/// gather kernel emits `Int32` lengths.
 pub fn build_length_table(dict: &[String], layout: KeyLayout) -> BoltResult<Vec<i32>> {
+    build_length_table_with(dict, layout, |s| s.chars().count(), "LENGTH", "characters")
+}
+
+/// Build the per-dictionary-entry `i32` BYTE-length table (`OCTET_LENGTH`).
+///
+/// Same layout rules as [`build_length_table`] but each slot holds the UTF-8
+/// byte length (`s.len()`) rather than the character count. Kept available for
+/// any path that needs Arrow `Utf8` byte length.
+pub fn build_octet_length_table(dict: &[String], layout: KeyLayout) -> BoltResult<Vec<i32>> {
+    build_length_table_with(dict, layout, |s| s.len(), "OCTET_LENGTH", "bytes")
+}
+
+/// Shared builder for the length tables. `measure` extracts the per-entry
+/// length; `op` / `unit` only phrase the overflow error.
+fn build_length_table_with(
+    dict: &[String],
+    layout: KeyLayout,
+    measure: impl Fn(&str) -> usize,
+    op: &str,
+    unit: &str,
+) -> BoltResult<Vec<i32>> {
     let extra = matches!(layout, KeyLayout::OneBasedNullSlot0) as usize;
     let mut table: Vec<i32> = Vec::with_capacity(dict.len() + extra);
     if extra == 1 {
         table.push(0); // NULL slot
     }
     for s in dict {
-        let len = s.len();
+        let len = measure(s);
         if len > i32::MAX as usize {
             return Err(BoltError::Other(format!(
-                "LENGTH: string of {} bytes exceeds i32::MAX",
-                len
+                "{op}: string of {len} {unit} exceeds i32::MAX"
             )));
         }
         table.push(len as i32);
@@ -167,16 +194,31 @@ mod tests {
     }
 
     #[test]
-    fn byte_length_not_char_length() {
-        // "é" is two UTF-8 bytes (one character): byte semantics → 2.
-        let dict = owned(&["é"]);
+    fn length_table_counts_characters_not_bytes() {
+        // SQL LENGTH counts characters: "héllo" is 5 chars (6 bytes), "日本語"
+        // is 3 chars (9 bytes). The character table reports 5 / 3.
+        let dict = owned(&["héllo", "日本語"]);
         assert_eq!(
             build_length_table(&dict, KeyLayout::ZeroBased).unwrap(),
-            vec![2]
+            vec![5, 3]
         );
         assert_eq!(
             build_length_table(&dict, KeyLayout::OneBasedNullSlot0).unwrap(),
-            vec![0, 2]
+            vec![0, 5, 3]
+        );
+    }
+
+    #[test]
+    fn octet_length_table_counts_bytes() {
+        // OCTET_LENGTH keeps byte semantics: "é"=2, "héllo"=6, "日本語"=9.
+        let dict = owned(&["é", "héllo", "日本語"]);
+        assert_eq!(
+            build_octet_length_table(&dict, KeyLayout::ZeroBased).unwrap(),
+            vec![2, 6, 9]
+        );
+        assert_eq!(
+            build_octet_length_table(&dict, KeyLayout::OneBasedNullSlot0).unwrap(),
+            vec![0, 2, 6, 9]
         );
     }
 

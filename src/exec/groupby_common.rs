@@ -193,8 +193,9 @@ pub(crate) enum KeyValue {
 /// NULL slots will form a fake group.
 ///
 /// Review C12: `-0.0` is canonicalised to `+0.0` (see [`canonicalise_f32`] /
-/// [`canonicalise_f64`]) so signed-zero pairs hash into one group; NaN bit
-/// patterns are preserved verbatim.
+/// [`canonicalise_f64`]) so signed-zero pairs hash into one group. F3: every
+/// NaN bit pattern is also folded to a single canonical quiet NaN so all NaN
+/// keys collapse into one group, matching DuckDB.
 ///
 /// dedup (groupby_common): consolidated from `groupby.rs` / `groupby_valid.rs`
 /// (the two copies were byte-identical apart from doc wording).
@@ -246,7 +247,8 @@ pub(crate) fn load_key_column_bits(
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Float32"))?;
             // Review C12: canonicalise -0.0 -> +0.0 so signed-zero pairs hash
-            // into one group. NaN bit patterns preserved (x == 0.0 is false for NaN).
+            // into one group. F3: all NaN payloads fold to one canonical quiet
+            // NaN so NaN keys collapse into a single group (DuckDB semantics).
             pa.values()
                 .iter()
                 .map(|&v| canonicalise_f32(v).to_bits() as u64)
@@ -273,18 +275,32 @@ pub(crate) fn load_key_column_bits(
     Ok((bits, null_mask))
 }
 
-/// Canonicalise `-0.0` to `+0.0` so that signed-zero pairs key the same
-/// group. Preserves every other bit pattern, including NaN payloads
-/// (`x == 0.0` is `false` for any NaN). Identical to the host-side
-/// canonicalisation in `distinct::canonicalise_f64` and `join::extract_key`
-/// — all those operators must agree on the float equivalence relation
-/// (review C12).
+/// Canonicalise a float GROUP BY / DISTINCT key so that values which SQL
+/// (DuckDB) treats as equal hash into one group:
+///
+/// * `-0.0` is folded to `+0.0` so signed-zero pairs key the same group
+///   (review C12).
+/// * Every NaN bit pattern (any payload, quiet or signalling, either sign)
+///   is folded to the single canonical quiet NaN (`f64::NAN`). This matches
+///   DuckDB, which treats all NaN as one GROUP BY / DISTINCT key (F3). Without
+///   this, two NaNs with different payloads — or even the negative-NaN half —
+///   would form distinct groups, diverging from the reference engine.
+///
+/// All float key operators (GROUP BY, DISTINCT, JOIN) must agree on this
+/// equivalence relation. `join::extract_key` carries its own copy; the
+/// `distinct::` / `groupby_wide::` copies are kept in lock-step.
 ///
 /// dedup (groupby_common): consolidated from `groupby.rs` / `groupby_valid.rs`
 /// (the two copies were byte-identical).
 #[inline]
 pub(crate) fn canonicalise_f64(x: f64) -> f64 {
-    if x == 0.0 { 0.0 } else { x }
+    if x.is_nan() {
+        f64::NAN
+    } else if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
 }
 
 /// `f32` analogue of [`canonicalise_f64`].
@@ -292,7 +308,13 @@ pub(crate) fn canonicalise_f64(x: f64) -> f64 {
 /// dedup (groupby_common): consolidated from `groupby.rs` / `groupby_valid.rs`.
 #[inline]
 pub(crate) fn canonicalise_f32(x: f32) -> f32 {
-    if x == 0.0 { 0.0 } else { x }
+    if x.is_nan() {
+        f32::NAN
+    } else if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
 }
 
 /// Encode each group-by column (in `aggregate.group_by` order) into a single

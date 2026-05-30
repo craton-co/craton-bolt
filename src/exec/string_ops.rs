@@ -16,7 +16,9 @@
 //!   launch, no variable-width device writes.
 //!
 //! * **LENGTH** is a per-index lookup over a tiny `lengths_table`. Same
-//!   download → host map → upload-as-`Int32Array` pattern.
+//!   download → host map pattern, returned as an `Int64Array` (the SQL
+//!   `LENGTH → Int64` contract) whose validity bitmap carries SQL `NULL` for
+//!   NULL rows.
 //!
 //! * **input_eq_literal** lifts a `col = 'literal'` predicate that the
 //!   codegen path was unable to fuse: one O(dict) lookup followed by
@@ -31,16 +33,16 @@
 //!   transform later (substring is closed under dictionary remap) but is out
 //!   of scope here.
 //! * No regex.
-//! * `LENGTH(NULL)` returns `0`, NOT SQL `NULL`. Real SQL semantics demand
-//!   `NULL`; surfacing that requires a validity bitmap the surrounding
-//!   pipeline does not yet plumb through. Documented; revisit when null
-//!   tracking lands.
-//! * `LENGTH` is byte length (Arrow `Utf8` semantics), not character count.
-//!   A future `CHAR_LENGTH` would walk graphemes per dictionary entry.
+//! * `LENGTH(NULL)` returns SQL `NULL` (carried on the result `Int64Array`'s
+//!   validity bitmap), distinct from `LENGTH('') = 0`.
+//! * `LENGTH` counts CHARACTERS (Unicode codepoints), matching SQL
+//!   `LENGTH` / `CHAR_LENGTH`: `LENGTH('héllo') = 5`. Byte length (Arrow
+//!   `Utf8` semantics) is available as `OCTET_LENGTH` via
+//!   `octet_lengths_table_pure`.
 
 use std::collections::HashMap;
 
-use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
+use arrow_array::{Array, BooleanArray, Int64Array, StringArray};
 
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::GpuVec;
@@ -117,21 +119,50 @@ fn lower_dict_pure(old_dict: &[String]) -> BoltResult<(Vec<String>, Vec<i32>)> {
     dedup_transformed(transformed)
 }
 
-/// Build the byte-length lookup table for `LENGTH`.
+/// Build the CHARACTER-length lookup table for SQL `LENGTH` / `CHAR_LENGTH`.
 ///
-/// `out[0] = 0` (NULL → 0, per the v1 caveat in the module docs);
-/// `out[k] = old_dict[k - 1].len() as i32` for `k` in `1..=old_dict.len()`.
+/// SQL `LENGTH` counts characters (Unicode codepoints), not bytes — so
+/// `LENGTH('héllo') = 5`, not `6`. Byte length is available separately via
+/// [`octet_lengths_table_pure`] (`OCTET_LENGTH`).
 ///
-/// Errors if any individual string's byte length exceeds `i32::MAX` — which
-/// would also be an absurd 2 GiB single value.
+/// `out[0] = 0` (NULL sentinel slot — see [`length`] for how the NULL row is
+/// surfaced as SQL `NULL` rather than `0`); `out[k] = char_count(old_dict[k-1])`
+/// for `k` in `1..=old_dict.len()`.
+///
+/// Errors if any individual string's character count exceeds `i32::MAX`.
 fn lengths_table_pure(old_dict: &[String]) -> BoltResult<Vec<i32>> {
+    let mut out: Vec<i32> = Vec::with_capacity(old_dict.len() + 1);
+    out.push(0); // NULL slot
+    for s in old_dict {
+        let len = s.chars().count();
+        if len > i32::MAX as usize {
+            return Err(BoltError::Other(format!(
+                "LENGTH: string of {} characters exceeds i32::MAX",
+                len
+            )));
+        }
+        out.push(len as i32);
+    }
+    Ok(out)
+}
+
+/// Build the BYTE-length lookup table for `OCTET_LENGTH`.
+///
+/// Same layout as [`lengths_table_pure`] (slot 0 = NULL sentinel) but each slot
+/// holds the UTF-8 byte length (`s.len()`), not the character count. Kept
+/// available for any path that needs Arrow `Utf8` byte length; SQL `LENGTH`
+/// itself uses the character-count table.
+///
+/// Errors if any individual string's byte length exceeds `i32::MAX` — an absurd
+/// 2 GiB single value.
+fn octet_lengths_table_pure(old_dict: &[String]) -> BoltResult<Vec<i32>> {
     let mut out: Vec<i32> = Vec::with_capacity(old_dict.len() + 1);
     out.push(0); // NULL slot
     for s in old_dict {
         let len = s.len();
         if len > i32::MAX as usize {
             return Err(BoltError::Other(format!(
-                "LENGTH: string of {} bytes exceeds i32::MAX",
+                "OCTET_LENGTH: string of {} bytes exceeds i32::MAX",
                 len
             )));
         }
@@ -165,18 +196,39 @@ pub fn lower(input: &DictionaryColumn) -> BoltResult<DictionaryColumn> {
     remap_and_upload(input, new_dict, &remap)
 }
 
-/// Compute the byte length of each row's string as `Int32`.
+/// Compute the SQL `LENGTH` (character count) of each row's string as `Int64`.
 ///
-/// NULL rows yield `0` (NOT SQL `NULL`); see the module-level caveat. The
-/// returned `Int32Array` has no validity bitmap.
+/// Returns an [`Int64Array`] (the SQL `LENGTH → Int64` type contract). NULL
+/// rows (dictionary index `0`) yield SQL `NULL` — carried on the returned
+/// array's validity bitmap — and are therefore *distinct* from `LENGTH('') = 0`
+/// (a non-NULL empty string at a non-zero index). `LENGTH` counts characters,
+/// not bytes: `LENGTH('héllo') = 5`.
 ///
 /// Cost: one device→host copy of `n_rows` i32s + an O(dict) table build.
-pub fn length(input: &DictionaryColumn) -> BoltResult<Int32Array> {
+pub fn length(input: &DictionaryColumn) -> BoltResult<Int64Array> {
     let table = lengths_table_pure(&input.dictionary)?;
     let indices: Vec<i32> = input.indices.to_vec()?;
+    length_from_indices(&indices, &table, input.dictionary.len())
+}
 
-    let mut lens: Vec<i32> = Vec::with_capacity(indices.len());
-    for &idx in &indices {
+/// Pure-host core of [`length`]: map dictionary `indices` through the
+/// (character-)length `table` into a validity-carrying [`Int64Array`].
+///
+/// Index `0` → SQL `NULL` (validity bit cleared), distinct from `LENGTH('')=0`.
+/// Lives as a free function so the NULL / Int64 / 3VL behaviour is unit-testable
+/// without a CUDA device (constructing a `DictionaryColumn` would upload to the
+/// driver). `dict_len` is only used to phrase the out-of-range error.
+fn length_from_indices(
+    indices: &[i32],
+    table: &[i32],
+    dict_len: usize,
+) -> BoltResult<Int64Array> {
+    // `Option<i64>`: index 0 → NULL (SQL `LENGTH(NULL) = NULL`); otherwise the
+    // character count from the table. Building from `Vec<Option<i64>>` gives the
+    // result array a validity bitmap so a downstream `IS NULL` / `> 0` sees the
+    // correct 3VL.
+    let mut lens: Vec<Option<i64>> = Vec::with_capacity(indices.len());
+    for &idx in indices {
         // A negative or out-of-range index would mean a kernel wrote
         // something the dictionary cannot decode. Mirror the strictness of
         // `DictionaryColumn::to_string_array`.
@@ -186,42 +238,72 @@ pub fn length(input: &DictionaryColumn) -> BoltResult<Int32Array> {
                 idx
             )));
         }
+        if idx == 0 {
+            // NULL row → SQL NULL (not 0).
+            lens.push(None);
+            continue;
+        }
         let pos = idx as usize;
         let len = *table.get(pos).ok_or_else(|| {
             BoltError::Other(format!(
                 "LENGTH: index {} out of range (dictionary size {})",
-                idx,
-                input.dictionary.len()
+                idx, dict_len
             ))
         })?;
-        lens.push(len);
+        lens.push(Some(len as i64));
     }
 
-    Ok(Int32Array::from(lens))
+    Ok(Int64Array::from(lens))
 }
 
 /// Predicate: `col = literal` evaluated host-side on a dictionary column.
 ///
 /// Used by the predicate-rewrite path when the equality could not be pushed
 /// into the fused codegen kernel. Walks the dictionary once for the literal
-/// lookup, then translates indices to bools on the host.
+/// lookup, then translates indices to booleans on the host.
 ///
-/// Returns an all-`false` array if the literal is absent from the dictionary
-/// (which trivially matches no rows) and an all-`false` array of `n_rows`
-/// length even when the input is empty.
+/// SQL three-valued logic: a NULL row (dictionary index `0`) evaluates to SQL
+/// `NULL`, NOT `false` — so the returned [`BooleanArray`] carries a validity
+/// bitmap with NULL at those rows (mirroring [`crate::exec::like::host_like`]).
+/// This keeps `NOT (NULL = 'x')`, `OR`, and projected-boolean compositions
+/// 3VL-correct rather than collapsing NULL to `false`. A non-NULL row is
+/// `true` iff its index equals the literal's, else `false`.
+///
+/// If the literal is absent from the dictionary it matches no non-NULL row, but
+/// NULL rows still evaluate to NULL (so the result is a mix of `false`/`NULL`,
+/// not all-`false`). Returns an `n_rows`-length array even when the input is
+/// empty.
 pub fn input_eq_literal(
     input: &DictionaryColumn,
     literal: &str,
 ) -> BoltResult<BooleanArray> {
-    let n = input.n_rows;
-    match input.index_of(literal) {
-        None => Ok(BooleanArray::from(vec![false; n])),
-        Some(target) => {
-            let indices: Vec<i32> = input.indices.to_vec()?;
-            let bools: Vec<bool> = indices.iter().map(|&i| i == target).collect();
-            Ok(BooleanArray::from(bools))
-        }
-    }
+    let indices: Vec<i32> = input.indices.to_vec()?;
+    // `target` is `None` when the literal is not in the dictionary: no non-NULL
+    // row can equal it, but NULL rows still propagate NULL under 3VL.
+    let target = input.index_of(literal);
+    Ok(eq_literal_from_indices(&indices, target))
+}
+
+/// Pure-host core of [`input_eq_literal`]: map dictionary `indices` to a
+/// 3VL-correct [`BooleanArray`] against the literal's dictionary index `target`
+/// (`None` ⇒ literal absent from the dictionary).
+///
+/// Index `0` (NULL row) → SQL `NULL` (validity cleared), NEVER `false`. A
+/// non-NULL row is `true` iff its index equals `target`. Free function so the
+/// 3VL behaviour is unit-testable without a CUDA device.
+fn eq_literal_from_indices(indices: &[i32], target: Option<i32>) -> BooleanArray {
+    let vals: Vec<Option<bool>> = indices
+        .iter()
+        .map(|&i| {
+            if i == 0 {
+                // NULL row → SQL NULL (3VL), never false.
+                None
+            } else {
+                Some(Some(i) == target)
+            }
+        })
+        .collect();
+    BooleanArray::from(vals)
 }
 
 // ---------------------------------------------------------------------------
@@ -425,12 +507,21 @@ mod tests {
     }
 
     #[test]
-    fn lengths_table_byte_not_char() {
-        // "é" is two bytes in UTF-8 but one character. We document byte
-        // semantics, so the length is 2.
-        let old = owned(&["é"]);
+    fn lengths_table_counts_characters_not_bytes() {
+        // SQL LENGTH counts characters: "é" is one character (two UTF-8 bytes),
+        // "héllo" is five characters (six bytes), "日本語" is three characters
+        // (nine bytes). The character table must report 1 / 5 / 3.
+        let old = owned(&["é", "héllo", "日本語"]);
         let table = lengths_table_pure(&old).unwrap();
-        assert_eq!(table, vec![0, 2]);
+        assert_eq!(table, vec![0, 1, 5, 3]);
+    }
+
+    #[test]
+    fn octet_lengths_table_counts_bytes() {
+        // OCTET_LENGTH keeps the byte semantics: "é"=2, "héllo"=6, "日本語"=9.
+        let old = owned(&["é", "héllo", "日本語"]);
+        let table = octet_lengths_table_pure(&old).unwrap();
+        assert_eq!(table, vec![0, 2, 6, 9]);
     }
 
     #[test]
@@ -485,6 +576,78 @@ mod tests {
             BoltError::Other(msg) => assert!(msg.contains("row count mismatch")),
             _ => panic!("expected Other(row count mismatch), got {:?}", err),
         }
+    }
+
+    // ----- LENGTH: NULL / Int64 / character semantics --------------------
+
+    #[test]
+    fn length_returns_int64_array() {
+        // F-8: SQL LENGTH is Int64. The result array's dtype must be Int64.
+        let table = lengths_table_pure(&owned(&["a", "bb"])).unwrap();
+        let out = length_from_indices(&[1, 2, 1], &table, 2).unwrap();
+        assert_eq!(out.data_type(), &arrow_schema::DataType::Int64);
+        let got: Vec<i64> = (0..out.len()).map(|i| out.value(i)).collect();
+        assert_eq!(got, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn length_of_null_is_sql_null_not_zero() {
+        // F-3: LENGTH(NULL) must be SQL NULL, distinct from LENGTH('') = 0.
+        // dict = ["", "x"]; index 0 = NULL, index 1 = "", index 2 = "x".
+        let table = lengths_table_pure(&owned(&["", "x"])).unwrap();
+        // rows: NULL, "", "x".
+        let out = length_from_indices(&[0, 1, 2], &table, 2).unwrap();
+        assert!(out.is_null(0), "LENGTH(NULL) must be NULL");
+        // The empty string is non-NULL with length 0 — distinguishable from NULL.
+        assert!(!out.is_null(1));
+        assert_eq!(out.value(1), 0);
+        assert!(!out.is_null(2));
+        assert_eq!(out.value(2), 1);
+        assert_eq!(out.null_count(), 1);
+    }
+
+    #[test]
+    fn length_counts_characters() {
+        // F-2: LENGTH('héllo') = 5 characters (not 6 bytes).
+        let table = lengths_table_pure(&owned(&["héllo"])).unwrap();
+        let out = length_from_indices(&[1], &table, 1).unwrap();
+        assert_eq!(out.value(0), 5);
+    }
+
+    #[test]
+    fn length_rejects_negative_index() {
+        let table = lengths_table_pure(&owned(&["a"])).unwrap();
+        let err = length_from_indices(&[1, -1], &table, 1).unwrap_err();
+        match err {
+            BoltError::Other(msg) => assert!(msg.contains("negative")),
+            _ => panic!("expected Other(negative), got {:?}", err),
+        }
+    }
+
+    // ----- input_eq_literal: 3VL ----------------------------------------
+
+    #[test]
+    fn eq_literal_null_row_is_sql_null() {
+        // F-5: a NULL row (index 0) must evaluate to SQL NULL under `= 'lit'`,
+        // not false. dict literal lives at index 1; rows: NULL, "lit", other.
+        let arr = eq_literal_from_indices(&[0, 1, 2], Some(1));
+        assert!(arr.is_null(0), "NULL = 'lit' must be NULL, not false");
+        assert!(!arr.is_null(1));
+        assert!(arr.value(1), "match → true");
+        assert!(!arr.is_null(2));
+        assert!(!arr.value(2), "non-match → false");
+    }
+
+    #[test]
+    fn eq_literal_absent_literal_still_nulls_null_rows() {
+        // Literal not in the dictionary (target None): no non-NULL row matches,
+        // but NULL rows must still be NULL (not collapsed to all-false).
+        let arr = eq_literal_from_indices(&[0, 1, 2], None);
+        assert!(arr.is_null(0));
+        assert!(!arr.is_null(1));
+        assert!(!arr.value(1));
+        assert!(!arr.is_null(2));
+        assert!(!arr.value(2));
     }
 
     #[test]

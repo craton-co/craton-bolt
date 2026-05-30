@@ -976,23 +976,37 @@ fn alloc_gathered(dtype: DataType, len: usize) -> BoltResult<GatheredCol> {
                 "gpu_compact: gather Utf8 not supported (variable-width)".into(),
             ))
         }
+        // F11 fallback-gap fix: Decimal128 gather is not yet lowered to the
+        // GPU. Previously this was a hard `BoltError::Plan` that propagated up
+        // through `compact_columns_on_gpu` → `execute_projection` and failed
+        // the whole query. We now decline with the typed `BoltError::GpuCapacity`
+        // marker — the same "GPU path declined, retry on host" signal the join
+        // gates use (`gpu_join.rs`) — so a filter+project over a Decimal128
+        // column routes to the host executor (which handles it correctly)
+        // rather than erroring. The supported gather dtypes above are unchanged.
         DataType::Decimal128(_, _) => {
-            return Err(BoltError::Plan(
-                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+            return Err(BoltError::GpuCapacity(
+                "GPU gather of Decimal128 not yet supported; decline to host"
+                    .into(),
             ))
         }
         // v0.7: Date32 / Timestamp arithmetic (subtraction) is wired in the
         // mainline projection codegen, but the gather/compact download path
         // here still emits the underlying Int32 / Int64 Arrow array — there
-        // is no Date32Array / TimestampArray reconstruction yet. Reject at
-        // the compaction boundary so a filter+project over a temporal
-        // column lands on the host executor path (which handles the
-        // dtype round-trip correctly) rather than silently downgrading
-        // to plain integers.
+        // is no Date32Array / TimestampArray reconstruction yet. Decline at
+        // the compaction boundary so a filter+project over a temporal column
+        // lands on the host executor path (which handles the dtype round-trip
+        // correctly) rather than silently downgrading to plain integers.
+        //
+        // F11 fallback-gap fix: emit the typed `BoltError::GpuCapacity` decline
+        // marker (mirroring the join gates and the Decimal128 arm above) rather
+        // than an opaque `BoltError::Other`, so the orchestrator routes this to
+        // its host fallback with the same type-safe pattern-match it uses for
+        // the GPU join overshoot path.
         DataType::Date32 | DataType::Timestamp(_, _) => {
-            return Err(BoltError::Other(
-                "Date/Timestamp not yet lowered through GPU gather; \
-                 filter+project over temporal columns falls back to the host executor"
+            return Err(BoltError::GpuCapacity(
+                "GPU gather of Date/Timestamp not yet supported; decline to \
+                 host (host executor handles the temporal dtype round-trip)"
                     .into(),
             ))
         }
@@ -1160,6 +1174,34 @@ mod tests {
         match alloc_gathered(DataType::Utf8, 1) {
             Ok(_) => panic!("utf8 should not be supported"),
             Err(e) => assert!(format!("{}", e).contains("Utf8")),
+        }
+    }
+
+    /// F11 fallback-gap fix: an unsupported-for-gather dtype must decline with
+    /// the typed `BoltError::GpuCapacity` "retry on host" marker (NOT a hard
+    /// `BoltError::Plan` / `BoltError::Other`), so the orchestrator routes a
+    /// filter+project over a Decimal128 / temporal column to the host executor
+    /// instead of failing the query. This is the same decline signal the GPU
+    /// join gates emit.
+    ///
+    /// Pure-host: the error returns *before* any device allocation, so this
+    /// runs without a GPU (no `#[ignore]`).
+    #[test]
+    fn alloc_gathered_declines_unsupported_dtypes_to_host() {
+        use crate::plan::logical_plan::TimeUnit;
+        for dtype in [
+            DataType::Decimal128(38, 10),
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ] {
+            match alloc_gathered(dtype, 1) {
+                Ok(_) => panic!("{dtype:?} gather should decline, not succeed"),
+                Err(BoltError::GpuCapacity(_)) => { /* expected host-fallback signal */ }
+                Err(other) => panic!(
+                    "{dtype:?} must decline with GpuCapacity (host-fallback marker), \
+                     got a different error kind: {other:?}"
+                ),
+            }
         }
     }
 

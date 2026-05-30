@@ -40,6 +40,11 @@ pub type CUgraph = *mut c_void;
 /// Batch 6: opaque executable graph handle (instantiated form of a `CUgraph`,
 /// the thing actually launched on a stream).
 pub type CUgraphExec = *mut c_void;
+/// Opaque CUDA event handle. Recorded on a stream to capture a point in its
+/// execution history; queried (non-blocking) or waited on later. Used by the
+/// event-based deferred-free pool (review finding C1 / P1) to reclaim a freed
+/// block only once every stream that touched it has drained *past* the event.
+pub type CUevent = *mut c_void;
 
 /// `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`: capture mode that scopes its
 /// "did anything race?" detection to operations issued from the calling
@@ -53,6 +58,18 @@ pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: u32 = 2;
 
 /// Driver "no error" sentinel.
 pub const CUDA_SUCCESS: CUresult = 0;
+
+/// `CUDA_ERROR_NOT_READY` (600): returned by `cuEventQuery` when the recorded
+/// work on the event's stream has not yet completed. It is NOT a failure —
+/// it is the "still in flight" answer the deferred-free pool uses to decide
+/// whether to reclaim a block now or defer it. Mirrors the C enum value.
+pub const CUDA_ERROR_NOT_READY: CUresult = 600;
+
+/// `CU_EVENT_DISABLE_TIMING`: create an event with timing data disabled.
+/// Cheaper to record and query than a default (timing-enabled) event, and the
+/// deferred-free pool never measures elapsed time — it only asks "is this
+/// point in the stream reached yet?". Mirrors the C macro.
+pub const CU_EVENT_DISABLE_TIMING: c_uint = 0x02;
 
 /// Sentinel error code returned by every FFI shim when the crate is built with
 /// the `cuda-stub` feature. Chosen well above the real CUDA driver error range
@@ -147,6 +164,15 @@ extern "C" {
     pub fn cuStreamDestroy_v2(stream: CUstream) -> CUresult;
     pub fn cuStreamSynchronize(stream: CUstream) -> CUresult;
     pub fn cuCtxSynchronize() -> CUresult;
+    // Event API — backs the event-based deferred-free pool (review finding
+    // C1 / P1). `cuEventRecord` captures the *exact* point a stream referenced
+    // a freed block; `cuEventQuery` is a non-blocking "has that point been
+    // reached?" probe so the pool can reclaim the block without stalling.
+    pub fn cuEventCreate(event: *mut CUevent, flags: c_uint) -> CUresult;
+    pub fn cuEventRecord(event: CUevent, stream: CUstream) -> CUresult;
+    pub fn cuEventQuery(event: CUevent) -> CUresult;
+    pub fn cuEventSynchronize(event: CUevent) -> CUresult;
+    pub fn cuEventDestroy_v2(event: CUevent) -> CUresult;
     pub fn cuLaunchKernel(
         f: CUfunction,
         grid_dim_x: c_uint, grid_dim_y: c_uint, grid_dim_z: c_uint,
@@ -267,6 +293,15 @@ mod stubs {
     pub unsafe fn cuStreamDestroy_v2(_stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuStreamSynchronize(_stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuCtxSynchronize() -> CUresult { CUDA_ERROR_STUB }
+    // Event API stubs (deferred-free pool). Return the stub sentinel so
+    // `check()` maps them to `BoltError::Other("cuda-stub mode")`; the
+    // deferred-free path treats a failed `cuEventCreate` as "events
+    // unavailable" and falls back to the blanket per-stream sync.
+    pub unsafe fn cuEventCreate(_event: *mut CUevent, _flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuEventRecord(_event: CUevent, _stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuEventQuery(_event: CUevent) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuEventSynchronize(_event: CUevent) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuEventDestroy_v2(_event: CUevent) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuLaunchKernel(
         _f: CUfunction,
         _grid_dim_x: c_uint, _grid_dim_y: c_uint, _grid_dim_z: c_uint,
@@ -615,11 +650,62 @@ pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
 
 /// Free a device allocation previously returned by `mem_alloc`.
 ///
+/// # Context-currency guard (review finding H1)
+///
+/// `cuMemFree_v2` frees `ptr` against whatever CUDA context is *current on
+/// the calling thread*. A `GpuBuffer` is `Send`, so its `Drop` (which routes
+/// here through the pool's `driver_free`) can run on a worker thread that
+/// never bound the owning context — or on a thread with no current context at
+/// all. Freeing then either hits `CUDA_ERROR_INVALID_CONTEXT` (a silent leak)
+/// or, worse, frees a same-valued pointer belonging to a *different* context.
+/// The cudarc backend already self-guards this exact hazard by re-establishing
+/// context currency before `free_sync` (see `cudarc_backend::mem_free`); this
+/// mirrors that instinct for the hand-rolled backend.
+///
+/// Unlike cudarc — which owns a single process-wide primary context it can
+/// always make current — the hand-rolled backend has one `cuCtxCreate_v2`
+/// context *per `Engine`* and `cuda_sys` does not retain a handle to "the"
+/// context here, so we cannot unilaterally re-bind the right one. Instead we
+/// *detect* the unsafe case: if no context is current on this thread we refuse
+/// the free and return an error rather than calling `cuMemFree_v2` against the
+/// wrong / no context. The pool's `driver_free` logs that error; the block
+/// leaks for the (short) remainder of the process rather than corrupting an
+/// unrelated context's allocations. In the normal path the dropping thread is
+/// the engine thread (which has its context current), so the guard is a single
+/// cheap `cuCtxGetCurrent` and the free proceeds exactly as before.
+///
+/// Returns `BoltError::Other` with a descriptive message when no context is
+/// current (so the caller can distinguish "skipped, leaked" from a genuine
+/// `cuMemFree_v2` driver error).
+///
 /// # Safety
 /// Caller must guarantee `ptr` is live, came from `mem_alloc`, is not aliased,
 /// and that no in-flight kernel still references it.
 pub unsafe fn mem_free(ptr: CUdeviceptr) -> BoltResult<()> {
-    check(cuMemFree_v2(ptr))
+    // Guard: a free with no current context would either error (silent leak)
+    // or free against the wrong context. Detect the no-context case and bail
+    // before touching `cuMemFree_v2`. `ctx_get_current` returns `Ok(None)`
+    // when the driver reports no context is bound to this thread.
+    match ctx_get_current() {
+        Ok(Some(_ctx)) => {
+            // A context is current; the common (engine-thread) path. The freed
+            // pointer belongs to that context for any pool-minted block, so the
+            // free is correct.
+            check(cuMemFree_v2(ptr))
+        }
+        Ok(None) => Err(BoltError::Other(
+            "cuda_sys::mem_free: no CUDA context current on this thread; \
+             refusing to free against the wrong/no context (review finding \
+             H1). The block is leaked rather than freed unsafely — drop \
+             GpuBuffers on a context-current thread."
+                .into(),
+        )),
+        Err(e) => {
+            // `cuCtxGetCurrent` itself failed (e.g. cuda-stub build). Surface
+            // the error rather than guessing; the caller logs and leaks.
+            Err(e)
+        }
+    }
 }
 
 /// Copy `count` elements of `T` from host `src` to device `dst`.
@@ -680,6 +766,84 @@ pub unsafe fn memcpy_d2d<T>(dst: CUdeviceptr, src: CUdeviceptr, count: usize) ->
         return Ok(());
     }
     check(cuMemcpyDtoD_v2(dst, src, bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Event API safe wrappers — back the event-based deferred-free pool (review
+// finding C1 / P1). See `buffer.rs` (`GpuBuffer::Drop`) and `mem_pool.rs`
+// (`PENDING_FREES`) for how these compose into the no-premature-reuse
+// invariant. Each wrapper is a thin `check()`-mapped call; the deferred path
+// is robust to any of them failing (it falls back to the blanket per-stream
+// `cuStreamSynchronize`).
+// ---------------------------------------------------------------------------
+
+/// Create a lightweight (timing-disabled) CUDA event.
+///
+/// Returns the opaque `CUevent` handle on success. The deferred-free pool
+/// records one of these on each stream that touched a freed block, then polls
+/// it with [`event_query`] to decide when the block is safe to reclaim.
+pub fn event_create() -> BoltResult<CUevent> {
+    let mut ev: CUevent = std::ptr::null_mut();
+    // SAFETY: `&mut ev` is a valid out-pointer; the driver writes the handle
+    // on success. `CU_EVENT_DISABLE_TIMING` is a valid flag bit.
+    check(unsafe { cuEventCreate(&mut ev, CU_EVENT_DISABLE_TIMING) })?;
+    Ok(ev)
+}
+
+/// Record `event` on `stream`, capturing the point in the stream's execution
+/// history at the moment of the call. A later [`event_query`] reports complete
+/// once the stream has executed past this point.
+///
+/// # Safety
+/// `event` must be a live handle from [`event_create`] and `stream` a valid
+/// stream handle; both must belong to the currently-current context. Neither
+/// is dereferenced here — they are forwarded to the driver.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe fn event_record(event: CUevent, stream: CUstream) -> BoltResult<()> {
+    check(cuEventRecord(event, stream))
+}
+
+/// Non-blocking query of `event`. Returns `Ok(true)` if the recorded work has
+/// completed, `Ok(false)` if it is still in flight (`CUDA_ERROR_NOT_READY`),
+/// or `Err` on any genuine driver error.
+///
+/// This is the probe the deferred-free pool gates reclamation on: a `false`
+/// answer DEFERS the free, it never authorises one — so no recycled address
+/// can alias an in-flight kernel/DMA.
+///
+/// # Safety
+/// `event` must be a live handle from [`event_create`].
+pub unsafe fn event_query(event: CUevent) -> BoltResult<bool> {
+    let rc = cuEventQuery(event);
+    if rc == CUDA_SUCCESS {
+        Ok(true)
+    } else if rc == CUDA_ERROR_NOT_READY {
+        Ok(false)
+    } else {
+        // Map any other code (incl. CUDA_ERROR_STUB) through `check`, which
+        // produces the appropriate typed error.
+        check(rc).map(|()| true)
+    }
+}
+
+/// Block until `event`'s recorded work completes. Used by the deferred-free
+/// pool's shutdown path to fence any still-pending entries before freeing
+/// them, so no block is leaked or freed early at teardown.
+///
+/// # Safety
+/// `event` must be a live handle from [`event_create`].
+pub unsafe fn event_synchronize(event: CUevent) -> BoltResult<()> {
+    check(cuEventSynchronize(event))
+}
+
+/// Destroy a CUDA event. Safe to call once the event's recorded work has
+/// completed (or after [`event_synchronize`]).
+///
+/// # Safety
+/// `event` must be a live handle from [`event_create`] that is not used again
+/// after this call.
+pub unsafe fn event_destroy(event: CUevent) -> BoltResult<()> {
+    check(cuEventDestroy_v2(event))
 }
 
 /// Allocate `bytes` of page-locked (pinned) host memory via `cuMemAllocHost_v2`.

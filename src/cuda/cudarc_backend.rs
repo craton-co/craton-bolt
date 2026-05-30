@@ -213,13 +213,35 @@ pub unsafe fn memcpy_h2d<T>(
     if bytes == 0 {
         return Ok(());
     }
+    // Review finding H4: do NOT synthesise a host `&[u8]` via
+    // `std::slice::from_raw_parts(src, bytes)`. That call requires `src` be
+    // non-null, properly aligned, and valid for `bytes` reads within a single
+    // allocation — invariants the generic caller only promises in its `# Safety`
+    // contract, with no enforcement in release builds. cudarc 0.13's safe
+    // `result::memcpy_htod_sync` *takes a slice*, so the fabricated slice would
+    // hand UB to safe Rust the moment a caller passed a too-short / dangling
+    // `src`, *before* any FFI. Instead we drop one level lower and pass the raw
+    // pointer straight to `cuMemcpyHtoD_v2` through cudarc's dynamically-loaded
+    // `driver::sys::lib()` — exactly what the async paths already do, and what
+    // the hand-rolled `cuda_sys::memcpy_h2d` does. No host slice is constructed,
+    // so the only `unsafe` surface is the FFI itself (whose contract matches the
+    // raw FFI backend bit-for-bit). The non-null `debug_assert` is kept purely as
+    // a developer tripwire; it is no longer load-bearing for soundness.
     debug_assert!(
         !src.is_null(),
         "memcpy_h2d: src is null with non-zero count"
     );
-    let src_bytes = std::slice::from_raw_parts(src as *const u8, bytes);
-    result::memcpy_htod_sync(dst as cudarc::driver::sys::CUdeviceptr, src_bytes)
-        .map_err(|e| cudarc_err("cudarc memcpy_htod_sync", e))
+    // Ensure the primary context is current before any FFI (mirrors the async
+    // paths and the sync free path).
+    let _dev = device_ref()?;
+    cudarc::driver::sys::lib()
+        .cuMemcpyHtoD_v2(
+            dst as cudarc::driver::sys::CUdeviceptr,
+            src as *const core::ffi::c_void,
+            bytes,
+        )
+        .result()
+        .map_err(|e| cudarc_err("cudarc cuMemcpyHtoD_v2", e))
 }
 
 /// Copy `count` elements of `T` from device to host.
@@ -248,13 +270,26 @@ pub unsafe fn memcpy_d2h<T>(
     if bytes == 0 {
         return Ok(());
     }
+    // Review finding H4 (mirror of `memcpy_h2d`): do NOT synthesise a host
+    // `&mut [u8]` via `from_raw_parts_mut(dst, bytes)` from an unchecked caller
+    // pointer — that is UB in release the moment `dst` is too short or dangling,
+    // and `result::memcpy_dtoh_sync`'s slice argument would expose it to safe
+    // Rust before any FFI. Route the raw pointer straight to `cuMemcpyDtoH_v2`
+    // via cudarc's `driver::sys::lib()`, as the async paths and the raw FFI
+    // backend do. No host slice is fabricated.
     debug_assert!(
         !dst.is_null(),
         "memcpy_d2h: dst is null with non-zero count"
     );
-    let dst_bytes = std::slice::from_raw_parts_mut(dst as *mut u8, bytes);
-    result::memcpy_dtoh_sync(dst_bytes, src as cudarc::driver::sys::CUdeviceptr)
-        .map_err(|e| cudarc_err("cudarc memcpy_dtoh_sync", e))
+    let _dev = device_ref()?;
+    cudarc::driver::sys::lib()
+        .cuMemcpyDtoH_v2(
+            dst as *mut core::ffi::c_void,
+            src as cudarc::driver::sys::CUdeviceptr,
+            bytes,
+        )
+        .result()
+        .map_err(|e| cudarc_err("cudarc cuMemcpyDtoH_v2", e))
 }
 
 // ---------------------------------------------------------------------------

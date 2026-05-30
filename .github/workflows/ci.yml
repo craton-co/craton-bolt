@@ -5,6 +5,13 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Weekly scheduled trigger — drives the allow-failure GPU lane below (the
+  # CPU lanes also run, which is harmless). Adjust/remove once a dedicated
+  # GPU runner is wired up. Cron is UTC.
+  schedule:
+    - cron: "0 6 * * 1"
+  # Allow maintainers to kick the GPU lane on demand.
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -214,3 +221,58 @@ jobs:
       # rust-cuda / NVVM build-dep tree is included in the scan.
       - name: cargo deny check (all features)
         run: cargo deny --all-features check advisories licenses bans
+
+  # ===========================================================================
+  # GPU integration lane (STUB / ALLOW-FAILURE — no GPU runner exists yet).
+  # ===========================================================================
+  #
+  # All other jobs in this file run with `--features cuda-stub` and therefore
+  # exercise ZERO real GPU code paths. The `#[ignore]`-gated CUDA integration
+  # tests need an actual NVIDIA GPU (compute capability >= 7.0) plus a CUDA
+  # Toolkit >= 12 on the runner — neither is available on github-hosted
+  # runners.
+  #
+  # This job is a documented placeholder so the wiring is ready the day a GPU
+  # runner is provisioned:
+  #
+  #   1. Register a self-hosted runner on a GPU box with the labels below
+  #      (e.g. `self-hosted, linux, gpu, cuda`).
+  #   2. Replace `runs-on: ubuntu-latest` with the commented `runs-on` block.
+  #   3. Drop `continue-on-error` / `if: false` once the lane is trusted to be
+  #      green, and consider making it a required check on `main`.
+  #
+  # It is INTENTIONALLY:
+  #   * `continue-on-error: true` — never blocks merges while it is a stub, and
+  #   * `if: false`               — does not even attempt to run on github-hosted
+  #                                 runners (which have no GPU), so it stays a
+  #                                 no-op until a maintainer enables it.
+  #
+  # The real command a GPU runner would execute is shown (and kept honest)
+  # below: build the `cudarc` backend and run ONLY the `#[ignore]`d tests.
+  gpu-integration:
+    name: gpu integration (stub, allow-failure)
+    # No GPU runner exists yet, so this never runs in the current setup.
+    # Flip to `true` (or delete) once a GPU runner is registered.
+    if: false
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    # When a self-hosted GPU runner is available, swap the line above for:
+    #   runs-on: [self-hosted, linux, gpu, cuda]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # On a real GPU runner the CUDA Toolkit (>= 12) and a matching driver
+      # must already be installed so `cuda.lib` / `libcuda.so` is on the
+      # linker path. The `cudarc` feature links the real CUDA driver API.
+      - name: cargo test (GPU, ignored)
+        run: |
+          # Build + run ONLY the #[ignore]-gated live-GPU integration tests.
+          # RUSTFLAGS is cleared because the cudarc tree can carry warnings we
+          # do not want to gate the GPU lane on.
+          cargo test --features cudarc --no-default-features -- --ignored
+        env:
+          RUSTFLAGS: ""

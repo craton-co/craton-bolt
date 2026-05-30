@@ -15,6 +15,18 @@ The project's two distinguishing ideas:
 
 **Active development — v0.7.0.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (multi-tier shared-memory + hash-partitioned), joins (`INNER` / `LEFT [OUTER]` / `RIGHT [OUTER]` / `FULL [OUTER]` on GPU when the shape qualifies, host-side hash join otherwise; `CROSS` on GPU or host; plus small-cardinality non-equi joins via a host nested-loop fallback), `DISTINCT`, `ORDER BY` (GPU bitonic sort integrated, plus an env-gated GPU radix path; host `lexsort` fallback), `LIMIT`, `HAVING`, and `UNION [ALL]` are implemented. The scalar surface includes `IN`, `BETWEEN`, `CASE`, `CAST`, `COALESCE` / `NULLIF`, and `LIKE` (numeric/Bool results lower to GPU; `Decimal128` / `Date32` / `Timestamp` parse and partially lower — see [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md)). String predicates (`=`, `!=`, `IN` over dictionary-encoded literals) plus host-callable `UPPER` / `LOWER` / `LENGTH` / `CONCAT` / `SUBSTRING` are available. Production use is **not** recommended — the public API is unstable pre-1.0.
 
+> **CI runs no GPU code.** The CI pipeline builds, tests, lints, and runs
+> `cargo deny` using the `cuda-stub` feature only — it exercises **0 GPU
+> code paths** because no GPU runner exists. The `#[ignore]`-gated CUDA
+> integration tests are dark in CI; GPU correctness is validated separately
+> on developer/maintainer hardware (see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
+> for the verification harness). Treat CI green as "host logic + codegen
+> shape are sound," not "GPU execution is verified."
+
+> **Limitations / not yet production-ready.** See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)
+> for the consolidated list of requirements, pre-1.0 caveats, and known
+> semantic gaps before you depend on Craton Bolt.
+
 See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported subset.
 
 ## What's in the box
@@ -196,8 +208,7 @@ craton-bolt/
 │   ├── BENCHMARKS.md         # measured numbers and methodology
 │   ├── COMPETITIVE_BENCHMARKING.md  # how to run fair comparisons
 │   ├── GROUPBY_PERF.md       # GROUP BY kernel design and analysis
-│   ├── CUDARC_ADOPTION.md    # cudarc migration plan
-│   ├── CUDA_OXIDE_SWEEP.md   # CUDA-Oxide refactor status
+│   ├── LIMITATIONS.md        # requirements, pre-1.0 caveats, known gaps
 │   ├── MIGRATION_GUIDE.md    # upgrading across breaking changes
 │   └── PATH_TO_1.0.md        # detailed 1.0 milestone plan
 ├── src/

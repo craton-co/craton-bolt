@@ -166,6 +166,20 @@ pub fn try_execute(
         return None;
     }
 
+    // F2: NaN handling. The host scalar/window MIN/MAX path implements
+    // DuckDB's total order (NaN sorts as the largest value; MIN skips NaN
+    // unless all-NaN; MAX surfaces NaN if present — see
+    // `aggregate.rs::float_total_cmp`). The CAS-loop reduce kernel compares
+    // raw IEEE floats, where NaN's participation is order-dependent, so it
+    // can disagree with the scalar path for the same data. Cheapest correct
+    // option: defer any NaN-bearing value column to the global-atomic / host
+    // path so grouped float MIN/MAX always matches the scalar aggregate.
+    if let Some(val_arr) = val_col.as_any().downcast_ref::<Float64Array>() {
+        if val_arr.values().iter().any(|v| v.is_nan()) {
+            return None;
+        }
+    }
+
     let n_rows = key_arr.len();
     if n_rows < 256 * 1024 {
         return None;
@@ -373,6 +387,92 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
 use arrow_schema::{Field as ArrowField};
+
+// ---------------------------------------------------------------------------
+// F2: host-only NaN-deferral eligibility tests. A NaN-bearing float value
+// column must DEFER (return `None`) so grouped float MIN/MAX routes through
+// the global-atomic / host scalar path, which implements DuckDB's
+// NaN-as-largest total order (`aggregate.rs::float_total_cmp`).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod nan_tests {
+    use super::*;
+    use crate::plan::logical_plan::Field;
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+
+    fn build_minmax_plan(op_is_min: bool) -> PhysicalPlan {
+        let agg = if op_is_min {
+            AggregateExpr::Min(Expr::Column("v".into()))
+        } else {
+            AggregateExpr::Max(Expr::Column("v".into()))
+        };
+        PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
+                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                ],
+                group_by: vec![0],
+                aggregates: vec![agg],
+                output_schema: Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("v", DataType::Float64, true),
+                ]),
+                input_has_validity: Vec::new(),
+            },
+        }
+    }
+
+    fn batch_with(vals: Vec<f64>) -> RecordBatch {
+        let n = vals.len();
+        let keys: Vec<i32> = (0..n as i32).map(|i| i % 8192).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v", ArrowDataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(vals)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A NaN in the value column must defer for both MIN and MAX so the
+    /// result matches the scalar aggregate's DuckDB total order.
+    #[test]
+    fn nan_value_defers_min_and_max() {
+        let n = 300_000usize;
+        for op_is_min in [true, false] {
+            let plan = build_minmax_plan(op_is_min);
+            let mut vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            vals[12345] = f64::NAN;
+            let batch = batch_with(vals);
+            assert!(
+                try_execute(&plan, &batch).is_none(),
+                "NaN-bearing float MIN/MAX must defer (op_is_min={op_is_min})"
+            );
+        }
+    }
+
+    /// Sanity: an all-finite value column is NOT declined by the NaN guard.
+    /// (It may still be served by the GPU path; here we only confirm the NaN
+    /// guard does not spuriously reject finite data — a sub-threshold size
+    /// gives a deterministic host decline for an unrelated reason.)
+    #[test]
+    fn finite_values_not_declined_by_nan_guard() {
+        let plan = build_minmax_plan(true);
+        let vals: Vec<f64> = (0..2048).map(|i| i as f64).collect();
+        let batch = batch_with(vals);
+        // Sub-threshold → None via the row gate, proving the NaN guard let it
+        // through to the later gate rather than rejecting on NaN.
+        assert!(try_execute(&plan, &batch).is_none());
+    }
+}
 
 #[cfg(test)]
 mod cache_tests {

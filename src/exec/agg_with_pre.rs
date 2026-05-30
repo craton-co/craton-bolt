@@ -447,18 +447,18 @@ fn build_one_aggregate(
             // `fused_avg_host_col` before uploading so the GPU never sees
             // garbage at NULL positions.
             //
-            // TODO(null): empty input -> 0.0 (not SQL NULL), matching the
-            // public AVG return-type contract; see `aggregate.rs` for the
-            // same TODO.
+            // F4: SQL returns NULL for AVG over zero matching rows. When the
+            // output field is nullable we surface that NULL; otherwise we keep
+            // 0.0 (a null in a non-nullable column would be rejected by
+            // RecordBatch::try_new). Mirrors the scalar path in `aggregate.rs`.
             let resolved =
                 resolve_agg_input_col(expr, pre_spec, compacted, DataType::Float64)?;
             let (sum_f64, count_u64) = fused_avg_host_col(resolved.as_ref())?;
-            let avg = if count_u64 == 0 {
-                0.0
-            } else {
-                sum_f64 / count_u64 as f64
-            };
-            scalar_to_array(Scalar::F64(avg), out_field.dtype)
+            Ok(crate::exec::aggregate::avg_result_array(
+                sum_f64,
+                count_u64,
+                out_field.nullable,
+            ))
         }
         AggregateExpr::VarPop(expr) | AggregateExpr::VarSamp(expr) => {
             // v0.5 host-side Welford reduction over the slow-path

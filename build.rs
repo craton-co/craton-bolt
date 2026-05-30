@@ -27,6 +27,14 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
+    // Track whether any CUDA library search path was emitted below. A real
+    // (non-stub) build links against `cuda.lib` / `libcuda.so`; if no lib
+    // directory is discovered, the build will fail at LINK time with an
+    // obscure "cannot find -lcuda" / "unresolved external symbol" error. We
+    // surface a clear, actionable `cargo:warning=` up front so the failure is
+    // self-explanatory and points at the CUDA-less escape hatch.
+    let mut cuda_lib_found = false;
+
     // Check CUDA_PATH environment variable first.
     //
     // V-16: CUDA_PATH is a TRUSTED build-environment input. We use it verbatim
@@ -42,18 +50,21 @@ fn main() {
             let lib_path = path.join("lib").join("x64");
             if lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", lib_path.display());
+                cuda_lib_found = true;
             }
         } else {
             let lib64_path = path.join("lib64");
             let lib_path = path.join("lib");
             if lib64_path.exists() {
                 println!("cargo:rustc-link-search=native={}", lib64_path.display());
+                cuda_lib_found = true;
                 let stubs_path = lib64_path.join("stubs");
                 if stubs_path.exists() {
                     println!("cargo:rustc-link-search=native={}", stubs_path.display());
                 }
             } else if lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", lib_path.display());
+                cuda_lib_found = true;
             }
         }
     } else {
@@ -91,6 +102,7 @@ fn main() {
                         let lib_path = path.join("lib").join("x64");
                         if lib_path.exists() {
                             println!("cargo:rustc-link-search=native={}", lib_path.display());
+                            cuda_lib_found = true;
                             break;
                         }
                     }
@@ -111,9 +123,31 @@ fn main() {
             ] {
                 if std::path::Path::new(path).exists() {
                     println!("cargo:rustc-link-search=native={}", path);
+                    cuda_lib_found = true;
                 }
             }
         }
+    }
+
+    // No CUDA library directory was discovered. This is NOT a stub build
+    // (CARGO_FEATURE_CUDA_STUB was handled and returned above), so the crate
+    // will try to link against the real CUDA driver and fail at the link
+    // stage. Emit a clear, actionable warning rather than letting the build
+    // die later with a cryptic linker error.
+    if !cuda_lib_found {
+        println!(
+            "cargo:warning=craton-bolt: no CUDA library directory found \
+             (checked CUDA_PATH and the standard install locations). This is a \
+             real (non-stub) build, so it WILL FAIL at link time with an \
+             unresolved CUDA driver symbol / \"cannot find -lcuda\" error."
+        );
+        println!(
+            "cargo:warning=craton-bolt: to build WITHOUT a CUDA toolkit \
+             (type-check / docs.rs / CUDA-less CI), use the cuda-stub feature: \
+             `cargo build --no-default-features --features cuda-stub`. To build \
+             the real GPU path, install a CUDA Toolkit >= 12 and set CUDA_PATH \
+             (or place it under the standard install root)."
+        );
     }
 }
 
