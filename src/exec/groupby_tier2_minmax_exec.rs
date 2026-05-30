@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
+use arrow_schema::DataType as ArrowDataType;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -43,7 +43,7 @@ use crate::jit::partition_reduce_kernel_minmax::{
     BLOCK_GROUPS, BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
 use crate::jit::{partition_kernel, scatter_kernel, CudaModule};
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
@@ -125,10 +125,12 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
 }
 
 fn partition_spec_for(n_rows: u32) -> KernelSpec {
-    if n_rows < partition_kernel::SHMEM_STAGING_MIN_ROWS {
-        KernelSpec::Partition
-    } else {
+    // dedup (tier2): threshold test shared via
+    // `groupby_tier2_common::use_shmem_staging_partition`.
+    if crate::exec::groupby_tier2_common::use_shmem_staging_partition(n_rows) {
         KernelSpec::PartitionShmemStaging
+    } else {
+        KernelSpec::Partition
     }
 }
 
@@ -491,17 +493,14 @@ fn run_reduce_phase(
     let host_out_vals: Vec<i32> = pinned_vals.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
 
-    let mut pairs: Vec<(i32, i32)> = Vec::new();
-    for pid in 0..num_partitions as usize {
-        let base = pid * block_groups;
-        for slot in 0..block_groups {
-            let idx = base + slot;
-            if host_out_set[idx] != 0 {
-                pairs.push((host_out_keys[idx], host_out_vals[idx]));
-            }
-        }
-    }
-    pairs.sort_by_key(|(k, _)| *k);
+    // dedup (tier2): shared populated-slot walk + key-sort.
+    let pairs = crate::exec::groupby_tier2_common::collect_populated_slots_sorted::<i32>(
+        &host_out_keys,
+        &host_out_vals,
+        &host_out_set,
+        num_partitions as usize,
+        block_groups,
+    );
     let keys: Vec<i32> = pairs.iter().map(|(k, _)| *k).collect();
     let vals: Vec<i32> = pairs.iter().map(|(_, v)| *v).collect();
 
@@ -509,7 +508,8 @@ fn run_reduce_phase(
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => unreachable!(),
     };
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(
         arrow_schema,
         vec![
@@ -591,17 +591,14 @@ fn run_reduce_phase_i64(
     let host_out_vals: Vec<i64> = pinned_vals.as_slice().to_vec();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
 
-    let mut pairs: Vec<(i32, i64)> = Vec::new();
-    for pid in 0..num_partitions as usize {
-        let base = pid * block_groups;
-        for slot in 0..block_groups {
-            let idx = base + slot;
-            if host_out_set[idx] != 0 {
-                pairs.push((host_out_keys[idx], host_out_vals[idx]));
-            }
-        }
-    }
-    pairs.sort_by_key(|(k, _)| *k);
+    // dedup (tier2): shared populated-slot walk + key-sort.
+    let pairs = crate::exec::groupby_tier2_common::collect_populated_slots_sorted::<i64>(
+        &host_out_keys,
+        &host_out_vals,
+        &host_out_set,
+        num_partitions as usize,
+        block_groups,
+    );
     let keys: Vec<i32> = pairs.iter().map(|(k, _)| *k).collect();
     let vals: Vec<i64> = pairs.iter().map(|(_, v)| *v).collect();
 
@@ -609,7 +606,8 @@ fn run_reduce_phase_i64(
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => unreachable!(),
     };
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(
         arrow_schema,
         vec![
@@ -620,9 +618,6 @@ fn run_reduce_phase_i64(
     .map_err(|e| {
         BoltError::Other(format!("groupby_tier2_minmax_exec(i64): build error: {e}"))
     })
-}
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +635,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 #[cfg(test)]
 mod tests {

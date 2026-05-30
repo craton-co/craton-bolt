@@ -92,11 +92,13 @@ pub fn fold_expr(expr: Expr) -> Expr {
             pattern,
             escape,
             negated,
+            case_insensitive,
         } => Expr::Like {
             expr: Box::new(fold_expr(*expr)),
             pattern,
             escape,
             negated,
+            case_insensitive,
         },
         Expr::Cast { expr, target } => {
             let inner = fold_expr(*expr);

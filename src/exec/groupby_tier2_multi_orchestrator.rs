@@ -130,10 +130,16 @@ pub fn execute_tier2_multi_sum(
     // Step 2. JIT + launch the partition kernel (once — pid depends only on
     // the key column, not on any value column).
     // ----------------------------------------------------------------------
-    let partition_spec_id = if n_rows < partition_kernel::SHMEM_STAGING_MIN_ROWS {
-        "partition_global_atomics"
-    } else {
+    // dedup (tier2): threshold test shared via
+    // `groupby_tier2_common::use_shmem_staging_partition` (same single-key
+    // `partition_kernel::SHMEM_STAGING_MIN_ROWS` comparison as before; only
+    // the resulting cache-key string differs from the enum-returning
+    // executors, so that mapping stays local here).
+    let partition_spec_id = if crate::exec::groupby_tier2_common::use_shmem_staging_partition(n_rows)
+    {
         "partition_shmem_staging"
+    } else {
+        "partition_global_atomics"
     };
     let partition_module = module_cache::get_or_build_module(
         module_path!(),

@@ -43,7 +43,6 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -54,7 +53,7 @@ use crate::jit::{
     partition_kernel, partition_reduce_kernel_count, partition_reduce_kernel_multi,
     scatter_values_by_dest_idx_kernel, scatter_with_dest_idx_kernel, CudaModule,
 };
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
@@ -134,10 +133,12 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
 }
 
 fn partition_spec_for(n_rows: u32) -> KernelSpec {
-    if n_rows < partition_kernel::SHMEM_STAGING_MIN_ROWS {
-        KernelSpec::Partition
-    } else {
+    // dedup (tier2): threshold test shared via
+    // `groupby_tier2_common::use_shmem_staging_partition`.
+    if crate::exec::groupby_tier2_common::use_shmem_staging_partition(n_rows) {
         KernelSpec::PartitionShmemStaging
+    } else {
+        KernelSpec::Partition
     }
 }
 
@@ -557,7 +558,8 @@ fn execute_inner(
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => unreachable!("try_execute guards this"),
     };
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     let mut cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(1 + n_vals);
     cols.push(Arc::new(Int32Array::from(sorted_keys)));
     for v in sorted_avgs {
@@ -568,9 +570,6 @@ fn execute_inner(
             "groupby_tier2_avg_exec: failed to build RecordBatch: {e}"
         ))
     })
-}
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +583,9 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+#[cfg(test)]
+use crate::plan::logical_plan::Schema;
 
 #[cfg(test)]
 mod cache_tests {

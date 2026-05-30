@@ -577,11 +577,13 @@ fn rename_columns(
             pattern,
             escape,
             negated,
+            case_insensitive,
         } => Expr::Like {
             expr: Box::new(rename_columns(expr, map)),
             pattern: pattern.clone(),
             escape: *escape,
             negated: *negated,
+            case_insensitive: *case_insensitive,
         },
         Expr::Cast { expr, target } => Expr::Cast {
             expr: Box::new(rename_columns(expr, map)),

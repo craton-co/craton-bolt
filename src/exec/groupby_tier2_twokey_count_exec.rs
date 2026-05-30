@@ -37,7 +37,6 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema};
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
@@ -48,7 +47,7 @@ use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel_i64, partition_reduce_kernel_count_i64, scatter_kernel_i64, CudaModule,
 };
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
@@ -91,10 +90,13 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
 }
 
 fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
-    if n_rows < partition_kernel_i64::SHMEM_STAGING_MIN_ROWS {
-        KernelSpec::PartitionI64
-    } else {
+    // dedup (tier2): threshold test shared via
+    // `groupby_tier2_common::use_shmem_staging_partition_i64` (same
+    // `partition_kernel_i64::SHMEM_STAGING_MIN_ROWS` comparison as before).
+    if crate::exec::groupby_tier2_common::use_shmem_staging_partition_i64(n_rows) {
         KernelSpec::PartitionI64ShmemStaging
+    } else {
+        KernelSpec::PartitionI64
     }
 }
 
@@ -394,7 +396,8 @@ fn execute_inner(
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => unreachable!("try_execute guards this"),
     };
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(
         arrow_schema,
         vec![
@@ -409,9 +412,6 @@ fn execute_inner(
         ))
     })
 }
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
-}
 
 // ---------------------------------------------------------------------------
 // Host-only eligibility-gate tests for the two-key Tier-2.1 COUNT(*) exec.
@@ -424,7 +424,9 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+#[cfg(test)]
+use crate::plan::logical_plan::Schema;
 
 #[cfg(test)]
 mod tests {

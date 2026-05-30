@@ -636,6 +636,11 @@ pub enum Expr {
         escape: Option<char>,
         /// `true` for `NOT LIKE`, `false` for `LIKE`.
         negated: bool,
+        /// `true` for `ILIKE` (case-insensitive), `false` for plain `LIKE`.
+        /// When set, both the pattern and the input are Unicode
+        /// case-folded (`to_lowercase`) before matching — see
+        /// [`crate::exec::like::PatternMatcher::compile`].
+        case_insensitive: bool,
     },
     /// SQL `CAST(expr AS type)` over primitive (non-Utf8) types.
     ///
@@ -2831,6 +2836,7 @@ mod null_handling_tests {
             pattern: "foo%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         assert_eq!(ok.dtype(&schema).unwrap(), DataType::Bool);
 
@@ -2839,6 +2845,7 @@ mod null_handling_tests {
             pattern: "foo%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let err = bad.dtype(&schema).expect_err("LIKE on Int32 must error");
         let msg = format!("{err}");

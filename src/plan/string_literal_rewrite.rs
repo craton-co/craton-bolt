@@ -599,6 +599,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             pattern,
             escape,
             negated,
+            case_insensitive,
         } => {
             let new_inner = rewrite_expr_with(like_expr, r, depth + 1)?;
 
@@ -620,7 +621,13 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             //     (after peeling any `Alias` wrappers).
             // Anything else falls through to the preserved `Expr::Like` below,
             // which the physical planner routes to the host filter.
-            if !*negated && escape.is_none() {
+            //
+            // `ILIKE` (case_insensitive) is deliberately excluded: the
+            // dictionary precompute uses the case-sensitive
+            // `LiteralResolver::like_match_indices`, so applying it to an
+            // ILIKE would silently produce case-sensitive results. ILIKE
+            // therefore always falls through to the host `Expr::Like` path.
+            if !*negated && escape.is_none() && !*case_insensitive {
                 if let Expr::Column(col_name) = strip_alias(&new_inner) {
                     if r.knows(col_name) {
                         if let Some(indices) =
@@ -638,6 +645,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 pattern: pattern.clone(),
                 escape: *escape,
                 negated: *negated,
+                case_insensitive: *case_insensitive,
             })
         }
         Expr::ScalarFn { kind, args } => {
@@ -1707,6 +1715,7 @@ mod tests {
             pattern: "al%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         let idxs = collect_membership_i32(&out, "__idx_region");
@@ -1722,6 +1731,7 @@ mod tests {
             pattern: "%eta".into(), // suffix: matches "beta"(2) only
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
@@ -1743,6 +1753,7 @@ mod tests {
             pattern: "zzz%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         assert!(
@@ -1761,6 +1772,7 @@ mod tests {
             pattern: "%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         let idxs = collect_membership_i32(&out, "__idx_region");
@@ -1782,6 +1794,7 @@ mod tests {
             pattern: "b%".into(), // matches bob(1), bart(2)
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         // Walk the OR tree collecting Int64 literals.
@@ -1816,14 +1829,16 @@ mod tests {
             pattern: "a%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
-            Expr::Like { expr: inner, pattern, escape, negated } => {
+            Expr::Like { expr: inner, pattern, escape, negated, case_insensitive } => {
                 assert_column(&inner, "name");
                 assert_eq!(pattern, "a%");
                 assert!(escape.is_none());
                 assert!(!negated);
+                assert!(!case_insensitive);
             }
             other => panic!("non-dict LIKE must stay host-side, got {other:?}"),
         }
@@ -1840,6 +1855,7 @@ mod tests {
             pattern: "al%".into(),
             escape: None,
             negated: true,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
@@ -1859,6 +1875,7 @@ mod tests {
             pattern: r"a\%b".into(),
             escape: Some('\\'),
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
@@ -1879,6 +1896,7 @@ mod tests {
             pattern: "al%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
@@ -1913,6 +1931,7 @@ mod tests {
             pattern: "al%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(scan),
@@ -1971,6 +1990,7 @@ mod tests {
             pattern: "ap%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         };
         let out = rewrite_expr_with(&expr, &rw, 0).unwrap();
         let collected = collect_membership_i32(&out, "__idx_fruit");

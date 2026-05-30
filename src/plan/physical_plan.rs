@@ -2649,11 +2649,13 @@ fn substitute_one_depth(
             pattern,
             escape,
             negated,
+            case_insensitive,
         } => Expr::Like {
             expr: Box::new(substitute_one_depth(expr, map, depth + 1)),
             pattern: pattern.clone(),
             escape: *escape,
             negated: *negated,
+            case_insensitive: *case_insensitive,
         },
         Expr::Cast { expr, target } => Expr::Cast {
             expr: Box::new(substitute_one(expr, map)),
@@ -3648,17 +3650,25 @@ fn try_lower_string_like_filter(
     depth: usize,
 ) -> BoltResult<Option<PhysicalPlan>> {
     // Predicate must be a bare LIKE (not inside AND/OR/NOT/...).
-    let (like_expr, pattern, escape, negated) = match peel_aliases(predicate) {
+    let (like_expr, pattern, escape, negated, case_insensitive) = match peel_aliases(predicate) {
         Expr::Like {
             expr,
             pattern,
             escape,
             negated,
-        } => (expr.as_ref(), pattern, *escape, *negated),
+            case_insensitive,
+        } => (expr.as_ref(), pattern, *escape, *negated, *case_insensitive),
         _ => return Ok(None),
     };
     // ESCAPE → host fallback.
     if escape.is_some() {
+        return Ok(None);
+    }
+    // ILIKE (case-insensitive) → host fallback. The GPU `string_like` kernel
+    // matches bytes case-sensitively; routing ILIKE through it would silently
+    // produce case-sensitive results. The host `Expr::Like` path honours
+    // case-insensitivity (see `exec::like::PatternMatcher::compile_ci`).
+    if case_insensitive {
         return Ok(None);
     }
     // Operand must be a bare column.

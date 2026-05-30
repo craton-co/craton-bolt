@@ -29,7 +29,6 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -39,7 +38,7 @@ use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel, partition_reduce_kernel_count, scatter_kernel, CudaModule,
 };
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
@@ -84,10 +83,13 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
 }
 
 fn partition_spec_for(n_rows: u32) -> KernelSpec {
-    if n_rows < partition_kernel::SHMEM_STAGING_MIN_ROWS {
-        KernelSpec::Partition
-    } else {
+    // dedup (tier2): threshold test shared via
+    // `groupby_tier2_common::use_shmem_staging_partition` (same
+    // `partition_kernel::SHMEM_STAGING_MIN_ROWS` comparison as before).
+    if crate::exec::groupby_tier2_common::use_shmem_staging_partition(n_rows) {
         KernelSpec::PartitionShmemStaging
+    } else {
+        KernelSpec::Partition
     }
 }
 
@@ -318,32 +320,30 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
         )));
     }
 
-    let mut pairs: Vec<(i32, i64)> = Vec::new();
-    for pid in 0..num_partitions as usize {
-        let base = pid * block_groups;
-        for slot in 0..block_groups {
-            let idx = base + slot;
-            if host_out_set[idx] == 0 {
-                continue;
-            }
-            let c = host_out_counts[idx];
-            // The output schema for COUNT is Int64 (SQL semantics, the
-            // planner widens it). Cast u64 → i64; in practice the count
-            // is bounded by n_rows which fits in i64 fine for any input
-            // size we care about.
-            pairs.push((host_out_keys[idx], c as i64));
-        }
-    }
-    pairs.sort_by_key(|(k, _)| *k);
+    // dedup (tier2): shared populated-slot walk + key-sort. COUNT downloads a
+    // `u64` value buffer; the output schema is Int64 (SQL semantics, planner-
+    // widened), so we keep the `u64 -> i64` cast at this call site after the
+    // shared selection. In practice the count is bounded by `n_rows`, which
+    // fits in i64 for any input size we care about.
+    let pairs = crate::exec::groupby_tier2_common::collect_populated_slots_sorted::<u64>(
+        &host_out_keys,
+        &host_out_counts,
+        &host_out_set,
+        num_partitions as usize,
+        block_groups,
+    );
 
     let keys_out: Vec<i32> = pairs.iter().map(|(k, _)| *k).collect();
-    let counts_out: Vec<i64> = pairs.iter().map(|(_, c)| *c).collect();
+    let counts_out: Vec<i64> = pairs.iter().map(|(_, c)| *c as i64).collect();
 
     let aggregate = match plan {
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => unreachable!("try_execute guards this"),
     };
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    // dedup (tier2): shared converter in
+    // `groupby_tier2_common::plan_schema_to_arrow_schema`.
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(
         arrow_schema,
         vec![
@@ -357,9 +357,6 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
         ))
     })
 }
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
-}
 
 // ---------------------------------------------------------------------------
 // Host-only eligibility-gate tests for the Tier-2.1 COUNT(*) executor.
@@ -372,7 +369,9 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+#[cfg(test)]
+use crate::plan::logical_plan::Schema;
 
 #[cfg(test)]
 mod tests {

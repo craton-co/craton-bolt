@@ -74,6 +74,14 @@ use crate::jit::string_kernel::LikeMode;
 /// classification for the SAME shapes, so the device result equals the host
 /// `PatternMatcher` result by construction (verified in tests).
 pub fn decompose_like_pattern(pattern: &str, escape: Option<char>) -> Option<(LikeMode, Vec<u8>)> {
+    // NOTE on ILIKE: the GPU matcher compares raw bytes and has no
+    // case-folding, so case-insensitive `ILIKE` is never routed here. The
+    // physical-plan lowering (`try_lower_string_like_filter`) rejects an
+    // `Expr::Like { case_insensitive: true, .. }` before this function is
+    // reached, sending it to the host `exec::like::host_like` /
+    // `PatternMatcher::compile_ci` path. Everything in this module is
+    // therefore the case-sensitive `LIKE` path only.
+    //
     // ESCAPE is out of scope — keep it on the host path.
     if escape.is_some() {
         return None;

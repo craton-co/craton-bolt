@@ -3451,7 +3451,9 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) ->
         } => Ok(contains_aggregate(expr, resolver, depth + 1)?
             || contains_aggregate(low, resolver, depth + 1)?
             || contains_aggregate(high, resolver, depth + 1)?),
-        SqlExpr::Like { expr, .. } => contains_aggregate(expr, resolver, depth + 1),
+        SqlExpr::Like { expr, .. } | SqlExpr::ILike { expr, .. } => {
+            contains_aggregate(expr, resolver, depth + 1)
+        }
         // `CAST(<expr> AS <type>)` is a transparent wrapper — recurse into
         // the inner expression so `HAVING CAST(SUM(v) AS Int64) > 0`
         // is recognised as referencing an aggregate.
@@ -4277,6 +4279,57 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
                 pattern: pattern_str,
                 escape,
                 negated: *negated,
+                case_insensitive: false,
+            })
+        }
+        // `ILIKE` is the case-insensitive form of `LIKE`. sqlparser surfaces
+        // it as a distinct AST node with identical fields; we mirror the
+        // `Like` lowering above verbatim and only flip `case_insensitive`.
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(BoltError::Sql(
+                    "unsupported: ILIKE ANY (...)".into(),
+                ));
+            }
+            let escape: Option<char> = match escape_char.as_deref() {
+                None => None,
+                Some(s) => {
+                    let mut iter = s.chars();
+                    let first = iter.next().ok_or_else(|| {
+                        BoltError::Sql(
+                            "ILIKE ESCAPE clause must be a single character, got an empty string"
+                                .into(),
+                        )
+                    })?;
+                    if iter.next().is_some() {
+                        return Err(BoltError::Sql(format!(
+                            "ILIKE ESCAPE clause must be a single character, got {s:?}"
+                        )));
+                    }
+                    Some(first)
+                }
+            };
+            let pattern_str = match pattern.as_ref() {
+                SqlExpr::Value(Value::SingleQuotedString(s)) => s.clone(),
+                other => {
+                    return Err(BoltError::Sql(format!(
+                        "ILIKE pattern must be a string literal constant, got: {other}"
+                    )));
+                }
+            };
+            let operand = lower_expr(expr, resolver, depth + 1)?;
+            Ok(Expr::Like {
+                expr: Box::new(operand),
+                pattern: pattern_str,
+                escape,
+                negated: *negated,
+                case_insensitive: true,
             })
         }
         SqlExpr::Function(func) => {
@@ -6761,6 +6814,64 @@ mod like_tests {
                 assert_eq!(pattern, "a!%b");
                 assert_eq!(*escape, Some('!'));
                 assert!(*negated, "NOT LIKE ... ESCAPE must set negated=true");
+            }
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    /// `ILIKE` lowers to `Expr::Like` with `case_insensitive = true` while
+    /// keeping the pattern verbatim and `negated = false`.
+    #[test]
+    fn parse_ilike_sets_case_insensitive_flag() {
+        let plan = parse("SELECT s FROM t WHERE s ILIKE 'Foo%'", &s_provider())
+            .expect("ILIKE 'Foo%' must parse");
+        match predicate(&plan) {
+            Expr::Like {
+                pattern,
+                negated,
+                case_insensitive,
+                ..
+            } => {
+                assert_eq!(pattern, "Foo%");
+                assert!(!negated);
+                assert!(*case_insensitive, "ILIKE must set case_insensitive=true");
+            }
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    /// Plain `LIKE` must keep `case_insensitive = false` (regression guard:
+    /// the new flag must not leak into the case-sensitive path).
+    #[test]
+    fn parse_plain_like_is_case_sensitive() {
+        let plan = parse("SELECT s FROM t WHERE s LIKE 'Foo%'", &s_provider())
+            .expect("LIKE 'Foo%' must parse");
+        match predicate(&plan) {
+            Expr::Like {
+                case_insensitive, ..
+            } => assert!(
+                !case_insensitive,
+                "plain LIKE must stay case-sensitive (case_insensitive=false)"
+            ),
+            other => panic!("expected Expr::Like, got {other:?}"),
+        }
+    }
+
+    /// `NOT ILIKE` sets both `negated` and `case_insensitive`.
+    #[test]
+    fn parse_not_ilike_sets_negated_and_case_insensitive() {
+        let plan = parse("SELECT s FROM t WHERE s NOT ILIKE '%bar'", &s_provider())
+            .expect("NOT ILIKE must parse");
+        match predicate(&plan) {
+            Expr::Like {
+                pattern,
+                negated,
+                case_insensitive,
+                ..
+            } => {
+                assert_eq!(pattern, "%bar");
+                assert!(*negated, "NOT ILIKE must set negated=true");
+                assert!(*case_insensitive, "NOT ILIKE must set case_insensitive=true");
             }
             other => panic!("expected Expr::Like, got {other:?}"),
         }

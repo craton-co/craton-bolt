@@ -437,11 +437,13 @@ where
             pattern,
             escape,
             negated,
+            case_insensitive,
         } => Expr::Like {
             expr: Box::new(resolve_expr(*expr, exec)?),
             pattern,
             escape,
             negated,
+            case_insensitive,
         },
         Expr::Cast { expr, target } => Expr::Cast {
             expr: Box::new(resolve_expr(*expr, exec)?),

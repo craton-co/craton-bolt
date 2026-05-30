@@ -22,7 +22,6 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Float64Array, Int32Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_tier2_multi_orchestrator::Tier2MultiPartial;
@@ -118,9 +117,10 @@ pub fn build_tier2_multi_result(
     }
 
     // 4. Build the output `RecordBatch` against the planner-supplied schema.
-    //    Local copy of the converter — every executor in this crate carries
-    //    its own; consolidating them is a separate refactor.
-    let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+    //    dedup (tier2): shared converter in
+    //    `groupby_tier2_common::plan_schema_to_arrow_schema`.
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(output_schema)?;
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(1 + n_vals);
     columns.push(Arc::new(Int32Array::from(keys_out)) as ArrayRef);
@@ -135,12 +135,6 @@ pub fn build_tier2_multi_result(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Local plan-schema → Arrow-schema conversion. Per the crate convention.
-// ---------------------------------------------------------------------------
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
-}
 
 // ---------------------------------------------------------------------------
 // Host-only tests — no CUDA needed. Run via:

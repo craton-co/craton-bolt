@@ -62,6 +62,24 @@ use arrow_array::{Array, BooleanArray, StringArray};
 
 use crate::error::{BoltError, BoltResult};
 
+/// Case-fold a single escape character to its `to_lowercase` form, matching
+/// the way [`str::to_lowercase`] folds the pattern. The vast majority of
+/// escape characters are case-neutral ASCII (`\`, `!`, `#`, …) where this is
+/// the identity. For the rare cased escape char we take the first scalar of
+/// its lowercase expansion (a single-char escape that lowercases to multiple
+/// scalars cannot match a single pattern position anyway), so this keeps the
+/// `ch == esc` comparison in [`tokenise`] consistent with the folded pattern.
+fn fold_char(c: char) -> char {
+    let mut it = c.to_lowercase();
+    match (it.next(), it.next()) {
+        (Some(first), None) => first,
+        // Multi-char expansion (extremely rare for an escape char) — fall
+        // back to the original; folding both pattern and escape identically
+        // is what matters for correctness on the common case.
+        _ => c,
+    }
+}
+
 /// Compiled LIKE pattern, ready for fast-path evaluation per row.
 ///
 /// Constructed via [`PatternMatcher::compile`] (validates the pattern and
@@ -70,6 +88,12 @@ use crate::error::{BoltError, BoltResult};
 pub struct PatternMatcher {
     /// Detected shape — drives the dispatch in `matches`.
     shape: Shape,
+    /// When `true` (compiled for `ILIKE`), the pattern was Unicode
+    /// case-folded (`to_lowercase`) at compile time and the input is
+    /// case-folded the same way before matching, yielding case-insensitive
+    /// comparison. When `false` (plain `LIKE`), matching is byte-for-byte
+    /// case-sensitive — the original, unchanged behaviour.
+    case_insensitive: bool,
 }
 
 /// Recognised pattern shapes, picked at compile time so per-row matching
@@ -118,6 +142,45 @@ impl PatternMatcher {
     /// * escape character equal to `%` or `_` — would render the wildcard
     ///   unreachable, which is almost certainly a user mistake.
     pub fn compile(pattern: &str, escape: Option<char>) -> BoltResult<Self> {
+        Self::compile_ci(pattern, escape, false)
+    }
+
+    /// Compile a SQL LIKE pattern with optional case-insensitivity.
+    ///
+    /// When `case_insensitive` is `false` this is exactly [`compile`] — the
+    /// pattern, escape rules, and matching are byte-for-byte case-sensitive
+    /// (the plain `LIKE` path, unchanged).
+    ///
+    /// When `case_insensitive` is `true` (the `ILIKE` path) BOTH the pattern
+    /// and the escape character are Unicode case-folded (`to_lowercase`) at
+    /// compile time, and the input is case-folded the same way in
+    /// [`matches`]. Folding both sides reuses the existing matcher unchanged
+    /// while giving correct case-insensitive comparison. Wildcards (`%`,
+    /// `_`) are unaffected by folding (they are not cased), and the escape
+    /// char is folded too so an escaped uppercase literal in the pattern
+    /// still matches a lowercase input character.
+    ///
+    /// [`compile`]: PatternMatcher::compile
+    /// [`matches`]: PatternMatcher::matches
+    pub fn compile_ci(
+        pattern: &str,
+        escape: Option<char>,
+        case_insensitive: bool,
+    ) -> BoltResult<Self> {
+        // Case-fold the pattern and escape char up front for the ILIKE path
+        // so the rest of the pipeline (classify / tokenise / matches) works
+        // on a single, lowercased representation. `to_lowercase` may map one
+        // char to several (e.g. some ligatures), but wildcards (`%`, `_`)
+        // are unaffected, so the fast-path classifier stays valid.
+        let folded_pattern;
+        let folded_escape;
+        let (pattern, escape) = if case_insensitive {
+            folded_pattern = pattern.to_lowercase();
+            folded_escape = escape.map(fold_char);
+            (folded_pattern.as_str(), folded_escape)
+        } else {
+            (pattern, escape)
+        };
         if let Some(c) = escape {
             if c == '%' || c == '_' {
                 return Err(BoltError::Plan(format!(
@@ -126,11 +189,26 @@ impl PatternMatcher {
             }
         }
         let shape = classify(pattern, escape)?;
-        Ok(Self { shape })
+        Ok(Self {
+            shape,
+            case_insensitive,
+        })
     }
 
     /// True if `s` matches this compiled pattern.
     pub fn matches(&self, s: &str) -> bool {
+        // For the ILIKE path the pattern was folded at compile time; fold
+        // the input the same way and dispatch on the (already folded) shape.
+        if self.case_insensitive {
+            let folded = s.to_lowercase();
+            return self.matches_folded(&folded);
+        }
+        self.matches_folded(s)
+    }
+
+    /// Shape dispatch against an already-prepared input (`s` is assumed to
+    /// be in the same case-folding as the compiled pattern).
+    fn matches_folded(&self, s: &str) -> bool {
         match &self.shape {
             Shape::Exact(p) => s == p,
             Shape::Prefix(p) => s.starts_with(p.as_str()),
@@ -438,6 +516,13 @@ mod tests {
     /// Helper: compile + match with an explicit ESCAPE character.
     fn me(pattern: &str, escape: char, s: &str) -> bool {
         PatternMatcher::compile(pattern, Some(escape))
+            .unwrap()
+            .matches(s)
+    }
+
+    /// Helper: case-insensitive (ILIKE) compile + match, no ESCAPE.
+    fn mi(pattern: &str, s: &str) -> bool {
+        PatternMatcher::compile_ci(pattern, None, true)
             .unwrap()
             .matches(s)
     }
@@ -763,5 +848,107 @@ mod tests {
         for (pat, s, want) in cases {
             assert_eq!(m(pat, s), *want, "pattern={pat:?} input={s:?}");
         }
+    }
+
+    // ─── ILIKE (case-insensitive) ────────────────────────────────────────
+
+    /// Case-insensitive matching across every fast-path shape: pattern and
+    /// input differ only in case yet still match.
+    #[test]
+    fn ilike_matches_across_case_all_shapes() {
+        // Exact.
+        assert!(mi("FOO", "foo"));
+        assert!(mi("foo", "FOO"));
+        assert!(mi("FoO", "fOo"));
+        // Prefix.
+        assert!(mi("Foo%", "FOOBAR"));
+        assert!(mi("foo%", "FOObar"));
+        // Suffix.
+        assert!(mi("%Bar", "FOOBAR"));
+        assert!(mi("%bar", "fooBAR"));
+        // Contains.
+        assert!(mi("%OoB%", "fOObar"));
+        // Underscore (generic) is case-insensitive on the literal parts.
+        assert!(mi("F_O", "foo"));
+        assert!(mi("f_O", "FXO"));
+        // Generic multi-`%`.
+        assert!(mi("a%B%c", "AxbYC"));
+    }
+
+    /// Case-insensitive matching still respects the actual characters — a
+    /// genuine mismatch is not masked by case folding.
+    #[test]
+    fn ilike_rejects_genuine_mismatch() {
+        assert!(!mi("FOO", "bar"));
+        assert!(!mi("foo%", "BAR"));
+        assert!(!mi("%bar", "BARFOO"));
+        assert!(!mi("f_o", "fooo"));
+    }
+
+    /// Unicode case folding: ILIKE folds non-ASCII letters too.
+    #[test]
+    fn ilike_unicode_case_fold() {
+        assert!(mi("ÉCOLE", "école"));
+        assert!(mi("école", "ÉCOLE"));
+        assert!(mi("café%", "CAFÉTERIA"));
+        assert!(!mi("café%", "TEACUP"));
+    }
+
+    /// Plain (case-sensitive) LIKE is UNCHANGED by the new flag: a case
+    /// difference must NOT match on the `compile`/`m` path.
+    #[test]
+    fn plain_like_stays_case_sensitive() {
+        assert!(!m("FOO", "foo"));
+        assert!(!m("foo", "FOO"));
+        assert!(!m("Foo%", "fooBAR"));
+        assert!(!m("%Bar", "foobar"));
+        // Same-case still matches (regression guard).
+        assert!(m("foo", "foo"));
+        assert!(m("foo%", "foobar"));
+    }
+
+    /// `host_like` (case-sensitive) keeps NOT-matching across case — verifies
+    /// the default 4-arg entry point is the case-sensitive path.
+    #[test]
+    fn host_like_default_is_case_sensitive() {
+        let arr = StringArray::from(vec![Some("FOO"), Some("foo")]);
+        let out = host_like(&arr, "foo", None, false).expect("ok");
+        assert_eq!(out.value(0), false, "FOO must NOT match case-sensitive 'foo'");
+        assert_eq!(out.value(1), true);
+    }
+
+    /// ILIKE preserves SQL 3VL NULL propagation: `NULL ILIKE 'x'` is NULL,
+    /// not false — exercised here at the matcher level by confirming the
+    /// matcher only sees non-NULL rows (NULL handling lives in the caller,
+    /// `exec::expr_agg::eval_like` / `host_like`), and that a non-NULL row
+    /// folds correctly. The end-to-end 3VL behaviour for ILIKE is identical
+    /// to LIKE because both route through the same NULL-masking caller.
+    #[test]
+    fn ilike_compile_ci_matches_folded_only() {
+        let mr = PatternMatcher::compile_ci("AB%", None, true).expect("ok");
+        assert!(mr.matches("abc"));
+        assert!(mr.matches("ABC"));
+        assert!(!mr.matches("xyz"));
+    }
+
+    /// ILIKE with NOT semantics is applied by the caller; confirm the raw
+    /// case-insensitive match result that the caller will invert.
+    #[test]
+    fn ilike_raw_match_for_not_ilike() {
+        // `s NOT ILIKE 'foo'`: matcher says FOO matches 'foo' (true), the
+        // caller inverts to false; "bar" does not match (false) → caller
+        // inverts to true.
+        assert!(mi("foo", "FOO"));
+        assert!(!mi("foo", "bar"));
+    }
+
+    /// Escape semantics compose with case-insensitivity: an escaped literal
+    /// still matches case-insensitively.
+    #[test]
+    fn ilike_with_escape_is_case_insensitive() {
+        let mr = PatternMatcher::compile_ci(r"A\%B", Some('\\'), true).expect("ok");
+        assert!(mr.matches("a%b"));
+        assert!(mr.matches("A%B"));
+        assert!(!mr.matches("axb"));
     }
 }

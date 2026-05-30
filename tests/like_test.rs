@@ -427,6 +427,7 @@ fn logical_plan_like_typecheck() {
             pattern: "foo%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         },
     };
     plan.schema().expect("Utf8 LIKE must typecheck");
@@ -448,6 +449,7 @@ fn logical_plan_like_typecheck() {
             pattern: "foo%".into(),
             escape: None,
             negated: false,
+            case_insensitive: false,
         },
     };
     let err = bad.schema().expect_err("LIKE on Int64 must error");

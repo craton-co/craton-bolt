@@ -40,7 +40,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
+use arrow_schema::DataType as ArrowDataType;
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -54,7 +54,7 @@ use crate::jit::partition_reduce_kernel_minmax_i64::{
     BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
 use crate::jit::{partition_kernel_i64, scatter_kernel_i64, CudaModule};
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const BLOCK_THREADS: u32 = 256;
@@ -134,10 +134,12 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
 }
 
 fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
-    if n_rows < partition_kernel_i64::SHMEM_STAGING_MIN_ROWS {
-        KernelSpec::PartitionI64
-    } else {
+    // dedup (tier2): threshold test shared via
+    // `groupby_tier2_common::use_shmem_staging_partition_i64`.
+    if crate::exec::groupby_tier2_common::use_shmem_staging_partition_i64(n_rows) {
         KernelSpec::PartitionI64ShmemStaging
+    } else {
+        KernelSpec::PartitionI64
     }
 }
 
@@ -494,7 +496,8 @@ fn run_reduce_phase_i32(
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => unreachable!("try_execute guards this"),
     };
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(
         arrow_schema,
         vec![
@@ -598,7 +601,8 @@ fn run_reduce_phase_i64(
         PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
         _ => unreachable!("try_execute guards this"),
     };
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     RecordBatch::try_new(
         arrow_schema,
         vec![
@@ -612,9 +616,6 @@ fn run_reduce_phase_i64(
             "groupby_tier2_twokey_minmax_exec(i64): build error: {e}"
         ))
     })
-}
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
 }
 
 // ---------------------------------------------------------------------------
@@ -630,7 +631,9 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+#[cfg(test)]
+use crate::plan::logical_plan::Schema;
 
 #[cfg(test)]
 mod tests {

@@ -333,7 +333,16 @@ fn eval_inner(
             pattern,
             escape,
             negated,
-        } => eval_like(expr, pattern, *escape, *negated, env, n_rows),
+            case_insensitive,
+        } => eval_like(
+            expr,
+            pattern,
+            *escape,
+            *negated,
+            *case_insensitive,
+            env,
+            n_rows,
+        ),
         Expr::Cast { .. } => Err(BoltError::Other(
             "expr_agg: CAST not yet supported on the host evaluator; \
              plan-time lowering should have rejected this expression"
@@ -381,15 +390,18 @@ fn eval_inner(
 /// `Some(true)` / `Some(false)`. `negated` inverts the per-row Bool but
 /// preserves the `None` cells.
 ///
-/// `escape` is currently always `None` — the SQL frontend rejects
-/// `ESCAPE '<char>'` for v0.5. We still accept the parameter so the
-/// follow-up that wires escape support doesn't need to change this
-/// signature.
+/// `escape` carries the optional `ESCAPE '<char>'` clause.
+///
+/// `case_insensitive` is `true` for `ILIKE` — the pattern and input are
+/// Unicode case-folded before matching (see
+/// [`crate::exec::like::PatternMatcher::compile_ci`]); `false` for the
+/// case-sensitive plain `LIKE` path (unchanged behaviour).
 fn eval_like(
     expr: &Expr,
     pattern: &str,
     escape: Option<char>,
     negated: bool,
+    case_insensitive: bool,
     env: &ColumnEnv<'_>,
     n_rows: usize,
 ) -> BoltResult<HostColumn> {
@@ -410,7 +422,8 @@ fn eval_like(
             n_rows
         )));
     }
-    let matcher = crate::exec::like::PatternMatcher::compile(pattern, escape)?;
+    let matcher =
+        crate::exec::like::PatternMatcher::compile_ci(pattern, escape, case_insensitive)?;
     let out: Vec<Option<bool>> = utf8
         .iter()
         .map(|cell| match cell {
@@ -2026,5 +2039,73 @@ mod tests {
     /// Helper: build a Utf8 literal expression.
     fn lit_str(s: &str) -> Expr {
         Expr::Literal(Literal::Utf8(s.to_string()))
+    }
+
+    // -----------------------------------------------------------------
+    // ILIKE host evaluation (Expr::Like { case_insensitive }).
+    // -----------------------------------------------------------------
+
+    /// Build an `Expr::Like` over column `s`.
+    fn like_expr(pattern: &str, negated: bool, case_insensitive: bool) -> Expr {
+        Expr::Like {
+            expr: Box::new(col("s")),
+            pattern: pattern.to_string(),
+            escape: None,
+            negated,
+            case_insensitive,
+        }
+    }
+
+    /// `ILIKE` matches across case AND propagates NULL (3VL): the NULL row
+    /// stays NULL, never false.
+    #[test]
+    fn ilike_matches_across_case_and_propagates_null() {
+        let s = utf8(&[Some("FOO"), Some("food"), None, Some("bar")]);
+        let env = env_of(&[("s", &s)]);
+        let expr = like_expr("foo%", false, true);
+        let out = eval_expr(&expr, &env, DataType::Bool, 4).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(
+                v,
+                vec![Some(true), Some(true), None, Some(false)],
+                "FOO/food match 'foo%' case-insensitively; NULL stays NULL"
+            ),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `NOT ILIKE` inverts the per-row boolean but keeps NULL as NULL.
+    #[test]
+    fn not_ilike_inverts_and_preserves_null() {
+        let s = utf8(&[Some("FOO"), None, Some("bar")]);
+        let env = env_of(&[("s", &s)]);
+        let expr = like_expr("foo", true, true);
+        let out = eval_expr(&expr, &env, DataType::Bool, 3).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(
+                v,
+                vec![Some(false), None, Some(true)],
+                "FOO ILIKE 'foo' is true → NOT ILIKE false; NULL stays NULL"
+            ),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Plain `LIKE` host eval is UNCHANGED: a case difference does NOT match,
+    /// and NULL still propagates.
+    #[test]
+    fn plain_like_host_eval_is_case_sensitive() {
+        let s = utf8(&[Some("FOO"), Some("foo"), None]);
+        let env = env_of(&[("s", &s)]);
+        let expr = like_expr("foo%", false, false);
+        let out = eval_expr(&expr, &env, DataType::Bool, 3).unwrap();
+        match out {
+            HostColumn::Bool(v) => assert_eq!(
+                v,
+                vec![Some(false), Some(true), None],
+                "case-sensitive LIKE: FOO does not match 'foo%'; NULL stays NULL"
+            ),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
+        }
     }
 }

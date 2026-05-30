@@ -139,10 +139,14 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
 }
 
 fn partition_spec_for(n_rows: u32) -> KernelSpec {
-    if n_rows < stub_partition_kernel::SHMEM_STAGING_MIN_ROWS {
-        KernelSpec::Partition
-    } else {
+    // dedup (tier2): threshold test shared via
+    // `groupby_tier2_common::use_shmem_staging_partition` (same
+    // `SHMEM_STAGING_MIN_ROWS` constant the `stub_partition_kernel` alias
+    // resolves to).
+    if crate::exec::groupby_tier2_common::use_shmem_staging_partition(n_rows) {
         KernelSpec::PartitionShmemStaging
+    } else {
+        KernelSpec::Partition
     }
 }
 

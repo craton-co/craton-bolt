@@ -22,7 +22,6 @@
 use std::sync::Arc;
 
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{Schema};
@@ -86,7 +85,11 @@ pub fn build_tier2_result(
     //    schema. This module owns its own schema converter (the rest of
     //    the executors in this crate carry local copies as well — a
     //    consolidation refactor is out of scope here).
-    let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+    // dedup (tier2): shared schema converter lives in
+    // `groupby_tier2_common::plan_schema_to_arrow_schema` (was a per-file
+    // wrapper carrying the same `ctx` string).
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(output_schema)?;
     let key_array = Arc::new(Int32Array::from(keys_out));
     let sum_array = Arc::new(Float64Array::from(sums_out));
     RecordBatch::try_new(arrow_schema, vec![key_array, sum_array]).map_err(|e| {
@@ -94,14 +97,6 @@ pub fn build_tier2_result(
             "tier2_merge: failed to build output RecordBatch: {e}"
         ))
     })
-}
-
-// ---------------------------------------------------------------------------
-// Local plan-schema → Arrow-schema conversion. Every executor in this crate
-// carries its own copy; consolidating them is a separate refactor.
-// ---------------------------------------------------------------------------
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
 }
 
 // ---------------------------------------------------------------------------

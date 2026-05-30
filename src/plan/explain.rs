@@ -125,9 +125,19 @@ pub fn format_expr(expr: &Expr) -> String {
             expr,
             pattern,
             negated,
+            case_insensitive,
             ..
         } => {
-            let kw = if *negated { "NOT LIKE" } else { "LIKE" };
+            let base = if *case_insensitive { "ILIKE" } else { "LIKE" };
+            let kw = if *negated {
+                if *case_insensitive {
+                    "NOT ILIKE"
+                } else {
+                    "NOT LIKE"
+                }
+            } else {
+                base
+            };
             format!("({} {} '{}')", format_expr(expr), kw, pattern)
         }
         Expr::Cast { expr, target } => {

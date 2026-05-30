@@ -87,10 +87,13 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
 }
 
 fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
-    if n_rows < partition_kernel_i64::SHMEM_STAGING_MIN_ROWS {
-        KernelSpec::PartitionI64
-    } else {
+    // dedup (tier2): threshold test shared via
+    // `groupby_tier2_common::use_shmem_staging_partition_i64` (same
+    // `partition_kernel_i64::SHMEM_STAGING_MIN_ROWS` comparison as before).
+    if crate::exec::groupby_tier2_common::use_shmem_staging_partition_i64(n_rows) {
         KernelSpec::PartitionI64ShmemStaging
+    } else {
+        KernelSpec::PartitionI64
     }
 }
 

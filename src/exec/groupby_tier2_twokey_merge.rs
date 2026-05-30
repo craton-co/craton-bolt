@@ -39,7 +39,6 @@
 use std::sync::Arc;
 
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_tier2_twokey_orchestrator::Tier2TwokeyPartial;
@@ -126,7 +125,10 @@ pub fn build_tier2_twokey_result(
             output_schema.fields.len()
         )));
     }
-    let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+    // dedup (tier2): shared converter in
+    // `groupby_tier2_common::plan_schema_to_arrow_schema`.
+    let arrow_schema =
+        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(output_schema)?;
     let k1_arr = Arc::new(Int32Array::from(key1_out));
     let k2_arr = Arc::new(Int32Array::from(key2_out));
     let sum_arr = Arc::new(Float64Array::from(sums_out));
@@ -135,14 +137,6 @@ pub fn build_tier2_twokey_result(
             "tier2_twokey_merge: failed to build output RecordBatch: {e}"
         ))
     })
-}
-
-// ---------------------------------------------------------------------------
-// Local plan-schema → Arrow-schema conversion. Mirrors the helper in the
-// single-key merger; consolidation across executors is a separate refactor.
-// ---------------------------------------------------------------------------
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
 }
 
 // ---------------------------------------------------------------------------
