@@ -693,3 +693,130 @@ fn trim_runs_end_to_end() {
     let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
     assert_eq!(got, vec!["hi", "nochange", "pad"]);
 }
+
+// ---- GPU end-to-end: LIKE / NOT LIKE over a non-dict Utf8 column ------------
+//
+// ⚠️ UNVALIDATED device path. The matcher kernel
+// (`jit::string_kernel::compile_like_match_kernel`) has not run on GPU
+// hardware; these `#[ignore = "gpu:string"]` tests are the bring-up harness.
+// Until they pass on a real device, correctness is guaranteed by the host
+// mirror (`exec::string_like::like_match_row` vs `exec::like::PatternMatcher`)
+// and the PTX-shape tests in `jit::string_kernel`. Run with:
+//     cargo test --test string_fns_sql_test -- --ignored
+// on a GPU host.
+
+/// Shared fixture: register a plain (non-dict) Utf8 column `s` and return the
+/// engine + the values, so each LIKE test can assert against a known set.
+fn like_e2e_engine() -> craton_bolt::Engine {
+    use std::sync::Arc;
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
+    let mut engine = craton_bolt::Engine::new().expect("CUDA ctx");
+    let s = StringArray::from(vec![
+        Some("foobar"),  // prefix foo, contains foo
+        Some("xfoo"),    // suffix foo, contains foo
+        Some("foo"),     // exact foo
+        Some("bar"),     // none
+        None,            // NULL stays NULL under both LIKE and NOT LIKE
+        Some("afoob"),   // contains foo only
+    ]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        ArrowDataType::Utf8,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(s)]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+    engine
+}
+
+fn collect_s(h: &craton_bolt::exec::QueryHandle) -> Vec<String> {
+    use arrow_array::{Array, StringArray};
+    let out = h.record_batch();
+    let col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("Utf8 output");
+    (0..col.len())
+        .filter(|&i| !col.is_null(i))
+        .map(|i| col.value(i).to_string())
+        .collect()
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn like_prefix_runs_on_gpu() {
+    let engine = like_e2e_engine();
+    let h = engine
+        .sql("SELECT s FROM t WHERE s LIKE 'foo%'")
+        .expect("LIKE 'foo%'");
+    let mut got = collect_s(&h);
+    got.sort();
+    // starts_with("foo"): "foobar", "foo".
+    assert_eq!(got, vec!["foo".to_string(), "foobar".to_string()]);
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn like_suffix_runs_on_gpu() {
+    let engine = like_e2e_engine();
+    let h = engine
+        .sql("SELECT s FROM t WHERE s LIKE '%foo'")
+        .expect("LIKE '%foo'");
+    let mut got = collect_s(&h);
+    got.sort();
+    // ends_with("foo"): "xfoo", "foo".
+    assert_eq!(got, vec!["foo".to_string(), "xfoo".to_string()]);
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn like_contains_runs_on_gpu() {
+    let engine = like_e2e_engine();
+    let h = engine
+        .sql("SELECT s FROM t WHERE s LIKE '%foo%'")
+        .expect("LIKE '%foo%'");
+    let mut got = collect_s(&h);
+    got.sort();
+    // contains("foo"): foobar, xfoo, foo, afoob.
+    assert_eq!(
+        got,
+        vec![
+            "afoob".to_string(),
+            "foo".to_string(),
+            "foobar".to_string(),
+            "xfoo".to_string(),
+        ]
+    );
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn like_exact_runs_on_gpu() {
+    let engine = like_e2e_engine();
+    let h = engine
+        .sql("SELECT s FROM t WHERE s LIKE 'foo'")
+        .expect("LIKE 'foo'");
+    let got = collect_s(&h);
+    // exact "foo" only.
+    assert_eq!(got, vec!["foo".to_string()]);
+}
+
+#[test]
+#[ignore = "gpu:string"]
+fn not_like_runs_on_gpu_and_preserves_nulls() {
+    let engine = like_e2e_engine();
+    let h = engine
+        .sql("SELECT s FROM t WHERE s NOT LIKE 'foo%'")
+        .expect("NOT LIKE 'foo%'");
+    let mut got = collect_s(&h);
+    got.sort();
+    // NOT starts_with("foo"), with NULL dropped (NULL NOT LIKE = NULL):
+    // "xfoo", "bar", "afoob".
+    assert_eq!(
+        got,
+        vec!["afoob".to_string(), "bar".to_string(), "xfoo".to_string()]
+    );
+}
