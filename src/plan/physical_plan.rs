@@ -1006,6 +1006,43 @@ pub enum PhysicalPlan {
         /// their source dtype).
         output_schema: Schema,
     },
+    /// GPU per-row `LIKE` filter over a **variable-width (non-dictionary)
+    /// `Utf8`** column — UNVALIDATED device path.
+    ///
+    /// Produced by the Filter lowering ONLY for the conservatively-scoped shape
+    /// `col LIKE 'pattern'` / `col NOT LIKE 'pattern'` where the pattern is a
+    /// constant with no `ESCAPE`, no `_`, and reduces (via
+    /// [`crate::exec::string_like::decompose_like_pattern`]) to a single literal
+    /// segment with optional leading/trailing `%` (EXACT / PREFIX / SUFFIX /
+    /// CONTAINS). The executor uploads the column as a row-aligned offsets+bytes
+    /// buffer, launches
+    /// [`crate::jit::string_kernel::compile_like_match_kernel`], downloads the
+    /// 0/1 mask, re-applies NULL 3VL, and materialises the surviving rows.
+    ///
+    /// ⚠️ The device kernel has not run on GPU hardware. The executor is
+    /// host-fallback-safe: any unsupported layout at run time evaluates the
+    /// identical predicate on the host via [`crate::exec::like::host_like`]
+    /// (no panic). Dict-encoded `Utf8` keeps its separate, untouched GPU LIKE
+    /// rewrite — this variant only ever targets non-dict `Utf8`.
+    ///
+    /// Output schema = `input.output_schema()` (Filter neither adds nor renames
+    /// columns).
+    StringLikeFilter {
+        /// Source plan whose output rows are filtered. Lowered from the inner
+        /// `LogicalPlan` so its output batch carries the `column` to test.
+        input: Box<PhysicalPlan>,
+        /// Source table the `column` belongs to (used to fetch the column for
+        /// the GPU upload / host fallback).
+        table: String,
+        /// The non-dict `Utf8` column the `LIKE` tests.
+        column: String,
+        /// The single literal segment's bytes (no wildcards).
+        literal: Vec<u8>,
+        /// Which match shape the (decomposed) pattern reduces to.
+        mode: crate::jit::string_kernel::LikeMode,
+        /// `true` for `NOT LIKE` (the kernel inverts the per-row 0/1).
+        negated: bool,
+    },
     /// Host-side post-aggregate (or other non-scan-chain) filter layer.
     ///
     /// Used when a `LogicalPlan::Filter` sits above an operator that
@@ -1088,6 +1125,7 @@ impl PhysicalPlan {
             PhysicalPlan::Distinct { input }
             | PhysicalPlan::Limit { input, .. }
             | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::StringLikeFilter { input, .. }
             | PhysicalPlan::Filter { input, .. } => input.output_schema(),
             PhysicalPlan::Union { inputs } => {
                 // Caller will have ensured at logical-plan time that all
@@ -3529,6 +3567,92 @@ fn try_lower_string_project(
     }))
 }
 
+/// Try to lower a `WHERE col LIKE 'pattern'` / `col NOT LIKE 'pattern'`
+/// predicate over a **non-dictionary `Utf8`** column into the GPU
+/// [`PhysicalPlan::StringLikeFilter`] variant. Returns `Ok(None)` when the
+/// shape is out of scope so the caller keeps the EXISTING (correct) host
+/// `Expr::Like` fallback unchanged.
+///
+/// ## When this fires (all required)
+///
+///   * `predicate` is exactly an `Expr::Like` (after peeling outer aliases) —
+///     not buried in an `AND`/`OR`/`NOT` (a compound predicate keeps the host
+///     path, which already handles LIKE inside boolean trees correctly),
+///   * its operand is a bare `Column(c)` (alias-peeled),
+///   * `escape` is `None`,
+///   * `c` resolves to a `Utf8` column of the underlying scan, and
+///   * the pattern decomposes (via
+///     [`crate::exec::string_like::decompose_like_pattern`]) to a supported
+///     single-literal-segment shape (EXACT / PREFIX / SUFFIX / CONTAINS).
+///
+/// Dictionary-encoded `Utf8` columns never reach here as an `Expr::Like`: the
+/// pre-lowering dictionary rewrite ([`crate::plan::string_literal_rewrite`])
+/// has already turned `dict_col LIKE 'pat'` into an OR-of-equalities. So any
+/// `Expr::Like` still standing over a `Utf8` column is, by construction, over a
+/// non-dict column — exactly this path's target.
+///
+/// The inner plan is lowered normally so its output batch carries `c`; the
+/// LIKE filter is applied on top.
+fn try_lower_string_like_filter(
+    input: &LogicalPlan,
+    predicate: &Expr,
+    depth: usize,
+) -> BoltResult<Option<PhysicalPlan>> {
+    // Predicate must be a bare LIKE (not inside AND/OR/NOT/...).
+    let (like_expr, pattern, escape, negated) = match peel_aliases(predicate) {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => (expr.as_ref(), pattern, *escape, *negated),
+        _ => return Ok(None),
+    };
+    // ESCAPE → host fallback.
+    if escape.is_some() {
+        return Ok(None);
+    }
+    // Operand must be a bare column.
+    let column = match peel_aliases(like_expr) {
+        Expr::Column(c) => c.clone(),
+        _ => return Ok(None),
+    };
+    // The pattern must reduce to a supported single-literal-segment shape.
+    let (mode, literal) =
+        match crate::exec::string_like::decompose_like_pattern(pattern, None) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+    // Require a BARE `Scan` underneath (no intervening Filter / Project that
+    // could drop or reorder rows). This guarantees the executed input batch is
+    // row-aligned with the source table the executor materialises to fetch the
+    // `column` bytes, and that `column` is present. Anything richer keeps the
+    // host `Expr::Like` path.
+    let (table, scan_schema) = match input {
+        LogicalPlan::Scan { table, schema, .. } => (table.clone(), schema),
+        _ => return Ok(None),
+    };
+    // `column` must be a Utf8 column of the scan. A lookup miss → host fallback.
+    let field = match scan_schema.field(&column) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    if field.dtype != DataType::Utf8 {
+        return Ok(None);
+    }
+
+    // Lower the inner scan so its output batch is the row-aligned source.
+    let inner = lower_depth(input, depth + 1)?;
+    Ok(Some(PhysicalPlan::StringLikeFilter {
+        input: Box::new(inner),
+        table,
+        column,
+        literal,
+        mode,
+        negated,
+    }))
+}
+
 /// Walk a `Scan` / `Filter` / `Project` chain and return true if any
 /// `Filter` node carries a predicate that contains a `BinaryOp::Concat`.
 ///
@@ -3685,6 +3809,7 @@ pub fn populate_input_validity(
         | PhysicalPlan::Window { input, .. }
         | PhysicalPlan::Project { input, .. }
         | PhysicalPlan::CountRows { input, .. }
+        | PhysicalPlan::StringLikeFilter { input, .. }
         | PhysicalPlan::Filter { input, .. } => {
             populate_input_validity(input.as_mut(), provider);
         }
@@ -4030,6 +4155,9 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
             // their predicate / SELECT exprs are NOT flagged. Still recurse to
             // catch any GPU kernel deeper in the tree.
             PhysicalPlan::Filter { input, .. } => walk(input),
+            // The LIKE matcher kernel carries no Div/And/Or IR; just recurse
+            // for any GPU kernel deeper in the tree.
+            PhysicalPlan::StringLikeFilter { input, .. } => walk(input),
             PhysicalPlan::Project { input, .. } => walk(input),
             PhysicalPlan::Distinct { input }
             | PhysicalPlan::Limit { input, .. }
@@ -4472,6 +4600,20 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             }
         }
         LogicalPlan::Filter { input, predicate } => {
+            // GPU per-row LIKE over a non-dict Utf8 column (UNVALIDATED device
+            // path). Fires ONLY for a bare `col LIKE 'pattern'` /
+            // `col NOT LIKE 'pattern'` whose constant pattern reduces to a
+            // single literal segment with optional leading/trailing `%` (no
+            // `_`, no ESCAPE). Every other LIKE shape falls through to the
+            // existing host `Expr::Like` fallback below, UNCHANGED. Dict-encoded
+            // Utf8 columns never reach here as `Expr::Like` (the dictionary
+            // rewrite already turned them into integer OR-of-equalities). See
+            // `try_lower_string_like_filter`.
+            if let Some(like_filter) =
+                try_lower_string_like_filter(input, predicate, depth)?
+            {
+                return Ok(like_filter);
+            }
             // v0.7: `||` in a WHERE predicate (e.g. `WHERE a || b = 'foo'`)
             // routes through the host-side `PhysicalPlan::Filter` executor,
             // mirroring how compound `IS NULL` and `LIKE` are handled. The
