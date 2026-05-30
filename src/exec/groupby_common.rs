@@ -773,6 +773,60 @@ mod tests {
         assert_eq!(packed.keys_i64[2], packed.keys_i64[3]);
     }
 
+    /// F3: every NaN bit pattern (distinct payloads, both signs, quiet and
+    /// signalling) is folded by `canonicalise_f32`/`f64` to a single canonical
+    /// quiet NaN, so all NaN GROUP BY keys pack to the SAME `keys_i64` value
+    /// and therefore collapse into one group — matching DuckDB. A finite value
+    /// must remain a distinct key. This pins the GROUP-BY half of the F3
+    /// decision (the DISTINCT half is pinned in `distinct.rs`).
+    #[test]
+    fn pack_keys_nan_collapse_f32() {
+        let agg = spec(vec![("f", DataType::Float32)], vec![0]);
+        let payload_nan = f32::from_bits(0x7fc0_0001); // quiet NaN, payload 1
+        let signalling_nan = f32::from_bits(0x7f80_0001); // signalling NaN
+        let neg_nan = f32::from_bits(0xffc0_0000); // negative NaN
+        let plain_nan = f32::NAN;
+        let finite = 1.5f32;
+        let vals = vec![payload_nan, signalling_nan, neg_nan, plain_nan, finite];
+        let batch = one_col_batch(
+            "f",
+            Arc::new(Float32Array::from(vals)) as ArrayRef,
+        );
+        let packed = pack_keys(&agg, &batch).expect("pack ok");
+        // All four NaN rows pack to one key.
+        let nan_key = packed.keys_i64[0];
+        assert_eq!(packed.keys_i64[1], nan_key, "signalling NaN must collapse");
+        assert_eq!(packed.keys_i64[2], nan_key, "negative NaN must collapse");
+        assert_eq!(packed.keys_i64[3], nan_key, "plain NaN must collapse");
+        // The canonical key is exactly `f32::NAN.to_bits()`.
+        assert_eq!(nan_key, (f32::NAN.to_bits() as u64) as i64);
+        // A finite value is a distinct group.
+        assert_ne!(packed.keys_i64[4], nan_key, "finite value must NOT join NaN group");
+    }
+
+    /// F3 (f64 lane): same NaN-collapse contract as `pack_keys_nan_collapse_f32`.
+    #[test]
+    fn pack_keys_nan_collapse_f64() {
+        let agg = spec(vec![("f", DataType::Float64)], vec![0]);
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0001);
+        let signalling_nan = f64::from_bits(0x7ff0_0000_0000_0001);
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        let plain_nan = f64::NAN;
+        let finite = -2.25f64;
+        let vals = vec![payload_nan, signalling_nan, neg_nan, plain_nan, finite];
+        let batch = one_col_batch(
+            "f",
+            Arc::new(Float64Array::from(vals)) as ArrayRef,
+        );
+        let packed = pack_keys(&agg, &batch).expect("pack ok");
+        let nan_key = packed.keys_i64[0];
+        assert_eq!(packed.keys_i64[1], nan_key, "signalling NaN must collapse");
+        assert_eq!(packed.keys_i64[2], nan_key, "negative NaN must collapse");
+        assert_eq!(packed.keys_i64[3], nan_key, "plain NaN must collapse");
+        assert_eq!(nan_key, f64::NAN.to_bits() as i64);
+        assert_ne!(packed.keys_i64[4], nan_key, "finite value must NOT join NaN group");
+    }
+
     /// 4. Three columns exceeds the v1 lossless packing budget.
     #[test]
     fn pack_keys_unsupported() {

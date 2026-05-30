@@ -592,6 +592,53 @@ mod tests {
         let batch = twokey_float_batch(300_000);
         assert!(try_execute(&plan, &batch).is_none());
     }
+
+    /// F2: a NaN in the value column must DEFER (return `None`) for both MIN
+    /// and MAX so grouped two-key float MIN/MAX routes through the
+    /// global-atomic / host scalar path, which implements DuckDB's
+    /// NaN-as-largest total order (`aggregate.rs::float_total_cmp`). The
+    /// CAS-loop kernel compares raw IEEE floats where NaN's participation is
+    /// order-dependent and would disagree with the scalar aggregate.
+    #[test]
+    fn rejects_nan_value_column_min_and_max() {
+        let n = 300_000usize;
+        for op_is_min in [true, false] {
+            let plan = build_twokey_float_minmax_plan(op_is_min, DataType::Float64);
+            let k1: Vec<i32> = (0..n as i32).collect();
+            let k2: Vec<i32> = (0..n as i32).map(|i| i + 1).collect();
+            let mut v: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            v[54321] = f64::NAN;
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("k1", ArrowDataType::Int32, false),
+                ArrowField::new("k2", ArrowDataType::Int32, false),
+                ArrowField::new("v", ArrowDataType::Float64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(k1)) as arrow_array::ArrayRef,
+                    Arc::new(Int32Array::from(k2)) as arrow_array::ArrayRef,
+                    Arc::new(Float64Array::from(v)) as arrow_array::ArrayRef,
+                ],
+            )
+            .unwrap();
+            assert!(
+                try_execute(&plan, &batch).is_none(),
+                "NaN-bearing two-key float MIN/MAX must defer (op_is_min={op_is_min})"
+            );
+        }
+    }
+
+    /// F2 sanity: an all-finite two-key float value column is NOT declined by
+    /// the NaN guard. A sub-threshold size gives a deterministic host decline
+    /// for an unrelated reason (the row gate), proving the NaN guard let the
+    /// finite data through to the later gate rather than rejecting on NaN.
+    #[test]
+    fn finite_values_not_declined_by_nan_guard() {
+        let plan = build_twokey_float_minmax_plan(false, DataType::Float64);
+        let batch = twokey_float_batch(2_048);
+        assert!(try_execute(&plan, &batch).is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------

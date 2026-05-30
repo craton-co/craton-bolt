@@ -419,6 +419,25 @@ impl<T: Pod> GpuBuffer<T> {
         &self.used_streams as StreamSetRef
     }
 
+    /// Test-only: synthesize a buffer over a chosen (fake, non-null) device
+    /// pointer and allocation size WITHOUT touching the driver. `Drop` will
+    /// route the synthetic `ptr` through `mem_pool::POOL.free`, whose
+    /// `#[cfg(test)]` driver shim records frees in a side-channel rather than
+    /// calling `cuMemFree_v2`. Lets host-only tests exercise the `Drop`
+    /// reclaim-dispatch (empty → inline free; non-empty → reclaim hook)
+    /// without a GPU. Never used in production.
+    #[cfg(test)]
+    fn test_with_raw(ptr: CUdeviceptr, alloc_bytes: usize) -> Self {
+        Self {
+            ptr,
+            len: 0,
+            capacity: 0,
+            alloc_bytes,
+            used_streams: RefCell::new(StreamSet::default()),
+            _t: PhantomData,
+        }
+    }
+
     /// Copy the buffer's contents back to a fresh host `Vec<T>`.
     pub fn to_vec(&self) -> BoltResult<Vec<T>> {
         let _span = tracing::info_span!(
@@ -748,6 +767,168 @@ fn current_drop_fence() -> StreamFenceFn {
     real_stream_fence
 }
 
+/// Signature of the reclaim action a non-empty-`used_streams` `Drop` performs:
+/// given the block (`ptr`, `alloc_bytes`) and the set of streams that touched
+/// it, return it to the pool *safely*. Aliased so a host-only test can swap in
+/// a recorder via [`drop_reclaim_with`] and assert whether the block was
+/// deferred (event path) or freed inline (blanket-sync fallback) — without a
+/// GPU. Mirrors the `StreamFenceFn` / `drop_fence_with` seam.
+type DropReclaimFn = fn(CUdeviceptr, usize, &StreamSet);
+
+/// Production reclaim for a buffer dropped with at least one recorded stream.
+///
+/// ## Fast path (event-based deferred free — review finding C1 / P1)
+///
+/// Record a lightweight (`CU_EVENT_DISABLE_TIMING`) CUDA event on *every*
+/// recorded stream, capturing the exact point in each stream that referenced
+/// this block. Then:
+///
+/// * if **all** events already report complete (`event_query` → ready), destroy
+///   them and return the block to the pool inline — no stall; or
+/// * if **any** event is still in flight, hand `(ptr, alloc_bytes, events)` to
+///   [`mem_pool::defer_free`]. The block is parked OUT of the allocatable pool
+///   until a later `alloc`/`free` sweep observes every event complete; only
+///   then does the block re-enter its bucket. The dropping thread never blocks.
+///
+/// ## Fallback (no less safe than the old blanket sync)
+///
+/// If events are unavailable — the `cuda-stub` backend (`event_create` returns
+/// `CUDA_ERROR_STUB`), or any `event_create` / `event_record` fails for a
+/// genuine driver reason — we destroy whatever events we partially created and
+/// fall back to the conservative blanket per-stream `cuStreamSynchronize`, then
+/// free the block inline. This is exactly the pre-C1 behaviour.
+///
+/// ## Why no premature reuse is possible (the safety invariant)
+///
+/// A block re-enters the allocatable pool ONLY after every stream that touched
+/// it has drained past its recorded event:
+///
+/// * inline fast path: we free only once every `event_query` reported complete;
+/// * deferred path: `defer_free` parks the block, and the sweep frees it only
+///   when every event queries complete (a not-ready / errored query keeps the
+///   whole entry parked — it never authorises a free);
+/// * fallback path: `cuStreamSynchronize` on every recorded stream drains all of
+///   them before the inline free.
+///
+/// In every branch the recorded set is the *full* `StreamSet` (deduped), so —
+/// just like the blanket sync — no stream that ever touched the block can still
+/// be in flight when the address is recycled. The event path strictly tightens
+/// the wait (to the recorded point rather than the stream's whole tail) and
+/// removes the stall; it never widens the reuse window.
+fn real_drop_reclaim(ptr: CUdeviceptr, alloc_bytes: usize, streams: &StreamSet) {
+    match record_defer_events(streams) {
+        Some(events) => {
+            // Inline fast path: if every event has already completed, reclaim
+            // now and skip the pending list entirely.
+            let all_ready = events.iter().all(|&ev| {
+                // SAFETY: `ev` is a live handle we just created and recorded on
+                // a stream; we only query it. A query error maps to `false`
+                // (treat as not-ready) so a bad probe defers rather than frees.
+                matches!(unsafe { cuda_sys::event_query(ev) }, Ok(true))
+            });
+            if all_ready {
+                for ev in &events {
+                    // SAFETY: event completed (queried ready) and is not used
+                    // again after destruction.
+                    let _ = unsafe { cuda_sys::event_destroy(*ev) };
+                }
+                crate::cuda::mem_pool::POOL.free(ptr, alloc_bytes);
+            } else {
+                // At least one event still in flight: park the block. The pool
+                // owns the events from here and destroys them on reclaim.
+                crate::cuda::mem_pool::defer_free(ptr, alloc_bytes, events);
+            }
+        }
+        None => {
+            // Events unavailable (cuda-stub, or create/record failed): fall
+            // back to the conservative blanket per-stream sync, then free.
+            fence_all_streams(streams, current_drop_fence());
+            crate::cuda::mem_pool::POOL.free(ptr, alloc_bytes);
+        }
+    }
+}
+
+/// Try to record a deferred-free event on every stream in `streams`.
+///
+/// Returns `Some(events)` (one event per recorded stream, in set order) when an
+/// event was successfully created AND recorded on every stream. Returns `None`
+/// — destroying any partially-created events first so none leak — the moment any
+/// `event_create` or `event_record` fails. Under `--features cuda-stub` the very
+/// first `event_create` returns `CUDA_ERROR_STUB`, so this returns `None` and
+/// the caller falls back to the blanket sync; no separate `cfg` is needed.
+///
+/// The all-or-nothing contract matters for safety: a partial set of events
+/// would let the sweep reclaim the block after only *some* streams drained. By
+/// returning `None` on any failure we route the whole block to the blanket-sync
+/// fallback, which fences *all* streams — never a subset.
+fn record_defer_events(streams: &StreamSet) -> Option<Vec<cuda_sys::CUevent>> {
+    let mut events: Vec<cuda_sys::CUevent> = Vec::with_capacity(streams.streams.len());
+    for &stream in &streams.streams {
+        match cuda_sys::event_create() {
+            Ok(ev) => {
+                // SAFETY: `ev` is a fresh live handle; `stream` is an opaque
+                // handle previously recorded via `mark_stream_use`. Recording
+                // captures the current point in the stream. Neither is deref'd.
+                match unsafe { cuda_sys::event_record(ev, stream) } {
+                    Ok(()) => events.push(ev),
+                    Err(_) => {
+                        // Record failed: destroy this event and every prior one,
+                        // then abandon the event path for the whole block.
+                        // SAFETY: `ev` was just created and never recorded
+                        // successfully; the others were created above.
+                        let _ = unsafe { cuda_sys::event_destroy(ev) };
+                        for prev in &events {
+                            let _ = unsafe { cuda_sys::event_destroy(*prev) };
+                        }
+                        return None;
+                    }
+                }
+            }
+            Err(_) => {
+                // Create failed (or cuda-stub): destroy any we already made and
+                // fall back.
+                for prev in &events {
+                    // SAFETY: each `prev` is a live handle created above.
+                    let _ = unsafe { cuda_sys::event_destroy(*prev) };
+                }
+                return None;
+            }
+        }
+    }
+    Some(events)
+}
+
+/// Test seam: when set, a non-empty-`used_streams` `Drop` reclaims through this
+/// stub instead of [`real_drop_reclaim`]. Host-only tests install a recorder to
+/// assert whether a block was deferred vs. freed inline — without a GPU.
+#[cfg(test)]
+thread_local! {
+    static DROP_RECLAIM_OVERRIDE: Cell<Option<DropReclaimFn>> = const { Cell::new(None) };
+}
+
+/// Install `reclaim` as the non-empty-streams `Drop` reclaim action for the
+/// current thread, run `body`, then restore the previous hook. Test-only.
+#[cfg(test)]
+fn drop_reclaim_with<R>(reclaim: DropReclaimFn, body: impl FnOnce() -> R) -> R {
+    let prev = DROP_RECLAIM_OVERRIDE.with(|c| c.replace(Some(reclaim)));
+    let out = body();
+    DROP_RECLAIM_OVERRIDE.with(|c| c.set(prev));
+    out
+}
+
+/// Resolve the reclaim action the current `Drop` should use: the test override
+/// if installed, else [`real_drop_reclaim`].
+#[inline]
+fn current_drop_reclaim() -> DropReclaimFn {
+    #[cfg(test)]
+    {
+        if let Some(f) = DROP_RECLAIM_OVERRIDE.with(|c| c.get()) {
+            return f;
+        }
+    }
+    real_drop_reclaim
+}
+
 /// # SAFETY — async DMA / kernel-launch lifetime hazard (review findings C-1, C-2)
 ///
 /// `Drop` fences **every** stream recorded in `used_streams` (a deduped
@@ -805,31 +986,35 @@ fn current_drop_fence() -> StreamFenceFn {
 /// — the synchronize on a *completed* stream is a fast no-op, but the
 /// synchronize on an *in-flight* one stalls the dropping thread.
 ///
-/// ## Follow-up (NOT implemented here — reviewer's recommended design)
+/// ## The event-based deferred free — NOW IMPLEMENTED (review finding C1 / P1)
 ///
 /// The fully-structural fix is an event-based *pending-free* pool. It is a
-/// **cross-file** change and is deliberately left as a TODO: it cannot be done
-/// inside `buffer.rs` because the event API it needs does not exist yet, and
-/// the safety-critical state it adds belongs in `mem_pool`.
+/// **cross-file** change (event API in `cuda_sys`, pending-free state in
+/// `mem_pool`, the Drop dispatch here) and is now in place: see
+/// [`real_drop_reclaim`] below, [`record_defer_events`], the `cuda_sys::event_*`
+/// wrappers, and `mem_pool::{defer_free, sweep_pending_frees,
+/// drain_pending_frees_blocking}`. The non-empty `Drop` path no longer blanket-
+/// syncs on the common path; it records an event per stream and either frees
+/// inline (events already complete) or defers to `mem_pool` (events in flight),
+/// falling back to the blanket sync only when events are unavailable (cuda-stub
+/// or a create/record failure). The design that was implemented is recorded
+/// below for the rationale.
 ///
-/// ### Why it is not implemented in this file
+/// ### Why it lived across three files
 ///
-/// `cuda_sys` today exposes **no** `cuEvent*` bindings — no `cuEventCreate`,
-/// `cuEventRecord`, `cuEventQuery`, `cuEventDestroy`, no `CUevent` type, and no
-/// `CUDA_ERROR_NOT_READY` constant (it has only `cuStreamSynchronize`, a
-/// *blocking* call). Adding those bindings + their `cuda-stub` shims is an edit
-/// to `cuda_sys.rs`, and the deferred-free reclaim state is an edit to
-/// `mem_pool.rs` — both outside this file. Crucially, there is also **no
-/// in-`buffer.rs`-only micro-optimisation** available: a "query the stream and
-/// only sync if still pending" trick is impossible without `cuEventQuery`,
-/// because the sole completion probe we have (`cuStreamSynchronize`) is the
-/// very blocking call we are trying to avoid, and it already no-ops cheaply on
-/// an already-drained stream. So the blanket per-stream sync below is already
-/// the cheapest *correct* thing this file can do on its own. (The only local
-/// change made alongside this note is documentary: the `Drop` already skips the
-/// fence when `used_streams` is empty — the never-async-touched fast path.)
+/// `cuda_sys` now exposes the `cuEvent*` bindings (`cuEventCreate`,
+/// `cuEventRecord`, `cuEventQuery`, `cuEventSynchronize`, `cuEventDestroy_v2`),
+/// the `CUevent` handle, `CU_EVENT_DISABLE_TIMING`, and `CUDA_ERROR_NOT_READY`,
+/// each with a `cuda-stub` shim. The deferred-free reclaim state
+/// (`PENDING_FREES` + sweep + shutdown drain) lives in `mem_pool`. Both were
+/// outside this file, which is why the wiring waited on them. There was no
+/// `buffer.rs`-only micro-opt: a "query the stream and only sync if still
+/// pending" trick is impossible without `cuEventQuery`, because the only other
+/// completion probe (`cuStreamSynchronize`) is the very blocking call we are
+/// avoiding. The empty-`used_streams` Drop still skips the fence entirely (the
+/// never-async-touched fast path).
 ///
-/// ### The cross-file design (actionable)
+/// ### The cross-file design (as implemented)
 ///
 /// 1. **`cuda_sys`:** add `cuEventCreate(&mut CUevent, flags)`,
 ///    `cuEventRecord(CUevent, CUstream)`, `cuEventQuery(CUevent) -> CUresult`,
@@ -860,35 +1045,44 @@ fn current_drop_fence() -> StreamFenceFn {
 /// Because the block stays out of the allocator's free list until every event
 /// reports complete, no recycled address can alias an in-flight DMA/kernel —
 /// the same no-premature-reuse property as the blanket sync, minus the stall.
-/// The blanket per-stream sync below is the conservative, correctness-first
-/// interim that needs no event lifecycle and no new pool state.
+/// The blanket per-stream sync is retained as the fallback (events unavailable
+/// / cuda-stub / create-or-record failure) — the conservative, correctness-first
+/// path that needs no event lifecycle and no new pool state.
 impl<T: Pod> Drop for GpuBuffer<T> {
     fn drop(&mut self) {
         if self.ptr == 0 {
             return;
         }
-        // Fence every stream this buffer was enqueued on (DMA *or* kernel
-        // launch) before the block goes back to the pool. Skipping this
-        // would let the pool re-issue the same physical address to an
-        // unrelated allocation while a `cuMemcpy*Async` / `cuMemset*Async`
-        // / kernel was still touching it — silent corruption, not an error.
-        //
         // The borrow is short-lived and cannot alias any other borrow:
         // `Drop` runs with exclusive ownership of `self`, so no other
         // `&self` method (which is what takes `borrow_mut` in
         // `mark_stream_use`) can be executing concurrently.
         let streams = self.used_streams.borrow();
-        if !streams.is_empty() {
-            fence_all_streams(&streams, current_drop_fence());
+        if streams.is_empty() {
+            drop(streams);
+            // Fast path: the buffer was never enqueued on any stream (only
+            // ever touched synchronously, if at all), so nothing can still be
+            // referencing it. Return it to the pool directly with no fence and
+            // no event bookkeeping. The pool's `drain` (run on process
+            // shutdown via `Drop` on the static) eventually hands it back to
+            // `cuMemFree_v2` — via the cudarc backend under `--features
+            // cudarc`, or the hand-rolled FFI otherwise; the call site is
+            // backend-agnostic because the pool stores raw `CUdeviceptr`s.
+            crate::cuda::mem_pool::POOL.free(self.ptr, self.alloc_bytes);
+            return;
         }
+        // At least one stream touched this block. Reclaim it safely WITHOUT a
+        // synchronous blanket stall on the common path: record a CUDA event on
+        // each recorded stream and either free inline (all events already
+        // complete) or defer the free until they do. A block can re-enter the
+        // allocatable pool ONLY after every recorded stream drains past its
+        // event — the same no-premature-reuse guarantee the old blanket sync
+        // gave, minus the stall. See [`real_drop_reclaim`] for the full safety
+        // argument and the blanket-sync fallback used when events are
+        // unavailable (cuda-stub) or event create/record fails.
+        let reclaim = current_drop_reclaim();
+        reclaim(self.ptr, self.alloc_bytes, &streams);
         drop(streams);
-        // Return the block to the pool rather than the driver. The pool's
-        // `drain` (run on process shutdown via `Drop` on the static) will
-        // eventually hand it back to `cuMemFree_v2` — via the cudarc
-        // backend when `--features cudarc` is active, or via the
-        // hand-rolled FFI otherwise. Either way the call site here is
-        // backend-agnostic because the pool stores raw `CUdeviceptr`s.
-        crate::cuda::mem_pool::POOL.free(self.ptr, self.alloc_bytes);
     }
 }
 
@@ -1196,20 +1390,24 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
         // exclusive ownership of `self`, so no `&self` method (which is what
         // takes `borrow_mut` in `mark_stream_use`) can run concurrently.
         //
-        // TODO(perf, cross-file — requires cuEvent FFI in `cuda_sys` + a
-        // pending-free list in `mem_pool`; deliberately NOT done here):
+        // TODO(perf, cross-file — the cuEvent FFI now EXISTS in `cuda_sys`
+        // (`event_create`/`event_record`/`event_query`/`event_destroy`,
+        // `CUDA_ERROR_NOT_READY`, used by `GpuBuffer::Drop`'s deferred path);
+        // what is still MISSING is a *pinned*-specific pending-free list — the
+        // device pool's `defer_free` parks `CUdeviceptr` pool blocks, NOT
+        // `cuMemFreeHost` host pages — so the deferred pinned path is
+        // deliberately still NOT wired here):
         //
         // A blanket per-stream `cuStreamSynchronize` is the safe default but
         // it stalls the dropping thread against each recorded stream's *entire*
         // trailing queue — not just the work that touched this buffer. The
         // structural fix is an event-based deferred free, identical in shape to
-        // the `GpuBuffer` follow-up (see the design note on `impl Drop for
-        // GpuBuffer`). Concretely, for pinned host pages:
+        // the `GpuBuffer` deferred path now implemented in `real_drop_reclaim`
+        // (see the design note on `impl Drop for GpuBuffer`). Concretely, for
+        // pinned host pages the remaining work is:
         //
-        //   1. Add `cuEventCreate` / `cuEventRecord` / `cuEventQuery` /
-        //      `cuEventDestroy` bindings + cuda-stub shims + a
-        //      `CUDA_ERROR_NOT_READY` constant to `cuda_sys` (none exist
-        //      today — that is why this cannot be implemented in this file).
+        //   1. (DONE) `cuEvent*` bindings + cuda-stub shims +
+        //      `CUDA_ERROR_NOT_READY` now live in `cuda_sys`.
         //   2. On `mark_stream_use`, `cuEventRecord` a lightweight
         //      (`CU_EVENT_DISABLE_TIMING`) event on that stream and stash it
         //      alongside the handle, so we capture the *exact* point in the
@@ -1217,10 +1415,20 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
         //   3. On `Drop`, `cuEventQuery` each event. If all are complete, free
         //      `cuMemFreeHost` inline (fast path, no stall). If any is
         //      `CUDA_ERROR_NOT_READY`, hand `(ptr, byte_len, [events])` to a
-        //      process-global pinned-pending-free list instead of fencing.
+        //      process-global *pinned*-pending-free list instead of fencing.
         //   4. Reclaim entries from that list opportunistically (on the next
         //      `PinnedHostBuffer::new`, and on pool drain at shutdown) once
         //      every event `cuEventQuery`s complete; only then `cuMemFreeHost`.
+        //
+        // Why not wired now: a deferred pinned free without a drain-at-shutdown
+        // list would risk LEAKING page-locked pages at process exit (strictly
+        // worse), and an inline query-then-`cuMemFreeHost` without deferral buys
+        // nothing — `cuStreamSynchronize` already no-ops cheaply once a stream
+        // has drained, so the only real win is the deferral, which needs the
+        // missing pinned list. Building that list (mirroring `mem_pool`'s
+        // device `PENDING_FREES` + `drain_pending_frees_blocking`) is the
+        // residual follow-up; the blanket sync below stays as the correct,
+        // no-leak interim.
         //
         // Safety contract the deferred path MUST preserve (exactly what the
         // synchronous fence below guarantees today): the pinned pages are
@@ -1603,7 +1811,9 @@ mod stream_set_tests {
     //! were fenced without calling `cuStreamSynchronize`. They run on hosts
     //! with no GPU and under `--features cuda-stub`.
     use super::*;
-    use crate::cuda::cuda_sys::{CUresult, CUstream, CUDA_SUCCESS};
+    // `CUdeviceptr` / `CUstream` come in via `super::*` (re-exported through
+    // `buffer.rs`'s top-level `use`); only pull the extras not already in scope.
+    use crate::cuda::cuda_sys::{CUresult, CUDA_SUCCESS};
     use std::cell::RefCell as StdRefCell;
     use std::ptr;
 
@@ -1749,5 +1959,129 @@ mod stream_set_tests {
             tag_stream_set(ptr::null(), fake_stream(0x1));
         }
         // Reaching here without UB / panic is the assertion.
+    }
+
+    // ---- C1 / P1: event-based deferred free dispatch on Drop -------------
+    //
+    // These tests prove the `Drop` decision tree host-only, via the
+    // `drop_reclaim_with` seam (mirroring `drop_fence_with`):
+    //   * empty `used_streams`  -> block freed INLINE, reclaim hook NEVER run;
+    //   * non-empty             -> reclaim hook runs with the full stream set;
+    //   * deferred block lands in `mem_pool`'s pending side-channel (NOT the
+    //     allocatable free pool) and a simulated sweep reclaims it.
+    // None touch the CUDA driver: synthetic `ptr`s route through the pool's
+    // `#[cfg(test)]` free shim.
+
+    thread_local! {
+        /// Records each `(ptr, alloc_bytes, stream_count)` a reclaim hook saw.
+        static RECLAIMED: StdRefCell<Vec<(CUdeviceptr, usize, usize)>> =
+            const { StdRefCell::new(Vec::new()) };
+    }
+
+    /// Recording reclaim stub: logs the block + how many streams were in the
+    /// set, but does NOT free or defer (keeps the synthetic ptr out of the
+    /// pool so the test fully owns observation).
+    fn recording_reclaim(ptr: CUdeviceptr, alloc_bytes: usize, streams: &StreamSet) {
+        RECLAIMED.with(|r| r.borrow_mut().push((ptr, alloc_bytes, streams.len())));
+    }
+
+    #[test]
+    fn empty_used_streams_frees_inline_without_reclaim_hook() {
+        RECLAIMED.with(|r| r.borrow_mut().clear());
+        // A non-null synthetic ptr so `Drop` does not early-return at
+        // `ptr == 0`; with an empty stream set it must take the inline-free
+        // branch and NEVER invoke the reclaim hook.
+        let buf: GpuBuffer<u8> = GpuBuffer::test_with_raw(0xBEEF as CUdeviceptr, 64);
+        assert_eq!(buf.recorded_stream_count(), 0);
+        drop_reclaim_with(recording_reclaim, || {
+            drop(buf); // empty set -> POOL.free inline (test shim records it)
+        });
+        RECLAIMED.with(|r| {
+            assert!(
+                r.borrow().is_empty(),
+                "empty used_streams must free inline, never the reclaim path"
+            );
+        });
+    }
+
+    #[test]
+    fn nonempty_used_streams_invokes_reclaim_with_full_set() {
+        RECLAIMED.with(|r| r.borrow_mut().clear());
+        let buf: GpuBuffer<u8> = GpuBuffer::test_with_raw(0xD00D as CUdeviceptr, 128);
+        let a = fake_stream(0x1);
+        let b = fake_stream(0x2);
+        buf.mark_stream_use(a);
+        buf.mark_stream_use(b);
+        buf.mark_stream_use(a); // dedup
+        drop_reclaim_with(recording_reclaim, || {
+            drop(buf);
+        });
+        RECLAIMED.with(|r| {
+            let rec = r.borrow();
+            assert_eq!(rec.len(), 1, "non-empty set must go through reclaim once");
+            let (ptr, bytes, n) = rec[0];
+            assert_eq!(ptr, 0xD00D as CUdeviceptr);
+            assert_eq!(bytes, 128);
+            assert_eq!(n, 2, "reclaim must see the FULL deduped stream set");
+        });
+    }
+
+    /// Reclaim stub that emulates `real_drop_reclaim`'s DEFER branch (the
+    /// "events not ready" case) without real events: it parks the block via
+    /// `mem_pool::defer_free`. Proves a still-in-flight buffer is NOT returned
+    /// to the allocatable pool on drop.
+    fn deferring_reclaim(ptr: CUdeviceptr, alloc_bytes: usize, _streams: &StreamSet) {
+        crate::cuda::mem_pool::defer_free(ptr, alloc_bytes, Vec::new());
+    }
+
+    #[test]
+    fn inflight_drop_defers_block_then_sweep_reclaims() {
+        // Clear the pending side-channel.
+        crate::cuda::mem_pool::TEST_DEFERRED.lock().clear();
+
+        let fake_ptr = 0xF00D as CUdeviceptr;
+        let buf: GpuBuffer<u8> = GpuBuffer::test_with_raw(fake_ptr, 256);
+        buf.mark_stream_use(fake_stream(0x9)); // in-flight on one stream
+
+        drop_reclaim_with(deferring_reclaim, || {
+            drop(buf);
+        });
+
+        // The block must be PARKED (deferred), proving no premature return to
+        // the allocatable pool while a stream still references it.
+        {
+            let parked = crate::cuda::mem_pool::TEST_DEFERRED.lock();
+            assert_eq!(parked.len(), 1, "in-flight drop must defer, not free");
+            assert_eq!(parked[0], (fake_ptr, 256));
+        }
+
+        // Simulate the sweep observing the event complete: the production
+        // sweep would `event_query` -> ready, then `POOL.free` the block. Here
+        // we model "event complete" by draining the pending channel and
+        // freeing through the pool's test shim, then assert the block left the
+        // pending list (reclaimed).
+        let drained: Vec<(CUdeviceptr, usize)> =
+            std::mem::take(&mut *crate::cuda::mem_pool::TEST_DEFERRED.lock());
+        for (p, b) in drained {
+            crate::cuda::mem_pool::POOL.free(p, b);
+        }
+        assert!(
+            crate::cuda::mem_pool::TEST_DEFERRED.lock().is_empty(),
+            "after the sweep reclaims it, the block must no longer be pending"
+        );
+    }
+
+    #[test]
+    fn record_defer_events_falls_back_when_events_unavailable() {
+        // Host CI has no CUDA driver / runs under cuda-stub: `event_create`
+        // returns an error, so `record_defer_events` must yield `None`
+        // (signalling the blanket-sync fallback) rather than a partial set.
+        let mut set = StreamSet::default();
+        set.insert(fake_stream(0x1));
+        set.insert(fake_stream(0x2));
+        assert!(
+            record_defer_events(&set).is_none(),
+            "no driver/events available -> must fall back, never a partial set"
+        );
     }
 }

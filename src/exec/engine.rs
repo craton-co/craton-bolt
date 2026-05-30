@@ -2366,7 +2366,29 @@ impl Engine {
                 table,
                 kernel,
                 output_schema,
-            } => self.execute_projection(table, kernel, output_schema),
+            } => {
+                // GPU projection path. If the GPU *declines* the upload/gather
+                // of a temporal/decimal column it returns the typed
+                // `BoltError::GpuCapacity` decline marker (see
+                // `gpu_table::GpuColumn::upload` / `gpu_compact::alloc_gathered`,
+                // agent-G F11). Mirror the join gates
+                // (`try_gpu_inner_join`/`try_gpu_outer_join`, which turn a
+                // declined GPU join into an `Ok` host re-run): catch the decline
+                // and transparently re-run the projection on the host instead of
+                // failing the query. Any *other* error still propagates.
+                match self.execute_projection(table, kernel, output_schema) {
+                    Err(BoltError::GpuCapacity(reason)) => {
+                        crate::metrics::metrics()
+                            .inc(crate::metrics::Counter::HostFallbacksTotal);
+                        log::debug!(
+                            "execute_projection: GPU declined ({reason}); \
+                             re-running projection on host"
+                        );
+                        self.execute_projection_host_fallback(table, kernel, output_schema, &reason)
+                    }
+                    other => other,
+                }
+            }
             PhysicalPlan::StringLength {
                 table,
                 outputs,
@@ -3022,6 +3044,95 @@ impl Engine {
         Ok(QueryHandle { batch: batch_out })
     }
 
+    /// Host re-run of a GPU projection the device *declined*
+    /// ([`BoltError::GpuCapacity`]).
+    ///
+    /// Agent-G's F11 turned the unsupported temporal/decimal GPU upload+gather
+    /// arms into the typed `GpuCapacity` decline marker instead of a fatal
+    /// error, so the engine can re-run on the host exactly like the join gates
+    /// (`try_gpu_inner_join`/`try_gpu_outer_join`) already do for declined GPU
+    /// joins. In practice the columns that trip the decline (Date32 /
+    /// Timestamp / Decimal128) only reach `execute_projection` as **passthrough**
+    /// projections — `SELECT date_col, dec_col, ... FROM t` — because the
+    /// arithmetic the GPU IR can express over them is narrow and the planner
+    /// routes anything richer through the host `PhysicalPlan::Project` /
+    /// `PhysicalPlan::StringProject` paths.
+    ///
+    /// We therefore serve the **identity-passthrough** shape directly from the
+    /// host-materialised table: a kernel with no predicate whose `ops` are
+    /// exactly `LoadColumn`→`Store` (or the 128-bit `LoadColumn128`→`Store128`)
+    /// pairs, one per output, each output fed by an input column we can pick out
+    /// of the source batch by name. This is correct by construction (no
+    /// computation is dropped) and needs no GPU.
+    ///
+    /// For any non-passthrough kernel (a predicate, or a real compute op over a
+    /// declined column) we deliberately **re-raise** the original decline rather
+    /// than risk an incorrect host result — there is no host op-VM interpreter
+    /// for the fused projection IR, and silently mis-evaluating would be worse
+    /// than surfacing the (rare) decline. `reason` is threaded through so the
+    /// re-raised error keeps the device's original message.
+    fn execute_projection_host_fallback(
+        &self,
+        table: &str,
+        kernel: &KernelSpec,
+        output_schema: &Schema,
+        reason: &str,
+    ) -> BoltResult<QueryHandle> {
+        let reraise = || {
+            BoltError::GpuCapacity(format!(
+                "GPU declined projection on table '{table}' ({reason}) and the \
+                 host fallback only supports identity-passthrough projections"
+            ))
+        };
+
+        // Detect the identity-passthrough shape and recover, for each output
+        // column, the input column ordinal that feeds it. `None` => not a pure
+        // passthrough (predicate present, or a compute/cast/select op), so we
+        // re-raise the decline rather than risk a wrong host result.
+        let out_src = passthrough_output_sources(kernel).ok_or_else(|| reraise())?;
+
+        // Pull the source rows from the host-materialised table and pick the
+        // mapped input column for each output, casting to the declared output
+        // arrow dtype (an identity/no-op cast for a true passthrough, but it
+        // also coerces a dictionary-encoded source to its logical dtype).
+        let src_batch = self.materialize_table(table)?;
+        let src_schema = src_batch.schema();
+        let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(kernel.outputs.len());
+        for (out_idx, out_io) in kernel.outputs.iter().enumerate() {
+            let in_idx = out_src[out_idx];
+            let in_io = kernel.inputs.get(in_idx).ok_or_else(|| reraise())?;
+            let col_pos = src_schema.index_of(&in_io.name).map_err(|_| {
+                BoltError::Plan(format!(
+                    "host projection fallback: input column '{}' not found in \
+                     table '{table}'",
+                    in_io.name
+                ))
+            })?;
+            let src_arr = src_batch.column(col_pos);
+            let want = arrow_schema.field(out_idx).data_type();
+            let arr: ArrayRef = if src_arr.data_type() == want {
+                src_arr.clone()
+            } else {
+                arrow::compute::cast(src_arr.as_ref(), want).map_err(|e| {
+                    BoltError::Other(format!(
+                        "host projection fallback: cast of '{}' to {:?} failed: {e}",
+                        out_io.name, want
+                    ))
+                })?
+            };
+            arrays.push(arr);
+        }
+
+        let batch_out = RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
+            BoltError::Other(format!(
+                "host projection fallback: failed to build RecordBatch: {e}"
+            ))
+        })?;
+        Ok(QueryHandle::from_record_batch(batch_out))
+    }
+
     /// Execute a [`PhysicalPlan::StringLength`]: a `SELECT LENGTH(<utf8_col>)`
     /// projection (plus passthrough columns) over a bare scan, with the
     /// `LENGTH` outputs computed on the GPU via the dictionary-index gather
@@ -3128,22 +3239,24 @@ impl Engine {
             Some(l) => l,
             None => {
                 // Host fallback: download keys and gather over the 1-based
-                // NULL-sentinel table (DictUtf8-with-nulls keys are zeroed to
-                // 0, which this table maps to length 0 — matching the
-                // documented `exec::string_ops::length` NULL → 0 behaviour).
+                // NULL-sentinel table. A NULL input row emits SQL NULL (a
+                // validity-carrying `None`), distinct from `LENGTH('') = 0` —
+                // matching the now-NULL-correct `exec::string_ops::length`
+                // (agent-C F-3). Valid rows map to `table[key+1]`.
                 let table_lengths =
                     build_length_table(dict, KeyLayout::OneBasedNullSlot0)?;
                 let keys_host = keys_vec.to_vec()?;
                 // DictUtf8 keys are 0-based; remap to the 1-based table by
                 // adding 1 only when the column is the DictUtf8 layout.
-                let lens = match &column.data {
+                let lens: Vec<Option<i64>> = match &column.data {
                     crate::exec::gpu_table::GpuColumnData::DictUtf8 { valid_mask, .. } => {
-                        // Consult validity: NULL rows → 0, valid rows → table[key+1].
+                        // Consult validity: NULL rows → SQL NULL, valid rows →
+                        // table[key+1].
                         let mask = valid_mask
                             .as_ref()
                             .map(|m| m.to_vec())
                             .transpose()?;
-                        let mut out: Vec<i64> = Vec::with_capacity(keys_host.len());
+                        let mut out: Vec<Option<i64>> = Vec::with_capacity(keys_host.len());
                         for (row, &k) in keys_host.iter().enumerate() {
                             let is_valid = match &mask {
                                 None => true,
@@ -3153,7 +3266,8 @@ impl Engine {
                                 }
                             };
                             if !is_valid {
-                                out.push(0);
+                                // SQL NULL, NOT length 0.
+                                out.push(None);
                             } else if k < 0 {
                                 return Err(BoltError::Other(format!(
                                     "LENGTH: negative dictionary key {k}"
@@ -3167,14 +3281,21 @@ impl Engine {
                                             "LENGTH: key {k} out of range"
                                         ))
                                     })?;
-                                out.push(len as i64);
+                                out.push(Some(len as i64));
                             }
                         }
                         out
                     }
-                    _ => host_gather_lengths(&keys_host, &table_lengths)?,
+                    // Non-DictUtf8 host gather: no per-row validity bitmap at
+                    // this layer, so every gathered length is non-NULL.
+                    _ => host_gather_lengths(&keys_host, &table_lengths)?
+                        .into_iter()
+                        .map(Some)
+                        .collect(),
                 };
                 check_len(lens.len(), n_rows)?;
+                // `Int64Array::from(Vec<Option<i64>>)` carries the validity
+                // bitmap, so NULL rows decode back to SQL NULL.
                 return Ok(Arc::new(Int64Array::from(lens)) as ArrayRef);
             }
         };
@@ -4435,6 +4556,72 @@ fn install_persistent_cache_override(path: Option<&std::path::Path>) {
     crate::jit::disk_cache::set_override_dir(path.map(|p| p.to_path_buf()));
 }
 
+/// Identity-passthrough analysis for the GPU-projection host fallback
+/// ([`Engine::execute_projection_host_fallback`]).
+///
+/// Returns `Some(out_src)` — where `out_src[output_col_idx] = input_col_idx` —
+/// IFF `kernel` is a pure passthrough: no predicate, and its `ops` are exactly
+/// `LoadColumn`→`Store` (or 128-bit `LoadColumn128`→`Store128`) pairs that
+/// route each input column straight to an output column with no computation.
+/// Returns `None` for any other shape (a predicate, or any compute / cast /
+/// select / 128-bit-arithmetic op), signalling the caller to re-raise the GPU
+/// decline rather than risk a wrong host result. Pulled out as a free function
+/// so the passthrough detection is unit-testable without a CUDA context.
+fn passthrough_output_sources(kernel: &KernelSpec) -> Option<Vec<usize>> {
+    use crate::plan::physical_plan::{Op, Reg};
+
+    // A predicate means rows are filtered — not a pure passthrough.
+    if kernel.predicate.is_some() {
+        return None;
+    }
+
+    // Register → source-column maps for the single and 128-bit load classes.
+    let mut loaded: HashMap<Reg, usize> = HashMap::new();
+    let mut loaded128: HashMap<(Reg, Reg), usize> = HashMap::new();
+    // output_col_idx → input_col_idx, recorded at each Store.
+    let mut out_src: HashMap<usize, usize> = HashMap::new();
+
+    for op in &kernel.ops {
+        match op {
+            Op::LoadColumn { dst, col_idx, .. } => {
+                loaded.insert(*dst, *col_idx);
+            }
+            Op::LoadColumn128 {
+                dst_lo,
+                dst_hi,
+                col_idx,
+            } => {
+                loaded128.insert((*dst_lo, *dst_hi), *col_idx);
+            }
+            Op::Store { src, col_idx, .. } => {
+                let in_idx = loaded.get(src).copied()?;
+                out_src.insert(*col_idx, in_idx);
+            }
+            Op::Store128 {
+                src_lo,
+                src_hi,
+                col_idx,
+            } => {
+                let in_idx = loaded128.get(&(*src_lo, *src_hi)).copied()?;
+                out_src.insert(*col_idx, in_idx);
+            }
+            // Any compute / cast / select / 128-bit arithmetic op disqualifies
+            // the passthrough fast path.
+            _ => return None,
+        }
+    }
+
+    // Every output must be covered by exactly one passthrough store.
+    if out_src.len() != kernel.outputs.len() {
+        return None;
+    }
+    let mut mapping = Vec::with_capacity(kernel.outputs.len());
+    for out_idx in 0..kernel.outputs.len() {
+        mapping.push(*out_src.get(&out_idx)?);
+    }
+    Some(mapping)
+}
+
 /// Decide whether to emit a pool-stats snapshot at time `now`, advancing
 /// the throttle state on a positive decision.
 ///
@@ -4795,6 +4982,193 @@ mod tests {
             false,
         )]));
         RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap()
+    }
+
+    // ---- Host-pure tests for the GPU-projection decline fallback ----
+    //
+    // These exercise `passthrough_output_sources` — the load-bearing,
+    // GPU-free decision the `execute_projection_host_fallback` path makes
+    // when a temporal/decimal column trips agent-G's `GpuCapacity` decline.
+    // No CUDA context needed.
+
+    use crate::plan::physical_plan::{ColumnIO, Op, Reg};
+
+    fn col_io(name: &str, dtype: DataType) -> ColumnIO {
+        ColumnIO {
+            name: name.to_string(),
+            dtype,
+        }
+    }
+
+    fn spec_with(inputs: Vec<ColumnIO>, outputs: Vec<ColumnIO>, ops: Vec<Op>) -> KernelSpec {
+        KernelSpec {
+            inputs,
+            outputs,
+            ops,
+            predicate: None,
+            register_count: 16,
+            input_has_validity: Vec::new(),
+            output_has_validity: Vec::new(),
+        }
+    }
+
+    /// A plain `SELECT date_col, ts_col FROM t` — two `LoadColumn`→`Store`
+    /// pairs — is recognised as a passthrough and maps each output back to
+    /// its source input column ordinal.
+    #[test]
+    fn passthrough_maps_outputs_to_inputs() {
+        let spec = spec_with(
+            vec![
+                col_io("d", DataType::Date32),
+                col_io("ts", DataType::Timestamp(crate::plan::TimeUnit::Microsecond, None)),
+            ],
+            vec![
+                col_io("d", DataType::Date32),
+                col_io("ts", DataType::Timestamp(crate::plan::TimeUnit::Microsecond, None)),
+            ],
+            vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Date32,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Timestamp(crate::plan::TimeUnit::Microsecond, None),
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Date32,
+                },
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Timestamp(crate::plan::TimeUnit::Microsecond, None),
+                },
+            ],
+        );
+        assert_eq!(passthrough_output_sources(&spec), Some(vec![0, 1]));
+    }
+
+    /// Output order may differ from input order (`SELECT b, a`); the mapping
+    /// must follow the stores, not the load order.
+    #[test]
+    fn passthrough_respects_output_reordering() {
+        let spec = spec_with(
+            vec![col_io("a", DataType::Int64), col_io("b", DataType::Int64)],
+            vec![col_io("b", DataType::Int64), col_io("a", DataType::Int64)],
+            vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Int64,
+                },
+                // output 0 <- input 1 (b), output 1 <- input 0 (a)
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 1,
+                    dtype: DataType::Int64,
+                },
+            ],
+        );
+        assert_eq!(passthrough_output_sources(&spec), Some(vec![1, 0]));
+    }
+
+    /// A Decimal128 passthrough lowers to a `LoadColumn128`→`Store128` pair
+    /// and is still recognised.
+    #[test]
+    fn passthrough_handles_decimal128_pair() {
+        let dec = DataType::Decimal128(38, 10);
+        let spec = spec_with(
+            vec![col_io("amt", dec)],
+            vec![col_io("amt", dec)],
+            vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::Store128 {
+                    src_lo: Reg(0),
+                    src_hi: Reg(1),
+                    col_idx: 0,
+                },
+            ],
+        );
+        assert_eq!(passthrough_output_sources(&spec), Some(vec![0]));
+    }
+
+    /// A compute op (here a `Binary` add) is NOT a passthrough — the helper
+    /// returns `None` so the caller re-raises the GPU decline instead of
+    /// silently producing a wrong host result.
+    #[test]
+    fn non_passthrough_compute_returns_none() {
+        let spec = spec_with(
+            vec![col_io("a", DataType::Int64), col_io("b", DataType::Int64)],
+            vec![col_io("sum", DataType::Int64)],
+            vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+                Op::LoadColumn {
+                    dst: Reg(1),
+                    col_idx: 1,
+                    dtype: DataType::Int64,
+                },
+                Op::Binary {
+                    dst: Reg(2),
+                    op: crate::plan::BinaryOp::Add,
+                    lhs: Reg(0),
+                    rhs: Reg(1),
+                    dtype: DataType::Int64,
+                    result_dtype: DataType::Int64,
+                },
+                Op::Store {
+                    src: Reg(2),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+            ],
+        );
+        assert_eq!(passthrough_output_sources(&spec), None);
+    }
+
+    /// A predicate-bearing kernel filters rows, so it is never treated as a
+    /// pure passthrough.
+    #[test]
+    fn predicate_kernel_is_not_passthrough() {
+        let mut spec = spec_with(
+            vec![col_io("a", DataType::Int64)],
+            vec![col_io("a", DataType::Int64)],
+            vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+            ],
+        );
+        spec.predicate = Some(Reg(0));
+        assert_eq!(passthrough_output_sources(&spec), None);
     }
 
     #[test]

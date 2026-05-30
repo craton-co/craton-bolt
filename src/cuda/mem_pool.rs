@@ -507,15 +507,42 @@ fn drain_pending_frees_blocking() {
     }
 }
 
-/// Test build: the deferred-free machinery is a no-op. Host-only pool tests
-/// run on synthetic pointers with no real events, and `GpuBuffer::Drop` never
-/// creates events under `#[cfg(test)]` (it has no driver), so nothing is ever
-/// deferred. These stubs keep the call sites uniform.
+/// Test build: the deferred-free machinery records into a side-channel instead
+/// of touching real events. Host-only pool tests run on synthetic pointers with
+/// no real CUDA events, so `sweep`/`drain` cannot meaningfully query them and
+/// are no-ops. `defer_free` records `(ptr, alloc_bytes)` so a host test can
+/// assert that a block was parked (deferred) rather than freed. These stubs
+/// keep the production call sites compiling under `#[cfg(test)]`.
 #[cfg(test)]
 pub(crate) fn sweep_pending_frees() {}
 
 #[cfg(test)]
 fn drain_pending_frees_blocking() {}
+
+/// Test-only side-channel: blocks routed through [`defer_free`] under
+/// `#[cfg(test)]`. Lets host tests assert a buffer's `Drop` *deferred* a block
+/// (event path) instead of freeing it inline. The `events` carried by the real
+/// signature are dropped here — host tests never create real events.
+#[cfg(test)]
+pub(crate) static TEST_DEFERRED: Lazy<Mutex<Vec<(CUdeviceptr, usize)>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Test build of `defer_free`: record the parked block in [`TEST_DEFERRED`].
+/// The event vector is accepted (to match the production signature so the
+/// `GpuBuffer::Drop` call site is identical) and dropped — under test no real
+/// events exist. Counted in `DEFERRED_FREE_COUNT` for parity with production.
+#[cfg(test)]
+pub(crate) fn defer_free(
+    ptr: CUdeviceptr,
+    alloc_bytes: usize,
+    _events: Vec<crate::cuda::cuda_sys::CUevent>,
+) {
+    if ptr == 0 {
+        return;
+    }
+    DEFERRED_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+    TEST_DEFERRED.lock().push((ptr, alloc_bytes));
+}
 
 /// Snapshot of pool-wide telemetry counters and capacity figures.
 ///

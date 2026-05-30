@@ -162,6 +162,15 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Serializes the tests that drive the process-wide single-slot
+    /// observer registry. The default test harness is multi-threaded, so
+    /// without this guard two registry-touching tests stomp each other's
+    /// installed observer (one overwrites the other's slot mid-run),
+    /// making call-count assertions flaky. `parking_lot::Mutex` is used
+    /// because it never poisons even if a test body unwinds while holding
+    /// the guard.
+    static TEST_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     fn dummy_stats() -> PoolStats {
         PoolStats {
             total_pooled_bytes: 0,
@@ -177,6 +186,7 @@ mod tests {
     /// still receive notifications.
     #[test]
     fn panicking_observer_does_not_disable_surface() {
+        let _serial = TEST_SERIAL.lock();
         // Install an observer that always panics.
         install_pool_stats_observer(Box::new(|_| panic!("boom")));
 
@@ -218,6 +228,7 @@ mod tests {
     /// emit firing more than once over a long-lived process.
     #[test]
     fn panicking_observer_swallowed_on_every_emit() {
+        let _serial = TEST_SERIAL.lock();
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         CALLS.store(0, Ordering::SeqCst);
         install_pool_stats_observer(Box::new(|_| {

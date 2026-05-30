@@ -865,6 +865,42 @@ pub fn compile_prefix_scan_kernel_blelloch() -> BoltResult<String> {
 /// * **Out-of-range lanes** in a partial last block contribute zero to the
 ///   block aggregate (the existing AFTER_LOAD predicate handles it), so
 ///   the published aggregate is correct for any `n_rows`.
+///
+/// ## Host launch contract — forward-progress / no-deadlock (review C-7 / E §2)
+///
+/// The LOOKBACK_SPIN step (algorithm step 3) spins on a *predecessor* block's
+/// `partial_status[blockIdx.x - 1]` with `ld.acquire.gpu.u32` and has **no
+/// timeout / fallback**. Forward progress therefore depends on every block
+/// being able to make progress without waiting on a block that has not been
+/// scheduled. This is only guaranteed when the whole grid is **co-resident** —
+/// i.e. the launch is a single occupancy-bounded wave. The host launch site
+/// MUST enforce, before selecting this kernel:
+///
+/// 1. **Single-wave occupancy bound.** `gridDim.x <= max_resident_blocks`,
+///    where
+///    `max_resident_blocks = num_SMs * maxActiveBlocksPerSM`
+///    for THIS kernel at the chosen `blockDim` and shared-mem usage (query via
+///    `cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, blockDim,
+///    smem)` then `* deviceProp.multiProcessorCount`). If `gridDim.x` would
+///    exceed that bound, a predecessor block may never be scheduled while a
+///    successor spins on its status slot — a **deadlock**. The launch site
+///    must instead fall back to the multipass scan
+///    ([`compile_prefix_scan_kernel`] / [`compile_prefix_scan_kernel_blelloch`]
+///    driven by the host download-scan-upload path, exposed in
+///    `gpu_compact` as `prefix_scan_multipass`).
+///
+/// 2. **`n_rows <= i32::MAX`.** The global thread id is computed in **s32**
+///    (`mad.lo.s32 %r3, %ctaid.x, %ntid.x, %tid.x`). For `n_rows > i32::MAX`
+///    the id wraps negative and mis-addresses the mask / index buffers. Every
+///    ptx_gen-/prefix-scan-emitted kernel shares this cap (see the C-3/C-4
+///    note in `ptx_gen::compile`); the launch site must assert it.
+///
+/// 3. **Value bit budget** (also a correctness note above):
+///    `n_rows < (1 << 30)` so the 30-bit prefix value cannot saturate.
+///
+/// The host helper [`lookback_launch_is_safe`] encodes bounds (1)–(3) as a
+/// single predicate the launch site can `debug_assert!` on and branch to the
+/// multipass fallback when it returns `false`.
 pub fn compile_prefix_scan_kernel_lookback() -> BoltResult<String> {
     // Re-use Hillis-Steele's shared-memory layout for the block scan: two
     // ping-pong u32 buffers of BLOCK_SIZE entries each. We also need ONE
@@ -1202,6 +1238,58 @@ pub fn compile_prefix_scan_kernel_lookback() -> BoltResult<String> {
     writeln!(ptx, "}}").map_err(write_err)?;
 
     Ok(ptx)
+}
+
+/// Exclusive upper bound on `n_rows` for the decoupled-lookback kernel imposed
+/// by its 30-bit `partial_status` value field: the cumulative prefix must fit
+/// in `LOOKBACK_VALUE_MASK` (`< 1 << 30`), so a launch with `n_rows >=
+/// LOOKBACK_MAX_ROWS` could saturate the prefix and MUST take the multipass
+/// fallback. See the "Host launch contract" section on
+/// [`compile_prefix_scan_kernel_lookback`].
+pub const LOOKBACK_MAX_ROWS: u32 = 1 << 30;
+
+/// Forward-progress / no-deadlock guard for the decoupled-lookback scan
+/// (review C-7 / E §2).
+///
+/// Returns `true` iff it is safe to launch [`SCAN_KERNEL_ENTRY_LOOKBACK`] with
+/// `grid_dim_x` blocks over `n_rows` rows given `max_resident_blocks` (the
+/// occupancy-bounded co-residency capacity, `num_SMs * maxActiveBlocksPerSM`
+/// for this kernel at the launch `blockDim`). The host launch site MUST gate
+/// on this predicate and, when it returns `false`, fall back to the multipass
+/// scan (`gpu_compact::prefix_scan_multipass`) instead of the single-pass
+/// lookback kernel:
+///
+/// ```ignore
+/// // At the lookback launch site (in the executor that owns the launch):
+/// debug_assert!(
+///     prefix_scan::lookback_launch_is_safe(grid_dim_x, max_resident_blocks, n_rows),
+///     "lookback scan grid {grid_dim_x} / n_rows {n_rows} violates the \
+///      forward-progress contract; would deadlock or saturate"
+/// );
+/// if !prefix_scan::lookback_launch_is_safe(grid_dim_x, max_resident_blocks, n_rows) {
+///     return prefix_scan_multipass(/* … */);
+/// }
+/// ```
+///
+/// The three bounds checked, in order:
+///
+/// 1. **Co-residency**: `grid_dim_x <= max_resident_blocks` — every block must
+///    be resident so a successor never spins on an unscheduled predecessor's
+///    status slot (the deadlock case). A `max_resident_blocks == 0` query
+///    result (no capacity reported) is treated as unsafe.
+/// 2. **Row addressing**: `n_rows <= i32::MAX` — the kernel computes the global
+///    thread id in s32; larger counts wrap negative and mis-address.
+/// 3. **Value budget**: `n_rows < LOOKBACK_MAX_ROWS` — the 30-bit prefix value
+///    field must not saturate.
+///
+/// Pure host arithmetic (no CUDA context), so the launch-site owner gets a
+/// single tested predicate rather than re-deriving the three bounds inline.
+#[must_use]
+pub fn lookback_launch_is_safe(grid_dim_x: u32, max_resident_blocks: u32, n_rows: usize) -> bool {
+    grid_dim_x <= max_resident_blocks
+        && max_resident_blocks > 0
+        && n_rows <= i32::MAX as usize
+        && (n_rows as u64) < LOOKBACK_MAX_ROWS as u64
 }
 
 /// Generate the per-dtype gather PTX module.
@@ -1705,6 +1793,33 @@ mod tests {
             ptx.contains("ld.acquire.gpu.u32"),
             "missing ld.acquire.gpu.u32 on partial_status read:\n{ptx}"
         );
+    }
+
+    /// The lookback forward-progress guard (review C-7 / E §2) accepts a
+    /// single occupancy-bounded wave and rejects an over-subscribed grid.
+    #[test]
+    fn lookback_guard_enforces_coresidency() {
+        // grid fits within resident capacity, small n_rows → safe.
+        assert!(lookback_launch_is_safe(64, 64, 100_000));
+        assert!(lookback_launch_is_safe(1, 80, 1));
+        // grid exceeds resident capacity → would deadlock → unsafe.
+        assert!(!lookback_launch_is_safe(65, 64, 100_000));
+        // zero reported capacity is never safe.
+        assert!(!lookback_launch_is_safe(0, 0, 0));
+    }
+
+    /// The guard also enforces the s32 row-addressing and 30-bit value-budget
+    /// bounds, falling back to multipass for oversize row counts.
+    #[test]
+    fn lookback_guard_enforces_row_bounds() {
+        // n_rows at/over the 30-bit value budget saturates the prefix → unsafe
+        // even with ample co-residency.
+        assert!(lookback_launch_is_safe(1, 1, LOOKBACK_MAX_ROWS as usize - 1));
+        assert!(!lookback_launch_is_safe(1, 1, LOOKBACK_MAX_ROWS as usize));
+        // n_rows above i32::MAX mis-addresses in the s32 tid math → unsafe.
+        assert!(!lookback_launch_is_safe(1, 1, i32::MAX as usize + 1));
+        // The value budget is the binding (smaller) of the two row caps.
+        assert!((LOOKBACK_MAX_ROWS as usize) < i32::MAX as usize);
     }
 }
 

@@ -571,4 +571,85 @@ mod stage4_tests {
             assert_eq!(vs.value(i), expected_min[ks.value(i) as usize]);
         }
     }
+
+    /// F2 (GPU): grouped float MIN and MAX on the fast path must equal a
+    /// per-group host scalar reference for finite data. The NaN case is
+    /// covered host-only by `nan_tests` (the fast path defers NaN-bearing
+    /// columns to the global-atomic / scalar path, which `aggregate.rs`'s
+    /// `float_total_cmp` tests pin to the DuckDB total order), so here we
+    /// assert the on-GPU grouped result agrees with the scalar reduction over
+    /// the same finite data — the "one answer per query" invariant.
+    #[test]
+    #[ignore = "gpu:tier2"]
+    fn grouped_float_minmax_matches_scalar_reference() {
+        let n: usize = 300_000;
+        let n_groups: usize = 4096;
+        // Mix signs and magnitudes so MIN and MAX exercise different groups.
+        let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
+        let vals: Vec<f64> = (0..n)
+            .map(|i| ((i as f64) * 1.5 - (n as f64)) * if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+
+        for op_is_min in [true, false] {
+            // Per-group scalar reference (plain comparison; data is finite).
+            let mut expected = vec![if op_is_min { f64::INFINITY } else { f64::NEG_INFINITY }; n_groups];
+            for (i, &k) in keys.iter().enumerate() {
+                let slot = &mut expected[k as usize];
+                if op_is_min {
+                    if vals[i] < *slot { *slot = vals[i]; }
+                } else if vals[i] > *slot {
+                    *slot = vals[i];
+                }
+            }
+            let agg = if op_is_min {
+                AggregateExpr::Min(Expr::Column("v".into()))
+            } else {
+                AggregateExpr::Max(Expr::Column("v".into()))
+            };
+            let plan = PhysicalPlan::Aggregate {
+                table: "t".into(),
+                pre: None,
+                aggregate: AggregateSpec {
+                    inputs: vec![
+                        ColumnIO { name: "k".into(), dtype: DataType::Int32 },
+                        ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ],
+                    group_by: vec![0],
+                    aggregates: vec![agg],
+                    output_schema: Schema::new(vec![
+                        Field::new("k", DataType::Int32, false),
+                        Field::new("v", DataType::Float64, true),
+                    ]),
+                    input_has_validity: Vec::new(),
+                },
+            };
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("k", ArrowDataType::Int32, false),
+                ArrowField::new("v", ArrowDataType::Float64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(keys.clone())) as arrow_array::ArrayRef,
+                    Arc::new(Float64Array::from(vals.clone())) as arrow_array::ArrayRef,
+                ],
+            )
+            .unwrap();
+            let out = match try_execute(&plan, &batch) {
+                Some(Ok(b)) => b,
+                _ => return, // no GPU / declined → nothing to assert on host
+            };
+            let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let vs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            for i in 0..out.num_rows() {
+                assert_eq!(
+                    vs.value(i),
+                    expected[ks.value(i) as usize],
+                    "grouped float {} disagrees with scalar reference for key {}",
+                    if op_is_min { "MIN" } else { "MAX" },
+                    ks.value(i)
+                );
+            }
+        }
+    }
 }
