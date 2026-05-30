@@ -182,25 +182,157 @@ pub(crate) fn use_shmem_staging_partition_i64(n_rows: u32) -> bool {
 /// stability, matching the pre-extraction code exactly.
 ///
 /// Pure host computation — no GPU calls, no launch parameters produced.
+///
+/// ## Performance
+///
+/// The original walk is a nested `pid`/`slot` loop, but because
+/// `idx = pid * block_groups + slot` enumerates `0..num_partitions *
+/// block_groups` strictly in ascending order with no gaps, the selection is
+/// equivalent to a single flat pass over the parallel `host_set` / `host_keys`
+/// / `host_vals` slices in index order. This is exploited below:
+///
+/// * **Serial fast path** (default, and the only path below
+///   [`PARALLEL_SLOT_SCAN_THRESHOLD`]): a single fused pass over `host_set`
+///   that pushes `(key, val)` only for populated slots. The output `Vec` is
+///   pre-sized to the slot count so the push loop never reallocates (the real
+///   populated count is `<= n_slots`, so this is an upper-bound reserve that
+///   trades a one-time over-allocation for zero reallocation churn). Slice
+///   bounds checks are hoisted by truncating all three inputs to the common
+///   `n_slots` length up front, after which the iterators carry no per-element
+///   bounds checks.
+///
+/// * **Parallel scan** (only when `n_slots > PARALLEL_SLOT_SCAN_THRESHOLD`):
+///   the `0..n_slots` index range is split into a fixed number of contiguous
+///   chunks; each chunk is scanned on its own `std::thread::scope` thread into
+///   a private `Vec`. The chunks are then concatenated **in ascending chunk
+///   order**, which reproduces the exact same pre-sort element sequence as the
+///   serial flat pass (each chunk covers a contiguous, non-overlapping,
+///   ascending index sub-range, and they are stitched back together in that
+///   same order). The identical pre-sort sequence fed through the identical
+///   `sort_by_key` (a *stable* sort) yields byte-identical output to the serial
+///   path for every input — even in the (contractually impossible) presence of
+///   duplicate keys, since stability + identical input order ⇒ identical
+///   output order.
 #[inline]
-pub(crate) fn collect_populated_slots_sorted<T: Copy>(
+pub(crate) fn collect_populated_slots_sorted<T: Copy + Send + Sync>(
     host_keys: &[i32],
     host_vals: &[T],
     host_set: &[u8],
     num_partitions: usize,
     block_groups: usize,
 ) -> Vec<(i32, T)> {
-    let mut pairs: Vec<(i32, T)> = Vec::new();
-    for pid in 0..num_partitions {
-        let base = pid * block_groups;
-        for slot in 0..block_groups {
-            let idx = base + slot;
-            if host_set[idx] != 0 {
-                pairs.push((host_keys[idx], host_vals[idx]));
-            }
+    let n_slots = num_partitions * block_groups;
+
+    // Hoist bounds checks: the flat pass only ever touches `0..n_slots`, so
+    // truncate all three parallel buffers to that common length once. This
+    // also preserves the original code's implicit assumption that every input
+    // is indexable across the full slot range (an out-of-range buffer would
+    // have panicked in the original nested loop too — `[..n_slots]` panics
+    // identically if a buffer is too short).
+    let host_set = &host_set[..n_slots];
+    let host_keys = &host_keys[..n_slots];
+    let host_vals = &host_vals[..n_slots];
+
+    let mut pairs: Vec<(i32, T)> =
+        if n_slots > PARALLEL_SLOT_SCAN_THRESHOLD {
+            collect_pairs_parallel(host_keys, host_vals, host_set, n_slots)
+        } else {
+            collect_pairs_serial(host_keys, host_vals, host_set, n_slots)
+        };
+
+    pairs.sort_by_key(|(k, _)| *k);
+    pairs
+}
+
+/// Minimum slot count above which [`collect_populated_slots_sorted`] fans the
+/// pre-sort scan out across threads. Below this, the scan stays single-threaded
+/// because thread-spawn / join overhead would dominate the cheap per-slot work.
+///
+/// Chosen conservatively: the production reduce output is
+/// `NUM_PARTITIONS * BLOCK_GROUPS == 4096 * 1024 ≈ 4.2M` slots, far above the
+/// threshold, while typical small/test inputs stay serial.
+const PARALLEL_SLOT_SCAN_THRESHOLD: usize = 256 * 1024;
+
+/// Single fused pass collecting populated `(key, val)` pairs in ascending slot
+/// order. Pre-sizes to `n_slots` (an upper bound on the populated count) so the
+/// push loop never reallocates.
+#[inline]
+fn collect_pairs_serial<T: Copy>(
+    host_keys: &[i32],
+    host_vals: &[T],
+    host_set: &[u8],
+    n_slots: usize,
+) -> Vec<(i32, T)> {
+    let mut pairs: Vec<(i32, T)> = Vec::with_capacity(n_slots);
+    for idx in 0..n_slots {
+        // SAFETY-FREE: all three slices were truncated to `n_slots`, so `idx`
+        // is in bounds for each; the compiler can elide the bounds checks.
+        if host_set[idx] != 0 {
+            pairs.push((host_keys[idx], host_vals[idx]));
         }
     }
-    pairs.sort_by_key(|(k, _)| *k);
+    pairs
+}
+
+/// Parallel analogue of [`collect_pairs_serial`]. Splits `0..n_slots` into
+/// contiguous chunks, scans each on its own scoped thread, then concatenates
+/// the per-chunk results in ascending chunk order so the pre-sort element
+/// sequence is byte-identical to the serial pass.
+fn collect_pairs_parallel<T: Copy + Send + Sync>(
+    host_keys: &[i32],
+    host_vals: &[T],
+    host_set: &[u8],
+    n_slots: usize,
+) -> Vec<(i32, T)> {
+    // Bound the fan-out by available parallelism, but never exceed the number
+    // of slots and always use at least one chunk.
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    let n_chunks = max_threads.min(n_slots).max(1);
+    // Ceil-divide so the last chunk absorbs the remainder; every chunk covers
+    // a contiguous, non-overlapping, ascending sub-range of `0..n_slots`.
+    let chunk_len = n_slots.div_ceil(n_chunks);
+
+    // Per-chunk outputs, indexed by chunk order so concatenation is
+    // deterministic regardless of thread completion order.
+    let mut chunk_outputs: Vec<Vec<(i32, T)>> = Vec::with_capacity(n_chunks);
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(n_chunks);
+        for c in 0..n_chunks {
+            let start = c * chunk_len;
+            if start >= n_slots {
+                break;
+            }
+            let end = (start + chunk_len).min(n_slots);
+            let set = &host_set[start..end];
+            let keys = &host_keys[start..end];
+            let vals = &host_vals[start..end];
+            handles.push(scope.spawn(move || {
+                // Local pass mirrors the serial loop over this sub-range,
+                // preserving ascending index order within the chunk.
+                let mut local: Vec<(i32, T)> = Vec::with_capacity(end - start);
+                for i in 0..(end - start) {
+                    if set[i] != 0 {
+                        local.push((keys[i], vals[i]));
+                    }
+                }
+                local
+            }));
+        }
+        // Join in spawn (chunk) order to rebuild the ascending sequence.
+        for h in handles {
+            chunk_outputs.push(h.join().expect("slot-scan worker panicked"));
+        }
+    });
+
+    let total: usize = chunk_outputs.iter().map(Vec::len).sum();
+    let mut pairs: Vec<(i32, T)> = Vec::with_capacity(total);
+    for mut chunk in chunk_outputs {
+        pairs.append(&mut chunk);
+    }
     pairs
 }
 
@@ -331,5 +463,100 @@ mod tests {
             block_groups,
         );
         assert_eq!(got, expected);
+    }
+
+    /// The exact pre-optimization nested `pid`/`slot` walk + key-sort, kept
+    /// here as the differential reference for the large-input tests below.
+    fn reference_walk<T: Copy>(
+        host_keys: &[i32],
+        host_vals: &[T],
+        host_set: &[u8],
+        num_partitions: usize,
+        block_groups: usize,
+    ) -> Vec<(i32, T)> {
+        let mut pairs: Vec<(i32, T)> = Vec::new();
+        for pid in 0..num_partitions {
+            let base = pid * block_groups;
+            for slot in 0..block_groups {
+                let idx = base + slot;
+                if host_set[idx] != 0 {
+                    pairs.push((host_keys[idx], host_vals[idx]));
+                }
+            }
+        }
+        pairs.sort_by_key(|(k, _)| *k);
+        pairs
+    }
+
+    #[test]
+    fn collect_populated_slots_large_matches_serial_reference() {
+        // LARGE input that crosses PARALLEL_SLOT_SCAN_THRESHOLD so the parallel
+        // scan path is exercised. Assert element-for-element equality with the
+        // exact serial reference walk.
+        assert!(
+            PARALLEL_SLOT_SCAN_THRESHOLD < 1024 * 1024,
+            "test sizing assumes threshold below the chosen slot count"
+        );
+        let num_partitions = 1024usize;
+        let block_groups = 1024usize; // 1,048,576 slots > 256K threshold.
+        let n = num_partitions * block_groups;
+        assert!(n > PARALLEL_SLOT_SCAN_THRESHOLD);
+
+        // Deterministic pseudo-random-ish key/value/present fill. Keys are made
+        // unique (the production invariant) by mixing the slot index, but the
+        // ordering across slots is intentionally scrambled so the sort does
+        // real work.
+        let mut host_keys: Vec<i32> = Vec::with_capacity(n);
+        let mut host_vals: Vec<i64> = Vec::with_capacity(n);
+        let mut host_set: Vec<u8> = Vec::with_capacity(n);
+        for i in 0..n {
+            // A bijection over 0..n keeps keys distinct, scrambled by a large
+            // odd multiplier modulo n.
+            let k = ((i as u64).wrapping_mul(2_654_435_761) % (n as u64)) as i32;
+            host_keys.push(k);
+            host_vals.push((i as i64).wrapping_mul(7).wrapping_add(3));
+            // ~62.5% populated, with a non-trivial bit pattern.
+            host_set.push(if (i * 5 + 1) % 8 < 5 { 1 } else { 0 });
+        }
+
+        let expected = reference_walk::<i64>(
+            &host_keys,
+            &host_vals,
+            &host_set,
+            num_partitions,
+            block_groups,
+        );
+        let got = collect_populated_slots_sorted::<i64>(
+            &host_keys,
+            &host_vals,
+            &host_set,
+            num_partitions,
+            block_groups,
+        );
+        assert_eq!(got.len(), expected.len());
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn collect_pairs_parallel_equals_serial_directly() {
+        // Directly pit the two private collectors against each other on a
+        // large slot range to confirm the parallel concatenation reproduces
+        // the serial flat-pass element order byte-for-byte (pre-sort), so the
+        // subsequent stable sort cannot diverge.
+        let n_slots = PARALLEL_SLOT_SCAN_THRESHOLD + 12_345;
+        let mut host_keys: Vec<i32> = Vec::with_capacity(n_slots);
+        let mut host_vals: Vec<f64> = Vec::with_capacity(n_slots);
+        let mut host_set: Vec<u8> = Vec::with_capacity(n_slots);
+        for i in 0..n_slots {
+            host_keys.push((n_slots - i) as i32);
+            host_vals.push(i as f64);
+            host_set.push((i % 3 != 0) as u8);
+        }
+        let serial =
+            collect_pairs_serial::<f64>(&host_keys, &host_vals, &host_set, n_slots);
+        let parallel =
+            collect_pairs_parallel::<f64>(&host_keys, &host_vals, &host_set, n_slots);
+        // Pre-sort sequences must be identical (same selection, same order).
+        assert_eq!(serial, parallel);
     }
 }

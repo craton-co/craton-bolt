@@ -58,57 +58,22 @@ use std::ops::{Deref, DerefMut};
 
 use bytemuck::Pod;
 
+use crate::cuda::buffer::StreamSet;
 use crate::cuda::cuda_sys::{self, CUstream};
 use crate::cuda::smart_ptrs::{GpuView, GpuViewMut};
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
 
-/// Deduplicated set of stream handles a [`PinnedBuffer`] has been enqueued on.
-///
-/// ## Why this is a local type, not [`crate::cuda::buffer::StreamSet`]
-///
-/// The sibling [`crate::cuda::buffer::PinnedHostBuffer`] fixes the identical
-/// host-side multi-stream use-after-free with a `RefCell<StreamSet>` and we
-/// would prefer to reuse that exact type. But while `buffer::StreamSet` is
-/// `pub(crate)` (nameable here), its `insert` / `len` / `is_empty` methods and
-/// its inner `streams` field are *module-private* to `buffer`, so a sibling
-/// module cannot actually operate on one. Exposing them would mean editing
-/// `buffer.rs`, which is out of scope for this fix. We therefore keep a
-/// minimal, behaviourally-identical local accumulator (deduped `Vec<CUstream>`,
-/// linear dedup — n is ~1–2 in practice, see the rationale on
-/// `buffer::StreamSet`). If `buffer::StreamSet`'s API is ever made
-/// `pub(crate)`, this type should be deleted in favour of importing it.
-///
-/// `CUstream` is a raw pointer handle; we never dereference it here, only
-/// compare handles for equality and forward them to `cuStreamSynchronize`.
-#[derive(Default)]
-struct StreamSet {
-    /// Distinct stream handles, in first-seen order. Never contains
-    /// duplicates (enforced by [`StreamSet::insert`]).
-    streams: Vec<CUstream>,
-}
-
-impl StreamSet {
-    /// Record `stream` if not already present, so `Drop` issues at most one
-    /// `cuStreamSynchronize` per distinct stream.
-    #[inline]
-    fn insert(&mut self, stream: CUstream) {
-        if !self.streams.contains(&stream) {
-            self.streams.push(stream);
-        }
-    }
-
-    /// Number of distinct streams recorded. Test/diagnostic hook.
-    #[inline]
-    fn len(&self) -> usize {
-        self.streams.len()
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.streams.is_empty()
-    }
-}
+// The deduplicated stream-handle accumulator this module's `PinnedBuffer`
+// tracks is the *same* type the sibling `GpuBuffer` / `PinnedHostBuffer` use:
+// the canonical [`crate::cuda::buffer::StreamSet`], imported above. A local,
+// behaviourally-identical copy used to live here only because that type's
+// `insert` / `len` / `is_empty` accessors were module-private to `buffer`;
+// they are now `pub(crate)` (an additive widening — see `buffer::StreamSet`),
+// so the duplicate has been deleted in favour of reuse. `Drop`'s fence loop
+// walks the set through the additive `StreamSet::iter()` accessor (the private
+// `streams` field stays encapsulated). No tracking / dedup / fence semantics
+// changed.
 
 /// Owned page-locked (pinned) host buffer, allocated via `cuMemHostAlloc`.
 ///
@@ -463,7 +428,7 @@ fn real_stream_fence(stream: CUstream) -> crate::cuda::cuda_sys::CUresult {
 /// stub `Drop` path never fences — so gate it to avoid a dead-code warning.
 #[cfg(any(not(feature = "cuda-stub"), test))]
 fn fence_all_streams(streams: &StreamSet, fence: StreamFenceFn) {
-    for &stream in &streams.streams {
+    for stream in streams.iter() {
         let rc = fence(stream);
         if rc != cuda_sys::CUDA_SUCCESS {
             log::warn!(
@@ -519,8 +484,10 @@ impl<T: Pod> Drop for PinnedBuffer<T> {
         {
             // Explicitly touch the field so a future refactor that drops it
             // trips here rather than silently. (`storage` drops on its own.)
-            // Reading both accessors also keeps `StreamSet::is_empty` / `len`
-            // exercised in a non-test stub build, so neither warns as dead.
+            // `StreamSet::is_empty` / `len` now live on the shared
+            // `buffer::StreamSet` and are referenced from `buffer` too, so they
+            // can't go dead; the read here is kept only as that field-touch
+            // canary.
             let set = self.used_streams.borrow();
             let _ = (set.is_empty(), set.len());
         }

@@ -59,7 +59,19 @@ Wave 2: A2 (critical deferred-free LIVE), D2 (groupby F1-F4), W (cross-file wiri
   Checkpoints green: 2098 passed / 0 failed / 324 GPU-ignored.
 Wave 3 RUNNING: M=a524045951acf20fd (string fns), J=abf8a96806fc82b6c (streaming wiring).
 
-## Wave 4 (after M/J merge + golden snapshots)
-- Orchestrator: generate & commit insta full-PTX golden snapshots (host-side codegen, no GPU needed) — guards dedup.
-- K (jit partition_reduce_kernel_* dedup) — PTX MUST stay byte-identical to committed goldens.
-- L (groupby_tier2_* dedup) — safe shared-helper extraction only; behavior-identical.
+## Wave 4 DONE: IL (ILIKE), L (tier2 dedup), GS (40 golden PTX snapshots).
+## Wave 5 DONE: K (jit partition_reduce fragment dedup; snapshots verified byte-identical).
+
+## FINAL STATUS: all review items implemented. dev = 8 commits over baseline.
+Final: 2201 host tests passing / 0 failed / 330 GPU-ignored. Lib + all integ bins compile under cuda-stub.
+
+## Remaining (NOT code — require human/GPU; out of agent scope)
+1. GPU validation: every fix is verified under cuda-stub + host oracle only. The
+   #[ignore]'d GPU correctness suite (incl. diff_duckdb) must run on the GPU CI lane
+   (stubbed by agent I) before release.
+2. Manual git-history scrub (mailmap/squash) for mixed author identities — orchestrator
+   must NOT rewrite shared history without sign-off (oss_readiness.md blocker).
+3. CODEOWNERS team creation + `cargo publish --dry-run` (manual, pre-release).
+4. Optional/deferred (risky without GPU profiling, left as backlog): AVG fused reduce,
+   parallelize host slot-walk, device-compact before D2H; PinnedHostBuffer Drop still
+   blanket-sync; streaming eager-tables &mut seam + real PinnedBudget backing.

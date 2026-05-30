@@ -58,8 +58,16 @@ pub(crate) struct StreamSet {
 impl StreamSet {
     /// Record `stream` if not already present. Dedups so `Drop` issues at
     /// most one `cuStreamSynchronize` per distinct stream.
+    ///
+    /// `pub(crate)` (was module-private) so sibling modules that already track
+    /// the same multi-stream use-after-free can reuse this canonical type
+    /// rather than duplicating the accumulator — see
+    /// [`crate::cuda::async_copy::PinnedBuffer`]. Widening private → `pub(crate)`
+    /// is purely additive: it cannot change the behaviour of any existing
+    /// caller. No logic, representation, or `Drop`/deferred-free semantics
+    /// change.
     #[inline]
-    fn insert(&mut self, stream: CUstream) {
+    pub(crate) fn insert(&mut self, stream: CUstream) {
         if !self.streams.contains(&stream) {
             self.streams.push(stream);
         }
@@ -67,13 +75,29 @@ impl StreamSet {
 
     /// Number of distinct streams recorded. Test/diagnostic hook.
     #[inline]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.streams.len()
     }
 
     #[inline]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.streams.is_empty()
+    }
+
+    /// Iterate the distinct recorded stream handles, in first-seen order.
+    ///
+    /// Lets sibling modules' `Drop`-time fence loops walk the set without
+    /// exposing the private `streams` field. Additive accessor; the in-module
+    /// `Drop`/deferred-free paths continue to iterate the field directly.
+    ///
+    /// Its only caller is `async_copy`'s `fence_all_streams`, which exists only
+    /// in a live build or any test build, so mirror that gate here to avoid a
+    /// dead-code warning in a non-test `cuda-stub` build (matching the rest of
+    /// this module's lint hygiene).
+    #[cfg(any(not(feature = "cuda-stub"), test))]
+    #[inline]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = CUstream> + '_ {
+        self.streams.iter().copied()
     }
 }
 
