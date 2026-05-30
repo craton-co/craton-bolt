@@ -3421,10 +3421,11 @@ impl Engine {
         mode: crate::jit::string_kernel::LikeMode,
         negated: bool,
     ) -> BoltResult<QueryHandle> {
+        use arrow_array::Array;
+
         // Execute the inner scan: this is the row-aligned source batch that
         // carries `column` (the lowering required a bare Scan beneath).
         let batch = self.execute(input)?.into_record_batch();
-        let n_rows = batch.num_rows();
         let schema = batch.schema();
 
         // Locate the column; if missing or not a StringArray, fall back to the
@@ -3489,7 +3490,6 @@ impl Engine {
                 "StringLikeFilter: failed to rebuild RecordBatch: {e}"
             ))
         })?;
-        let _ = n_rows;
         Ok(QueryHandle { batch: out })
     }
 
@@ -3506,6 +3506,7 @@ impl Engine {
         mode: crate::jit::string_kernel::LikeMode,
         negated: bool,
     ) -> BoltResult<arrow_array::BooleanArray> {
+        use arrow_array::Array;
         use crate::exec::string_like::{build_row_aligned_from_strings, mask_to_boolean_array};
 
         let n_rows = col.len();
