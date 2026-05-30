@@ -14,8 +14,12 @@ v0.7 turns the v0.6 carry-overs into live code paths. The themes are
 the same three the v0.6 closing notes scheduled for "v0.7+": wiring the
 `KernelSpec` module cache into real call sites, lighting up the
 `Decimal128` / `Date` / `Timestamp` GPU lowering boundaries, and landing
-the GPU radix sort dispatch in the executor. Items are grouped to mirror
-the v0.6 milestone headings.
+the GPU radix sort dispatch in the executor. It also widens the SQL
+surface itself — set operations (`EXCEPT` / `INTERSECT`), host-side
+window functions, non-recursive CTEs, uncorrelated subqueries,
+`JOIN ... USING` / `NATURAL`, `COUNT(DISTINCT)`, and GPU `LIKE` /
+`UPPER` / `LOWER` / `LENGTH`. Items are grouped to mirror the v0.6
+milestone headings.
 
 ### Added — Types (Decimal128 / Date / Timestamp)
 - **`Decimal128` GPU arithmetic** — dual-register IR (`Op::*128` +
@@ -51,6 +55,52 @@ the v0.6 milestone headings.
 ### Changed — Lowering / validation
 - **WHERE predicate type-checking** during SQL lowering (fixes `LIKE` on
   a non-`Utf8` column).
+
+### Added — SQL surface (set ops, windows, CTEs, subqueries, joins)
+- **`EXCEPT [ALL]` / `INTERSECT [ALL]`** — lowered to a binary
+  `LogicalPlan::SetOp` node and executed **host-side** by
+  `src/exec/setops.rs`. Set forms return distinct left rows; multiset
+  (`ALL`) forms follow the SQL-standard `max(0, lc - rc)` /
+  `min(lc, rc)` multiplicities. Row equality reuses the `DISTINCT`
+  executor's row-key machinery (NULLs not distinct; `±0.0`
+  canonicalised). `UNION` / `EXCEPT` / `INTERSECT BY NAME` rejected.
+- **Window functions (`OVER`)** — host-side executor
+  (`src/exec/window.rs`) for `ROW_NUMBER`, `RANK`, `DENSE_RANK`, and
+  `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` aggregate windows. Default
+  `RANGE UNBOUNDED PRECEDING AND CURRENT ROW` frame only; window
+  functions must be top-level SELECT items. Explicit / non-default
+  frames, named `WINDOW`, `QUALIFY`, and `COUNT(DISTINCT) OVER` rejected.
+- **Non-recursive CTEs (`WITH name AS (...)`)** — lowered against the
+  left-to-right CTE scope and type-checked at the definition site.
+  `WITH RECURSIVE`, CTE column-list aliases, and the materialization
+  hint rejected.
+- **Uncorrelated subqueries** — scalar `(SELECT ...)` and
+  `[NOT] IN (SELECT ...)` in `SELECT` / `WHERE`, resolved to constants
+  before physical lowering (`src/exec/subquery_resolve.rs`). Scalar
+  `>1` row errors; `IN` folds to an `OR`/`AND` chain. Correlated
+  subqueries, `EXISTS`, and derived tables in `FROM` rejected.
+- **`JOIN ... USING (...)` / `NATURAL JOIN`** — desugared to equi
+  `left.col = right.col` pairs and run through the existing join paths.
+  Missing / ambiguous / duplicate `USING` columns and a `NATURAL` join
+  with no common column are rejected.
+- **`COUNT(DISTINCT col)`** — supported as the sole SELECT item (no
+  `GROUP BY` / `HAVING` / `SELECT DISTINCT`), lowered to
+  `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` and
+  executed via the new `PhysicalPlan::CountRows` node.
+
+### Added — GPU string functions
+- **GPU `LIKE` / `NOT LIKE`** over `Utf8` columns — dictionary columns
+  via dictionary-precompute → index membership; non-dictionary `Utf8`
+  via the new `PhysicalPlan::StringLikeFilter` device matcher
+  (`compile_like_match_kernel`, EXACT / PREFIX / SUFFIX / CONTAINS).
+  Host `host_like` fallback retained.
+- **GPU `UPPER` / `LOWER`** — two-pass variable-width device output via
+  `PhysicalPlan::StringProject`.
+- **GPU `LENGTH`** — `PhysicalPlan::StringLength` (dictionary-gather,
+  `Int64` output).
+- **Host-side `SUBSTRING` / `TRIM`** (`TRIM BOTH` / `LEADING` /
+  `TRAILING`) executed end-to-end through a host projection.
+- **GPU `NOT`** in a predicate lowered via `Op::Not`.
 
 ### Internal
 - **Schema-converter consolidation** — the plan↔Arrow schema converters
@@ -488,6 +538,7 @@ Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --
 - Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
 - Polars head-to-head numbers are not yet published.
 
+[0.7.0]: https://github.com/craton-co/craton-bolt/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/craton-co/craton-bolt/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/craton-co/craton-bolt/compare/v0.3.0...v0.5.0
 [0.3.0]: https://github.com/craton-co/craton-bolt/compare/v0.1.0...v0.3.0

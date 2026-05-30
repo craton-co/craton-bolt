@@ -2686,6 +2686,30 @@ impl Engine {
                     col.set_utf8_dictionary(src.to_vec());
                 }
             }
+            // Decimal128 NULL fix: for a pure passthrough Decimal128 output
+            // (output name + dtype matches an input column), carry the
+            // source column's validity bitmap onto the output so the
+            // download path reconstructs NULL rows as NULL, not `0`. We
+            // round-trip the mask through host memory (download + re-upload)
+            // to get an owned device buffer for the output column, mirroring
+            // the dictionary-clone passthrough above.
+            if let DataType::Decimal128(_, _) = io.dtype {
+                if let Some(src_col) = kernel
+                    .inputs
+                    .iter()
+                    .find(|in_io| in_io.name == io.name && in_io.dtype == io.dtype)
+                    .and_then(|in_io| gpu_table.column(&in_io.name))
+                {
+                    if let crate::exec::gpu_table::GpuColumnData::Decimal128 {
+                        valid_mask: Some(src_mask),
+                        ..
+                    } = &src_col.data
+                    {
+                        let bits = src_mask.to_vec()?;
+                        col.set_decimal128_valid_mask(Some(GpuVec::<u8>::from_slice(&bits)?));
+                    }
+                }
+            }
             output_cols.push(col);
         }
 
@@ -3680,6 +3704,14 @@ enum DeviceCol {
         precision: u8,
         /// Plan-level scale.
         scale: i8,
+        /// Optional Arrow-LE packed validity bitmap on the device, one byte
+        /// per 8 rows (lsb-first) — mirrors
+        /// [`GpuColumnData::Decimal128`](crate::exec::gpu_table::GpuColumnData::Decimal128)'s
+        /// `valid_mask`. For pure passthrough columns we copy the source
+        /// column's mask so the download path can reconstruct NULL rows as
+        /// NULL rather than `0`. `None` ⇒ all rows valid (no nulls on the
+        /// source, or a freshly-allocated output buffer).
+        valid_mask: Option<GpuVec<u8>>,
     },
 }
 
@@ -3710,6 +3742,10 @@ impl DeviceCol {
                 values: GpuVec::<u64>::zeros(2 * n)?,
                 precision,
                 scale,
+                // Freshly-allocated output buffer: no validity yet. A
+                // passthrough column copies the source mask in after alloc
+                // (see the output-allocation loop in `run_kernel`).
+                valid_mask: None,
             }),
             // v0.7: PTX codegen for Date32 / Timestamp arithmetic is wired
             // (see `crate::jit::ptx_gen`), but the device-side download
@@ -3754,6 +3790,18 @@ impl DeviceCol {
         }
     }
 
+    /// Install a device-side validity bitmap on a Decimal128 output column
+    /// (for pure passthrough projections whose source column carries one).
+    /// No-op for non-Decimal128 columns or a `None` mask. Mirrors
+    /// [`Self::set_utf8_dictionary`]'s passthrough plumbing.
+    fn set_decimal128_valid_mask(&mut self, mask: Option<GpuVec<u8>>) {
+        if let DeviceCol::Decimal128 { valid_mask, .. } = self {
+            if mask.is_some() {
+                *valid_mask = mask;
+            }
+        }
+    }
+
     /// Copy the device column back to a host Arrow array of length `n_rows`.
     fn download(self, n_rows: usize) -> BoltResult<ArrayRef> {
         match self {
@@ -3792,23 +3840,20 @@ impl DeviceCol {
                 values,
                 precision,
                 scale,
+                valid_mask,
             } => {
                 let host = copy_back::<u64>(&values, 2 * n_rows)?;
-                let mut out: Vec<i128> = Vec::with_capacity(n_rows);
-                for row in 0..n_rows {
-                    let lo = host[2 * row];
-                    let hi = host[2 * row + 1];
-                    let bits = (lo as u128) | ((hi as u128) << 64);
-                    out.push(bits as i128);
-                }
-                let arr = Decimal128Array::from(out)
-                    .with_precision_and_scale(precision, scale)
-                    .map_err(|e| {
-                        BoltError::Type(format!(
-                            "Decimal128 download: precision/scale ({precision}, {scale}) \
-                             rejected by Arrow: {e}"
-                        ))
-                    })?;
+                // Decimal128 NULL fix: download the validity bitmap (if any)
+                // so NULL rows reconstruct as Arrow NULL, not `0`.
+                let mask_bits = valid_mask.as_ref().map(|m| m.to_vec()).transpose()?;
+                let arr = decimal128_from_interleaved(
+                    &host,
+                    n_rows,
+                    mask_bits.as_deref(),
+                    precision,
+                    scale,
+                    "Decimal128 download",
+                )?;
                 Ok(Arc::new(arr) as ArrayRef)
             }
         }
@@ -3881,26 +3926,23 @@ impl DeviceCol {
                 values,
                 precision,
                 scale,
+                valid_mask,
             } => {
                 let staged = StagedDownload::<u64>::from_gpu(&values, stream.raw())?;
                 stream.synchronize()?;
                 let host = staged.into_vec();
                 check_len(host.len(), 2 * n_rows)?;
-                let mut out: Vec<i128> = Vec::with_capacity(n_rows);
-                for row in 0..n_rows {
-                    let lo = host[2 * row];
-                    let hi = host[2 * row + 1];
-                    let bits = (lo as u128) | ((hi as u128) << 64);
-                    out.push(bits as i128);
-                }
-                let arr = Decimal128Array::from(out)
-                    .with_precision_and_scale(precision, scale)
-                    .map_err(|e| {
-                        BoltError::Type(format!(
-                            "Decimal128 pinned download: precision/scale \
-                             ({precision}, {scale}) rejected by Arrow: {e}"
-                        ))
-                    })?;
+                // Decimal128 NULL fix: same validity-aware reassembly as the
+                // sync `download` site (shared helper keeps them consistent).
+                let mask_bits = valid_mask.as_ref().map(|m| m.to_vec()).transpose()?;
+                let arr = decimal128_from_interleaved(
+                    &host,
+                    n_rows,
+                    mask_bits.as_deref(),
+                    precision,
+                    scale,
+                    "Decimal128 pinned download",
+                )?;
                 Ok(Arc::new(arr) as ArrayRef)
             }
         }
@@ -3918,6 +3960,52 @@ fn check_len(have: usize, want: usize) -> BoltResult<()> {
         )));
     }
     Ok(())
+}
+
+/// Decimal128 NULL fix — shared reassembly used by BOTH download sites
+/// (`DeviceCol::download` and `DeviceCol::download_pinned`) so they cannot
+/// drift. Reconstruct each row's `i128` from the interleaved `[lo, hi]` u64
+/// pair, then attach Arrow validity from the (optional, lsb-first packed)
+/// `mask_bits`: a row whose validity bit is 0 becomes an Arrow NULL rather
+/// than the zeroed bit-pattern it was stored as. `mask_bits == None` ⇒ every
+/// row is valid (non-null source), preserving the original non-null
+/// behaviour byte-for-byte.
+///
+/// `host` must be `2 * n_rows` u64s (already length-checked by callers).
+fn decimal128_from_interleaved(
+    host: &[u64],
+    n_rows: usize,
+    mask_bits: Option<&[u8]>,
+    precision: u8,
+    scale: i8,
+    ctx: &str,
+) -> BoltResult<Decimal128Array> {
+    let mut out: Vec<Option<i128>> = Vec::with_capacity(n_rows);
+    for row in 0..n_rows {
+        let lo = host[2 * row];
+        let hi = host[2 * row + 1];
+        let bits = (lo as u128) | ((hi as u128) << 64);
+        // lsb-first packed bitmap: bit `row % 8` of byte `row / 8`. Absent
+        // mask ⇒ all rows valid.
+        let is_valid = match mask_bits {
+            None => true,
+            Some(b) => {
+                let byte = b.get(row / 8).copied().unwrap_or(0);
+                (byte >> (row % 8)) & 1 == 1
+            }
+        };
+        out.push(if is_valid { Some(bits as i128) } else { None });
+    }
+    // `FromIterator<Option<i128>>` builds the array with the correct null
+    // bitmap; `with_precision_and_scale` reattaches the plan dtype.
+    out.into_iter()
+        .collect::<Decimal128Array>()
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| {
+            BoltError::Type(format!(
+                "{ctx}: precision/scale ({precision}, {scale}) rejected by Arrow: {e}"
+            ))
+        })
 }
 
 /// Copy back a `GpuVec<T>` into a host `Vec<T>` of length `n_rows`.

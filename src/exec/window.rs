@@ -327,9 +327,10 @@ fn compute_running_aggregate(
         {
             peer_end += 1;
         }
-        // Fold every peer row into the running accumulator.
+        // Fold every peer row into the running accumulator. Integer SUM
+        // overflow surfaces here as a BoltError (never a silent wrap).
         for &row in &rows[idx..peer_end] {
-            acc.push(input.get(row));
+            acc.push(input.get(row))?;
         }
         // Emit the running value (through this peer group) for every peer.
         let value = acc.value();
@@ -355,17 +356,51 @@ enum AggValue {
     Float(f64),
 }
 
-/// Running accumulator over the aggregate-input column's f64 view. SUM / AVG
-/// accumulate as f64; the [`ResultBuilder`] coerces to the declared output
-/// dtype (rounding to i64 for integer-typed outputs). MIN / MAX track the
-/// running extreme; COUNT tracks the number of non-NULL inputs.
+/// Order two `f64`s under the DuckDB float convention: NaN sorts as the
+/// *largest* value (greater than +inf), and all NaN bit-patterns are treated
+/// as equal. We delegate to [`f64::total_cmp`] (which already orders
+/// `-0 < +0` and places NaN at the extremes) and then fold the negative-NaN
+/// half up to the top so *every* NaN is the maximum. This makes MIN skip NaN
+/// unless the input is all-NaN, and MAX surface NaN whenever one is present —
+/// matching the NaN-ignoring `f64::min`/`f64::max` scalar path in
+/// `aggregate.rs` for MIN, and giving MAX a single well-defined NaN answer.
+#[inline]
+fn float_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater, // NaN is the largest
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.total_cmp(&b),
+    }
+}
+
+/// Running accumulator over the aggregate-input column. SUM/MIN/MAX stay on
+/// the input column's native numeric lane so integer columns never round-trip
+/// through `f64`:
+///
+/// * integer SUM accumulates in `int_sum` with `checked_add` (errors loudly on
+///   `i64` overflow, mirroring the `SUM(integer)` contract in `aggregate.rs`);
+/// * integer MIN/MAX pass the exact `i64` extreme through unchanged;
+/// * float SUM/MIN/MAX accumulate in the `f64` lane;
+/// * AVG always accumulates in `f64` (documented: averages are inherently
+///   fractional, so the f64 lane is the natural representation);
+/// * COUNT tracks the number of non-NULL inputs.
+///
+/// The lane (`Int` vs `Float`) is locked in by the first non-NULL cell, which
+/// always matches the column's dtype because a column is uniformly one lane.
 struct Accumulator {
     kind: AggKind,
     /// True once at least one non-NULL value has been folded in.
     seen: bool,
+    /// `true` once we've decided the SUM/MIN/MAX lane is integer (vs float).
+    int_lane: bool,
+    /// f64 lane: SUM (float), AVG (always), MIN/MAX (float extreme).
     sum: f64,
-    count: i64,
     extreme: f64,
+    /// i64 lane: SUM (integer, checked), MIN/MAX (integer extreme).
+    int_sum: i64,
+    int_extreme: i64,
+    count: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -390,36 +425,91 @@ impl Accumulator {
         Accumulator {
             kind,
             seen: false,
+            int_lane: false,
             sum: 0.0,
-            count: 0,
             extreme: 0.0,
+            int_sum: 0,
+            int_extreme: 0,
+            count: 0,
         }
     }
 
     /// Fold one input cell (`None` = SQL NULL, skipped for every aggregate
     /// except its effect on COUNT, which only counts non-NULLs anyway).
-    fn push(&mut self, v: Option<f64>) {
-        let Some(x) = v else { return };
+    ///
+    /// Returns `Err` only when an integer SUM overflows `i64`, matching the
+    /// engine's never-silently-wrong invariant (see `aggregate.rs`'s
+    /// `SUM(integer) overflow` contract).
+    fn push(&mut self, v: Option<Cell>) -> BoltResult<()> {
+        let Some(cell) = v else { return Ok(()) };
         self.count += 1;
-        self.sum += x;
-        if !self.seen {
-            self.extreme = x;
-            self.seen = true;
-        } else {
-            match self.kind {
-                AggKind::Min => {
-                    if x < self.extreme {
-                        self.extreme = x;
+
+        match cell {
+            Cell::Int(x) => {
+                if !self.seen {
+                    self.int_lane = true;
+                    self.int_sum = 0;
+                    self.int_extreme = x;
+                    self.seen = true;
+                }
+                // SUM(integer): exact, checked. AVG also needs an f64 running
+                // sum; keep it alongside for the AVG lane.
+                self.sum += x as f64;
+                match self.kind {
+                    AggKind::Sum => {
+                        self.int_sum = self.int_sum.checked_add(x).ok_or_else(|| {
+                            BoltError::Type(
+                                "SUM(integer) overflow: accumulator exceeds i64 range"
+                                    .to_string(),
+                            )
+                        })?;
+                    }
+                    AggKind::Min => {
+                        if x < self.int_extreme {
+                            self.int_extreme = x;
+                        }
+                    }
+                    AggKind::Max => {
+                        if x > self.int_extreme {
+                            self.int_extreme = x;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Cell::Float(x) => {
+                if !self.seen {
+                    self.int_lane = false;
+                    self.extreme = x;
+                    self.seen = true;
+                    self.sum = x;
+                } else {
+                    self.sum += x;
+                    match self.kind {
+                        // NaN-as-largest: MIN keeps the smaller, MAX the
+                        // larger, under `float_total_cmp`. A leading NaN no
+                        // longer sticks for MIN (it's the maximum, so any
+                        // real value beats it), and MAX returns NaN if present.
+                        AggKind::Min => {
+                            if float_total_cmp(x, self.extreme)
+                                == std::cmp::Ordering::Less
+                            {
+                                self.extreme = x;
+                            }
+                        }
+                        AggKind::Max => {
+                            if float_total_cmp(x, self.extreme)
+                                == std::cmp::Ordering::Greater
+                            {
+                                self.extreme = x;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                AggKind::Max => {
-                    if x > self.extreme {
-                        self.extreme = x;
-                    }
-                }
-                _ => {}
             }
         }
+        Ok(())
     }
 
     /// The current running value.
@@ -430,8 +520,10 @@ impl Accumulator {
                 if !self.seen {
                     // SUM over zero non-NULL rows is SQL NULL.
                     AggValue::Null
+                } else if self.int_lane {
+                    // Exact integer sum (checked during push).
+                    AggValue::Int(self.int_sum)
                 } else {
-                    // Carry the exact f64; ResultBuilder rounds for Int outputs.
                     AggValue::Float(self.sum)
                 }
             }
@@ -439,12 +531,16 @@ impl Accumulator {
                 if self.count == 0 {
                     AggValue::Null
                 } else {
+                    // AVG stays f64 by design.
                     AggValue::Float(self.sum / self.count as f64)
                 }
             }
             AggKind::Min | AggKind::Max => {
                 if !self.seen {
                     AggValue::Null
+                } else if self.int_lane {
+                    // Exact i64 passthrough — no float round-trip.
+                    AggValue::Int(self.int_extreme)
                 } else {
                     AggValue::Float(self.extreme)
                 }
@@ -694,11 +790,25 @@ impl KeyColumn {
     }
 }
 
-/// A per-row f64 view of an aggregate-input column, with validity. NULLs are
-/// `None`. Only numeric dtypes are accepted (the type-checker guarantees the
-/// aggregate inner is numeric).
-struct NumericColumn {
-    values: Vec<Option<f64>>,
+/// A per-row native view of an aggregate-input column, with validity. NULLs
+/// are `None`. Only numeric dtypes are accepted (the type-checker guarantees
+/// the aggregate inner is numeric).
+///
+/// Integer inputs (`Int32`/`Int64`) keep an exact `i64` lane so SUM/MIN/MAX of
+/// integers never round-trip through `f64` — values beyond 2^53 (which `f64`
+/// cannot represent exactly) survive intact. Float inputs keep an `f64` lane.
+/// The two lanes are surfaced as [`Cell`]s so the [`Accumulator`] can stay on
+/// the native type per column.
+enum NumericColumn {
+    Int(Vec<Option<i64>>),
+    Float(Vec<Option<f64>>),
+}
+
+/// One folded aggregate-input cell, carrying the column's native numeric type.
+#[derive(Clone, Copy)]
+enum Cell {
+    Int(i64),
+    Float(f64),
 }
 
 impl NumericColumn {
@@ -709,52 +819,59 @@ impl NumericColumn {
 
         // Aggregate-input literals (e.g. the `COUNT(*)` sentinel `1`) are
         // broadcast to every row. A NULL literal broadcasts to all-NULL.
+        // Integer literals stay on the integer lane; float literals on the
+        // float lane.
         if let Expr::Literal(lit) = unwrap_alias(e) {
             let n = batch.num_rows();
-            let v = match lit {
-                Literal::Null => None,
-                Literal::Int32(x) => Some(*x as f64),
-                Literal::Int64(x) => Some(*x as f64),
-                Literal::Float32(x) => Some(*x as f64),
-                Literal::Float64(x) => Some(*x),
+            return Ok(match lit {
+                Literal::Null => NumericColumn::Int(vec![None; n]),
+                Literal::Int32(x) => NumericColumn::Int(vec![Some(*x as i64); n]),
+                Literal::Int64(x) => NumericColumn::Int(vec![Some(*x); n]),
+                Literal::Float32(x) => NumericColumn::Float(vec![Some(*x as f64); n]),
+                Literal::Float64(x) => NumericColumn::Float(vec![Some(*x); n]),
                 other => {
                     return Err(BoltError::Other(format!(
                         "window aggregate literal input {other:?} is not numeric"
                     )));
                 }
-            };
-            return Ok(NumericColumn {
-                values: vec![v; n],
             });
         }
 
         let idx = column_index(batch, e)?;
         let arr = batch.column(idx);
         let n = arr.len();
-        let values: Vec<Option<f64>> = match arr.data_type() {
+        let col = match arr.data_type() {
             A::Int32 => {
                 let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
-                (0..n)
-                    .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
-                    .collect()
+                NumericColumn::Int(
+                    (0..n)
+                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as i64) })
+                        .collect(),
+                )
             }
             A::Int64 => {
                 let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
-                (0..n)
-                    .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
-                    .collect()
+                NumericColumn::Int(
+                    (0..n)
+                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                        .collect(),
+                )
             }
             A::Float32 => {
                 let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
-                (0..n)
-                    .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
-                    .collect()
+                NumericColumn::Float(
+                    (0..n)
+                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
+                        .collect(),
+                )
             }
             A::Float64 => {
                 let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
-                (0..n)
-                    .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
-                    .collect()
+                NumericColumn::Float(
+                    (0..n)
+                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                        .collect(),
+                )
             }
             other => {
                 return Err(BoltError::Other(format!(
@@ -763,12 +880,15 @@ impl NumericColumn {
                 )));
             }
         };
-        Ok(NumericColumn { values })
+        Ok(col)
     }
 
     #[inline]
-    fn get(&self, row: usize) -> Option<f64> {
-        self.values[row]
+    fn get(&self, row: usize) -> Option<Cell> {
+        match self {
+            NumericColumn::Int(v) => v[row].map(Cell::Int),
+            NumericColumn::Float(v) => v[row].map(Cell::Float),
+        }
     }
 }
 
@@ -1122,6 +1242,150 @@ mod tests {
         // 2 non-NULL values in the single partition.
         let cnt = as_i64(&out, "cnt");
         assert_eq!(cnt, vec![Some(2), Some(2), Some(2)]);
+    }
+
+    /// Build a handle from a single Int64 column.
+    fn i64_col(name: &str, values: Vec<Option<i64>>) -> (ArrowField, ArrayRef) {
+        (
+            ArrowField::new(name, ArrowDataType::Int64, true),
+            Arc::new(Int64Array::from(values)) as ArrayRef,
+        )
+    }
+
+    /// Build a handle from a single Float64 column.
+    fn f64_col(name: &str, values: Vec<Option<f64>>) -> (ArrowField, ArrayRef) {
+        (
+            ArrowField::new(name, ArrowDataType::Float64, true),
+            Arc::new(Float64Array::from(values)) as ArrayRef,
+        )
+    }
+
+    /// BUG 1: SUM(Int64) over a value > 2^53 must stay EXACT (no f64 round
+    /// trip). 9_007_199_254_740_993 == 2^53 + 1 is the smallest integer f64
+    /// cannot represent; folding it as f64 would round to 2^53.
+    #[test]
+    fn sum_int64_above_2_53_is_exact() {
+        let big = 9_007_199_254_740_993_i64; // 2^53 + 1
+        let h = handle(vec![i64_col("v", vec![Some(big), Some(1)])]);
+        let wexprs = vec![WindowExpr {
+            func: WindowFunc::Sum(col("v")),
+            output_name: "s".into(),
+        }];
+        // No ORDER BY -> whole partition is one peer group; every row sees the
+        // full sum.
+        let os = out_schema(&[("v", DataType::Int64)], &[("s", DataType::Int64)]);
+        let out = execute_window(h, &wexprs, &[], &[], &os)
+            .unwrap()
+            .into_record_batch();
+        let s = as_i64(&out, "s");
+        assert_eq!(s, vec![Some(big + 1), Some(big + 1)]);
+    }
+
+    /// BUG 1: MIN/MAX(Int64) must pass the EXACT i64 through. With a value
+    /// beyond 2^53, the old f64 path would have returned a neighbour that was
+    /// never in the input.
+    #[test]
+    fn min_max_int64_above_2_53_are_exact() {
+        let big = 9_007_199_254_740_993_i64; // 2^53 + 1, not representable in f64
+        let h = handle(vec![i64_col("v", vec![Some(big), Some(big + 2)])]);
+        let wexprs = vec![
+            WindowExpr {
+                func: WindowFunc::Min(col("v")),
+                output_name: "mn".into(),
+            },
+            WindowExpr {
+                func: WindowFunc::Max(col("v")),
+                output_name: "mx".into(),
+            },
+        ];
+        let os = out_schema(
+            &[("v", DataType::Int64)],
+            &[("mn", DataType::Int64), ("mx", DataType::Int64)],
+        );
+        let out = execute_window(h, &wexprs, &[], &[], &os)
+            .unwrap()
+            .into_record_batch();
+        let mn = as_i64(&out, "mn");
+        let mx = as_i64(&out, "mx");
+        assert_eq!(mn, vec![Some(big), Some(big)]);
+        assert_eq!(mx, vec![Some(big + 2), Some(big + 2)]);
+    }
+
+    /// BUG 1: integer SUM overflow must ERROR (BoltError::Type), never wrap —
+    /// mirroring the `SUM(integer) overflow` contract in aggregate.rs.
+    #[test]
+    fn sum_int64_overflow_errors() {
+        let h = handle(vec![i64_col("v", vec![Some(i64::MAX), Some(1)])]);
+        let wexprs = vec![WindowExpr {
+            func: WindowFunc::Sum(col("v")),
+            output_name: "s".into(),
+        }];
+        let os = out_schema(&[("v", DataType::Int64)], &[("s", DataType::Int64)]);
+        let err = execute_window(h, &wexprs, &[], &[], &os).unwrap_err();
+        match err {
+            BoltError::Type(msg) => {
+                assert!(
+                    msg.contains("SUM(integer) overflow"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected BoltError::Type on SUM overflow, got {other:?}"),
+        }
+    }
+
+    /// BUG 2: float MIN/MAX with a leading NaN follow the DuckDB convention
+    /// (NaN sorts as the largest value): MIN skips the NaN and returns the
+    /// real minimum; MAX returns NaN because one is present.
+    #[test]
+    fn float_min_max_nan_convention() {
+        // Leading NaN used to seed `extreme` and stick under `<`/`>`.
+        let h = handle(vec![f64_col(
+            "v",
+            vec![Some(f64::NAN), Some(2.0), Some(-1.0)],
+        )]);
+        let wexprs = vec![
+            WindowExpr {
+                func: WindowFunc::Min(col("v")),
+                output_name: "mn".into(),
+            },
+            WindowExpr {
+                func: WindowFunc::Max(col("v")),
+                output_name: "mx".into(),
+            },
+        ];
+        let os = out_schema(
+            &[("v", DataType::Float64)],
+            &[("mn", DataType::Float64), ("mx", DataType::Float64)],
+        );
+        let out = execute_window(h, &wexprs, &[], &[], &os)
+            .unwrap()
+            .into_record_batch();
+        let mn = as_f64(&out, "mn");
+        let mx = as_f64(&out, "mx");
+        // MIN skips NaN -> -1.0 on every row (whole partition, one peer group).
+        assert_eq!(mn, vec![Some(-1.0), Some(-1.0), Some(-1.0)]);
+        // MAX returns NaN (NaN is the largest under the convention).
+        for cell in &mx {
+            assert!(cell.unwrap().is_nan(), "expected NaN MAX, got {cell:?}");
+        }
+    }
+
+    /// BUG 2: all-NaN float MIN returns NaN (there is no real value to prefer).
+    #[test]
+    fn float_min_all_nan_is_nan() {
+        let h = handle(vec![f64_col("v", vec![Some(f64::NAN), Some(f64::NAN)])]);
+        let wexprs = vec![WindowExpr {
+            func: WindowFunc::Min(col("v")),
+            output_name: "mn".into(),
+        }];
+        let os = out_schema(&[("v", DataType::Float64)], &[("mn", DataType::Float64)]);
+        let out = execute_window(h, &wexprs, &[], &[], &os)
+            .unwrap()
+            .into_record_batch();
+        let mn = as_f64(&out, "mn");
+        for cell in &mn {
+            assert!(cell.unwrap().is_nan(), "expected NaN MIN, got {cell:?}");
+        }
     }
 
     /// Empty input produces an empty output with the appended column present.

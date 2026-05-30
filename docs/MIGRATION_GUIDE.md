@@ -29,10 +29,14 @@ If you only need the headline:
 - 0.6 -> 0.7: no API moved. Queries that parsed and type-checked in 0.6
   but rejected at the GPU lowering boundary with "not yet lowered to GPU"
   now execute — `Decimal128` / `Date` / `Timestamp` arithmetic, grouped
-  `STDDEV` / `VAR`, and GPU-side `ORDER BY`. The one change that can alter
-  an existing result is the `DESC` radix-sort fix; the one change that can
-  turn a previously-accepted query into an error is WHERE type-checking
-  catching `LIKE` on a non-`Utf8` column.
+  `STDDEV` / `VAR`, and GPU-side `ORDER BY`. The SQL surface also widens:
+  `EXCEPT` / `INTERSECT`, non-recursive CTEs, host-side window functions,
+  uncorrelated subqueries, `JOIN ... USING` / `NATURAL`, and
+  `COUNT(DISTINCT)` — all previously rejected at the parser — are now
+  accepted (purely additive). The one change that can alter an existing
+  result is the `DESC` radix-sort fix; the one change that can turn a
+  previously-accepted query into an error is WHERE type-checking catching
+  `LIKE` on a non-`Utf8` column.
 
 ---
 
@@ -537,6 +541,47 @@ The change is internal to the executor — there is no before/after code at
 the SQL or Rust API level. If you have golden-result fixtures that pinned
 the *previous* (incorrect) `DESC` ordering, re-baseline them after the
 upgrade.
+
+### New SQL surface (set ops, windows, CTEs, subqueries, joins)
+
+**What changed.** A batch of SQL constructs that 0.6 rejected at the
+parser / planner now lower and execute:
+
+- **`EXCEPT [ALL]` / `INTERSECT [ALL]`** — host-side set / multiset
+  operations.
+- **Non-recursive CTEs** — `WITH name AS (...) SELECT ...`.
+- **Window functions** — `ROW_NUMBER` / `RANK` / `DENSE_RANK` and
+  `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` `OVER (PARTITION BY ... ORDER
+  BY ...)`, host-side, default frame only, as top-level SELECT items.
+- **Uncorrelated subqueries** — scalar `(SELECT ...)` and
+  `[NOT] IN (SELECT ...)` in `SELECT` / `WHERE`.
+- **`JOIN ... USING (...)` / `NATURAL JOIN`** — desugared to equi-key
+  joins.
+- **`COUNT(DISTINCT col)`** — as the sole SELECT item.
+- **GPU `LIKE`** over `Utf8`, and GPU `UPPER` / `LOWER` / `LENGTH`;
+  host-side `SUBSTRING` / `TRIM` / `CONCAT`.
+
+**Classification: Additive.** These were hard parser/planner rejections
+in 0.6, so no previously-working query changes behaviour. Correlated
+subqueries, `EXISTS`, derived tables in `FROM`, `WITH RECURSIVE`,
+`QUALIFY`, the named `WINDOW` clause, and non-default window frames
+remain rejected. See `docs/SQL_REFERENCE.md` for the exact caveats on
+each.
+
+```sql
+-- Before (0.6): rejected at the SQL frontend.
+-- After  (0.7): supported.
+WITH recent AS (SELECT * FROM orders WHERE ts > 0)
+SELECT region, COUNT(DISTINCT user_id)            -- COUNT(DISTINCT), sole item
+  FROM recent;                                    -- (illustrative; see caveats)
+
+SELECT user_id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts)
+  FROM orders;
+
+SELECT region FROM orders EXCEPT SELECT region FROM archived_orders;
+
+SELECT * FROM orders WHERE user_id IN (SELECT id FROM vip_users);
+```
 
 ### WHERE-clause predicate type-checking
 

@@ -51,7 +51,9 @@
 //! `BOLT_POOL_STATS_INTERVAL_SECS`). Useful for forwarding pool-occupancy
 //! gauges into Prometheus / OTel meters without parsing the log line.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 use crate::PoolStats;
 
@@ -60,15 +62,25 @@ use crate::PoolStats;
 /// process.
 pub type PoolStatsObserver = Box<dyn Fn(PoolStats) + Send + Sync + 'static>;
 
+/// Reference-counted handle to a registered observer. Cloning the
+/// `Arc` (cheap) lets `notify_observers` lift the callback out of the
+/// registry slot and DROP the lock before invoking it — see
+/// [`notify_observers`].
+type ObserverHandle = Arc<dyn Fn(PoolStats) + Send + Sync + 'static>;
+
 /// Single-slot observer registry. Replacing the observer is allowed
 /// (the typical install-once-on-startup pattern is the default, but
 /// integration-test code may want to swap collectors mid-process).
-/// The mutex is contended only on install — `notify_observers` reads
-/// the slot via `lock().ok().and_then(...)` and never blocks on
-/// itself.
-static REGISTRY: OnceLock<Mutex<Option<PoolStatsObserver>>> = OnceLock::new();
+///
+/// The mutex is a `parking_lot::Mutex`: it does not poison, so a
+/// panicking observer can never permanently disable the surface (the
+/// old `std::sync::Mutex` + `if let Ok(..)` pattern silently no-op'd
+/// every later call once poisoned). The lock is contended only on
+/// install — `notify_observers` clones the handle out and never holds
+/// the lock across the callback.
+static REGISTRY: OnceLock<Mutex<Option<ObserverHandle>>> = OnceLock::new();
 
-fn registry() -> &'static Mutex<Option<PoolStatsObserver>> {
+fn registry() -> &'static Mutex<Option<ObserverHandle>> {
     REGISTRY.get_or_init(|| Mutex::new(None))
 }
 
@@ -92,23 +104,82 @@ fn registry() -> &'static Mutex<Option<PoolStatsObserver>> {
 pub fn install_pool_stats_observer(
     f: Box<dyn Fn(PoolStats) + Send + Sync + 'static>,
 ) {
-    if let Ok(mut slot) = registry().lock() {
-        *slot = Some(f);
+    // `Box<dyn Fn>` → `Arc<dyn Fn>` so `notify_observers` can clone the
+    // handle out of the slot and release the lock before invoking it.
+    let handle: ObserverHandle = Arc::from(f);
+    *registry().lock() = Some(handle);
+}
+
+/// Invoke the registered observer with `stats`, if any.
+///
+/// The registry lock is **not** held while the observer callback runs:
+/// we acquire the lock, clone the observer handle (a cheap `Arc` bump)
+/// into a local, DROP the guard, and only then invoke the callback.
+/// This matters for two reasons:
+///
+/// * **Re-entrancy** — an observer is free to call
+///   [`install_pool_stats_observer`] (or otherwise touch the registry)
+///   without self-deadlocking on a non-reentrant mutex.
+/// * **Panics** — if the observer panics, the unwind crosses no held
+///   lock. Combined with the `parking_lot::Mutex` (which never
+///   poisons), a panicking observer cannot disable the surface: the
+///   next `notify_observers` / `install_pool_stats_observer` still
+///   works, honouring the documented invariant.
+pub(crate) fn notify_observers(stats: PoolStats) {
+    // Clone the handle out under the lock, then release it.
+    let observer = registry().lock().clone();
+    if let Some(observer) = observer {
+        observer(stats);
     }
 }
 
-/// Invoke the registered observer with `stats`, if any. Silently
-/// drops the call if the mutex is poisoned — an observer that
-/// panicked once should not stop subsequent engine work.
-pub(crate) fn notify_observers(stats: PoolStats) {
-    if let Ok(slot) = registry().lock() {
-        if let Some(observer) = slot.as_ref() {
-            // We intentionally hold the lock across the observer
-            // call: it's a `Send + Sync` `Fn`, no re-entrant install
-            // is expected, and serialising notifications is the
-            // simpler contract. Heavy observer work is the caller's
-            // problem to offload (e.g. via a channel).
-            observer(stats);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn dummy_stats() -> PoolStats {
+        PoolStats {
+            total_pooled_bytes: 0,
+            bucket_count: 0,
+            oom_recovery_count: 0,
+            proactive_eviction_count: 0,
         }
+    }
+
+    /// A panicking observer must not poison/disable the surface:
+    /// after it panics, a subsequently installed observer must still
+    /// receive notifications, and install itself must still work.
+    #[test]
+    fn panicking_observer_does_not_disable_surface() {
+        // Install an observer that always panics.
+        install_pool_stats_observer(Box::new(|_| panic!("boom")));
+
+        // Triggering notify must propagate the panic out of the
+        // callback (the lock is already released by then). Catch the
+        // unwind so the test process survives.
+        let result = std::panic::catch_unwind(|| notify_observers(dummy_stats()));
+        assert!(result.is_err(), "panicking observer should unwind");
+
+        // The surface must still be usable: installing a fresh
+        // observer must succeed and it must receive notifications.
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        HITS.store(0, Ordering::SeqCst);
+        install_pool_stats_observer(Box::new(|_| {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        notify_observers(dummy_stats());
+        notify_observers(dummy_stats());
+
+        assert_eq!(
+            HITS.load(Ordering::SeqCst),
+            2,
+            "observer installed after a panic must still be notified"
+        );
+
+        // Reset the single-slot registry so we don't leak a live
+        // observer into other tests in the process.
+        install_pool_stats_observer(Box::new(|_| ()));
     }
 }

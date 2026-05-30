@@ -151,19 +151,29 @@ Craton Bolt's frontend is built on
 accepts a precisely-bounded subset of SQL. The authoritative list lives
 in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
 
-- `SELECT [DISTINCT] ... FROM <table> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`.
+- `[WITH ...] SELECT [DISTINCT] ... FROM <table> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`.
 - Aggregates: `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (GPU), plus host-side
   `STDDEV` / `VAR` (scalar and grouped) and `SUM(Decimal128)`.
   `SUM(Int32)` widens to `Int64` to prevent silent wraparound.
+  `COUNT(DISTINCT col)` is supported as the sole SELECT item.
 - Scalar expressions: arithmetic and comparisons (GPU), `IN` / `BETWEEN`
   (desugar to GPU comparison chains), `CASE` / `CAST` / `COALESCE` /
   `NULLIF` (GPU for numeric/Bool results; rejected at GPU lowering for
-  string/Decimal/Date/Timestamp results), `LIKE` and `||` (host-side),
-  `NOT` (host-side).
-- Joins: one `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS` JOIN
-  per `SELECT`, equi-`ON` predicates only. Each shape has a gated GPU
-  fast path that falls back to a host executor on a gate miss.
-- Set ops: `UNION` (dedups), `UNION ALL` (concatenates).
+  string/Decimal/Date/Timestamp results), `LIKE` (GPU over `Utf8`),
+  `||` (host-side), `NOT` (GPU). String functions: `UPPER` / `LOWER` /
+  `LENGTH` (GPU), `SUBSTRING` / `TRIM` / `CONCAT` (host-side).
+- Joins: one or more `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS`
+  JOINs per `SELECT`, with `ON` / `USING (...)` / `NATURAL` constraints
+  (equi-keys only). Each shape has a gated GPU fast path that falls back
+  to a host executor on a gate miss.
+- Set ops: `UNION` (dedups), `UNION ALL` (concatenates),
+  `EXCEPT [ALL]` / `INTERSECT [ALL]` (host-side).
+- Query composition: non-recursive CTEs (`WITH`); uncorrelated scalar
+  and `[NOT] IN` subqueries in `SELECT` / `WHERE`. (Correlated
+  subqueries, `EXISTS`, and derived tables in `FROM` are rejected.)
+- Window functions: `ROW_NUMBER` / `RANK` / `DENSE_RANK` /
+  `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` `OVER (PARTITION BY ... ORDER
+  BY ...)` (host-side, default frame only).
 - `ORDER BY`: single-key `Int32`/`Int64` orderings (and multi-key /
   `DESC`) run on the GPU radix sort; other shapes sort host-side.
 - Types: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`, dictionary-
@@ -193,9 +203,10 @@ let result = engine.sql(
 Anything outside the supported surface returns a structured
 `BoltError::Sql(...)` or `BoltError::Plan(...)` with the unsupported
 construct quoted in the message. Some *supported* constructs execute on
-a host-side code path rather than the GPU — `LIKE`, the `||` concat
-operator, `NOT`, `STDDEV` / `VAR`, `SUM(Decimal128)`, host-side join /
-sort fallbacks — and a few constructs parse and type-check but are
+a host-side code path rather than the GPU — the `||` concat operator,
+`SUBSTRING` / `TRIM` / `CONCAT`, `STDDEV` / `VAR`, `SUM(Decimal128)`,
+set operations (`EXCEPT` / `INTERSECT`), window functions, and host-side
+join / sort fallbacks — and a few constructs parse and type-check but are
 rejected at the GPU lowering boundary with a clear `"… not yet lowered
 to GPU"` message (e.g. `CAST` to/from Decimal/Date/Timestamp, `CASE` over
 those result types). `SQL_REFERENCE.md` tags every feature with its

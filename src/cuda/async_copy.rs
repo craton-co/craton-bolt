@@ -46,6 +46,12 @@
 //! mirroring the discipline documented on
 //! [`crate::cuda::buffer::PinnedHostBuffer`].
 
+use std::cell::RefCell;
+// `Cell` is only used by the test-only `DROP_FENCE_OVERRIDE` thread-local
+// (the production multi-stream tracking uses `RefCell<StreamSet>` after the
+// single-stream `Cell<Option<CUstream>>` was removed); gate the import so a
+// non-test build doesn't warn on an unused import. Mirrors `cuda::buffer`.
+#[cfg(test)]
 use std::cell::Cell;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
@@ -56,6 +62,53 @@ use crate::cuda::cuda_sys::{self, CUstream};
 use crate::cuda::smart_ptrs::{GpuView, GpuViewMut};
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
+
+/// Deduplicated set of stream handles a [`PinnedBuffer`] has been enqueued on.
+///
+/// ## Why this is a local type, not [`crate::cuda::buffer::StreamSet`]
+///
+/// The sibling [`crate::cuda::buffer::PinnedHostBuffer`] fixes the identical
+/// host-side multi-stream use-after-free with a `RefCell<StreamSet>` and we
+/// would prefer to reuse that exact type. But while `buffer::StreamSet` is
+/// `pub(crate)` (nameable here), its `insert` / `len` / `is_empty` methods and
+/// its inner `streams` field are *module-private* to `buffer`, so a sibling
+/// module cannot actually operate on one. Exposing them would mean editing
+/// `buffer.rs`, which is out of scope for this fix. We therefore keep a
+/// minimal, behaviourally-identical local accumulator (deduped `Vec<CUstream>`,
+/// linear dedup — n is ~1–2 in practice, see the rationale on
+/// `buffer::StreamSet`). If `buffer::StreamSet`'s API is ever made
+/// `pub(crate)`, this type should be deleted in favour of importing it.
+///
+/// `CUstream` is a raw pointer handle; we never dereference it here, only
+/// compare handles for equality and forward them to `cuStreamSynchronize`.
+#[derive(Default)]
+struct StreamSet {
+    /// Distinct stream handles, in first-seen order. Never contains
+    /// duplicates (enforced by [`StreamSet::insert`]).
+    streams: Vec<CUstream>,
+}
+
+impl StreamSet {
+    /// Record `stream` if not already present, so `Drop` issues at most one
+    /// `cuStreamSynchronize` per distinct stream.
+    #[inline]
+    fn insert(&mut self, stream: CUstream) {
+        if !self.streams.contains(&stream) {
+            self.streams.push(stream);
+        }
+    }
+
+    /// Number of distinct streams recorded. Test/diagnostic hook.
+    #[inline]
+    fn len(&self) -> usize {
+        self.streams.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+}
 
 /// Owned page-locked (pinned) host buffer, allocated via `cuMemHostAlloc`.
 ///
@@ -96,15 +149,28 @@ pub struct PinnedBuffer<T: Pod> {
     /// construction). Cached so `Drop` / `byte_len` don't recompute and so a
     /// future bucketed pinned pool can hook in cleanly.
     byte_len: usize,
-    /// Last stream this buffer participated in async work on, if any. `Drop`
-    /// fences this stream before freeing the pinned pages so an in-flight
-    /// `cuMemcpy*Async` cannot DMA into reclaimed memory. See
-    /// [`mark_stream_use`](Self::mark_stream_use).
+    /// The set of streams this buffer's pinned pages have been enqueued on
+    /// (via [`mark_stream_use`](Self::mark_stream_use)). `Drop` fences **every**
+    /// recorded stream before freeing the pinned pages so an in-flight
+    /// `cuMemcpy*Async` on any of them cannot DMA into reclaimed memory.
     ///
-    /// `Cell<_>` so the shared-borrow async helpers can tag the stream
-    /// without forcing every call site onto `&mut self`; sound because the
-    /// type is `!Sync`.
-    last_use_stream: Cell<Option<CUstream>>,
+    /// ## Why a *set*, not a single "last stream"
+    ///
+    /// The previous design tracked only the most-recently-used stream
+    /// (`Cell<Option<CUstream>>`) and fenced just that one at `Drop`. A pinned
+    /// buffer uploaded on stream A then used on stream B fenced only B, so an
+    /// independent transfer still draining on A could read/write the
+    /// page-locked region *after* `cuMemFreeHost` handed the pages back — a
+    /// host-side use-after-free the DMA engine has no way to detect. This is
+    /// the exact analogue of the multi-stream race the sibling
+    /// [`crate::cuda::buffer::PinnedHostBuffer`] already fixed, so we apply the
+    /// same accumulate-every-stream-and-fence-all-at-`Drop` pattern here.
+    ///
+    /// `RefCell<StreamSet>` (mirroring `PinnedHostBuffer::used_streams`) so the
+    /// shared-borrow async helpers can tag the stream without forcing every
+    /// call site onto `&mut self`; sound because the type is `!Sync`, so there
+    /// is never a concurrent borrow from another thread.
+    used_streams: RefCell<StreamSet>,
 }
 
 impl<T: Pod> PinnedBuffer<T> {
@@ -143,7 +209,7 @@ impl<T: Pod> PinnedBuffer<T> {
                 ptr: raw as *mut T,
                 len,
                 byte_len,
-                last_use_stream: Cell::new(None),
+                used_streams: RefCell::new(StreamSet::default()),
             })
         }
 
@@ -161,7 +227,7 @@ impl<T: Pod> PinnedBuffer<T> {
                 storage,
                 len,
                 byte_len,
-                last_use_stream: Cell::new(None),
+                used_streams: RefCell::new(StreamSet::default()),
             })
         }
     }
@@ -175,7 +241,7 @@ impl<T: Pod> PinnedBuffer<T> {
             storage: Vec::new(),
             len: 0,
             byte_len: 0,
-            last_use_stream: Cell::new(None),
+            used_streams: RefCell::new(StreamSet::default()),
         }
     }
 
@@ -285,31 +351,42 @@ impl<T: Pod> PinnedBuffer<T> {
 
     /// Record that `stream` has enqueued (or is about to enqueue) async work
     /// that references this buffer's host pages. `Drop` will
-    /// `cuStreamSynchronize` against the most-recently-recorded stream before
+    /// `cuStreamSynchronize` against **every** recorded stream before
     /// `cuMemFreeHost` reclaims the pages, so the DMA engine can't be reading
-    /// / writing freed memory.
+    /// / writing freed memory on any stream that ever touched them.
     ///
     /// Mirrors the `mark_stream_use` contract on
-    /// [`crate::cuda::buffer::PinnedHostBuffer`]. Only the most recent stream
-    /// is remembered; cross-stream users must arrange their own barriers so a
-    /// single final-stream sync suffices.
+    /// [`crate::cuda::buffer::PinnedHostBuffer`]. Every distinct stream is
+    /// accumulated (not just the last one), so a pinned buffer used across
+    /// multiple streams fences all of them at `Drop` — closing the host-side
+    /// multi-stream use-after-free. Recording the same stream twice is a no-op
+    /// (the set dedups), so over-calling is always safe.
     ///
-    /// Takes `&self` (interior mutability via `Cell`) so an async helper that
-    /// only reads `as_ptr()` through a shared borrow doesn't have to be
-    /// rewritten to `&mut self`. Sound because the type is `!Sync`.
+    /// Takes `&self` (interior mutability via `RefCell`) so an async helper
+    /// that only reads `as_ptr()` through a shared borrow doesn't have to be
+    /// rewritten to `&mut self`. Sound because the type is `!Sync`, and the
+    /// borrow is held only for the `insert` call so it cannot overlap the
+    /// `borrow()` taken in `Drop`.
     // `stream` is an opaque CUstream handle that we merely store — no deref,
     // no FFI — so the outer fn stays safe.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     #[inline]
     pub fn mark_stream_use(&self, stream: CUstream) {
-        self.last_use_stream.set(Some(stream));
+        self.used_streams.borrow_mut().insert(stream);
     }
 
-    /// The stream most recently recorded via
-    /// [`mark_stream_use`](Self::mark_stream_use), or `None`.
+    /// Number of distinct streams currently recorded for this buffer.
+    ///
+    /// Test / diagnostic hook (mirrors
+    /// [`crate::cuda::buffer::PinnedHostBuffer::recorded_stream_count`]): lets
+    /// host-only tests assert the stream-set bookkeeping (dedup, multi-stream
+    /// accumulation) without a GPU. Replaces the former single-stream
+    /// `last_use_stream()` accessor, which no longer has a well-defined
+    /// meaning now that the buffer tracks the full set.
+    #[doc(hidden)]
     #[inline]
-    pub fn last_use_stream(&self) -> Option<CUstream> {
-        self.last_use_stream.get()
+    pub fn recorded_stream_count(&self) -> usize {
+        self.used_streams.borrow().len()
     }
 
     /// Override the logical length — used after an async D2H that filled fewer
@@ -350,16 +427,102 @@ impl<T: Pod> DerefMut for PinnedBuffer<T> {
     }
 }
 
+/// Signature of the per-stream fence used by [`PinnedBuffer`]'s `Drop`.
+/// Aliased so a host-only test can swap in a recording stub via
+/// [`drop_fence_with`], mirroring the same mockable seam on
+/// [`crate::cuda::buffer::PinnedHostBuffer`] / `GpuBuffer`. Returns the raw
+/// `CUresult` so the production hook can warn on failure.
+///
+/// Like [`fence_all_streams`], this is unreferenced in a non-test `cuda-stub`
+/// build, so gate it to avoid a dead-code warning.
+#[cfg(any(not(feature = "cuda-stub"), test))]
+type StreamFenceFn = fn(CUstream) -> crate::cuda::cuda_sys::CUresult;
+
+/// Production stream fence: forwards to `cuStreamSynchronize`.
+///
+/// SAFETY: `stream` is an opaque handle previously recorded via
+/// `mark_stream_use` (exactly what the caller passed to the async FFI). It is
+/// never dereferenced here, only handed to the driver, which tolerates a
+/// synchronize-on-completed-stream as a cheap no-op.
+#[cfg(not(feature = "cuda-stub"))]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // handle forwarded, not deref'd
+fn real_stream_fence(stream: CUstream) -> crate::cuda::cuda_sys::CUresult {
+    unsafe { cuda_sys::cuStreamSynchronize(stream) }
+}
+
+/// Fence every stream in `streams` via `fence`, warning on any non-success rc.
+/// Factored out of `Drop` so it can be unit-tested with a recording stub
+/// (counting how many distinct streams get fenced) on a host with no GPU.
+///
+/// The set is already deduped by [`StreamSet::insert`], so each distinct
+/// stream is fenced exactly once.
+///
+/// Compiled for the live build (where `Drop` calls it) and for any test build
+/// (where the host-only fence tests call it through the recording stub). It is
+/// unreferenced in a *non-test* `cuda-stub` build — there is no driver and the
+/// stub `Drop` path never fences — so gate it to avoid a dead-code warning.
+#[cfg(any(not(feature = "cuda-stub"), test))]
+fn fence_all_streams(streams: &StreamSet, fence: StreamFenceFn) {
+    for &stream in &streams.streams {
+        let rc = fence(stream);
+        if rc != cuda_sys::CUDA_SUCCESS {
+            log::warn!(
+                "craton-bolt: cuStreamSynchronize before PinnedBuffer free returned {} \
+                 (buffer dropped while a pending DMA may still reference it; the pinned \
+                 pages may be reclaimed before the driver is done with them)",
+                rc
+            );
+        }
+    }
+}
+
+/// Test seam: when set, `Drop` fences through this stub instead of the real
+/// `cuStreamSynchronize`. Host-only tests install a recorder here to assert
+/// the *number of distinct streams fenced* without a GPU, then clear it.
+/// Mirrors `DROP_FENCE_OVERRIDE` in `crate::cuda::buffer`.
+#[cfg(test)]
+thread_local! {
+    static DROP_FENCE_OVERRIDE: Cell<Option<StreamFenceFn>> = const { Cell::new(None) };
+}
+
+/// Install `fence` as the `Drop`-time stream fence for the current thread,
+/// run `body`, then restore the previous hook. Test-only.
+#[cfg(test)]
+fn drop_fence_with<R>(fence: StreamFenceFn, body: impl FnOnce() -> R) -> R {
+    let prev = DROP_FENCE_OVERRIDE.with(|c| c.replace(Some(fence)));
+    let out = body();
+    DROP_FENCE_OVERRIDE.with(|c| c.set(prev));
+    out
+}
+
+/// Resolve the fence the current `Drop` should use: the test override if
+/// installed, else the real `cuStreamSynchronize`. Under `cuda-stub` there is
+/// no driver, so only the test override path exists.
+#[cfg(not(feature = "cuda-stub"))]
+#[inline]
+fn current_drop_fence() -> StreamFenceFn {
+    #[cfg(test)]
+    {
+        if let Some(f) = DROP_FENCE_OVERRIDE.with(|c| c.get()) {
+            return f;
+        }
+    }
+    real_stream_fence
+}
+
 impl<T: Pod> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
         // Stub backend: the `Vec` frees itself; nothing to fence (no DMA can
         // be in flight without a driver). Recording a stream on a stub buffer
-        // is meaningless, so we ignore `last_use_stream` here.
+        // is meaningless, so we ignore `used_streams` here.
         #[cfg(feature = "cuda-stub")]
         {
-            // Explicitly read the field so a future refactor that drops it
+            // Explicitly touch the field so a future refactor that drops it
             // trips here rather than silently. (`storage` drops on its own.)
-            let _ = self.last_use_stream.get();
+            // Reading both accessors also keeps `StreamSet::is_empty` / `len`
+            // exercised in a non-test stub build, so neither warns as dead.
+            let set = self.used_streams.borrow();
+            let _ = (set.is_empty(), set.len());
         }
 
         #[cfg(not(feature = "cuda-stub"))]
@@ -369,26 +532,28 @@ impl<T: Pod> Drop for PinnedBuffer<T> {
                 // fence.
                 return;
             }
-            // Fence any in-flight DMA before returning the pinned pages to the
-            // driver. Without this, an outstanding `cuMemcpyHtoDAsync_v2` /
-            // `cuMemcpyDtoHAsync_v2` whose host operand is `self.ptr` would
-            // keep reading / writing the page-locked region after
-            // `cuMemFreeHost` released it — a host-side use-after-free the DMA
-            // engine has no way to detect.
-            if let Some(stream) = self.last_use_stream.get() {
-                // SAFETY: `stream` is an opaque handle the caller passed to
-                // `mark_stream_use`; we only forward it. A synchronize on a
-                // completed stream is a cheap no-op; on a destroyed stream it
-                // errors and we warn but still proceed to free so we don't
-                // leak the pinned pages.
-                let rc = unsafe { cuda_sys::check(cuda_sys::cuStreamSynchronize(stream)) };
-                if let Err(e) = rc {
-                    log::warn!(
-                        "craton-bolt: cuStreamSynchronize before PinnedBuffer free failed \
-                         ({e:?}); proceeding with cuMemFreeHost but in-flight DMA may have UB'd"
-                    );
-                }
+            // Fence EVERY stream this buffer was enqueued on before returning
+            // the pinned pages to the driver. Without this, an outstanding
+            // `cuMemcpyHtoDAsync_v2` / `cuMemcpyDtoHAsync_v2` whose host operand
+            // is `self.ptr` on ANY recorded stream would keep reading / writing
+            // the page-locked region after `cuMemFreeHost` released it — a
+            // host-side use-after-free the DMA engine has no way to detect.
+            //
+            // Fencing the whole set (not just the last stream) is what closes
+            // the multi-stream race: a buffer uploaded on stream A then used on
+            // stream B fenced only B under the old design, leaving an
+            // independent transfer still draining on A to scribble the freed
+            // pages. The set is deduped, so each stream is fenced at most once.
+            //
+            // The borrow is short-lived and cannot alias any other borrow:
+            // `Drop` runs with exclusive ownership of `self`, so no `&self`
+            // method (which is what takes `borrow_mut` in `mark_stream_use`)
+            // can run concurrently.
+            let streams = self.used_streams.borrow();
+            if !streams.is_empty() {
+                fence_all_streams(&streams, current_drop_fence());
             }
+            drop(streams);
             // SAFETY: `self.ptr` came from `cuMemHostAlloc` and we have unique
             // ownership (move-only, `!Sync`). Cast through `c_void` so we
             // don't need `libc` in the `use` list just for this.
@@ -623,27 +788,116 @@ mod tests {
 
     // ---- stream-tracking state ------------------------------------------
 
+    fn fake_stream(bits: usize) -> CUstream {
+        bits as CUstream
+    }
+
     #[test]
-    fn mark_stream_use_records_last_stream() {
-        // The stream cell must round-trip a fabricated handle. We never deref
-        // the pointer — it's only stored. An empty buffer keeps the test
-        // driver-free on both backends (Drop skips the fence / free).
+    fn mark_stream_use_accumulates_distinct_streams() {
+        // The stream set must round-trip fabricated handles, dedup repeats, and
+        // accumulate distinct streams (NOT overwrite to "last wins"). We never
+        // deref the pointers — they're only stored. An empty buffer keeps the
+        // test driver-free on both backends (Drop skips the fence / free).
         let buf: PinnedBuffer<u32> = PinnedBuffer::new(0).expect("zero-len alloc");
-        assert!(buf.last_use_stream().is_none());
+        assert_eq!(buf.recorded_stream_count(), 0);
 
-        let fake: CUstream = 0xDEAD_BEEF_usize as CUstream;
-        buf.mark_stream_use(fake);
-        assert_eq!(buf.last_use_stream(), Some(fake));
+        let a = fake_stream(0xDEAD_BEEF);
+        buf.mark_stream_use(a);
+        buf.mark_stream_use(a); // duplicate — must dedup
+        assert_eq!(buf.recorded_stream_count(), 1);
 
-        // Shared-borrow methods must not clobber the recorded stream.
+        // Shared-borrow methods must not clobber the recorded set.
         let _ = buf.len();
         let _ = buf.as_slice();
-        assert_eq!(buf.last_use_stream(), Some(fake));
+        assert_eq!(buf.recorded_stream_count(), 1);
 
-        // Last-wins, matching the documented contract; null is a legal value
-        // (the default stream is the null handle).
+        // A second distinct stream accumulates rather than replacing the first
+        // — this is the multi-stream fix. Null is a legal value (the default
+        // stream is the null handle) and counts as a distinct member.
+        let b = fake_stream(0xCAFE_F00D);
+        buf.mark_stream_use(b);
+        assert_eq!(
+            buf.recorded_stream_count(),
+            2,
+            "distinct streams must accumulate, not overwrite"
+        );
         buf.mark_stream_use(std::ptr::null_mut());
-        assert_eq!(buf.last_use_stream(), Some(std::ptr::null_mut::<()>() as CUstream));
+        assert_eq!(buf.recorded_stream_count(), 3);
+    }
+
+    // ---- Drop fences ALL recorded streams, via the mock seam -------------
+
+    thread_local! {
+        static FENCED: std::cell::RefCell<Vec<CUstream>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Recording stub installed via `drop_fence_with`: logs each stream it is
+    /// asked to fence and returns success. Never calls the driver.
+    fn recording_fence(stream: CUstream) -> crate::cuda::cuda_sys::CUresult {
+        FENCED.with(|f| f.borrow_mut().push(stream));
+        crate::cuda::cuda_sys::CUDA_SUCCESS
+    }
+
+    #[test]
+    fn drop_fences_every_recorded_stream_exactly_once() {
+        // Mirror `cuda::buffer`'s multi-stream fence test: drive the exact
+        // code `Drop` runs (`fence_all_streams` over the borrowed set) through
+        // the recording stub, asserting every distinct recorded stream is
+        // fenced exactly once. We operate on an empty buffer so no FFI free
+        // runs — this isolates the "fence all, deduped" guarantee from the
+        // `cuMemFreeHost`, keeping it driver-free on both backends.
+        FENCED.with(|f| f.borrow_mut().clear());
+
+        let buf: PinnedBuffer<u8> = PinnedBuffer::new(0).expect("zero-len alloc");
+        let a = fake_stream(0x11);
+        let b = fake_stream(0x22);
+        buf.mark_stream_use(a);
+        buf.mark_stream_use(b);
+        buf.mark_stream_use(a); // duplicate — must not produce a 3rd fence
+
+        drop_fence_with(recording_fence, || {
+            let set = buf.used_streams.borrow();
+            fence_all_streams(&set, recording_fence);
+        });
+
+        FENCED.with(|f| {
+            let fenced = f.borrow();
+            assert_eq!(
+                fenced.len(),
+                2,
+                "Drop must fence each distinct recorded stream exactly once"
+            );
+            assert!(fenced.contains(&a) && fenced.contains(&b));
+        });
+    }
+
+    #[test]
+    fn empty_stream_set_fences_nothing() {
+        // A buffer that was never tagged must not fence anything at Drop.
+        FENCED.with(|f| f.borrow_mut().clear());
+        let buf: PinnedBuffer<u8> = PinnedBuffer::new(0).expect("zero-len alloc");
+        drop_fence_with(recording_fence, || {
+            let set = buf.used_streams.borrow();
+            if !set.is_empty() {
+                fence_all_streams(&set, recording_fence);
+            }
+        });
+        FENCED.with(|f| assert!(f.borrow().is_empty()));
+    }
+
+    #[test]
+    fn stream_set_dedups_and_treats_null_as_real_handle() {
+        // Pure bookkeeping check on the local accumulator: repeats dedup and
+        // the null handle (default stream) is a distinct member like any other.
+        let mut s = StreamSet::default();
+        assert!(s.is_empty());
+        let a = fake_stream(0x1000);
+        s.insert(a);
+        s.insert(a);
+        s.insert(std::ptr::null_mut());
+        s.insert(std::ptr::null_mut());
+        assert_eq!(s.len(), 2);
     }
 
     #[test]

@@ -1256,11 +1256,15 @@ fn column_null_mask(
 /// borrow-checker constraints around returning `&GpuVec<i64>` whose lifetime
 /// might come from local storage.
 enum FilteredKeys<'a> {
-    /// Reuse the shared post-key-filter key column.
-    Borrowed { group_col: &'a GpuVec<i64>, n_rows: usize },
+    /// Reuse the shared post-key-filter key column. `host_keys` borrows the
+    /// per-query cached host image of that same column (bit-identical to a
+    /// D2H of `group_col`) so the host-side overflow check can read the
+    /// per-row group assignment without a device round-trip.
+    Borrowed { group_col: &'a GpuVec<i64>, host_keys: &'a [i64], n_rows: usize },
     /// Freshly-uploaded smaller column applying a value-NULL filter on top
     /// of `key_valid`. The owned vec must live across the kernel launch.
-    Owned { group_col: GpuVec<i64>, n_rows: usize },
+    /// `host_keys` owns the matching host image used to build it.
+    Owned { group_col: GpuVec<i64>, host_keys: Vec<i64>, n_rows: usize },
 }
 
 impl<'a> FilteredKeys<'a> {
@@ -1275,6 +1279,113 @@ impl<'a> FilteredKeys<'a> {
             FilteredKeys::Borrowed { n_rows, .. } | FilteredKeys::Owned { n_rows, .. } => *n_rows,
         }
     }
+    /// Host image of the per-row group-key column, aligned 1:1 with the
+    /// filtered value vec produced by `collect_filtered_primitive`. Used by
+    /// the host-side SUM overflow check to replicate the kernel's grouping.
+    fn host_keys(&self) -> &[i64] {
+        match self {
+            FilteredKeys::Borrowed { host_keys, .. } => host_keys,
+            FilteredKeys::Owned { host_keys, .. } => host_keys,
+        }
+    }
+}
+
+/// V-10 (grouped): host-side integer SUM overflow guard for GROUP BY.
+///
+/// The GPU group-by SUM accumulates each group with `atom.global.add.u64`
+/// (PTX has no signed `atom.add`; `.u64` is bit-identical for two's-complement
+/// addition). That atomic WRAPS modulo 2^64 on overflow, so a per-group sum
+/// exceeding `i64::MAX` would silently come back as a wrapped (often negative)
+/// value. The SCALAR SUM path in `aggregate.rs` instead ERRORS on i64 overflow
+/// via `i64::checked_add` (see `ReduceScalar::finalize`, the
+/// `"SUM(integer) overflow"` arm) to honour the engine's "never silently
+/// wrong" invariant. Without this guard, `SELECT SUM(x) FROM t` would error on
+/// overflow while `SELECT k, SUM(x) FROM t GROUP BY k` over the SAME data
+/// silently wrapped — an inconsistency this restores.
+///
+/// We cannot change the kernel PTX from this file, so we replicate the
+/// grouping on the host: `host_keys[i]` is the group key of `values[i]`
+/// (the two vecs are aligned 1:1 — both are produced from the same post-filter
+/// row set). We fold each group with `i64::checked_add`; the first group whose
+/// true sum leaves i64 range yields a `BoltError::Type` whose message mirrors
+/// the scalar path verbatim. Groups that do not overflow are untouched, so a
+/// correct (non-overflowing) query is never regressed — the kernel result is
+/// returned unchanged.
+///
+/// This pass is the exact arithmetic the kernel performs (integer addition is
+/// associative and commutative, so any accumulation order reaches the same i64
+/// result and overflows iff the device sum overflowed), making the detection
+/// faithful rather than a conservative magnitude bound. It costs one O(n) host
+/// pass plus an O(#groups) map; acceptable next to the H2D/D2H already on this
+/// path.
+///
+/// NOTE (kernel follow-up): the device atomic is still wrapping; this host
+/// guard is the build-safe restoration of the invariant. The proper long-term
+/// fix is an overflow flag raised inside the atomic kernel.
+// TODO(overflow-kernel): add a saturating/overflow-detecting variant of the
+// u64 group SUM atomic (e.g. a per-launch device "overflow" flag set on signed
+// carry) so overflow is caught on-device for streaming inputs that are never
+// fully materialised host-side, and this host re-fold can be dropped.
+fn checked_group_sum(values: &[i64], host_keys: &[i64]) -> BoltResult<()> {
+    debug_assert_eq!(
+        values.len(),
+        host_keys.len(),
+        "checked_group_sum: value/key columns must be aligned 1:1",
+    );
+    let mut sums: std::collections::HashMap<i64, i64> =
+        std::collections::HashMap::with_capacity(host_keys.len().min(1 << 20));
+    for (&v, &key) in values.iter().zip(host_keys.iter()) {
+        let slot = sums.entry(key).or_insert(0i64);
+        *slot = match slot.checked_add(v) {
+            Some(s) => s,
+            None => {
+                // Mirror the scalar contract's message verbatim
+                // (`aggregate.rs` ReduceScalar::finalize SUM arm) so callers
+                // and tests see one canonical integer-overflow error string.
+                return Err(BoltError::Type(
+                    "SUM(integer) overflow: accumulator exceeds i64 range".to_string(),
+                ));
+            }
+        };
+    }
+    Ok(())
+}
+
+/// V-10 (grouped, native-validity path): overflow guard for the
+/// `run_typed_agg_native_validity` SUM branches.
+///
+/// That path uploads the FULL value column (`values`, length `n_rows`) plus a
+/// device validity bitmap and lets the kernel skip NULL rows on-device, so it
+/// never builds a host-compacted value vec. To replicate the kernel's grouping
+/// for the overflow check we download the per-row key column host image
+/// (`group_col`, parallel to the batch by row index — guaranteed by the
+/// `key_valid.is_none()` precondition at the dispatch site) and fold per group
+/// with `i64::checked_add`, skipping rows where `value_valid[i]` is false
+/// exactly as the kernel does. Returns the same `BoltError::Type` as the
+/// host-strip path on overflow.
+///
+/// The single D2H of the key column here is the cost of restoring the
+/// invariant on this path; see the `// TODO(overflow-kernel)` on
+/// `checked_group_sum` for the on-device follow-up that would remove it.
+fn checked_group_sum_native_validity(
+    values: &[i64],
+    value_valid: &[bool],
+    group_col: &GpuVec<i64>,
+) -> BoltResult<()> {
+    debug_assert_eq!(values.len(), value_valid.len());
+    let host_keys: Vec<i64> = group_col.to_vec()?;
+    debug_assert_eq!(host_keys.len(), values.len());
+    // Compact out NULL value rows so the host fold sees exactly the rows the
+    // kernel accumulates.
+    let mut vals: Vec<i64> = Vec::with_capacity(values.len());
+    let mut keys: Vec<i64> = Vec::with_capacity(values.len());
+    for ((&v, &valid), &key) in values.iter().zip(value_valid.iter()).zip(host_keys.iter()) {
+        if valid {
+            vals.push(v);
+            keys.push(key);
+        }
+    }
+    checked_group_sum(&vals, &keys)
 }
 
 /// Decide whether to reuse the shared `group_col` (when no value-NULL filter
@@ -1311,11 +1422,14 @@ fn prepare_filtered_keys<'a>(
     n_rows: usize,
     key_valid: Option<&[bool]>,
     value_valid: Option<&[bool]>,
-    cached_host_keys: &[i64],
+    // Tied to `'a` so the `Borrowed` variant can hold this slice as the
+    // per-row group host image for the V-10 overflow check (it lives as long
+    // as the borrowed `group_col`, which is what the returned value borrows).
+    cached_host_keys: &'a [i64],
     stream: &CudaStream,
 ) -> BoltResult<FilteredKeys<'a>> {
     if value_valid.is_none() {
-        return Ok(FilteredKeys::Borrowed { group_col, n_rows });
+        return Ok(FilteredKeys::Borrowed { group_col, host_keys: cached_host_keys, n_rows });
     }
 
     // Project `value_valid` (indexed by ORIGINAL row position) through the
@@ -1352,7 +1466,7 @@ fn prepare_filtered_keys<'a>(
     // after this upload without a separate barrier. Replaces the prior
     // synchronous `GpuVec::from_slice` here.
     let owned = GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
-    Ok(FilteredKeys::Owned { group_col: owned, n_rows: filtered_n })
+    Ok(FilteredKeys::Owned { group_col: owned, host_keys: filtered, n_rows: filtered_n })
 }
 
 /// Common path for SUM/MIN/MAX. Uploads the typed input column, allocates a
@@ -1470,6 +1584,13 @@ fn run_typed_agg(
                     .map(|v| v as i64)
                     .collect();
                 debug_assert_eq!(host.len(), n);
+                // V-10 (grouped): error on per-group i64 overflow before the
+                // wrapping u64 atomic can silently produce a wrong answer,
+                // matching the scalar SUM contract. SUM(Int32->i64) cannot
+                // actually overflow i64 for realistic row counts, but we run
+                // the same guard for contract uniformity — it never rejects a
+                // correct result.
+                checked_group_sum(&host, filtered.host_keys())?;
                 let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
                 let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
@@ -1514,6 +1635,13 @@ fn run_typed_agg(
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
             let host: Vec<i64> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
             debug_assert_eq!(host.len(), n);
+            // V-10 (grouped): for SUM, error on any per-group i64 overflow
+            // BEFORE the wrapping `atom.global.add.u64` group atomic can
+            // silently return a wrapped result — matching the scalar SUM
+            // path in aggregate.rs. MIN/MAX are non-arithmetic and skipped.
+            if matches!(op, ReduceOp::Sum) {
+                checked_group_sum(&host, filtered.host_keys())?;
+            }
             let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
@@ -1639,6 +1767,13 @@ fn run_typed_agg_native_validity(
             let widened_dtype = sum_output_dtype(DataType::Int32);
             if matches!(op, ReduceOp::Sum) && widened_dtype == DataType::Int64 {
                 let widened: Vec<i64> = pa.values().iter().map(|&v| v as i64).collect();
+                // V-10 (grouped, native-validity path): same overflow contract
+                // as the host-strip SUM path — the device atomic wraps, so
+                // re-fold per group on the host skipping NULL rows (the kernel
+                // skips them via the validity bitmap) and error on i64
+                // overflow. SUM(Int32->i64) cannot realistically overflow, but
+                // we run the guard for contract uniformity.
+                checked_group_sum_native_validity(&widened, value_valid, group_col)?;
                 let input_gpu = GpuVec::<i64>::from_slice_async(&widened, stream.raw())?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
                 let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
@@ -1683,6 +1818,12 @@ fn run_typed_agg_native_validity(
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
             let host: Vec<i64> = pa.values().to_vec();
+            // V-10 (grouped, native-validity path): for SUM, error on per-group
+            // i64 overflow before the wrapping device atomic can silently wrap.
+            // MIN/MAX are non-arithmetic and skip the guard.
+            if matches!(op, ReduceOp::Sum) {
+                checked_group_sum_native_validity(&host, value_valid, group_col)?;
+            }
             let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
@@ -2247,6 +2388,70 @@ mod tests {
             name, dt, true,
         )]));
         RecordBatch::try_new(schema, vec![arr]).expect("one-col batch")
+    }
+
+    // V-10 (grouped): `checked_group_sum` is the host-side overflow guard
+    // that restores the scalar SUM "never silently wrong" contract for the
+    // GROUP BY SUM(i64) / SUM(i32->i64) paths. These tests are pure host
+    // logic and run under `--no-default-features --features cuda-stub`.
+
+    /// A grouped SUM whose per-group accumulator stays inside i64 range
+    /// passes the guard untouched (no false positive — correct queries are
+    /// never regressed). Two distinct groups, each summing within range.
+    #[test]
+    fn checked_group_sum_within_range_ok() {
+        // group 7 -> 1+2+3 = 6 ; group 9 -> 10+20 = 30
+        let values = [1i64, 2, 3, 10, 20];
+        let keys = [7i64, 7, 7, 9, 9];
+        assert!(checked_group_sum(&values, &keys).is_ok());
+    }
+
+    /// Even when the GLOBAL sum would overflow, the guard operates PER GROUP:
+    /// here every individual group stays in range, so no error is raised
+    /// (mirrors the kernel, which accumulates independently per group).
+    #[test]
+    fn checked_group_sum_per_group_not_global() {
+        // Two groups each at i64::MAX individually; global sum would overflow
+        // but neither group does, so this must succeed.
+        let values = [i64::MAX, i64::MAX];
+        let keys = [1i64, 2];
+        assert!(checked_group_sum(&values, &keys).is_ok());
+    }
+
+    /// A single group whose true sum exceeds `i64::MAX` must ERROR with a
+    /// `BoltError::Type` whose message matches the scalar SUM path verbatim
+    /// — not silently wrap the way the device `atom.add.u64` would.
+    #[test]
+    fn checked_group_sum_overflow_errors_not_wraps() {
+        // group 5: i64::MAX + 1 overflows.
+        let values = [i64::MAX, 1i64];
+        let keys = [5i64, 5];
+        match checked_group_sum(&values, &keys) {
+            Err(BoltError::Type(msg)) => {
+                assert!(
+                    msg.contains("SUM(integer) overflow"),
+                    "message should mirror the scalar SUM contract, got: {msg}",
+                );
+            }
+            other => panic!("expected BoltError::Type on grouped SUM overflow, got {other:?}"),
+        }
+    }
+
+    /// Negative-direction overflow (below `i64::MIN`) is equally detected.
+    #[test]
+    fn checked_group_sum_underflow_errors() {
+        let values = [i64::MIN, -1i64];
+        let keys = [0i64, 0];
+        assert!(matches!(
+            checked_group_sum(&values, &keys),
+            Err(BoltError::Type(_)),
+        ));
+    }
+
+    /// Empty input is trivially in-range.
+    #[test]
+    fn checked_group_sum_empty_ok() {
+        assert!(checked_group_sum(&[], &[]).is_ok());
     }
 
     // dedup (groupby_common): the `pack_keys` / `decode_key` / `and_masks`

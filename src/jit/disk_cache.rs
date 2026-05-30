@@ -113,30 +113,93 @@ pub const DISK_PTX_CACHE_ENV: &str = "BOLT_PTX_CACHE_DIR";
 /// [`codegen_salt`]) as a cheap cross-release guard, but that only
 /// protects across published releases — `CODEGEN_VERSION` is what
 /// protects within a release / between local dev builds.
+///
+/// Defense-in-depth: [`codegen_salt`] *additionally* folds in an
+/// optional compile-time codegen fingerprint
+/// ([`CODEGEN_FINGERPRINT`], from `BOLT_CODEGEN_FINGERPRINT`) when a
+/// `build.rs` provides one. Where present, that fingerprint rotates the
+/// salt automatically on any codegen change, so a forgotten bump of this
+/// constant no longer silently serves stale PTX. Until that env var is
+/// wired up, this constant remains the load-bearing in-release guard.
 pub(crate) const CODEGEN_VERSION: u32 = 1;
+
+/// Optional build-time codegen fingerprint env var.
+///
+/// # Why this exists (defense-in-depth against a forgotten `CODEGEN_VERSION` bump)
+///
+/// [`CODEGEN_VERSION`] is the *manual* freshness guard: a human has to
+/// remember to bump it whenever PTX emission changes. That single point
+/// of failure is exactly the JIT-M1 hazard — forget the bump and a NEW
+/// binary happily serves PTX a structurally-different OLD binary wrote.
+///
+/// To reduce reliance on that manual constant we *also* fold an
+/// automatically-derived fingerprint into the salt when one is available
+/// at compile time. If `build.rs` is ever extended to emit
+/// `cargo:rustc-env=BOLT_CODEGEN_FINGERPRINT=<hash-of-codegen-surface>`
+/// (e.g. a digest over `ptx_gen.rs` / the codegen module tree), this
+/// helper consumes it via [`option_env!`] with **zero** edits here and
+/// **no** new dependency. When the env var is absent (today's build),
+/// `option_env!` resolves to `None` at compile time and the salt falls
+/// back to `CODEGEN_VERSION` + crate version alone — i.e. the previous
+/// behaviour, never weaker.
+///
+/// We consume it (rather than requiring it) so that the file compiles
+/// unchanged under the current `build.rs`, including the
+/// `--no-default-features --features cuda-stub` build, while
+/// automatically tightening the moment a fingerprint is wired up.
+///
+/// NOTE: We deliberately do NOT edit `build.rs` here — this file only
+/// *reads* the variable if a future build script provides it.
+const CODEGEN_FINGERPRINT: Option<&str> = option_env!("BOLT_CODEGEN_FINGERPRINT");
 
 /// Compose the codegen-version salt component for the disk cache key.
 ///
-/// Combines [`CODEGEN_VERSION`] with the crate version
-/// (`CARGO_PKG_VERSION`). The crate version is a cheap extra guard so
-/// two different published releases that happen to share a
-/// `CODEGEN_VERSION` value still land in distinct on-disk keys.
+/// The salt is **defense-in-depth**: it combines three independent
+/// freshness signals so that a forgotten manual bump cannot, on its own,
+/// re-introduce JIT-M1 (stale PTX served as correct):
+///
+///   1. [`CODEGEN_VERSION`] — the manual, in-release guard (`cgN`).
+///   2. The crate version (`CARGO_PKG_VERSION`, `vX.Y.Z`) — a cheap
+///      cross-release guard so two *published* releases that happen to
+///      share a `CODEGEN_VERSION` value still land in distinct on-disk
+///      keys. Across releases the crate version always changes, so even a
+///      forgotten `CODEGEN_VERSION` bump can't serve another release's
+///      stale PTX.
+///   3. An optional compile-time codegen fingerprint
+///      ([`CODEGEN_FINGERPRINT`], `fp<hash>`) — present only when
+///      `build.rs` exports `BOLT_CODEGEN_FINGERPRINT`. When present it
+///      makes the salt rotate *automatically* on any change to the
+///      codegen surface, so a forgotten manual bump is caught even
+///      between local dev builds of the same crate version.
+///
+/// NOTE / MAINTAINERS: this salt MUST change whenever the emitted PTX
+/// *text* changes for an otherwise-identical `KernelSpec`. Until a
+/// `build.rs` fingerprint is wired up (signal 3), bumping
+/// [`CODEGEN_VERSION`] is the load-bearing way to do that within a single
+/// crate version — see the maintainer note on [`CODEGEN_VERSION`].
 ///
 /// Returned as a short, filename-safe string (no path separators, no
 /// shell metacharacters — the crate version is `MAJOR.MINOR.PATCH[-pre]`
-/// which contains only `[0-9A-Za-z.\-+]`). Callers prepend this to the
-/// spec-hash portion of the disk key.
+/// which contains only `[0-9A-Za-z.\-+]`, and any fingerprint we emit is
+/// expected to be hex). Callers prepend this to the spec-hash portion of
+/// the disk key. Even if a future fingerprint contained a stray
+/// separator, [`valid_key`] is the trust boundary that rejects an unsafe
+/// final key, so the cache degrades to a miss rather than a path escape.
 #[must_use]
 pub(crate) fn codegen_salt() -> String {
-    format!("cg{}-v{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"))
+    match CODEGEN_FINGERPRINT {
+        Some(fp) => format!("cg{}-v{}-fp{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"), fp),
+        None => format!("cg{}-v{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION")),
+    }
 }
 
 /// Compose the full on-disk cache key for a kernel.
 ///
 /// The key has three domain-separated components joined by `-`:
-///   1. [`codegen_salt`] — the codegen-version + crate-version salt that
-///      fixes JIT-M1 (a codegen change rotates the key, so stale entries
-///      miss and codegen re-runs).
+///   1. [`codegen_salt`] — the codegen-version + crate-version (+ optional
+///      build-time codegen-fingerprint) salt that fixes JIT-M1 (a codegen
+///      change rotates the key, so stale entries miss and codegen
+///      re-runs).
 ///   2. `entry` — the kernel entry-point symbol, so two kernels with
 ///      identical `KernelSpec` content but different entry symbols
 ///      (e.g. `KERNEL_ENTRY` vs `PREDICATE_ENTRY`) never alias.
@@ -363,11 +426,17 @@ impl DiskPtxCache {
     /// the pre-existing permissions, which is no worse than today. We only
     /// propagate a hard error from `create_dir_all` itself.
     ///
-    /// On Windows there is no portable `0o700` analogue in std; the
-    /// per-user `%LOCALAPPDATA%` default root already lives under the
-    /// user's profile ACL, so we leave permissions as created and note it
-    /// here. Tightening Windows ACLs would require the `windows`/`winapi`
-    /// crates, which the task budget excludes.
+    /// On Windows there is no portable `0o700` analogue in std, so we
+    /// apply best-effort ACL tightening via `icacls` (see
+    /// [`harden_windows_dir`]). The **primary** protection on Windows
+    /// remains the per-user `%LOCALAPPDATA%` default root, which already
+    /// lives under the user's own profile ACL; the `icacls` pass is a
+    /// defense-in-depth hardening for the case where the operator points
+    /// `BOLT_PTX_CACHE_DIR` at a *shared* / world-writable location, where
+    /// another local user could otherwise plant PTX that we read back and
+    /// *launch*. It restricts the directory to the current user, mirroring
+    /// the Unix `0o700` intent. Like the Unix branch it is best-effort:
+    /// any failure is ignored and `open` still succeeds.
     pub fn open(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         // V-7: restrict the cache root to owner-only on Unix. Best-effort.
@@ -377,6 +446,13 @@ impl DiskPtxCache {
             // 0o700 = rwx for owner, nothing for group/other.
             let perms = std::fs::Permissions::from_mode(0o700);
             let _ = fs::set_permissions(&dir, perms);
+        }
+        // V-7 (Windows): best-effort ACL tightening to the current user,
+        // the closest analogue to the Unix 0o700 above. Best-effort: a
+        // failure (e.g. dir owned by another user) is ignored.
+        #[cfg(windows)]
+        {
+            harden_windows_dir(&dir);
         }
         Ok(Self {
             root: std::sync::Arc::new(dir),
@@ -521,6 +597,67 @@ impl DiskPtxCache {
             }
         }
     }
+}
+
+/// Best-effort tighten the ACL on the cache root to the current user
+/// (V-7, Windows analogue of the Unix `0o700`).
+///
+/// # Threat boundary
+///
+/// The on-disk cache stores PTX that is later read back and *launched*.
+/// On a shared Windows host, if `BOLT_PTX_CACHE_DIR` points at a
+/// world-writable directory, a different local user could plant or tamper
+/// with `<key>.ptx` files for us to load. The per-user `%LOCALAPPDATA%`
+/// default already lives under the user's profile ACL and is the
+/// *primary* protection; this routine is defense-in-depth for the
+/// explicit-shared-dir case.
+///
+/// # Implementation
+///
+/// We shell out to the built-in `icacls` tool rather than pull in the
+/// `windows`/`winapi` crates (no new dependency, matching the task
+/// budget). The invocation:
+///
+///   * `/inheritance:r` — remove inherited ACEs (a world-writable parent
+///     would otherwise keep granting access), and
+///   * `/grant:r "<user>":(OI)(CI)F` — replace the DACL with a single
+///     Full-control grant to the current user, inherited by child files
+///     `(OI)` and subdirectories `(CI)`.
+///
+/// The user principal is taken from `USERDOMAIN\USERNAME` when both are
+/// present (the fully-qualified form `icacls` prefers), falling back to
+/// bare `USERNAME`. If neither is set we skip silently.
+///
+/// Strictly best-effort, mirroring the Unix `let _ = set_permissions(..)`
+/// pattern: we suppress stdout/stderr, never inspect the exit status, and
+/// any spawn/IO error is swallowed. `open` still succeeds either way, so a
+/// host without `icacls` (or a path we can't re-ACL) is no worse off than
+/// before this hardening existed.
+#[cfg(windows)]
+fn harden_windows_dir(dir: &Path) {
+    use std::process::{Command, Stdio};
+
+    // Prefer the domain-qualified principal `DOMAIN\USER`; fall back to a
+    // bare username. Without a username we can't name a grantee, so skip.
+    let user = match std::env::var("USERNAME") {
+        Ok(u) if !u.is_empty() => match std::env::var("USERDOMAIN") {
+            Ok(d) if !d.is_empty() => format!("{d}\\{u}"),
+            _ => u,
+        },
+        _ => return,
+    };
+
+    // Best-effort: spawn icacls, ignore success/failure entirely. We pass
+    // the grant spec as a single argument (no shell involved, so the
+    // `(OI)(CI)F` parens and the `:` are passed literally to icacls).
+    let _ = Command::new("icacls")
+        .arg(dir)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:(OI)(CI)F"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Monotonically-increasing counter for tempfile-suffix
@@ -923,6 +1060,56 @@ mod tests {
         assert!(disk_key("e", 0, 0).starts_with(&salt));
     }
 
+    /// Changing the crate version must rotate the disk key independently of
+    /// `CODEGEN_VERSION` — the cross-release defense-in-depth guard. We
+    /// can't mutate `CARGO_PKG_VERSION` at runtime, so we reconstruct the
+    /// salt shape with a different version and assert it diverges from the
+    /// live key for an otherwise-identical spec + entry.
+    #[test]
+    fn crate_version_change_changes_disk_key() {
+        let entry = "kernel_main";
+        let (hi, lo) = (0x0123_4567_89ab_cdefu64, 0xfedc_ba98_7654_3210u64);
+        let k_now = disk_key(entry, hi, lo);
+        // A hypothetical different release with the same CODEGEN_VERSION.
+        let salt_other = format!("cg{}-v{}", CODEGEN_VERSION, "0.0.0-other");
+        let k_other = format!("{}-{}-{}", salt_other, entry, hash_to_key(hi, lo));
+        assert_ne!(
+            k_now, k_other,
+            "a different crate version must rotate the disk key"
+        );
+    }
+
+    /// The optional build-time codegen fingerprint, when present, must
+    /// further partition the salt: a salt built with a fingerprint differs
+    /// from the same salt without one (and from one with a different
+    /// fingerprint). This guards the defense-in-depth path that catches a
+    /// forgotten `CODEGEN_VERSION` bump. We exercise the salt *shape*
+    /// directly because `CODEGEN_FINGERPRINT` is fixed at compile time.
+    #[test]
+    fn codegen_fingerprint_partitions_the_salt() {
+        let base = format!("cg{}-v{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"));
+        let with_fp_a = format!("{base}-fp{}", "aaaa1111");
+        let with_fp_b = format!("{base}-fp{}", "bbbb2222");
+        // A fingerprint changes the salt vs. no fingerprint...
+        assert_ne!(base, with_fp_a);
+        // ...and two different fingerprints don't collide.
+        assert_ne!(with_fp_a, with_fp_b);
+
+        // Whatever the compile-time fingerprint is (Some or None), the live
+        // salt must be consistent with codegen_salt()'s documented shape.
+        let live = codegen_salt();
+        assert!(live.starts_with(&base), "live salt must start with cgN-vX.Y.Z");
+        match CODEGEN_FINGERPRINT {
+            Some(fp) => assert_eq!(live, format!("{base}-fp{fp}")),
+            None => assert_eq!(live, base),
+        }
+        // The salt remains a filename-safe key component regardless.
+        assert!(
+            valid_key(&disk_key("e", 0, 0)),
+            "disk key (incl. salt) must stay filename-safe"
+        );
+    }
+
     #[test]
     fn empty_env_var_resolves_to_none() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1094,6 +1281,24 @@ mod tests {
         // Compare the low 9 permission bits; the file-type bits above are
         // irrelevant here.
         assert_eq!(mode & 0o777, 0o700, "cache root must be owner-only (0o700)");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// V-7 (Windows only): `open` must still create the directory and a
+    /// store→lookup round-trip must work after the best-effort `icacls`
+    /// ACL-hardening pass. The hardening itself is best-effort and hard to
+    /// assert on portably (it depends on host ACLs / `icacls` presence), so
+    /// the contract under test is "hardening never breaks the cache".
+    #[cfg(windows)]
+    #[test]
+    fn open_hardens_and_round_trips_on_windows() {
+        let dir = fresh_tempdir("winacl");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open must succeed after icacls pass");
+        assert!(dir.is_dir(), "open() must create the cache root");
+        let key = hash_to_key(0xfeed_face_dead_beef, 0x0bad_cafe_f00d_d00d);
+        let ptx = "// win ptx\n.version 7.0\n.target sm_70\n";
+        cache.store(&key, ptx).expect("store");
+        assert_eq!(cache.lookup(&key).as_deref(), Some(ptx), "round-trip after hardening");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -19,10 +19,12 @@ feature is tagged with where it actually executes:
 ## Supported query shape
 
 ```
+[WITH <name> AS (<query>) [, ...]]
 SELECT [DISTINCT] <select_list>
   FROM <table>
-       [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table> ON <equi_predicate>
-        | CROSS JOIN <table>]
+       [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table>
+            {ON <equi_predicate> | USING (<col>, ...) | NATURAL}
+        | CROSS JOIN <table>] ...
  [WHERE  <bool_expr>]
  [GROUP BY <expr_list>]
  [HAVING <bool_expr>]
@@ -30,14 +32,17 @@ SELECT [DISTINCT] <select_list>
  [LIMIT <int_literal>] [OFFSET <int_literal>]
 ```
 
-Two queries can be combined with `UNION` or `UNION ALL`; the optional `ORDER BY` / `LIMIT` / `OFFSET` then apply to the combined result.
+Window functions (`func(...) OVER (...)`) may appear as top-level SELECT items. Uncorrelated scalar and `[NOT] IN` subqueries may appear in `SELECT` / `WHERE`.
+
+Two queries can be combined with `UNION` / `UNION ALL` / `EXCEPT [ALL]` / `INTERSECT [ALL]`; the optional `ORDER BY` / `LIMIT` / `OFFSET` then apply to the combined result. A query may be prefixed with a non-recursive `WITH` (CTE) clause.
 
 **Hard restrictions** (everything else returns a `BoltError`):
 
-- Exactly one base table in `FROM`, optionally widened by **one** JOIN per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an equi `ON` predicate, or `CROSS JOIN` (no `ON`). Every shape has a gated GPU fast path with a host-side fallback (see the [JOIN](#join) section). `JOIN USING`, `NATURAL JOIN`, computed join keys, and chaining more than one JOIN per `SELECT` are rejected at the parser. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities (a small-cardinality non-equi INNER predicate is handled by a capped host nested-loop).
-- No CTEs (`WITH`), no subqueries in `FROM` or `WHERE`, no correlated subqueries, no `EXISTS`.
-- No `EXCEPT`, `INTERSECT`, `UNION BY NAME`.
-- No `WINDOW`, `OVER`, `QUALIFY`, `LATERAL`, table-valued functions, `PREWHERE` (ClickHouse-ism), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `FETCH`, `FOR UPDATE/SHARE`, `INTO`.
+- Exactly one base table in `FROM`, optionally widened by one or more JOINs per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an `ON` / `USING (...)` / `NATURAL` constraint, or `CROSS JOIN` (no constraint). Every shape has a gated GPU fast path with a host-side fallback (see the [JOIN](#join) section). `JOIN ... USING (...)` and `NATURAL JOIN` desugar to equi `<left.col> = <right.col>` pairs; computed join keys are still rejected. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities (a small-cardinality non-equi INNER predicate is handled by a capped host nested-loop).
+- **Uncorrelated** scalar (`(SELECT ...)`) and `[NOT] IN (SELECT ...)` subqueries in `SELECT` / `WHERE` are supported (resolved to constants before lowering). **Correlated** subqueries, `EXISTS` / `NOT EXISTS`, and subqueries in `FROM` (derived tables — use a `WITH`/CTE instead) are rejected.
+- Non-recursive CTEs (`WITH name AS (...)`) are supported. `WITH RECURSIVE`, CTE column-list aliases (`WITH c (a, b) AS ...`), and the materialization hint are rejected.
+- `EXCEPT [ALL]` and `INTERSECT [ALL]` are supported (host-side). `UNION BY NAME` (and `EXCEPT`/`INTERSECT BY NAME`) are rejected.
+- Window functions (`OVER`) are supported host-side for a fixed function set under the default frame only (see the [Window functions](#window-functions) section). `QUALIFY`, the named `WINDOW` clause, and explicit/non-default frames are rejected. `LATERAL`, table-valued functions, `PREWHERE` (ClickHouse-ism), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `FETCH`, `FOR UPDATE/SHARE`, `INTO` remain rejected.
 - No `GROUP BY ALL`, `ROLLUP`, `CUBE`, `TOTALS`.
 - No schema-qualified table names. Single-level qualified column references (`t.col`) are supported in SELECT, WHERE, GROUP BY, HAVING, and `JOIN ... ON` predicates; the qualifier must match a FROM table and only the resolved column name survives lowering. Deeper qualifications (`db.t.col`, struct-field access) are rejected.
 - `LIMIT` and `OFFSET` must be integer literals; expressions and parameters are rejected.
@@ -118,7 +123,7 @@ For `Utf8` columns, only equality (`=`, `<>`, `!=`) against string *literals* is
 
 ### LIKE
 
-`<expr> [NOT] LIKE 'pattern'` is supported (0.5) for constant patterns with `%` and `_` wildcards (with prefix / suffix / contains / exact fast paths). It executes on the **host-side** `host_like` evaluator; a `LIKE` predicate forces the whole filter onto the host path (`"LIKE requires host fallback"` on the GPU path). `LIKE` with `ESCAPE` parses but the escape handling is a follow-up. WHERE-predicate `LIKE` is type-checked against the column dtype during lowering (must be `Utf8`).
+`<expr> [NOT] LIKE 'pattern'` is supported (0.5) for constant patterns with `%` and `_` wildcards (with prefix / suffix / contains / exact fast paths). As of 0.7 a `LIKE` / `NOT LIKE` predicate over a `Utf8` column **lowers to the GPU**: dictionary-encoded columns use a dictionary-precompute → index-membership kernel, and non-dictionary `Utf8` columns use the `StringLikeFilter` device matcher (`compile_like_match_kernel`, with EXACT/PREFIX/SUFFIX/CONTAINS specialisations). Both retain a **host-side** `host_like` fallback on a gate miss. `LIKE` with `ESCAPE` parses but the escape handling is a follow-up. WHERE-predicate `LIKE` is type-checked against the column dtype during lowering (must be `Utf8`).
 
 ## SELECT list
 
@@ -161,7 +166,7 @@ Aggregates over an all-NULL group (Bool/Utf8 inputs, which thread validity throu
 
 `SUM` widens narrow integer inputs to the corresponding 64-bit type to prevent silent overflow: `SUM(Int32) -> Int64`. `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The widening is applied consistently in both the scalar and GROUP BY paths via `crate::plan::logical_plan::sum_output_dtype`.
 
-`DISTINCT` inside an aggregate (`COUNT(DISTINCT col)`) is not supported. Aggregate aliasing (`SUM(price) AS total`) is supported in v0.5: the alias renames the aggregate's plan-assigned name (e.g. `sum_price`) in a post-Aggregate Project, and the alias is visible to `HAVING` and `ORDER BY`.
+`COUNT(DISTINCT col)` is supported, but **only as the sole SELECT item** with no `GROUP BY`, no `HAVING`, and no `SELECT DISTINCT` alongside it. It lowers to `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` (NULL-excluding distinct count, executed via the host-side `Distinct` executor). `COUNT(DISTINCT *)`, `COUNT(DISTINCT a, b)`, `COUNT(DISTINCT col) OVER (...)`, and `DISTINCT` inside any other aggregate are rejected. Aggregate aliasing (`SUM(price) AS total`) is supported in v0.5: the alias renames the aggregate's plan-assigned name (e.g. `sum_price`) in a post-Aggregate Project, and the alias is visible to `HAVING` and `ORDER BY`.
 
 ## GROUP BY
 
@@ -205,13 +210,43 @@ Output ordering: groups are sorted by encoded key for determinism. (Float bit-pa
 
 `LIMIT <int>` and `OFFSET <int>` are both supported and fold into a single `Limit` node, so a downstream executor can implement the offset as a skip. Either clause alone is legal; `OFFSET` without `LIMIT` is represented as `Limit { limit: usize::MAX, offset }`. The argument must be a non-negative integer literal — `LIMIT -1`, `LIMIT 1.5`, and `LIMIT <expr>` are all rejected.
 
-## UNION and UNION ALL
+## Set operations (UNION / EXCEPT / INTERSECT)
 
 `q1 UNION ALL q2 [UNION ALL q3 ...]` lowers to a single flat `Union { inputs }` node (left-recursive chains of the same quantifier are flattened, so a three-way union is one 3-input node, not nested binary trees).
 
 `q1 UNION q2` (no `ALL`) lowers to `Distinct(Union { inputs })`, matching SQL's set-union semantics.
 
-`UNION BY NAME`, `EXCEPT`, and `INTERSECT` are rejected. `ORDER BY` / `LIMIT` / `OFFSET` applied to a `UNION` apply to the combined result, not the individual branches.
+`q1 EXCEPT [ALL] q2` and `q1 INTERSECT [ALL] q2` are supported and lower to a binary `LogicalPlan::SetOp` node executed **host-side** by `src/exec/setops.rs`. The set forms (`EXCEPT` / `INTERSECT`, no `ALL`) return distinct left rows; the multiset forms (`EXCEPT ALL` → `max(0, lc - rc)` copies; `INTERSECT ALL` → `min(lc, rc)` copies) follow the SQL-standard multiplicity rules. Row equality reuses the `DISTINCT` executor's row-key machinery, so two NULLs in the same column position compare **equal** (the engine-wide "NULLs are not distinct" convention) and `+0.0` / `-0.0` canonicalise to one key. Chains are left-associative (`a EXCEPT b EXCEPT c` = `(a EXCEPT b) EXCEPT c`); they are not flattened.
+
+`UNION BY NAME` (and `EXCEPT` / `INTERSECT BY NAME`) are rejected. `ORDER BY` / `LIMIT` / `OFFSET` applied to a set operation apply to the combined result, not the individual branches.
+
+## Common table expressions (WITH)
+
+`WITH name AS (<query>) [, name2 AS (...)] <body>` is supported for **non-recursive** CTEs. Each CTE is lowered against the scope of the CTEs that precede it (standard left-to-right visibility) and type-checked eagerly at its definition site. A CTE name is referenced from `FROM` exactly like a base table. Nested subqueries may reference an in-scope CTE.
+
+Rejected: `WITH RECURSIVE` (only non-recursive CTEs), CTE column-list aliases (`WITH c (a, b) AS ...`), the CTE materialization hint, and a duplicate CTE name in the same `WITH` clause.
+
+## Window functions
+
+`func(...) OVER (PARTITION BY ... ORDER BY ...)` is supported, executed **host-side** by `src/exec/window.rs` (the executor needs a global partition + ordering view the per-scan GPU kernels can't express yet). Supported functions:
+
+- **Ranking**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` (no argument).
+- **Aggregate windows**: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT` over a single bare column argument.
+
+A window function must appear as a **top-level SELECT item** (optionally aliased); a window call nested inside a larger expression is rejected with a clear message. `PARTITION BY` / `ORDER BY` / the aggregate argument must each be a bare column reference (computed keys are rejected host-side). Window partition / order key dtypes supported host-side: `Int32` / `Int64` / `Float32` / `Float64` / `Bool` / `Utf8` / `Date32` / `Timestamp(ns)`; aggregate-input columns must be numeric (`Int32` / `Int64` / `Float32` / `Float64`).
+
+**Frame**: only the SQL default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` is implemented. Under this frame every ordering peer (rows with equal `ORDER BY` keys) sees the same running aggregate; with no `ORDER BY` the whole partition is one peer group, so the aggregate windows report the full-partition value on every row. Explicit non-default frames (custom bounds, `GROUPS`, anything other than `UNBOUNDED PRECEDING [AND CURRENT ROW]`) are rejected.
+
+Rejected: `QUALIFY`, the named `WINDOW` clause, `OVER <named_window>`, `COUNT(DISTINCT ...) OVER (...)`, `FILTER` / `IGNORE NULLS` / `WITHIN GROUP` on a window function, and lead/lag/value functions (`LAG`, `LEAD`, `FIRST_VALUE`, `NTILE`, etc.).
+
+## Subqueries
+
+**Uncorrelated** subqueries in `SELECT` and `WHERE` are supported and resolved to constants *before* physical lowering (`src/exec/subquery_resolve.rs`):
+
+- **Scalar** `(SELECT ...)` — the subquery must produce a single column; 0 rows folds to SQL `NULL`, 1 row to that value, and `>1` row is a clean error.
+- **`<expr> [NOT] IN (SELECT ...)`** — the single-column result set is folded into an `OR`/`AND` chain of equalities over `expr` (`expr = v1 OR …` / `expr <> v1 AND …`). NULLs are dropped from the value set; this matches strict SQL exactly for `IN` under `WHERE`, and diverges only for `NOT IN` against a set containing NULLs (documented in the module).
+
+Nested subqueries resolve inner-first. **Correlated** subqueries (any reference to an outer column) are detected and rejected with a precise message. `EXISTS` / `NOT EXISTS` and subqueries in `FROM` (derived tables — use a `WITH`/CTE instead) are rejected.
 
 ## INNER JOIN
 
@@ -235,7 +270,9 @@ All join shapes have a GPU fast path *and* a host fallback. The dispatch lives i
 - `LEFT` / `RIGHT` / `FULL [OUTER]` — Stage-2 GPU fast path (`try_gpu_outer_join`); host hash join on a gate miss.
 - `CROSS` — Stage-3 GPU fast path for cell counts within a bounded window (`execute_cross_join_on_gpu`); host cartesian product otherwise.
 
-Still rejected at the parser: `NATURAL JOIN`, `JOIN ... USING`, `INNER JOIN` without `ON`, non-equi `ON` predicates with arbitrary cardinality, computed join keys, and any join graph wider than one join per `SELECT`.
+`JOIN ... USING (c1, ...)` and `NATURAL JOIN` are supported: each is desugared to equi `<left.col> = <right.col>` pairs (`USING` over the named columns; `NATURAL` over every column common to both sides) and then runs the same join paths as an explicit `ON`. A `USING` column that is missing, ambiguous, or duplicated — and a `NATURAL JOIN` with no common column — is rejected with a clear message.
+
+Still rejected: a JOIN with no `ON` / `USING` / `NATURAL` constraint (other than `CROSS`), non-equi `ON` predicates with arbitrary cardinality, computed join keys (`ON l.a + 1 = r.b`), and `GLOBAL JOIN` (ClickHouse extension).
 
 ## Dictionary-encoded Utf8 predicates
 
@@ -244,13 +281,13 @@ For every `Utf8` column registered on a table, the engine builds a dictionary (i
 - `WHERE col = 'X'`  →  `WHERE __idx_col = i32/i64(idx_of_X)`
 - `WHERE col != 'X'` →  the same with `!=`
 
-After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `IN (...)` against a Utf8 column is still *not* folded through the dictionary rewriter (it defers this shape — see `src/plan/string_literal_rewrite.rs`); rewrite as an `OR` chain of literal equalities. `LIKE` on a Utf8 column *is* supported but runs on the **host-side** `host_like` evaluator (see the LIKE section above), not through the dictionary index. Ordering comparisons (`<`, `>`) on Utf8 columns are still rejected.
+After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `IN (...)` against a Utf8 column is still *not* folded through the dictionary rewriter (it defers this shape — see `src/plan/string_literal_rewrite.rs`); rewrite as an `OR` chain of literal equalities. `LIKE` on a Utf8 column *is* supported and, as of 0.7, **lowers to the GPU** (dictionary-precompute → index membership for dictionary columns, or the `StringLikeFilter` device matcher for non-dictionary `Utf8`), with a host-side `host_like` fallback (see the LIKE section above). Ordering comparisons (`<`, `>`) on Utf8 columns are still rejected.
 
 ## SELECT DISTINCT
 
 `SELECT DISTINCT <select_list> FROM ...` is supported and dedups the *output* rows (after projection, HAVING, and any aggregate work). The executor is host-side (`src/exec/distinct.rs`).
 
-`DISTINCT ON (...)` (Postgres extension) and `COUNT(DISTINCT col)` are rejected.
+`DISTINCT ON (...)` (Postgres extension) is rejected. `COUNT(DISTINCT col)` *is* supported as the sole SELECT item (see [Aggregate functions](#aggregate-functions)).
 
 ## Expression examples
 
@@ -301,13 +338,35 @@ SELECT * FROM sales LIMIT 100 OFFSET 50;
 SELECT region_id, SUM(price)
   FROM sales GROUP BY region_id ORDER BY region_id LIMIT 10;
 
--- UNION
+-- Set operations
 SELECT region FROM sales UNION ALL SELECT region FROM sales_archive;
 SELECT region FROM sales UNION     SELECT region FROM sales_archive;  -- dedups
+SELECT region FROM sales EXCEPT    SELECT region FROM sales_archive;  -- host-side
+SELECT region FROM sales INTERSECT SELECT region FROM sales_archive;  -- host-side
 
--- INNER JOIN
+-- CTE (WITH), non-recursive
+WITH us_sales AS (SELECT * FROM sales WHERE region = 'US')
+SELECT region_id, SUM(price) FROM us_sales GROUP BY region_id;
+
+-- Uncorrelated subqueries
+SELECT region_id FROM sales WHERE price > (SELECT AVG(price) FROM sales);
+SELECT * FROM sales WHERE region_id IN (SELECT id FROM active_regions);
+
+-- COUNT(DISTINCT) — sole SELECT item only
+SELECT COUNT(DISTINCT region) FROM sales;
+
+-- Window functions (host-side, default frame)
+SELECT region_id, ROW_NUMBER() OVER (PARTITION BY region_id ORDER BY price) FROM sales;
+SELECT region_id, SUM(price) OVER (PARTITION BY region_id) AS region_total FROM sales;
+
+-- String functions
+SELECT UPPER(region), LENGTH(region) FROM sales;          -- UPPER/LENGTH (GPU)
+
+-- INNER JOIN (ON / USING / NATURAL)
 SELECT s.region_id, c.name
   FROM sales INNER JOIN customers ON sales.customer_id = customers.id;
+SELECT * FROM sales INNER JOIN customers USING (customer_id);
+SELECT * FROM sales NATURAL JOIN customers;
 SELECT *
   FROM orders INNER JOIN line_items
     ON orders.id = line_items.order_id AND orders.region = line_items.region;
@@ -317,12 +376,13 @@ SELECT *
 
 ```
 SELECT ... FROM <table>
-  [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table> ON <equi_predicate>]
+  [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table>
+        {ON <equi_predicate> | USING (<col>, ...) | NATURAL}]
   [CROSS JOIN <table>]
   ...
 ```
 
-- The ON predicate is a conjunction of `left.col = right.col` equalities. Non-equi predicates and non-conjunctive shapes are rejected.
+- The ON predicate is a conjunction of `left.col = right.col` equalities. Non-equi predicates and non-conjunctive shapes are rejected. `USING (...)` and `NATURAL` desugar to the same equi-pair form.
 - `CROSS JOIN` has no ON clause. The output row count is `|left| × |right|`; rewrite your query if it would exceed the engine's `u32::MAX`-row materialisation limit (an explicit `BoltError::Plan` surfaces at execute time when it would).
 - For `LEFT` / `RIGHT` / `FULL [OUTER]`, columns coming from the *non-preserved* side are marked nullable in the output schema. Unmatched preserved-side rows emit with NULLs in those columns.
 - Right-side column names that collide with a left-side name are prefixed with `right.` (e.g. left `id` and right `id` → output has `id` and `right.id`).
@@ -335,17 +395,16 @@ SELECT ... FROM <table>
 These produce explicit errors at parse / plan time:
 
 ### Joins beyond the supported set
-- `NATURAL JOIN`.
-- Non-equi `ON` predicates (`>`, `<`, function calls, `BETWEEN`, range joins).
-- `JOIN ... USING (...)` (rewrite as `ON`).
-- More than one JOIN per `SELECT` (chained joins).
+- Non-equi `ON` predicates (`>`, `<`, function calls, `BETWEEN`, range joins) with arbitrary cardinality. (A small-cardinality non-equi INNER predicate runs through a capped host nested-loop.)
 - Computed join keys (`ON l.a + 1 = r.b`).
+- `GLOBAL JOIN` (ClickHouse extension).
+- (`NATURAL JOIN`, `JOIN ... USING`, and multiple joins per `SELECT` are now **supported** — see the [JOIN](#join) section.)
 
 ### Query composition
-- Subqueries anywhere (`FROM`, `WHERE`, scalar, correlated, `EXISTS`).
-- CTEs (`WITH`).
-- `EXCEPT`, `INTERSECT`, `UNION BY NAME`.
-- Window functions (`OVER`), `QUALIFY`.
+- **Correlated** subqueries, `EXISTS` / `NOT EXISTS`, and subqueries in `FROM` (derived tables). (Uncorrelated scalar and `[NOT] IN` subqueries are **supported** — see [Subqueries](#subqueries).)
+- `WITH RECURSIVE`, CTE column-list aliases. (Non-recursive CTEs are **supported** — see [Common table expressions](#common-table-expressions-with).)
+- `UNION BY NAME` (and `EXCEPT` / `INTERSECT BY NAME`). (`EXCEPT [ALL]` / `INTERSECT [ALL]` are **supported** — see [Set operations](#set-operations-union--except--intersect).)
+- `QUALIFY`, the named `WINDOW` clause, `OVER <named_window>`, and non-default window frames. (`OVER (...)` with `ROW_NUMBER` / `RANK` / `DENSE_RANK` / `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` under the default frame is **supported** — see [Window functions](#window-functions).)
 
 ### Expressions
 
@@ -362,8 +421,9 @@ Still rejected (or only partially lowered):
 - `IN (...)` against a `Utf8` column — not folded through the dictionary rewriter; rewrite as an `OR` chain of literal equalities.
 - Ordering comparisons on Utf8 columns (`WHERE name < 'M'`).
 - Schema- or multi-level qualified column references (`db.t.col`, struct-field access). Single-level `t.col` *is* supported — see "Hard restrictions" above.
-- `COUNT(DISTINCT col)`.
 - The "parses; GPU lowering pending" cases below.
+
+(`COUNT(DISTINCT col)` is now supported as the sole SELECT item — see [Aggregate functions](#aggregate-functions).)
 
 ### Parses but GPU lowering pending
 
@@ -373,7 +433,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 - `CASE` whose unified result dtype is `Utf8`, `Decimal128`, `Date32`, or `Timestamp`.
 - `Decimal128` division (`/`); only `+`, `-`, `*` and the comparisons lower to GPU.
 - GPU lowering of `NOT` in a predicate (runs host-side instead).
-- Scalar string functions through the SQL surface (`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`) — see "Not yet supported (planned)" below.
+- `SUBSTRING`, `TRIM`, and the `CONCAT` scalar function: routed to a **host-side** projection (not GPU). The `||` concat operator likewise runs host-side. (`UPPER` / `LOWER` / `LENGTH` *do* lower to GPU as of 0.7 — see "String functions" below.)
 
 ### Types and values
 - Time-of-day / general interval (beyond Day-`INTERVAL` on dates) literals and arithmetic. `Date32`, `Timestamp`, and `Decimal128` *are* supported (see Data types).
@@ -390,11 +450,18 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 ### Validity propagation
 - Scalar primitive aggregates honour validity as of 0.5: `COUNT(col)` excludes NULLs via the bitmap, and `SUM`/`MIN`/`MAX`/`AVG` host-strip NULL positions before the GPU reduction (the zero-null fast path stays a zero-copy upload). The Bool/Utf8 `extended_agg` path also honours nulls. Full per-row NULL propagation through `CASE` branches on the GPU is still a follow-up (a CASE that fires no WHEN currently yields a deterministic zero rather than SQL NULL).
 
+## String functions
+
+`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`, and `TRIM` are surfaced through the SQL frontend via `Expr::ScalarFn` and **execute end-to-end** as of 0.7:
+
+- **`UPPER` / `LOWER`** lower to the **GPU** via the two-pass `PhysicalPlan::StringProject` executor (variable-width device output).
+- **`LENGTH`** lowers to the **GPU** via `PhysicalPlan::StringLength` (dictionary-gather, `Int64` output).
+- **`SUBSTRING` / `TRIM`** (`TRIM BOTH` / `LEADING` / `TRAILING`) execute **host-side** end-to-end.
+- **`CONCAT`** (and the `||` concat operator) execute **host-side** via the `Project` executor.
+
+The underlying transformations live in `src/exec/string_ops` / `src/exec/string_ops_extended` / `src/exec/string_project`.
+
 ## Not yet supported (planned)
-
-### String functions
-
-`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT` are surfaced through the SQL frontend as of 0.5 via `Expr::ScalarFn` (parser + type-check), but **GPU lowering is pending**: the physical layer rejects each with a `"string scalar function … not yet lowered to GPU"` message because variable-width device writes remain unsupported by the codegen path. The underlying host transformations live in the executor-level `src/exec/string_ops` / `src/exec/string_ops_extended` Rust API; routing the SQL surface through a per-function host-side projection executor is the remaining step.
 
 ### Wider GPU sort coverage
 

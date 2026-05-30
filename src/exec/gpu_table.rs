@@ -96,6 +96,13 @@ pub enum GpuColumnData {
         precision: u8,
         /// Plan-level scale (digits right of the decimal point).
         scale: i8,
+        /// Optional Arrow-LE packed validity bitmap on the device, one byte
+        /// per 8 rows (lsb-first), mirroring [`DictUtf8`](Self::DictUtf8)'s
+        /// `valid_mask`. `None` when the upload source had no nulls. NULL
+        /// rows are zeroed in `values` at upload time, so this mask is the
+        /// source of truth for per-row validity — without it a NULL
+        /// Decimal128 would silently read back as `0`.
+        valid_mask: Option<GpuVec<u8>>,
     },
     /// **Stage 5** — native dict-encoded Utf8 column. Stage 4 worked around
     /// the lack of this variant by flattening every `DictionaryArray<i32, Utf8>`
@@ -166,6 +173,10 @@ impl GpuColumnData {
     pub fn validity_ptr(&self) -> Option<CUdeviceptr> {
         match self {
             GpuColumnData::DictUtf8 {
+                valid_mask: Some(v),
+                ..
+            } => Some(v.device_ptr()),
+            GpuColumnData::Decimal128 {
                 valid_mask: Some(v),
                 ..
             } => Some(v.device_ptr()),
@@ -494,20 +505,31 @@ impl GpuColumn {
                 let n = da.len();
                 let mut packed: Vec<u64> = Vec::with_capacity(2 * n);
                 for i in 0..n {
-                    // NULL rows are stored as zeroed bit-patterns. The
-                    // device-side validity bitmap (a future sub-task)
-                    // will be the source of truth for per-row validity;
-                    // until then a NULL Decimal128 reads back as 0.
+                    // NULL rows are stored as zeroed bit-patterns; the
+                    // `valid_mask` packed below is the source of truth for
+                    // per-row validity so the download path can reconstruct
+                    // a NULL (not 0).
                     let v: i128 = if da.is_null(i) { 0 } else { da.value(i) };
                     let bits = v as u128;
                     packed.push(bits as u64);
                     packed.push((bits >> 64) as u64);
                 }
                 let buf = GpuVec::<u64>::from_slice(&packed)?;
+                // Optional validity: pack from the Arrow null buffer if
+                // present, exactly as `upload_dict_utf8` does for the
+                // DictUtf8 keys (same u8 element type, same lsb-first
+                // bitmap, same `None`-when-no-nulls contract).
+                let valid_mask = if let Some(nb) = da.nulls() {
+                    let bits = pack_validity_from_arrow(nb, n);
+                    Some(GpuVec::<u8>::from_slice(&bits)?)
+                } else {
+                    None
+                };
                 GpuColumnData::Decimal128 {
                     values: buf,
                     precision,
                     scale,
+                    valid_mask,
                 }
             }
             DataType::Date32 | DataType::Timestamp(_, _) => {
@@ -912,6 +934,70 @@ mod tests {
                 assert!(valid_mask.is_none(), "no-nulls upload should omit validity");
             }
             _ => panic!("expected DictUtf8"),
+        }
+        assert!(col.data.validity_ptr().is_none());
+    }
+
+    /// Decimal128 NULL fix — host-only check that the mask-building helper
+    /// (`pack_validity_from_arrow`, the same one the Decimal128 upload path
+    /// uses) packs a `Decimal128Array`'s null buffer into the expected
+    /// lsb-first bitmap. No CUDA required: we exercise only the pure
+    /// mask-construction step, not the device upload.
+    #[test]
+    fn decimal128_null_buffer_packs_lsb_first() {
+        // Rows: [10, NULL, 30, 40, NULL] (p=10, s=2).
+        //  valid bits: [1, 0, 1, 1, 0]  → byte 0 = 0b0000_1101 = 0x0D.
+        let arr = Decimal128Array::from(vec![Some(10i128), None, Some(30), Some(40), None])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let nb = arr.nulls().expect("array has nulls");
+        let packed = pack_validity_from_arrow(nb, arr.len());
+        assert_eq!(packed, vec![0x0Du8]);
+    }
+
+    /// Decimal128 NULL fix — GPU round-trip: a `Decimal128Array` containing a
+    /// NULL must upload (carrying a `valid_mask`) and read back as NULL, not
+    /// `0`. Requires a CUDA device, so it is ignored in host-only CI.
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn decimal128_null_roundtrips_as_null() {
+        let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
+
+        let arr = Decimal128Array::from(vec![Some(123i128), None, Some(456)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let col = GpuColumn::upload("d".into(), &arr, DataType::Decimal128(10, 2))
+            .expect("upload");
+        // The upload must carry a validity bitmap (source had a null).
+        match &col.data {
+            GpuColumnData::Decimal128 { valid_mask, .. } => {
+                assert!(
+                    valid_mask.is_some(),
+                    "Decimal128 upload with a null must carry a valid_mask"
+                );
+            }
+            _ => panic!("expected Decimal128 variant"),
+        }
+        assert!(col.data.validity_ptr().is_some());
+    }
+
+    /// Decimal128 NULL fix — a no-nulls `Decimal128Array` uploads with
+    /// `valid_mask == None` (mirrors the DictUtf8 no-nulls contract).
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn decimal128_without_nulls_omits_validity() {
+        let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
+
+        let arr = Decimal128Array::from(vec![1i128, 2, 3])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let col = GpuColumn::upload("d".into(), &arr, DataType::Decimal128(10, 2))
+            .expect("upload");
+        match &col.data {
+            GpuColumnData::Decimal128 { valid_mask, .. } => {
+                assert!(valid_mask.is_none(), "no-nulls upload should omit validity");
+            }
+            _ => panic!("expected Decimal128 variant"),
         }
         assert!(col.data.validity_ptr().is_none());
     }

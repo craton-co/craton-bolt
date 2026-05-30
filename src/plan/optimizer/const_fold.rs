@@ -223,11 +223,21 @@ fn fold_unary(op: UnaryOp, operand: Expr) -> Expr {
 fn fold_literal_binary(op: BinaryOp, l: &Literal, r: &Literal) -> Option<Literal> {
     use BinaryOp::*;
     match (l, r) {
-        (Literal::Int32(a), Literal::Int32(b)) => fold_int(op, *a as i64, *b as i64)
-            .map(|v| match v {
-                FoldVal::Int(n) => Literal::Int32(n as i32),
-                FoldVal::Bool(x) => Literal::Bool(x),
-            }),
+        (Literal::Int32(a), Literal::Int32(b)) => match fold_int(op, *a as i64, *b as i64)? {
+            // The i64 fold guards i64 overflow, but the result must still fit
+            // back into i32 — otherwise narrowing with `as i32` would wrap
+            // silently (e.g. `i32::MAX + 1` -> `i32::MIN`). When it doesn't
+            // fit we leave the expression unfolded for the runtime, mirroring
+            // the `None`-on-overflow behaviour of the i64 path.
+            FoldVal::Int(n) => {
+                if (i32::MIN as i64..=i32::MAX as i64).contains(&n) {
+                    Some(Literal::Int32(n as i32))
+                } else {
+                    None
+                }
+            }
+            FoldVal::Bool(x) => Some(Literal::Bool(x)),
+        },
         (Literal::Int64(a), Literal::Int64(b)) => fold_int(op, *a, *b).map(|v| match v {
             FoldVal::Int(n) => Literal::Int64(n),
             FoldVal::Bool(x) => Literal::Bool(x),
@@ -346,6 +356,50 @@ mod tests {
     #[test]
     fn does_not_fold_overflow() {
         let e = b(BinaryOp::Add, lit(i64::MAX), lit(1_i64));
+        assert!(matches!(fold_expr(e), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn folds_i32_arithmetic() {
+        // A non-overflowing i32 fold still produces an Int32 literal.
+        let e = b(
+            BinaryOp::Add,
+            Expr::Literal(Literal::Int32(2)),
+            Expr::Literal(Literal::Int32(3)),
+        );
+        assert!(matches!(fold_expr(e), Expr::Literal(Literal::Int32(5))));
+    }
+
+    #[test]
+    fn does_not_fold_i32_add_overflow() {
+        // i32::MAX + 1 overflows i32: must stay a Binary, not wrap to i32::MIN.
+        let e = b(
+            BinaryOp::Add,
+            Expr::Literal(Literal::Int32(i32::MAX)),
+            Expr::Literal(Literal::Int32(1)),
+        );
+        assert!(matches!(fold_expr(e), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn does_not_fold_i32_sub_overflow() {
+        // i32::MIN - 1 underflows i32: must stay a Binary.
+        let e = b(
+            BinaryOp::Sub,
+            Expr::Literal(Literal::Int32(i32::MIN)),
+            Expr::Literal(Literal::Int32(1)),
+        );
+        assert!(matches!(fold_expr(e), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn does_not_fold_i32_mul_overflow() {
+        // 100000 * 100000 = 10_000_000_000 overflows i32: must stay a Binary.
+        let e = b(
+            BinaryOp::Mul,
+            Expr::Literal(Literal::Int32(100_000)),
+            Expr::Literal(Literal::Int32(100_000)),
+        );
         assert!(matches!(fold_expr(e), Expr::Binary { .. }));
     }
 

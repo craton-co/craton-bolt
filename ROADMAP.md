@@ -28,18 +28,28 @@ dispatch in the executor. Highlights (see `CHANGELOG.md` for the full list):
   both codegen and PTXAS); async memcpy rolled out to the remaining
   `GROUP BY` variants and the `WHERE` filter D2H path.
 - **WHERE-predicate type-checking** during SQL lowering.
-
-### What works (carried forward)
+- **SQL surface expansion** (set ops, windows, CTEs, subqueries, joins):
+  `EXCEPT [ALL]` / `INTERSECT [ALL]` (host-side), non-recursive CTEs
+  (`WITH`), host-side window functions (`ROW_NUMBER` / `RANK` /
+  `DENSE_RANK` / `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` `OVER`, default
+  frame only), uncorrelated scalar and `[NOT] IN` subqueries,
+  `JOIN ... USING` / `NATURAL JOIN`, and `COUNT(DISTINCT col)` (sole
+  SELECT item). GPU `LIKE` (dict + non-dict `Utf8`) and GPU
+  `UPPER` / `LOWER` / `LENGTH`; host-side `SUBSTRING` / `TRIM` / `CONCAT`.
 
 ### What works (carried forward from 0.5)
 
 - SQL → PTX → execution end-to-end for projection, filter, scalar
   aggregate, and GROUP BY (single/multi-column, packed and wide keys).
-- `DISTINCT`, `LIMIT [OFFSET]`, `ORDER BY [ASC|DESC]`, `HAVING`, and
-  `UNION [ALL]` (host-side executors for the non-GROUP-BY paths).
+- `DISTINCT`, `LIMIT [OFFSET]`, `ORDER BY [ASC|DESC]`, `HAVING`,
+  `UNION [ALL]`, `EXCEPT [ALL]`, and `INTERSECT [ALL]` (host-side
+  executors for the non-GROUP-BY paths). Non-recursive CTEs (`WITH`).
 - `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, and `CROSS`
-  joins (host-side hash join). Multiple joins per `SELECT` are
+  joins (GPU fast path + host hash-join fallback), with `ON` /
+  `USING (...)` / `NATURAL` constraints. Multiple joins per `SELECT` are
   permitted.
+- Host-side window functions (`OVER`) and uncorrelated scalar / `[NOT] IN`
+  subqueries.
 - Borrow-checked GPU memory primitives (`GpuVec` / `GpuView` /
   `GpuViewMut`) — use-after-free, double-free, and mutable/shared
   aliasing across kernel boundaries are compile-time errors.
@@ -150,8 +160,9 @@ dispatch, and the freeze checklist:
 ### Goals
 
 - **GPU lowering for the still-deferred scalar items**: `CASE WHEN ... END`
-  (predicated select), `CAST` over documented primitive pairs, and the
-  scalar string functions (`UPPER` / `LOWER` / `LENGTH` / `SUBSTRING`).
+  (predicated select) and `CAST` over documented primitive pairs.
+  (`UPPER` / `LOWER` / `LENGTH` and `LIKE` already lower to GPU as of
+  0.7; `SUBSTRING` / `TRIM` / `CONCAT` remain host-side.)
 - **Planner-driven radix-sort dispatch** — promote the integrated
   `src/exec/sort.rs` radix path from `BOLT_GPU_SORT=1` opt-in to a
   default selected on size / dtype.

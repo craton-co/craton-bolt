@@ -48,9 +48,35 @@
 //! When `Engine` is plumbed through every executor's entry point (or when we
 //! refactor `Engine::module_cache` to accept a string key rather than a
 //! `ModuleCacheKey`), migrate every call site to `engine.get_or_build_module_str`
-//! or similar. The global cache is correct for single-GPU workloads but
-//! cannot disambiguate between modules belonging to different CUDA contexts
-//! on a multi-GPU host. Tracked as a follow-up.
+//! or similar. Tracked as a follow-up.
+//!
+//! ## Multi-GPU keying (HARD-fix, this revision)
+//!
+//! A `CudaModule` handle is bound to the CUDA context that loaded it, and a
+//! context is in turn pinned to one physical device. Serving a device-0
+//! module to an executor bound to device 1 hands back an invalid handle. We
+//! therefore fold the **active device ordinal** (see [`active_device_id`],
+//! which consumes `crate::cuda::cuda_sys::current_device`) into every cache
+//! key — both the string-keyed [`GLOBAL_MODULE_CACHE`] (via a `dev{N}:`
+//! namespace-suffix on `spec_id`) and the 128-bit-hashed spec caches (via a
+//! device-domain byte mixed into [`hash128`], so the device also propagates
+//! into the disk-cache key). Two executors bound to different devices now key
+//! into disjoint slots. Under `--features cuda-stub` no real context exists,
+//! so `current_device` fails and we fall back to a stable placeholder
+//! (device 0); single-GPU production rigs behave exactly as before.
+//!
+//! ## Hash-collision re-check (MED-fix, this revision)
+//!
+//! The spec caches key on a 128-bit hash of the spec's `Debug` output. A hash
+//! collision would otherwise serve the *wrong* kernel with no fallback —
+//! unlike the PTX-text cache in `jit::jit_compiler`, which always re-compares
+//! the full PTX string on a hit and so is collision-proof. To match that
+//! guarantee we stash the spec's full `Debug` string ("key material") in each
+//! [`CacheEntry`] and re-compare it on every hit (see [`SpecCache::get`]). On
+//! a mismatch (a genuine 128-bit collision) we log a warning and treat the
+//! lookup as a miss, forcing a rebuild under the correct content. The compare
+//! only runs on a hash hit, so the warm-path cost is one `String` equality
+//! check against an already-located entry.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,6 +99,27 @@ use crate::plan::physical_plan::{
 /// local KernelSpec enum without leaking the enum's type identity into this
 /// crate-wide module.
 type Key = (&'static str, String);
+
+/// Active CUDA device ordinal for cache-key disambiguation (HARD-fix).
+///
+/// A loaded `CudaModule` is valid only in the CUDA context that produced it,
+/// and that context is pinned to one physical device. Folding this ordinal
+/// into every cache key keeps a device-0 module from ever being served to an
+/// executor bound to device 1 (where the handle is invalid).
+///
+/// We consume the existing crate accessor
+/// [`crate::cuda::cuda_sys::current_device`] (a thin wrapper over
+/// `cuCtxGetDevice`). It returns `Err` when no context is current on the
+/// calling thread — which is always the case under `--features cuda-stub`,
+/// where `cuCtxGetDevice` is a stub that returns an error code. In that case
+/// (and on any other driver error) we fall back to a stable placeholder of
+/// device `0`: single-GPU production rigs and stub-feature test builds both
+/// see the same key shape they did before this change, while genuine
+/// multi-GPU rigs get per-device slots. The fallback is intentionally silent
+/// because the no-context path is the normal, expected case under the stub.
+fn active_device_id() -> i32 {
+    crate::cuda::cuda_sys::current_device().unwrap_or(0)
+}
 
 /// Process-wide module cache.
 ///
@@ -118,6 +165,13 @@ pub(crate) fn get_or_build_module<F>(
 where
     F: FnOnce() -> BoltResult<String>,
 {
+    // HARD-fix: fold the active device ordinal into the string key so a
+    // module loaded on device 0 is never served to a device-1 executor. We
+    // append `\0dev{N}` rather than prepend so existing `spec_id` Debug shapes
+    // stay legible in any logging; the NUL byte can't appear in a Rust
+    // `format!("{:?}", …)` of a normal spec, so it can't be forged by the
+    // spec content.
+    let spec_id = format!("{spec_id}\0dev{}", active_device_id());
     // Fast path: cache hit. Hold the lock only long enough to clone the Arc.
     {
         let cache = GLOBAL_MODULE_CACHE.lock();
@@ -236,22 +290,52 @@ impl<H: std::hash::Hasher> std::fmt::Write for HasherWrite<'_, H> {
 /// hypothetical collision between the `Debug` shapes of two different spec
 /// types can never alias cache keys across families. The per-family domain
 /// bytes are part of the on-disk cache key contract and MUST NOT change.
+///
+/// HARD-fix: the active device ordinal is mixed into *both* halves so the
+/// 128-bit fingerprint — and therefore the in-memory key *and* the composed
+/// disk-cache key — differs per device. A module hashed on device 0 cannot
+/// alias one hashed on device 1.
 fn hash128<S: std::fmt::Debug + ?Sized>(spec: &S, hi_byte: u8, lo_byte: u8) -> (u64, u64) {
+    hash128_for_device(spec, hi_byte, lo_byte, active_device_id())
+}
+
+/// Device-explicit body of [`hash128`], split out so the device-folding logic
+/// is unit-testable without a live CUDA context (the stub build can only ever
+/// observe device `0` from [`active_device_id`]). Production callers go
+/// through [`hash128`], which supplies the active ordinal.
+fn hash128_for_device<S: std::fmt::Debug + ?Sized>(
+    spec: &S,
+    hi_byte: u8,
+    lo_byte: u8,
+    dev: i32,
+) -> (u64, u64) {
     use std::collections::hash_map::DefaultHasher;
     use std::fmt::Write as _;
     use std::hash::Hasher;
 
     let mut hi = DefaultHasher::new();
     hi.write_u8(hi_byte);
+    hi.write_i32(dev);
     // Both arms are unreachable in practice; degrade to a benign cache miss
     // rather than panic if Debug formatting ever fails.
     let _ = write!(HasherWrite(&mut hi), "{:?}", spec);
 
     let mut lo = DefaultHasher::new();
     lo.write_u8(lo_byte);
+    lo.write_i32(dev);
     let _ = write!(HasherWrite(&mut lo), "{:?}", spec);
 
     (hi.finish(), lo.finish())
+}
+
+/// Render a spec's full `Debug` string — the collision re-check "key material".
+///
+/// MED-fix: stored alongside each cached module and re-compared on a hit so a
+/// 128-bit hash collision can never serve the wrong kernel (see
+/// [`SpecCache::get`]). Computing this is one heap allocation per *miss*; on a
+/// hit we only run a `String` equality compare against the stored copy.
+fn key_material<S: std::fmt::Debug + ?Sized>(spec: &S) -> String {
+    format!("{spec:?}")
 }
 
 /// Trait implemented by every per-family content-hash key
@@ -278,6 +362,15 @@ struct CacheEntry {
     /// refactor to drop the field by mistake.
     #[allow(dead_code)]
     ptx: String,
+    /// Full `Debug` string of the spec that produced this entry (the
+    /// collision-detection "key material"; see [`key_material`]). On a hash
+    /// hit the caller re-compares its own spec's material against this stored
+    /// copy — a mismatch means a genuine 128-bit hash collision, which we
+    /// treat as a miss and rebuild. This is what makes the spec caches
+    /// collision-proof, matching the PTX-text cache in `jit::jit_compiler`.
+    /// `None` for entries that have no associated spec (the FIFO-eviction
+    /// unit tests, which insert raw entries).
+    key_material: Option<String>,
     module: CudaModule,
 }
 
@@ -305,6 +398,19 @@ struct SpecCache<K: CacheKey> {
     misses: u64,
 }
 
+/// Outcome of a [`SpecCache::get`] classification, computed under an
+/// immutable borrow of `by_key` so the hit/miss counters can be bumped
+/// afterwards without a borrow conflict.
+enum GetOutcome {
+    /// Hash hit and (if checked) the stored key material matched.
+    Hit(CacheEntry),
+    /// Hash hit but the stored key material disagreed — a 128-bit collision;
+    /// treated as a miss so the caller rebuilds.
+    Collision,
+    /// No entry under this key.
+    Miss,
+}
+
 impl<K: CacheKey> SpecCache<K> {
     fn new(cap: usize) -> Self {
         Self {
@@ -318,13 +424,53 @@ impl<K: CacheKey> SpecCache<K> {
 
     /// Look up `key`; on a hit, return the cached entry (cheap clone — the
     /// inner `CudaModule` is `Arc`-shared and `String` is one allocation).
-    fn get(&mut self, key: &K) -> Option<CacheEntry> {
-        if let Some(entry) = self.by_key.get(key) {
-            self.hits = self.hits.saturating_add(1);
-            Some(entry.clone())
-        } else {
-            self.misses = self.misses.saturating_add(1);
-            None
+    ///
+    /// MED-fix (collision re-check): when `expected_material` is `Some`, a
+    /// hash hit additionally re-compares the looked-up spec's `Debug` material
+    /// against the material stored in the entry. On a mismatch — a genuine
+    /// 128-bit hash collision — we log a warning and report a **miss** so the
+    /// caller rebuilds under the correct content rather than serving the wrong
+    /// kernel. Pass `None` to skip the check (the raw-insert unit tests do).
+    ///
+    /// The compare only runs after the hash already located an entry, so the
+    /// warm-path cost is a single `String` equality test.
+    fn get(&mut self, key: &K, expected_material: Option<&str>) -> Option<CacheEntry> {
+        // Classify the lookup while holding only an immutable borrow of
+        // `by_key`; bump the hit/miss counters afterwards so we never hold an
+        // immutable and a mutable borrow of `self` simultaneously.
+        let outcome = match self.by_key.get(key) {
+            None => GetOutcome::Miss,
+            Some(entry) => match (expected_material, entry.key_material.as_deref()) {
+                // Collision re-check: hash hit but the stored spec material
+                // disagrees with the request → genuine 128-bit collision.
+                (Some(want), Some(have)) if want != have => GetOutcome::Collision,
+                _ => GetOutcome::Hit(entry.clone()),
+            },
+        };
+        match outcome {
+            GetOutcome::Hit(entry) => {
+                self.hits = self.hits.saturating_add(1);
+                Some(entry)
+            }
+            GetOutcome::Collision => {
+                // Two distinct specs hashed to the same key. Astronomically
+                // unlikely, but if it ever happens we must NOT hand back the
+                // other spec's module. Count it as a miss; the caller
+                // recompiles for the real spec and (idempotent) insert keeps
+                // the incumbent entry.
+                log::warn!(
+                    "module_cache: spec-cache hash collision for entry {:?} — \
+                     stored material differs from request; rebuilding to avoid \
+                     serving the wrong kernel",
+                    key.entry(),
+                );
+                self.misses = self.misses.saturating_add(1);
+                None
+            }
+            GetOutcome::Miss => {
+                self.misses = self.misses.saturating_add(1);
+                None
+            }
         }
     }
 
@@ -390,6 +536,7 @@ fn compose_disk_key(disk_prefix: &str, entry: &str, hi: u64, lo: u64) -> String 
 fn get_or_build_with_disk<K, F>(
     cache: &Lazy<Mutex<SpecCache<K>>>,
     key: K,
+    material: String,
     disk_prefix: &str,
     compile: F,
 ) -> BoltResult<CudaModule>
@@ -397,8 +544,10 @@ where
     K: CacheKey,
     F: FnOnce() -> BoltResult<String>,
 {
-    // Fast path: in-memory hit. Hold the lock just long enough to clone.
-    if let Some(cached) = cache.lock().get(&key) {
+    // Fast path: in-memory hit. Hold the lock just long enough to clone. The
+    // `material` re-check (MED-fix) turns a hash collision into a miss so we
+    // never serve the wrong kernel.
+    if let Some(cached) = cache.lock().get(&key, Some(material.as_str())) {
         return Ok(cached.module);
     }
     // In-memory miss: try the optional on-disk cache before paying for codegen.
@@ -427,6 +576,7 @@ where
         key,
         CacheEntry {
             ptx,
+            key_material: Some(material),
             module: module.clone(),
         },
     );
@@ -535,9 +685,11 @@ where
     L: FnOnce(&str) -> BoltResult<CudaModule>,
 {
     let key = KernelSpecKey::new(spec, entry);
-    // Fast path: hit.
-    if let Some(entry) = KERNELSPEC_CACHE.lock().get(&key) {
-        return Ok(entry.module);
+    let material = key_material(spec);
+    // Fast path: hit. The `material` re-check (MED-fix) turns a hash collision
+    // into a miss so we never serve the wrong kernel.
+    if let Some(cached) = KERNELSPEC_CACHE.lock().get(&key, Some(material.as_str())) {
+        return Ok(cached.module);
     }
     // Miss: run codegen + module load WITHOUT the cache lock held. Both
     // steps can be slow and we don't want to serialise unrelated misses.
@@ -548,6 +700,7 @@ where
         key,
         CacheEntry {
             ptx,
+            key_material: Some(material),
             module: module.clone(),
         },
     );
@@ -702,9 +855,13 @@ where
     F: FnOnce(&ScalarAggSpec) -> BoltResult<String>,
 {
     let key = ScalarAggKey::new(spec, entry);
-    get_or_build_with_disk(&SCALARAGG_CACHE, key, SCALAR_AGG_DISK_PREFIX, || {
-        compile(spec)
-    })
+    get_or_build_with_disk(
+        &SCALARAGG_CACHE,
+        key,
+        key_material(spec),
+        SCALAR_AGG_DISK_PREFIX,
+        || compile(spec),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -839,7 +996,13 @@ where
     F: FnOnce(&HashJoinKernelSpec) -> BoltResult<String>,
 {
     let key = HashJoinKey::new(spec, entry);
-    get_or_build_with_disk(&HASHJOIN_CACHE, key, HASH_JOIN_DISK_PREFIX, || compile(spec))
+    get_or_build_with_disk(
+        &HASHJOIN_CACHE,
+        key,
+        key_material(spec),
+        HASH_JOIN_DISK_PREFIX,
+        || compile(spec),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -996,9 +1159,13 @@ where
     F: FnOnce(&RadixSortKernelSpec) -> BoltResult<String>,
 {
     let key = RadixSortKey::new(spec, entry);
-    get_or_build_with_disk(&RADIXSORT_CACHE, key, RADIX_SORT_DISK_PREFIX, || {
-        compile(spec)
-    })
+    get_or_build_with_disk(
+        &RADIXSORT_CACHE,
+        key,
+        key_material(spec),
+        RADIX_SORT_DISK_PREFIX,
+        || compile(spec),
+    )
 }
 
 /// Test-friendly variant of [`get_or_build_module_for_radix_sort`] that
@@ -1017,7 +1184,8 @@ where
     L: FnOnce(&str) -> BoltResult<CudaModule>,
 {
     let key = RadixSortKey::new(spec, entry);
-    if let Some(cached) = RADIXSORT_CACHE.lock().get(&key) {
+    let material = key_material(spec);
+    if let Some(cached) = RADIXSORT_CACHE.lock().get(&key, Some(material.as_str())) {
         return Ok(cached.module);
     }
     let ptx = compile(spec)?;
@@ -1026,6 +1194,7 @@ where
         key,
         CacheEntry {
             ptx,
+            key_material: Some(material),
             module: module.clone(),
         },
     );
@@ -1156,9 +1325,13 @@ where
     F: FnOnce(&CompactionKernelSpec) -> BoltResult<String>,
 {
     let key = CompactionKey::new(spec, entry);
-    get_or_build_with_disk(&COMPACTION_CACHE, key, COMPACTION_DISK_PREFIX, || {
-        compile(spec)
-    })
+    get_or_build_with_disk(
+        &COMPACTION_CACHE,
+        key,
+        key_material(spec),
+        COMPACTION_DISK_PREFIX,
+        || compile(spec),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,6 +1370,16 @@ mod spec_cache_tests {
     fn entry() -> CacheEntry {
         CacheEntry {
             ptx: String::new(),
+            key_material: None,
+            module: crate::jit::CudaModule::stub_for_tests(),
+        }
+    }
+
+    /// Like [`entry`] but tags the entry with collision re-check key material.
+    fn entry_with_material(material: &str) -> CacheEntry {
+        CacheEntry {
+            ptx: String::new(),
+            key_material: Some(material.to_string()),
             module: crate::jit::CudaModule::stub_for_tests(),
         }
     }
@@ -1213,9 +1396,15 @@ mod spec_cache_tests {
         // At cap. Inserting key(3) must evict key(1) (the front of the FIFO).
         cache.insert(key(3), entry());
 
-        assert!(cache.get(&key(1)).is_none(), "oldest key must be evicted");
-        assert!(cache.get(&key(2)).is_some(), "key(2) must survive");
-        assert!(cache.get(&key(3)).is_some(), "freshly inserted key present");
+        assert!(
+            cache.get(&key(1), None).is_none(),
+            "oldest key must be evicted"
+        );
+        assert!(cache.get(&key(2), None).is_some(), "key(2) must survive");
+        assert!(
+            cache.get(&key(3), None).is_some(),
+            "freshly inserted key present"
+        );
         assert!(cache.by_key.len() <= 2, "live entries must not exceed cap");
     }
 
@@ -1234,11 +1423,11 @@ mod spec_cache_tests {
 
         cache.insert(key(3), entry());
         assert!(
-            cache.get(&key(1)).is_none(),
+            cache.get(&key(1), None).is_none(),
             "key(1) kept its original FIFO position and was evicted first"
         );
-        assert!(cache.get(&key(2)).is_some());
-        assert!(cache.get(&key(3)).is_some());
+        assert!(cache.get(&key(2), None).is_some());
+        assert!(cache.get(&key(3), None).is_some());
     }
 
     /// Hit/miss accounting: `get` bumps `misses` on a cold key and `hits`
@@ -1249,15 +1438,95 @@ mod spec_cache_tests {
         let mut cache: SpecCache<TestKey> = SpecCache::new(4);
 
         // Cold lookup: miss.
-        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(1), None).is_none());
         assert_eq!(cache.misses, 1);
         assert_eq!(cache.hits, 0);
 
         // Seed then warm lookup: hit.
         cache.insert(key(1), entry());
-        assert!(cache.get(&key(1)).is_some());
+        assert!(cache.get(&key(1), None).is_some());
         assert_eq!(cache.hits, 1);
         assert_eq!(cache.misses, 1, "a hit must not bump the miss counter");
+    }
+
+    /// MED-fix (collision re-check): two distinct specs forced to the SAME
+    /// primary key must still be disambiguated by the stored key material.
+    ///
+    /// We simulate a 128-bit hash collision directly: insert an entry under
+    /// `key(1)` tagged with material `"spec_A"`, then look the same key up
+    /// while *claiming* the material is `"spec_B"`. The mismatch must be
+    /// classified as a MISS (so the caller rebuilds for spec_B) rather than a
+    /// hit that would hand back spec_A's module. Looking it up with the
+    /// matching material must still hit.
+    #[test]
+    fn spec_cache_get_rechecks_material_on_collision() {
+        let mut cache: SpecCache<TestKey> = SpecCache::new(4);
+
+        cache.insert(key(1), entry_with_material("spec_A"));
+
+        // Same primary key, DIFFERENT material → simulated collision → miss.
+        let misses_before = cache.misses;
+        assert!(
+            cache.get(&key(1), Some("spec_B")).is_none(),
+            "a key-material mismatch on a hash hit must be treated as a miss \
+             (collision: must not serve spec_A's module to a spec_B request)"
+        );
+        assert_eq!(
+            cache.misses,
+            misses_before + 1,
+            "the collision must be accounted as a miss, not a hit"
+        );
+
+        // Same primary key, SAME material → genuine hit.
+        let hits_before = cache.hits;
+        assert!(
+            cache.get(&key(1), Some("spec_A")).is_some(),
+            "matching key material must still hit"
+        );
+        assert_eq!(cache.hits, hits_before + 1, "the match must count as a hit");
+
+        // `None` expected-material skips the check entirely (raw-insert path).
+        assert!(
+            cache.get(&key(1), None).is_some(),
+            "passing None must bypass the re-check and hit"
+        );
+    }
+
+    /// HARD-fix (multi-GPU keying): the active device ordinal participates in
+    /// the 128-bit content fingerprint, so the *same* spec hashed against two
+    /// different devices yields two different keys. This is what stops a
+    /// module loaded on device 0 from being served to a device-1 executor.
+    ///
+    /// We exercise the device-explicit `hash128_for_device` directly because
+    /// the live accessor (`active_device_id`) can only report device 0 under
+    /// `--features cuda-stub` (no CUDA context exists).
+    #[test]
+    fn hash128_folds_in_device_id() {
+        // Same spec material + domain bytes, different device ordinals.
+        let dev0 = hash128_for_device("identical-spec-debug", 0x01, 0x02, 0);
+        let dev1 = hash128_for_device("identical-spec-debug", 0x01, 0x02, 1);
+        assert_ne!(
+            dev0, dev1,
+            "the device ordinal must change the fingerprint so device-0 and \
+             device-1 modules occupy disjoint cache slots"
+        );
+
+        // Sanity: device 0 is stable (the stub-build / single-GPU placeholder).
+        let dev0_again = hash128_for_device("identical-spec-debug", 0x01, 0x02, 0);
+        assert_eq!(dev0, dev0_again, "same device must hash stably");
+
+        // And `active_device_id()` is the production source of that ordinal;
+        // under cuda-stub it falls back to the device-0 placeholder (no CUDA
+        // context exists, so `current_device()` errors and we use 0). Only
+        // assert the placeholder value on the stub build — a real-CUDA test
+        // host with a bound context could legitimately report a non-zero
+        // ordinal here.
+        #[cfg(feature = "cuda-stub")]
+        assert_eq!(
+            active_device_id(),
+            0,
+            "under cuda-stub (no CUDA context) the device id must fall back to 0"
+        );
     }
 }
 
@@ -1296,7 +1565,7 @@ mod kernelspec_cache_tests {
         let spec = empty_spec();
         let key = KernelSpecKey::new(&spec, "bolt_kernel");
 
-        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert!(cache.get(&key, None).is_none(), "fresh cache must miss");
         assert_eq!(cache.misses, 1);
         assert_eq!(cache.hits, 0);
     }
@@ -1561,7 +1830,7 @@ mod scalar_agg_cache_tests {
         };
         let key = ScalarAggKey::new(&spec, "bolt_reduce");
 
-        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert!(cache.get(&key, None).is_none(), "fresh cache must miss");
         assert_eq!(cache.misses, 1);
         assert_eq!(cache.hits, 0);
     }
@@ -1836,7 +2105,7 @@ mod hash_join_cache_tests {
         let spec = mk_spec(HashJoinKernelKind::Build, DataType::Int64);
         let key = HashJoinKey::new(&spec, "bolt_build");
 
-        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert!(cache.get(&key, None).is_none(), "fresh cache must miss");
         assert_eq!(cache.misses, 1);
         assert_eq!(cache.hits, 0);
     }
@@ -2086,7 +2355,7 @@ mod radix_sort_cache_tests {
         let spec = mk_spec(RadixSortPass::Histogram, DataType::Int32);
         let key = RadixSortKey::new(&spec, "bolt_radix_histogram_i32");
 
-        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert!(cache.get(&key, None).is_none(), "fresh cache must miss");
         assert_eq!(cache.misses, 1);
         assert_eq!(cache.hits, 0);
     }
