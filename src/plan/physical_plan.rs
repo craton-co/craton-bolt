@@ -3148,7 +3148,13 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
 /// `PhysicalPlan::Project` fallback rather than emitting wrong GPU code.
 fn case_needs_null_output(expr: &Expr) -> bool {
     match expr {
-        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
+        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) => false,
+        // The `InSubquery` probe is evaluated in this query's namespace and may
+        // itself be a NULL-output CASE; recurse so such a predicate still routes
+        // to the host fallback. (In `Engine::sql` the subquery is resolved to a
+        // boolean fold before lowering, but `lower`/`lower_physical` may be
+        // called directly on an unresolved plan, so handle it here too.)
+        Expr::InSubquery { expr: probe, .. } => case_needs_null_output(probe),
         Expr::Case {
             branches,
             else_branch,
@@ -3289,7 +3295,10 @@ fn expr_contains_concat(expr: &Expr) -> bool {
 fn expr_contains_scalar_fn(expr: &Expr) -> bool {
     match expr {
         Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => expr_contains_scalar_fn(expr),
-        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
+        Expr::ScalarSubquery(_) => false,
+        // The `InSubquery` probe is evaluated in this query's namespace; a
+        // scalar fn inside it must be detected like any other operand.
+        Expr::InSubquery { expr: probe, .. } => expr_contains_scalar_fn(probe),
         Expr::ScalarFn { .. } => true,
         Expr::Binary { left, right, .. } => {
             expr_contains_scalar_fn(left) || expr_contains_scalar_fn(right)
@@ -3337,7 +3346,10 @@ fn all_scalar_fns_host_evaluable(exprs: &[Expr]) -> bool {
                 ok && args.iter().all(walk)
             }
             Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => walk(expr),
-            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => true,
+            Expr::ScalarSubquery(_) => true,
+            // Validate scalar fns inside the `InSubquery` probe too — it is
+            // evaluated in this query's namespace.
+            Expr::InSubquery { expr, .. } => walk(expr),
             Expr::Binary { left, right, .. } => walk(left) && walk(right),
             Expr::Unary { operand, .. } => walk(operand),
             Expr::Alias(inner, _) => walk(inner),
@@ -3361,7 +3373,10 @@ fn first_scalar_fn_kind(exprs: &[Expr]) -> Option<ScalarFnKind> {
     fn walk(e: &Expr) -> Option<ScalarFnKind> {
         match e {
             Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => walk(expr),
-            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => None,
+            Expr::ScalarSubquery(_) => None,
+            // Look into the `InSubquery` probe so the rejection message can name
+            // a scalar fn that appears there.
+            Expr::InSubquery { expr, .. } => walk(expr),
             Expr::ScalarFn { kind, .. } => Some(*kind),
             Expr::Binary { left, right, .. } => walk(left).or_else(|| walk(right)),
             Expr::Unary { operand, .. } => walk(operand),
@@ -4300,7 +4315,10 @@ fn logical_plan_contains_unsupported_cast_target(plan: &LogicalPlan) -> Option<D
     }
     fn expr_bad_cast(e: &Expr) -> Option<DataType> {
         match e {
-            Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => None,
+            Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) => None,
+            // The `InSubquery` probe is in this query's namespace; an
+            // unsupported cast target inside it must route to host too.
+            Expr::InSubquery { expr, .. } => expr_bad_cast(expr),
             Expr::Cast { expr, target } => {
                 if cast_target_unsupported(*target) {
                     return Some(*target);
@@ -6288,20 +6306,31 @@ mod tests {
         );
     }
 
-    /// Regression guards for the `InSubquery`-probe shadowing fix.
+    /// Regression guards for the `InSubquery`-probe folding fix.
     ///
-    /// Four host-fallback / substitution helpers
+    /// Every host-fallback / substitution / validation helper that walks an
+    /// expression tree must recurse into an `InSubquery`'s *probe* (which lives
+    /// in the enclosing query's namespace), not fold it into a non-recursing
+    /// catch-all alongside `Extract | DateTrunc | ScalarSubquery`. Four helpers
     /// (`substitute_one_depth`, `predicate_contains_unary`,
-    /// `expr_contains_concat`, `expr_has_unsafe_eager_shortcircuit`) each have a
-    /// dedicated `Expr::InSubquery` arm that recurses into the *probe* (which
-    /// lives in the enclosing query's namespace). A combined early arm used to
-    /// fold `InSubquery` into the `Extract | DateTrunc | ScalarSubquery`
-    /// catch-all, shadowing those dedicated arms so the probe was never visited.
-    /// These tests build an `InSubquery` whose probe carries the shape each
-    /// helper is meant to detect/transform and assert the probe is now reached.
+    /// `expr_contains_concat`, `expr_has_unsafe_eager_shortcircuit`) originally
+    /// had a *dead* dedicated arm shadowed by such a catch-all; five more
+    /// (`case_needs_null_output`, `expr_contains_scalar_fn`,
+    /// `all_scalar_fns_host_evaluable`, `first_scalar_fn_kind`, `expr_bad_cast`)
+    /// folded the probe optimistically with no warning. In `Engine::sql` the
+    /// subquery is resolved to a boolean fold before lowering, but `lower` /
+    /// `lower_physical` may be called directly on an unresolved plan, so each
+    /// helper must inspect the probe. These tests build an `InSubquery` whose
+    /// probe carries the shape each helper detects and assert the probe is
+    /// reached.
+    ///
+    /// The `emit` (fused-codegen) and `expr_eager_safe_under_shortcircuit`
+    /// (allowlist) arms intentionally do NOT recurse: they already force the
+    /// host fallback for the whole `InSubquery` (reject / "unsafe"), which is
+    /// the conservative, correct direction.
     mod in_subquery_probe_recursion {
         use crate::plan::logical_plan::{
-            BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema, UnaryOp,
+            BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema, UnaryOp,
         };
         use std::collections::HashMap;
 
@@ -6392,6 +6421,71 @@ mod tests {
             assert!(!super::super::expr_has_unsafe_eager_shortcircuit(&in_subquery(
                 Expr::Column("a".into())
             )));
+        }
+
+        /// `case_needs_null_output` must see a NULL-output CASE (no ELSE) inside
+        /// the probe so the predicate routes to the host fallback.
+        #[test]
+        fn null_case_detected_in_probe() {
+            // `CASE WHEN a THEN 1 END` — no ELSE → SQL NULL on the unmatched
+            // path, which the GPU `selp` case emitter cannot represent.
+            let probe = Expr::Case {
+                branches: vec![(
+                    Expr::Column("a".into()),
+                    Expr::Literal(Literal::Int64(1)),
+                )],
+                else_branch: None,
+            };
+            assert!(super::super::case_needs_null_output(&in_subquery(probe)));
+            assert!(!super::super::case_needs_null_output(&in_subquery(
+                Expr::Column("a".into())
+            )));
+        }
+
+        /// `expr_contains_scalar_fn` must see a scalar fn inside the probe.
+        #[test]
+        fn scalar_fn_detected_in_probe() {
+            let probe = Expr::ScalarFn {
+                kind: ScalarFnKind::Substring,
+                args: vec![
+                    Expr::Column("s".into()),
+                    Expr::Literal(Literal::Int64(1)),
+                    Expr::Literal(Literal::Int64(2)),
+                ],
+            };
+            assert!(super::super::expr_contains_scalar_fn(&in_subquery(probe)));
+            assert!(!super::super::expr_contains_scalar_fn(&in_subquery(
+                Expr::Column("a".into())
+            )));
+        }
+
+        /// `expr_bad_cast` (via `logical_plan_contains_unsupported_cast_target`)
+        /// must see an unsupported cast target inside the probe of a Filter
+        /// predicate.
+        #[test]
+        fn bad_cast_detected_in_probe() {
+            let probe = Expr::Cast {
+                expr: Box::new(Expr::Column("a".into())),
+                target: DataType::Utf8,
+            };
+            let plan = LogicalPlan::Filter {
+                input: Box::new(one_col_subquery()),
+                predicate: in_subquery(probe),
+            };
+            assert_eq!(
+                super::super::logical_plan_contains_unsupported_cast_target(&plan),
+                Some(DataType::Utf8),
+                "unsupported cast target inside the probe must be detected"
+            );
+            // A bare-column probe carries no bad cast.
+            let ok = LogicalPlan::Filter {
+                input: Box::new(one_col_subquery()),
+                predicate: in_subquery(Expr::Column("a".into())),
+            };
+            assert_eq!(
+                super::super::logical_plan_contains_unsupported_cast_target(&ok),
+                None
+            );
         }
     }
 }
