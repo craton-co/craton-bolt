@@ -291,11 +291,7 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     // start = partition_offsets[pid], end = partition_offsets[pid + 1].
     // We need offsets[K+1]-shaped input, with offsets[K] = n_rows; the
     // orchestrator passes the full (K+1) buffer for exactly this reason.
-    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?; // start
-    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?; // end
+    super::partition_reduce_kernel_spill_common::emit_partition_slice_read(&mut ptx)?;
     writeln!(ptx).map_err(write_err)?;
 
     // ----------------------------------------------------------------------
@@ -623,11 +619,7 @@ pub fn compile_partition_reduce_kernel_with_spill() -> BoltResult<String> {
     writeln!(ptx).map_err(write_err)?;
 
     // Partition slice [start, end).
-    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_partition_slice_read(&mut ptx)?;
     writeln!(ptx).map_err(write_err)?;
 
     // Phase 1: zero shared arrays.

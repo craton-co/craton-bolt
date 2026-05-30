@@ -166,6 +166,42 @@ pub(crate) fn emit_spill_bump_unchecked(
     Ok(())
 }
 
+/// Emit the per-block partition-slice read that loads `[start, end)` from
+/// the `partition_offsets` buffer (held in `%rd5`) for this block's
+/// partition id (`%r0`):
+///
+/// ```text
+/// \tmul.wide.u32 %rd10, %r0, 4;
+/// \tadd.s64 %rd11, %rd5, %rd10;
+/// \tld.global.u32 %r10, [%rd11];
+/// \tadd.s64 %rd12, %rd11, 4;
+/// \tld.global.u32 %r11, [%rd12];
+/// ```
+///
+/// `%r10` receives `start = partition_offsets[pid]` and `%r11` receives
+/// `end = partition_offsets[pid + 1]`. The fixed register allocation
+/// (`%rd10`/`%rd11`/`%rd12`, `%r10`/`%r11`) and the offsets pointer in
+/// `%rd5` are shared verbatim by the 6 scalar-key SUM / MIN-MAX emitters
+/// (SUM and MIN/MAX-int and MIN/MAX-float, each in its i32-key and
+/// i64-key form, and each in its non-spill and `_with_spill` variant —
+/// 12 call sites total).
+///
+/// The `count` kernels are deliberately NOT callers: their reduced
+/// parameter list (no separate values array) shifts the offsets pointer
+/// to `%rd4`, so they emit `add.s64 %rd11, %rd4, %rd10` and would drift
+/// by one register if routed through this helper. The `multi` kernels
+/// place the offsets pointer in a parametric `%rd` register and use a
+/// different scratch register block (`%rd80`..). Both keep their own
+/// inline emission.
+pub(crate) fn emit_partition_slice_read(ptx: &mut String) -> BoltResult<()> {
+    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
+    Ok(())
+}
+
 /// Emit the post-loop epilogue:
 ///
 /// ```text
@@ -257,6 +293,20 @@ mod tests {
         let mut s = String::new();
         emit_spin_backoff(&mut s, 32).unwrap();
         assert_eq!(s, "\tmov.u32 %nstime, 32;\n\tnanosleep.u32 %nstime;\n");
+    }
+
+    #[test]
+    fn partition_slice_read_emits_expected_bytes() {
+        let mut s = String::new();
+        emit_partition_slice_read(&mut s).unwrap();
+        assert_eq!(
+            s,
+            "\tmul.wide.u32 %rd10, %r0, 4;\n\
+             \tadd.s64 %rd11, %rd5, %rd10;\n\
+             \tld.global.u32 %r10, [%rd11];\n\
+             \tadd.s64 %rd12, %rd11, 4;\n\
+             \tld.global.u32 %r11, [%rd12];\n"
+        );
     }
 
     #[test]

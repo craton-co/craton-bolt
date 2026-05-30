@@ -199,11 +199,7 @@ pub fn compile_partition_reduce_kernel_minmax_float(
     writeln!(ptx).map_err(write_err)?;
 
     // Read partition slice.
-    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_partition_slice_read(&mut ptx)?;
     writeln!(ptx).map_err(write_err)?;
 
     // Phase 1: zero shared. Vals init to ±infinity identity.
@@ -632,11 +628,7 @@ pub fn compile_partition_reduce_kernel_minmax_float_with_spill(
     writeln!(ptx, "\tcvta.to.global.u64 %rd9, %rd9;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_partition_slice_read(&mut ptx)?;
     writeln!(ptx).map_err(write_err)?;
 
     writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
