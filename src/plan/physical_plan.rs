@@ -1343,6 +1343,26 @@ fn all_bare_columns(exprs: &[Expr]) -> bool {
     exprs.iter().all(|e| matches!(e, Expr::Column(_)))
 }
 
+/// Return `agg` with its input expression replaced by `input`, preserving the
+/// aggregate kind. Used by [`lower_aggregate`] to retarget each aggregate onto
+/// the pre-kernel output column that materialised its (possibly compound) input
+/// expression, so the executor reads the already-computed, validity-bearing
+/// column instead of re-evaluating the raw expr against a now-consumed scan
+/// namespace.
+fn rebuild_agg_with_input(agg: &AggregateExpr, input: Expr) -> AggregateExpr {
+    match agg {
+        AggregateExpr::Count(_) => AggregateExpr::Count(input),
+        AggregateExpr::Sum(_) => AggregateExpr::Sum(input),
+        AggregateExpr::Min(_) => AggregateExpr::Min(input),
+        AggregateExpr::Max(_) => AggregateExpr::Max(input),
+        AggregateExpr::Avg(_) => AggregateExpr::Avg(input),
+        AggregateExpr::VarPop(_) => AggregateExpr::VarPop(Box::new(input)),
+        AggregateExpr::VarSamp(_) => AggregateExpr::VarSamp(Box::new(input)),
+        AggregateExpr::StddevPop(_) => AggregateExpr::StddevPop(Box::new(input)),
+        AggregateExpr::StddevSamp(_) => AggregateExpr::StddevSamp(Box::new(input)),
+    }
+}
+
 /// Emitter for a single kernel's IR.
 struct Codegen<'a> {
     /// Schema of the underlying scan (column lookup).
@@ -3062,34 +3082,58 @@ fn lower_aggregate(
         (Some(pre_kernel), inputs, group_ords)
     };
 
-    // Substitute aggregate exprs through any chain Project map so the
-    // column names they reference match what the pre-aggregation kernel
-    // actually exposes (i.e., scan namespace).
-    let lowered_aggregates: Vec<AggregateExpr> = aggregates
-        .iter()
-        .map(|agg| match chain_proj_map.as_ref() {
-            None => agg.clone(),
-            Some(m) => match agg {
-                AggregateExpr::Count(e) => AggregateExpr::Count(substitute_one(e, m)),
-                AggregateExpr::Sum(e) => AggregateExpr::Sum(substitute_one(e, m)),
-                AggregateExpr::Min(e) => AggregateExpr::Min(substitute_one(e, m)),
-                AggregateExpr::Max(e) => AggregateExpr::Max(substitute_one(e, m)),
-                AggregateExpr::Avg(e) => AggregateExpr::Avg(substitute_one(e, m)),
-                AggregateExpr::VarPop(e) => {
-                    AggregateExpr::VarPop(Box::new(substitute_one(e.as_ref(), m)))
-                }
-                AggregateExpr::VarSamp(e) => {
-                    AggregateExpr::VarSamp(Box::new(substitute_one(e.as_ref(), m)))
-                }
-                AggregateExpr::StddevPop(e) => {
-                    AggregateExpr::StddevPop(Box::new(substitute_one(e.as_ref(), m)))
-                }
-                AggregateExpr::StddevSamp(e) => {
-                    AggregateExpr::StddevSamp(Box::new(substitute_one(e.as_ref(), m)))
-                }
-            },
-        })
-        .collect();
+    // Retarget each aggregate onto the column its input feeds.
+    //
+    // Non-trivial path: the pre-aggregation kernel already materialised every
+    // feed expr (group keys then aggregate inputs, in order) as an output
+    // column. Aggregate `j`'s input is therefore `agg_inputs[n_groups + j]`.
+    // Reference that pre-output column by name so the executor's fast path
+    // reads the computed, validity-bearing column directly. Without this the
+    // executor would re-evaluate the raw input expr (e.g. `price * tax`)
+    // against an env of pre OUTPUTS that no longer contains the source columns
+    // (`price`, `tax` were consumed by the pre kernel into `__expr_*`),
+    // failing with "column 'price' not found in evaluator env".
+    //
+    // Trivial path: no pre kernel; aggregate inputs are bare scan columns the
+    // aggregator reads directly, so keep the chain-substituted exprs (which
+    // resolve by their scan-namespace column name).
+    let n_groups = group_indices.len();
+    let lowered_aggregates: Vec<AggregateExpr> = if pre.is_some() {
+        aggregates
+            .iter()
+            .enumerate()
+            .map(|(j, agg)| {
+                let col = Expr::Column(agg_inputs[n_groups + j].name.clone());
+                rebuild_agg_with_input(agg, col)
+            })
+            .collect()
+    } else {
+        aggregates
+            .iter()
+            .map(|agg| match chain_proj_map.as_ref() {
+                None => agg.clone(),
+                Some(m) => match agg {
+                    AggregateExpr::Count(e) => AggregateExpr::Count(substitute_one(e, m)),
+                    AggregateExpr::Sum(e) => AggregateExpr::Sum(substitute_one(e, m)),
+                    AggregateExpr::Min(e) => AggregateExpr::Min(substitute_one(e, m)),
+                    AggregateExpr::Max(e) => AggregateExpr::Max(substitute_one(e, m)),
+                    AggregateExpr::Avg(e) => AggregateExpr::Avg(substitute_one(e, m)),
+                    AggregateExpr::VarPop(e) => {
+                        AggregateExpr::VarPop(Box::new(substitute_one(e.as_ref(), m)))
+                    }
+                    AggregateExpr::VarSamp(e) => {
+                        AggregateExpr::VarSamp(Box::new(substitute_one(e.as_ref(), m)))
+                    }
+                    AggregateExpr::StddevPop(e) => {
+                        AggregateExpr::StddevPop(Box::new(substitute_one(e.as_ref(), m)))
+                    }
+                    AggregateExpr::StddevSamp(e) => {
+                        AggregateExpr::StddevSamp(Box::new(substitute_one(e.as_ref(), m)))
+                    }
+                },
+            })
+            .collect()
+    };
 
     let aggregate = AggregateSpec {
         inputs: agg_inputs,
