@@ -206,21 +206,21 @@ pub trait LiteralResolver {
         DataType::Int32
     }
 
-    /// True iff a `col LIKE 'pattern'` predicate over `column` may be folded
-    /// into the GPU integer-index membership form (the dictionary precompute,
-    /// see [`Self::like_match_indices`]).
+    /// True iff a string predicate over `column` (`col LIKE 'pat'`,
+    /// `col = 'lit'`, `col <> 'lit'`) may be folded into the GPU integer-index
+    /// form (the dictionary precompute / index equality).
     ///
     /// Defaults to `true`. The engine's [`StringPredicateRewriter`] overrides
     /// this to return `false` for columns that the query also *projects as a
     /// bare Utf8 output*. For those, the integer-index filter cannot produce
     /// the surviving Utf8 rows (the fused GPU scan kernel has no Utf8 register
-    /// class and does not compact), so the predicate must stay a real
-    /// `Expr::Like` — the physical planner then routes it to the per-row GPU
-    /// `StringLikeFilter` (or the host `LIKE`), both of which materialise and
-    /// compact the Utf8 output correctly. `SELECT v FROM t WHERE s LIKE 'p%'`
-    /// (string column NOT projected) is unaffected and keeps the faster
-    /// integer-membership fold.
-    fn like_rewrite_allowed(&self, column: &str) -> bool {
+    /// class and does not compact), so the predicate must stay a real string
+    /// comparison — the physical planner then routes it to the per-row GPU
+    /// `StringLikeFilter` (LIKE) or a host `Filter` (Eq/Neq), both of which
+    /// materialise and compact the Utf8 output correctly. `SELECT v FROM t
+    /// WHERE s = 'x'` (string column NOT projected) is unaffected and keeps the
+    /// faster integer fold.
+    fn predicate_rewrite_allowed(&self, column: &str) -> bool {
         let _ = column;
         true
     }
@@ -246,11 +246,11 @@ pub struct StringPredicateRewriter<'a> {
     /// completeness guarantee on its own; callers that built the dictionary
     /// from a full single-pass scan opt in via [`Self::mark_complete`].
     complete: std::collections::HashSet<String>,
-    /// Columns whose `LIKE` predicate must NOT be folded into the integer-index
-    /// membership form because the query projects the column as a bare Utf8
-    /// output (see [`LiteralResolver::like_rewrite_allowed`]). Populated by
-    /// [`Self::protect_like`] from the plan before rewriting.
-    like_protected: std::collections::HashSet<String>,
+    /// Columns whose string predicate (`LIKE`, `=`, `<>`) must NOT be folded
+    /// into the integer-index form because the query projects the column as a
+    /// bare Utf8 output (see [`LiteralResolver::predicate_rewrite_allowed`]).
+    /// Populated by [`Self::protect_predicate`] from the plan before rewriting.
+    predicate_protected: std::collections::HashSet<String>,
 }
 
 impl<'a> Default for StringPredicateRewriter<'a> {
@@ -266,18 +266,18 @@ impl<'a> StringPredicateRewriter<'a> {
             dicts: HashMap::new(),
             name_map: HashMap::new(),
             complete: std::collections::HashSet::new(),
-            like_protected: std::collections::HashSet::new(),
+            predicate_protected: std::collections::HashSet::new(),
         }
     }
 
-    /// Protect `column`'s `LIKE` predicate from the integer-index membership
-    /// fold (see [`LiteralResolver::like_rewrite_allowed`]). Called for every
-    /// column the query projects as a bare Utf8 output, so the predicate stays
-    /// a real `Expr::Like` and reaches the per-row GPU `StringLikeFilter` (which
-    /// can emit the surviving Utf8 rows) instead of an integer filter that
-    /// cannot.
-    pub fn protect_like(&mut self, column: impl Into<String>) {
-        self.like_protected.insert(column.into());
+    /// Protect `column`'s string predicates (`LIKE`, `=`, `<>`) from the
+    /// integer-index fold (see [`LiteralResolver::predicate_rewrite_allowed`]).
+    /// Called for every column the query projects as a bare Utf8 output, so the
+    /// predicate stays a real string comparison and reaches the per-row GPU
+    /// `StringLikeFilter` (LIKE) or a host `Filter` (Eq/Neq) — both of which can
+    /// emit the surviving Utf8 rows — instead of an integer filter that cannot.
+    pub fn protect_predicate(&mut self, column: impl Into<String>) {
+        self.predicate_protected.insert(column.into());
     }
 
     /// Mark `column`'s dictionary as known-complete: it observed every distinct
@@ -350,8 +350,8 @@ impl<'a> LiteralResolver for StringPredicateRewriter<'a> {
         self.dicts.contains_key(column)
     }
 
-    fn like_rewrite_allowed(&self, column: &str) -> bool {
-        !self.like_protected.contains(column)
+    fn predicate_rewrite_allowed(&self, column: &str) -> bool {
+        !self.predicate_protected.contains(column)
     }
 
     fn like_match_indices(
@@ -533,7 +533,16 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 extract_col_and_string_lit(&new_left, &new_right)
             {
                 if r.knows(&col_name) {
-                    if is_eq_or_neq(*op) {
+                    // `predicate_rewrite_allowed` is false when the query
+                    // projects this column as a bare Utf8 output: the
+                    // integer-index filter can't emit the surviving Utf8 rows,
+                    // so keep the real `col <op> 'lit'` string comparison for
+                    // the host `Filter` path (routed by the physical planner).
+                    // `SELECT v WHERE s = 'x'` (s not projected) stays eligible
+                    // for the fold. The gate is scoped to the Eq/Neq fold only;
+                    // ordering ops keep their explicit "not yet implemented"
+                    // error below regardless of projection.
+                    if is_eq_or_neq(*op) && r.predicate_rewrite_allowed(&col_name) {
                         let mangled = r.index_column_name(&col_name);
                         match r.resolve(&col_name, &lit_str) {
                             Some(idx) => {
@@ -668,12 +677,12 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             // therefore always falls through to the host `Expr::Like` path.
             if !*negated && escape.is_none() && !*case_insensitive {
                 if let Expr::Column(col_name) = strip_alias(&new_inner) {
-                    // `like_rewrite_allowed` is false when the query projects
-                    // this column as a bare Utf8 output: the integer-index
-                    // filter can't emit the surviving Utf8 rows, so keep the
-                    // real `Expr::Like` for the per-row `StringLikeFilter` /
-                    // host path. See the trait method doc.
-                    if r.knows(col_name) && r.like_rewrite_allowed(col_name) {
+                    // `predicate_rewrite_allowed` is false when the query
+                    // projects this column as a bare Utf8 output: the
+                    // integer-index filter can't emit the surviving Utf8 rows,
+                    // so keep the real `Expr::Like` for the per-row
+                    // `StringLikeFilter` / host path. See the trait method doc.
+                    if r.knows(col_name) && r.predicate_rewrite_allowed(col_name) {
                         if let Some(indices) =
                             r.like_match_indices(col_name, pattern, *escape)
                         {

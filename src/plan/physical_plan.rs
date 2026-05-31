@@ -3350,6 +3350,48 @@ fn expr_contains_concat(expr: &Expr) -> bool {
     }
 }
 
+/// True if `expr` contains a `Utf8` string literal anywhere in its subtree.
+///
+/// A surviving `Expr::Literal(Literal::Utf8(_))` in a WHERE predicate means a
+/// string comparison the dictionary rewrite did NOT fold to an integer index —
+/// either because the column is `protect_predicate`-protected (projected as a
+/// bare Utf8 output) or because no dictionary was registered. The fused GPU
+/// predicate kernel has no Utf8 register class or string-compare ops, so such a
+/// predicate must run on the host-side `PhysicalPlan::Filter` (whose
+/// `expr_agg::eval_expr` compares the decoded strings and compacts). Mirrors
+/// the `expr_contains_concat` / `predicate_contains_unary` host-routing guards.
+/// `Expr::Like` carries its pattern in a `String` field (not a `Literal::Utf8`)
+/// and has its own `StringLikeFilter` route, so it is intentionally not matched.
+fn expr_contains_utf8_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::Utf8(_)) => true,
+        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_utf8_literal(left) || expr_contains_utf8_literal(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_utf8_literal(operand),
+        Expr::Alias(inner, _) => expr_contains_utf8_literal(inner),
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            branches
+                .iter()
+                .any(|(w, t)| expr_contains_utf8_literal(w) || expr_contains_utf8_literal(t))
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_utf8_literal)
+                    .unwrap_or(false)
+        }
+        Expr::Like { expr, .. } => expr_contains_utf8_literal(expr),
+        Expr::Cast { expr, .. } => expr_contains_utf8_literal(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_utf8_literal),
+        Expr::ScalarSubquery(_) => false,
+        Expr::InSubquery { expr, .. } => expr_contains_utf8_literal(expr),
+        Expr::Extract { .. } | Expr::DateTrunc { .. } => false,
+    }
+}
+
 /// True if `expr` contains an `Expr::ScalarFn` (string scalar function:
 /// `UPPER`/`LOWER`/`LENGTH`/`SUBSTRING`/`CONCAT`) anywhere in its subtree.
 ///
@@ -4744,6 +4786,25 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                         output_schema,
                     });
                 }
+                // `SELECT <utf8 col> FROM t WHERE s = 'x'`: the predicate kept a
+                // Utf8 string comparison (protected output column), which the
+                // fused GPU scan kernel can't fold. Lower the Filter on its own
+                // (it routes to the host `PhysicalPlan::Filter` via the Filter
+                // arm's `expr_contains_utf8_literal` guard, materialising and
+                // compacting the Utf8 column), then wrap a host `Project` for
+                // the SELECT list. Mirrors the `StringLikeFilter` route above.
+                if expr_contains_utf8_literal(predicate) {
+                    let inner = lower_depth(input, depth + 1)?;
+                    let output_schema = plan.schema()?;
+                    if project_is_identity(exprs, inner.output_schema(), &output_schema) {
+                        return Ok(inner);
+                    }
+                    return Ok(PhysicalPlan::Project {
+                        input: Box::new(inner),
+                        exprs: exprs.clone(),
+                        output_schema,
+                    });
+                }
             }
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
@@ -4775,6 +4836,26 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 try_lower_string_like_filter(input, predicate, depth)?
             {
                 return Ok(like_filter);
+            }
+            // String equality/inequality on a Utf8 column that survived the
+            // dictionary rewrite (e.g. `WHERE s = 'x'` where `s` is projected
+            // as a bare Utf8 output, so `protect_predicate` kept it a real
+            // string comparison). The fused GPU predicate kernel has no Utf8
+            // register class, so route to the host `PhysicalPlan::Filter`,
+            // whose `expr_agg::eval_expr` compares the decoded strings and
+            // compacts the surviving rows. Mirrors the `||` / `IS NULL` / CASE
+            // host-routing guards below.
+            if expr_contains_utf8_literal(predicate) {
+                log::debug!(
+                    "physical_plan: Utf8 string literal in Filter predicate; \
+                     lowering to host-side PhysicalPlan::Filter \
+                     (GPU codegen has no Utf8 support)"
+                );
+                let inner = lower(input)?;
+                return Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                });
             }
             // v0.7: `||` in a WHERE predicate (e.g. `WHERE a || b = 'foo'`)
             // routes through the host-side `PhysicalPlan::Filter` executor,
