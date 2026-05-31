@@ -150,15 +150,23 @@ impl ResultSet {
 
 fn duckdb_run(conn: &duckdb::Connection, sql: &str) -> ResultSet {
     let mut stmt = conn.prepare(sql).expect("duckdb prepare");
-    // `column_names` / `column_count` read the schema cached by `prepare`
-    // (see duckdb-1.2.2 `raw_statement.rs` where `prepare` populates
-    // `self.schema`). The docstring's "panics if not yet executed" warning
-    // is stale from the rusqlite ancestor — in DuckDB's Rust binding the
-    // schema is populated up front and these accessors are safe pre-query.
-    let column_names: Vec<String> = stmt.column_names();
+    // In duckdb-1.2.2 the statement's Arrow schema is `None` until the
+    // statement is *executed* (`RawStatement::execute` is what populates
+    // `self.schema`; `prepare` alone leaves it `None`). `column_names()`
+    // dereferences that schema via `schema().unwrap()`, so it MUST be called
+    // only after `query()` has run the statement — calling it pre-query
+    // panics at `raw_statement.rs:213` with `Option::unwrap() on None`.
+    //
+    // We therefore execute first (`query([])`), then read the column names
+    // back off the now-executed statement via `Rows::as_ref()` (which is
+    // `Some` until the row stream is exhausted — we read it before iterating).
+    let mut rows_iter = stmt.query([]).expect("duckdb query");
+    let column_names: Vec<String> = rows_iter
+        .as_ref()
+        .expect("duckdb executed statement")
+        .column_names();
     let ncols = column_names.len();
 
-    let mut rows_iter = stmt.query([]).expect("duckdb query");
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     while let Some(row) = rows_iter.next().expect("duckdb row") {
         let mut out = Vec::with_capacity(ncols);

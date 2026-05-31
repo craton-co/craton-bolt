@@ -316,9 +316,16 @@ mod semantic_diff {
 
     fn run_duckdb(conn: &duckdb::Connection, sql: &str) -> Result<ResultSet, String> {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let column_names: Vec<String> = stmt.column_names();
-        let ncols = column_names.len();
+        // duckdb-1.2.2 only populates the statement's Arrow schema on execute,
+        // so `column_names()` (which unwraps that schema) must be called AFTER
+        // `query([])` — pre-query it panics at `raw_statement.rs:213`. Read the
+        // names off the executed statement via `Rows::as_ref()`.
         let mut rows_iter = stmt.query([]).map_err(|e| e.to_string())?;
+        let column_names: Vec<String> = rows_iter
+            .as_ref()
+            .ok_or_else(|| "duckdb executed statement unavailable".to_string())?
+            .column_names();
+        let ncols = column_names.len();
         let mut rows: Vec<Vec<Cell>> = Vec::new();
         while let Some(row) = rows_iter.next().map_err(|e| e.to_string())? {
             let mut out = Vec::with_capacity(ncols);

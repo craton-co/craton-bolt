@@ -118,9 +118,17 @@ impl ResultSet {
 
 fn duckdb_run(conn: &duckdb::Connection, sql: &str) -> ResultSet {
     let mut stmt = conn.prepare(sql).expect("duckdb prepare");
-    let column_names: Vec<String> = stmt.column_names();
-    let ncols = column_names.len();
+    // duckdb-1.2.2: the Arrow schema is `None` until the statement is
+    // executed, so `column_names()` (which unwraps that schema) must run
+    // AFTER `query([])`, not before — otherwise it panics at
+    // `raw_statement.rs:213`. Read the names off the executed statement via
+    // `Rows::as_ref()` before consuming the row stream.
     let mut rows_iter = stmt.query([]).expect("duckdb query");
+    let column_names: Vec<String> = rows_iter
+        .as_ref()
+        .expect("duckdb executed statement")
+        .column_names();
+    let ncols = column_names.len();
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     while let Some(row) = rows_iter.next().expect("duckdb row") {
         let mut out = Vec::with_capacity(ncols);

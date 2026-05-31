@@ -681,8 +681,22 @@ unsafe fn driver_free(ptr: CUdeviceptr) {
 /// minted by `test_support::test_driver_alloc`; routing them through the
 /// real CUDA driver would crash. Tests record each "free" in a side-channel
 /// list so they can assert on eviction behaviour.
+///
+/// When `BOLT_BENCH_GPU=1` is set (real-GPU lib test runs), the pool does
+/// genuine device allocations via the active backend, so frees must route
+/// to the real backend free rather than the synthetic record list.
 #[cfg(test)]
 unsafe fn driver_free(ptr: CUdeviceptr) {
+    if test_support::gpu_gate_enabled() {
+        #[cfg(feature = "cudarc")]
+        let result = crate::cuda::cudarc_backend::mem_free(ptr);
+        #[cfg(not(feature = "cudarc"))]
+        let result = crate::cuda::cuda_sys::mem_free(ptr);
+        if let Err(e) = result {
+            log::warn!("craton-bolt: DeviceMemPool failed to free ptr: {}", e);
+        }
+        return;
+    }
     test_support::record_driver_free(ptr);
 }
 
@@ -709,6 +723,25 @@ fn driver_mem_alloc(alloc_bytes: usize) -> BoltResult<CUdeviceptr> {
 
 #[cfg(test)]
 fn driver_mem_alloc(alloc_bytes: usize) -> BoltResult<CUdeviceptr> {
+    // When `BOLT_BENCH_GPU=1` is set we are running the lib unit tests on a
+    // real device: do a genuine device allocation through the active backend
+    // (which self-initialises CUDA lazily via `device_ref()`), so kernels and
+    // memcpys land on valid pointers instead of synthetic ones. The OOM
+    // fault-injection latch is honoured first so host policy tests that arm it
+    // still see the injected error even under the gate.
+    if test_support::gpu_gate_enabled() {
+        if let Some(err) = test_support::take_injected_oom() {
+            return Err(err);
+        }
+        #[cfg(feature = "cudarc")]
+        {
+            return crate::cuda::cudarc_backend::mem_alloc(alloc_bytes);
+        }
+        #[cfg(not(feature = "cudarc"))]
+        {
+            return crate::cuda::cuda_sys::mem_alloc(alloc_bytes);
+        }
+    }
     test_support::test_driver_alloc(alloc_bytes)
 }
 
@@ -2386,26 +2419,47 @@ mod test_support {
     /// so the latch is effectively single-tenant.
     static OOM_LATCH: AtomicU64 = AtomicU64::new(0);
 
+    /// `true` when `BOLT_BENCH_GPU=1` is set in the environment: the lib
+    /// unit tests are running against a real device, so `driver_mem_alloc`
+    /// / `driver_free` must route to the real backend instead of the
+    /// synthetic pointer pool. When unset (GPU-less CI default) the
+    /// synthetic + OOM-injection behaviour is used unchanged.
+    pub(super) fn gpu_gate_enabled() -> bool {
+        std::env::var("BOLT_BENCH_GPU")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Drain the OOM-injection latch by one. Returns the canonical OOM
+    /// error if the latch was armed, otherwise `None`. Shared between the
+    /// synthetic alloc path and the GPU-gated real-alloc path so an armed
+    /// latch still injects a fault before any real allocation is attempted.
+    pub(super) fn take_injected_oom() -> Option<BoltError> {
+        loop {
+            let cur = OOM_LATCH.load(Ordering::Acquire);
+            if cur == 0 {
+                return None;
+            }
+            if OOM_LATCH
+                .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(BoltError::CudaWithCode {
+                    code: 2,
+                    message: "out of memory".to_string(),
+                });
+            }
+        }
+    }
+
     pub(super) fn test_driver_alloc(_bytes: usize) -> BoltResult<CUdeviceptr> {
         // OOM-injection: drain the latch by one and return an OOM
         // error in the same shape `cuda_sys::check` would produce for
         // `CUDA_ERROR_OUT_OF_MEMORY = 2` — Stage 4 carries the code in
         // a typed integer field rather than embedding it in a format
         // string.
-        loop {
-            let cur = OOM_LATCH.load(Ordering::Acquire);
-            if cur == 0 {
-                break;
-            }
-            if OOM_LATCH
-                .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Err(BoltError::CudaWithCode {
-                    code: 2,
-                    message: "out of memory".to_string(),
-                });
-            }
+        if let Some(err) = take_injected_oom() {
+            return Err(err);
         }
         // Wraparound is irrelevant — tests use a few hundred at most.
         Ok(NEXT_PTR.fetch_add(1, Ordering::Relaxed))
