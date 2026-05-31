@@ -251,6 +251,19 @@ fn emit_reduction_kernel(
     let acc_dtype = reduction_output_dtype(op, dtype);
     let (acc_load_suffix, acc_store_suffix, acc_reg_class, acc_reg_ty, acc_imm_ty) =
         ptx_type_info(acc_dtype)?;
+    // Int32's natural register class "r" aliases the general-purpose b32 bank
+    // that holds tid (%r2) and ctaid (%r0) — both live across the WHOLE
+    // reduction: tid gates every stride step, and ctaid indexes the per-block
+    // output store at the end. Putting the value/accumulator (and the phase-1
+    // reduction scratch %{rc}1/2/3) in %r would clobber them, corrupting both
+    // the reduction and the output address (the block's result lands in the
+    // wrong slot, leaving the real slot zero-initialised). Route Int32 values
+    // through a DISTINCT b32 bank %rv instead — Int64/Float32/Float64 already
+    // use distinct rl/f/fd banks, which is why only Int32 reductions were
+    // wrong. Applied to both the accumulator and (for SUM(Int32)->Int64) the
+    // widening input load.
+    let acc_reg_class = if acc_reg_class == "r" { "rv" } else { acc_reg_class };
+    let input_reg_class = if input_reg_class == "r" { "rv" } else { input_reg_class };
     let widens = acc_dtype != dtype;
 
     // Identity and combine are computed against the ACCUMULATOR dtype: the
@@ -552,17 +565,23 @@ fn emit_reduction_kernel(
     for &stride in &[16i32, 8, 4, 2, 1] {
         match acc_dtype {
             DataType::Int32 => {
-                // For Int32 the acc register class is "r" (b32), so %r5 is
-                // already a valid `shfl.sync.down.b32` source — no mov needed.
-                // Working value lives in %r5; shfl scratch is %r6.
+                // The Int32 acc bank %rv is b32, so %rv5 is already a valid
+                // `shfl.sync.down.b32` source — no mov bridge needed. Working
+                // value lives in %rv5; shfl scratch is %rv6 (same bank).
                 writeln!(
                     ptx,
-                    "\tshfl.sync.down.b32 %r6, %r5, {stride}, 0x1f, 0xffffffff;",
+                    "\tshfl.sync.down.b32 %{rc}6, %{rc}5, {stride}, 0x1f, 0xffffffff;",
+                    rc = acc_reg_class,
                     stride = stride
                 )
                 .map_err(write_err)?;
-                writeln!(ptx, "\t{combine} %r5, %r5, %r6;", combine = combine)
-                    .map_err(write_err)?;
+                writeln!(
+                    ptx,
+                    "\t{combine} %{rc}5, %{rc}5, %{rc}6;",
+                    combine = combine,
+                    rc = acc_reg_class
+                )
+                .map_err(write_err)?;
             }
             DataType::Float32 => {
                 // Working value lives in %f5; bridge through %r6/%r7 for shfl.
@@ -745,6 +764,13 @@ pub const AVG_COUNT_ELEM_BYTES: usize = 4;
 pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
     let (input_load_suffix, _, input_reg_class, input_reg_ty, _input_imm_ty) =
         ptx_type_info(dtype)?;
+    // Int32's natural class "r" aliases the general bank holding ctaid (%r0,
+    // used for the per-block output index) and tid (%r2); loading the input
+    // into %r0 would clobber ctaid and write the block's sum/count to the wrong
+    // slot. Route the (transient) Int32 input load through the distinct %rv
+    // b32 bank, matching emit_reduction_kernel. Int64/Float inputs already use
+    // distinct rl/f banks.
+    let input_reg_class = if input_reg_class == "r" { "rv" } else { input_reg_class };
     let input_elem_bytes = dtype.byte_width().ok_or_else(|| {
         BoltError::Other(format!(
             "agg_kernels: variable-width dtype {:?} not supported in AVG kernel",
@@ -830,9 +856,20 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
             rc = input_reg_class
         )
         .map_err(write_err)?;
+        // PTX requires a rounding modifier on integer -> floating-point cvt
+        // (e.g. `cvt.rn.f64.s32`): the result of s32/s64 -> f64 must name a
+        // rounding mode or ptxas aborts with "Rounding modifier required for
+        // instruction 'cvt'". A widening f32 -> f64 conversion is exact and
+        // takes (and allows) no rounding modifier.
+        let cvt_round = if matches!(dtype, DataType::Int32 | DataType::Int64) {
+            "rn."
+        } else {
+            ""
+        };
         writeln!(
             ptx,
-            "\tcvt.f64.{ld} %fd0, %{rc}0;",
+            "\tcvt.{round}f64.{ld} %fd0, %{rc}0;",
+            round = cvt_round,
             ld = input_load_suffix,
             rc = input_reg_class
         )
