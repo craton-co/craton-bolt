@@ -509,10 +509,10 @@ fn emit_multikey_multilaunch(
     writeln!(p, "\t.reg .b64 %rd<48>;").map_err(write_err)?;
     // Key registers: 2 per key (self/partner), max across all dtype reg
     // classes — emit a small pool per width. Bool keys share the i32 pool.
-    writeln!(p, "\t.reg .b32 %ki32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %ki64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .f32 %kf32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .f64 %kf64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %ki<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %kl<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .f32 %kf<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .f64 %kd<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
 
     // -- tid -----------------------------------------------------------
     writeln!(p, "\tmov.u32 %r4, %ctaid.x;").map_err(write_err)?;
@@ -785,15 +785,20 @@ fn emit_key_compare(
 
 /// PTX register names for a key's (self, partner) registers.
 ///
-/// Bool keys share the b32 (`ki32`) register pool: bytes are loaded with
-/// `ld.global.u8 %ki32X, [...]`, which PTX zero-extends into the 32-bit
+/// Bool keys share the b32 (`ki`) register pool: bytes are loaded with
+/// `ld.global.u8 %kiX, [...]`, which PTX zero-extends into the 32-bit
 /// register. The compare then uses the same s32 mnemonic as Int32.
 fn key_regs(ki: usize, dtype: DataType) -> (String, String) {
     let prefix = match dtype {
-        DataType::Int32 | DataType::Bool => "ki32",
-        DataType::Int64 => "ki64",
-        DataType::Float32 => "kf32",
-        DataType::Float64 => "kf64",
+        // NOTE: register-bank base names must NOT end in a digit. PTX
+        // parameterized names declared as `.reg .b32 %ki<N>;` expand to
+        // `%ki0..%ki(N-1)`; if the base itself ended in digits (`%ki32<N>`)
+        // a use like `%ki320` is lexically ambiguous to ptxas (`%ki32`[0] vs
+        // `%ki3`[20]) and fails with "Unknown symbol". Hence ki/kl/kf/kd.
+        DataType::Int32 | DataType::Bool => "ki",
+        DataType::Int64 => "kl",
+        DataType::Float32 => "kf",
+        DataType::Float64 => "kd",
         _ => unreachable!("validated"),
     };
     (
@@ -1045,10 +1050,10 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
     writeln!(p, "\t.reg .pred %p_pp2;").map_err(write_err)?;
     writeln!(p, "\t.reg .b32 %r<40>;").map_err(write_err)?;
     writeln!(p, "\t.reg .b64 %rd<40>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b32 %ki32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %ki64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .f32 %kf32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .f64 %kf64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %ki<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %kl<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .f32 %kf<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .f64 %kd<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
 
     // tid
     writeln!(p, "\tmov.u32 %r6, %tid.x;").map_err(write_err)?;
