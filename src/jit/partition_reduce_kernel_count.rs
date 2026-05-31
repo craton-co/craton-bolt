@@ -232,18 +232,21 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // MATCH path: fence between observing set==1 (via CAS) and loading
-    // the key. CAS and the key store touch different shared addresses,
-    // so PTX on sm_70 requires an explicit membar.cta to order them
-    // across threads. Without this, a racing thread could read a still-
-    // zeroed key and false-match key 0.
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
-    // read-of-published-value contract explicit (sm_70+). Replaces the
-    // plain `ld.<space>.<ty>` which relied on the publisher's release +
-    // SASS-level implicit acquire — sound in practice but not promised
-    // by PTX semantics.
-    writeln!(ptx, "\tld.acquire.cta.s32 %r35, [%rd36];").map_err(write_err)?;
+    // 3-state publish protocol (claim-then-write race fix; see
+    // partition_reduce_kernel.rs). Slot occupied (set is 1=claiming or
+    // 2=ready). Spin on a VOLATILE SHARED re-read of set (a bare
+    // ld.acquire.cta defaults to global space and faults on the shared
+    // offset) until the claimer publishes set:=2, yielding via nanosleep so
+    // the same-warp claimer can run, THEN read the key.
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd35];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
@@ -263,6 +266,7 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
     writeln!(ptx, "\tatom.shared.add.u64 %rd40, [%rd38], 1;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
@@ -485,7 +489,15 @@ pub fn compile_partition_reduce_kernel_count_with_spill() -> BoltResult<String> 
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    // 3-state publish protocol (claim-then-write race fix).
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd35];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -501,6 +513,7 @@ pub fn compile_partition_reduce_kernel_count_with_spill() -> BoltResult<String> 
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
     writeln!(ptx, "\tatom.shared.add.u64 %rd40, [%rd38], 1;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 

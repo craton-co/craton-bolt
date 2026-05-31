@@ -286,17 +286,19 @@ pub fn compile_partition_reduce_kernel_minmax_float(
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // MATCH path: fence between the set CAS and the key load — PTX
-    // sm_70 has no inter-address ordering, so without membar.cta a
-    // racing thread can read a still-zeroed key under set==1 and
-    // false-match key 0.
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
-    // read-of-published-value contract explicit (sm_70+). Replaces the
-    // plain `ld.<space>.<ty>` which relied on the publisher's release +
-    // SASS-level implicit acquire — sound in practice but not promised
-    // by PTX semantics.
-    writeln!(ptx, "\tld.acquire.cta.s32 %r35, [%rd36];").map_err(write_err)?;
+    // 3-state publish protocol (claim-then-write race fix; see
+    // partition_reduce_kernel.rs). VOLATILE SHARED re-read of set (not
+    // ld.acquire.cta — that defaults to global and faults on the shared
+    // offset) + nanosleep yield until set:=2, THEN read the key.
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd35];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
@@ -314,6 +316,7 @@ pub fn compile_partition_reduce_kernel_minmax_float(
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
     emit_cas_loop(&mut ptx, op, dtype, "CLAIM_CAS", val_reg)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
@@ -710,7 +713,15 @@ pub fn compile_partition_reduce_kernel_minmax_float_with_spill(
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    // 3-state publish protocol (claim-then-write race fix).
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd35];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -726,6 +737,7 @@ pub fn compile_partition_reduce_kernel_minmax_float_with_spill(
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
     emit_cas_loop(&mut ptx, op, dtype, "CLAIM_CAS", val_reg)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
