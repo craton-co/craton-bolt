@@ -325,11 +325,29 @@ pub fn execute_groupby_with_pre(
     // alongside their aggregate inputs. For now we reject with a clear
     // message rather than silently accumulate NULL-keyed rows into
     // whichever real group happens to collide.
-    if key_host.validity.is_some() {
+    //
+    // Determine real NULL keys from the ORIGINAL key column, NOT from
+    // `key_host.validity`: the pre-stage uses a blanket output-validity flag
+    // (if ANY input column carries validity, EVERY pre output — including the
+    // passthrough key — receives the *combined* input validity), so a
+    // null-free key's propagated bitmap is contaminated by a NULL-bearing
+    // *value* column. Reading the source key column's own `null_count` avoids
+    // that false positive, so `SUM(<nullable value>) GROUP BY <non-null key>`
+    // (the common case) runs instead of being wrongly rejected. A genuinely
+    // NULL-bearing key still trips the unimplemented "NULL group" path. The
+    // check is conservative: if the source key has nulls we reject even when a
+    // WHERE filter may have removed them (acceptable for the Stage B limit).
+    let key_src_idx = table_batch.schema().index_of(&key_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "execute_groupby_with_pre: GROUP BY key '{}' not present in table batch: {}",
+            key_io.name, e
+        ))
+    })?;
+    if table_batch.column(key_src_idx).null_count() > 0 {
         return Err(BoltError::Other(format!(
-            "groupby_with_pre: GROUP BY key column '{}' carries a NULL validity \
-             bitmap, but the GPU group-by keys kernel does not yet represent the \
-             NULL group. NULL keys are a Stage C follow-up to Option B.",
+            "groupby_with_pre: GROUP BY key column '{}' contains a NULL key, but \
+             the GPU group-by keys kernel does not yet represent the NULL group. \
+             NULL keys are a Stage C follow-up to Option B.",
             key_io.name
         )));
     }
