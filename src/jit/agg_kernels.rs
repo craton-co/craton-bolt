@@ -308,12 +308,24 @@ fn emit_reduction_kernel(
     writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b32   %r<16>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<24>;").map_err(write_err)?;
-    writeln!(ptx, "\t.reg .{}   %{}<8>;", acc_reg_ty, acc_reg_class).map_err(write_err)?;
-    // When the kernel widens (e.g. SUM(Int32) -> Int64), allocate a separate
-    // register class for the raw input load that is then sign-extended into
-    // the accumulator register. Skip when input and accumulator dtype agree
-    // to avoid emitting a duplicate `.reg` declaration of the same class.
-    if widens {
+    // The general-purpose banks above already cover the b32 (`%r`) and b64
+    // (`%rd`) classes. An INTEGER accumulator/input shares those banks (the
+    // body emits `%r`/`%rd` names for both index math and the accumulated
+    // value), so a dedicated `.reg .b32 %r<..>;` / `.reg .b64 %rd<..>;` here
+    // would be a duplicate-definition PTX error ("Duplicate definition of
+    // variable '%r<'", aborting cuModuleLoadDataEx). Only FLOAT accumulators
+    // (`%f`/`%fd`) and inputs need their own bank. `is_general_bank` gates
+    // both the accumulator decl and the widening-input decl on that.
+    let is_general_bank = |class: &str| matches!(class, "p" | "r" | "rd");
+    if !is_general_bank(acc_reg_class) {
+        writeln!(ptx, "\t.reg .{}   %{}<8>;", acc_reg_ty, acc_reg_class).map_err(write_err)?;
+    }
+    // When the kernel widens (e.g. SUM(Int32) -> Int64), the raw input load
+    // uses a separate register class that is then sign-extended into the
+    // accumulator. Emit it only when it's a NEW (float) bank that isn't already
+    // declared above and doesn't coincide with the accumulator bank — otherwise
+    // it's another duplicate `.reg` of the same class.
+    if widens && !is_general_bank(input_reg_class) && input_reg_class != acc_reg_class {
         writeln!(ptx, "\t.reg .{}   %{}<4>;", input_reg_ty, input_reg_class)
             .map_err(write_err)?;
     }
@@ -779,7 +791,10 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
     writeln!(ptx, "\t.reg .f64   %fd<16>;").map_err(write_err)?;
     // If the input dtype isn't already f64, allocate the input-class register
     // so we can `ld.global.<inp>` then `cvt.f64.<inp>` into the sum accumulator.
-    if dtype != DataType::Float64 {
+    // An INTEGER input (`%r`/`%rd`) shares the general-purpose banks declared
+    // above, so emitting a dedicated decl would be a duplicate-definition PTX
+    // error; only a distinct FLOAT input bank (`%f`) needs its own declaration.
+    if dtype != DataType::Float64 && !matches!(input_reg_class, "r" | "rd") {
         writeln!(ptx, "\t.reg .{}   %{}<4>;", input_reg_ty, input_reg_class)
             .map_err(write_err)?;
     }
