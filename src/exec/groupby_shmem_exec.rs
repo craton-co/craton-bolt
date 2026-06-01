@@ -356,7 +356,18 @@ pub fn try_execute_resident(
         return None;
     }
 
-    let stream = CudaStream::null_or_default();
+    // IMPORTANT: use the long-lived NULL stream, NOT a per-query owned stream
+    // (`null_or_default`). This path runs kernels that READ the *resident*
+    // GpuTable buffers, which outlive the query (they stay in `gpu_tables`).
+    // A per-query owned stream is destroyed when this fn returns; the pool's
+    // stream-aware async-free then records an event on that dead stream when
+    // the resident table is later freed (e.g. by `replace_table`) →
+    // CUDA_ERROR_INVALID_HANDLE / segfault. The NULL stream is never destroyed,
+    // so the resident buffers are always associated with a live stream. (The
+    // host-upload path keeps `null_or_default` safely: its buffers are owned
+    // and dropped in-query while that stream is still alive. This mirrors the
+    // scalar resident path in `agg_with_pre`, which also uses the NULL stream.)
+    let stream = CudaStream::null();
 
     // On-device key range scan (replaces the ~14 ms host `scan_max_nonneg_key`
     // pass — the keys already live on the device). MAX gives the slot count;
