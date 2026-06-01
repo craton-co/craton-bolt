@@ -76,7 +76,15 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
             KernelSpec::PartitionShmemStaging => partition_kernel::compile_partition_kernel_shmem_staging()?,
             KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
             KernelSpec::ReduceCount => {
-                partition_reduce_kernel_count::compile_partition_reduce_kernel_count()?
+                // The single launch site (`execute_inner`) looks up
+                // `KERNEL_ENTRY_WITH_SPILL` and pushes the spill ABI (6 args
+                // incl. the trailing `spill_counter`), so this MUST compile the
+                // spill variant. The non-spill PTX lacks the `..._spill` entry
+                // and uses a 5-arg ABI, so building it here caused
+                // `cuModuleGetFunction(bolt_partition_reduce_count_spill)` to
+                // fail with "named symbol not found" on the single-key Tier-2
+                // COUNT path (never previously exercised by a test).
+                partition_reduce_kernel_count::compile_partition_reduce_kernel_count_with_spill()?
             }
         })
     })
