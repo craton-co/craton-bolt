@@ -75,8 +75,110 @@ use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
 
+use crate::cuda::GpuVec;
 use crate::error::BoltResult;
+use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
+use crate::exec::partition_offsets;
+use crate::jit::{partition_kernel, CudaModule};
 use crate::plan::logical_plan::Schema;
+
+/// dedup (tier2): the op-independent single-key partition pass that every
+/// single-Int32-key Tier-2 reduce executor (`COUNT` / `MIN`/`MAX` int /
+/// `MIN`/`MAX` float / `AVG`) ran inline at the top of its `execute_inner`,
+/// byte-for-byte.
+///
+/// Each executor previously inlined the identical block:
+///
+/// ```ignore
+/// let num_partitions = partition_kernel::NUM_PARTITIONS;
+/// let mut counts: GpuVec<u32> =
+///     GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+/// let mut partition_ids: GpuVec<u32> =
+///     GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
+/// let partition_module = get_or_build_module(&partition_spec_for(n_rows))?;
+/// {
+///     let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
+///     let view_keys = keys_gpu.view();
+///     let mut view_pids = partition_ids.view_mut();
+///     let mut view_counts = counts.view_mut();
+///     let mut args = KernelArgs::empty();
+///     args.push_input(&view_keys);
+///     args.push_output(&mut view_pids);
+///     args.push_output(&mut view_counts);
+///     args.push_scalar_u32(n_rows);
+///     let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
+///     launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
+/// }
+/// let (offsets, offsets_gpu) =
+///     partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
+/// ```
+///
+/// The module *building* (`get_or_build_module(&partition_spec_for(n_rows))`)
+/// stays at each call site — that is the per-executor decision (its own
+/// `KernelSpec`, its own `LOAD_COUNT` test) — so this helper receives the
+/// already-built `partition_module` and reproduces only the op-independent
+/// remainder: allocate `counts` (zeros, `NUM_PARTITIONS`) + `partition_ids`
+/// (zeros, `n_rows`), launch the partition kernel with the exact ABI
+/// `[keys, partition_ids(out), counts(out), n_rows]` at grid
+/// `n_rows.div_ceil(BLOCK_THREADS).max(1)` / `BLOCK_THREADS`, then call
+/// `compute_and_upload_partition_offsets_async`.
+///
+/// Every operation, its order, the buffers it allocates, and the single
+/// `stream` it runs on are identical to the inlined code:
+/// * `num_partitions == partition_kernel::NUM_PARTITIONS` (4096) — the same
+///   constant each executor read.
+/// * `BLOCK_THREADS == partition_kernel::BLOCK_THREADS` (256) — identical to
+///   the per-file local `const BLOCK_THREADS: u32 = 256;` every converted
+///   executor declared.
+/// * `KERNEL_ENTRY == partition_kernel::KERNEL_ENTRY` — same launched entry.
+///
+/// The returned `partition_ids` / `offsets` / `offsets_gpu` buffers are moved
+/// out so the caller's downstream scatter pass consumes them with the same
+/// lifetimes as before. `counts` is fully consumed by the offsets helper and
+/// dropped here exactly as it was at the original call site.
+#[allow(clippy::type_complexity)]
+pub(crate) fn run_partition_launch(
+    partition_module: &CudaModule,
+    keys_gpu: &GpuVec<i32>,
+    n_rows: u32,
+    stream: &CudaStream,
+) -> BoltResult<(GpuVec<u32>, Vec<u32>, GpuVec<u32>, u32)> {
+    let num_partitions = partition_kernel::NUM_PARTITIONS;
+
+    let mut counts: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut partition_ids: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
+
+    {
+        let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
+
+        let view_keys = keys_gpu.view();
+        let mut view_pids = partition_ids.view_mut();
+        let mut view_counts = counts.view_mut();
+
+        let mut args = KernelArgs::empty();
+        args.push_input(&view_keys);
+        args.push_output(&mut view_pids);
+        args.push_output(&mut view_counts);
+        args.push_scalar_u32(n_rows);
+
+        let grid = n_rows.div_ceil(partition_kernel::BLOCK_THREADS).max(1);
+        launch_with_geometry(
+            func,
+            grid,
+            partition_kernel::BLOCK_THREADS,
+            0,
+            stream,
+            &mut args,
+        )?;
+    }
+
+    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
+        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
+
+    Ok((partition_ids, offsets, offsets_gpu, num_partitions))
+}
 
 /// dedup (tier2): single home for the per-file `plan_schema_to_arrow_schema`
 /// wrappers that every Tier-2 executor / merger carried verbatim.

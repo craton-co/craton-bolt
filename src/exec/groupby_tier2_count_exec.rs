@@ -34,7 +34,6 @@ use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
-use crate::exec::partition_offsets;
 use crate::jit::{
     partition_kernel, partition_reduce_kernel_count, scatter_kernel, CudaModule,
 };
@@ -195,36 +194,21 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
     let stream = CudaStream::null_or_default();
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
 
-    let num_partitions = partition_kernel::NUM_PARTITIONS;
-    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
-    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
-
     // Partition pass — CUDA-Oxide typed launch.
     // Kernel ABI: keys_ptr, pids_ptr, counts_ptr, n_rows
+    // dedup (tier2): alloc+launch+offsets extracted to the shared
+    // `run_partition_launch` helper (op-independent). Module building stays
+    // here so the per-spec `get_or_build_module` + its LOAD_COUNT test are
+    // untouched. The collapsed offsets round-trip (2 syncs → 1, via the
+    // thread-local pinned scratch) lives inside the helper.
     let partition_module = get_or_build_module(&partition_spec_for(n_rows))?;
-    {
-        let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
-        let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
-
-        let view_keys = keys_gpu.view();
-        let mut view_pids = partition_ids.view_mut();
-        let mut view_counts = counts.view_mut();
-
-        let mut args = KernelArgs::empty();
-        args.push_input(&view_keys);
-        args.push_output(&mut view_pids);
-        args.push_output(&mut view_counts);
-        args.push_scalar_u32(n_rows);
-
-        launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
-    }
-
-    // P1b-stage8: joint helper collapses the legacy
-    // `compute_partition_offsets` + `upload_offsets` 2-sync pair into 1
-    // sync via a single async D2H → host scan → async H2D round-trip
-    // through a thread-local pinned scratch buffer.
-    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
-        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
+    let (partition_ids, offsets, offsets_gpu, num_partitions) =
+        crate::exec::groupby_tier2_common::run_partition_launch(
+            &partition_module,
+            &keys_gpu,
+            n_rows,
+            &stream,
+        )?;
 
     // Scatter keys only. We still use the scatter kernel; it requires a
     // value column input, but for COUNT we have no meaningful value —
