@@ -51,6 +51,20 @@ use craton_bolt::Engine;
 mod common;
 use common::REL_TOL;
 
+/// Serializes the multi-engine tests in this binary.
+///
+/// `Engine` keeps exactly ONE active CUDA context per process (see the module
+/// docs), but the default `cargo test` harness runs `#[test]` functions on
+/// parallel threads. Two multi-engine tests running at once would each stand up
+/// their own context on the same device and cross-contaminate the context-bound
+/// globals (device pool, stream pool, module caches, the Tier-2 pinned scratch)
+/// — exactly the unsupported mode this file documents. Each test holds this
+/// lock for its whole body so they run strictly sequentially WITHOUT requiring
+/// the caller to pass `--test-threads=1`. Poisoning is recovered (a panicking
+/// test must not permanently block the other) — the assertion failure already
+/// surfaces via the panicking test itself.
+static MULTI_ENGINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---- Fixture ----------------------------------------------------------------
 //
 // h2o-shaped generators, matching `groupby_resident_replace_regression.rs` /
@@ -155,13 +169,15 @@ fn collect_key_agg(engine: &Engine, sql: &str) -> Vec<(i32, f64)> {
 ///   be compared bit/rel-exact across every engine and iteration.
 /// - q_agg: scalar aggregate (no GROUP BY) — the resident on-device reduce.
 ///
-/// High-cardinality Tier-2 GROUP BY (id2/id3) is deliberately EXCLUDED here:
-/// that path has a known nondeterministic phantom-group issue at scale, and
-/// across multiple live/destroyed contexts it additionally trips a separate
-/// context-bound device-buffer hazard (a crash) — both are pre-existing issues
-/// out of scope for THIS test, whose job is the cross-context MODULE-CACHE
-/// regression guard. GROUP-BY-over-JOIN is likewise excluded (it is a planner
-/// limitation — aggregation over a non-scan-chain input is unsupported). See
+/// High-cardinality Tier-2 GROUP BY (id2/id3) is deliberately EXCLUDED from
+/// THIS exact-equality mix because that path has a known nondeterministic
+/// phantom-group issue at scale (a wrong-count bug, not a crash), which would
+/// make a bit/rel-exact assertion flaky. The *cross-context crash* it used to
+/// also trip — a per-context pinned-host scratch buffer surviving teardown
+/// (`src/exec/partition_offsets.rs`) — is now FIXED and has its own dedicated
+/// regression guard, [`sequential_engines_high_card_tier2_no_crash`], below.
+/// GROUP-BY-over-JOIN is likewise excluded (it is a planner limitation —
+/// aggregation over a non-scan-chain input is unsupported). See
 /// docs/LIMITATIONS.md.
 struct QuerySet {
     t1: Vec<(i32, f64)>,
@@ -170,6 +186,12 @@ struct QuerySet {
 
 const Q_T1: &str = "SELECT id1, SUM(v1) FROM fact GROUP BY id1";
 const Q_AGG: &str = "SELECT SUM(v2) FROM fact";
+
+/// High-cardinality single-key GROUP BY over id3 (~1M distinct keys). Drives
+/// the Tier-2 hash-partitioned path whose host round-trip goes through the
+/// per-thread pinned scratch in `src/exec/partition_offsets.rs`. Only used by
+/// [`sequential_engines_high_card_tier2_no_crash`].
+const Q_T2_HIGHCARD: &str = "SELECT id3, SUM(v1) FROM fact GROUP BY id3";
 
 /// Run a scalar `SELECT SUM(v2) FROM fact` and return the single f64 cell.
 fn collect_scalar(engine: &Engine) -> f64 {
@@ -240,6 +262,9 @@ fn assert_queryset_eq(label: &str, got: &QuerySet, want: &QuerySet) {
 #[test]
 #[ignore = "gpu:multi-engine"]
 fn sequential_engines_and_repeated_queries_are_stable() {
+    let _guard = MULTI_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // 2M rows: above TWOKEY_MIN_ROWS (256K) so the two-key path uses Tier-2,
     // and large enough that id3 (1M-cardinality) exercises the high-card
     // Tier-2 single-key path. The same size the single-threaded
@@ -285,5 +310,67 @@ fn sequential_engines_and_repeated_queries_are_stable() {
             let got = run_all(&engine);
             assert_queryset_eq(&format!("repeat iter {iter}"), &got, &reference);
         }
+    }
+}
+
+/// Regression guard for the per-context **pinned-host scratch** crash.
+///
+/// The Tier-2 single-key GROUP BY downloads its per-partition counts through a
+/// thread-local `PinnedHostBuffer` (`src/exec/partition_offsets.rs`,
+/// `PINNED_SCRATCH`). That buffer is page-locked via `cuMemAllocHost_v2` *in
+/// the context current at allocation time*, but the thread-local outlives any
+/// single `Engine`. Before the fix, dropping the first engine destroyed its
+/// context (reclaiming the pinned pages) while leaving the thread-local
+/// pointing at them; the *second* engine's first high-cardinality Tier-2 query
+/// then wrote into the now-unmapped host pages and issued `cuMemcpy*Async`
+/// against a pinned registration in a dead context — a `STATUS_ACCESS_VIOLATION`
+/// (`0xc0000005`). `CudaContext::Drop` now calls
+/// `partition_offsets::invalidate_pinned_scratch_on_context_teardown()`, which
+/// frees the dropping thread's scratch while the context is still live and
+/// bumps a global epoch so any other thread's scratch is discarded on next use.
+///
+/// This is a DISTINCT bug from the cross-context module-cache crash that
+/// `sequential_engines_and_repeated_queries_are_stable` guards, and distinct
+/// again from the nondeterministic phantom-group *correctness* issue at ~10M
+/// rows — hence the modest 2M-row scale here, which trips the high-card Tier-2
+/// path (id3 ≈ 1M distinct keys) without entering the phantom-group regime, so
+/// the cross-engine equality assertion stays deterministic.
+///
+/// GPU-gated; run on a CUDA host with
+/// `cargo test --test concurrent_streams_test -- --ignored`.
+#[test]
+#[ignore = "gpu:multi-engine"]
+fn sequential_engines_high_card_tier2_no_crash() {
+    let _guard = MULTI_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    const N_ROWS: usize = 2_000_000;
+    const N_ENGINES: usize = 4;
+
+    // Ground truth from a fresh engine. (Computing it on engine 0 of the loop
+    // would conflate "first run" with "reference"; a separate build keeps the
+    // comparison honest.)
+    let reference = {
+        let engine = build_engine(N_ROWS);
+        collect_key_agg(&engine, Q_T2_HIGHCARD)
+    };
+    // Sanity: this must actually be the high-cardinality Tier-2 path. id3 yields
+    // ~1M distinct keys at 2M rows; if a threshold/fixture drift ever routed it
+    // through a low-card path the crash wouldn't be exercised, so fail loudly.
+    assert!(
+        reference.len() > 100_000,
+        "expected high-cardinality Tier-2 (>100k groups), got {} groups — \
+         fixture or Tier-2 dispatch threshold drift?",
+        reference.len()
+    );
+
+    for e in 0..N_ENGINES {
+        let engine = build_engine(N_ROWS);
+        // Pre-fix, this faulted for e >= 1: the second (and later) engine's
+        // first Tier-2 query touched the stale pinned scratch from the prior,
+        // destroyed context. Post-fix every engine reallocates fresh scratch.
+        let got = collect_key_agg(&engine, Q_T2_HIGHCARD);
+        assert_key_agg_eq(&format!("tier2 engine {e}"), &got, &reference);
+        // `engine` drops here: context torn down, pinned scratch invalidated.
     }
 }

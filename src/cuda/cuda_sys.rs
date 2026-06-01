@@ -642,6 +642,21 @@ impl Drop for CudaContext {
         // current context regardless of the `cudarc` feature).
         crate::exec::module_cache::clear_all_caches();
 
+        // Invalidate the Tier-2 group-by pinned host scratch BEFORE the context
+        // is destroyed. `partition_offsets` keeps a per-thread
+        // `PinnedHostBuffer` (page-locked via `cuMemAllocHost_v2`) that, like
+        // the pool pointers and module handles above, is bound to the context
+        // that allocated it: `cuCtxDestroy` reclaims the pinned pages, so a
+        // later `Engine::new()` reusing the surviving thread-local would write
+        // into unmapped host pages and `cuMemcpy*Async` against a pinned
+        // registration in a dead context — a `STATUS_ACCESS_VIOLATION` on the
+        // second engine's first high-cardinality Tier-2 query. This frees the
+        // dropping thread's buffer cleanly now (context still live) and bumps a
+        // global epoch so any other thread's buffer is discarded on next use.
+        // Runs on both backends (the scratch is pinned via raw FFI regardless
+        // of the `cudarc` feature). See `crate::exec::partition_offsets`.
+        crate::exec::partition_offsets::invalidate_pinned_scratch_on_context_teardown();
+
         // Default backend only: tear down the hand-rolled context.
         // Under `--features cudarc` we never minted one (`raw` is null);
         // cudarc owns its primary context and will release it at process

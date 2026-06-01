@@ -1369,6 +1369,37 @@ impl<T: Pod> PinnedHostBuffer<T> {
         self.ptr
     }
 
+    /// Neutralize this buffer so its [`Drop`] will NOT call `cuMemFreeHost`,
+    /// then behave as a zero-length buffer.
+    ///
+    /// # When this is the right thing to do
+    ///
+    /// `cuMemAllocHost_v2` pins pages *inside the CUDA context that was
+    /// current at allocation time*. `cuCtxDestroy` reclaims every pinned host
+    /// allocation that context owns, which leaves any surviving
+    /// `PinnedHostBuffer` holding a stale host pointer registered in a context
+    /// that no longer exists. Calling `cuMemFreeHost` on that pointer from a
+    /// *different* (later) context is invalid — at best it errors, at worst it
+    /// faults. This method lets an owner that has detected its allocating
+    /// context was torn down (e.g. via a context-epoch check) drop the buffer
+    /// cleanly: the FFI free is skipped (the driver already reclaimed the
+    /// pages on `cuCtxDestroy`) while the small host-side wrapper — the length
+    /// bookkeeping and the stream set — is freed normally when the struct
+    /// drops.
+    ///
+    /// This is NOT a substitute for a real free: only call it when the pinned
+    /// pages are already gone. For a buffer whose context is still alive, just
+    /// drop it (or let the slot it lives in drop) so `cuMemFreeHost` runs.
+    #[inline]
+    pub(crate) fn forget_pinned_pages(&mut self) {
+        // Match the zero-length representation so `as_slice`/`as_mut_slice`
+        // hand back empty slices and `Drop` takes the `ptr.is_null()` fast
+        // path (no `cuMemFreeHost`, no stream fence against dead streams).
+        self.ptr = std::ptr::null_mut();
+        self.len = 0;
+        self.byte_len = 0;
+    }
+
     /// Borrow as a shared slice. Safe: `T: Pod` so any bit pattern is a
     /// valid value, and the buffer guarantees `len` initialized elements
     /// (post-allocation the contents are driver-defined but readable —

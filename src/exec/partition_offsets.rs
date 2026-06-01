@@ -80,6 +80,7 @@
 //! larger without also blowing up the per-partition hashtable budget.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cuda::cuda_sys::{self, CUstream};
 use crate::cuda::{GpuVec, PinnedHostBuffer};
@@ -93,6 +94,15 @@ use crate::exec::launch::CudaStream;
 /// bound the Tier-1 block-local hashtable can hold in shared memory.
 pub const NUM_PARTITIONS: u32 = 4096;
 
+/// Process-global CUDA-context epoch.
+///
+/// Bumped by [`invalidate_pinned_scratch_on_context_teardown`] every time a
+/// `CudaContext` is destroyed. The thread-local pinned scratch stashes the
+/// epoch it was allocated under; a mismatch means "the context that pinned my
+/// pages is gone" and forces a fresh allocation in the live context. See the
+/// teardown function for the full rationale.
+static CONTEXT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 // Stage-7: per-thread pinned scratch buffer of length `NUM_PARTITIONS + 1`.
 //
 // One 16 KiB page-locked region per thread that ever calls into this
@@ -102,6 +112,22 @@ pub const NUM_PARTITIONS: u32 = 4096;
 // region via `cuMemFreeHost`, so the buffer's lifecycle is bound to the
 // thread that owns it.
 //
+// **Context binding (the multi-engine crash).** `cuMemAllocHost_v2` pins the
+// pages *inside the CUDA context current at allocation time*. The engine mints
+// a fresh context per `Engine`, and `cuCtxDestroy` reclaims that context's
+// pinned allocations on teardown — but this thread-local outlives the context
+// (the thread keeps running across `Engine::new()` / drop cycles). Without a
+// guard, the second engine would reuse a `PinnedHostBuffer` whose host pointer
+// was reclaimed by the first context's `cuCtxDestroy`, then `as_mut_slice()`
+// into now-unmapped pages and `cuMemcpy*Async` against a pinned registration
+// in a dead context — a `STATUS_ACCESS_VIOLATION`. This is the pinned-host
+// analogue of the dangling pooled `CUdeviceptr` that `POOL.drain()` guards and
+// the stale `CudaModule` that `module_cache::clear_all_caches()` guards. We
+// close it by tagging each buffer with the `CONTEXT_EPOCH` it was allocated
+// under and discarding it on mismatch (see `with_pinned_scratch`), plus a
+// clean free of the dropping thread's own buffer at teardown (see
+// `invalidate_pinned_scratch_on_context_teardown`).
+//
 // **Why a `RefCell`**: callers borrow the scratch mutably (to write the
 // downloaded counts and the prefix-summed bases) but only one borrow is
 // ever live at a time — the orchestrator calls a single helper at a time
@@ -109,17 +135,55 @@ pub const NUM_PARTITIONS: u32 = 4096;
 // path therefore never panics under correct use; we surface a clean
 // `BoltError` if it ever does (e.g. a future re-entrant caller).
 thread_local! {
-    /// The thread-local pinned scratch slot. `RefCell<Option<...>>` so we
-    /// can:
+    /// The thread-local pinned scratch slot. `RefCell<Option<(buf, epoch)>>`
+    /// so we can:
     ///   * Lazily allocate on first `with_pinned_scratch` call (`None` → `Some`).
     ///   * Recover from a previous allocation failure by leaving the slot
     ///     `None` and re-attempting on the next call.
+    ///   * Detect that the allocating context was torn down by comparing the
+    ///     stashed `epoch` against [`CONTEXT_EPOCH`].
     ///
     /// `Option` matters because `RefCell` itself can't be empty — without
     /// it we'd have to stash a zero-length placeholder, which the callers
     /// can't distinguish from a real (but truncated) buffer.
-    static PINNED_SCRATCH: RefCell<Option<PinnedHostBuffer<u32>>> =
+    static PINNED_SCRATCH: RefCell<Option<(PinnedHostBuffer<u32>, u64)>> =
         const { RefCell::new(None) };
+}
+
+/// Invalidate the process-wide pinned scratch on `CudaContext` teardown.
+///
+/// Called from `CudaContext::Drop` (alongside `POOL.drain()`,
+/// `stream_pool::drain()`, and `module_cache::clear_all_caches()`) *while the
+/// dying context is still alive and current*. It does two things:
+///
+/// 1. **Frees the dropping thread's own scratch cleanly.** In the supported
+///    single-context model the thread that drops the `Engine` is the same one
+///    that ran the Tier-2 queries, so its `PINNED_SCRATCH` holds a buffer
+///    pinned in the context we're about to destroy. Setting the slot to `None`
+///    here runs `PinnedHostBuffer::Drop` → `cuMemFreeHost` against the still-
+///    live context, reclaiming the pages without a warning.
+///
+/// 2. **Invalidates every other thread's scratch.** A thread-local cannot be
+///    reset from another thread, so for any *other* thread that allocated
+///    scratch under this context we instead bump [`CONTEXT_EPOCH`]. That
+///    thread's next `with_pinned_scratch` observes the stale epoch and
+///    discards its buffer via `forget_pinned_pages` — skipping the now-invalid
+///    `cuMemFreeHost` (the pages were already reclaimed by `cuCtxDestroy`) and
+///    reallocating fresh in the live context. This makes the fix robust beyond
+///    the single-threaded repro without ever touching foreign TLS.
+pub fn invalidate_pinned_scratch_on_context_teardown() {
+    // (1) Free this thread's buffer while the context is still current.
+    PINNED_SCRATCH.with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut() {
+            // Drop -> cuMemFreeHost in the live context (clean reclaim).
+            *slot = None;
+        }
+        // A failed borrow means we're nested inside `with_pinned_scratch`,
+        // which never happens from within a context Drop; ignore it rather
+        // than risk panicking in a destructor.
+    });
+    // (2) Force every other thread's stale buffer to be discarded lazily.
+    CONTEXT_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 /// Run `f` with the calling thread's pinned scratch buffer, allocating
@@ -147,9 +211,22 @@ fn with_pinned_scratch<R>(
                     .into(),
             )
         })?;
+        let epoch = CONTEXT_EPOCH.load(Ordering::Acquire);
+        // Discard a buffer pinned under a now-destroyed context. Its host
+        // pages were reclaimed by that context's `cuCtxDestroy`, so we must
+        // NOT let `cuMemFreeHost` run on the stale pointer — `forget_pinned_pages`
+        // neutralizes the `Drop` before the slot is cleared, then we reallocate
+        // fresh in the live context below.
+        if let Some((buf, buf_epoch)) = slot.as_mut() {
+            if *buf_epoch != epoch {
+                buf.forget_pinned_pages();
+                *slot = None;
+            }
+        }
         if slot.is_none() {
-            // Allocate on first use for this thread. If allocation fails
-            // we leave the slot empty so a later call can retry.
+            // Allocate on first use for this thread (or after a context-epoch
+            // invalidation). If allocation fails we leave the slot empty so a
+            // later call can retry.
             let buf = PinnedHostBuffer::<u32>::new(NUM_PARTITIONS as usize + 1)
                 .map_err(|e| {
                     BoltError::Other(format!(
@@ -157,10 +234,10 @@ fn with_pinned_scratch<R>(
                          pinned scratch (cuMemAllocHost): {e}"
                     ))
                 })?;
-            *slot = Some(buf);
+            *slot = Some((buf, epoch));
         }
         // SAFETY of unwrap: just installed `Some` if it was `None`.
-        let buf = slot.as_mut().expect("pinned scratch was just installed");
+        let (buf, _) = slot.as_mut().expect("pinned scratch was just installed");
         debug_assert!(buf.len() >= NUM_PARTITIONS as usize + 1);
         f(buf)
     })
