@@ -2782,7 +2782,19 @@ fn build_projection_kernel(
                 .unwrap_or(false),
             _ => false,
         });
-        if all_bare && any_utf8 {
+        // Nullable PRIMITIVE columns also cannot be projected on the GPU: the
+        // fused scan kernel emits an `Op::IsNullCheck` to preserve the column's
+        // nulls in the output, but nullable primitives carry no device validity
+        // bitmap (only BoolNullable / DictUtf8 do), so execution fails wiring
+        // the validity pointer. Route such bare passthroughs to the host
+        // `StringProject`, which lifts the column straight from the source batch
+        // with its Arrow null buffer intact. Non-nullable numerics keep the
+        // (more efficient) GPU path below.
+        let any_nullable = projected.iter().any(|(_, e)| match peel_aliases(e) {
+            Expr::Column(name) => scan_schema.field(name).map(|f| f.nullable).unwrap_or(false),
+            _ => false,
+        });
+        if all_bare && (any_utf8 || any_nullable) {
             let mut outputs = Vec::with_capacity(projected.len());
             let mut output_fields = Vec::with_capacity(projected.len());
             for (name, e) in projected {
