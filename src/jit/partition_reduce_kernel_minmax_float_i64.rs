@@ -85,6 +85,258 @@ fn ptx_setp_suffix(dtype: FloatDtype) -> &'static str {
     }
 }
 
+/// Identity bit pattern literal (MIN = +inf, MAX = -inf) for the (op, dtype)
+/// pair. Shared verbatim by both emitters.
+fn identity_lit(op: MinMaxOp, dtype: FloatDtype) -> String {
+    match (op, dtype) {
+        (MinMaxOp::Min, FloatDtype::Float32) => "0x7F800000".to_string(),
+        (MinMaxOp::Max, FloatDtype::Float32) => "0xFF800000".to_string(),
+        (MinMaxOp::Min, FloatDtype::Float64) => "0x7FF0000000000000".to_string(),
+        (MinMaxOp::Max, FloatDtype::Float64) => "0xFFF0000000000000".to_string(),
+    }
+}
+
+/// Emit the three `.shared .align` buffer declarations + trailing blank line.
+/// `suffix` is `""` for the non-spill kernel and `"_sp"` for the spill kernel
+/// (the only divergence: the buffer symbol names).
+fn emit_shared_decls(
+    ptx: &mut String,
+    suffix: &str,
+    val_align: u32,
+    keys_bytes: u32,
+    vals_bytes: u32,
+    set_bytes: u32,
+) -> BoltResult<()> {
+    writeln!(
+        ptx,
+        ".shared .align 8 .b8 block_keys_buf{suffix}[{bytes}];",
+        bytes = keys_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align {a} .b8 block_vals_buf{suffix}[{bytes}];",
+        a = val_align,
+        bytes = vals_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align 4 .b8 block_set_buf{suffix}[{bytes}];",
+        bytes = set_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit Phase 1 (zero shared; vals init to ±inf identity) — the
+/// `mov.u32 %r20, %r2;` seed through the `ZERO_DONE:` / `bar.sync 0;` and
+/// trailing blank line. Byte-identical across both emitters.
+fn emit_zero_init_phase(
+    ptx: &mut String,
+    dtype: FloatDtype,
+    vbpw: u32,
+    identity_lit: &str,
+    block_groups: u32,
+    block_threads: u32,
+) -> BoltResult<()> {
+    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r20, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
+    // block_keys[s] = 0  (i64, 8 B)
+    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u64 [%rd21], 0;").map_err(write_err)?;
+    // block_vals[s] = identity
+    writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, {vbpw};").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
+    match dtype {
+        FloatDtype::Float32 => {
+            writeln!(ptx, "\tst.shared.u32 [%rd23], {identity_lit};").map_err(write_err)?;
+        }
+        FloatDtype::Float64 => {
+            writeln!(ptx, "\tst.shared.u64 [%rd23], {identity_lit};").map_err(write_err)?;
+        }
+    }
+    // block_set[s] = 0  (u32, 4 B)
+    writeln!(ptx, "\tmul.wide.u32 %rd25, %r20, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd25;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r20, %r20, {bt};", bt = block_threads).map_err(write_err)?;
+    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit the Phase-2 probe prologue: `LOOP_TOP:` through the
+/// `mov.u32 %r33, 0;` probe-counter seed. Returns the chosen value register
+/// (`%f0` / `%fd0`) for the caller's CAS loops. Byte-identical across both
+/// emitters (the `val_load` token string is the same for a given dtype).
+fn emit_probe_prologue(
+    ptx: &mut String,
+    dtype: FloatDtype,
+    vbpw: u32,
+    val_load: &str,
+    mask: u32,
+) -> BoltResult<&'static str> {
+    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+
+    // key = partition_keys[i] (i64)
+    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s64 %rd60, [%rd31];").map_err(write_err)?;
+    // val (typed float)
+    writeln!(ptx, "\tmul.wide.u32 %rd32, %r30, {vbpw};").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd33, %rd4, %rd32;").map_err(write_err)?;
+    let val_reg = match dtype {
+        FloatDtype::Float32 => "%f0",
+        FloatDtype::Float64 => "%fd0",
+    };
+    writeln!(ptx, "\t{val_load} {val_reg}, [%rd33];").map_err(write_err)?;
+    // slot = low32(key) & mask
+    writeln!(ptx, "\tcvt.u32.u64 %r31, %rd60;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
+
+    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    Ok(val_reg)
+}
+
+/// Emit the probe-slot address computation (`addr_set` / `addr_key` /
+/// `addr_val`) followed by the claim CAS + `@%p3 bra CLAIM;` branch.
+/// Byte-identical across both emitters.
+fn emit_probe_slot_and_claim(ptx: &mut String, vbpw: u32) -> BoltResult<()> {
+    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?; // addr_set
+    writeln!(ptx, "\tmul.wide.u32 %rd39, %r32, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd39;").map_err(write_err)?; // addr_key (i64)
+    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, {vbpw};").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?; // addr_val
+
+    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit the `CLAIM:` block (publish key, fence, publish set:=2, CAS-loop the
+/// val) then `bra LOOP_NEXT;`, and the `MATCH:` block (CAS-loop the val).
+/// `match_trailer` is appended after the MATCH CAS loop: empty in the
+/// non-spill kernel (MATCH falls through into the inline `LOOP_NEXT:`), or
+/// `"\tbra LOOP_NEXT;\n"` in the spill kernel (whose `LOOP_NEXT:` is emitted
+/// later, after `SPILL_BUMP:`).
+fn emit_claim_and_match(
+    ptx: &mut String,
+    op: MinMaxOp,
+    dtype: FloatDtype,
+    val_reg: &str,
+    match_has_trailing_bra: bool,
+) -> BoltResult<()> {
+    // CLAIM: publish key (i64), fence, then CAS-loop the val.
+    writeln!(ptx, "CLAIM:").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
+    emit_cas_loop(ptx, op, dtype, "CLAIM_CAS", val_reg)?;
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+
+    // MATCH: slot already holds our key. CAS-loop to update the val.
+    writeln!(ptx, "MATCH:").map_err(write_err)?;
+    emit_cas_loop(ptx, op, dtype, "MATCH_CAS", val_reg)?;
+    if match_has_trailing_bra {
+        writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+    }
+    Ok(())
+}
+
+/// Emit Phase 3 (export). `ge_pred` / `ne_pred` are the predicate registers
+/// for the loop-guard `setp.ge.u32` and the presence `setp.ne.s32`: the
+/// non-spill kernel uses `%p5` / `%p6`, the spill kernel `%p6` / `%p7` (their
+/// only divergence — every instruction is otherwise identical).
+fn emit_export_phase(
+    ptx: &mut String,
+    dtype: FloatDtype,
+    vbpw: u32,
+    block_groups: u32,
+    block_threads: u32,
+    ge_pred: &str,
+    ne_pred: &str,
+) -> BoltResult<()> {
+    writeln!(ptx, "\tmul.lo.u32 %r40, %r0, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 {ge_pred}, %r41, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\t@{ge_pred} bra EXPORT_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd45, %rd0, %rd44;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s64 %rd62, [%rd45];").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd46, %r41, {vbpw};").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd47, %rd1, %rd46;").map_err(write_err)?;
+    let export_val_reg = match dtype {
+        FloatDtype::Float32 => "%f8",
+        FloatDtype::Float64 => "%fd8",
+    };
+    match dtype {
+        FloatDtype::Float32 => {
+            writeln!(ptx, "\tld.shared.f32 {export_val_reg}, [%rd47];").map_err(write_err)?;
+        }
+        FloatDtype::Float64 => {
+            writeln!(ptx, "\tld.shared.f64 {export_val_reg}, [%rd47];").map_err(write_err)?;
+        }
+    }
+    writeln!(ptx, "\tmul.wide.u32 %rd48, %r41, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd49, %rd2, %rd48;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.u32 %r49, [%rd49];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 {ne_pred}, %r49, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tselp.u32 %r50, 1, 0, {ne_pred};").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.s64 [%rd51], %rd62;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd52, %r42, {vbpw};").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd53, %rd7, %rd52;").map_err(write_err)?;
+    match dtype {
+        FloatDtype::Float32 => {
+            writeln!(ptx, "\tst.global.f32 [%rd53], {export_val_reg};").map_err(write_err)?;
+        }
+        FloatDtype::Float64 => {
+            writeln!(ptx, "\tst.global.f64 [%rd53], {export_val_reg};").map_err(write_err)?;
+        }
+    }
+    writeln!(ptx, "\tcvt.u64.u32 %rd54, %r42;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd55, %rd8, %rd54;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u8 [%rd55], %r50;").map_err(write_err)?;
+
+    writeln!(ptx, "\tadd.u32 %r41, %r41, {bt};", bt = block_threads).map_err(write_err)?;
+    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
+
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+    Ok(())
+}
+
+/// The `PublishRegs` used by both emitters' collision path (identical
+/// register tokens and key-type token in both kernels).
+fn publish_regs() -> super::partition_reduce_kernel_spill_common::PublishRegs<'static> {
+    super::partition_reduce_kernel_spill_common::PublishRegs {
+        set_flag_reg: "%r36",
+        set_addr_reg: "%rd35",
+        key_addr_reg: "%rd36",
+        key_dst_reg: "%rd61",
+        probe_key_reg: "%rd60",
+    }
+}
+
 pub fn compile_partition_reduce_kernel_minmax_float_i64(
     op: MinMaxOp,
     dtype: FloatDtype,
@@ -103,37 +355,13 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     let val_load = ptx_load(dtype);
 
     // Identity bit pattern: MIN = +inf, MAX = -inf.
-    let identity_lit: String = match (op, dtype) {
-        (MinMaxOp::Min, FloatDtype::Float32) => "0x7F800000".to_string(),
-        (MinMaxOp::Max, FloatDtype::Float32) => "0xFF800000".to_string(),
-        (MinMaxOp::Min, FloatDtype::Float64) => "0x7FF0000000000000".to_string(),
-        (MinMaxOp::Max, FloatDtype::Float64) => "0xFFF0000000000000".to_string(),
-    };
+    let identity_lit = identity_lit(op, dtype);
 
     super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     let val_align = val_bytes_per_slot;
     // Keys are 8-byte aligned (i64).
-    writeln!(
-        ptx,
-        ".shared .align 8 .b8 block_keys_buf[{bytes}];",
-        bytes = keys_bytes
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        ".shared .align {a} .b8 block_vals_buf[{bytes}];",
-        a = val_align,
-        bytes = vals_bytes
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        ".shared .align 4 .b8 block_set_buf[{bytes}];",
-        bytes = set_bytes
-    )
-    .map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    emit_shared_decls(&mut ptx, "", val_align, keys_bytes, vals_bytes, set_bytes)?;
 
     writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
     for p in 0..5 {
@@ -169,75 +397,18 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     writeln!(ptx).map_err(write_err)?;
 
     // Phase 1: zero shared. Vals init to ±inf identity.
-    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
-    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p0, %r20, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
-    // block_keys[s] = 0  (i64, 8 B)
-    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u64 [%rd21], 0;").map_err(write_err)?;
-    // block_vals[s] = identity
     let vbpw = val_bytes_per_slot;
-    writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
-    match dtype {
-        FloatDtype::Float32 => {
-            writeln!(ptx, "\tst.shared.u32 [%rd23], {identity_lit};").map_err(write_err)?;
-        }
-        FloatDtype::Float64 => {
-            writeln!(ptx, "\tst.shared.u64 [%rd23], {identity_lit};").map_err(write_err)?;
-        }
-    }
-    // block_set[s] = 0  (u32, 4 B)
-    writeln!(ptx, "\tmul.wide.u32 %rd25, %r20, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd25;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r20, %r20, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
-    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    emit_zero_init_phase(
+        &mut ptx,
+        dtype,
+        vbpw,
+        &identity_lit,
+        block_groups,
+        block_threads,
+    )?;
 
     // Phase 2: probe + CAS-loop atomic MIN/MAX.
-    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
-    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
-
-    // key = partition_keys[i] (i64)
-    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s64 %rd60, [%rd31];").map_err(write_err)?;
-    // val (typed float)
-    writeln!(ptx, "\tmul.wide.u32 %rd32, %r30, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd33, %rd4, %rd32;").map_err(write_err)?;
-    let val_reg = match dtype {
-        FloatDtype::Float32 => "%f0",
-        FloatDtype::Float64 => "%fd0",
-    };
-    writeln!(ptx, "\t{val_load} {val_reg}, [%rd33];").map_err(write_err)?;
-    // slot = low32(key) & mask
-    writeln!(ptx, "\tcvt.u32.u64 %r31, %rd60;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tand.b32 %r32, %r31, 0x{mask:X};",
-        mask = mask
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
-
-    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    let val_reg = emit_probe_prologue(&mut ptx, dtype, vbpw, val_load, mask)?;
     writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
     writeln!(
         ptx,
@@ -247,16 +418,7 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     .map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra LOOP_NEXT;").map_err(write_err)?;
 
-    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?; // addr_set
-    writeln!(ptx, "\tmul.wide.u32 %rd39, %r32, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd39;").map_err(write_err)?; // addr_key (i64)
-    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?; // addr_val
-
-    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+    emit_probe_slot_and_claim(&mut ptx, vbpw)?;
 
     // Else: slot occupied. membar.cta orders the set CAS against the
     // i64 key load (different addresses) — without this PTX sm_70 lets
@@ -266,13 +428,7 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     // until the claimer publishes set:=2, THEN read the i64 key.
     super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
         &mut ptx,
-        &super::partition_reduce_kernel_spill_common::PublishRegs {
-            set_flag_reg: "%r36",
-            set_addr_reg: "%rd35",
-            key_addr_reg: "%rd36",
-            key_dst_reg: "%rd61",
-            probe_key_reg: "%rd60",
-        },
+        &publish_regs(),
         "s64",
     )?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
@@ -286,17 +442,9 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: publish key (i64), fence, then CAS-loop the val.
-    writeln!(ptx, "CLAIM:").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
-    emit_cas_loop(&mut ptx, op, dtype, "CLAIM_CAS", val_reg)?;
-    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
-
-    // MATCH: slot already holds our key. CAS-loop to update the val.
-    writeln!(ptx, "MATCH:").map_err(write_err)?;
-    emit_cas_loop(&mut ptx, op, dtype, "MATCH_CAS", val_reg)?;
+    // CLAIM + MATCH CAS-loops. Non-spill MATCH falls through into the inline
+    // LOOP_NEXT below, so no trailing `bra LOOP_NEXT;`.
+    emit_claim_and_match(&mut ptx, op, dtype, val_reg, false)?;
 
     writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r30, %r30, %r1;").map_err(write_err)?;
@@ -306,74 +454,15 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64(
     writeln!(ptx).map_err(write_err)?;
 
     // Phase 3: export.
-    writeln!(
-        ptx,
-        "\tmul.lo.u32 %r40, %r0, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
-    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p5, %r41, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p5 bra EXPORT_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd45, %rd0, %rd44;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s64 %rd62, [%rd45];").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd46, %r41, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd47, %rd1, %rd46;").map_err(write_err)?;
-    let export_val_reg = match dtype {
-        FloatDtype::Float32 => "%f8",
-        FloatDtype::Float64 => "%fd8",
-    };
-    match dtype {
-        FloatDtype::Float32 => {
-            writeln!(ptx, "\tld.shared.f32 {export_val_reg}, [%rd47];").map_err(write_err)?;
-        }
-        FloatDtype::Float64 => {
-            writeln!(ptx, "\tld.shared.f64 {export_val_reg}, [%rd47];").map_err(write_err)?;
-        }
-    }
-    writeln!(ptx, "\tmul.wide.u32 %rd48, %r41, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd49, %rd2, %rd48;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.u32 %r49, [%rd49];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ne.s32 %p6, %r49, 0;").map_err(write_err)?;
-    writeln!(ptx, "\tselp.u32 %r50, 1, 0, %p6;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.s64 [%rd51], %rd62;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd52, %r42, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd53, %rd7, %rd52;").map_err(write_err)?;
-    match dtype {
-        FloatDtype::Float32 => {
-            writeln!(ptx, "\tst.global.f32 [%rd53], {export_val_reg};").map_err(write_err)?;
-        }
-        FloatDtype::Float64 => {
-            writeln!(ptx, "\tst.global.f64 [%rd53], {export_val_reg};").map_err(write_err)?;
-        }
-    }
-    writeln!(ptx, "\tcvt.u64.u32 %rd54, %r42;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd55, %rd8, %rd54;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.u8 [%rd55], %r50;").map_err(write_err)?;
-
-    writeln!(
-        ptx,
-        "\tadd.u32 %r41, %r41, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
-    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
-
-    writeln!(ptx, "\tret;").map_err(write_err)?;
-    writeln!(ptx, "}}").map_err(write_err)?;
+    emit_export_phase(
+        &mut ptx,
+        dtype,
+        vbpw,
+        block_groups,
+        block_threads,
+        "%p5",
+        "%p6",
+    )?;
 
     Ok(ptx)
 }
@@ -519,36 +608,12 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64_with_spill(
     let max_probes = MAX_PROBES;
     let vload = ptx_load(dtype);
 
-    let identity_lit: String = match (op, dtype) {
-        (MinMaxOp::Min, FloatDtype::Float32) => "0x7F800000".to_string(),
-        (MinMaxOp::Max, FloatDtype::Float32) => "0xFF800000".to_string(),
-        (MinMaxOp::Min, FloatDtype::Float64) => "0x7FF0000000000000".to_string(),
-        (MinMaxOp::Max, FloatDtype::Float64) => "0xFFF0000000000000".to_string(),
-    };
+    let identity_lit = identity_lit(op, dtype);
 
     super::partition_reduce_kernel_spill_common::emit_ptx_header(&mut ptx)?;
 
     let val_align = val_bytes_per_slot;
-    writeln!(
-        ptx,
-        ".shared .align 8 .b8 block_keys_buf_sp[{bytes}];",
-        bytes = keys_bytes
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        ".shared .align {a} .b8 block_vals_buf_sp[{bytes}];",
-        a = val_align,
-        bytes = vals_bytes
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        ".shared .align 4 .b8 block_set_buf_sp[{bytes}];",
-        bytes = set_bytes
-    )
-    .map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    emit_shared_decls(&mut ptx, "_sp", val_align, keys_bytes, vals_bytes, set_bytes)?;
 
     writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
     for p in 0..6 {
@@ -581,68 +646,17 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64_with_spill(
     super::partition_reduce_kernel_spill_common::emit_partition_slice_read(&mut ptx)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
-    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p0, %r20, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u64 [%rd21], 0;").map_err(write_err)?;
     let vbpw = val_bytes_per_slot;
-    writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
-    match dtype {
-        FloatDtype::Float32 => {
-            writeln!(ptx, "\tst.shared.u32 [%rd23], {identity_lit};").map_err(write_err)?;
-        }
-        FloatDtype::Float64 => {
-            writeln!(ptx, "\tst.shared.u64 [%rd23], {identity_lit};").map_err(write_err)?;
-        }
-    }
-    writeln!(ptx, "\tmul.wide.u32 %rd25, %r20, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd25;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r20, %r20, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
-    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    emit_zero_init_phase(
+        &mut ptx,
+        dtype,
+        vbpw,
+        &identity_lit,
+        block_groups,
+        block_threads,
+    )?;
 
-    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
-    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s64 %rd60, [%rd31];").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd32, %r30, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd33, %rd4, %rd32;").map_err(write_err)?;
-    let val_reg = match dtype {
-        FloatDtype::Float32 => "%f0",
-        FloatDtype::Float64 => "%fd0",
-    };
-    writeln!(ptx, "\t{vload} {val_reg}, [%rd33];").map_err(write_err)?;
-    writeln!(ptx, "\tcvt.u32.u64 %r31, %rd60;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tand.b32 %r32, %r31, 0x{mask:X};",
-        mask = mask
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
-
-    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    let val_reg = emit_probe_prologue(&mut ptx, dtype, vbpw, vload, mask)?;
     writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
     writeln!(
         ptx,
@@ -650,29 +664,15 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64_with_spill(
         mp = max_probes
     )
     .map_err(write_err)?;
+    // Spill divergence: overflow jumps to SPILL_BUMP instead of LOOP_NEXT.
     writeln!(ptx, "\t@%p2 bra SPILL_BUMP;").map_err(write_err)?;
 
-    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd39, %r32, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd39;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?;
-
-    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+    emit_probe_slot_and_claim(&mut ptx, vbpw)?;
 
     // 3-state publish protocol (claim-then-write race fix).
     super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
         &mut ptx,
-        &super::partition_reduce_kernel_spill_common::PublishRegs {
-            set_flag_reg: "%r36",
-            set_addr_reg: "%rd35",
-            key_addr_reg: "%rd36",
-            key_dst_reg: "%rd61",
-            probe_key_reg: "%rd60",
-        },
+        &publish_regs(),
         "s64",
     )?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
@@ -682,91 +682,26 @@ pub fn compile_partition_reduce_kernel_minmax_float_i64_with_spill(
         mask = mask
     )
     .map_err(write_err)?;
+    // Spill divergence: collision path has no back-off; jump straight back.
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    writeln!(ptx, "CLAIM:").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
-    emit_cas_loop(&mut ptx, op, dtype, "CLAIM_CAS", val_reg)?;
-    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
-
-    writeln!(ptx, "MATCH:").map_err(write_err)?;
-    emit_cas_loop(&mut ptx, op, dtype, "MATCH_CAS", val_reg)?;
-    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+    // CLAIM + MATCH CAS-loops. Spill MATCH branches to LOOP_NEXT (which is
+    // emitted after SPILL_BUMP), so it needs a trailing `bra LOOP_NEXT;`.
+    emit_claim_and_match(&mut ptx, op, dtype, val_reg, true)?;
 
     super::partition_reduce_kernel_spill_common::emit_spill_bump_with_null_check(&mut ptx, 9)?;
 
     super::partition_reduce_kernel_spill_common::emit_loop_next_done(&mut ptx)?;
 
-    writeln!(
-        ptx,
-        "\tmul.lo.u32 %r40, %r0, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
-    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p6, %r41, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p6 bra EXPORT_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd45, %rd0, %rd44;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s64 %rd62, [%rd45];").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd46, %r41, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd47, %rd1, %rd46;").map_err(write_err)?;
-    let export_val_reg = match dtype {
-        FloatDtype::Float32 => "%f8",
-        FloatDtype::Float64 => "%fd8",
-    };
-    match dtype {
-        FloatDtype::Float32 => {
-            writeln!(ptx, "\tld.shared.f32 {export_val_reg}, [%rd47];").map_err(write_err)?;
-        }
-        FloatDtype::Float64 => {
-            writeln!(ptx, "\tld.shared.f64 {export_val_reg}, [%rd47];").map_err(write_err)?;
-        }
-    }
-    writeln!(ptx, "\tmul.wide.u32 %rd48, %r41, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd49, %rd2, %rd48;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.u32 %r49, [%rd49];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ne.s32 %p7, %r49, 0;").map_err(write_err)?;
-    writeln!(ptx, "\tselp.u32 %r50, 1, 0, %p7;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.s64 [%rd51], %rd62;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd52, %r42, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd53, %rd7, %rd52;").map_err(write_err)?;
-    match dtype {
-        FloatDtype::Float32 => {
-            writeln!(ptx, "\tst.global.f32 [%rd53], {export_val_reg};").map_err(write_err)?;
-        }
-        FloatDtype::Float64 => {
-            writeln!(ptx, "\tst.global.f64 [%rd53], {export_val_reg};").map_err(write_err)?;
-        }
-    }
-    writeln!(ptx, "\tcvt.u64.u32 %rd54, %r42;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd55, %rd8, %rd54;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.u8 [%rd55], %r50;").map_err(write_err)?;
-
-    writeln!(
-        ptx,
-        "\tadd.u32 %r41, %r41, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
-    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
-
-    writeln!(ptx, "\tret;").map_err(write_err)?;
-    writeln!(ptx, "}}").map_err(write_err)?;
+    emit_export_phase(
+        &mut ptx,
+        dtype,
+        vbpw,
+        block_groups,
+        block_threads,
+        "%p6",
+        "%p7",
+    )?;
 
     Ok(ptx)
 }

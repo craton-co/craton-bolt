@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-partition shared-memory GROUP BY **COUNT(*)** kernel — Tier 2.1
 //! companion to `partition_reduce_kernel_multi`.
@@ -31,6 +31,19 @@
 //!   block_keys   : i32 × 1024 =  4 KiB
 //!   block_counts : u64 × 1024 =  8 KiB
 //!   block_set    : u32 × 1024 =  4 KiB
+//!
+//! ## Intra-file dedup
+//!
+//! The non-spill [`compile_partition_reduce_kernel_count`] and the
+//! [`compile_partition_reduce_kernel_count_with_spill`] sibling share ~80%
+//! of their PTX body. The identical phases — the per-partition slice read,
+//! the shared-array zero-init, the probe + atomic-count loop, and the
+//! export — are factored here into the private `emit_*` helpers below.
+//! Each helper emits the exact bytes both emitters previously wrote inline;
+//! the few divergent tokens (the buffer-name suffix, the over-probe branch
+//! target, the collision back-off, and the `MATCH` trailing branch) are
+//! threaded through as parameters so the PTX golden snapshots
+//! (`tests/ptx_golden_partition_snapshots.rs`) stay byte-identical.
 
 use std::fmt::Write;
 
@@ -62,6 +75,197 @@ pub const KERNEL_ENTRY: &str = "bolt_partition_reduce_count";
 /// Distinct from [`KERNEL_ENTRY`] so both PTX modules can coexist in the
 /// JIT cache.
 pub const KERNEL_ENTRY_WITH_SPILL: &str = "bolt_partition_reduce_count_spill";
+
+// ---------------------------------------------------------------------------
+// Private shared-phase emitters.
+//
+// Both the non-spill and the `_with_spill` emitter call these. Every helper
+// reproduces the exact byte sequence its caller previously wrote inline; the
+// only variation is threaded through explicit parameters (the buffer-name
+// suffix, the over-probe branch target, whether the collision-advance path
+// emits the `nanosleep` back-off, and whether `MATCH` ends with an explicit
+// `bra LOOP_NEXT`). Keeping the literal `%r*` / `%rd*` tokens identical to the
+// originals preserves the register-appearance order the golden snapshots
+// normalize against.
+// ---------------------------------------------------------------------------
+
+/// Emit the per-partition slice read: `start = offsets[pid]`,
+/// `end = offsets[pid+1]` into `%r10` / `%r11`. The COUNT kernels keep the
+/// offsets pointer in `%rd4` (their reduced param list has no values array),
+/// so this is NOT the `spill_common::emit_partition_slice_read` helper, which
+/// expects `%rd5`.
+fn emit_offsets_read(ptx: &mut String) -> BoltResult<()> {
+    // start, end = offsets[pid], offsets[pid+1]
+    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd11, %rd4, %rd10;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit Phase 1 — the strided zero-init of `block_keys` / `block_counts` /
+/// `block_set` followed by `bar.sync 0`. Byte-identical between the two
+/// emitters.
+fn emit_zero_phase(ptx: &mut String, block_groups: u32, block_threads: u32) -> BoltResult<()> {
+    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r20, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd21], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u64 [%rd23], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r20, %r20, {bt};", bt = block_threads).map_err(write_err)?;
+    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
+    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit Phase 2 — the probe + atomic-count loop, from the `LOOP_TOP` setup
+/// through the `MATCH` accumulate. The four divergence points between the two
+/// emitters are parameterised:
+///
+///   * `over_probe_target` — the `@%p2 bra <target>` taken when the linear
+///     probe exceeds `max_probes`: `"LOOP_NEXT"` (non-spill, silently drops
+///     the row) vs `"SPILL_BUMP"` (spill, bumps the counter).
+///   * `spill` — when `false`, the collision-advance path emits the
+///     `nanosleep.u32` occupancy back-off before `bra PROBE_TOP`; the spill
+///     path drops it. When `true`, the `MATCH` accumulate ends with an
+///     explicit `bra LOOP_NEXT;` (the spill emitter follows `MATCH` with the
+///     `SPILL_BUMP` block, so it cannot fall through); the non-spill emitter
+///     lets `MATCH` fall straight into the `LOOP_NEXT` label that immediately
+///     follows it.
+fn emit_probe_loop(
+    ptx: &mut String,
+    mask: u32,
+    max_probes: u32,
+    over_probe_target: &str,
+    spill: bool,
+) -> BoltResult<()> {
+    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+
+    // key = partition_keys[i]
+    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.s32 %r31, [%rd31];").map_err(write_err)?;
+
+    // slot = key & mask
+    writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
+
+    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p2, %r33, {mp};", mp = max_probes).map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 bra {target};", target = over_probe_target).map_err(write_err)?;
+
+    // Slot addresses:
+    //   addr_set   = block_set    + slot * 4
+    //   addr_key   = block_keys   + slot * 4
+    //   addr_count = block_counts + slot * 8
+    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd34;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?;
+
+    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+
+    // 3-state publish protocol (claim-then-write race fix; see
+    // partition_reduce_kernel.rs). Slot occupied (set is 1=claiming or
+    // 2=ready). Spin on a VOLATILE SHARED re-read of set (a bare
+    // ld.acquire.cta defaults to global space and faults on the shared
+    // offset) until the claimer publishes set:=2, yielding via nanosleep so
+    // the same-warp claimer can run, THEN read the key.
+    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
+        ptx,
+        &super::partition_reduce_kernel_spill_common::PublishRegs {
+            set_flag_reg: "%r36",
+            set_addr_reg: "%rd35",
+            key_addr_reg: "%rd36",
+            key_dst_reg: "%r35",
+            probe_key_reg: "%r31",
+        },
+        "s32",
+    )?;
+    writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r32, %r32, 0x{mask:X};", mask = mask).map_err(write_err)?;
+    if !spill {
+        // Occupancy-friendly back-off on the collision-advance path
+        // (sm_70+). See partition_reduce_kernel.rs for full rationale. The
+        // spill variant omits the back-off and jumps straight to PROBE_TOP.
+        super::partition_reduce_kernel_spill_common::emit_spin_backoff(ptx, SPIN_BACKOFF_NS)?;
+    }
+    writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
+
+    // CLAIM: publish the key, fence so racing readers see it, then
+    // atomically add 1 to the count.
+    writeln!(ptx, "CLAIM:").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.shared.add.u64 %rd40, [%rd38], 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+
+    writeln!(ptx, "MATCH:").map_err(write_err)?;
+    writeln!(ptx, "\tatom.shared.add.u64 %rd41, [%rd38], 1;").map_err(write_err)?;
+    if spill {
+        // The spill emitter places the SPILL_BUMP block immediately after
+        // MATCH, so MATCH must branch over it; the non-spill emitter falls
+        // straight through into the LOOP_NEXT label that follows.
+        writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+    }
+    Ok(())
+}
+
+/// Emit Phase 3 — the strided export of `(key, count, set)` from shared to
+/// global. Byte-identical between the two emitters.
+fn emit_export_phase(ptx: &mut String, block_groups: u32, block_threads: u32) -> BoltResult<()> {
+    writeln!(ptx, "\tmul.lo.u32 %r40, %r0, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p5, %r41, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra EXPORT_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd42, %r41, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd43, %rd0, %rd42;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r43, [%rd43];").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd45, %rd1, %rd44;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.u64 %rd46, [%rd45];").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd47, %rd2, %rd42;").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.u32 %r44, [%rd47];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 %p6, %r44, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tselp.u32 %r45, 1, 0, %p6;").map_err(write_err)?;
+
+    writeln!(ptx, "\tmul.wide.u32 %rd48, %r42, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd49, %rd5, %rd48;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.s32 [%rd49], %r43;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u64 [%rd51], %rd46;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u64.u32 %rd52, %r42;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd53, %rd7, %rd52;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u8 [%rd53], %r45;").map_err(write_err)?;
+
+    writeln!(ptx, "\tadd.u32 %r41, %r41, {bt};", bt = block_threads).map_err(write_err)?;
+    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
+    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
+    Ok(())
+}
 
 /// Generate PTX for the COUNT(*) per-partition reduce kernel.
 ///
@@ -151,127 +355,13 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     writeln!(ptx, "\tcvta.to.global.u64 %rd7, %rd7;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    // start, end = offsets[pid], offsets[pid+1]
-    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd11, %rd4, %rd10;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    emit_offsets_read(&mut ptx)?;
 
     // ---------- Phase 1: zero shared arrays --------------------------------
-    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
-    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p0, %r20, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd21], 0;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u64 [%rd23], 0;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r20, %r20, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
-    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    emit_zero_phase(&mut ptx, block_groups, block_threads)?;
 
     // ---------- Phase 2: probe + atomic count ------------------------------
-    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
-    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
-
-    // key = partition_keys[i]
-    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s32 %r31, [%rd31];").map_err(write_err)?;
-
-    // slot = key & mask
-    writeln!(
-        ptx,
-        "\tand.b32 %r32, %r31, 0x{mask:X};",
-        mask = mask
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
-
-    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.gt.u32 %p2, %r33, {mp};",
-        mp = max_probes
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p2 bra LOOP_NEXT;").map_err(write_err)?;
-
-    // Slot addresses:
-    //   addr_set   = block_set    + slot * 4
-    //   addr_key   = block_keys   + slot * 4
-    //   addr_count = block_counts + slot * 8
-    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd34;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?;
-
-    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
-
-    // 3-state publish protocol (claim-then-write race fix; see
-    // partition_reduce_kernel.rs). Slot occupied (set is 1=claiming or
-    // 2=ready). Spin on a VOLATILE SHARED re-read of set (a bare
-    // ld.acquire.cta defaults to global space and faults on the shared
-    // offset) until the claimer publishes set:=2, yielding via nanosleep so
-    // the same-warp claimer can run, THEN read the key.
-    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
-        &mut ptx,
-        &super::partition_reduce_kernel_spill_common::PublishRegs {
-            set_flag_reg: "%r36",
-            set_addr_reg: "%rd35",
-            key_addr_reg: "%rd36",
-            key_dst_reg: "%r35",
-            probe_key_reg: "%r31",
-        },
-        "s32",
-    )?;
-    writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tand.b32 %r32, %r32, 0x{mask:X};",
-        mask = mask
-    )
-    .map_err(write_err)?;
-    // Occupancy-friendly back-off on the collision-advance path
-    // (sm_70+). See partition_reduce_kernel.rs for full rationale.
-    super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
-    writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
-
-    // CLAIM: publish the key, fence so racing readers see it, then
-    // atomically add 1 to the count.
-    writeln!(ptx, "CLAIM:").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
-    writeln!(ptx, "\tatom.shared.add.u64 %rd40, [%rd38], 1;").map_err(write_err)?;
-    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
-
-    writeln!(ptx, "MATCH:").map_err(write_err)?;
-    writeln!(ptx, "\tatom.shared.add.u64 %rd41, [%rd38], 1;").map_err(write_err)?;
+    emit_probe_loop(&mut ptx, mask, max_probes, "LOOP_NEXT", false)?;
 
     writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r30, %r30, %r1;").map_err(write_err)?;
@@ -281,52 +371,7 @@ pub fn compile_partition_reduce_kernel_count() -> BoltResult<String> {
     writeln!(ptx).map_err(write_err)?;
 
     // ---------- Phase 3: export ---------------------------------------------
-    writeln!(
-        ptx,
-        "\tmul.lo.u32 %r40, %r0, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
-    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p5, %r41, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p5 bra EXPORT_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd42, %r41, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd43, %rd0, %rd42;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r43, [%rd43];").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd45, %rd1, %rd44;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.u64 %rd46, [%rd45];").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd47, %rd2, %rd42;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.u32 %r44, [%rd47];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ne.s32 %p6, %r44, 0;").map_err(write_err)?;
-    writeln!(ptx, "\tselp.u32 %r45, 1, 0, %p6;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd48, %r42, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd49, %rd5, %rd48;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.s32 [%rd49], %r43;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.u64 [%rd51], %rd46;").map_err(write_err)?;
-    writeln!(ptx, "\tcvt.u64.u32 %rd52, %r42;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd53, %rd7, %rd52;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.u8 [%rd53], %r45;").map_err(write_err)?;
-
-    writeln!(
-        ptx,
-        "\tadd.u32 %r41, %r41, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
-    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
+    emit_export_phase(&mut ptx, block_groups, block_threads)?;
 
     writeln!(ptx, "\tret;").map_err(write_err)?;
     writeln!(ptx, "}}").map_err(write_err)?;
@@ -415,111 +460,13 @@ pub fn compile_partition_reduce_kernel_count_with_spill() -> BoltResult<String> 
     writeln!(ptx, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, "\tmul.wide.u32 %rd10, %r0, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd11, %rd4, %rd10;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r10, [%rd11];").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd12, %rd11, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.u32 %r11, [%rd12];").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    emit_offsets_read(&mut ptx)?;
 
     // Zero shared arrays.
-    writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
-    writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p0, %r20, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd21], 0;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u64 [%rd23], 0;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r20, %r20, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
-    writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-    writeln!(ptx).map_err(write_err)?;
+    emit_zero_phase(&mut ptx, block_groups, block_threads)?;
 
     // Probe + count.
-    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
-    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s32 %r31, [%rd31];").map_err(write_err)?;
-
-    writeln!(
-        ptx,
-        "\tand.b32 %r32, %r31, 0x{mask:X};",
-        mask = mask
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
-
-    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.gt.u32 %p2, %r33, {mp};",
-        mp = max_probes
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p2 bra SPILL_BUMP;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd34;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?;
-
-    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
-
-    // 3-state publish protocol (claim-then-write race fix).
-    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
-        &mut ptx,
-        &super::partition_reduce_kernel_spill_common::PublishRegs {
-            set_flag_reg: "%r36",
-            set_addr_reg: "%rd35",
-            key_addr_reg: "%rd36",
-            key_dst_reg: "%r35",
-            probe_key_reg: "%r31",
-        },
-        "s32",
-    )?;
-    writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tand.b32 %r32, %r32, 0x{mask:X};",
-        mask = mask
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
-
-    writeln!(ptx, "CLAIM:").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
-    writeln!(ptx, "\tatom.shared.add.u64 %rd40, [%rd38], 1;").map_err(write_err)?;
-    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
-
-    writeln!(ptx, "MATCH:").map_err(write_err)?;
-    writeln!(ptx, "\tatom.shared.add.u64 %rd41, [%rd38], 1;").map_err(write_err)?;
-    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+    emit_probe_loop(&mut ptx, mask, max_probes, "SPILL_BUMP", true)?;
 
     // Unchecked SPILL_BUMP: i32-key COUNT predates the null-check
     // convention; preserved as-is for PTX golden parity.
@@ -528,52 +475,7 @@ pub fn compile_partition_reduce_kernel_count_with_spill() -> BoltResult<String> 
     super::partition_reduce_kernel_spill_common::emit_loop_next_done(&mut ptx)?;
 
     // Export.
-    writeln!(
-        ptx,
-        "\tmul.lo.u32 %r40, %r0, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
-    writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p5, %r41, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\t@%p5 bra EXPORT_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd42, %r41, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd43, %rd0, %rd42;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r43, [%rd43];").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd45, %rd1, %rd44;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.u64 %rd46, [%rd45];").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd47, %rd2, %rd42;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.u32 %r44, [%rd47];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ne.s32 %p6, %r44, 0;").map_err(write_err)?;
-    writeln!(ptx, "\tselp.u32 %r45, 1, 0, %p6;").map_err(write_err)?;
-
-    writeln!(ptx, "\tmul.wide.u32 %rd48, %r42, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd49, %rd5, %rd48;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.s32 [%rd49], %r43;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.u64 [%rd51], %rd46;").map_err(write_err)?;
-    writeln!(ptx, "\tcvt.u64.u32 %rd52, %r42;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd53, %rd7, %rd52;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.u8 [%rd53], %r45;").map_err(write_err)?;
-
-    writeln!(
-        ptx,
-        "\tadd.u32 %r41, %r41, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tbra EXPORT_TOP;").map_err(write_err)?;
-    writeln!(ptx, "EXPORT_DONE:").map_err(write_err)?;
+    emit_export_phase(&mut ptx, block_groups, block_threads)?;
 
     writeln!(ptx, "\tret;").map_err(write_err)?;
     writeln!(ptx, "}}").map_err(write_err)?;
