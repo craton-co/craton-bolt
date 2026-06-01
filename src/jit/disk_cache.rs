@@ -156,22 +156,21 @@ pub(crate) const CODEGEN_VERSION: u32 = 2;
 ///
 /// To reduce reliance on that manual constant we *also* fold an
 /// automatically-derived fingerprint into the salt when one is available
-/// at compile time. If `build.rs` is ever extended to emit
+/// at compile time. `build.rs` emits
 /// `cargo:rustc-env=BOLT_CODEGEN_FINGERPRINT=<hash-of-codegen-surface>`
-/// (e.g. a digest over `ptx_gen.rs` / the codegen module tree), this
-/// helper consumes it via [`option_env!`] with **zero** edits here and
-/// **no** new dependency. When the env var is absent (today's build),
-/// `option_env!` resolves to `None` at compile time and the salt falls
-/// back to `CODEGEN_VERSION` + crate version alone — i.e. the previous
-/// behaviour, never weaker.
+/// (a stable 128-bit FNV-1a digest over the `src/jit/*.rs` codegen tree),
+/// and this helper consumes it via [`option_env!`] with **no** new
+/// dependency. Because the digest rotates on *any* change to the codegen
+/// source, a forgotten [`CODEGEN_VERSION`] bump no longer silently serves
+/// stale PTX — the key rotates automatically instead.
 ///
-/// We consume it (rather than requiring it) so that the file compiles
-/// unchanged under the current `build.rs`, including the
-/// `--no-default-features --features cuda-stub` build, while
-/// automatically tightening the moment a fingerprint is wired up.
-///
-/// NOTE: We deliberately do NOT edit `build.rs` here — this file only
-/// *reads* the variable if a future build script provides it.
+/// We consume it via [`option_env!`] (rather than `env!`) so the file
+/// still compiles even if the env var is absent — e.g. if `build.rs`
+/// couldn't read `src/jit/` and fell back to emitting nothing. In that
+/// case `option_env!` resolves to `None` at compile time and the salt
+/// falls back to `CODEGEN_VERSION` + crate version alone — i.e. the
+/// previous behaviour, never weaker. This also keeps the
+/// `--no-default-features --features cuda-stub` build working unchanged.
 const CODEGEN_FINGERPRINT: Option<&str> = option_env!("BOLT_CODEGEN_FINGERPRINT");
 
 /// Compose the codegen-version salt component for the disk cache key.
@@ -187,18 +186,22 @@ const CODEGEN_FINGERPRINT: Option<&str> = option_env!("BOLT_CODEGEN_FINGERPRINT"
 ///      keys. Across releases the crate version always changes, so even a
 ///      forgotten `CODEGEN_VERSION` bump can't serve another release's
 ///      stale PTX.
-///   3. An optional compile-time codegen fingerprint
-///      ([`CODEGEN_FINGERPRINT`], `fp<hash>`) — present only when
-///      `build.rs` exports `BOLT_CODEGEN_FINGERPRINT`. When present it
-///      makes the salt rotate *automatically* on any change to the
-///      codegen surface, so a forgotten manual bump is caught even
-///      between local dev builds of the same crate version.
+///   3. The compile-time codegen fingerprint
+///      ([`CODEGEN_FINGERPRINT`], `fp<hash>`) — supplied by `build.rs`,
+///      which hashes the `src/jit/*.rs` codegen tree into a stable digest
+///      and exports `BOLT_CODEGEN_FINGERPRINT`. It makes the salt rotate
+///      *automatically* on any change to the codegen surface, so a
+///      forgotten manual bump is caught even between local dev builds of
+///      the same crate version. It is absent only in the degenerate case
+///      where `build.rs` could not read `src/jit/` (it then emits nothing
+///      and the salt falls back to signals 1+2 — never weaker).
 ///
 /// NOTE / MAINTAINERS: this salt MUST change whenever the emitted PTX
-/// *text* changes for an otherwise-identical `KernelSpec`. Until a
-/// `build.rs` fingerprint is wired up (signal 3), bumping
-/// [`CODEGEN_VERSION`] is the load-bearing way to do that within a single
-/// crate version — see the maintainer note on [`CODEGEN_VERSION`].
+/// *text* changes for an otherwise-identical `KernelSpec`. The `build.rs`
+/// fingerprint (signal 3) now does this automatically for any change to
+/// the `src/jit/` codegen source; bumping [`CODEGEN_VERSION`] remains the
+/// belt-and-braces in-release guard — see the maintainer note on
+/// [`CODEGEN_VERSION`].
 ///
 /// Returned as a short, filename-safe string (no path separators, no
 /// shell metacharacters — the crate version is `MAJOR.MINOR.PATCH[-pre]`

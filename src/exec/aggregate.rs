@@ -240,6 +240,23 @@ fn build_one_aggregate(
             let op = ReduceOp::from_agg(agg)?;
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
+            // SQL semantics: SUM/MIN/MAX over an empty or all-NULL input is
+            // NULL, not the reduction identity (0 for SUM, ±inf / i64::MAX /
+            // i64::MIN for MIN/MAX). Detect the zero-valid-rows case up front
+            // and emit a single NULL row when the planner has marked the
+            // output field nullable — mirroring the Decimal128 MIN/MAX fold
+            // (`minmax_decimal128_from_batch`, seed `None`) and the AVG path
+            // (`avg_result_array`). The GPU/host reduction below still seeds
+            // from the identity for the non-empty happy path, which is only
+            // reached when at least one valid row exists. (If the field were
+            // somehow non-nullable we fall through to the legacy identity so
+            // `RecordBatch::try_new` doesn't reject a null in a non-nullable
+            // column.)
+            if out_field.nullable
+                && non_null_count_for_input(col_io, table_batch)? == 0
+            {
+                return null_scalar_array(out_field.dtype);
+            }
             // Decimal128: SUM via the dedicated i128 GPU block-reduce kernel
             // (`decimal_sum_from_batch`; host-fold fallback inside it). MIN/MAX
             // via the host fold over the decoded `Decimal128Array` (raw i128
@@ -1742,6 +1759,22 @@ trait ReduceScalar: Sized + Copy {
 
 impl ReduceScalar for i32 {
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
+        // INVARIANT (V-10): SUM(Int32) is ALWAYS widened to an i64 accumulator
+        // before it reaches a host finalize — the SUM(Int32) dispatch site in
+        // `reduce_column_from_batch` routes through `reduce_gpu_vec_widened::
+        // <i32, i64>`, which finalizes via the `i64` `ReduceScalar` impl (whose
+        // Sum arm uses `checked_add` and errors loudly on overflow). This i32
+        // finalize is therefore only ever reached for MIN/MAX (and COUNT, a
+        // synthesized sum-over-ones that cannot overflow i32). The `Sum` arm
+        // below is unreachable for a real SUM; we assert that here so a future
+        // dispatch change that accidentally routes a native i32 SUM through this
+        // (silently wrapping) fold is caught in debug builds rather than
+        // producing a wrong answer.
+        debug_assert!(
+            !matches!(op, ReduceOp::Sum),
+            "SUM(Int32) must widen to i64 before host finalize (see i64 ReduceScalar); \
+             the i32 finalize Sum arm is unreachable for a real SUM"
+        );
         let acc = match op {
             ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0i32, i32::wrapping_add),
             ReduceOp::Min => host.iter().copied().fold(i32::MAX, i32::min),
@@ -2006,6 +2039,44 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
         (s, dt) => Err(BoltError::Type(format!(
             "aggregate: cannot pack scalar {:?} into output dtype {:?}",
             s, dt
+        ))),
+    }
+}
+
+/// Build a single-row, all-NULL Arrow array of `out_dtype`. Used by the
+/// scalar SUM/MIN/MAX path when the input is empty or all-NULL: SQL says the
+/// result is NULL, not the reduction identity. The output field must be
+/// nullable (the caller gates on `out_field.nullable`) — a NULL in a
+/// non-nullable column would be rejected by `RecordBatch::try_new`. Mirrors
+/// the `None`-seeded packing in `minmax_decimal128_from_batch` and the
+/// nullable branch of `avg_result_array`.
+fn null_scalar_array(out_dtype: DataType) -> BoltResult<ArrayRef> {
+    match out_dtype {
+        DataType::Int32 => Ok(Arc::new(Int32Array::from(vec![Option::<i32>::None])) as ArrayRef),
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(vec![Option::<i64>::None])) as ArrayRef),
+        DataType::Float32 => {
+            Ok(Arc::new(Float32Array::from(vec![Option::<f32>::None])) as ArrayRef)
+        }
+        DataType::Float64 => {
+            Ok(Arc::new(Float64Array::from(vec![Option::<f64>::None])) as ArrayRef)
+        }
+        // SUM(Decimal128) widens to Decimal128(38, s); MIN/MAX preserve the
+        // input (p, s). A `None` validity bit packs SQL NULL; the (p, s) tag
+        // still has to satisfy Arrow so we carry the declared output scale.
+        DataType::Decimal128(p, s) => {
+            let arr = Decimal128Array::from(vec![Option::<i128>::None])
+                .with_precision_and_scale(p, s)
+                .map_err(|e| {
+                    BoltError::Type(format!(
+                        "aggregate NULL result: precision/scale {:?} rejected by Arrow: {e}",
+                        (p, s)
+                    ))
+                })?;
+            Ok(Arc::new(arr) as ArrayRef)
+        }
+        other => Err(BoltError::Type(format!(
+            "aggregate: cannot build NULL scalar for output dtype {:?}",
+            other
         ))),
     }
 }

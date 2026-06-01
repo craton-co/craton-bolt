@@ -55,10 +55,15 @@ device.
 
 ## Q7. Why does `SUM(int_col)` return `Int64` even when the column is `Int32`?
 
-Widening. `SUM(Int32) -> Int64` prevents silent wraparound on long
+Widening. `SUM(Int32) -> Int64` gives the accumulator headroom on long
 columns; `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The
 widening is applied consistently in the scalar and GROUP BY paths via
-`crate::plan::logical_plan::sum_output_dtype`.
+`crate::plan::logical_plan::sum_output_dtype`. Note that widening is not a
+substitute for overflow safety: if the `i64` accumulator does overflow, the
+query fails loudly with a `BoltError::Type("SUM(integer) overflow")` rather
+than wrapping silently (the same applies to `SUM(Decimal128)`). See
+[`SQL_REFERENCE.md`](SQL_REFERENCE.md) and [`LIMITATIONS.md`](LIMITATIONS.md)
+for the full overflow semantics, including the grouped-`SUM` streaming caveat.
 
 ## Q8. Are `SELECT t.col FROM t` and `SELECT COL FROM t` (uppercase) accepted?
 

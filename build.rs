@@ -4,6 +4,23 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA_STUB");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RUST_CUDA");
 
+    // --- Auto-rotating codegen fingerprint ------------------------------
+    //
+    // Hash the codegen source tree (`src/jit/*.rs`) into a stable hex
+    // digest and export it as `BOLT_CODEGEN_FINGERPRINT`. The disk PTX
+    // cache (src/jit/disk_cache.rs) reads it via `option_env!` and folds
+    // it into the codegen salt, so ANY change to PTX-emitting source
+    // automatically rotates the on-disk cache key — removing the manual
+    // `CODEGEN_VERSION` bump as a single point of failure (it remains as
+    // a complementary in-release guard; the fingerprint is additive).
+    //
+    // The digest is deterministic: files are hashed in sorted filename
+    // order and only file *bytes* (plus the bare filename) feed the hash
+    // — no timestamps, no absolute paths. If the directory can't be read
+    // we emit nothing rather than panicking, so the consumer falls back
+    // to `CODEGEN_VERSION` + crate version alone (never weaker).
+    emit_codegen_fingerprint();
+
     // --- Wave A: rust-cuda PTX generation -------------------------------
     //
     // When `--features rust-cuda` is on, compile the kernels/ crate to
@@ -149,6 +166,91 @@ fn main() {
              (or place it under the standard install root)."
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Codegen fingerprint: auto-rotate the disk PTX cache key on codegen changes.
+// ---------------------------------------------------------------------------
+//
+// Computes a stable hex digest over `src/jit/*.rs` and emits it as
+// `cargo:rustc-env=BOLT_CODEGEN_FINGERPRINT=<digest>`, plus a
+// `rerun-if-changed` on the directory (and each hashed file) so the digest
+// recomputes whenever the codegen surface changes.
+//
+// The hash is a self-contained 128-bit FNV-1a fold (no external crate): for
+// each `*.rs` file, in sorted filename order, we mix in the bare filename,
+// the byte length, and the raw file bytes. Sorted order + filename-only (no
+// absolute paths) + no timestamps make the digest reproducible across hosts
+// and checkouts for identical source.
+fn emit_codegen_fingerprint() {
+    use std::path::Path;
+
+    // Always re-run when the directory changes (file added/removed/edited).
+    println!("cargo:rerun-if-changed=src/jit");
+
+    let jit_dir = Path::new("src/jit");
+
+    // Collect `(filename, path)` for every readable `*.rs` file, sorted by
+    // filename so the hash is order-independent of the OS directory listing.
+    let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(jit_dir) else {
+        // Codegen dir unreadable: fall back gracefully — emit no env var so
+        // `option_env!` resolves to `None` and the salt uses CODEGEN_VERSION
+        // + crate version alone (i.e. prior behaviour, never weaker).
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".rs") {
+            files.push((name, path));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // 128-bit FNV-1a, split into two 64-bit lanes seeded with distinct
+    // offset bases so the digest is wider than a single u64 (cheap collision
+    // headroom) without pulling in a hashing crate.
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hi: u64 = FNV_OFFSET;
+    let mut lo: u64 = FNV_OFFSET ^ 0x5555_5555_5555_5555;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            hi ^= u64::from(b);
+            hi = hi.wrapping_mul(FNV_PRIME);
+            lo ^= u64::from(b).rotate_left(1);
+            lo = lo.wrapping_mul(FNV_PRIME);
+        }
+    };
+
+    for (name, path) in &files {
+        // Re-run codegen fingerprinting when this individual file changes.
+        println!("cargo:rerun-if-changed={}", path.display());
+        let Ok(bytes) = std::fs::read(path) else {
+            // Skip an unreadable file rather than panicking; the directory
+            // rerun-if-changed still covers it on a later successful build.
+            continue;
+        };
+        // Domain-separate filename | length | content so two files can't
+        // alias by, e.g., shifting a byte across a file boundary.
+        mix(name.as_bytes());
+        mix(&[0x1f]); // unit separator between name and content
+        mix(&(bytes.len() as u64).to_le_bytes());
+        mix(&bytes);
+        mix(&[0x1e]); // record separator between files
+    }
+
+    // Emit a fixed-width 32-char lowercase hex digest (same shape as the
+    // disk cache's other keys). The consumer (codegen_salt) renders it as
+    // `fp<digest>`.
+    println!(
+        "cargo:rustc-env=BOLT_CODEGEN_FINGERPRINT={:016x}{:016x}",
+        hi, lo
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -84,6 +84,24 @@ fn out_f64(out: &RecordBatch) -> f64 {
         .value(0)
 }
 
+/// Assert the single output cell is SQL NULL, dtype-agnostically. SUM/MIN/MAX
+/// preserve the input dtype while AVG promotes to Float64, so we check the
+/// Arrow null bitmap on the array itself (`is_null(0)` / `null_count`) rather
+/// than downcasting to a concrete array type and reading a sentinel value.
+fn assert_out_null(out: &RecordBatch) {
+    let col = out.column(0);
+    assert_eq!(
+        col.null_count(),
+        1,
+        "expected the single aggregate output row to be NULL; null_count = {}",
+        col.null_count()
+    );
+    assert!(
+        col.is_null(0),
+        "expected the single aggregate output row to be NULL (is_null(0) was false)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Int32 column with NULLs — COUNT / SUM / MIN / MAX / AVG
 // ---------------------------------------------------------------------------
@@ -418,34 +436,46 @@ fn primitive_aggregates_no_nulls_fast_path() {
     assert!((avg - 3.0).abs() < 1e-12, "AVG no-nulls: got {avg}");
 }
 
-/// All-NULL column: COUNT returns 0; SUM/MIN/MAX/AVG fall back to the
-/// reduction identity (the host strip yields an empty slice and the
-/// GPU launch is skipped via the `n_rows == 0` short-circuit in
-/// `reduce_gpu_vec` / `fused_avg_gpu_vec`).
+/// All-NULL column: COUNT returns 0; SUM/MIN/MAX/AVG return SQL NULL.
 ///
-/// SQL semantics says SUM(all-NULL) is NULL and AVG(all-NULL) is NULL;
-/// `aggregate.rs` currently returns the accumulator identity (0 / 0.0) to
-/// preserve a non-nullable output schema. This test pins the public
-/// contract while the nullable-output work is still TBD (see the
-/// `TODO(null)` in `build_one_aggregate::Avg`).
+/// SQL semantics says SUM/MIN/MAX/AVG over an all-NULL (or empty) input are
+/// all NULL — only COUNT returns 0. The host strip yields an empty slice and
+/// the GPU launch is skipped via the `n_rows == 0` short-circuit in
+/// `reduce_gpu_vec` / `fused_avg_gpu_vec`; the aggregate output column is then
+/// emitted as a single NULL row rather than the accumulator identity.
+///
+/// This pins the corrected public contract (matches DuckDB / standard SQL):
+/// the result array's single row must be NULL, not a sentinel
+/// (i64::MAX/MIN, ±inf) or 0.
 #[test]
 #[ignore = "gpu:tier1"]
-fn primitive_aggregates_all_null_returns_identity() {
+fn primitive_aggregates_all_null_returns_sql_null() {
+    // --- Int64 all-NULL ---
     let arr = Int64Array::from(vec![Option::<i64>::None, None, None]);
     let batch = one_col_batch(Arc::new(arr) as ArrayRef);
 
-    // COUNT(v): 0 non-null rows.
+    // COUNT(v): 0 non-null rows — still 0, never NULL.
     let out = run_single_row_query("SELECT COUNT(v) FROM t", batch.clone());
     assert_eq!(out_i64(&out), 0);
 
-    // SUM identity is 0; this is NOT SQL-standard NULL but matches the
-    // documented Bolt behaviour for non-nullable aggregate outputs.
-    let sum = out_i64(&run_single_row_query("SELECT SUM(v) FROM t", batch.clone()));
-    assert_eq!(sum, 0);
+    // SUM / MIN / MAX over all-NULL Int64 are SQL NULL.
+    assert_out_null(&run_single_row_query("SELECT SUM(v) FROM t", batch.clone()));
+    assert_out_null(&run_single_row_query("SELECT MIN(v) FROM t", batch.clone()));
+    assert_out_null(&run_single_row_query("SELECT MAX(v) FROM t", batch.clone()));
+    // AVG over all-NULL is SQL NULL (not 0.0).
+    assert_out_null(&run_single_row_query("SELECT AVG(v) FROM t", batch));
 
-    // AVG with 0 non-null rows uses the `count == 0 ? 0.0 : ...` guard.
-    let avg = out_f64(&run_single_row_query("SELECT AVG(v) FROM t", batch));
-    assert_eq!(avg, 0.0);
+    // --- Float64 all-NULL ---
+    let arr = Float64Array::from(vec![Option::<f64>::None, None, None]);
+    let batch = one_col_batch(Arc::new(arr) as ArrayRef);
+
+    let out = run_single_row_query("SELECT COUNT(v) FROM t", batch.clone());
+    assert_eq!(out_i64(&out), 0);
+
+    assert_out_null(&run_single_row_query("SELECT SUM(v) FROM t", batch.clone()));
+    assert_out_null(&run_single_row_query("SELECT MIN(v) FROM t", batch.clone()));
+    assert_out_null(&run_single_row_query("SELECT MAX(v) FROM t", batch.clone()));
+    assert_out_null(&run_single_row_query("SELECT AVG(v) FROM t", batch));
 }
 
 /// First-row and last-row NULL positions stress the strip path's loop bounds:
@@ -484,4 +514,62 @@ fn nulls_at_boundary_positions() {
         .unwrap()
         .value(0);
     assert_eq!(max, 13);
+}
+
+// ---------------------------------------------------------------------------
+// SQL-NULL semantics for empty / all-NULL inputs (MIN/MAX/SUM/AVG → NULL)
+// ---------------------------------------------------------------------------
+//
+// MIN/MAX over an all-NULL or empty primitive column is SQL NULL — previously
+// this leaked the reduction identity sentinel (i64::MAX for MIN, i64::MIN for
+// MAX, ±inf for floats). SUM/AVG over the same inputs are likewise NULL
+// (previously SUM returned 0). These pin the corrected, DuckDB-matching
+// behaviour by checking the Arrow null bitmap (`is_null(0)` / `null_count`)
+// rather than a concrete value, so no sentinel can sneak through.
+
+#[test]
+#[ignore = "gpu:tier1"]
+fn min_max_all_null_int64_returns_null() {
+    let arr = Int64Array::from(vec![Option::<i64>::None, None, None, None]);
+    let batch = one_col_batch(Arc::new(arr) as ArrayRef);
+
+    // Previously MIN leaked i64::MAX and MAX leaked i64::MIN as sentinels.
+    assert_out_null(&run_single_row_query("SELECT MIN(v) FROM t", batch.clone()));
+    assert_out_null(&run_single_row_query("SELECT MAX(v) FROM t", batch));
+}
+
+#[test]
+#[ignore = "gpu:tier1"]
+fn min_max_all_null_float64_returns_null() {
+    let arr = Float64Array::from(vec![Option::<f64>::None, None, None]);
+    let batch = one_col_batch(Arc::new(arr) as ArrayRef);
+
+    // Previously MIN leaked +inf and MAX leaked -inf as sentinels.
+    assert_out_null(&run_single_row_query("SELECT MIN(v) FROM t", batch.clone()));
+    assert_out_null(&run_single_row_query("SELECT MAX(v) FROM t", batch));
+}
+
+#[test]
+#[ignore = "gpu:tier1"]
+fn sum_empty_table_returns_null() {
+    // Zero-row table: SUM over an empty input is SQL NULL (not 0). The strip
+    // path produces an empty slice exactly as for all-NULL, exercising the
+    // `n_rows == 0` short-circuit. COUNT over the same input stays 0.
+    let arr = Int64Array::from(Vec::<Option<i64>>::new());
+    let batch = one_col_batch(Arc::new(arr) as ArrayRef);
+
+    let count = out_i64(&run_single_row_query("SELECT COUNT(v) FROM t", batch.clone()));
+    assert_eq!(count, 0);
+
+    assert_out_null(&run_single_row_query("SELECT SUM(v) FROM t", batch));
+}
+
+#[test]
+#[ignore = "gpu:tier1"]
+fn sum_all_null_returns_null() {
+    // All-NULL (non-empty) input: SUM is SQL NULL, never the 0 identity.
+    let arr = Int64Array::from(vec![Option::<i64>::None, None, None, None, None]);
+    let batch = one_col_batch(Arc::new(arr) as ArrayRef);
+
+    assert_out_null(&run_single_row_query("SELECT SUM(v) FROM t", batch));
 }

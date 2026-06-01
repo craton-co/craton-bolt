@@ -310,6 +310,10 @@ impl<T: Pod> GpuBuffer<T> {
             // contract; the two allocations are distinct (just allocated
             // vs. caller-supplied) so the non-overlap requirement of
             // `cuMemcpyDtoD_v2` holds.
+            debug_assert_ne!(
+                buf.ptr, prefix_src,
+                "DtoD copy requires non-overlapping device pointers"
+            );
             cuda_sys::memcpy_d2d::<T>(buf.ptr, prefix_src, prefix_len)?;
         }
         // 2. Host-to-device copy of the tail directly into the offset

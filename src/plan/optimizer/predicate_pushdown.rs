@@ -461,9 +461,19 @@ fn classify_side(expr: &Expr, left: &Schema, right: &Schema) -> Side {
     let mut cols = Vec::new();
     collect_columns(expr, &mut cols);
     if cols.is_empty() {
-        // A constant conjunct (e.g. a folded literal) is safe to push to
-        // either side; route it left arbitrarily.
-        return Side::Left;
+        // A column-free conjunct (a folded literal like `WHERE FALSE`, or an
+        // *uncorrelated* scalar subquery — `collect_columns` deliberately does
+        // not descend into subquery bodies, so they surface here too). Such a
+        // predicate is row-invariant, so keeping it ABOVE the join is always
+        // equivalent for INNER/CROSS and is the only *safe* choice for OUTER
+        // joins: pushing a predicate into a single outer-join side changes
+        // NULL-padding semantics. Routing it to one side is sound only while
+        // the predicate is genuinely row-invariant AND correlated subqueries
+        // are rejected at the frontend; the moment a correlated subquery (which
+        // also presents with no collected columns) reaches here, a one-sided
+        // push would silently produce wrong results. `Side::Both` keeps it
+        // above the join and removes that latent coupling.
+        return Side::Both;
     }
     let in_left = |c: &String| left.fields.iter().any(|f| &f.name == c);
     let in_right = |c: &String| right.fields.iter().any(|f| &f.name == c);

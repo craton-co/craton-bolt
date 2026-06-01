@@ -6,7 +6,7 @@
 //! `cuda-stub` feature is enabled, the `#[link]` block is omitted and every
 //! FFI entry point is replaced by a Rust shim that returns
 //! [`CUDA_ERROR_STUB`]; [`check`] converts that into
-//! `BoltError::Other("cuda-stub mode: no GPU support compiled in")`.
+//! `BoltError::Unsupported("cuda-stub mode: no GPU support compiled in")`.
 //! Stub mode lets the crate compile on hosts without the CUDA toolkit and on
 //! docs.rs.
 
@@ -227,7 +227,7 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // `cuda-stub` feature: stand-in implementations so the crate compiles on hosts
 // without the CUDA toolkit (including docs.rs). Every shim returns
-// `CUDA_ERROR_STUB`, which `check()` maps to `BoltError::Other(...)`.
+// `CUDA_ERROR_STUB`, which `check()` maps to `BoltError::Unsupported(...)`.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "cuda-stub")]
 #[allow(non_snake_case, unused_variables)]
@@ -302,7 +302,7 @@ mod stubs {
     pub unsafe fn cuStreamSynchronize(_stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuCtxSynchronize() -> CUresult { CUDA_ERROR_STUB }
     // Event API stubs (deferred-free pool). Return the stub sentinel so
-    // `check()` maps them to `BoltError::Other("cuda-stub mode")`; the
+    // `check()` maps them to `BoltError::Unsupported("cuda-stub mode")`; the
     // deferred-free path treats a failed `cuEventCreate` as "events
     // unavailable" and falls back to the blanket per-stream sync.
     pub unsafe fn cuEventCreate(_event: *mut CUevent, _flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
@@ -322,7 +322,7 @@ mod stubs {
     pub unsafe fn cuMemGetInfo_v2(_free: *mut usize, _total: *mut usize) -> CUresult { CUDA_ERROR_STUB }
 
     // Batch 6: cuGraph stub mirrors. Returning the stub sentinel so
-    // `check()` maps every call to `BoltError::Other("cuda-stub mode")`.
+    // `check()` maps every call to `BoltError::Unsupported("cuda-stub mode")`.
     pub unsafe fn cuStreamBeginCapture_v2(_stream: CUstream, _mode: c_uint) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuStreamEndCapture(_stream: CUstream, _graph_out: *mut CUgraph) -> CUresult { CUDA_ERROR_STUB }
     pub unsafe fn cuGraphInstantiate_v2(
@@ -355,7 +355,7 @@ pub fn check(code: CUresult) -> BoltResult<()> {
         return Ok(());
     }
     if code == CUDA_ERROR_STUB {
-        return Err(BoltError::Other(
+        return Err(BoltError::Unsupported(
             "cuda-stub mode: no GPU support compiled in".into(),
         ));
     }
@@ -1102,7 +1102,7 @@ mod init_cache_tests {
     /// the `CudaWithCode` branch.
     ///
     /// `check(CUDA_SUCCESS)` short-circuits without an FFI call, and
-    /// `check(CUDA_ERROR_STUB)` short-circuits to `BoltError::Other`;
+    /// `check(CUDA_ERROR_STUB)` short-circuits to `BoltError::Unsupported`;
     /// both branches are exercised here too without touching the
     /// driver.
     #[test]
@@ -1110,12 +1110,12 @@ mod init_cache_tests {
         // Success short-circuits.
         assert!(check(CUDA_SUCCESS).is_ok());
 
-        // Stub sentinel maps to `BoltError::Other`, NOT CudaWithCode —
+        // Stub sentinel maps to `BoltError::Unsupported`, NOT CudaWithCode —
         // documented in `check()` and depended on by the docs.rs path.
         let stub = check(CUDA_ERROR_STUB).expect_err("stub must be Err");
         assert!(
-            matches!(stub, BoltError::Other(_)),
-            "CUDA_ERROR_STUB must surface as Other(_), got: {stub:?}"
+            matches!(stub, BoltError::Unsupported(_)),
+            "CUDA_ERROR_STUB must surface as Unsupported(_), got: {stub:?}"
         );
     }
 
@@ -1329,7 +1329,7 @@ pub(crate) fn memset_d8_async(
 // kernel-arg pointer at instantiation time — see `gpu_sort.rs` for the
 // cache-key discussion).
 //
-// Every wrapper short-circuits to `BoltError::Other("cuda-stub …")` under
+// Every wrapper short-circuits to `BoltError::Unsupported("cuda-stub …")` under
 // `--features cuda-stub` because the underlying FFI shim returns
 // `CUDA_ERROR_STUB`. Callers that want to opt out of the graph path on
 // stub builds should check the env var BEFORE calling these wrappers

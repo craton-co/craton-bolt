@@ -98,6 +98,13 @@ pub enum BoltError {
     #[error("memory error: {0}")]
     Memory(String),
 
+    /// I/O failure, wrapping a [`std::io::Error`] via `#[from]`.
+    ///
+    /// Note: carrying [`std::io::Error`] here is why [`BoltError`] is
+    /// intentionally **not** `Clone` — `std::io::Error` is not `Clone`.
+    /// Downstream consumers that need to stash an error in multiple places
+    /// should wrap it (e.g. in an `Arc<BoltError>`) rather than expecting the
+    /// enum itself to be cloneable.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -113,6 +120,17 @@ pub enum BoltError {
     /// type-safe rather than string-parsed.
     #[error("GPU capacity exceeded: {0}")]
     GpuCapacity(String),
+
+    /// Typed marker for "no GPU available / operation unsupported in this
+    /// build". Emitted by the cuda-stub path (a CPU-only build compiled
+    /// without a CUDA backend) and by any "feature not compiled in" case.
+    ///
+    /// Prefer this over funnelling such failures through the stringly-typed
+    /// [`BoltError::Other`]: callers (and tests) can pattern-match the
+    /// "this build can't do GPU work" condition type-safely instead of
+    /// inspecting a formatted string.
+    #[error("{0}")]
+    Unsupported(String),
 
     #[error("{0}")]
     Other(String),

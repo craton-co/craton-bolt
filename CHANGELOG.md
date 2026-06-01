@@ -18,11 +18,47 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
   same stable sort), proven by a 1M-slot parity test; the collector's generic bound
   widened to `T: Copy + Send + Sync`.
 
+### Fixed
+- **`Dictionary(Utf8)` `ORDER BY` now sorts by string value** (lexicographic)
+  instead of by the raw dictionary index — fixes wrong ordering for unordered
+  dictionaries on the GPU sort path.
+- **Scalar `MIN` / `MAX` / `SUM` / `AVG` over an all-NULL or empty input now
+  return SQL `NULL`** (matching DuckDB / standard SQL) instead of a sentinel
+  value (`i64::MAX` / `±inf`) or `0`.
+- **`ILIKE` now uses Unicode-aware per-character case folding** — fixes
+  incorrect matches when case folding changes string length (e.g. the dotted-I
+  `İ`) around `_` and prefix / suffix / contains patterns.
+- **Predicate pushdown no longer pushes column-free (row-invariant) predicates
+  into a single side of an OUTER join**, removing a latent wrong-results hazard.
+
 ### Changed
 - **De-duplicated `StreamSet`** — `cuda::async_copy` now consumes the canonical
   `cuda::buffer::StreamSet` instead of carrying its own identical copy (~46 LOC
   removed). Stream tracking, `Drop` fencing, and the event-based deferred-free path
   are unchanged; `buffer::StreamSet` gained only additive `pub(crate)` accessors.
+- **Integer `SUM` overflow is now a hard error** (`BoltError::Type`) rather than
+  a silent wraparound; the behavior is documented in `docs/SQL_REFERENCE.md`.
+- **New typed `BoltError::Unsupported` variant** for the no-GPU / `cuda-stub`
+  case, which previously surfaced through the generic `BoltError::Other`.
+- **`GpuView` / `GpuViewMut::byte_len` use checked multiplication**
+  (overflow-safe), consistent with the other buffer types.
+- **PTX disk-cache key now incorporates an automatic codegen fingerprint**
+  emitted by `build.rs`, so the on-disk cache self-invalidates when the codegen
+  source changes.
+- **Hardened the module-cache key** with a `Debug`-injectivity guard test;
+  disk-cache write-through failures are now logged.
+
+### Docs
+- Corrected `docs/JIT_PIPELINE.md` (LRU + 128-bit key, disk cache documented)
+  and `docs/SQL_REFERENCE.md` (fused `AVG`, integer `SUM` overflow error,
+  NULL / empty aggregate semantics, `ESCAPE` implemented, `ILIKE` documented).
+- Added a "Rejected SQL constructs" section to `docs/LIMITATIONS.md`, created
+  `docs/CUDARC_ADOPTION.md`, and refreshed the milestone framing in
+  `docs/COMPETITIVE_BENCHMARKING.md`.
+
+### Packaging
+- Removed internal scratch files from the published repo / tarball; cleaned up
+  `deny.toml` and the example declarations.
 
 ### Internal
 - Documented the GPU-only performance items deliberately deferred pending on-hardware

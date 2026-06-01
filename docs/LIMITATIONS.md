@@ -87,11 +87,23 @@ These are real, code-level behaviors to be aware of:
   functions, string functions, and `DISTINCT`. "Runs" does not always mean "ran
   on the GPU." See [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md) for the
   per-feature execution tier (GPU / host-side / GPU-lowering-pending).
-- **`NOT IN` with NULL semantics.** SQL three-valued logic around
-  `NOT IN (... NULL ...)` has historically been a correctness foot-gun in GPU
-  engines (a `NULL` in the list makes the predicate `UNKNOWN`/false for
-  non-matching rows). Verify behavior against your reference engine before
-  relying on `NOT IN`/`IN` over nullable lists.
+- **`NOT IN` / `IN` with NULL — three-valued-logic caveat (known foot-gun).**
+  SQL three-valued logic around `NOT IN (... NULL ...)` has historically been a
+  correctness foot-gun in GPU engines (a `NULL` in the list makes the predicate
+  `UNKNOWN`/false for non-matching rows). The engine drops NULLs from a folded
+  `IN`/`NOT IN` value set, which matches strict SQL for `IN` under `WHERE` but
+  **diverges for `NOT IN` against a set containing NULLs**. Verify behavior
+  against your reference engine before relying on `NOT IN`/`IN` over nullable
+  lists.
+- **Grouped integer `SUM` overflow may go undetected for streaming inputs.**
+  Scalar and grouped integer `SUM` overflow is normally a hard error
+  (`BoltError::Type("SUM(integer) overflow")`; see
+  [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md)). For the **grouped** case the
+  overflow is currently detected via a **host-side recompute** of the per-group
+  sums, so an overflow may **not** be caught for streaming inputs the host
+  cannot replicate (the device produced the result but the host has no way to
+  re-derive it for the check). Tracked follow-up: an on-device overflow flag
+  that makes the check independent of the host recompute.
 - **String handling is dictionary/ASCII-oriented.** String predicates operate
   over dictionary-encoded literals, and the GPU string functions
   (`UPPER` / `LOWER` / `LENGTH`) are byte/ASCII-oriented. Treat non-ASCII /
@@ -109,6 +121,33 @@ These are real, code-level behaviors to be aware of:
 - **Builder knobs not fully wired.** Some `EngineBuilder` knobs (e.g. the
   persistent-cache option) are not yet connected to `build()`. See
   [`ROADMAP.md`](../ROADMAP.md) "Known limitations."
+
+---
+
+## Rejected SQL constructs
+
+The frontend **cleanly rejects** the following constructs with a
+`BoltError::Sql(...)` (a clear parse/plan-time error), **not** a crash or a
+silent wrong answer. If you depend on any of these, expect an error and
+rewrite the query (see [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md) for the
+supported alternatives):
+
+- **Derived tables / subqueries in `FROM`** — use a `WITH`/CTE instead.
+- **Correlated subqueries** (and `EXISTS` / `NOT EXISTS`).
+- **`GROUP BY ROLLUP` / `CUBE` / `ALL`** (and `TOTALS`).
+- **`WINDOW` clause / `QUALIFY` / named windows** (`OVER <named_window>`), and
+  non-default window frames.
+- **`VALUES` lists** (as a standalone row source).
+- **`WITH RECURSIVE`** and **CTE column-list aliases** (`WITH c (a, b) AS ...`).
+- **Table-valued functions.**
+- **`DISTINCT ON (...)`** (Postgres extension).
+- **`TOP`** (T-SQL row limit).
+- **`LATERAL`.**
+- **`PREWHERE`** (ClickHouse extension).
+- **`GLOBAL JOIN`** (ClickHouse extension).
+
+These return a clean error rather than crashing, so the engine gives you correct
+expectations up front.
 
 ---
 

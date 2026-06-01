@@ -739,7 +739,17 @@ fn build_one_aggregate(
             } else {
                 crate::exec::welford::var_samp_f64(&xs)
             };
-            Ok(Arc::new(Float64Array::from(vec![result])) as ArrayRef)
+            // F4: VAR_POP/VAR_SAMP over zero matching rows (and VAR_SAMP over a
+            // single row) is SQL NULL. Gate that NULL on the output field's
+            // nullability exactly like the AVG sibling above: when the field is
+            // nullable surface the `None`, otherwise fall back to 0.0 (a null in
+            // a non-nullable column would be rejected by RecordBatch::try_new).
+            let cell: Option<f64> = if out_field.nullable {
+                result
+            } else {
+                Some(result.unwrap_or(0.0))
+            };
+            Ok(Arc::new(Float64Array::from(vec![cell])) as ArrayRef)
         }
     }
 }

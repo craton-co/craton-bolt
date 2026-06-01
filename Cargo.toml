@@ -12,7 +12,7 @@ readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
 categories   = ["database", "compilers"]
 rust-version = "1.74"
-exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "continue_prompt.md", "reviews", "reviews/*"]
+exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "bolt_continue_prompt.md", "reviews", "reviews/*"]
 
 # --- Workspace shim ---------------------------------------------------------
 #
@@ -182,6 +182,14 @@ path = "examples/quickstart.rs"
 [[example]]
 name = "groupby"
 path = "examples/groupby.rs"
+
+[[example]]
+name = "profile_groupby"
+path = "examples/profile_groupby.rs"
+
+[[example]]
+name = "profile_overhead"
+path = "examples/profile_overhead.rs"
 
 [profile.release]
 opt-level = 3

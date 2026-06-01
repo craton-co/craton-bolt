@@ -1086,7 +1086,9 @@ impl Engine {
                             // future processes won't benefit, but the
                             // current process still loads the module
                             // successfully via the in-process caches.
-                            let _ = cache.store(k, &text);
+                            if let Err(e) = cache.store(k, &text) {
+                                log::debug!("ptx disk-cache store failed: {e}");
+                            }
                             text
                         }
                     },
@@ -6180,6 +6182,95 @@ mod tests {
             "clone of the same spec must produce the same cache key — \
              otherwise repeat queries would always JIT-compile from scratch"
         );
+    }
+
+    /// Debug-injectivity guard (finding V-15). The module cache derives its
+    /// key from `format!("{:?}", spec)`, so correctness rests on the
+    /// invariant *distinct specs => distinct `Debug` output*. This test
+    /// perturbs a base `KernelSpec` in EACH semantically-relevant field and
+    /// asserts the perturbed key differs from the base. If a future field is
+    /// added to `KernelSpec` but left out of its `Debug` impl, two distinct
+    /// kernels would format identically, hash to the same key, and the cache
+    /// would silently serve the WRONG compiled module — a silent-wrong-result
+    /// failure mode. Adding the new field's perturbation here makes that
+    /// regression a compile-or-test failure rather than a runtime hazard.
+    #[test]
+    fn module_cache_key_debug_distinguishes_specs() {
+        use crate::plan::{ColumnIO, Op, Reg};
+
+        // Base spec: one input, one output, one LoadColumn op, no predicate.
+        // Each variant below mutates exactly one semantically-relevant field.
+        let base = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "x".to_string(),
+                dtype: DataType::Int32,
+            }],
+            outputs: vec![ColumnIO {
+                name: "y".to_string(),
+                dtype: DataType::Int64,
+            }],
+            ops: vec![Op::LoadColumn {
+                dst: Reg(0),
+                col_idx: 0,
+                dtype: DataType::Int32,
+            }],
+            predicate: None,
+            register_count: 1,
+            input_has_validity: vec![false],
+            output_has_validity: vec![false],
+        };
+
+        // `inputs` — differ in input column dtype.
+        let mut v_inputs = base.clone();
+        v_inputs.inputs[0].dtype = DataType::Int64;
+
+        // `outputs` — differ in output column name.
+        let mut v_outputs = base.clone();
+        v_outputs.outputs[0].name = "z".to_string();
+
+        // `ops` — differ in a nested op field (destination register).
+        let mut v_ops = base.clone();
+        v_ops.ops[0] = Op::LoadColumn {
+            dst: Reg(1),
+            col_idx: 0,
+            dtype: DataType::Int32,
+        };
+
+        // `predicate` — None vs Some(reg).
+        let mut v_predicate = base.clone();
+        v_predicate.predicate = Some(Reg(0));
+
+        // `register_count` — affects PTX register allocation.
+        let mut v_register_count = base.clone();
+        v_register_count.register_count = 2;
+
+        // `input_has_validity` — flips the pre-stage validity layout.
+        let mut v_input_validity = base.clone();
+        v_input_validity.input_has_validity = vec![true];
+
+        // `output_has_validity` — flips the per-output validity stores.
+        let mut v_output_validity = base.clone();
+        v_output_validity.output_has_validity = vec![true];
+
+        let base_key = ModuleCacheKey::new(&base, KERNEL_ENTRY);
+        for (field, variant) in [
+            ("inputs", &v_inputs),
+            ("outputs", &v_outputs),
+            ("ops", &v_ops),
+            ("predicate", &v_predicate),
+            ("register_count", &v_register_count),
+            ("input_has_validity", &v_input_validity),
+            ("output_has_validity", &v_output_validity),
+        ] {
+            let variant_key = ModuleCacheKey::new(variant, KERNEL_ENTRY);
+            assert_ne!(
+                base_key, variant_key,
+                "a spec differing only in `{field}` must produce a distinct \
+                 cache key — if it does not, that field is missing from \
+                 `KernelSpec`'s `Debug` and two kernels would silently alias \
+                 to the same cached PTX (wrong results)"
+            );
+        }
     }
 
     // ---- v0.7: `EngineBuilder::persistent_cache` wires into disk PTX cache ----
