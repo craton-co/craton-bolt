@@ -1600,13 +1600,22 @@ enum Scalar {
 /// name in `aggregate.rs` so the scalar and pre-stage paths agree bit-for-bit.
 ///
 /// Accumulation is always in `f64` (callers upcast `f32` partials), which is
-/// both more accurate and the typical engine behavior. NaN/Inf propagate
-/// naturally through the IEEE arithmetic. Summing nothing yields `0.0`.
+/// both more accurate and the typical engine behavior. Summing nothing yields
+/// `0.0`. Non-finite terms fall back to a plain IEEE fold (a `+Inf`/`-Inf`/`NaN`
+/// summand makes the compensation evaluate `inf - inf == NaN`, which would
+/// wrongly turn `SUM` over a column containing `+Inf` into `NaN`); the naive
+/// fold propagates `Inf`/`NaN` per the SQL/IEEE contract.
 #[inline]
 fn neumaier_sum_f64(iter: impl IntoIterator<Item = f64>) -> f64 {
     let mut sum = 0.0_f64;
     let mut c = 0.0_f64; // running compensation for lost low-order bits
+    let mut naive = 0.0_f64; // plain IEEE fold, used as the non-finite fallback
+    let mut saw_nonfinite = false;
     for v in iter {
+        if !v.is_finite() {
+            saw_nonfinite = true;
+        }
+        naive += v;
         let t = sum + v;
         if sum.abs() >= v.abs() {
             // `sum` is larger: the low-order bits of `v` are lost.
@@ -1617,7 +1626,12 @@ fn neumaier_sum_f64(iter: impl IntoIterator<Item = f64>) -> f64 {
         }
         sum = t;
     }
-    sum + c
+    // Compensated summation is only valid for finite terms (see doc above).
+    if saw_nonfinite {
+        naive
+    } else {
+        sum + c
+    }
 }
 
 /// Per-`T` helpers for the GPU reduction path. Mirrors the trait in
@@ -1905,14 +1919,15 @@ mod null_propagation_tests {
 
     // ---- Neumaier compensated summation (float SUM/AVG host finalize) --------
 
-    /// Neumaier compensated summation recovers an ill-conditioned sequence that
-    /// a naive left-fold cancels to `0.0`. `[1e16, 1.0, -1e16, 1.0]` sums to
-    /// `2.0` exactly under Neumaier; the naive fold loses both `+1.0` terms.
+    /// Neumaier compensated summation recovers an ill-conditioned sequence whose
+    /// low-order terms a naive left-fold drops. For `[1e16, 1.0, -1e16, 1.0]`
+    /// the naive fold loses the FIRST `+1.0` (below 1e16's ULP) and yields
+    /// `1.0`; Neumaier recovers both and yields `2.0`.
     #[test]
     fn neumaier_sum_is_accurate_on_ill_conditioned_input() {
         let data = [1e16_f64, 1.0, -1e16, 1.0];
         let naive = data.iter().copied().fold(0.0_f64, |a, b| a + b);
-        assert_eq!(naive, 0.0, "precondition: naive fold cancels to 0.0");
+        assert_eq!(naive, 1.0, "precondition: naive fold drops the first +1.0");
         let neumaier = neumaier_sum_f64(data.iter().copied());
         assert_eq!(neumaier, 2.0, "Neumaier must recover the exact sum");
     }
