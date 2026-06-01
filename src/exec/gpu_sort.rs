@@ -2384,6 +2384,133 @@ mod tests {
     // exercising the same `compile_sort_kernel_spec` PTX surface in a
     // narrower form.
 
+    /// DIAGNOSTIC: triangulate the bitonic-sort bug by isolating one dimension
+    /// at a time (DESC, 64-bit, float, padding). The shipped tests confound
+    /// these (int32/asc/no-pad passes; int64/desc/PAD and float64/asc/PAD
+    /// fail). Each case below varies exactly ONE axis off the known-good
+    /// int32/asc/no-pad baseline. Collects all failures so one run names every
+    /// broken dimension.
+    #[test]
+    #[ignore = "gpu:sort"]
+    fn gpu_sort_dimension_isolation() {
+        fn scramble_idx(n: usize, seed: u64) -> Vec<usize> {
+            let mut idx: Vec<usize> = (0..n).collect();
+            let mut s = seed;
+            for i in (1..n).rev() {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let j = (s as usize) % (i + 1);
+                idx.swap(i, j);
+            }
+            idx
+        }
+        let mut failures: Vec<String> = Vec::new();
+
+        // (1) int32 DESC, no padding (n = 2^14) — isolates DESC.
+        {
+            let n = 16_384usize;
+            let perm_idx = scramble_idx(n, 0x1111);
+            let values: Vec<i32> = perm_idx.iter().map(|&i| i as i32).collect();
+            let arr = Int32Array::from(values.clone());
+            let keys = vec![GpuSortKey {
+                column: &arr,
+                dtype: DataType::Int32,
+                direction: SortDirection::Desc,
+                nulls_first: false,
+            }];
+            match sort_indices_on_gpu_multi(&keys) {
+                Ok(Some((_l, perm))) => {
+                    let sorted: Vec<i32> =
+                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    if sorted.windows(2).any(|w| w[0] < w[1]) {
+                        failures.push("int32/DESC/no-pad: non-monotonic".into());
+                    }
+                }
+                other => failures.push(format!("int32/DESC/no-pad: {other:?}")),
+            }
+        }
+        // (2) int64 ASC, no padding (n = 2^14) — isolates 64-bit.
+        {
+            let n = 16_384usize;
+            let perm_idx = scramble_idx(n, 0x2222);
+            let values: Vec<i64> = perm_idx.iter().map(|&i| i as i64).collect();
+            let arr = Int64Array::from(values.clone());
+            let keys = vec![GpuSortKey {
+                column: &arr,
+                dtype: DataType::Int64,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            }];
+            match sort_indices_on_gpu_multi(&keys) {
+                Ok(Some((_l, perm))) => {
+                    let sorted: Vec<i64> =
+                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    if sorted.windows(2).any(|w| w[0] > w[1]) {
+                        failures.push("int64/ASC/no-pad: non-monotonic".into());
+                    }
+                }
+                other => failures.push(format!("int64/ASC/no-pad: {other:?}")),
+            }
+        }
+        // (3) float64 ASC, no padding (n = 2^14) — isolates float (incl. negatives).
+        {
+            let n = 16_384usize;
+            let perm_idx = scramble_idx(n, 0x3333);
+            let values: Vec<f64> = perm_idx.iter().map(|&i| (i as f64) - 8192.0).collect();
+            let arr = Float64Array::from(values.clone());
+            let keys = vec![GpuSortKey {
+                column: &arr,
+                dtype: DataType::Float64,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            }];
+            match sort_indices_on_gpu_multi(&keys) {
+                Ok(Some((_l, perm))) => {
+                    let sorted: Vec<f64> =
+                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    if sorted.windows(2).any(|w| w[0] > w[1]) {
+                        failures.push("float64/ASC/no-pad: non-monotonic".into());
+                    }
+                }
+                other => failures.push(format!("float64/ASC/no-pad: {other:?}")),
+            }
+        }
+        // (4) int32 ASC, WITH padding (n = 20000, not pow2) — isolates padding.
+        {
+            let n = 20_000usize;
+            let perm_idx = scramble_idx(n, 0x4444);
+            let values: Vec<i32> = perm_idx.iter().map(|&i| i as i32).collect();
+            let arr = Int32Array::from(values.clone());
+            let keys = vec![GpuSortKey {
+                column: &arr,
+                dtype: DataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            }];
+            match sort_indices_on_gpu_multi(&keys) {
+                Ok(Some((_l, perm))) => {
+                    if perm.len() != n {
+                        failures.push(format!("int32/ASC/pad: len {} != {n}", perm.len()));
+                    } else {
+                        let sorted: Vec<i32> =
+                            (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                        if sorted.windows(2).any(|w| w[0] > w[1]) {
+                            failures.push("int32/ASC/pad: non-monotonic".into());
+                        }
+                    }
+                }
+                other => failures.push(format!("int32/ASC/pad: {other:?}")),
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "bitonic dimension isolation — failing axes:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
     /// End-to-end ASC int32 sort. Builds a 16k-row scrambled column, runs it
     /// through `sort_indices_on_gpu_multi` (single-key spec), gathers, and
     /// asserts strictly ascending output.

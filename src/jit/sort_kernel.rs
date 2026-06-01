@@ -557,9 +557,9 @@ fn emit_multikey_multilaunch(
     // values (the ASC sentinel) no longer fight with padded slots over the
     // last position; the explicit padded bit wins.
     let padded_param_idx = MAX_SORT_KEYS * 2 + 1;
-    emit_padded_route_global(p, entry, padded_param_idx)?;
-
     let indices_param_idx = MAX_SORT_KEYS * 2;
+    emit_padded_route_global(p, entry, padded_param_idx, indices_param_idx)?;
+
     for (ki, k) in spec.keys.iter().enumerate() {
         emit_key_compare(p, entry, ki, k, /*shmem=*/ false)?;
     }
@@ -823,23 +823,43 @@ fn key_regs(ki: usize, dtype: DataType) -> (String, String) {
 ///
 /// Writing into `%r10` and branching to `DECIDED` short-circuits the entire
 /// per-key compare loop.
-fn emit_padded_route_global(p: &mut String, entry: &str, padded_param_idx: usize) -> BoltResult<()> {
+fn emit_padded_route_global(
+    p: &mut String,
+    entry: &str,
+    padded_param_idx: usize,
+    indices_param_idx: usize,
+) -> BoltResult<()> {
     writeln!(p, "// ---- stage3: padded-row pre-routing (is_padded bitmap) ----")
         .map_err(write_err)?;
-    // Load padded bit for self into %r16.
+    // CRITICAL: `is_padded` is keyed by ORIGINAL row index, not by cell. The
+    // bitonic network permutes rows across cells (swapping keys + the indices
+    // array in lockstep), so a static cell-indexed bitmap goes stale after the
+    // first swap. Index it by `indices[cell]` (the original index of whatever
+    // row currently occupies the cell) so padded-ness travels with the row.
+    // indices base -> %rd47, is_padded base -> %rd44.
+    writeln!(p, "\tld.param.u64 %rd47, [{entry}_param_{}];", indices_param_idx)
+        .map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd47, %rd47;").map_err(write_err)?;
     writeln!(p, "\tld.param.u64 %rd44, [{entry}_param_{}];", padded_param_idx)
         .map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd44, %rd44;").map_err(write_err)?;
-    writeln!(p, "\tshr.u32 %r16, %r3, 3;").map_err(write_err)?;
-    writeln!(p, "\tand.b32 %r17, %r3, 7;").map_err(write_err)?;
+    // idx_self = indices[tid] -> %r25, then self_padded = is_padded[idx_self].
+    writeln!(p, "\tmul.wide.u32 %rd45, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd45, %rd47, %rd45;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u32 %r25, [%rd45];").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r16, %r25, 3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r17, %r25, 7;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd45, %r16, 1;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd45, %rd44, %rd45;").map_err(write_err)?;
     writeln!(p, "\tld.global.u8 %r18, [%rd45];").map_err(write_err)?;
     writeln!(p, "\tshr.u32 %r18, %r18, %r17;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r18, %r18, 1;").map_err(write_err)?; // %r18 = self_padded
-    // partner bit -> %r19.
-    writeln!(p, "\tshr.u32 %r20, %r7, 3;").map_err(write_err)?;
-    writeln!(p, "\tand.b32 %r21, %r7, 7;").map_err(write_err)?;
+    // idx_partner = indices[partner] -> %r26, then partner_padded.
+    writeln!(p, "\tmul.wide.u32 %rd46, %r7, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd46, %rd47, %rd46;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u32 %r26, [%rd46];").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r20, %r26, 3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r21, %r26, 7;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd46, %r20, 1;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd46, %rd44, %rd46;").map_err(write_err)?;
     writeln!(p, "\tld.global.u8 %r19, [%rd46];").map_err(write_err)?;
