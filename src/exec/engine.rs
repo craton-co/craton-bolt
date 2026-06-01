@@ -2586,16 +2586,47 @@ impl Engine {
                 // numerically-stable single-pass update; the executors fold
                 // per-group state on the host after the GPU keys kernel
                 // populates the slot table.
-                let batch = self.materialize_table(table)?;
                 let out = match (!aggregate.group_by.is_empty(), pre.is_some()) {
                     (true, true) => {
+                        let batch = self.materialize_table(table)?;
                         crate::exec::groupby_with_pre::execute_groupby_with_pre(phys, &batch)?
                     }
-                    (true, false) => crate::exec::groupby::execute_groupby(phys, &batch)?,
-                    (false, true) => {
-                        crate::exec::agg_with_pre::execute_aggregate_with_pre(phys, &batch)?
+                    (true, false) => {
+                        let batch = self.materialize_table(table)?;
+                        crate::exec::groupby::execute_groupby(phys, &batch)?
                     }
-                    (false, false) => crate::exec::aggregate::execute_aggregate(phys, &batch)?,
+                    (false, true) => {
+                        // Performance: try the fully on-device resident path
+                        // first — pre-kernel inputs are read straight from the
+                        // already-uploaded GpuTable and every reduce runs in
+                        // place on the device, so a repeat scalar aggregate
+                        // pays NO per-query bulk H2D/D2H. It returns `None`
+                        // (and we fall back to the host-materialised path,
+                        // preserving behaviour) whenever a precondition isn't
+                        // met — a predicate, NULL inputs, a widening reduce, or
+                        // an unaccelerated aggregate. The resident-table borrow
+                        // is scoped to this match so the fallback can
+                        // re-borrow `gpu_tables` via `materialize_table`.
+                        let fast = match self.ensure_gpu_table(table) {
+                            Ok(resident) => {
+                                crate::exec::agg_with_pre::try_execute_resident(phys, &resident)?
+                            }
+                            Err(_) => None,
+                        };
+                        match fast {
+                            Some(b) => b,
+                            None => {
+                                let batch = self.materialize_table(table)?;
+                                crate::exec::agg_with_pre::execute_aggregate_with_pre(
+                                    phys, &batch,
+                                )?
+                            }
+                        }
+                    }
+                    (false, false) => {
+                        let batch = self.materialize_table(table)?;
+                        crate::exec::aggregate::execute_aggregate(phys, &batch)?
+                    }
                 };
                 Ok(QueryHandle { batch: out })
             }

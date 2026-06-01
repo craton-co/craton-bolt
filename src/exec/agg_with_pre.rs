@@ -52,6 +52,8 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::expr_agg;
+use crate::exec::gpu_compact::{gather_one, prefix_scan_mask, GatheredCol, ScanResult};
+use crate::exec::gpu_table::{GpuColumnData, GpuTable};
 use crate::exec::launch::CudaStream;
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
@@ -125,6 +127,265 @@ pub fn execute_aggregate_with_pre(
     RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
         BoltError::Other(format!("failed to build aggregate RecordBatch: {e}"))
     })
+}
+
+/// Resident, fully **on-device** fast path for `pre.is_some()` scalar
+/// aggregates — the performance fix for the per-query host round-trip.
+///
+/// The default [`execute_aggregate_with_pre`] path re-uploads every input
+/// column from the host batch on each query, downloads the pre-kernel
+/// outputs, host-compacts, then re-uploads for the reduce — ~480 MB of PCIe
+/// traffic per query for a 4-column SUM at 10M rows, which dominates the
+/// wall-clock (~100x below the device bandwidth roofline). This path instead:
+///
+///   1. reads the pre-kernel **inputs straight from the resident
+///      [`GpuTable`]** (already uploaded by `register_table` / cached by
+///      `ensure_gpu_table`) — zero per-query input H2D;
+///   2. runs the pre kernel into device output buffers;
+///   3. **reduces each output buffer in place on the device** — no D2H, no
+///      host-compact, no re-upload. Only the final scalars come back.
+///
+/// When the plan carries a `WHERE` predicate the survivors are compacted
+/// **on the device** (`prefix_scan_mask` + `gather_one`, the same tested
+/// primitives the projection path uses) before the reduce — so filtered
+/// scalar aggregates stay device-resident end-to-end too.
+///
+/// It is deliberately conservative: it returns `Ok(None)` (the caller then
+/// falls back to the host path, preserving behaviour) whenever a precondition
+/// isn't met — any input carries NULLs, an input/output dtype isn't a plain
+/// numeric, the resident row count disagrees, an aggregate isn't a
+/// bare-column `SUM`/`MIN`/`MAX`/`COUNT`, or a `SUM`/`MIN`/`MAX` would require
+/// accumulator widening (output dtype ≠ pre-output dtype). `AVG`/`STDDEV`
+/// stay on the host route for now.
+pub fn try_execute_resident(
+    plan: &PhysicalPlan,
+    resident: &GpuTable,
+) -> BoltResult<Option<RecordBatch>> {
+    let (pre, aggregate) = match plan {
+        PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
+        _ => return Ok(None),
+    };
+    let Some(pre_spec) = pre.as_ref() else {
+        return Ok(None);
+    };
+    if !aggregate.group_by.is_empty() {
+        return Ok(None);
+    }
+    let n_rows = resident.n_rows;
+    if n_rows == 0 {
+        // Degenerate: let the host path return the typed identity.
+        return Ok(None);
+    }
+
+    // -- (1) Resolve resident input device pointers. Bail to the host path on
+    //        NULLs, a missing column, or a non-plain-numeric dtype.
+    let mut input_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(pre_spec.inputs.len());
+    for io in &pre_spec.inputs {
+        let Some(col) = resident.columns.iter().find(|c| c.name == io.name) else {
+            return Ok(None);
+        };
+        if col.dtype != io.dtype {
+            return Ok(None);
+        }
+        if col.data.validity_ptr().is_some() {
+            return Ok(None);
+        }
+        match &col.data {
+            GpuColumnData::I32(_)
+            | GpuColumnData::I64(_)
+            | GpuColumnData::F32(_)
+            | GpuColumnData::F64(_) => {}
+            _ => return Ok(None),
+        }
+        input_ptrs.push(col.data.device_ptr());
+    }
+
+    // -- (2) Pre-resolve every aggregate to (output ordinal, op) BEFORE any
+    //        launch, so a fallback costs nothing. Only bare-column
+    //        SUM/MIN/MAX/COUNT are accelerated here.
+    enum FastAgg {
+        Reduce(usize, ReduceOp),
+        Count,
+    }
+    let out_ordinal = |expr: &Expr| -> Option<usize> {
+        let name = expr_agg::try_bare_column(expr)?;
+        pre_spec.outputs.iter().position(|o| o.name == name)
+    };
+    if aggregate.output_schema.fields.len() != aggregate.aggregates.len() {
+        return Ok(None);
+    }
+    let mut plans: Vec<FastAgg> = Vec::with_capacity(aggregate.aggregates.len());
+    for (i, agg) in aggregate.aggregates.iter().enumerate() {
+        let out_dtype = aggregate.output_schema.fields[i].dtype;
+        let fa = match agg {
+            AggregateExpr::Sum(e) | AggregateExpr::Min(e) | AggregateExpr::Max(e) => {
+                let Some(idx) = out_ordinal(e) else {
+                    return Ok(None);
+                };
+                // No accumulator widening on this path: the reduce reads the
+                // pre-output buffer as its own dtype, so the result dtype must
+                // match (e.g. SUM(Int32)->Int64 widening stays on host).
+                if pre_spec.outputs[idx].dtype != out_dtype {
+                    return Ok(None);
+                }
+                FastAgg::Reduce(idx, ReduceOp::from_agg(agg)?)
+            }
+            AggregateExpr::Count(e) => {
+                // Bare-column COUNT over a no-NULL input is just the row count.
+                if out_ordinal(e).is_none() {
+                    return Ok(None);
+                }
+                FastAgg::Count
+            }
+            _ => return Ok(None),
+        };
+        plans.push(fa);
+    }
+
+    // -- (3) Allocate device output buffers (no validity) and run the pre
+    //        kernel. The no-validity `KernelSpec` hashes to the SAME module
+    //        cache key the host no-NULL path uses, so the PTX is reused warm.
+    let mut output_cols: Vec<PreCol> = Vec::with_capacity(pre_spec.outputs.len());
+    for io in &pre_spec.outputs {
+        output_cols.push(PreCol::alloc_zeros(io.dtype, n_rows, false)?);
+    }
+    let pre_spec_for_ptx = KernelSpec {
+        input_has_validity: vec![false; pre_spec.inputs.len()],
+        output_has_validity: vec![false; pre_spec.outputs.len()],
+        ..pre_spec.clone()
+    };
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("pre_kernel:{}:{:?}", PRE_KERNEL_ENTRY, pre_spec_for_ptx),
+        None,
+        || compile_ptx(&pre_spec_for_ptx, PRE_KERNEL_ENTRY),
+    )?;
+    let function = module.function(PRE_KERNEL_ENTRY)?;
+
+    let mut device_ptrs: Vec<CUdeviceptr> =
+        Vec::with_capacity(input_ptrs.len() + output_cols.len());
+    device_ptrs.extend_from_slice(&input_ptrs);
+    for c in &output_cols {
+        device_ptrs.push(c.device_ptr());
+    }
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let mut kernel_params: Vec<*mut c_void> = Vec::with_capacity(device_ptrs.len() + 1);
+    for p in device_ptrs.iter_mut() {
+        kernel_params.push(p as *mut CUdeviceptr as *mut c_void);
+    }
+    kernel_params.push(&mut n_rows_u32 as *mut u32 as *mut c_void);
+
+    let stream = CudaStream::null();
+    let grid_x = ((n_rows_u32 + PRE_BLOCK_SIZE - 1) / PRE_BLOCK_SIZE).max(1);
+    // SAFETY: `function` is borrowed from a live module; every param slot
+    // points into `device_ptrs` (resident input ptrs + owned output buffers)
+    // or `n_rows_u32`, all of which outlive the launch + synchronize below.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            PRE_BLOCK_SIZE,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+    drop(device_ptrs);
+
+    // -- (3b) Optional WHERE predicate: build the survivor mask on the device
+    //         and prefix-scan it, exactly as the host path's predicate kernel
+    //         does (same module cache key → warm reuse) but WITHOUT downloading
+    //         the mask. The `_mask` buffer is bound here so it outlives every
+    //         `gather_one` below (the `ScanResult` borrows its device pointer).
+    let scan: Option<(GpuVec<u8>, ScanResult)> = if pre_spec.predicate.is_some() {
+        let pred_module = module_cache::get_or_build_module(
+            module_path!(),
+            format!("predicate_kernel:{}:{:?}", PRE_PREDICATE_ENTRY, pre_spec),
+            None,
+            || crate::jit::scan_kernel::compile_predicate_kernel(pre_spec, PRE_PREDICATE_ENTRY),
+        )?;
+        let pred_function = pred_module.function(PRE_PREDICATE_ENTRY)?;
+        let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
+        // No-validity path (we gated on no-NULL inputs above), so the predicate
+        // kernel takes the legacy no-validity param layout — empty slice.
+        let validity_ptrs: Vec<CUdeviceptr> = Vec::new();
+        crate::exec::compact::launch_predicate_kernel(
+            pred_function,
+            &input_ptrs,
+            mask.device_ptr(),
+            &validity_ptrs,
+            n_rows_to_u32(n_rows)?,
+            &stream,
+        )?;
+        let sr = prefix_scan_mask(mask.device_ptr(), n_rows, &stream)?;
+        Some((mask, sr))
+    } else {
+        None
+    };
+
+    // -- (4) Reduce each aggregate on the device; assemble the one-row batch.
+    //        With a predicate we gather the survivors on-device first; without
+    //        one we reduce the dense pre-output buffer in place.
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plans.len());
+    for (i, fa) in plans.iter().enumerate() {
+        let out_dtype = aggregate.output_schema.fields[i].dtype;
+        let array = match fa {
+            FastAgg::Reduce(idx, op) => {
+                let scalar = match &scan {
+                    Some((_mask, sr)) => {
+                        let gathered = gather_one(
+                            output_cols[*idx].device_ptr(),
+                            n_rows,
+                            sr,
+                            out_dtype,
+                            &stream,
+                        )?;
+                        reduce_gathered(*op, &gathered)?
+                    }
+                    None => output_cols[*idx].reduce_ondevice(*op, n_rows)?,
+                };
+                scalar_to_array(scalar, out_dtype)?
+            }
+            FastAgg::Count => {
+                let n = match &scan {
+                    Some((_mask, sr)) => sr.total_count,
+                    None => n_rows,
+                };
+                scalar_to_array(Scalar::I64(n as i64), out_dtype)?
+            }
+        };
+        arrays.push(array);
+    }
+    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let batch = RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
+        BoltError::Other(format!(
+            "failed to build resident on-device aggregate RecordBatch: {e}"
+        ))
+    })?;
+    Ok(Some(batch))
+}
+
+/// Reduce a device-resident [`GatheredCol`] (compacted survivors) in place,
+/// reading it as its own element type. Used by [`try_execute_resident`]'s
+/// predicate branch. An empty gather (`len == 0`) flows through
+/// `reduce_gpu_vec`, which short-circuits to the op's identity.
+fn reduce_gathered(op: ReduceOp, gathered: &GatheredCol) -> BoltResult<Scalar> {
+    let n = gathered.len();
+    match gathered {
+        GatheredCol::I32(v) => reduce_gpu_vec::<i32>(op, DataType::Int32, v, n),
+        GatheredCol::I64(v) => reduce_gpu_vec::<i64>(op, DataType::Int64, v, n),
+        GatheredCol::F32(v) => reduce_gpu_vec::<f32>(op, DataType::Float32, v, n),
+        GatheredCol::F64(v) => reduce_gpu_vec::<f64>(op, DataType::Float64, v, n),
+        GatheredCol::Bool(_) | GatheredCol::BoolNullable { .. } => Err(BoltError::Other(
+            "resident on-device aggregate: cannot reduce a Bool gathered column".into(),
+        )),
+    }
 }
 
 /// Materialised, host-side, post-filter output of the pre kernel: one host
@@ -1167,6 +1428,21 @@ impl PreCol {
     /// True iff this `PreCol` carries a per-row validity bitmap.
     fn has_validity(&self) -> bool {
         self.valid_mask.is_some()
+    }
+
+    /// Reduce this device buffer **in place** (no host round-trip), reading it
+    /// as its own element type. Used by the resident on-device aggregate fast
+    /// path, where the pre kernel has already written the values to the device
+    /// and there is no validity bitmap to honour (the caller gates on
+    /// no-NULL inputs). Returns the reduction as a [`Scalar`] at the buffer's
+    /// native dtype.
+    fn reduce_ondevice(&self, op: ReduceOp, n_rows: usize) -> BoltResult<Scalar> {
+        match &self.values {
+            PreColValues::I32(v) => reduce_gpu_vec::<i32>(op, DataType::Int32, v, n_rows),
+            PreColValues::I64(v) => reduce_gpu_vec::<i64>(op, DataType::Int64, v, n_rows),
+            PreColValues::F32(v) => reduce_gpu_vec::<f32>(op, DataType::Float32, v, n_rows),
+            PreColValues::F64(v) => reduce_gpu_vec::<f64>(op, DataType::Float64, v, n_rows),
+        }
     }
 
     /// Download the column to host and verify the length matches `n_rows`.
