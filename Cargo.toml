@@ -149,6 +149,13 @@ harness = false
 name = "olap_benchmarks"
 harness = false
 
+# GPU-favorable companion to olap_benchmarks: compute-bound scalar aggregates
+# and compound-predicate filters (no GROUP BY → no hash contention). Gated on
+# BOLT_BENCH_GPU=1 for the device path; CPU engines always run.
+[[bench]]
+name = "compute_benchmarks"
+harness = false
+
 # Stage-6 microbench: throughput of `ORDER BY <utf8>` across a sweep of
 # cardinality ratios, used to calibrate `HIGH_CARDINALITY_THRESHOLD`.
 # Off by default — set `BOLT_BENCH_THRESHOLD=1` to actually exercise the
