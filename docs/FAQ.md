@@ -87,7 +87,7 @@ formality of the Apache-2.0 NOTICE convention, not a CLA.
 
 ## Q10. How do I report a security issue?
 
-Email `security@cratonsoftware.com`. Do not file public GitHub issues
+Email `security@craton.com.ar`. Do not file public GitHub issues
 for vulnerabilities. See [`../SECURITY.md`](../SECURITY.md) for the full
 disclosure policy.
 

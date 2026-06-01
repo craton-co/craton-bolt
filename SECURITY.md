@@ -26,7 +26,7 @@ the issue is widely known.
 
 Report vulnerabilities by email to:
 
-> **security@cratonsoftware.com**
+> **security@craton.com.ar**
 
 If you would prefer encrypted email, request our PGP key in your first
 message and we will provide it before you send details.
