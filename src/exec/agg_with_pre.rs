@@ -1172,7 +1172,10 @@ where
     drop(block_sums);
     drop(block_counts);
 
-    let total_sum: f64 = host_sums.iter().copied().sum();
+    // Neumaier-compensated host finalize over the per-block f64 partials so
+    // the AVG numerator matches the GPU's tree-order sum to low bits and
+    // tracks DuckDB's compensated summation (a naive left-fold drifts).
+    let total_sum: f64 = neumaier_sum_f64(host_sums.iter().copied());
     let total_count: u64 = host_counts.iter().copied().map(u64::from).sum();
     Ok((total_sum, total_count))
 }
@@ -1589,6 +1592,34 @@ enum Scalar {
     F64(f64),
 }
 
+/// Neumaier-compensated summation (an improved Kahan variant) over an `f64`
+/// iterator. Used by the float SUM/AVG host finalize so the host-side fold of
+/// GPU partials matches the device's tree-order sum to low bits and tracks
+/// DuckDB's compensated summation — a naive left-fold (`fold(0.0, |a, b| a +
+/// b)`) loses the low bits and drifts vs both. Mirrors the helper of the same
+/// name in `aggregate.rs` so the scalar and pre-stage paths agree bit-for-bit.
+///
+/// Accumulation is always in `f64` (callers upcast `f32` partials), which is
+/// both more accurate and the typical engine behavior. NaN/Inf propagate
+/// naturally through the IEEE arithmetic. Summing nothing yields `0.0`.
+#[inline]
+fn neumaier_sum_f64(iter: impl IntoIterator<Item = f64>) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut c = 0.0_f64; // running compensation for lost low-order bits
+    for v in iter {
+        let t = sum + v;
+        if sum.abs() >= v.abs() {
+            // `sum` is larger: the low-order bits of `v` are lost.
+            c += (sum - t) + v;
+        } else {
+            // `v` is larger: the low-order bits of `sum` are lost.
+            c += (v - t) + sum;
+        }
+        sum = t;
+    }
+    sum + c
+}
+
 /// Per-`T` helpers for the GPU reduction path. Mirrors the trait in
 /// `aggregate.rs` exactly so this module stays self-contained.
 trait ReduceScalar: Sized + Copy {
@@ -1635,7 +1666,15 @@ impl ReduceScalar for i64 {
 impl ReduceScalar for f32 {
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
-            ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0.0f32, |a, b| a + b),
+            // SUM/COUNT: Neumaier-compensated summation in f64 (upcasting the
+            // f32 partials) so the host finalize matches the GPU's tree-order
+            // sum to low bits and tracks DuckDB's compensated summation; a
+            // naive f32 left-fold drifts. The accumulated f64 is narrowed back
+            // to f32 to preserve the SUM(Float32) output dtype. NaN/Inf
+            // propagate through Neumaier unchanged.
+            ReduceOp::Sum | ReduceOp::Count => {
+                neumaier_sum_f64(host.iter().copied().map(f64::from)) as f32
+            }
             ReduceOp::Min => host.iter().copied().fold(f32::INFINITY, f32::min),
             ReduceOp::Max => host.iter().copied().fold(f32::NEG_INFINITY, f32::max),
         };
@@ -1653,7 +1692,11 @@ impl ReduceScalar for f32 {
 impl ReduceScalar for f64 {
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
-            ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0.0f64, |a, b| a + b),
+            // SUM/COUNT: Neumaier-compensated summation so the host finalize
+            // matches the GPU's tree-order sum to low bits and tracks DuckDB's
+            // compensated summation; a naive left-fold drifts. NaN/Inf
+            // propagate through Neumaier unchanged.
+            ReduceOp::Sum | ReduceOp::Count => neumaier_sum_f64(host.iter().copied()),
             ReduceOp::Min => host.iter().copied().fold(f64::INFINITY, f64::min),
             ReduceOp::Max => host.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         };
@@ -1858,5 +1901,40 @@ mod null_propagation_tests {
             .map(|i| if arr.is_null(i) { 0 } else { 1 })
             .collect();
         assert_eq!(expected, vec![1, 0, 1]);
+    }
+
+    // ---- Neumaier compensated summation (float SUM/AVG host finalize) --------
+
+    /// Neumaier compensated summation recovers an ill-conditioned sequence that
+    /// a naive left-fold cancels to `0.0`. `[1e16, 1.0, -1e16, 1.0]` sums to
+    /// `2.0` exactly under Neumaier; the naive fold loses both `+1.0` terms.
+    #[test]
+    fn neumaier_sum_is_accurate_on_ill_conditioned_input() {
+        let data = [1e16_f64, 1.0, -1e16, 1.0];
+        let naive = data.iter().copied().fold(0.0_f64, |a, b| a + b);
+        assert_eq!(naive, 0.0, "precondition: naive fold cancels to 0.0");
+        let neumaier = neumaier_sum_f64(data.iter().copied());
+        assert_eq!(neumaier, 2.0, "Neumaier must recover the exact sum");
+    }
+
+    /// NaN and Inf propagate through Neumaier summation (IEEE arithmetic).
+    #[test]
+    fn neumaier_sum_propagates_nan_and_inf() {
+        let with_nan = [1.0_f64, f64::NAN, 2.0];
+        assert!(
+            neumaier_sum_f64(with_nan.iter().copied()).is_nan(),
+            "NaN summand must produce NaN"
+        );
+        let with_inf = [1.0_f64, f64::INFINITY, 2.0];
+        assert_eq!(
+            neumaier_sum_f64(with_inf.iter().copied()),
+            f64::INFINITY,
+            "+Inf summand must produce +Inf"
+        );
+        let mixed_inf = [f64::INFINITY, f64::NEG_INFINITY];
+        assert!(
+            neumaier_sum_f64(mixed_inf.iter().copied()).is_nan(),
+            "+Inf and -Inf together must produce NaN"
+        );
     }
 }

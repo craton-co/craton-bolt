@@ -45,24 +45,20 @@
 //! ### Group (b) — GPU execution-equivalence (compiles, `#[ignore]`'d in CI)
 //!
 //! The ideal test executes the *same* query twice — once with the optimizer,
-//! once without — and asserts identical result rows. **That is not reachable
-//! through the public API today:** both [`Engine::sql`] and
-//! [`Engine::run_logical_plan`] *always* run `run_to_fixpoint` internally
-//! (verified in `src/exec/engine.rs`), and the only optimizer-free execution
-//! path (`lower_physical` + the engine's private `execute`) is not public. An
-//! "optimizer truly disabled" run would need an internal hook (e.g. an
-//! `EngineBuilder::without_optimizer()` toggle, or a `pub` test-only
-//! `execute_physical`).
+//! once without — and asserts identical result rows. This is now reachable:
+//! the test-only `EngineBuilder::without_optimizer()` toggle (see
+//! `src/exec/engine.rs`) builds an engine that SKIPS the default pass
+//! pipeline and lowers a plan as written, while a normal `Engine` runs
+//! `run_to_fixpoint` as it always has. The toggle defaults to OFF (optimizer
+//! ON) for every production construction path, so it changes nothing outside
+//! this test.
 //!
-//! The strongest variant we CAN build without that hook is below
-//! ([`gpu_optimized_plan_executes_like_raw_plan`]): we hand the engine BOTH the
-//! raw SQL-built plan AND a copy we pre-optimized ourselves to fixpoint, run
-//! both through [`Engine::run_logical_plan`], and assert the result rows match.
-//! Because the engine re-optimizes idempotently, this proves that
-//! hand-applying the optimizer before execution does not change results vs.
-//! letting the engine do it — i.e. the optimizer is execution-idempotent on a
-//! real device. It is the best reachable execution-level guard; upgrade it to a
-//! true opt-vs-no-opt comparison the day an optimizer-bypass hook lands.
+//! [`gpu_optimized_plan_executes_like_raw_plan`] uses it for a TRUE
+//! opt-vs-no-opt comparison: it feeds the same raw SQL-built plan to both an
+//! optimizer-ON engine and an optimizer-OFF engine via
+//! [`Engine::run_logical_plan`], and asserts identical result row multisets.
+//! It trips if the composed optimizer passes ever change a query's answer on
+//! a real device.
 
 use craton_bolt::plan::{
     default_passes, parse_sql, DataType, Field, LogicalPlan, MemTableProvider, Schema,
@@ -506,37 +502,52 @@ fn grids_equal(a: &[Vec<Cell>], b: &[Vec<Cell>]) -> bool {
     true
 }
 
-/// GPU execution guard. For each representative query, run the engine on (1) the
-/// raw SQL-built plan and (2) a copy we pre-optimized to fixpoint ourselves, and
-/// assert the result rows are identical.
+/// GPU execution guard — TRUE optimizer-on vs optimizer-off comparison.
 ///
-/// NOTE: the engine re-runs `run_to_fixpoint` on BOTH inputs, so this asserts
-/// optimizer *idempotence under execution*, not a true optimizer-on vs
-/// optimizer-off comparison — which is unreachable until an optimizer-bypass
-/// hook exists (see the module header). It is the strongest end-to-end guard the
-/// current public API allows, and it WILL trip if a future rewrite makes the
-/// hand-optimized plan execute differently from the engine's own optimization of
-/// the raw plan. Promote this to opt-vs-no-opt the day a bypass hook lands.
+/// The module header used to note that a real opt-vs-no-opt comparison was
+/// "unreachable through the public API" because both `Engine::sql` and
+/// `Engine::run_logical_plan` always ran `run_to_fixpoint` internally. That
+/// hook now exists: the test-only `EngineBuilder::without_optimizer()` toggle
+/// (see `src/exec/engine.rs`) builds an engine that lowers a plan as written,
+/// skipping the default pass pipeline.
+///
+/// For each representative query we run the SAME raw SQL-built plan through:
+///   (a) a normal `Engine` (optimizer ON — the production path), and
+///   (b) an `Engine::builder().without_optimizer().build()` engine (OFF),
+/// then assert identical result row multisets (order-insensitive, via the
+/// canonicalising `run_and_normalize`). This is the genuine soundness guard:
+/// it trips if the composed optimizer passes ever change a query's answer.
 #[test]
-#[ignore = "gpu:opt-equiv — needs a CUDA device; also see header re: true opt/no-opt hook"]
+#[ignore = "gpu:opt-equiv — needs a CUDA device"]
 fn gpu_optimized_plan_executes_like_raw_plan() {
-    let mut engine = craton_bolt::Engine::new().expect("open CUDA device");
+    // (a) Optimizer ON: the default for every production construction path.
+    let mut opt_engine = craton_bolt::Engine::new().expect("open CUDA device");
+    // (b) Optimizer OFF: the test-only bypass hook. Same device/defaults
+    // otherwise, so the only difference between the two engines is whether
+    // `run_to_fixpoint` runs before lowering.
+    let mut raw_engine = craton_bolt::Engine::builder()
+        .without_optimizer()
+        .build()
+        .expect("open CUDA device (no-optimizer engine)");
 
-    // Register the same three tables the host fixtures describe, with concrete
-    // data, so the SQL above actually executes.
-    register_fixture_tables(&mut engine);
+    // Register the same three tables (identical concrete data) on BOTH engines
+    // so the representative queries execute end-to-end on each.
+    register_fixture_tables(&mut opt_engine);
+    register_fixture_tables(&mut raw_engine);
 
     for sql in representative_queries() {
+        // One plan, built once from SQL — fed verbatim to both engines. The
+        // optimizer-ON engine runs the full pass pipeline over it; the
+        // optimizer-OFF engine lowers it as written.
         let raw = parse_sql(sql, engine_provider_schema())
             .unwrap_or_else(|e| panic!("parse `{sql}`: {e:?}"));
-        let pre_optimized = optimize(raw.clone());
 
-        let from_raw = run_and_normalize(&mut engine, &raw);
-        let from_opt = run_and_normalize(&mut engine, &pre_optimized);
+        let with_opt = run_and_normalize(&mut opt_engine, &raw);
+        let without_opt = run_and_normalize(&mut raw_engine, &raw);
 
         assert!(
-            grids_equal(&from_raw, &from_opt),
-            "optimizer changed results for `{sql}`\n  raw:       {from_raw:?}\n  optimized: {from_opt:?}"
+            grids_equal(&with_opt, &without_opt),
+            "optimizer changed results for `{sql}`\n  optimizer ON:  {with_opt:?}\n  optimizer OFF: {without_opt:?}"
         );
     }
 }

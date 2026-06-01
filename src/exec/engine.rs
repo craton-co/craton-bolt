@@ -657,6 +657,14 @@ pub struct Engine {
     persistent_cache_path: Option<std::path::PathBuf>,
     /// v0.6 builder: whether tracing was enabled by the builder.
     tracing_enabled: bool,
+    /// Test-only: run the built-in logical optimizer before lowering.
+    /// Defaults to `true` (the production behaviour); flipped to `false`
+    /// only via [`EngineBuilder::without_optimizer`] so the
+    /// optimizer-equivalence test can execute an UN-optimized plan and
+    /// compare its results against the optimized path. Every production
+    /// construction leaves this `true`, so the gate at the
+    /// `run_to_fixpoint` call sites is a no-op for all stable callers.
+    optimize: bool,
     /// Owned CUDA context — declared LAST so it drops AFTER dictionaries.
     _ctx: CudaContext,
 }
@@ -697,6 +705,12 @@ pub struct EngineBuilder {
     persistent_cache_path: Option<std::path::PathBuf>,
     /// Install a default tracing subscriber from [`build`](Self::build).
     enable_tracing: bool,
+    /// Test-only: when `true`, [`build`](Self::build) constructs an engine
+    /// that SKIPS the built-in logical optimizer. Defaults to `false`
+    /// (optimizer ON — the production behaviour), so the derived
+    /// [`Default`] and every existing builder call leave optimization
+    /// enabled. Set only via [`EngineBuilder::without_optimizer`].
+    disable_optimizer: bool,
 }
 
 impl EngineBuilder {
@@ -710,6 +724,7 @@ impl EngineBuilder {
             memory_budget_bytes: None,
             persistent_cache_path: None,
             enable_tracing: false,
+            disable_optimizer: false,
         }
     }
 
@@ -766,6 +781,25 @@ impl EngineBuilder {
     /// `set_logger` is idempotent under contention).
     pub fn enable_tracing(mut self) -> Self {
         self.enable_tracing = true;
+        self
+    }
+
+    /// Test-only: build an engine that SKIPS the built-in logical optimizer.
+    ///
+    /// Not part of the stable public API — it exists so the
+    /// optimizer-equivalence test can execute a logical plan WITHOUT the
+    /// default optimizer pass pipeline (`run_to_fixpoint(default_passes,
+    /// ..)`) and compare the resulting rows against the normal,
+    /// optimizer-ON path. With the optimizer disabled, `sql()`,
+    /// `run_logical_plan()`, and subplan execution all lower the plan as
+    /// written (after the always-on dict rewrite + subquery resolution,
+    /// which are correctness-preserving, not optimizations).
+    ///
+    /// Production code must never call this: leaving the optimizer on is
+    /// the default for every other construction path.
+    #[doc(hidden)]
+    pub fn without_optimizer(mut self) -> Self {
+        self.disable_optimizer = true;
         self
     }
 
@@ -858,6 +892,10 @@ impl EngineBuilder {
             memory_budget_bytes: self.memory_budget_bytes,
             persistent_cache_path: self.persistent_cache_path,
             tracing_enabled: self.enable_tracing,
+            // Optimizer ON unless the test-only `without_optimizer()` knob
+            // flipped it. Every production path leaves `disable_optimizer`
+            // false, so this is `true` for all stable callers.
+            optimize: !self.disable_optimizer,
             _ctx: ctx,
         })
     }
@@ -2103,7 +2141,14 @@ impl Engine {
         // hit) so a conjunct exposed by one sweep — e.g. a now-constant
         // predicate moved by pushdown — gets folded/pushed on the next.
         let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
+        // `self.optimize` is `true` for every production engine; the
+        // test-only `EngineBuilder::without_optimizer()` flips it to `false`
+        // so the optimizer-equivalence test can execute the plan as written.
+        let plan = if self.optimize {
+            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
+        } else {
+            plan
+        };
         // v0.6 / M7: run user-registered PlanRewrite implementations in
         // registration order, threading each rewriter's output into the
         // next. This runs AFTER the built-in optimizer and the internal
@@ -2233,7 +2278,13 @@ impl Engine {
         // `sql()` does, so DataFrame-built plans get the same thorough
         // fold/push convergence.
         let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
+        // Gated by the test-only optimizer toggle; `true` in production.
+        // See `EngineBuilder::without_optimizer`.
+        let plan = if self.optimize {
+            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
+        } else {
+            plan
+        };
         // Mirror `sql()`: resolve uncorrelated subqueries to constants before
         // lowering so a DataFrame-built plan carrying a subquery executes too.
         let plan = self.resolve_subqueries(plan)?;
@@ -2312,7 +2363,15 @@ impl Engine {
         // Bounded-fixpoint optimizer, mirroring the `sql()` / `run_logical_plan`
         // paths so a subplan is optimized to the same convergence.
         let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
+        // Gated by the test-only optimizer toggle; `true` in production.
+        // See `EngineBuilder::without_optimizer`. Keeping the subplan path
+        // gated too means a query run on a `without_optimizer()` engine is
+        // un-optimized end to end (outer plan AND any subplans).
+        let plan = if self.optimize {
+            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
+        } else {
+            plan
+        };
         let plan = self.resolve_subqueries(plan)?;
         let mut phys = crate::plan::lower_physical(&plan)?;
         // The outer `sql()` / `run_logical_plan` has already collapsed any
