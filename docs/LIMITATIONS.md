@@ -51,6 +51,26 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 
 ---
 
+## Concurrency: one active `Engine` (CUDA context) per process
+
+- `Engine` is **`!Sync`** (it holds `RefCell` state), so a single `Engine`
+  cannot be shared across threads, and `&Engine` is not `Send`.
+- More fundamentally, the engine keeps **one active CUDA context per process**.
+  The device-memory pool, the CUDA stream pool, and the JIT module caches are
+  process-global statics whose resources (pooled pointers, streams, loaded
+  `CudaModule`s) are **bound to the context that created them**. Constructing
+  and using **two `Engine`s at the same time** (two contexts on one device)
+  cross-contaminates those globals and is **not supported** — expect invalid
+  handles or faults.
+- **Sequential** multi-engine use **is** supported: build an `Engine`, use it,
+  drop it (its context tears down and the module caches are cleared), then build
+  another. This is the right pattern for "reset" or per-job isolation.
+- Practical guidance: use **one long-lived `Engine` per process**, and serialize
+  queries through it. Multi-GPU / multi-context concurrency (per-context pools,
+  streams, and caches) is post-1.0 work.
+
+---
+
 ## Pre-1.0 API instability
 
 - The crate is `0.7.0`. Per [SemVer](https://semver.org/), pre-1.0 the public
