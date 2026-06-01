@@ -28,6 +28,7 @@ use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
 
 use arrow_schema::{Schema as ArrowSchema};
 
+use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_shmem_dispatch::{
@@ -37,6 +38,10 @@ use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::gpu_table::{GpuColumnData, GpuTable};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
+use crate::exec::n_rows_to_u32;
+use crate::jit::agg_kernels::{
+    compile_reduction_kernel, ReduceOp, BLOCK_SIZE as REDUCE_BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
+};
 use crate::jit::shmem_sum_kernel::{
     compile_shmem_sum_kernel, BLOCK_GROUPS, BLOCK_THREADS, KERNEL_ENTRY,
 };
@@ -158,25 +163,33 @@ fn execute_inner(
     let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
     let vals_gpu = GpuVec::<f64>::from_slice_async(val_arr.values(), stream.raw())?;
 
-    run_shmem_sum_core(plan, &keys_gpu, &vals_gpu, key_arr.values(), n_groups, &stream)
+    // Host presence scan (unchanged): a slot with ≥1 row is emitted.
+    let mut present = vec![false; n_groups as usize];
+    for &k in key_arr.values() {
+        present[k as usize] = true;
+    }
+
+    run_shmem_sum_core(plan, &keys_gpu, &vals_gpu, &present, n_groups, &stream)
 }
 
 /// Kernel launch + D2H + presence scan + output assembly over **borrowed**
 /// device buffers, shared by the host-upload path ([`execute_inner`]) and the
 /// resident on-device path ([`try_execute_resident`]). `keys_gpu` / `vals_gpu`
 /// may be freshly-uploaded buffers OR buffers borrowed from the resident
-/// `GpuTable`; `present_keys` is the host-side key slice (read off the
-/// RecordBatch, no transfer) used only for the presence scan that decides
-/// which slots are emitted.
+/// `GpuTable`. `present[slot]` is the precomputed presence bitmap (length
+/// `n_groups`) deciding which slots are emitted — the host path builds it with
+/// a host key scan, the resident path builds it on-device (`present_via_count`)
+/// so it never touches the host keys.
 fn run_shmem_sum_core(
     plan: &PhysicalPlan,
     keys_gpu: &GpuVec<i32>,
     vals_gpu: &GpuVec<f64>,
-    present_keys: &[i32],
+    present: &[bool],
     n_groups: u32,
     stream: &CudaStream,
 ) -> BoltResult<RecordBatch> {
-    let n_rows = present_keys.len();
+    let n_rows = keys_gpu.len();
+    debug_assert_eq!(present.len(), n_groups as usize);
 
     // Output buffer sized to slot count (== n_groups since we already
     // gated on max_key < BLOCK_GROUPS, and slot index == key value).
@@ -258,15 +271,10 @@ fn run_shmem_sum_core(
     stream.synchronize()?;
     let host_sums: Vec<f64> = pinned.as_slice().to_vec();
 
-    // The fast path only filled slots [0, n_groups). Build a presence map
-    // by host-scanning the keys (cheap on a single Int32 column); a slot
-    // with no rows must be omitted from the output to match SQL semantics
-    // (SUM over an empty group is NULL / absent, not 0).
-    let mut present = vec![false; n_groups as usize];
-    for &k in present_keys {
-        present[k as usize] = true;
-    }
-
+    // The fast path only filled slots [0, n_groups). The caller supplies the
+    // presence bitmap (host scan for the upload path, on-device count for the
+    // resident path); a slot with no rows must be omitted to match SQL
+    // semantics (SUM over an empty group is NULL / absent, not 0).
     let mut out_keys: Vec<i32> = Vec::with_capacity(n_groups as usize);
     let mut out_sums: Vec<f64> = Vec::with_capacity(n_groups as usize);
     for (slot, &is_present) in present.iter().enumerate() {
@@ -339,10 +347,29 @@ pub fn try_execute_resident(
     if key_arr.null_count() > 0 || val_arr.null_count() > 0 {
         return None;
     }
-    // Host key scan: max-key range check (transfer-free; reads the batch).
-    let max_key = crate::exec::groupby_tier2_common::scan_max_nonneg_key(key_arr.values())?;
-    if max_key < 0 {
+
+    // --- Resolve resident device buffers; fall back if not plain non-null
+    //     I32/F64 of the expected length. ----------------------------------
+    let keys_gpu = resident_i32(resident, &key_io.name)?;
+    let vals_gpu = resident_f64(resident, sum_col_name)?;
+    if keys_gpu.len() != key_arr.len() || vals_gpu.len() != val_arr.len() {
+        return None;
+    }
+
+    let stream = CudaStream::null_or_default();
+
+    // On-device key range scan (replaces the ~14 ms host `scan_max_nonneg_key`
+    // pass — the keys already live on the device). MAX gives the slot count;
+    // MIN < 0 means a negative key is present, which the dense-slot shmem path
+    // can't represent, so we decline exactly as the host scan did. A reduce
+    // failure falls back to the host-upload path (`.ok()?`), never an error.
+    if keys_gpu.len() == 0 {
         return Some(build_empty_result(plan));
+    }
+    let max_key = reduce_i32_device(keys_gpu, ReduceOp::Max, &stream).ok()?;
+    let min_key = reduce_i32_device(keys_gpu, ReduceOp::Min, &stream).ok()?;
+    if min_key < 0 {
+        return None;
     }
     let n_groups = max_key as u32 + 1;
     let inputs = DispatchInputs {
@@ -357,23 +384,77 @@ pub fn try_execute_resident(
         return None;
     }
 
-    // --- Resolve resident device buffers; fall back if not plain non-null
-    //     I32/F64 of the expected length. ----------------------------------
-    let keys_gpu = resident_i32(resident, &key_io.name)?;
-    let vals_gpu = resident_f64(resident, sum_col_name)?;
-    if keys_gpu.len() != key_arr.len() || vals_gpu.len() != val_arr.len() {
-        return None;
-    }
-
-    let stream = CudaStream::null_or_default();
+    // On-device presence (replaces the ~8 ms host presence scan): per-group
+    // counts over the resident keys; count > 0 ⇒ the slot is non-empty. A
+    // count-kernel failure falls back to the host-upload path (`.ok()?`).
+    let present = match present_via_count(keys_gpu, n_groups, &stream) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
     Some(run_shmem_sum_core(
         plan,
         keys_gpu,
         vals_gpu,
-        key_arr.values(),
+        &present,
         n_groups,
         &stream,
     ))
+}
+
+/// On-device presence bitmap for the resident path: launches the shared-mem
+/// COUNT kernel ([`crate::jit::shmem_count_kernel`], also used by the Tier-1
+/// COUNT executor) over the resident keys and maps `count > 0` to presence.
+/// Replaces the host scan over 10M `i32` with a coalesced device pass + a tiny
+/// `n_groups`-byte D2H. The keys are already resident — no upload.
+fn present_via_count(
+    keys_gpu: &GpuVec<i32>,
+    n_groups: u32,
+    stream: &CudaStream,
+) -> BoltResult<Vec<bool>> {
+    let n_rows = keys_gpu.len();
+    let mut out_counts: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_groups as usize, stream.raw())?;
+
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "shmem_count_for_presence".to_string(),
+        None,
+        || crate::jit::shmem_count_kernel::compile_shmem_count_kernel(),
+    )?;
+    let function = module.function(crate::jit::shmem_count_kernel::KERNEL_ENTRY)?;
+
+    let params = tune(TuneInputs {
+        n_rows: n_rows as u32,
+        n_groups: BLOCK_GROUPS,
+        bytes_per_acc_slot: 8, // u64
+        max_shared_per_block: None,
+    })
+    .map_err(|e| {
+        BoltError::Other(format!(
+            "shmem presence-count tuner refused: {e} (n_rows={n_rows}, n_groups={n_groups})"
+        ))
+    })?;
+
+    let view_keys = keys_gpu.view();
+    let mut view_out = out_counts.view_mut();
+    let mut args = KernelArgs::empty();
+    args.push_input(&view_keys);
+    args.push_output(&mut view_out);
+    args.push_scalar_u32(n_rows as u32);
+    args.push_scalar_u32(n_groups);
+
+    launch_with_geometry(
+        function,
+        params.grid_blocks,
+        params.block_threads,
+        0,
+        stream,
+        &mut args,
+    )?;
+
+    let pinned = out_counts.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let counts: Vec<u64> = pinned.as_slice().to_vec();
+    Ok(counts.iter().map(|&c| c > 0).collect())
 }
 
 /// Borrow a resident column's `i32` device buffer by name, declining
@@ -400,6 +481,72 @@ fn resident_f64<'a>(rt: &'a GpuTable, name: &str) -> Option<&'a GpuVec<f64>> {
         GpuColumnData::F64(v) => Some(v),
         _ => None,
     }
+}
+
+/// On-device `i32` MIN/MAX reduction over a resident key buffer, replacing the
+/// host `scan_max_nonneg_key` pass for the resident path. The keys already live
+/// on the device, so this is a coalesced device scan instead of a branchy host
+/// loop over 10M `i32` (~14 ms). Reuses the scalar reduction kernel
+/// (`agg_kernels::compile_reduction_kernel`): one partial per block, folded on
+/// the host (a few thousand `i32`s — negligible).
+///
+/// Caller must ensure `keys.len() > 0`.
+fn reduce_i32_device(keys: &GpuVec<i32>, op: ReduceOp, stream: &CudaStream) -> BoltResult<i32> {
+    let n_rows = keys.len();
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let block = REDUCE_BLOCK_SIZE;
+    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
+    let partials = GpuVec::<i32>::zeros_async(grid_x as usize, stream.raw())?;
+
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("groupby_shmem_reduce:{:?}:Int32", op),
+        None,
+        || compile_reduction_kernel(op, DataType::Int32),
+    )?;
+    let function = module.function(REDUCTION_KERNEL_ENTRY)?;
+
+    let mut input_ptr: CUdeviceptr = keys.device_ptr();
+    let mut output_ptr: CUdeviceptr = partials.device_ptr();
+    let mut kernel_params: [*mut std::ffi::c_void; 3] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut std::ffi::c_void,
+        &mut output_ptr as *mut CUdeviceptr as *mut std::ffi::c_void,
+        &mut n_rows_u32 as *mut u32 as *mut std::ffi::c_void,
+    ];
+    // SAFETY: `function` is borrowed from a live module; every param slot
+    // points to a stack local (or the resident `keys` / owned `partials`
+    // buffers) that outlives the synchronize below.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+    let _ = (input_ptr, output_ptr);
+
+    let host_partials = partials.to_vec()?;
+    let folded = match op {
+        ReduceOp::Max => host_partials.iter().copied().max(),
+        ReduceOp::Min => host_partials.iter().copied().min(),
+        other => {
+            return Err(BoltError::Other(format!(
+                "reduce_i32_device: only MIN/MAX supported, got {other:?}"
+            )))
+        }
+    };
+    folded.ok_or_else(|| {
+        BoltError::Other("reduce_i32_device: kernel produced no partials".into())
+    })
 }
 
 /// Build a 0-row output `RecordBatch` matching the plan's output schema.
