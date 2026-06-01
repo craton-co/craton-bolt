@@ -49,11 +49,28 @@
 //! (constant variant per column) instead of an `Array::data_type()`
 //! match in the inner loop.
 //!
-//! Dispatch: a single host-side path. The 0.2 target (sort-based DISTINCT
-//! via `gpu_sort::sort_indices_on_gpu_multi`) is tracked in ROADMAP.md;
-//! it requires the input columns to already be uploaded as `GpuVec`s,
-//! which the distinct executor does not have hand — that restructure is
-//! deferred to the GPU-side rework.
+//! Dispatch: two paths.
+//!
+//!   * **Host** (default, always correct): the `HashSet<RowKey>` dedup
+//!     described above. Handles every dtype, any column count, and preserves
+//!     first-occurrence order.
+//!   * **GPU sort-based** (opt-in via `BOLT_GPU_DISTINCT=1`): sort the single
+//!     key column on the device (reusing
+//!     [`crate::exec::gpu_sort::sort_record_batch_on_gpu_multi`]), then mark
+//!     adjacent-distinct rows and filter the survivors. See
+//!     [`try_gpu_distinct`] for the gates and [`adjacent_distinct_mask`] for
+//!     the (host-testable) dedup-after-sort core. The device "adjacent-distinct
+//!     flag" kernel lives in [`crate::jit::distinct_kernel`]; the executor
+//!     increment here computes the equivalent mask on the host after the GPU
+//!     sort returns the reordered batch (the per-row flag is trivially cheap;
+//!     the expensive sort is on-device). On ANY unsupported case — Utf8, wide
+//!     multi-key, an unsupported dtype, the GPU sort declining (`Ok(None)`),
+//!     or a `BoltError::GpuCapacity` decline — it returns `Ok(None)` and the
+//!     caller runs the host path. **Ordering note:** the GPU path returns rows
+//!     in sorted-key order, not first-occurrence order. SQL `DISTINCT` is an
+//!     unordered set operation, so this is correct; callers that need a
+//!     specific order must `ORDER BY` explicitly. The host path's
+//!     first-occurrence order is therefore not a contract, just an artefact.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -355,19 +372,210 @@ impl<'a> ColumnReader<'a> {
 }
 
 /// Apply DISTINCT to the input handle, returning a new handle whose
-/// RecordBatch has duplicate rows removed (first-occurrence wins).
+/// RecordBatch has duplicate rows removed.
 ///
-/// Host-side implementation. For wide schemas or large row counts this
-/// is the slow path; the 0.2 release will add a GPU sort-based variant.
+/// Two implementations (see the module doc-comment for the full dispatch
+/// rules):
+///   * **GPU sort-based** ([`try_gpu_distinct`]), opt-in via
+///     `BOLT_GPU_DISTINCT=1`, for a single fixed-width primitive key column.
+///     Returns rows in sorted-key order (DISTINCT is an unordered set
+///     operation, so this is correct).
+///   * **Host** (default), the `HashSet<RowKey>` dedup, which handles every
+///     dtype and column count and preserves first-occurrence order.
 ///
-/// Stage 3 note: host-side only, no async opportunity here. The upstream
-/// executor that produced `input` has already done its own pinned/async
-/// D2H, so the `RecordBatch` we receive is already settled in host
-/// memory. When the GPU-side DISTINCT lands it should pick up the same
-/// async memcpy + pinned D2H pattern as the projection / aggregate paths.
+/// The GPU path degrades to the host path on any unsupported case or a
+/// `BoltError::GpuCapacity` decline, so it can never regress correctness.
+///
+/// Host-side note: no async opportunity here. The upstream executor that
+/// produced `input` has already done its own pinned/async D2H, so the
+/// `RecordBatch` we receive is already settled in host memory.
 pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
+    // GPU sort-based DISTINCT is opt-in (`BOLT_GPU_DISTINCT=1`) and degrades
+    // to the host path on any unsupported case. We peek at the batch without
+    // consuming the handle's ownership semantics: `try_gpu_distinct` borrows
+    // the batch and returns `Some(out)` only when it produced a complete
+    // result, so on `None` we fall through to the host path with the same
+    // batch. On a `GpuCapacity` decline (the engine-wide "GPU path declined,
+    // retry on host" marker — see `gpu_join.rs` / `gpu_compact.rs`) we also
+    // fall back rather than propagate the error.
+    let batch = input.into_record_batch();
+    if gpu_distinct_enabled() {
+        match try_gpu_distinct(&batch) {
+            Ok(Some(out)) => return Ok(QueryHandle::from_record_batch(out)),
+            Ok(None) => { /* fall through to host */ }
+            Err(BoltError::GpuCapacity(_)) => { /* decline → host */ }
+            Err(e) => return Err(e),
+        }
+    }
     let max_rows = distinct_host_max_rows();
-    execute_distinct_with_cap(input, max_rows)
+    execute_distinct_with_cap(QueryHandle::from_record_batch(batch), max_rows)
+}
+
+/// Env gate for the GPU sort-based DISTINCT path. `BOLT_GPU_DISTINCT=1`
+/// (or `true`/`yes`, case-insensitive) opts in; default OFF so the host
+/// path stays the production default until the device round-trip has soak
+/// time on real hardware. Mirrors the `BOLT_GPU_SORT` gate convention in
+/// `gpu_sort.rs`.
+fn gpu_distinct_enabled() -> bool {
+    match std::env::var("BOLT_GPU_DISTINCT") {
+        Ok(v) => {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Engine-internal dtypes the GPU sort-based DISTINCT path supports as the
+/// single key column. Utf8 (and wide multi-key) fall back to the host path.
+///
+/// Operates on [`crate::plan::logical_plan::DataType`] (the *internal* dtype
+/// produced by [`crate::exec::gpu_sort::arrow_dtype_to_internal`]), not the
+/// Arrow `DataType` in scope at the top of this module.
+fn gpu_distinct_supported_dtype(d: &crate::plan::logical_plan::DataType) -> bool {
+    use crate::plan::logical_plan::DataType as Idt;
+    matches!(d, Idt::Int32 | Idt::Int64 | Idt::Float32 | Idt::Float64)
+}
+
+/// GPU sort-based DISTINCT for the single, fixed-width primitive-key case.
+///
+/// Algorithm:
+///   1. **Sort** the whole batch on the single key column using the existing
+///      device sort ([`crate::exec::gpu_sort::sort_record_batch_on_gpu_multi`]).
+///      NULLs are routed to one contiguous end (we ask for `nulls_first`), so
+///      every NULL forms one adjacent run — the SQL "all NULLs are equal"
+///      rule. The sort returns `Ok(None)` if it declines (e.g. row count below
+///      its own GPU threshold, or an unsupported shape); we propagate that as
+///      a host fallback.
+///   2. **Mark** adjacent-distinct rows with [`adjacent_distinct_mask`]: a row
+///      survives iff it is the first row or its key differs from the previous
+///      row's key (with `-0.0`/NaN canonicalisation and NULL-vs-NULL collapse).
+///      This is the host-side equivalent of the device flag kernel in
+///      [`crate::jit::distinct_kernel`]; the per-row pass is trivially cheap
+///      compared with the on-device sort.
+///   3. **Filter** every column by the mask (Arrow `filter`).
+///
+/// Returns `Ok(None)` (→ host fallback) when:
+///   * the batch is not exactly one column,
+///   * the key column dtype is not one of Int32/Int64/Float32/Float64,
+///   * the GPU sort declines (`Ok(None)`).
+///
+/// Returns `Err(BoltError::GpuCapacity(_))` is *not* produced here directly,
+/// but a `GpuCapacity` bubbling up from the sort path is caught by the caller
+/// and turned into a host fallback.
+///
+/// **GPU-execution caveat (could not verify without a device):** the on-device
+/// sort + reorder is exercised only under `cuda-stub` here; the correctness of
+/// the sort itself is covered by `gpu_sort`'s own `#[ignore = "gpu:..."]`
+/// round-trips. The host-testable part of THIS path — the post-sort
+/// adjacent-distinct masking — is unit-tested directly via
+/// [`adjacent_distinct_mask`].
+fn try_gpu_distinct(batch: &RecordBatch) -> BoltResult<Option<RecordBatch>> {
+    // Gate: single key column only (multi-key is a follow-up; see module doc).
+    if batch.num_columns() != 1 {
+        return Ok(None);
+    }
+    let n_rows = batch.num_rows();
+    if n_rows == 0 {
+        // Trivial: an empty batch is already distinct.
+        return Ok(Some(batch.clone()));
+    }
+
+    let col = batch.column(0);
+    let arrow_dt = col.data_type();
+    // Restrict to the fixed-width primitive Arrow dtypes we can compare
+    // adjacently with `adjacent_distinct_mask`. We gate on the *Arrow* dtype
+    // directly rather than the mapped internal dtype because
+    // `arrow_dtype_to_internal` folds plain `Utf8` (and `Dictionary(_, Utf8)`)
+    // down to an integer index dtype via an inline dictionary — sorting those
+    // indices is correct, but the post-sort adjacency compare would then run
+    // on dictionary indices while the mask is applied to the original string
+    // column. Rather than reason about that index/value split, we exclude
+    // Utf8/Dictionary here and let them take the host path. Multi-key, Bool,
+    // and the temporal/decimal dtypes likewise fall back.
+    if !matches!(
+        arrow_dt,
+        DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+    ) {
+        return Ok(None);
+    }
+    let internal = match crate::exec::gpu_sort::arrow_dtype_to_internal(arrow_dt) {
+        Some(d) if gpu_distinct_supported_dtype(&d) => d,
+        _ => return Ok(None),
+    };
+
+    // Sort the batch on the single key column. nulls_first=true groups NULLs
+    // at the front as one adjacent run; ASC direction is arbitrary for a set
+    // operation (order is not a DISTINCT contract). The sort path declines
+    // with Ok(None) below its own GPU row threshold, which we forward.
+    let nullable = col.null_count() > 0;
+    let keys = [(
+        0usize,
+        internal,
+        crate::jit::sort_kernel::SortDirection::Asc,
+        /* nulls_first */ true,
+    )];
+    let sorted = match crate::exec::gpu_sort::sort_record_batch_on_gpu_multi(batch, &keys)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    // Mark adjacent-distinct rows on the sorted column, then filter.
+    let sorted_col = sorted.column(0);
+    let mask = adjacent_distinct_mask(sorted_col.as_ref(), nullable)?;
+    let filtered_cols: Vec<Arc<dyn Array>> = sorted
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::filter(c.as_ref(), &mask).map_err(arrow_err))
+        .collect::<BoltResult<Vec<_>>>()?;
+    let out = RecordBatch::try_new(sorted.schema(), filtered_cols).map_err(arrow_err)?;
+    Ok(Some(out))
+}
+
+/// Compute the adjacent-distinct keep-mask over a **sorted** single key
+/// column: `keep[i] = (i == 0) || key[i] != key[i-1]`, with SQL DISTINCT NULL
+/// semantics (two adjacent NULLs collapse; NULL vs non-NULL is a boundary) and
+/// float canonicalisation (`-0.0 == +0.0`, all NaN collapse to one).
+///
+/// This is the host-side mirror of the device flag kernel
+/// ([`crate::jit::distinct_kernel::compile_distinct_flag_kernel`]). It is the
+/// load-bearing, GPU-free part of the sort-based DISTINCT path, so it carries
+/// the bulk of the unit tests: given a sorted column it must reproduce exactly
+/// what the kernel would write to the `u8` mask.
+///
+/// `expect_nulls` is a hint from the caller's `null_count() > 0` check; the
+/// function is correct regardless (it always consults `is_null`), the flag
+/// only documents whether the validity-aware branches are expected to fire.
+fn adjacent_distinct_mask(sorted: &dyn Array, expect_nulls: bool) -> BoltResult<BooleanArray> {
+    let _ = expect_nulls; // documented hint only; correctness uses is_null.
+    let n = sorted.len();
+    let mut keep: Vec<bool> = Vec::with_capacity(n);
+
+    // Pull a typed reader once (reuse the existing per-dtype downcast). Only
+    // the fixed-width primitive variants are valid here — the GPU gate
+    // guarantees that, but we re-validate so a misuse is a clean error.
+    let reader = ColumnReader::new(sorted)?;
+    if matches!(reader, ColumnReader::Utf8(_)) {
+        return Err(BoltError::Type(
+            "adjacent_distinct_mask: Utf8 is not a sort-based DISTINCT key (host fallback)".into(),
+        ));
+    }
+
+    for i in 0..n {
+        if i == 0 {
+            keep.push(true);
+            continue;
+        }
+        // `value_at` already applies float canonicalisation and maps NULL to
+        // `RowKeyValue::Null`, so equality of two `RowKeyValue`s is exactly the
+        // DISTINCT equivalence relation (Null == Null, +0.0 == -0.0, NaN ==
+        // NaN). A row begins a new run iff its canonicalised value differs
+        // from the previous row's.
+        let cur = reader.value_at(i);
+        let prev = reader.value_at(i - 1);
+        keep.push(cur != prev);
+    }
+    Ok(BooleanArray::from(keep))
 }
 
 /// Internal entry point that lets callers (and tests) inject a cap directly,
@@ -945,5 +1153,177 @@ mod tests {
         assert!(matches!(wide, RowKey::Heap(_)));
         assert_eq!(wide.as_slice(), wide_vals.as_slice());
         assert_eq!(hash_of(&wide), hash_of(&wide_vals));
+    }
+
+    // =====================================================================
+    // GPU sort-based DISTINCT — host-testable parts.
+    //
+    // The on-device sort + reorder is exercised by `gpu_sort`'s own
+    // `#[ignore = "gpu:..."]` round-trips. Here we unit-test the two
+    // GPU-free pieces of `try_gpu_distinct`: the env gate and the
+    // post-sort adjacent-distinct masking (`adjacent_distinct_mask`),
+    // which is the host mirror of `jit::distinct_kernel`.
+    // =====================================================================
+
+    /// Collect a `BooleanArray` mask into a `Vec<bool>` for assertions.
+    fn mask_to_vec(m: &BooleanArray) -> Vec<bool> {
+        (0..m.len()).map(|i| m.value(i)).collect()
+    }
+
+    /// On a SORTED i32 column, a row is kept iff it differs from its
+    /// predecessor; runs of equal values collapse to their first row.
+    #[test]
+    fn adjacent_mask_i32_collapses_runs() {
+        let arr = Int32Array::from(vec![1, 1, 2, 3, 3, 3, 4]);
+        let mask = adjacent_distinct_mask(&arr, false).unwrap();
+        assert_eq!(
+            mask_to_vec(&mask),
+            vec![true, false, true, true, false, false, true]
+        );
+    }
+
+    /// Single-element column: the lone row is always kept (it is row 0).
+    #[test]
+    fn adjacent_mask_single_row_kept() {
+        let arr = Int64Array::from(vec![42_i64]);
+        let mask = adjacent_distinct_mask(&arr, false).unwrap();
+        assert_eq!(mask_to_vec(&mask), vec![true]);
+    }
+
+    /// NULLs sorted into one adjacent run collapse to a single kept row; the
+    /// NULL↔non-NULL boundary is a keep. Layout mirrors what the sort emits
+    /// with `nulls_first=true`: [NULL, NULL, 5, 5, 7].
+    #[test]
+    fn adjacent_mask_nulls_collapse_and_boundary_kept() {
+        let arr = Int32Array::from(vec![None, None, Some(5), Some(5), Some(7)]);
+        let mask = adjacent_distinct_mask(&arr, true).unwrap();
+        // row0: keep (first). row1: NULL==NULL -> drop. row2: NULL->5 boundary
+        // keep. row3: 5==5 drop. row4: 5->7 keep.
+        assert_eq!(mask_to_vec(&mask), vec![true, false, true, false, true]);
+    }
+
+    /// Float canonicalisation: a sorted run containing `+0.0` then `-0.0`
+    /// collapses (they are one DISTINCT equivalence class), and adjacent
+    /// canonical NaNs collapse too. We hand a column already in sorted order
+    /// (what the device sort would produce; +0.0/-0.0 are bit-distinct but
+    /// the mask must still treat them equal).
+    #[test]
+    fn adjacent_mask_f64_signed_zero_and_nan_collapse() {
+        // Two signed zeros adjacent -> collapse; two NaNs adjacent -> collapse.
+        let arr = Float64Array::from(vec![0.0_f64, -0.0_f64, 1.5, f64::NAN, f64::NAN]);
+        let mask = adjacent_distinct_mask(&arr, false).unwrap();
+        // row0 keep; row1 -0.0==+0.0 drop; row2 1.5 keep; row3 NaN keep
+        // (1.5 != NaN); row4 NaN==NaN drop.
+        assert_eq!(mask_to_vec(&mask), vec![true, false, true, true, false]);
+    }
+
+    /// Utf8 is rejected by the masking helper (the GPU gate also excludes it,
+    /// but the helper guards independently so a misuse is a clean error).
+    #[test]
+    fn adjacent_mask_rejects_utf8() {
+        let arr = StringArray::from(vec!["a", "a", "b"]);
+        assert!(adjacent_distinct_mask(&arr, false).is_err());
+    }
+
+    /// End-to-end masking + filter on a sorted column reproduces the unique
+    /// set (order is sorted-key order, which DISTINCT does not constrain).
+    #[test]
+    fn adjacent_mask_then_filter_yields_uniques() {
+        let arr: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 1, 2, 2, 2, 5]));
+        let mask = adjacent_distinct_mask(arr.as_ref(), false).unwrap();
+        let filtered = arrow::compute::filter(arr.as_ref(), &mask).unwrap();
+        let out = filtered.as_any().downcast_ref::<Int32Array>().unwrap();
+        let got: Vec<i32> = (0..out.len()).map(|i| out.value(i)).collect();
+        assert_eq!(got, vec![1, 2, 5]);
+    }
+
+    /// dtype gate: only the fixed-width primitives are accepted by the GPU
+    /// sort-based DISTINCT path; everything else falls back to host.
+    #[test]
+    fn gpu_distinct_dtype_gate() {
+        use crate::plan::logical_plan::DataType as Idt;
+        assert!(gpu_distinct_supported_dtype(&Idt::Int32));
+        assert!(gpu_distinct_supported_dtype(&Idt::Int64));
+        assert!(gpu_distinct_supported_dtype(&Idt::Float32));
+        assert!(gpu_distinct_supported_dtype(&Idt::Float64));
+        assert!(!gpu_distinct_supported_dtype(&Idt::Utf8));
+        assert!(!gpu_distinct_supported_dtype(&Idt::Bool));
+    }
+
+    /// `try_gpu_distinct` declines (Ok(None)) on shapes it does not handle —
+    /// multi-column and Utf8 — so the caller falls back to the host path.
+    /// These checks don't touch the GPU: the gate fires before any sort.
+    #[test]
+    fn gpu_distinct_declines_unsupported_shapes() {
+        // Multi-column: declined regardless of dtype.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let a: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 1]));
+        let b: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 1]));
+        let batch = RecordBatch::try_new(schema, vec![a, b]).unwrap();
+        assert!(matches!(try_gpu_distinct(&batch), Ok(None)));
+
+        // Single Utf8 column: declined (Utf8 is host-only here).
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let s: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "a", "b"]));
+        let batch = RecordBatch::try_new(schema, vec![s]).unwrap();
+        assert!(matches!(try_gpu_distinct(&batch), Ok(None)));
+    }
+
+    /// Empty single-column batch is trivially distinct (no sort needed).
+    #[test]
+    fn gpu_distinct_empty_batch_is_passthrough() {
+        let batch = int32_batch(vec![]);
+        let out = try_gpu_distinct(&batch).unwrap();
+        assert!(out.is_some());
+        assert_eq!(out.unwrap().num_rows(), 0);
+    }
+
+    /// Env gate parses `1`/`true`/`yes` as enabled, everything else disabled.
+    /// Serialised on a local lock because `std::env` is process-global.
+    #[test]
+    fn gpu_distinct_env_gate() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap();
+        let probe = |val: Option<&str>| {
+            match val {
+                Some(v) => std::env::set_var("BOLT_GPU_DISTINCT", v),
+                None => std::env::remove_var("BOLT_GPU_DISTINCT"),
+            }
+            let got = gpu_distinct_enabled();
+            std::env::remove_var("BOLT_GPU_DISTINCT");
+            got
+        };
+        assert!(!probe(None));
+        assert!(!probe(Some("0")));
+        assert!(!probe(Some("off")));
+        assert!(probe(Some("1")));
+        assert!(probe(Some("true")));
+        assert!(probe(Some("YES")));
+    }
+
+    /// Real device round-trip for the GPU sort-based DISTINCT path. Ignored
+    /// without a GPU per the repo convention; requires `BOLT_GPU_DISTINCT=1`
+    /// and a batch large enough to clear the sort path's own GPU row
+    /// threshold (`GPU_SORT_MIN_ROWS`). Verifies that the deduped output is
+    /// the set of unique input values (sorted order is acceptable).
+    #[test]
+    #[ignore = "gpu:distinct"]
+    fn gpu_distinct_roundtrip_i32() {
+        // 32K rows of two repeating values -> two uniques. Well above the
+        // sort path's GPU threshold so the device path actually engages.
+        let n = 32_768usize;
+        let vals: Vec<Option<i32>> = (0..n).map(|i| Some((i % 2) as i32)).collect();
+        let batch = int32_batch(vals);
+        std::env::set_var("BOLT_GPU_DISTINCT", "1");
+        let out = try_gpu_distinct(&batch).unwrap();
+        std::env::remove_var("BOLT_GPU_DISTINCT");
+        let out = out.expect("GPU distinct should engage above the sort threshold");
+        let mut got = col_to_vec(&out, 0);
+        got.sort();
+        assert_eq!(got, vec![Some(0), Some(1)]);
     }
 }

@@ -181,8 +181,8 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   per-type GPU-lowering caveats in `SQL_REFERENCE.md`).
 - Utf8 predicates: equality / inequality against string literals (folded
   to integer comparisons on the dictionary index at plan time, GPU) and
-  `LIKE` (host-side). `IN` against Utf8 and ordering comparisons on Utf8
-  are still rejected.
+  `LIKE` (GPU as of v0.7, with a host-side fallback). `IN` against Utf8 and
+  ordering comparisons on Utf8 are still rejected.
 - Qualified column refs (`t.col`) and case-insensitive identifiers are
   supported.
 

@@ -125,6 +125,24 @@ use crate::plan::physical_plan::{ColumnIO, PhysicalPlan};
 /// existing call sites in this module unchanged.
 const EMPTY_KEY: i64 = I64_EMPTY_SENTINEL;
 
+/// Reserved encoded-key value used to represent the single SQL "NULL group"
+/// on the classic kernel path (NULL-key fix). SQL standard / DuckDB /
+/// Postgres group all NULL-keyed rows into ONE group whose key is NULL; the
+/// previous code silently DROPPED those rows. We re-introduce them under
+/// this sentinel so the existing keys + agg kernels compute the NULL group's
+/// aggregates exactly like any other group, then [`build_key_arrays`] emits
+/// a NULL (not a decoded value) for the slot that carries this key.
+///
+/// `i64::MAX` is chosen as the mirror of the `i64::MIN` empty-slot sentinel.
+/// It can only collide with a real key if a single Int64 GROUP BY column
+/// literally contains `i64::MAX`; that case is detected in `execute_groupby`
+/// and routed to the sentinel-free valid-flag executor (which preserves the
+/// pre-existing drop-NULLs behaviour — see the call site note). For every
+/// other key dtype (Int32 widening, Float32/Float64 bit patterns, and
+/// 2-column packs) the encoded value range never reaches `i64::MAX` for a
+/// genuine key, so the sentinel is safe.
+const NULL_GROUP_KEY: i64 = i64::MAX;
+
 /// Review C7: host-side pre-flight scan of an Int64 key column for the
 /// classic-kernel empty-slot sentinel ([`I64_EMPTY_SENTINEL`] = `i64::MIN`).
 ///
@@ -448,23 +466,91 @@ pub fn execute_groupby(
         Err(e) => return Err(e),
     };
     let key_components = packed.components;
-    let key_valid = packed.key_valid;
+    let mut key_valid = packed.key_valid;
 
-    // NULL keys: SQL standard semantics are implementation-defined for whether
-    // a NULL key forms its own group. For v1 we drop rows whose key is NULL
-    // (matching the simplest behaviour: NULL keys are not a group). The
-    // alternative — synthesise an explicit "NULL group" — would require
-    // either a reserved sentinel collision check (we already use i64::MIN
-    // for that purpose) or a separate code path; the dropped-rows approach
-    // is the conservative-and-correct first cut.
-    let host_keys: Vec<i64> = match &key_valid {
-        Some(mask) => packed
+    // NULL keys (NULL-group fix): SQL standard / DuckDB / Postgres group ALL
+    // NULL-keyed rows into a SINGLE group whose key is NULL, with the
+    // aggregates computed over those rows. The previous behaviour silently
+    // DROPPED NULL-key rows entirely, which diverged from that semantics.
+    //
+    // We re-introduce them by REMAPPING each NULL-key row's encoded key to
+    // the reserved `NULL_GROUP_KEY` sentinel (a real, non-empty hash-table
+    // value) instead of filtering it out. Because the agg kernels read every
+    // value column BY ROW INDEX and gate only on `key_valid` (key nulls) and
+    // each column's own value-null mask, remapping the key and then clearing
+    // `key_valid` to `None` makes the NULL-key rows flow through exactly like
+    // any other group: they hash to one slot (`NULL_GROUP_KEY`), and the agg
+    // kernels accumulate their values there. `build_key_arrays` later emits a
+    // NULL (not a decoded value) for that slot's key column.
+    //
+    // SCOPE: this NULL-group synthesis is applied to SINGLE-column GROUP BY
+    // only. For a multi-column key, the standard rule treats a NULL in each
+    // column independently — `(NULL, 5)` and `(NULL, 6)` are DISTINCT groups —
+    // but `pack_keys` collapses any per-column NULL into one combined keep
+    // bit, so the per-column NULL structure is unrecoverable here. We keep the
+    // previous drop-NULL-rows behaviour for the multi-column case and leave a
+    // distinct-NULL-tuple grouping to the wide-key path / a follow-up. (The
+    // common GROUP BY shape in practice is a single column.)
+    let single_col = key_components.len() == 1;
+    let synthesise_null_group = single_col && key_valid.is_some();
+
+    // NULL-group sentinel collision (only relevant when we are about to
+    // synthesise a NULL group): if a GENUINE (non-NULL) key already encodes
+    // to `NULL_GROUP_KEY` (only possible for a single Int64 column literally
+    // holding `i64::MAX`), we cannot tell that real key apart from the
+    // synthesised NULL group. Route to the sentinel-free valid-flag executor.
+    // NOTE: that executor currently DROPS NULL keys (it shares the legacy
+    // behaviour), so this rare edge regresses to "no NULL group" rather than
+    // producing a WRONG result — a correctness-preserving degradation,
+    // flagged for the follow-up that teaches `groupby_valid` the same
+    // NULL-group synthesis. We check only genuine keys (via the keep mask),
+    // since NULL positions in `packed.keys_i64` carry undefined bits.
+    if synthesise_null_group {
+        let mask = key_valid.as_ref().expect("synthesise_null_group implies Some");
+        let genuine_hits_sentinel = packed
             .keys_i64
             .iter()
             .zip(mask.iter())
-            .filter_map(|(k, &keep)| if keep { Some(*k) } else { None })
-            .collect(),
-        None => packed.keys_i64,
+            .any(|(&k, &keep)| keep && k == NULL_GROUP_KEY);
+        if genuine_hits_sentinel {
+            log::warn!(
+                "execute_groupby: a genuine GROUP BY key encodes to the reserved \
+                 NULL-group sentinel (i64::MAX); routing to valid-flag executor \
+                 (NULL group not synthesised on that path)"
+            );
+            return crate::exec::groupby_valid::execute_groupby_valid(plan, table_batch);
+        }
+    }
+
+    let host_keys: Vec<i64> = if synthesise_null_group {
+        // Single-column + nulls present: remap NULL-key rows to the NULL
+        // sentinel, keep every row (preserve row alignment with the agg
+        // value columns), and drop the now-redundant key-null mask.
+        let mask = key_valid.as_ref().expect("synthesise_null_group implies Some");
+        let remapped: Vec<i64> = packed
+            .keys_i64
+            .iter()
+            .zip(mask.iter())
+            .map(|(&k, &keep)| if keep { k } else { NULL_GROUP_KEY })
+            .collect();
+        // After remapping, no row carries a NULL key, so the agg path must
+        // NOT filter on key validity any more (the NULL group is now a real
+        // key like any other). Value-NULL masks are handled independently
+        // per aggregate input inside `run_one_aggregate`.
+        key_valid = None;
+        remapped
+    } else {
+        // Multi-column (NULL semantics scoped out — see above) or no nulls:
+        // unchanged path. Drop NULL-key rows when a mask is present.
+        match &key_valid {
+            Some(mask) => packed
+                .keys_i64
+                .iter()
+                .zip(mask.iter())
+                .filter_map(|(k, &keep)| if keep { Some(*k) } else { None })
+                .collect(),
+            None => packed.keys_i64,
+        }
     };
 
     // Check for EMPTY_KEY sentinel collision. If any encoded key equals
@@ -2068,7 +2154,33 @@ fn build_key_arrays(
         }
     }
 
+    // NULL-group fix: per-group validity for the key column(s). A group whose
+    // encoded key is the reserved `NULL_GROUP_KEY` sentinel is the synthesised
+    // SQL NULL group — its key value must be emitted as NULL, not decoded.
+    // (Only the single-column path synthesises this sentinel; see
+    // `execute_groupby`.) For genuine groups every key column is valid. We
+    // still push a placeholder value into the typed buffer at the NULL slot
+    // so the buffer length matches `n`; the validity mask masks it out.
+    let mut row_valid: Vec<bool> = Vec::with_capacity(n);
+    let mut any_null_group = false;
+
     for (k, _) in groups {
+        let is_null_group = *k == NULL_GROUP_KEY;
+        row_valid.push(!is_null_group);
+        if is_null_group {
+            any_null_group = true;
+            // Push a placeholder (zero / 0.0) into each typed buffer; it is
+            // never observed because the validity mask marks this row NULL.
+            for buf in buffers.iter_mut() {
+                match buf {
+                    ColBuf::I32(v) => v.push(0),
+                    ColBuf::I64(v) => v.push(0),
+                    ColBuf::F32(v) => v.push(0.0),
+                    ColBuf::F64(v) => v.push(0.0),
+                }
+            }
+            continue;
+        }
         let decoded = decode_key(*k, components);
         for (buf, val) in buffers.iter_mut().zip(decoded.iter()) {
             match (buf, val) {
@@ -2087,14 +2199,49 @@ fn build_key_arrays(
         }
     }
 
+    // Build each output array. When a NULL group is present we attach the
+    // per-row validity mask so its key cell is NULL; otherwise we build the
+    // dense (all-valid) array exactly as before (no behaviour change for the
+    // common no-NULL-key case). `*Array::from(Vec<Option<_>>)` threads the
+    // validity buffer through Arrow's builders.
     let mut out: Vec<ArrayRef> = Vec::with_capacity(m);
     for buf in buffers {
-        match buf {
-            ColBuf::I32(v) => out.push(Arc::new(Int32Array::from(v)) as ArrayRef),
-            ColBuf::I64(v) => out.push(Arc::new(Int64Array::from(v)) as ArrayRef),
-            ColBuf::F32(v) => out.push(Arc::new(Float32Array::from(v)) as ArrayRef),
-            ColBuf::F64(v) => out.push(Arc::new(Float64Array::from(v)) as ArrayRef),
-        }
+        let arr: ArrayRef = if any_null_group {
+            match buf {
+                ColBuf::I32(v) => Arc::new(Int32Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| if ok { Some(x) } else { None })
+                        .collect::<Vec<Option<i32>>>(),
+                )) as ArrayRef,
+                ColBuf::I64(v) => Arc::new(Int64Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| if ok { Some(x) } else { None })
+                        .collect::<Vec<Option<i64>>>(),
+                )) as ArrayRef,
+                ColBuf::F32(v) => Arc::new(Float32Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| if ok { Some(x) } else { None })
+                        .collect::<Vec<Option<f32>>>(),
+                )) as ArrayRef,
+                ColBuf::F64(v) => Arc::new(Float64Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| if ok { Some(x) } else { None })
+                        .collect::<Vec<Option<f64>>>(),
+                )) as ArrayRef,
+            }
+        } else {
+            match buf {
+                ColBuf::I32(v) => Arc::new(Int32Array::from(v)) as ArrayRef,
+                ColBuf::I64(v) => Arc::new(Int64Array::from(v)) as ArrayRef,
+                ColBuf::F32(v) => Arc::new(Float32Array::from(v)) as ArrayRef,
+                ColBuf::F64(v) => Arc::new(Float64Array::from(v)) as ArrayRef,
+            }
+        };
+        out.push(arr);
     }
     Ok(out)
 }

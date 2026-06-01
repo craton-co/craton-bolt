@@ -339,9 +339,9 @@ fn where_string_equality_returns_matching_rows() {
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("v is Int64");
-    // The engine does not compact: masked positions keep their zero-init
-    // value; unmasked positions hold the projected `v`. Collect non-zero
-    // outputs and assert they're exactly the `foo` rows' values.
+    // The engine compacts filter output, so `out` holds exactly the matching
+    // rows' `v` values. The `!= 0` filter is a harmless safety net (none of the
+    // fixture values are 0) that also tolerated the older non-compacting path.
     let mut got: Vec<i64> = (0..v.len()).map(|i| v.value(i)).filter(|x| *x != 0).collect();
     got.sort();
     assert_eq!(

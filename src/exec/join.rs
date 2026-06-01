@@ -925,26 +925,20 @@ fn empty_output(arrow_schema: Arc<ArrowSchema>) -> BoltResult<QueryHandle> {
 /// two `NaN` join rows whose payloads differ never match each other,
 /// matching the SQL standard's `NaN != NaN` rule (and DuckDB).
 ///
-/// Utf8 keys take two shapes (review L6):
+/// Utf8 keys ALWAYS take the `Utf8(Box<str>)` shape, whether the source
+/// column is a raw `StringArray` or a `DictionaryArray<_, Utf8>`:
 ///
-/// * `DictIdx(i32)` — the source column is a `DictionaryArray<Int32, Utf8>`.
-///   We key on the dictionary INDEX instead of the string itself: two rows
-///   share a key iff they share a dict index, which (within one batch /
-///   one dictionary) is equivalent to sharing a string value. 4 bytes per
-///   row instead of cloning the entire string. Used by the engine's
-///   `DictRegistry` ingest, which is the common path for SQL Utf8 columns.
-/// * `Utf8(Box<str>)` — raw (non-dict) Utf8 fallback. Still allocates a
-///   per-row copy, but `Box<str>` skips `String`'s capacity field (~16 B
-///   header vs 24 B) and the typical over-allocation, so it's roughly
-///   half the host-side footprint of the previous `String` path.
-///
-/// IMPORTANT: a `DictIdx(i32)` and a `Utf8(_)` never compare equal even if
-/// the underlying string matches. This is safe because both sides of a
-/// single equi-join column must agree on Arrow dtype (verified by
-/// `check_key_dtypes`); a build side keying as `DictIdx` cannot face a
-/// probe side keying as `Utf8`. If that invariant ever weakens, the
-/// dispatch in `extract_key` must learn to decode either dict or string
-/// into the same variant.
+/// * `Utf8(Box<str>)` — the decoded string value. Raw `StringArray` rows
+///   produce it directly; dict-encoded rows are first resolved through
+///   their own dictionary to the string and then keyed the same way. This
+///   unification is load-bearing for correctness (review F-7 analogue):
+///   keying dict columns on the raw INDEX is WRONG when the build and probe
+///   sides carry independent dictionaries (equal indices can map to
+///   different strings, and vice-versa). `check_key_dtypes` only verifies
+///   the Arrow datatype, so it cannot detect independent dictionaries — the
+///   only safe key is the string value itself. `Box<str>` skips `String`'s
+///   capacity field (~16 B header vs 24 B) and the typical over-allocation,
+///   so it's roughly half the host-side footprint of a `String` key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum JoinKeyValue {
     I32(i32),
@@ -956,13 +950,6 @@ enum JoinKeyValue {
     /// the capacity field + over-allocation overhead in the hot per-row
     /// path; `Box<str>` is `Eq + Hash`, so this is a drop-in swap.
     Utf8(Box<str>),
-    /// Dictionary index from a `DictionaryArray<Int32, Utf8>` build/probe
-    /// column. Same equivalence relation as the underlying string (two
-    /// rows with the same dict index share a string value), but costs
-    /// 4 bytes/row instead of allocating and copying the string. See the
-    /// type-level doc-comment for why this variant cannot collide with
-    /// `Utf8(_)` at lookup time.
-    DictIdx(i32),
 }
 
 /// A row's join key — one [`JoinKeyValue`] per equi column.
@@ -1087,8 +1074,9 @@ fn extract_key(
 /// is NULL at that row (the SQL "NULL keys never match" rule). Factored out
 /// of [`extract_key`] so the single-key fast path can build a `JoinKey::One`
 /// without an intermediate `Vec`. The per-dtype dispatch, float
-/// canonicalisation (review C12), and dict-index handling (review L6) are
-/// identical to the inline version it replaced.
+/// canonicalisation (review C12), and dict decoding (review F-7 analogue,
+/// see the Dictionary arm below) are identical to the inline version it
+/// replaced.
 fn extract_key_value(
     batch: &RecordBatch,
     idx: usize,
@@ -1141,14 +1129,39 @@ fn extract_key_value(
                     .value(row)
                     .into(),
             ),
-            // Review L6: dict-encoded Utf8 keys on the i32-index. Same
-            // equivalence as the string value (one dict per batch/column,
-            // so equal indices ⇒ equal strings) but 4 bytes/row instead
-            // of allocating and copying the string.
+            // Correctness fix (review F-7 analogue): dict-encoded Utf8 keys
+            // must key on the DECODED STRING VALUE, not the raw dictionary
+            // index. The previous L6 optimisation keyed on the i32 index on
+            // the assumption that "one dict per batch/column ⇒ equal indices
+            // ⇔ equal strings". That assumption breaks the moment a join
+            // child yields a raw Arrow `DictionaryArray`: the build side and
+            // the probe side then carry INDEPENDENT dictionaries, so the
+            // SAME index can map to DIFFERENT strings (and the same string
+            // can sit at DIFFERENT indices). `check_key_dtypes` only checks
+            // the Arrow datatype — both sides are `Dictionary(Int32, Utf8)`
+            // — so it cannot catch this. Keying on the index produced silent
+            // WRONG join results.
+            //
+            // We therefore resolve each row's index through ITS OWN
+            // dictionary to the actual string and key on `Utf8(Box<str>)` —
+            // the exact same variant the raw-`StringArray` path produces. A
+            // dict-encoded side and a raw-string side (or two independently
+            // dict-encoded sides) now compare on string identity, which is
+            // correct regardless of how each side encoded its dictionary.
+            // This costs one string copy per row on the dict path (the raw
+            // Utf8 fast path below is untouched).
             ArrowDataType::Dictionary(key_ty, value_ty)
                 if matches!(value_ty.as_ref(), ArrowDataType::Utf8) =>
             {
-                match key_ty.as_ref() {
+                // Resolve the dict index for `row` to a (values_array,
+                // position) pair, dispatching on the index width. NULL was
+                // already handled by the `arr.is_null(row)` guard at the top
+                // of this fn (Arrow dict NULL lives in the keys array's
+                // validity). We borrow the typed dictionary's `values()`
+                // (the dictionary value array) so we can decode the index to
+                // the actual string.
+                let (values_ref, value_pos): (&ArrayRef, usize) = match key_ty.as_ref()
+                {
                     ArrowDataType::Int32 => {
                         let da = arr
                             .as_any()
@@ -1158,13 +1171,14 @@ fn extract_key_value(
                                     "JOIN: dict<i32,utf8> downcast failed".into(),
                                 )
                             })?;
-                        JoinKeyValue::DictIdx(da.keys().value(row))
+                        let pos = usize::try_from(da.keys().value(row)).map_err(|_| {
+                            BoltError::Type(
+                                "JOIN: dict<i32,utf8> negative key index".into(),
+                            )
+                        })?;
+                        (da.values(), pos)
                     }
                     ArrowDataType::Int64 => {
-                        // i64-indexed dicts: down-cast to i32 if the value
-                        // fits (dict cardinality > u32::MAX is implausible
-                        // here — the engine's i64 dicts cap at the same
-                        // logical dictionary size as i32 ones in practice).
                         let da = arr
                             .as_any()
                             .downcast_ref::<DictionaryArray<ArrowInt64Type>>()
@@ -1173,21 +1187,32 @@ fn extract_key_value(
                                     "JOIN: dict<i64,utf8> downcast failed".into(),
                                 )
                             })?;
-                        let v = da.keys().value(row);
-                        let v32 = i32::try_from(v).map_err(|_| {
-                            BoltError::Type(format!(
-                                "JOIN: dict<i64,utf8> key {v} exceeds i32 range; \
-                                 dictionary cardinality unexpectedly large"
-                            ))
+                        let pos = usize::try_from(da.keys().value(row)).map_err(|_| {
+                            BoltError::Type(
+                                "JOIN: dict<i64,utf8> negative key index".into(),
+                            )
                         })?;
-                        JoinKeyValue::DictIdx(v32)
+                        (da.values(), pos)
                     }
                     other => {
                         return Err(BoltError::Type(format!(
                             "JOIN: unsupported dict key dtype {other:?} (expected Int32/Int64)"
                         )));
                     }
-                }
+                };
+                // Decode the index to the string via the dictionary's value
+                // array. Downcast to StringArray — guaranteed Utf8 by the
+                // `value_ty` guard above.
+                let str_values = values_ref
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        BoltError::Type(
+                            "JOIN: dict values not a StringArray despite Utf8 value type"
+                                .into(),
+                        )
+                    })?;
+                JoinKeyValue::Utf8(str_values.value(value_pos).into())
             }
             other => {
                 return Err(BoltError::Type(format!(
@@ -1703,9 +1728,10 @@ mod tests {
     //!   * Raw `Utf8` → `JoinKeyValue::Utf8(Box<str>)`. Tests assert the
     //!     equivalence relation (equal strings ⇒ equal keys; distinct
     //!     strings ⇒ distinct keys).
-    //!   * `Dictionary(Int32, Utf8)` → `JoinKeyValue::DictIdx(i32)`. Tests
-    //!     assert the key is the dictionary INDEX (not the string), which
-    //!     is the whole point of the optimisation.
+    //!   * `Dictionary(Int32, Utf8)` → `JoinKeyValue::Utf8(Box<str>)`. Tests
+    //!     assert the dict index is DECODED to the underlying string value
+    //!     (review F-7 analogue) so that two independently-encoded
+    //!     dictionaries key on string identity, not raw indices.
     use super::*;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -1741,7 +1767,7 @@ mod tests {
 
     #[test]
     fn extract_key_utf8_returns_box_str_variant() {
-        // Raw Utf8 — key should be `Utf8(Box<str>)`, not `DictIdx`.
+        // Raw Utf8 — key should be `Utf8(Box<str>)`.
         let batch = utf8_batch("s", vec![Some("alpha"), Some("beta"), Some("alpha")]);
         let k0 = extract_key(&batch, &[0], 0).unwrap().unwrap();
         let k1 = extract_key(&batch, &[0], 1).unwrap().unwrap();
@@ -1758,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_key_dict_utf8_returns_dict_idx_variant() {
+    fn extract_key_dict_utf8_decodes_to_string_value() {
         // Dictionary(Int32, Utf8): values = ["alpha", "beta"], keys =
         // [0, 1, 0, 1, 0]. The keys at rows {0,2,4} all point at "alpha",
         // and so must produce the same JoinKey.
@@ -1770,22 +1796,53 @@ mod tests {
         let keys: Vec<_> = (0..5)
             .map(|r| extract_key(&batch, &[0], r).unwrap().unwrap())
             .collect();
-        // Variant check on row 0: must be DictIdx, NOT Utf8 — that's the
-        // whole point of the optimisation.
+        // Variant check: dict rows are DECODED to the string value (review
+        // F-7 analogue), NOT keyed on the raw index — that's what makes two
+        // independently-encoded dictionaries join correctly.
         match &keys[0][0] {
-            JoinKeyValue::DictIdx(i) => assert_eq!(*i, 0),
-            other => panic!("expected DictIdx(0), got {other:?}"),
+            JoinKeyValue::Utf8(s) => assert_eq!(s.as_ref(), "alpha"),
+            other => panic!("expected Utf8(\"alpha\"), got {other:?}"),
         }
         match &keys[1][0] {
-            JoinKeyValue::DictIdx(i) => assert_eq!(*i, 1),
-            other => panic!("expected DictIdx(1), got {other:?}"),
+            JoinKeyValue::Utf8(s) => assert_eq!(s.as_ref(), "beta"),
+            other => panic!("expected Utf8(\"beta\"), got {other:?}"),
         }
-        // Equivalence relation preserved: rows with the same dict index
-        // (= same string) hash and compare equal.
+        // Equivalence relation preserved: rows with the same string hash
+        // and compare equal.
         assert_eq!(keys[0], keys[2]);
         assert_eq!(keys[0], keys[4]);
         assert_eq!(keys[1], keys[3]);
         assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn extract_key_dict_and_raw_utf8_key_equal_on_string_value() {
+        // Correctness regression (review F-7 analogue): a dict-encoded side
+        // and a raw-string side must key EQUAL when their strings match,
+        // even though one carries an index and the other a string.
+        let dict = dict_utf8_batch("s", vec![Some(1)], vec!["alpha", "beta"]);
+        let raw = utf8_batch("s", vec![Some("beta")]);
+        let dk = extract_key(&dict, &[0], 0).unwrap().unwrap();
+        let rk = extract_key(&raw, &[0], 0).unwrap().unwrap();
+        assert_eq!(dk, rk);
+    }
+
+    #[test]
+    fn extract_key_independent_dicts_key_on_strings_not_indices() {
+        // The core bug: two dict columns with INDEPENDENT dictionaries. The
+        // same index maps to DIFFERENT strings, and the same string sits at
+        // DIFFERENT indices. Keying on the index would (wrongly) match
+        // build idx 0 ("alpha") with probe idx 0 ("zeta"), and would (wrongly)
+        // FAIL to match the two "alpha" rows that sit at different indices.
+        let build = dict_utf8_batch("s", vec![Some(0), Some(1)], vec!["alpha", "beta"]);
+        let probe = dict_utf8_batch("s", vec![Some(0), Some(1)], vec!["zeta", "alpha"]);
+        let b_alpha = extract_key(&build, &[0], 0).unwrap().unwrap(); // idx 0 -> "alpha"
+        let p_idx0 = extract_key(&probe, &[0], 0).unwrap().unwrap(); // idx 0 -> "zeta"
+        let p_alpha = extract_key(&probe, &[0], 1).unwrap().unwrap(); // idx 1 -> "alpha"
+        // Same index, different string => must NOT be equal.
+        assert_ne!(b_alpha, p_idx0);
+        // Different index, same string => MUST be equal.
+        assert_eq!(b_alpha, p_alpha);
     }
 
     #[test]
@@ -1803,32 +1860,20 @@ mod tests {
     }
 
     #[test]
-    fn dict_idx_and_raw_utf8_are_distinct_variants() {
-        // Sanity: `DictIdx(0)` and `Utf8("alpha")` must NOT compare equal,
-        // even if they share an "alpha" semantic. `check_key_dtypes`
-        // guarantees both sides agree on Arrow dtype, so this case never
-        // arises in production — but the type system should still keep
-        // the variants distinct so we don't lose that guarantee silently.
-        let dict_key = JoinKeyValue::DictIdx(0);
-        let str_key = JoinKeyValue::Utf8("alpha".into());
-        assert_ne!(dict_key, str_key);
-    }
-
-    #[test]
-    fn build_hash_map_dict_utf8_groups_by_index() {
+    fn build_hash_map_dict_utf8_groups_by_string_value() {
         // End-to-end: build_hash_map over a dict-utf8 build side. Two
         // build rows share dict index 0 ("alpha"), so the resulting bucket
-        // must hold both row indices.
+        // (now keyed on the decoded string) must hold both row indices.
         let batch = dict_utf8_batch(
             "s",
             vec![Some(0), Some(1), Some(0), Some(2)],
             vec!["alpha", "beta", "gamma"],
         );
         let map = build_hash_map(&batch, &[0]).unwrap();
-        // Three distinct dict indices => three buckets.
+        // Three distinct strings => three buckets.
         assert_eq!(map.len(), 3);
         // The "alpha" bucket has both row 0 and row 2.
-        let alpha_key: JoinKey = JoinKey::from(vec![JoinKeyValue::DictIdx(0)]);
+        let alpha_key: JoinKey = JoinKey::from(vec![JoinKeyValue::Utf8("alpha".into())]);
         let alpha_rows = map.get(&alpha_key).expect("alpha bucket present");
         let alpha_slice = alpha_rows.as_slice();
         assert_eq!(alpha_slice.len(), 2);
@@ -1863,13 +1908,13 @@ mod tests {
         assert_eq!(hash_of(&one), hash_of(&many));
 
         // Multi-key path stays a Vec and matches the Vec hash too.
-        let mv = vec![JoinKeyValue::I32(1), JoinKeyValue::DictIdx(2)];
+        let mv = vec![JoinKeyValue::I32(1), JoinKeyValue::Utf8("x".into())];
         let mk = JoinKey::from(mv.clone());
         assert!(matches!(mk, JoinKey::Many(_)));
         assert_eq!(hash_of(&mk), hash_of(&mv));
         assert_eq!(mk.len(), 2);
         assert_eq!(mk[0], JoinKeyValue::I32(1));
-        assert_eq!(mk[1], JoinKeyValue::DictIdx(2));
+        assert_eq!(mk[1], JoinKeyValue::Utf8("x".into()));
 
         // Distinct single keys differ.
         let other = JoinKey::One(JoinKeyValue::I64(100));

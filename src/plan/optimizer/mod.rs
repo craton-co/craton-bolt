@@ -69,6 +69,7 @@ use crate::plan::rewrite::PlanRewrite;
 pub const MAX_FIXPOINT_ITERS: usize = 4;
 
 pub mod const_fold;
+pub mod cost;
 pub mod expr_util;
 pub mod filter_into_join;
 pub mod join_reorder;

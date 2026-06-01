@@ -168,14 +168,25 @@ pub fn try_execute(
         return None;
     }
 
-    // F2: NaN handling. The host scalar/window MIN/MAX path implements
-    // DuckDB's total order (NaN sorts as the largest value; MIN skips NaN
-    // unless all-NaN; MAX surfaces NaN if present — see
-    // `aggregate.rs::float_total_cmp`). The CAS-loop reduce kernel compares
-    // raw IEEE floats, where NaN's participation is order-dependent, so it
-    // can disagree with the scalar path for the same data. Cheapest correct
-    // option: defer any NaN-bearing value column to the global-atomic / host
-    // path so grouped float MIN/MAX always matches the scalar aggregate.
+    // F2: NaN handling. The total order we must honour (DuckDB / scalar /
+    // window): NaN sorts as the LARGEST value, so MAX surfaces NaN whenever
+    // present and MIN skips NaN unless the group is all-NaN — see
+    // `aggregate.rs::float_total_cmp`.
+    //
+    // This Tier-2 fast path reduces via `partition_reduce_kernel_minmax_float`,
+    // whose `atom.shared.cas` retry loop still uses a bare IEEE `setp.lt/gt`
+    // (false on any NaN operand) and therefore IGNORES NaN — it would disagree
+    // with the scalar path on NaN-bearing data. That kernel does not yet
+    // implement the NaN-as-largest order.
+    //
+    // So we keep deferring NaN-bearing value columns. The fallback is now
+    // genuinely correct: it routes to `groupby::execute_groupby` → the
+    // global-atomic float MIN/MAX kernel in
+    // `jit::float_atomics::compile_groupby_float_atomic_kernel`, which DOES
+    // implement the NaN-as-largest total order (it tests each CAS operand with
+    // `testp.notanumber` and folds NaN to the top). Once the Tier-2
+    // partition-reduce kernel gains the same `testp.notanumber` handling this
+    // guard can be dropped and NaN columns can take the Tier-2 path directly.
     if let Some(val_arr) = val_col.as_any().downcast_ref::<Float64Array>() {
         if val_arr.values().iter().any(|v| v.is_nan()) {
             return None;
@@ -389,9 +400,11 @@ use crate::plan::logical_plan::Schema;
 
 // ---------------------------------------------------------------------------
 // F2: host-only NaN-deferral eligibility tests. A NaN-bearing float value
-// column must DEFER (return `None`) so grouped float MIN/MAX routes through
-// the global-atomic / host scalar path, which implements DuckDB's
-// NaN-as-largest total order (`aggregate.rs::float_total_cmp`).
+// column must DEFER (return `None`) from this Tier-2 path, because its
+// `partition_reduce_kernel_minmax_float` CAS loop still ignores NaN. The
+// deferral routes to the global-atomic `float_atomics` kernel, which now
+// implements DuckDB's NaN-as-largest total order (`testp.notanumber` in the
+// CAS loop), matching `aggregate.rs::float_total_cmp`.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod nan_tests {

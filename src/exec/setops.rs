@@ -42,7 +42,7 @@
 //! `crate::exec::distinct`).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Array, BooleanArray, RecordBatch};
 
@@ -50,6 +50,77 @@ use crate::error::{BoltError, BoltResult};
 use crate::exec::distinct::{ColumnReader, RowKey};
 use crate::exec::QueryHandle;
 use crate::plan::logical_plan::SetOpKind;
+
+/// Host-side cap on the number of distinct row keys the set-op key map may
+/// hold, mirroring the `DISTINCT` executor's `DISTINCT_HOST_MAX_ROWS` guard
+/// (`distinct.rs`).
+///
+/// Rationale: [`build_key_counts`] builds a `HashMap<RowKey, usize>` over the
+/// *entire* right input (and [`execute_setop`] builds an `emitted` set over
+/// distinct surviving left rows for the set variants). On a high-cardinality
+/// input that map grows to `n_distinct × n_cols × ~24 B` of host RAM with no
+/// upper limit — the same memory-DoS surface on user-controlled inputs that
+/// the DISTINCT cap closes. The cap converts unbounded growth into a clean
+/// [`BoltError::Other`] long before the OOM killer gets involved.
+///
+/// Overridable at runtime via [`SETOP_HOST_MAX_ROWS_ENV`] (parsed once on
+/// first call; see [`setop_host_max_rows`]). The default matches
+/// `DISTINCT_HOST_MAX_ROWS` (10M) so the two host set-building paths share a
+/// single resource budget.
+const SETOP_HOST_MAX_ROWS: usize = 10_000_000;
+
+/// Environment variable that overrides [`SETOP_HOST_MAX_ROWS`] at runtime.
+/// Parsed as a base-10 `usize`; `0` is rejected (it would disable the cap and
+/// reintroduce the unbounded-growth bug). On any parse failure a `log::warn!`
+/// is emitted and the default is used. Mirrors
+/// `CRATON_DISTINCT_HOST_MAX_ROWS`.
+const SETOP_HOST_MAX_ROWS_ENV: &str = "CRATON_SETOP_HOST_MAX_ROWS";
+
+/// Latch for the per-process set-op host-row cap. First call resolves the env
+/// var; subsequent calls hit the cached `usize`. Mirrors the DISTINCT cap's
+/// `OnceLock` latch in `distinct.rs`.
+static SETOP_HOST_MAX_ROWS_CACHE: OnceLock<usize> = OnceLock::new();
+
+/// Resolve the per-process set-op host-row cap. First call performs the
+/// env-var lookup; subsequent calls hit the latch. On any parse failure a
+/// one-time `log::warn!` is emitted and the compile-time default
+/// [`SETOP_HOST_MAX_ROWS`] is used.
+fn setop_host_max_rows() -> usize {
+    *SETOP_HOST_MAX_ROWS_CACHE.get_or_init(parse_setop_host_max_rows_env)
+}
+
+/// Pure parser for [`SETOP_HOST_MAX_ROWS_ENV`]. Extracted from the
+/// `OnceLock` so callers (and tests) can exercise the parsing rules without
+/// touching the latch. Returns the compile-time default on unset / empty /
+/// unparseable / zero values, logging a warning in the unparseable / zero
+/// cases. Mirrors `distinct::parse_distinct_host_max_rows_env`.
+fn parse_setop_host_max_rows_env() -> usize {
+    let raw = match std::env::var(SETOP_HOST_MAX_ROWS_ENV) {
+        Ok(v) => v,
+        Err(_) => return SETOP_HOST_MAX_ROWS,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return SETOP_HOST_MAX_ROWS;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(0) => {
+            log::warn!(
+                "setops: {SETOP_HOST_MAX_ROWS_ENV}='0' would disable the host-side cap; \
+                 using default of {SETOP_HOST_MAX_ROWS}"
+            );
+            SETOP_HOST_MAX_ROWS
+        }
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "setops: {SETOP_HOST_MAX_ROWS_ENV}='{trimmed}' is not a valid usize ({e}); \
+                 using default of {SETOP_HOST_MAX_ROWS}"
+            );
+            SETOP_HOST_MAX_ROWS
+        }
+    }
+}
 
 /// Execute an `EXCEPT` / `INTERSECT` (optionally `ALL`) over the two already-
 /// materialised inputs.
@@ -63,6 +134,22 @@ pub fn execute_setop(
     right: QueryHandle,
     op: SetOpKind,
     all: bool,
+) -> BoltResult<QueryHandle> {
+    let max_rows = setop_host_max_rows();
+    execute_setop_with_cap(left, right, op, all, max_rows)
+}
+
+/// Internal entry point that lets callers (and tests) inject the host key-map
+/// cap directly, bypassing the `OnceLock`-latched env-var resolution.
+/// Production code goes through [`execute_setop`]; tests use this to exercise
+/// the bound-exceeded path without poisoning the global latch for other tests
+/// running in the same process. Mirrors `distinct::execute_distinct_with_cap`.
+fn execute_setop_with_cap(
+    left: QueryHandle,
+    right: QueryHandle,
+    op: SetOpKind,
+    all: bool,
+    max_rows: usize,
 ) -> BoltResult<QueryHandle> {
     let left_batch = left.into_record_batch();
     let right_batch = right.into_record_batch();
@@ -98,7 +185,7 @@ pub fn execute_setop(
     // never interleave: in the set arms the counts are read but never
     // mutated, so consuming `right_counts` as the working multiset for the
     // `ALL` arms is safe and preserves EXACT multiset semantics.
-    let mut right_counts = build_key_counts(&right_batch)?;
+    let mut right_counts = build_key_counts(&right_batch, max_rows)?;
 
     // Pre-downcast the left columns once (mirrors the DISTINCT executor's
     // `ColumnReader` allocation strategy: N·K vtable lookups → K).
@@ -154,6 +241,19 @@ pub fn execute_setop(
             }
         };
         keep.push(survive);
+        // Resource bound on the left-side dedup map, mirroring the DISTINCT
+        // cap (and the right-side cap in `build_key_counts`). Only the set
+        // (`!all`) variants populate `emitted`; the `ALL` arms leave it empty
+        // so this check is a no-op for them. Checking `emitted.len()` (the
+        // distinct surviving-key count) rather than the row count lets a long
+        // left input full of duplicates still complete.
+        if emitted.len() > max_rows {
+            return Err(BoltError::Other(format!(
+                "{} exceeded host bound of {max_rows} distinct rows; \
+                 LIMIT the input (override via {SETOP_HOST_MAX_ROWS_ENV})",
+                op.keyword(),
+            )));
+        }
     }
 
     // Apply the keep-mask to every left column. `arrow::compute::filter`
@@ -173,9 +273,23 @@ pub fn execute_setop(
 /// Uses the same [`ColumnReader`] / [`RowKey`] machinery as the `DISTINCT`
 /// executor so the keys are byte-for-byte comparable with the ones built over
 /// the left input in [`execute_setop`].
-fn build_key_counts(batch: &RecordBatch) -> BoltResult<HashMap<RowKey, usize>> {
+///
+/// `max_rows` bounds the number of *distinct* keys the map may hold (the
+/// resource cap mirroring DISTINCT — see [`SETOP_HOST_MAX_ROWS`]). The
+/// initial capacity is clamped to `min(n_rows, max_rows)` so a giant `n_rows`
+/// can't drive a multi-GiB up-front allocation, and the per-key check fires
+/// when the *distinct* count crosses the cap (a right input full of
+/// duplicates still completes). Exceeding the cap returns a clean
+/// [`BoltError::Other`] rather than growing unboundedly.
+fn build_key_counts(
+    batch: &RecordBatch,
+    max_rows: usize,
+) -> BoltResult<HashMap<RowKey, usize>> {
     let n_rows = batch.num_rows();
-    let mut counts: HashMap<RowKey, usize> = HashMap::with_capacity(n_rows);
+    // Clamp the up-front allocation to the cap (DISTINCT's `initial_cap`
+    // pattern): a huge `n_rows` must not pre-allocate past the budget.
+    let initial_cap = n_rows.min(max_rows);
+    let mut counts: HashMap<RowKey, usize> = HashMap::with_capacity(initial_cap);
     if n_rows == 0 {
         return Ok(counts);
     }
@@ -188,6 +302,16 @@ fn build_key_counts(batch: &RecordBatch) -> BoltResult<HashMap<RowKey, usize>> {
     for row in 0..n_rows {
         let key = RowKey::from_values(n_cols, readers.iter().map(|r| r.value_at(row)));
         *counts.entry(key).or_insert(0) += 1;
+        // Resource bound: keep the multiset from growing without limit on a
+        // high-cardinality right input. Checked on the distinct-key count
+        // (`counts.len()`), not the row count, so a duplicate-heavy input
+        // still completes; only the distinct cardinality is bounded.
+        if counts.len() > max_rows {
+            return Err(BoltError::Other(format!(
+                "set operation exceeded host bound of {max_rows} distinct rows on the \
+                 right input; LIMIT the input (override via {SETOP_HOST_MAX_ROWS_ENV})"
+            )));
+        }
     }
     Ok(counts)
 }
@@ -308,5 +432,82 @@ mod tests {
         let batch = out.record_batch();
         let s = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(s.value(0), "b");
+    }
+
+    // ─── Host key-map cap (memory-DoS guard, mirrors DISTINCT) ───────────
+
+    /// A right input whose distinct cardinality exceeds the cap surfaces a
+    /// clean error from `build_key_counts` rather than growing unboundedly.
+    #[test]
+    fn right_input_exceeding_cap_errors() {
+        // 5 distinct right keys, cap of 3 → must error while building the
+        // right multiset.
+        let l = int32_handle(vec![Some(1)]);
+        let r = int32_handle(vec![Some(10), Some(11), Some(12), Some(13), Some(14)]);
+        let err = execute_setop_with_cap(l, r, SetOpKind::Intersect, false, 3)
+            .expect_err("right-side cardinality over cap must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeded host bound") && msg.contains("right input"),
+            "expected right-side bound error, got: {msg}"
+        );
+    }
+
+    /// The set (`!all`) left-side dedup map is also capped: a left input with
+    /// many distinct surviving keys errors even when the right side is small.
+    #[test]
+    fn left_distinct_survivors_exceeding_cap_errors() {
+        // Right is empty → EXCEPT (set) = DISTINCT(left). 5 distinct left
+        // keys with cap 3 must trip the `emitted` cap.
+        let l = int32_handle(vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        let r = int32_handle(vec![]);
+        let err = execute_setop_with_cap(l, r, SetOpKind::Except, false, 3)
+            .expect_err("left distinct survivors over cap must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeded host bound"),
+            "expected host-bound error, got: {msg}"
+        );
+    }
+
+    /// A duplicate-heavy input under the *distinct* cap still completes: the
+    /// cap is on cardinality, not row count.
+    #[test]
+    fn duplicates_under_cap_complete() {
+        // 100 rows but only 1 distinct key on each side; cap of 2 is fine.
+        let l = int32_handle(vec![Some(7); 100]);
+        let r = int32_handle(vec![Some(7); 100]);
+        let out = execute_setop_with_cap(l, r, SetOpKind::Intersect, false, 2)
+            .expect("duplicate-heavy input under the distinct cap must pass");
+        assert_eq!(col_to_vec(&out), vec![Some(7)]);
+    }
+
+    /// Env-var parser: unset / empty / unparseable / zero all fall back to
+    /// the compile-time default; a valid positive integer wins. Exercised
+    /// against the pure parser so the `OnceLock` latch is not poisoned.
+    /// Serialised on a local lock — `std::env` is process-global.
+    #[test]
+    fn setop_env_var_parser_handles_all_paths() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let set = |v: Option<&str>| match v {
+            Some(s) => std::env::set_var(SETOP_HOST_MAX_ROWS_ENV, s),
+            None => std::env::remove_var(SETOP_HOST_MAX_ROWS_ENV),
+        };
+
+        set(None);
+        assert_eq!(parse_setop_host_max_rows_env(), SETOP_HOST_MAX_ROWS);
+        set(Some(""));
+        assert_eq!(parse_setop_host_max_rows_env(), SETOP_HOST_MAX_ROWS);
+        set(Some("0"));
+        assert_eq!(parse_setop_host_max_rows_env(), SETOP_HOST_MAX_ROWS);
+        set(Some("not-a-number"));
+        assert_eq!(parse_setop_host_max_rows_env(), SETOP_HOST_MAX_ROWS);
+        set(Some("42"));
+        assert_eq!(parse_setop_host_max_rows_env(), 42);
+
+        set(None);
     }
 }

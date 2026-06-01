@@ -324,7 +324,7 @@ SELECT price FROM sales WHERE price BETWEEN 10.0 AND 100.0;            -- desuga
 SELECT CASE WHEN price > 100 THEN 1 ELSE 0 END FROM sales;            -- numeric CASE (GPU)
 SELECT CAST(region_id AS FLOAT8) FROM sales;                         -- numeric CAST (GPU)
 SELECT region || '-' || CAST(region_id AS VARCHAR) FROM sales;       -- || concat (host-side Project)
-SELECT name FROM sales WHERE name LIKE 'A%';                         -- LIKE (host-side filter)
+SELECT name FROM sales WHERE name LIKE 'A%';                         -- LIKE (GPU, host fallback)
 SELECT * FROM sales WHERE active;
 
 -- Scalar aggregates

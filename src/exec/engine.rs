@@ -2125,6 +2125,9 @@ impl Engine {
             .observe_duration(crate::metrics::Phase::Parse, parse_start.elapsed());
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding __idx_<col> i32 column.
+        // Time the whole logical-planning stage (rewrites + optimizer +
+        // subquery resolution) into the `Plan` histogram.
+        let plan_start = Instant::now();
         let plan = tracing::info_span!("plan")
             .in_scope(|| self.dict_registry.rewrite_plan(&plan))?;
         let plan = self.dict_registry.rewrite_plan(&plan)?;
@@ -2170,6 +2173,8 @@ impl Engine {
         // net for hand-built physical plans). See
         // `crate::exec::subquery_resolve`.
         let plan = self.resolve_subqueries(plan)?;
+        crate::metrics::metrics()
+            .observe_duration(crate::metrics::Phase::Plan, plan_start.elapsed());
         // Time the lower phase (LogicalPlan → PhysicalPlan) into the Lower
         // histogram; mirrors the `lower` tracing span in `observability`.
         let lower_start = Instant::now();
@@ -3212,6 +3217,7 @@ impl Engine {
                 ptr::null_mut(),
             ))?;
         }
+        crate::metrics::metrics().inc(crate::metrics::Counter::GpuLaunchesTotal);
         // V-1 / F10a: this hand-rolled `cuLaunchKernel` bypasses
         // `KernelArgs::tag_launch_stream` (the central Drop-fence enforcement
         // point that `launch_1d` callers get for free). Restore the invariant
@@ -3301,11 +3307,10 @@ impl Engine {
                 )?;
                 // Output buffers can drop now; gathered owns the compacted data.
                 drop(output_cols);
-                let mut out: Vec<ArrayRef> = Vec::with_capacity(gathered.len());
-                for g in &gathered {
-                    out.push(g.download()?);
-                }
-                out
+                // Batched, stream-overlapped D2H: enqueue every column's async
+                // copy into pinned host buffers on one stream, then synchronize
+                // once — instead of N blocking per-column `download()` round trips.
+                crate::exec::gpu_compact::download_columns(&gathered, &stream)?
             }
         } else {
             // Stage-3 pinned downloads on the per-call stream. Each
@@ -3319,11 +3324,14 @@ impl Engine {
             full
         };
 
-        // 9. Build the result RecordBatch.
+        // 9. Build the result RecordBatch (Materialize phase).
+        let materialize_start = Instant::now();
         let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
         let batch_out = RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
             BoltError::Other(format!("failed to build output RecordBatch: {e}"))
         })?;
+        crate::metrics::metrics()
+            .observe_duration(crate::metrics::Phase::Materialize, materialize_start.elapsed());
         Ok(QueryHandle { batch: batch_out })
     }
 
@@ -4122,6 +4130,7 @@ impl Engine {
 }
 
 /// Result of a query — wraps the output Arrow `RecordBatch`.
+#[derive(Debug)]
 pub struct QueryHandle {
     /// The materialised result.
     batch: RecordBatch,

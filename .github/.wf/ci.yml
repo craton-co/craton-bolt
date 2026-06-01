@@ -232,32 +232,28 @@ jobs:
   # Toolkit >= 12 on the runner — neither is available on github-hosted
   # runners.
   #
-  # This job is a documented placeholder so the wiring is ready the day a GPU
-  # runner is provisioned:
+  # This job runs the ~243 `#[ignore = "gpu:*"]` live-GPU tests, which are the
+  # ONLY way the crate's real-device GPU paths get exercised (every other job
+  # uses `--features cuda-stub` and touches zero GPU code).
   #
-  #   1. Register a self-hosted runner on a GPU box with the labels below
-  #      (e.g. `self-hosted, linux, gpu, cuda`).
-  #   2. Replace `runs-on: ubuntu-latest` with the commented `runs-on` block.
-  #   3. Drop `continue-on-error` / `if: false` once the lane is trusted to be
-  #      green, and consider making it a required check on `main`.
+  # REQUIREMENT: a self-hosted NVIDIA GPU runner MUST be registered for this
+  # lane. Register a self-hosted runner on a GPU box (compute capability >= 7.0,
+  # CUDA Toolkit >= 12 + matching driver installed so `libcuda.so` / `cuda.lib`
+  # is on the linker path) with the labels `self-hosted` and `gpu`. Until such a
+  # runner is online, this job stays queued rather than failing — that is
+  # expected. The `runs-on` labels below MUST match the registered runner.
   #
-  # It is INTENTIONALLY:
-  #   * `continue-on-error: true` — never blocks merges while it is a stub, and
-  #   * `if: false`               — does not even attempt to run on github-hosted
-  #                                 runners (which have no GPU), so it stays a
-  #                                 no-op until a maintainer enables it.
-  #
-  # The real command a GPU runner would execute is shown (and kept honest)
-  # below: build the `cudarc` backend and run ONLY the `#[ignore]`d tests.
+  # The lane is guarded to run only on the canonical repo (NOT on PRs from
+  # forks), so untrusted fork code never executes on the self-hosted hardware.
   gpu-integration:
-    name: gpu integration (stub, allow-failure)
-    # No GPU runner exists yet, so this never runs in the current setup.
-    # Flip to `true` (or delete) once a GPU runner is registered.
-    if: false
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    # When a self-hosted GPU runner is available, swap the line above for:
-    #   runs-on: [self-hosted, linux, gpu, cuda]
+    name: gpu integration (self-hosted NVIDIA GPU)
+    # Only run on the main repo — never on fork PRs, so fork code cannot run on
+    # the self-hosted GPU hardware. Still runs on push / schedule / dispatch.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # Self-hosted NVIDIA GPU runner. A maintainer must register a runner with
+    # these labels (see the comment block above). Placeholder labels — adjust
+    # to match the actual runner registration if different.
+    runs-on: [self-hosted, gpu]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -265,14 +261,15 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      # On a real GPU runner the CUDA Toolkit (>= 12) and a matching driver
-      # must already be installed so `cuda.lib` / `libcuda.so` is on the
-      # linker path. The `cudarc` feature links the real CUDA driver API.
+      # On the GPU runner the CUDA Toolkit (>= 12) and a matching driver must
+      # already be installed so `cuda.lib` / `libcuda.so` is on the linker
+      # path. BOLT_BENCH_GPU=1 gates the lib's GPU unit tests onto the real
+      # device; `-- --ignored` runs the `#[ignore = "gpu:*"]` integration tests.
       - name: cargo test (GPU, ignored)
         run: |
-          # Build + run ONLY the #[ignore]-gated live-GPU integration tests.
-          # RUSTFLAGS is cleared because the cudarc tree can carry warnings we
+          # Build + run ONLY the #[ignore]-gated live-GPU tests.
+          # RUSTFLAGS is cleared because the GPU tree can carry warnings we
           # do not want to gate the GPU lane on.
-          cargo test --features cudarc --no-default-features -- --ignored
+          BOLT_BENCH_GPU=1 cargo test --features cuda-stub -- --ignored
         env:
           RUSTFLAGS: ""

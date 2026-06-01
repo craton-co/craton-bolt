@@ -35,7 +35,9 @@
 use std::collections::BTreeSet;
 
 use crate::error::BoltResult;
-use crate::plan::logical_plan::{AggregateExpr, Expr, LogicalPlan, Schema};
+use crate::plan::logical_plan::{
+    join_combined_schema, AggregateExpr, Expr, LogicalPlan, Schema,
+};
 use crate::plan::rewrite::PlanRewrite;
 
 use super::expr_util::{collect_agg_columns, collect_columns};
@@ -206,6 +208,23 @@ fn prune(plan: LogicalPlan, required: &BTreeSet<String>) -> LogicalPlan {
             // The join needs: the parent's required columns that resolve on a
             // side, plus every column its own `on` pairs and residual `filter`
             // reference. Attribute each required name to the side that owns it.
+            //
+            // Subtlety: the parent's `required` set is expressed in the join's
+            // *combined* output schema, where a right-side column whose name
+            // collides with a left-side name has been renamed (e.g. `a` ->
+            // `right.a`) by `join_combined_schema` / `join_rename`. The child
+            // schemas, however, still use the bare names. So we cannot simply
+            // intersect `required` against each child schema: a renamed right
+            // column (`right.a`) would match neither child and get dropped.
+            //
+            // Instead we rebuild the combined schema and use it as the
+            // authoritative map from combined-name -> originating child. The
+            // first `lschema.fields.len()` combined fields are the left child's
+            // columns (always bare); the remaining ones correspond positionally
+            // to the right child's fields, so combined field at index
+            // `nleft + i` maps back to `rschema.fields[i].name`. Columns the
+            // join itself consumes (`on` / `filter`) are named in the *child*
+            // schemas (bare) and attributed directly.
             let lschema = left.schema().ok();
             let rschema = right.schema().ok();
             let (Some(lschema), Some(rschema)) = (lschema, rschema) else {
@@ -219,7 +238,32 @@ fn prune(plan: LogicalPlan, required: &BTreeSet<String>) -> LogicalPlan {
                 };
             };
 
-            // Columns the join itself consumes.
+            let combined = join_combined_schema(&lschema, &rschema, join_type);
+            let nleft = lschema.fields.len();
+
+            let mut left_req = BTreeSet::new();
+            let mut right_req = BTreeSet::new();
+
+            // Attribute each parent-required combined-schema name back to the
+            // child column it originated from.
+            for (idx, field) in combined.fields.iter().enumerate() {
+                if !required.contains(&field.name) {
+                    continue;
+                }
+                if idx < nleft {
+                    // Left columns are passed through with their bare name.
+                    left_req.insert(field.name.clone());
+                } else {
+                    // Right column: recover the child's bare name positionally,
+                    // undoing any `right.`/`__N` rename the combined schema
+                    // applied.
+                    right_req.insert(rschema.fields[idx - nleft].name.clone());
+                }
+            }
+
+            // Columns the join itself consumes are referenced in the *child*
+            // (bare-named) schemas via `on` / `filter`. Attribute each to
+            // whichever side actually owns it.
             let mut join_cols = BTreeSet::new();
             for (l, r) in &on {
                 add_expr_cols(l, &mut join_cols);
@@ -228,12 +272,37 @@ fn prune(plan: LogicalPlan, required: &BTreeSet<String>) -> LogicalPlan {
             if let Some(f) = &filter {
                 add_expr_cols(f, &mut join_cols);
             }
+            for c in &join_cols {
+                if lschema.fields.iter().any(|f| &f.name == c) {
+                    left_req.insert(c.clone());
+                }
+                if rschema.fields.iter().any(|f| &f.name == c) {
+                    right_req.insert(c.clone());
+                }
+            }
 
-            let mut wanted = required.clone();
-            wanted.extend(join_cols);
-
-            let left_req = restrict_to_schema(&wanted, &lschema);
-            let right_req = restrict_to_schema(&wanted, &rschema);
+            // Output-schema stability under child pruning. A right-side column
+            // whose bare name collides with a left-side name is RENAMED to
+            // `right.<name>` by `join_combined_schema`/`join_rename`, and the
+            // parent references it by that renamed name. If we pruned the
+            // colliding LEFT column away, the collision — and hence the rename —
+            // would vanish: the right column would re-emerge as bare `<name>`
+            // and the parent's `right.<name>` reference would dangle (the exact
+            // Critical bug this pass had). So retain every left column that
+            // anchors a required right column's rename, even if it is otherwise
+            // unused on the left. (Limitation: duplicate column names *within*
+            // one side can still shift `__N` suffixes; that pathological shape
+            // is not handled here.)
+            let left_names: BTreeSet<String> =
+                lschema.fields.iter().map(|f| f.name.clone()).collect();
+            let anchors: Vec<String> = right_req
+                .iter()
+                .filter(|rname| left_names.contains(*rname))
+                .cloned()
+                .collect();
+            for a in anchors {
+                left_req.insert(a);
+            }
 
             LogicalPlan::Join {
                 left: Box::new(prune(*left, &left_req)),
@@ -294,15 +363,6 @@ fn full_schema_cols(plan: &LogicalPlan) -> BTreeSet<String> {
         Ok(s) => s.fields.into_iter().map(|f| f.name).collect(),
         Err(_) => BTreeSet::new(),
     }
-}
-
-/// Subset of `wanted` whose names exist in `schema`.
-fn restrict_to_schema(wanted: &BTreeSet<String>, schema: &Schema) -> BTreeSet<String> {
-    wanted
-        .iter()
-        .filter(|c| schema.fields.iter().any(|f| &f.name == *c))
-        .cloned()
-        .collect()
 }
 
 /// Add every column referenced by `expr` into `set`.
@@ -440,18 +500,21 @@ mod tests {
         assert_eq!(bnames, anames);
     }
 
-    // REVIEW PROBE: join with colliding column names, select only the
-    // renamed right-side column. Does pruning drop the needed right column?
-    #[test]
-    fn review_probe_join_collision_rename() {
+    /// Build the `t1(k,a) JOIN t2(k,a)` plan used by the collision tests,
+    /// selecting only the renamed right-side column `right.a`.
+    fn join_collision_select_right_a() -> LogicalPlan {
         use crate::plan::logical_plan::JoinType;
         // t1(k, a), t2(k, a). SELECT right.a FROM t1 JOIN t2 ON t1.k=t2.k
+        // Each table carries an unused `x` so pruning has something safe to
+        // drop (proving the pass still narrows scans) while `k` (join key) and
+        // `a` (collision anchor / required) must be kept.
         let left = LogicalPlan::Scan {
             table: "t1".into(),
             projection: None,
             schema: Schema::new(vec![
                 Field::new("k", DataType::Int64, false),
                 Field::new("a", DataType::Int64, false),
+                Field::new("x", DataType::Int64, false),
             ]),
         };
         let right = LogicalPlan::Scan {
@@ -460,6 +523,7 @@ mod tests {
             schema: Schema::new(vec![
                 Field::new("k", DataType::Int64, false),
                 Field::new("a", DataType::Int64, false),
+                Field::new("x", DataType::Int64, false),
             ]),
         };
         let join = LogicalPlan::Join {
@@ -471,22 +535,93 @@ mod tests {
             filter: None,
         };
         // combined schema is [k, a, right.k, right.a]; select right.a
-        let plan = LogicalPlan::Project {
+        LogicalPlan::Project {
             input: Box::new(join),
             exprs: vec![col("right.a")],
-        };
-        let before = plan.schema().expect("typecheck");
-        eprintln!("BEFORE cols: {:?}", before.fields.iter().map(|f| &f.name).collect::<Vec<_>>());
-        let out = ProjectionPruning.rewrite(plan).expect("prune");
-        // Inspect the right scan's projection.
-        if let LogicalPlan::Project { input, .. } = &out {
-            if let LogicalPlan::Join { right, .. } = input.as_ref() {
-                if let LogicalPlan::Scan { projection, .. } = right.as_ref() {
-                    eprintln!("RIGHT scan projection after prune: {:?}", projection);
-                }
-            }
         }
-        let after = out.schema();
-        eprintln!("AFTER schema ok? {:?}", after.as_ref().map(|s| s.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>()));
+    }
+
+    // REVIEW PROBE: join with colliding column names, select only the
+    // renamed right-side column. Asserts pruning keeps the needed right
+    // column (`a` in the t2 scan) and the plan still type-checks with the
+    // same output schema. With the bug present, the right scan would be
+    // pruned to `[k]` (dropping `a`) and the plan would fail to type-check.
+    #[test]
+    fn review_probe_join_collision_rename() {
+        let plan = join_collision_select_right_a();
+        let before = plan.schema().expect("typecheck");
+        let out = ProjectionPruning.rewrite(plan).expect("prune");
+
+        // The right (t2) scan must still produce `a` (the originating bare
+        // name of the renamed combined column `right.a`).
+        let right_proj = match &out {
+            LogicalPlan::Project { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { right, .. } => match right.as_ref() {
+                    LogicalPlan::Scan { projection, .. } => projection.clone(),
+                    other => panic!("expected right Scan, got {other:?}"),
+                },
+                other => panic!("expected Join, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        };
+        if let Some(p) = &right_proj {
+            assert!(
+                p.contains(&"a".to_string()),
+                "right scan must still read `a`; got {right_proj:?}",
+            );
+        }
+
+        // And the pruned plan must still type-check to the same output schema.
+        let after = out.schema().expect("pruned plan must still type-check");
+        let bnames: Vec<_> = before.fields.iter().map(|f| f.name.clone()).collect();
+        let anames: Vec<_> = after.fields.iter().map(|f| f.name.clone()).collect();
+        assert_eq!(bnames, anames, "output schema must be preserved");
+    }
+
+    #[test]
+    fn join_collision_keeps_renamed_right_column() {
+        // SELECT right.a FROM t1 JOIN t2 (both have column `a`): the right
+        // scan must keep `a`, and the left scan must NOT keep `a` (it is
+        // unreferenced on the left — only `k` is needed there for the join).
+        let plan = join_collision_select_right_a();
+        let out = ProjectionPruning.rewrite(plan).expect("prune");
+
+        let (left_proj, right_proj) = match &out {
+            LogicalPlan::Project { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { left, right, .. } => {
+                    let lp = match left.as_ref() {
+                        LogicalPlan::Scan { projection, .. } => projection.clone(),
+                        other => panic!("expected left Scan, got {other:?}"),
+                    };
+                    let rp = match right.as_ref() {
+                        LogicalPlan::Scan { projection, .. } => projection.clone(),
+                        other => panic!("expected right Scan, got {other:?}"),
+                    };
+                    (lp, rp)
+                }
+                other => panic!("expected Join, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        };
+
+        // Right side keeps `a` (required as `right.a`) and `k` (join key), and
+        // drops the unused `x`.
+        let rp = right_proj.expect("right scan should be pruned to [k, a]");
+        assert!(rp.contains(&"a".to_string()), "right scan must keep `a`; got {rp:?}");
+        assert!(rp.contains(&"k".to_string()), "right scan must keep `k`; got {rp:?}");
+        assert!(!rp.contains(&"x".to_string()), "right scan must drop unused `x`; got {rp:?}");
+
+        // Left side keeps `k` (join key) and `a` (the collision ANCHOR — its
+        // presence is what makes the right `a` render as `right.a`; dropping it
+        // would dangle the parent's `right.a` reference). It still drops the
+        // genuinely-unused `x`, proving the pass narrows scans without breaking
+        // the renamed output schema.
+        let lp = left_proj.expect("left scan should be pruned to [k, a]");
+        assert!(lp.contains(&"k".to_string()), "left scan must keep `k`; got {lp:?}");
+        assert!(
+            lp.contains(&"a".to_string()),
+            "left scan must keep collision anchor `a`; got {lp:?}",
+        );
+        assert!(!lp.contains(&"x".to_string()), "left scan must drop unused `x`; got {lp:?}");
     }
 }

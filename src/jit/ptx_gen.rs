@@ -10,9 +10,18 @@ use crate::plan::logical_plan::{BinaryOp, DataType, Literal};
 use crate::plan::physical_plan::{KernelSpec, Op, Reg};
 
 /// PTX target metadata baked into every emitted module.
-const PTX_VERSION: &str = ".version 7.5";
+///
+/// Exposed `pub(crate)` so the on-disk / in-process cache salt
+/// ([`crate::jit::disk_cache::codegen_salt`]) can fold the PTX ISA
+/// `.version` and the `.target` arch string into the cache key. See the
+/// `JIT-arch` note on `codegen_salt`: the target is a hardcoded `sm_70`
+/// today, but folding it into the salt means that if the target ever
+/// becomes device-derived, cached kernels can never be mis-routed across
+/// GPU architectures (a key written under `sm_70` won't be served to an
+/// `sm_90` process).
+pub(crate) const PTX_VERSION: &str = ".version 7.5";
 /// Target SM architecture string.
-const PTX_TARGET: &str = ".target sm_70";
+pub(crate) const PTX_TARGET: &str = ".target sm_70";
 /// Address size directive (we always use 64-bit pointers).
 const PTX_ADDRESS_SIZE: &str = ".address_size 64";
 
@@ -341,28 +350,54 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
         }
     }
 
-    // -------- Compute the combined input validity: AND of every flagged
-    //          input's validity byte at row tid. This is a conservative
-    //          per-output validity (every output is marked valid only if
-    //          EVERY input row is valid). A finer per-output dataflow
-    //          analysis is a Stage C follow-up; for the common case
-    //          (`SUM(price * tax)` etc.) every input feeds every output,
-    //          so AND-of-all is exact.
+    // -------- Per-output validity (issue B: precise NULL propagation).
     //
-    //          When no input carries validity we still need a register
-    //          holding `1` to drive flagged output stores (e.g. a kernel
-    //          whose inputs are all-valid but whose outputs nonetheless
-    //          carry a validity column for downstream-shape reasons).
-    let combined_valid: Option<String> = if n_input_validity == 0 && n_output_validity == 0 {
-        None
-    } else {
+    //          Each flagged output's NULL mask is the AND of ONLY the inputs
+    //          that output transitively depends on — not the AND of *every*
+    //          kernel input. `output_input_dependencies` does the backward
+    //          def-use walk from each `Store`'s source register down to the
+    //          `LoadColumn`s it reaches, returning the (sorted) input column
+    //          ordinals per output. We then keep only those that actually
+    //          carry a validity bitmap (`input_validity_ptrs[c].is_some()`).
+    //
+    //          Correctness for the common single-output case is preserved
+    //          byte-for-byte: when there is exactly one flagged output and it
+    //          depends on every flagged input (e.g. `SUM(price * tax)`), the
+    //          filtered dep-set equals "all flagged inputs in ascending column
+    //          order", so the emitted AND-tree, register allocation order, and
+    //          store are identical to the previous AND-of-all-inputs shape.
+    //          Multi-output kernels and CASE branches now get a *tighter*
+    //          (per-output) mask, which is a deliberate behavior change: an
+    //          output is no longer NULLed by a NULL in an input it never reads.
+    //
+    //          When an output's filtered dep-set is empty (no flagged input
+    //          feeds it) we still emit a register holding `1`, so a flagged
+    //          output whose inputs are all-valid (or which carries a validity
+    //          column purely for downstream-shape reasons) stores valid=1.
+    //
+    //          The AND-trees are emitted here (before the compute/store ops) so
+    //          the store sites below stay a single, obvious gate point; the
+    //          per-output combined register is recorded for the store loop.
+    let output_deps = output_input_dependencies(spec);
+    let mut output_combined: Vec<Option<String>> = vec![None; spec.outputs.len()];
+    for (out_idx, opt_vptr) in output_validity_ptrs.iter().enumerate() {
+        if opt_vptr.is_none() {
+            // Output carries no validity bitmap -> nothing to compute/store.
+            continue;
+        }
+        // Inputs this output depends on AND that carry a validity bitmap, in
+        // ascending column order (the dep list is already sorted). Indexing
+        // `output_deps` is bounds-safe: it is parallel to `spec.outputs`.
+        let deps: &[usize] = output_deps.get(out_idx).map(Vec::as_slice).unwrap_or(&[]);
         let combined = b.alloc.alloc("r");
         // PERF (codegen alloc): emit straight into `b.body` via `emit_fmt!`.
-        // `vptr` is a borrow of a local Vec, not `b`, so it nests fine.
         emit_fmt!(b, "mov.b32 {}, 1;", combined)?;
-        for (i, opt) in input_validity_ptrs.iter().enumerate() {
-            let Some(vptr) = opt else { continue };
-            let _ = i;
+        for &c in deps {
+            let Some(vptr) = input_validity_ptrs.get(c).and_then(|o| o.as_ref()) else {
+                // Dependency on an input with no validity bitmap: it can never
+                // be NULL, so it contributes nothing to the AND-tree.
+                continue;
+            };
             // off = tid (u8 stride => offset = tid).
             // C-3: widen the row index UNSIGNED (`mul.wide.u32 .. , 1`) so the
             // validity-byte offset matches the value-load path
@@ -385,8 +420,8 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
             // pattern used by logical Bool ops (see emit_binary).
             emit_fmt!(b, "and.b32 {}, {}, {};", combined, combined, byte_reg)?;
         }
-        Some(combined)
-    };
+        output_combined[out_idx] = Some(combined);
+    }
 
     // -------- Split ops into "compute" and "store" so the predicate gate
     //          sits between them. `Store128` joins `Store` in the sink
@@ -434,25 +469,28 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
         )?;
     }
 
-    // -------- (Option B) Per-output validity stores. Each flagged output
-    //          receives the same combined input validity at row tid. This
-    //          runs AFTER the value stores so a Stage C optimisation that
-    //          skips the value math when validity is 0 has a single,
-    //          obvious gate site.
-    if let Some(combined) = &combined_valid {
-        for (i, opt) in output_validity_ptrs.iter().enumerate() {
-            let Some(vptr) = opt else { continue };
-            let _ = i;
-            let off = b.alloc.alloc("rd");
-            let addr = b.alloc.alloc("rd");
-            // PERF (codegen alloc): emit straight into `b.body` via `emit_fmt!`;
-            // `vptr`/`combined` are borrows of locals, not `b`.
-            // C-3: UNSIGNED widen (`mul.wide.u32 _, 1`) to match the value path
-            // and the AND-of-inputs fold above; see the input-validity comment.
-            emit_fmt!(b, "mul.wide.u32 {}, {}, 1;", off, tid)?;
-            emit_fmt!(b, "add.s64 {}, {}, {};", addr, vptr, off)?;
-            emit_fmt!(b, "st.global.u8 [{}], {};", addr, combined)?;
-        }
+    // -------- (Issue B) Per-output validity stores. Each flagged output
+    //          stores ITS OWN combined mask (the AND of just the inputs it
+    //          depends on, computed above) at row tid. This runs AFTER the
+    //          value stores so a Stage C optimisation that skips the value
+    //          math when validity is 0 has a single, obvious gate site.
+    for (i, opt) in output_validity_ptrs.iter().enumerate() {
+        let Some(vptr) = opt else { continue };
+        // A flagged output always has a recorded combined register (the loop
+        // above allocates one for every `Some` validity ptr); skip defensively
+        // if somehow absent rather than emitting a store of an unset register.
+        let Some(combined) = output_combined.get(i).and_then(|o| o.as_ref()) else {
+            continue;
+        };
+        let off = b.alloc.alloc("rd");
+        let addr = b.alloc.alloc("rd");
+        // PERF (codegen alloc): emit straight into `b.body` via `emit_fmt!`;
+        // `vptr`/`combined` are borrows of locals, not `b`.
+        // C-3: UNSIGNED widen (`mul.wide.u32 _, 1`) to match the value path
+        // and the AND-of-inputs fold above; see the input-validity comment.
+        emit_fmt!(b, "mul.wide.u32 {}, {}, 1;", off, tid)?;
+        emit_fmt!(b, "add.s64 {}, {}, {};", addr, vptr, off)?;
+        emit_fmt!(b, "st.global.u8 [{}], {};", addr, combined)?;
     }
 
     // -------- Done label + return.
@@ -1442,6 +1480,17 @@ fn emit_binary(
                 }
             }
             let dst_name = b.alloc.assign(dst, result_dtype)?;
+            // JIT-DIV0/INT_MIN UB fix: integer `Div` must NOT lower to a bare
+            // `div.s32`/`div.s64`. On the GPU both `b == 0` and the single
+            // overflow case `INT_MIN / -1` are UNDEFINED (div-by-zero is UB;
+            // `INT_MIN / -1` overflows the signed result). Route signed
+            // integer division through a guarded sequence that produces a
+            // fully-defined result in every case. Float division keeps the
+            // historical single-instruction emission (IEEE `div.rn.*` is
+            // already total — `x/0.0` yields ±inf/NaN, no UB).
+            if matches!(op, Div) && matches!(dtype, DataType::Int32 | DataType::Int64) {
+                return emit_int_div_guarded(b, &dst_name, lhs, rhs, dtype);
+            }
             let mnemonic = arith_mnemonic(op, dtype)?;
             emit_fmt!(
                 b,
@@ -1512,6 +1561,105 @@ fn emit_binary(
             ))
         }
     }
+}
+
+/// Emit a guarded **signed integer** division `dst = lhs / rhs` that is
+/// fully defined for every operand pair, removing two GPU undefined-behavior
+/// hazards that a bare `div.s32`/`div.s64` leaves open:
+///
+///   1. **Divide-by-zero** (`rhs == 0`). On the GPU integer div-by-zero is
+///      UB (the result is unspecified; on some architectures it can fault).
+///      SQL/DuckDB semantics treat integer divide-by-zero as producing
+///      **NULL**. The proper fix is to mark the output row NULL via the
+///      kernel's per-row validity bitmap — but `emit_binary` runs in a
+///      codegen context that has **no access** to the output-validity
+///      pointers (those are wired up in `compile`, keyed by output column,
+///      not by intermediate `Reg`). So at this layer we do the next-best,
+///      UB-removing thing: divide by a safe non-zero stand-in and `selp` a
+///      **defined `0`** into `dst` when the real divisor was zero. The result
+///      is deterministic (no UB / no fault) but is `0`, not NULL.
+///
+///      LIMITATION (documented intentionally): the divide-by-zero row is NOT
+///      flagged NULL here. The conservative AND-of-inputs validity fold in
+///      `compile` still NULLs the row if any *input* was NULL, but a
+///      genuine `x / 0` over non-NULL inputs currently yields `0` rather than
+///      SQL-NULL. Closing that gap requires threading a per-op "computed
+///      NULL" signal into the output-validity store, which is a larger IR
+///      change tracked separately. The critical property delivered here is:
+///      **no undefined behavior / no hardware trap**.
+///
+///   2. **Signed overflow `INT_MIN / -1`**. The mathematical result
+///      (`+2^31` / `+2^63`) is unrepresentable, so the hardware result is
+///      undefined and can trap. We detect this single case and produce the
+///      wrapping result `INT_MIN` (matching two's-complement wraparound,
+///      which is what callers/SQL engines expect for this corner).
+///
+/// PTX shape (Int32; Int64 is identical with `.s64` / the `rl` class and the
+/// 64-bit `INT_MIN` literal):
+/// ```text
+///   setp.eq.s32     %p_dz,  %rhs, 0;            // divisor == 0 ?
+///   selp.s32        %safe,  1, %rhs, %p_dz;     // avoid UB: divide by 1 when 0
+///   setp.eq.s32     %p_min, %lhs, -2147483648;  // lhs == INT_MIN ?
+///   setp.eq.s32     %p_m1,  %rhs, -1;           // rhs == -1 ?
+///   and.pred        %p_ovf, %p_min, %p_m1;      // INT_MIN / -1 overflow ?
+///   selp.s32        %safe2, 1, %safe, %p_ovf;   // also dodge the trap divisor
+///   div.s32         %q,     %lhs, %safe2;       // defined division
+///   selp.s32        %q,     %lhs, %q, %p_ovf;   // overflow -> INT_MIN (== lhs)
+///   selp.s32        %dst,   0,    %q, %p_dz;    // div-by-zero -> defined 0
+/// ```
+fn emit_int_div_guarded(
+    b: &mut PtxBuilder,
+    dst_name: &str,
+    lhs: Reg,
+    rhs: Reg,
+    dtype: DataType,
+) -> BoltResult<()> {
+    // PTX type suffix + value register class for this integer width, and the
+    // two's-complement minimum literal used for the overflow corner.
+    let (suf, class, int_min) = match dtype {
+        DataType::Int32 => ("s32", "r", "-2147483648"),
+        DataType::Int64 => ("s64", "rl", "-9223372036854775808"),
+        // Caller (`emit_binary`) only routes Int32/Int64 here.
+        _ => {
+            return Err(BoltError::Other(format!(
+                "ptx_gen: emit_int_div_guarded called on non-integer dtype {:?}",
+                dtype
+            )))
+        }
+    };
+
+    // Resolve operand names up front (immutable `alloc` borrows) before we
+    // start allocating temporaries; copy into owned Strings so the later
+    // `&mut b.alloc.alloc(..)` calls don't overlap a live borrow.
+    let lhs_name = b.alloc.get(lhs)?.to_string();
+    let rhs_name = b.alloc.get(rhs)?.to_string();
+
+    // Predicates live in the `p` class; the safe-divisor / quotient temporaries
+    // share the value register class of the dtype.
+    let p_dz = b.alloc.alloc("p");
+    let p_min = b.alloc.alloc("p");
+    let p_m1 = b.alloc.alloc("p");
+    let p_ovf = b.alloc.alloc("p");
+    let safe = b.alloc.alloc(class);
+    let safe2 = b.alloc.alloc(class);
+    let q = b.alloc.alloc(class);
+
+    // Divide-by-zero detection + a non-zero stand-in divisor (1) to keep the
+    // `div` instruction itself defined.
+    emit_fmt!(b, "setp.eq.{} {}, {}, 0;", suf, p_dz, rhs_name)?;
+    emit_fmt!(b, "selp.{} {}, 1, {}, {};", suf, safe, rhs_name, p_dz)?;
+    // INT_MIN / -1 overflow detection.
+    emit_fmt!(b, "setp.eq.{} {}, {}, {};", suf, p_min, lhs_name, int_min)?;
+    emit_fmt!(b, "setp.eq.{} {}, {}, -1;", suf, p_m1, rhs_name)?;
+    emit_fmt!(b, "and.pred {}, {}, {};", p_ovf, p_min, p_m1)?;
+    // Also avoid feeding the trapping (INT_MIN, -1) pair to `div`.
+    emit_fmt!(b, "selp.{} {}, 1, {}, {};", suf, safe2, safe, p_ovf)?;
+    // Defined division by the sanitised divisor.
+    emit_fmt!(b, "div.{} {}, {}, {};", suf, q, lhs_name, safe2)?;
+    // Overflow corner: the wrapping result is INT_MIN, which equals lhs here.
+    emit_fmt!(b, "selp.{} {}, {}, {}, {};", suf, q, lhs_name, q, p_ovf)?;
+    // Divide-by-zero: produce a defined 0 (see LIMITATION in the doc comment).
+    emit_fmt!(b, "selp.{} {}, 0, {}, {};", suf, dst_name, q, p_dz)
 }
 
 /// Mnemonic string for an arithmetic op at a given dtype.
