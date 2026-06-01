@@ -279,6 +279,14 @@ impl DictRegistry {
             // rewriter inspects the variant when it resolves a literal.
             rewriter.register(col_name.to_string(), dict);
         }
+        // Protect the `LIKE` of any column the query projects as a bare output
+        // from the integer-index membership fold, so it reaches the per-row GPU
+        // `StringLikeFilter` (which can emit + compact the Utf8 rows) instead of
+        // an integer filter that cannot produce a Utf8 output column. Equality /
+        // inequality folds are unaffected — only the `LIKE` arm consults this.
+        for col_name in collect_projected_bare_columns(plan) {
+            rewriter.protect_like(col_name);
+        }
         rewriter.rewrite(plan)
     }
 
@@ -397,6 +405,59 @@ fn dicts_conflict(a: &DictionaryColumnAny, b: &DictionaryColumnAny) -> bool {
 /// Pure host function — no I/O, no allocations beyond the result vec. Used by
 /// [`DictRegistry::rewrite_plan`] to know which tables' dictionaries to fold
 /// into the rewriter.
+/// Collect the names of every column a `Project` node surfaces as a *bare
+/// column output* (an `Expr::Column`, optionally wrapped in transparent
+/// `Alias`es), anywhere in the plan.
+///
+/// Used by [`DictRegistry::rewrite_plan`] to decide which columns' `LIKE`
+/// predicates must be protected from the integer-index membership fold: if the
+/// query projects a string column verbatim, the GPU integer filter can't emit
+/// the surviving Utf8 rows, so the `LIKE` has to stay a real `Expr::Like` for
+/// the `StringLikeFilter` / host path. Collecting a superset (e.g. numeric
+/// outputs too) is harmless — only registered Utf8 dict columns are ever gated.
+fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashSet<String> {
+    use crate::plan::logical_plan::Expr;
+    fn peel(e: &Expr) -> &Expr {
+        let mut cur = e;
+        while let Expr::Alias(inner, _) = cur {
+            cur = inner.as_ref();
+        }
+        cur
+    }
+    fn walk(p: &LogicalPlan, out: &mut std::collections::HashSet<String>) {
+        match p {
+            LogicalPlan::Project { input, exprs } => {
+                for e in exprs {
+                    if let Expr::Column(name) = peel(e) {
+                        out.insert(name.clone());
+                    }
+                }
+                walk(input, out);
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::Sort { input, .. } => walk(input, out),
+            LogicalPlan::Union { inputs } => {
+                for inp in inputs {
+                    walk(inp, out);
+                }
+            }
+            LogicalPlan::Join { left, right, .. }
+            | LogicalPlan::SetOp { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            LogicalPlan::Scan { .. } => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    walk(plan, &mut out);
+    out
+}
+
 fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
     fn walk(p: &LogicalPlan, out: &mut Vec<String>) {
         match p {

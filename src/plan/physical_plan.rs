@@ -2734,6 +2734,67 @@ fn build_projection_kernel(
     predicate: Option<&Expr>,
     projected: &[(String, Expr)],
 ) -> BoltResult<PhysicalPlan> {
+    // Host-materialised passthrough escape hatch.
+    //
+    // The fused GPU scan/projection codegen has no register class for `Utf8`
+    // (see `jit::ptx_gen` — every Utf8 input/output is rejected). So a
+    // projection that is a *pure passthrough of bare columns* — at least one of
+    // which is `Utf8` — and carries *no predicate* cannot be lowered to a scan
+    // kernel at all. This is the shape behind `SELECT s FROM t`, the inner scan
+    // a `StringLikeFilter` lowers (`SELECT s FROM t WHERE s LIKE …`), and the
+    // inner scan a host `Project` lowers for `||` / `SUBSTRING` / `TRIM`.
+    //
+    // Lower it to a host-materialising `StringProject` whose outputs are all
+    // `Passthrough`: its executor lifts each column straight from the host
+    // source batch (`materialize_table`), so Utf8 columns round-trip untouched
+    // and every downstream consumer (the host `Project`, the `StringLikeFilter`
+    // executor) gets a real batch carrying the string column. Numeric-only
+    // passthroughs keep the GPU path below — it is more efficient and preserves
+    // existing behaviour and golden-PTX tests.
+    if predicate.is_none() {
+        let all_bare = projected
+            .iter()
+            .all(|(_, e)| matches!(peel_aliases(e), Expr::Column(_)));
+        let any_utf8 = projected.iter().any(|(_, e)| match peel_aliases(e) {
+            Expr::Column(name) => scan_schema
+                .field(name)
+                .map(|f| f.dtype == DataType::Utf8)
+                .unwrap_or(false),
+            _ => false,
+        });
+        if all_bare && any_utf8 {
+            let mut outputs = Vec::with_capacity(projected.len());
+            let mut output_fields = Vec::with_capacity(projected.len());
+            for (name, e) in projected {
+                let src = match peel_aliases(e) {
+                    Expr::Column(c) => c.clone(),
+                    // unreachable: `all_bare` proved every expr is a bare Column.
+                    _ => unreachable!("all_bare guarantees a bare Column here"),
+                };
+                // Skip the synthetic `__idx_<col>` dictionary-index columns that
+                // `DictRegistry::extended_schema` splices into the scan schema
+                // alongside the originals (see `string_literal_rewrite::
+                // index_column_name`). They are a GPU-only artefact for folding
+                // dict-encoded string equality into integer predicates; the
+                // host source batch that `StringProject` materialises has no
+                // such column, so passing one through would fail the executor's
+                // name lookup. The host consumer (a `Project` / `StringLikeFilter`)
+                // only ever references the original user columns.
+                if src.starts_with("__idx_") {
+                    continue;
+                }
+                let field = scan_schema.field(&src)?;
+                output_fields.push(Field::new(name.clone(), field.dtype.clone(), field.nullable));
+                outputs.push(StringProjectOutput::Passthrough { source: src });
+            }
+            return Ok(PhysicalPlan::StringProject {
+                table: table.to_string(),
+                outputs,
+                output_schema: Schema::new(output_fields),
+            });
+        }
+    }
+
     let mut cg = Codegen::new(scan_schema);
 
     let predicate_reg = if let Some(pred) = predicate {
@@ -4647,6 +4708,42 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                      into the executor (coming in a follow-up)",
                     kind.map(|k| format!(" {}", k.sql_name())).unwrap_or_default()
                 )));
+            }
+            // `SELECT <cols> FROM t WHERE <col> LIKE 'pattern'` over a non-dict
+            // Utf8 column. The GPU per-row LIKE matcher lives in the Filter
+            // lowering ([`try_lower_string_like_filter`] → `StringLikeFilter`),
+            // but a Project that selects the (Utf8) column on TOP of that Filter
+            // cannot fold into the GPU scan kernel — there is no Utf8 register
+            // class, so `lower_projection` would fail with "Utf8 not supported in
+            // PTX codegen yet". Detect a `Filter { Like, Scan }` whose predicate
+            // `try_lower_string_like_filter` accepts and route the whole Project
+            // to a host stack: use the lowered `StringLikeFilter` (its inner Scan
+            // host-materialises via `build_projection_kernel`'s passthrough
+            // escape) as the inner, then wrap a host `PhysicalPlan::Project` for
+            // the SELECT-list — its executor evaluates each output column over a
+            // `HostColumn` env, so the surviving Utf8 rows round-trip untouched.
+            // Dict-encoded Utf8 never reaches here as `Expr::Like` (the dict
+            // rewrite already folded it into an integer predicate that the GPU
+            // fold below handles), so this only ever fires for the non-dict
+            // StringLikeFilter shape.
+            if let LogicalPlan::Filter {
+                input: filter_in,
+                predicate,
+            } = input.as_ref()
+            {
+                if let Some(like_filter) =
+                    try_lower_string_like_filter(filter_in, predicate, depth)?
+                {
+                    let output_schema = plan.schema()?;
+                    if project_is_identity(exprs, like_filter.output_schema(), &output_schema) {
+                        return Ok(like_filter);
+                    }
+                    return Ok(PhysicalPlan::Project {
+                        input: Box::new(like_filter),
+                        exprs: exprs.clone(),
+                        output_schema,
+                    });
+                }
             }
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)

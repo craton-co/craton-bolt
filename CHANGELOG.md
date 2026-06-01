@@ -8,6 +8,29 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
 
 ## [Unreleased]
 
+### Performance
+- **Tier-2 group-by host slot-walk** (`exec::groupby_tier2_common::collect_populated_slots_sorted`):
+  the post-reduce collection over the fixed `NUM_PARTITIONS × BLOCK_GROUPS`
+  (~4.2M-entry) slot buffer now uses a fused single-pass serial scan (pre-sized
+  output `Vec`, hoisted bounds) and, above a 256K-slot threshold, a
+  `std::thread::scope` parallel scan (no new dependency). Output is byte-identical
+  to the previous serial implementation (ordered chunk concatenation followed by the
+  same stable sort), proven by a 1M-slot parity test; the collector's generic bound
+  widened to `T: Copy + Send + Sync`.
+
+### Changed
+- **De-duplicated `StreamSet`** — `cuda::async_copy` now consumes the canonical
+  `cuda::buffer::StreamSet` instead of carrying its own identical copy (~46 LOC
+  removed). Stream tracking, `Drop` fencing, and the event-based deferred-free path
+  are unchanged; `buffer::StreamSet` gained only additive `pub(crate)` accessors.
+
+### Internal
+- Documented the GPU-only performance items deliberately deferred pending on-hardware
+  benchmarking (AVG sum+count reduce fusion, device-side compaction before the 52 MiB
+  group-by D2H, adaptive spin back-off, pinned-memory pool) — see
+  `reviews/PERF_BACKLOG.md`. These change device behavior or emitted PTX and cannot be
+  validated under the `cuda-stub` + host-oracle CI used on this branch.
+
 ## [0.7.0] - 2026-05-29
 
 v0.7 turns the v0.6 carry-overs into live code paths. The themes are

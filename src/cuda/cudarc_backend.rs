@@ -62,14 +62,28 @@ static GLOBAL_DEVICE: once_cell::sync::OnceCell<Arc<CudaDevice>> =
 /// (single-GPU only for now; tracked in
 /// `docs/CUDARC_ADOPTION.md` Stage 2).
 pub(crate) fn ensure_device(ordinal: i32) -> BoltResult<()> {
-    GLOBAL_DEVICE
-        .get_or_try_init(|| {
-            CudaDevice::new(ordinal as usize).map_err(|e| cudarc_err(
-                &format!("cudarc CudaDevice::new({ordinal})"),
-                e,
-            ))
+    let dev = GLOBAL_DEVICE.get_or_try_init(|| {
+        CudaDevice::new(ordinal as usize).map_err(|e| {
+            cudarc_err(&format!("cudarc CudaDevice::new({ordinal})"), e)
         })
-        .map(|_| ())
+    })?;
+    // Bind the primary context to THIS thread. See `device_ref()` for why a
+    // per-call bind is mandatory: `CudaDevice::new` only makes the context
+    // current on the thread that first latched the cell, but engines call
+    // `CudaContext::new` (→ here) from arbitrary threads.
+    dev.bind_to_thread()
+        .map_err(|e| cudarc_err("cudarc bind_to_thread", e))?;
+    Ok(())
+}
+
+/// Bind cudarc's primary context to the calling thread (initialising it on
+/// device 0 first if no `ensure_device` ran yet). This is the entry point for
+/// `CudaContext::set_current` under `--features cudarc`: kernel launches and
+/// module loads still route through the hand-rolled FFI, which operates on the
+/// thread's *current* context, so a launch-only worker thread that never
+/// touched the alloc path must bind here before it issues a launch.
+pub(crate) fn bind_current_thread() -> BoltResult<()> {
+    device_ref().map(|_| ())
 }
 
 /// Lazily initialise the primary context on device 0 (if nobody called
@@ -88,10 +102,25 @@ pub(crate) fn ensure_device(ordinal: i32) -> BoltResult<()> {
 /// public behaviour are unchanged; only the no-longer-needed `Arc::clone`
 /// is gone. No call site requires owned escape, so no clone remains.
 fn device_ref() -> BoltResult<&'static Arc<CudaDevice>> {
-    GLOBAL_DEVICE.get_or_try_init(|| {
+    let dev = GLOBAL_DEVICE.get_or_try_init(|| {
         CudaDevice::new(0)
             .map_err(|e| cudarc_err("cudarc CudaDevice::new", e))
-    })
+    })?;
+    // CORRECTNESS (per-thread context currency): `get_or_try_init` runs the
+    // init closure — and thus cudarc's `cuDevicePrimaryCtxRetain` +
+    // `cuCtxSetCurrent` — exactly ONCE, on whichever thread first latches the
+    // cell. Every later call (including from a *different* thread) returns the
+    // cached `Arc<CudaDevice>` without re-binding. We deliberately use cudarc's
+    // raw `result::malloc_sync` / `cuMemcpy*` escape hatch instead of its safe
+    // `CudaSlice` API, so we do NOT get cudarc's own per-op `bind_to_thread()`
+    // (see `driver/safe/alloc.rs`). Without an explicit bind here, any CUDA op
+    // issued from a thread other than the initialiser hits
+    // `CUDA_ERROR_INVALID_CONTEXT` (201) — exactly what libtest's per-test
+    // worker threads triggered. `cuCtxSetCurrent` is a cheap thread-local set,
+    // so binding on every entry is correct and inexpensive.
+    dev.bind_to_thread()
+        .map_err(|e| cudarc_err("cudarc bind_to_thread", e))?;
+    Ok(dev)
 }
 
 /// Stage 5 (M3L5): translate a cudarc `DriverError` into the typed
