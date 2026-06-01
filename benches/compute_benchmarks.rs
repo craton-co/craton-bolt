@@ -51,6 +51,23 @@ const C3: &str = "SELECT SUM(a) FROM x WHERE a*a + b*b + c*c < 1.0";
 const C4: &str = "SELECT SUM(a*0.4 + b*0.3 + c*0.2 + d*0.1) FROM x";
 /// Filtered FMA: arithmetic predicate gate + a product reduce.
 const C5: &str = "SELECT SUM(a*b) FROM x WHERE c*c + d*d < 0.5";
+/// **Compute-bound extreme**: a degree-12 Horner polynomial of a SINGLE
+/// column — 12 muls + 12 adds (24 FLOPs) over just 8 bytes read per row, an
+/// arithmetic intensity ~4x higher than `c2` and an order above `c1`/`c4`.
+/// This is the case where the device's FP throughput, not memory bandwidth,
+/// sets the pace — the clearest test of raw GPU compute. The coefficients
+/// here are kept in lockstep with [`POLY12_COEFFS`] (Horner order: high
+/// degree first), so the SQL string and the Polars expression evaluate the
+/// identical polynomial.
+const C6: &str = "SELECT SUM(((((((((((((0.13 * a + 0.11) * a + 0.17) * a + 0.19) \
+    * a + 0.23) * a + 0.29) * a + 0.31) * a + 0.37) * a + 0.41) * a + 0.43) \
+    * a + 0.47) * a + 0.53) * a + 0.59)) FROM x";
+
+/// Coefficients for `c6`'s degree-12 Horner polynomial, highest degree first.
+/// `p(a) = ((…((c0*a + c1)*a + c2)…)*a + c12)`.
+const POLY12_COEFFS: [f64; 13] = [
+    0.13, 0.11, 0.17, 0.19, 0.23, 0.29, 0.31, 0.37, 0.41, 0.43, 0.47, 0.53, 0.59,
+];
 
 const QUERIES: &[(&str, &str)] = &[
     ("c1_fma_sum", C1),
@@ -58,6 +75,7 @@ const QUERIES: &[(&str, &str)] = &[
     ("c3_sphere_filter_sum", C3),
     ("c4_weighted_sum", C4),
     ("c5_filtered_fma_sum", C5),
+    ("c6_poly12_sum", C6),
 ];
 
 // --- Deterministic data: 4 Float64 columns in [0, 1), byte-identical across
@@ -156,6 +174,16 @@ fn polars_scalar(df: &polars::prelude::DataFrame, q: &str) -> f64 {
         C5 => lf
             .filter((col("c") * col("c") + col("d") * col("d")).lt(lit(0.5)))
             .select([(col("a") * col("b")).sum()]),
+        C6 => {
+            // Horner: acc = c0; acc = acc*a + c_i. Same op order as the SQL
+            // string and the engine, so all three evaluate the identical poly.
+            let a = col("a");
+            let mut acc = lit(POLY12_COEFFS[0]);
+            for &k in &POLY12_COEFFS[1..] {
+                acc = acc * a.clone() + lit(k);
+            }
+            lf.select([acc.sum()])
+        }
         _ => panic!("unknown query"),
     }
     .collect()
