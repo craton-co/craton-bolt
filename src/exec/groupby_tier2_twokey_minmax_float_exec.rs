@@ -45,7 +45,6 @@ use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
-use crate::exec::partition_offsets;
 use crate::jit::partition_reduce_kernel_minmax::MinMaxOp;
 use crate::jit::partition_reduce_kernel_minmax_float::FloatDtype;
 use crate::jit::partition_reduce_kernel_minmax_float_i64::{
@@ -241,32 +240,19 @@ fn execute_inner(
         .ok_or_else(|| BoltError::Other("expected Float64Array".into()))?;
     let vals_gpu: GpuVec<f64> = GpuVec::<f64>::from_slice_async(val_arr.values(), stream.raw())?;
 
-    let num_partitions = partition_kernel_i64::NUM_PARTITIONS;
-
     // ---- Partition pass (i64) ----
-    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
-    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
+    // dedup (tier2): the op-independent two-key partition launch + offsets is
+    // shared via `groupby_tier2_common::run_partition_launch_i64` (same
+    // `launch_with_geometry`/`KernelArgs` ABI, grid, and single-stream
+    // sync as the inlined block). Module building stays local.
     let partition_module = get_or_build_module(&partition_i64_spec_for(n_rows))?;
-    {
-        let func = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
-
-        let view_keys = keys_gpu.view();
-        let mut view_pids = partition_ids.view_mut();
-        let mut view_counts = counts.view_mut();
-
-        let mut args = KernelArgs::empty();
-        args.push_input(&view_keys);
-        args.push_output(&mut view_pids);
-        args.push_output(&mut view_counts);
-        args.push_scalar_u32(n_rows);
-
-        let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
-        launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
-    }
-
-    // P1b-stage8: joint helper, 2 syncs → 1.
-    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
-        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
+    let (partition_ids, offsets, offsets_gpu, num_partitions) =
+        crate::exec::groupby_tier2_common::run_partition_launch_i64(
+            &partition_module,
+            &keys_gpu,
+            n_rows,
+            &stream,
+        )?;
 
     // ---- Scatter (i64 keys + f64 vals — no conversion needed) ----
     let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;

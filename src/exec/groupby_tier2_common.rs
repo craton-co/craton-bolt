@@ -79,7 +79,7 @@ use crate::cuda::GpuVec;
 use crate::error::BoltResult;
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::partition_offsets;
-use crate::jit::{partition_kernel, CudaModule};
+use crate::jit::{partition_kernel, partition_kernel_i64, CudaModule};
 use crate::plan::logical_plan::Schema;
 
 /// dedup (tier2): the op-independent single-key partition pass that every
@@ -168,6 +168,100 @@ pub(crate) fn run_partition_launch(
             func,
             grid,
             partition_kernel::BLOCK_THREADS,
+            0,
+            stream,
+            &mut args,
+        )?;
+    }
+
+    let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
+        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
+
+    Ok((partition_ids, offsets, offsets_gpu, num_partitions))
+}
+
+/// dedup (tier2): the two-key (packed-i64 key) analogue of
+/// [`run_partition_launch`].
+///
+/// Every two-key Tier-2 reduce executor whose partition pass was written in the
+/// `launch_with_geometry` / `KernelArgs` style (the integer + float MIN/MAX
+/// twokey execs) inlined the byte-identical block:
+///
+/// ```ignore
+/// let num_partitions = partition_kernel_i64::NUM_PARTITIONS;
+/// let mut counts: GpuVec<u32> =
+///     GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+/// let mut partition_ids: GpuVec<u32> =
+///     GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
+/// let partition_module = get_or_build_module(&partition_i64_spec_for(n_rows))?;
+/// {
+///     let func = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
+///     let view_keys = keys_gpu.view();
+///     let mut view_pids = partition_ids.view_mut();
+///     let mut view_counts = counts.view_mut();
+///     let mut args = KernelArgs::empty();
+///     args.push_input(&view_keys);
+///     args.push_output(&mut view_pids);
+///     args.push_output(&mut view_counts);
+///     args.push_scalar_u32(n_rows);
+///     let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
+///     launch_with_geometry(func, grid, BLOCK_THREADS, 0, &stream, &mut args)?;
+/// }
+/// let (offsets, offsets_gpu) =
+///     partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
+/// ```
+///
+/// This is the exact same shape as [`run_partition_launch`], except the keys
+/// are an `i64` packed-two-key column and the partition kernel is the i64
+/// variant. As with the single-key helper the module *building*
+/// (`get_or_build_module(&partition_i64_spec_for(n_rows))`) stays at each call
+/// site — its own `KernelSpec`, its own `LOAD_COUNT` test — so this helper
+/// receives the already-built `partition_module` and reproduces only the
+/// op-independent remainder.
+///
+/// Every operation, its order, the buffers it allocates, and the single
+/// `stream` it runs on are identical to the inlined code:
+/// * `num_partitions == partition_kernel_i64::NUM_PARTITIONS` (4096) — the same
+///   constant each executor read.
+/// * `BLOCK_THREADS == partition_kernel_i64::BLOCK_THREADS` (256) — identical to
+///   the per-file local `const BLOCK_THREADS: u32 = 256;` every converted
+///   executor declared.
+/// * `KERNEL_ENTRY == partition_kernel_i64::KERNEL_ENTRY` — same launched entry.
+/// * `launch_with_geometry` is used identically (it tags the launch stream and
+///   synchronizes once), so the stream fencing / sync behaviour is byte-for-byte
+///   the same as the inlined call.
+#[allow(clippy::type_complexity)]
+pub(crate) fn run_partition_launch_i64(
+    partition_module: &CudaModule,
+    keys_gpu: &GpuVec<i64>,
+    n_rows: u32,
+    stream: &CudaStream,
+) -> BoltResult<(GpuVec<u32>, Vec<u32>, GpuVec<u32>, u32)> {
+    let num_partitions = partition_kernel_i64::NUM_PARTITIONS;
+
+    let mut counts: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut partition_ids: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
+
+    {
+        let func = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
+
+        let view_keys = keys_gpu.view();
+        let mut view_pids = partition_ids.view_mut();
+        let mut view_counts = counts.view_mut();
+
+        let mut args = KernelArgs::empty();
+        args.push_input(&view_keys);
+        args.push_output(&mut view_pids);
+        args.push_output(&mut view_counts);
+        args.push_scalar_u32(n_rows);
+
+        let grid = n_rows.div_ceil(partition_kernel_i64::BLOCK_THREADS).max(1);
+        launch_with_geometry(
+            func,
+            grid,
+            partition_kernel_i64::BLOCK_THREADS,
             0,
             stream,
             &mut args,
