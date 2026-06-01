@@ -2,8 +2,13 @@
 #
 # `rustc_codegen_nvvm` is a codegen backend that links rustc's internal
 # crates, so it must be built against the exact nightly it was written for.
-# Per docs/rust_cuda/01_toolchain_audit.md, Rust-GPU/Rust-CUDA HEAD on
-# 2026-04-29 pins nightly-2026-04-02 with these components.
+# This pin MUST match the `cuda_std`/`cuda_builder` Rust-GPU/Rust-CUDA git rev
+# that `kernels/Cargo.toml` targets. That rev
+# (103a8d56935c4e0885ff7c3d25402319df1a8e00, HEAD of `main` on 2026-04-29)
+# ships its own `rust-toolchain.toml` pinning `nightly-2026-04-02` with the
+# components below, so the three (toolchain pin, cuda_std rev, source
+# attributes) are mutually consistent. See `docs/JIT_PIPELINE.md` and the top
+# comment block of `kernels/src/lib.rs` for the full prerequisites.
 #
 # This file applies ONLY when cargo is invoked from inside `kernels/`.
 # `cuda_builder` does exactly that, so the host crate (which lives in

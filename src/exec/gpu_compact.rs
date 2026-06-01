@@ -198,6 +198,16 @@ impl GatheredCol {
     /// `Bool` variant goes through `Vec<u8> -> Vec<bool>` because Arrow's
     /// `BooleanArray::from` expects a `Vec<bool>`, not a packed byte buffer.
     ///
+    /// ## Per-column vs. batched download
+    ///
+    /// This method does a *synchronous* `to_vec` per column and blocks the
+    /// host on each copy, so downloading N columns this way serialises N
+    /// host↔device round trips. When you have a whole `Vec<GatheredCol>` in
+    /// hand (the `compact_columns_on_gpu` output), prefer
+    /// [`download_columns`], which overlaps all the D2H copies on one stream
+    /// (pinned-host async) and synchronizes once. The reconstruction is
+    /// byte-for-byte identical; only the transfer scheduling differs.
+    ///
     /// [`GatheredCol::BoolNullable`] materialises a *nullable* `BooleanArray`
     /// by zipping the values and validity bytes — the same reconstruction
     /// that `ExtendedDeviceCol::BoolNullable::download` uses for the
@@ -892,6 +902,134 @@ pub fn compact_columns_on_gpu(
     }
 
     Ok((out, scan.total_count))
+}
+
+/// Download a batch of gathered columns back to host Arrow arrays, overlapping
+/// the per-column device→host copies on `stream`.
+///
+/// ## Why this exists (perf: overlap the D2H copies)
+///
+/// [`GatheredCol::download`] issues a *synchronous* `GpuVec::to_vec` per
+/// column — each call enqueues one D2H copy and immediately blocks the host
+/// on it. Downloading N columns that way serialises N host↔device round
+/// trips, with the host idle during each copy and the copy engine idle
+/// between them. For a wide projection that is the dominant cost of the
+/// compaction epilogue.
+///
+/// This helper instead issues every column's D2H **asynchronously into pinned
+/// host memory** ([`GpuVec::to_pinned_async`]) on the shared `stream`, then
+/// does a SINGLE `stream.synchronize()` after all copies are enqueued, and
+/// only then materialises the Arrow arrays from the now-settled pinned
+/// buffers. Pinned (page-locked) staging is what lets the copies actually
+/// DMA-overlap rather than bounce through a driver-synthesised staging copy;
+/// the single sync collapses N round trips into one.
+///
+/// ## Correctness / validity handling
+///
+/// The reconstruction is byte-for-byte identical to
+/// [`GatheredCol::download`]:
+///   * fixed-width columns become the matching primitive Arrow array;
+///   * `Bool` goes through `u8 -> bool`;
+///   * `BoolNullable` zips the gathered value + validity bytes back into a
+///     nullable `BooleanArray`, and the same length-mismatch guard is
+///     applied — so the per-row null-ness contract is preserved exactly.
+///
+/// The two `BoolNullable` halves are each downloaded with their own async
+/// copy on the same stream, so they too overlap and are settled by the one
+/// synchronize before the zip reads them.
+///
+/// Hazard note: the copies are pure reads of disjoint source buffers into
+/// disjoint pinned destinations, so back-to-back async D2H on one stream are
+/// race-free under CUDA's in-stream ordering (the same argument
+/// [`gather_one_async`] relies on for the gather launches).
+pub fn download_columns(
+    cols: &[GatheredCol],
+    stream: &CudaStream,
+) -> BoltResult<Vec<arrow_array::ArrayRef>> {
+    use std::sync::Arc;
+
+    // Per-column pinned host staging buffers. We hold ALL of them alive across
+    // the single synchronize so every async D2H has a stable destination; the
+    // Arrow arrays are built only after the sync settles every copy.
+    enum Pinned {
+        I32(crate::cuda::PinnedHostBuffer<i32>),
+        I64(crate::cuda::PinnedHostBuffer<i64>),
+        F32(crate::cuda::PinnedHostBuffer<f32>),
+        F64(crate::cuda::PinnedHostBuffer<f64>),
+        Bool(crate::cuda::PinnedHostBuffer<u8>),
+        BoolNullable {
+            values: crate::cuda::PinnedHostBuffer<u8>,
+            validity: crate::cuda::PinnedHostBuffer<u8>,
+        },
+    }
+
+    let raw = stream.raw();
+    let mut staged: Vec<Pinned> = Vec::with_capacity(cols.len());
+    // Phase 1: enqueue every column's D2H on the stream (no per-column sync).
+    for c in cols {
+        let p = match c {
+            GatheredCol::I32(v) => Pinned::I32(v.to_pinned_async(raw)?),
+            GatheredCol::I64(v) => Pinned::I64(v.to_pinned_async(raw)?),
+            GatheredCol::F32(v) => Pinned::F32(v.to_pinned_async(raw)?),
+            GatheredCol::F64(v) => Pinned::F64(v.to_pinned_async(raw)?),
+            GatheredCol::Bool(v) => Pinned::Bool(v.to_pinned_async(raw)?),
+            GatheredCol::BoolNullable { values, validity } => Pinned::BoolNullable {
+                values: values.to_pinned_async(raw)?,
+                validity: validity.to_pinned_async(raw)?,
+            },
+        };
+        staged.push(p);
+    }
+
+    // Phase 2: ONE synchronize makes every enqueued copy host-observable.
+    stream.synchronize()?;
+
+    // Phase 3: build the Arrow arrays from the settled pinned buffers. This is
+    // pure host work — same reconstruction as `GatheredCol::download`.
+    let mut out: Vec<arrow_array::ArrayRef> = Vec::with_capacity(staged.len());
+    for p in &staged {
+        let arr: arrow_array::ArrayRef = match p {
+            Pinned::I32(b) => {
+                Arc::new(arrow_array::Int32Array::from(b.as_slice().to_vec()))
+            }
+            Pinned::I64(b) => {
+                Arc::new(arrow_array::Int64Array::from(b.as_slice().to_vec()))
+            }
+            Pinned::F32(b) => {
+                Arc::new(arrow_array::Float32Array::from(b.as_slice().to_vec()))
+            }
+            Pinned::F64(b) => {
+                Arc::new(arrow_array::Float64Array::from(b.as_slice().to_vec()))
+            }
+            Pinned::Bool(b) => {
+                let bools: Vec<bool> = b.as_slice().iter().map(|&x| x != 0).collect();
+                Arc::new(arrow_array::BooleanArray::from(bools))
+            }
+            Pinned::BoolNullable { values, validity } => {
+                let hv = values.as_slice();
+                let hm = validity.as_slice();
+                // Same defensive length guard as `GatheredCol::download`: a
+                // mismatch would silently truncate the `zip`.
+                if hv.len() != hm.len() {
+                    return Err(BoltError::Other(format!(
+                        "GatheredCol::BoolNullable buffer length mismatch: \
+                         values={}, validity={}",
+                        hv.len(),
+                        hm.len(),
+                    )));
+                }
+                let a: arrow_array::BooleanArray = hv
+                    .iter()
+                    .zip(hm.iter())
+                    .map(|(&v, &m)| if m == 1 { Some(v == 1) } else { None })
+                    .collect();
+                Arc::new(a)
+            }
+        };
+        out.push(arr);
+    }
+
+    Ok(out)
 }
 
 /// Identifier for which prefix-scan algorithm should service the current

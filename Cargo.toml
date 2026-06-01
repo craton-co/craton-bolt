@@ -12,7 +12,7 @@ readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
 categories   = ["database", "compilers"]
 rust-version = "1.74"
-exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "continue_prompt.md", "reviews", "reviews/*"]
+exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "reviews", "reviews/*"]
 
 # --- Workspace shim ---------------------------------------------------------
 #

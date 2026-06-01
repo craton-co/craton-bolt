@@ -2249,7 +2249,12 @@ impl LogicalPlan {
                     // recover these names when re-projecting the
                     // Aggregate's output into SELECT-list order.
                     let name = group_key_output_name(g, i);
-                    fields.push(Field::new(name, dtype, false));
+                    // GROUP BY key fields are nullable: SQL groups NULL keys into
+                    // a single NULL group (see `execute_groupby`'s NULL-group
+                    // handling), so the key column of the output can carry a NULL
+                    // cell. A nullable field still accepts a fully-non-null key
+                    // array, so the common no-NULL path is unaffected.
+                    fields.push(Field::new(name, dtype, true));
                 }
                 for agg in aggregates {
                     let dtype = agg.output_dtype(&s)?;

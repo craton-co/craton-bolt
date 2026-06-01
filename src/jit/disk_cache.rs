@@ -78,6 +78,27 @@ use parking_lot::Mutex;
 /// disabled.
 pub const DISK_PTX_CACHE_ENV: &str = "BOLT_PTX_CACHE_DIR";
 
+/// Environment variable that caps the **total bytes** of cached `*.ptx`
+/// entries (LRU-by-mtime eviction). Naming mirrors the GPU memory pool's
+/// `CRATON_BOLT_POOL_MAX_BYTES` knob. Unset / unparseable → [`DEFAULT_MAX_CACHE_BYTES`].
+/// A value of `0` disables the byte cap (entry-count cap still applies).
+pub const DISK_PTX_CACHE_MAX_BYTES_ENV: &str = "CRATON_BOLT_PTX_CACHE_MAX_BYTES";
+
+/// Environment variable that caps the **number** of cached `*.ptx` entries.
+/// Unset / unparseable → [`DEFAULT_MAX_CACHE_ENTRIES`]. A value of `0`
+/// disables the entry-count cap (byte cap still applies).
+pub const DISK_PTX_CACHE_MAX_ENTRIES_ENV: &str = "CRATON_BOLT_PTX_CACHE_MAX_ENTRIES";
+
+/// Default total-bytes cap for the on-disk PTX cache (64 MiB). PTX modules
+/// are small (a few KiB each), so this comfortably holds thousands of
+/// kernels while still bounding unbounded growth on a long-lived cache dir.
+pub const DEFAULT_MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default entry-count cap for the on-disk PTX cache. A second, independent
+/// bound so a pathological flood of tiny entries can't blow up the directory
+/// inode count even while staying under the byte cap.
+pub const DEFAULT_MAX_CACHE_ENTRIES: u64 = 4096;
+
 /// Codegen-version salt for the **on-disk** PTX cache key (fixes
 /// JIT-M1).
 ///
@@ -209,10 +230,69 @@ const CODEGEN_FINGERPRINT: Option<&str> = option_env!("BOLT_CODEGEN_FINGERPRINT"
 /// final key, so the cache degrades to a miss rather than a path escape.
 #[must_use]
 pub(crate) fn codegen_salt() -> String {
+    // JIT-arch: fold the PTX target arch + ISA `.version` into the salt.
+    //
+    // The cache key historically carried only a codegen version + crate
+    // version. The emitted module, however, is pinned to a specific GPU
+    // architecture via `.target sm_70` and a specific PTX ISA via
+    // `.version 7.5` (both in `ptx_gen.rs`). Those are constants today, so
+    // they can't drift within a build — but if the target ever becomes
+    // device-derived (so an `sm_70` host and an `sm_90` host run the same
+    // binary), a cached kernel compiled for one arch could be mis-routed to
+    // a process targeting another. Folding the arch token into the salt makes
+    // the key rotate per-arch, so that mis-route is impossible by
+    // construction. Because the salt is the single source feeding BOTH the
+    // in-process module key (`exec::module_cache::compose_disk_key`) and the
+    // on-disk key ([`disk_key`]), both inherit this automatically.
+    let arch = arch_salt_token();
     match CODEGEN_FINGERPRINT {
-        Some(fp) => format!("cg{}-v{}-fp{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"), fp),
-        None => format!("cg{}-v{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION")),
+        Some(fp) => format!(
+            "cg{}-v{}-{}-fp{}",
+            CODEGEN_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            arch,
+            fp
+        ),
+        None => format!(
+            "cg{}-v{}-{}",
+            CODEGEN_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            arch
+        ),
     }
+}
+
+/// Derive a compact, filename-safe token from the PTX target arch + ISA
+/// version strings (`crate::jit::ptx_gen::PTX_TARGET` /
+/// [`PTX_VERSION`](crate::jit::ptx_gen::PTX_VERSION)).
+///
+/// The raw directives (`.target sm_70`, `.version 7.5`) contain spaces and a
+/// leading `.`, neither of which is in the [`valid_key`] charset, so we
+/// reduce them to a single hyphen-free token: the last whitespace-separated
+/// word of each directive (`sm_70`, `7.5`), then map any remaining
+/// non-`[0-9A-Za-z._]` byte to `_`. The result for today's constants is
+/// `arch_sm_70_isa_7.5`. Keeping it derived (rather than hardcoding the
+/// token) means the salt tracks the directives automatically if they change.
+fn arch_salt_token() -> String {
+    use crate::jit::ptx_gen::{PTX_TARGET, PTX_VERSION};
+    // `.target sm_70` -> "sm_70"; `.version 7.5` -> "7.5". Fall back to the
+    // whole trimmed string if there's no whitespace.
+    let arch = PTX_TARGET.rsplit(char::is_whitespace).next().unwrap_or(PTX_TARGET);
+    let isa = PTX_VERSION.rsplit(char::is_whitespace).next().unwrap_or(PTX_VERSION);
+    let mut s = format!("arch_{arch}_isa_{isa}");
+    // Sanitise to the `valid_key` charset so the salt can never introduce a
+    // path separator / unsafe byte into the final cache key.
+    s = s
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'.' || b == b'_' {
+                b as char
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    s
 }
 
 /// Compose the full on-disk cache key for a kernel.
@@ -476,9 +556,14 @@ impl DiskPtxCache {
         {
             harden_windows_dir(&dir);
         }
-        Ok(Self {
+        let cache = Self {
             root: std::sync::Arc::new(dir),
-        })
+        };
+        // JIT-cache-bound: enforce the size / entry-count caps on open so a
+        // directory left oversized by a previous process (or a lowered cap)
+        // is trimmed before we start serving from it. Best-effort.
+        cache.enforce_bounds();
+        Ok(cache)
     }
 
     /// Path to this cache's root directory. Useful for tests, logging,
@@ -610,12 +695,118 @@ impl DiskPtxCache {
         // Atomic rename. On Windows `fs::rename` already implements
         // `MOVEFILE_REPLACE_EXISTING` semantics in stable std.
         match fs::rename(&tmp, &target) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // JIT-cache-bound: after a successful insert, enforce the
+                // size / entry-count caps so the directory can't grow without
+                // limit over a long-lived process. Best-effort and never
+                // fatal — the freshly-written entry stays, and a failed sweep
+                // only means we retry the bound on the next store/open.
+                self.enforce_bounds();
+                Ok(())
+            }
             Err(e) => {
                 // Best-effort cleanup of the stray tempfile so we don't
                 // leak inodes under repeated failures.
                 let _ = fs::remove_file(&tmp);
                 Err(e)
+            }
+        }
+    }
+
+    /// Enforce the cache's size / entry-count bounds via LRU-by-mtime
+    /// eviction (fixes the unbounded-growth gap).
+    ///
+    /// # Policy
+    ///
+    /// The cache is capped by two independent limits, each overridable via a
+    /// `CRATON_*` env var consistent with the crate's other knobs (e.g. the
+    /// GPU pool's `CRATON_BOLT_POOL_MAX_BYTES`):
+    ///
+    ///   * total bytes — [`DISK_PTX_CACHE_MAX_BYTES_ENV`]
+    ///     (default [`DEFAULT_MAX_CACHE_BYTES`]); and
+    ///   * entry count — [`DISK_PTX_CACHE_MAX_ENTRIES_ENV`]
+    ///     (default [`DEFAULT_MAX_CACHE_ENTRIES`]).
+    ///
+    /// A cap of `0` disables that particular limit. When either limit is
+    /// exceeded we delete `*.ptx` entries oldest-first by last-modified time
+    /// (an LRU approximation that needs no separate index) until BOTH limits
+    /// are satisfied. PTX entries are deterministic and re-derivable, so an
+    /// evicted entry simply costs a recompile on its next lookup.
+    ///
+    /// # Safety / robustness
+    ///
+    /// Entirely best-effort: every filesystem call is failure-tolerant and
+    /// the method never panics and never returns an error. It only ever
+    /// removes regular `*.ptx` cache files — never directories, never the
+    /// in-flight `*.ptx.tmp.*` tempfiles `store` is racing on (so it cannot
+    /// disturb the atomic-rename / integrity-header write path), and never
+    /// anything outside the cache root.
+    fn enforce_bounds(&self) {
+        let max_bytes = env_u64(DISK_PTX_CACHE_MAX_BYTES_ENV, DEFAULT_MAX_CACHE_BYTES);
+        let max_entries = env_u64(DISK_PTX_CACHE_MAX_ENTRIES_ENV, DEFAULT_MAX_CACHE_ENTRIES);
+        // Both caps disabled -> nothing to do.
+        if max_bytes == 0 && max_entries == 0 {
+            return;
+        }
+
+        // Collect the committed cache entries: regular files whose name ends
+        // in `.ptx` (NOT the `.ptx.tmp.<pid>.<n>` tempfiles a concurrent
+        // `store` may be writing). Tolerate any per-entry I/O error by
+        // skipping that entry.
+        let read_dir = match fs::read_dir(self.root.as_path()) {
+            Ok(rd) => rd,
+            Err(_) => return, // can't scan -> give up this round, no panic.
+        };
+        struct Entry {
+            path: PathBuf,
+            mtime: std::time::SystemTime,
+            size: u64,
+        }
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        for dirent in read_dir.flatten() {
+            let path = dirent.path();
+            // Only committed `.ptx` files; explicitly skip tempfiles whose
+            // name contains `.tmp.` so we never race the rename path.
+            let name = dirent.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".ptx") || name.contains(".tmp.") {
+                continue;
+            }
+            let meta = match dirent.metadata() {
+                Ok(m) if m.is_file() => m,
+                _ => continue,
+            };
+            let size = meta.len();
+            // Fall back to UNIX_EPOCH (oldest possible) when mtime is
+            // unavailable, so an entry with no timestamp is evicted first.
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            total_bytes = total_bytes.saturating_add(size);
+            entries.push(Entry { path, mtime, size });
+        }
+
+        let over_bytes = max_bytes != 0 && total_bytes > max_bytes;
+        let over_entries = max_entries != 0 && entries.len() as u64 > max_entries;
+        if !over_bytes && !over_entries {
+            return;
+        }
+
+        // Oldest first (ascending mtime) so we evict least-recently-modified
+        // entries until both caps are satisfied.
+        entries.sort_by_key(|e| e.mtime);
+        let mut count = entries.len() as u64;
+        for e in &entries {
+            let need_bytes = max_bytes != 0 && total_bytes > max_bytes;
+            let need_entries = max_entries != 0 && count > max_entries;
+            if !need_bytes && !need_entries {
+                break;
+            }
+            // Best-effort delete; only adjust the running totals if it
+            // actually succeeded so a stuck (e.g. permission-denied) file
+            // doesn't make us under-count and stop early.
+            if fs::remove_file(&e.path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(e.size);
+                count = count.saturating_sub(1);
             }
         }
     }
@@ -680,6 +871,20 @@ fn harden_windows_dir(dir: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Read a `u64` tuning knob from the environment, falling back to `default`
+/// when the var is unset, empty, or unparseable.
+///
+/// Mirrors the lenient parsing the GPU memory pool uses for its
+/// `CRATON_BOLT_POOL_*` knobs: a malformed value is ignored (default wins)
+/// rather than being treated as an error, so a typo in an env var can never
+/// crash a process or silently disable a cap in a surprising way.
+fn env_u64(var: &str, default: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(v) => v.trim().parse::<u64>().unwrap_or(default),
+        Err(_) => default,
+    }
 }
 
 /// Monotonically-increasing counter for tempfile-suffix
@@ -1109,7 +1314,11 @@ mod tests {
     /// directly because `CODEGEN_FINGERPRINT` is fixed at compile time.
     #[test]
     fn codegen_fingerprint_partitions_the_salt() {
-        let base = format!("cg{}-v{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"));
+        // JIT-arch: the salt shape is `cgN-vX.Y.Z-<arch>[-fp<fp>]`. The
+        // arch token (`arch_sm_70_isa_7.5` today) is folded in between the
+        // crate version and the optional fingerprint.
+        let arch = arch_salt_token();
+        let base = format!("cg{}-v{}-{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"), arch);
         let with_fp_a = format!("{base}-fp{}", "aaaa1111");
         let with_fp_b = format!("{base}-fp{}", "bbbb2222");
         // A fingerprint changes the salt vs. no fingerprint...
@@ -1120,7 +1329,12 @@ mod tests {
         // Whatever the compile-time fingerprint is (Some or None), the live
         // salt must be consistent with codegen_salt()'s documented shape.
         let live = codegen_salt();
-        assert!(live.starts_with(&base), "live salt must start with cgN-vX.Y.Z");
+        let cg_v = format!("cg{}-v{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(live.starts_with(&cg_v), "live salt must start with cgN-vX.Y.Z");
+        assert!(
+            live.contains(&arch),
+            "live salt must fold in the PTX target arch token"
+        );
         match CODEGEN_FINGERPRINT {
             Some(fp) => assert_eq!(live, format!("{base}-fp{fp}")),
             None => assert_eq!(live, base),
@@ -1130,6 +1344,20 @@ mod tests {
             valid_key(&disk_key("e", 0, 0)),
             "disk key (incl. salt) must stay filename-safe"
         );
+    }
+
+    /// JIT-arch: the PTX target arch token must be present in the salt (and
+    /// therefore in every disk key) so cached kernels are partitioned by GPU
+    /// architecture and can never be mis-routed across `.target`s.
+    #[test]
+    fn codegen_salt_folds_in_target_arch() {
+        let salt = codegen_salt();
+        assert!(
+            salt.contains("arch_sm_70_isa_7.5"),
+            "salt must embed the PTX target arch + ISA token, got: {salt}"
+        );
+        // The arch token keeps the key filename-safe.
+        assert!(valid_key(&disk_key("e", 0, 0)));
     }
 
     #[test]
@@ -1147,6 +1375,81 @@ mod tests {
         if let Some(v) = prev_env {
             std::env::set_var(DISK_PTX_CACHE_ENV, v);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // JIT-cache-bound: size / entry-count eviction.
+    // -----------------------------------------------------------------
+
+    /// Counts committed `*.ptx` entries (ignores tempfiles) in `dir`.
+    fn count_ptx_entries(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| {
+                        let n = e.file_name();
+                        let n = n.to_string_lossy();
+                        n.ends_with(".ptx") && !n.contains(".tmp.")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// With the entry-count cap set to 1, a second insert must evict the
+    /// older entry so the directory never exceeds the bound. Serialised via
+    /// `ENV_LOCK` because it mutates a process-wide env var.
+    #[test]
+    fn entry_count_cap_evicts_oldest() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var(DISK_PTX_CACHE_MAX_ENTRIES_ENV).ok();
+        std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "1");
+
+        let dir = fresh_tempdir("evict_entries");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        cache.store(&hash_to_key(1, 1), "first").expect("store 1");
+        cache.store(&hash_to_key(2, 2), "second").expect("store 2");
+
+        assert_eq!(
+            count_ptx_entries(&dir),
+            1,
+            "entry-count cap of 1 must keep exactly one entry after two inserts"
+        );
+
+        // Restore env + clean up.
+        match prev {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A cap of `0` disables eviction for that dimension; with BOTH caps at
+    /// `0` the cache grows unbounded (no entry is ever evicted).
+    #[test]
+    fn zero_caps_disable_eviction() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_b = std::env::var(DISK_PTX_CACHE_MAX_BYTES_ENV).ok();
+        let prev_e = std::env::var(DISK_PTX_CACHE_MAX_ENTRIES_ENV).ok();
+        std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, "0");
+        std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "0");
+
+        let dir = fresh_tempdir("evict_off");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        for i in 0..5u64 {
+            cache.store(&hash_to_key(i, i), "ptx").expect("store");
+        }
+        assert_eq!(count_ptx_entries(&dir), 5, "zero caps must not evict");
+
+        match prev_b {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_BYTES_ENV),
+        }
+        match prev_e {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV),
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------

@@ -92,11 +92,16 @@ These are real, code-level behaviors to be aware of:
   engines (a `NULL` in the list makes the predicate `UNKNOWN`/false for
   non-matching rows). Verify behavior against your reference engine before
   relying on `NOT IN`/`IN` over nullable lists.
-- **String handling is dictionary/ASCII-oriented.** String predicates operate
-  over dictionary-encoded literals, and the GPU string functions
-  (`UPPER` / `LOWER` / `LENGTH`) are byte/ASCII-oriented. Treat non-ASCII /
-  multi-byte UTF-8 case-folding and length-in-characters semantics as
-  unverified — `LENGTH` is byte-length, and case conversion is ASCII-range.
+- **String handling is dictionary-oriented; GPU case-folding is ASCII-only
+  with a Unicode host fallback.** String-literal predicates operate over
+  dictionary-encoded indices. `UPPER` / `LOWER` / `LENGTH` lower to the GPU
+  (v0.7). `LENGTH` counts **characters** (Unicode codepoints), not bytes —
+  `LENGTH('héllo') = 5` — matching `s.chars().count()` in `string_ops.rs`;
+  `OCTET_LENGTH` covers byte length. `UPPER` / `LOWER` case-fold byte-wise
+  on the GPU, which is correct only for ASCII; when a column's dictionary
+  contains any non-ASCII byte the executor falls back to the full-Unicode
+  host transform (`str::to_uppercase` / `str::to_lowercase`), so non-ASCII
+  case-folding is correct but runs host-side rather than on the device.
 - **Temporal types partially lower; host fallback on upload.** `Decimal128`,
   `Date32`, and `Timestamp` parse and **partially** lower to the GPU. Some
   temporal paths fall back to a host upload/compute step rather than running

@@ -26,14 +26,33 @@ description = "Craton Bolt GPU kernels compiled via rust-cuda (Wave A spike)."
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Pinned to the latest published versions on crates.io as of 2026-05-25.
-# These are the Feb-2022 cuts; the audit doc (docs/rust_cuda/01_toolchain_audit.md)
-# notes that consumers normally pin a git rev of Rust-GPU/Rust-CUDA HEAD.
-# For the Wave A spike we deliberately try the crates.io path first because
-# it minimises supply-chain surprises. If the build fails because the
-# 0.2.2 cut is too old for our pinned nightly, the documented next step
-# is to flip to a git rev (see the Wave A outcome doc).
-cuda_std = "0.2.2"
+# Pinned to a Rust-GPU/Rust-CUDA git rev, NOT a crates.io version.
+#
+# Why not crates.io: the only versions ever published to crates.io are the
+# Feb-2022 cuts (`cuda_std 0.2.2` / `cuda_builder 0.3.0`). Those cuts depend
+# on the long-removed `#![feature(register_attr)]` and an early-2022 nightly,
+# which is fundamentally incompatible with the `nightly-2026-04-02` pin in
+# `rust-toolchain.toml`. The modern Rust-CUDA API (which dropped
+# `register_attr`; `#[kernel]` is now self-sufficient) is only distributed
+# via git — the project bumps its in-tree manifest versions but has not
+# re-published to crates.io since 2022.
+#
+# This rev is HEAD of Rust-GPU/Rust-CUDA `main` as of 2026-04-29, the same
+# revision the toolchain audit references; its own `rust-toolchain.toml`
+# pins `nightly-2026-04-02`, matching ours exactly. The in-tree crate still
+# declares itself `0.2.x`, so the host crate's `cuda_builder = "0.3"`
+# requirement (in the root Cargo.toml, which is intentionally NOT edited
+# here) is satisfied by the matching `cuda_builder` from the same workspace
+# rev — see the maintainer note in `src/lib.rs` for the `[patch]`/git-dep
+# wiring the host side may additionally need.
+#
+# NOTE (not compile-verified): pinning a git rev for `cuda_std` here keeps
+# THIS crate's source API consistent with the 2026 nightly. The root crate's
+# build-time `cuda_builder` dependency must resolve to the SAME rev for the
+# emitted PTX ABI to match; if cargo resolves `cuda_builder = "0.3"` to the
+# stale crates.io 0.3.0 instead, the maintainer must add a matching git
+# `[patch]`/dependency on the host side (outside this crate's edit scope).
+cuda_std = { git = "https://github.com/Rust-GPU/Rust-CUDA", rev = "103a8d56935c4e0885ff7c3d25402319df1a8e00" }
 
 [profile.release]
 # rust-cuda canonical setting — debug=false keeps PTX size manageable;

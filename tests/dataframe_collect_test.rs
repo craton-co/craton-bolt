@@ -223,9 +223,9 @@ fn collect_group_by_aggregate_runs_through_engine() {
 }
 
 /// `filter()` chained with `select()` — exercises predicate lowering on
-/// the DataFrame path. The engine's projection-with-filter pipeline
-/// fills masked rows with zero (it does not host-compact), so the
-/// assertion mirrors the existing `e2e_filtered_select` shape.
+/// the DataFrame path. The engine's projection-with-filter pipeline COMPACTS
+/// its output (only matching rows survive, in original order), so the
+/// assertion mirrors the updated `e2e_filtered_select` shape.
 #[test]
 #[ignore = "gpu:e2e"]
 fn collect_filter_then_select_runs_predicate() {
@@ -238,7 +238,6 @@ fn collect_filter_then_select_runs_predicate() {
         .select(vec![col("price")]);
     let out = df.collect(&mut engine).expect("collect");
 
-    assert_eq!(out.num_rows(), 2048);
     let actual = out
         .column(0)
         .as_any()
@@ -254,11 +253,14 @@ fn collect_filter_then_select_runs_predicate() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    for i in 0..2048 {
-        if region.value(i) == 1 {
-            assert_eq!(actual.value(i), price.value(i), "unmasked row {i}");
-        } else {
-            assert_eq!(actual.value(i), 0.0, "masked row {i}");
-        }
+    // `region_id = i % 4` → 512 of 2048 rows match `region_id = 1`.
+    let expected: Vec<f64> = (0..2048)
+        .filter(|&i| region.value(i) == 1)
+        .map(|i| price.value(i))
+        .collect();
+    assert_eq!(out.num_rows(), expected.len(), "compacted row count");
+    assert_eq!(out.num_rows(), 512, "region_id == 1 matches 2048/4 rows");
+    for (k, want) in expected.iter().enumerate() {
+        assert_eq!(actual.value(k), *want, "compacted row {k}");
     }
 }

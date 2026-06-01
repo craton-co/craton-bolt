@@ -332,6 +332,45 @@ fn estimate_join_rows(
     result.max(1.0)
 }
 
+/// Estimate the output cardinality of an INNER equi-join given the two input
+/// cardinalities, the equi-`on` pairs, and the two input subtrees (used to
+/// resolve per-column NDVs through [`column_ndv`]).
+///
+/// This is the public entry point the cost-based join enumerator
+/// ([`crate::plan::optimizer::cost`]) calls when combining two subplans: it
+/// shares the exact textbook formula used by [`estimate_join_rows`]
+/// (`|L|·|R| / ∏ max(ndv_l, ndv_r)`), so the enumeration cost model and the
+/// whole-plan estimator never diverge.
+///
+/// When `on` is empty this returns the cartesian product `|L|·|R|` — a caller
+/// that wants to forbid cross products should check connectivity itself.
+/// NDV resolution degrades gracefully: a key whose column has no NDV stat
+/// falls back to the larger input's size as the key cardinality (the
+/// containment assumption), which never inflates the estimate above the
+/// cartesian product.
+pub fn estimate_equijoin_rows(
+    left_rows: u64,
+    right_rows: u64,
+    on: &[(Expr, Expr)],
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    stats: &dyn StatsProvider,
+) -> u64 {
+    let l = left_rows as f64;
+    let r = right_rows as f64;
+    if on.is_empty() {
+        return clamp_rows((l * r).max(1.0)) as u64;
+    }
+    let mut result = l * r;
+    for (left_key, right_key) in on {
+        let ndv_l = column_ndv(left_key, left, stats);
+        let ndv_r = column_ndv(right_key, right, stats);
+        let denom = join_key_cardinality(ndv_l, ndv_r, l, r);
+        result /= denom.max(1.0);
+    }
+    clamp_rows(result.max(1.0)) as u64
+}
+
 /// Pick the divisor for an equi-join key pair from the two sides' NDVs.
 ///
 /// Standard rule: divide by `max(ndv_l, ndv_r)`. When only one side has an
@@ -946,6 +985,52 @@ mod tests {
         let est = StatsRowEstimator::new(&stats);
         assert_eq!(est.estimate_leaf_rows(&plan), estimate_rows(&plan, &stats));
         assert_eq!(est.estimate_leaf_rows(&plan), Some(1_000));
+    }
+
+    #[test]
+    fn estimate_equijoin_rows_matches_join_node() {
+        // The standalone equijoin entry point must agree with the whole-plan
+        // Join estimate for the same inputs/keys.
+        let left_stats = TableStats::new(1_000).with_column("id", ColumnStats::with_ndv(100));
+        let right_stats = TableStats::new(200).with_column("rid", ColumnStats::with_ndv(50));
+        let stats = MockStats::default()
+            .with("l", left_stats)
+            .with("r", right_stats);
+        let left = scan("l", "id", DataType::Int64);
+        let right = scan("r", "rid", DataType::Int64);
+        let on = vec![(col("id"), col("rid"))];
+        // 1000 * 200 / max(100, 50) = 2000.
+        let direct = estimate_equijoin_rows(1_000, 200, &on, &left, &right, &stats);
+        assert_eq!(direct, 2_000);
+
+        // Same as building the Join node and calling estimate_rows.
+        let join = LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            on,
+            filter: None,
+        };
+        assert_eq!(estimate_rows(&join, &stats), Some(direct as usize));
+    }
+
+    #[test]
+    fn estimate_equijoin_rows_no_key_is_cartesian() {
+        let stats = MockStats::default();
+        let l = scan("l", "a", DataType::Int64);
+        let r = scan("r", "b", DataType::Int64);
+        // No keys: 30 * 20 = 600.
+        assert_eq!(estimate_equijoin_rows(30, 20, &[], &l, &r, &stats), 600);
+    }
+
+    #[test]
+    fn estimate_equijoin_rows_no_ndv_uses_containment() {
+        let stats = MockStats::default();
+        let l = scan("l", "id", DataType::Int64);
+        let r = scan("r", "rid", DataType::Int64);
+        let on = vec![(col("id"), col("rid"))];
+        // No NDV anywhere: denom = max(|L|, |R|) = 1000 → 1000*200/1000 = 200.
+        assert_eq!(estimate_equijoin_rows(1_000, 200, &on, &l, &r, &stats), 200);
     }
 
     #[test]

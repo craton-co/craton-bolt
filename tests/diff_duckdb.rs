@@ -150,27 +150,44 @@ impl ResultSet {
 
 fn duckdb_run(conn: &duckdb::Connection, sql: &str) -> ResultSet {
     let mut stmt = conn.prepare(sql).expect("duckdb prepare");
-    // `column_names` / `column_count` read the schema cached by `prepare`
-    // (see duckdb-1.2.2 `raw_statement.rs` where `prepare` populates
-    // `self.schema`). The docstring's "panics if not yet executed" warning
-    // is stale from the rusqlite ancestor — in DuckDB's Rust binding the
-    // schema is populated up front and these accessors are safe pre-query.
-    let column_names: Vec<String> = stmt.column_names();
-    let ncols = column_names.len();
-
-    let mut rows_iter = stmt.query([]).expect("duckdb query");
+    // IMPORTANT: `column_names()` / `column_count()` must NOT be called before
+    // the statement is executed. Contrary to an earlier assumption here,
+    // duckdb-1.2.2 does NOT populate the prepared-statement schema in
+    // `prepare()` — it is filled in only when the statement is stepped. Reading
+    // the schema pre-execution dereferences a `None` (`schema.unwrap()` in the
+    // binding's `raw_statement.rs`) and panics, which made this whole harness
+    // unusable. So: execute first, decode each row by probing columns until the
+    // index runs past the row width (`get_ref` returns `Err` for an
+    // out-of-range index), then read the now-populated column names afterwards.
+    // Column names are used only for failure diagnostics — `assert_results_equal`
+    // compares the `rows` positionally — so reading them last is fine.
     let mut rows: Vec<Vec<Cell>> = Vec::new();
-    while let Some(row) = rows_iter.next().expect("duckdb row") {
-        let mut out = Vec::with_capacity(ncols);
-        for i in 0..ncols {
+    {
+        let mut rows_iter = stmt.query([]).expect("duckdb query");
+        while let Some(row) = rows_iter.next().expect("duckdb row") {
+            let mut out = Vec::new();
+            let mut i = 0;
             // `get_ref` exposes the cell's runtime type so we can map any
             // numeric / bool / string / null result column into our `Cell`
-            // enum without pre-declaring the schema.
-            let v = row.get_ref(i).expect("duckdb cell");
-            out.push(duckdb_value_to_cell(v));
+            // enum without pre-declaring the schema. An out-of-range index
+            // ends the row.
+            while let Ok(v) = row.get_ref(i) {
+                out.push(duckdb_value_to_cell(v));
+                i += 1;
+            }
+            rows.push(out);
         }
-        rows.push(out);
-    }
+    } // drop `rows_iter` so its mutable borrow of `stmt` is released
+
+    // Post-execution the schema is populated, so this no longer panics. Names
+    // are diagnostic-only; fall back to positional labels if the binding still
+    // declines to surface them for some statement shapes.
+    let ncols = rows.first().map(Vec::len).unwrap_or(0);
+    let column_names: Vec<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stmt.column_names()
+    }))
+    .unwrap_or_else(|_| (0..ncols).map(|i| format!("col{i}")).collect());
+
     ResultSet {
         columns: column_names,
         rows,

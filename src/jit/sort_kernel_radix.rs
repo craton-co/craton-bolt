@@ -401,18 +401,38 @@ fn dtype_tag(dtype: DataType) -> BoltResult<&'static str> {
 
 /// Emit the PTX for the radix-sort **histogram** kernel for `dtype`.
 ///
-/// Per-thread logic:
+/// Per-block logic (shared-memory **privatized** — see PERF note below):
 ///
 /// ```text
-///   tid = blockIdx.x * blockDim.x + threadIdx.x
-///   if tid >= n_rows: return
-///   key = keys[tid]            // .b32 or .b64
-///   if signed_msb_flip: key ^= MSB     // (deferred to a separate pre-pass
-///                                      // in the executor; the kernel sees
-///                                      // already-transformed keys)
-///   digit = (key >> shift) & 0xF
-///   atomicAdd(&hist[digit], 1u32)
+///   __shared__ u32 s_hist[16]
+///   tid   = blockIdx.x * blockDim.x + threadIdx.x
+///   lane  = threadIdx.x
+///   if lane < 16: s_hist[lane] = 0          // zero the private histogram
+///   __syncthreads()
+///   if tid < n_rows:
+///       key   = keys[tid]                   // .b32 or .b64
+///       digit = (key >> shift) & 0xF
+///       atomicAdd(&s_hist[digit], 1u32)     // SHARED atomic — fast, per-block
+///   __syncthreads()
+///   if lane < 16: atomicAdd(&hist[lane], s_hist[lane])  // reduce to global
 /// ```
+///
+/// **PERF (C / histogram privatization).** The previous version bumped the
+/// 16-entry histogram directly in GLOBAL memory with `atom.global.add`. Under
+/// skewed digit distributions (e.g. a column where most keys share a digit)
+/// every thread serializes on the *same* global counter, which is the dominant
+/// cost of the pass. Privatizing the histogram in shared memory turns the hot
+/// per-element bump into a `atom.shared.add` (an order of magnitude cheaper and
+/// contended only within a block) and collapses the global traffic to exactly
+/// 16 `atom.global.add`s per block in the reduction step. The emitted global
+/// histogram is bit-identical to the old kernel's (sum over all blocks), so the
+/// host-side exclusive-scan that follows is unchanged.
+///
+/// **Barrier / divergence note.** Because the kernel now contains
+/// `bar.sync`, out-of-range threads (`tid >= n_rows`) must NOT early-`ret`
+/// before the barriers or the block would hang. We therefore guard only the
+/// per-element increment with a predicate and let every thread fall through
+/// both barriers and the reduction.
 ///
 /// The MSB-flip transform is **not** done inside this kernel — the executor
 /// runs the dedicated [`compile_radix_msb_flip`] kernel once before pass 0
@@ -438,21 +458,36 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
     writeln!(p, ")").map_err(write_err)?;
     writeln!(p, "{{").map_err(write_err)?;
 
-    // -- Register declarations ---------------------------------------
-    writeln!(p, "\t.reg .pred %p<2>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b32 %r<16>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %rd<8>;").map_err(write_err)?;
+    // -- Shared-memory private histogram (C). 16 u32 buckets per block. -----
+    writeln!(p, "\t.shared .align 4 .b32 s_hist[{}];", RADIX_BUCKETS)
+        .map_err(write_err)?;
 
-    // tid = ctaid.x * ntid.x + tid.x
+    // -- Register declarations ---------------------------------------
+    writeln!(p, "\t.reg .pred %p<4>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %r<20>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %rd<16>;").map_err(write_err)?;
+
+    // lane = threadIdx.x ; tid = ctaid.x * ntid.x + lane
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?; // lane
     writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
     writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
 
-    // bail if tid >= n_rows
+    // n_rows -> %r4 ; active = (tid < n_rows) in %p0. NOTE: no early `ret`
+    // here — the block contains barriers below, so every thread must fall
+    // through. We gate only the per-element increment on %p0.
     writeln!(p, "\tld.param.u32 %r4, [{entry}_param_2];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
-    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
+    writeln!(p, "\tsetp.lt.u32 %p0, %r3, %r4;").map_err(write_err)?;
+
+    // s_hist base address -> %rd5 (generic shared address of s_hist[0]).
+    writeln!(p, "\tmov.u64 %rd5, s_hist;").map_err(write_err)?;
+
+    // Zero the private histogram: lanes 0..15 each clear one bucket.
+    writeln!(p, "\tsetp.lt.u32 %p1, %r2, {};", RADIX_BUCKETS).map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd6, %r2, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd7, %rd5, %rd6;").map_err(write_err)?;
+    writeln!(p, "\t@%p1 st.shared.u32 [%rd7], 0;").map_err(write_err)?;
+    writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
 
     // load shift (radix step) -> %r5
     writeln!(p, "\tld.param.u32 %r5, [{entry}_param_3];").map_err(write_err)?;
@@ -466,28 +501,41 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
     writeln!(p, "\tmul.wide.u32 %rd1, %r3, {key_w};").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
 
+    // Per-element private bump, guarded by %p0 (tid < n_rows). Inactive
+    // threads skip the load+increment but still reach the barriers/reduction.
+    //
     // load key, then extract digit = (key >> shift) & 0xF
     if flavour.byte_width == 4 {
-        writeln!(p, "\tld.global.{} %r6, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
+        writeln!(p, "\t@%p0 ld.global.{} %r6, [%rd2];", flavour.ld_st_suffix)
+            .map_err(write_err)?;
         writeln!(p, "\tshr.u32 %r7, %r6, %r5;").map_err(write_err)?;
         writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
     } else {
         // 64-bit keys: shift in b64, then narrow the digit to b32 for indexing.
-        writeln!(p, "\tld.global.{} %rd3, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
+        writeln!(p, "\t@%p0 ld.global.{} %rd3, [%rd2];", flavour.ld_st_suffix)
+            .map_err(write_err)?;
         // `shr.u64` takes a b32 shift amount in PTX — %r5 is already b32.
         writeln!(p, "\tshr.u64 %rd4, %rd3, %r5;").map_err(write_err)?;
         writeln!(p, "\tcvt.u32.u64 %r7, %rd4;").map_err(write_err)?;
         writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
     }
 
-    // hist_ptr -> %rd5 (globalised); bucket address = hist_ptr + digit*4
-    writeln!(p, "\tld.param.u64 %rd5, [{entry}_param_1];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd5, %rd5;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.u32 %rd6, %r8, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd7, %rd5, %rd6;").map_err(write_err)?;
+    // private bucket address = s_hist + digit*4 ; atom.shared.add 1.
+    writeln!(p, "\tmul.wide.u32 %rd8, %r8, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd9, %rd5, %rd8;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 atom.shared.add.u32 %r9, [%rd9], 1;").map_err(write_err)?;
+    writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
 
-    // atomic-add 1 to hist[digit]
-    writeln!(p, "\tatom.global.add.u32 %r9, [%rd7], 1;").map_err(write_err)?;
+    // Reduce the private histogram into the global one: lanes 0..15 each add
+    // their bucket's block-local count to hist[lane]. Skip the global atomic
+    // when the count is zero so empty digits cost no global traffic.
+    writeln!(p, "\tld.param.u64 %rd10, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd10, %rd10;").map_err(write_err)?;
+    writeln!(p, "\t@%p1 ld.shared.u32 %r10, [%rd7];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ne.u32 %p2, %r10, 0;").map_err(write_err)?;
+    writeln!(p, "\tand.pred %p3, %p1, %p2;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd11, %rd10, %rd6;").map_err(write_err)?;
+    writeln!(p, "\t@%p3 atom.global.add.u32 %r11, [%rd11], %r10;").map_err(write_err)?;
 
     writeln!(p, "DONE:").map_err(write_err)?;
     writeln!(p, "\tret;").map_err(write_err)?;
@@ -498,40 +546,55 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
 
 /// Emit the PTX for the radix-sort **scatter** kernel for `dtype`.
 ///
-/// Per-thread logic:
+/// Per-block logic (**block-stable** — see stability note):
 ///
 /// ```text
-///   tid = blockIdx.x * blockDim.x + threadIdx.x
-///   if tid >= n_rows: return
-///   key = keys_in[tid]
-///   digit = (key >> shift) & 0xF
-///   out_idx = atomicAdd(&offsets[digit], 1u32)
-///   keys_out[out_idx] = key
+///   __shared__ u32 s_digit[BLOCK]      // each lane's digit (0xFFFF = inactive)
+///   __shared__ u32 s_hist[16]          // per-block digit counts
+///   __shared__ u32 s_base[16]          // reserved global base per digit
+///   tid  = blockIdx.x*blockDim.x + lane ; lane = threadIdx.x
+///   active = tid < n_rows
+///   digit  = active ? (keys_in[tid] >> shift) & 0xF : 0xFFFF
+///   s_digit[lane] = digit
+///   if lane < 16: s_hist[lane] = 0
+///   __syncthreads()
+///   if active: atomicAdd(&s_hist[digit], 1)       // shared, per-block count
+///   __syncthreads()
+///   if lane < 16 && s_hist[lane] != 0:
+///       s_base[lane] = atomicAdd(&offsets[lane], s_hist[lane])  // reserve range
+///   __syncthreads()
+///   if active:
+///       rank = #{ j < lane : s_digit[j] == digit }   // STABLE within block
+///       out_idx = s_base[digit] + rank
+///       keys_out[out_idx] = key
 /// ```
 ///
-/// `offsets[]` is initialised on the host to the exclusive-scan of the
-/// histogram; each thread then atomic-bumps its digit's offset and writes
-/// the key at the bumped position.
+/// `offsets[]` is still initialised on the host to the exclusive-scan of the
+/// histogram. Each block reserves a contiguous run inside its digit's region
+/// via a single `atom.global.add(offsets[digit], block_count)` (instead of one
+/// global atomic *per element*), then places its own elements inside that run
+/// in **input (tid) order** using a deterministic per-block rank.
 ///
-/// **EXEC-H1 / stability — read this.** Unlike the bitonic kernel (which was
-/// made stable by an original-row-index tiebreak in the comparator — see
-/// `crate::jit::sort_kernel`), this radix scatter is **NOT stable**: two
-/// threads whose keys share a digit race on the same `atomicAdd`, so their
-/// relative output order is non-deterministic. The bitonic fix does not
-/// transfer here — there is no pairwise comparator to add a tiebreak to;
-/// making the radix sort stable requires a structurally different scheme (a
-/// deterministic per-block stable partition / per-warp prefix-scan that
-/// assigns slots in input order within each digit bucket). That rewrite is
-/// out of scope for EXEC-H1 and is deferred.
+/// **Stability — read this.** The old kernel claimed each output slot with a
+/// racing `atom.global.add` per element, so two equal-digit elements landed in
+/// nondeterministic relative order: every LSD pass was non-stable and the
+/// multi-pass sort could be **wrong** for `ORDER BY non_unique_key`. This
+/// version is **stable within a block**: the rank loop counts only lanes with a
+/// strictly smaller `threadIdx.x`, so equal-digit elements in the same block
+/// keep their input order deterministically.
 ///
-/// This is currently acceptable only because the radix path is **gated behind
-/// `BOLT_GPU_SORT=1` (default OFF)** and is therefore not the path EXEC-H1
-/// targets (the default-on bitonic path at `n_rows >= GPU_SORT_MIN_ROWS`).
-/// Before the radix path is promoted to default-on it must be made stable to
-/// keep `ORDER BY non_unique_key [LIMIT k]` consistent with the host fallback.
-/// The standard trick is the per-warp prefix-scan within each block; defer
-/// that with the
-/// float transform.
+/// **Residual limitation (documented, not yet fixed).** Ordering is *not* yet
+/// stable **across** blocks: blocks reserve their per-digit runs in
+/// `atom.global.add` arrival order, which is scheduling-dependent, so a higher-
+/// `blockIdx` block can occupy an earlier run than a lower one. Full global
+/// stability needs a per-block-per-digit exclusive prefix sum
+/// (`block_digit_offsets[num_blocks][16]`) computed in a separate pass so each
+/// block's run is ordered by `blockIdx` — that requires an extra buffer and
+/// kernel launch in the executor (`gpu_sort.rs`) and is deferred. Until then
+/// the radix path stays gated behind `BOLT_GPU_SORT=1` (default OFF); it must
+/// reach full cross-block stability before being promoted to default-on so
+/// `ORDER BY non_unique_key [LIMIT k]` matches the host `lexsort_to_indices`
+/// fallback. The per-element race, however, is gone.
 pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     let entry = radix_scatter_entry(dtype)?;
@@ -552,50 +615,18 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     writeln!(p, ")").map_err(write_err)?;
     writeln!(p, "{{").map_err(write_err)?;
 
-    // -- Register declarations ---------------------------------------
-    writeln!(p, "\t.reg .pred %p<2>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b32 %r<16>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %rd<16>;").map_err(write_err)?;
-
-    // tid
-    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
-    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
-
-    // bail if tid >= n_rows
-    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_3];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
-    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
-
-    // load shift
-    writeln!(p, "\tld.param.u32 %r5, [{entry}_param_4];").map_err(write_err)?;
-
-    // keys_in_ptr -> %rd0 (globalised); load key.
-    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    // Block-stable prologue: computes digit (%r8), out_idx (%r9), and leaves
+    // the loaded key in %r6 (b32) / %rd3 (b64). `active` predicate is %p0.
     let key_w = flavour.byte_width as i64;
-    writeln!(p, "\tmul.wide.u32 %rd1, %r3, {key_w};").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-
-    if flavour.byte_width == 4 {
-        writeln!(p, "\tld.global.{} %r6, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
-        writeln!(p, "\tshr.u32 %r7, %r6, %r5;").map_err(write_err)?;
-        writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
-    } else {
-        writeln!(p, "\tld.global.{} %rd3, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
-        writeln!(p, "\tshr.u64 %rd4, %rd3, %r5;").map_err(write_err)?;
-        writeln!(p, "\tcvt.u32.u64 %r7, %rd4;").map_err(write_err)?;
-        writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
-    }
-
-    // offsets_ptr -> %rd5; atomic-add 1 to offsets[digit], capturing the
-    // *pre*-increment value as the output slot for this key.
-    writeln!(p, "\tld.param.u64 %rd5, [{entry}_param_2];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd5, %rd5;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.u32 %rd6, %r8, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd7, %rd5, %rd6;").map_err(write_err)?;
-    writeln!(p, "\tatom.global.add.u32 %r9, [%rd7], 1;").map_err(write_err)?;
+    emit_block_stable_scatter_prologue(
+        &mut p,
+        &flavour,
+        &entry,
+        /* keys_in_param  */ 0,
+        /* offsets_param  */ 2,
+        /* n_rows_param   */ 3,
+        /* shift_param    */ 4,
+    )?;
 
     // keys_out_ptr -> %rd8; out_addr = keys_out_ptr + out_idx * byte_width.
     writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_1];").map_err(write_err)?;
@@ -604,9 +635,11 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     writeln!(p, "\tadd.s64 %rd10, %rd8, %rd9;").map_err(write_err)?;
 
     if flavour.byte_width == 4 {
-        writeln!(p, "\tst.global.{} [%rd10], %r6;", flavour.ld_st_suffix).map_err(write_err)?;
+        writeln!(p, "\t@%p0 st.global.{} [%rd10], %r6;", flavour.ld_st_suffix)
+            .map_err(write_err)?;
     } else {
-        writeln!(p, "\tst.global.{} [%rd10], %rd3;", flavour.ld_st_suffix).map_err(write_err)?;
+        writeln!(p, "\t@%p0 st.global.{} [%rd10], %rd3;", flavour.ld_st_suffix)
+            .map_err(write_err)?;
     }
 
     writeln!(p, "DONE:").map_err(write_err)?;
@@ -614,6 +647,155 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     writeln!(p, "}}").map_err(write_err)?;
 
     Ok(p)
+}
+
+/// Emit the shared block-stable scatter prologue used by both
+/// [`compile_radix_scatter`] and [`compile_radix_scatter_with_indices`].
+///
+/// On return, the following registers/predicates are live:
+///   - `%p0`  = active (tid < n_rows)
+///   - `%r3`  = tid, `%r2` = lane (threadIdx.x)
+///   - `%r6`  = loaded key (b32 path) ; `%rd3` = loaded key (b64 path)
+///   - `%r8`  = digit (0..15) for active threads
+///   - `%r9`  = out_idx = s_base[digit] + per-block stable rank
+///
+/// Register budget consumed: `%r0..%r15`, `%rd0..%rd15`, `%p0..%p3`.
+/// Shared symbols emitted: `s_digit`, `s_hist`, `s_base`.
+///
+/// Barrier-safety: the kernel contains three `bar.sync`s, so the prologue
+/// never early-`ret`s on out-of-range threads — every lane falls through all
+/// barriers; out-of-range lanes simply store the `0xFFFF` inactive sentinel
+/// into `s_digit[lane]` and skip the increment/store via `%p0`.
+#[allow(clippy::too_many_arguments)]
+fn emit_block_stable_scatter_prologue(
+    p: &mut String,
+    flavour: &RadixFlavour,
+    entry: &str,
+    keys_in_param: u32,
+    offsets_param: u32,
+    n_rows_param: u32,
+    shift_param: u32,
+) -> BoltResult<()> {
+    // Inactive-lane sentinel stored into s_digit (never a real 4-bit digit).
+    const INACTIVE: u32 = 0xFFFF;
+
+    // -- Shared state -------------------------------------------------
+    writeln!(p, "\t.shared .align 4 .b32 s_digit[{}];", RADIX_BLOCK_SIZE)
+        .map_err(write_err)?;
+    writeln!(p, "\t.shared .align 4 .b32 s_hist[{}];", RADIX_BUCKETS).map_err(write_err)?;
+    writeln!(p, "\t.shared .align 4 .b32 s_base[{}];", RADIX_BUCKETS).map_err(write_err)?;
+
+    // -- Register declarations ---------------------------------------
+    // The prologue itself uses %r0..%r15 / %rd0..%rd15 / %p0..%p3. We declare a
+    // wider pool (r/rd up to 23) so callers can stage their own payload
+    // (e.g. the with-indices scatter's u32 row-index) in %r16.. / %rd16..
+    // without emitting a second (illegal) `.reg` directive in the same body.
+    writeln!(p, "\t.reg .pred %p<4>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %r<24>;").map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %rd<24>;").map_err(write_err)?;
+
+    // lane = threadIdx.x ; tid = ctaid.x * ntid.x + lane
+    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+
+    // active = tid < n_rows -> %p0 (no early ret; barriers below).
+    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_{n_rows_param}];").map_err(write_err)?;
+    writeln!(p, "\tsetp.lt.u32 %p0, %r3, %r4;").map_err(write_err)?;
+
+    // load shift -> %r5
+    writeln!(p, "\tld.param.u32 %r5, [{entry}_param_{shift_param}];").map_err(write_err)?;
+
+    // keys_in_ptr -> %rd0; load key (guarded) and compute digit.
+    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_{keys_in_param}];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    let key_w = flavour.byte_width as i64;
+    writeln!(p, "\tmul.wide.u32 %rd1, %r3, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+
+    // Default digit to INACTIVE; active lanes overwrite with the real digit.
+    writeln!(p, "\tmov.u32 %r8, {INACTIVE};").map_err(write_err)?;
+    if flavour.byte_width == 4 {
+        writeln!(p, "\t@%p0 ld.global.{} %r6, [%rd2];", flavour.ld_st_suffix)
+            .map_err(write_err)?;
+        writeln!(p, "\tshr.u32 %r7, %r6, %r5;").map_err(write_err)?;
+        writeln!(p, "\t@%p0 and.b32 %r8, %r7, 15;").map_err(write_err)?;
+    } else {
+        writeln!(p, "\t@%p0 ld.global.{} %rd3, [%rd2];", flavour.ld_st_suffix)
+            .map_err(write_err)?;
+        writeln!(p, "\tshr.u64 %rd4, %rd3, %r5;").map_err(write_err)?;
+        writeln!(p, "\tcvt.u32.u64 %r7, %rd4;").map_err(write_err)?;
+        writeln!(p, "\t@%p0 and.b32 %r8, %r7, 15;").map_err(write_err)?;
+    }
+
+    // s_digit / s_hist / s_base base addresses.
+    writeln!(p, "\tmov.u64 %rd5, s_digit;").map_err(write_err)?;
+    writeln!(p, "\tmov.u64 %rd6, s_hist;").map_err(write_err)?;
+    writeln!(p, "\tmov.u64 %rd7, s_base;").map_err(write_err)?;
+
+    // s_digit[lane] = digit (every lane writes; inactive lanes write INACTIVE).
+    writeln!(p, "\tmul.wide.u32 %rd11, %r2, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd12, %rd5, %rd11;").map_err(write_err)?;
+    writeln!(p, "\tst.shared.u32 [%rd12], %r8;").map_err(write_err)?;
+
+    // Zero s_hist with lanes 0..15.
+    writeln!(p, "\tsetp.lt.u32 %p1, %r2, {};", RADIX_BUCKETS).map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd13, %rd6, %rd11;").map_err(write_err)?; // &s_hist[lane]
+    writeln!(p, "\t@%p1 st.shared.u32 [%rd13], 0;").map_err(write_err)?;
+    writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
+
+    // Per-block digit count: active lanes bump s_hist[digit].
+    writeln!(p, "\tmul.wide.u32 %rd14, %r8, 4;").map_err(write_err)?; // digit*4
+    writeln!(p, "\tadd.s64 %rd15, %rd6, %rd14;").map_err(write_err)?; // &s_hist[digit]
+    writeln!(p, "\t@%p0 atom.shared.add.u32 %r10, [%rd15], 1;").map_err(write_err)?;
+    writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
+
+    // Reserve a contiguous global run per non-empty digit: lanes 0..15.
+    //   s_base[lane] = atomicAdd(&offsets[lane], s_hist[lane])
+    writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_{offsets_param}];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    writeln!(p, "\t@%p1 ld.shared.u32 %r11, [%rd13];").map_err(write_err)?; // block count
+    writeln!(p, "\tsetp.ne.u32 %p2, %r11, 0;").map_err(write_err)?;
+    writeln!(p, "\tand.pred %p3, %p1, %p2;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd9, %rd8, %rd11;").map_err(write_err)?; // &offsets[lane]
+    // Reserve (only non-empty buckets touch global memory). %r12 = run base.
+    writeln!(p, "\tmov.u32 %r12, 0;").map_err(write_err)?;
+    writeln!(p, "\t@%p3 atom.global.add.u32 %r12, [%rd9], %r11;").map_err(write_err)?;
+    // s_base[lane] = run base (write for all 16 lanes; empty buckets store 0,
+    // and no active thread will read an empty bucket's base anyway).
+    writeln!(p, "\tadd.s64 %rd10, %rd7, %rd11;").map_err(write_err)?; // &s_base[lane]
+    writeln!(p, "\t@%p1 st.shared.u32 [%rd10], %r12;").map_err(write_err)?;
+    writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
+
+    // Per-block STABLE rank: rank = #{ j in 0..lane : s_digit[j] == digit }.
+    // Deterministic and tid-ordered → equal-digit elements keep input order
+    // within the block. Loop counter %r13 = j, accumulator %r14 = rank.
+    writeln!(p, "\tmov.u32 %r13, 0;").map_err(write_err)?; // j
+    writeln!(p, "\tmov.u32 %r14, 0;").map_err(write_err)?; // rank
+    writeln!(p, "RANK_LOOP:").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u32 %p2, %r13, %r2;").map_err(write_err)?; // j >= lane?
+    writeln!(p, "\t@%p2 bra RANK_DONE;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd11, %r13, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd12, %rd5, %rd11;").map_err(write_err)?; // &s_digit[j]
+    writeln!(p, "\tld.shared.u32 %r15, [%rd12];").map_err(write_err)?;
+    writeln!(p, "\tsetp.eq.u32 %p3, %r15, %r8;").map_err(write_err)?; // same digit?
+    writeln!(p, "\t@%p3 add.u32 %r14, %r14, 1;").map_err(write_err)?;
+    writeln!(p, "\tadd.u32 %r13, %r13, 1;").map_err(write_err)?;
+    writeln!(p, "\tbra RANK_LOOP;").map_err(write_err)?;
+    writeln!(p, "RANK_DONE:").map_err(write_err)?;
+
+    // out_idx (%r9) = s_base[digit] + rank. (Meaningful only for active lanes;
+    // the store at the call site is guarded by %p0 so inactive lanes — whose
+    // digit is the INACTIVE sentinel and would index out of s_base — never read
+    // a bad base or write. We still gate the s_base load on %p0 to avoid an
+    // out-of-bounds shared read for inactive lanes.)
+    writeln!(p, "\tmov.u32 %r9, 0;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 mul.wide.u32 %rd11, %r8, 4;").map_err(write_err)?; // digit*4
+    writeln!(p, "\t@%p0 add.s64 %rd12, %rd7, %rd11;").map_err(write_err)?; // &s_base[digit]
+    writeln!(p, "\t@%p0 ld.shared.u32 %r9, [%rd12];").map_err(write_err)?; // run base
+    writeln!(p, "\tadd.u32 %r9, %r9, %r14;").map_err(write_err)?; // + stable rank
+    Ok(())
 }
 
 /// Emit the PTX for the radix-sort **keys+indices scatter** kernel for `dtype`.
@@ -627,32 +809,27 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
 /// Per-thread logic:
 ///
 /// ```text
-///   tid = blockIdx.x * blockDim.x + threadIdx.x
-///   if tid >= n_rows: return
-///   key = keys_in[tid]
-///   val = vals_in[tid]                    // u32 row-index payload
-///   digit = (key >> shift) & 0xF
-///   out_idx = atomicAdd(&offsets[digit], 1u32)
+///   (block-stable prologue — see emit_block_stable_scatter_prologue):
+///   active = tid < n_rows
+///   digit  = (keys_in[tid] >> shift) & 0xF
+///   out_idx = s_base[digit] + per-block stable rank
+///   // then, at the same out_idx:
 ///   keys_out[out_idx] = key
-///   vals_out[out_idx] = val               // lock-step with key at same slot
+///   vals_out[out_idx] = vals_in[tid]      // u32 row-index, lock-step with key
 /// ```
 ///
-/// The single `atomicAdd` is critical: keys and values must land at the
-/// **same** slot, so we capture `out_idx` once and reuse it for both stores.
-/// Two `atomicAdd`s would race and break the pairing.
+/// The key and its row-index payload are written to the **same** `out_idx`
+/// computed once by the prologue, so the pairing is preserved.
 ///
-/// **EXEC-H1 / stability — read this.** Like the keys-only scatter, this path
-/// is **NOT stable**: the `atomicAdd` slot claim races between threads whose
-/// keys share a digit, so equal-key rows can land in any relative order ("the
-/// kernel processes rows in `tid` order within each digit bucket modulo
-/// scheduling jitter" is a hope, not a guarantee). The bitonic kernel was made
-/// stable for EXEC-H1 via an original-row-index tiebreak in its pairwise
-/// comparator (see `crate::jit::sort_kernel`); that fix has no analogue in a
-/// race-based radix scatter and a stable rewrite (deterministic per-block
-/// stable partition) is deferred. This is tolerated only because the radix
-/// path is gated behind `BOLT_GPU_SORT=1` (default OFF); it must be made stable
-/// before being promoted to default-on so `ORDER BY non_unique_key [LIMIT k]`
-/// stays consistent with the host `lexsort_to_indices` fallback.
+/// **Stability.** This path now shares the **block-stable** scatter prologue
+/// with the keys-only kernel: equal-key rows within a block keep their input
+/// order via the deterministic per-block rank, eliminating the previous
+/// per-element `atom.global.add` race. The same residual limitation applies —
+/// ordering is not yet stable across blocks (block runs are reserved in
+/// scheduling order), which requires a per-block-per-digit prefix-sum pass in
+/// the executor and is deferred. The radix path stays gated behind
+/// `BOLT_GPU_SORT=1` (default OFF) until that lands. See
+/// [`compile_radix_scatter`] for the full discussion.
 pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     let entry = radix_scatter_with_indices_entry(dtype)?;
@@ -675,80 +852,48 @@ pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String>
     writeln!(p, ")").map_err(write_err)?;
     writeln!(p, "{{").map_err(write_err)?;
 
-    // -- Register declarations ---------------------------------------
-    // %r10 holds the u32 row-index payload; reserve a larger b32 pool.
-    writeln!(p, "\t.reg .pred %p<2>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b32 %r<20>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %rd<24>;").map_err(write_err)?;
-
-    // tid
-    writeln!(p, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
-    writeln!(p, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
-
-    // bail if tid >= n_rows
-    writeln!(p, "\tld.param.u32 %r4, [{entry}_param_5];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
-    writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
-
-    // load shift
-    writeln!(p, "\tld.param.u32 %r5, [{entry}_param_6];").map_err(write_err)?;
-
-    // keys_in_ptr -> %rd0; load key from keys_in + tid * key_w
-    writeln!(p, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    // Block-stable prologue. Params: keys_in=0, offsets=4, n_rows=5, shift=6.
+    // On return: %p0=active, %r3=tid, %r9=out_idx, key in %r6 (b32)/%rd3 (b64).
+    // The prologue declares a register pool up to %r23 / %rd23 so we can stage
+    // the row-index payload in %r16 / %rd16.. below without a second `.reg`.
     let key_w = flavour.byte_width as i64;
-    writeln!(p, "\tmul.wide.u32 %rd1, %r3, {key_w};").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    emit_block_stable_scatter_prologue(
+        &mut p,
+        &flavour,
+        &entry,
+        /* keys_in_param  */ 0,
+        /* offsets_param  */ 4,
+        /* n_rows_param   */ 5,
+        /* shift_param    */ 6,
+    )?;
+
+    // vals_in_ptr -> %rd16; load the u32 row-index payload for active lanes.
+    writeln!(p, "\tld.param.u64 %rd16, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd16, %rd16;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd17, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd18, %rd16, %rd17;").map_err(write_err)?;
+    writeln!(p, "\t@%p0 ld.global.u32 %r16, [%rd18];").map_err(write_err)?;
+
+    // keys_out_ptr -> %rd19; out_addr = keys_out_ptr + out_idx * key_w
+    writeln!(p, "\tld.param.u64 %rd19, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd19, %rd19;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd20, %r9, {key_w};").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd21, %rd19, %rd20;").map_err(write_err)?;
 
     if flavour.byte_width == 4 {
-        writeln!(p, "\tld.global.{} %r6, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
-        writeln!(p, "\tshr.u32 %r7, %r6, %r5;").map_err(write_err)?;
-        writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
+        writeln!(p, "\t@%p0 st.global.{} [%rd21], %r6;", flavour.ld_st_suffix)
+            .map_err(write_err)?;
     } else {
-        writeln!(p, "\tld.global.{} %rd3, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
-        writeln!(p, "\tshr.u64 %rd4, %rd3, %r5;").map_err(write_err)?;
-        writeln!(p, "\tcvt.u32.u64 %r7, %rd4;").map_err(write_err)?;
-        writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
+        writeln!(p, "\t@%p0 st.global.{} [%rd21], %rd3;", flavour.ld_st_suffix)
+            .map_err(write_err)?;
     }
 
-    // vals_in_ptr -> %rd11; addr = vals_in_ptr + tid * 4 (u32 payload).
-    // Load the row-index now, before we claim the output slot, so the load
-    // and the store are independent.
-    writeln!(p, "\tld.param.u64 %rd11, [{entry}_param_2];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd11, %rd11;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.u32 %rd12, %r3, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd13, %rd11, %rd12;").map_err(write_err)?;
-    writeln!(p, "\tld.global.u32 %r10, [%rd13];").map_err(write_err)?;
-
-    // offsets_ptr -> %rd5; atomic-add 1 to offsets[digit], capturing the
-    // *pre*-increment value as the output slot. The single atomic guarantees
-    // keys and vals land at the same slot.
-    writeln!(p, "\tld.param.u64 %rd5, [{entry}_param_4];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd5, %rd5;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.u32 %rd6, %r8, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd7, %rd5, %rd6;").map_err(write_err)?;
-    writeln!(p, "\tatom.global.add.u32 %r9, [%rd7], 1;").map_err(write_err)?;
-
-    // keys_out_ptr -> %rd8; out_addr = keys_out_ptr + out_idx * key_w
-    writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_1];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.u32 %rd9, %r9, {key_w};").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd10, %rd8, %rd9;").map_err(write_err)?;
-
-    if flavour.byte_width == 4 {
-        writeln!(p, "\tst.global.{} [%rd10], %r6;", flavour.ld_st_suffix).map_err(write_err)?;
-    } else {
-        writeln!(p, "\tst.global.{} [%rd10], %rd3;", flavour.ld_st_suffix).map_err(write_err)?;
-    }
-
-    // vals_out_ptr -> %rd14; vout_addr = vals_out_ptr + out_idx * 4
-    writeln!(p, "\tld.param.u64 %rd14, [{entry}_param_3];").map_err(write_err)?;
-    writeln!(p, "\tcvta.to.global.u64 %rd14, %rd14;").map_err(write_err)?;
-    writeln!(p, "\tmul.wide.u32 %rd15, %r9, 4;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd16, %rd14, %rd15;").map_err(write_err)?;
-    writeln!(p, "\tst.global.u32 [%rd16], %r10;").map_err(write_err)?;
+    // vals_out_ptr -> %rd22; vout_addr = vals_out_ptr + out_idx * 4
+    writeln!(p, "\tld.param.u64 %rd22, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd22, %rd22;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd23, %r9, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd16, %rd22, %rd23;").map_err(write_err)?; // reuse %rd16
+    writeln!(p, "\t@%p0 st.global.u32 [%rd16], %r16;").map_err(write_err)?;
 
     writeln!(p, "DONE:").map_err(write_err)?;
     writeln!(p, "\tret;").map_err(write_err)?;
@@ -1008,7 +1153,16 @@ mod tests {
         // 4-bit digit extraction.
         assert!(ptx.contains("and.b32"));
         assert!(ptx.contains(", 15;"));
-        // Atomic histogram bump.
+        // (C) Privatized histogram: a per-block shared histogram bumped with
+        // atom.shared.add, two barriers, then a global reduction with
+        // atom.global.add over the 16 buckets.
+        assert!(ptx.contains(".shared .align 4 .b32 s_hist"));
+        assert!(ptx.contains("atom.shared.add.u32"));
+        assert_eq!(
+            ptx.matches("bar.sync").count(),
+            2,
+            "privatized histogram needs two barriers (post-zero, post-count)",
+        );
         assert!(ptx.contains("atom.global.add.u32"));
         // The b32 load suffix for an Int32 key.
         assert!(ptx.contains("ld.global.b32"));
@@ -1032,19 +1186,34 @@ mod tests {
     fn scatter_ptx_shape_i32() {
         let ptx = compile_radix_scatter(DataType::Int32).unwrap();
         assert!(ptx.contains(".visible .entry bolt_radix_scatter_i32("));
-        assert!(ptx.contains("atom.global.add.u32"));
+        // Block-stable scatter: a per-block shared histogram, three barriers,
+        // a single global atomic to RESERVE the per-digit run (no longer a
+        // per-element bump), and the deterministic per-block rank loop.
         assert!(ptx.contains("st.global.b32"));
         assert!(ptx.contains("ld.global.b32"));
+        assert!(ptx.contains("atom.shared.add.u32"));
+        assert!(ptx.contains("atom.global.add.u32"));
+        assert_eq!(
+            ptx.matches("bar.sync").count(),
+            3,
+            "block-stable scatter needs exactly three bar.sync barriers",
+        );
+        assert!(ptx.contains("RANK_LOOP:"));
+        // Exactly one GLOBAL atomic: the per-digit run reservation.
+        assert_eq!(ptx.matches("atom.global.add.u32").count(), 1);
     }
 
-    /// Keys+indices scatter PTX shape for `i32`:
+    /// Keys+indices scatter PTX shape for `i32` (block-stable):
     ///   1. The entry name and signature carry the documented seven `.param`s.
     ///   2. The key load (`ld.global.b32`) and key store (`st.global.b32`)
-    ///      survive intact — same shape as the keys-only scatter.
-    ///   3. A single atomic-add bumps the offset; both stores reuse its result
-    ///      (we don't see a second `atom.global.add.u32` for the index).
-    ///   4. The new `vals_in` u32 load and `vals_out` u32 store appear —
-    ///      these are the new ABI surface the executor depends on.
+    ///      survive intact.
+    ///   3. Exactly one GLOBAL atomic — the per-digit run reservation — so the
+    ///      key and its row-index payload share the single `out_idx` the
+    ///      block-stable prologue computes. The per-element race is gone.
+    ///   4. The `vals_in` u32 load and `vals_out` u32 store appear — the ABI
+    ///      surface the executor depends on.
+    ///   5. The block-stable machinery (shared atomic, barriers, rank loop) is
+    ///      present.
     #[test]
     fn scatter_with_indices_ptx_shape_i32() {
         let ptx = compile_radix_scatter_with_indices(DataType::Int32).unwrap();
@@ -1059,14 +1228,19 @@ mod tests {
         // Existing key-side ABI preserved.
         assert!(ptx.contains("ld.global.b32"));
         assert!(ptx.contains("st.global.b32"));
-        // Single atomic bump — paired key+val writes share its result.
+        // Exactly one GLOBAL atomic: the per-digit run reservation. Key and val
+        // writes both use the prologue's single `out_idx`, so they stay paired.
         assert_eq!(
             ptx.matches("atom.global.add.u32").count(),
             1,
-            "keys+indices scatter must use exactly one atomicAdd per thread \
-             so keys and vals land at the same slot",
+            "keys+indices scatter must reserve its per-digit run with exactly \
+             one global atomicAdd so keys and vals land at the same slot",
         );
-        // The new vals payload: u32 load from vals_in and u32 store to vals_out.
+        // Block-stable machinery.
+        assert!(ptx.contains("atom.shared.add.u32"));
+        assert_eq!(ptx.matches("bar.sync").count(), 3);
+        assert!(ptx.contains("RANK_LOOP:"));
+        // The vals payload: u32 load from vals_in and u32 store to vals_out.
         assert!(
             ptx.contains("ld.global.u32"),
             "expected `ld.global.u32` for the vals_in row-index payload load",
@@ -1079,12 +1253,12 @@ mod tests {
         assert!(ptx.contains("ret;"));
     }
 
-    /// Keys+indices scatter PTX shape for `i64`:
+    /// Keys+indices scatter PTX shape for `i64` (block-stable):
     ///   1. Entry name carries the i64 tag.
     ///   2. Key load/store use the `b64` suffix (the 64-bit-key path).
     ///   3. The vals payload remains u32 — row indices don't grow with key
     ///      width — so we still see `ld.global.u32` / `st.global.u32`.
-    ///   4. A single `atomicAdd` couples the key and val writes.
+    ///   4. Exactly one global atomic (the per-digit run reservation).
     #[test]
     fn scatter_with_indices_ptx_shape_i64() {
         let ptx = compile_radix_scatter_with_indices(DataType::Int64).unwrap();
@@ -1097,8 +1271,12 @@ mod tests {
         assert_eq!(
             ptx.matches("atom.global.add.u32").count(),
             1,
-            "keys+indices scatter (i64) must use exactly one atomicAdd per thread",
+            "keys+indices scatter (i64) must reserve its per-digit run with \
+             exactly one global atomicAdd",
         );
+        assert!(ptx.contains("atom.shared.add.u32"));
+        assert_eq!(ptx.matches("bar.sync").count(), 3);
+        assert!(ptx.contains("RANK_LOOP:"));
     }
 
     /// MSB-flip PTX shape for `i32`: XOR with `0x8000_0000` (decimal

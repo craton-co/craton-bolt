@@ -118,17 +118,30 @@ impl ResultSet {
 
 fn duckdb_run(conn: &duckdb::Connection, sql: &str) -> ResultSet {
     let mut stmt = conn.prepare(sql).expect("duckdb prepare");
-    let column_names: Vec<String> = stmt.column_names();
-    let ncols = column_names.len();
-    let mut rows_iter = stmt.query([]).expect("duckdb query");
+    // duckdb-1.2.2 populates the prepared-statement schema only AFTER the
+    // statement is executed. Reading `column_names()` before `query()` panics
+    // on a `None` schema (`schema.unwrap()` in the binding), so we execute
+    // first, decode each row by probing columns until the index runs past the
+    // row width, and read the column names afterwards. Names are diagnostic-only
+    // (the comparison is positional). See `diff_duckdb.rs` for the full rationale.
     let mut rows: Vec<Vec<Cell>> = Vec::new();
-    while let Some(row) = rows_iter.next().expect("duckdb row") {
-        let mut out = Vec::with_capacity(ncols);
-        for i in 0..ncols {
-            out.push(duckdb_value_to_cell(row.get_ref(i).expect("duckdb cell")));
+    {
+        let mut rows_iter = stmt.query([]).expect("duckdb query");
+        while let Some(row) = rows_iter.next().expect("duckdb row") {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while let Ok(v) = row.get_ref(i) {
+                out.push(duckdb_value_to_cell(v));
+                i += 1;
+            }
+            rows.push(out);
         }
-        rows.push(out);
     }
+    let ncols = rows.first().map(Vec::len).unwrap_or(0);
+    let column_names: Vec<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stmt.column_names()
+    }))
+    .unwrap_or_else(|_| (0..ncols).map(|i| format!("col{i}")).collect());
     ResultSet {
         columns: column_names,
         rows,

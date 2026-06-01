@@ -39,6 +39,9 @@ use craton_bolt::jit::prefix_scan::{
 use craton_bolt::jit::string_kernel::{
     compile_length_gather_kernel, compile_varwidth_len_pass, compile_varwidth_write_pass,
 };
+use craton_bolt::jit::window_kernel::{
+    compile_boundary_flag_kernel, compile_segmented_scan_kernel, WINDOW_BLOCK_SIZE,
+};
 use craton_bolt::plan::ScalarFnKind;
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema, TimeUnit,
@@ -1233,6 +1236,57 @@ fn golden_sort_kernel_shmem_smoke() {
     assert!(ptx.contains("bar.sync 0"), "{ptx}");
 }
 
+// ---- Tests: distinct_kernel (adjacent-distinct flag) -----------------------
+
+#[test]
+fn golden_distinct_flag_i32_nonnull_smoke() {
+    use craton_bolt::jit::distinct_kernel::compile_distinct_flag_kernel;
+    let ptx = compile_distinct_flag_kernel(DataType::Int32, false).expect("compile");
+    // Non-nullable entry name (no `_v` suffix).
+    assert!(
+        ptx.contains(".visible .entry bolt_distinct_flag_i32("),
+        "{ptx}"
+    );
+    // tid==0 always-keep + adjacent value compare.
+    assert!(ptx.contains("setp.eq.s32 %p1, %r3, 0;"), "{ptx}");
+    assert!(ptx.contains("setp.eq.s32 %p4"), "{ptx}");
+    // u8 mask stores for keep(1)/drop(0).
+    assert!(ptx.contains("st.global.u8 [%rd1], %r20;"), "{ptx}");
+    assert!(ptx.contains("st.global.u8 [%rd1], %r21;"), "{ptx}");
+    // Non-nullable variant has no 4th param and no validity byte load.
+    assert!(!ptx.contains("bolt_distinct_flag_i32_param_3"), "{ptx}");
+}
+
+#[test]
+fn golden_distinct_flag_i64_nullable_smoke() {
+    use craton_bolt::jit::distinct_kernel::compile_distinct_flag_kernel;
+    let ptx = compile_distinct_flag_kernel(DataType::Int64, true).expect("compile");
+    // Nullable entry name carries the `_v` suffix + a 4th (n_rows) param.
+    assert!(
+        ptx.contains(".visible .entry bolt_distinct_flag_i64_v("),
+        "{ptx}"
+    );
+    assert!(ptx.contains("bolt_distinct_flag_i64_v_param_3"), "{ptx}");
+    // Packed-bit validity loads for self + prev, both-NULL collapse + one-NULL
+    // boundary keep.
+    assert!(ptx.contains("ld.global.u8 %r10"), "{ptx}");
+    assert!(ptx.contains("ld.global.u8 %r11"), "{ptx}");
+    assert!(ptx.contains("@%p2 bra DROP;"), "{ptx}");
+    assert!(ptx.contains("@%p3 bra KEEP;"), "{ptx}");
+    // i64 key compare.
+    assert!(ptx.contains("setp.eq.s64"), "{ptx}");
+}
+
+#[test]
+fn golden_distinct_flag_f64_uses_float_eq() {
+    use craton_bolt::jit::distinct_kernel::compile_distinct_flag_kernel;
+    let ptx = compile_distinct_flag_kernel(DataType::Float64, false).expect("compile");
+    // After host -0.0/NaN canonicalisation the device compare is a plain f64
+    // equality.
+    assert!(ptx.contains("setp.eq.f64"), "{ptx}");
+    assert!(ptx.contains("ld.global.f64"), "{ptx}");
+}
+
 // ---- Tests: scatter_kernel variants (review L4) ----------------------------
 
 #[test]
@@ -1756,3 +1810,62 @@ fn golden_case_timestamp_emits_selp_b64() {
     );
 }
 
+
+// ---- Window-function kernels (GPU framed window path) -----------------------
+
+/// Boundary-flag kernel: pinned entry name + 5-arg ABI + the two i64 key
+/// compares and two u8 flag stores that define partition/peer boundaries.
+#[test]
+fn golden_window_boundary_flags_abi() {
+    let ptx = compile_boundary_flag_kernel().expect("compile boundary kernel");
+    assert!(
+        ptx.contains(".visible .entry bolt_window_boundary_flags("),
+        "missing boundary entry\n{ptx}"
+    );
+    // 4 pointers + n_rows; no 6th param.
+    assert!(ptx.contains("bolt_window_boundary_flags_param_4"));
+    assert!(!ptx.contains("bolt_window_boundary_flags_param_5"));
+    // Partition-key and order-key inequality compares (i64 lane).
+    assert!(
+        ptx.matches("setp.ne.s64").count() >= 2,
+        "expected >=2 i64 ne compares\n{ptx}"
+    );
+    // peer_head = part_head | order_changed.
+    assert!(ptx.contains("or.b32"), "missing peer-head OR\n{ptx}");
+    // Two u8 flag stores (part_head, peer_head).
+    assert_eq!(
+        ptx.matches("st.global.u8").count(),
+        2,
+        "expected exactly 2 u8 flag stores\n{ptx}"
+    );
+}
+
+/// Segmented-scan kernel: pinned entry name + 4-arg ABI + segmented combine
+/// (flag OR, value add, segment-reset select) + log2(BLOCK_SIZE) barriers.
+#[test]
+fn golden_window_segmented_scan_abi_and_combine() {
+    let ptx = compile_segmented_scan_kernel().expect("compile segmented scan");
+    assert!(
+        ptx.contains(".visible .entry bolt_window_segmented_scan("),
+        "missing segmented-scan entry\n{ptx}"
+    );
+    assert!(ptx.contains("bolt_window_segmented_scan_param_3"));
+    assert!(!ptx.contains("bolt_window_segmented_scan_param_4"));
+    // Segmented combine: OR the flags, add the values, select on the head flag.
+    assert!(ptx.contains("or.b32"), "missing flag OR\n{ptx}");
+    assert!(ptx.contains("add.s64"), "missing value add\n{ptx}");
+    assert!(ptx.contains("selp.b64"), "missing segment-reset select\n{ptx}");
+    // Shared buffer = 2 ping-pong * BLOCK_SIZE * 16-byte (i64+flag) records.
+    let expect = WINDOW_BLOCK_SIZE * 16 * 2;
+    assert!(
+        ptx.contains(&format!(".shared .align 8 .b8 sdata[{expect}];")),
+        "incorrect shared-buffer size (want {expect})\n{ptx}"
+    );
+    // Barriers: one seed + one per Hillis-Steele round.
+    let expect_bars = 1 + WINDOW_BLOCK_SIZE.trailing_zeros() as usize;
+    assert_eq!(
+        ptx.matches("bar.sync 0;").count(),
+        expect_bars,
+        "expected {expect_bars} barriers\n{ptx}"
+    );
+}

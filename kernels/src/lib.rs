@@ -1,5 +1,45 @@
 ﻿// SPDX-License-Identifier: Apache-2.0
 //
+// ============================================================================
+// EXPERIMENTAL — OFF BY DEFAULT.
+//
+// This crate is built ONLY when the host crate's `rust-cuda` Cargo feature is
+// enabled, at which point the host `build.rs` invokes `cuda_builder` to compile
+// this crate to PTX. It is excluded from the workspace and is never part of a
+// normal `cargo build`/`cargo test`. See `docs/JIT_PIPELINE.md` ("rust-cuda
+// alternative emitter (experimental, opt-in)").
+//
+// ----------------------------------------------------------------------------
+// Toolchain prerequisites (the maintainer MUST install these to build/verify):
+//
+//   * Rust nightly:        nightly-2026-04-02   (pinned in
+//                          `kernels/rust-toolchain.toml`, with components
+//                          rust-src, rustc-dev, llvm-tools-preview).
+//   * The `rustc_codegen_nvvm` backend + NVIDIA libNVVM (ships with the CUDA
+//     Toolkit) + LLVM, per the Rust-GPU/Rust-CUDA install guide.
+//   * `cuda_std` API target: Rust-GPU/Rust-CUDA git rev
+//     103a8d56935c4e0885ff7c3d25402319df1a8e00 (HEAD of `main` on 2026-04-29),
+//     pinned in `kernels/Cargo.toml`. That rev's own `rust-toolchain.toml`
+//     pins the SAME nightly-2026-04-02, so the pin here is consistent.
+//
+// IMPORTANT — this source was modernised but NOT compile-verified (no
+// rust-cuda toolchain / libNVVM is available in the editing environment). The
+// obsolete `#![feature(register_attr)]` (removed from rustc years ago) and its
+// `#[register_attr]` usage have been dropped: in modern `cuda_std` the
+// `#[kernel]` attribute is self-sufficient and auto-cfg-gates the function for
+// nvptx64. To verify, install the toolchain above and build the host crate
+// with `--features rust-cuda` (which drives `cuda_builder`); see
+// `docs/JIT_PIPELINE.md` and `kernels/rust-toolchain.toml`.
+//
+// MAINTAINER NOTE on `cuda_builder`: the root (host) Cargo.toml — intentionally
+// untouched by this change — pins `cuda_builder = "0.3"`. crates.io only has
+// the stale 0.3.0 (Feb 2022) cut, which is incompatible with this nightly. For
+// the emitted-PTX ABI to match this crate's `cuda_std` git rev, the host side
+// must resolve `cuda_builder` to the SAME git rev (e.g. via a git dependency or
+// a `[patch.crates-io]` on the host crate). That wiring lives outside this
+// crate's edit scope and is called out here so it is not lost.
+// ============================================================================
+//
 // Craton Bolt GPU kernels (rust-cuda Wave A spike).
 //
 // This crate is compiled to PTX by `rustc_codegen_nvvm` via `cuda_builder`.
@@ -19,9 +59,14 @@
 // const definitions in a future wave).
 
 #![cfg_attr(target_arch = "nvptx64", no_std)]
-// `cuda_std`'s `#[kernel]` attribute requires the `register_attr` feature
-// (per the rust-cuda guide). Only enabled on the GPU build.
-#![cfg_attr(target_arch = "nvptx64", feature(register_attr))]
+// NOTE: the obsolete `#![feature(register_attr)]` (and the matching
+// `#[register_attr(nvvm_internal)]` on the kernel) that older `cuda_std`
+// 0.2.x required have been REMOVED. `register_attr` was deleted from rustc
+// years ago and does not exist on the pinned `nightly-2026-04-02`. In the
+// modern `cuda_std` (the git rev pinned in Cargo.toml) the `#[kernel]`
+// attribute is self-sufficient — it expands the necessary `nvvm_internal`
+// wiring itself and auto-cfg-gates the function for nvptx64 — so no
+// crate-level feature gate is needed for kernel entry points.
 
 // --- Shared constants -------------------------------------------------------
 //
@@ -85,14 +130,18 @@ mod gpu {
     /// `counts` MUST be zero-initialised by the caller before launch
     /// (matches `src/jit/partition_kernel.rs` contract).
     ///
-    /// Pointer parameters are raw `*mut` rather than `&[T]` slices because
-    /// `cuda_std` 0.2.2's kernel-ABI doesn't yet carry slice metadata
-    /// through the nvptx parameter convention reliably (see the audit doc
-    /// section 1 — "high-level `AtomicU32` wrapper does not exist yet as
-    /// of 0.2.2"). Raw pointers match the hand-emit's PTX param shape
-    /// exactly: four `.u64 / .u32` slots in declaration order.
+    /// Pointer parameters are raw `*const`/`*mut` rather than `&[T]` slices so
+    /// the PTX parameter shape matches the hand-emit byte-for-byte: four
+    /// `.u64 / .u32` slots in declaration order. (Modern `cuda_std` CAN pass
+    /// slices — as a pointer+len pair — but that would add a 5th param slot and
+    /// diverge from the hand-emit's ABI, which the host loader expects.)
+    ///
+    /// `#[kernel]` (from `cuda_std`) is the sole attribute needed to emit a
+    /// `.visible .entry`; it enforces `extern "C"` and the nvptx kernel ABI
+    /// itself. `#[export_name]` keeps the symbol unmangled as `bolt_partition`
+    /// so the host PTX loader can look it up by that exact name.
     #[kernel]
-    #[allow(improper_ctypes_definitions)]
+    #[allow(improper_ctypes_definitions, clippy::missing_safety_doc)]
     #[export_name = "bolt_partition"]
     pub unsafe fn bolt_partition(
         keys: *const i32,

@@ -27,20 +27,39 @@
 //!
 //! ## NaN behaviour
 //!
-//! `setp.lt.fXX NaN, x` and `setp.lt.fXX x, NaN` are both `false`. As a
-//! consequence:
+//! This kernel implements the **DuckDB total order** used by the scalar /
+//! window MIN/MAX path (`aggregate.rs::float_total_cmp`): **NaN sorts as the
+//! largest value** (NaN > +inf), and all NaN bit-patterns are treated as
+//! equal. Concretely:
 //!
-//! * If the SLOT holds a real value and the CANDIDATE is NaN, `p_less` is
-//!   false → `new = old` → `p_same` is true → we bail out without writing.
-//! * If the SLOT holds NaN (only possible if NaN was the identity, which it
-//!   is not — we initialise to ±inf in `agg_kernels::ReduceOp::identity_ptx`)
-//!   and the CANDIDATE is real, `p_less` is false → `new = old (NaN)` →
-//!   `p_same` is true → again, no write.
+//! * **MAX** surfaces NaN whenever one is present in a group (NaN beats every
+//!   finite value and ±inf).
+//! * **MIN** skips NaN unless the group is all-NaN (any real value beats NaN
+//!   because NaN is the maximum; if every value is NaN the slot keeps NaN).
 //!
-//! In other words: NaN inputs are silently ignored. That matches the standard
-//! SQL semantic ("MIN/MAX ignore NaN") and is acceptable for v1. A future
-//! revision could promote NaN to a propagating sentinel if a dialect ever
-//! demands it.
+//! IEEE `setp.lt`/`setp.gt` return **false** for any NaN operand, so a naive
+//! ordered compare would silently *ignore* NaN — disagreeing with the scalar
+//! path. We therefore compute the "should the candidate replace the slot?"
+//! predicate explicitly, testing each operand for NaN with
+//! `testp.notanumber.fXX` and folding NaN to the top of the order:
+//!
+//! ```text
+//! cand_nan = testp.notanumber(candidate)
+//! slot_nan = testp.notanumber(slot)
+//! // MAX: replace when candidate sorts strictly ABOVE slot:
+//! //   (cand_nan & !slot_nan)            NaN candidate beats a finite slot
+//! //   | (!cand_nan & !slot_nan & cand > slot)   ordered case, neither NaN
+//! // MIN: replace when candidate sorts strictly BELOW slot:
+//! //   (!cand_nan & slot_nan)            finite candidate beats a NaN slot
+//! //   | (!cand_nan & !slot_nan & cand < slot)   ordered case, neither NaN
+//! ```
+//!
+//! In both ops, a NaN-vs-NaN pair never replaces (they compare equal), and the
+//! ordered branch is gated on *both* operands being non-NaN so the IEEE
+//! "false on NaN" quirk can never leak a spurious decision. The accumulator is
+//! still initialised to ±inf by `agg_kernels::ReduceOp::identity_ptx`; with
+//! the rules above a single NaN in a MAX group overwrites that +(-)inf seed and
+//! propagates to the result, exactly matching the scalar reduction.
 //!
 //! ## ABI
 //!
@@ -110,11 +129,20 @@ pub fn compile_groupby_float_atomic_kernel(
     dtype: DataType,
 ) -> BoltResult<String> {
     // Validate inputs up front so the rest of the function can assume them.
-    let cmp_setp = match (op, dtype) {
-        (ReduceOp::Min, DataType::Float32) => "setp.lt.f32",
-        (ReduceOp::Max, DataType::Float32) => "setp.gt.f32",
-        (ReduceOp::Min, DataType::Float64) => "setp.lt.f64",
-        (ReduceOp::Max, DataType::Float64) => "setp.gt.f64",
+    // `ordered_cmp` is the IEEE ordered comparison used only when BOTH operands
+    // are known non-NaN (we test for NaN separately to honour the NaN-as-largest
+    // total order — see the module-level "NaN behaviour" note). The float suffix
+    // is filled in below from `dtype`.
+    let is_min = match op {
+        ReduceOp::Min => true,
+        ReduceOp::Max => false,
+        ReduceOp::Sum | ReduceOp::Count => false, // unused; rejected below
+    };
+    match (op, dtype) {
+        (ReduceOp::Min, DataType::Float32)
+        | (ReduceOp::Max, DataType::Float32)
+        | (ReduceOp::Min, DataType::Float64)
+        | (ReduceOp::Max, DataType::Float64) => {}
         (ReduceOp::Sum, _) | (ReduceOp::Count, _) => {
             return Err(BoltError::Other(format!(
                 "float_atomics: only MIN/MAX are supported here (got {:?}); \
@@ -150,6 +178,14 @@ pub fn compile_groupby_float_atomic_kernel(
                 dtype
             )));
         }
+    };
+
+    // IEEE *ordered* comparison used only on the both-operands-non-NaN branch.
+    // For MIN we ask `candidate < slot`; for MAX, `candidate > slot`.
+    let ordered_cmp = if is_min {
+        format!("setp.lt.{}", float_ty)
+    } else {
+        format!("setp.gt.{}", float_ty)
     };
 
     let mut ptx = String::new();
@@ -345,16 +381,56 @@ pub fn compile_groupby_float_atomic_kernel(
         br = bits_reg
     )
     .map_err(write_err)?;
-    // %p3 = (candidate <op> old). For MIN, op is `<`; for MAX, op is `>`.
-    // NaN-comparison semantics: setp.lt/gt with a NaN operand is always
-    // false, so a NaN candidate leaves %p3 false → new_f := old_f → bail.
+    // Compute %p3 = "candidate sorts strictly past the slot under the DuckDB
+    // total order (NaN as largest)". A bare `setp.lt/gt` is FALSE for any NaN
+    // operand, which would silently ignore NaN; we instead test each operand
+    // for NaN explicitly and fold NaN to the top of the order. Predicate map:
+    //   %p3  = cand_nan  = testp.notanumber(candidate, %{fr}0)
+    //   %p4  = slot_nan  = testp.notanumber(old,       %{fr}1)
+    //   %p5  = !cand_nan ;  %p6 = !slot_nan   (materialised — PTX `and.pred` /
+    //         `or.pred` do not accept an inline `!` source negation)
+    //   %p7  = ordered   = candidate <lt|gt> old   (valid only when neither NaN)
+    // Final replace decision (rebuilt into %p3):
+    //   MAX: (cand_nan & !slot_nan) | (!cand_nan & !slot_nan & ordered)
+    //   MIN: (!cand_nan & slot_nan) | (!cand_nan & !slot_nan & ordered)
     writeln!(
         ptx,
-        "\t{cmp} %p3, %{fr}0, %{fr}1;",
-        cmp = cmp_setp,
+        "\ttestp.notanumber.{fty} %p3, %{fr}0;",
+        fty = float_ty,
         fr = float_reg
     )
     .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\ttestp.notanumber.{fty} %p4, %{fr}1;",
+        fty = float_ty,
+        fr = float_reg
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tnot.pred %p5, %p3;").map_err(write_err)?; // !cand_nan
+    writeln!(ptx, "\tnot.pred %p6, %p4;").map_err(write_err)?; // !slot_nan
+    writeln!(
+        ptx,
+        "\t{cmp} %p7, %{fr}0, %{fr}1;",
+        cmp = ordered_cmp,
+        fr = float_reg
+    )
+    .map_err(write_err)?;
+    // ordered term (common to MIN/MAX): ordered & !cand_nan & !slot_nan → %p7
+    writeln!(ptx, "\tand.pred %p7, %p7, %p5;").map_err(write_err)?;
+    writeln!(ptx, "\tand.pred %p7, %p7, %p6;").map_err(write_err)?;
+    if is_min {
+        // NaN-slot term: finite candidate beats a NaN slot = !cand_nan & slot_nan
+        writeln!(ptx, "\tand.pred %p4, %p4, %p5;").map_err(write_err)?;
+        // replace = ordered_term | nan_slot_term → %p3
+        writeln!(ptx, "\tor.pred  %p3, %p7, %p4;").map_err(write_err)?;
+    } else {
+        // NaN-candidate term: NaN candidate beats a finite slot = cand_nan & !slot_nan
+        writeln!(ptx, "\tand.pred %p3, %p3, %p6;").map_err(write_err)?;
+        // replace = nan_cand_term | ordered_term → %p3
+        writeln!(ptx, "\tor.pred  %p3, %p3, %p7;").map_err(write_err)?;
+    }
+    // new_f := candidate if we should replace, else keep old.
     writeln!(
         ptx,
         "\tselp.{fty} %{fr}2, %{fr}0, %{fr}1, %p3;",

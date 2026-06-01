@@ -89,10 +89,15 @@ pub struct PatternMatcher {
     /// Detected shape — drives the dispatch in `matches`.
     shape: Shape,
     /// When `true` (compiled for `ILIKE`), the pattern was Unicode
-    /// case-folded (`to_lowercase`) at compile time and the input is
-    /// case-folded the same way before matching, yielding case-insensitive
-    /// comparison. When `false` (plain `LIKE`), matching is byte-for-byte
-    /// case-sensitive — the original, unchanged behaviour.
+    /// case-folded (`to_lowercase`) at compile time and the input is folded
+    /// the same way before matching, yielding case-insensitive comparison.
+    /// For the `_` wildcard (Generic shape) the input is folded *with
+    /// original-codepoint boundaries* so `_` consumes exactly one original
+    /// input codepoint even under expanding folds — see [`matches`] and
+    /// [`generic_match_folded`]. When `false` (plain `LIKE`), matching is
+    /// byte-for-byte case-sensitive — the original, unchanged behaviour.
+    ///
+    /// [`matches`]: PatternMatcher::matches
     case_insensitive: bool,
 }
 
@@ -196,12 +201,53 @@ impl PatternMatcher {
     }
 
     /// True if `s` matches this compiled pattern.
+    ///
+    /// ## Unicode case-fold semantics for ILIKE (`_` wildcard)
+    ///
+    /// For the ILIKE path the pattern was Unicode case-folded
+    /// (`to_lowercase`) at compile time, so we fold the input the same way
+    /// before matching. The subtlety is that `to_lowercase` is **not**
+    /// length-preserving per codepoint: a single source codepoint can fold
+    /// to *several* scalars (e.g. `İ` U+0130 → `i` + U+0307 combining dot;
+    /// the Cherokee/`ẞ`-style expansions behave the same way). Folding the
+    /// whole input into one string therefore loses the original-codepoint
+    /// boundaries.
+    ///
+    /// SQL semantics require `_` to match **exactly one input character**
+    /// (one original codepoint), regardless of how it case-folds. If we
+    /// matched `_` against the *folded* stream, one `_` would consume only
+    /// the first scalar of an expanding fold and the trailing scalar(s)
+    /// would desynchronise the rest of the pattern. To keep `_` = one
+    /// *original* input codepoint while still comparing literals
+    /// case-insensitively, we fold the input char-by-char and record, for
+    /// each folded scalar, whether it begins a new original codepoint. The
+    /// generic matcher consumes a whole fold-group per `_` using those
+    /// boundaries (see [`generic_match_folded`]).
+    ///
+    /// The fast-path shapes (Exact / Prefix / Suffix / Contains) carry no
+    /// `_` by construction (the classifier routes any `_` to Generic), so a
+    /// plain folded-string comparison is correct and cheaper for them.
     pub fn matches(&self, s: &str) -> bool {
-        // For the ILIKE path the pattern was folded at compile time; fold
-        // the input the same way and dispatch on the (already folded) shape.
         if self.case_insensitive {
-            let folded = s.to_lowercase();
-            return self.matches_folded(&folded);
+            match &self.shape {
+                // No `_` in these shapes → plain folded-string comparison is
+                // correct (and avoids building the boundary map).
+                Shape::Exact(_)
+                | Shape::Prefix(_)
+                | Shape::Suffix(_)
+                | Shape::Contains(_) => {
+                    let folded = s.to_lowercase();
+                    return self.matches_folded(&folded);
+                }
+                Shape::Generic(tokens) => {
+                    // Fold char-by-char, tracking original-codepoint
+                    // boundaries so `Token::One` (`_`) consumes exactly one
+                    // ORIGINAL input codepoint even when it folds to several
+                    // scalars.
+                    let (folded, starts) = fold_with_boundaries(s);
+                    return generic_match_folded(&folded, &starts, tokens);
+                }
+            }
         }
         self.matches_folded(s)
     }
@@ -223,6 +269,50 @@ impl PatternMatcher {
             Shape::Generic(tokens) => generic_match(s, tokens),
         }
     }
+}
+
+/// Case-fold `s` to its `to_lowercase` form, returning the folded scalar
+/// sequence **and** a parallel boolean per folded scalar marking whether it
+/// begins a new *original* input codepoint.
+///
+/// This is the load-bearing helper for correct ILIKE `_` semantics under
+/// expanding folds: `to_lowercase` may map one source codepoint to several
+/// folded scalars, so `starts[i] == true` exactly when `folded[i]` is the
+/// first folded scalar produced by some original codepoint. The number of
+/// `true` entries therefore equals the number of original codepoints in `s`,
+/// which is what `_` must count.
+///
+/// Example: `"İ"` (U+0130) folds to `['i', '\u{307}']` with
+/// `starts == [true, false]` — one original codepoint, two folded scalars.
+///
+/// ## Folding-consistency note (Final_Sigma)
+///
+/// This folds char-by-char (`char::to_lowercase` per codepoint), whereas the
+/// pattern was folded once via whole-string `str::to_lowercase` in
+/// [`PatternMatcher::compile_ci`]. The two agree for every codepoint *except*
+/// the Greek capital sigma `Σ`, which `str::to_lowercase` context-maps to
+/// final-form `ς` at a word boundary versus medial `σ` elsewhere
+/// (`char::to_lowercase` always yields `σ`). So an ILIKE pattern with a
+/// *literal* `Σ` adjacent to a `_` could mismatch a final-sigma input. This
+/// is an exceedingly narrow corner and is strictly less wrong than the
+/// previous whole-string fold, which desynchronised `_` for *every*
+/// expanding-fold codepoint. A future tightening could fold the pattern
+/// char-by-char as well so both sides use identical per-codepoint folding.
+fn fold_with_boundaries(s: &str) -> (Vec<char>, Vec<bool>) {
+    let mut folded: Vec<char> = Vec::with_capacity(s.len());
+    let mut starts: Vec<bool> = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        let mut first = true;
+        for lc in ch.to_lowercase() {
+            folded.push(lc);
+            starts.push(first);
+            first = false;
+        }
+        // Defensive: `char::to_lowercase` always yields at least one scalar,
+        // so `first` is guaranteed to have been consumed once. No empty-fold
+        // case to handle.
+    }
+    (folded, starts)
 }
 
 /// Classify the pattern into a fast-path [`Shape`] when possible, falling
@@ -459,6 +549,110 @@ fn generic_match(s: &str, tokens: &[Token]) -> bool {
         match star_tok {
             Some(tok) if star_s < n => {
                 star_s += 1;
+                s_idx = star_s;
+                t_idx = tok;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// ILIKE-aware generic matcher over a folded input.
+///
+/// Identical algorithm to [`generic_match`] (the non-recursive greedy
+/// two-pointer LIKE matcher with a single backtrack pointer, so the same
+/// `O(|s| * |pattern|)` bound and no catastrophic backtracking), but the
+/// input is the *folded* scalar stream `folded` paired with `starts`, a
+/// per-scalar flag marking original-codepoint boundaries (see
+/// [`fold_with_boundaries`]).
+///
+/// The only behavioural difference is how the wildcards treat codepoint
+/// boundaries so that `_` counts **original** input codepoints, not folded
+/// scalars:
+///
+///   * `Token::One` (`_`) consumes one whole fold-group: the folded scalar
+///     at `s_idx` (which must be an original-codepoint start) plus any
+///     following continuation scalars (`starts[k] == false`). This is what
+///     makes a single `_` match a single original input character even when
+///     that character expands to several folded scalars (e.g. `İ` → `i` +
+///     U+0307).
+///   * The `%` backtrack pointer only advances to **original-codepoint
+///     boundaries**. `%` matches zero-or-more *characters*, so resuming in
+///     the middle of an expanded fold would let `%` "match" a fraction of a
+///     codepoint — wrong, and it could also strand a continuation scalar
+///     that no token can consume. Advancing `star_s` to the next `starts`
+///     position keeps `%` aligned to character boundaries.
+///
+/// `Token::Literal` still matches folded scalars one-for-one: the pattern
+/// literal was itself folded at compile time, so an expanding fold on the
+/// pattern side already produced the matching scalar run, and comparing
+/// folded-scalar-to-folded-scalar there is exactly right.
+fn generic_match_folded(folded: &[char], starts: &[bool], tokens: &[Token]) -> bool {
+    let chars = folded;
+    let n = chars.len();
+    debug_assert_eq!(starts.len(), n);
+
+    let mut s_idx = 0usize;
+    let mut t_idx = 0usize;
+    let mut star_tok: Option<usize> = None;
+    let mut star_s = 0usize;
+
+    loop {
+        if t_idx < tokens.len() {
+            match &tokens[t_idx] {
+                Token::Any => {
+                    star_tok = Some(t_idx + 1);
+                    star_s = s_idx;
+                    t_idx += 1;
+                    continue;
+                }
+                Token::One => {
+                    // Consume exactly one ORIGINAL input codepoint = one
+                    // fold-group: the start scalar plus its continuations.
+                    if s_idx < n {
+                        // `s_idx` is always positioned at a fold-group start
+                        // here: it starts at 0 (a start), and every advance
+                        // below lands on the next start or end-of-input.
+                        s_idx += 1;
+                        while s_idx < n && !starts[s_idx] {
+                            s_idx += 1;
+                        }
+                        t_idx += 1;
+                        continue;
+                    }
+                    // else fall through to backtrack / fail below.
+                }
+                Token::Literal(lit) => {
+                    let mut k = s_idx;
+                    let mut ok = true;
+                    for lc in lit.chars() {
+                        if k < n && chars[k] == lc {
+                            k += 1;
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        s_idx = k;
+                        t_idx += 1;
+                        continue;
+                    }
+                    // else fall through to backtrack / fail below.
+                }
+            }
+        } else if s_idx == n {
+            return true;
+        }
+        // Backtrack to the last `%`, but only ever resume at an
+        // original-codepoint boundary so `%` stays char-aligned (see the
+        // doc-comment). Advance `star_s` past the current fold-group.
+        match star_tok {
+            Some(tok) if star_s < n => {
+                star_s += 1;
+                while star_s < n && !starts[star_s] {
+                    star_s += 1;
+                }
                 s_idx = star_s;
                 t_idx = tok;
             }
@@ -940,6 +1134,41 @@ mod tests {
         // inverts to true.
         assert!(mi("foo", "FOO"));
         assert!(!mi("foo", "bar"));
+    }
+
+    /// ILIKE `_` must match exactly ONE original input codepoint even when
+    /// that codepoint expands under `to_lowercase` to several scalars. This
+    /// is the regression test for the expanding-fold desync: `İ` (U+0130)
+    /// folds to `i` + U+0307 (two scalars). With the buggy whole-string fold
+    /// a single `_` would match only the `i` and strand the combining dot.
+    #[test]
+    fn ilike_underscore_matches_one_expanding_fold_codepoint() {
+        // "aİb" — three original codepoints. `a_b` (one `_`) must match it:
+        // the `_` consumes the whole `İ` fold-group (`i` + U+0307).
+        assert!(mi("a_b", "a\u{0130}b"));
+        // Two `_` must NOT match (only one original char sits between a/b).
+        assert!(!mi("a__b", "a\u{0130}b"));
+        // A literal lowercase pattern of the SAME expanding char still
+        // matches (both sides fold identically): pattern `aİb` ~ input `aİb`.
+        assert!(mi("a\u{0130}b", "a\u{0130}b"));
+        // `_` at end consuming an expanding-fold final char.
+        assert!(mi("a_", "a\u{0130}"));
+        assert!(!mi("a__", "a\u{0130}"));
+    }
+
+    /// ILIKE `%` stays aligned to original-codepoint boundaries around an
+    /// expanding fold — it must not "stop inside" a multi-scalar fold group.
+    #[test]
+    fn ilike_percent_aligns_to_codepoint_boundaries_with_expanding_fold() {
+        // `a%b` over "aİXb": `%` spans İ and X (two original codepoints).
+        assert!(mi("a%b", "a\u{0130}Xb"));
+        // `a%_b`: `%` is empty/greedy and `_` takes exactly one original
+        // codepoint before the literal `b`. "aİb" → `%`="", `_`=İ.
+        assert!(mi("a%_b", "a\u{0130}b"));
+        // "aXİb" → `%`="X", `_`=İ.
+        assert!(mi("a%_b", "aX\u{0130}b"));
+        // Genuine mismatch is still rejected.
+        assert!(!mi("a%_b", "ab"));
     }
 
     /// Escape semantics compose with case-insensitivity: an escaped literal

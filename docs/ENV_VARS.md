@@ -16,6 +16,8 @@ variable.
 | `CRATON_BOLT_POOL_MAX_BYTES`     | 512 MiB              | byte count  | Soft cap on total pooled GPU bytes              |
 | `CRATON_BOLT_POOL_BUCKET_CAP`    | 16                   | integer     | Per-bucket max pooled blocks                    |
 | `CRATON_BOLT_PTX_CACHE_CAP`      | 256                  | integer     | JIT PTX module-cache capacity (FIFO eviction)   |
+| `CRATON_DISTINCT_HOST_MAX_ROWS`  | 10_000_000           | integer > 0 | Host-side DISTINCT / set-op input row cap       |
+| `CRATON_PLAN_CACHE_SIZE`         | 64                   | integer > 0 | SQL→LogicalPlan parse-cache capacity (FIFO)     |
 | `BOLT_POOL_STATS_INTERVAL_SECS`  | 60                   | seconds / 0 | Pool-stats log emit cadence (`0` disables)      |
 | `BOLT_POOL_WATCH_INTERVAL_SECS`  | 5                    | seconds     | Background watcher poll cadence                 |
 | `BOLT_POOL_WATCH_LOW_WATER_FRAC` | 0.10                 | `(0, 1)`    | Watcher proactive-evict threshold (free/total)  |
@@ -319,15 +321,43 @@ path in every case.
   (env var name constant `BOLT_SORT_USE_GRAPH_ENV`, line 1722;
   gate consulted at line 1942).
 
-## Not present in this build
+## Query planning and execution limits
 
-The following vars appear in some forward-looking design notes but are
-NOT honoured by the current codebase. Setting them has no effect:
+### `CRATON_DISTINCT_HOST_MAX_ROWS`
+- **Default**: `10_000_000` (ten million rows)
+- **Type**: positive integer, parsed as `usize`; `0` is rejected
+- **What**: Upper bound on the number of input rows the host-side
+  `DISTINCT` / set-op executor (`src/exec/distinct.rs`) will buffer. Without
+  the cap, `SELECT DISTINCT col FROM big_table` on a high-cardinality column
+  allocates `n_rows × n_cols × ~24 B` of host RAM with no ceiling — a
+  memory-DoS surface on user-controlled inputs. Exceeding the cap produces a
+  clean `BoltError::Other(...)` instead of an OOM.
+- **When**: Raise on trusted workloads that legitimately dedup more than
+  10M rows on the host; lower to bound host memory on shared / hostile
+  inputs.
+- **Notes**: Parsed once on first DISTINCT call and cached for the process
+  lifetime (`OnceLock`). A value of `0` would disable the cap entirely and
+  is rejected with a one-time `log::warn!`; empty / unparseable values also
+  fall back to the default with a warning.
+- **Source**: `src/exec/distinct.rs::parse_distinct_host_max_rows_env`
+  (env var name constant `DISTINCT_HOST_MAX_ROWS_ENV`, line 90; default
+  constant `DISTINCT_HOST_MAX_ROWS`, line 84).
 
-- `CRATON_DISTINCT_HOST_MAX_ROWS` — the host DISTINCT cap is a compile-
-  time constant, not an env var.
-- `CRATON_PLAN_CACHE_SIZE` — the plan cache capacity is a compile-time
-  constant.
-
-If any of these graduates to a runtime knob, document it here and link
-the source file that reads it.
+### `CRATON_PLAN_CACHE_SIZE`
+- **Default**: `64` entries
+- **Type**: positive integer, parsed as `usize`; `0` falls back to the
+  default
+- **What**: Capacity of the SQL→`LogicalPlan` parse cache in the SQL
+  frontend (`src/plan/sql_frontend.rs`). The cache is keyed by
+  `(sql_text, schema_version)` and stores `Arc<LogicalPlan>` with FIFO
+  eviction once the cap is exceeded. Sized by default for "tens of
+  dashboard tiles".
+- **When**: Raise on long-running processes that cycle through more than
+  ~64 distinct query texts and observe repeat parses; lower to bound the
+  cache footprint.
+- **Notes**: Read exactly once on first parse and frozen for the process
+  lifetime (`OnceLock`). Empty / zero / unparseable values fall back to the
+  default of `64`.
+- **Source**: `src/plan/sql_frontend.rs::plan_cache_cap` /
+  `parse_plan_cache_cap` (env var name constant `PLAN_CACHE_SIZE_ENV`,
+  line 818; default constant `PLAN_CACHE_CAP_DEFAULT`, line 824).

@@ -1,31 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conservative join reordering for chained left-deep INNER joins.
+//! Cost-based join reordering for chained INNER equi-joins.
 //!
 //! A query like `a JOIN b JOIN c` parses into a left-deep tree
 //! `Join(Join(a, b), c)`. When every join in the chain is a commutative
 //! `INNER` join with pure equi-`on` pairs (and no residual `filter`), the
-//! relative order of the *leaf* inputs does not affect the result set, only
-//! the work the executor does — putting smaller inputs first shrinks the
-//! intermediate hash tables.
+//! relative order *and shape* of the leaf inputs does not affect the result
+//! set, only the work the executor does — joining small inputs early shrinks
+//! the intermediate hash tables that flow through the pipeline.
 //!
 //! This pass:
 //!
-//! 1. flattens a maximal run of such joins into the ordered list of leaf
-//!    inputs and the multiset of equi-`on` pairs;
-//! 2. estimates each leaf's row count via [`RowEstimator`];
-//! 3. if **every** leaf has an estimate, reorders the leaves smallest-first
-//!    and rebuilds a left-deep tree, re-deriving each join's `on` pairs from
-//!    the equi-pairs whose two columns are now both available;
-//! 4. otherwise leaves the chain exactly as it was (the conservative default
-//!    — without statistics, the original order is preserved).
+//! 1. flattens a maximal run of such joins into the list of leaf inputs and the
+//!    multiset of equi-`on` pairs;
+//! 2. estimates each leaf's row count via [`RowEstimator`] (every leaf must
+//!    have an estimate, else the pass stays a no-op);
+//! 3. maps each equi-pair to the pair of leaves it connects, building a
+//!    cardinality + connectivity model ([`super::cost::CardModel`]);
+//! 4. asks the cost enumerator ([`super::cost::optimize`]) for the cheapest
+//!    join *shape* — Selinger-style DP for small chains, a greedy fallback past
+//!    [`super::cost::MAX_DP_RELATIONS`] — minimising the sum of intermediate
+//!    cardinalities. The result may be **bushy**, not just left-deep;
+//! 5. rebuilds a `LogicalPlan` from that shape, re-attaching each original
+//!    equi-pair at the join level where both of its columns are in scope;
+//! 6. otherwise (no estimate, disconnected graph, unplaceable pair) leaves the
+//!    chain exactly as it was — the conservative default.
 //!
 //! Correctness guards (any failure => leave the chain untouched):
 //!
 //! * only `INNER` joins with non-empty `on` and `filter == None` participate;
+//! * every equi-pair must resolve to exactly two distinct leaves, and the leaf
+//!   set must be a single connected component over the equi-key graph — a
+//!   reorder never invents a cross product the original chain lacked;
 //! * a reordered tree is only accepted if every original equi-pair can be
-//!   re-placed at a join level where both of its columns are in scope, so the
-//!   rebuilt plan is structurally valid;
+//!   re-placed at a join level where both of its columns are in scope and every
+//!   pair is consumed exactly once, so no `on` condition is dropped or
+//!   duplicated and the rebuilt plan is structurally valid;
 //! * the leaf *set* is identical, so the output schema's field set is
 //!   preserved (column *order* in the combined schema may change — see the
 //!   note on [`JoinReorder`]).
@@ -43,6 +53,7 @@ use crate::plan::logical_plan::{Expr, JoinType, LogicalPlan};
 use crate::plan::rewrite::PlanRewrite;
 use crate::plan::statistics::{estimate_rows, StatsProvider};
 
+use super::cost::{optimize, CardModel, JoinShape};
 use super::expr_util::collect_columns;
 
 /// Row-count estimator for join leaves. Implementations return `Some(rows)`
@@ -245,18 +256,59 @@ impl JoinReorder {
         }
 
         // Every leaf must have an estimate, else stay conservative.
-        let mut estimated: Vec<(u64, LogicalPlan)> = Vec::with_capacity(leaves.len());
-        for leaf in leaves {
-            let rows = self.estimator.estimate(&leaf)?;
-            estimated.push((rows, leaf));
+        let mut leaf_rows: Vec<u64> = Vec::with_capacity(leaves.len());
+        for leaf in &leaves {
+            leaf_rows.push(self.estimator.estimate(leaf)?);
         }
 
-        // Stable sort smallest-first; ties keep original relative order.
-        estimated.sort_by_key(|(rows, _)| *rows);
-        let ordered: Vec<LogicalPlan> = estimated.into_iter().map(|(_, p)| p).collect();
+        // Per-leaf output column sets, used both to map each equi-pair to the
+        // pair of leaves it connects (the cost model's edges) and, during
+        // rebuild, to place each pair at the join level where both columns are
+        // in scope. An untypeable leaf yields an empty set and aborts below.
+        let leaf_cols: Vec<HashSet<String>> = leaves.iter().map(column_names).collect();
 
-        rebuild_left_deep(ordered, equi_pairs)
+        // Map each equi-pair to the (i, j) leaf indices it connects. A pair
+        // whose two sides do not resolve to exactly two distinct leaves makes
+        // the chain unsafe to re-derive, so bail to the conservative no-op.
+        let mut edges: Vec<(usize, usize)> = Vec::with_capacity(equi_pairs.len());
+        for (l, r) in &equi_pairs {
+            let li = leaf_for_expr(l, &leaf_cols)?;
+            let ri = leaf_for_expr(r, &leaf_cols)?;
+            if li == ri {
+                return None;
+            }
+            edges.push((li, ri));
+        }
+
+        // Cost-based enumeration: pick the cheapest (possibly bushy) join shape.
+        let model = CardModel::new(leaf_rows, &edges);
+        let plan = optimize(&model)?;
+
+        rebuild_from_shape(&plan.shape, &leaves, &equi_pairs)
     }
+}
+
+/// Resolve the single leaf index whose output columns contain *every* column
+/// referenced by `expr`. Returns `None` when `expr` references no columns, or
+/// when its columns are not all contained in exactly one leaf (a key spanning
+/// two leaves, or referencing an unknown column, makes the rewrite unsafe).
+fn leaf_for_expr(expr: &Expr, leaf_cols: &[HashSet<String>]) -> Option<usize> {
+    let mut cols = Vec::new();
+    collect_columns(expr, &mut cols);
+    if cols.is_empty() {
+        return None;
+    }
+    let mut found: Option<usize> = None;
+    for (idx, set) in leaf_cols.iter().enumerate() {
+        if cols.iter().all(|c| set.contains(c)) {
+            if found.is_some() {
+                // Columns satisfiable by more than one leaf is ambiguous.
+                return None;
+            }
+            found = Some(idx);
+        }
+    }
+    found
 }
 
 /// Flatten a left-deep chain of reorderable INNER joins into `leaves` (in
@@ -298,60 +350,82 @@ fn flatten_chain(
     }
 }
 
-/// Rebuild a left-deep INNER-join tree from `ordered` leaves, distributing
-/// `equi_pairs` to the join level at which both of their columns first become
-/// available. Returns `None` if any equi-pair cannot be placed (then the
-/// caller keeps the original chain).
-fn rebuild_left_deep(
-    ordered: Vec<LogicalPlan>,
-    equi_pairs: Vec<(Expr, Expr)>,
+/// Materialise an abstract [`JoinShape`] (over leaf indices) back into a
+/// `LogicalPlan`, cloning the chosen `leaves` and re-attaching every original
+/// equi-pair at the join level where both of its columns first become in scope.
+///
+/// Returns `None` (caller keeps the original chain) if the shape's leaf set
+/// does not cover every leaf exactly once, if any join level finds no equi-pair
+/// connecting its two children (a cross product the original plan lacked), or
+/// if any equi-pair is left unplaced (a dropped join condition). These guards
+/// make the rewrite a strict no-op whenever it cannot reproduce the original
+/// semantics.
+fn rebuild_from_shape(
+    shape: &JoinShape,
+    leaves: &[LogicalPlan],
+    equi_pairs: &[(Expr, Expr)],
 ) -> Option<LogicalPlan> {
-    let mut iter = ordered.into_iter();
-    let first = iter.next()?;
-    // Columns currently in scope on the accumulated left subtree.
-    let mut scope: HashSet<String> = column_names(&first);
-    let mut acc = first;
-    // Remaining equi-pairs not yet attached.
-    let mut remaining: Vec<(Expr, Expr)> = equi_pairs;
-
-    for right in iter {
-        let right_cols = column_names(&right);
-        // Pull every pair whose columns are split across (scope, right_cols)
-        // — i.e. one side resolves in the accumulated left, the other in the
-        // new right input.
-        let mut here: Vec<(Expr, Expr)> = Vec::new();
-        let mut keep: Vec<(Expr, Expr)> = Vec::new();
-        for (l, r) in remaining.into_iter() {
-            if pair_spans(&l, &r, &scope, &right_cols) {
-                here.push((l, r));
-            } else {
-                keep.push((l, r));
-            }
-        }
-        remaining = keep;
-        if here.is_empty() {
-            // No join condition connects this leaf to the accumulated tree
-            // at this position — would produce a cross product the original
-            // plan did not have. Bail out and keep the original order.
-            return None;
-        }
-        // Merge the new leaf's columns into scope.
-        scope.extend(right_cols);
-        acc = LogicalPlan::Join {
-            left: Box::new(acc),
-            right: Box::new(right),
-            join_type: JoinType::Inner,
-            on: here,
-            filter: None,
-        };
+    // Sanity: the shape must cover every leaf exactly once.
+    let covered = shape.leaves();
+    if covered.len() != leaves.len() || (0..leaves.len()).any(|i| !covered.contains(&i)) {
+        return None;
     }
-
+    let mut remaining: Vec<(Expr, Expr)> = equi_pairs.to_vec();
+    let (plan, _scope) = build_node(shape, leaves, &mut remaining)?;
     // Every equi-pair must have been consumed; a leftover means the rebuilt
     // tree would silently drop a join condition.
     if remaining.is_empty() {
-        Some(acc)
+        Some(plan)
     } else {
         None
+    }
+}
+
+/// Recursively build the `LogicalPlan` for one [`JoinShape`] node, returning the
+/// node and the set of column names in its output scope. Equi-pairs consumed at
+/// a join level are removed from `remaining`.
+fn build_node(
+    shape: &JoinShape,
+    leaves: &[LogicalPlan],
+    remaining: &mut Vec<(Expr, Expr)>,
+) -> Option<(LogicalPlan, HashSet<String>)> {
+    match shape {
+        JoinShape::Leaf(i) => {
+            let leaf = leaves.get(*i)?.clone();
+            let cols = column_names(&leaf);
+            Some((leaf, cols))
+        }
+        JoinShape::Join { left, right } => {
+            let (left_plan, left_cols) = build_node(left, leaves, remaining)?;
+            let (right_plan, right_cols) = build_node(right, leaves, remaining)?;
+            // Pull every still-unplaced pair whose two columns straddle the
+            // (left_cols, right_cols) boundary — those are this join's `on`.
+            let mut here: Vec<(Expr, Expr)> = Vec::new();
+            let mut keep: Vec<(Expr, Expr)> = Vec::new();
+            for (l, r) in remaining.drain(..) {
+                if pair_spans(&l, &r, &left_cols, &right_cols) {
+                    here.push((l, r));
+                } else {
+                    keep.push((l, r));
+                }
+            }
+            *remaining = keep;
+            if here.is_empty() {
+                // No condition connects the two subtrees here: this would be a
+                // cross product the original plan did not have. Bail.
+                return None;
+            }
+            let mut scope = left_cols;
+            scope.extend(right_cols);
+            let node = LogicalPlan::Join {
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+                join_type: JoinType::Inner,
+                on: here,
+                filter: None,
+            };
+            Some((node, scope))
+        }
     }
 }
 
@@ -378,8 +452,9 @@ fn expr_cols_within(expr: &Expr, scope: &HashSet<String>) -> bool {
 }
 
 /// Output column names of `plan`. On a type-check failure (shouldn't happen on
-/// a valid plan) returns an empty set, which makes [`rebuild_left_deep`] bail
-/// out conservatively.
+/// a valid plan) returns an empty set, which makes [`rebuild_from_shape`] bail
+/// out conservatively (an empty scope places no equi-pair, so a join level
+/// finds no condition and the rewrite aborts to a no-op).
 fn column_names(plan: &LogicalPlan) -> HashSet<String> {
     match plan.schema() {
         Ok(s) => s.fields.into_iter().map(|f| f.name).collect(),
@@ -611,5 +686,235 @@ mod tests {
         // non-reorderable; it terminates the spine as an opaque leaf, leaving
         // a 2-leaf chain (< 3) that the pass declines to touch.
         assert_eq!(before, format!("{:?}", out));
+    }
+
+    /// Collect every join's `on` pairs across a whole tree, rendered as a
+    /// sorted multiset of `"l=r"` strings (orientation-normalised so `a=b` and
+    /// `b=a` compare equal). Used to prove no predicate is dropped, duplicated,
+    /// or invented by a reorder.
+    fn collect_on_pairs(plan: &LogicalPlan) -> Vec<String> {
+        fn pair_key(l: &Expr, r: &Expr) -> String {
+            let a = format!("{l:?}");
+            let b = format!("{r:?}");
+            // Normalise orientation so a=b and b=a hash the same.
+            if a <= b {
+                format!("{a}={b}")
+            } else {
+                format!("{b}={a}")
+            }
+        }
+        fn go(plan: &LogicalPlan, out: &mut Vec<String>) {
+            if let LogicalPlan::Join { left, right, on, filter, .. } = plan {
+                assert!(filter.is_none(), "reorder must not introduce a residual filter");
+                for (l, r) in on {
+                    out.push(pair_key(l, r));
+                }
+                go(left, out);
+                go(right, out);
+            }
+        }
+        let mut out = Vec::new();
+        go(plan, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn reorder_preserves_all_join_predicates() {
+        // Every original equi-pair must survive the reorder exactly once — no
+        // dropped ON condition, no invented cross product.
+        let stats = MockStats::default()
+            .with("a", 1000)
+            .with("b", 10)
+            .with("c", 5);
+        let est = Arc::new(StatsEstimator::new(stats));
+        let pass = JoinReorder::with_estimator(est);
+
+        let plan = three_way();
+        let before_pairs = collect_on_pairs(&plan);
+        let out = pass.rewrite(plan).expect("reorder");
+        let after_pairs = collect_on_pairs(&out);
+
+        assert_eq!(
+            before_pairs, after_pairs,
+            "the set of equi-join predicates must be identical after reordering"
+        );
+        // And concretely: both original keys are still present.
+        assert_eq!(after_pairs.len(), 2, "exactly the two original ON pairs remain");
+    }
+
+    /// Build a 4-leaf chain a-b-c-d connected as two cheap pairs (a-b, c-d)
+    /// bridged by a single b-c key, where a bushy `(a⋈b) ⋈ (c⋈d)` plan is
+    /// cheapest. Schema: a(ka), b(kb1,kb2), c(kc1,kc2), d(kd).
+    fn four_way_bushy() -> LogicalPlan {
+        let a = leaf("a", "ka");
+        let b = LogicalPlan::Scan {
+            table: "b".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("kb1", DataType::Int64, false),
+                Field::new("kb2", DataType::Int64, false),
+            ]),
+        };
+        let c = LogicalPlan::Scan {
+            table: "c".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("kc1", DataType::Int64, false),
+                Field::new("kc2", DataType::Int64, false),
+            ]),
+        };
+        let d = leaf("d", "kd");
+        // Original left-deep order: ((a JOIN b) JOIN c) JOIN d
+        let ab = LogicalPlan::Join {
+            left: Box::new(a),
+            right: Box::new(b),
+            join_type: JoinType::Inner,
+            on: vec![(col("ka"), col("kb1"))],
+            filter: None,
+        };
+        let abc = LogicalPlan::Join {
+            left: Box::new(ab),
+            right: Box::new(c),
+            join_type: JoinType::Inner,
+            on: vec![(col("kb2"), col("kc1"))],
+            filter: None,
+        };
+        LogicalPlan::Join {
+            left: Box::new(abc),
+            right: Box::new(d),
+            join_type: JoinType::Inner,
+            on: vec![(col("kc2"), col("kd"))],
+            filter: None,
+        }
+    }
+
+    /// Count the leaf scans on the deepest-left chain of a (possibly bushy)
+    /// tree — helps assert structural validity without over-constraining shape.
+    fn total_leaves(plan: &LogicalPlan) -> usize {
+        match plan {
+            LogicalPlan::Join { left, right, .. } => total_leaves(left) + total_leaves(right),
+            _ => 1,
+        }
+    }
+
+    #[test]
+    fn four_way_reorder_is_valid_and_predicate_preserving() {
+        // A 4-way INNER equi-chain reorders into *some* cheapest cross-product-
+        // free tree. We don't pin the exact shape (the containment cost model's
+        // optimum on a path is implementation-defined up to ties), but the
+        // rewrite MUST: (a) cover all four leaves, (b) preserve every ON pair
+        // exactly once, (c) introduce no residual filter, and (d) keep the
+        // output column set. This is the core semantics-preservation contract.
+        let stats = MockStats::default()
+            .with("a", 1000)
+            .with("b", 5)
+            .with("c", 5)
+            .with("d", 1000);
+        let est = Arc::new(StatsEstimator::new(stats));
+        let pass = JoinReorder::with_estimator(est);
+
+        let plan = four_way_bushy();
+        let before_pairs = collect_on_pairs(&plan);
+        let before = plan.schema().expect("typecheck");
+        let out = pass.rewrite(plan).expect("reorder");
+
+        // (a) all four leaves present.
+        assert_eq!(total_leaves(&out), 4, "all four input relations must survive");
+        // (b) + (c) every predicate preserved, no residual filter.
+        assert_eq!(
+            before_pairs,
+            collect_on_pairs(&out),
+            "all three ON pairs must be preserved exactly"
+        );
+        // (d) output column set preserved.
+        let after = out.schema().expect("typecheck after");
+        let bset: HashSet<_> = before.fields.iter().map(|f| f.name.clone()).collect();
+        let aset: HashSet<_> = after.fields.iter().map(|f| f.name.clone()).collect();
+        assert_eq!(bset, aset);
+    }
+
+    #[test]
+    fn four_way_sinks_a_small_relation_to_a_build_side() {
+        // With a=1000, b=5, c=6, d=1000 over the path a-b-c-d, the cheapest
+        // plan threads the two large relations around the small b-c core. We
+        // prove the cost model steers the order by checking that *some* small
+        // relation (b or c) lands at a deepest-left (build) position — i.e. it
+        // is not the case that every build leaf is a 1000-row table.
+        let stats = MockStats::default()
+            .with("a", 1000)
+            .with("b", 5)
+            .with("c", 6)
+            .with("d", 1000);
+        let est = Arc::new(StatsEstimator::new(stats));
+        let pass = JoinReorder::with_estimator(est);
+
+        let out = pass.rewrite(four_way_bushy()).expect("reorder");
+
+        // Collect every deepest-left leaf reachable by descending `left` from
+        // each Join node (one per join level).
+        fn build_side_leaves<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a str>) {
+            if let LogicalPlan::Join { left, right, .. } = plan {
+                // The deepest-left scan under this node is a build leaf.
+                let mut cur = &**left;
+                while let LogicalPlan::Join { left: l, .. } = cur {
+                    cur = l;
+                }
+                if let LogicalPlan::Scan { table, .. } = cur {
+                    out.push(table.as_str());
+                }
+                build_side_leaves(left, out);
+                build_side_leaves(right, out);
+            }
+        }
+        let mut builds = Vec::new();
+        build_side_leaves(&out, &mut builds);
+        assert!(
+            builds.iter().any(|t| *t == "b" || *t == "c"),
+            "a small relation must occupy a build-side leaf, got builds={builds:?}"
+        );
+    }
+
+    #[test]
+    fn cross_product_chain_is_noop() {
+        // Three leaves but only a-b is connected; c is unjoined (a cartesian
+        // product the planner would never have produced from a pure equi
+        // chain). The model reports a disconnected component, so the pass must
+        // leave the plan untouched rather than invent a cross product.
+        //
+        // We build this by hand as a chain whose second join's `on` references
+        // only columns already in the left subtree — which `leaf_for_expr`
+        // cannot resolve to two distinct leaves, forcing the no-op.
+        let a = leaf("a", "k");
+        let b = leaf("b", "k2");
+        let c = leaf("c", "k3");
+        let ab = LogicalPlan::Join {
+            left: Box::new(a),
+            right: Box::new(b),
+            join_type: JoinType::Inner,
+            on: vec![(col("k"), col("k2"))],
+            filter: None,
+        };
+        // c is joined on (k = k2): both columns live in the {a,b} subtree, so
+        // there is no edge to leaf c — disconnected.
+        let abc = LogicalPlan::Join {
+            left: Box::new(ab),
+            right: Box::new(c),
+            join_type: JoinType::Inner,
+            on: vec![(col("k"), col("k2"))],
+            filter: None,
+        };
+        let stats = MockStats::default()
+            .with("a", 1000)
+            .with("b", 10)
+            .with("c", 5);
+        let pass = JoinReorder::with_estimator(Arc::new(StatsEstimator::new(stats)));
+        let before = format!("{:?}", abc);
+        let out = pass.rewrite(abc).expect("noop");
+        assert_eq!(
+            before,
+            format!("{:?}", out),
+            "a disconnected (cross-product) chain must not be reordered"
+        );
     }
 }

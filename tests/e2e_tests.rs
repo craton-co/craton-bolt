@@ -624,7 +624,6 @@ fn e2e_filtered_select() {
         .sql("SELECT price FROM sales WHERE region_id = 1")
         .expect("execute");
     let out = h.record_batch();
-    assert_eq!(out.num_rows(), 2048);
     let actual = out
         .column(0)
         .as_any()
@@ -640,14 +639,18 @@ fn e2e_filtered_select() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    // The engine doesn't compact: masked positions remain at the zero-init value (0.0);
-    // unmasked positions hold the projected `price`.
-    for i in 0..2048 {
-        if region.value(i) == 1 {
-            assert_eq!(actual.value(i), price.value(i), "unmasked row {i}");
-        } else {
-            assert_eq!(actual.value(i), 0.0, "masked row {i}");
-        }
+    // The engine COMPACTS filter output (GPU prefix-scan + gather, or the host
+    // `compact::compact_arrays` fallback): only rows matching `region_id = 1`
+    // survive, in their original order. `region_id = i % 4`, so 512 of the 2048
+    // rows match. Build the expected projected `price` values from the fixture.
+    let expected: Vec<f64> = (0..2048)
+        .filter(|&i| region.value(i) == 1)
+        .map(|i| price.value(i))
+        .collect();
+    assert_eq!(out.num_rows(), expected.len(), "compacted row count");
+    assert_eq!(out.num_rows(), 512, "region_id == 1 matches 2048/4 rows");
+    for (k, want) in expected.iter().enumerate() {
+        assert_eq!(actual.value(k), *want, "compacted row {k}");
     }
 }
 
@@ -1808,9 +1811,8 @@ fn other_batch(ids: &[i32], vals: &[i32]) -> RecordBatch {
 /// `SELECT region_id FROM sales WHERE qty > (SELECT MAX(val) FROM other)`.
 ///
 /// The scalar subquery `MAX(val)` over `other = {3, 7, 5}` folds to the
-/// literal `7`; the surviving predicate is `qty > 7`. The engine's filter
-/// path does not compact, so masked rows retain the zero-init projected
-/// value — we assert per-row using the original `qty` to decide membership.
+/// literal `7`; the surviving predicate is `qty > 7`. The engine compacts
+/// filter output, so only the matching rows survive (in original order).
 #[test]
 #[ignore = "gpu:e2e"]
 fn e2e_scalar_subquery_in_filter() {
@@ -1826,19 +1828,16 @@ fn e2e_scalar_subquery_in_filter() {
         .sql("SELECT region_id FROM sales WHERE qty > (SELECT MAX(val) FROM other)")
         .expect("execute");
     let out = h.record_batch();
-    // qty > 7 holds for rows with qty in {8, 9} → region_id 20 and 40.
+    // Row qty = {5, 8, 7, 9}; predicate qty > 7 keeps rows {8, 9} → region_id
+    // 20 and 40. Compaction drops the non-matching rows entirely.
     let region = out
         .column(0)
         .as_any()
         .downcast_ref::<Int32Array>()
         .expect("Int32 region");
-    // Row qty = {5, 8, 7, 9}; predicate qty > 7 → mask {F, T, F, T}.
-    // Filter path leaves masked rows at zero-init (0), unmasked at region_id.
-    assert_eq!(out.num_rows(), 4);
-    assert_eq!(region.value(0), 0, "row 0 masked (qty 5)");
-    assert_eq!(region.value(1), 20, "row 1 kept (qty 8)");
-    assert_eq!(region.value(2), 0, "row 2 masked (qty 7)");
-    assert_eq!(region.value(3), 40, "row 3 kept (qty 9)");
+    assert_eq!(out.num_rows(), 2, "two rows satisfy qty > 7");
+    assert_eq!(region.value(0), 20, "first kept row (qty 8)");
+    assert_eq!(region.value(1), 40, "second kept row (qty 9)");
 }
 
 /// `SELECT region_id FROM sales WHERE region_id IN (SELECT id FROM other)`.
@@ -1866,10 +1865,8 @@ fn e2e_in_subquery_in_filter() {
         .as_any()
         .downcast_ref::<Int32Array>()
         .expect("Int32 region");
-    assert_eq!(out.num_rows(), 4);
-    // region_id in {20, 40} survives; {10, 30} are masked to 0.
-    assert_eq!(region.value(0), 0, "10 not in set");
-    assert_eq!(region.value(1), 20, "20 in set");
-    assert_eq!(region.value(2), 0, "30 not in set");
-    assert_eq!(region.value(3), 40, "40 in set");
+    // region_id in {20, 40} survives; {10, 30} are dropped by compaction.
+    assert_eq!(out.num_rows(), 2, "two rows in the membership set");
+    assert_eq!(region.value(0), 20, "20 in set");
+    assert_eq!(region.value(1), 40, "40 in set");
 }

@@ -195,9 +195,11 @@ Setting reader expectations honestly is part of the deliverable. As of 0.7.0:
 - Cold-start queries: parse + JIT + first H2D often exceeds DuckDB's entire
   warm run on small data.
 - Sub-million-row workloads: launch + transfer overhead dominates.
-- Queries dominated by string operations: string predicates run as
-  dictionary equality, and `UPPER` / `LOWER` / `LENGTH` / `CONCAT` /
-  `SUBSTRING` run host-side — see `SQL_REFERENCE.md` for the exact routing.
+- Queries dominated by string operations: string-literal predicates run
+  as dictionary equality, and `UPPER` / `LOWER` / `LENGTH` and `LIKE`
+  lower to the GPU as of v0.7 (each with a host fallback), while `CONCAT` /
+  `SUBSTRING` / `TRIM` still run host-side — see `SQL_REFERENCE.md` for
+  the exact routing.
 - Joins are supported (`INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS`,
   plus small-cardinality non-equi via the nested-loop fallback), but
   many-table query plans still pay host-side materialisation between joins.

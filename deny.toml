@@ -77,12 +77,22 @@ ignore = [
     # Add RUSTSEC-XXXX-YYYY ids here only with justification + tracking
     # GH issue. Default is empty.
     #
-    # V-11: the rust-cuda build tree contains the unmaintained `xz 0.1.0`
-    # crate. We deliberately do NOT add a (possibly fabricated) RUSTSEC id
-    # here; instead the all-features cargo-deny CI job is non-blocking
-    # (continue-on-error). If/when we want the rust-cuda scan to be blocking,
-    # add the confirmed advisory id below.
-    # TODO: confirm RUSTSEC id for xz 0.1.0 before ignoring it explicitly.
+    # V-11 (reviewed 2026-05-30): the OFF-BY-DEFAULT `rust-cuda` build tree
+    # (rustc_codegen_nvvm -> ... -> `xz 0.1.0`) pulls in the unmaintained
+    # `xz 0.1.0` crate. This affects ONLY the `--all-features` scan run by the
+    # informational, non-blocking `cargo-deny-all-features` CI job; the default
+    # host graph (graph.all-features=false) does NOT contain it and stays clean
+    # under `unmaintained = "deny"`. We therefore keep this scoped, non-blocking
+    # rather than globally loosening `unmaintained`.
+    #
+    # The advisory id below is a PLACEHOLDER: at the time of writing the exact
+    # RUSTSEC id for the unmaintained `xz 0.1.0` crate could not be confirmed
+    # (likely RUSTSEC-2022-0011, "xz crate is unmaintained", but UNVERIFIED).
+    # It is intentionally left COMMENTED OUT so we do not suppress an
+    # unverified/fabricated id (cargo-deny would also warn on an id that matches
+    # nothing). To make the all-features scan blocking, confirm the id at
+    # https://rustsec.org/advisories/ , uncomment, and update this note.
+    #   "RUSTSEC-2022-0011", # PLACEHOLDER — confirm before enabling; xz 0.1.0 (rust-cuda tree)
 ]
 
 [sources]

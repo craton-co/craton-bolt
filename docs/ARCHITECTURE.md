@@ -230,7 +230,7 @@ StringArray ──► DictionaryColumn { dictionary: Vec<String>, indices: GpuVe
 
 The registry (`dict_registry.rs`) builds a dictionary for every Utf8 column at `register_table` time, picks i32 or i64 indices based on a distinct-string estimate, and exposes a `rewrite_plan` method that the engine calls before lowering. The rewriter folds `WHERE region = 'US'` into `WHERE __idx_region = <i32 or i64>(idx)` — pure integer equality, which the standard codegen already handles.
 
-UPPER / LOWER / LENGTH / SUBSTRING all run as pure-host dictionary transformations (`string_ops.rs`, `string_ops_extended.rs`). CONCAT builds a new dictionary via cross-product on the host. None of these go through the GPU because variable-width device writes remain unsupported by the codegen path.
+As of v0.7, `UPPER` / `LOWER` / `LENGTH` lower to the GPU: `UPPER` / `LOWER` use the two-pass variable-width `PhysicalPlan::StringProject` executor (`string_project.rs`), and `LENGTH` uses the dictionary-gather `PhysicalPlan::StringLength` executor (`string_length.rs`). The GPU case-fold path is ASCII-only (byte-wise) and falls back to the full-Unicode host transform in `string_ops.rs` for any column whose dictionary contains non-ASCII bytes; both paths produce identical results for ASCII data. `LENGTH` counts characters (Unicode codepoints), not bytes (`OCTET_LENGTH` covers byte length). `SUBSTRING` / `TRIM` / `CONCAT` still run as pure-host dictionary transformations (`string_ops.rs`, `string_ops_extended.rs`) — CONCAT builds a new dictionary via cross-product on the host — because their variable-width device-write paths are not yet wired through the codegen path.
 
 ## Filter compaction
 
