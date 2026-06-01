@@ -3560,7 +3560,26 @@ impl Engine {
                              table '{table}'"
                         ))
                     })?;
-                    arrays.push(src_batch.column(idx).clone());
+                    let src_col = src_batch.column(idx);
+                    // A dictionary-encoded Utf8 column is stored as
+                    // `Dictionary(Int32, Utf8)` on the host but projects as
+                    // logical `Utf8` (the output schema declares `Utf8`).
+                    // Decode it to a plain Utf8 array so the built batch matches
+                    // the schema; non-dictionary columns pass through unchanged.
+                    if matches!(src_col.data_type(), ArrowDataType::Dictionary(_, _)) {
+                        let decoded = arrow::compute::cast(
+                            src_col.as_ref(),
+                            &ArrowDataType::Utf8,
+                        )
+                        .map_err(|e| {
+                            BoltError::Other(format!(
+                                "StringProject: decode dictionary '{source}' to Utf8 failed: {e}"
+                            ))
+                        })?;
+                        arrays.push(decoded);
+                    } else {
+                        arrays.push(src_col.clone());
+                    }
                 }
                 StringProjectOutput::Transform { source, transform } => {
                     arrays.push(self.string_transform_column(table, source, *transform, n_rows)?);
