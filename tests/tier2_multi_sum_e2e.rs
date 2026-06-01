@@ -594,17 +594,84 @@ fn tier2_multi_pipeline_preserves_value_column_alignment() {
     let (keys, vals) = fixture_aligned_multiples(n_rows, n_distinct_keys, n_vals, 0xFEED);
     let expected = cpu_tier2_multi_sum_model(&keys, &vals);
 
-    // Wire-up (mirrors the previous test):
-    //   1. RecordBatch with `id2` (Int32) from keys, `v1`/`v2`/`v3` (Float64)
-    //      from vals[0..3].
-    //   2. engine.sql("SELECT id2, SUM(v1), SUM(v2), SUM(v3) FROM x GROUP BY id2")
-    //   3. Sort by key; per-key, assert
-    //        SUM(v2) == 1000 * SUM(v1) within 1e-12 relative
-    //        SUM(v3) == 1_000_000 * SUM(v1) within 1e-12 relative
-    //      and that the per-key totals match `expected` within 1e-9
-    //      relative via `max_relative_error_multi`.
-    let _ = expected.len();
-    unimplemented!(
-        "wire engine.sql -> per-key ratio + max_relative_error_multi against expected"
-    );
+    use std::sync::Arc;
+    use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
+    // 1. RecordBatch: id2 (Int32) + v1/v2/v3 (Float64), where the fixture made
+    //    v2 = 1000*key, v3 = 1_000_000*key per row, so per-group SUMs preserve
+    //    SUM(v2) == 1000*SUM(v1) and SUM(v3) == 1_000_000*SUM(v1) exactly. A
+    //    scatter that paired a value column with the wrong key would break it.
+    let id2: Int32Array = keys.iter().copied().collect();
+    let v1: Float64Array = vals[0].iter().copied().collect();
+    let v2: Float64Array = vals[1].iter().copied().collect();
+    let v3: Float64Array = vals[2].iter().copied().collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id2", ArrowDataType::Int32, false),
+        ArrowField::new("v1", ArrowDataType::Float64, false),
+        ArrowField::new("v2", ArrowDataType::Float64, false),
+        ArrowField::new("v3", ArrowDataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(id2), Arc::new(v1), Arc::new(v2), Arc::new(v3)],
+    )
+    .expect("build RecordBatch");
+
+    let mut engine = craton_bolt::Engine::new().expect("CUDA engine");
+    engine.register_table("x", batch).expect("register table");
+
+    // 2. Execute the 3-value multi-SUM groupby.
+    let h = engine
+        .sql("SELECT id2, SUM(v1), SUM(v2), SUM(v3) FROM x GROUP BY id2")
+        .expect("execute 3-value multi-sum groupby");
+    let out = h.record_batch();
+
+    let id_col = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id2 Int32");
+    let s1 = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("SUM(v1) Float64");
+    let s2 = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("SUM(v2) Float64");
+    let s3 = out
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("SUM(v3) Float64");
+
+    // 3a. Per-key ratio: the value columns must stay aligned to their keys.
+    for i in 0..out.num_rows() {
+        let (a, b, c) = (s1.value(i), s2.value(i), s3.value(i));
+        let denom2 = (1000.0 * a).abs().max(b.abs()).max(1.0);
+        let denom3 = (1_000_000.0 * a).abs().max(c.abs()).max(1.0);
+        assert!(
+            (b - 1000.0 * a).abs() / denom2 < 1e-12,
+            "key {}: SUM(v2)={b} != 1000*SUM(v1)={}",
+            id_col.value(i),
+            1000.0 * a
+        );
+        assert!(
+            (c - 1_000_000.0 * a).abs() / denom3 < 1e-12,
+            "key {}: SUM(v3)={c} != 1_000_000*SUM(v1)={}",
+            id_col.value(i),
+            1_000_000.0 * a
+        );
+    }
+
+    // 3b. Per-key totals match the CPU oracle within REL_TOL.
+    let mut actual: Vec<(i32, Vec<f64>)> = (0..out.num_rows())
+        .map(|i| (id_col.value(i), vec![s1.value(i), s2.value(i), s3.value(i)]))
+        .collect();
+    actual.sort_by_key(|(k, _)| *k);
+    let err = max_relative_error_multi(&actual, &expected);
+    assert!(err < REL_TOL, "max rel err {err:e} exceeded {REL_TOL:e}");
 }
