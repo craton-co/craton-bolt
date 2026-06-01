@@ -334,17 +334,27 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // Else: slot occupied — membar.cta orders the CAS (block_set)
-    // against the key load (block_keys, different address). PTX sm_70
-    // requires this fence; without it a racing thread can read a zero
-    // key under set==1 and false-match key 0.
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
-    // read-of-published-value contract explicit (sm_70+). Replaces the
-    // plain `ld.<space>.<ty>` which relied on the publisher's release +
-    // SASS-level implicit acquire — sound in practice but not promised
-    // by PTX semantics.
-    writeln!(ptx, "\tld.acquire.cta.s32 %r35, [%rd94];").map_err(write_err)?;
+    // Slot occupied: CAS returned 1 (claimer mid-publish) or 2 (key ready).
+    // A `membar.cta` only orders THIS thread's accesses; it can't make us wait
+    // for the claimer's separate key store, so reading the key now can observe
+    // a stale 0 (keys can be 0; block_keys is zero-initialised), false-mismatch,
+    // probe on, and MINT A DUPLICATE GROUP (the tier-2 phantom-groups bug).
+    // 3-state set flag (0=empty, 1=claimed/publishing, 2=ready): spin on an
+    // acquire-load of `set` until the claimer publishes (it stores set:=2 after
+    // the key, in CLAIM) before reading the key. Deadlock-free on sm_70.
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd93];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    // Yield so the same-warp claimer can run and publish set:=2. A bare spin
+    // can starve the publisher under sm_70 thread scheduling and hang the
+    // kernel (-> Windows TDR / illegal-access). %r36 is dead here (reloaded
+    // next iter), so reuse it as the nanosleep operand.
+    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.s32 %r35, [%rd94];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
     // Collision: advance.
@@ -359,11 +369,13 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: this thread won the slot. Write the key, fence, then sum
-    // N vals.
+    // CLAIM: won the slot (CAS set 0->1). Store key, fence, publish set:=2
+    // (releases the key to spinning probers), then sum N vals. The order
+    // key store -> membar.cta -> set:=2 is what closes the claim-then-write race.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd94], %r31;").map_err(write_err)?;
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd93], 2;").map_err(write_err)?;
     for j in 0..n_vals {
         let rd_v = 1 + j;
         let fd_v = j;
@@ -666,7 +678,19 @@ pub fn compile_partition_reduce_kernel_multi_with_spill(n_vals: u32) -> BoltResu
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    // 3-state publish protocol (tier-2 phantom-groups fix): spin on an
+    // acquire-load of `set` until the claimer publishes (set:=2 after its key
+    // store) before reading the key, so a mid-publish claimer can't make us
+    // read a stale 0 and mint a duplicate group. Deadlock-free on sm_70.
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd93];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    // Yield to the same-warp claimer (Volta spin-livelock / TDR avoidance).
+    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd94];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -679,9 +703,12 @@ pub fn compile_partition_reduce_kernel_multi_with_spill(n_vals: u32) -> BoltResu
     .map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
+    // CLAIM: won the slot. Store key, fence, publish set:=2 (releases the key),
+    // then sum N vals. Order key -> membar.cta -> set:=2 closes the race.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd94], %r31;").map_err(write_err)?;
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd93], 2;").map_err(write_err)?;
     for j in 0..n_vals {
         let rd_v = 1 + j;
         let fd_v = j;

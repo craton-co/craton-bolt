@@ -178,8 +178,12 @@ fn pad_to_pow2<T: Copy>(values: &[T], n_pow2: usize, sentinel: T) -> Vec<T> {
 /// **Stage 3** additions:
 ///   - `Boolean` -> `Bool` (loaded as u8, compared as s32 0/1).
 ///   - `Dictionary(I32 | I64, Utf8)` -> the index dtype (Int32 / Int64). The
-///     dictionary's *values* are immaterial for the sort: the indices alone
-///     induce the lex order the dictionary was built with.
+///     raw dictionary *indices* are NOT usable as sort keys: Arrow assigns
+///     them in first-seen / insertion order, so a numeric sort of the raw
+///     indices does not reproduce the lexicographic string order. The dict
+///     path therefore remaps each row's index to the *lex rank* of its
+///     string value before sorting (see `build_dict_lex_rank_indices`),
+///     mirroring the plain-Utf8 path's `build_inline_dict_indices`.
 ///
 /// **Stage 4** addition:
 ///   - `Utf8` -> `Int32`. The GPU sort path now builds an inline dictionary
@@ -405,6 +409,70 @@ fn build_inline_dict_indices(sa: &StringArray) -> Vec<i32> {
     tmp_idx
 }
 
+/// Build per-row **lex-rank** indices for a pre-encoded `DictionaryArray<K>`
+/// whose values are a `StringArray`. Mirrors [`build_inline_dict_indices`]
+/// but consumes an existing Arrow dictionary instead of building one from a
+/// plain `StringArray`.
+///
+/// Arrow dictionary keys are assigned in *first-seen* / insertion order, so
+/// the raw key column does NOT induce lexicographic order over the strings
+/// (dict `["b","a","c"]` → keys b=0,a=1,c=2, and a numeric ASC sort of the
+/// keys yields b,a,c — not the lex order a,b,c). This remaps every row's raw
+/// dict key to the *lex rank* of its string value, so feeding the remapped
+/// indices to the numeric kernel makes a numeric ASC sort == lexicographic
+/// string ASC sort.
+///
+/// NULL rows contribute the placeholder `0` (exactly as
+/// [`build_inline_dict_indices`] does): the value byte is don't-care because
+/// the kernel's validity bitmap — built separately by `build_validity_padded`
+/// — routes NULLs by the `nulls_first` flag. We do NOT collapse nulls into
+/// lex-rank 0, which would corrupt the nulls-first/last contract; the
+/// placeholder is only read for non-null rows.
+///
+/// Returns a `Vec<i32>` of length `da.len()`. i32 ranks are sufficient even
+/// for an `Int64`-keyed dictionary: the rank space is bounded by the number
+/// of *distinct* dictionary values, which is itself bounded by `n_rows`, and
+/// the GPU sort caps `n_rows <= 2^31`.
+fn build_dict_lex_rank_indices<K>(da: &DictionaryArray<K>) -> BoltResult<Vec<i32>>
+where
+    K: arrow_array::types::ArrowDictionaryKeyType,
+{
+    let values = da
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            BoltError::Other("gpu_sort: dictionary values are not Utf8".into())
+        })?;
+
+    // Lex-rank remap over the distinct dictionary values. `remap[k]` is the
+    // rank of `values[k]` in lex order, so a numeric ASC sort of the ranks
+    // reproduces the lexicographic string order. A dictionary value slot can
+    // itself be null (rare, but legal); such slots are unreachable for any
+    // non-null row's key, so their rank is immaterial — we still assign one
+    // to keep the table dense.
+    let d = values.len();
+    let mut perm: Vec<usize> = (0..d).collect();
+    perm.sort_by(|&a, &b| values.value(a).cmp(values.value(b)));
+    let mut remap = vec![0i32; d];
+    for (rank, original) in perm.into_iter().enumerate() {
+        remap[original] = rank as i32;
+    }
+
+    // Map each row's raw dict key to its value's lex rank. `key(i)` returns
+    // `None` for a null row (placeholder 0, routed by the validity bitmap,
+    // not the value) and `Some(k)` with the dictionary slot for a valid row.
+    let n = da.len();
+    let mut out: Vec<i32> = Vec::with_capacity(n);
+    for i in 0..n {
+        match da.key(i) {
+            Some(k) => out.push(remap[k]),
+            None => out.push(0),
+        }
+    }
+    Ok(out)
+}
+
 /// Extract a numeric "host view" from a sortable Arrow column. Stage 3
 /// addition: handles Bool (-> u8 0/1 widened to i32) and dictionary-encoded
 /// Utf8 (-> index column as i32 or i64). Stage 4 addition: handles plain
@@ -522,11 +590,17 @@ fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<Option<Ho
             }
             HostKeyValues::I32(build_inline_dict_indices(sa))
         }
-        // Stage 3 dictionary-Utf8 adapter: read the dictionary's index column
-        // (`Int32` or `Int64`); the dictionary values themselves never reach
-        // the GPU sort. The output permutation is then applied (host-side)
-        // to the dictionary-encoded column intact, which keeps the
-        // values-dictionary edge alive without re-encoding.
+        // Stage 3 dictionary-Utf8 adapter: the dictionary's *values* never
+        // reach the GPU sort, but the raw index column cannot be fed directly
+        // — Arrow dictionary keys are assigned in first-seen / insertion
+        // order, so a numeric sort of the raw keys does NOT reproduce the
+        // lexicographic string order (dict `["b","a","c"]` → keys b=0,a=1,c=2,
+        // numeric ASC → b,a,c, not lex a,b,c). We therefore remap every row's
+        // key to the *lex rank* of its string value (see
+        // `build_dict_lex_rank_indices`), exactly as the plain-Utf8 path does
+        // via `build_inline_dict_indices`. The output permutation is then
+        // applied (host-side) to the dictionary-encoded column intact, which
+        // keeps the values-dictionary edge alive without re-encoding.
         (DataType::Int32, A::Dictionary(key_ty, _)) if matches!(key_ty.as_ref(), A::Int32) => {
             let da = arr
                 .as_any()
@@ -534,7 +608,7 @@ fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<Option<Ho
                 .ok_or_else(|| {
                     BoltError::Other("gpu_sort: dict<i32,utf8> downcast failed".into())
                 })?;
-            HostKeyValues::I32(da.keys().values().as_ref().to_vec())
+            HostKeyValues::I32(build_dict_lex_rank_indices(da)?)
         }
         (DataType::Int64, A::Dictionary(key_ty, _)) if matches!(key_ty.as_ref(), A::Int64) => {
             let da = arr
@@ -543,7 +617,13 @@ fn host_values_for_key(arr: &dyn Array, dtype: DataType) -> BoltResult<Option<Ho
                 .ok_or_else(|| {
                     BoltError::Other("gpu_sort: dict<i64,utf8> downcast failed".into())
                 })?;
-            HostKeyValues::I64(da.keys().values().as_ref().to_vec())
+            // Lex ranks fit in i32 (bounded by #distinct <= n_rows <= 2^31),
+            // but the declared key dtype here is Int64 — the kernel loads
+            // 8-byte keys and `upload_padded_key_for_dtype` pads with an i64
+            // sentinel — so widen the i32 ranks to i64 to keep the device
+            // buffer width matching `k.dtype`.
+            let ranks = build_dict_lex_rank_indices(da)?;
+            HostKeyValues::I64(ranks.into_iter().map(|r| r as i64).collect())
         }
         (dt, arrow_dt) => {
             return Err(BoltError::Other(format!(
@@ -2383,6 +2463,133 @@ mod tests {
     // multi-key driver; deleting it removes a parallel code path that was
     // exercising the same `compile_sort_kernel_spec` PTX surface in a
     // narrower form.
+
+    /// DIAGNOSTIC: triangulate the bitonic-sort bug by isolating one dimension
+    /// at a time (DESC, 64-bit, float, padding). The shipped tests confound
+    /// these (int32/asc/no-pad passes; int64/desc/PAD and float64/asc/PAD
+    /// fail). Each case below varies exactly ONE axis off the known-good
+    /// int32/asc/no-pad baseline. Collects all failures so one run names every
+    /// broken dimension.
+    #[test]
+    #[ignore = "gpu:sort"]
+    fn gpu_sort_dimension_isolation() {
+        fn scramble_idx(n: usize, seed: u64) -> Vec<usize> {
+            let mut idx: Vec<usize> = (0..n).collect();
+            let mut s = seed;
+            for i in (1..n).rev() {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let j = (s as usize) % (i + 1);
+                idx.swap(i, j);
+            }
+            idx
+        }
+        let mut failures: Vec<String> = Vec::new();
+
+        // (1) int32 DESC, no padding (n = 2^14) — isolates DESC.
+        {
+            let n = 16_384usize;
+            let perm_idx = scramble_idx(n, 0x1111);
+            let values: Vec<i32> = perm_idx.iter().map(|&i| i as i32).collect();
+            let arr = Int32Array::from(values.clone());
+            let keys = vec![GpuSortKey {
+                column: &arr,
+                dtype: DataType::Int32,
+                direction: SortDirection::Desc,
+                nulls_first: false,
+            }];
+            match sort_indices_on_gpu_multi(&keys) {
+                Ok(Some((_l, perm))) => {
+                    let sorted: Vec<i32> =
+                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    if sorted.windows(2).any(|w| w[0] < w[1]) {
+                        failures.push("int32/DESC/no-pad: non-monotonic".into());
+                    }
+                }
+                other => failures.push(format!("int32/DESC/no-pad: {other:?}")),
+            }
+        }
+        // (2) int64 ASC, no padding (n = 2^14) — isolates 64-bit.
+        {
+            let n = 16_384usize;
+            let perm_idx = scramble_idx(n, 0x2222);
+            let values: Vec<i64> = perm_idx.iter().map(|&i| i as i64).collect();
+            let arr = Int64Array::from(values.clone());
+            let keys = vec![GpuSortKey {
+                column: &arr,
+                dtype: DataType::Int64,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            }];
+            match sort_indices_on_gpu_multi(&keys) {
+                Ok(Some((_l, perm))) => {
+                    let sorted: Vec<i64> =
+                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    if sorted.windows(2).any(|w| w[0] > w[1]) {
+                        failures.push("int64/ASC/no-pad: non-monotonic".into());
+                    }
+                }
+                other => failures.push(format!("int64/ASC/no-pad: {other:?}")),
+            }
+        }
+        // (3) float64 ASC, no padding (n = 2^14) — isolates float (incl. negatives).
+        {
+            let n = 16_384usize;
+            let perm_idx = scramble_idx(n, 0x3333);
+            let values: Vec<f64> = perm_idx.iter().map(|&i| (i as f64) - 8192.0).collect();
+            let arr = Float64Array::from(values.clone());
+            let keys = vec![GpuSortKey {
+                column: &arr,
+                dtype: DataType::Float64,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            }];
+            match sort_indices_on_gpu_multi(&keys) {
+                Ok(Some((_l, perm))) => {
+                    let sorted: Vec<f64> =
+                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    if sorted.windows(2).any(|w| w[0] > w[1]) {
+                        failures.push("float64/ASC/no-pad: non-monotonic".into());
+                    }
+                }
+                other => failures.push(format!("float64/ASC/no-pad: {other:?}")),
+            }
+        }
+        // (4) int32 ASC, WITH padding (n = 20000, not pow2) — isolates padding.
+        {
+            let n = 20_000usize;
+            let perm_idx = scramble_idx(n, 0x4444);
+            let values: Vec<i32> = perm_idx.iter().map(|&i| i as i32).collect();
+            let arr = Int32Array::from(values.clone());
+            let keys = vec![GpuSortKey {
+                column: &arr,
+                dtype: DataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            }];
+            match sort_indices_on_gpu_multi(&keys) {
+                Ok(Some((_l, perm))) => {
+                    if perm.len() != n {
+                        failures.push(format!("int32/ASC/pad: len {} != {n}", perm.len()));
+                    } else {
+                        let sorted: Vec<i32> =
+                            (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                        if sorted.windows(2).any(|w| w[0] > w[1]) {
+                            failures.push("int32/ASC/pad: non-monotonic".into());
+                        }
+                    }
+                }
+                other => failures.push(format!("int32/ASC/pad: {other:?}")),
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "bitonic dimension isolation — failing axes:\n  {}",
+            failures.join("\n  ")
+        );
+    }
 
     /// End-to-end ASC int32 sort. Builds a 16k-row scrambled column, runs it
     /// through `sort_indices_on_gpu_multi` (single-key spec), gathers, and

@@ -80,7 +80,7 @@ buying anything *on that workload*, full stop.
 | **SSB** (joined)   | 5            | 13 | Partial (needs INNER) | The 0.7.0 hash join (INNER on GPU; LEFT/RIGHT/FULL/CROSS on GPU or host) handles SSB joins. |
 | **TPC-H** SF1      | 8            | 22 | Partial (~6 queries)  | Many queries need LEFT JOIN, subqueries, CTEs. |
 | **TPC-H** SF10+    | 8            | 22 | No                     | Multi-batch / streaming needed. |
-| **TPC-DS**         | 24           | 99 | No                     | Out of scope until 0.4+.               |
+| **TPC-DS**         | 24           | 99 | No                     | Out of scope (post-1.0).               |
 | **YCSB**           | 1            | KV  | No                     | Wrong category (transactional).        |
 
 **Default recommendation: ClickBench**. It's the modern standard, it's
@@ -207,11 +207,14 @@ Setting reader expectations honestly is part of the deliverable. As of 0.7.0:
   `BETWEEN`, `CASE`, `NULLIF`, `COALESCE`, `CAST`, etc.) and what still
   rejects at the physical layer, see `SQL_REFERENCE.md` and `CHANGELOG.md`.
 
-**Likely losses (by design, until 0.4+)**
-- Streaming / multi-batch tables.
-- Larger-than-VRAM datasets.
-- Distributed queries.
-- Anything from TPC-DS.
+**Likely losses (by design, as of 0.7.0)**
+- Streaming tables and larger-than-VRAM datasets — the whole table is
+  uploaded eagerly today; lazy streaming and spill are 1.0-track work
+  that has not landed yet (see [`ROADMAP.md`](../ROADMAP.md) and
+  [`PATH_TO_1.0.md`](./PATH_TO_1.0.md)).
+- Distributed queries — single-node by design; distributed execution is
+  explicitly post-1.0.
+- Anything from TPC-DS — out of scope (post-1.0).
 
 If you find Craton Bolt winning on a workload in the "Likely losses" bucket, that's
 suspicious — recheck your correctness assertions before publishing.

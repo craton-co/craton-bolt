@@ -10,7 +10,7 @@ team handle referenced in [`CODEOWNERS`](CODEOWNERS)
 
 | Maintainer                | Contact                              |
 |---------------------------|--------------------------------------|
-| Craton Software Company   | opensource@cratonsoftware.com        |
+| Craton Software Company   | opensource@craton.com.ar        |
 
 ## Interim review process
 
@@ -20,7 +20,7 @@ no-op. In the meantime:
 - Open your pull request as normal, following
   [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - If a maintainer has not picked up the PR within a few business days,
-  ping **opensource@cratonsoftware.com** with the PR link.
+  ping **opensource@craton.com.ar** with the PR link.
 - Security reports follow a different path — see [`SECURITY.md`](SECURITY.md).
 
 ## Becoming a maintainer

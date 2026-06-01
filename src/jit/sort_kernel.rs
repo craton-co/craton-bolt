@@ -509,10 +509,10 @@ fn emit_multikey_multilaunch(
     writeln!(p, "\t.reg .b64 %rd<48>;").map_err(write_err)?;
     // Key registers: 2 per key (self/partner), max across all dtype reg
     // classes — emit a small pool per width. Bool keys share the i32 pool.
-    writeln!(p, "\t.reg .b32 %ki32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %ki64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .f32 %kf32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .f64 %kf64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %ki<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %kl<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .f32 %kf<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .f64 %kd<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
 
     // -- tid -----------------------------------------------------------
     writeln!(p, "\tmov.u32 %r4, %ctaid.x;").map_err(write_err)?;
@@ -557,9 +557,9 @@ fn emit_multikey_multilaunch(
     // values (the ASC sentinel) no longer fight with padded slots over the
     // last position; the explicit padded bit wins.
     let padded_param_idx = MAX_SORT_KEYS * 2 + 1;
-    emit_padded_route_global(p, entry, padded_param_idx)?;
-
     let indices_param_idx = MAX_SORT_KEYS * 2;
+    emit_padded_route_global(p, entry, padded_param_idx, indices_param_idx)?;
+
     for (ki, k) in spec.keys.iter().enumerate() {
         emit_key_compare(p, entry, ki, k, /*shmem=*/ false)?;
     }
@@ -785,15 +785,20 @@ fn emit_key_compare(
 
 /// PTX register names for a key's (self, partner) registers.
 ///
-/// Bool keys share the b32 (`ki32`) register pool: bytes are loaded with
-/// `ld.global.u8 %ki32X, [...]`, which PTX zero-extends into the 32-bit
+/// Bool keys share the b32 (`ki`) register pool: bytes are loaded with
+/// `ld.global.u8 %kiX, [...]`, which PTX zero-extends into the 32-bit
 /// register. The compare then uses the same s32 mnemonic as Int32.
 fn key_regs(ki: usize, dtype: DataType) -> (String, String) {
     let prefix = match dtype {
-        DataType::Int32 | DataType::Bool => "ki32",
-        DataType::Int64 => "ki64",
-        DataType::Float32 => "kf32",
-        DataType::Float64 => "kf64",
+        // NOTE: register-bank base names must NOT end in a digit. PTX
+        // parameterized names declared as `.reg .b32 %ki<N>;` expand to
+        // `%ki0..%ki(N-1)`; if the base itself ended in digits (`%ki32<N>`)
+        // a use like `%ki320` is lexically ambiguous to ptxas (`%ki32`[0] vs
+        // `%ki3`[20]) and fails with "Unknown symbol". Hence ki/kl/kf/kd.
+        DataType::Int32 | DataType::Bool => "ki",
+        DataType::Int64 => "kl",
+        DataType::Float32 => "kf",
+        DataType::Float64 => "kd",
         _ => unreachable!("validated"),
     };
     (
@@ -818,23 +823,43 @@ fn key_regs(ki: usize, dtype: DataType) -> (String, String) {
 ///
 /// Writing into `%r10` and branching to `DECIDED` short-circuits the entire
 /// per-key compare loop.
-fn emit_padded_route_global(p: &mut String, entry: &str, padded_param_idx: usize) -> BoltResult<()> {
+fn emit_padded_route_global(
+    p: &mut String,
+    entry: &str,
+    padded_param_idx: usize,
+    indices_param_idx: usize,
+) -> BoltResult<()> {
     writeln!(p, "// ---- stage3: padded-row pre-routing (is_padded bitmap) ----")
         .map_err(write_err)?;
-    // Load padded bit for self into %r16.
+    // CRITICAL: `is_padded` is keyed by ORIGINAL row index, not by cell. The
+    // bitonic network permutes rows across cells (swapping keys + the indices
+    // array in lockstep), so a static cell-indexed bitmap goes stale after the
+    // first swap. Index it by `indices[cell]` (the original index of whatever
+    // row currently occupies the cell) so padded-ness travels with the row.
+    // indices base -> %rd47, is_padded base -> %rd44.
+    writeln!(p, "\tld.param.u64 %rd47, [{entry}_param_{}];", indices_param_idx)
+        .map_err(write_err)?;
+    writeln!(p, "\tcvta.to.global.u64 %rd47, %rd47;").map_err(write_err)?;
     writeln!(p, "\tld.param.u64 %rd44, [{entry}_param_{}];", padded_param_idx)
         .map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd44, %rd44;").map_err(write_err)?;
-    writeln!(p, "\tshr.u32 %r16, %r3, 3;").map_err(write_err)?;
-    writeln!(p, "\tand.b32 %r17, %r3, 7;").map_err(write_err)?;
+    // idx_self = indices[tid] -> %r25, then self_padded = is_padded[idx_self].
+    writeln!(p, "\tmul.wide.u32 %rd45, %r3, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd45, %rd47, %rd45;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u32 %r25, [%rd45];").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r16, %r25, 3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r17, %r25, 7;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd45, %r16, 1;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd45, %rd44, %rd45;").map_err(write_err)?;
     writeln!(p, "\tld.global.u8 %r18, [%rd45];").map_err(write_err)?;
     writeln!(p, "\tshr.u32 %r18, %r18, %r17;").map_err(write_err)?;
     writeln!(p, "\tand.b32 %r18, %r18, 1;").map_err(write_err)?; // %r18 = self_padded
-    // partner bit -> %r19.
-    writeln!(p, "\tshr.u32 %r20, %r7, 3;").map_err(write_err)?;
-    writeln!(p, "\tand.b32 %r21, %r7, 7;").map_err(write_err)?;
+    // idx_partner = indices[partner] -> %r26, then partner_padded.
+    writeln!(p, "\tmul.wide.u32 %rd46, %r7, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd46, %rd47, %rd46;").map_err(write_err)?;
+    writeln!(p, "\tld.global.u32 %r26, [%rd46];").map_err(write_err)?;
+    writeln!(p, "\tshr.u32 %r20, %r26, 3;").map_err(write_err)?;
+    writeln!(p, "\tand.b32 %r21, %r26, 7;").map_err(write_err)?;
     writeln!(p, "\tmul.wide.u32 %rd46, %r20, 1;").map_err(write_err)?;
     writeln!(p, "\tadd.s64 %rd46, %rd44, %rd46;").map_err(write_err)?;
     writeln!(p, "\tld.global.u8 %r19, [%rd46];").map_err(write_err)?;
@@ -1045,10 +1070,10 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
     writeln!(p, "\t.reg .pred %p_pp2;").map_err(write_err)?;
     writeln!(p, "\t.reg .b32 %r<40>;").map_err(write_err)?;
     writeln!(p, "\t.reg .b64 %rd<40>;").map_err(write_err)?;
-    writeln!(p, "\t.reg .b32 %ki32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .b64 %ki64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .f32 %kf32<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
-    writeln!(p, "\t.reg .f64 %kf64<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .b32 %ki<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .b64 %kl<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .f32 %kf<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
+    writeln!(p, "\t.reg .f64 %kd<{}>;", MAX_SORT_KEYS * 2).map_err(write_err)?;
 
     // tid
     writeln!(p, "\tmov.u32 %r6, %tid.x;").map_err(write_err)?;

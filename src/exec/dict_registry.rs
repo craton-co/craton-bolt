@@ -279,13 +279,14 @@ impl DictRegistry {
             // rewriter inspects the variant when it resolves a literal.
             rewriter.register(col_name.to_string(), dict);
         }
-        // Protect the `LIKE` of any column the query projects as a bare output
-        // from the integer-index membership fold, so it reaches the per-row GPU
-        // `StringLikeFilter` (which can emit + compact the Utf8 rows) instead of
-        // an integer filter that cannot produce a Utf8 output column. Equality /
-        // inequality folds are unaffected — only the `LIKE` arm consults this.
+        // Protect any string predicate (`LIKE`, `=`, `<>`) over a column the
+        // query projects as a bare Utf8 output from the integer-index fold, so
+        // it reaches the per-row GPU `StringLikeFilter` (LIKE) or a host
+        // `Filter` (Eq/Neq) — both of which emit + compact the Utf8 rows —
+        // instead of an integer filter that cannot produce a Utf8 output
+        // column. Predicates over columns NOT projected keep the faster fold.
         for col_name in collect_projected_bare_columns(plan) {
-            rewriter.protect_like(col_name);
+            rewriter.protect_predicate(col_name);
         }
         rewriter.rewrite(plan)
     }

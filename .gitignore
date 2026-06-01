@@ -21,3 +21,9 @@
 /dataSources.local.xml
 # Editor-based HTTP Client requests
 /httpRequests/
+
+# Internal AI scratch — must not ship
+bolt_continue_prompt.md
+
+# Internal review notes — kept local, not published
+reviews/

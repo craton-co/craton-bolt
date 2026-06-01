@@ -222,11 +222,8 @@ use crate::cuda::cuda_sys::CUdeviceptr;
 // path. Under `--features cudarc` the alloc/free hit `cudarc_backend`
 // instead, so the import is feature-gated to keep both builds warning-
 // free.
-// Used by the always-compiled `real_driver_mem_alloc` / `real_driver_free` and
-// the deferred-free sweep/drain. Needed in `#[cfg(test)]` builds too now that
-// those real, driver-touching paths can be selected at runtime via
-// `BOLT_BENCH_GPU=1` (see `bench_gpu_enabled`).
 #[cfg(not(feature = "cudarc"))]
+#[cfg(not(test))]
 use crate::cuda::cuda_sys;
 use crate::error::BoltResult;
 
@@ -375,6 +372,7 @@ pub(crate) fn deferred_free_count() -> u64 {
 /// while the owning context is current on the sweeping thread, the same
 /// precondition the pool already documents for `cuMemFree_v2`. We never
 /// dereference them; we only forward them to the driver via `cuda_sys::event_*`.
+#[cfg(not(test))]
 struct PendingFree {
     ptr: CUdeviceptr,
     alloc_bytes: usize,
@@ -388,6 +386,7 @@ struct PendingFree {
 // never dereference them, and access is serialized through the `PENDING_FREES`
 // mutex. Moving them between threads upholds the same context-currency
 // precondition the rest of the pool relies on.
+#[cfg(not(test))]
 unsafe impl Send for PendingFree {}
 
 /// Process-global list of blocks awaiting event completion before reuse.
@@ -395,6 +394,7 @@ unsafe impl Send for PendingFree {}
 /// their events are already complete and they free inline). Guarded by a
 /// `parking_lot::Mutex`; the lock is held only for short list splices, never
 /// across a driver call that could block.
+#[cfg(not(test))]
 static PENDING_FREES: Lazy<Mutex<Vec<PendingFree>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// Record a deferred free. Called by `GpuBuffer::Drop` when at least one
@@ -405,12 +405,8 @@ static PENDING_FREES: Lazy<Mutex<Vec<PendingFree>>> = Lazy::new(|| Mutex::new(Ve
 /// `events` must be the full set of events recorded for the block (one per
 /// stream that touched it). Ownership of the events transfers here; the sweep
 /// destroys them once they complete.
-///
-/// This is the real, driver-touching implementation. Under `#[cfg(test)]` it is
-/// reached only when `BOLT_BENCH_GPU=1` selects the live-device path; the
-/// host-only default routes through the [`defer_free`] dispatcher's side-channel
-/// shim instead (see [`bench_gpu_enabled`]).
-fn real_defer_free(
+#[cfg(not(test))]
+pub(crate) fn defer_free(
     ptr: CUdeviceptr,
     alloc_bytes: usize,
     events: Vec<crate::cuda::cuda_sys::CUevent>,
@@ -426,29 +422,6 @@ fn real_defer_free(
     });
 }
 
-/// Public deferred-free entry point used by `GpuBuffer::Drop`. In a non-test
-/// build this is exactly [`real_defer_free`]. In a `#[cfg(test)]` build the
-/// host-only default records the parked block in [`TEST_DEFERRED`] (and drops
-/// the — empty under synthetic pointers — event vector) so policy tests can
-/// assert deferral without a CUDA context; `BOLT_BENCH_GPU=1` flips it to the
-/// real path so the crate's `#[ignore]`'d GPU tests free on a live device.
-pub(crate) fn defer_free(
-    ptr: CUdeviceptr,
-    alloc_bytes: usize,
-    events: Vec<crate::cuda::cuda_sys::CUevent>,
-) {
-    #[cfg(test)]
-    if !bench_gpu_enabled() {
-        if ptr == 0 {
-            return;
-        }
-        DEFERRED_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
-        TEST_DEFERRED.lock().push((ptr, alloc_bytes));
-        return;
-    }
-    real_defer_free(ptr, alloc_bytes, events);
-}
-
 /// Sweep the pending-free list: any block whose events have ALL completed is
 /// returned to the pool (its events destroyed first); blocks with at least one
 /// still-in-flight event are retained for the next sweep.
@@ -457,19 +430,8 @@ pub(crate) fn defer_free(
 /// when the list is empty, which is the steady state). Never blocks: it only
 /// *queries* events. A query error (e.g. transient driver issue) is treated
 /// conservatively as "not ready yet" so we never free early on a bad probe.
-/// Public sweep entry point, called opportunistically from `alloc`/`free`. In a
-/// non-test build this is [`real_sweep_pending_frees`]. Under `#[cfg(test)]` the
-/// host-only default is a no-op (synthetic pointers carry no real events to
-/// query); `BOLT_BENCH_GPU=1` selects the real sweep.
+#[cfg(not(test))]
 pub(crate) fn sweep_pending_frees() {
-    #[cfg(test)]
-    if !bench_gpu_enabled() {
-        return;
-    }
-    real_sweep_pending_frees();
-}
-
-fn real_sweep_pending_frees() {
     // Fast path: nothing pending. Avoid taking the lock's write section and
     // doing any driver work in the overwhelmingly common case.
     {
@@ -523,18 +485,8 @@ fn real_sweep_pending_frees() {
 /// entry's events, destroy them, and free the block. Guarantees no deferred
 /// block is leaked or freed early at teardown — the safety invariant the
 /// deferred path must preserve. Called from `DeviceMemPool::drain`.
-/// Shutdown drain dispatcher, called from `DeviceMemPool::drain`. Non-test
-/// builds run [`real_drain_pending_frees_blocking`]; the `#[cfg(test)]` host
-/// default is a no-op, and `BOLT_BENCH_GPU=1` selects the real blocking drain.
+#[cfg(not(test))]
 fn drain_pending_frees_blocking() {
-    #[cfg(test)]
-    if !bench_gpu_enabled() {
-        return;
-    }
-    real_drain_pending_frees_blocking();
-}
-
-fn real_drain_pending_frees_blocking() {
     let pending: Vec<PendingFree> = {
         let mut guard = PENDING_FREES.lock();
         std::mem::take(&mut *guard)
@@ -555,33 +507,41 @@ fn real_drain_pending_frees_blocking() {
     }
 }
 
-/// Test-only side-channel: blocks routed through the host-only branch of
-/// [`defer_free`] under `#[cfg(test)]` (i.e. when `BOLT_BENCH_GPU` is unset).
-/// Lets host tests assert a buffer's `Drop` *deferred* a block (event path)
-/// instead of freeing it inline, without a CUDA context — synthetic pointers
-/// carry no real events. Under `BOLT_BENCH_GPU=1` the real deferred-free path
-/// is used instead and this side-channel stays empty.
+/// Test build: the deferred-free machinery records into a side-channel instead
+/// of touching real events. Host-only pool tests run on synthetic pointers with
+/// no real CUDA events, so `sweep`/`drain` cannot meaningfully query them and
+/// are no-ops. `defer_free` records `(ptr, alloc_bytes)` so a host test can
+/// assert that a block was parked (deferred) rather than freed. These stubs
+/// keep the production call sites compiling under `#[cfg(test)]`.
+#[cfg(test)]
+pub(crate) fn sweep_pending_frees() {}
+
+#[cfg(test)]
+fn drain_pending_frees_blocking() {}
+
+/// Test-only side-channel: blocks routed through [`defer_free`] under
+/// `#[cfg(test)]`. Lets host tests assert a buffer's `Drop` *deferred* a block
+/// (event path) instead of freeing it inline. The `events` carried by the real
+/// signature are dropped here — host tests never create real events.
 #[cfg(test)]
 pub(crate) static TEST_DEFERRED: Lazy<Mutex<Vec<(CUdeviceptr, usize)>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 
-/// Runtime gate for the `#[cfg(test)]` memory-pool driver shims. When
-/// `BOLT_BENCH_GPU=1` (or `=true`) is set, [`defer_free`], [`sweep_pending_frees`],
-/// [`drain_pending_frees_blocking`], [`driver_mem_alloc`], and [`driver_free`]
-/// route to their real, CUDA-driver-touching implementations instead of the
-/// host-only synthetic shims — so the crate's `#[ignore]`'d GPU unit tests can
-/// run on a live device with `cargo test -- --ignored`. Read once and cached;
-/// the default (unset) preserves the GPU-less host-CI behaviour exactly. The
-/// OOM-injection latch in [`test_support::test_driver_alloc`] still takes
-/// precedence so host fault-injection tests are unaffected.
+/// Test build of `defer_free`: record the parked block in [`TEST_DEFERRED`].
+/// The event vector is accepted (to match the production signature so the
+/// `GpuBuffer::Drop` call site is identical) and dropped — under test no real
+/// events exist. Counted in `DEFERRED_FREE_COUNT` for parity with production.
 #[cfg(test)]
-pub(crate) fn bench_gpu_enabled() -> bool {
-    static GATE: Lazy<bool> = Lazy::new(|| {
-        std::env::var("BOLT_BENCH_GPU")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    });
-    *GATE
+pub(crate) fn defer_free(
+    ptr: CUdeviceptr,
+    alloc_bytes: usize,
+    _events: Vec<crate::cuda::cuda_sys::CUevent>,
+) {
+    if ptr == 0 {
+        return;
+    }
+    DEFERRED_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+    TEST_DEFERRED.lock().push((ptr, alloc_bytes));
 }
 
 /// Snapshot of pool-wide telemetry counters and capacity figures.
@@ -703,14 +663,8 @@ impl BucketEntry {
 /// # Safety
 /// `ptr` must have been minted by the matching backend's `mem_alloc` and
 /// must no longer be aliased.
-/// Real, driver-touching free. Always compiled. In a non-test build it is the
-/// only free path; under `#[cfg(test)]` it is reached only when
-/// `BOLT_BENCH_GPU=1` selects the live-device path.
-///
-/// # Safety
-/// `ptr` must have been minted by the matching backend's `mem_alloc` and must
-/// no longer be aliased.
-unsafe fn real_driver_free(ptr: CUdeviceptr) {
+#[cfg(not(test))]
+unsafe fn driver_free(ptr: CUdeviceptr) {
     #[cfg(feature = "cudarc")]
     let result = crate::cuda::cudarc_backend::mem_free(ptr);
     #[cfg(not(feature = "cudarc"))]
@@ -723,36 +677,35 @@ unsafe fn real_driver_free(ptr: CUdeviceptr) {
     }
 }
 
-/// Free a `CUdeviceptr` through whichever backend is active for this build.
-/// Errors are logged but otherwise swallowed — the pool's eviction paths run
-/// under a lock and cannot meaningfully propagate failures.
-///
 /// Under `#[cfg(test)]` the pool's policy logic runs on synthetic pointers
-/// minted by `test_support::test_driver_alloc`; routing them through the real
-/// CUDA driver would crash, so the host-only default records each "free" in a
-/// side-channel list for eviction assertions. `BOLT_BENCH_GPU=1` routes to the
-/// real driver instead so the `#[ignore]`'d GPU tests free real device memory.
+/// minted by `test_support::test_driver_alloc`; routing them through the
+/// real CUDA driver would crash. Tests record each "free" in a side-channel
+/// list so they can assert on eviction behaviour.
 ///
-/// # Safety
-/// `ptr` must have been minted by the matching backend's `mem_alloc` and must
-/// no longer be aliased.
+/// When `BOLT_BENCH_GPU=1` is set (real-GPU lib test runs), the pool does
+/// genuine device allocations via the active backend, so frees must route
+/// to the real backend free rather than the synthetic record list.
+#[cfg(test)]
 unsafe fn driver_free(ptr: CUdeviceptr) {
-    #[cfg(test)]
-    if !bench_gpu_enabled() {
-        test_support::record_driver_free(ptr);
+    if test_support::gpu_gate_enabled() {
+        #[cfg(feature = "cudarc")]
+        let result = crate::cuda::cudarc_backend::mem_free(ptr);
+        #[cfg(not(feature = "cudarc"))]
+        let result = crate::cuda::cuda_sys::mem_free(ptr);
+        if let Err(e) = result {
+            log::warn!("craton-bolt: DeviceMemPool failed to free ptr: {}", e);
+        }
         return;
     }
-    real_driver_free(ptr);
+    test_support::record_driver_free(ptr);
 }
 
 /// Allocate `alloc_bytes` of device memory through whichever backend is
 /// active for this build. Mirrors `driver_free` in shape: tests intercept
 /// it via `test_support::test_driver_alloc` so the OOM-recovery logic can
 /// be exercised on synthetic pointers without a live CUDA context.
-/// Real, driver-touching allocation. Always compiled. In a non-test build it is
-/// the only alloc path; under `#[cfg(test)]` it is reached only when
-/// `BOLT_BENCH_GPU=1` selects the live-device path (via `test_driver_alloc`).
-fn real_driver_mem_alloc(alloc_bytes: usize) -> BoltResult<CUdeviceptr> {
+#[cfg(not(test))]
+fn driver_mem_alloc(alloc_bytes: usize) -> BoltResult<CUdeviceptr> {
     // Under `--features cudarc`, the alloc is satisfied by cudarc's
     // `result::malloc_sync`, which calls the same `cuMemAlloc_v2` under
     // the hood and returns a bit-compatible `CUdeviceptr` — so pointers
@@ -768,21 +721,28 @@ fn real_driver_mem_alloc(alloc_bytes: usize) -> BoltResult<CUdeviceptr> {
     }
 }
 
-/// Allocate `alloc_bytes` of device memory through whichever backend is active.
-/// Non-test builds call [`real_driver_mem_alloc`] directly. Under `#[cfg(test)]`
-/// the call is routed through `test_support::test_driver_alloc`, which honours
-/// the OOM-injection latch first and then either mints a synthetic pointer
-/// (host default) or delegates to [`real_driver_mem_alloc`] when
-/// `BOLT_BENCH_GPU=1` is set.
+#[cfg(test)]
 fn driver_mem_alloc(alloc_bytes: usize) -> BoltResult<CUdeviceptr> {
-    #[cfg(test)]
-    {
-        test_support::test_driver_alloc(alloc_bytes)
+    // When `BOLT_BENCH_GPU=1` is set we are running the lib unit tests on a
+    // real device: do a genuine device allocation through the active backend
+    // (which self-initialises CUDA lazily via `device_ref()`), so kernels and
+    // memcpys land on valid pointers instead of synthetic ones. The OOM
+    // fault-injection latch is honoured first so host policy tests that arm it
+    // still see the injected error even under the gate.
+    if test_support::gpu_gate_enabled() {
+        if let Some(err) = test_support::take_injected_oom() {
+            return Err(err);
+        }
+        #[cfg(feature = "cudarc")]
+        {
+            return crate::cuda::cudarc_backend::mem_alloc(alloc_bytes);
+        }
+        #[cfg(not(feature = "cudarc"))]
+        {
+            return crate::cuda::cuda_sys::mem_alloc(alloc_bytes);
+        }
     }
-    #[cfg(not(test))]
-    {
-        real_driver_mem_alloc(alloc_bytes)
-    }
+    test_support::test_driver_alloc(alloc_bytes)
 }
 
 /// Recognise a driver-OOM error from `BoltError::CudaWithCode`'s integer
@@ -2459,38 +2419,49 @@ mod test_support {
     /// so the latch is effectively single-tenant.
     static OOM_LATCH: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn test_driver_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
-        // OOM-injection: drain the latch by one and return an OOM
-        // error in the same shape `cuda_sys::check` would produce for
-        // `CUDA_ERROR_OUT_OF_MEMORY = 2` — Stage 4 carries the code in
-        // a typed integer field rather than embedding it in a format
-        // string. The latch is consulted FIRST, before the bench-GPU gate,
-        // so host fault-injection tests keep working even if the process
-        // happens to have `BOLT_BENCH_GPU` set.
+    /// `true` when `BOLT_BENCH_GPU=1` is set in the environment: the lib
+    /// unit tests are running against a real device, so `driver_mem_alloc`
+    /// / `driver_free` must route to the real backend instead of the
+    /// synthetic pointer pool. When unset (GPU-less CI default) the
+    /// synthetic + OOM-injection behaviour is used unchanged.
+    pub(super) fn gpu_gate_enabled() -> bool {
+        std::env::var("BOLT_BENCH_GPU")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Drain the OOM-injection latch by one. Returns the canonical OOM
+    /// error if the latch was armed, otherwise `None`. Shared between the
+    /// synthetic alloc path and the GPU-gated real-alloc path so an armed
+    /// latch still injects a fault before any real allocation is attempted.
+    pub(super) fn take_injected_oom() -> Option<BoltError> {
         loop {
             let cur = OOM_LATCH.load(Ordering::Acquire);
             if cur == 0 {
-                break;
+                return None;
             }
             if OOM_LATCH
                 .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Err(BoltError::CudaWithCode {
+                return Some(BoltError::CudaWithCode {
                     code: 2,
                     message: "out of memory".to_string(),
                 });
             }
         }
-        // `BOLT_BENCH_GPU=1`: hand the allocation to the real CUDA driver so
-        // the crate's `#[ignore]`'d GPU unit tests operate on live device
-        // memory instead of synthetic pointers (which would fault with
-        // `NOT_INITIALIZED` the moment a kernel touched them).
-        if super::bench_gpu_enabled() {
-            return super::real_driver_mem_alloc(bytes);
+    }
+
+    pub(super) fn test_driver_alloc(_bytes: usize) -> BoltResult<CUdeviceptr> {
+        // OOM-injection: drain the latch by one and return an OOM
+        // error in the same shape `cuda_sys::check` would produce for
+        // `CUDA_ERROR_OUT_OF_MEMORY = 2` — Stage 4 carries the code in
+        // a typed integer field rather than embedding it in a format
+        // string.
+        if let Some(err) = take_injected_oom() {
+            return Err(err);
         }
-        // Host default: mint a synthetic pointer. Wraparound is irrelevant —
-        // tests use a few hundred at most.
+        // Wraparound is irrelevant — tests use a few hundred at most.
         Ok(NEXT_PTR.fetch_add(1, Ordering::Relaxed))
     }
 

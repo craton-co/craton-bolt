@@ -396,20 +396,32 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // Else: slot was occupied. PTX gives no inter-address ordering between
-    // the CAS on block_set[slot] and the publishing thread's subsequent
-    // st.shared.u32 on block_keys[slot] — those touch different addresses.
-    // Insert a membar.cta here so this thread, having observed set==1 via
-    // its own CAS, sees the winner's key store (which is ordered before
-    // its own membar.cta on the CLAIM path). Without this fence a racing
-    // thread can read a still-zeroed key and false-match key 0.
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
-    // read-of-published-value contract explicit (sm_70+). Replaces the
-    // plain `ld.<space>.<ty>` which relied on the publisher's release +
-    // SASS-level implicit acquire — sound in practice but not promised
-    // by PTX semantics.
-    writeln!(ptx, "\tld.acquire.cta.s32 %r35, [%rd36];").map_err(write_err)?;
+    // Slot occupied: CAS returned 1 (a claimer is MID-PUBLISH) or 2 (a key is
+    // already published). Claiming (CAS set 0->1) and the key store are two
+    // separate ops, so reading the key now races the claimer's store. Because
+    // keys can be 0 while block_keys is zero-initialised, a racing thread can
+    // read a stale 0, false-mismatch its non-zero key, probe on, and MINT A
+    // DUPLICATE GROUP (the tier-2 phantom-groups bug). A `membar.cta` only
+    // orders THIS thread's accesses — it cannot make us wait for the claimer's
+    // store. Fix with a 3-state set flag (0=empty, 1=claimed/publishing,
+    // 2=ready): spin on an acquire-load of `set` until the claimer publishes
+    // (it stores set:=2 AFTER the key, below) before reading the key. Bounded
+    // and deadlock-free on sm_70 — independent thread scheduling lets the
+    // claimer make progress while a same-warp prober spins.
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd35];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    // Yield so the same-warp claimer can run and publish set:=2. A bare spin
+    // can starve the publisher under sm_70 scheduling and hang -> TDR. %r36 is
+    // dead here (reloaded next iteration), so reuse it as the sleep operand.
+    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
+    // Key is now guaranteed published (released by the claimer's set:=2,
+    // observed via the acquire-load above), so a plain load is safe.
+    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
     // Collision: advance slot = (slot + 1) & mask.
@@ -429,12 +441,14 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     super::partition_reduce_kernel_spill_common::emit_spin_backoff(&mut ptx, SPIN_BACKOFF_NS)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: this thread won the slot. Publish the key, then fence so
-    // racing MATCH-path readers (which insert their own membar.cta after
-    // observing set==1) can never see a zeroed key under set==1.
+    // CLAIM: this thread won the slot (CAS set 0->1). Store the key, fence so
+    // the key store is CTA-visible, then PUBLISH by storing set:=2 — which
+    // releases the key to the spinning probers in PUBLISH_WAIT. The order
+    // (key store, membar, set:=2) is what makes the publication race-free.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
     writeln!(ptx, "\tatom.shared.add.f64 %fd1, [%rd38], %fd0;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
@@ -697,8 +711,20 @@ pub fn compile_partition_reduce_kernel_with_spill() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
-    // MATCH-path inter-address fence (same fix as the non-spill kernel).
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    // Slot occupied (CAS returned 1=claiming or 2=ready). Same 3-state publish
+    // protocol as the non-spill kernel: spin on an acquire-load of `set` until
+    // the claimer publishes (set:=2 after its key store) before reading the
+    // key, so a mid-publish claimer can't make us read a stale 0 and mint a
+    // duplicate group. Deadlock-free on sm_70 (independent thread scheduling).
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd35];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    // Yield to the same-warp claimer (Volta spin-livelock / TDR avoidance).
+    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
@@ -711,9 +737,12 @@ pub fn compile_partition_reduce_kernel_with_spill() -> BoltResult<String> {
     .map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
+    // CLAIM: won the slot. Store key, fence, then publish set:=2 (releases the
+    // key to spinning probers). Order key->membar->set is what closes the race.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
     writeln!(ptx, "\tatom.shared.add.f64 %fd1, [%rd38], %fd0;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
@@ -838,39 +867,42 @@ mod tests {
         );
     }
 
-    /// Inter-address ordering fix: the CAS on `block_set[slot]` and the
-    /// store/load on `block_keys[slot]` touch DIFFERENT addresses, so PTX
-    /// gives no ordering on sm_70 without an explicit `membar.cta`. Both
-    /// the CLAIM path (after publishing the key) and the MATCH path
-    /// (before loading the key) must emit it. Without these fences a
-    /// racing thread can read a zeroed key under set==1 and false-match
-    /// key 0 — the bug this fence pair guards against.
+    /// 3-state publish protocol (the tier-2 phantom-groups fix). Claiming a
+    /// slot (CAS set 0->1) and storing the key are separate ops, so a prober
+    /// must NOT read the key until the claimer has published it — otherwise it
+    /// reads a stale 0 and mints a duplicate group. The protocol:
+    ///   * CLAIM: `st key; membar.cta; st set:=2` (publish/release), in order.
+    ///   * prober: spin in `PUBLISH_WAIT` on an `ld.acquire.cta.u32` of `set`
+    ///     until it reads 2, THEN load the key.
     #[test]
-    fn membar_cta_on_claim_and_match_paths() {
+    fn publish_protocol_closes_claim_then_write_race() {
         let ptx = compile_partition_reduce_kernel().expect("kernel compiles");
-        let count = ptx.matches("membar.cta").count();
+
+        // Prober spin-waits for publication before reading the key.
         assert!(
-            count >= 2,
-            "expected >=2 membar.cta (CLAIM publish + MATCH read), saw {count}:\n{ptx}"
+            ptx.contains("PUBLISH_WAIT:"),
+            "PTX must spin-wait for the claimer to publish before reading the key:\n{ptx}"
         );
-        // The MATCH-path fence must live between the CAS and the key
-        // load. We locate the CAS and assert the next `membar.cta`
-        // appears before the `ld.acquire.cta.s32 %r35` (the key load).
-        // The acquire load is in ADDITION to the membar.cta — it makes
-        // the read-of-published-value contract explicit at the PTX level.
-        let cas_pos = ptx
-            .find("atom.shared.cas.b32")
-            .expect("CAS must be present");
-        let after_cas = &ptx[cas_pos..];
-        let mb_pos = after_cas
-            .find("membar.cta")
-            .expect("membar.cta missing after CAS");
-        let ld_pos = after_cas
-            .find("ld.acquire.cta.s32 %r35")
-            .expect("MATCH-path acquire key load missing");
         assert!(
-            mb_pos < ld_pos,
-            "membar.cta must appear between CAS and key load on MATCH path:\n{ptx}"
+            ptx.contains("ld.volatile.shared.u32 %r36"),
+            "PUBLISH_WAIT must acquire-load the set flag each spin:\n{ptx}"
+        );
+
+        // CLAIM must publish in order: key store -> membar.cta -> set:=2.
+        let claim_pos = ptx.find("CLAIM:").expect("CLAIM label must be present");
+        let after_claim = &ptx[claim_pos..];
+        let key_store = after_claim
+            .find("st.shared.u32 [%rd36], %r31")
+            .expect("CLAIM must store the key");
+        let mb = after_claim
+            .find("membar.cta")
+            .expect("CLAIM must fence after the key store");
+        let set_pub = after_claim
+            .find("st.shared.u32 [%rd35], 2")
+            .expect("CLAIM must publish set:=2");
+        assert!(
+            key_store < mb && mb < set_pub,
+            "CLAIM order must be key store -> membar.cta -> set:=2:\n{ptx}"
         );
     }
 
@@ -1041,15 +1073,31 @@ mod tests {
         );
     }
 
-    /// Spill variant must keep the membar.cta inter-address fences — the
-    /// CAS-race fix from batch 2 still applies here.
+    /// Spill variant must carry the same 3-state publish protocol as the base
+    /// emitter (the tier-2 phantom-groups fix): a PUBLISH_WAIT spin on an
+    /// acquire-load of `set`, and a CLAIM that orders key store -> membar.cta
+    /// -> set:=2.
     #[test]
-    fn with_spill_preserves_membar_cta_fences() {
+    fn with_spill_carries_publish_protocol() {
         let ptx = compile_partition_reduce_kernel_with_spill().expect("kernel compiles");
-        let count = ptx.matches("membar.cta").count();
         assert!(
-            count >= 2,
-            "spill variant must keep both membar.cta fences, saw {count}:\n{ptx}"
+            ptx.contains("PUBLISH_WAIT:") && ptx.contains("ld.volatile.shared.u32 %r36"),
+            "spill variant must spin-wait for publication before reading the key:\n{ptx}"
+        );
+        let claim_pos = ptx.find("CLAIM:").expect("CLAIM label must be present");
+        let after_claim = &ptx[claim_pos..];
+        let key_store = after_claim
+            .find("st.shared.u32 [%rd36], %r31")
+            .expect("CLAIM must store the key");
+        let mb = after_claim
+            .find("membar.cta")
+            .expect("CLAIM must fence after the key store");
+        let set_pub = after_claim
+            .find("st.shared.u32 [%rd35], 2")
+            .expect("CLAIM must publish set:=2");
+        assert!(
+            key_store < mb && mb < set_pub,
+            "CLAIM order must be key store -> membar.cta -> set:=2:\n{ptx}"
         );
     }
 

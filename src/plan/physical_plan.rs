@@ -1343,6 +1343,26 @@ fn all_bare_columns(exprs: &[Expr]) -> bool {
     exprs.iter().all(|e| matches!(e, Expr::Column(_)))
 }
 
+/// Return `agg` with its input expression replaced by `input`, preserving the
+/// aggregate kind. Used by [`lower_aggregate`] to retarget each aggregate onto
+/// the pre-kernel output column that materialised its (possibly compound) input
+/// expression, so the executor reads the already-computed, validity-bearing
+/// column instead of re-evaluating the raw expr against a now-consumed scan
+/// namespace.
+fn rebuild_agg_with_input(agg: &AggregateExpr, input: Expr) -> AggregateExpr {
+    match agg {
+        AggregateExpr::Count(_) => AggregateExpr::Count(input),
+        AggregateExpr::Sum(_) => AggregateExpr::Sum(input),
+        AggregateExpr::Min(_) => AggregateExpr::Min(input),
+        AggregateExpr::Max(_) => AggregateExpr::Max(input),
+        AggregateExpr::Avg(_) => AggregateExpr::Avg(input),
+        AggregateExpr::VarPop(_) => AggregateExpr::VarPop(Box::new(input)),
+        AggregateExpr::VarSamp(_) => AggregateExpr::VarSamp(Box::new(input)),
+        AggregateExpr::StddevPop(_) => AggregateExpr::StddevPop(Box::new(input)),
+        AggregateExpr::StddevSamp(_) => AggregateExpr::StddevSamp(Box::new(input)),
+    }
+}
+
 /// Emitter for a single kernel's IR.
 struct Codegen<'a> {
     /// Schema of the underlying scan (column lookup).
@@ -2762,7 +2782,19 @@ fn build_projection_kernel(
                 .unwrap_or(false),
             _ => false,
         });
-        if all_bare && any_utf8 {
+        // Nullable PRIMITIVE columns also cannot be projected on the GPU: the
+        // fused scan kernel emits an `Op::IsNullCheck` to preserve the column's
+        // nulls in the output, but nullable primitives carry no device validity
+        // bitmap (only BoolNullable / DictUtf8 do), so execution fails wiring
+        // the validity pointer. Route such bare passthroughs to the host
+        // `StringProject`, which lifts the column straight from the source batch
+        // with its Arrow null buffer intact. Non-nullable numerics keep the
+        // (more efficient) GPU path below.
+        let any_nullable = projected.iter().any(|(_, e)| match peel_aliases(e) {
+            Expr::Column(name) => scan_schema.field(name).map(|f| f.nullable).unwrap_or(false),
+            _ => false,
+        });
+        if all_bare && (any_utf8 || any_nullable) {
             let mut outputs = Vec::with_capacity(projected.len());
             let mut output_fields = Vec::with_capacity(projected.len());
             for (name, e) in projected {
@@ -3062,34 +3094,58 @@ fn lower_aggregate(
         (Some(pre_kernel), inputs, group_ords)
     };
 
-    // Substitute aggregate exprs through any chain Project map so the
-    // column names they reference match what the pre-aggregation kernel
-    // actually exposes (i.e., scan namespace).
-    let lowered_aggregates: Vec<AggregateExpr> = aggregates
-        .iter()
-        .map(|agg| match chain_proj_map.as_ref() {
-            None => agg.clone(),
-            Some(m) => match agg {
-                AggregateExpr::Count(e) => AggregateExpr::Count(substitute_one(e, m)),
-                AggregateExpr::Sum(e) => AggregateExpr::Sum(substitute_one(e, m)),
-                AggregateExpr::Min(e) => AggregateExpr::Min(substitute_one(e, m)),
-                AggregateExpr::Max(e) => AggregateExpr::Max(substitute_one(e, m)),
-                AggregateExpr::Avg(e) => AggregateExpr::Avg(substitute_one(e, m)),
-                AggregateExpr::VarPop(e) => {
-                    AggregateExpr::VarPop(Box::new(substitute_one(e.as_ref(), m)))
-                }
-                AggregateExpr::VarSamp(e) => {
-                    AggregateExpr::VarSamp(Box::new(substitute_one(e.as_ref(), m)))
-                }
-                AggregateExpr::StddevPop(e) => {
-                    AggregateExpr::StddevPop(Box::new(substitute_one(e.as_ref(), m)))
-                }
-                AggregateExpr::StddevSamp(e) => {
-                    AggregateExpr::StddevSamp(Box::new(substitute_one(e.as_ref(), m)))
-                }
-            },
-        })
-        .collect();
+    // Retarget each aggregate onto the column its input feeds.
+    //
+    // Non-trivial path: the pre-aggregation kernel already materialised every
+    // feed expr (group keys then aggregate inputs, in order) as an output
+    // column. Aggregate `j`'s input is therefore `agg_inputs[n_groups + j]`.
+    // Reference that pre-output column by name so the executor's fast path
+    // reads the computed, validity-bearing column directly. Without this the
+    // executor would re-evaluate the raw input expr (e.g. `price * tax`)
+    // against an env of pre OUTPUTS that no longer contains the source columns
+    // (`price`, `tax` were consumed by the pre kernel into `__expr_*`),
+    // failing with "column 'price' not found in evaluator env".
+    //
+    // Trivial path: no pre kernel; aggregate inputs are bare scan columns the
+    // aggregator reads directly, so keep the chain-substituted exprs (which
+    // resolve by their scan-namespace column name).
+    let n_groups = group_indices.len();
+    let lowered_aggregates: Vec<AggregateExpr> = if pre.is_some() {
+        aggregates
+            .iter()
+            .enumerate()
+            .map(|(j, agg)| {
+                let col = Expr::Column(agg_inputs[n_groups + j].name.clone());
+                rebuild_agg_with_input(agg, col)
+            })
+            .collect()
+    } else {
+        aggregates
+            .iter()
+            .map(|agg| match chain_proj_map.as_ref() {
+                None => agg.clone(),
+                Some(m) => match agg {
+                    AggregateExpr::Count(e) => AggregateExpr::Count(substitute_one(e, m)),
+                    AggregateExpr::Sum(e) => AggregateExpr::Sum(substitute_one(e, m)),
+                    AggregateExpr::Min(e) => AggregateExpr::Min(substitute_one(e, m)),
+                    AggregateExpr::Max(e) => AggregateExpr::Max(substitute_one(e, m)),
+                    AggregateExpr::Avg(e) => AggregateExpr::Avg(substitute_one(e, m)),
+                    AggregateExpr::VarPop(e) => {
+                        AggregateExpr::VarPop(Box::new(substitute_one(e.as_ref(), m)))
+                    }
+                    AggregateExpr::VarSamp(e) => {
+                        AggregateExpr::VarSamp(Box::new(substitute_one(e.as_ref(), m)))
+                    }
+                    AggregateExpr::StddevPop(e) => {
+                        AggregateExpr::StddevPop(Box::new(substitute_one(e.as_ref(), m)))
+                    }
+                    AggregateExpr::StddevSamp(e) => {
+                        AggregateExpr::StddevSamp(Box::new(substitute_one(e.as_ref(), m)))
+                    }
+                },
+            })
+            .collect()
+    };
 
     let aggregate = AggregateSpec {
         inputs: agg_inputs,
@@ -3347,6 +3403,48 @@ fn expr_contains_concat(expr: &Expr) -> bool {
         Expr::ScalarSubquery(_) => false,
         Expr::InSubquery { expr, .. } => expr_contains_concat(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
+/// True if `expr` contains a `Utf8` string literal anywhere in its subtree.
+///
+/// A surviving `Expr::Literal(Literal::Utf8(_))` in a WHERE predicate means a
+/// string comparison the dictionary rewrite did NOT fold to an integer index —
+/// either because the column is `protect_predicate`-protected (projected as a
+/// bare Utf8 output) or because no dictionary was registered. The fused GPU
+/// predicate kernel has no Utf8 register class or string-compare ops, so such a
+/// predicate must run on the host-side `PhysicalPlan::Filter` (whose
+/// `expr_agg::eval_expr` compares the decoded strings and compacts). Mirrors
+/// the `expr_contains_concat` / `predicate_contains_unary` host-routing guards.
+/// `Expr::Like` carries its pattern in a `String` field (not a `Literal::Utf8`)
+/// and has its own `StringLikeFilter` route, so it is intentionally not matched.
+fn expr_contains_utf8_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::Utf8(_)) => true,
+        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_utf8_literal(left) || expr_contains_utf8_literal(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_utf8_literal(operand),
+        Expr::Alias(inner, _) => expr_contains_utf8_literal(inner),
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            branches
+                .iter()
+                .any(|(w, t)| expr_contains_utf8_literal(w) || expr_contains_utf8_literal(t))
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_utf8_literal)
+                    .unwrap_or(false)
+        }
+        Expr::Like { expr, .. } => expr_contains_utf8_literal(expr),
+        Expr::Cast { expr, .. } => expr_contains_utf8_literal(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_utf8_literal),
+        Expr::ScalarSubquery(_) => false,
+        Expr::InSubquery { expr, .. } => expr_contains_utf8_literal(expr),
+        Expr::Extract { .. } | Expr::DateTrunc { .. } => false,
     }
 }
 
@@ -4744,6 +4842,25 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                         output_schema,
                     });
                 }
+                // `SELECT <utf8 col> FROM t WHERE s = 'x'`: the predicate kept a
+                // Utf8 string comparison (protected output column), which the
+                // fused GPU scan kernel can't fold. Lower the Filter on its own
+                // (it routes to the host `PhysicalPlan::Filter` via the Filter
+                // arm's `expr_contains_utf8_literal` guard, materialising and
+                // compacting the Utf8 column), then wrap a host `Project` for
+                // the SELECT list. Mirrors the `StringLikeFilter` route above.
+                if expr_contains_utf8_literal(predicate) {
+                    let inner = lower_depth(input, depth + 1)?;
+                    let output_schema = plan.schema()?;
+                    if project_is_identity(exprs, inner.output_schema(), &output_schema) {
+                        return Ok(inner);
+                    }
+                    return Ok(PhysicalPlan::Project {
+                        input: Box::new(inner),
+                        exprs: exprs.clone(),
+                        output_schema,
+                    });
+                }
             }
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
@@ -4775,6 +4892,26 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 try_lower_string_like_filter(input, predicate, depth)?
             {
                 return Ok(like_filter);
+            }
+            // String equality/inequality on a Utf8 column that survived the
+            // dictionary rewrite (e.g. `WHERE s = 'x'` where `s` is projected
+            // as a bare Utf8 output, so `protect_predicate` kept it a real
+            // string comparison). The fused GPU predicate kernel has no Utf8
+            // register class, so route to the host `PhysicalPlan::Filter`,
+            // whose `expr_agg::eval_expr` compares the decoded strings and
+            // compacts the surviving rows. Mirrors the `||` / `IS NULL` / CASE
+            // host-routing guards below.
+            if expr_contains_utf8_literal(predicate) {
+                log::debug!(
+                    "physical_plan: Utf8 string literal in Filter predicate; \
+                     lowering to host-side PhysicalPlan::Filter \
+                     (GPU codegen has no Utf8 support)"
+                );
+                let inner = lower(input)?;
+                return Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                });
             }
             // v0.7: `||` in a WHERE predicate (e.g. `WHERE a || b = 'foo'`)
             // routes through the host-side `PhysicalPlan::Filter` executor,

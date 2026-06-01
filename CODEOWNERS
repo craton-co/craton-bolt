@@ -8,7 +8,7 @@
 # auto-review-request (the PR is still mergeable; no failure is raised).
 #
 # In the interim, see MAINTAINERS.md at the repo root for the human(s) to
-# contact for reviews (currently routed via opensource@cratonsoftware.com).
+# contact for reviews (currently routed via opensource@craton.com.ar).
 # Once the team is created on GitHub, this file works as-is — no edit needed.
 #
 # REQUIRED MANUAL STEP (orchestrator): the @craton-co/craton-bolt-maintainers

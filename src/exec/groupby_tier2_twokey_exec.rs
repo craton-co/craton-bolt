@@ -64,8 +64,29 @@ fn pack_two_i32(col0: &[i32], col1: &[i32]) -> Vec<i64> {
     out
 }
 
-/// Try the two-key Tier-2 fast path. Returns `None` on any precondition
-/// miss so the caller falls through to the next strategy.
+/// Two-key Tier-2 fast path. Re-enabled after the real cause of the h2o-q3
+/// crash was found and fixed: it was NOT a per-block hash-table overflow / TDR
+/// (the reduce kernel runs in ~1–4 ms — see `groupby_tier2_twokey_orchestrator`
+/// phase timings) but the orchestrator's per-query owned CUDA stream. A buffer
+/// read/written on that stream records its handle in `used_streams` and only
+/// fences it (`cuStreamSynchronize`) or records a deferred-free event on it
+/// (`cuEventRecord`) at its own `Drop` — which can land AFTER the per-query
+/// `CudaStream` was destroyed (e.g. an input buffer dropped once the
+/// orchestrator that minted its own stream has returned). `cuEventRecord` /
+/// `cuStreamSynchronize` on a destroyed stream is undefined behaviour and on
+/// our drivers FAULTS the host (`STATUS_ACCESS_VIOLATION`) once the freed stream
+/// object is recycled — it does NOT reliably return INVALID_HANDLE, so no
+/// Rust-side error check (not even the drop-time `cuCtxSynchronize` escalation in
+/// `cuda::buffer::fence_all_streams`) can intercept it.
+///
+/// Fixed at the root by POOLING owned per-call streams instead of destroying
+/// them per query (`crate::cuda::stream_pool`): `CudaStream::Drop` returns the
+/// handle to a process-global pool for reuse, and the pool is destroyed only at
+/// context teardown — after every `GpuBuffer` has dropped — so any `used_streams`
+/// handle is always live and the deferred-free event machinery can never touch a
+/// dangling stream. This makes per-query owned streams safe everywhere, so the
+/// orchestrators keep `null_or_default`. See memory
+/// `groupby-resident-and-hostscan-finding.md`.
 pub fn try_execute(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
@@ -177,7 +198,8 @@ fn execute_inner(
         }
     };
 
-    build_tier2_twokey_result(partial, &aggregate.output_schema)
+    let out = build_tier2_twokey_result(partial, &aggregate.output_schema);
+    out
 }
 
 // ---------------------------------------------------------------------------

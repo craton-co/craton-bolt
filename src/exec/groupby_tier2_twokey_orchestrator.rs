@@ -178,7 +178,7 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_counts);
         args.push_scalar_u32(n_rows);
 
-        launch_with_geometry(
+    launch_with_geometry(
             partition_fn,
             grid_blocks,
             BLOCK_THREADS,
@@ -247,7 +247,7 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_sv);
         args.push_scalar_u32(n_rows);
 
-        launch_with_geometry(
+    launch_with_geometry(
             scatter_fn,
             grid_blocks,
             BLOCK_THREADS,
@@ -315,7 +315,7 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_os);
         args.push_output(&mut view_sp);
 
-        launch_with_geometry(
+    launch_with_geometry(
             reduce_fn,
             num_partitions,
             partition_reduce_kernel_i64::BLOCK_THREADS,

@@ -639,18 +639,18 @@ fn e2e_filtered_select() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    // The engine COMPACTS filter output (GPU prefix-scan + gather, or the host
-    // `compact::compact_arrays` fallback): only rows matching `region_id = 1`
-    // survive, in their original order. `region_id = i % 4`, so 512 of the 2048
-    // rows match. Build the expected projected `price` values from the fixture.
+    // SQL/DuckDB WHERE semantics: the engine COMPACTS — the result holds only
+    // the matching rows (`region_id = 1`), in source order, with no zero-fill
+    // padding. `sales_batch` sets region_id = i % 4, so exactly 512 of 2048
+    // rows match.
     let expected: Vec<f64> = (0..2048)
         .filter(|&i| region.value(i) == 1)
         .map(|i| price.value(i))
         .collect();
-    assert_eq!(out.num_rows(), expected.len(), "compacted row count");
-    assert_eq!(out.num_rows(), 512, "region_id == 1 matches 2048/4 rows");
-    for (k, want) in expected.iter().enumerate() {
-        assert_eq!(actual.value(k), *want, "compacted row {k}");
+    assert_eq!(out.num_rows(), expected.len(), "compacted row count = #matches");
+    assert_eq!(out.num_rows(), 512, "region_id = 1 matches 512 of 2048 rows");
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(actual.value(i), *want, "compacted row {i}");
     }
 }
 
@@ -1751,11 +1751,13 @@ fn e2e_var_samp_single_row_is_null() {
     assert!(col_pop.value(0).abs() < 1e-12, "got {}", col_pop.value(0));
 }
 
-/// Execution-time rejection: GROUP BY + VAR_POP must surface a clear
-/// error message from the engine's dispatch layer.
+/// GROUP BY + VAR_POP is supported via the host Welford finalize path
+/// (`groupby_with_pre::finalize_welford_array_with_pre`). Verify the per-group
+/// population variance matches the CPU model. (This previously asserted the
+/// feature was rejected — a v0.5-era limitation that has since been lifted.)
 #[test]
 #[ignore = "gpu:tier1"]
-fn e2e_groupby_variance_returns_clear_error() {
+fn e2e_groupby_var_pop_matches_cpu() {
     use craton_bolt::Engine;
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("k", ArrowDataType::Int32, false),
@@ -1766,14 +1768,35 @@ fn e2e_groupby_variance_returns_clear_error() {
     let batch = RecordBatch::try_new(schema, vec![k, v]).expect("batch");
     let mut engine = Engine::new().expect("ctx");
     engine.register_table("t", batch).unwrap();
-    let err = match engine.sql("SELECT k, VAR_POP(v) FROM t GROUP BY k") {
-        Ok(_) => panic!("v0.5: GROUP BY VAR_POP must be rejected"),
-        Err(e) => e,
-    };
-    let msg = format!("{err}");
+    let h = engine
+        .sql("SELECT k, VAR_POP(v) FROM t GROUP BY k")
+        .expect("GROUP BY VAR_POP executes");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), 2, "two groups");
+    let kc = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("Int32 k");
+    let vc = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64 var");
+    let mut got: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
+    for i in 0..out.num_rows() {
+        got.insert(kc.value(i), vc.value(i));
+    }
+    // Population variance per group: k=1 -> {1,2} -> 0.25; k=2 -> {10,20} -> 25.
     assert!(
-        msg.contains("VAR_POP") || msg.contains("VAR_SAMP"),
-        "error must mention the rejected aggregate; got: {msg}"
+        (got[&1] - 0.25).abs() < 1e-9,
+        "VAR_POP k=1: got {}",
+        got[&1]
+    );
+    assert!(
+        (got[&2] - 25.0).abs() < 1e-9,
+        "VAR_POP k=2: got {}",
+        got[&2]
     );
 }
 
@@ -1811,8 +1834,9 @@ fn other_batch(ids: &[i32], vals: &[i32]) -> RecordBatch {
 /// `SELECT region_id FROM sales WHERE qty > (SELECT MAX(val) FROM other)`.
 ///
 /// The scalar subquery `MAX(val)` over `other = {3, 7, 5}` folds to the
-/// literal `7`; the surviving predicate is `qty > 7`. The engine compacts
-/// filter output, so only the matching rows survive (in original order).
+/// literal `7`; the surviving predicate is `qty > 7`. Per SQL/DuckDB WHERE
+/// semantics the engine COMPACTS, so the result holds only the matching rows
+/// in source order.
 #[test]
 #[ignore = "gpu:e2e"]
 fn e2e_scalar_subquery_in_filter() {
@@ -1828,23 +1852,25 @@ fn e2e_scalar_subquery_in_filter() {
         .sql("SELECT region_id FROM sales WHERE qty > (SELECT MAX(val) FROM other)")
         .expect("execute");
     let out = h.record_batch();
-    // Row qty = {5, 8, 7, 9}; predicate qty > 7 keeps rows {8, 9} → region_id
-    // 20 and 40. Compaction drops the non-matching rows entirely.
+    // qty > 7 holds for rows with qty in {8, 9} → region_id 20 and 40.
     let region = out
         .column(0)
         .as_any()
         .downcast_ref::<Int32Array>()
         .expect("Int32 region");
-    assert_eq!(out.num_rows(), 2, "two rows satisfy qty > 7");
-    assert_eq!(region.value(0), 20, "first kept row (qty 8)");
-    assert_eq!(region.value(1), 40, "second kept row (qty 9)");
+    // Row qty = {5, 8, 7, 9}; predicate qty > 7 → mask {F, T, F, T}.
+    // Compaction keeps only the surviving rows, in order: region_id {20, 40}.
+    assert_eq!(out.num_rows(), 2);
+    assert_eq!(region.value(0), 20, "row kept (qty 8)");
+    assert_eq!(region.value(1), 40, "row kept (qty 9)");
 }
 
 /// `SELECT region_id FROM sales WHERE region_id IN (SELECT id FROM other)`.
 ///
 /// The IN-subquery over `other.id = {20, 40}` rewrites to
 /// `region_id = 20 OR region_id = 40`. Rows whose `region_id` is in that set
-/// survive the mask.
+/// survive the mask; per SQL/DuckDB WHERE semantics the engine COMPACTS the
+/// output to exactly those rows.
 #[test]
 #[ignore = "gpu:e2e"]
 fn e2e_in_subquery_in_filter() {
@@ -1865,8 +1891,9 @@ fn e2e_in_subquery_in_filter() {
         .as_any()
         .downcast_ref::<Int32Array>()
         .expect("Int32 region");
-    // region_id in {20, 40} survives; {10, 30} are dropped by compaction.
-    assert_eq!(out.num_rows(), 2, "two rows in the membership set");
+    // SQL/DuckDB WHERE semantics: the engine COMPACTS — only region_id in
+    // {20, 40} survives; {10, 30} are dropped (not zero-filled).
+    assert_eq!(out.num_rows(), 2);
     assert_eq!(region.value(0), 20, "20 in set");
     assert_eq!(region.value(1), 40, "40 in set");
 }

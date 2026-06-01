@@ -37,15 +37,6 @@ allow = [
 # Confidence threshold for LICENSE-file inference. The default 0.8 is fine.
 confidence-threshold = 0.8
 
-[[licenses.clarify]]
-name = "ring"
-# `ring` ships with a mix-and-match license file; this is the standard
-# clarification crates use.
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 },
-]
-
 [bans]
 # Allow multiple versions of common transitive deps for now (the Rust
 # ecosystem is mid-flight on syn 1 → 2, etc.). Tighten over time.

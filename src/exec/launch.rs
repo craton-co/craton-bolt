@@ -82,6 +82,17 @@ impl CudaStream {
     /// end of the executor before returning device results back to
     /// host-visible code.
     pub fn null_or_default() -> Self {
+        // Reuse a pooled owned stream if one is free. Pooling (rather than a
+        // fresh `cuStreamCreate` per call) is what makes per-call owned streams
+        // safe: a buffer can record this stream's handle in its `used_streams`
+        // and only fence / `cuEventRecord` it at `Drop` long after this
+        // `CudaStream` is gone. If we destroyed the stream per call that later
+        // call would hit a dangling handle — UB that FAULTS the host, not a
+        // clean `INVALID_HANDLE`. Pooled handles stay live until the context is
+        // torn down (see `crate::cuda::stream_pool`).
+        if let Some(raw) = crate::cuda::stream_pool::acquire() {
+            return Self { raw, owned: true };
+        }
         match Self::new() {
             Ok(s) => s,
             Err(_) => Self::null(),
@@ -114,12 +125,14 @@ impl CudaStream {
 impl Drop for CudaStream {
     fn drop(&mut self) {
         if self.owned && !self.raw.is_null() {
-            unsafe {
-                let rc = cuda_sys::cuStreamDestroy_v2(self.raw);
-                if rc != cuda_sys::CUDA_SUCCESS {
-                    log::warn!("craton-bolt: cuStreamDestroy failed ({})", rc);
-                }
-            }
+            // Return the handle to the pool for reuse instead of destroying it.
+            // A `GpuBuffer` touched on this stream may still name its handle in
+            // `used_streams` and will `cuStreamSynchronize` / `cuEventRecord` it
+            // at its own (later) `Drop`; doing that on a destroyed stream is UB
+            // that can fault the host. The pool destroys all handles exactly
+            // once, at context teardown, after every buffer has dropped. See
+            // `crate::cuda::stream_pool`.
+            crate::cuda::stream_pool::release(self.raw);
         }
     }
 }

@@ -9,8 +9,8 @@ contact_links:
   - name: Security disclosure
     url: https://github.com/craton-co/craton-bolt/security/advisories/new
     about: Report a vulnerability privately. Do NOT file a public issue for security bugs — see SECURITY.md for the disclosure SLA.
-  - name: Email security@cratonsoftware.com
-    url: mailto:security@cratonsoftware.com
+  - name: Email security@craton.com.ar
+    url: mailto:security@craton.com.ar
     about: Alternative private channel for security reports (PGP available on request).
   - name: Read the docs
     url: https://github.com/craton-co/craton-bolt/tree/main/docs

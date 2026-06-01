@@ -219,15 +219,11 @@ fn bucket_index(micros: u64) -> usize {
     if micros <= 1 {
         return 0;
     }
-    // `micros >= 2` here. The smallest power of two whose value is `>= micros`
-    // is `2^ceil(log2(micros))`; its exponent is the target bucket. For an
-    // exact power of two `2^k` we want bucket `k` (upper bound inclusive), and
-    // `(micros - 1).next_power_of_two()` delivers exactly that:
-    //   micros = 2   -> (1).next_power_of_two() = 1  -> exp 0 ... corrected below
-    // We instead compute it via leading-zeros to keep the inclusive-upper rule
-    // crisp and branch-light.
-    //
-    // ceil_log2(micros) for micros >= 2:
+    // `micros >= 2` here. The target bucket is `ceil(log2(micros))`, which is
+    // also the exponent of the smallest power of two `>= micros`. Computing it
+    // via leading-zeros keeps the inclusive-upper-bound rule (exact `2^k` maps
+    // to bucket `k`) crisp and branch-light:
+    //   ceil_log2(micros) == u64::BITS - (micros - 1).leading_zeros()
     let ceil_log2 = (u64::BITS - (micros - 1).leading_zeros()) as usize;
     ceil_log2.min(HISTOGRAM_BUCKETS - 1)
 }

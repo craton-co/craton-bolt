@@ -4,7 +4,7 @@ version = "0.7.0"
 edition = "2021"
 description = "JIT-compiled GPU SQL engine — runtime PTX codegen with Rust-tracked CUDA memory safety"
 license = "Apache-2.0"
-authors      = ["Craton Software Company <opensource@cratonsoftware.com>"]
+authors      = ["Craton Software Company <opensource@craton.com.ar>"]
 repository   = "https://github.com/craton-co/craton-bolt"
 homepage     = "https://github.com/craton-co/craton-bolt"
 documentation = "https://docs.rs/craton-bolt"
@@ -12,7 +12,7 @@ readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
 categories   = ["database", "compilers"]
 rust-version = "1.74"
-exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "reviews", "reviews/*"]
+exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "bolt_continue_prompt.md", "reviews", "reviews/*"]
 
 # --- Workspace shim ---------------------------------------------------------
 #
@@ -149,6 +149,13 @@ harness = false
 name = "olap_benchmarks"
 harness = false
 
+# GPU-favorable companion to olap_benchmarks: compute-bound scalar aggregates
+# and compound-predicate filters (no GROUP BY → no hash contention). Gated on
+# BOLT_BENCH_GPU=1 for the device path; CPU engines always run.
+[[bench]]
+name = "compute_benchmarks"
+harness = false
+
 # Stage-6 microbench: throughput of `ORDER BY <utf8>` across a sweep of
 # cardinality ratios, used to calibrate `HIGH_CARDINALITY_THRESHOLD`.
 # Off by default — set `BOLT_BENCH_THRESHOLD=1` to actually exercise the
@@ -175,6 +182,14 @@ path = "examples/quickstart.rs"
 [[example]]
 name = "groupby"
 path = "examples/groupby.rs"
+
+[[example]]
+name = "profile_groupby"
+path = "examples/profile_groupby.rs"
+
+[[example]]
+name = "profile_overhead"
+path = "examples/profile_overhead.rs"
 
 [profile.release]
 opt-level = 3

@@ -657,6 +657,14 @@ pub struct Engine {
     persistent_cache_path: Option<std::path::PathBuf>,
     /// v0.6 builder: whether tracing was enabled by the builder.
     tracing_enabled: bool,
+    /// Test-only: run the built-in logical optimizer before lowering.
+    /// Defaults to `true` (the production behaviour); flipped to `false`
+    /// only via [`EngineBuilder::without_optimizer`] so the
+    /// optimizer-equivalence test can execute an UN-optimized plan and
+    /// compare its results against the optimized path. Every production
+    /// construction leaves this `true`, so the gate at the
+    /// `run_to_fixpoint` call sites is a no-op for all stable callers.
+    optimize: bool,
     /// Owned CUDA context — declared LAST so it drops AFTER dictionaries.
     _ctx: CudaContext,
 }
@@ -697,6 +705,12 @@ pub struct EngineBuilder {
     persistent_cache_path: Option<std::path::PathBuf>,
     /// Install a default tracing subscriber from [`build`](Self::build).
     enable_tracing: bool,
+    /// Test-only: when `true`, [`build`](Self::build) constructs an engine
+    /// that SKIPS the built-in logical optimizer. Defaults to `false`
+    /// (optimizer ON — the production behaviour), so the derived
+    /// [`Default`] and every existing builder call leave optimization
+    /// enabled. Set only via [`EngineBuilder::without_optimizer`].
+    disable_optimizer: bool,
 }
 
 impl EngineBuilder {
@@ -710,6 +724,7 @@ impl EngineBuilder {
             memory_budget_bytes: None,
             persistent_cache_path: None,
             enable_tracing: false,
+            disable_optimizer: false,
         }
     }
 
@@ -766,6 +781,25 @@ impl EngineBuilder {
     /// `set_logger` is idempotent under contention).
     pub fn enable_tracing(mut self) -> Self {
         self.enable_tracing = true;
+        self
+    }
+
+    /// Test-only: build an engine that SKIPS the built-in logical optimizer.
+    ///
+    /// Not part of the stable public API — it exists so the
+    /// optimizer-equivalence test can execute a logical plan WITHOUT the
+    /// default optimizer pass pipeline (`run_to_fixpoint(default_passes,
+    /// ..)`) and compare the resulting rows against the normal,
+    /// optimizer-ON path. With the optimizer disabled, `sql()`,
+    /// `run_logical_plan()`, and subplan execution all lower the plan as
+    /// written (after the always-on dict rewrite + subquery resolution,
+    /// which are correctness-preserving, not optimizations).
+    ///
+    /// Production code must never call this: leaving the optimizer on is
+    /// the default for every other construction path.
+    #[doc(hidden)]
+    pub fn without_optimizer(mut self) -> Self {
+        self.disable_optimizer = true;
         self
     }
 
@@ -858,6 +892,10 @@ impl EngineBuilder {
             memory_budget_bytes: self.memory_budget_bytes,
             persistent_cache_path: self.persistent_cache_path,
             tracing_enabled: self.enable_tracing,
+            // Optimizer ON unless the test-only `without_optimizer()` knob
+            // flipped it. Every production path leaves `disable_optimizer`
+            // false, so this is `true` for all stable callers.
+            optimize: !self.disable_optimizer,
             _ctx: ctx,
         })
     }
@@ -1086,7 +1124,9 @@ impl Engine {
                             // future processes won't benefit, but the
                             // current process still loads the module
                             // successfully via the in-process caches.
-                            let _ = cache.store(k, &text);
+                            if let Err(e) = cache.store(k, &text) {
+                                log::debug!("ptx disk-cache store failed: {e}");
+                            }
                             text
                         }
                     },
@@ -2104,7 +2144,14 @@ impl Engine {
         // hit) so a conjunct exposed by one sweep — e.g. a now-constant
         // predicate moved by pushdown — gets folded/pushed on the next.
         let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
+        // `self.optimize` is `true` for every production engine; the
+        // test-only `EngineBuilder::without_optimizer()` flips it to `false`
+        // so the optimizer-equivalence test can execute the plan as written.
+        let plan = if self.optimize {
+            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
+        } else {
+            plan
+        };
         // v0.6 / M7: run user-registered PlanRewrite implementations in
         // registration order, threading each rewriter's output into the
         // next. This runs AFTER the built-in optimizer and the internal
@@ -2236,7 +2283,13 @@ impl Engine {
         // `sql()` does, so DataFrame-built plans get the same thorough
         // fold/push convergence.
         let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
+        // Gated by the test-only optimizer toggle; `true` in production.
+        // See `EngineBuilder::without_optimizer`.
+        let plan = if self.optimize {
+            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
+        } else {
+            plan
+        };
         // Mirror `sql()`: resolve uncorrelated subqueries to constants before
         // lowering so a DataFrame-built plan carrying a subquery executes too.
         let plan = self.resolve_subqueries(plan)?;
@@ -2315,7 +2368,15 @@ impl Engine {
         // Bounded-fixpoint optimizer, mirroring the `sql()` / `run_logical_plan`
         // paths so a subplan is optimized to the same convergence.
         let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        let plan = crate::plan::optimizer::run_to_fixpoint(&passes, plan)?;
+        // Gated by the test-only optimizer toggle; `true` in production.
+        // See `EngineBuilder::without_optimizer`. Keeping the subplan path
+        // gated too means a query run on a `without_optimizer()` engine is
+        // un-optimized end to end (outer plan AND any subplans).
+        let plan = if self.optimize {
+            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
+        } else {
+            plan
+        };
         let plan = self.resolve_subqueries(plan)?;
         let mut phys = crate::plan::lower_physical(&plan)?;
         // The outer `sql()` / `run_logical_plan` has already collapsed any
@@ -2591,16 +2652,65 @@ impl Engine {
                 // numerically-stable single-pass update; the executors fold
                 // per-group state on the host after the GPU keys kernel
                 // populates the slot table.
-                let batch = self.materialize_table(table)?;
                 let out = match (!aggregate.group_by.is_empty(), pre.is_some()) {
                     (true, true) => {
+                        let batch = self.materialize_table(table)?;
                         crate::exec::groupby_with_pre::execute_groupby_with_pre(phys, &batch)?
                     }
-                    (true, false) => crate::exec::groupby::execute_groupby(phys, &batch)?,
-                    (false, true) => {
-                        crate::exec::agg_with_pre::execute_aggregate_with_pre(phys, &batch)?
+                    (true, false) => {
+                        // Performance: try the resident on-device GROUP BY path
+                        // first (keys/values read from the already-uploaded
+                        // GpuTable, no per-query re-upload — the H2D dominates a
+                        // low-cardinality SUM's wall-clock). `batch` is a cheap
+                        // Arc clone for a singly-registered table and is still
+                        // needed for the transfer-free host key scans. Falls
+                        // back to the host-upload path on `None`, preserving
+                        // behaviour for shapes without a resident variant. The
+                        // resident Ref is scoped to this arm.
+                        let batch = self.materialize_table(table)?;
+                        let fast = match self.ensure_gpu_table(table) {
+                            Ok(resident) => crate::exec::groupby::try_execute_groupby_resident(
+                                phys, &resident, &batch,
+                            ),
+                            Err(_) => None,
+                        };
+                        match fast {
+                            Some(r) => r?,
+                            None => crate::exec::groupby::execute_groupby(phys, &batch)?,
+                        }
                     }
-                    (false, false) => crate::exec::aggregate::execute_aggregate(phys, &batch)?,
+                    (false, true) => {
+                        // Performance: try the fully on-device resident path
+                        // first — pre-kernel inputs are read straight from the
+                        // already-uploaded GpuTable and every reduce runs in
+                        // place on the device, so a repeat scalar aggregate
+                        // pays NO per-query bulk H2D/D2H. It returns `None`
+                        // (and we fall back to the host-materialised path,
+                        // preserving behaviour) whenever a precondition isn't
+                        // met — a predicate, NULL inputs, a widening reduce, or
+                        // an unaccelerated aggregate. The resident-table borrow
+                        // is scoped to this match so the fallback can
+                        // re-borrow `gpu_tables` via `materialize_table`.
+                        let fast = match self.ensure_gpu_table(table) {
+                            Ok(resident) => {
+                                crate::exec::agg_with_pre::try_execute_resident(phys, &resident)?
+                            }
+                            Err(_) => None,
+                        };
+                        match fast {
+                            Some(b) => b,
+                            None => {
+                                let batch = self.materialize_table(table)?;
+                                crate::exec::agg_with_pre::execute_aggregate_with_pre(
+                                    phys, &batch,
+                                )?
+                            }
+                        }
+                    }
+                    (false, false) => {
+                        let batch = self.materialize_table(table)?;
+                        crate::exec::aggregate::execute_aggregate(phys, &batch)?
+                    }
                 };
                 Ok(QueryHandle { batch: out })
             }
@@ -3568,7 +3678,26 @@ impl Engine {
                              table '{table}'"
                         ))
                     })?;
-                    arrays.push(src_batch.column(idx).clone());
+                    let src_col = src_batch.column(idx);
+                    // A dictionary-encoded Utf8 column is stored as
+                    // `Dictionary(Int32, Utf8)` on the host but projects as
+                    // logical `Utf8` (the output schema declares `Utf8`).
+                    // Decode it to a plain Utf8 array so the built batch matches
+                    // the schema; non-dictionary columns pass through unchanged.
+                    if matches!(src_col.data_type(), ArrowDataType::Dictionary(_, _)) {
+                        let decoded = arrow::compute::cast(
+                            src_col.as_ref(),
+                            &ArrowDataType::Utf8,
+                        )
+                        .map_err(|e| {
+                            BoltError::Other(format!(
+                                "StringProject: decode dictionary '{source}' to Utf8 failed: {e}"
+                            ))
+                        })?;
+                        arrays.push(decoded);
+                    } else {
+                        arrays.push(src_col.clone());
+                    }
                 }
                 StringProjectOutput::Transform { source, transform } => {
                     arrays.push(self.string_transform_column(table, source, *transform, n_rows)?);
@@ -6121,6 +6250,95 @@ mod tests {
             "clone of the same spec must produce the same cache key — \
              otherwise repeat queries would always JIT-compile from scratch"
         );
+    }
+
+    /// Debug-injectivity guard (finding V-15). The module cache derives its
+    /// key from `format!("{:?}", spec)`, so correctness rests on the
+    /// invariant *distinct specs => distinct `Debug` output*. This test
+    /// perturbs a base `KernelSpec` in EACH semantically-relevant field and
+    /// asserts the perturbed key differs from the base. If a future field is
+    /// added to `KernelSpec` but left out of its `Debug` impl, two distinct
+    /// kernels would format identically, hash to the same key, and the cache
+    /// would silently serve the WRONG compiled module — a silent-wrong-result
+    /// failure mode. Adding the new field's perturbation here makes that
+    /// regression a compile-or-test failure rather than a runtime hazard.
+    #[test]
+    fn module_cache_key_debug_distinguishes_specs() {
+        use crate::plan::{ColumnIO, Op, Reg};
+
+        // Base spec: one input, one output, one LoadColumn op, no predicate.
+        // Each variant below mutates exactly one semantically-relevant field.
+        let base = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "x".to_string(),
+                dtype: DataType::Int32,
+            }],
+            outputs: vec![ColumnIO {
+                name: "y".to_string(),
+                dtype: DataType::Int64,
+            }],
+            ops: vec![Op::LoadColumn {
+                dst: Reg(0),
+                col_idx: 0,
+                dtype: DataType::Int32,
+            }],
+            predicate: None,
+            register_count: 1,
+            input_has_validity: vec![false],
+            output_has_validity: vec![false],
+        };
+
+        // `inputs` — differ in input column dtype.
+        let mut v_inputs = base.clone();
+        v_inputs.inputs[0].dtype = DataType::Int64;
+
+        // `outputs` — differ in output column name.
+        let mut v_outputs = base.clone();
+        v_outputs.outputs[0].name = "z".to_string();
+
+        // `ops` — differ in a nested op field (destination register).
+        let mut v_ops = base.clone();
+        v_ops.ops[0] = Op::LoadColumn {
+            dst: Reg(1),
+            col_idx: 0,
+            dtype: DataType::Int32,
+        };
+
+        // `predicate` — None vs Some(reg).
+        let mut v_predicate = base.clone();
+        v_predicate.predicate = Some(Reg(0));
+
+        // `register_count` — affects PTX register allocation.
+        let mut v_register_count = base.clone();
+        v_register_count.register_count = 2;
+
+        // `input_has_validity` — flips the pre-stage validity layout.
+        let mut v_input_validity = base.clone();
+        v_input_validity.input_has_validity = vec![true];
+
+        // `output_has_validity` — flips the per-output validity stores.
+        let mut v_output_validity = base.clone();
+        v_output_validity.output_has_validity = vec![true];
+
+        let base_key = ModuleCacheKey::new(&base, KERNEL_ENTRY);
+        for (field, variant) in [
+            ("inputs", &v_inputs),
+            ("outputs", &v_outputs),
+            ("ops", &v_ops),
+            ("predicate", &v_predicate),
+            ("register_count", &v_register_count),
+            ("input_has_validity", &v_input_validity),
+            ("output_has_validity", &v_output_validity),
+        ] {
+            let variant_key = ModuleCacheKey::new(variant, KERNEL_ENTRY);
+            assert_ne!(
+                base_key, variant_key,
+                "a spec differing only in `{field}` must produce a distinct \
+                 cache key — if it does not, that field is missing from \
+                 `KernelSpec`'s `Debug` and two kernels would silently alias \
+                 to the same cached PTX (wrong results)"
+            );
+        }
     }
 
     // ---- v0.7: `EngineBuilder::persistent_cache` wires into disk PTX cache ----

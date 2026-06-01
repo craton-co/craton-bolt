@@ -33,6 +33,22 @@
 //! inputs, computed sort keys, or any GPU precondition miss inside
 //! [`try_gpu_sort`]). The host-side `lexsort_to_indices` always produces a
 //! correct result, so a decline at any stage is safe.
+//!
+//! ## ⚠️ TEMPORARY SAFETY GATE — GPU sort is opt-in only
+//!
+//! The GPU sort kernels currently MIS-SORT and must not silently corrupt
+//! `ORDER BY` results, so [`execute_sort`] only runs them under an explicit
+//! `BOLT_GPU_SORT=1` opt-in; every other sort falls through to the correct host
+//! `lexsort_to_indices`. The [`should_use_gpu_sort`] heuristic below is retained
+//! unchanged (it still answers "would the heuristic pick GPU?") for an easy
+//! re-enable once the kernels are fixed. The known kernel bugs:
+//!   * the radix scatter is non-stable (a global per-digit `atom.global.add`
+//!     race), so the LSD radix sort returns wrong results; and
+//!   * the bitonic kernel is only verified for Int32 ASC at a power-of-two row
+//!     count — DESC, 64-bit, float, and padded inputs mis-sort.
+//! See the `gpu-validation-known-issues` notes. To re-enable GPU sort by
+//! default, drop the `gpu_sort_override() == Some(true)` conjunct in
+//! [`execute_sort`].
 
 use std::sync::Arc;
 
@@ -147,7 +163,25 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
     // first, then bitonic; any precondition miss falls through to the host
     // sort, which always produces a correct result.
     if let Some((key_dtypes, directions)) = resolve_key_shape(&batch, sort_exprs) {
-        if should_use_gpu_sort(batch.num_rows(), &key_dtypes, &directions) {
+        // SAFETY GATE (see gpu-validation known issues): the GPU sort kernels
+        // are known to mis-sort and must NOT silently corrupt ORDER BY results.
+        //   * The radix scatter is non-stable — every thread `atom.global.add`s
+        //     into a shared per-digit offset, so equal-digit rows race; LSD
+        //     radix requires stable passes, so the result is wrong.
+        //   * The bitonic kernel is only verified correct for Int32 ASC with a
+        //     power-of-two row count; DESC, 64-bit, float, and padded
+        //     (non-power-of-two) inputs mis-sort.
+        // Until the kernels are fixed and validated, run the GPU path ONLY under
+        // an explicit `BOLT_GPU_SORT=1` opt-in (for benchmarking / kernel
+        // validation). Every production ORDER BY falls through to the correct
+        // host `lexsort_to_indices` below. The lib-level kernel tests call the
+        // `sort_indices_on_gpu_*` entry points directly, so they still exercise
+        // the kernels regardless of this gate. To re-enable the GPU sort by
+        // default once correct, drop the `gpu_sort_override() == Some(true)`
+        // conjunct (restoring the plain `should_use_gpu_sort` dispatch).
+        if gpu_sort_override() == Some(true)
+            && should_use_gpu_sort(batch.num_rows(), &key_dtypes, &directions)
+        {
             if let Some(perm) = try_gpu_sort_radix(&batch, sort_exprs)? {
                 let new_cols: Vec<Arc<dyn Array>> = batch
                     .columns()

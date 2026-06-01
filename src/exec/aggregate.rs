@@ -240,6 +240,23 @@ fn build_one_aggregate(
             let op = ReduceOp::from_agg(agg)?;
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
+            // SQL semantics: SUM/MIN/MAX over an empty or all-NULL input is
+            // NULL, not the reduction identity (0 for SUM, ±inf / i64::MAX /
+            // i64::MIN for MIN/MAX). Detect the zero-valid-rows case up front
+            // and emit a single NULL row when the planner has marked the
+            // output field nullable — mirroring the Decimal128 MIN/MAX fold
+            // (`minmax_decimal128_from_batch`, seed `None`) and the AVG path
+            // (`avg_result_array`). The GPU/host reduction below still seeds
+            // from the identity for the non-empty happy path, which is only
+            // reached when at least one valid row exists. (If the field were
+            // somehow non-nullable we fall through to the legacy identity so
+            // `RecordBatch::try_new` doesn't reject a null in a non-nullable
+            // column.)
+            if out_field.nullable
+                && non_null_count_for_input(col_io, table_batch)? == 0
+            {
+                return null_scalar_array(out_field.dtype);
+            }
             // Decimal128: SUM via the dedicated i128 GPU block-reduce kernel
             // (`decimal_sum_from_batch`; host-fold fallback inside it). MIN/MAX
             // via the host fold over the decoded `Decimal128Array` (raw i128
@@ -981,7 +998,10 @@ where
     let pinned_counts = block_counts.to_pinned_async(stream.raw())?;
     stream.synchronize()?;
 
-    let total_sum: f64 = pinned_sums.as_slice().iter().copied().sum();
+    // Neumaier-compensated host finalize over the per-block f64 partials so
+    // the AVG numerator matches the GPU's tree-order sum to low bits and
+    // tracks DuckDB's compensated summation (naive left-fold drifts).
+    let total_sum: f64 = neumaier_sum_f64(pinned_sums.as_slice().iter().copied());
     let total_count: u64 = pinned_counts
         .as_slice()
         .iter()
@@ -1732,6 +1752,50 @@ enum Scalar {
     Decimal128(i128, u8, i8),
 }
 
+/// Neumaier-compensated summation (an improved Kahan variant) over an `f64`
+/// iterator. Used by the float SUM/AVG host finalize so the host-side fold of
+/// GPU partials matches the device's tree-order sum to low bits and tracks
+/// DuckDB's compensated summation — a naive left-fold (`fold(0.0, |a, b| a +
+/// b)`) loses the low bits and drifts vs both.
+///
+/// Accumulation is always in `f64` (callers upcast `f32` partials), which is
+/// both more accurate and the typical engine behavior. Summing nothing yields
+/// `0.0` — callers gate the empty/all-NULL → SQL NULL case upstream.
+///
+/// Non-finite terms are handled by falling back to a plain IEEE fold: a `+Inf`
+/// (or `-Inf`/`NaN`) summand makes the compensation terms evaluate `inf - inf
+/// == NaN`, which would wrongly turn `SUM` over a column containing `+Inf` into
+/// `NaN`. The naive fold propagates `Inf`/`NaN` exactly as the SQL/IEEE
+/// contract requires, so we return it whenever any non-finite term is seen.
+#[inline]
+fn neumaier_sum_f64(iter: impl IntoIterator<Item = f64>) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut c = 0.0_f64; // running compensation for lost low-order bits
+    let mut naive = 0.0_f64; // plain IEEE fold, used as the non-finite fallback
+    let mut saw_nonfinite = false;
+    for v in iter {
+        if !v.is_finite() {
+            saw_nonfinite = true;
+        }
+        naive += v;
+        let t = sum + v;
+        if sum.abs() >= v.abs() {
+            // `sum` is larger: the low-order bits of `v` are lost.
+            c += (sum - t) + v;
+        } else {
+            // `v` is larger: the low-order bits of `sum` are lost.
+            c += (v - t) + sum;
+        }
+        sum = t;
+    }
+    // Compensated summation is only valid for finite terms (see doc above).
+    if saw_nonfinite {
+        naive
+    } else {
+        sum + c
+    }
+}
+
 /// Per-`T` helpers for the GPU reduction path.
 trait ReduceScalar: Sized + Copy {
     /// Combine a host-side slice using `op` and wrap as a `Scalar`.
@@ -1742,6 +1806,22 @@ trait ReduceScalar: Sized + Copy {
 
 impl ReduceScalar for i32 {
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
+        // INVARIANT (V-10): SUM(Int32) is ALWAYS widened to an i64 accumulator
+        // before it reaches a host finalize — the SUM(Int32) dispatch site in
+        // `reduce_column_from_batch` routes through `reduce_gpu_vec_widened::
+        // <i32, i64>`, which finalizes via the `i64` `ReduceScalar` impl (whose
+        // Sum arm uses `checked_add` and errors loudly on overflow). This i32
+        // finalize is therefore only ever reached for MIN/MAX (and COUNT, a
+        // synthesized sum-over-ones that cannot overflow i32). The `Sum` arm
+        // below is unreachable for a real SUM; we assert that here so a future
+        // dispatch change that accidentally routes a native i32 SUM through this
+        // (silently wrapping) fold is caught in debug builds rather than
+        // producing a wrong answer.
+        debug_assert!(
+            !matches!(op, ReduceOp::Sum),
+            "SUM(Int32) must widen to i64 before host finalize (see i64 ReduceScalar); \
+             the i32 finalize Sum arm is unreachable for a real SUM"
+        );
         let acc = match op {
             ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0i32, i32::wrapping_add),
             ReduceOp::Min => host.iter().copied().fold(i32::MAX, i32::min),
@@ -1869,7 +1949,15 @@ impl FloatTotalCmp for f64 {
 impl ReduceScalar for f32 {
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
-            ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0.0f32, |a, b| a + b),
+            // SUM/COUNT: Neumaier-compensated summation in f64 (upcasting the
+            // f32 partials) so the host finalize matches the GPU's tree-order
+            // sum to low bits and tracks DuckDB's compensated summation; a
+            // naive f32 left-fold drifts. The accumulated f64 is narrowed back
+            // to f32 to preserve the SUM(Float32) output dtype. NaN/Inf
+            // propagate through Neumaier unchanged.
+            ReduceOp::Sum | ReduceOp::Count => {
+                neumaier_sum_f64(host.iter().copied().map(f64::from)) as f32
+            }
             // MIN/MAX use the DuckDB NaN-as-largest convention (see
             // `float_total_cmp`) so the scalar path agrees with window.rs.
             // We seed from the first element (via `reduce`) rather than an
@@ -1915,7 +2003,11 @@ impl ReduceScalar for f32 {
 impl ReduceScalar for f64 {
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
-            ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0.0f64, |a, b| a + b),
+            // SUM/COUNT: Neumaier-compensated summation so the host finalize
+            // matches the GPU's tree-order sum to low bits and tracks DuckDB's
+            // compensated summation; a naive left-fold drifts. NaN/Inf
+            // propagate through Neumaier unchanged.
+            ReduceOp::Sum | ReduceOp::Count => neumaier_sum_f64(host.iter().copied()),
             // MIN/MAX use the DuckDB NaN-as-largest convention (see
             // `float_total_cmp`) so the scalar path agrees with window.rs.
             // Seed from the first element (via `reduce`) so all-NaN yields
@@ -2006,6 +2098,44 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
         (s, dt) => Err(BoltError::Type(format!(
             "aggregate: cannot pack scalar {:?} into output dtype {:?}",
             s, dt
+        ))),
+    }
+}
+
+/// Build a single-row, all-NULL Arrow array of `out_dtype`. Used by the
+/// scalar SUM/MIN/MAX path when the input is empty or all-NULL: SQL says the
+/// result is NULL, not the reduction identity. The output field must be
+/// nullable (the caller gates on `out_field.nullable`) — a NULL in a
+/// non-nullable column would be rejected by `RecordBatch::try_new`. Mirrors
+/// the `None`-seeded packing in `minmax_decimal128_from_batch` and the
+/// nullable branch of `avg_result_array`.
+fn null_scalar_array(out_dtype: DataType) -> BoltResult<ArrayRef> {
+    match out_dtype {
+        DataType::Int32 => Ok(Arc::new(Int32Array::from(vec![Option::<i32>::None])) as ArrayRef),
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(vec![Option::<i64>::None])) as ArrayRef),
+        DataType::Float32 => {
+            Ok(Arc::new(Float32Array::from(vec![Option::<f32>::None])) as ArrayRef)
+        }
+        DataType::Float64 => {
+            Ok(Arc::new(Float64Array::from(vec![Option::<f64>::None])) as ArrayRef)
+        }
+        // SUM(Decimal128) widens to Decimal128(38, s); MIN/MAX preserve the
+        // input (p, s). A `None` validity bit packs SQL NULL; the (p, s) tag
+        // still has to satisfy Arrow so we carry the declared output scale.
+        DataType::Decimal128(p, s) => {
+            let arr = Decimal128Array::from(vec![Option::<i128>::None])
+                .with_precision_and_scale(p, s)
+                .map_err(|e| {
+                    BoltError::Type(format!(
+                        "aggregate NULL result: precision/scale {:?} rejected by Arrow: {e}",
+                        (p, s)
+                    ))
+                })?;
+            Ok(Arc::new(arr) as ArrayRef)
+        }
+        other => Err(BoltError::Type(format!(
+            "aggregate: cannot build NULL scalar for output dtype {:?}",
+            other
         ))),
     }
 }
@@ -2765,5 +2895,54 @@ mod tests {
         let via_pinned: Vec<i32> = pinned.as_slice().to_vec();
 
         assert_eq!(via_sync, via_pinned);
+    }
+
+    /// Neumaier compensated summation recovers an ill-conditioned sequence whose
+    /// low-order terms a naive left-fold drops. For `[1e16, 1.0, -1e16, 1.0]`
+    /// the naive fold loses the FIRST `+1.0` (below 1e16's ULP) and keeps only
+    /// the last, yielding `1.0`; Neumaier recovers both and yields `2.0`.
+    #[test]
+    fn neumaier_sum_is_accurate_on_ill_conditioned_input() {
+        let data = [1e16_f64, 1.0, -1e16, 1.0];
+        // Sanity: confirm the naive left-fold actually drifts here (drops the
+        // first +1.0 -> 1.0), so the Neumaier assertion below is meaningful.
+        let naive = data.iter().copied().fold(0.0_f64, |a, b| a + b);
+        assert_eq!(naive, 1.0, "precondition: naive fold drops the first +1.0");
+        let neumaier = neumaier_sum_f64(data.iter().copied());
+        assert_eq!(neumaier, 2.0, "Neumaier must recover the exact sum");
+    }
+
+    /// NaN and Inf propagate through Neumaier summation (IEEE arithmetic):
+    /// any NaN summand makes the whole sum NaN, and a lone +Inf among finite
+    /// values yields +Inf.
+    #[test]
+    fn neumaier_sum_propagates_nan_and_inf() {
+        // NaN poisons the running sum.
+        let with_nan = [1.0_f64, f64::NAN, 2.0];
+        assert!(
+            neumaier_sum_f64(with_nan.iter().copied()).is_nan(),
+            "NaN summand must produce NaN"
+        );
+        // +Inf with finite values stays +Inf.
+        let with_inf = [1.0_f64, f64::INFINITY, 2.0];
+        assert_eq!(
+            neumaier_sum_f64(with_inf.iter().copied()),
+            f64::INFINITY,
+            "+Inf summand must produce +Inf"
+        );
+        // +Inf and -Inf together produce NaN (Inf - Inf), as IEEE dictates.
+        let mixed_inf = [f64::INFINITY, f64::NEG_INFINITY];
+        assert!(
+            neumaier_sum_f64(mixed_inf.iter().copied()).is_nan(),
+            "+Inf and -Inf together must produce NaN"
+        );
+    }
+
+    /// An empty iterator sums to the identity `0.0` (the empty/all-NULL → SQL
+    /// NULL case is gated upstream of the finalize, so this must not panic).
+    #[test]
+    fn neumaier_sum_empty_is_zero() {
+        let empty: [f64; 0] = [];
+        assert_eq!(neumaier_sum_f64(empty.iter().copied()), 0.0);
     }
 }

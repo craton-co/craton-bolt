@@ -310,6 +310,10 @@ impl<T: Pod> GpuBuffer<T> {
             // contract; the two allocations are distinct (just allocated
             // vs. caller-supplied) so the non-overlap requirement of
             // `cuMemcpyDtoD_v2` holds.
+            debug_assert_ne!(
+                buf.ptr, prefix_src,
+                "DtoD copy requires non-overlapping device pointers"
+            );
             cuda_sys::memcpy_d2d::<T>(buf.ptr, prefix_src, prefix_len)?;
         }
         // 2. Host-to-device copy of the tail directly into the offset
@@ -742,13 +746,44 @@ fn real_stream_fence(stream: CUstream) -> crate::cuda::cuda_sys::CUresult {
 /// The set is already deduped by [`StreamSet::insert`], so each distinct
 /// stream is fenced exactly once.
 fn fence_all_streams(streams: &StreamSet, fence: StreamFenceFn) {
+    let mut any_failed = false;
     for &stream in &streams.streams {
         let rc = fence(stream);
         if rc != cuda_sys::CUDA_SUCCESS {
+            any_failed = true;
             log::warn!(
                 "craton-bolt: GpuBuffer::Drop stream fence returned {} \
-                 (buffer dropped while a pending op may still reference it; \
-                 pool block may be recycled before the driver is done with it)",
+                 (unexpected — owned per-query streams are pooled, not \
+                 destroyed; see crate::cuda::stream_pool); falling back to a \
+                 device-wide cuCtxSynchronize before the pool block is recycled",
+                rc
+            );
+        }
+    }
+    if any_failed {
+        // A per-stream fence returned an error. This is a DEFENSE-IN-DEPTH
+        // path, not the primary safety mechanism: the real fix for the
+        // per-query-stream use-after-free is that owned streams are POOLED and
+        // never destroyed while a buffer may still reference their handle (see
+        // `crate::cuda::stream_pool`), so `cuStreamSynchronize` /
+        // `cuEventRecord` here normally always hit a LIVE handle. (Calling them
+        // on a *destroyed* stream is undefined behaviour that on our drivers
+        // FAULTS the host rather than returning an error — so this fallback
+        // could not have caught the original crash; only pooling does.)
+        //
+        // If a fence does fail for some other reason, fall back to a device-wide
+        // `cuCtxSynchronize`, which blocks until ALL outstanding work on the
+        // context completes BEFORE the caller returns the block to the pool —
+        // strictly conservative (it waits for MORE work than the per-stream
+        // fences would, never less), so it can never authorise a premature
+        // reuse. One `cuCtxSynchronize` drains the whole device, so a single
+        // call after the loop suffices regardless of how many streams failed.
+        let rc = current_drop_ctx_fence()();
+        if rc != cuda_sys::CUDA_SUCCESS {
+            log::warn!(
+                "craton-bolt: GpuBuffer::Drop device-wide cuCtxSynchronize \
+                 fallback returned {} (pool block is being recycled despite an \
+                 unfenced stream; in-flight work may still alias it)",
                 rc
             );
         }
@@ -789,6 +824,61 @@ fn current_drop_fence() -> StreamFenceFn {
         }
     }
     real_stream_fence
+}
+
+/// Signature of the device-wide fence used as the conservative fallback when a
+/// per-stream fence in [`fence_all_streams`] fails. Aliased so a host-only test
+/// can swap in a recorder via [`drop_ctx_fence_with`], mirroring the
+/// `StreamFenceFn` / [`drop_fence_with`] seam. Returns the raw `CUresult` so the
+/// production hook can warn if even the device-wide sync fails.
+type CtxFenceFn = fn() -> crate::cuda::cuda_sys::CUresult;
+
+/// Production device-wide fence: forwards to `cuCtxSynchronize`.
+///
+/// SAFETY: `cuCtxSynchronize` dereferences nothing — it blocks the calling
+/// thread until every stream on the current context has drained. We invoke it
+/// only on the per-stream-fence error path, where a recorded stream (most
+/// likely a destroyed per-query owned stream) could not be fenced individually;
+/// draining the whole context is the conservative way to guarantee no in-flight
+/// op still references the block before it is recycled.
+///
+/// Under `--features cuda-stub` `cuCtxSynchronize` is the stub shim returning
+/// `CUDA_ERROR_STUB`; the caller treats any non-success rc as "could not fence"
+/// and logs — the correct conservative behaviour for a GPU-less build.
+fn real_ctx_fence() -> crate::cuda::cuda_sys::CUresult {
+    unsafe { cuda_sys::cuCtxSynchronize() }
+}
+
+/// Test seam: when set, the [`fence_all_streams`] device-wide fallback syncs
+/// through this stub instead of the real `cuCtxSynchronize`. Host-only tests
+/// install a recorder here to assert the fallback fires (exactly once, on the
+/// per-stream-failure path) without a GPU. Mirrors [`DROP_FENCE_OVERRIDE`].
+#[cfg(test)]
+thread_local! {
+    static DROP_CTX_FENCE_OVERRIDE: Cell<Option<CtxFenceFn>> = const { Cell::new(None) };
+}
+
+/// Install `fence` as the `Drop`-time device-wide fallback fence for the current
+/// thread, run `body`, then restore the previous hook. Test-only.
+#[cfg(test)]
+fn drop_ctx_fence_with<R>(fence: CtxFenceFn, body: impl FnOnce() -> R) -> R {
+    let prev = DROP_CTX_FENCE_OVERRIDE.with(|c| c.replace(Some(fence)));
+    let out = body();
+    DROP_CTX_FENCE_OVERRIDE.with(|c| c.set(prev));
+    out
+}
+
+/// Resolve the device-wide fallback fence the current `Drop` should use: the
+/// test override if installed, else the real `cuCtxSynchronize`.
+#[inline]
+fn current_drop_ctx_fence() -> CtxFenceFn {
+    #[cfg(test)]
+    {
+        if let Some(f) = DROP_CTX_FENCE_OVERRIDE.with(|c| c.get()) {
+            return f;
+        }
+    }
+    real_ctx_fence
 }
 
 /// Signature of the reclaim action a non-empty-`used_streams` `Drop` performs:
@@ -864,8 +954,14 @@ fn real_drop_reclaim(ptr: CUdeviceptr, alloc_bytes: usize, streams: &StreamSet) 
             }
         }
         None => {
-            // Events unavailable (cuda-stub, or create/record failed): fall
-            // back to the conservative blanket per-stream sync, then free.
+            // Events unavailable (cuda-stub, or create/record failed — which
+            // includes `cuEventRecord` returning `CUDA_ERROR_INVALID_HANDLE`
+            // because a recorded stream was a per-query owned stream that has
+            // already been destroyed): fall back to the conservative blanket
+            // per-stream sync, then free. `fence_all_streams` additionally
+            // escalates to a device-wide `cuCtxSynchronize` if any per-stream
+            // fence fails (the destroyed-stream case), so the block is never
+            // recycled while a dead stream's DMA is still draining into it.
             fence_all_streams(streams, current_drop_fence());
             crate::cuda::mem_pool::POOL.free(ptr, alloc_bytes);
         }
@@ -1494,17 +1590,41 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
             }
             return;
         }
+        let mut any_failed = false;
         for &stream in &streams.streams {
             // SAFETY: `stream` is an opaque CUstream handle handed to
             // us by the caller; we just forward it. If the stream has
-            // already been destroyed, `cuStreamSynchronize` returns an
-            // error which we surface as a warning — we still attempt
-            // the free so we don't leak the pinned pages.
+            // already been destroyed (a per-query owned stream that was
+            // `cuStreamDestroy`'d), `cuStreamSynchronize` returns
+            // `CUDA_ERROR_INVALID_HANDLE` WITHOUT waiting for that stream's
+            // still-draining DMA. We record that and escalate to a
+            // device-wide sync below before freeing the pages.
             let sync_rc =
                 unsafe { cuda_sys::check(cuda_sys::cuStreamSynchronize(stream)) };
             if let Err(e) = sync_rc {
+                any_failed = true;
                 log::warn!(
-                    "craton-bolt: cuStreamSynchronize before pinned-host free failed ({:?}); proceeding with cuMemFreeHost but in-flight DMA may have UB'd",
+                    "craton-bolt: cuStreamSynchronize before pinned-host free failed ({:?}); \
+                     stream may be a destroyed per-query stream — falling back to a \
+                     device-wide cuCtxSynchronize before cuMemFreeHost",
+                    e
+                );
+            }
+        }
+        if any_failed {
+            // A per-stream sync failed — most likely a destroyed per-query
+            // owned stream whose `cuMemcpy*Async` into these pinned pages is
+            // still in flight. Freeing the pages now would be a host-side
+            // use-after-free: the DMA engine would keep writing into memory the
+            // kernel has reclaimed. Drain ALL outstanding device work with a
+            // device-wide `cuCtxSynchronize` before `cuMemFreeHost`. This is
+            // strictly conservative — the error path waits for more work than
+            // the per-stream syncs would have, never less.
+            let ctx_rc = unsafe { cuda_sys::check(cuda_sys::cuCtxSynchronize()) };
+            if let Err(e) = ctx_rc {
+                log::warn!(
+                    "craton-bolt: cuCtxSynchronize fallback before pinned-host free failed \
+                     ({:?}); proceeding with cuMemFreeHost but in-flight DMA may have UB'd",
                     e
                 );
             }
@@ -1948,6 +2068,84 @@ mod stream_set_tests {
             }
         });
         FENCED.with(|f| assert!(f.borrow().is_empty()));
+    }
+
+    // ---- Destroyed per-query stream -> device-wide cuCtxSynchronize fallback -
+    //
+    // When a recorded stream is a per-query OWNED stream that was already
+    // destroyed, `cuStreamSynchronize` returns an error WITHOUT waiting for its
+    // still-draining DMA. `fence_all_streams` must then escalate to a single
+    // device-wide `cuCtxSynchronize` before the pool block is recycled — the
+    // conservative fix that makes per-query streams safe everywhere. Proven
+    // host-only through the `drop_ctx_fence_with` seam (no GPU).
+
+    thread_local! {
+        /// Counts how many times the device-wide fallback fence was invoked.
+        static CTX_FENCED: StdRefCell<usize> = const { StdRefCell::new(0) };
+    }
+
+    /// Per-stream fence stub that always fails, emulating `cuStreamSynchronize`
+    /// on a destroyed per-query stream (`CUDA_ERROR_INVALID_HANDLE`, 400).
+    fn failing_fence(_stream: CUstream) -> CUresult {
+        const INVALID_HANDLE: CUresult = 400;
+        INVALID_HANDLE
+    }
+
+    /// Device-wide fence recorder installed via `drop_ctx_fence_with`: counts
+    /// invocations and reports success. Never calls the driver.
+    fn recording_ctx_fence() -> CUresult {
+        CTX_FENCED.with(|c| *c.borrow_mut() += 1);
+        CUDA_SUCCESS
+    }
+
+    #[test]
+    fn failed_per_stream_fence_escalates_to_one_ctx_sync() {
+        CTX_FENCED.with(|c| *c.borrow_mut() = 0);
+        let buf: GpuBuffer<u8> = GpuBuffer::empty();
+        // Two distinct (pretend-destroyed) streams both fail to fence.
+        buf.mark_stream_use(fake_stream(0x11));
+        buf.mark_stream_use(fake_stream(0x22));
+
+        drop_fence_with(failing_fence, || {
+            drop_ctx_fence_with(recording_ctx_fence, || {
+                let set = buf.used_streams.borrow();
+                fence_all_streams(&set, current_drop_fence());
+            });
+        });
+
+        CTX_FENCED.with(|c| {
+            assert_eq!(
+                *c.borrow(),
+                1,
+                "a failed per-stream fence (destroyed per-query stream) must \
+                 escalate to EXACTLY ONE device-wide cuCtxSynchronize, even with \
+                 multiple failing streams"
+            );
+        });
+    }
+
+    #[test]
+    fn all_successful_per_stream_fences_never_ctx_sync() {
+        CTX_FENCED.with(|c| *c.borrow_mut() = 0);
+        let buf: GpuBuffer<u8> = GpuBuffer::empty();
+        buf.mark_stream_use(fake_stream(0x1));
+        buf.mark_stream_use(fake_stream(0x2));
+
+        drop_fence_with(recording_fence, || {
+            drop_ctx_fence_with(recording_ctx_fence, || {
+                let set = buf.used_streams.borrow();
+                fence_all_streams(&set, current_drop_fence());
+            });
+        });
+
+        CTX_FENCED.with(|c| {
+            assert_eq!(
+                *c.borrow(),
+                0,
+                "the all-success path must never device-wide sync — only the \
+                 error path escalates (conservative: more work, never less)"
+            );
+        });
     }
 
     // ---- C-1: view back-reference forwards into the parent's set ---------

@@ -223,9 +223,10 @@ fn collect_group_by_aggregate_runs_through_engine() {
 }
 
 /// `filter()` chained with `select()` — exercises predicate lowering on
-/// the DataFrame path. The engine's projection-with-filter pipeline COMPACTS
-/// its output (only matching rows survive, in original order), so the
-/// assertion mirrors the updated `e2e_filtered_select` shape.
+/// the DataFrame path. Per SQL/DuckDB WHERE semantics the engine's
+/// projection-with-filter pipeline COMPACTS (GPU prefix-scan + gather), so the
+/// result holds only the matching rows in source order — mirroring the
+/// `e2e_filtered_select` shape.
 #[test]
 #[ignore = "gpu:e2e"]
 fn collect_filter_then_select_runs_predicate() {
@@ -253,14 +254,13 @@ fn collect_filter_then_select_runs_predicate() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    // `region_id = i % 4` → 512 of 2048 rows match `region_id = 1`.
     let expected: Vec<f64> = (0..2048)
         .filter(|&i| region.value(i) == 1)
         .map(|i| price.value(i))
         .collect();
-    assert_eq!(out.num_rows(), expected.len(), "compacted row count");
-    assert_eq!(out.num_rows(), 512, "region_id == 1 matches 2048/4 rows");
-    for (k, want) in expected.iter().enumerate() {
-        assert_eq!(actual.value(k), *want, "compacted row {k}");
+    assert_eq!(out.num_rows(), expected.len(), "compacted row count = #matches");
+    assert_eq!(out.num_rows(), 512, "region_id = 1 matches 512 of 2048 rows");
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(actual.value(i), *want, "compacted row {i}");
     }
 }

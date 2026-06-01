@@ -281,7 +281,9 @@ impl<'a, T: Pod> GpuView<'a, T> {
     /// Byte length of the view (`len * size_of::<T>()`).
     #[inline]
     pub fn byte_len(&self) -> usize {
-        self.len * std::mem::size_of::<T>()
+        self.len
+            .checked_mul(std::mem::size_of::<T>())
+            .expect("GpuView byte_len overflow")
     }
 
     /// Record that `stream` has a kernel launch (or other async op) in
@@ -375,7 +377,9 @@ impl<'a, T: Pod> GpuViewMut<'a, T> {
     /// Byte length of the view (`len * size_of::<T>()`).
     #[inline]
     pub fn byte_len(&self) -> usize {
-        self.len * std::mem::size_of::<T>()
+        self.len
+            .checked_mul(std::mem::size_of::<T>())
+            .expect("GpuView byte_len overflow")
     }
 
     /// Record that `stream` has a kernel launch (or other async op) writing
