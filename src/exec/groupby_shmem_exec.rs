@@ -34,6 +34,7 @@ use crate::exec::groupby_shmem_dispatch::{
     dispatch, AggOp, DispatchInputs, GroupByStrategy,
 };
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
+use crate::exec::gpu_table::{GpuColumnData, GpuTable};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
 use crate::jit::shmem_sum_kernel::{
@@ -146,17 +147,36 @@ fn execute_inner(
     val_arr: &Float64Array,
     n_groups: u32,
 ) -> BoltResult<RecordBatch> {
-    let n_rows = key_arr.len();
-
     // Stage-4 (P1b): per-call stream shared across H2D, kernel, and D2H.
     let stream = CudaStream::null_or_default();
 
     // --- Upload inputs ----------------------------------------------------
-    // We don't go through GpuTable here because this fast-path is currently
-    // invoked from `execute_groupby` which takes a host RecordBatch. A future
-    // refactor can short-circuit to on-device inputs.
+    // Host-upload path. The resident on-device path (`try_execute_resident`)
+    // skips this entirely and reads the key/value buffers straight from the
+    // already-uploaded `GpuTable` — the H2D here is the dominant per-query
+    // cost (~24 ms of q1's ~31 ms at 10M rows).
     let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
     let vals_gpu = GpuVec::<f64>::from_slice_async(val_arr.values(), stream.raw())?;
+
+    run_shmem_sum_core(plan, &keys_gpu, &vals_gpu, key_arr.values(), n_groups, &stream)
+}
+
+/// Kernel launch + D2H + presence scan + output assembly over **borrowed**
+/// device buffers, shared by the host-upload path ([`execute_inner`]) and the
+/// resident on-device path ([`try_execute_resident`]). `keys_gpu` / `vals_gpu`
+/// may be freshly-uploaded buffers OR buffers borrowed from the resident
+/// `GpuTable`; `present_keys` is the host-side key slice (read off the
+/// RecordBatch, no transfer) used only for the presence scan that decides
+/// which slots are emitted.
+fn run_shmem_sum_core(
+    plan: &PhysicalPlan,
+    keys_gpu: &GpuVec<i32>,
+    vals_gpu: &GpuVec<f64>,
+    present_keys: &[i32],
+    n_groups: u32,
+    stream: &CudaStream,
+) -> BoltResult<RecordBatch> {
+    let n_rows = present_keys.len();
 
     // Output buffer sized to slot count (== n_groups since we already
     // gated on max_key < BLOCK_GROUPS, and slot index == key value).
@@ -229,7 +249,7 @@ fn execute_inner(
         params.grid_blocks,
         params.block_threads,
         0,
-        &stream,
+        stream,
         &mut args,
     )?;
 
@@ -243,7 +263,7 @@ fn execute_inner(
     // with no rows must be omitted from the output to match SQL semantics
     // (SUM over an empty group is NULL / absent, not 0).
     let mut present = vec![false; n_groups as usize];
-    for &k in key_arr.values() {
+    for &k in present_keys {
         present[k as usize] = true;
     }
 
@@ -271,6 +291,115 @@ fn execute_inner(
             "shmem_exec: failed to build output RecordBatch: {e}"
         ))
     })
+}
+
+/// Resident on-device variant of [`try_execute`]: identical eligibility, but
+/// the kernel reads keys/values straight from the already-uploaded `GpuTable`
+/// (zero per-query H2D — the dominant per-query cost, ~24 ms of q1's ~31 ms at
+/// 10M rows). Falls back (`None`) to the host-upload path whenever the
+/// resident columns aren't present as plain non-null I32/F64 of the expected
+/// length. `batch` is still consulted for the transfer-free host scans
+/// (max-key range check + presence map); for a singly-registered table
+/// `materialize_table` is an Arc clone, so this adds no copy.
+pub fn try_execute_resident(
+    plan: &PhysicalPlan,
+    resident: &GpuTable,
+    batch: &RecordBatch,
+) -> Option<BoltResult<RecordBatch>> {
+    // --- Plan-shape eligibility (mirrors `try_execute`) ------------------
+    let (pre, aggregate) = match plan {
+        PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
+        _ => return None,
+    };
+    if pre.is_some() {
+        return None;
+    }
+    if aggregate.group_by.len() != 1 || aggregate.aggregates.len() != 1 {
+        return None;
+    }
+    let key_io_idx = aggregate.group_by[0];
+    let key_io = match aggregate.inputs.get(key_io_idx) {
+        Some(io) if io.dtype == DataType::Int32 => io,
+        _ => return None,
+    };
+    let sum_col_name = match &aggregate.aggregates[0] {
+        AggregateExpr::Sum(Expr::Column(name)) => name.as_str(),
+        _ => return None,
+    };
+    let key_arr = batch
+        .column_by_name(&key_io.name)
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())?;
+    let val_arr = batch
+        .column_by_name(sum_col_name)
+        .and_then(|c| c.as_any().downcast_ref::<Float64Array>())?;
+    if key_arr.len() != val_arr.len() {
+        return None;
+    }
+    // NULL-bearing batches defer to the global-atomic path (validity-aware).
+    if key_arr.null_count() > 0 || val_arr.null_count() > 0 {
+        return None;
+    }
+    // Host key scan: max-key range check (transfer-free; reads the batch).
+    let max_key = crate::exec::groupby_tier2_common::scan_max_nonneg_key(key_arr.values())?;
+    if max_key < 0 {
+        return Some(build_empty_result(plan));
+    }
+    let n_groups = max_key as u32 + 1;
+    let inputs = DispatchInputs {
+        n_groups,
+        n_rows: key_arr.len() as u32,
+        n_key_cols: 1,
+        op: AggOp::Sum,
+        value_dtype: DataType::Float64,
+        key_dtype: DataType::Int32,
+    };
+    if dispatch(inputs) != GroupByStrategy::SharedMemPreAgg {
+        return None;
+    }
+
+    // --- Resolve resident device buffers; fall back if not plain non-null
+    //     I32/F64 of the expected length. ----------------------------------
+    let keys_gpu = resident_i32(resident, &key_io.name)?;
+    let vals_gpu = resident_f64(resident, sum_col_name)?;
+    if keys_gpu.len() != key_arr.len() || vals_gpu.len() != val_arr.len() {
+        return None;
+    }
+
+    let stream = CudaStream::null_or_default();
+    Some(run_shmem_sum_core(
+        plan,
+        keys_gpu,
+        vals_gpu,
+        key_arr.values(),
+        n_groups,
+        &stream,
+    ))
+}
+
+/// Borrow a resident column's `i32` device buffer by name, declining
+/// (`None`) if it's absent, nullable, or not a plain `I32` column.
+fn resident_i32<'a>(rt: &'a GpuTable, name: &str) -> Option<&'a GpuVec<i32>> {
+    let col = rt.columns.iter().find(|c| c.name == name)?;
+    if col.data.validity_ptr().is_some() {
+        return None;
+    }
+    match &col.data {
+        GpuColumnData::I32(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Borrow a resident column's `f64` device buffer by name, declining
+/// (`None`) if it's absent, nullable, or not a plain `F64` column.
+fn resident_f64<'a>(rt: &'a GpuTable, name: &str) -> Option<&'a GpuVec<f64>> {
+    let col = rt.columns.iter().find(|c| c.name == name)?;
+    if col.data.validity_ptr().is_some() {
+        return None;
+    }
+    match &col.data {
+        GpuColumnData::F64(v) => Some(v),
+        _ => None,
+    }
 }
 
 /// Build a 0-row output `RecordBatch` matching the plan's output schema.

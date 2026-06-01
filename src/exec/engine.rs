@@ -2592,8 +2592,26 @@ impl Engine {
                         crate::exec::groupby_with_pre::execute_groupby_with_pre(phys, &batch)?
                     }
                     (true, false) => {
+                        // Performance: try the resident on-device GROUP BY path
+                        // first (keys/values read from the already-uploaded
+                        // GpuTable, no per-query re-upload — the H2D dominates a
+                        // low-cardinality SUM's wall-clock). `batch` is a cheap
+                        // Arc clone for a singly-registered table and is still
+                        // needed for the transfer-free host key scans. Falls
+                        // back to the host-upload path on `None`, preserving
+                        // behaviour for shapes without a resident variant. The
+                        // resident Ref is scoped to this arm.
                         let batch = self.materialize_table(table)?;
-                        crate::exec::groupby::execute_groupby(phys, &batch)?
+                        let fast = match self.ensure_gpu_table(table) {
+                            Ok(resident) => crate::exec::groupby::try_execute_groupby_resident(
+                                phys, &resident, &batch,
+                            ),
+                            Err(_) => None,
+                        };
+                        match fast {
+                            Some(r) => r?,
+                            None => crate::exec::groupby::execute_groupby(phys, &batch)?,
+                        }
                     }
                     (false, true) => {
                         // Performance: try the fully on-device resident path

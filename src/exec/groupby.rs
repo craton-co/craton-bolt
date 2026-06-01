@@ -247,6 +247,28 @@ use crate::exec::groupby_common::{
     download_pinned_i64, next_pow2, pack_keys, unique_count, KeyComponent, KeyValue,
 };
 
+/// Resident on-device GROUP BY fast path — the perf companion to
+/// [`execute_groupby`]. Tries each tier executor's *resident* variant, which
+/// reads keys/values straight from the already-uploaded `GpuTable` instead of
+/// re-uploading them from the host batch every query (the H2D upload is ~78%
+/// of a low-cardinality SUM's wall-clock at 10M rows — see
+/// `examples/profile_groupby.rs`). Returns `None` to fall back to
+/// `execute_groupby` (the host-upload path), preserving behaviour for every
+/// shape without a resident variant yet.
+///
+/// `batch` is the host-materialised table (an Arc clone for a singly-registered
+/// table) consulted only for transfer-free host scans (key range / presence);
+/// `resident` carries the device buffers. Currently only the Tier-1 shared-mem
+/// single-`SUM(Float64)`-by-`Int32` path is implemented on-device; everything
+/// else falls through.
+pub fn try_execute_groupby_resident(
+    plan: &PhysicalPlan,
+    resident: &crate::exec::gpu_table::GpuTable,
+    batch: &RecordBatch,
+) -> Option<BoltResult<RecordBatch>> {
+    crate::exec::groupby_shmem_exec::try_execute_resident(plan, resident, batch)
+}
+
 /// Execute a GROUP BY aggregate plan against a host-side `RecordBatch`.
 ///
 /// `plan` must be `PhysicalPlan::Aggregate` with non-empty `group_by`.
