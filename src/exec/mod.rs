@@ -3,6 +3,12 @@
 #[doc(hidden)]
 pub mod launch;
 pub mod engine;
+// Pure-reorg split of the former monolithic `engine.rs`: self-contained items
+// moved into sibling modules. `engine` re-imports the names it still uses.
+mod engine_cache_key;
+mod engine_device_col;
+mod engine_provider;
+mod engine_support;
 /// Process-wide JIT-module cache shared across executors. Lifted out of
 /// per-file `static MODULE_CACHE` declarations to avoid the multi-GPU
 /// hazard described in the module docs.
