@@ -407,23 +407,20 @@ pub fn compile_partition_reduce_kernel() -> BoltResult<String> {
     // 2=ready): spin on an acquire-load of `set` until the claimer publishes
     // (it stores set:=2 AFTER the key, below) before reading the key. Bounded
     // and deadlock-free on sm_70 — independent thread scheduling lets the
-    // claimer make progress while a same-warp prober spins.
-    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
-    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd35];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
-    // Yield so the same-warp claimer can run and publish set:=2. A bare spin
-    // can starve the publisher under sm_70 scheduling and hang -> TDR. %r36 is
-    // dead here (reloaded next iteration), so reuse it as the sleep operand.
-    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
-    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
-    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
-    // Key is now guaranteed published (released by the claimer's set:=2,
-    // observed via the acquire-load above), so a plain load is safe.
-    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    // claimer make progress while a same-warp prober spins. Shared verbatim
+    // (modulo key width / register tokens) with the spill variant and the i64
+    // sibling; see emit_publish_probe_protocol.
+    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
+        &mut ptx,
+        &super::partition_reduce_kernel_spill_common::PublishRegs {
+            set_flag_reg: "%r36",
+            set_addr_reg: "%rd35",
+            key_addr_reg: "%rd36",
+            key_dst_reg: "%r35",
+            probe_key_reg: "%r31",
+        },
+        "s32",
+    )?;
     // Collision: advance slot = (slot + 1) & mask.
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
     writeln!(
@@ -716,18 +713,17 @@ pub fn compile_partition_reduce_kernel_with_spill() -> BoltResult<String> {
     // the claimer publishes (set:=2 after its key store) before reading the
     // key, so a mid-publish claimer can't make us read a stale 0 and mint a
     // duplicate group. Deadlock-free on sm_70 (independent thread scheduling).
-    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
-    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd35];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
-    // Yield to the same-warp claimer (Volta spin-livelock / TDR avoidance).
-    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
-    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
-    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r35, [%rd36];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
+        &mut ptx,
+        &super::partition_reduce_kernel_spill_common::PublishRegs {
+            set_flag_reg: "%r36",
+            set_addr_reg: "%rd35",
+            key_addr_reg: "%rd36",
+            key_dst_reg: "%r35",
+            probe_key_reg: "%r31",
+        },
+        "s32",
+    )?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
     writeln!(
         ptx,

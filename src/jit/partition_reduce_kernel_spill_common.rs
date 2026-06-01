@@ -225,6 +225,92 @@ pub(crate) fn emit_loop_next_done(ptx: &mut String) -> BoltResult<()> {
     Ok(())
 }
 
+/// Register / type tokens that vary between the i32-key and i64-key SUM
+/// kernels when emitting the 3-state publish/probe protocol
+/// ([`emit_publish_probe_protocol`]).
+///
+/// Every field is the *full* PTX register token (including the `%r` / `%rd`
+/// prefix) or a bare type token, so the helper never has to know a width —
+/// it just substitutes the strings verbatim.
+pub(crate) struct PublishRegs<'a> {
+    /// Set-flag scratch register, re-used as the `nanosleep` operand. `%r36`
+    /// in both the i32 and i64 SUM kernels.
+    pub set_flag_reg: &'a str,
+    /// Address register holding `addr_set` (the set-flag slot). `%rd35` in
+    /// both SUM kernels.
+    pub set_addr_reg: &'a str,
+    /// Address register holding `addr_key` (the key slot). `%rd36` in both
+    /// SUM kernels.
+    pub key_addr_reg: &'a str,
+    /// Destination register for the published key load. `%r35` (i32) /
+    /// `%rd61` (i64).
+    pub key_dst_reg: &'a str,
+    /// The probe key register compared against the loaded key. `%r31` (i32) /
+    /// `%rd60` (i64).
+    pub probe_key_reg: &'a str,
+}
+
+/// Emit the 3-state publish/probe protocol for the open-addressing hash
+/// table — the claim-then-publish race fix shared verbatim (modulo register
+/// numbers and the key-type token) by all four SUM emitters (i32 / i64, each
+/// in its non-spill and `_with_spill` form).
+///
+/// Emits, starting at the `PUBLISH_WAIT:` label and ending with the
+/// `@%p4 bra MATCH;` collision/match branch:
+///
+/// ```text
+/// PUBLISH_WAIT:
+/// \tld.volatile.shared.u32 {set_flag_reg}, [{set_addr_reg}];
+/// \tsetp.eq.u32 %p7, {set_flag_reg}, 2;
+/// \t@%p7 bra PUBLISH_DONE;
+/// \tmov.u32 {set_flag_reg}, 32;
+/// \tnanosleep.u32 {set_flag_reg};
+/// \tbra PUBLISH_WAIT;
+/// PUBLISH_DONE:
+/// \tld.shared.{key_ty} {key_dst_reg}, [{key_addr_reg}];
+/// \tsetp.eq.{key_ty} %p4, {key_dst_reg}, {probe_key_reg};
+/// \t@%p4 bra MATCH;
+/// ```
+///
+/// `key_ty` is the signed-integer key-type token (`s32` for the i32-key
+/// kernel, `s64` for the i64-key kernel); it appears both as the
+/// `ld.shared` width and the `setp.eq` width. Every other character is
+/// literal text shared by all four call sites — only the register tokens
+/// and `key_ty` are substituted, so the emitted bytes are unchanged.
+pub(crate) fn emit_publish_probe_protocol(
+    ptx: &mut String,
+    regs: &PublishRegs,
+    key_ty: &str,
+) -> BoltResult<()> {
+    let PublishRegs {
+        set_flag_reg,
+        set_addr_reg,
+        key_addr_reg,
+        key_dst_reg,
+        probe_key_reg,
+    } = regs;
+    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.volatile.shared.u32 {set_flag_reg}, [{set_addr_reg}];"
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.u32 %p7, {set_flag_reg}, 2;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 {set_flag_reg}, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 {set_flag_reg};").map_err(write_err)?;
+    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
+    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tld.shared.{key_ty} {key_dst_reg}, [{key_addr_reg}];").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.eq.{key_ty} %p4, {key_dst_reg}, {probe_key_reg};"
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests — exact byte-output assertions so regressions surface immediately.
 // ---------------------------------------------------------------------------
@@ -306,6 +392,68 @@ mod tests {
              \tld.global.u32 %r10, [%rd11];\n\
              \tadd.s64 %rd12, %rd11, 4;\n\
              \tld.global.u32 %r11, [%rd12];\n"
+        );
+    }
+
+    #[test]
+    fn publish_probe_protocol_i32_emits_expected_bytes() {
+        let mut s = String::new();
+        emit_publish_probe_protocol(
+            &mut s,
+            &PublishRegs {
+                set_flag_reg: "%r36",
+                set_addr_reg: "%rd35",
+                key_addr_reg: "%rd36",
+                key_dst_reg: "%r35",
+                probe_key_reg: "%r31",
+            },
+            "s32",
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            "PUBLISH_WAIT:\n\
+             \tld.volatile.shared.u32 %r36, [%rd35];\n\
+             \tsetp.eq.u32 %p7, %r36, 2;\n\
+             \t@%p7 bra PUBLISH_DONE;\n\
+             \tmov.u32 %r36, 32;\n\
+             \tnanosleep.u32 %r36;\n\
+             \tbra PUBLISH_WAIT;\n\
+             PUBLISH_DONE:\n\
+             \tld.shared.s32 %r35, [%rd36];\n\
+             \tsetp.eq.s32 %p4, %r35, %r31;\n\
+             \t@%p4 bra MATCH;\n"
+        );
+    }
+
+    #[test]
+    fn publish_probe_protocol_i64_emits_expected_bytes() {
+        let mut s = String::new();
+        emit_publish_probe_protocol(
+            &mut s,
+            &PublishRegs {
+                set_flag_reg: "%r36",
+                set_addr_reg: "%rd35",
+                key_addr_reg: "%rd36",
+                key_dst_reg: "%rd61",
+                probe_key_reg: "%rd60",
+            },
+            "s64",
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            "PUBLISH_WAIT:\n\
+             \tld.volatile.shared.u32 %r36, [%rd35];\n\
+             \tsetp.eq.u32 %p7, %r36, 2;\n\
+             \t@%p7 bra PUBLISH_DONE;\n\
+             \tmov.u32 %r36, 32;\n\
+             \tnanosleep.u32 %r36;\n\
+             \tbra PUBLISH_WAIT;\n\
+             PUBLISH_DONE:\n\
+             \tld.shared.s64 %rd61, [%rd36];\n\
+             \tsetp.eq.s64 %p4, %rd61, %rd60;\n\
+             \t@%p4 bra MATCH;\n"
         );
     }
 
