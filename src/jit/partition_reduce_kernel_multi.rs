@@ -342,21 +342,17 @@ pub fn compile_partition_reduce_kernel_multi(n_vals: u32) -> BoltResult<String> 
     // 3-state set flag (0=empty, 1=claimed/publishing, 2=ready): spin on an
     // acquire-load of `set` until the claimer publishes (it stores set:=2 after
     // the key, in CLAIM) before reading the key. Deadlock-free on sm_70.
-    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
-    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd93];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
-    // Yield so the same-warp claimer can run and publish set:=2. A bare spin
-    // can starve the publisher under sm_70 thread scheduling and hang the
-    // kernel (-> Windows TDR / illegal-access). %r36 is dead here (reloaded
-    // next iter), so reuse it as the nanosleep operand.
-    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
-    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
-    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r35, [%rd94];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
+        &mut ptx,
+        &super::partition_reduce_kernel_spill_common::PublishRegs {
+            set_flag_reg: "%r36",
+            set_addr_reg: "%rd93",
+            key_addr_reg: "%rd94",
+            key_dst_reg: "%r35",
+            probe_key_reg: "%r31",
+        },
+        "s32",
+    )?;
     // Collision: advance.
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
     writeln!(
@@ -682,18 +678,17 @@ pub fn compile_partition_reduce_kernel_multi_with_spill(n_vals: u32) -> BoltResu
     // acquire-load of `set` until the claimer publishes (set:=2 after its key
     // store) before reading the key, so a mid-publish claimer can't make us
     // read a stale 0 and mint a duplicate group. Deadlock-free on sm_70.
-    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
-    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd93];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
-    // Yield to the same-warp claimer (Volta spin-livelock / TDR avoidance).
-    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
-    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
-    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r35, [%rd94];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p4, %r35, %r31;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
+        &mut ptx,
+        &super::partition_reduce_kernel_spill_common::PublishRegs {
+            set_flag_reg: "%r36",
+            set_addr_reg: "%rd93",
+            key_addr_reg: "%rd94",
+            key_dst_reg: "%r35",
+            probe_key_reg: "%r31",
+        },
+        "s32",
+    )?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
     writeln!(
         ptx,

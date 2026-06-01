@@ -246,17 +246,17 @@ pub fn compile_partition_reduce_kernel_multi_i64(n_vals: u32) -> BoltResult<Stri
     // 3-state publish protocol (claim-then-write race fix; set u32 at %rd93,
     // key i64 at %rd94). VOLATILE SHARED re-read of set + nanosleep yield
     // until the claimer publishes set:=2, THEN read the i64 key.
-    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
-    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd93];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
-    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
-    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s64 %rd61, [%rd94];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s64 %p4, %rd61, %rd60;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
+        &mut ptx,
+        &super::partition_reduce_kernel_spill_common::PublishRegs {
+            set_flag_reg: "%r36",
+            set_addr_reg: "%rd93",
+            key_addr_reg: "%rd94",
+            key_dst_reg: "%rd61",
+            probe_key_reg: "%rd60",
+        },
+        "s64",
+    )?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
     writeln!(
         ptx,
@@ -560,17 +560,17 @@ pub fn compile_partition_reduce_kernel_multi_i64_with_spill(n_vals: u32) -> Bolt
     writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
 
     // 3-state publish protocol (claim-then-write race fix).
-    writeln!(ptx, "PUBLISH_WAIT:").map_err(write_err)?;
-    writeln!(ptx, "\tld.volatile.shared.u32 %r36, [%rd93];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.u32 %p7, %r36, 2;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p7 bra PUBLISH_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r36, 32;").map_err(write_err)?;
-    writeln!(ptx, "\tnanosleep.u32 %r36;").map_err(write_err)?;
-    writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
-    writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s64 %rd61, [%rd94];").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s64 %p4, %rd61, %rd60;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p4 bra MATCH;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
+        &mut ptx,
+        &super::partition_reduce_kernel_spill_common::PublishRegs {
+            set_flag_reg: "%r36",
+            set_addr_reg: "%rd93",
+            key_addr_reg: "%rd94",
+            key_dst_reg: "%rd61",
+            probe_key_reg: "%rd60",
+        },
+        "s64",
+    )?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
     writeln!(
         ptx,
