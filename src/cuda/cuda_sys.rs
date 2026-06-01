@@ -629,6 +629,19 @@ impl Drop for CudaContext {
         // (cudarc's primary, or the hand-rolled one) is alive.
         crate::cuda::stream_pool::drain();
 
+        // Clear the process-global JIT module caches BEFORE the context is
+        // destroyed. A cached `CudaModule` handle is valid only in the context
+        // that loaded it, and these caches key on the device ordinal (not the
+        // context identity), so on a single-GPU host a later `Engine::new()`
+        // (a fresh context, same device) would otherwise be served a module
+        // bound to THIS now-dead context and fail its first launch with
+        // `cuModuleGetFunction ... invalid resource handle`. This is the
+        // module-lifetime analogue of the dangling-pool-pointer guard above;
+        // the `Arc`-backed `cuModuleUnload` fires here while the context is
+        // still current. Runs on both backends (modules are loaded into the
+        // current context regardless of the `cudarc` feature).
+        crate::exec::module_cache::clear_all_caches();
+
         // Default backend only: tear down the hand-rolled context.
         // Under `--features cudarc` we never minted one (`raw` is null);
         // cudarc owns its primary context and will release it at process

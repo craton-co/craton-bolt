@@ -239,6 +239,19 @@ impl PtxCache {
         self.by_key.len()
     }
 
+    /// Drop every cached module, resetting the LRU structure. The cumulative
+    /// hit/miss/eviction counters are preserved (observability). Used on CUDA
+    /// context teardown via [`clear_ptx_cache`]: a loaded `CudaModule` is valid
+    /// only in the context that produced it, and this cache keys purely on
+    /// PTX-text hash (no context), so its entries MUST NOT outlive the context.
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.free_list.clear();
+        self.by_key.clear();
+        self.head = None;
+        self.tail = None;
+    }
+
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.by_key.is_empty()
@@ -404,6 +417,24 @@ static PTX_CACHE: OnceLock<Mutex<PtxCache>> = OnceLock::new();
 
 fn ptx_cache() -> &'static Mutex<PtxCache> {
     PTX_CACHE.get_or_init(|| Mutex::new(PtxCache::new()))
+}
+
+/// Clear the process-wide loaded-module (PTX) cache. Called on CUDA context
+/// teardown (`cuda::cuda_sys::CudaContext::Drop`, via
+/// `exec::module_cache::clear_all_caches`).
+///
+/// A cached [`CudaModule`] wraps a `CUmodule` that is valid ONLY in the context
+/// that loaded it, but this cache keys purely on the PTX-text hash — there is
+/// no device or context in the key. So once a context is destroyed, every
+/// module it loaded is dangling; a later `Engine` (new context, same PTX) would
+/// be handed that dead handle and fail with `cuModuleGetFunction ... invalid
+/// resource handle`. Clearing here drops the cache's `Arc<CudaModuleInner>`
+/// clones; the real `cuModuleUnload` runs (when the last clone drops) while the
+/// outgoing context is still current. No-op if the cache was never initialised.
+pub(crate) fn clear_ptx_cache() {
+    if let Some(cache) = PTX_CACHE.get() {
+        cache.lock().clear();
+    }
 }
 
 /// Returns `(hits, misses, evictions)` snapshot of the process-wide PTX cache.

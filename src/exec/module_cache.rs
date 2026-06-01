@@ -207,6 +207,14 @@ impl GlobalModuleCache {
         self.by_key.insert(key, module.clone());
         module
     }
+
+    /// Drop every cached module. Used by [`clear_all_caches`] on context
+    /// teardown — the cached `CudaModule` handles are valid only in the context
+    /// that loaded them, so they must not survive into the next context.
+    fn clear(&mut self) {
+        self.by_key.clear();
+        self.order.clear();
+    }
 }
 
 /// Test- and observability-facing global miss counter.
@@ -217,6 +225,38 @@ impl GlobalModuleCache {
 /// available for cross-executor observability if we ever want it.
 #[doc(hidden)]
 pub static GLOBAL_LOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Clear every process-global module cache. Invoked from `CudaContext::Drop`
+/// (see `cuda::cuda_sys`) while the context is still alive and current, right
+/// alongside `DeviceMemPool::drain()` and `stream_pool::drain()`.
+///
+/// **Why this is required for correctness.** A `CudaModule` handle is valid
+/// only inside the CUDA context that loaded it. These caches are process-wide
+/// statics keyed by `(namespace, spec_id)` with only the *device ordinal*
+/// folded in — not the context identity — so on a single-GPU host a later
+/// `Engine::new()` (a brand-new context on the same device) hashes to the SAME
+/// slot and would be served a `CudaModule` bound to the previous, now-destroyed
+/// context. The first kernel launch then fails with
+/// `cuModuleGetFunction(...) invalid resource handle` (CUDA_ERROR_INVALID_HANDLE,
+/// code 400). This is the exact module-lifetime analogue of the dangling pooled
+/// `CUdeviceptr` problem that `POOL.drain()` already guards against.
+///
+/// Clearing drops this layer's `Arc<CudaModuleInner>` clones; the real
+/// `cuModuleUnload` fires (via `Arc` drop) while the context is still current,
+/// reclaiming the cubins cleanly. A module still held by an in-flight caller
+/// keeps its own `Arc` and is unloaded when that last reference drops.
+pub(crate) fn clear_all_caches() {
+    GLOBAL_MODULE_CACHE.lock().clear();
+    KERNELSPEC_CACHE.lock().clear();
+    SCALARAGG_CACHE.lock().clear();
+    HASHJOIN_CACHE.lock().clear();
+    RADIXSORT_CACHE.lock().clear();
+    COMPACTION_CACHE.lock().clear();
+    // The lower PTX-text-hash cache in `jit_compiler` holds the actual loaded
+    // `CudaModule` handles and keys WITHOUT any context/device — it is the real
+    // source of cross-context stale handles, so it must be cleared too.
+    crate::jit::jit_compiler::clear_ptx_cache();
+}
 
 /// Look up (or build, on a miss) the `CudaModule` for `(namespace, spec_id)`.
 ///
@@ -503,6 +543,15 @@ impl<K: CacheKey> SpecCache<K> {
             hits: 0,
             misses: 0,
         }
+    }
+
+    /// Drop every cached entry (keeping `cap` and the cumulative hit/miss
+    /// counters). Used by [`clear_all_caches`] on context teardown: a cached
+    /// `CudaModule` is only valid in the context that loaded it, so the cache
+    /// must be emptied before that context is destroyed.
+    fn clear(&mut self) {
+        self.by_key.clear();
+        self.order.clear();
     }
 
     /// Look up `key`; on a hit, return the cached entry (cheap clone — the
