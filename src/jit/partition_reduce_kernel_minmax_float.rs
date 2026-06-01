@@ -53,6 +53,7 @@
 use std::fmt::Write;
 
 use crate::error::{BoltError, BoltResult};
+use crate::jit::partition_reduce_kernel::KeyWidth;
 use crate::jit::partition_reduce_kernel_minmax::MinMaxOp;
 
 pub const BLOCK_GROUPS: u32 = 1024;
@@ -121,19 +122,43 @@ pub fn compile_partition_reduce_kernel_minmax_float(
     dtype: FloatDtype,
 ) -> BoltResult<String> {
     let entry = kernel_entry(op, dtype);
-    emit_kernel(op, dtype, entry.as_str(), "", false)
+    emit_minmax_float_kernel(KeyWidth::I32, op, dtype, entry.as_str(), "", false)
 }
 
-/// Shared body emitter for both the non-spill and `_with_spill` float
-/// MIN/MAX kernels. The two variants are ~80% byte-identical; this routine
-/// emits the common scaffolding and branches on `spill` only where the
-/// emitted PTX actually diverges (extra spill-counter param + load, the
-/// `MAX_PROBES`-overflow target, the dropped collision back-off, the
-/// `MATCH` fall-through vs explicit branch + `SPILL_BUMP`, and the export
-/// predicate numbering). `buf_suffix` distinguishes the shared-memory
-/// buffer symbol names (`""` for the base kernel, `"_sp"` for the spill
-/// sibling) so the two compilation units do not collide.
-fn emit_kernel(
+/// Unified key-width-parameterised float MIN/MAX generator.
+///
+/// Emits BOTH the i32-key kernel (this file's public
+/// `compile_partition_reduce_kernel_minmax_float{,_with_spill}`) and the
+/// i64-key kernel (`partition_reduce_kernel_minmax_float_i64`'s
+/// `compile_partition_reduce_kernel_minmax_float_i64{,_with_spill}`, which
+/// delegate here). The whole scaffold — header, entry/regs framing,
+/// shmem-base + global-pointer setup, partition-slice read, the
+/// publish/probe protocol, the float CAS-loop accumulate, and the export
+/// control flow — is written ONCE. Only the genuinely key-dependent bytes
+/// branch on `key_width`:
+///
+///   * shmem `block_keys` align + byte size (4 B/slot vs 8 B/slot),
+///   * the `%rd<N>` register-file width (i32 keeps `%rd<64>`; i64 non-spill
+///     `%rd<80>`, i64 spill `%rd<96>`),
+///   * the zero-init key store width + scratch-register order,
+///   * the probe-prologue key load (`s32`+direct slot vs `s64`+`cvt.u32.u64`)
+///     and the slot-addr scratch-register order,
+///   * the publish/probe `PublishRegs` + key-type token,
+///   * the CLAIM key store width,
+///   * the export key load/store width + scratch-register order.
+///
+/// The float value handling — the CAS retry loop, the `setp.{lt,gt}.f{32,64}`
+/// comparison, the `selp.b{32,64}` pick, and the `±inf` identity init — is
+/// INDEPENDENT of the key width and is emitted identically for both. The
+/// `op`/`dtype`/`spill` runtime parameters are preserved exactly as the prior
+/// within-file dedup left them.
+///
+/// `buf_suffix` distinguishes the shared-memory buffer symbol names (`""` for
+/// the base kernel, `"_sp"` for the spill sibling) so the two compilation
+/// units do not collide.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_minmax_float_kernel(
+    key_width: KeyWidth,
     op: MinMaxOp,
     dtype: FloatDtype,
     entry: &str,
@@ -144,7 +169,10 @@ fn emit_kernel(
     let block_groups = BLOCK_GROUPS;
     let mask = BLOCK_GROUPS - 1;
     let block_threads = BLOCK_THREADS;
-    let keys_bytes = BLOCK_GROUPS * 4;
+    let keys_bytes = match key_width {
+        KeyWidth::I32 => BLOCK_GROUPS * 4,
+        KeyWidth::I64 => BLOCK_GROUPS * 8,
+    };
     let val_bytes_per_slot = dtype.bytes();
     let vals_bytes = BLOCK_GROUPS * val_bytes_per_slot;
     let set_bytes = BLOCK_GROUPS * 4;
@@ -165,6 +193,7 @@ fn emit_kernel(
 
     emit_shared_buffers(
         &mut ptx,
+        key_width,
         buf_suffix,
         val_bytes_per_slot,
         keys_bytes,
@@ -172,13 +201,14 @@ fn emit_kernel(
         set_bytes,
     )?;
 
-    emit_entry_and_regs(&mut ptx, entry, spill)?;
+    emit_entry_and_regs(&mut ptx, key_width, entry, spill)?;
 
     emit_prologue(&mut ptx, entry, buf_suffix, spill)?;
 
     // Phase 1: zero shared. Vals init to ±infinity identity.
     emit_zero_phase(
         &mut ptx,
+        key_width,
         dtype,
         &identity_lit,
         val_bytes_per_slot,
@@ -193,11 +223,19 @@ fn emit_kernel(
         FloatDtype::Float64 => "%fd0",
     };
     emit_probe_loop(
-        &mut ptx, op, dtype, val_load, val_reg, mask, max_probes, vbpw, spill,
+        &mut ptx, key_width, op, dtype, val_load, val_reg, mask, max_probes, vbpw, spill,
     )?;
 
     // Phase 3: export.
-    emit_export_phase(&mut ptx, dtype, vbpw, block_groups, block_threads, spill)?;
+    emit_export_phase(
+        &mut ptx,
+        key_width,
+        dtype,
+        vbpw,
+        block_groups,
+        block_threads,
+        spill,
+    )?;
 
     writeln!(ptx, "\tret;").map_err(write_err)?;
     writeln!(ptx, "}}").map_err(write_err)?;
@@ -206,18 +244,26 @@ fn emit_kernel(
 }
 
 /// Emit the three `.shared` buffer declarations + trailing blank line.
-/// `suffix` is appended to each symbol name (`""` base / `"_sp"` spill).
+/// `suffix` is appended to each symbol name (`""` base / `"_sp"` spill). The
+/// `block_keys` align is the only key-width divergence (4 B/slot for i32,
+/// 8 B/slot for i64).
 fn emit_shared_buffers(
     ptx: &mut String,
+    key_width: KeyWidth,
     suffix: &str,
     val_align: u32,
     keys_bytes: u32,
     vals_bytes: u32,
     set_bytes: u32,
 ) -> BoltResult<()> {
+    let keys_align = match key_width {
+        KeyWidth::I32 => 4,
+        KeyWidth::I64 => 8,
+    };
     writeln!(
         ptx,
-        ".shared .align 4 .b8 block_keys_buf{suffix}[{bytes}];",
+        ".shared .align {ka} .b8 block_keys_buf{suffix}[{bytes}];",
+        ka = keys_align,
         bytes = keys_bytes
     )
     .map_err(write_err)?;
@@ -243,7 +289,12 @@ fn emit_shared_buffers(
 /// declarations. The non-spill kernel additionally declares the
 /// `%nstime` back-off operand; the spill kernel drops it (its collision
 /// path has no back-off).
-fn emit_entry_and_regs(ptx: &mut String, entry: &str, spill: bool) -> BoltResult<()> {
+fn emit_entry_and_regs(
+    ptx: &mut String,
+    key_width: KeyWidth,
+    entry: &str,
+    spill: bool,
+) -> BoltResult<()> {
     let last_param = if spill { 6 } else { 5 };
     writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
     for p in 0..last_param {
@@ -253,9 +304,18 @@ fn emit_entry_and_regs(ptx: &mut String, entry: &str, spill: bool) -> BoltResult
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
+    // `%rd` register-file width. The i32-key kernel uses `%rd<64>` for both
+    // variants; the i64-key kernel needs the wider key-handling slots —
+    // `%rd<80>` non-spill, `%rd<96>` spill (the spill null-check + bump
+    // consume the extra `%rd` slots).
+    let rd_count = match (key_width, spill) {
+        (KeyWidth::I32, _) => 64,
+        (KeyWidth::I64, false) => 80,
+        (KeyWidth::I64, true) => 96,
+    };
     writeln!(ptx, "\t.reg .pred  %p<16>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b32   %r<64>;").map_err(write_err)?;
-    writeln!(ptx, "\t.reg .b64   %rd<64>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<{rd_count}>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .f32   %f<16>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .f64   %fd<16>;").map_err(write_err)?;
     if !spill {
@@ -297,6 +357,7 @@ fn emit_prologue(ptx: &mut String, entry: &str, suffix: &str, spill: bool) -> Bo
 /// both variants.
 fn emit_zero_phase(
     ptx: &mut String,
+    key_width: KeyWidth,
     dtype: FloatDtype,
     identity_lit: &str,
     vbpw: u32,
@@ -307,9 +368,20 @@ fn emit_zero_phase(
     writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r20, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd21], 0;").map_err(write_err)?;
+    // block_keys[s] = 0 — i32 stores 4 B (offset %rd20 also serves the set
+    // store), i64 stores 8 B (set needs its own ×4 offset %rd25).
+    match key_width {
+        KeyWidth::I32 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
+            writeln!(ptx, "\tst.shared.u32 [%rd21], 0;").map_err(write_err)?;
+        }
+        KeyWidth::I64 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd20, %r20, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd21, %rd0, %rd20;").map_err(write_err)?;
+            writeln!(ptx, "\tst.shared.u64 [%rd21], 0;").map_err(write_err)?;
+        }
+    }
     writeln!(ptx, "\tmul.wide.u32 %rd22, %r20, {vbpw};").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd23, %rd1, %rd22;").map_err(write_err)?;
     match dtype {
@@ -320,8 +392,19 @@ fn emit_zero_phase(
             writeln!(ptx, "\tst.shared.u64 [%rd23], {identity_lit};").map_err(write_err)?;
         }
     }
-    writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
+    match key_width {
+        KeyWidth::I32 => {
+            // block_set addressed at rd2 + s*4, reusing the key offset %rd20.
+            writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd20;").map_err(write_err)?;
+            writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
+        }
+        KeyWidth::I64 => {
+            // block_set needs its own ×4 offset (%rd20 holds the ×8 key offset).
+            writeln!(ptx, "\tmul.wide.u32 %rd25, %r20, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd24, %rd2, %rd25;").map_err(write_err)?;
+            writeln!(ptx, "\tst.shared.u32 [%rd24], 0;").map_err(write_err)?;
+        }
+    }
     writeln!(ptx, "\tadd.u32 %r20, %r20, {bt};", bt = block_threads).map_err(write_err)?;
     writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
     writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
@@ -343,6 +426,7 @@ fn emit_zero_phase(
 #[allow(clippy::too_many_arguments)]
 fn emit_probe_loop(
     ptx: &mut String,
+    key_width: KeyWidth,
     op: MinMaxOp,
     dtype: FloatDtype,
     val_load: &str,
@@ -357,16 +441,34 @@ fn emit_probe_loop(
     writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
 
-    // key
-    writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s32 %r31, [%rd31];").map_err(write_err)?;
-    // val (typed float)
-    writeln!(ptx, "\tmul.wide.u32 %rd32, %r30, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd33, %rd4, %rd32;").map_err(write_err)?;
-    writeln!(ptx, "\t{val_load} {val_reg}, [%rd33];").map_err(write_err)?;
-    // slot
-    writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
+    // key load + slot derivation. i32 loads an s32 key straight into %r31 and
+    // masks it directly; i64 loads an s64 key into %rd60 then derives the slot
+    // from the low 32 bits via cvt.u32.u64.
+    match key_width {
+        KeyWidth::I32 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.s32 %r31, [%rd31];").map_err(write_err)?;
+            // val (typed float)
+            writeln!(ptx, "\tmul.wide.u32 %rd32, %r30, {vbpw};").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd33, %rd4, %rd32;").map_err(write_err)?;
+            writeln!(ptx, "\t{val_load} {val_reg}, [%rd33];").map_err(write_err)?;
+            // slot = key & mask
+            writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
+        }
+        KeyWidth::I64 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd30, %r30, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.s64 %rd60, [%rd31];").map_err(write_err)?;
+            // val (typed float)
+            writeln!(ptx, "\tmul.wide.u32 %rd32, %r30, {vbpw};").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd33, %rd4, %rd32;").map_err(write_err)?;
+            writeln!(ptx, "\t{val_load} {val_reg}, [%rd33];").map_err(write_err)?;
+            // slot = low32(key) & mask
+            writeln!(ptx, "\tcvt.u32.u64 %r31, %rd60;").map_err(write_err)?;
+            writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
+        }
+    }
     writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
 
     writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
@@ -375,11 +477,25 @@ fn emit_probe_loop(
     let overflow_target = if spill { "SPILL_BUMP" } else { "LOOP_NEXT" };
     writeln!(ptx, "\t@%p2 bra {overflow_target};").map_err(write_err)?;
 
-    writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?; // addr_set
-    writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd34;").map_err(write_err)?; // addr_key
-    writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?; // addr_val
+    // Slot-address compute. addr_set is ×4 in both; addr_key is ×4 reusing
+    // %rd34 for i32 vs a separate ×8 (%rd39) for i64; addr_val is ×vbpw.
+    match key_width {
+        KeyWidth::I32 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?; // addr_set
+            writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd34;").map_err(write_err)?; // addr_key
+            writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, {vbpw};").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?; // addr_val
+        }
+        KeyWidth::I64 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd34, %r32, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd35, %rd2, %rd34;").map_err(write_err)?; // addr_set
+            writeln!(ptx, "\tmul.wide.u32 %rd39, %r32, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd36, %rd0, %rd39;").map_err(write_err)?; // addr_key (i64)
+            writeln!(ptx, "\tmul.wide.u32 %rd37, %r32, {vbpw};").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd38, %rd1, %rd37;").map_err(write_err)?; // addr_val
+        }
+    }
 
     writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
@@ -388,17 +504,22 @@ fn emit_probe_loop(
     // 3-state publish protocol (claim-then-write race fix; see
     // partition_reduce_kernel.rs). VOLATILE SHARED re-read of set (not
     // ld.acquire.cta — that defaults to global and faults on the shared
-    // offset) + nanosleep yield until set:=2, THEN read the key.
+    // offset) + nanosleep yield until set:=2, THEN read the key. Only the key
+    // destination / probe-key registers and the key-type token branch on width.
+    let (key_dst_reg, probe_key_reg, key_ty) = match key_width {
+        KeyWidth::I32 => ("%r35", "%r31", "s32"),
+        KeyWidth::I64 => ("%rd61", "%rd60", "s64"),
+    };
     super::partition_reduce_kernel_spill_common::emit_publish_probe_protocol(
         ptx,
         &super::partition_reduce_kernel_spill_common::PublishRegs {
             set_flag_reg: "%r36",
             set_addr_reg: "%rd35",
             key_addr_reg: "%rd36",
-            key_dst_reg: "%r35",
-            probe_key_reg: "%r31",
+            key_dst_reg,
+            probe_key_reg,
         },
-        "s32",
+        key_ty,
     )?;
     writeln!(ptx, "\tadd.u32 %r32, %r32, 1;").map_err(write_err)?;
     writeln!(ptx, "\tand.b32 %r32, %r32, 0x{mask:X};", mask = mask).map_err(write_err)?;
@@ -408,9 +529,17 @@ fn emit_probe_loop(
     }
     writeln!(ptx, "\tbra PROBE_TOP;").map_err(write_err)?;
 
-    // CLAIM: publish key, fence, then enter the CAS-loop to set the val.
+    // CLAIM: publish key, fence, then enter the CAS-loop to set the val. Only
+    // the key store width (u32+%r31 vs u64+%rd60) branches on width.
     writeln!(ptx, "CLAIM:").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+    match key_width {
+        KeyWidth::I32 => {
+            writeln!(ptx, "\tst.shared.u32 [%rd36], %r31;").map_err(write_err)?;
+        }
+        KeyWidth::I64 => {
+            writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
+        }
+    }
     writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
     emit_cas_loop(ptx, op, dtype, "CLAIM_CAS", val_reg)?;
@@ -444,6 +573,7 @@ fn emit_probe_loop(
 /// are `%p6`/`%p7` instead of `%p5`/`%p6`.
 fn emit_export_phase(
     ptx: &mut String,
+    key_width: KeyWidth,
     dtype: FloatDtype,
     vbpw: u32,
     block_groups: u32,
@@ -458,31 +588,71 @@ fn emit_export_phase(
     writeln!(ptx, "\t@{p_guard} bra EXPORT_DONE;").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
 
-    writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd45, %rd0, %rd44;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.s32 %r47, [%rd45];").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd46, %r41, {vbpw};").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd47, %rd1, %rd46;").map_err(write_err)?;
+    // Load shared slot key + val + set. The key load width / offset stride and
+    // the set-offset scratch register branch on key width; i32 reuses the ×4
+    // key offset %rd44 for the set load, i64 needs its own ×4 offset %rd48.
     let export_val_reg = match dtype {
         FloatDtype::Float32 => "%f8",
         FloatDtype::Float64 => "%fd8",
     };
-    match dtype {
-        FloatDtype::Float32 => {
-            writeln!(ptx, "\tld.shared.f32 {export_val_reg}, [%rd47];").map_err(write_err)?;
+    match key_width {
+        KeyWidth::I32 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd45, %rd0, %rd44;").map_err(write_err)?;
+            writeln!(ptx, "\tld.shared.s32 %r47, [%rd45];").map_err(write_err)?;
+            writeln!(ptx, "\tmul.wide.u32 %rd46, %r41, {vbpw};").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd47, %rd1, %rd46;").map_err(write_err)?;
+            match dtype {
+                FloatDtype::Float32 => {
+                    writeln!(ptx, "\tld.shared.f32 {export_val_reg}, [%rd47];")
+                        .map_err(write_err)?;
+                }
+                FloatDtype::Float64 => {
+                    writeln!(ptx, "\tld.shared.f64 {export_val_reg}, [%rd47];")
+                        .map_err(write_err)?;
+                }
+            }
+            writeln!(ptx, "\tadd.s64 %rd49, %rd2, %rd44;").map_err(write_err)?;
+            writeln!(ptx, "\tld.shared.u32 %r49, [%rd49];").map_err(write_err)?;
         }
-        FloatDtype::Float64 => {
-            writeln!(ptx, "\tld.shared.f64 {export_val_reg}, [%rd47];").map_err(write_err)?;
+        KeyWidth::I64 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd44, %r41, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd45, %rd0, %rd44;").map_err(write_err)?;
+            writeln!(ptx, "\tld.shared.s64 %rd62, [%rd45];").map_err(write_err)?;
+            writeln!(ptx, "\tmul.wide.u32 %rd46, %r41, {vbpw};").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd47, %rd1, %rd46;").map_err(write_err)?;
+            match dtype {
+                FloatDtype::Float32 => {
+                    writeln!(ptx, "\tld.shared.f32 {export_val_reg}, [%rd47];")
+                        .map_err(write_err)?;
+                }
+                FloatDtype::Float64 => {
+                    writeln!(ptx, "\tld.shared.f64 {export_val_reg}, [%rd47];")
+                        .map_err(write_err)?;
+                }
+            }
+            writeln!(ptx, "\tmul.wide.u32 %rd48, %r41, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd49, %rd2, %rd48;").map_err(write_err)?;
+            writeln!(ptx, "\tld.shared.u32 %r49, [%rd49];").map_err(write_err)?;
         }
     }
-    writeln!(ptx, "\tadd.s64 %rd49, %rd2, %rd44;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.u32 %r49, [%rd49];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 {p_set}, %r49, 0;").map_err(write_err)?;
     writeln!(ptx, "\tselp.u32 %r50, 1, 0, {p_set};").map_err(write_err)?;
 
-    writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
-    writeln!(ptx, "\tst.global.s32 [%rd51], %r47;").map_err(write_err)?;
+    // Store the slot out to global. Key store width / offset stride branch on
+    // key width; the val (×vbpw) and set (×1) stores are shared.
+    match key_width {
+        KeyWidth::I32 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
+            writeln!(ptx, "\tst.global.s32 [%rd51], %r47;").map_err(write_err)?;
+        }
+        KeyWidth::I64 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd50, %r42, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd51, %rd6, %rd50;").map_err(write_err)?;
+            writeln!(ptx, "\tst.global.s64 [%rd51], %rd62;").map_err(write_err)?;
+        }
+    }
     writeln!(ptx, "\tmul.wide.u32 %rd52, %r42, {vbpw};").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd53, %rd7, %rd52;").map_err(write_err)?;
     match dtype {
@@ -657,7 +827,7 @@ pub fn compile_partition_reduce_kernel_minmax_float_with_spill(
     dtype: FloatDtype,
 ) -> BoltResult<String> {
     let entry = kernel_entry_with_spill(op, dtype);
-    emit_kernel(op, dtype, entry.as_str(), "_sp", true)
+    emit_minmax_float_kernel(KeyWidth::I32, op, dtype, entry.as_str(), "_sp", true)
 }
 
 fn write_err(e: std::fmt::Error) -> BoltError {
