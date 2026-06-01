@@ -2771,7 +2771,7 @@ mod null_propagation_tests {
     #[test]
     #[ignore = "gpu:tier1"]
     fn v07_async_download_pinned_helpers_do_not_panic() {
-        let stream = CudaStream::null_or_default();
+        let stream = CudaStream::null();
         // If we can't even allocate a 4-element GpuVec on this backend
         // (the stub will Err), short-circuit — the migrated pinned path
         // simply wasn't reachable, which is fine for the "no panic"

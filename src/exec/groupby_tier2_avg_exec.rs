@@ -243,7 +243,7 @@ fn execute_inner(
 
     // Stage-4 (P1b): per-call stream so every H2D upload, kernel
     // launch, and final D2H share one ordering domain.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // ---- Upload inputs --------------------------------------------------
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;

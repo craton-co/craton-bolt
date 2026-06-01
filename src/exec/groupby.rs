@@ -500,7 +500,7 @@ pub fn execute_groupby(
     // ordering domain — the driver can then overlap kernel work with
     // any unrelated activity on the NULL stream. Falls back to NULL if
     // stream creation fails (functionally identical, just no overlap).
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // Build the keys table on the host (filled with EMPTY_KEY) and upload it.
     //

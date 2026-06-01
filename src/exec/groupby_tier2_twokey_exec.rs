@@ -64,34 +64,17 @@ fn pack_two_i32(col0: &[i32], col1: &[i32]) -> Vec<i64> {
     out
 }
 
-/// Two-key Tier-2 fast path — **currently GATED OFF** (always declines) so
-/// two-key single-SUM `GROUP BY` falls through to the correct global-atomic
-/// path. The Tier-2 `partition_reduce_kernel_i64` builds a fixed 1024-slot
-/// per-block open-addressing table; for a high-cardinality two-key GROUP BY
-/// (e.g. h2o q3 — id1×id2 ≈ 250K groups at 10M rows) the per-block distinct-key
-/// count vastly exceeds 1024, so probing degenerates into a multi-second scan
-/// that trips the Windows ~2 s TDR watchdog → CUDA_ERROR_INVALID_HANDLE and a
-/// process crash, BEFORE the MAX_PROBES spill sentinel can fire and route to
-/// the safe path. The crash is data-dependent on distinct-key count (not row
-/// count), which we can't cheaply estimate here, so the path is disabled
-/// wholesale: the global-atomic fallthrough computes the same result correctly
-/// (verified vs DuckDB on q1–q5; q3 ≈ 1.2 s at 10M). Re-enabling needs an
-/// overflow-safe kernel (spill-to-global, or a larger / dynamically-sized
-/// table). See memory `groupby-resident-and-hostscan-finding.md` /
-/// `gpu-validation-known-issues.md` (q3 two-key TDR). The original
-/// implementation is retained in [`try_execute_impl`] for that future re-enable.
+/// Two-key Tier-2 fast path. Re-enabled after the real cause of the h2o-q3
+/// crash was found and fixed: it was NOT a per-block hash-table overflow / TDR
+/// (the reduce kernel runs in ~1–4 ms — see `groupby_tier2_twokey_orchestrator`
+/// phase timings) but the orchestrator's **per-query owned CUDA stream**
+/// (`null_or_default`). Across repeated invocations (e.g. a criterion warmup
+/// loop) the memory pool's stream-aware async-free referenced a now-destroyed
+/// per-query stream, accumulating to a CUDA_ERROR_INVALID_HANDLE / use-after-
+/// free segfault after ~9 iterations. The fix is the same as the q1 resident
+/// path (ab590d3): run the Tier-2 orchestrators on the long-lived NULL stream.
+/// See memory `groupby-resident-and-hostscan-finding.md`.
 pub fn try_execute(
-    _plan: &PhysicalPlan,
-    _batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
-    None
-}
-
-/// Retained two-key Tier-2 implementation (see [`try_execute`] for why it is
-/// currently gated off). Kept compiling so re-enabling is a one-line change
-/// once the per-block-overflow TDR is fixed.
-#[allow(dead_code)]
-fn try_execute_impl(
     plan: &PhysicalPlan,
     batch: &RecordBatch,
 ) -> Option<BoltResult<RecordBatch>> {
@@ -175,7 +158,7 @@ fn execute_inner(
     // orchestrator mints its own stream for its kernel + D2H phase;
     // we synchronize here before handing off so the orchestrator's
     // stream sees a fully-realised input buffer.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // Upload to device. Both vecs are exactly `n_rows` long — the
     // orchestrator's length invariant is the caller's responsibility per
@@ -316,7 +299,7 @@ mod tests {
     fn rejects_non_aggregate_plan() {
         let plan = PhysicalPlan::Union { inputs: vec![] };
         let batch = twokey_sum_batch(0);
-        assert!(try_execute_impl(&plan, &batch).is_none());
+        assert!(try_execute(&plan, &batch).is_none());
     }
 
     /// Below-threshold rows fall through to a smaller path.
@@ -324,7 +307,7 @@ mod tests {
     fn rejects_below_row_threshold() {
         let plan = build_twokey_sum_plan();
         let batch = twokey_sum_batch(1_024);
-        assert!(try_execute_impl(&plan, &batch).is_none());
+        assert!(try_execute(&plan, &batch).is_none());
     }
 
     /// COUNT-shaped agg → wrong shim.
@@ -337,7 +320,7 @@ mod tests {
                 vec![AggregateExpr::Count(Expr::Literal(Literal::Null))];
         }
         let batch = twokey_sum_batch(300_000);
-        assert!(try_execute_impl(&plan, &batch).is_none());
+        assert!(try_execute(&plan, &batch).is_none());
     }
 
     /// Three group keys → not our shape.
@@ -354,7 +337,7 @@ mod tests {
         let batch = twokey_sum_batch(300_000);
         // Even though the batch lacks `k3`, the group_by.len() check fires
         // first and returns None.
-        assert!(try_execute_impl(&plan, &batch).is_none());
+        assert!(try_execute(&plan, &batch).is_none());
     }
 
     /// Int64 key → reject (packing convention is (i32, i32)).
@@ -365,7 +348,7 @@ mod tests {
             aggregate.inputs[0].dtype = DataType::Int64;
         }
         let batch = twokey_sum_batch(300_000);
-        assert!(try_execute_impl(&plan, &batch).is_none());
+        assert!(try_execute(&plan, &batch).is_none());
     }
 }
 
@@ -426,7 +409,7 @@ mod stage4_tests {
             ],
         )
         .unwrap();
-        let out = match try_execute_impl(&plan, &batch) {
+        let out = match try_execute(&plan, &batch) {
             Some(Ok(b)) => b,
             _ => return,
         };

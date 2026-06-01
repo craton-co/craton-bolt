@@ -171,7 +171,7 @@ fn execute_inner(
     let n_vals = val_arrs.len() as u32;
 
     // Stage-4 (P1b): per-call stream shared across H2D / kernel / D2H.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // --- Upload inputs ----------------------------------------------------
     //

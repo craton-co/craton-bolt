@@ -144,7 +144,7 @@ pub fn execute_tier2_twokey_sum(
 
     // Stage-4 (P1b): per-call stream so device allocs, launches, and
     // the final D2H share one ordering domain.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // ----------------------------------------------------------------------
     // Step 1. Allocate partition-pass outputs.

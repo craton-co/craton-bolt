@@ -153,7 +153,7 @@ fn execute_inner(
     n_groups: u32,
 ) -> BoltResult<RecordBatch> {
     // Stage-4 (P1b): per-call stream shared across H2D, kernel, and D2H.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // --- Upload inputs ----------------------------------------------------
     // Host-upload path. The resident on-device path (`try_execute_resident`)

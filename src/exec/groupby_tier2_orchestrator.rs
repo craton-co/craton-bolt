@@ -229,7 +229,7 @@ pub fn execute_tier2_sum(
     // launches, and the final D2H share one ordering domain. Each
     // `launch_with_geometry` already synchronizes on the stream, so the
     // kernel ordering matches the previous NULL-stream behaviour.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // ----------------------------------------------------------------------
     // Step 1. Allocate the partition-pass outputs.

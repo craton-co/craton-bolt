@@ -202,7 +202,7 @@ fn execute_inner(
 
     // Stage-4 (P1b): per-call stream shared across every H2D, kernel
     // launch, and final D2H.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // ---- Host-side pack ------------------------------------------------
     // `(k1 << 32) | (k2 & 0xFFFF_FFFF)`. Matches `groupby.rs::pack_keys`

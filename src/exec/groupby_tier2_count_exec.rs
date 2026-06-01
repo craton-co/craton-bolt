@@ -184,7 +184,7 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
     let n_rows = key_arr.len() as u32;
     // Stage-4 (P1b): per-call stream so H2D, kernels, and the final
     // D2H share one ordering domain.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
 
     let num_partitions = partition_kernel::NUM_PARTITIONS;

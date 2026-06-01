@@ -118,7 +118,7 @@ pub fn execute_tier2_multi_sum(
 
     // Stage-4 (P1b): per-call stream so every device allocation, kernel
     // launch, and the final D2H share one ordering domain.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // ----------------------------------------------------------------------
     // Step 1. Allocate the partition-pass outputs.

@@ -182,7 +182,7 @@ fn execute_inner(
     // The orchestrator mints its own stream for the kernel + D2H phase;
     // splitting the input upload from the launch keeps the orchestrator
     // signature stable (it doesn't take a stream parameter).
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // Upload key column + each value column independently. Sharing a single
     // buffer would require concatenation; the scatter kernel reads per-row

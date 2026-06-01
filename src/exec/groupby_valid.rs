@@ -289,7 +289,7 @@ pub fn execute_groupby_valid(
 
     // Stage-3: per-call stream up front so all subsequent H2D / kernels /
     // D2H land on the same ordering domain.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
 
     // Allocate keys table (arbitrary contents — slot_valid drives occupancy)
     // and the slot_valid table (zero-initialised = all slots empty).
@@ -2878,7 +2878,7 @@ mod tests {
         // stream handle that works under both real CUDA and the stub.
         // We intentionally don't care whether the call succeeds — only
         // that the async path is reachable without panicking.
-        let stream = CudaStream::null_or_default();
+        let stream = CudaStream::null();
         let _ = alloc_agg_spill::<i64>(&stream);
     }
 

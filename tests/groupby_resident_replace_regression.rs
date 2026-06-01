@@ -183,3 +183,39 @@ fn resident_groupby_survives_mixed_shape_sequence_then_replace() {
     engine.replace_table("x", full_batch(big)).expect("replace");
     assert_q1(&engine, big);
 }
+
+/// Repeated-invocation stress: the Tier-2 GROUP BY orchestrators previously ran
+/// on a per-query OWNED CUDA stream (`null_or_default`). Across many calls the
+/// memory pool's stream-aware async-free referenced a now-destroyed per-query
+/// stream, accumulating to a CUDA_ERROR_INVALID_HANDLE / use-after-free segfault
+/// after ~9 iterations (it surfaced as a crash in the olap bench's criterion
+/// warmup loop, originally mis-diagnosed as a high-cardinality kernel TDR — the
+/// reduce kernel is actually ~1-4 ms). The fix runs the orchestrators on the
+/// long-lived NULL stream. This loops the high-cardinality two-key (q3) and
+/// high-card single-key (q5) Tier-2 paths well past the old ~9-iteration crash
+/// point.
+#[test]
+#[ignore = "requires a CUDA device; run with BOLT_BENCH_GPU=1 -- --ignored"]
+fn tier2_high_card_groupby_survives_repeated_invocation() {
+    if std::env::var("BOLT_BENCH_GPU").ok().as_deref() != Some("1") {
+        eprintln!("skipping: set BOLT_BENCH_GPU=1");
+        return;
+    }
+    // 2M rows > TWOKEY_MIN_ROWS (256K) so q3 uses the two-key Tier-2 path; the
+    // accumulation bug is iteration-count-dependent, not size-dependent.
+    let n = 2_000_000;
+    let mut engine = craton_bolt::Engine::new().expect("engine");
+    engine.register_table("x", full_batch(n)).expect("register");
+
+    // q3: two-key Tier-2 (id1×id2). q5: high-card single-key Tier-2 (id3).
+    for i in 0..20 {
+        let h3 = engine
+            .sql("SELECT id1, id2, SUM(v1) FROM x GROUP BY id1, id2")
+            .unwrap_or_else(|e| panic!("q3 iter {i}: {e}"));
+        assert!(h3.record_batch().num_rows() > 0, "q3 iter {i}: empty");
+        let h5 = engine
+            .sql("SELECT id3, SUM(v1) FROM x GROUP BY id3")
+            .unwrap_or_else(|e| panic!("q5 iter {i}: {e}"));
+        assert!(h5.record_batch().num_rows() > 0, "q5 iter {i}: empty");
+    }
+}

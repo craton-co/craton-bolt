@@ -122,7 +122,7 @@ fn execute_inner(
     // Stage-4 (P1b): mint a per-call stream so the input H2D uploads,
     // kernel launches inside the orchestrator, and final D2H share a
     // single ordering domain. Falls back to NULL if creation fails.
-    let stream = CudaStream::null_or_default();
+    let stream = CudaStream::null();
     let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
     let vals_gpu = GpuVec::<f64>::from_slice_async(val_arr.values(), stream.raw())?;
 
