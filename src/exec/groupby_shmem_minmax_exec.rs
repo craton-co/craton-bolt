@@ -112,7 +112,7 @@ fn execute_inner(
 ) -> BoltResult<RecordBatch> {
     let n_rows = key_arr.len() as u32;
     // Stage-4 (P1b): per-call stream shared across H2D / kernel / D2H.
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
 
     // Initialise out_vals to the IDENTITY for the op so global atomics

@@ -218,7 +218,7 @@ fn execute_inner(
     let n_rows = key_arr.len() as u32;
 
     // Stage-4 (P1b): per-call stream shared by all H2D / kernels / D2H.
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
 
     // Upload values. Float64 path only for v0.

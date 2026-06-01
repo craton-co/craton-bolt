@@ -118,7 +118,7 @@ fn execute_inner(
 ) -> BoltResult<RecordBatch> {
     let n_rows = key_arr.len();
     // Stage-4 (P1b): per-call stream shared across H2D, kernel, and D2H.
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
     let mut out_gpu: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_groups as usize, stream.raw())?;
 

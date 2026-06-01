@@ -193,7 +193,7 @@ fn execute_inner(
     let n_aggs = val_arrs.len();
 
     // Stage-4 (P1b): per-call stream shared across every H2D / kernel / D2H.
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
 
     // --- Upload key column ONCE; reused by every SUM + the one COUNT. ----
     let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;

@@ -428,13 +428,32 @@ fn real_stream_fence(stream: CUstream) -> crate::cuda::cuda_sys::CUresult {
 /// stub `Drop` path never fences — so gate it to avoid a dead-code warning.
 #[cfg(any(not(feature = "cuda-stub"), test))]
 fn fence_all_streams(streams: &StreamSet, fence: StreamFenceFn) {
+    let mut any_failed = false;
     for stream in streams.iter() {
         let rc = fence(stream);
         if rc != cuda_sys::CUDA_SUCCESS {
+            any_failed = true;
             log::warn!(
                 "craton-bolt: cuStreamSynchronize before PinnedBuffer free returned {} \
-                 (buffer dropped while a pending DMA may still reference it; the pinned \
-                 pages may be reclaimed before the driver is done with them)",
+                 (stream may be a per-query owned stream that was already destroyed); \
+                 falling back to a device-wide cuCtxSynchronize before cuMemFreeHost",
+                rc
+            );
+        }
+    }
+    if any_failed {
+        // A per-stream fence failed — most likely a destroyed per-query OWNED
+        // stream whose `cuMemcpy*Async` into these pinned pages is still in
+        // flight (`cuStreamSynchronize` on a destroyed stream returns an error
+        // WITHOUT waiting). Freeing the pages now would be a host-side
+        // use-after-free. Drain ALL outstanding device work with a device-wide
+        // `cuCtxSynchronize` before the caller's `cuMemFreeHost`. Strictly
+        // conservative: the error path waits for more work, never less.
+        let rc = current_drop_ctx_fence()();
+        if rc != cuda_sys::CUDA_SUCCESS {
+            log::warn!(
+                "craton-bolt: cuCtxSynchronize fallback before PinnedBuffer free returned {} \
+                 (pinned pages reclaimed despite an unfenced stream; in-flight DMA may have UB'd)",
                 rc
             );
         }
@@ -473,6 +492,57 @@ fn current_drop_fence() -> StreamFenceFn {
         }
     }
     real_stream_fence
+}
+
+/// Signature of the device-wide fence used as the conservative fallback when a
+/// per-stream fence in [`fence_all_streams`] fails (e.g. the stream was a
+/// per-query owned stream that has since been destroyed). Mirrors the
+/// `CtxFenceFn` seam on [`crate::cuda::buffer`]. Gated like `fence_all_streams`:
+/// referenced from the live `Drop` path and from the host-only fence tests, but
+/// unused in a non-test `cuda-stub` build.
+#[cfg(any(not(feature = "cuda-stub"), test))]
+type CtxFenceFn = fn() -> crate::cuda::cuda_sys::CUresult;
+
+/// Production device-wide fence: forwards to `cuCtxSynchronize`, draining every
+/// stream on the current context. Invoked only on the per-stream-fence error
+/// path, where a recorded (likely destroyed) stream could not be fenced
+/// individually; draining the whole context conservatively guarantees no
+/// in-flight DMA still references the pinned pages before `cuMemFreeHost`.
+#[cfg(any(not(feature = "cuda-stub"), test))]
+fn real_ctx_fence() -> crate::cuda::cuda_sys::CUresult {
+    unsafe { cuda_sys::cuCtxSynchronize() }
+}
+
+/// Test seam: when set, the [`fence_all_streams`] device-wide fallback syncs
+/// through this stub instead of the real `cuCtxSynchronize`. Mirrors
+/// `DROP_FENCE_OVERRIDE`.
+#[cfg(test)]
+thread_local! {
+    static DROP_CTX_FENCE_OVERRIDE: Cell<Option<CtxFenceFn>> = const { Cell::new(None) };
+}
+
+/// Install `fence` as the `Drop`-time device-wide fallback fence for the current
+/// thread, run `body`, then restore the previous hook. Test-only.
+#[cfg(test)]
+fn drop_ctx_fence_with<R>(fence: CtxFenceFn, body: impl FnOnce() -> R) -> R {
+    let prev = DROP_CTX_FENCE_OVERRIDE.with(|c| c.replace(Some(fence)));
+    let out = body();
+    DROP_CTX_FENCE_OVERRIDE.with(|c| c.set(prev));
+    out
+}
+
+/// Resolve the device-wide fallback fence: the test override if installed, else
+/// the real `cuCtxSynchronize`.
+#[cfg(any(not(feature = "cuda-stub"), test))]
+#[inline]
+fn current_drop_ctx_fence() -> CtxFenceFn {
+    #[cfg(test)]
+    {
+        if let Some(f) = DROP_CTX_FENCE_OVERRIDE.with(|c| c.get()) {
+            return f;
+        }
+    }
+    real_ctx_fence
 }
 
 impl<T: Pod> Drop for PinnedBuffer<T> {
@@ -851,6 +921,75 @@ mod tests {
             }
         });
         FENCED.with(|f| assert!(f.borrow().is_empty()));
+    }
+
+    // ---- Destroyed per-query stream -> device-wide cuCtxSynchronize fallback -
+    //
+    // Mirrors the `cuda::buffer` test: a failed per-stream fence (a destroyed
+    // per-query owned stream) must escalate to exactly one device-wide
+    // `cuCtxSynchronize` before `cuMemFreeHost` reclaims the pinned pages.
+
+    thread_local! {
+        static CTX_FENCED: std::cell::RefCell<usize> = const { std::cell::RefCell::new(0) };
+    }
+
+    /// Per-stream fence stub that always fails, emulating `cuStreamSynchronize`
+    /// on a destroyed per-query stream (`CUDA_ERROR_INVALID_HANDLE`, 400).
+    fn failing_fence(_stream: CUstream) -> crate::cuda::cuda_sys::CUresult {
+        const INVALID_HANDLE: crate::cuda::cuda_sys::CUresult = 400;
+        INVALID_HANDLE
+    }
+
+    /// Device-wide fence recorder installed via `drop_ctx_fence_with`.
+    fn recording_ctx_fence() -> crate::cuda::cuda_sys::CUresult {
+        CTX_FENCED.with(|c| *c.borrow_mut() += 1);
+        crate::cuda::cuda_sys::CUDA_SUCCESS
+    }
+
+    #[test]
+    fn failed_per_stream_fence_escalates_to_one_ctx_sync() {
+        CTX_FENCED.with(|c| *c.borrow_mut() = 0);
+        let buf: PinnedBuffer<u8> = PinnedBuffer::new(0).expect("zero-len alloc");
+        buf.mark_stream_use(fake_stream(0x11));
+        buf.mark_stream_use(fake_stream(0x22));
+
+        // Pass the failing fence explicitly (the `current_drop_fence` resolver
+        // is gated out under `cuda-stub`, so the existing tests pass the fence
+        // directly to stay buildable on every backend).
+        drop_ctx_fence_with(recording_ctx_fence, || {
+            let set = buf.used_streams.borrow();
+            fence_all_streams(&set, failing_fence);
+        });
+
+        CTX_FENCED.with(|c| {
+            assert_eq!(
+                *c.borrow(),
+                1,
+                "a failed per-stream fence (destroyed per-query stream) must \
+                 escalate to EXACTLY ONE device-wide cuCtxSynchronize"
+            );
+        });
+    }
+
+    #[test]
+    fn all_successful_per_stream_fences_never_ctx_sync() {
+        CTX_FENCED.with(|c| *c.borrow_mut() = 0);
+        let buf: PinnedBuffer<u8> = PinnedBuffer::new(0).expect("zero-len alloc");
+        buf.mark_stream_use(fake_stream(0x1));
+        buf.mark_stream_use(fake_stream(0x2));
+
+        drop_ctx_fence_with(recording_ctx_fence, || {
+            let set = buf.used_streams.borrow();
+            fence_all_streams(&set, recording_fence);
+        });
+
+        CTX_FENCED.with(|c| {
+            assert_eq!(
+                *c.borrow(),
+                0,
+                "the all-success path must never device-wide sync"
+            );
+        });
     }
 
     #[test]

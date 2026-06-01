@@ -10,6 +10,7 @@ pub mod dictionary;
 pub mod dictionary_i64;
 pub mod dictionary_any;
 pub mod mem_pool;
+pub mod stream_pool;
 #[cfg(feature = "cudarc")]
 pub mod cudarc_backend;
 

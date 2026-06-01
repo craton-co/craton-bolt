@@ -391,7 +391,7 @@ pub fn execute_groupby_with_pre(
         ))
     })?;
 
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
     let host_keys_init: Vec<i64> = vec![EMPTY_KEY; k];
     let mut keys_table =
         GpuVec::<i64>::from_slice_async(&host_keys_init, stream.raw())?;
@@ -625,7 +625,7 @@ fn run_pre_stage(
     kernel_params.push(&mut n_rows_u32 as *mut u32 as *mut c_void);
 
     // -- Launch one thread per row.
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
     if n_rows > 0 {
         let grid_x = grid_x_for(n_rows_u32, PRE_BLOCK_SIZE);
         // SAFETY: `function` is borrowed from a live `CudaModule`; every entry
@@ -2771,7 +2771,7 @@ mod null_propagation_tests {
     #[test]
     #[ignore = "gpu:tier1"]
     fn v07_async_download_pinned_helpers_do_not_panic() {
-        let stream = CudaStream::null();
+        let stream = CudaStream::null_or_default();
         // If we can't even allocate a 4-element GpuVec on this backend
         // (the stub will Err), short-circuit — the migrated pinned path
         // simply wasn't reachable, which is fine for the "no panic"

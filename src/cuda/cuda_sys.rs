@@ -616,6 +616,19 @@ impl Drop for CudaContext {
         // pointers are freed against cudarc's still-live primary context.
         crate::cuda::mem_pool::POOL.drain();
 
+        // Destroy the pooled per-call CUDA streams. MUST run AFTER `POOL.drain()`
+        // — that drains the deferred-free list, `cuEventSynchronize`-ing events
+        // that were recorded on these still-live streams; destroying the streams
+        // first could strand that work. By here every `GpuBuffer` has already
+        // dropped (the `Engine` drops `_ctx` last), so no `used_streams` set can
+        // still name a pooled handle, and destroying them while the context is
+        // still current reclaims them cleanly. See `crate::cuda::stream_pool`.
+        // Runs on BOTH backends: the handles were minted via raw
+        // `cuStreamCreate` regardless of the `cudarc` feature, so they must be
+        // released via the matching raw `cuStreamDestroy_v2` while the context
+        // (cudarc's primary, or the hand-rolled one) is alive.
+        crate::cuda::stream_pool::drain();
+
         // Default backend only: tear down the hand-rolled context.
         // Under `--features cudarc` we never minted one (`raw` is null);
         // cudarc owns its primary context and will release it at process

@@ -153,7 +153,7 @@ fn execute_inner(
     n_groups: u32,
 ) -> BoltResult<RecordBatch> {
     // Stage-4 (P1b): per-call stream shared across H2D, kernel, and D2H.
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
 
     // --- Upload inputs ----------------------------------------------------
     // Host-upload path. The resident on-device path (`try_execute_resident`)
@@ -356,18 +356,19 @@ pub fn try_execute_resident(
         return None;
     }
 
-    // IMPORTANT: use the long-lived NULL stream, NOT a per-query owned stream
-    // (`null_or_default`). This path runs kernels that READ the *resident*
-    // GpuTable buffers, which outlive the query (they stay in `gpu_tables`).
-    // A per-query owned stream is destroyed when this fn returns; the pool's
-    // stream-aware async-free then records an event on that dead stream when
-    // the resident table is later freed (e.g. by `replace_table`) →
-    // CUDA_ERROR_INVALID_HANDLE / segfault. The NULL stream is never destroyed,
-    // so the resident buffers are always associated with a live stream. (The
-    // host-upload path keeps `null_or_default` safely: its buffers are owned
-    // and dropped in-query while that stream is still alive. This mirrors the
-    // scalar resident path in `agg_with_pre`, which also uses the NULL stream.)
-    let stream = CudaStream::null();
+    // Per-call owned stream (`null_or_default`) — safe even though this path
+    // runs kernels that READ the *resident* GpuTable buffers (which outlive the
+    // query in `gpu_tables` and get tagged with this stream). The handle stays
+    // valid long after this query because owned streams are POOLED, not
+    // destroyed per call (`crate::cuda::stream_pool`): `CudaStream::Drop` returns
+    // the handle for reuse and the pool is torn down only at context teardown,
+    // after every `GpuBuffer` (including the resident table) has dropped. So when
+    // the resident table is later freed (e.g. by `replace_table`), its drop-time
+    // fence / deferred-free `cuEventRecord` always runs against a LIVE stream
+    // handle — never a destroyed one (which would be UB that faults the host).
+    // This previously needed the NULL stream as a workaround (ab590d3); the
+    // stream-pool fix retired it.
+    let stream = CudaStream::null_or_default();
 
     // On-device key range scan (replaces the ~14 ms host `scan_max_nonneg_key`
     // pass — the keys already live on the device). MAX gives the slot count;

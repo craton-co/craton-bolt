@@ -225,7 +225,7 @@ fn execute_inner(
     let n_rows = k1.len() as u32;
 
     // Stage-4 (P1b): per-call stream threaded through every helper.
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
 
     // ---- Host-side pack ----
     // `(k1 << 32) | (k2 & 0xFFFF_FFFF)`. Matches `groupby.rs::pack_keys`.

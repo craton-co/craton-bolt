@@ -229,7 +229,7 @@ fn execute_inner(
     let n_rows = key_arr.len() as u32;
     // Stage-4 (P1b): single per-call stream threaded through every
     // helper so all H2D / kernels / D2H share one ordering domain.
-    let stream = CudaStream::null();
+    let stream = CudaStream::null_or_default();
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
 
     let num_partitions = partition_kernel::NUM_PARTITIONS;
