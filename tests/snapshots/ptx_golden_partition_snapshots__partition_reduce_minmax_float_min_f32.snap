@@ -92,10 +92,17 @@ PROBE_TOP:
 	atom.shared.cas.b32 %r{10}, [%rd{22}], 0, 1;
 	setp.eq.s32 %p{3}, %r{10}, 0;
 	@%p{3} bra CLAIM;
-	membar.cta;
-	ld.acquire.cta.s32 %r{11}, [%rd{23}];
-	setp.eq.s32 %p{4}, %r{11}, %r{7};
-	@%p{4} bra MATCH;
+PUBLISH_WAIT:
+	ld.volatile.shared.u32 %r{11}, [%rd{22}];
+	setp.eq.u32 %p{4}, %r{11}, 2;
+	@%p{4} bra PUBLISH_DONE;
+	mov.u32 %r{11}, 32;
+	nanosleep.u32 %r{11};
+	bra PUBLISH_WAIT;
+PUBLISH_DONE:
+	ld.shared.s32 %r{12}, [%rd{23}];
+	setp.eq.s32 %p{5}, %r{12}, %r{7};
+	@%p{5} bra MATCH;
 	add.u32 %r{8}, %r{8}, 1;
 	and.b32 %r{8}, %r{8}, 0x3FF;
 	mov.u32 %nstime, 32;
@@ -104,16 +111,17 @@ PROBE_TOP:
 CLAIM:
 	st.shared.u32 [%rd{23}], %r{7};
 	membar.cta;
+	st.shared.u32 [%rd{22}], 2;
 CLAIM_CAS_LOAD:
-	ld.shared.b32 %r{12}, [%rd{25}];
-	mov.b32 %f{1}, %r{12};
+	ld.shared.b32 %r{11}, [%rd{25}];
+	mov.b32 %f{1}, %r{11};
 	mov.b32 %r{13}, %f{0};
-	setp.lt.f32 %p{5}, %f{0}, %f{1};
-	selp.b32 %r{14}, %r{13}, %r{12}, %p{5};
-	setp.eq.b32 %p{6}, %r{14}, %r{12};
+	setp.lt.f32 %p{4}, %f{0}, %f{1};
+	selp.b32 %r{14}, %r{13}, %r{11}, %p{4};
+	setp.eq.b32 %p{6}, %r{14}, %r{11};
 	@%p{6} bra CLAIM_CAS_DONE;
-	atom.shared.cas.b32 %r{15}, [%rd{25}], %r{12}, %r{14};
-	setp.eq.b32 %p{7}, %r{15}, %r{12};
+	atom.shared.cas.b32 %r{15}, [%rd{25}], %r{11}, %r{14};
+	setp.eq.b32 %p{7}, %r{15}, %r{11};
 	@!%p{7} mov.u32 %nstime, 32;
 	@!%p{7} nanosleep.u32 %nstime;
 	@!%p{7} bra CLAIM_CAS_LOAD;
@@ -121,15 +129,15 @@ CLAIM_CAS_DONE:
 	bra LOOP_NEXT;
 MATCH:
 MATCH_CAS_LOAD:
-	ld.shared.b32 %r{12}, [%rd{25}];
-	mov.b32 %f{1}, %r{12};
+	ld.shared.b32 %r{11}, [%rd{25}];
+	mov.b32 %f{1}, %r{11};
 	mov.b32 %r{13}, %f{0};
-	setp.lt.f32 %p{5}, %f{0}, %f{1};
-	selp.b32 %r{14}, %r{13}, %r{12}, %p{5};
-	setp.eq.b32 %p{6}, %r{14}, %r{12};
+	setp.lt.f32 %p{4}, %f{0}, %f{1};
+	selp.b32 %r{14}, %r{13}, %r{11}, %p{4};
+	setp.eq.b32 %p{6}, %r{14}, %r{11};
 	@%p{6} bra MATCH_CAS_DONE;
-	atom.shared.cas.b32 %r{15}, [%rd{25}], %r{12}, %r{14};
-	setp.eq.b32 %p{7}, %r{15}, %r{12};
+	atom.shared.cas.b32 %r{15}, [%rd{25}], %r{11}, %r{14};
+	setp.eq.b32 %p{7}, %r{15}, %r{11};
 	@!%p{7} mov.u32 %nstime, 32;
 	@!%p{7} nanosleep.u32 %nstime;
 	@!%p{7} bra MATCH_CAS_LOAD;

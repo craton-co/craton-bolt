@@ -104,16 +104,24 @@ PROBE_TOP:
 	atom.shared.cas.b32 %r{10}, [%rd{26}], 0, 1;
 	setp.eq.s32 %p{3}, %r{10}, 0;
 	@%p{3} bra CLAIM;
-	membar.cta;
+PUBLISH_WAIT:
+	ld.volatile.shared.u32 %r{11}, [%rd{26}];
+	setp.eq.u32 %p{4}, %r{11}, 2;
+	@%p{4} bra PUBLISH_DONE;
+	mov.u32 %r{11}, 32;
+	nanosleep.u32 %r{11};
+	bra PUBLISH_WAIT;
+PUBLISH_DONE:
 	ld.shared.s64 %rd{29}, [%rd{28}];
-	setp.eq.s64 %p{4}, %rd{29}, %rd{23};
-	@%p{4} bra MATCH;
+	setp.eq.s64 %p{5}, %rd{29}, %rd{23};
+	@%p{5} bra MATCH;
 	add.u32 %r{8}, %r{8}, 1;
 	and.b32 %r{8}, %r{8}, 0x3FF;
 	bra PROBE_TOP;
 CLAIM:
 	st.shared.u64 [%rd{28}], %rd{23};
 	membar.cta;
+	st.shared.u32 [%rd{26}], 2;
 	add.s64 %rd{30}, %rd{1}, %rd{27};
 	atom.shared.add.f64 %fd{2}, [%rd{30}], %fd{0};
 	add.s64 %rd{30}, %rd{2}, %rd{27};
@@ -126,8 +134,8 @@ MATCH:
 	atom.shared.add.f64 %fd{5}, [%rd{30}], %fd{1};
 	bra LOOP_NEXT;
 SPILL_BUMP:
-	setp.eq.u64 %p{5}, %rd{12}, 0;
-	@%p{5} bra LOOP_NEXT;
+	setp.eq.u64 %p{6}, %rd{12}, 0;
+	@%p{6} bra LOOP_NEXT;
 	atom.global.add.u32 %r{11}, [%rd{12}], 1;
 LOOP_NEXT:
 	add.u32 %r{6}, %r{6}, %r{1};
@@ -138,8 +146,8 @@ LOOP_DONE:
 	mul.lo.u32 %r{12}, %r{0}, 1024;
 	mov.u32 %r{13}, %r{2};
 EXPORT_TOP:
-	setp.ge.u32 %p{6}, %r{13}, 1024;
-	@%p{6} bra EXPORT_DONE;
+	setp.ge.u32 %p{7}, %r{13}, 1024;
+	@%p{7} bra EXPORT_DONE;
 	add.u32 %r{14}, %r{12}, %r{13};
 	mul.wide.u32 %rd{31}, %r{13}, 8;
 	add.s64 %rd{32}, %rd{0}, %rd{31};
@@ -151,8 +159,8 @@ EXPORT_TOP:
 	mul.wide.u32 %rd{35}, %r{13}, 4;
 	add.s64 %rd{36}, %rd{3}, %rd{35};
 	ld.shared.u32 %r{15}, [%rd{36}];
-	setp.ne.s32 %p{7}, %r{15}, 0;
-	selp.u32 %r{16}, 1, 0, %p{7};
+	setp.ne.s32 %p{4}, %r{15}, 0;
+	selp.u32 %r{16}, 1, 0, %p{4};
 	mul.wide.u32 %rd{37}, %r{14}, 8;
 	add.s64 %rd{38}, %rd{8}, %rd{37};
 	st.global.s64 [%rd{38}], %rd{33};

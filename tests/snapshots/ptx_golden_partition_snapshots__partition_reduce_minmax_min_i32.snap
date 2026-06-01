@@ -90,10 +90,17 @@ PROBE_TOP:
 	atom.shared.cas.b32 %r{11}, [%rd{22}], 0, 1;
 	setp.eq.s32 %p{3}, %r{11}, 0;
 	@%p{3} bra CLAIM;
-	membar.cta;
-	ld.acquire.cta.s32 %r{12}, [%rd{23}];
-	setp.eq.s32 %p{4}, %r{12}, %r{7};
-	@%p{4} bra MATCH;
+PUBLISH_WAIT:
+	ld.volatile.shared.u32 %r{12}, [%rd{22}];
+	setp.eq.u32 %p{4}, %r{12}, 2;
+	@%p{4} bra PUBLISH_DONE;
+	mov.u32 %r{12}, 32;
+	nanosleep.u32 %r{12};
+	bra PUBLISH_WAIT;
+PUBLISH_DONE:
+	ld.shared.s32 %r{13}, [%rd{23}];
+	setp.eq.s32 %p{5}, %r{13}, %r{7};
+	@%p{5} bra MATCH;
 	add.u32 %r{9}, %r{9}, 1;
 	and.b32 %r{9}, %r{9}, 0x3FF;
 	mov.u32 %nstime, 32;
@@ -102,42 +109,43 @@ PROBE_TOP:
 CLAIM:
 	st.shared.u32 [%rd{23}], %r{7};
 	membar.cta;
-	atom.shared.min.s32 %r{13}, [%rd{25}], %r{8};
+	st.shared.u32 [%rd{22}], 2;
+	atom.shared.min.s32 %r{14}, [%rd{25}], %r{8};
 	bra LOOP_NEXT;
 MATCH:
-	atom.shared.min.s32 %r{14}, [%rd{25}], %r{8};
+	atom.shared.min.s32 %r{15}, [%rd{25}], %r{8};
 LOOP_NEXT:
 	add.u32 %r{6}, %r{6}, %r{1};
 	bra LOOP_TOP;
 LOOP_DONE:
 	bar.sync 0;
 
-	mul.lo.u32 %r{15}, %r{0}, 1024;
-	mov.u32 %r{16}, %r{2};
+	mul.lo.u32 %r{16}, %r{0}, 1024;
+	mov.u32 %r{17}, %r{2};
 EXPORT_TOP:
-	setp.ge.u32 %p{5}, %r{16}, 1024;
-	@%p{5} bra EXPORT_DONE;
-	add.u32 %r{17}, %r{15}, %r{16};
-	mul.wide.u32 %rd{26}, %r{16}, 4;
+	setp.ge.u32 %p{6}, %r{17}, 1024;
+	@%p{6} bra EXPORT_DONE;
+	add.u32 %r{18}, %r{16}, %r{17};
+	mul.wide.u32 %rd{26}, %r{17}, 4;
 	add.s64 %rd{27}, %rd{0}, %rd{26};
-	ld.shared.s32 %r{18}, [%rd{27}];
-	mul.wide.u32 %rd{28}, %r{16}, 4;
+	ld.shared.s32 %r{19}, [%rd{27}];
+	mul.wide.u32 %rd{28}, %r{17}, 4;
 	add.s64 %rd{29}, %rd{1}, %rd{28};
-	ld.shared.s32 %r{19}, [%rd{29}];
+	ld.shared.s32 %r{20}, [%rd{29}];
 	add.s64 %rd{30}, %rd{2}, %rd{26};
-	ld.shared.u32 %r{20}, [%rd{30}];
-	setp.ne.s32 %p{6}, %r{20}, 0;
-	selp.u32 %r{21}, 1, 0, %p{6};
-	mul.wide.u32 %rd{31}, %r{17}, 4;
+	ld.shared.u32 %r{21}, [%rd{30}];
+	setp.ne.s32 %p{7}, %r{21}, 0;
+	selp.u32 %r{22}, 1, 0, %p{7};
+	mul.wide.u32 %rd{31}, %r{18}, 4;
 	add.s64 %rd{32}, %rd{6}, %rd{31};
-	st.global.s32 [%rd{32}], %r{18};
-	mul.wide.u32 %rd{33}, %r{17}, 4;
+	st.global.s32 [%rd{32}], %r{19};
+	mul.wide.u32 %rd{33}, %r{18}, 4;
 	add.s64 %rd{34}, %rd{7}, %rd{33};
-	st.global.s32 [%rd{34}], %r{19};
-	cvt.u64.u32 %rd{35}, %r{17};
+	st.global.s32 [%rd{34}], %r{20};
+	cvt.u64.u32 %rd{35}, %r{18};
 	add.s64 %rd{36}, %rd{8}, %rd{35};
-	st.global.u8 [%rd{36}], %r{21};
-	add.u32 %r{16}, %r{16}, 256;
+	st.global.u8 [%rd{36}], %r{22};
+	add.u32 %r{17}, %r{17}, 256;
 	bra EXPORT_TOP;
 EXPORT_DONE:
 	ret;

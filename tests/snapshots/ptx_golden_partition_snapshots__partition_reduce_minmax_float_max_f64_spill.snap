@@ -94,22 +94,30 @@ PROBE_TOP:
 	atom.shared.cas.b32 %r{10}, [%rd{23}], 0, 1;
 	setp.eq.s32 %p{3}, %r{10}, 0;
 	@%p{3} bra CLAIM;
-	membar.cta;
-	ld.shared.s32 %r{11}, [%rd{24}];
-	setp.eq.s32 %p{4}, %r{11}, %r{7};
-	@%p{4} bra MATCH;
+PUBLISH_WAIT:
+	ld.volatile.shared.u32 %r{11}, [%rd{23}];
+	setp.eq.u32 %p{4}, %r{11}, 2;
+	@%p{4} bra PUBLISH_DONE;
+	mov.u32 %r{11}, 32;
+	nanosleep.u32 %r{11};
+	bra PUBLISH_WAIT;
+PUBLISH_DONE:
+	ld.shared.s32 %r{12}, [%rd{24}];
+	setp.eq.s32 %p{5}, %r{12}, %r{7};
+	@%p{5} bra MATCH;
 	add.u32 %r{8}, %r{8}, 1;
 	and.b32 %r{8}, %r{8}, 0x3FF;
 	bra PROBE_TOP;
 CLAIM:
 	st.shared.u32 [%rd{24}], %r{7};
 	membar.cta;
+	st.shared.u32 [%rd{23}], 2;
 CLAIM_CAS_LOAD:
 	ld.shared.b64 %rd{27}, [%rd{26}];
 	mov.b64 %fd{1}, %rd{27};
 	mov.b64 %rd{28}, %fd{0};
-	setp.gt.f64 %p{5}, %fd{0}, %fd{1};
-	selp.b64 %rd{29}, %rd{28}, %rd{27}, %p{5};
+	setp.gt.f64 %p{4}, %fd{0}, %fd{1};
+	selp.b64 %rd{29}, %rd{28}, %rd{27}, %p{4};
 	setp.eq.b64 %p{6}, %rd{29}, %rd{27};
 	@%p{6} bra CLAIM_CAS_DONE;
 	atom.shared.cas.b64 %rd{30}, [%rd{26}], %rd{27}, %rd{29};
@@ -124,8 +132,8 @@ MATCH_CAS_LOAD:
 	ld.shared.b64 %rd{27}, [%rd{26}];
 	mov.b64 %fd{1}, %rd{27};
 	mov.b64 %rd{28}, %fd{0};
-	setp.gt.f64 %p{5}, %fd{0}, %fd{1};
-	selp.b64 %rd{29}, %rd{28}, %rd{27}, %p{5};
+	setp.gt.f64 %p{4}, %fd{0}, %fd{1};
+	selp.b64 %rd{29}, %rd{28}, %rd{27}, %p{4};
 	setp.eq.b64 %p{6}, %rd{29}, %rd{27};
 	@%p{6} bra MATCH_CAS_DONE;
 	atom.shared.cas.b64 %rd{30}, [%rd{26}], %rd{27}, %rd{29};
@@ -138,7 +146,7 @@ MATCH_CAS_DONE:
 SPILL_BUMP:
 	setp.eq.u64 %p{8}, %rd{9}, 0;
 	@%p{8} bra LOOP_NEXT;
-	atom.global.add.u32 %r{12}, [%rd{9}], 1;
+	atom.global.add.u32 %r{11}, [%rd{9}], 1;
 LOOP_NEXT:
 	add.u32 %r{6}, %r{6}, %r{1};
 	bra LOOP_TOP;
@@ -159,8 +167,8 @@ EXPORT_TOP:
 	ld.shared.f64 %fd{2}, [%rd{34}];
 	add.s64 %rd{35}, %rd{2}, %rd{31};
 	ld.shared.u32 %r{17}, [%rd{35}];
-	setp.ne.s32 %p{5}, %r{17}, 0;
-	selp.u32 %r{18}, 1, 0, %p{5};
+	setp.ne.s32 %p{4}, %r{17}, 0;
+	selp.u32 %r{18}, 1, 0, %p{4};
 	mul.wide.u32 %rd{36}, %r{15}, 4;
 	add.s64 %rd{37}, %rd{6}, %rd{36};
 	st.global.s32 [%rd{37}], %r{16};
