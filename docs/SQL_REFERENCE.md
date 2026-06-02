@@ -42,7 +42,7 @@ Two queries can be combined with `UNION` / `UNION ALL` / `EXCEPT [ALL]` / `INTER
 - **Uncorrelated** scalar (`(SELECT ...)`) and `[NOT] IN (SELECT ...)` subqueries in `SELECT` / `WHERE` are supported (resolved to constants before lowering). An uncorrelated **scalar subquery** is also accepted in `ORDER BY`. **Correlated** scalar and `EXISTS` / `NOT EXISTS` subqueries are rejected. **Derived tables** (a subquery in `FROM`, `(SELECT ...) AS alias`) are supported as of 0.7, with restrictions: the alias is **required** and a column-list alias (`AS d(x, y)`) is rejected. **`LATERAL`** derived tables (correlated, may reference earlier FROM items) are also supported as of the 0.7 feature waves — executed as a host nested-loop apply (see [Subqueries](#subqueries)).
 - Non-recursive CTEs (`WITH name AS (...)`) are supported. `WITH RECURSIVE` is supported (linear, non-linear, and mutual recursion — see [Recursive CTEs](#recursive-ctes-with-recursive)), including an optional recursive-CTE column-list alias (`WITH RECURSIVE c (a, b) AS ...`). The materialization hint and a column-list alias on a *non-recursive* CTE are rejected.
 - `EXCEPT [ALL]` and `INTERSECT [ALL]` are supported (host-side). `UNION BY NAME` (and `EXCEPT`/`INTERSECT BY NAME`) are rejected.
-- Window functions (`OVER`) are supported host-side for a fixed function set under the default frame only (see the [Window functions](#window-functions) section). `QUALIFY`, the named `WINDOW` clause, and explicit/non-default frames are rejected. Table-valued functions, `PREWHERE` (ClickHouse-ism), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `FETCH`, `FOR UPDATE/SHARE`, `INTO` remain rejected. (`LATERAL` derived tables are now **supported** — see [Subqueries](#subqueries).)
+- Window functions (`OVER`) are supported host-side for a fixed function set under the default frame only (see the [Window functions](#window-functions) section). `QUALIFY`, the named `WINDOW` clause, and `OVER <named_window>` are now **supported**; explicit/non-default frames are still rejected. `FETCH` / T-SQL `TOP` fold into `LIMIT`, `FOR UPDATE` / `FOR SHARE` are accepted as a no-op, and `PREWHERE` (ClickHouse-ism) is folded into `WHERE`. `VALUES` as a row source, `DISTINCT ON (...)`, and the `generate_series(start, stop[, step])` table-valued function in `FROM` are also **supported** (see the sections below). Other table-valued functions, `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, and `INTO` remain rejected. (`LATERAL` derived tables are now **supported** — see [Subqueries](#subqueries).)
 - `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` / `ALL`, the trailing `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` modifiers, and the `GROUPING()` / `GROUPING_ID()` indicators are supported (host-expanded to a UNION-ALL of the per-set plans; max 12 grouping columns) — see [GROUP BY](#group-by). A bare `FROM a, b [WHERE ...]` comma list is supported and desugars to a `CROSS JOIN` chain.
 - No schema-qualified *table* names in `FROM`. Single-level qualified column references (`t.col`) are supported in SELECT, WHERE, GROUP BY, HAVING, and `JOIN ... ON` predicates; the qualifier must match a FROM table and only the resolved column name survives lowering. In a `JOIN ... ON` predicate the **schema-qualified `schema.table.col`** form is also accepted (the leading single-catalog segment is dropped, so it resolves to `table.col`). Four-or-more-segment references (`catalog.db.t.col`) and struct-field access are rejected.
 - `LIMIT` and `OFFSET` must be integer literals; expressions and parameters are rejected.
@@ -59,7 +59,7 @@ The plan's `DataType` enum is intentionally small.
 | `Float32`  | `Float32`       |                                                          |
 | `Float64`  | `Float64`       |                                                          |
 | `Utf8`     | `Utf8`          | Dictionary-encoded on register; i32 or i64 indices.      |
-| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, `*`, **`/`** all lower to GPU (dual-register 128-bit IR), including **mixed Decimal/integer** arithmetic (the integer side is auto-coerced); comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to GPU and are **scale-aligned** (differing scales are rescaled to `max(s)` before the i128 compare). **Scalar** `SUM`/`MIN`/`MAX` run on the GPU (dedicated i128 block-reduce kernels, host-fold fallback inside); **grouped** `SUM`/`MIN`/`MAX` are host-side. **CAST** integer↔Decimal128, Decimal128↔Decimal128 (rescale), and (plain) Float↔Decimal128 all lower to GPU; only `TRY_CAST`/`SAFE_CAST` of Float⇄Decimal128 is rejected (host evaluator has no Decimal column). GPU gather (filter/compaction) + upload are wired (16-byte interleaved layout). **CASE** with a Decimal128 result lowers to GPU (a pair of `selp.b64` via `Op::Select128`). |
+| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, `*`, **`/`** all lower to GPU (dual-register 128-bit IR), including **mixed Decimal/integer** arithmetic (the integer side is auto-coerced); comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to GPU and are **scale-aligned** (differing scales are rescaled to `max(s)` before the i128 compare). **Scalar** `SUM`/`MIN`/`MAX` run on the GPU (dedicated i128 block-reduce kernels, host-fold fallback inside); **grouped** `SUM`/`MIN`/`MAX` now also run on the GPU (`bolt_groupby_agg_decimal`, a per-slot-locked 128-bit accumulator; `SUM` overflow errors, `MIN`/`MAX` preserve `(p, s)`). **CAST** integer↔Decimal128, Decimal128↔Decimal128 (rescale), and (plain) Float↔Decimal128 all lower to GPU; only `TRY_CAST`/`SAFE_CAST` of Float⇄Decimal128 is rejected (host evaluator has no Decimal column). GPU gather (filter/compaction) + upload are wired (16-byte interleaved layout). **CASE** with a Decimal128 result lowers to GPU (a pair of `selp.b64` via `Op::Select128`). |
 | `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)`, **`MIN(date_col)` and `MAX(date_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i32 storage and the result is rebuilt as a `Date32`); `SUM` over a date is rejected by design. CAST integer→Date32 lowers via the Decimal/i128 path; CAST to/from Date32 (string, etc.): parses; GPU lowering pending. |
 | `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)`, **`MIN(ts_col)` and `MAX(ts_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i64 storage and the result is rebuilt preserving unit + timezone); `SUM` over a timestamp is rejected by design. CAST to/from Timestamp: parses; GPU lowering pending. |
 
@@ -196,15 +196,15 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `MIN(bool)`    | `Bool`                        | `FALSE < TRUE`. NULL if all-null group.                    |
 | `MIN(utf8)`    | `Utf8`                        | Lexicographic; NULL if all-null group.                     |
 | `MIN(date32 \| timestamp)` | Same dtype as input | GPU reduction on the i32/i64 storage; result rebuilt preserving the date / (unit + tz). NULL if all-null group. Scalar + GROUP BY. |
-| `MIN(decimal)` | `Decimal128(p, s)`            | **Scalar: GPU** i128 block-reduce (host-fold fallback inside); **grouped: host-side** fold. Preserves input `(p, s)`. NULL if all-null group. |
+| `MIN(decimal)` | `Decimal128(p, s)`            | **GPU** i128 reduce — scalar via block-reduce (host-fold fallback inside), **grouped** via the per-slot-locked 128-bit accumulator (`bolt_groupby_agg_decimal`). Preserves input `(p, s)`. NULL if all-null group. |
 | `MAX(int|float)` | Same dtype as input         | Same caveats as MIN.                                       |
 | `MAX(bool)`    | `Bool`                        | NULL if all-null group.                                    |
 | `MAX(utf8)`    | `Utf8`                        | NULL if all-null group.                                    |
 | `MAX(date32 \| timestamp)` | Same dtype as input | Same as `MIN` (temporal): GPU reduction, type/unit/tz preserved. Scalar + GROUP BY. |
-| `MAX(decimal)` | `Decimal128(p, s)`            | **Scalar: GPU** i128 block-reduce; **grouped: host-side** fold. Preserves input `(p, s)`. |
+| `MAX(decimal)` | `Decimal128(p, s)`            | **GPU** i128 reduce — scalar block-reduce + **grouped** per-slot-locked accumulator. Preserves input `(p, s)`. |
 | `AVG(numeric)` | `Float64`                     | Single fused kernel (on-device `SUM` + `COUNT` reduced together, divided on finalise); no longer split into separate host passes. |
 | `AVG(bool)`    | `Float64`                     | Fraction of `TRUE` rows. NULL if all-null group.           |
-| `SUM(decimal)` | `Decimal128`                  | **Scalar: GPU** i128 block-reduce (0.7; host-fold fallback inside); **grouped: host-side** reduction. |
+| `SUM(decimal)` | `Decimal128`                  | **GPU** i128 reduce — scalar block-reduce (0.7; host-fold fallback inside) + **grouped** per-slot-locked 128-bit accumulator. Overflow raises a hard error. |
 | `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP` | `Float64`  | **Host-side** Welford (0.5 scalar; 0.7 adds `GROUP BY` via per-group Welford). |
 | `VARIANCE`, `VAR_POP`, `VAR_SAMP`     | `Float64`  | **Host-side** Welford, shared state with STDDEV. Scalar (0.5) + grouped (0.7). |
 
@@ -339,7 +339,15 @@ A window function must appear as a **top-level SELECT item** (optionally aliased
 
 **Frame**: only the SQL default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` is implemented. Under this frame every ordering peer (rows with equal `ORDER BY` keys) sees the same running aggregate; with no `ORDER BY` the whole partition is one peer group, so the aggregate windows report the full-partition value on every row. Explicit non-default frames (custom bounds, `GROUPS`, anything other than `UNBOUNDED PRECEDING [AND CURRENT ROW]`) are rejected.
 
-Rejected: `QUALIFY`, the named `WINDOW` clause, `OVER <named_window>`, `COUNT(DISTINCT ...) OVER (...)`, `FILTER` / `IGNORE NULLS` / `WITHIN GROUP` on a window function, and lead/lag/value functions (`LAG`, `LEAD`, `FIRST_VALUE`, `NTILE`, etc.).
+**Named windows and `QUALIFY` are supported.** A named `WINDOW w AS (...)` clause may be defined and referenced via `OVER w` (including extending it, e.g. `OVER (w ORDER BY ...)`), and `QUALIFY <window-predicate>` filters rows on a window-function result — exactly as `HAVING` filters aggregates — lowering to a `Filter` over the window projection (a window function used only in `QUALIFY` materialises a hidden column). `QUALIFY` may reference a window function by its SELECT-list alias. Residual: `QUALIFY` and the named `WINDOW` clause are rejected when combined with `GROUP BY` / aggregates (window-over-aggregate is not lowered — use `HAVING` for aggregate filtering).
+
+```sql
+SELECT g, v, ROW_NUMBER() OVER w AS rn
+FROM t WINDOW w AS (PARTITION BY g ORDER BY v)
+QUALIFY rn = 1;                              -- named window + QUALIFY
+```
+
+Still rejected: `COUNT(DISTINCT ...) OVER (...)`, `FILTER` / `IGNORE NULLS` / `WITHIN GROUP` on a window function, and lead/lag/value functions (`LAG`, `LEAD`, `FIRST_VALUE`, `NTILE`, etc.).
 
 ## Subqueries
 
@@ -350,7 +358,30 @@ Rejected: `QUALIFY`, the named `WINDOW` clause, `OVER <named_window>`, `COUNT(DI
 
 An uncorrelated **scalar subquery** is also accepted in `ORDER BY` (it folds to a constant before physical lowering, exactly like a SELECT / WHERE scalar subquery).
 
-Nested subqueries resolve inner-first. **Correlated** subqueries (any reference to an outer column) are detected and rejected with a precise message. `EXISTS` / `NOT EXISTS` are rejected.
+Nested subqueries resolve inner-first. A **single correlated subquery in a top-level `WHERE` conjunct** — a correlated scalar comparison, `EXISTS`, or `NOT EXISTS` — is now **supported** (see [Correlated WHERE subqueries](#correlated-where-subqueries) below). A correlated subquery anywhere else (in `SELECT`, in `ORDER BY`) is still detected and rejected with a precise message.
+
+### Correlated WHERE subqueries
+
+As of the LATERAL feature wave, the frontend detects a **single** correlated subquery in a top-level `WHERE` `AND`-conjunct (`plan_correlated_where` in `src/plan/sql_frontend.rs`) and the engine executes it as a **host nested-loop apply** (`execute_correlated_where` in `src/exec/engine.rs`), reusing the LATERAL machinery: the outer relation (with the ordinary non-correlated conjuncts applied as a `Filter`) is materialised, then for each outer row the correlated subquery is re-evaluated and the row is kept iff —
+
+- `EXISTS (...)` — the subquery returns ≥ 1 row (a semi-join);
+- `NOT EXISTS (...)` — the subquery returns 0 rows (an anti-join);
+- a scalar comparison carrying one correlated `(SELECT ...)` — the per-row boolean is `TRUE` (a `NULL` / `FALSE` drops the row).
+
+The outer loop is bounded by the same `CRATON_MAX_APPLY_ROWS` cap as LATERAL.
+
+```sql
+SELECT name FROM emp e
+WHERE EXISTS (SELECT 1 FROM dept d WHERE d.id = e.dept_id);          -- correlated EXISTS (semi-join)
+
+SELECT name FROM emp e
+WHERE NOT EXISTS (SELECT 1 FROM bonus b WHERE b.emp_id = e.id);      -- correlated NOT EXISTS (anti-join)
+
+SELECT name FROM emp e
+WHERE e.salary > (SELECT AVG(salary) FROM emp x WHERE x.dept_id = e.dept_id);  -- correlated scalar
+```
+
+Residual rejections: **more than one** correlated subquery in `WHERE`, a correlation **inside an `OR`** (only top-level `AND`-conjuncts are scanned), and a **correlated `IN (SELECT ...)`**.
 
 ### Derived tables (subquery in FROM)
 
@@ -400,7 +431,38 @@ After the rewrite the predicate is pure integer equality, which the standard cod
 
 `SELECT DISTINCT <select_list> FROM ...` is supported and dedups the *output* rows (after projection, HAVING, and any aggregate work). The executor is host-side (`src/exec/distinct.rs`).
 
-`DISTINCT ON (...)` (Postgres extension) is rejected. `COUNT(DISTINCT col)` *is* supported as the sole SELECT item (see [Aggregate functions](#aggregate-functions)).
+`DISTINCT ON (...)` (Postgres extension) is **supported** (`plan_distinct_on` / `execute_distinct_on`), host-orchestrated: the base query is run with the `DISTINCT ON` keys prepended to the projection and the query's `ORDER BY` applied, then the engine keeps the **first row per key**. The result is deterministic when the leading `ORDER BY` keys match the `DISTINCT ON` keys (standard Postgres usage). `LIMIT` is applied *after* dedup. The keys must be simple column references; `DISTINCT ON` combined with `GROUP BY` or `HAVING`, or with a computed-expression key, is rejected.
+
+```sql
+SELECT DISTINCT ON (customer_id) customer_id, order_id, ts
+FROM orders
+ORDER BY customer_id, ts DESC;               -- latest order per customer
+```
+
+`COUNT(DISTINCT col)` *is* supported as the sole SELECT item (see [Aggregate functions](#aggregate-functions)).
+
+## VALUES as a row source
+
+A `VALUES` list may be used as a row source (`plan_values_query` / `execute_values_query`), in two shapes:
+
+- **Bare** — `VALUES (...), (...) [ORDER BY ...] [LIMIT ...]` returns the materialised relation directly. Columns are named `column1`, `column2`, … (sqlparser default).
+- **In `FROM`** — `SELECT ... FROM (VALUES (...), (...)) AS t(a, b) ...`, where the relation is bound under the alias and the outer query runs over it.
+
+Per-column dtypes are inferred by promoting every row's value to a common type, limited to the numeric widenings (`Int32`↔`Int64`, integer↔`Float`, `Float32`↔`Float64`); other mixed-type columns (e.g. Int vs Utf8) are rejected. Row count is capped (`CRATON_VALUES_MAX_ROWS`, default 1,000,000).
+
+```sql
+VALUES (1, 'a'), (2, 'b');                                  -- bare row source
+SELECT a + 1 FROM (VALUES (1), (2), (3)) AS t(a);           -- VALUES in FROM
+```
+
+## generate_series
+
+`generate_series(start, stop[, step])` is supported as a table-valued function in `FROM` (`plan_generate_series_query` / `execute_generate_series_query`) — the **one** supported TVF; all others remain rejected. It produces a single non-nullable `Int64` column of an **inclusive** integer series. `step` defaults to `1`; a negative `step` descends; `step = 0` is a clean error (PostgreSQL: "step size cannot be zero"). An empty direction (e.g. `start > stop` with a positive step) yields zero rows. Row count is capped (`CRATON_GENERATE_SERIES_MAX_ROWS`).
+
+```sql
+SELECT n FROM generate_series(1, 5) AS g(n);               -- 1,2,3,4,5
+SELECT n FROM generate_series(10, 1, -2) AS g(n);          -- 10,8,6,4,2
+```
 
 ## Expression examples
 
@@ -570,10 +632,10 @@ These produce explicit errors at parse / plan time:
 - (`NATURAL JOIN`, `JOIN ... USING`, and multiple joins per `SELECT` are now **supported** — see the [JOIN](#join) section.)
 
 ### Query composition
-- **Correlated** subqueries and `EXISTS` / `NOT EXISTS`. (Uncorrelated scalar and `[NOT] IN` subqueries are **supported** in SELECT / WHERE, an uncorrelated scalar subquery is also accepted in ORDER BY, and **derived tables** `(SELECT ...) AS alias` are **supported**, including **`LATERAL`** (correlated, host nested-loop apply) — see [Subqueries](#subqueries). Column-list aliases `AS d(x, y)` remain rejected.)
+- A **correlated** subquery in `SELECT` or `ORDER BY`; **more than one** correlated subquery in `WHERE`; a correlation inside an `OR`; and a **correlated `IN (SELECT ...)`**. (A **single** correlated scalar / `EXISTS` / `NOT EXISTS` subquery in a top-level `WHERE` conjunct is now **supported**, executed as a host nested-loop apply — see [Correlated WHERE subqueries](#correlated-where-subqueries). Uncorrelated scalar and `[NOT] IN` subqueries are **supported** in SELECT / WHERE, an uncorrelated scalar subquery is also accepted in ORDER BY, and **derived tables** `(SELECT ...) AS alias` are **supported**, including **`LATERAL`** (correlated, host nested-loop apply) — see [Subqueries](#subqueries). Column-list aliases `AS d(x, y)` remain rejected.)
 - A column-list alias on a *non-recursive* CTE. (`WITH RECURSIVE` is **supported** — linear, non-linear, and mutual, with an optional recursive column-list alias — see [Recursive CTEs](#recursive-ctes-with-recursive); non-recursive CTEs are **supported** — see [Common table expressions](#common-table-expressions-with). Residual recursive rejections: a recursive anchor seeding from a recursive member, a self-reference buried in a subquery, and `UNION BY NAME`.)
 - `UNION BY NAME` (and `EXCEPT` / `INTERSECT BY NAME`). (`EXCEPT [ALL]` / `INTERSECT [ALL]` are **supported** — see [Set operations](#set-operations-union--except--intersect).)
-- `QUALIFY`, the named `WINDOW` clause, `OVER <named_window>`, and non-default window frames. (`OVER (...)` with `ROW_NUMBER` / `RANK` / `DENSE_RANK` / `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` under the default frame is **supported** — see [Window functions](#window-functions).)
+- Non-default window frames (custom bounds, `GROUPS`, anything other than the default `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`). (`OVER (...)` with `ROW_NUMBER` / `RANK` / `DENSE_RANK` / `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` under the default frame is **supported**, as are `QUALIFY`, the named `WINDOW` clause, and `OVER <named_window>` — see [Window functions](#window-functions). Residual: `QUALIFY` / named `WINDOW` combined with `GROUP BY` / aggregates.)
 
 ### Expressions
 
@@ -608,7 +670,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 
 ### Clauses and statements
 - `LIMIT <expr>` (must be an integer literal); `LIMIT BY` (ClickHouse).
-- `FETCH`, `FOR UPDATE/SHARE`, `INTO`, table-valued functions, `PREWHERE`, `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `SETTINGS`, and the trailing `FORMAT` output clause (distinct from the supported `CAST(... FORMAT '<pattern>')` expression — see the CASE / CAST section).
+- `INTO`, table-valued functions **other than `generate_series`** (`unnest`, etc.), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `SETTINGS`, and the trailing `FORMAT` output clause (distinct from the supported `CAST(... FORMAT '<pattern>')` expression — see the CASE / CAST section). (`FETCH` and T-SQL `TOP` now fold into `LIMIT`, `FOR UPDATE` / `FOR SHARE` are accepted as a no-op, `PREWHERE` is folded into `WHERE`, and `generate_series(...)` and `VALUES` are supported row sources — see the [generate_series](#generate_series) and [VALUES](#values-as-a-row-source) sections. Residuals: `FETCH` / `TOP` with `PERCENT` or `WITH TIES`, and a `TOP` combined with `LIMIT` / `FETCH`.)
 - (`GROUP BY ALL` / `ROLLUP` / `CUBE` / `GROUPING SETS` / `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` and the `GROUPING()` / `GROUPING_ID()` indicators are now **supported** — see [GROUP BY](#group-by). Residuals: more than 12 grouping columns, and `GROUPING()` without a grouping construct.)
 - `SELECT AS STRUCT/VALUE`.
 - DDL of any kind — no `CREATE TABLE`. Tables are registered via the Rust API (`Engine::register_table`).

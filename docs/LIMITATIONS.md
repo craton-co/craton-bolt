@@ -193,10 +193,12 @@ These are real, code-level behaviors to be aware of:
   with a host-fold fallback inside). A `CASE` whose result dtype is `Decimal128`
   now lowers to the **GPU** (a pair of `selp.b64` via `Op::Select128`). **Plain**
   `CAST` between **Float and `Decimal128`** now lowers to the **GPU**
-  (`F64ToI128` / `I128ToF64`). **Residual gaps:** `SUM` over a temporal column
-  is rejected by design (undefined SQL); **grouped** `Decimal128`
-  `SUM` / `MIN` / `MAX` still run **host-side** (the grouped accumulator table
-  has no 16-byte slot path yet); `TRY_CAST` / `SAFE_CAST` of Float⇄`Decimal128`
+  (`F64ToI128` / `I128ToF64`). **Grouped** `Decimal128` `SUM` / `MIN` / `MAX`
+  now also run on the **GPU** (`bolt_groupby_agg_decimal`, a per-slot spin-locked
+  128-bit accumulator; `SUM` raises the same overflow error as the scalar path,
+  `MIN` / `MAX` preserve the input `(p, s)`). **Residual gaps:** `SUM` over a
+  temporal column is rejected by design (undefined SQL);
+  `TRY_CAST` / `SAFE_CAST` of Float⇄`Decimal128`
   is rejected at type-check (the host evaluator has no `Decimal128` column); and
   `CAST` to/from `Timestamp` / `String` is still rejected at the GPU lowering
   boundary. See the type tiers in
@@ -228,18 +230,24 @@ silent wrong answer. If you depend on any of these, expect an error and
 rewrite the query (see [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md) for the
 supported alternatives):
 
-- **Correlated scalar / `EXISTS` / `NOT EXISTS` subqueries** (in `SELECT` /
-  `WHERE`). (Non-lateral **derived tables** `(SELECT ...) AS alias` are
-  **supported** — alias required; **`LATERAL` derived tables** are now
-  **supported** too, executed as a host nested-loop apply — see below;
-  column-list aliases `AS d(x, y)` remain rejected.)
-- **`WINDOW` clause / `QUALIFY` / named windows** (`OVER <named_window>`), and
-  non-default window frames.
-- **`VALUES` lists** (as a standalone row source).
-- **Table-valued functions.**
-- **`DISTINCT ON (...)`** (Postgres extension).
-- **`TOP`** (T-SQL row limit).
-- **`PREWHERE`** (ClickHouse extension).
+- **Correlated scalar / `EXISTS` / `NOT EXISTS` subqueries in `SELECT`.**
+  (A **single** correlated scalar / `EXISTS` / `NOT EXISTS` subquery in a
+  top-level `WHERE` conjunct is now **supported**, executed as a host
+  nested-loop apply — see below. Residual rejections: **more than one**
+  correlated subquery in `WHERE`, correlation **inside an `OR`**, and a
+  **correlated `IN (SELECT ...)`** are still rejected. Non-lateral **derived
+  tables** `(SELECT ...) AS alias` are **supported** — alias required;
+  **`LATERAL` derived tables** are now **supported** too; column-list aliases
+  `AS d(x, y)` remain rejected.)
+- **Non-default window frames** (custom bounds, `GROUPS`, anything other than
+  the default `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`). (`QUALIFY`, the
+  named `WINDOW` clause, and `OVER <named_window>` are now **supported** — see
+  below.)
+- **Table-valued functions** *except* `generate_series(start, stop[, step])`,
+  which is now **supported** in `FROM` — see below. Other TVFs (`unnest`, etc.)
+  remain rejected: they would need a function-as-table-source mechanism, and
+  the engine scans only registered tables / CTEs / derived tables.
+- **`CONNECT BY`**, **`CLUSTER` / `DISTRIBUTE` / `SORT BY`**, **`INTO`**.
 - **`GLOBAL JOIN`** (ClickHouse extension).
 - **`SUM(Date32 / Timestamp)`** — undefined in SQL; rejected by design.
 
@@ -264,6 +272,35 @@ detail and residual sub-rejections:
   type-check; unknown `FORMAT` tokens are rejected.
 - **Multi-table `FROM a, b [WHERE ...]`** — the comma list desugars to a
   left-deep chain of `CROSS JOIN`s.
+- **A single correlated scalar / `EXISTS` / `NOT EXISTS` subquery in `WHERE`** —
+  detected at plan time and executed as a host nested-loop apply (semi-join for
+  `EXISTS`, anti-join for `NOT EXISTS`, per-row scalar test otherwise) over a
+  row-capped outer relation. Residuals: more than one correlated subquery in
+  `WHERE`, correlation inside `OR`, and correlated `IN (SELECT ...)`.
+- **`QUALIFY`**, the named **`WINDOW`** clause (`WINDOW w AS (...)`), and
+  **`OVER w`** named-window references — lowered onto the host-side window
+  executor. Residual: `QUALIFY` combined with `GROUP BY` / aggregates.
+- **`FETCH FIRST n ROWS` / T-SQL `TOP n`** — both fold into `LIMIT`.
+  **`FOR UPDATE` / `FOR SHARE`** are accepted as a no-op (read-only OLAP engine).
+  **`PREWHERE`** (ClickHouse early filter) is folded into `WHERE`. Residuals:
+  `FETCH` / `TOP` with `PERCENT` or `WITH TIES`, a `TOP` combined with
+  `LIMIT` / `FETCH` (ambiguous), and `QUALIFY` combined with `GROUP BY`.
+- **`VALUES` as a row source** — both the bare `VALUES (...), (...)` form and
+  `FROM (VALUES ...) AS t(a, b)`. Common-type inference is limited to the
+  numeric widenings (`Int32`↔`Int64`, `Int`↔`Float`, `Float32`↔`Float64`);
+  other mixed-type columns require an exact match. Row count is capped
+  (`CRATON_VALUES_MAX_ROWS`, default 1,000,000).
+- **`DISTINCT ON (...)`** (Postgres extension) — host-orchestrated; keeps the
+  first row per key, deterministic when the query's leading `ORDER BY` keys
+  match the `DISTINCT ON` keys. Keys must be simple column references; rejected
+  alongside `GROUP BY` / `HAVING`.
+- **`generate_series(start, stop[, step])`** in `FROM` — an inclusive integer
+  (`Int64`) series; `step` defaults to `1`, a negative `step` descends, and
+  `step = 0` is an error. Row count is capped
+  (`CRATON_GENERATE_SERIES_MAX_ROWS`). This is the one supported
+  table-valued function.
+- **Grouped `Decimal128` `SUM` / `MIN` / `MAX`** now run on the **GPU** (see the
+  temporal / decimal note above), no longer host-side.
 
 These return a clean error rather than crashing, so the engine gives you correct
 expectations up front.

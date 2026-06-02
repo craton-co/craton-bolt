@@ -154,8 +154,9 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
 - `[WITH ...] SELECT [DISTINCT] ... FROM <table> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`.
 - Aggregates: `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (GPU), plus host-side
   `STDDEV` / `VAR` (scalar and grouped). `SUM` / `MIN` / `MAX` over
-  `Decimal128` run on the **GPU** (i128 block-reduce kernels) in the scalar
-  path and **host-side** in the grouped path. `SUM(Int32)` widens to `Int64`
+  `Decimal128` run on the **GPU** in both the scalar path (i128 block-reduce
+  kernels) and the grouped path (a per-slot-locked 128-bit accumulator).
+  `SUM(Int32)` widens to `Int64`
   to prevent silent wraparound. `COUNT(DISTINCT col)` is supported as the sole
   SELECT item — and, as of the 0.7 wave, also with a surrounding
   `SELECT DISTINCT`, a `HAVING` over the count (no `GROUP BY`), and as the
@@ -197,8 +198,13 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   `SELECT` / `WHERE` (and an uncorrelated scalar subquery in `ORDER BY`);
   **derived tables** in `FROM` (`(SELECT ...) AS alias`, alias required),
   including **`LATERAL`** derived tables (correlated, run as a host
-  nested-loop apply); and a multi-table comma `FROM a, b` (desugars to
-  `CROSS JOIN`). (Correlated scalar / `EXISTS` subqueries and
+  nested-loop apply); a **single correlated scalar / `EXISTS` / `NOT EXISTS`
+  subquery in a top-level `WHERE` conjunct** (also a host nested-loop apply);
+  `VALUES` as a row source; `DISTINCT ON (...)`; the
+  `generate_series(start, stop[, step])` table-valued function in `FROM`; and a
+  multi-table comma `FROM a, b` (desugars to `CROSS JOIN`). (A correlated
+  subquery in `SELECT` / `ORDER BY`, more than one correlated subquery in
+  `WHERE`, correlation inside `OR`, correlated `IN (SELECT ...)`, and
   non-recursive-CTE column-list aliases `AS d(x, y)` are rejected.)
 - GROUP BY super-aggregates: `ROLLUP` / `CUBE` / `GROUPING SETS` /
   `GROUP BY ALL`, the `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` trailing
@@ -206,7 +212,8 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   UNION-ALL of per-set plans; max 12 grouping columns).
 - Window functions: `ROW_NUMBER` / `RANK` / `DENSE_RANK` /
   `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` `OVER (PARTITION BY ... ORDER
-  BY ...)` (host-side, default frame only).
+  BY ...)` (host-side, default frame only), including a named `WINDOW w AS
+  (...)` clause with `OVER w`, and `QUALIFY` to filter on a window result.
 - `ORDER BY`: single-key `Int32`/`Int64` orderings (and multi-key /
   `DESC`) run on the GPU radix sort; other shapes sort host-side.
 - Types: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`, dictionary-
@@ -249,9 +256,10 @@ Anything outside the supported surface returns a structured
 construct quoted in the message. Some *supported* constructs execute on
 a host-side code path rather than the GPU — the `||` concat operator,
 `SUBSTRING` / `TRIM` / `CONCAT`, a `Utf8`-result `CASE`, `STDDEV` / `VAR`,
-`TRY_CAST` / `CAST(... FORMAT ...)`, *grouped* `SUM` / `MIN` / `MAX` over
-`Decimal128` (the *scalar* Decimal aggregates run on the GPU), set operations
-(`EXCEPT` / `INTERSECT`), `WITH RECURSIVE` orchestration, GROUP BY
+`TRY_CAST` / `CAST(... FORMAT ...)`, set operations
+(`EXCEPT` / `INTERSECT`), `WITH RECURSIVE` orchestration, the correlated-`WHERE`
+nested-loop apply, `DISTINCT ON`, `VALUES` / `generate_series` row sources,
+GROUP BY
 super-aggregate expansion, window functions, and host-side join / sort
 fallbacks — and a few constructs parse and type-check but are rejected at
 the GPU lowering boundary with a clear `"… not yet lowered to GPU"` message
