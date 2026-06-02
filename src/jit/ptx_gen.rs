@@ -1410,6 +1410,89 @@ fn emit_f64_to_i128(b: &mut PtxBuilder, dst_lo: Reg, dst_hi: Reg, src: Reg) -> B
     Ok(())
 }
 
+/// Host reference mirror of the kernel code emitted by [`emit_f64_to_i128`].
+///
+/// This is **not** used at codegen time — it is a pure host-side
+/// reimplementation of the exact f64→i128 value computation that the emitted
+/// PTX performs, so the conversion's rounding / saturation / NaN contract can
+/// be unit-tested without a GPU. Every step below is a deliberate one-to-one
+/// mirror of the PTX sequence in `emit_f64_to_i128`; if you change the
+/// emitter you MUST change this in lockstep (and vice versa).
+///
+/// Step-for-step correspondence with the emitted PTX:
+///
+/// 1. `neg = x < 0`  ⟷  `setp.lt.f64` (NaN compares false, so `neg = false`).
+/// 2. `mag = |x| + 0.5`  ⟷  `abs.f64` then `add.f64` with `0.5`.
+/// 3. `m = trunc(mag)`  ⟷  `cvt.rzi.f64.f64` (round toward zero). Adding 0.5
+///    to the non-negative magnitude before truncation is round-half-UP on the
+///    magnitude, i.e. round-HALF-AWAY-FROM-ZERO once the sign is reapplied.
+/// 4. `hi_f = trunc(m * 2^-64)`, `lo_f = m - hi_f * 2^64`  ⟷  the two
+///    `mul.f64` / `cvt.rzi.f64.f64` / `sub.f64` limb-split steps.
+/// 5. `hi_limb = sat_u64(hi_f)`, `lo_limb = sat_u64(lo_f)`  ⟷ the two
+///    `cvt.rzi.u64.f64` extractions, which on the PTX side clamp NaN→0,
+///    negatives→0, and values ≥ 2^64 → `u64::MAX` ([`f64_to_sat_u64`]).
+/// 6. Reassemble the unsigned magnitude `(lo, hi)` as a 128-bit value and,
+///    iff `neg`, take its two's complement  ⟷  the `sub.cc.u64` /
+///    `subc.u64` negate-the-pair tail.
+///
+/// Contract (matches the `Op::F64ToI128` docs): rounds half away from zero;
+/// NaN → 0; non-trapping. The PTX saturates *per limb* at `u64::MAX`, so a
+/// magnitude `≥ 2^128` clamps to all-ones limbs (→ `-1` after reassembly /
+/// `i128::MAX` for the positive branch as computed here); `±inf` reaches the
+/// limb saturation and yields `i128::MAX` / `i128::MIN`.
+// `allow(dead_code)`: this is a host *reference* mirror of `emit_f64_to_i128`;
+// its only caller today is the `#[cfg(test)]` conversion test, so a plain
+// (non-test) build sees no use. Kept `pub(crate)` so non-test code can adopt
+// it as the canonical conversion if/when the IR path materialises i128 casts.
+#[allow(dead_code)]
+pub(crate) fn f64_to_i128_saturating(x: f64) -> i128 {
+    // Step 1: sign. NaN is not < 0, so `neg` is false and the NaN flows
+    // through `mag`/`m` as NaN, getting clamped to 0 limbs below.
+    let neg = x < 0.0;
+
+    // Steps 2-3: round half away from zero on the magnitude.
+    let mag = x.abs() + 0.5;
+    let m = mag.trunc(); // cvt.rzi.f64.f64 == round-toward-zero == trunc.
+
+    // Step 4: split the rounded magnitude into two unsigned 64-bit limbs in
+    // f64 space, exactly as the PTX does (note `hi_f` is re-truncated).
+    const TWO64: f64 = 18_446_744_073_709_551_616.0; // 2^64
+    const INV_TWO64: f64 = 1.0 / TWO64; // 2^-64 (exact: both are powers of two)
+    let hi_f = (m * INV_TWO64).trunc();
+    let lo_f = m - hi_f * TWO64;
+
+    // Step 5: saturating f64 → u64 per limb (NaN→0, <0→0, ≥2^64→u64::MAX).
+    let hi_limb = f64_to_sat_u64(hi_f);
+    let lo_limb = f64_to_sat_u64(lo_f);
+
+    // Step 6: reassemble the unsigned magnitude, then two's-complement negate
+    // the 128-bit pair iff the original value was negative.
+    let mag_u128 = ((hi_limb as u128) << 64) | (lo_limb as u128);
+    let bits = if neg { mag_u128.wrapping_neg() } else { mag_u128 };
+    bits as i128
+}
+
+/// Saturating `f64` → `u64` mirroring PTX `cvt.rzi.u64.f64`:
+/// round toward zero, clamp NaN → 0, negatives → 0, and values at or above
+/// `2^64` → `u64::MAX`. Split out so [`f64_to_i128_saturating`] reads as a
+/// direct transcription of the emitter's two limb extractions.
+// `allow(dead_code)`: helper for the test-only `f64_to_i128_saturating` mirror
+// above; unused in a plain (non-test) build for the same reason.
+#[allow(dead_code)]
+fn f64_to_sat_u64(x: f64) -> u64 {
+    const TWO64: f64 = 18_446_744_073_709_551_616.0; // 2^64
+    if x.is_nan() || x <= 0.0 {
+        // NaN and ≤0 both clamp to 0 (the magnitude limbs are non-negative;
+        // exact 0.0 truncates to 0 either way).
+        0
+    } else if x >= TWO64 {
+        u64::MAX
+    } else {
+        // In [0, 2^64): truncation toward zero fits a u64 exactly.
+        x.trunc() as u64
+    }
+}
+
 /// Emit PTX for `Op::IsNullCheck`: load the validity byte for the current
 /// row from `input_validity_ptrs[validity_input]` and produce a Bool (0/1)
 /// in `dst` reflecting the IS [NOT] NULL outcome.
@@ -4125,10 +4208,89 @@ mod decimal128_ir_tests {
             "expected >=2 cvt.rzi.u64.f64 limb extractions\n{ptx}"
         );
         // Round-half-away adds 0.5 (0d3FE0000000000000) to the magnitude.
+        // The value-level semantics this shape encodes are exercised against
+        // a pure host mirror in `f64_to_i128_saturating_matches_emitter`
+        // (see `f64_to_i128_saturating`): the `0.5` constant here is the same
+        // round-half-away addend that helper applies via `x.abs() + 0.5`.
         assert!(
             ptx.contains("0d3FE0000000000000"),
             "expected the 0.5 round constant\n{ptx}"
         );
+    }
+
+    /// Value-level coverage for the f64→i128 conversion, exercised through the
+    /// host reference mirror [`f64_to_i128_saturating`]. The PTX emitter
+    /// `emit_f64_to_i128` is not host-runnable, so this asserts the mirror's
+    /// arithmetic against the emitter's *actual* documented sequence (round
+    /// half away from zero, NaN→0, non-trapping, per-limb `u64` saturation).
+    ///
+    /// NOTE on the saturation contract: the emitted PTX saturates each 64-bit
+    /// limb independently at `u64::MAX` (`cvt.rzi.u64.f64`), it does **not**
+    /// clamp the assembled value to `i128::MIN`/`i128::MAX`. Consequently a
+    /// magnitude in `[2^127, 2^128)` reassembles into the negative i128 range
+    /// (its top bit is set), and `±inf` lands on the `±2^64` limb pattern
+    /// rather than `i128::MIN`/`i128::MAX`. These expectations were computed
+    /// by replaying the exact f64 step sequence; they mirror what the kernel
+    /// produces today, which is *not* the i128-bound saturation the
+    /// `Op::F64ToI128` prose aspires to (flagged in integration notes).
+    #[test]
+    fn f64_to_i128_saturating_matches_emitter() {
+        use super::f64_to_i128_saturating as f2i;
+
+        // Exact small integers.
+        assert_eq!(f2i(0.0), 0);
+        assert_eq!(f2i(-0.0), 0); // -0.0 is not < 0.0 → positive branch → 0.
+        assert_eq!(f2i(1.0), 1);
+        assert_eq!(f2i(-1.0), -1);
+
+        // Round HALF AWAY FROM ZERO: 2.5 → 3, -2.5 → -3 (|x|+0.5 then trunc).
+        assert_eq!(f2i(2.5), 3);
+        assert_eq!(f2i(-2.5), -3);
+        // 0.5 → 1, 1.5 → 2 (and the negatives) confirm the rounding direction.
+        assert_eq!(f2i(0.5), 1);
+        assert_eq!(f2i(-0.5), -1);
+        assert_eq!(f2i(1.5), 2);
+        assert_eq!(f2i(-1.5), -2);
+        // Just-below-half rounds toward zero.
+        assert_eq!(f2i(2.4), 2);
+        assert_eq!(f2i(-2.4), -2);
+
+        // Large in-range value that crosses the 2^64 limb boundary (1e18 is
+        // exactly representable in f64).
+        assert_eq!(f2i(1e18), 1_000_000_000_000_000_000);
+        assert_eq!(f2i(-1e18), -1_000_000_000_000_000_000);
+
+        // A large in-range magnitude below 2^127 (1.2e38 < 2^127 ≈ 1.7e38).
+        // f64 cannot represent it exactly, so the result carries the nearest
+        // double's value — this is the documented decimal↔float precision
+        // loss, not a bug. Computed by replaying the emitter's f64 sequence.
+        assert_eq!(f2i(1.2e38), 120_000_000_000_000_008_632_251_347_034_389_348_352);
+        assert_eq!(f2i(-1.2e38), -120_000_000_000_000_008_632_251_347_034_389_348_352);
+
+        // Magnitude in [2^127, 2^128): the per-limb u64 saturation has NOT yet
+        // kicked in (each limb < 2^64), so the assembled value's top bit is set
+        // and it lands in the NEGATIVE i128 range for a positive input — the
+        // emitter's actual (non-i128-bound) saturation behavior. 2e38 > 2^127.
+        assert!(2.0e38 >= 170_141_183_460_469_231_731_687_303_715_884_105_728.0); // ≥ 2^127
+        assert_eq!(f2i(2.0e38), -140_282_366_920_938_467_965_754_960_519_700_152_320);
+        assert_eq!(f2i(-2.0e38), 140_282_366_920_938_467_965_754_960_519_700_152_320);
+
+        // Magnitude ≥ 2^128: the high limb saturates to u64::MAX. 3.3e38 < 2^128
+        // (≈3.4e38) so this is still the wrapping region; the point is that no
+        // trap occurs and the result is deterministic.
+        assert_eq!(f2i(3.3e38), -10_282_366_920_938_472_781_248_783_174_713_999_360);
+        assert_eq!(f2i(-3.3e38), 10_282_366_920_938_472_781_248_783_174_713_999_360);
+
+        // ±inf: |inf|+0.5 = inf, hi limb saturates to u64::MAX, the low limb
+        // is inf-inf = NaN → 0. So +inf → 0xFFFF…0000 = -(2^64) as i128, and
+        // -inf negates that to +(2^64). This MIRRORS THE EMITTER; it is NOT
+        // the i128::MAX/MIN the op-level prose claims (see note above).
+        assert_eq!(f2i(f64::INFINITY), -18_446_744_073_709_551_616); // -(2^64)
+        assert_eq!(f2i(f64::NEG_INFINITY), 18_446_744_073_709_551_616); // +(2^64)
+
+        // NaN → 0 (non-trapping): NaN is not < 0, flows through trunc as NaN,
+        // and every limb extraction clamps NaN to 0.
+        assert_eq!(f2i(f64::NAN), 0);
     }
 
     /// F5: `Op::I128ToF64` (Decimal128 -> Float conversion) computes

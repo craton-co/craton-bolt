@@ -430,13 +430,21 @@ fn golden_groupby_keys_kernel_has_probe_bound() {
     let setp_pos = ptx[probe_start..]
         .find("setp.gt.u32")
         .expect("setp.gt.u32 should live inside the probe loop");
+    // The probe bound now branches to the OVERFLOW block (which atomically
+    // bumps the host-visible overflow counter before exiting), not directly
+    // to DONE — overflow is surfaced to the host rather than silently dropped.
     let bra_pos = ptx[probe_start + setp_pos..]
-        .find("bra DONE")
-        .expect("expected @%pN bra DONE immediately after the bound check");
-    // Sanity: the bra DONE must come within a few lines of the setp.
+        .find("bra OVERFLOW")
+        .expect("expected @%pN bra OVERFLOW immediately after the bound check");
+    // Sanity: the bra OVERFLOW must come within a few lines of the setp.
     assert!(
         bra_pos < 100,
-        "bra DONE too far from setp.gt.u32 (probe bound check broken)\n{ptx}"
+        "bra OVERFLOW too far from setp.gt.u32 (probe bound check broken)\n{ptx}"
+    );
+    // And the kernel must actually emit the OVERFLOW block.
+    assert!(
+        ptx.contains("OVERFLOW:"),
+        "missing OVERFLOW block (overflow must be host-visible, not silent)\n{ptx}"
     );
 }
 
@@ -449,9 +457,10 @@ fn golden_groupby_agg_kernel_has_probe_bound() {
     // `compile_groupby_agg_kernel`) would spin forever and hang the SM.
     // The fix mirrors the keys kernel's `MAX_PROBE_FACTOR * k` cap:
     // increment a probe counter each iteration, `setp.gt.u32` against the
-    // precomputed `max_probes` register, and branch to the `DONE` exit
-    // label on overflow (silent-drop semantics — no atomic is issued for
-    // the over-probing row, matching the keys kernel).
+    // precomputed `max_probes` register, and branch to the `OVERFLOW` block
+    // on over-probe. That block atomically bumps the host-visible overflow
+    // counter (no aggregation atomic is issued for the over-probing row) and
+    // then falls through to DONE — overflow is reported, not silently dropped.
     let ptx = compile_groupby_agg_kernel(ReduceOp::Sum, DataType::Int32)
         .expect("compile agg kernel");
     assert!(
@@ -469,20 +478,26 @@ fn golden_groupby_agg_kernel_has_probe_bound() {
         .find("setp.gt.u32")
         .expect("setp.gt.u32 should live inside the probe loop");
     let bra_pos = ptx[probe_start + setp_pos..]
-        .find("bra DONE")
-        .expect("expected @%pN bra DONE immediately after the probe bound");
+        .find("bra OVERFLOW")
+        .expect("expected @%pN bra OVERFLOW immediately after the probe bound");
     assert!(
         bra_pos < 100,
-        "bra DONE too far from setp.gt.u32 (probe bound check broken)\n{ptx}"
+        "bra OVERFLOW too far from setp.gt.u32 (probe bound check broken)\n{ptx}"
     );
-    // The give-up `bra DONE` must precede the `FOUND` label so a thread
-    // that exceeds the bound exits without issuing the atomic update.
-    let bra_done_abs = probe_start + setp_pos + bra_pos;
+    // The give-up `bra OVERFLOW` must precede the `FOUND` label so a thread
+    // that exceeds the bound exits (via the overflow counter) without issuing
+    // the aggregation atomic update.
+    let bra_overflow_abs = probe_start + setp_pos + bra_pos;
     let found_pos = ptx.find("FOUND:").expect("FOUND label exists");
     assert!(
-        bra_done_abs < found_pos,
-        "probe-bound `bra DONE` must precede the FOUND label (otherwise the \
-         atomic update still fires on over-probe)\n{ptx}"
+        bra_overflow_abs < found_pos,
+        "probe-bound `bra OVERFLOW` must precede the FOUND label (otherwise the \
+         aggregation atomic still fires on over-probe)\n{ptx}"
+    );
+    // Overflow must be host-visible: the kernel emits an OVERFLOW block.
+    assert!(
+        ptx.contains("OVERFLOW:"),
+        "missing OVERFLOW block (overflow must be host-visible, not silent)\n{ptx}"
     );
 }
 
@@ -721,6 +736,15 @@ fn golden_float_atomic_min_uses_cas_loop() {
         ptx.contains("setp.lt.f64"),
         "MIN(f64) must use float < comparison\n{ptx}"
     );
+    // ORDERING (not just presence): the float comparison that decides whether
+    // the candidate improves the accumulator must be emitted BEFORE the CAS
+    // that publishes it, and the `@%p4 bra DONE` skip-on-no-improvement gate
+    // must also precede the CAS. Otherwise a thread would issue the atomic CAS
+    // unconditionally (or before computing the new value), reopening the
+    // hot-cacheline storm the gate exists to avoid and risking a stale store.
+    // Presence checks pass either way, so pin the order.
+    assert_emitted_before(&ptx, "setp.lt.f64", "atom.global.cas.b64");
+    assert_emitted_before(&ptx, "@%p4 bra DONE;", "atom.global.cas.b64");
 }
 
 // NOTE: Option B pre-stage validity propagation golden tests live in
@@ -1126,6 +1150,41 @@ fn assert_appears_before(ptx: &str, needle_pre: &str, needle_post: &str) {
     );
 }
 
+/// Assert that a validity / predicate *gate* is emitted strictly before the
+/// store / atomic it protects.
+///
+/// This is the load-bearing counterpart to the many substring-PRESENCE checks
+/// in this file. A test that asserts `ptx.contains("@%pN bra SKIP")` AND
+/// `ptx.contains("st.global…")` passes even if codegen emits the store BEFORE
+/// the gate — i.e. the write happens unconditionally and the "skip" branch is
+/// dead. Such a regression is silently wrong (a NULL row gets written, an
+/// unimproved slot gets an atomic) yet invisible to a presence check. By
+/// pinning the byte order of the two markers we turn an ordering bug into a
+/// red test.
+///
+/// `earlier` is the gate marker (the `setp`/`@%p..` guard or the `bra` skip),
+/// `later` is the guarded store/atomic. Both must be unique enough that
+/// `str::find` (first occurrence) lands on the intended site; the callers
+/// below pick markers — exact register-bearing lines or distinctive labels —
+/// that satisfy this. On failure we dump the full PTX plus both byte offsets
+/// so the contract violation is actionable from the test log alone.
+fn assert_emitted_before(ptx: &str, earlier: &str, later: &str) {
+    let gate = ptx.find(earlier).unwrap_or_else(|| {
+        panic!("ordering check: gate marker `{earlier}` not found in PTX\n{ptx}")
+    });
+    let store = ptx.find(later).unwrap_or_else(|| {
+        panic!("ordering check: guarded marker `{later}` not found in PTX\n{ptx}")
+    });
+    assert!(
+        gate < store,
+        "ordering violation: the gate `{earlier}` (byte {gate}) must be emitted \
+         BEFORE the store/atomic `{later}` (byte {store}) it protects, but it is \
+         emitted after. A substring-presence check would not catch this — the \
+         store now fires before (or instead of being skipped by) its validity \
+         gate, which is a silent-wrong-output regression.\n{ptx}"
+    );
+}
+
 #[test]
 fn probe_soa_ptx_speculative_load_before_atom_add() {
     use craton_bolt::jit::hash_join_kernel::compile_probe_kernel;
@@ -1288,6 +1347,14 @@ fn golden_distinct_flag_i64_nullable_smoke() {
     assert!(ptx.contains("@%p3 bra KEEP;"), "{ptx}");
     // i64 key compare.
     assert!(ptx.contains("setp.eq.s64"), "{ptx}");
+    // ORDERING (not just presence): the validity-derived branches that route a
+    // row to KEEP (store 1) vs DROP (store 0) must be emitted BEFORE the
+    // keep-store. If a refactor moved the `st.global.u8 …, %r20` keep-store
+    // above its `@%p2 bra DROP` / `@%p3 bra KEEP` gates, every row would take
+    // the fall-through store regardless of validity — a presence check still
+    // passes, so pin the order explicitly.
+    assert_emitted_before(&ptx, "@%p2 bra DROP;", "st.global.u8 [%rd1], %r20;");
+    assert_emitted_before(&ptx, "@%p3 bra KEEP;", "st.global.u8 [%rd1], %r20;");
 }
 
 #[test]
@@ -1857,6 +1924,12 @@ fn golden_window_boundary_flags_abi() {
         2,
         "expected exactly 2 u8 flag stores\n{ptx}"
     );
+    // ORDERING (not just presence): the `tid >= n_rows` bounds gate
+    // (`@%p0 bra DONE`) must be emitted BEFORE the first flag store. If the
+    // store were hoisted above the gate, an out-of-range thread would write
+    // past the end of the part_head/peer_head buffers — a presence check on
+    // the gate + the store cannot catch that, so pin the order.
+    assert_emitted_before(&ptx, "@%p0 bra DONE;", "st.global.u8");
 }
 
 /// Segmented-scan kernel: pinned entry name + 4-arg ABI + segmented combine

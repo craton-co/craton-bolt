@@ -53,6 +53,9 @@ pub fn kernel_entry_with_spill(op: MinMaxOp, dtype: FloatDtype) -> String {
 
 /// CAS-suffix token (`b32` / `b64`) for the float value dtype. Retained for
 /// the in-file shape tests; the actual emission lives in the shared generator.
+// Used only by the #[cfg(test)] shape tests below (see `uses_atom_shared_cas`);
+// mirrors `partition_reduce_kernel_minmax_float::FloatDtype::ptx_cas_suffix`.
+#[allow(dead_code)]
 fn ptx_cas_suffix(dtype: FloatDtype) -> &'static str {
     match dtype {
         FloatDtype::Float32 => "b32",

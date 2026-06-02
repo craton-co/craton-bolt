@@ -555,6 +555,9 @@ pub fn classify_operator(kind: OperatorKind) -> StreamCapability {
 /// through [`crate::exec::gpu_table::GpuColumn::upload`]. Returning empty (vs.
 /// erroring) keeps the per-column vector index-aligned with the schema so the
 /// caller can decide per column.
+// reserved for streaming-on-device wiring (see ROADMAP): only `upload_each`
+// (cfg(not(cuda-stub))) and unit tests call this, so it is dead under cuda-stub.
+#[allow(dead_code)]
 fn morsel_primitive_value_bytes(batch: &RecordBatch) -> Vec<Vec<u8>> {
     batch
         .columns()
@@ -603,6 +606,9 @@ fn morsel_primitive_value_bytes(batch: &RecordBatch) -> Vec<Vec<u8>> {
 /// Byte width of a fixed-width primitive Arrow type, or `None` for types whose
 /// upload the streaming primitive path does not own (variable-width, nested,
 /// dictionary, etc.).
+// reserved for streaming-on-device wiring (see ROADMAP): only used by
+// `morsel_primitive_value_bytes` / tests, so it is dead under cuda-stub.
+#[allow(dead_code)]
 fn primitive_byte_width(dt: &arrow_schema::DataType) -> Option<usize> {
     use arrow_schema::DataType as D;
     Some(match dt {

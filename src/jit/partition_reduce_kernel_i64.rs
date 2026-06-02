@@ -94,14 +94,6 @@ pub const KERNEL_ENTRY: &str = "bolt_partition_reduce_i64";
 /// [`KERNEL_ENTRY`] so both kernels can coexist in the JIT module cache.
 pub const KERNEL_ENTRY_WITH_SPILL: &str = "bolt_partition_reduce_i64_spill";
 
-/// Probe bound. Same as i32 sibling.
-const MAX_PROBES: u32 = BLOCK_GROUPS;
-
-/// Per-iteration `nanosleep.u32` operand for the collision-advance path.
-/// See `partition_reduce_kernel::SPIN_BACKOFF_NS` for full rationale.
-/// TODO(perf): exponential back-off.
-const SPIN_BACKOFF_NS: u32 = 32;
-
 /// Generate PTX for the i64-key per-partition reduce kernel.
 ///
 /// Kernel signature (PTX-level):
