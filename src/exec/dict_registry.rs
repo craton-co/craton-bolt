@@ -406,18 +406,36 @@ fn dicts_conflict(a: &DictionaryColumnAny, b: &DictionaryColumnAny) -> bool {
 /// Pure host function — no I/O, no allocations beyond the result vec. Used by
 /// [`DictRegistry::rewrite_plan`] to know which tables' dictionaries to fold
 /// into the rewriter.
-/// Collect the names of every column a `Project` node surfaces as a *bare
-/// column output* (an `Expr::Column`, optionally wrapped in transparent
-/// `Alias`es), anywhere in the plan.
+/// Collect the names of every column a `Project` node surfaces in a way that
+/// forces the column's string value to be materialised host-side, anywhere in
+/// the plan. Two shapes qualify:
 ///
-/// Used by [`DictRegistry::rewrite_plan`] to decide which columns' `LIKE`
-/// predicates must be protected from the integer-index membership fold: if the
-/// query projects a string column verbatim, the GPU integer filter can't emit
-/// the surviving Utf8 rows, so the `LIKE` has to stay a real `Expr::Like` for
-/// the `StringLikeFilter` / host path. Collecting a superset (e.g. numeric
-/// outputs too) is harmless — only registered Utf8 dict columns are ever gated.
+///   * a *bare column output* (an `Expr::Column`, optionally wrapped in
+///     transparent `Alias`es) — the column is projected verbatim, and
+///   * a *host-bound string projection* — an output expression that contains a
+///     string scalar function (`SUBSTRING` / `TRIM` / `CONCAT` / …) or the SQL
+///     `||` concat operator (`BinaryOp::Concat`). Such projections have no fused
+///     GPU producer over a Filter chain, so the physical planner routes them to
+///     the host `PhysicalPlan::Project`, which materialises every referenced
+///     column (including the predicate column) from the host source batch.
+///
+/// Used by [`DictRegistry::rewrite_plan`] to decide which columns' string
+/// (`LIKE` / `=` / `<>`) predicates must be protected from the integer-index
+/// membership fold. If the query surfaces a string column verbatim, the GPU
+/// integer filter can't emit the surviving Utf8 rows, so the predicate has to
+/// stay a real Utf8 comparison for the `StringLikeFilter` / host `Filter` path.
+/// The host-bound-string-projection case is the same hazard one level up: if the
+/// predicate column is folded to `__idx_<col> = <int>`, the inner Filter loses
+/// its Utf8 literal and the host `Project`'s inner-plan lowering falls into the
+/// fused GPU scan kernel over the still-Utf8 source column — which has no Utf8
+/// register class ("Utf8 not supported in PTX codegen yet"). Protecting the
+/// referenced column keeps the predicate a Utf8 comparison so the existing
+/// `expr_contains_utf8_literal` host-`Filter` route handles it. Collecting a
+/// superset (e.g. numeric outputs too) is harmless — only registered Utf8 dict
+/// columns are ever gated, and protection only swaps the integer fold for the
+/// (correct) host path.
 fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashSet<String> {
-    use crate::plan::logical_plan::Expr;
+    use crate::plan::logical_plan::{BinaryOp, Expr};
     fn peel(e: &Expr) -> &Expr {
         let mut cur = e;
         while let Expr::Alias(inner, _) = cur {
@@ -425,12 +443,87 @@ fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashS
         }
         cur
     }
+    /// True if `e` contains a string scalar function or the `||` concat
+    /// operator anywhere in its subtree — i.e. the output is materialised by
+    /// the host `PhysicalPlan::Project` rather than the fused GPU scan kernel.
+    fn is_host_bound_string_expr(e: &Expr) -> bool {
+        match e {
+            Expr::ScalarFn { .. } => true,
+            Expr::Binary { op: BinaryOp::Concat, .. } => true,
+            Expr::Binary { left, right, .. } => {
+                is_host_bound_string_expr(left) || is_host_bound_string_expr(right)
+            }
+            Expr::Unary { operand, .. } => is_host_bound_string_expr(operand),
+            Expr::Alias(inner, _) => is_host_bound_string_expr(inner),
+            Expr::Cast { expr, .. } | Expr::Like { expr, .. } => {
+                is_host_bound_string_expr(expr)
+            }
+            Expr::Case { branches, else_branch } => {
+                branches
+                    .iter()
+                    .any(|(w, t)| is_host_bound_string_expr(w) || is_host_bound_string_expr(t))
+                    || else_branch
+                        .as_deref()
+                        .map(is_host_bound_string_expr)
+                        .unwrap_or(false)
+            }
+            Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
+                is_host_bound_string_expr(expr)
+            }
+            Expr::InSubquery { expr, .. } => is_host_bound_string_expr(expr),
+            Expr::Column(_) | Expr::Literal(_) | Expr::ScalarSubquery(_) => false,
+        }
+    }
+    /// Insert every column name referenced anywhere in `e` into `out`.
+    fn collect_column_refs(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        match e {
+            Expr::Column(name) => {
+                out.insert(name.clone());
+            }
+            Expr::Literal(_) | Expr::ScalarSubquery(_) => {}
+            Expr::Binary { left, right, .. } => {
+                collect_column_refs(left, out);
+                collect_column_refs(right, out);
+            }
+            Expr::Unary { operand, .. } => collect_column_refs(operand, out),
+            Expr::Alias(inner, _) => collect_column_refs(inner, out),
+            Expr::Cast { expr, .. } | Expr::Like { expr, .. } => {
+                collect_column_refs(expr, out)
+            }
+            Expr::ScalarFn { args, .. } => {
+                for a in args {
+                    collect_column_refs(a, out);
+                }
+            }
+            Expr::Case { branches, else_branch } => {
+                for (w, t) in branches {
+                    collect_column_refs(w, out);
+                    collect_column_refs(t, out);
+                }
+                if let Some(eb) = else_branch.as_deref() {
+                    collect_column_refs(eb, out);
+                }
+            }
+            Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
+                collect_column_refs(expr, out)
+            }
+            Expr::InSubquery { expr, .. } => collect_column_refs(expr, out),
+        }
+    }
     fn walk(p: &LogicalPlan, out: &mut std::collections::HashSet<String>) {
         match p {
             LogicalPlan::Project { input, exprs } => {
                 for e in exprs {
-                    if let Expr::Column(name) = peel(e) {
+                    let body = peel(e);
+                    if let Expr::Column(name) = body {
                         out.insert(name.clone());
+                    } else if is_host_bound_string_expr(body) {
+                        // A host-materialised string projection (e.g.
+                        // `SUBSTRING(s, …)`, `s || x`): protect every column it
+                        // references so a string predicate on that column is not
+                        // folded to an integer index (which would strand the
+                        // Utf8 source column in the fused GPU scan kernel).
+                        collect_column_refs(body, out);
                     }
                 }
                 walk(input, out);
@@ -536,6 +629,64 @@ mod tests {
         };
 
         assert_eq!(collect_scan_tables(&proj), vec!["events".to_string()]);
+    }
+
+    /// `Project(SUBSTRING(s, …)) over Filter over Scan`: a host-bound string
+    /// projection must protect the column it references (`s`) so a later string
+    /// predicate on `s` is NOT folded to an integer index. Without protection,
+    /// the inner Filter would lose its Utf8 literal and the host Project's
+    /// inner-plan lowering would fall into the fused GPU scan kernel over the
+    /// still-Utf8 `s` column ("Utf8 not supported in PTX codegen yet").
+    #[test]
+    fn collect_projected_columns_protects_host_bound_string_fn() {
+        use crate::plan::logical_plan::ScalarFnKind;
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("s", DataType::Utf8, true)]),
+        };
+        let filt = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: col("s").eq(lit("héllo")),
+        };
+        let proj = LogicalPlan::Project {
+            input: Box::new(filt),
+            exprs: vec![Expr::ScalarFn {
+                kind: ScalarFnKind::Substring,
+                args: vec![Expr::Column("s".into()), lit(2_i64), lit(1_i64)],
+            }],
+        };
+        let cols = collect_projected_bare_columns(&proj);
+        assert!(
+            cols.contains("s"),
+            "SUBSTRING(s, …) projection must protect column 's', got {cols:?}"
+        );
+    }
+
+    /// A purely numeric projection (`v + 1`) over a Filter must NOT be treated
+    /// as a host-bound string projection: it references `v` only through plain
+    /// arithmetic, so `v` is left unprotected and keeps the (correct) integer
+    /// fold path. Guards against the new string-fn protection over-collecting.
+    #[test]
+    fn collect_projected_columns_skips_numeric_projection() {
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![Field::new("v", DataType::Int64, false)]),
+        };
+        let filt = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: col("v").gt(lit(0_i64)),
+        };
+        let proj = LogicalPlan::Project {
+            input: Box::new(filt),
+            exprs: vec![col("v").add(lit(1_i64))],
+        };
+        let cols = collect_projected_bare_columns(&proj);
+        assert!(
+            !cols.contains("v"),
+            "a non-string arithmetic projection must not protect 'v', got {cols:?}"
+        );
     }
 
     /// A bare Scan returns exactly its table name.
