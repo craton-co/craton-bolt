@@ -27,10 +27,10 @@ use crate::plan::{DataType, Field, KernelSpec, MemTableProvider, Schema};
 pub(crate) fn column_storage_rows(data: &crate::exec::gpu_table::GpuColumnData) -> usize {
     use crate::exec::gpu_table::GpuColumnData::*;
     match data {
-        I32(v) => v.len(),
-        I64(v) => v.len(),
-        F32(v) => v.len(),
-        F64(v) => v.len(),
+        I32 { values, .. } => values.len(),
+        I64 { values, .. } => values.len(),
+        F32 { values, .. } => values.len(),
+        F64 { values, .. } => values.len(),
         Bool(v) => v.len(),
         BoolNullable { values, .. } => values.len(),
         Utf8 { indices, .. } => indices.len(),
@@ -75,7 +75,7 @@ pub(crate) fn try_extend_column(
         host_revision: _,
     } = prev;
     let new_data: GpuColumnData = match data {
-        GpuColumnData::I32(old) => {
+        GpuColumnData::I32 { values: old, validity } => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Int32Array>()
@@ -86,13 +86,24 @@ pub(crate) fn try_extend_column(
                         arr.data_type()
                     ))
                 })?;
+            // Nullable primitives carry an unpacked per-row validity buffer
+            // that the prefix-extend path doesn't update. If the device
+            // column already has validity, or the appended batch introduces
+            // nulls, punt to a full re-upload (mirrors Bool-with-nulls).
+            use arrow::array::Array as _;
+            if validity.is_some() || pa.null_count() != 0 {
+                return Ok(None);
+            }
             let tail: Vec<i32> = (prev_rows..n_rows_total)
                 .map(|i| pa.value(i))
                 .collect();
             let extended = old.extended_with_prefix(n_rows_total, prev_rows, &tail)?;
-            GpuColumnData::I32(extended)
+            GpuColumnData::I32 {
+                values: extended,
+                validity: None,
+            }
         }
-        GpuColumnData::I64(old) => {
+        GpuColumnData::I64 { values: old, validity } => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Int64Array>()
@@ -103,13 +114,20 @@ pub(crate) fn try_extend_column(
                         arr.data_type()
                     ))
                 })?;
+            use arrow::array::Array as _;
+            if validity.is_some() || pa.null_count() != 0 {
+                return Ok(None);
+            }
             let tail: Vec<i64> = (prev_rows..n_rows_total)
                 .map(|i| pa.value(i))
                 .collect();
             let extended = old.extended_with_prefix(n_rows_total, prev_rows, &tail)?;
-            GpuColumnData::I64(extended)
+            GpuColumnData::I64 {
+                values: extended,
+                validity: None,
+            }
         }
-        GpuColumnData::F32(old) => {
+        GpuColumnData::F32 { values: old, validity } => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -120,13 +138,20 @@ pub(crate) fn try_extend_column(
                         arr.data_type()
                     ))
                 })?;
+            use arrow::array::Array as _;
+            if validity.is_some() || pa.null_count() != 0 {
+                return Ok(None);
+            }
             let tail: Vec<f32> = (prev_rows..n_rows_total)
                 .map(|i| pa.value(i))
                 .collect();
             let extended = old.extended_with_prefix(n_rows_total, prev_rows, &tail)?;
-            GpuColumnData::F32(extended)
+            GpuColumnData::F32 {
+                values: extended,
+                validity: None,
+            }
         }
-        GpuColumnData::F64(old) => {
+        GpuColumnData::F64 { values: old, validity } => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
@@ -137,11 +162,18 @@ pub(crate) fn try_extend_column(
                         arr.data_type()
                     ))
                 })?;
+            use arrow::array::Array as _;
+            if validity.is_some() || pa.null_count() != 0 {
+                return Ok(None);
+            }
             let tail: Vec<f64> = (prev_rows..n_rows_total)
                 .map(|i| pa.value(i))
                 .collect();
             let extended = old.extended_with_prefix(n_rows_total, prev_rows, &tail)?;
-            GpuColumnData::F64(extended)
+            GpuColumnData::F64 {
+                values: extended,
+                validity: None,
+            }
         }
         GpuColumnData::Bool(old) => {
             let ba = arr

@@ -2728,6 +2728,12 @@ impl Engine {
             kernel.input_has_validity.clone()
         };
         let mut input_validity_ptrs: Vec<CUdeviceptr> = Vec::new();
+        // Holds any all-valid bitmaps synthesised below for columns that are
+        // nullable-in-schema but carry NO actual nulls (so `validity_ptr()` is
+        // `None`). These must outlive the kernel launch + the result D2H sync,
+        // which both happen later in this function — so a function-scoped Vec is
+        // the correct lifetime.
+        let mut synth_validity_bufs: Vec<GpuVec<u8>> = Vec::new();
         for (i, has) in need_input_validity.iter().enumerate() {
             if !*has {
                 continue;
@@ -2752,18 +2758,22 @@ impl Engine {
                     io.name, table
                 ))
             })?;
-            let vptr = column.data.validity_ptr().ok_or_else(|| {
-                BoltError::Plan(format!(
-                    "engine: kernel flags input '{}' as needing validity but the GPU \
-                     column has no validity bitmap on device. The plan-time constant-fold \
-                     in physical_plan::Codegen::emit_unary should have collapsed this \
-                     IsNullCheck to a Bool constant — was the schema's nullable flag \
-                     out of sync with the actual GPU storage? \
-                     (Nullable primitives on the device are a follow-up; today only \
-                     BoolNullable and DictUtf8 expose `validity_ptr`.)",
-                    io.name
-                ))
-            })?;
+            let vptr = match column.data.validity_ptr() {
+                Some(vptr) => vptr,
+                None => {
+                    // The column is nullable in the schema (so the planner did
+                    // NOT constant-fold this IsNullCheck) but carries NO actual
+                    // nulls on device, so `validity_ptr()` is `None`. Every row
+                    // is valid: synthesise an all-valid (all-1s) per-row bitmap
+                    // — the unpacked 1-byte-per-row format `emit_is_null_check`
+                    // reads — so IS NULL → false / IS NOT NULL → true for every
+                    // row, instead of erroring on the schema-vs-storage mismatch.
+                    let all_valid = GpuVec::<u8>::from_slice(&vec![1u8; n_rows])?;
+                    let ptr = all_valid.device_ptr();
+                    synth_validity_bufs.push(all_valid);
+                    ptr
+                }
+            };
             input_validity_ptrs.push(vptr);
         }
 

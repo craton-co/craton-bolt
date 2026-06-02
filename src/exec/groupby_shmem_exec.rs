@@ -477,7 +477,7 @@ fn resident_i32<'a>(rt: &'a GpuTable, name: &str) -> Option<&'a GpuVec<i32>> {
         return None;
     }
     match &col.data {
-        GpuColumnData::I32(v) => Some(v),
+        GpuColumnData::I32 { values, .. } => Some(values),
         _ => None,
     }
 }
@@ -490,7 +490,7 @@ fn resident_f64<'a>(rt: &'a GpuTable, name: &str) -> Option<&'a GpuVec<f64>> {
         return None;
     }
     match &col.data {
-        GpuColumnData::F64(v) => Some(v),
+        GpuColumnData::F64 { values, .. } => Some(values),
         _ => None,
     }
 }

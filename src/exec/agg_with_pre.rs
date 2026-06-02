@@ -191,10 +191,10 @@ pub fn try_execute_resident(
             return Ok(None);
         }
         match &col.data {
-            GpuColumnData::I32(_)
-            | GpuColumnData::I64(_)
-            | GpuColumnData::F32(_)
-            | GpuColumnData::F64(_) => {}
+            GpuColumnData::I32 { .. }
+            | GpuColumnData::I64 { .. }
+            | GpuColumnData::F32 { .. }
+            | GpuColumnData::F64 { .. } => {}
             _ => return Ok(None),
         }
         input_ptrs.push(col.data.device_ptr());

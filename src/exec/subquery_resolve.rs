@@ -39,7 +39,9 @@ use arrow_array::{
 use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
 
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{AggregateExpr, BinaryOp, Expr, Literal, LogicalPlan, SortExpr};
+use crate::plan::logical_plan::{
+    AggregateExpr, BinaryOp, Expr, Literal, LogicalPlan, SortExpr, UnaryOp,
+};
 
 /// Extract the value at row `row` of the (single) first column of `batch` as a
 /// [`Literal`]. A null at that position yields [`Literal::Null`]. Unsupported
@@ -246,11 +248,32 @@ pub fn build_in_predicate(expr: &Expr, values: &[Literal], negated: bool) -> Exp
     });
     // `non_null` is non-empty, so `next()` is `Some`.
     let first = iter.next().expect("non_null checked non-empty");
-    iter.fold(first, |acc, eq| Expr::Binary {
+    let folded = iter.fold(first, |acc, eq| Expr::Binary {
         op: fold_op,
         left: Box::new(acc),
         right: Box::new(eq),
-    })
+    });
+
+    if negated {
+        // SQL 3VL: `expr NOT IN (set)` evaluates to UNKNOWN (→ row excluded
+        // under a WHERE clause) whenever `expr` itself is NULL, regardless of
+        // the set contents. The lowered `expr <> v AND …` does NOT capture
+        // this: the GPU `<>` comparator reads a NULL probe as its raw stored
+        // value (e.g. 0) and would wrongly include it. AND in an explicit
+        // `expr IS NOT NULL` guard so NULL probe rows are dropped. (For the
+        // non-negated `IN` form a NULL probe yields UNKNOWN through the `=`
+        // fold and is already excluded under WHERE, so no guard is added there.)
+        Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(folded),
+            right: Box::new(Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(expr.clone()),
+            }),
+        }
+    } else {
+        folded
+    }
 }
 
 /// Recursively resolve every subquery in `plan`, executing subplans via
@@ -623,12 +646,29 @@ mod tests {
     fn build_not_in_and_of_inequalities() {
         let probe = Expr::Column("x".into());
         let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true);
+        // NOT IN lowers to `(x <> 1 AND x <> 2) AND x IS NOT NULL` — the trailing
+        // IS NOT NULL guard drops NULL probe rows (SQL 3VL: NULL NOT IN ... is
+        // UNKNOWN → excluded under WHERE).
         match got {
             Expr::Binary { op: BinaryOp::And, left, right } => {
-                check_cmp(&left, "x", BinaryOp::NotEq, Literal::Int32(1));
-                check_cmp(&right, "x", BinaryOp::NotEq, Literal::Int32(2));
+                // right-hand operand is the IS NOT NULL guard over the probe.
+                match &*right {
+                    Expr::Unary { op: UnaryOp::IsNotNull, operand } => match &**operand {
+                        Expr::Column(name) => assert_eq!(name.as_str(), "x"),
+                        other => panic!("expected Column in IS NOT NULL, got {other:?}"),
+                    },
+                    other => panic!("expected IS NOT NULL guard, got {other:?}"),
+                }
+                // left-hand operand is the AND-of-inequalities.
+                match &*left {
+                    Expr::Binary { op: BinaryOp::And, left: l2, right: r2 } => {
+                        check_cmp(l2, "x", BinaryOp::NotEq, Literal::Int32(1));
+                        check_cmp(r2, "x", BinaryOp::NotEq, Literal::Int32(2));
+                    }
+                    other => panic!("expected AND of inequalities, got {other:?}"),
+                }
             }
-            other => panic!("expected AND of inequalities, got {other:?}"),
+            other => panic!("expected AND with IS NOT NULL guard, got {other:?}"),
         }
     }
 
@@ -687,12 +727,23 @@ mod tests {
             &[Literal::Int32(1), Literal::Int32(2)],
             true,
         );
+        // `(x <> 1 AND x <> 2) AND x IS NOT NULL` — the IS NOT NULL guard drops
+        // NULL probe rows (SQL 3VL); the inequality fold is over the non-NULL set.
         match got {
             Expr::Binary { op: BinaryOp::And, left, right } => {
-                check_cmp(&left, "x", BinaryOp::NotEq, Literal::Int32(1));
-                check_cmp(&right, "x", BinaryOp::NotEq, Literal::Int32(2));
+                assert!(
+                    matches!(&*right, Expr::Unary { op: UnaryOp::IsNotNull, .. }),
+                    "expected trailing IS NOT NULL guard, got {right:?}"
+                );
+                match &*left {
+                    Expr::Binary { op: BinaryOp::And, left: l2, right: r2 } => {
+                        check_cmp(l2, "x", BinaryOp::NotEq, Literal::Int32(1));
+                        check_cmp(r2, "x", BinaryOp::NotEq, Literal::Int32(2));
+                    }
+                    other => panic!("expected AND of inequalities, got {other:?}"),
+                }
             }
-            other => panic!("expected AND of inequalities, got {other:?}"),
+            other => panic!("expected AND with IS NOT NULL guard, got {other:?}"),
         }
     }
 

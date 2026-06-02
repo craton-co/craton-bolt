@@ -43,13 +43,41 @@ pub struct GpuColumn {
 /// Heterogeneous owned device storage for a single column.
 pub enum GpuColumnData {
     /// 32-bit signed integer column.
-    I32(GpuVec<i32>),
+    I32 {
+        /// Per-row i32 values on the device.
+        values: GpuVec<i32>,
+        /// Optional per-row validity, ONE u8 per row (0 = NULL, 1 = non-null),
+        /// matching `BoolNullable` and what `emit_is_null_check` reads. `None`
+        /// when the source had no nulls.
+        validity: Option<GpuVec<u8>>,
+    },
     /// 64-bit signed integer column.
-    I64(GpuVec<i64>),
+    I64 {
+        /// Per-row i64 values on the device.
+        values: GpuVec<i64>,
+        /// Optional per-row validity, ONE u8 per row (0 = NULL, 1 = non-null),
+        /// matching `BoolNullable` and what `emit_is_null_check` reads. `None`
+        /// when the source had no nulls.
+        validity: Option<GpuVec<u8>>,
+    },
     /// 32-bit float column.
-    F32(GpuVec<f32>),
+    F32 {
+        /// Per-row f32 values on the device.
+        values: GpuVec<f32>,
+        /// Optional per-row validity, ONE u8 per row (0 = NULL, 1 = non-null),
+        /// matching `BoolNullable` and what `emit_is_null_check` reads. `None`
+        /// when the source had no nulls.
+        validity: Option<GpuVec<u8>>,
+    },
     /// 64-bit float column.
-    F64(GpuVec<f64>),
+    F64 {
+        /// Per-row f64 values on the device.
+        values: GpuVec<f64>,
+        /// Optional per-row validity, ONE u8 per row (0 = NULL, 1 = non-null),
+        /// matching `BoolNullable` and what `emit_is_null_check` reads. `None`
+        /// when the source had no nulls.
+        validity: Option<GpuVec<u8>>,
+    },
     /// Boolean column, one byte per row.
     Bool(GpuVec<u8>),
     /// Nullable boolean column, values and validity mask buffers.
@@ -151,10 +179,10 @@ impl GpuColumnData {
     /// stride-16 buffer.
     pub fn device_ptr(&self) -> CUdeviceptr {
         match self {
-            GpuColumnData::I32(v) => v.device_ptr(),
-            GpuColumnData::I64(v) => v.device_ptr(),
-            GpuColumnData::F32(v) => v.device_ptr(),
-            GpuColumnData::F64(v) => v.device_ptr(),
+            GpuColumnData::I32 { values, .. } => values.device_ptr(),
+            GpuColumnData::I64 { values, .. } => values.device_ptr(),
+            GpuColumnData::F32 { values, .. } => values.device_ptr(),
+            GpuColumnData::F64 { values, .. } => values.device_ptr(),
             GpuColumnData::Bool(v) => v.device_ptr(),
             GpuColumnData::BoolNullable { values, .. } => values.device_ptr(),
             GpuColumnData::Utf8 { indices, .. } => indices.device_ptr(),
@@ -181,6 +209,13 @@ impl GpuColumnData {
                 ..
             } => Some(v.device_ptr()),
             GpuColumnData::BoolNullable { validity, .. } => Some(validity.device_ptr()),
+            // Primitive columns carry an UNPACKED per-row validity (one u8 per
+            // row, 0 = NULL / 1 = non-null) — exactly the form
+            // `emit_is_null_check` reads. `None` when the source had no nulls.
+            GpuColumnData::I32 { validity, .. } => validity.as_ref().map(|v| v.device_ptr()),
+            GpuColumnData::I64 { validity, .. } => validity.as_ref().map(|v| v.device_ptr()),
+            GpuColumnData::F32 { validity, .. } => validity.as_ref().map(|v| v.device_ptr()),
+            GpuColumnData::F64 { validity, .. } => validity.as_ref().map(|v| v.device_ptr()),
             _ => None,
         }
     }
@@ -205,6 +240,26 @@ fn pack_validity_from_arrow(null_buffer: &arrow_buffer::NullBuffer, n_rows: usiz
     out
 }
 
+/// Build the UNPACKED per-row validity buffer for a primitive Arrow array:
+/// one `u8` per row, `0 = NULL`, `1 = non-null`. This is the exact layout
+/// `BoolNullable` uses and the only layout `emit_is_null_check` reads
+/// (`ld.global.nc.u8 [vptr + tid]`, byte `tid` per row) — NOT the packed
+/// bitmap produced by [`pack_validity_from_arrow`].
+///
+/// Returns `Ok(None)` when the array has no nulls (no validity buffer needed),
+/// and `Ok(Some(GpuVec<u8>))` of length `arr.len()` otherwise.
+fn unpacked_validity_from_arrow(arr: &dyn Array) -> BoltResult<Option<GpuVec<u8>>> {
+    if arr.null_count() == 0 {
+        return Ok(None);
+    }
+    let n = arr.len();
+    let mut validity: Vec<u8> = Vec::with_capacity(n);
+    for i in 0..n {
+        validity.push(if arr.is_null(i) { 0 } else { 1 });
+    }
+    Ok(Some(GpuVec::<u8>::from_slice(&validity)?))
+}
+
 impl GpuColumn {
     /// Upload an Arrow array to the GPU, downcasting per `dtype`.
     pub fn upload(name: String, arr: &dyn Array, dtype: DataType) -> BoltResult<Self> {
@@ -215,7 +270,11 @@ impl GpuColumn {
                     .downcast_ref::<Int32Array>()
                     .ok_or_else(|| type_mismatch_err(arr, "Int32"))?;
                 let buf = primitive_to_gpu(pa)?;
-                GpuColumnData::I32(GpuVec::from_buffer(buf))
+                let validity = unpacked_validity_from_arrow(pa)?;
+                GpuColumnData::I32 {
+                    values: GpuVec::from_buffer(buf),
+                    validity,
+                }
             }
             DataType::Int64 => {
                 let pa = arr
@@ -223,7 +282,11 @@ impl GpuColumn {
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| type_mismatch_err(arr, "Int64"))?;
                 let buf = primitive_to_gpu(pa)?;
-                GpuColumnData::I64(GpuVec::from_buffer(buf))
+                let validity = unpacked_validity_from_arrow(pa)?;
+                GpuColumnData::I64 {
+                    values: GpuVec::from_buffer(buf),
+                    validity,
+                }
             }
             DataType::Float32 => {
                 let pa = arr
@@ -231,7 +294,11 @@ impl GpuColumn {
                     .downcast_ref::<Float32Array>()
                     .ok_or_else(|| type_mismatch_err(arr, "Float32"))?;
                 let buf = primitive_to_gpu(pa)?;
-                GpuColumnData::F32(GpuVec::from_buffer(buf))
+                let validity = unpacked_validity_from_arrow(pa)?;
+                GpuColumnData::F32 {
+                    values: GpuVec::from_buffer(buf),
+                    validity,
+                }
             }
             DataType::Float64 => {
                 let pa = arr
@@ -239,7 +306,11 @@ impl GpuColumn {
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| type_mismatch_err(arr, "Float64"))?;
                 let buf = primitive_to_gpu(pa)?;
-                GpuColumnData::F64(GpuVec::from_buffer(buf))
+                let validity = unpacked_validity_from_arrow(pa)?;
+                GpuColumnData::F64 {
+                    values: GpuVec::from_buffer(buf),
+                    validity,
+                }
             }
             DataType::Bool => {
                 let ba = arr
