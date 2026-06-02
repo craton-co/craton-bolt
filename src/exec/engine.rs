@@ -2210,7 +2210,11 @@ impl Engine {
         // ordinary error accounting below.
         match crate::plan::sql_frontend::plan_recursive_cte(query, &self.provider) {
             Ok(Some(rec)) => {
-                let result = self.execute_recursive_cte(&rec);
+                use crate::plan::sql_frontend::RecursiveQueryPlan;
+                let result = match rec {
+                    RecursiveQueryPlan::Single(rec) => self.execute_recursive_cte(&rec),
+                    RecursiveQueryPlan::Mutual(rec) => self.execute_mutual_recursive_cte(&rec),
+                };
                 if result.is_err() {
                     crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
                 }
@@ -2391,10 +2395,17 @@ impl Engine {
         if let Some(rec) =
             crate::plan::sql_frontend::plan_recursive_cte(query, &self.provider)?
         {
-            return Ok(format!(
-                "Recursive CTE plan:\n{}",
-                crate::plan::explain::format_recursive_cte(&rec)
-            ));
+            use crate::plan::sql_frontend::RecursiveQueryPlan;
+            return Ok(match rec {
+                RecursiveQueryPlan::Single(rec) => format!(
+                    "Recursive CTE plan:\n{}",
+                    crate::plan::explain::format_recursive_cte(&rec)
+                ),
+                RecursiveQueryPlan::Mutual(rec) => format!(
+                    "Mutual recursive CTE plan:\n{}",
+                    crate::plan::explain::format_mutual_recursive_cte(&rec)
+                ),
+            });
         }
         // F3-finish: render the host-orchestrated COUNT(DISTINCT) + GROUP BY
         // descriptor via its dedicated formatter.
@@ -2700,7 +2711,26 @@ impl Engine {
 
             let rec_out = relabel(run_with_cte(&working_set, &rec.recursive)?)?;
 
-            if rec.all {
+            if rec.all && rec.naive {
+                // NON-LINEAR UNION ALL (naive): the recursive term scans the
+                // CTE more than once (a self-join), and every scan resolves to
+                // the single ephemeral table we bind by name. Correct naive
+                // semantics evaluate `r = anchor ∪ recursive_term(r)` against
+                // the FULL accumulation each step, so the next full relation is
+                // the anchor rows unioned with the freshly re-derived rows
+                // (`rec_out`). The relation REPLACES (not appends to) the
+                // accumulation — re-deriving a fixpoint, not streaming a delta.
+                // Fixpoint is reached when the relation stops growing (row count
+                // stable); since we cannot dedup under UNION ALL, the iteration
+                // cap above is the mandatory guard against unbounded growth on
+                // cyclic data.
+                let next = concat_two_batches(&anchor_out, &rec_out)?;
+                if next.num_rows() == result.num_rows() {
+                    break; // Fixpoint: the re-derived relation did not grow.
+                }
+                working_set = next.clone();
+                result = next;
+            } else if rec.all {
                 // UNION ALL: append every produced row; the next working set is
                 // the whole recursive output. Stop when it is empty.
                 if rec_out.num_rows() == 0 {
@@ -2736,6 +2766,169 @@ impl Engine {
 
         // --- 4. Run the main query over the full accumulated relation. ---
         let main_out = run_with_cte(&result, &rec.main)?;
+        Ok(QueryHandle::from_record_batch(main_out))
+    }
+
+    /// Execute a mutually-recursive `WITH RECURSIVE` system (multiple CTEs that
+    /// reference each other) by orchestrating a multi-relation **lockstep**
+    /// fixpoint, then running the main query over the accumulated relations.
+    ///
+    /// This is the multi-relation generalisation of
+    /// [`Engine::execute_recursive_cte`]. Where the single-CTE path advances a
+    /// scalar working set, this advances a *vector* of working sets in lockstep:
+    ///
+    /// 1. **Seed.** Materialise every CTE's anchor → its initial accumulated
+    ///    relation (de-duplicated for a `UNION` member).
+    /// 2. **Iterate.** Each step, bind ALL CTE names to their CURRENT
+    ///    accumulated relations in the streaming overlay, then evaluate every
+    ///    recursive term (each may reference any CTE in the system). Union each
+    ///    term's output into its own CTE's accumulation: append for `UNION ALL`,
+    ///    dedup-against-accumulation for `UNION`. A naive (whole-relation)
+    ///    binding is used — correct for set semantics and for cross-references,
+    ///    and required because a sibling's rows feed this term.
+    /// 3. **Fixpoint.** Stop only when NO CTE grew in a full step (the combined
+    ///    fixpoint). For a `UNION ALL` member "grew" means produced ≥1 new row;
+    ///    for a `UNION` member it means the de-duplicated accumulation gained
+    ///    rows. Mixed systems terminate on the cap if any `UNION ALL` member
+    ///    keeps producing rows (the cap is mandatory).
+    /// 4. **Cap.** The shared [`max_recursive_iterations`] cap bounds the loop.
+    /// 5. **Main.** Bind all final accumulations and run the main query.
+    ///
+    /// All ephemeral CTE tables live only in the interior-mutable streaming
+    /// overlay and are removed before returning; a name collision with a real
+    /// table is rejected up front.
+    fn execute_mutual_recursive_cte(
+        &self,
+        rec: &crate::plan::sql_frontend::MutualRecursiveCtePlan,
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::distinct::execute_distinct;
+        use crate::exec::streaming::TableSource;
+
+        // Reject collisions with real tables (and detect any duplicate name the
+        // frontend already guards, defensively).
+        for term in &rec.ctes {
+            if self.tables.contains_key(&term.name)
+                || self.streaming_sources.borrow().contains_key(&term.name)
+            {
+                return Err(BoltError::Plan(format!(
+                    "WITH RECURSIVE: CTE name '{}' collides with a registered \
+                     table — rename the CTE",
+                    term.name
+                )));
+            }
+        }
+
+        // Per-CTE relabel closure factory: every term's batch is re-labelled to
+        // its declared `cte_schema` before it is registered / unioned.
+        let arrow_schemas = rec
+            .ctes
+            .iter()
+            .map(|t| plan_schema_to_arrow_schema(&t.cte_schema))
+            .collect::<BoltResult<Vec<_>>>()?;
+        let relabel = |idx: usize, batch: RecordBatch| -> BoltResult<RecordBatch> {
+            let schema = &arrow_schemas[idx];
+            if batch.num_columns() != schema.fields().len() {
+                return Err(BoltError::Plan(format!(
+                    "WITH RECURSIVE: a term produced {} columns but the CTE \
+                     '{}' declares {}",
+                    batch.num_columns(),
+                    rec.ctes[idx].name,
+                    schema.fields().len()
+                )));
+            }
+            RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec())
+                .map_err(|e| BoltError::Plan(format!("WITH RECURSIVE relabel: {e}")))
+        };
+
+        // Bind ALL current accumulations under their CTE names, run `plan`, then
+        // clear every overlay entry (and evict any GPU-resident copy so the next
+        // bind re-uploads the current rows). Returns the produced batch.
+        let run_with_all = |accums: &[RecordBatch], plan: &LogicalPlan| -> BoltResult<RecordBatch> {
+            for (i, term) in rec.ctes.iter().enumerate() {
+                self.gpu_tables.borrow_mut().remove(&term.name);
+                self.streaming_sources.borrow_mut().insert(
+                    term.name.clone(),
+                    TableSource::Materialized(vec![accums[i].clone()]),
+                );
+            }
+            let out = self.run_subplan(plan.clone());
+            for term in &rec.ctes {
+                self.streaming_sources.borrow_mut().remove(&term.name);
+                self.gpu_tables.borrow_mut().remove(&term.name);
+            }
+            out
+        };
+
+        // --- 1. Seed: materialise every anchor. ---
+        let mut accums: Vec<RecordBatch> = Vec::with_capacity(rec.ctes.len());
+        for (i, term) in rec.ctes.iter().enumerate() {
+            let anchor_out = relabel(i, self.run_subplan(term.anchor.clone())?)?;
+            // De-duplicate the seed for a UNION member (matches the single path).
+            let seeded = if term.recursive.is_some() && !term.all {
+                execute_distinct(QueryHandle::from_record_batch(anchor_out))?
+                    .into_record_batch()
+            } else {
+                anchor_out
+            };
+            accums.push(seeded);
+        }
+
+        let cap = max_recursive_iterations();
+        let mut iters = 0usize;
+
+        // --- 2. Lockstep iteration to a combined fixpoint. ---
+        loop {
+            iters += 1;
+            if iters > cap {
+                return Err(BoltError::Plan(format!(
+                    "WITH RECURSIVE: exceeded the {cap}-iteration safety cap \
+                     (set {MAX_RECURSIVE_ITERATIONS_ENV} to override) — the \
+                     mutual recursion is not terminating"
+                )));
+            }
+
+            // Snapshot the current accumulations; every recursive term this
+            // step is evaluated against THIS snapshot (lockstep — a sibling's
+            // growth this step is not visible until the next).
+            let snapshot = accums.clone();
+            let mut any_grew = false;
+            let mut next = snapshot.clone();
+
+            for (i, term) in rec.ctes.iter().enumerate() {
+                let recursive = match &term.recursive {
+                    Some(r) => r,
+                    None => continue, // Non-recursive member: seeded once.
+                };
+                let rec_out = relabel(i, run_with_all(&snapshot, recursive)?)?;
+                if term.all {
+                    // UNION ALL: append produced rows; "grew" iff ≥1 row.
+                    if rec_out.num_rows() > 0 {
+                        next[i] = concat_two_batches(&next[i], &rec_out)?;
+                        any_grew = true;
+                    }
+                } else {
+                    // UNION: dedup the produced rows against this CTE's current
+                    // accumulation; "grew" iff the de-duplicated relation gained
+                    // rows.
+                    let prev_rows = next[i].num_rows();
+                    let combined = concat_two_batches(&next[i], &rec_out)?;
+                    let deduped = execute_distinct(QueryHandle::from_record_batch(combined))?
+                        .into_record_batch();
+                    if deduped.num_rows() != prev_rows {
+                        any_grew = true;
+                    }
+                    next[i] = deduped;
+                }
+            }
+
+            accums = next;
+            if !any_grew {
+                break; // Combined fixpoint: no CTE grew this step.
+            }
+        }
+
+        // --- 5. Bind all final accumulations and run the main query. ---
+        let main_out = run_with_all(&accums, &rec.main)?;
         Ok(QueryHandle::from_record_batch(main_out))
     }
 
@@ -7061,6 +7254,131 @@ mod tests {
                  ) SELECT n FROM seq",
             )
             .expect_err("a non-terminating recursion must hit the cap");
+        std::env::remove_var(MAX_RECURSIVE_ITERATIONS_ENV);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("safety cap") || msg.contains("not terminating"),
+            "expected iteration-cap error, got: {msg}"
+        );
+    }
+
+    // ---- Non-linear recursion (naive evaluation) e2e ----
+
+    /// End-to-end: transitive closure of `edges` via a NON-LINEAR recursive
+    /// term (a self-join `r JOIN r`). Naive evaluation re-derives against the
+    /// full accumulation each step, so the closure of 1->2->3->4 is the set of
+    /// all reachable pairs {(1,2),(2,3),(3,4),(1,3),(2,4),(1,4)} (6 pairs).
+    #[test]
+    #[ignore = "gpu:e2e — recursive CTE subplans run through the GPU execute path"]
+    fn recursive_non_linear_transitive_closure() {
+        let mut engine = Engine::new().expect("ctx");
+        register_edges(&mut engine); // 1->2, 2->3, 3->4
+        let h = engine
+            .sql(
+                "WITH RECURSIVE tc(x, y) AS (\
+                     SELECT src, dst FROM edges \
+                     UNION \
+                     SELECT a.x, b.y FROM tc AS a JOIN tc AS b ON a.y = b.x\
+                 ) SELECT x, y FROM tc ORDER BY x, y",
+            )
+            .expect("non-linear transitive closure must execute");
+        let b = h.record_batch();
+        assert_eq!(b.num_rows(), 6, "transitive closure of a 4-node path is 6 pairs");
+        let xs = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ys = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<(i64, i64)> =
+            (0..xs.len()).map(|i| (xs.value(i), ys.value(i))).collect();
+        assert_eq!(
+            got,
+            vec![(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)],
+            "all reachable ordered pairs"
+        );
+    }
+
+    /// A NON-LINEAR `UNION ALL` self-join over cyclic data grows without bound
+    /// under naive evaluation, so it must hit the iteration cap with a clean
+    /// error (the cap is the mandatory guard when dedup is unavailable).
+    #[test]
+    #[ignore = "gpu:e2e — recursive CTE subplans run through the GPU execute path"]
+    fn recursive_non_linear_union_all_cycle_hits_cap() {
+        use arrow_array::Int64Array as I64;
+        let mut engine = Engine::new().expect("ctx");
+        // A 2-cycle: 1->2, 2->1. Composing self-joins re-derives forever.
+        let src: ArrayRef = Arc::new(I64::from(vec![1_i64, 2]));
+        let dst: ArrayRef = Arc::new(I64::from(vec![2_i64, 1]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("src", ArrowDataType::Int64, false),
+            ArrowField::new("dst", ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![src, dst]).expect("cyc batch");
+        engine.register_table("cyc", batch).expect("register cyc");
+        std::env::set_var(MAX_RECURSIVE_ITERATIONS_ENV, "8");
+        let err = engine
+            .sql(
+                "WITH RECURSIVE tc(x, y) AS (\
+                     SELECT src, dst FROM cyc \
+                     UNION ALL \
+                     SELECT a.x, b.y FROM tc AS a JOIN tc AS b ON a.y = b.x\
+                 ) SELECT x, y FROM tc",
+            )
+            .expect_err("non-linear UNION ALL over a cycle must hit the cap");
+        std::env::remove_var(MAX_RECURSIVE_ITERATIONS_ENV);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("safety cap") || msg.contains("not terminating"),
+            "expected iteration-cap error, got: {msg}"
+        );
+    }
+
+    // ---- Mutual recursion (lockstep fixpoint) e2e ----
+
+    /// End-to-end: two mutually-recursive CTEs that ping-pong. `evens` starts
+    /// at 0 and adds 1 to every `odd`; `odds` starts at 1 and adds 1 to every
+    /// `even`, both bounded by `< 6`. The lockstep fixpoint accumulates
+    /// evens={0,2,4,6} and odds={1,3,5}, and the main query unions them.
+    #[test]
+    #[ignore = "gpu:e2e — recursive CTE subplans run through the GPU execute path"]
+    fn recursive_mutual_even_odd() {
+        let mut engine = Engine::new().expect("ctx");
+        register_edges(&mut engine); // base table so a FROM seed is available
+        let h = engine
+            .sql(
+                "WITH RECURSIVE \
+                   evens(n) AS (\
+                       SELECT 0 FROM edges WHERE src = 1 \
+                       UNION \
+                       SELECT n + 1 FROM odds WHERE n < 6\
+                   ), \
+                   odds(n) AS (\
+                       SELECT 1 FROM edges WHERE src = 1 \
+                       UNION \
+                       SELECT n + 1 FROM evens WHERE n < 6\
+                   ) \
+                 SELECT n FROM evens UNION SELECT n FROM odds ORDER BY n",
+            )
+            .expect("mutual recursion must execute");
+        let b = h.record_batch();
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<i64> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5, 6], "0..=6 from the lockstep fixpoint");
+    }
+
+    /// A mutually-recursive system with no bound grows forever and must hit the
+    /// shared iteration cap with the mutual-recursion error message.
+    #[test]
+    #[ignore = "gpu:e2e — recursive CTE subplans run through the GPU execute path"]
+    fn recursive_mutual_non_terminating_hits_cap() {
+        let mut engine = Engine::new().expect("ctx");
+        register_edges(&mut engine);
+        std::env::set_var(MAX_RECURSIVE_ITERATIONS_ENV, "8");
+        let err = engine
+            .sql(
+                "WITH RECURSIVE \
+                   a(n) AS (SELECT src FROM edges WHERE src = 1 UNION ALL SELECT n + 1 FROM b), \
+                   b(n) AS (SELECT dst FROM edges WHERE dst = 2 UNION ALL SELECT n + 1 FROM a) \
+                 SELECT n FROM a",
+            )
+            .expect_err("a non-terminating mutual recursion must hit the cap");
         std::env::remove_var(MAX_RECURSIVE_ITERATIONS_ENV);
         let msg = format!("{err}");
         assert!(

@@ -1202,6 +1202,17 @@ pub struct RecursiveCtePlan {
     /// `true` for `UNION ALL` (no dedup); `false` for `UNION` (dedup the
     /// accumulated result set; stop when no new rows are produced).
     pub all: bool,
+    /// `true` when the recursive term references the CTE **more than once**
+    /// (non-linear recursion, e.g. a self-join `FROM r AS r1, r AS r2`). All
+    /// the self-reference scans resolve to the same ephemeral table the engine
+    /// binds by name, so the only correct evaluation is **naive**: each
+    /// iteration binds the FULL accumulated relation (not just the previous
+    /// delta) and re-derives. The engine reads this flag to force the
+    /// whole-result working set even for `UNION ALL` (where the linear path
+    /// would otherwise feed only the delta — which is wrong for a self-join,
+    /// and which semi-naive evaluation cannot rescue for a non-linear term).
+    /// `false` for the linear single-self-reference case.
+    pub naive: bool,
     /// Main query, planned with `name` resolvable as a table. Its schema is
     /// the overall query's output schema.
     pub main: LogicalPlan,
@@ -1212,6 +1223,75 @@ impl RecursiveCtePlan {
     pub fn schema(&self) -> BoltResult<Schema> {
         self.main.schema()
     }
+}
+
+/// One relation of a mutually-recursive `WITH RECURSIVE` system (feature:
+/// mutual recursion). Each CTE in the system has its own anchor (seed) and an
+/// optional recursive term; the recursive term may reference **any** of the
+/// system's CTE names (its own or a sibling's). The host engine advances all
+/// of these in lockstep to a combined fixpoint (see
+/// [`crate::exec::engine::Engine::execute_mutual_recursive_cte`]).
+#[derive(Debug, Clone)]
+pub struct RecursiveCteTerm {
+    /// Case-folded CTE name (the ephemeral relation siblings + the main query
+    /// scan).
+    pub name: String,
+    /// Accumulated-relation schema (anchor schema, optionally renamed by a
+    /// column-list alias). The ephemeral table registered for this CTE each
+    /// iteration has exactly this schema.
+    pub cte_schema: Schema,
+    /// Non-recursive seed term. Does NOT reference any CTE in the system.
+    pub anchor: LogicalPlan,
+    /// Recursive term, planned with every CTE name in the system bound to a
+    /// synthetic `Scan` over that CTE's `cte_schema`. `None` for a
+    /// non-recursive member of a `WITH RECURSIVE` list (a plain CTE that just
+    /// happens to share the recursive `WITH`): such a member is seeded once
+    /// and never re-derived.
+    pub recursive: Option<LogicalPlan>,
+    /// `true` for `UNION ALL` (append, no dedup); `false` for `UNION` (dedup
+    /// the accumulated relation). Only meaningful when `recursive` is `Some`.
+    pub all: bool,
+}
+
+/// A fully-planned mutually-recursive `WITH RECURSIVE` query: a *system* of
+/// recursive relations advanced in lockstep, plus the main query.
+///
+/// This is the multi-relation generalisation of [`RecursiveCtePlan`]. It is
+/// produced when a `WITH RECURSIVE` list declares more than one CTE (so a
+/// recursive term may reference a sibling — mutual recursion). The host engine
+/// materialises every anchor, then on each iteration binds ALL CTE names to
+/// their current accumulated relations, re-evaluates every recursive term, and
+/// unions the new rows into each CTE; it stops only when NO CTE grew (combined
+/// fixpoint) or the shared iteration cap fires.
+///
+/// Kept as a standalone descriptor (not a `LogicalPlan` variant) for the same
+/// reason as [`RecursiveCtePlan`]: it does not fit a single plan tree, and a
+/// new enum variant would break exhaustive matches in shared files.
+#[derive(Debug, Clone)]
+pub struct MutualRecursiveCtePlan {
+    /// The recursive system, in declaration order.
+    pub ctes: Vec<RecursiveCteTerm>,
+    /// Main query, planned with every CTE name resolvable as a table. Its
+    /// schema is the overall query's output schema.
+    pub main: LogicalPlan,
+}
+
+impl MutualRecursiveCtePlan {
+    /// Overall output schema (== the main query's schema).
+    pub fn schema(&self) -> BoltResult<Schema> {
+        self.main.schema()
+    }
+}
+
+/// Result of detecting a top-level `WITH RECURSIVE` query: either the
+/// single-CTE fast path ([`RecursiveCtePlan`], possibly non-linear/naive) or a
+/// multi-CTE lockstep system ([`MutualRecursiveCtePlan`]).
+#[derive(Debug, Clone)]
+pub enum RecursiveQueryPlan {
+    /// Exactly one recursive CTE (linear or non-linear).
+    Single(RecursiveCtePlan),
+    /// Two or more CTEs in the `WITH RECURSIVE` list (mutual recursion).
+    Mutual(MutualRecursiveCtePlan),
 }
 
 // ---------------------------------------------------------------------------
@@ -2377,22 +2457,30 @@ fn lower_multi_agg_having(
 /// columns. ORDER BY / LIMIT on the outer query are applied to the main query
 /// (the same place the non-recursive path applies them).
 ///
+/// Both NON-LINEAR recursion (a recursive term that scans the CTE more than
+/// once — a self-join) and MUTUAL recursion (multiple recursive CTEs that
+/// reference each other) are now supported and orchestrated host-side:
+/// * a single-CTE query returns [`RecursiveQueryPlan::Single`] — linear when
+///   there is exactly one self-reference, naive (`RecursiveCtePlan::naive`)
+///   when there is more than one;
+/// * a multi-CTE `WITH RECURSIVE` list returns [`RecursiveQueryPlan::Mutual`]
+///   — a system advanced in lockstep to a combined fixpoint.
+///
 /// # Precise rejections (harder shapes)
 ///
-/// * more than one CTE in a `WITH RECURSIVE` list (would permit *mutual*
-///   recursion, which the host orchestrator does not implement);
 /// * a body that is not a top-level `UNION` / `UNION ALL`;
 /// * `UNION BY NAME`;
-/// * an anchor term that references the CTE (a recursive anchor — no seed);
-/// * a recursive term that references the CTE more than once (non-linear) or
-///   not at all (would never recurse);
+/// * an anchor term that references any CTE in the system (a recursive anchor
+///   has no seed);
 /// * a self-reference buried inside a scalar / `IN` subquery rather than a
 ///   top-level FROM/JOIN (our orchestrator only binds the CTE as a top-level
-///   scan source).
+///   scan source);
+/// * a multi-CTE list in which NO member references any CTE (it would never
+///   recurse — that is an ordinary non-recursive `WITH`, handled elsewhere).
 pub fn plan_recursive_cte(
     sql: &str,
     provider: &dyn TableProvider,
-) -> BoltResult<Option<RecursiveCtePlan>> {
+) -> BoltResult<Option<RecursiveQueryPlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
     let mut stmts =
@@ -2418,19 +2506,22 @@ pub fn plan_recursive_cte(
     Ok(Some(plan))
 }
 
-/// Plan a `WITH RECURSIVE` [`Query`] into a [`RecursiveCtePlan`] (feature F1).
+/// Plan a `WITH RECURSIVE` [`Query`] into a [`RecursiveQueryPlan`].
 ///
-/// Assumes `query.with` is present and `recursive`. The anchor / recursive /
-/// main subplans are lowered as ordinary `LogicalPlan`s; the CTE name is bound
-/// (in a private scope used only for lowering the recursive term and main
-/// query) to a synthetic `Scan` over the anchor's output schema. The outer
-/// query's ORDER BY / LIMIT are layered onto the main query.
+/// Dispatches on the number of CTEs in the `WITH RECURSIVE` list:
+/// * exactly one → [`plan_single_recursive_query`] →
+///   [`RecursiveQueryPlan::Single`] (linear or non-linear/naive);
+/// * two or more → [`plan_mutual_recursive_query`] →
+///   [`RecursiveQueryPlan::Mutual`] (a lockstep system).
+///
+/// Assumes `query.with` is present and `recursive`. The outer query's
+/// ORDER BY / LIMIT are layered onto the main query in each path.
 fn plan_recursive_query(
     query: &Query,
     provider: &dyn TableProvider,
     base: &CteScope,
     depth: usize,
-) -> BoltResult<RecursiveCtePlan> {
+) -> BoltResult<RecursiveQueryPlan> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(BoltError::Sql(format!(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
@@ -2440,34 +2531,44 @@ fn plan_recursive_query(
         .with
         .as_ref()
         .expect("plan_recursive_query called without a WITH clause");
-
-    // Single-CTE restriction: more than one CTE in a `WITH RECURSIVE` list
-    // would permit *mutual recursion* (CTE A's recursive term references B and
-    // vice-versa), which is an intentional, documented limitation.
-    //
-    // Why this stays rejected (assessment, feature B): the fixpoint executor
-    // in [`crate::exec::engine::Engine::execute_recursive_cte`] drives a
-    // SINGLE working-set relation — it binds one CTE name to one accumulating
-    // table and iterates one recursive subplan to a fixpoint. Mutual recursion
-    // needs a *system* of relations advanced in lockstep: N working sets, each
-    // recursive term re-planned against the others' current iterates, with a
-    // combined termination test (all sets stable). That is a different
-    // execution shape (a vector fixpoint, not a scalar one) and a different
-    // planner contract (each CTE's Scan must resolve to its own per-iteration
-    // working set). Neither the single-relation orchestrator nor the
-    // single-`scope.defs` binding here can express it without a correlated /
-    // multi-relation rewrite, so a half-implementation would silently compute
-    // wrong results. It is left as a clean, named rejection rather than a
-    // broken partial.
-    if with.cte_tables.len() != 1 {
-        return Err(BoltError::Sql(format!(
-            "unsupported: WITH RECURSIVE with {} CTEs — only a single \
-             recursive CTE is supported (mutual recursion between multiple \
-             recursive CTEs requires a multi-relation lockstep fixpoint the \
-             single-working-set executor does not implement)",
-            with.cte_tables.len()
-        )));
+    if with.cte_tables.len() == 1 {
+        Ok(RecursiveQueryPlan::Single(plan_single_recursive_query(
+            query, provider, base, depth,
+        )?))
+    } else {
+        Ok(RecursiveQueryPlan::Mutual(plan_mutual_recursive_query(
+            query, provider, base, depth,
+        )?))
     }
+}
+
+/// Plan a single-CTE `WITH RECURSIVE` [`Query`] into a [`RecursiveCtePlan`].
+///
+/// The anchor / recursive / main subplans are lowered as ordinary
+/// `LogicalPlan`s; the CTE name is bound (in a private scope used only for
+/// lowering the recursive term and main query) to a synthetic `Scan` over the
+/// anchor's output schema. The outer query's ORDER BY / LIMIT are layered onto
+/// the main query.
+///
+/// Both linear (one self-reference) and non-linear (a self-join — more than
+/// one self-reference) recursion are supported. A non-linear term sets
+/// [`RecursiveCtePlan::naive`] so the engine binds the FULL accumulated
+/// relation each iteration (the only correct evaluation when all the aliased
+/// self-reference scans resolve to the one ephemeral table the engine binds by
+/// name).
+fn plan_single_recursive_query(
+    query: &Query,
+    provider: &dyn TableProvider,
+    base: &CteScope,
+    depth: usize,
+) -> BoltResult<RecursiveCtePlan> {
+    // `plan_recursive_query` already enforced the depth bound and the
+    // single-CTE dispatch; this function handles exactly one recursive CTE.
+    let with = query
+        .with
+        .as_ref()
+        .expect("plan_single_recursive_query called without a WITH clause");
+    debug_assert_eq!(with.cte_tables.len(), 1);
     let cte = &with.cte_tables[0];
     if cte.from.is_some() {
         return Err(BoltError::Sql(
@@ -2570,32 +2671,21 @@ fn plan_recursive_query(
              never recurse)"
         )));
     }
-    // Linearity restriction: >1 top-level self-reference is *non-linear*
-    // recursion (e.g. `r JOIN r` in the recursive term).
-    //
-    // Why this stays rejected (assessment, feature B): the orchestrator feeds
-    // the PREVIOUS iteration's output as the working set bound to the single
-    // CTE Scan, then runs the recursive subplan once per step. With two
-    // self-references in one term, the two Scans would need DIFFERENT bindings
-    // — the standard SQL semantics evaluate every self-reference against the
-    // *full accumulated* relation, but a naive "bind both to the last delta"
-    // is wrong and "bind both to the full accumulation" requires materialising
-    // and re-scanning the whole accumulation per step (a semi-naive vs. naive
-    // evaluation choice) plus a self-join inside the fixpoint. The single
-    // `scope.defs` binding here resolves *one* relation for the name, so both
-    // Scans collapse to the same working set and the join semantics are
-    // undefined. Implementing it correctly needs per-self-reference binding +
-    // a documented naive/semi-naive evaluation strategy, so it is left as a
-    // clean rejection.
-    if self_refs > 1 {
-        return Err(BoltError::Sql(format!(
-            "unsupported: WITH RECURSIVE recursive term references '{name}' \
-             {self_refs} times — only a single (linear) self-reference is \
-             supported (non-linear recursion needs a self-join inside the \
-             fixpoint with per-reference working-set bindings, which the \
-             single-relation executor does not implement)"
-        )));
-    }
+    // >1 top-level self-reference is *non-linear* recursion (e.g.
+    // `FROM r AS r1, r AS r2` or `r JOIN r` in the recursive term). This is now
+    // supported via NAIVE evaluation: every aliased self-reference scan
+    // resolves to the SAME ephemeral table the engine binds by `name`, so the
+    // engine must bind the FULL accumulated relation (not just the previous
+    // delta) each iteration. That is exactly the standard naive semantics —
+    // each self-reference evaluates against the full accumulation so far. The
+    // semi-naive (delta-only) optimisation is unsafe for a non-linear term, so
+    // we mark the plan `naive` and the engine forces the whole-result working
+    // set even for `UNION ALL`. (For non-linear `UNION ALL` over cyclic data
+    // naive evaluation can grow without bound; the engine's iteration cap is
+    // the mandatory guard.) The binder resolves each aliased scan of the CTE
+    // name through the single `scope.defs` binding below, which is correct here
+    // because all references share one relation per iteration.
+    let naive = self_refs > 1;
 
     // Lower the recursive term against the scope that now binds the CTE, and
     // validate its schema matches the anchor's (column count + per-position
@@ -2664,8 +2754,296 @@ fn plan_recursive_query(
         anchor,
         recursive,
         all,
+        naive,
         main,
     })
+}
+
+/// Plan a multi-CTE `WITH RECURSIVE` [`Query`] into a
+/// [`MutualRecursiveCtePlan`] (mutual recursion).
+///
+/// Each CTE in the list is parsed into an anchor + optional recursive term. A
+/// CTE is *recursive* iff its body is a top-level `UNION [ALL]` whose right
+/// (recursive) term references ANY CTE in the system; otherwise it is treated
+/// as a plain (seeded-once) member. The anchors are lowered against the base
+/// scope (anchors may not reference any system CTE). Every recursive term and
+/// the main query are then lowered against a scope binding ALL CTE names to
+/// synthetic `Scan`s over their accumulated schemas, so a recursive term may
+/// reference its own CTE and/or a sibling. The engine advances the whole
+/// system in lockstep to a combined fixpoint.
+///
+/// Schema validation: each recursive CTE's recursive term must be
+/// union-compatible with its own anchor (column count + per-position dtype).
+fn plan_mutual_recursive_query(
+    query: &Query,
+    provider: &dyn TableProvider,
+    base: &CteScope,
+    depth: usize,
+) -> BoltResult<MutualRecursiveCtePlan> {
+    let with = query
+        .with
+        .as_ref()
+        .expect("plan_mutual_recursive_query called without a WITH clause");
+
+    // --- Pass 1: extract each CTE's name, optional column-list alias, and
+    // split its body into (anchor, optional recursive term, all). ---
+    struct Parsed<'a> {
+        name: String,
+        column_aliases: Option<Vec<String>>,
+        anchor_expr: &'a SetExpr,
+        recursive_expr: Option<&'a SetExpr>,
+        all: bool,
+    }
+    // The set of all CTE names in the system, used to classify a body's right
+    // term as recursive (references any system CTE) vs. a plain UNION.
+    let mut system_names: Vec<String> = Vec::with_capacity(with.cte_tables.len());
+    for cte in &with.cte_tables {
+        system_names.push(ident_to_name(&cte.alias.name));
+    }
+    let references_any_system = |expr: &SetExpr| -> bool {
+        system_names
+            .iter()
+            .any(|n| set_expr_references_table(expr, n))
+    };
+
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(with.cte_tables.len());
+    for cte in &with.cte_tables {
+        if cte.from.is_some() {
+            return Err(BoltError::Sql(
+                "unsupported: CTE materialization hint (FROM)".into(),
+            ));
+        }
+        let name = ident_to_name(&cte.alias.name);
+        let column_aliases: Option<Vec<String>> = if cte.alias.columns.is_empty() {
+            None
+        } else {
+            Some(cte.alias.columns.iter().map(ident_to_name).collect())
+        };
+        // Detect a duplicate CTE name (the binder would otherwise silently
+        // shadow one with another).
+        if parsed.iter().any(|p| p.name == name) {
+            return Err(BoltError::Sql(format!(
+                "unsupported: WITH RECURSIVE declares CTE '{name}' more than once"
+            )));
+        }
+        // Split the body. A top-level UNION whose right term references any
+        // system CTE is recursive; anything else is a plain (seeded-once)
+        // member of the recursive WITH list.
+        let (anchor_expr, recursive_expr, all) = match cte.query.body.as_ref() {
+            SetExpr::SetOperation {
+                op: SetOperator::Union,
+                set_quantifier,
+                left,
+                right,
+            } if references_any_system(right) => {
+                let all = match set_quantifier {
+                    SetQuantifier::All => true,
+                    SetQuantifier::Distinct | SetQuantifier::None => false,
+                    SetQuantifier::ByName
+                    | SetQuantifier::AllByName
+                    | SetQuantifier::DistinctByName => {
+                        return Err(BoltError::Sql(
+                            "unsupported: WITH RECURSIVE with UNION BY NAME".into(),
+                        ));
+                    }
+                };
+                (left.as_ref(), Some(right.as_ref()), all)
+            }
+            // Not recursive: the whole body is the seed. (A plain CTE in a
+            // recursive WITH list is legal SQL.)
+            other => (other, None, false),
+        };
+        parsed.push(Parsed {
+            name,
+            column_aliases,
+            anchor_expr,
+            recursive_expr,
+            all,
+        });
+    }
+
+    // At least one member must actually recurse, otherwise this is an ordinary
+    // non-recursive WITH (handled by the normal pipeline). The engine hook only
+    // routes `recursive` WITH clauses here, but a `WITH RECURSIVE` list whose
+    // members never self/cross-reference would loop zero times — reject so it
+    // is not silently mistaken for recursion.
+    if !parsed.iter().any(|p| p.recursive_expr.is_some()) {
+        return Err(BoltError::Sql(
+            "unsupported: WITH RECURSIVE list has no recursive member (no CTE's \
+             term references any CTE in the list) — a recursive term must \
+             reference a CTE in the system at the top-level FROM/JOIN"
+                .into(),
+        ));
+    }
+
+    // The set of *recursive* member names. An anchor may reference an earlier
+    // NON-recursive member (a plain seeded CTE, lowered first) but must NOT
+    // reference any recursive member (those have no seed value yet — that would
+    // be a recursive anchor).
+    let recursive_names: Vec<String> = parsed
+        .iter()
+        .filter(|p| p.recursive_expr.is_some())
+        .map(|p| p.name.clone())
+        .collect();
+    let references_recursive = |expr: &SetExpr| -> bool {
+        recursive_names
+            .iter()
+            .any(|n| set_expr_references_table(expr, n))
+    };
+    for p in &parsed {
+        if p.recursive_expr.is_some() && references_recursive(p.anchor_expr) {
+            return Err(BoltError::Sql(format!(
+                "unsupported: WITH RECURSIVE anchor term of '{}' references a \
+                 recursive CTE — the anchor (left of UNION) must be non-recursive",
+                p.name
+            )));
+        }
+    }
+
+    // --- Pass 2a: lower the NON-recursive members first, left-to-right,
+    // accumulating them into `nonrec_scope`. A recursive member's anchor (and
+    // any later non-recursive member) may reference an earlier non-recursive
+    // member through this scope; recursive members are NOT bound here (no seed
+    // yet). Each member's accumulated schema + synthetic Scan binding is built
+    // in declaration-order slots so passes below can index by position.
+    let mut anchors: Vec<Option<LogicalPlan>> = vec![None; parsed.len()];
+    let mut cte_schemas: Vec<Option<Schema>> = vec![None; parsed.len()];
+    let mut nonrec_scope = base.clone();
+    // Helper: given a lowered anchor plan, build the CTE's accumulated schema
+    // (honouring any column-list alias) and the synthetic Scan over it.
+    let build_schema_and_scan =
+        |p: &Parsed<'_>, anchor: &LogicalPlan| -> BoltResult<(Schema, LogicalPlan)> {
+            let anchor_schema = anchor.schema()?;
+            let cte_schema = match &p.column_aliases {
+                Some(aliases) => {
+                    if aliases.len() != anchor_schema.fields.len() {
+                        return Err(BoltError::Sql(format!(
+                            "WITH RECURSIVE column-list alias names {} columns but \
+                             the CTE '{}' anchor produces {}",
+                            aliases.len(),
+                            p.name,
+                            anchor_schema.fields.len()
+                        )));
+                    }
+                    apply_column_aliases(&anchor_schema, aliases)
+                }
+                None => anchor_schema.clone(),
+            };
+            let cte_scan = LogicalPlan::Scan {
+                table: p.name.clone(),
+                projection: None,
+                schema: cte_schema.clone(),
+            };
+            Ok((cte_schema, cte_scan))
+        };
+    for (i, p) in parsed.iter().enumerate() {
+        if p.recursive_expr.is_some() {
+            continue; // recursive member — handled in pass 2b
+        }
+        let anchor = lower_set_expr(p.anchor_expr, provider, &nonrec_scope, depth + 1)?;
+        let (cte_schema, cte_scan) = build_schema_and_scan(p, &anchor)?;
+        nonrec_scope.defs.insert(p.name.clone(), cte_scan);
+        anchors[i] = Some(anchor);
+        cte_schemas[i] = Some(cte_schema);
+    }
+
+    // --- Pass 2b: lower each RECURSIVE member's anchor against the
+    // non-recursive scope (it may seed from a non-recursive member but not from
+    // a recursive one), and build its schema + binding. ---
+    let mut scope = nonrec_scope.clone();
+    for (i, p) in parsed.iter().enumerate() {
+        if p.recursive_expr.is_none() {
+            continue;
+        }
+        let anchor = lower_set_expr(p.anchor_expr, provider, &nonrec_scope, depth + 1)?;
+        let (cte_schema, cte_scan) = build_schema_and_scan(p, &anchor)?;
+        scope.defs.insert(p.name.clone(), cte_scan);
+        anchors[i] = Some(anchor);
+        cte_schemas[i] = Some(cte_schema);
+    }
+    // Every slot is now filled (every member is either recursive or not).
+    let anchors: Vec<LogicalPlan> = anchors.into_iter().map(|a| a.unwrap()).collect();
+    let cte_schemas: Vec<Schema> = cte_schemas.into_iter().map(|s| s.unwrap()).collect();
+
+    // --- Pass 3: lower each recursive term against the full system scope and
+    // validate it against its own anchor's schema. ---
+    let mut terms: Vec<RecursiveCteTerm> = Vec::with_capacity(parsed.len());
+    for (i, p) in parsed.iter().enumerate() {
+        let recursive = match p.recursive_expr {
+            None => None,
+            Some(expr) => {
+                let plan = lower_set_expr(expr, provider, &scope, depth + 1)?;
+                let recursive_schema = plan.schema()?;
+                let anchor_schema = anchors[i].schema()?;
+                if !recursive_matches_anchor(&anchor_schema, &recursive_schema) {
+                    return Err(BoltError::Plan(format!(
+                        "WITH RECURSIVE: CTE '{}' anchor and recursive terms have \
+                         incompatible schemas: anchor produces {} columns, \
+                         recursive term produces {} columns (per-position dtypes \
+                         must also match)",
+                        p.name,
+                        anchor_schema.fields.len(),
+                        recursive_schema.fields.len(),
+                    )));
+                }
+                Some(plan)
+            }
+        };
+        terms.push(RecursiveCteTerm {
+            name: p.name.clone(),
+            cte_schema: cte_schemas[i].clone(),
+            anchor: anchors[i].clone(),
+            recursive,
+            all: p.all,
+        });
+    }
+
+    // --- Main query: lower against the full system scope, then layer the
+    // outer ORDER BY / LIMIT / OFFSET (identical handling to the single path).
+    if !query.limit_by.is_empty() {
+        return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
+    }
+    if query.fetch.is_some() {
+        return Err(BoltError::Sql("unsupported: FETCH".into()));
+    }
+    if !query.locks.is_empty() {
+        return Err(BoltError::Sql("unsupported: FOR UPDATE/SHARE".into()));
+    }
+    let mut main = lower_set_expr(query.body.as_ref(), provider, &scope, depth + 1)?;
+    if let Some(order_by) = &query.order_by {
+        let sort_exprs = lower_order_by(
+            &order_by.exprs,
+            SubqueryCtx {
+                provider,
+                ctes: &scope,
+            },
+        )?;
+        if !sort_exprs.is_empty() {
+            main = LogicalPlan::Sort {
+                input: Box::new(main),
+                sort_exprs,
+            };
+        }
+    }
+    let limit_value = match &query.limit {
+        Some(e) => Some(usize_from_literal(e, "LIMIT")?),
+        None => None,
+    };
+    let offset_value = match &query.offset {
+        Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
+        None => None,
+    };
+    if limit_value.is_some() || offset_value.is_some() {
+        main = LogicalPlan::Limit {
+            input: Box::new(main),
+            limit: limit_value.unwrap_or(usize::MAX),
+            offset: offset_value.unwrap_or(0),
+        };
+    }
+    // Force a type-check of the main query so a bad reference surfaces here.
+    let _ = main.schema()?;
+
+    Ok(MutualRecursiveCtePlan { ctes: terms, main })
 }
 
 /// True if a recursive term's schema is union-compatible with the anchor's
@@ -4630,27 +5008,49 @@ fn lower_table_factor(
             subquery,
             alias,
         } => {
-            // Why LATERAL stays rejected (assessment, feature B): a LATERAL
-            // derived table may reference columns from FROM items to its LEFT
-            // (`FROM t, LATERAL (SELECT ... WHERE x = t.c) d`), so the subquery
-            // must be re-evaluated *per outer row* with the outer row's values
-            // bound in. The engine has no correlated-execution path at all —
-            // every derived table / subquery here is lowered to a
-            // self-contained, uncorrelated subplan executed once (see
-            // [`crate::plan::subquery::reject_if_correlated`], which rejects any
-            // outer-column reference). Supporting LATERAL would require either a
-            // per-row nested-loop apply (re-planning + re-running the subplan
-            // for each outer row, with the outer schema threaded into name
-            // resolution) or a decorrelation rewrite into a join — both are
-            // substantial new machinery (correlated planning + an Apply
-            // operator), so this is a clean, documented limitation rather than a
-            // partial implementation.
+            // LATERAL decision (feature F3 — assessment outcome: REJECT
+            // cleanly, do not ship a half-correct apply).
+            //
+            // A LATERAL derived table may reference columns from FROM items to
+            // its LEFT (`FROM t, LATERAL (SELECT ... WHERE x = t.c) d`), so the
+            // subquery is *correlated*: it must be re-evaluated per outer row
+            // with the outer row's values bound in. The engine has no
+            // correlated-execution path — every derived table / subquery here
+            // lowers to a self-contained, uncorrelated subplan executed exactly
+            // once (see [`crate::plan::subquery::reject_if_correlated`], which
+            // rejects any outer-column reference).
+            //
+            // Two correct paths were considered and BOTH deferred:
+            //   1. Decorrelate a *simple* equality-correlated LATERAL into an
+            //      inner join (`... WHERE d.x = t.c` ⇒ `t JOIN (uncorrelated d)
+            //      ON d.x = t.c`). This is only sound for the narrow shape where
+            //      the correlation is a conjunction of equalities and the inner
+            //      body is otherwise uncorrelated and duplicate-preserving; it
+            //      silently changes results for LATERALs with aggregates,
+            //      LIMIT, non-equality correlation, or that must produce a row
+            //      per outer row even with no match (LEFT-JOIN-LATERAL). The
+            //      frontend cannot yet detect that safe sub-shape reliably (the
+            //      correlation predicate is buried inside the subquery's WHERE
+            //      and is not surfaced as a join key by name resolution), so a
+            //      naive decorrelation here would be the "half-correct LATERAL"
+            //      the spec forbids.
+            //   2. A nested-loop apply (re-plan + re-run the inner subplan per
+            //      outer row with the outer schema threaded into resolution).
+            //      This is general and correct but needs a new correlated
+            //      planning contract + an Apply executor — substantial new
+            //      machinery outside the scope of these files.
+            //
+            // Unlike non-linear and mutual recursion (now implemented as
+            // host-orchestrated fixpoints that reuse the existing single-query
+            // executor), neither LATERAL path reuses existing machinery without
+            // a correctness risk, so this stays a precise, documented rejection.
             if *lateral {
                 return Err(BoltError::Sql(
-                    "unsupported: LATERAL derived table — correlated subqueries in \
-                     FROM require a per-row apply / decorrelation path the engine \
-                     does not implement (all derived tables are executed once as \
-                     uncorrelated subplans)"
+                    "unsupported: LATERAL derived table — a correlated subquery in \
+                     FROM needs a per-row apply or a (safe-shape) decorrelation \
+                     into a join, neither of which the engine implements; all \
+                     derived tables are executed once as uncorrelated subplans. \
+                     Rewrite the correlation as an explicit JOIN where possible"
                         .into(),
                 ));
             }
@@ -11462,6 +11862,15 @@ mod recursive_cte_tests {
         MemTableProvider::new().with_table("edges", edges)
     }
 
+    /// Unwrap a planned single-CTE recursive query (the common fast path) or
+    /// panic — used by the shape tests below.
+    fn single(plan: RecursiveQueryPlan) -> RecursiveCtePlan {
+        match plan {
+            RecursiveQueryPlan::Single(s) => s,
+            RecursiveQueryPlan::Mutual(_) => panic!("expected a single recursive CTE"),
+        }
+    }
+
     /// A non-recursive query returns `Ok(None)` so the engine falls through to
     /// the ordinary parse path.
     #[test]
@@ -11481,11 +11890,14 @@ mod recursive_cte_tests {
                        UNION ALL \
                        SELECT n + 1 FROM seq WHERE n < 5\
                    ) SELECT n FROM seq";
-        let rec = plan_recursive_cte(sql, &provider())
-            .expect("planning must succeed")
-            .expect("must be recognised as a recursive CTE");
+        let rec = single(
+            plan_recursive_cte(sql, &provider())
+                .expect("planning must succeed")
+                .expect("must be recognised as a recursive CTE"),
+        );
         assert_eq!(rec.name, "seq");
         assert!(rec.all, "UNION ALL must set `all`");
+        assert!(!rec.naive, "a single self-reference is linear (not naive)");
         assert_eq!(rec.cte_schema.fields.len(), 1);
         assert_eq!(rec.cte_schema.fields[0].name, "n");
         // The main query's output schema has a single column `n`.
@@ -11507,9 +11919,11 @@ mod recursive_cte_tests {
                        UNION \
                        SELECT n + 1 FROM r WHERE n < 3\
                    ) SELECT n FROM r";
-        let rec = plan_recursive_cte(sql, &provider())
-            .expect("planning must succeed")
-            .expect("recursive CTE");
+        let rec = single(
+            plan_recursive_cte(sql, &provider())
+                .expect("planning must succeed")
+                .expect("recursive CTE"),
+        );
         assert!(!rec.all, "plain UNION must clear `all` (dedup)");
     }
 
@@ -11567,19 +11981,63 @@ mod recursive_cte_tests {
         );
     }
 
-    /// Mutual recursion (two CTEs in one `WITH RECURSIVE`) is rejected.
+    /// Mutual recursion (two CTEs in one `WITH RECURSIVE`) now plans as a
+    /// `Mutual` system rather than being rejected.
     #[test]
-    fn multiple_recursive_ctes_rejected() {
+    fn mutual_recursion_plans_as_system() {
         let sql = "WITH RECURSIVE \
-                     a(n) AS (SELECT src FROM edges WHERE src=1 UNION ALL SELECT n+1 FROM a WHERE n<3), \
-                     b(m) AS (SELECT src FROM edges WHERE src=1 UNION ALL SELECT m+1 FROM b WHERE m<3) \
+                     a(n) AS (SELECT src FROM edges WHERE src=1 UNION ALL SELECT m+1 FROM b WHERE m<3), \
+                     b(m) AS (SELECT dst FROM edges WHERE dst=2 UNION ALL SELECT n+1 FROM a WHERE n<3) \
+                   SELECT n FROM a";
+        let plan = plan_recursive_cte(sql, &provider())
+            .expect("planning must succeed")
+            .expect("recursive CTE");
+        let sys = match plan {
+            RecursiveQueryPlan::Mutual(m) => m,
+            RecursiveQueryPlan::Single(_) => panic!("expected a mutual system"),
+        };
+        assert_eq!(sys.ctes.len(), 2, "two CTEs in the system");
+        assert_eq!(sys.ctes[0].name, "a");
+        assert_eq!(sys.ctes[1].name, "b");
+        // Both members are recursive (each references the other).
+        assert!(sys.ctes[0].recursive.is_some());
+        assert!(sys.ctes[1].recursive.is_some());
+        // The main query type-checks.
+        let schema = sys.schema().expect("main schema must type-check");
+        assert_eq!(schema.fields.len(), 1);
+    }
+
+    /// A multi-CTE `WITH RECURSIVE` whose anchor of a recursive member
+    /// references a recursive CTE is rejected (the anchor must be a seed).
+    #[test]
+    fn mutual_recursion_recursive_anchor_rejected() {
+        let sql = "WITH RECURSIVE \
+                     a(n) AS (SELECT n FROM b UNION ALL SELECT m+1 FROM b WHERE m<3), \
+                     b(m) AS (SELECT dst FROM edges UNION ALL SELECT n+1 FROM a WHERE n<3) \
                    SELECT n FROM a";
         let err = plan_recursive_cte(sql, &provider())
-            .expect_err("multiple recursive CTEs must be rejected");
+            .expect_err("a recursive anchor in a mutual system must be rejected");
         let msg = format!("{err}");
         assert!(
-            msg.contains("single") && msg.contains("recursive CTE"),
-            "expected single-CTE message, got: {msg}"
+            msg.contains("anchor") && msg.contains("non-recursive"),
+            "expected recursive-anchor message, got: {msg}"
+        );
+    }
+
+    /// A multi-CTE `WITH RECURSIVE` list where NO member references any CTE in
+    /// the list is rejected (it would never recurse).
+    #[test]
+    fn mutual_recursion_no_recursive_member_rejected() {
+        let sql = "WITH RECURSIVE \
+                     a(n) AS (SELECT src FROM edges), \
+                     b(m) AS (SELECT dst FROM edges) \
+                   SELECT n FROM a";
+        let err = plan_recursive_cte(sql, &provider())
+            .expect_err("a non-recursive multi-CTE list must be rejected here");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no recursive member"),
+            "expected 'no recursive member' message, got: {msg}"
         );
     }
 
@@ -11596,22 +12054,25 @@ mod recursive_cte_tests {
         );
     }
 
-    /// More than one self-reference (non-linear recursion) is rejected.
+    /// More than one self-reference (non-linear recursion, a self-join) now
+    /// plans as a single CTE with the `naive` flag set (the engine binds the
+    /// full accumulated relation each iteration).
     #[test]
-    fn multiple_self_references_rejected() {
+    fn non_linear_self_join_sets_naive() {
         // Two references to `r` in the recursive term's FROM (self-join).
-        let sql = "WITH RECURSIVE r(n) AS (\
-                       SELECT src FROM edges WHERE src = 1 \
+        let sql = "WITH RECURSIVE r(x, y) AS (\
+                       SELECT src, dst FROM edges \
                        UNION ALL \
-                       SELECT r1.n + 1 FROM r AS r1, r AS r2 WHERE r1.n < 3\
-                   ) SELECT n FROM r";
-        let err = plan_recursive_cte(sql, &provider())
-            .expect_err("multiple self-references must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("single (linear) self-reference"),
-            "expected linear-recursion message, got: {msg}"
+                       SELECT r1.x, r2.y FROM r AS r1 JOIN r AS r2 ON r1.y = r2.x\
+                   ) SELECT x, y FROM r";
+        let rec = single(
+            plan_recursive_cte(sql, &provider())
+                .expect("non-linear recursion must plan")
+                .expect("recursive CTE"),
         );
+        assert!(rec.naive, "a self-join recursive term must set `naive`");
+        assert!(rec.all, "UNION ALL is preserved");
+        assert_eq!(rec.cte_schema.fields.len(), 2);
     }
 
     /// A graph-traversal recursive CTE over a real base table plans cleanly and
@@ -11625,55 +12086,40 @@ mod recursive_cte_tests {
                        UNION \
                        SELECT edges.dst FROM edges JOIN reach ON edges.src = reach.node\
                    ) SELECT node FROM reach";
-        let rec = plan_recursive_cte(sql, &provider())
-            .expect("planning must succeed")
-            .expect("recursive CTE");
+        let rec = single(
+            plan_recursive_cte(sql, &provider())
+                .expect("planning must succeed")
+                .expect("recursive CTE"),
+        );
         assert_eq!(rec.name, "reach");
         assert!(!rec.all);
+        assert!(!rec.naive, "a single self-reference is linear");
         assert_eq!(rec.cte_schema.fields.len(), 1);
         assert_eq!(rec.cte_schema.fields[0].name, "node");
         assert_eq!(rec.cte_schema.fields[0].dtype, DataType::Int64);
     }
 
-    // -------------------------------------------------------------------
-    // Feature B (assessment): the recursion-extension rejections stay, but
-    // the messages now explain *why* (documented, intentional limitations).
-    // These pin the improved wording so the rejection is clearly scoped.
-    // -------------------------------------------------------------------
-
-    /// Mutual recursion: the message explains the multi-relation lockstep
-    /// fixpoint the single-working-set executor does not implement.
+    /// A mutual system may mix a recursive member with a plain (seeded-once)
+    /// member; the plain member has `recursive == None`.
     #[test]
-    fn mutual_recursion_message_explains_limitation() {
+    fn mutual_recursion_allows_plain_member() {
         let sql = "WITH RECURSIVE \
-                     a(n) AS (SELECT src FROM edges WHERE src=1 UNION ALL SELECT n+1 FROM a WHERE n<3), \
-                     b(m) AS (SELECT src FROM edges WHERE src=1 UNION ALL SELECT m+1 FROM b WHERE m<3) \
-                   SELECT n FROM a";
-        let err = plan_recursive_cte(sql, &provider())
-            .expect_err("mutual recursion must be rejected (cleanly, no panic)");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("mutual recursion") && msg.contains("lockstep fixpoint"),
-            "improved mutual-recursion message expected, got: {msg}"
-        );
-    }
-
-    /// Non-linear recursion: the message explains the self-join-in-fixpoint
-    /// requirement.
-    #[test]
-    fn non_linear_recursion_message_explains_limitation() {
-        let sql = "WITH RECURSIVE r(n) AS (\
-                       SELECT src FROM edges WHERE src = 1 \
-                       UNION ALL \
-                       SELECT r1.n + 1 FROM r AS r1, r AS r2 WHERE r1.n < 3\
-                   ) SELECT n FROM r";
-        let err = plan_recursive_cte(sql, &provider())
-            .expect_err("non-linear recursion must be rejected (cleanly, no panic)");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("non-linear recursion") && msg.contains("self-join"),
-            "improved non-linear message expected, got: {msg}"
-        );
+                     seed(s) AS (SELECT src FROM edges WHERE src = 1), \
+                     walk(n) AS (SELECT s FROM seed UNION ALL SELECT n + 1 FROM walk WHERE n < 3) \
+                   SELECT n FROM walk";
+        let plan = plan_recursive_cte(sql, &provider())
+            .expect("planning must succeed")
+            .expect("recursive CTE");
+        let sys = match plan {
+            RecursiveQueryPlan::Mutual(m) => m,
+            RecursiveQueryPlan::Single(_) => panic!("expected a mutual system"),
+        };
+        assert_eq!(sys.ctes.len(), 2);
+        // `seed` is non-recursive; `walk` is recursive and references `seed`.
+        let seed = sys.ctes.iter().find(|c| c.name == "seed").unwrap();
+        let walk = sys.ctes.iter().find(|c| c.name == "walk").unwrap();
+        assert!(seed.recursive.is_none(), "plain member has no recursive term");
+        assert!(walk.recursive.is_some(), "walk recurses");
     }
 }
 

@@ -358,9 +358,13 @@ pub fn format_recursive_cte(rec: &crate::plan::sql_frontend::RecursiveCtePlan) -
     let mut out = String::new();
     let cols: Vec<&str> = rec.cte_schema.fields.iter().map(|f| f.name.as_str()).collect();
     let union = if rec.all { "UNION ALL" } else { "UNION" };
+    // A non-linear (self-join) recursive term is evaluated naively (the full
+    // accumulated relation is re-bound each iteration); surface that in the
+    // header so EXPLAIN distinguishes it from the linear/semi-naive path.
+    let eval = if rec.naive { " naive" } else { "" };
     let _ = writeln!(
         out,
-        "RecursiveCte: name={} ({}) {union}",
+        "RecursiveCte: name={} ({}) {union}{eval}",
         rec.name,
         cols.join(", ")
     );
@@ -370,6 +374,42 @@ pub fn format_recursive_cte(rec: &crate::plan::sql_frontend::RecursiveCtePlan) -
     indent(&mut out, 1);
     let _ = writeln!(out, "Recursive:");
     format_logical_into(&rec.recursive, 2, &mut out);
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Main:");
+    format_logical_into(&rec.main, 2, &mut out);
+    out
+}
+
+/// Render a
+/// [`MutualRecursiveCtePlan`](crate::plan::sql_frontend::MutualRecursiveCtePlan)
+/// — a system of mutually-recursive CTEs advanced in lockstep — for `EXPLAIN`.
+///
+/// Emits a `MutualRecursiveCte` header naming the member count, then one
+/// `Cte: <name> ...` block per member (each with its `Anchor:` and, when
+/// recursive, `Recursive:` subplans), and finally the shared `Main:` subplan.
+pub fn format_mutual_recursive_cte(
+    rec: &crate::plan::sql_frontend::MutualRecursiveCtePlan,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "MutualRecursiveCte: {} CTEs", rec.ctes.len());
+    for term in &rec.ctes {
+        let cols: Vec<&str> = term.cte_schema.fields.iter().map(|f| f.name.as_str()).collect();
+        indent(&mut out, 1);
+        let kind = match &term.recursive {
+            Some(_) if term.all => "recursive UNION ALL",
+            Some(_) => "recursive UNION",
+            None => "non-recursive",
+        };
+        let _ = writeln!(out, "Cte: {} ({}) {kind}", term.name, cols.join(", "));
+        indent(&mut out, 2);
+        let _ = writeln!(out, "Anchor:");
+        format_logical_into(&term.anchor, 3, &mut out);
+        if let Some(recursive) = &term.recursive {
+            indent(&mut out, 2);
+            let _ = writeln!(out, "Recursive:");
+            format_logical_into(recursive, 3, &mut out);
+        }
+    }
     indent(&mut out, 1);
     let _ = writeln!(out, "Main:");
     format_logical_into(&rec.main, 2, &mut out);
@@ -784,6 +824,7 @@ mod tests {
             anchor: scan.clone(),
             recursive: scan.clone(),
             all: true,
+            naive: false,
             main: scan,
         };
         let out = format_recursive_cte(&rec);
@@ -793,6 +834,43 @@ mod tests {
         assert_eq!(lines[2], "    Scan: table=seq");
         assert_eq!(lines[3], "  Recursive:");
         assert_eq!(lines[5], "  Main:");
+    }
+
+    #[test]
+    fn mutual_recursive_cte_renders_each_member() {
+        use crate::plan::logical_plan::Field;
+        use crate::plan::sql_frontend::{MutualRecursiveCtePlan, RecursiveCteTerm};
+        let schema = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+        let scan = LogicalPlan::Scan {
+            table: "a".to_string(),
+            projection: None,
+            schema: schema.clone(),
+        };
+        let rec = MutualRecursiveCtePlan {
+            ctes: vec![
+                RecursiveCteTerm {
+                    name: "a".to_string(),
+                    cte_schema: schema.clone(),
+                    anchor: scan.clone(),
+                    recursive: Some(scan.clone()),
+                    all: false,
+                },
+                RecursiveCteTerm {
+                    name: "b".to_string(),
+                    cte_schema: schema.clone(),
+                    anchor: scan.clone(),
+                    recursive: None,
+                    all: false,
+                },
+            ],
+            main: scan,
+        };
+        let out = format_mutual_recursive_cte(&rec);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "MutualRecursiveCte: 2 CTEs");
+        assert_eq!(lines[1], "  Cte: a (n) recursive UNION");
+        assert!(lines.iter().any(|l| *l == "  Cte: b (n) non-recursive"));
+        assert!(lines.iter().any(|l| l.trim() == "Main:"));
     }
 
     #[test]
