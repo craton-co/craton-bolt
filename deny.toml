@@ -9,6 +9,22 @@
 # Schema reference: https://embarkstudios.github.io/cargo-deny/
 
 [graph]
+# SCAN SCOPE — read this before relying on the advisory/license gates below.
+#
+# `cargo deny check` here covers ONLY the DEFAULT feature graph
+# (all-features = false, no-default-features = false). The blocking gates in
+# [advisories] (`unmaintained = "deny"` etc.) and [licenses] therefore apply
+# to the default host build, which is clean.
+#
+# The OFF-BY-DEFAULT `rust-cuda` feature pulls a much larger build-dependency
+# tree (rustc_codegen_nvvm -> ... -> the unmaintained `xz 0.1.0`). That graph
+# is scanned SEPARATELY and NON-BLOCKING by the informational
+# `cargo-deny-all-features` CI job (`cargo deny --all-features check`, run
+# continue-on-error — see .github/workflows/ci.yml). So an advisory that only
+# affects the `rust-cuda` graph (e.g. xz 0.1.0; documented in [advisories]
+# below) is surfaced for auditors but does NOT block CI, and the `deny`
+# policies here stay strict for the default graph rather than being globally
+# loosened to accommodate the off-default tree.
 all-features = false
 no-default-features = false
 # Only check the host build. The nvptx64 kernels crate has its own
@@ -66,7 +82,15 @@ unsound = "deny"
 yanked = "warn"
 ignore = [
     # Add RUSTSEC-XXXX-YYYY ids here only with justification + tracking
-    # GH issue. Default is empty.
+    # GH issue. Default is empty — i.e. NOTHING is suppressed for the default
+    # host graph, which stays strict under `unmaintained = "deny"`.
+    #
+    # KNOWN & ACCEPTED (does not block CI): unmaintained `xz 0.1.0` reaches the
+    # build graph ONLY via the off-default `rust-cuda` feature and is reported
+    # only by the non-blocking all-features CI job (see [graph] scope note and
+    # the detail below). It is intentionally NOT ignored here, because the
+    # default-graph scan never sees it; listing it would have no effect on the
+    # default scan and could mask a future default-graph regression.
     #
     # V-11 (reviewed 2026-05-30): the OFF-BY-DEFAULT `rust-cuda` build tree
     # (rustc_codegen_nvvm -> ... -> `xz 0.1.0`) pulls in the unmaintained

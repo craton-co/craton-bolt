@@ -312,6 +312,179 @@ pub(crate) fn proactive_eviction_count() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Owning-context binder (findings V4 + V5).
+//
+// One process-wide, epoch-guarded record of the CUDA context the pool's
+// blocks were allocated under, shared by:
+//
+//   * the `pool-watcher` thread (V4), which re-binds it before each
+//     `cuMemGetInfo_v2` poll, and
+//   * the default-backend `driver_free` (V5), which re-binds it before
+//     `cuMemFree_v2` when the dropping thread has no current context — so a
+//     `GpuBuffer` dropped on a worker/watcher/teardown thread no longer
+//     leaks its block.
+//
+// ## Why one shared module (not the watcher's private statics)
+//
+// V4 originally lived inside `pool_watcher`, gated on `--features
+// pool-watcher`. V5 must work in the default build too (frees happen with no
+// watcher), and the task requires both findings to share *one* guard + epoch
+// so a capture (V4) and a free-time re-bind (V5) can never resurrect a
+// context that a concurrent `CudaContext::Drop` has invalidated. Hoisting the
+// state here — ungated — gives both paths the same `CTX_BIND_GUARD` and the
+// same `CTX_EPOCH`. The watcher now delegates to these helpers; its public
+// surface (`retry_context_capture`, `invalidate_captured_ctx`,
+// `real_ctx_attach`) is unchanged.
+//
+// ## Epoch protocol (mirrors `exec::partition_offsets::CONTEXT_EPOCH`)
+//
+// `CTX_EPOCH` is bumped by `invalidate_owning_ctx` (called from
+// `CudaContext::Drop` *before* `cuCtxDestroy_v2`) under `CTX_BIND_GUARD`,
+// together with clearing `OWNING_CTX`. Any path that wants to *store* a
+// captured context (V4 `capture_owning_ctx`) reads the epoch BEFORE binding,
+// takes the guard, and only commits the store if the epoch still matches —
+// so a capture that raced a concurrent invalidation is discarded instead of
+// resurrecting a freed context. Any path that wants to *use* the context
+// (V4 attach, V5 free) does so under the guard, where a non-null
+// `OWNING_CTX` is guaranteed still alive (the destroyer is blocked on the
+// guard and has not yet called `cuCtxDestroy_v2`).
+// ---------------------------------------------------------------------------
+
+pub(crate) mod ctx_binder {
+    //! Epoch-guarded owning-context record shared by the V4 watcher re-bind
+    //! and the V5 `driver_free` re-bind. See the section comment above for
+    //! the rationale and the epoch protocol.
+    //!
+    //! `allow(dead_code)`: which helpers are live depends on the feature
+    //! matrix — the V5 default-backend re-bind (`with_guard` / `load_raw`)
+    //! compiles out under `--features cudarc`, and the V4 watcher capture
+    //! (`epoch` / `capture_owning_ctx`) compiles out under
+    //! `not(feature = "pool-watcher")`. The module is correct in every combo;
+    //! the attribute just suppresses the per-combo "unused" noise rather than
+    //! sprinkling cfgs across the helpers.
+    #![allow(dead_code)]
+    use once_cell::sync::Lazy;
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+
+    /// The CUDA context the pool's blocks were allocated under, captured on
+    /// the engine thread. Held as `AtomicPtr<c_void>` because `CUcontext` is
+    /// itself `*mut c_void` — keeping it in a pointer-typed atomic preserves
+    /// provenance through the static-storage round-trip rather than launder
+    /// it through `usize`. Null when no context has been captured (or after
+    /// invalidation). Never dereferenced here; only forwarded to the driver.
+    static OWNING_CTX: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// Serialises every load-then-bind and every capture-store against
+    /// `invalidate_owning_ctx`. While held, a non-null `OWNING_CTX` cannot be
+    /// destroyed: the destroyer (`CudaContext::Drop`) blocks on this guard and
+    /// has not yet reached `cuCtxDestroy_v2`. A `parking_lot::Mutex<()>` used
+    /// purely as a critical-section gate; contention is nil (binds are rare,
+    /// destruction rarer). Replaces the watcher's old private `CTX_BIND_GUARD`.
+    static CTX_BIND_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    /// Generation counter, bumped by `invalidate_owning_ctx` under the guard.
+    /// Mirrors `exec::partition_offsets::CONTEXT_EPOCH`: a capture (V4) snapshots
+    /// the epoch before binding and only commits its store if the epoch is
+    /// still unchanged when it takes the guard — so a capture that raced an
+    /// invalidation cannot resurrect a freed context.
+    static CTX_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    /// Snapshot the current epoch. Used by `capture_owning_ctx` before it
+    /// binds/queries, so the post-guard commit can detect a concurrent
+    /// invalidation.
+    #[inline]
+    pub(crate) fn epoch() -> u64 {
+        CTX_EPOCH.load(Ordering::Acquire)
+    }
+
+    /// Current owning context (raw pointer); null if none / invalidated.
+    /// Callers that intend to *bind* it must do so under [`with_guard`] and
+    /// re-load inside the critical section — a bare load here is only safe for
+    /// a fast-path "is anything captured?" check.
+    #[inline]
+    pub(crate) fn load_raw() -> *mut std::ffi::c_void {
+        OWNING_CTX.load(Ordering::Acquire)
+    }
+
+    /// Run `f` while holding `CTX_BIND_GUARD`. Every bind/capture/invalidate
+    /// goes through here so they are mutually serialised. `parking_lot`'s
+    /// mutex does not poison, so this never has to recover from a poisoned
+    /// lock (unlike the watcher's former `std::sync::Mutex`).
+    #[inline]
+    pub(crate) fn with_guard<R>(f: impl FnOnce() -> R) -> R {
+        let _bind = CTX_BIND_GUARD.lock();
+        f()
+    }
+
+    /// V4 capture: store `ctx` as the owning context iff no concurrent
+    /// invalidation happened since `observed_epoch` was snapshotted.
+    ///
+    /// The caller snapshots [`epoch`] *before* it does any driver work
+    /// (`ctx_get_current`), then calls this with that snapshot. We take the
+    /// guard and re-check the live epoch: if it advanced, a `CudaContext::Drop`
+    /// invalidated the context in the window and we must NOT store — doing so
+    /// would resurrect a context that is being / has been destroyed. Returns
+    /// `true` if the capture committed.
+    pub(crate) fn capture_owning_ctx(
+        ctx: *mut std::ffi::c_void,
+        observed_epoch: u64,
+    ) -> bool {
+        if ctx.is_null() {
+            return false;
+        }
+        with_guard(|| {
+            if CTX_EPOCH.load(Ordering::Acquire) != observed_epoch {
+                // A context was invalidated between the caller's snapshot and
+                // here; the pointer we were handed may already be (or is about
+                // to be) destroyed. Drop the capture.
+                return false;
+            }
+            OWNING_CTX.store(ctx, Ordering::Release);
+            true
+        })
+    }
+
+    /// V4 + V5 invalidation: invoked from `CudaContext::Drop` *before*
+    /// `cuCtxDestroy_v2(raw)`. Under the guard, bump the epoch and — iff the
+    /// stored context equals `raw` — clear it. Bumping the epoch
+    /// unconditionally invalidates any in-flight capture snapshot even when a
+    /// *different* live context is currently stored (a second Engine), so a
+    /// capture racing this drop is always rejected; clearing is conditional so
+    /// we never drop another Engine's still-live capture.
+    ///
+    /// Acquiring the guard also blocks until any in-flight bind/free for the
+    /// stored pointer has finished, so after this returns the caller may
+    /// safely run `cuCtxDestroy_v2(raw)`.
+    pub(crate) fn invalidate_owning_ctx(raw: *mut std::ffi::c_void) {
+        if raw.is_null() {
+            return;
+        }
+        with_guard(|| {
+            // Bump first: this rejects any racing capture snapshot regardless
+            // of which context is currently stored.
+            CTX_EPOCH.fetch_add(1, Ordering::AcqRel);
+            let _ = OWNING_CTX.compare_exchange(
+                raw,
+                std::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_for_tests(raw: *mut std::ffi::c_void) {
+        OWNING_CTX.store(raw, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_for_tests() -> *mut std::ffi::c_void {
+        OWNING_CTX.load(Ordering::Acquire)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Event-based deferred-free pool (review finding C1 / P1).
 //
 // ## What this gives us
@@ -364,6 +537,26 @@ pub(crate) fn deferred_free_count() -> u64 {
     DEFERRED_FREE_COUNT.load(Ordering::Relaxed)
 }
 
+/// Maximum number of consecutive not-ready sweeps a [`PendingFree`] may
+/// survive before [`sweep_pending_frees`] escalates it to the blocking
+/// `event_synchronize`-then-`driver_free` path (V8).
+///
+/// A `cuEventQuery` that returns a genuine `Err` (a permanently-errored
+/// handle, not merely `CUDA_ERROR_NOT_READY`) never becomes ready, so the
+/// pre-V8 sweep re-parked such an entry on every pass forever, leaking its
+/// block and events for the process lifetime. Bounding the retries lets the
+/// sweep fall back to the same blocking reclaim the shutdown drain uses.
+///
+/// This is a *sweep-iteration* budget, not a wall-clock timeout — `Instant`
+/// / `Date::now` are treated as restricted on this path, and an iteration
+/// count is the metric the sweep already has cheaply to hand. The sweep runs
+/// opportunistically from `alloc`/`free`, so under any live workload 1024
+/// not-ready observations is far longer than any legitimately in-flight
+/// stream needs to drain; a healthy entry frees inline long before reaching
+/// it. The bound only ever bites a wedged/errored handle.
+#[cfg(not(test))]
+const MAX_PENDING_SWEEPS: u32 = 1024;
+
 /// A device block whose free was deferred because a recorded stream had not
 /// yet drained past its event. Held in the process-global [`PENDING_FREES`]
 /// list until a sweep observes every `event` complete.
@@ -372,11 +565,22 @@ pub(crate) fn deferred_free_count() -> u64 {
 /// while the owning context is current on the sweeping thread, the same
 /// precondition the pool already documents for `cuMemFree_v2`. We never
 /// dereference them; we only forward them to the driver via `cuda_sys::event_*`.
+///
+/// `sweeps_not_ready` counts how many times [`sweep_pending_frees`] observed
+/// this entry as not-ready (an event reported in-flight OR a query *errored*).
+/// A genuinely-errored event handle never transitions to ready, so without a
+/// bound the entry — and its block + events — would be re-parked forever (V8).
+/// Once the counter reaches [`MAX_PENDING_SWEEPS`] the sweep escalates the
+/// entry to the blocking `event_synchronize`-then-`driver_free` path (matching
+/// `drain_pending_frees_blocking`) so a permanently-errored handle can no
+/// longer strand memory. We count sweep iterations rather than wall time
+/// because `Instant::now` is treated as restricted on the deferred-free path.
 #[cfg(not(test))]
 struct PendingFree {
     ptr: CUdeviceptr,
     alloc_bytes: usize,
     events: Vec<crate::cuda::cuda_sys::CUevent>,
+    sweeps_not_ready: u32,
 }
 
 // SAFETY: `PendingFree` holds raw `CUevent`/`CUdeviceptr` handles. Like the
@@ -419,6 +623,7 @@ pub(crate) fn defer_free(
         ptr,
         alloc_bytes,
         events,
+        sweeps_not_ready: 0,
     });
 }
 
@@ -427,9 +632,20 @@ pub(crate) fn defer_free(
 /// still-in-flight event are retained for the next sweep.
 ///
 /// Called opportunistically at the start of `alloc` and `free` (cheap no-op
-/// when the list is empty, which is the steady state). Never blocks: it only
-/// *queries* events. A query error (e.g. transient driver issue) is treated
-/// conservatively as "not ready yet" so we never free early on a bad probe.
+/// when the list is empty, which is the steady state). The common path never
+/// blocks: it only *queries* events. A query error (e.g. transient driver
+/// issue) is treated conservatively as "not ready yet" so we never free early
+/// on a bad probe.
+///
+/// **V8 (bounded retries).** A `cuEventQuery` that returns a genuine `Err`
+/// never becomes ready, so the pre-V8 sweep re-parked such an entry forever,
+/// leaking its block and events. Each not-ready observation now bumps
+/// `sweeps_not_ready`; once it reaches [`MAX_PENDING_SWEEPS`] the entry is
+/// escalated to the blocking `event_synchronize`-then-`driver_free` reclaim
+/// (`force_reclaim_pending`, the same path `drain_pending_frees_blocking`
+/// uses) instead of being parked again. The fast path for a healthy in-flight
+/// entry is unchanged — it frees inline the moment its events report complete,
+/// long before the bound bites.
 #[cfg(not(test))]
 pub(crate) fn sweep_pending_frees() {
     // Fast path: nothing pending. Avoid taking the lock's write section and
@@ -449,10 +665,10 @@ pub(crate) fn sweep_pending_frees() {
         std::mem::take(&mut *guard)
     };
     let mut still_pending: Vec<PendingFree> = Vec::new();
-    for entry in pending {
+    for mut entry in pending {
         // An entry is ready iff EVERY recorded event reports complete. A
         // not-ready or errored query keeps the WHOLE entry parked (we never
-        // partially free).
+        // partially free) — until the V8 retry budget is exhausted, below.
         let all_ready = entry.events.iter().all(|&ev| {
             // SAFETY: `ev` is a live event handle created via
             // `cuda_sys::event_create` and recorded on a stream; we only query
@@ -471,7 +687,26 @@ pub(crate) fn sweep_pending_frees() {
             }
             POOL.free(entry.ptr, entry.alloc_bytes);
         } else {
-            still_pending.push(entry);
+            // V8: a not-ready (or errored) probe. Charge it against the retry
+            // budget. A genuinely-errored handle never flips to ready, so we
+            // must not park it forever — escalate to the blocking reclaim once
+            // the budget is spent rather than re-queueing it indefinitely.
+            entry.sweeps_not_ready = entry.sweeps_not_ready.saturating_add(1);
+            if entry.sweeps_not_ready >= MAX_PENDING_SWEEPS {
+                log::warn!(
+                    "craton-bolt: deferred free for ptr {:#x} not ready after \
+                     {} sweeps; escalating to blocking event_synchronize \
+                     (likely a permanently-errored event handle)",
+                    entry.ptr,
+                    entry.sweeps_not_ready
+                );
+                // SAFETY: same provenance/precondition as the shutdown drain —
+                // block on every recorded event so no stream still references
+                // the block, destroy the events, then free to the driver.
+                unsafe { force_reclaim_pending(entry) };
+            } else {
+                still_pending.push(entry);
+            }
         }
     }
     if !still_pending.is_empty() {
@@ -479,6 +714,32 @@ pub(crate) fn sweep_pending_frees() {
         // while we were sweeping stays ahead of them — order is irrelevant).
         PENDING_FREES.lock().extend(still_pending);
     }
+}
+
+/// Blocking reclaim of a single [`PendingFree`]: `event_synchronize` every
+/// recorded event (so no stream still references the block), destroy the
+/// events, then return the block to the driver. Factored out so both the V8
+/// retry-budget escalation in [`sweep_pending_frees`] and the shutdown
+/// [`drain_pending_frees_blocking`] use exactly one reclaim sequence.
+///
+/// # Safety
+/// The events must be live handles recorded for `entry.ptr`; after this call
+/// they (and the block) are released and must not be reused. `entry.ptr` must
+/// have been minted by the active backend's `mem_alloc`.
+#[cfg(not(test))]
+unsafe fn force_reclaim_pending(entry: PendingFree) {
+    for ev in &entry.events {
+        // SAFETY: live event handle; block until its recorded work completes
+        // so the subsequent free cannot race in-flight work. A synchronize
+        // error on an already-errored handle is swallowed — we still proceed
+        // to free, which is the whole point of the escalation.
+        let _ = unsafe { crate::cuda::cuda_sys::event_synchronize(*ev) };
+        // SAFETY: event is complete (or permanently errored) and unused after.
+        let _ = unsafe { crate::cuda::cuda_sys::event_destroy(*ev) };
+    }
+    // SAFETY: events synchronized above, so no stream still references the
+    // block; provenance is the same as any pooled pointer.
+    unsafe { driver_free(entry.ptr) };
 }
 
 /// Shutdown drain of the pending-free list: BLOCK on every still-pending
@@ -492,18 +753,13 @@ fn drain_pending_frees_blocking() {
         std::mem::take(&mut *guard)
     };
     for entry in pending {
-        for ev in &entry.events {
-            // SAFETY: live event handle; block until its recorded work
-            // completes so the subsequent free cannot race in-flight work.
-            let _ = unsafe { crate::cuda::cuda_sys::event_synchronize(*ev) };
-            // SAFETY: event is complete (just synchronized) and unused after.
-            let _ = unsafe { crate::cuda::cuda_sys::event_destroy(*ev) };
-        }
         // Free directly to the driver — at shutdown we are draining the pool,
-        // so re-pooling would be immediately undone.
-        // SAFETY: events synchronized above, so no stream still references the
-        // block; provenance is the same as any pooled pointer.
-        unsafe { driver_free(entry.ptr) };
+        // so re-pooling would be immediately undone. `force_reclaim_pending`
+        // synchronizes + destroys every event before the free (shared with the
+        // V8 escalation path in `sweep_pending_frees`).
+        // SAFETY: same provenance/precondition as the per-entry escalation —
+        // see `force_reclaim_pending`.
+        unsafe { force_reclaim_pending(entry) };
     }
 }
 
@@ -660,6 +916,27 @@ impl BucketEntry {
 /// Errors are logged but otherwise swallowed — the pool's eviction paths
 /// run under a lock and cannot meaningfully propagate failures.
 ///
+/// ## Context re-bind on the default backend (finding V5)
+///
+/// `driver_free` is called from worker / watcher threads and from the
+/// multi-Engine teardown path, none of which necessarily have the owning
+/// CUDA context current. The hand-rolled backend's `cuda_sys::mem_free`
+/// guards against a wrong/no-context free by *refusing* it — which, on a
+/// thread with no current context, leaks the block for the process lifetime.
+///
+/// The cudarc backend never hits this: `cudarc_backend::mem_free`
+/// re-establishes its single process-wide primary context itself. To match
+/// that for the hand-rolled backend, when no context is current we re-bind
+/// the pool's recorded owning context (`ctx_binder`) for the duration of the
+/// free, then restore the prior context. The re-bind happens under
+/// `ctx_binder`'s `CTX_BIND_GUARD` so it shares one epoch/guard with the V4
+/// watcher capture: a `CudaContext::Drop` that is concurrently invalidating
+/// the context blocks on the guard, so we can never `cuCtxSetCurrent` a
+/// context that is about to be (or has been) destroyed. If the owning context
+/// has already been invalidated (null under the guard), we keep the existing
+/// safe behaviour — `cuda_sys::mem_free` logs and skips, leaking the block
+/// rather than binding a freed context.
+///
 /// # Safety
 /// `ptr` must have been minted by the matching backend's `mem_alloc` and
 /// must no longer be aliased.
@@ -667,14 +944,84 @@ impl BucketEntry {
 unsafe fn driver_free(ptr: CUdeviceptr) {
     #[cfg(feature = "cudarc")]
     let result = crate::cuda::cudarc_backend::mem_free(ptr);
+    // SAFETY: `driver_free_default_backend` shares this function's contract
+    // (`ptr` live, from the matching backend, no longer aliased).
     #[cfg(not(feature = "cudarc"))]
-    let result = cuda_sys::mem_free(ptr);
+    let result = unsafe { driver_free_default_backend(ptr) };
     if let Err(e) = result {
         // Use `log::warn!` for consistency with the rest of the module
         // (pool_watcher, OOM recovery). `eprintln!` bypasses the
         // crate's structured logging and is harder to silence in tests.
         log::warn!("craton-bolt: DeviceMemPool failed to free ptr: {}", e);
     }
+}
+
+/// Default-backend `driver_free` body (finding V5). On the common engine-thread
+/// path a context is already current and this is exactly the old direct
+/// `cuda_sys::mem_free`. When no context is current, re-bind the pool's
+/// recorded owning context under `ctx_binder`'s shared guard/epoch, free, then
+/// restore the prior context — turning a process-lifetime leak into a clean
+/// free without ever binding a destroyed context.
+///
+/// # Safety
+/// Same contract as [`driver_free`].
+#[cfg(all(not(test), not(feature = "cudarc")))]
+unsafe fn driver_free_default_backend(ptr: CUdeviceptr) -> BoltResult<()> {
+    // Fast path: a context is already current on this thread (the engine
+    // thread, the overwhelmingly common case) — free directly, unchanged.
+    match cuda_sys::ctx_get_current() {
+        // SAFETY: a context is current and `ptr`'s pool block belongs to it;
+        // delegates to the caller's `# Safety` contract.
+        Ok(Some(_)) => return unsafe { cuda_sys::mem_free(ptr) },
+        Ok(None) => {
+            // Fall through to the V5 re-bind below.
+        }
+        Err(e) => {
+            // `cuCtxGetCurrent` itself failed; surface it (caller logs/leaks).
+            return Err(e);
+        }
+    }
+
+    // No context current. Re-bind the owning context under the shared guard so
+    // a concurrent `CudaContext::Drop` invalidation cannot race the bind.
+    ctx_binder::with_guard(|| {
+        let raw = ctx_binder::load_raw();
+        if raw.is_null() {
+            // No owning context recorded, or it was already invalidated by a
+            // `CudaContext::Drop`. Binding here would either bind nothing or
+            // bind a freed context — keep the safe leak-and-log behaviour by
+            // delegating to `mem_free`, which detects the no-context case and
+            // returns the descriptive H1 error (the caller logs it).
+            // SAFETY: delegates to the caller's `# Safety` contract; `mem_free`
+            // refuses the free when no context is current rather than freeing
+            // against the wrong one.
+            return unsafe { cuda_sys::mem_free(ptr) };
+        }
+        let owning: cuda_sys::CUcontext = raw;
+        // SAFETY: under the guard, a non-null `raw` cannot be a context that
+        // has been destroyed — the only destroyer (`CudaContext::Drop` ->
+        // `ctx_binder::invalidate_owning_ctx`) is blocked on this same guard
+        // and has not yet reached `cuCtxDestroy_v2`. `owning` is a live
+        // `CUcontext` captured via `cuCtxGetCurrent` on the engine thread.
+        if let Err(e) = unsafe { cuda_sys::ctx_set_current(owning) } {
+            // Could not bind; do not free against the wrong/no context.
+            return Err(e);
+        }
+        // Free against the now-current owning context.
+        // SAFETY: the owning context is now current (just bound) and `ptr`'s
+        // pool block belongs to it; delegates to the caller's `# Safety`
+        // contract.
+        let free_result = unsafe { cuda_sys::mem_free(ptr) };
+        // Restore the prior (no) context: re-bind null so we leave the thread
+        // exactly as we found it and don't strand the owning context current
+        // on a worker/teardown thread. A restore failure is non-fatal — log
+        // via the returned error if the free itself didn't already fail.
+        // SAFETY: binding the null context is always valid (it unsets the
+        // current context, the state this thread was in on entry).
+        let restore_result =
+            unsafe { cuda_sys::ctx_set_current(std::ptr::null_mut()) };
+        free_result.and(restore_result)
+    })
 }
 
 /// Under `#[cfg(test)]` the pool's policy logic runs on synthetic pointers
@@ -1841,22 +2188,47 @@ pub fn pool_watcher_retry_context_capture() {
 }
 
 /// ctx-race fix: invoked from `cuda_sys::CudaContext::Drop` (via runtime
-/// indirection) immediately before `cuCtxDestroy_v2`. If the pool-watcher
-/// captured the context identified by `raw`, this clears the capture and
-/// blocks until any in-flight re-bind of that pointer has completed, so the
-/// watcher can never call `cuCtxSetCurrent` on the soon-to-be-destroyed
-/// context. `raw` is the raw `CUcontext` (`*mut c_void`) being destroyed.
+/// indirection) immediately before `cuCtxDestroy_v2`. Invalidates the pool's
+/// shared owning-context record (`ctx_binder`): under the shared guard it
+/// bumps the epoch (rejecting any in-flight V4 capture or V5 free-time bind
+/// snapshot) and clears the slot iff it matches `raw`, then blocks until any
+/// bind already in flight for that pointer has finished. So neither the
+/// `pool-watcher` re-bind (V4) nor the default-backend `driver_free` re-bind
+/// (V5) can ever call `cuCtxSetCurrent` on the soon-to-be-destroyed context.
+/// `raw` is the raw `CUcontext` (`*mut c_void`) being destroyed.
 ///
-/// No-op under `not(feature = "pool-watcher")` (the whole watcher module is
-/// compiled out and this call site disappears).
-#[cfg(not(feature = "pool-watcher"))]
-#[inline(always)]
-pub fn pool_watcher_invalidate_ctx(_raw: crate::cuda::cuda_sys::CUcontext) {}
-
-#[cfg(feature = "pool-watcher")]
+/// **Ungated (findings V4 + V5).** This is intentionally NOT gated on
+/// `pool-watcher`: the V5 `driver_free` re-bind exists in the default build
+/// too, and it relies on this invalidation to never bind a freed context.
+/// Under `pool-watcher` the watcher's capture shares the same `ctx_binder`
+/// state, so one invalidation covers both. `ctx_binder::invalidate_owning_ctx`
+/// is a no-op for a null `raw`, and cheap (one uncontended guard) otherwise —
+/// `CudaContext::Drop` is a rare, non-hot path.
 #[inline]
 pub fn pool_watcher_invalidate_ctx(raw: crate::cuda::cuda_sys::CUcontext) {
-    pool_watcher::invalidate_captured_ctx(raw);
+    ctx_binder::invalidate_owning_ctx(raw);
+}
+
+/// Register the owning CUDA context the pool's blocks will be allocated under
+/// (finding V5). Invoked from `cuda_sys::CudaContext::new` (default backend)
+/// right after `cuCtxCreate_v2`, so the default build — which never runs the
+/// `pool-watcher` capture path — still records a context that the
+/// `driver_free` re-bind can make current on a no-context thread, turning a
+/// process-lifetime leak into a clean free.
+///
+/// Uses the same guarded, epoch-checked commit as the V4 watcher capture, so
+/// it cannot race a concurrent `CudaContext::Drop` invalidation: snapshot the
+/// epoch, then commit only if it is unchanged. The freshly-created context is
+/// the newest, so on the common single-/sequential-Engine path the epoch is
+/// stable and the capture commits. Calling thread is the engine thread that
+/// just created the context (it is current there). Ungated so the default
+/// backend benefits regardless of the `pool-watcher` feature.
+///
+/// `raw` is the raw `CUcontext` (`*mut c_void`) just created.
+#[inline]
+pub fn pool_register_owning_ctx(raw: crate::cuda::cuda_sys::CUcontext) {
+    let observed_epoch = ctx_binder::epoch();
+    ctx_binder::capture_owning_ctx(raw, observed_epoch);
 }
 
 // Under the `pool-watcher` feature `ensure_watcher_started` defers to
@@ -1951,41 +2323,15 @@ pub(super) mod pool_watcher {
     static STARTED: AtomicBool = AtomicBool::new(false);
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-    /// Stage 5: capture of the engine thread's CUDA context, taken at
-    /// `ensure_started()` time. The watcher thread re-attaches this
-    /// context via `cuCtxSetCurrent` before each `cuMemGetInfo_v2` poll
-    /// — otherwise the watcher thread inherits no current context and
-    /// every poll errors with `CUDA_ERROR_INVALID_CONTEXT`.
-    ///
-    /// Held as `AtomicPtr<c_void>` because `CUcontext` is itself
-    /// `*mut c_void` (see `cuda_sys`) — keeping the pointer in a
-    /// pointer-typed atomic preserves provenance through the static-
-    /// storage round-trip rather than launder it through `usize` (the
-    /// strict-provenance model treats `as usize` / `as *mut _` as a
-    /// provenance-erasing cast). Acquire/Release semantics fence the
-    /// capture against the load on the watcher thread.
-    static CAPTURED_CTX: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
-        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-    /// ctx-race fix: serialises the watcher's load-then-`cuCtxSetCurrent`
-    /// of `CAPTURED_CTX` against `invalidate_captured_ctx`, which a
-    /// `CudaContext::Drop` calls before `cuCtxDestroy_v2`.
-    ///
-    /// Without this guard there is a TOCTOU window in `real_ctx_attach`:
-    /// it loads `CAPTURED_CTX`, then calls `ctx_set_current(raw)`. A
-    /// concurrent context destruction could clear the slot and free the
-    /// context *between* the load and the bind, so the bind would touch a
-    /// dangling pointer. By holding this lock across BOTH the load+bind
-    /// (in `real_ctx_attach`) and the clear+publish (in
-    /// `invalidate_captured_ctx`), we guarantee that once a destroyer has
-    /// observed no in-flight bind and cleared the slot, no later bind can
-    /// resurrect the stale pointer, and any bind already in progress
-    /// completes before `cuCtxDestroy_v2` runs.
-    ///
-    /// It is a plain `std::sync::Mutex<()>` (no data) used purely as a
-    /// critical-section gate. The watcher only contends it once per poll
-    /// (every few seconds), and destruction is rare, so contention is nil.
-    static CTX_BIND_GUARD: Mutex<()> = Mutex::new(());
+    // The captured engine context, the bind guard, and the invalidation
+    // epoch formerly lived here as the watcher's private statics. They were
+    // hoisted to `super::ctx_binder` (findings V4 + V5) so the V5
+    // `driver_free` re-bind shares ONE guard and ONE epoch with this
+    // watcher's capture/attach — a single epoch protocol guarantees neither
+    // path can bind a context a concurrent `CudaContext::Drop` is
+    // destroying. The functions below now delegate to that module; the
+    // watcher's external surface (`real_ctx_attach`, `invalidate_captured_ctx`,
+    // `retry_context_capture`) is unchanged.
 
     fn real_mem_info() -> BoltResult<(usize, usize)> {
         crate::cuda::cuda_sys::mem_get_info()
@@ -1996,67 +2342,52 @@ pub(super) mod pool_watcher {
     /// captured, which happens if `ensure_started` ran before any
     /// engine thread had a context current.
     fn real_ctx_attach() -> BoltResult<()> {
-        // ctx-race fix: hold `CTX_BIND_GUARD` across the load AND the
-        // `ctx_set_current` bind so a concurrent `invalidate_captured_ctx`
-        // (from `CudaContext::Drop`) cannot clear the slot and let
-        // `cuCtxDestroy_v2` run while we are mid-bind on the captured
-        // pointer. While we hold the guard, either we observe a non-null
-        // pointer that is guaranteed still alive (the destroyer is blocked
-        // on the guard and has not yet called `cuCtxDestroy_v2`), or we
-        // observe null (it was already invalidated) and no-op.
-        let _bind = CTX_BIND_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        // Acquire load pairs with the Release store in `ensure_started`
-        // / `retry_context_capture` — guarantees the captured pointer
-        // is visible with its full provenance to this thread.
-        let raw = CAPTURED_CTX.load(Ordering::Acquire);
-        if raw.is_null() {
-            return Ok(());
-        }
-        // `CUcontext` is itself `*mut c_void`, so this is a no-op cast.
-        let ctx: crate::cuda::cuda_sys::CUcontext = raw;
-        // SAFETY: `raw` was captured via `cuCtxGetCurrent` on the engine
-        // thread. It is still live here: the only thing that destroys it
-        // (`CudaContext::Drop`) first calls `invalidate_captured_ctx`,
-        // which takes `CTX_BIND_GUARD` (held by us right now) and clears
-        // `CAPTURED_CTX` before `cuCtxDestroy_v2`. So a non-null load under
-        // the guard cannot be a context that has already been destroyed.
-        // See `cuda_sys::ctx_set_current` docs for the precondition.
-        unsafe { crate::cuda::cuda_sys::ctx_set_current(ctx) }
+        // ctx-race fix (V4): hold the shared `ctx_binder` guard across the
+        // load AND the `ctx_set_current` bind so a concurrent
+        // `invalidate_captured_ctx` (from `CudaContext::Drop`) cannot clear
+        // the slot and let `cuCtxDestroy_v2` run while we are mid-bind on the
+        // captured pointer. While we hold the guard, either we observe a
+        // non-null pointer that is guaranteed still alive (the destroyer is
+        // blocked on the same guard and has not yet called `cuCtxDestroy_v2`),
+        // or we observe null (it was already invalidated) and no-op.
+        super::ctx_binder::with_guard(|| {
+            let raw = super::ctx_binder::load_raw();
+            if raw.is_null() {
+                return Ok(());
+            }
+            // `CUcontext` is itself `*mut c_void`, so this is a no-op cast.
+            let ctx: crate::cuda::cuda_sys::CUcontext = raw;
+            // SAFETY: `raw` was captured via `cuCtxGetCurrent` on the engine
+            // thread. It is still live here: the only thing that destroys it
+            // (`CudaContext::Drop`) first calls `invalidate_captured_ctx`,
+            // which takes the same `ctx_binder` guard (held by us right now)
+            // and clears the slot before `cuCtxDestroy_v2`. So a non-null
+            // load under the guard cannot be an already-destroyed context.
+            // See `cuda_sys::ctx_set_current` docs for the precondition.
+            unsafe { crate::cuda::cuda_sys::ctx_set_current(ctx) }
+        })
     }
 
     /// ctx-race fix: invoked from `cuda_sys::CudaContext::Drop` (through
     /// the `mem_pool::pool_watcher_invalidate_ctx` shim) immediately
     /// before `cuCtxDestroy_v2(raw)`.
     ///
-    /// If the watcher captured the context `raw`, clear `CAPTURED_CTX` so
-    /// no future `real_ctx_attach` re-binds it, and — by taking
-    /// `CTX_BIND_GUARD` — block until any bind already in flight for that
-    /// pointer has finished. After this returns, the caller may safely
-    /// destroy `raw`: the watcher will load null on its next poll and skip
-    /// the bind (its poll then fails benignly with no current context,
-    /// which the loop already logs-and-skips).
+    /// Delegates to `super::ctx_binder::invalidate_owning_ctx` (findings V4 +
+    /// V5): under the shared guard it bumps the shared epoch — so any in-flight
+    /// capture (V4 `retry_context_capture`) or free-time bind (V5
+    /// `driver_free`) snapshot is invalidated — and clears the owning context
+    /// iff it matches `raw`. Acquiring the guard also blocks until any bind
+    /// already in flight for that pointer has finished, so after this returns
+    /// the caller may safely run `cuCtxDestroy_v2(raw)`: no later attach/free
+    /// can resurrect or touch the destroyed context.
     ///
-    /// If a *different* context is captured (another live Engine), we leave
-    /// the capture intact so that Engine's watcher visibility is preserved.
+    /// If a *different* context is captured (another live Engine), the clear is
+    /// skipped so that Engine's watcher visibility / V5 binding is preserved,
+    /// but the epoch bump still rejects any racing capture snapshot.
     ///
     /// `raw` is the raw `CUcontext` (`*mut c_void`) being destroyed.
     pub(super) fn invalidate_captured_ctx(raw: crate::cuda::cuda_sys::CUcontext) {
-        if raw.is_null() {
-            return;
-        }
-        // Take the same guard `real_ctx_attach` holds. Acquiring it means
-        // no bind is in progress; any bind that started before us has
-        // completed. Inside the critical section we compare-and-clear so we
-        // only drop OUR context, never another Engine's still-live capture.
-        let _bind = CTX_BIND_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = CAPTURED_CTX.compare_exchange(
-            raw,
-            std::ptr::null_mut(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        // Guard released here; subsequent `real_ctx_attach` calls that
-        // observe the cleared slot return Ok(()) without binding.
+        super::ctx_binder::invalidate_owning_ctx(raw);
     }
 
     /// Spawn the watcher exactly once (idempotent). Subsequent calls are
@@ -2066,7 +2397,7 @@ pub(super) mod pool_watcher {
     ///
     /// Stage 5 (M3L5): on the first call, captures the current CUDA
     /// context on the calling thread (via `cuCtxGetCurrent`) and stashes
-    /// it in `CAPTURED_CTX`. The watcher thread re-attaches that
+    /// it in the shared `ctx_binder` slot. The watcher thread re-attaches that
     /// context on every iteration before polling `cuMemGetInfo_v2` —
     /// without the re-attach, the watcher's first poll fails with
     /// `CUDA_ERROR_INVALID_CONTEXT` because background threads inherit
@@ -2085,12 +2416,17 @@ pub(super) mod pool_watcher {
         }
         // Capture the engine thread's context BEFORE spawning the
         // background thread (otherwise we'd capture the new thread's
-        // empty context).
+        // empty context). Snapshot the `ctx_binder` epoch BEFORE the driver
+        // query so the guarded commit (`capture_owning_ctx`) can reject the
+        // capture if a `CudaContext::Drop` invalidated a context in the
+        // window — the same epoch protocol the V5 free path observes.
+        let observed_epoch = super::ctx_binder::epoch();
         match crate::cuda::cuda_sys::ctx_get_current() {
             Ok(Some(ctx)) => {
-                // `ctx` is `*mut c_void` (CUcontext) — store directly
-                // into the typed `AtomicPtr` so provenance is preserved.
-                CAPTURED_CTX.store(ctx, Ordering::Release);
+                // Commit under the shared guard+epoch; a racing invalidation
+                // since `observed_epoch` discards the capture rather than
+                // resurrecting a soon-to-be-destroyed context.
+                super::ctx_binder::capture_owning_ctx(ctx, observed_epoch);
             }
             Ok(None) => {
                 log::debug!(
@@ -2167,48 +2503,53 @@ pub(super) mod pool_watcher {
     ///
     /// If `ensure_started` ran before any engine thread had a CUDA context
     /// bound (e.g. tests, or `DeviceMemPool::POOL` first-touched on an
-    /// idle thread), `CAPTURED_CTX` will be zero and every watcher poll
-    /// falls through `real_ctx_attach` as a no-op — losing visibility
-    /// into device memory pressure.
+    /// idle thread), the shared `ctx_binder` slot will be zero and every
+    /// watcher poll falls through `real_ctx_attach` as a no-op — losing
+    /// visibility into device memory pressure.
     ///
     /// This hook is called from `Engine::sql` (and other engine entry
     /// points) on every query: if the slot is still empty AND the
     /// calling thread has a context bound, populate it. Cheap atomic
     /// load on the steady-state path; one `cuCtxGetCurrent` on the
     /// first call after a context becomes available.
+    ///
+    /// ## ctx-race synchronization (finding V4 — formerly a TODO here)
+    ///
+    /// The capture is now serialized against `invalidate_captured_ctx`
+    /// through the shared `ctx_binder` guard + epoch, so it can no longer
+    /// resurrect a context that a concurrent `CudaContext::Drop` invalidated.
+    /// The protocol:
+    ///
+    ///   1. Fast path: a bare load — if a context is already captured, return
+    ///      with no guard and no driver call (the steady state).
+    ///   2. Snapshot `ctx_binder::epoch()` *before* the `cuCtxGetCurrent`
+    ///      query, so the snapshot predates any pointer we are about to read.
+    ///   3. Commit via `ctx_binder::capture_owning_ctx`, which takes the guard
+    ///      and stores the pointer *only if the epoch is still unchanged*. Any
+    ///      `CudaContext::Drop` that ran in the window bumped the epoch under
+    ///      the same guard, so the commit is rejected and the captured pointer
+    ///      — which may be the very context being destroyed — is discarded.
+    ///
+    /// This closes the previously-documented gap where a thread using context
+    /// `C` could race a drop of the Engine owning `C` and re-store the freed
+    /// pointer just after the drop cleared it. The guarded commit costs one
+    /// uncontended mutex acquisition only on the *first* successful capture
+    /// (the fast-path load short-circuits every subsequent call), so the
+    /// hot `Engine::sql` path is unaffected in the steady state.
     pub fn retry_context_capture() {
-        // TODO(ctx-race): this CAS populates `CAPTURED_CTX` WITHOUT taking
-        // `CTX_BIND_GUARD`, so it is not serialised against
-        // `invalidate_captured_ctx`. The remaining (benign-in-practice) gap:
-        // if a thread that still has context `C` current calls this AT THE
-        // SAME TIME another thread is dropping the `CudaContext` that owns
-        // `C`, this could re-store `C` into the slot just after the drop
-        // cleared it, and the watcher's next bind would touch a freed `C`.
-        // That requires *using* an Engine's context concurrently with
-        // dropping that same Engine — already undefined at the API level
-        // (`CudaContext` is `Send` but not `Sync`, and an Engine must not be
-        // queried while being torn down). The common multi-Engine case (each
-        // Engine used and dropped from its own thread) is fully covered by
-        // the guard in `real_ctx_attach`/`invalidate_captured_ctx`. Closing
-        // this fully would require gating the capture CAS on the guard plus a
-        // generation counter; deferred as it would add hot-path cost to every
-        // `Engine::sql` for a misuse that is already UB.
-        //
-        // Fast path: already captured.
-        if !CAPTURED_CTX.load(Ordering::Acquire).is_null() {
+        // Fast path: already captured. Bare load, no guard, no driver call.
+        if !super::ctx_binder::load_raw().is_null() {
             return;
         }
+        // Snapshot the epoch BEFORE the driver query so a concurrent
+        // invalidation between here and the commit is detectable.
+        let observed_epoch = super::ctx_binder::epoch();
         match crate::cuda::cuda_sys::ctx_get_current() {
             Ok(Some(ctx)) => {
-                // CAS so concurrent first-callers don't race. Only the
-                // winner stores; losers no-op. `ctx` is `*mut c_void`
-                // (CUcontext) — feeds the typed `AtomicPtr` directly.
-                let _ = CAPTURED_CTX.compare_exchange(
-                    std::ptr::null_mut(),
-                    ctx,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+                // Guarded, epoch-checked commit. A racing `CudaContext::Drop`
+                // (which bumped the epoch under the same guard) causes this to
+                // no-op rather than store a soon-to-be-destroyed context.
+                super::ctx_binder::capture_owning_ctx(ctx, observed_epoch);
             }
             Ok(None) | Err(_) => {
                 // No context yet, or driver query failed — try again
@@ -2358,18 +2699,19 @@ pub(super) mod pool_watcher {
         CAP_BUMP_WARNED.load(Ordering::Acquire)
     }
 
-    /// Test-only: directly seed `CAPTURED_CTX` with a fake pointer so the
-    /// ctx-race invalidation path can be exercised without a real driver.
-    /// `raw` is treated as an opaque `*mut c_void` and never dereferenced.
+    /// Test-only: directly seed the shared owning-context slot with a fake
+    /// pointer so the ctx-race invalidation path can be exercised without a
+    /// real driver. `raw` is an opaque `*mut c_void` and never dereferenced.
+    /// Delegates to `ctx_binder` (the slot moved there for V4 + V5).
     #[cfg(test)]
     pub(super) fn set_captured_ctx_for_tests(raw: *mut std::ffi::c_void) {
-        CAPTURED_CTX.store(raw, Ordering::Release);
+        super::ctx_binder::store_for_tests(raw);
     }
 
-    /// Test-only: read back the raw captured-context pointer.
+    /// Test-only: read back the raw owning-context pointer.
     #[cfg(test)]
     pub(super) fn captured_ctx_for_tests() -> *mut std::ffi::c_void {
-        CAPTURED_CTX.load(Ordering::Acquire)
+        super::ctx_binder::load_for_tests()
     }
 
     fn read_interval() -> Duration {

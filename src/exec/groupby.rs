@@ -1430,10 +1430,30 @@ impl<'a> FilteredKeys<'a> {
 /// NOTE (kernel follow-up): the device atomic is still wrapping; this host
 /// guard is the build-safe restoration of the invariant. The proper long-term
 /// fix is an overflow flag raised inside the atomic kernel.
+// COVERAGE (integer SUM overflow, as of V-10): every reachable integer-SUM
+// finalization in the engine now raises the canonical "SUM(integer) overflow"
+// error rather than silently wrapping:
+//   - grouped SUM(Int64) / SUM(Int32->i64), host-strip path: guarded here via
+//     `checked_group_sum` in `run_typed_agg` (the values are host-materialised
+//     by `collect_filtered_primitive`, so the re-fold is free of an extra D2H);
+//   - grouped SUM, native-validity path: guarded via
+//     `checked_group_sum_native_validity` in `run_typed_agg_native_validity`;
+//   - the grouped shared-mem fast path is gated to (Sum, Float64) at
+//     `groupby_shmem_dispatch.rs:~149`, so integer grouped SUM never reaches an
+//     on-device-only finalize and always falls through to the guarded paths
+//     above;
+//   - scalar (non-grouped) integer SUM: `aggregate.rs`'s and `agg_with_pre.rs`'s
+//     `ReduceScalar for {i32,i64}` finalize the device partials with
+//     `checked_add` (agg_with_pre.rs was fixed in V-10 — it previously merged
+//     `Sum | Count` into `wrapping_add` and wrapped silently).
+// RESIDUAL/FUTURE GAP: the device group atomic (`atom.global.add.u64`) is still
+// itself wrapping; the host re-fold here is the build-safe restoration of the
+// invariant and depends on the grouped values being host-materialised. A
+// future never-materialised streaming grouped aggregate would bypass it.
 // TODO(overflow-kernel): add a saturating/overflow-detecting variant of the
 // u64 group SUM atomic (e.g. a per-launch device "overflow" flag set on signed
-// carry) so overflow is caught on-device for streaming inputs that are never
-// fully materialised host-side, and this host re-fold can be dropped.
+// carry) so overflow is caught on-device for that future streaming case and the
+// host re-fold can be dropped.
 fn checked_group_sum(values: &[i64], host_keys: &[i64]) -> BoltResult<()> {
     debug_assert_eq!(
         values.len(),

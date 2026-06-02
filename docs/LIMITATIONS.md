@@ -107,14 +107,27 @@ These are real, code-level behaviors to be aware of:
   functions, string functions, and `DISTINCT`. "Runs" does not always mean "ran
   on the GPU." See [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md) for the
   per-feature execution tier (GPU / host-side / GPU-lowering-pending).
-- **`NOT IN` / `IN` with NULL — three-valued-logic caveat (known foot-gun).**
-  SQL three-valued logic around `NOT IN (... NULL ...)` has historically been a
-  correctness foot-gun in GPU engines (a `NULL` in the list makes the predicate
-  `UNKNOWN`/false for non-matching rows). The engine drops NULLs from a folded
-  `IN`/`NOT IN` value set, which matches strict SQL for `IN` under `WHERE` but
-  **diverges for `NOT IN` against a set containing NULLs**. Verify behavior
-  against your reference engine before relying on `NOT IN`/`IN` over nullable
-  lists.
+- **`NOT IN` / `IN` with NULL — three-valued logic (now strict for the
+  subquery path).** SQL three-valued logic around `NOT IN (... NULL ...)` is a
+  classic correctness foot-gun in GPU engines (a `NULL` in the set makes the
+  predicate `UNKNOWN` for non-matching rows, so no row passes). The
+  subquery-membership lowering (`build_in_predicate`) now matches strict SQL:
+  - `expr NOT IN (set)` where the set contains a `NULL` folds to `Bool(false)`
+    (no row passes), because every row is `UNKNOWN`/`FALSE`;
+  - a `NULL` *probe* (`expr` itself is `NULL`) is excluded from `NOT IN` via an
+    explicit `expr IS NOT NULL` guard ANDed onto the lowered `<>` chain — the
+    raw GPU `<>` comparator would otherwise read the NULL probe as its stored
+    value and wrongly include it;
+  - `NULL` elements of a non-negated `IN` set are dropped (they can only
+    contribute `UNKNOWN`), and an empty / NULL-only set folds to `IN` → `false`,
+    `NOT IN` → `true`.
+
+  Caveat on scope: this strict handling lives in the **`IN`/`NOT IN`
+  subquery** path. The literal-list path (`WHERE x IN (v1, v2, …)`) desugars to
+  a plain `=`/`<>` comparison chain and relies on three-valued evaluation of
+  those comparators rather than the explicit set-NULL fold above; verify
+  behavior against your reference engine if you embed a literal `NULL` directly
+  in an `IN`/`NOT IN` value list.
 - **Grouped integer `SUM` overflow may go undetected for streaming inputs.**
   Scalar and grouped integer `SUM` overflow is normally a hard error
   (`BoltError::Type("SUM(integer) overflow")`; see
@@ -123,7 +136,32 @@ These are real, code-level behaviors to be aware of:
   sums, so an overflow may **not** be caught for streaming inputs the host
   cannot replicate (the device produced the result but the host has no way to
   re-derive it for the check). Tracked follow-up: an on-device overflow flag
-  that makes the check independent of the host recompute.
+  that makes the check independent of the host recompute. Where the host
+  *can* re-fold (the host-materialized grouped path), the recompute uses
+  `i64::checked_add` per group and raises the same hard error on overflow
+  (`checked_group_sum` / `checked_group_sum_native_validity`,
+  `src/exec/groupby.rs`).
+- **Integer division by zero does not error — defined as `0` (deliberate).**
+  The GPU integer-division codegen (`emit_int_div_guarded`,
+  `src/jit/ptx_gen.rs`) defines `x / 0 => 0` rather than
+  raising the standard-SQL division-by-zero error: the divisor is sanitised
+  to a non-zero stand-in for the hardware `div` and the result is then
+  `selp`-ed back to `0` when the divisor was zero. The two's-complement
+  overflow corner `INT_MIN / -1` is likewise defined as a **wrapping**
+  `INT_MIN` (the `(INT_MIN, -1)` pair is steered away from the trapping
+  `div` and the result forced to `INT_MIN`), not an error. This is an
+  intentional, test-pinned engine choice to keep the division kernel
+  total/branch-free, and it diverges from standard SQL (and from DuckDB,
+  which raises a divide-by-zero error). Integer **float** division is
+  unaffected (IEEE `div.rn` semantics).
+- **Grouped `AVG` of an empty / all-NULL group returns `0.0`, not NULL
+  (deliberate).** Standard SQL says `AVG` over zero contributing rows is
+  `NULL`; the engine instead returns `0.0` to keep the `AVG` output column
+  non-nullable (`src/exec/aggregate.rs`; the empty-input behavior is pinned
+  by `fused_avg_empty_input_returns_zero` and flagged in-code with a
+  `TODO(null)`). This diverges from standard SQL and from DuckDB (both of
+  which return `NULL`). Intentional for now; tracked as the `TODO(null)`
+  follow-up.
 - **String handling is dictionary/ASCII-oriented.** String predicates operate
   over dictionary-encoded literals, and the GPU string functions
   (`UPPER` / `LOWER` / `LENGTH`) are byte/ASCII-oriented. Treat non-ASCII /
@@ -138,9 +176,18 @@ These are real, code-level behaviors to be aware of:
   CUDA-graph sort, alternate hash/scan algorithms) are gated behind
   environment variables and are not the default path. See
   [`docs/ENV_VARS.md`](ENV_VARS.md).
-- **Builder knobs not fully wired.** Some `EngineBuilder` knobs (e.g. the
-  persistent-cache option) are not yet connected to `build()`. See
-  [`ROADMAP.md`](../ROADMAP.md) "Known limitations."
+- **Persistent PTX cache: opt-in, no automatic eviction.** The
+  `EngineBuilder::persistent_cache(path)` knob **is** wired into `build()`:
+  it installs the path as the process-wide disk PTX-cache override (via
+  `install_persistent_cache_override`), so the JIT compile path reads and
+  writes cubins at the configured directory. Precedence is builder-path →
+  `BOLT_PTX_CACHE_DIR` env var → disabled; an unset builder knob does **not**
+  clear an env-var- or otherwise-installed override (opt-in: a default-built
+  engine never enables the disk cache on its own). The override is
+  process-global, so it is shared across sequential engines in the same
+  process. The cache directory itself has no size cap or eviction policy —
+  you manage its lifetime. See [`ROADMAP.md`](../ROADMAP.md) "Known
+  limitations" for remaining builder-surface gaps.
 
 ---
 

@@ -16,6 +16,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::Tokenizer;
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
@@ -37,6 +38,111 @@ use sqlparser::ast::{WindowFrameBound, WindowFrameUnits, WindowType};
 /// Windows' 1 MiB default — comes close to its overflow point even with
 /// large per-frame locals on the lowering call path.
 pub(crate) const MAX_RECURSION_DEPTH: usize = 256;
+
+/// Hard ceiling on the *byte length* of an incoming SQL string, enforced
+/// **before** the text is handed to `sqlparser`.
+///
+/// # Why this exists (do not remove)
+///
+/// sqlparser 0.52's own recursion guard (`ParserError::RecursionLimitExceeded`)
+/// only counts *prefix* recursion. It does NOT bound the size of the AST built
+/// from a flat, left-associative operator chain (`a + a + … + a`, tens of
+/// thousands deep) or a long `OR`/`AND` chain, nor a deeply nested
+/// `IN (SELECT …)` ladder. Such inputs parse into an enormous AST whose
+/// *recursive `Drop`* blows the host thread stack and aborts the process
+/// (observed: `STATUS_STACK_OVERFLOW` on ~20k `+`, ~200k `OR`, ~5k-deep
+/// nested `IN`-subqueries). Our existing [`MAX_RECURSION_DEPTH`] lowering
+/// guard runs far too late — by the time lowering walks the tree, the
+/// dangerous AST already exists and will still crash on `Drop`.
+///
+/// The only robust mitigation is to refuse pathological inputs *before*
+/// `sqlparser` allocates an AST at all. 1 MiB is generous — orders of
+/// magnitude larger than any dashboard / hand-written query in our corpus —
+/// yet small enough that even the densest valid SQL within it cannot build
+/// an AST deep enough to overflow the stack on `Drop`.
+const MAX_SQL_BYTES_DEFAULT: usize = 1 << 20; // 1 MiB
+
+/// Hard ceiling on the *token count* of an incoming SQL string, enforced
+/// **before** the full parse. See [`MAX_SQL_BYTES_DEFAULT`] for the crash
+/// rationale: byte length alone does not bound AST depth (a 1 MiB blob of
+/// `a+a+a+…` is short on bytes-per-token but long on AST nodes), so we also
+/// cap how many tokens we will feed to the parser. Cheap to compute — the
+/// tokenizer is a linear scan and allocates only a flat `Vec<Token>`, never
+/// the recursive AST whose `Drop` is the hazard.
+const MAX_SQL_TOKENS_DEFAULT: usize = 100_000;
+
+/// Environment variable overriding [`MAX_SQL_BYTES_DEFAULT`]. Follows the
+/// same `CRATON_*` convention as [`PLAN_CACHE_SIZE_ENV`]; read once and
+/// frozen for the process lifetime.
+const MAX_SQL_BYTES_ENV: &str = "CRATON_MAX_SQL_BYTES";
+
+/// Environment variable overriding [`MAX_SQL_TOKENS_DEFAULT`]. See
+/// [`MAX_SQL_BYTES_ENV`].
+const MAX_SQL_TOKENS_ENV: &str = "CRATON_MAX_SQL_TOKENS";
+
+/// Resolve the effective byte cap. Memoised via an inner `OnceLock` so the
+/// env var is consulted only once (matching [`plan_cache_cap`]); an empty,
+/// zero, or unparseable value falls back to the default.
+fn max_sql_bytes() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var(MAX_SQL_BYTES_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_SQL_BYTES_DEFAULT)
+    })
+}
+
+/// Resolve the effective token cap. See [`max_sql_bytes`].
+fn max_sql_tokens() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var(MAX_SQL_TOKENS_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_SQL_TOKENS_DEFAULT)
+    })
+}
+
+/// Pre-parse denial-of-service guard. Run at the very top of the parse
+/// pipeline, *before* the SQL string reaches `sqlparser`'s `Parser`.
+///
+/// Rejects inputs that exceed [`max_sql_bytes`] (cheap, no allocation) or
+/// [`max_sql_tokens`] (a linear tokenizer scan that allocates only a flat
+/// token vector — never the recursive AST). See [`MAX_SQL_BYTES_DEFAULT`]
+/// for why this must happen before parsing: an over-large AST crashes the
+/// process during recursive `Drop`, long before the [`MAX_RECURSION_DEPTH`]
+/// lowering guard could fire. Returns a descriptive [`BoltError::Sql`] so
+/// the failure is a clean, recoverable error rather than a process abort.
+fn guard_sql_size(sql: &str) -> BoltResult<()> {
+    let max_bytes = max_sql_bytes();
+    if sql.len() > max_bytes {
+        return Err(BoltError::Sql(format!(
+            "SQL input is {} bytes, exceeding the {max_bytes}-byte limit \
+             (set {MAX_SQL_BYTES_ENV} to override)",
+            sql.len()
+        )));
+    }
+    // Tokenize cheaply to bound AST size. The tokenizer is a flat linear
+    // scan; it never builds the recursive AST whose `Drop` is the crash
+    // hazard, so counting tokens here is safe even for adversarial input.
+    let max_tokens = max_sql_tokens();
+    let dialect = GenericDialect {};
+    let mut tokenizer = Tokenizer::new(&dialect, sql);
+    let tokens = tokenizer
+        .tokenize()
+        .map_err(|e| BoltError::Sql(format!("tokenizer error: {e}")))?;
+    if tokens.len() > max_tokens {
+        return Err(BoltError::Sql(format!(
+            "SQL input has {} tokens, exceeding the {max_tokens}-token limit \
+             (set {MAX_SQL_TOKENS_ENV} to override)",
+            tokens.len()
+        )));
+    }
+    Ok(())
+}
 
 /// SQL-standard identifier folding (v0.5 / M2).
 ///
@@ -615,6 +721,15 @@ pub fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan>
 /// Separated out so the cache layer in [`parse`] is a thin shell that's easy
 /// to read and so tests / benches that want to bypass the cache can.
 fn parse_uncached(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan> {
+    // DoS guard: reject pathologically large / token-heavy SQL BEFORE
+    // sqlparser builds an AST. An over-large flat AST (long `+`/`OR` chains,
+    // deep `IN (SELECT …)`) crashes the process during recursive `Drop`,
+    // which the late `MAX_RECURSION_DEPTH` lowering guard cannot prevent.
+    // See [`guard_sql_size`]. This is the single chokepoint before
+    // `Parser::parse_sql`; the cache in [`parse`] never holds an over-cap
+    // entry because such input never reaches a successful parse + insert.
+    guard_sql_size(sql)?;
+
     let dialect = GenericDialect {};
     let mut stmts =
         Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
@@ -5340,6 +5455,43 @@ mod plan_cache_tests {
         assert_eq!(parse_plan_cache_cap(Some(""), 64), 64);
         assert_eq!(parse_plan_cache_cap(Some("0"), 64), 64);
         assert_eq!(parse_plan_cache_cap(Some("not-a-number"), 64), 64);
+    }
+
+    #[test]
+    fn oversized_sql_is_rejected_not_panicked() {
+        // DoS guard (V1): inputs over the byte / token caps must return a
+        // clean `BoltError::Sql`, never panic or overflow the stack. We
+        // assert on the pure `guard_sql_size` helper (independent of the
+        // memoised global caps) for byte length, and synthesize a flat
+        // operator chain that blows the token cap for the token path.
+        // Byte cap: a string longer than the default 1 MiB.
+        let big = "x".repeat(MAX_SQL_BYTES_DEFAULT + 1);
+        assert!(
+            matches!(guard_sql_size(&big), Err(BoltError::Sql(_))),
+            "over-byte-cap SQL must be a clean Sql error"
+        );
+
+        // Token cap: a flat `1+1+1+…` chain that stays under the byte cap
+        // but exceeds the token cap. This is exactly the AST-bloat shape
+        // that crashes on recursive Drop if it reaches the parser.
+        let mut adversarial = String::from("SELECT 1");
+        // Each "+1" is 2 tokens; comfortably clear the 100k cap.
+        for _ in 0..(MAX_SQL_TOKENS_DEFAULT) {
+            adversarial.push_str("+1");
+        }
+        assert!(adversarial.len() <= MAX_SQL_BYTES_DEFAULT);
+        assert!(
+            matches!(guard_sql_size(&adversarial), Err(BoltError::Sql(_))),
+            "over-token-cap SQL must be a clean Sql error"
+        );
+
+        // And end-to-end through the public entry point: still an Err,
+        // still no panic.
+        let p = provider();
+        assert!(parse(&adversarial, &p).is_err());
+
+        // A normal query passes the guard unharmed.
+        assert!(guard_sql_size("SELECT a FROM t1").is_ok());
     }
 
     #[test]

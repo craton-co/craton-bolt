@@ -1155,21 +1155,28 @@ impl PhysicalPlan {
                 // `&Schema` (not a `Result` and not an owned value), we cannot
                 // surface a `BoltError` here without rippling a signature
                 // change through every call site and recursive call; and a
-                // Union has no meaningful schema with zero branches, so
-                // returning `Schema::empty()` would be semantically wrong (and
-                // is impossible to return by borrow anyway). We therefore keep
-                // the documented invariant but express the empty case as an
-                // `unreachable!` with an explanation rather than a bare
-                // `.expect()`. Non-empty unions are unaffected: we still return
-                // the first branch's schema exactly as before.
+                // Union has no meaningful schema with zero branches.
+                //
+                // Hardening: a hand-constructed empty Union must not abort a
+                // *release* build. We assert loudly in debug/test builds (so
+                // the producer bug is caught in CI) via `debug_assert!`, then
+                // degrade gracefully in release by returning a borrow of a
+                // process-static empty schema instead of `unreachable!()`
+                // (which would `panic!`/abort). Non-empty unions are
+                // unaffected: we still return the first branch's schema.
                 match inputs.first() {
                     Some(first) => first.output_schema(),
-                    None => unreachable!(
-                        "PhysicalPlan::Union {{ inputs: vec![] }} is malformed; \
-                         construction sites (sql_frontend, DataFrame::from_plan, \
-                         lower) all reject empty Union before this accessor is \
-                         reached"
-                    ),
+                    None => {
+                        debug_assert!(
+                            false,
+                            "PhysicalPlan::Union {{ inputs: vec![] }} is malformed; \
+                             construction sites (sql_frontend, DataFrame::from_plan, \
+                             lower) all reject empty Union before this accessor is \
+                             reached"
+                        );
+                        static EMPTY: std::sync::OnceLock<Schema> = std::sync::OnceLock::new();
+                        EMPTY.get_or_init(|| Schema::new(Vec::new()))
+                    }
                 }
             }
             PhysicalPlan::Project { output_schema, .. } => output_schema,
@@ -2340,23 +2347,31 @@ impl<'a> Codegen<'a> {
     /// v0.7 sub-task B: Decimal128 values route through `Op::Store128`
     /// (two `st.global.u64` writes for the low / high halves) — the
     /// `Value` carries both register handles via `hi_reg`.
-    fn emit_store(&mut self, value: Value, col_idx: usize) {
+    fn emit_store(&mut self, value: Value, col_idx: usize) -> BoltResult<()> {
         if matches!(value.dtype, DataType::Decimal128(_, _)) {
-            let hi = value.hi_reg.expect(
-                "physical_plan: Decimal128 store value has no hi_reg — producer bug",
-            );
+            // A Decimal128 `Value` must carry both register halves; a missing
+            // `hi_reg` is an internal producer bug. Surface it as a graceful
+            // `BoltError::Plan` (propagated via `?` at the call site) rather
+            // than `.expect()`-panicking the process in a release build.
+            let hi = value.hi_reg.ok_or_else(|| {
+                BoltError::Plan(
+                    "physical_plan: Decimal128 store value has no hi_reg — producer bug"
+                        .to_string(),
+                )
+            })?;
             self.ops.push(Op::Store128 {
                 src_lo: value.reg,
                 src_hi: hi,
                 col_idx,
             });
-            return;
+            return Ok(());
         }
         self.ops.push(Op::Store {
             src: value.reg,
             col_idx,
             dtype: value.dtype,
         });
+        Ok(())
     }
 
     /// Finalize into a `KernelSpec`.
@@ -2846,7 +2861,7 @@ fn build_projection_kernel(
     let mut output_fields = Vec::with_capacity(projected.len());
     for (i, (name, expr)) in projected.iter().enumerate() {
         let value = cg.emit_expr(expr)?;
-        cg.emit_store(value, i);
+        cg.emit_store(value, i)?;
         outputs.push(ColumnIO {
             name: name.clone(),
             dtype: value.dtype,

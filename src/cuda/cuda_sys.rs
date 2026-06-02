@@ -549,6 +549,15 @@ impl CudaContext {
         let dev = device_get(device_ordinal)?;
         let mut raw: CUcontext = std::ptr::null_mut();
         check(unsafe { cuCtxCreate_v2(&mut raw, 0, dev) })?;
+        // Finding V5: register this context as the pool's owning context so a
+        // `GpuBuffer` dropped on a thread with no current context can still be
+        // freed — `mem_pool::driver_free` re-binds this context under the
+        // shared `ctx_binder` guard/epoch before `cuMemFree_v2`. `cuCtxCreate_v2`
+        // also makes `raw` current on this (engine) thread, so the registration
+        // captures a live, current context. Routed through the runtime
+        // indirection to keep the `cuda_sys -> mem_pool -> cuda_sys` cycle out
+        // of the build graph (same pattern as the `Drop` invalidation below).
+        crate::cuda::mem_pool::pool_register_owning_ctx(raw);
         Ok(Self { raw })
     }
 

@@ -1258,16 +1258,21 @@ fn run_radix_pipeline_i32(
             // sum of all bucket counts is exactly `n_rows` (every key lands in
             // one of the 16 buckets), and `n_rows <= u32::MAX`, so `running`
             // can never exceed `n_rows` and the add never actually wraps. Use
-            // `checked_add` + a panic-on-overflow to make that invariant
-            // load-bearing rather than silently masked. The `debug_assert`
-            // documents the bound at the point it must hold.
+            // `checked_add` to make that invariant load-bearing rather than
+            // silently masked. A buggy/garbage histogram readback would
+            // otherwise overflow here; map it to a recoverable `BoltError`
+            // (returned via `?`) so the sort degrades gracefully instead of
+            // panicking. The `debug_assert` documents the bound at the point
+            // it must hold.
             debug_assert!(
                 running <= n_rows_u32,
                 "radix histogram prefix exceeded n_rows: {running} > {n_rows_u32}",
             );
-            running = running
-                .checked_add(hist_slice[i])
-                .expect("radix histogram bucket-sum overflowed u32 (invariant: sum == n_rows)");
+            running = running.checked_add(hist_slice[i]).ok_or_else(|| {
+                BoltError::Other(
+                    "radix histogram bucket-sum overflowed u32 (invariant: sum == n_rows)".into(),
+                )
+            })?;
         }
         debug_assert_eq!(
             running, n_rows_u32,
@@ -1453,14 +1458,19 @@ fn run_radix_pipeline_i64(
             // PERF (radix round-trip): bucket sums total exactly `n_rows`
             // (<= u32::MAX), so `running` never wraps. Use `checked_add` to
             // make that invariant load-bearing instead of masking it with
-            // `wrapping_add`.
+            // `wrapping_add`. A buggy/garbage histogram readback would
+            // otherwise overflow here; map it to a recoverable `BoltError`
+            // (returned via `?`) so the sort degrades gracefully instead of
+            // panicking.
             debug_assert!(
                 running <= n_rows_u32,
                 "radix histogram prefix exceeded n_rows: {running} > {n_rows_u32}",
             );
-            running = running
-                .checked_add(hist_slice[i])
-                .expect("radix histogram bucket-sum overflowed u32 (invariant: sum == n_rows)");
+            running = running.checked_add(hist_slice[i]).ok_or_else(|| {
+                BoltError::Other(
+                    "radix histogram bucket-sum overflowed u32 (invariant: sum == n_rows)".into(),
+                )
+            })?;
         }
         debug_assert_eq!(
             running, n_rows_u32,

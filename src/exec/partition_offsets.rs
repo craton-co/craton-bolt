@@ -272,7 +272,7 @@ pub fn compute_partition_offsets(counts: &GpuVec<u32>) -> BoltResult<Vec<u32>> {
     with_pinned_scratch(|scratch| {
         d2h_into_pinned(counts, scratch, stream.raw())?;
         stream.synchronize()?;
-        Ok(prefix_sum_pinned_to_vec(scratch))
+        prefix_sum_pinned_to_vec(scratch)
     })
 }
 
@@ -401,7 +401,7 @@ pub fn compute_and_upload_partition_offsets_async(
         // Step 2: prefix-sum in pinned memory. We materialise the
         // host-visible `Vec<u32>` here (length NUM_PARTITIONS+1) because
         // the caller wants it for the scatter-buffer sizing.
-        let host_offsets = prefix_sum_pinned_to_vec(scratch);
+        let host_offsets = prefix_sum_pinned_to_vec(scratch)?;
 
         // Step 3: write the bases (offsets[0..NUM_PARTITIONS]) back into
         // pinned scratch[0..NUM_PARTITIONS]. They sit alongside the
@@ -466,7 +466,7 @@ fn d2h_into_pinned(
 /// NUM_PARTITIONS entries are unchanged, and entry [K] is unused. We
 /// build a separate `Vec<u32>` because callers want owned host data and
 /// the pinned scratch is shared.
-fn prefix_sum_pinned_to_vec(scratch: &PinnedHostBuffer<u32>) -> Vec<u32> {
+fn prefix_sum_pinned_to_vec(scratch: &PinnedHostBuffer<u32>) -> BoltResult<Vec<u32>> {
     prefix_sum_cpu(&scratch.as_slice()[..NUM_PARTITIONS as usize])
 }
 
@@ -475,20 +475,29 @@ fn prefix_sum_pinned_to_vec(scratch: &PinnedHostBuffer<u32>) -> Vec<u32> {
 /// Output length is `counts.len() + 1`; `out[0] = 0`,
 /// `out[k] = sum(counts[0..k])`, and `out[counts.len()]` is the total.
 ///
-/// Uses `wrapping_add` because partition counts are bounded by row count,
-/// which is itself bounded by `u32::MAX`; a real workload that overflows
-/// `u32` here would also overflow the launch-shape `u32` row count caught
-/// upstream by `n_rows_to_u32`. Wrapping is the cheapest safe choice and
-/// avoids per-element branching on every step of the hot path.
-fn prefix_sum_cpu(counts: &[u32]) -> Vec<u32> {
+/// The legitimate total equals the row count, which is bounded by
+/// `u32::MAX` (any real workload that overflowed it would already have
+/// been rejected upstream by `n_rows_to_u32`). We therefore use
+/// `checked_add`: under correct operation it never overflows, but a
+/// corrupt/garbage partition count (kernel bug, uninitialized scratch
+/// slot) would otherwise *wrap* and silently emit wrong scatter base
+/// offsets, sending downstream scatter writes out of place or OOB.
+/// Converting that overflow into a clean `BoltError` turns a silent
+/// device-memory corruption into a recoverable error. The cost over the
+/// 4096-element domain is negligible.
+fn prefix_sum_cpu(counts: &[u32]) -> BoltResult<Vec<u32>> {
     let mut out = Vec::with_capacity(counts.len() + 1);
     let mut acc: u32 = 0;
     out.push(0);
     for &c in counts {
-        acc = acc.wrapping_add(c);
+        acc = acc.checked_add(c).ok_or_else(|| {
+            BoltError::Other(
+                "partition count prefix-sum overflowed u32: corrupt partition counts".into(),
+            )
+        })?;
         out.push(acc);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -498,7 +507,7 @@ mod tests {
     #[test]
     fn prefix_sum_empty() {
         let counts = vec![0u32; NUM_PARTITIONS as usize];
-        let offsets = prefix_sum_cpu(&counts);
+        let offsets = prefix_sum_cpu(&counts).unwrap();
         assert_eq!(offsets.len(), NUM_PARTITIONS as usize + 1);
         assert!(offsets.iter().all(|&v| v == 0));
     }
@@ -506,7 +515,7 @@ mod tests {
     #[test]
     fn prefix_sum_uniform() {
         let counts = vec![5u32; NUM_PARTITIONS as usize];
-        let offsets = prefix_sum_cpu(&counts);
+        let offsets = prefix_sum_cpu(&counts).unwrap();
         assert_eq!(offsets.len(), NUM_PARTITIONS as usize + 1);
         for k in 0..=NUM_PARTITIONS as usize {
             assert_eq!(offsets[k], (k as u32) * 5, "offsets[{}] mismatch", k);
@@ -518,7 +527,7 @@ mod tests {
         // All rows land in partition 0; every other partition is empty.
         let mut counts = vec![0u32; NUM_PARTITIONS as usize];
         counts[0] = NUM_PARTITIONS;
-        let offsets = prefix_sum_cpu(&counts);
+        let offsets = prefix_sum_cpu(&counts).unwrap();
 
         // offsets[0] must be zero (exclusive scan).
         assert_eq!(offsets[0], 0);
@@ -538,7 +547,7 @@ mod tests {
     fn prefix_sum_known_pattern() {
         // counts[k] = k + 1, so sum_{i=0..k} counts[i] = sum_{i=1..=k} i = k*(k+1)/2.
         let counts: Vec<u32> = (0..NUM_PARTITIONS).map(|k| k + 1).collect();
-        let offsets = prefix_sum_cpu(&counts);
+        let offsets = prefix_sum_cpu(&counts).unwrap();
         for k in 0..=NUM_PARTITIONS as usize {
             let k_u32 = k as u32;
             let expected = k_u32 * (k_u32 + 1) / 2;
@@ -553,7 +562,7 @@ mod tests {
         // of NUM_PARTITIONS being a power of two.
         for &n in &[0usize, 1, 2, 17, 1023, NUM_PARTITIONS as usize, 4096] {
             let counts = vec![1u32; n];
-            let offsets = prefix_sum_cpu(&counts);
+            let offsets = prefix_sum_cpu(&counts).unwrap();
             assert_eq!(offsets.len(), n + 1, "length invariant violated at n = {}", n);
         }
     }
@@ -564,7 +573,7 @@ mod tests {
         // accumulator (e.g. inclusive scan) would be visible.
         let counts: Vec<u32> = (0..NUM_PARTITIONS).map(|k| (k * 7 + 3) % 11).collect();
         let total: u32 = counts.iter().sum();
-        let offsets = prefix_sum_cpu(&counts);
+        let offsets = prefix_sum_cpu(&counts).unwrap();
         assert_eq!(offsets[NUM_PARTITIONS as usize], total);
         assert_eq!(offsets[0], 0);
     }
@@ -574,7 +583,7 @@ mod tests {
         // Guard against a regression where someone "simplifies" the loop and
         // accidentally produces an inclusive scan.
         let counts = vec![1u32, 2, 3, 4];
-        let offsets = prefix_sum_cpu(&counts);
+        let offsets = prefix_sum_cpu(&counts).unwrap();
         // Exclusive scan: [0, 1, 3, 6, 10]
         assert_eq!(offsets, vec![0, 1, 3, 6, 10]);
     }
@@ -654,7 +663,7 @@ mod tests {
         assert_eq!(offsets[NUM_PARTITIONS as usize], expected_total);
 
         // Cross-check against the pure-host prefix sum.
-        let cpu = prefix_sum_cpu(&host_counts);
+        let cpu = prefix_sum_cpu(&host_counts).unwrap();
         assert_eq!(offsets, cpu);
     }
 
@@ -708,8 +717,8 @@ mod tests {
         let offs_a = compute_partition_offsets(&dev_a).expect("compute a");
         let offs_b = compute_partition_offsets(&dev_b).expect("compute b");
 
-        assert_eq!(offs_a, prefix_sum_cpu(&a));
-        assert_eq!(offs_b, prefix_sum_cpu(&b));
+        assert_eq!(offs_a, prefix_sum_cpu(&a).unwrap());
+        assert_eq!(offs_b, prefix_sum_cpu(&b).unwrap());
     }
 
     // ---------------------------------------------------------------------
@@ -751,7 +760,7 @@ mod tests {
                             for k in 0..NUM_PARTITIONS as usize {
                                 s[k] = tid.wrapping_add(iter).wrapping_add(k as u32);
                             }
-                            Ok(prefix_sum_cpu(&s[..NUM_PARTITIONS as usize]))
+                            prefix_sum_cpu(&s[..NUM_PARTITIONS as usize])
                         });
                     if let Ok(v) = result {
                         // Sanity: prefix sum's first element is 0 and
@@ -812,7 +821,7 @@ mod tests {
         }
         for h in handles {
             let (tid, got, host) = h.join().expect("worker thread panicked");
-            let expected = prefix_sum_cpu(&host[..]);
+            let expected = prefix_sum_cpu(&host[..]).unwrap();
             assert_eq!(
                 got, expected,
                 "thread {tid} returned a prefix sum that doesn't match the \

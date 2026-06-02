@@ -276,7 +276,7 @@ pub fn try_execute_resident(
     kernel_params.push(&mut n_rows_u32 as *mut u32 as *mut c_void);
 
     let stream = CudaStream::null();
-    let grid_x = ((n_rows_u32 + PRE_BLOCK_SIZE - 1) / PRE_BLOCK_SIZE).max(1);
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, PRE_BLOCK_SIZE);
     // SAFETY: `function` is borrowed from a live module; every param slot
     // points into `device_ptrs` (resident input ptrs + owned output buffers)
     // or `n_rows_u32`, all of which outlive the launch + synchronize below.
@@ -525,7 +525,7 @@ fn run_pre_stage(
     // -- Launch one thread per row.
     let stream = CudaStream::null();
     if n_rows > 0 {
-        let grid_x = ((n_rows_u32 + PRE_BLOCK_SIZE - 1) / PRE_BLOCK_SIZE).max(1);
+        let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, PRE_BLOCK_SIZE);
         // SAFETY: `function` is borrowed from a live `CudaModule`; every entry
         // of `kernel_params` points into `device_ptrs` or `n_rows_u32`, both of
         // which outlive the launch + synchronize below.
@@ -1119,7 +1119,7 @@ where
 
     let block = BLOCK_SIZE;
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
-    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block);
 
     let block_sums = GpuVec::<f64>::zeros(grid_x as usize)?;
     let block_counts = GpuVec::<u32>::zeros(grid_x as usize)?;
@@ -1241,7 +1241,7 @@ where
 
     let block = BLOCK_SIZE;
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
-    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block);
     let partials = GpuVec::<T>::zeros(grid_x as usize)?;
 
     let module = module_cache::get_or_build_module(
@@ -1642,13 +1642,44 @@ trait ReduceScalar: Sized + Copy {
 }
 
 impl ReduceScalar for i32 {
+    /// V-10: SUM(Int32) widens to i64 and is overflow-checked.
+    ///
+    /// SQL `SUM(Int32)` has an Int64 result dtype (the planner widens it), so
+    /// folding at i32 width would wrap at `i32::MAX` for sums that legitimately
+    /// fit i64 — silently wrong. Unlike `aggregate.rs` (whose i32 finalize
+    /// asserts the SUM arm is unreachable because SUM(Int32) is pre-widened
+    /// there), the pre-stage host reduce reaches this finalize at the column's
+    /// NATIVE i32 dtype for a bare `SUM(int32_col)` (`resolve_agg_input_col`'s
+    /// bare-column fast path returns the compacted col untyped-by-expected, and
+    /// `reduce_host_col` dispatches on the stored dtype). We therefore widen the
+    /// accumulator to i64 here and return `Scalar::I64`; `scalar_to_array` packs
+    /// it into the Int64 output. The `checked_add` mirrors the i64 contract for
+    /// the (practically unreachable) case that the widened sum exceeds i64.
+    ///
+    /// MIN/MAX stay at i32 width (non-arithmetic, never overflow, Int32 output).
+    /// COUNT never reaches this finalize on the pre-stage path (it is computed
+    /// from `non_null_count`), so the Sum arm is exercised only by real
+    /// SUM(Int32).
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
-        let acc = match op {
-            ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0i32, i32::wrapping_add),
-            ReduceOp::Min => host.iter().copied().fold(i32::MAX, i32::min),
-            ReduceOp::Max => host.iter().copied().fold(i32::MIN, i32::max),
-        };
-        Ok(Scalar::I32(acc))
+        match op {
+            ReduceOp::Sum | ReduceOp::Count => {
+                let mut sum: i64 = 0;
+                for &v in host {
+                    sum = match sum.checked_add(v as i64) {
+                        Some(s) => s,
+                        None => {
+                            return Err(BoltError::Type(
+                                "SUM(integer) overflow: accumulator exceeds i64 range"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                }
+                Ok(Scalar::I64(sum))
+            }
+            ReduceOp::Min => Ok(Scalar::I32(host.iter().copied().fold(i32::MAX, i32::min))),
+            ReduceOp::Max => Ok(Scalar::I32(host.iter().copied().fold(i32::MIN, i32::max))),
+        }
     }
     fn identity_scalar(op: ReduceOp, _dtype: DataType) -> BoltResult<Scalar> {
         Ok(Scalar::I32(match op {
@@ -1660,9 +1691,40 @@ impl ReduceScalar for i32 {
 }
 
 impl ReduceScalar for i64 {
+    /// V-10: Integer SUM overflow contract (pre-stage scalar finalize).
+    ///
+    /// This MUST mirror `aggregate.rs`'s `ReduceScalar for i64` exactly: a
+    /// scalar `SELECT SUM(int_col) ...` that exceeds `i64::MAX` must ERROR with
+    /// the canonical `"SUM(integer) overflow"` message rather than silently
+    /// wrapping (the engine's "never silently wrong" invariant). Previously
+    /// this arm merged `Sum | Count` into `i64::wrapping_add`, so the
+    /// pre-aggregated scalar path (`try_execute_resident` reducing a resident
+    /// Int64 column, and `build_one_aggregate` reducing a host-materialised
+    /// Int64 column) returned a wrapped (often negative) answer — while the
+    /// non-pre scalar path in `aggregate.rs` over the SAME data errored. This
+    /// restores consistency between the two scalar paths.
+    ///
+    /// COUNT (synthesized as a SUM over ones) deliberately keeps `wrapping_add`:
+    /// a row count cannot realistically exceed `i64::MAX` and COUNT stays
+    /// infallible, matching `aggregate.rs`. MIN/MAX never overflow.
     fn finalize(op: ReduceOp, _dtype: DataType, host: &[Self]) -> BoltResult<Scalar> {
         let acc = match op {
-            ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0i64, i64::wrapping_add),
+            ReduceOp::Sum => {
+                let mut sum: i64 = 0;
+                for &v in host {
+                    sum = match sum.checked_add(v) {
+                        Some(s) => s,
+                        None => {
+                            return Err(BoltError::Type(
+                                "SUM(integer) overflow: accumulator exceeds i64 range"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                }
+                sum
+            }
+            ReduceOp::Count => host.iter().copied().fold(0i64, i64::wrapping_add),
             ReduceOp::Min => host.iter().copied().fold(i64::MAX, i64::min),
             ReduceOp::Max => host.iter().copied().fold(i64::MIN, i64::max),
         };

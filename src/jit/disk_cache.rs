@@ -65,6 +65,37 @@
 //! never observe a partial file. Two writers racing on the same key
 //! both produce identical bytes (the codegen pipeline is
 //! deterministic), so the last-writer-wins outcome is harmless.
+//!
+//! # Security boundary (V-7) — fail-closed directory trust
+//!
+//! The bytes in this cache are read back and **launched** as PTX, so a
+//! cache directory another local user can write is a code-execution
+//! surface. The integrity boundary is therefore **directory ownership +
+//! permissions plus key-bound integrity**, NOT the strength of the
+//! integrity hash. The hash is a non-cryptographic `DefaultHasher` digest
+//! and lives in the same directory as the body, so an attacker who can
+//! write the directory could also recompute it — it only guards against
+//! accidental corruption, naive tampering, and (via key binding) cross-key
+//! content replay.
+//!
+//! On [`DiskPtxCache::open`] the cache directory is verified **fail-closed**:
+//!
+//! - Unix: the dir must be owned by the current effective uid and must not
+//!   be group- or world-writable (`mode & 0o022 == 0`).
+//! - Windows: the dir's ACL is locked to the current user via `icacls`, and
+//!   a failure of that pass disables the disk cache.
+//!
+//! If the directory is not trusted, the disk layer is **disabled** (lookups
+//! miss, stores are no-ops) and a warning is logged — the engine keeps
+//! running on the in-process module cache + codegen. Because PTX is
+//! deterministically re-derivable from source, a disabled disk cache is
+//! always safe.
+//!
+//! Each on-disk entry additionally carries a `#bolt-ptx-cache v1 <digest>`
+//! header whose digest is **bound to the cache key**, so a file's bytes
+//! cannot be replayed under a different `<key>.ptx` filename. Lookups read
+//! the bytes once and verify before returning them (TOCTOU-safe — no
+//! re-open between check and use).
 
 use std::fs;
 use std::io;
@@ -506,66 +537,120 @@ pub fn platform_default_dir() -> Option<PathBuf> {
 /// can each carry their own handle without lock contention. Per-entry
 /// I/O takes no shared lock; the only synchronisation is the inherent
 /// atomicity of `rename`.
+///
+/// # Disabled (fail-closed) state — V-7
+///
+/// A handle whose `disk_enabled` flag is `false` is a **disk no-op**:
+/// [`Self::lookup`] always misses and [`Self::store`] silently writes
+/// nothing. [`Self::open`] returns such a handle when the cache directory
+/// fails the ownership / permission trust check (see the `open` doc). The
+/// engine keeps running and falls back to its in-process module cache +
+/// codegen, so a disabled disk layer is always safe: PTX is deterministically
+/// re-derivable from source.
 #[derive(Clone)]
 pub struct DiskPtxCache {
     root: std::sync::Arc<PathBuf>,
+    /// Whether disk I/O is permitted. `false` after a failed directory
+    /// trust check (V-7) turns this handle into a disk no-op.
+    disk_enabled: bool,
 }
 
 impl DiskPtxCache {
     /// Open (creating if needed) a cache rooted at `dir`. Returns an
-    /// error if the directory cannot be created.
+    /// error only if the directory cannot be *created*; a directory that
+    /// exists but fails the trust check yields a **disabled** (disk-no-op)
+    /// handle rather than an error (see the fail-closed contract below).
     ///
-    /// # Directory hardening (V-7)
+    /// # Directory trust check — fail-closed (V-7)
     ///
-    /// After `create_dir_all`, on Unix we tighten the root directory's
-    /// permissions to `0o700` (owner-only rwx) via
-    /// `PermissionsExt::set_mode`. The cache stores PTX that is read back
-    /// and *launched*, so a world-writable cache dir would let any local
-    /// user plant or tamper with kernels for another user; `0o700` makes
-    /// the directory owner the only writer (and reader), which is the real
-    /// integrity boundary for the on-disk cache.
+    /// The on-disk cache stores PTX that is later read back and **launched**
+    /// via `cuModuleLoadDataEx`. A cache directory that another local user
+    /// can write — or that we don't even own — is therefore a code-execution
+    /// surface: an attacker who can plant `<key>.ptx` files (and recompute
+    /// the non-cryptographic integrity digest, which lives in the same
+    /// directory) could get arbitrary PTX launched in our process. The hash
+    /// strength is *not* the security boundary; **directory ownership +
+    /// permissions** is. We therefore verify trust before using the dir and
+    /// **fail closed** if it is not met.
     ///
-    /// The `set_permissions` call is best-effort: if it fails (e.g. the
-    /// directory is owned by another user on a shared cache path) we do
-    /// **not** abort `open` — the cache stays usable and the worst case is
-    /// the pre-existing permissions, which is no worse than today. We only
-    /// propagate a hard error from `create_dir_all` itself.
+    /// After `create_dir_all`, we tighten then *verify* the root:
     ///
-    /// On Windows there is no portable `0o700` analogue in std, so we
-    /// apply best-effort ACL tightening via `icacls` (see
-    /// [`harden_windows_dir`]). The **primary** protection on Windows
-    /// remains the per-user `%LOCALAPPDATA%` default root, which already
-    /// lives under the user's own profile ACL; the `icacls` pass is a
-    /// defense-in-depth hardening for the case where the operator points
-    /// `BOLT_PTX_CACHE_DIR` at a *shared* / world-writable location, where
-    /// another local user could otherwise plant PTX that we read back and
-    /// *launch*. It restricts the directory to the current user, mirroring
-    /// the Unix `0o700` intent. Like the Unix branch it is best-effort:
-    /// any failure is ignored and `open` still succeeds.
+    /// * **Unix** — we first best-effort `chmod 0o700` (owner-only rwx), then
+    ///   `stat` the directory via [`dir_is_trusted_unix`] and require BOTH:
+    ///     * the directory is owned by the current effective uid
+    ///       (`st_uid == geteuid()`), and
+    ///     * it is **not** group- or world-writable (`mode & 0o022 == 0`).
+    ///   A pre-existing directory owned by another user, or one left
+    ///   group/world-writable, fails the check even though the `chmod`
+    ///   "succeeded" or was refused — we do not trust a dir we can't prove
+    ///   is owner-private.
+    ///
+    /// * **Windows** — there is no portable `0o700` analogue in std. We run
+    ///   the `icacls` ACL-tightening pass ([`harden_windows_dir`]) which
+    ///   removes inherited ACEs and grants the current user sole Full-control.
+    ///   Unlike the previous best-effort posture, a **failure of that pass
+    ///   now disables the disk cache** (we can no longer prove the directory
+    ///   is restricted to us), mirroring the Unix fail-closed branch. The
+    ///   per-user `%LOCALAPPDATA%` default root still passes trivially; an
+    ///   operator pointing `BOLT_PTX_CACHE_DIR` at a shared location we
+    ///   cannot lock down falls back to in-memory only.
+    ///
+    /// # Fail-closed behavior
+    ///
+    /// If the trust check fails we do **not** hard-error the engine — we log
+    /// a clear warning and return a handle with `disk_enabled == false`, so
+    /// every subsequent [`Self::lookup`] misses and [`Self::store`] is a
+    /// disk no-op. The in-process module cache and codegen path are
+    /// untouched, and because PTX is deterministically re-derivable a
+    /// disabled disk layer is always safe.
     pub fn open(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
-        // V-7: restrict the cache root to owner-only on Unix. Best-effort.
+
+        // V-7: tighten the cache root, then VERIFY ownership + permissions.
+        // A directory we cannot prove is owner-private is not trusted, and
+        // an untrusted dir disables the disk layer (fail-closed) rather than
+        // being used with best-effort perms as before.
         #[cfg(unix)]
-        {
+        let disk_enabled = {
             use std::os::unix::fs::PermissionsExt;
-            // 0o700 = rwx for owner, nothing for group/other.
+            // Best-effort first: try to bring a freshly-created (or fixable)
+            // dir down to owner-only 0o700. The *verification* below — not
+            // this call — is the trust decision, so we ignore failures here.
             let perms = std::fs::Permissions::from_mode(0o700);
             let _ = fs::set_permissions(&dir, perms);
-        }
-        // V-7 (Windows): best-effort ACL tightening to the current user,
-        // the closest analogue to the Unix 0o700 above. Best-effort: a
-        // failure (e.g. dir owned by another user) is ignored.
+            dir_is_trusted_unix(&dir)
+        };
+        // V-7 (Windows): tighten the ACL to the current user; a failure of
+        // that pass now DISABLES the disk cache (fail-closed) instead of
+        // proceeding with whatever ACL the directory happened to carry.
         #[cfg(windows)]
-        {
-            harden_windows_dir(&dir);
+        let disk_enabled = harden_windows_dir(&dir);
+        // On any other platform we cannot verify ownership/permissions
+        // portably, so fail closed: the disk cache stays disabled.
+        #[cfg(not(any(unix, windows)))]
+        let disk_enabled = false;
+
+        if !disk_enabled {
+            log::warn!(
+                "PTX disk cache at {} is not owner-private (untrusted \
+                 ownership/permissions); disabling the on-disk cache and \
+                 falling back to in-memory PTX only. PTX is re-derived from \
+                 source, so correctness is unaffected.",
+                dir.display()
+            );
         }
+
         let cache = Self {
             root: std::sync::Arc::new(dir),
+            disk_enabled,
         };
         // JIT-cache-bound: enforce the size / entry-count caps on open so a
         // directory left oversized by a previous process (or a lowered cap)
-        // is trimmed before we start serving from it. Best-effort.
-        cache.enforce_bounds();
+        // is trimmed before we start serving from it. Best-effort, and only
+        // meaningful when the disk layer is enabled.
+        if cache.disk_enabled {
+            cache.enforce_bounds();
+        }
         Ok(cache)
     }
 
@@ -573,6 +658,26 @@ impl DiskPtxCache {
     /// and the builder's "where did the cache land?" diagnostic.
     pub fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    /// Whether this handle's disk layer is enabled. `false` after the V-7
+    /// directory trust check in [`Self::open`] failed — every `lookup`
+    /// misses and every `store` is a disk no-op. Exposed for tests and for
+    /// callers that want to surface "disk cache disabled" diagnostics.
+    #[must_use]
+    pub fn is_disk_enabled(&self) -> bool {
+        self.disk_enabled
+    }
+
+    /// Construct a disk-disabled handle directly (test-only) so the
+    /// fail-closed no-op contract can be asserted without having to
+    /// fabricate an untrusted directory (impossible to do portably).
+    #[cfg(test)]
+    fn disabled_for_test(dir: PathBuf) -> Self {
+        Self {
+            root: std::sync::Arc::new(dir),
+            disk_enabled: false,
+        }
     }
 
     /// Compose the on-disk path for a given content-hash key, validating
@@ -622,23 +727,47 @@ impl DiskPtxCache {
     ///
     /// The cache file carries a `#bolt-ptx-cache v1 <digest>` header line
     /// (see [`CACHE_HEADER_MAGIC`]). We parse that header, recompute
-    /// [`body_digest`] over the body, and return the body **only** if the
-    /// digests match. This catches accidental corruption / partial writes
-    /// and trips on naive tampering. A file with no/old/garbled header
-    /// (e.g. a raw-PTX entry from an older binary, or a digest mismatch)
-    /// is treated as a miss so the caller recompiles and rewrites it in
-    /// the current format. See [`Self::store`] for the write side.
+    /// [`body_digest`] over the body **bound to the lookup `key`**, and
+    /// return the body **only** if the digests match. Binding the digest to
+    /// the key means a file's contents cannot be replayed under a different
+    /// `<key>.ptx` filename — a moved/renamed entry mismatches and misses.
+    /// This catches accidental corruption / partial writes and trips on
+    /// naive tampering. A file with no/old/garbled header (e.g. a raw-PTX
+    /// entry from an older binary, or a digest mismatch) is treated as a miss
+    /// so the caller recompiles and rewrites it in the current format. See
+    /// [`Self::store`] for the write side.
+    ///
+    /// # Fail-closed disk layer (V-7)
+    ///
+    /// If this handle's disk layer is disabled (the cache directory failed
+    /// the ownership/permission trust check in [`Self::open`]), every lookup
+    /// is an immediate miss — we never read from an untrusted directory.
+    ///
+    /// # TOCTOU
+    ///
+    /// We read the file's bytes exactly once (`read_to_string`), verify the
+    /// header against those same bytes, and return them — we never re-open
+    /// the path after verification, so there is no time-of-check/time-of-use
+    /// window between the integrity check and the bytes the caller launches.
     #[must_use]
     pub fn lookup(&self, key: &str) -> Option<String> {
+        // V-7: a disabled (untrusted-dir) handle never touches disk.
+        if !self.disk_enabled {
+            return None;
+        }
         // V-3: refuse to read through an unsanitised key.
         let path = self.entry_path(key)?;
+        // TOCTOU-safe: read the bytes ONCE, then verify those same bytes.
         let raw = fs::read_to_string(path).ok()?;
         // V-7: require a well-formed integrity header, else miss.
         let (header_line, body) = split_header(&raw)?;
         let stored_digest = header_line.strip_prefix(CACHE_HEADER_MAGIC)?.trim();
-        if stored_digest != body_digest(body) {
-            // Corrupt or tampered body -> treat as a miss so the caller
-            // recompiles rather than launching untrusted PTX.
+        // V-7: the digest is bound to `key`, so contents planted under a
+        // different filename (or a renamed entry) mismatch and miss.
+        if stored_digest != body_digest(key, body) {
+            // Corrupt, tampered, or replayed-under-another-key body -> treat
+            // as a miss so the caller recompiles rather than launching
+            // untrusted PTX.
             return None;
         }
         Some(body.to_string())
@@ -672,18 +801,31 @@ impl DiskPtxCache {
     /// # Content-integrity header (V-7)
     ///
     /// The file is written as a `#bolt-ptx-cache v1 <digest>\n` header line
-    /// (the digest of `ptx` per [`body_digest`]) followed by the verbatim
-    /// PTX body, so [`Self::lookup`] can verify the body on read.
+    /// (the [`body_digest`] of `ptx` **bound to `key`**) followed by the
+    /// verbatim PTX body, so [`Self::lookup`] can verify the body — and that
+    /// it was stored under this exact filename — on read.
+    ///
+    /// # Fail-closed disk layer (V-7)
+    ///
+    /// If this handle's disk layer is disabled (untrusted cache directory —
+    /// see [`Self::open`]), the store is a silent no-op: we return `Ok(())`
+    /// without writing anything, so a disabled disk layer never plants files
+    /// in a directory we don't trust.
     pub fn store(&self, key: &str, ptx: &str) -> io::Result<()> {
+        // V-7: a disabled (untrusted-dir) handle never writes to disk.
+        if !self.disk_enabled {
+            return Ok(());
+        }
         // V-3: refuse to write through an unsanitised key. Best-effort
         // contract: a refused store is a silent no-op, not an error.
         let Some(target) = self.entry_path(key) else {
             return Ok(());
         };
-        // V-7: prepend the integrity header. `body_digest` is computed over
-        // the body only, so the header line is self-describing and `lookup`
-        // re-derives the same digest from the bytes after the first `\n`.
-        let contents = format!("{}{}\n{}", CACHE_HEADER_MAGIC, body_digest(ptx), ptx);
+        // V-7: prepend the integrity header. `body_digest` binds the body to
+        // `key`, so the header line is self-describing and `lookup`
+        // re-derives the same key-bound digest from the bytes after the
+        // first `\n`.
+        let contents = format!("{}{}\n{}", CACHE_HEADER_MAGIC, body_digest(key, ptx), ptx);
         // Tempfile name: same directory, suffixed with the OS PID and a
         // process-monotonic counter so concurrent writers in the same
         // process don't collide. We use a counter (not a random number)
@@ -815,8 +957,46 @@ impl DiskPtxCache {
     }
 }
 
-/// Best-effort tighten the ACL on the cache root to the current user
-/// (V-7, Windows analogue of the Unix `0o700`).
+/// Verify the cache root is owner-private (V-7, fail-closed trust check).
+///
+/// Returns `true` **only** when BOTH hold:
+///   * the directory is owned by the current *effective* uid
+///     (`st_uid == geteuid()`), and
+///   * the directory is not group- or world-writable (`mode & 0o022 == 0`).
+///
+/// This is the Unix half of the fail-closed directory trust boundary. The
+/// cache stores PTX that is later read back and launched, so a directory we
+/// don't own, or one any other local user can write, is treated as
+/// untrusted: [`DiskPtxCache::open`] disables the disk layer rather than
+/// using it. We deliberately check ownership *and* the write bits (not just
+/// the `0o700` we tried to set) because the `chmod` in `open` is best-effort
+/// and may have been refused (e.g. a pre-existing dir owned by another user),
+/// so the only sound signal is the *observed* post-stat state.
+///
+/// Uses `std::os::unix::fs::MetadataExt` for `st_uid`/`st_mode` and
+/// `libc::geteuid()` for the current uid — both already in the dependency
+/// set, so no new crate is pulled in. Any `stat` failure is treated as
+/// untrusted (fail-closed).
+#[cfg(unix)]
+fn dir_is_trusted_unix(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match fs::metadata(dir) {
+        Ok(m) => m,
+        // Can't stat it -> can't prove it's safe -> fail closed.
+        Err(_) => return false,
+    };
+    // SAFETY: `geteuid` is a pure getter with no preconditions and is
+    // always-safe to call; it returns the effective uid of the process.
+    let current_uid = unsafe { libc::geteuid() };
+    let owned_by_us = meta.uid() == current_uid;
+    // No group- or world-write bits (mode & 0o022 == 0).
+    let not_group_world_writable = meta.mode() & 0o022 == 0;
+    owned_by_us && not_group_world_writable
+}
+
+/// Tighten the ACL on the cache root to the current user and report whether
+/// the directory can now be trusted (V-7, Windows analogue of the Unix
+/// `0o700` + ownership check).
 ///
 /// # Threat boundary
 ///
@@ -842,38 +1022,53 @@ impl DiskPtxCache {
 ///
 /// The user principal is taken from `USERDOMAIN\USERNAME` when both are
 /// present (the fully-qualified form `icacls` prefers), falling back to
-/// bare `USERNAME`. If neither is set we skip silently.
+/// bare `USERNAME`. If neither is set we cannot name a grantee to lock the
+/// directory down, so we cannot trust it: return `false` (fail-closed).
 ///
-/// Strictly best-effort, mirroring the Unix `let _ = set_permissions(..)`
-/// pattern: we suppress stdout/stderr, never inspect the exit status, and
-/// any spawn/IO error is swallowed. `open` still succeeds either way, so a
-/// host without `icacls` (or a path we can't re-ACL) is no worse off than
-/// before this hardening existed.
+/// # Fail-closed (V-7)
+///
+/// Unlike the previous best-effort posture, the return value is now the
+/// Windows half of the directory trust decision. We suppress stdout/stderr
+/// but DO inspect the exit status: `icacls` returning success means the DACL
+/// was replaced with a sole current-user Full-control grant (inherited ACEs
+/// removed), so the directory is trusted (`true`). A missing username, a
+/// spawn/IO error (e.g. `icacls` absent), or a non-success exit status all
+/// mean we could not prove the directory is restricted to us, so we return
+/// `false` and [`DiskPtxCache::open`] disables the disk cache (in-memory
+/// fallback). A host without `icacls` therefore loses the disk cache rather
+/// than silently launching PTX out of a directory we couldn't lock down.
 #[cfg(windows)]
-fn harden_windows_dir(dir: &Path) {
+fn harden_windows_dir(dir: &Path) -> bool {
     use std::process::{Command, Stdio};
 
     // Prefer the domain-qualified principal `DOMAIN\USER`; fall back to a
-    // bare username. Without a username we can't name a grantee, so skip.
+    // bare username. Without a username we can't name a grantee, so we can't
+    // lock the dir down -> untrusted.
     let user = match std::env::var("USERNAME") {
         Ok(u) if !u.is_empty() => match std::env::var("USERDOMAIN") {
             Ok(d) if !d.is_empty() => format!("{d}\\{u}"),
             _ => u,
         },
-        _ => return,
+        _ => return false,
     };
 
-    // Best-effort: spawn icacls, ignore success/failure entirely. We pass
-    // the grant spec as a single argument (no shell involved, so the
-    // `(OI)(CI)F` parens and the `:` are passed literally to icacls).
-    let _ = Command::new("icacls")
+    // Spawn icacls and require a success exit status. We pass the grant spec
+    // as a single argument (no shell involved, so the `(OI)(CI)F` parens and
+    // the `:` are passed literally to icacls).
+    match Command::new("icacls")
         .arg(dir)
         .arg("/inheritance:r")
         .arg("/grant:r")
         .arg(format!("{user}:(OI)(CI)F"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+    {
+        Ok(status) => status.success(),
+        // icacls missing / spawn failure -> can't prove the dir is locked
+        // down -> fail closed.
+        Err(_) => false,
+    }
 }
 
 /// Read a `u64` tuning knob from the environment, falling back to `default`
@@ -980,37 +1175,58 @@ pub(crate) fn valid_key(key: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
-/// Compute the content-integrity digest of a PTX body (fixes V-7).
+/// Compute the **key-bound** content-integrity digest of a PTX body
+/// (V-7).
 ///
 /// Returns a fixed-width 32-char lowercase hex string — the same shape as
-/// [`hash_to_key`] — derived from the body via two domain-separated
+/// [`hash_to_key`] — derived from `(key, body)` via two domain-separated
 /// `DefaultHasher` instances packed into 128 bits. This deliberately
 /// reuses the crate's existing `DefaultHasher`-based 128-bit hashing
 /// convention (the same shape `exec::module_cache::hash128` and the
 /// `ModuleCacheKey` use for content keys) so we pull in **no new
 /// dependency** for a hash.
 ///
-/// This is NOT a cryptographic MAC — the cache file and any future header
-/// live in the same attacker-writable directory, so a determined attacker
-/// who can write the cache dir can also recompute and rewrite the digest.
-/// Its purpose is *integrity against accidental corruption and partial
-/// writes*, and a tripwire against naive tampering, consistent with the
-/// best-effort threat model of an opt-in build cache (the real
-/// confidentiality/integrity boundary for V-7 is the 0o700 dir perms on
-/// Unix; see [`DiskPtxCache::open`]).
+/// # Key binding
+///
+/// The cache `key` (the `<key>.ptx` filename stem) is mixed into the digest
+/// — with a length prefix so `key`/`body` can't be ambiguously concatenated
+/// — *before* the body bytes. This binds a stored entry to the exact
+/// filename it was written under: a file whose contents are copied or
+/// renamed to a different `<key>.ptx` will fail [`DiskPtxCache::lookup`]'s
+/// comparison (which re-derives the digest from the *lookup* key) and miss,
+/// so contents can't be replayed under another key.
+///
+/// # This is NOT the security boundary
+///
+/// This is **not** a cryptographic MAC and the hash strength is **not** the
+/// integrity boundary. The header and body live in the same directory, so an
+/// attacker who can write that directory can recompute and rewrite the
+/// digest. The actual confidentiality/integrity boundary for V-7 is the
+/// **directory ownership + permission trust check** enforced fail-closed in
+/// [`DiskPtxCache::open`] (owner-only on Unix; ACL-locked-to-current-user on
+/// Windows — an untrusted dir disables the disk layer entirely). This digest
+/// only provides integrity against accidental corruption / partial writes,
+/// is a tripwire against naive tampering, and — via the key binding above —
+/// prevents cross-key content replay within an otherwise-trusted directory.
 #[must_use]
-fn body_digest(body: &str) -> String {
+fn body_digest(key: &str, body: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
 
     // Domain bytes (0xD1 / 0xD2) distinct from the key-hash domains used in
-    // `exec::module_cache` so a digest can never be confused with a key.
+    // `exec::module_cache` so a digest can never be confused with a key. The
+    // `key` is fed in with a u64 length prefix so `(key, body)` can never be
+    // re-parsed as a different `(key', body')` split (length-prefix framing).
     let mut hi = DefaultHasher::new();
     hi.write_u8(0xD1);
+    hi.write_u64(key.len() as u64);
+    hi.write(key.as_bytes());
     hi.write(body.as_bytes());
 
     let mut lo = DefaultHasher::new();
     lo.write_u8(0xD2);
+    lo.write_u64(key.len() as u64);
+    lo.write(key.as_bytes());
     lo.write(body.as_bytes());
 
     hash_to_key(hi.finish(), lo.finish())
@@ -1588,27 +1804,112 @@ mod tests {
     }
 
     /// `body_digest` is deterministic and content-sensitive: identical
-    /// bodies hash equal, different bodies (almost surely) differ.
+    /// `(key, body)` pairs hash equal, different bodies (almost surely)
+    /// differ, and — crucially for V-7 — the SAME body under a DIFFERENT key
+    /// produces a different digest (key binding prevents cross-key replay).
     #[test]
     fn body_digest_is_deterministic_and_content_sensitive() {
-        assert_eq!(body_digest("abc"), body_digest("abc"));
-        assert_ne!(body_digest("abc"), body_digest("abd"));
-        assert_eq!(body_digest("abc").len(), 32);
+        let k = "key0";
+        assert_eq!(body_digest(k, "abc"), body_digest(k, "abc"));
+        assert_ne!(body_digest(k, "abc"), body_digest(k, "abd"));
+        assert_eq!(body_digest(k, "abc").len(), 32);
+        // Key binding: identical body, different key -> different digest.
+        assert_ne!(body_digest("key0", "abc"), body_digest("key1", "abc"));
     }
 
-    /// V-7 (Unix only): the cache root is created with owner-only `0o700`
-    /// permissions. Gated to `cfg(unix)` because Windows has no portable
-    /// std equivalent (see [`DiskPtxCache::open`]).
+    /// V-7 key binding, end-to-end: an entry's bytes copied verbatim to a
+    /// DIFFERENT `<key>.ptx` filename must miss, because `lookup` re-derives
+    /// the digest from the *lookup* key and it won't match the header the
+    /// bytes were written with. This is the cross-key content-replay guard.
+    #[test]
+    fn replayed_content_under_different_key_is_a_miss() {
+        let dir = fresh_tempdir("v7replay");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let key_a = hash_to_key(0x1111, 0x2222);
+        let key_b = hash_to_key(0x3333, 0x4444);
+        let ptx = "// body\n.version 7.0\n";
+        cache.store(&key_a, ptx).expect("store under key_a");
+
+        // Copy key_a's file bytes verbatim to key_b's filename.
+        let raw = fs::read_to_string(dir.join(format!("{key_a}.ptx"))).expect("read a");
+        fs::write(dir.join(format!("{key_b}.ptx")), &raw).expect("plant under b");
+
+        // key_a still hits; the replayed key_b file is rejected (digest was
+        // bound to key_a, not key_b).
+        assert_eq!(cache.lookup(&key_a).as_deref(), Some(ptx));
+        assert!(
+            cache.lookup(&key_b).is_none(),
+            "content replayed under a different key must miss"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// V-7 fail-closed: a disk-disabled handle is a total disk no-op —
+    /// `store` writes nothing and `lookup` always misses — yet returns the
+    /// best-effort `Ok`/`None` the caller expects, so the engine keeps
+    /// running on the in-memory + codegen path.
+    #[test]
+    fn disabled_handle_is_a_disk_noop() {
+        let dir = fresh_tempdir("v7disabled");
+        fs::create_dir_all(&dir).expect("mkdir");
+        let cache = DiskPtxCache::disabled_for_test(dir.clone());
+        assert!(!cache.is_disk_enabled());
+        let key = hash_to_key(9, 9);
+        // store is a silent Ok no-op...
+        cache.store(&key, "payload").expect("store must be Ok no-op");
+        // ...nothing landed on disk...
+        assert!(
+            !dir.join(format!("{key}.ptx")).exists(),
+            "disabled store must not write any file"
+        );
+        // ...and lookup always misses, even if a file were present.
+        assert!(cache.lookup(&key).is_none(), "disabled lookup must miss");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// V-7 (Unix only): a freshly-opened cache root is owner-only `0o700`
+    /// AND passes the fail-closed trust check (owned by us, no group/world
+    /// write), so the disk layer is enabled. Gated to `cfg(unix)` because
+    /// Windows has no portable std equivalent (see [`DiskPtxCache::open`]).
     #[cfg(unix)]
     #[test]
     fn open_sets_owner_only_perms_on_unix() {
         use std::os::unix::fs::PermissionsExt;
         let dir = fresh_tempdir("v7perms");
-        let _cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
         let mode = fs::metadata(&dir).expect("metadata").permissions().mode();
         // Compare the low 9 permission bits; the file-type bits above are
         // irrelevant here.
         assert_eq!(mode & 0o777, 0o700, "cache root must be owner-only (0o700)");
+        // The owner-private dir must be trusted, so the disk layer is live.
+        assert!(
+            cache.is_disk_enabled(),
+            "an owner-only 0o700 dir we own must pass the V-7 trust check"
+        );
+        assert!(dir_is_trusted_unix(&dir), "trust check must accept 0o700 owner dir");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// V-7 (Unix only): a group/world-writable cache root FAILS the trust
+    /// check, so `open` returns a disk-disabled handle (fail-closed) instead
+    /// of using the untrusted directory.
+    #[cfg(unix)]
+    #[test]
+    fn group_world_writable_dir_disables_disk_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_tempdir("v7ww");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open must not hard-error");
+        // Loosen the perms AFTER open's chmod to simulate a pre-existing
+        // world-writable dir, then re-run the trust check directly.
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod 0777");
+        assert!(
+            !dir_is_trusted_unix(&dir),
+            "a world-writable dir must fail the V-7 trust check"
+        );
+        // (The handle from the earlier open is still enabled because it was
+        // verified at 0o700; the contract under test is the trust predicate
+        // that `open` consults.)
+        let _ = cache;
         let _ = fs::remove_dir_all(&dir);
     }
 

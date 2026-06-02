@@ -82,6 +82,19 @@ impl<T: Pod> GpuVec<T> {
     ///
     /// Returns an error if `prefix_len > self.len()` or if
     /// `prefix_len + tail.len() != total_len`.
+    ///
+    /// ## V3 ordering hazard (why the source is fenced first)
+    ///
+    /// The prefix copy is a *synchronous* `cuMemcpyDtoD_v2` on the default
+    /// (NULL) stream, reading `self.buffer`'s device memory. The NULL stream
+    /// is **not** ordered after work enqueued on a non-blocking per-query pool
+    /// stream, so if `self.buffer` still has writes in flight on such a stream
+    /// (its recorded `used_streams` is non-empty — e.g. a kernel or async DMA
+    /// that produced these rows), the DtoD could copy a torn/stale prefix into
+    /// the grown buffer (silent corruption when `GpuTable::register_batch`
+    /// appends rows). The buffer's own `Drop` only fences those streams *after*
+    /// the copy, which is too late. We therefore drain the source buffer's
+    /// recorded streams BEFORE reading its memory.
     pub fn extended_with_prefix(
         self,
         total_len: usize,
@@ -94,6 +107,14 @@ impl<T: Pod> GpuVec<T> {
                 prefix_len,
                 self.buffer.len()
             )));
+        }
+        // V3: fence the SOURCE buffer's in-flight streams before the
+        // synchronous NULL-stream DtoD reads its device memory (see the
+        // ordering-hazard note above). Uses the buffer's own per-stream fence
+        // helper, which `Drop` also uses; a no-op if the buffer was only ever
+        // touched synchronously.
+        if prefix_len > 0 {
+            self.buffer.fence_recorded_streams();
         }
         // SAFETY: `self.buffer` is a live device allocation of `self.len()`
         // `T`s and `prefix_len <= self.len()` (checked above). The

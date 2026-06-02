@@ -328,7 +328,18 @@ impl<T: Pod> GpuBuffer<T> {
                         size_of::<T>()
                     ))
                 })?;
-            let tail_dst: cuda_sys::CUdeviceptr = buf.ptr.wrapping_add(byte_offset as u64);
+            // M1: checked device-pointer add (mirrors the `checked_mul`
+            // discipline used for `byte_offset` just above). A wrapping add
+            // here would silently fold an overflowing offset back to a low
+            // address and let the H2D copy scribble over unrelated memory;
+            // surface the overflow as a `BoltError` instead.
+            let tail_dst: cuda_sys::CUdeviceptr =
+                buf.ptr.checked_add(byte_offset as u64).ok_or_else(|| {
+                    BoltError::Memory(format!(
+                        "GpuBuffer::from_prefix_and_tail: device pointer overflow: {} + {}",
+                        buf.ptr, byte_offset
+                    ))
+                })?;
             // SAFETY: `tail_dst` is `buf.ptr + prefix_len` elements in; the
             // buffer has room for `total_len = prefix_len + tail.len()`
             // elements; `tail` is a host slice of `tail.len()` `T`s.
@@ -435,6 +446,36 @@ impl<T: Pod> GpuBuffer<T> {
     #[doc(hidden)]
     pub fn recorded_stream_count(&self) -> usize {
         self.used_streams.borrow().len()
+    }
+
+    /// Block until every stream this buffer has been enqueued on
+    /// ([`mark_stream_use`](Self::mark_stream_use)) has drained, so the
+    /// buffer's device memory is safe to *read* synchronously (e.g. by a
+    /// NULL-stream `cuMemcpyDtoD_v2`) without racing in-flight async writes.
+    ///
+    /// ## Why this exists (V3 ordering hazard)
+    ///
+    /// A synchronous DtoD/DtoH that reads this buffer runs on the default
+    /// (NULL) stream and is **not** ordered after work enqueued on a
+    /// non-blocking per-query pool stream. If a kernel / async DMA writing
+    /// this buffer is still in flight on such a stream, the synchronous read
+    /// can copy a torn/stale snapshot. Recording the stream in `used_streams`
+    /// only makes `Drop` fence it *later*, which is too late for a read that
+    /// happens before the drop. Callers that read this buffer's memory
+    /// synchronously while it may have async writes in flight MUST call this
+    /// first.
+    ///
+    /// Reuses the same per-stream [`cuStreamSynchronize`](real_stream_fence)
+    /// fence loop ([`fence_all_streams`]) that `Drop` uses — no global
+    /// `cuCtxSynchronize` unless a per-stream fence fails (the same
+    /// defense-in-depth fallback). A no-op for a buffer never touched by any
+    /// stream (the common synchronous case).
+    pub fn fence_recorded_streams(&self) {
+        let streams = self.used_streams.borrow();
+        if streams.is_empty() {
+            return;
+        }
+        fence_all_streams(&streams, current_drop_fence());
     }
 
     /// Raw pointer to this buffer's stream-set cell, for the view
