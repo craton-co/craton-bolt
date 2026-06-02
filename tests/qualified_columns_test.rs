@@ -13,12 +13,17 @@
 //!   * unknown table prefix → clear "unknown table qualifier" error
 //!   * 4-part identifier `cat.schema.table.col` → "deeply qualified"
 //!
+//! The single-catalog rule (accept ≤3-part `schema.table.col` by dropping the
+//! leading schema, reject 4+ as "deeply qualified") is applied CONSISTENTLY in
+//! both the SELECT/WHERE path (`lower_expr`) and the JOIN ON path
+//! (`lower_join_side`) — see the two `three_part_*` tests below.
+//!
 //! These tests only assert that parse + lower succeed (or fail with the
 //! expected message); the executor-side correctness of the resolved column
 //! is exercised by the broader e2e suite.
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema,
+    lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider, Schema,
 };
 
 // ---- Fixtures ---------------------------------------------------------------
@@ -311,28 +316,73 @@ fn four_part_identifier_rejected_as_deeply_qualified() {
     assert_err_contains(res, "deeply qualified");
 }
 
-// PRE-EXISTING INCONSISTENCY (surfaced when CI was un-blocked; not a
-// regression of any recent change): a 3-part name in a JOIN ON-clause
-// (`public.orders.customer_id`) is now ACCEPTED, while the same 3-part form
-// in a SELECT list is still rejected with "deeply qualified" (see
-// `deeply_qualified_column_rejected` above). The two CompoundIdentifier
-// paths disagree. Until it's decided whether 3-part (schema-qualified)
-// names should be uniformly accepted or uniformly rejected, this test is
-// ignored rather than asserting the (possibly-wrong) current behavior.
-// Tracked for separate triage.
-#[ignore = "pre-existing: JOIN-ON 3-part name accepted but SELECT 3-part rejected; needs design decision"]
+// DECISION (consistent across both CompoundIdentifier paths): a single-catalog
+// engine accepts 3-part `schema.table.col` by dropping the leading schema
+// segment and resolving the trailing `table.col`, and rejects 4+ parts as
+// "deeply qualified". This holds for SELECT/WHERE (`lower_expr`) AND JOIN ON
+// (`lower_join_side`) — see `three_part_column_ref_resolves_by_table_and_column`
+// (SELECT) and `four_part_identifier_rejected_as_deeply_qualified` (4-part).
+// This test pins the JOIN-ON side and proves it resolves to the CORRECT bare
+// columns (not a silent mis-resolution), mirroring the SELECT behavior.
 #[test]
-fn three_part_in_join_on_rejected_with_schema_message() {
-    // The JOIN ON-clause has its own CompoundIdentifier path; it should
-    // produce the same schema-qualified rejection so users see a
-    // consistent error regardless of where the 3-part name appeared.
+fn three_part_in_join_on_resolves_consistently_with_select() {
     let provider = two_tables();
-    let res = try_plan(
+    // 3-part `schema.table.col` on BOTH sides of the equi-join must resolve
+    // (consistent with the accepted 3-part SELECT form), dropping the leading
+    // `public` schema and keying on the trailing `table.col`.
+    let plan = parse_sql(
         "SELECT * FROM orders INNER JOIN customers \
-         ON public.orders.customer_id = customers.id",
+         ON public.orders.customer_id = public.customers.id",
         &provider,
-    );
-    assert_err_contains(res, "schema-qualified names not supported");
+    )
+    .expect("3-part schema-qualified JOIN ON must resolve (consistent with SELECT)");
+
+    // `SELECT *` may wrap the Join in a Project; unwrap if so.
+    let join_plan = match &plan {
+        LogicalPlan::Project { input, .. } => input.as_ref(),
+        other => other,
+    };
+    match join_plan {
+        LogicalPlan::Join { on, .. } => {
+            assert_eq!(on.len(), 1, "expected exactly one equi pair, got {on:?}");
+            match &on[0] {
+                (Expr::Column(l), Expr::Column(r)) => {
+                    // Leading `public` dropped; resolved by the trailing column.
+                    assert_eq!(l, "customer_id", "left ON key resolves to the bare column");
+                    assert_eq!(r, "id", "right ON key resolves to the bare column");
+                }
+                other => panic!("expected two Column refs in the ON pair, got {other:?}"),
+            }
+        }
+        other => panic!("expected a Join under the plan root, got {other:?}"),
+    }
+
+    // And it must lower cleanly end-to-end, exactly like the 2-part form.
+    lower_physical(&plan).expect("3-part JOIN ON plan must lower");
+}
+
+/// SELECT-side mirror: the same 3-part `schema.table.col` form in a SELECT
+/// list resolves to the CORRECT column in the produced LogicalPlan (the
+/// leading schema is dropped; the trailing `table.col` is resolved), proving
+/// the SELECT and JOIN-ON paths agree.
+#[test]
+fn three_part_select_resolves_to_correct_column_in_plan() {
+    let provider = two_tables();
+    let plan = parse_sql("SELECT main.orders.customer_id FROM main.orders", &provider)
+        .expect("3-part schema-qualified SELECT column must resolve");
+    match &plan {
+        LogicalPlan::Project { exprs, .. } => {
+            assert_eq!(exprs.len(), 1, "expected one projected expr, got {exprs:?}");
+            match &exprs[0] {
+                Expr::Column(name) => assert_eq!(
+                    name, "customer_id",
+                    "3-part SELECT ref must resolve to the bare trailing column"
+                ),
+                other => panic!("expected a Column ref, got {other:?}"),
+            }
+        }
+        other => panic!("expected a Project at the plan root, got {other:?}"),
+    }
 }
 
 #[test]
