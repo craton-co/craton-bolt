@@ -3458,7 +3458,107 @@ impl Engine {
         // index column through the host. `&self` is borrowed for the entire
         // `execute_projection`, so the dictionary's GpuVec outlives the launch.
         let mut input_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(kernel.inputs.len());
+        // F12 column-vs-column Utf8 ordering: per-row rank columns
+        // (`__rank_<col>`) are MATERIALISED here from the registered dictionary
+        // index column and the unified rank table the rewriter stashed. The
+        // freshly-allocated i64 device buffers must outlive the kernel launch +
+        // the D2H download below, so this function-scoped Vec owns them for the
+        // whole `execute_projection` (mirrors `synth_validity_bufs`).
+        let mut rank_bufs: Vec<GpuVec<i64>> = Vec::new();
         for io in &kernel.inputs {
+            if let Some(original) = io.name.strip_prefix("__rank_") {
+                // The rewriter lowered a `col_a OP col_b` Utf8 ordering to a
+                // NULL-safe integer comparison over `__rank_<col>` columns whose
+                // per-row value is `rank_table[index_column[row]]`. The rank
+                // table (ranked against the SHARED byte-sorted universe of both
+                // columns' dictionaries) was recorded by the rewriter and keyed
+                // by this synthetic name in the registry side-channel.
+                if io.dtype != DataType::Int64 {
+                    return Err(BoltError::Plan(format!(
+                        "rewriter-emitted rank column '{}' must be Int64, plan says {:?}",
+                        io.name, io.dtype
+                    )));
+                }
+                let rank_table = self.dict_registry.rank_table(&io.name).ok_or_else(|| {
+                    BoltError::Plan(format!(
+                        "rewriter-emitted rank column '{}' has no rank table in registry \
+                         (was the plan rewritten by DictRegistry::rewrite_plan?)",
+                        io.name
+                    ))
+                })?;
+                // The source dictionary index column (`__idx_<original>` lives in
+                // the same dictionary entry) supplies one GPU index per row; the
+                // rank table maps each index to its rank. NULL rows carry index
+                // 0, which the rank table maps to the `-1` sentinel — the
+                // rewriter's `(__rank_ >= 0)` guard then drops them (SQL 3VL).
+                let dict = self.dict_registry.dictionary(table, original).ok_or_else(|| {
+                    BoltError::Plan(format!(
+                        "rank column '{}' references column '{}' with no dictionary in registry",
+                        io.name, original
+                    ))
+                })?;
+                // Gather host-side: download the index column once, map each
+                // index through the rank table, upload the i64 rank column. This
+                // is per-query setup cost (one D2H + one H2D of the index/rank
+                // column), not a per-row hot path; it reuses the existing index
+                // buffer rather than re-deriving indices. A bounds-checked map
+                // turns a malformed index into a structured error rather than an
+                // out-of-range panic.
+                let host_ranks: Vec<i64> = match dict {
+                    crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
+                        let idxs = d.indices.to_vec()?;
+                        let mut out = Vec::with_capacity(idxs.len());
+                        for &ix in &idxs {
+                            if ix < 0 {
+                                return Err(BoltError::Other(format!(
+                                    "rank materialise: negative index {} for column '{}'",
+                                    ix, original
+                                )));
+                            }
+                            let slot = ix as usize;
+                            let rank = rank_table.get(slot).copied().ok_or_else(|| {
+                                BoltError::Other(format!(
+                                    "rank materialise: index {} for column '{}' out of rank-table range {}",
+                                    ix, original, rank_table.len()
+                                ))
+                            })?;
+                            out.push(rank);
+                        }
+                        out
+                    }
+                    crate::cuda::dictionary_any::DictionaryColumnAny::I64(d) => {
+                        let idxs = d.indices.to_vec()?;
+                        let mut out = Vec::with_capacity(idxs.len());
+                        for &ix in &idxs {
+                            if ix < 0 {
+                                return Err(BoltError::Other(format!(
+                                    "rank materialise: negative index {} for column '{}'",
+                                    ix, original
+                                )));
+                            }
+                            let slot = ix as usize;
+                            let rank = rank_table.get(slot).copied().ok_or_else(|| {
+                                BoltError::Other(format!(
+                                    "rank materialise: index {} for column '{}' out of rank-table range {}",
+                                    ix, original, rank_table.len()
+                                ))
+                            })?;
+                            out.push(rank);
+                        }
+                        out
+                    }
+                };
+                if host_ranks.len() != n_rows {
+                    return Err(BoltError::Other(format!(
+                        "rank materialise: column '{}' produced {} rows, table has {}",
+                        io.name, host_ranks.len(), n_rows
+                    )));
+                }
+                let dev = GpuVec::<i64>::from_slice(&host_ranks)?;
+                input_ptrs.push(dev.device_ptr());
+                rank_bufs.push(dev);
+                continue;
+            }
             if let Some(original) = io.name.strip_prefix("__idx_") {
                 let dict = self.dict_registry.dictionary(table, original).ok_or_else(|| {
                     BoltError::Plan(format!(
@@ -3727,6 +3827,14 @@ impl Engine {
         // load-bearing buffers to tag are the outputs.
         for col in &output_cols {
             col.mark_launch_stream(stream.raw());
+        }
+        // F12: the materialised `__rank_<col>` input buffers are freshly
+        // allocated (unlike the persistent GpuTable inputs), so they too must
+        // fence this stream on drop. They are read by both the projection
+        // kernel above and the predicate kernel below; tagging here restores the
+        // same `Drop`-fence invariant `mark_launch_stream` gives the outputs.
+        for buf in &rank_bufs {
+            buf.mark_stream_use(stream.raw());
         }
         // Debug-only synchronize: pin any in-kernel fault to THIS launch
         // rather than letting it surface at the next CUDA API call.

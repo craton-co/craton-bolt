@@ -63,6 +63,26 @@ use crate::plan::string_literal_rewrite::{index_column_name, StringPredicateRewr
 pub struct DictRegistry {
     /// `table_name` → `column_name` → on-host-and-device dictionary.
     by_table: HashMap<String, HashMap<String, DictionaryColumnAny>>,
+    /// Column-vs-column rank tables (finding F12), keyed by the synthetic
+    /// `__rank_<col>` column name the rewriter emits. Populated by
+    /// [`Self::rewrite_plan`] from the just-rewritten plan's recorded
+    /// [`ColVsColRankPlan`](crate::plan::string_literal_rewrite::ColVsColRankPlan)s
+    /// and read back by the engine's `execute_projection` to MATERIALISE the
+    /// per-row rank column (`rank_table[index_column[row]]`).
+    ///
+    /// Each entry is the full per-GPU-index rank lookup table (slot 0 = NULL
+    /// sentinel `-1`, real ranks `>= 0`) ranked against the SHARED byte-sorted
+    /// universe of the comparison's two dictionaries — so the two tables of a
+    /// pair are directly comparable even across different dictionaries.
+    ///
+    /// Interior mutability: [`Self::rewrite_plan`] takes `&self` (the engine
+    /// query path holds `&self`), so the map is replaced through a `RefCell` on
+    /// every rewrite. It is scoped to the most recent rewrite — a fresh query
+    /// overwrites it — which is correct because the engine rewrites then
+    /// executes a single plan before the next rewrite. The rank-column names are
+    /// unqualified (matching the unqualified `Expr::Column` refs), consistent
+    /// with the `__idx_<col>` convention.
+    rank_tables: std::cell::RefCell<HashMap<String, Vec<i64>>>,
 }
 
 impl Default for DictRegistry {
@@ -76,6 +96,7 @@ impl DictRegistry {
     pub fn new() -> Self {
         Self {
             by_table: HashMap::new(),
+            rank_tables: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -288,7 +309,56 @@ impl DictRegistry {
         for col_name in collect_projected_bare_columns(plan) {
             rewriter.protect_predicate(col_name);
         }
-        rewriter.rewrite(plan)
+        let rewritten = rewriter.rewrite(plan)?;
+
+        // Finding F12: drain the column-vs-column rank plans the rewriter
+        // recorded while lowering `col_a OP col_b` ordering comparisons to
+        // `__rank_a OP __rank_b`, and stash each table keyed by its
+        // `__rank_<col>` name so the engine's `execute_projection` can
+        // materialise the per-row rank columns.
+        //
+        // Replace-on-non-empty: the engine calls `rewrite_plan` more than once
+        // per query (an idempotent re-run over the already-rewritten plan, plus
+        // optimizer-driven re-walks — see `Engine::query`). The FIRST pass over
+        // the still-`col_a OP col_b` plan records the rank plans; subsequent
+        // passes see only the lowered `__rank_a OP __rank_b` integer compare
+        // (the col-vs-col Utf8 shape is gone) and record NOTHING. Blindly
+        // replacing with the empty set on those later passes would CLOBBER the
+        // tables before execution. So we only overwrite when this pass actually
+        // produced tables; an empty drain leaves the prior (correct) map intact.
+        //
+        // Staleness across queries is not a hazard: a later query's
+        // `__rank_<col>` is only resolvable if that query's own rewrite declared
+        // the scan field (via the pre-pass) AND recorded a table — which
+        // overwrites the key here. A `__rank_<col>` left over from an earlier
+        // query is unreferenced by any plan the planner can lower, so it is
+        // dead, not wrong. Keying by unqualified name matches the unqualified
+        // `Expr::Column` refs and the `__idx_<col>` convention.
+        let mut tables: HashMap<String, Vec<i64>> = HashMap::new();
+        for rp in rewriter.take_rank_plans() {
+            tables.insert(rp.rank_col_a, rp.rank_a);
+            tables.insert(rp.rank_col_b, rp.rank_b);
+        }
+        if !tables.is_empty() {
+            *self.rank_tables.borrow_mut() = tables;
+        }
+
+        Ok(rewritten)
+    }
+
+    /// Borrow a clone of the column-vs-column rank table (finding F12) for the
+    /// synthetic `__rank_<col>` column `rank_col`, if the most recent
+    /// [`Self::rewrite_plan`] recorded one.
+    ///
+    /// The returned vector is the per-GPU-index rank lookup (slot 0 = NULL
+    /// sentinel `-1`, real ranks `>= 0`) ranked against the shared byte-sorted
+    /// universe of the comparison's two dictionaries. The engine's
+    /// `execute_projection` gathers `rank_table[index_column[row]]` for every
+    /// row to materialise the i64 `__rank_<col>` device column the integer
+    /// comparison kernel consumes. Returns `None` when `rank_col` is not a
+    /// rank column the current plan emitted.
+    pub fn rank_table(&self, rank_col: &str) -> Option<Vec<i64>> {
+        self.rank_tables.borrow().get(rank_col).cloned()
     }
 
     /// Extend the engine-side "logical" schema for `table` with index columns
@@ -1140,5 +1210,98 @@ mod tests {
             }
             other => panic!("expected Binary: {other:?}"),
         }
+    }
+
+    // ---- F12: column-vs-column Utf8 ordering (rank side-channel) -----------
+
+    /// Helper: build a two-Utf8-column `RecordBatch` for the F12 registry test.
+    fn utf8_batch2(c0: &str, v0: &[&str], c1: &str, v1: &[&str]) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(c0, ArrowDataType::Utf8, true),
+            ArrowField::new(c1, ArrowDataType::Utf8, true),
+        ]));
+        let a0 = Arc::new(StringArray::from(v0.to_vec()));
+        let a1 = Arc::new(StringArray::from(v1.to_vec()));
+        RecordBatch::try_new(schema, vec![a0, a1]).expect("build 2-col batch")
+    }
+
+    /// F12 end-to-end (registry): `rewrite_plan` over `WHERE a < b` (two dict
+    /// columns) lowers to the NULL-safe rank comparison and registers the
+    /// unified rank tables in the side-channel under `__rank_a` / `__rank_b`, so
+    /// the engine's `execute_projection` can materialise the per-row rank
+    /// columns. CUDA-dependent (`register_table` uploads index columns).
+    #[test]
+    #[ignore = "gpu:string"]
+    fn rewrite_plan_lowers_col_vs_col_and_registers_rank_tables() {
+        use crate::plan::logical_plan::{BinaryOp, Literal};
+
+        let mut reg = DictRegistry::new();
+        // DIFFERENT dictionaries on the two columns → exercises the unified
+        // cross-dictionary universe.
+        reg.register_table(
+            "t",
+            &utf8_batch2("a", &["delta", "apple", "mango"], "b", &["cherry", "Zebra", "apple"]),
+        )
+        .expect("register t");
+
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("a", DataType::Utf8, true),
+                Field::new("b", DataType::Utf8, true),
+            ]),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate: col("a").lt(col("b")),
+        };
+
+        let rewritten = reg.rewrite_plan(&plan).expect("rewrite");
+        let LogicalPlan::Filter { predicate, .. } = rewritten else {
+            panic!("expected Filter at root");
+        };
+        // Top-level shape: AND( AND(__rank_a >= 0, __rank_b >= 0), __rank_a < __rank_b ).
+        let Expr::Binary { op: BinaryOp::And, left: guards, right: ordering } = &predicate else {
+            panic!("expected NULL-safe AND, got {predicate:?}");
+        };
+        let Expr::Binary { op: BinaryOp::And, left: ga, right: gb } = &**guards else {
+            panic!("expected two NULL guards, got {guards:?}");
+        };
+        for (g, name) in [(&**ga, "__rank_a"), (&**gb, "__rank_b")] {
+            match g {
+                Expr::Binary { op: BinaryOp::GtEq, left, right } => {
+                    assert!(matches!(&**left, Expr::Column(n) if n == name));
+                    assert!(matches!(&**right, Expr::Literal(Literal::Int64(0))));
+                }
+                other => panic!("expected `{name} >= 0`, got {other:?}"),
+            }
+        }
+        match &**ordering {
+            Expr::Binary { op: BinaryOp::Lt, left, right } => {
+                assert!(matches!(&**left, Expr::Column(n) if n == "__rank_a"));
+                assert!(matches!(&**right, Expr::Column(n) if n == "__rank_b"));
+            }
+            other => panic!("expected `__rank_a < __rank_b`, got {other:?}"),
+        }
+
+        // The side-channel now holds both rank tables (slot 0 = NULL sentinel).
+        let ra = reg.rank_table("__rank_a").expect("rank table a registered");
+        let rb = reg.rank_table("__rank_b").expect("rank table b registered");
+        assert_eq!(ra[0], crate::cuda::dictionary::NULL_RANK_SENTINEL);
+        assert_eq!(rb[0], crate::cuda::dictionary::NULL_RANK_SENTINEL);
+        // 3 distinct strings each + NULL slot ⇒ length 4.
+        assert_eq!(ra.len(), 4);
+        assert_eq!(rb.len(), 4);
+        // Cross-dictionary correctness: "apple" is dict_a slot 2, dict_b slot 3;
+        // both must rank identically in the shared universe.
+        assert_eq!(ra[2], rb[3], "shared 'apple' must share a rank");
+
+        // An unknown rank column is not registered.
+        assert!(reg.rank_table("__rank_zzz").is_none());
     }
 }
