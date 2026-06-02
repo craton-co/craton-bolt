@@ -730,6 +730,107 @@ fn emit_load_src_slice(
     Ok(())
 }
 
+/// Convert a 1-based **character** start and a **character** length into a
+/// byte window `[byte_start, byte_start + byte_copy)` into a UTF-8 slice.
+///
+/// `SUBSTRING` is defined over Unicode characters, not bytes. A naive
+/// byte-offset implementation (`src += start-1`, copy `len` bytes) splits
+/// multibyte codepoints: e.g. `SUBSTRING('héllo', 2, 1)` would land at the
+/// first byte of the 2-byte `é` and copy a single byte (a partial char that
+/// leaks the lead byte and drops the trail), and `SUBSTRING('世界x', 2, 2)`
+/// would land in the middle of `世`. This helper walks whole characters so the
+/// emitted window always starts and ends on a UTF-8 boundary.
+///
+/// A byte begins a character iff `(b & 0xC0) != 0x80` (continuation bytes are
+/// `10xxxxxx`). The input is always valid UTF-8 (dictionary entries are valid
+/// Rust strings), so stepping a lead byte then its continuation bytes is safe.
+///
+/// Inputs (all already loaded): `r_inlen` = slice byte length, `rd_slice` =
+/// pointer to the slice's first byte, `r_start` = 1-based character start,
+/// `r_sublen` = character count. Outputs: `r_bstart` = byte start offset and
+/// `r_bcopy` = byte length of the selected window. `label` makes the emitted
+/// branch targets unique within the enclosing kernel.
+///
+/// Scratch: `%r24`–`%r29`, `%rs2`, `%rd25`–`%rd26` (free in the SUBSTRING
+/// branch — TRIM's `emit_trim_bounds` scratch is on the mutually-exclusive
+/// TRIM path).
+#[allow(clippy::too_many_arguments)]
+fn emit_substring_char_window(
+    ptx: &mut String,
+    label: &str,
+    r_inlen: &str,
+    rd_slice: &str,
+    r_start: &str,
+    r_sublen: &str,
+    r_bstart: &str,
+    r_bcopy: &str,
+) -> BoltResult<()> {
+    // start0 = max(start - 1, 0) characters to skip; want = max(sub_len, 0)
+    // characters to take.
+    writeln!(ptx, "\tsub.s32 %r24, {st}, 1;", st = r_start).map_err(write_err)?;
+    writeln!(ptx, "\tmax.s32 %r24, %r24, 0;").map_err(write_err)?; // %r24 = start0 (chars)
+    writeln!(ptx, "\tmax.s32 %r25, {sl}, 0;", sl = r_sublen).map_err(write_err)?; // %r25 = want (chars)
+
+    // Walk `start0` whole characters → byte index %r26 = byte_start.
+    // %r26 = i (byte index), %r27 = chars skipped so far.
+    writeln!(ptx, "\tmov.u32 %r26, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r27, 0;").map_err(write_err)?;
+    writeln!(ptx, "{lbl}_SKIP:", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p1, %r26, {inl};", inl = r_inlen).map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra {lbl}_SKIP_DONE;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p1, %r27, %r24;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra {lbl}_SKIP_DONE;", lbl = label).map_err(write_err)?;
+    // Step past this character's lead byte, then its continuation bytes.
+    writeln!(ptx, "\tadd.s32 %r26, %r26, 1;").map_err(write_err)?;
+    writeln!(ptx, "{lbl}_SKIP_CONT:", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p1, %r26, {inl};", inl = r_inlen).map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra {lbl}_SKIP_CONT_DONE;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd25, %r26, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd26, {sl}, %rd25;", sl = rd_slice).map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.u8 %rs2, [%rd26];").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u16 %r28, %rs2;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r28, %r28, 192;").map_err(write_err)?; // b & 0xC0
+    writeln!(ptx, "\tsetp.ne.s32 %p1, %r28, 128;").map_err(write_err)?; // boundary if != 0x80
+    writeln!(ptx, "\t@%p1 bra {lbl}_SKIP_CONT_DONE;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r26, %r26, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra {lbl}_SKIP_CONT;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "{lbl}_SKIP_CONT_DONE:", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r27, %r27, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra {lbl}_SKIP;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "{lbl}_SKIP_DONE:", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 {bs}, %r26;", bs = r_bstart).map_err(write_err)?; // byte_start
+
+    // Walk `want` more whole characters from byte_start → byte_end %r26.
+    // %r27 reused as chars taken so far.
+    writeln!(ptx, "\tmov.u32 %r27, 0;").map_err(write_err)?;
+    writeln!(ptx, "{lbl}_TAKE:", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p1, %r26, {inl};", inl = r_inlen).map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra {lbl}_TAKE_DONE;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p1, %r27, %r25;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra {lbl}_TAKE_DONE;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r26, %r26, 1;").map_err(write_err)?;
+    writeln!(ptx, "{lbl}_TAKE_CONT:", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p1, %r26, {inl};", inl = r_inlen).map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra {lbl}_TAKE_CONT_DONE;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd25, %r26, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd26, {sl}, %rd25;", sl = rd_slice).map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.u8 %rs2, [%rd26];").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u16 %r28, %rs2;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r28, %r28, 192;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.s32 %p1, %r28, 128;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra {lbl}_TAKE_CONT_DONE;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r26, %r26, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra {lbl}_TAKE_CONT;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "{lbl}_TAKE_CONT_DONE:", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r27, %r27, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra {lbl}_TAKE;", lbl = label).map_err(write_err)?;
+    writeln!(ptx, "{lbl}_TAKE_DONE:", lbl = label).map_err(write_err)?;
+    // byte_copy = byte_end - byte_start
+    writeln!(ptx, "\tsub.s32 {bc}, %r26, {bs};", bc = r_bcopy, bs = r_bstart)
+        .map_err(write_err)?;
+    Ok(())
+}
+
 /// Compile **pass 1** (the length pass) of the two-pass variable-width string
 /// producer for `kind`.
 ///
@@ -842,19 +943,16 @@ pub fn compile_varwidth_len_pass(kind: ScalarFnKind) -> BoltResult<String> {
         // recomputes the SAME bounds, so the two passes always agree.
         emit_trim_bounds(&mut ptx, mode, "%r7", "%rd10", "%r14", "%r13")?;
     } else if is_substring {
-        // start (1-based), sub_len in params 4/5.
+        // start (1-based CHARACTER), sub_len (CHARACTER count) in params 4/5.
+        // SUBSTRING is character-indexed: walk whole UTF-8 characters to find
+        // the byte window so no multibyte codepoint is split (see
+        // `emit_substring_char_window`). out_len = byte length of that window.
         writeln!(ptx, "\tld.param.u32 %r8, [{}_param_4];", entry).map_err(write_err)?;
         writeln!(ptx, "\tld.param.u32 %r9, [{}_param_5];", entry).map_err(write_err)?;
-        // start0 = max(start - 1, 0). start is unsigned 1-based; if start==0
-        // treat as 0 offset (defensive — SQL start is >= 1).
-        writeln!(ptx, "\tsub.s32 %r10, %r8, 1;").map_err(write_err)?;
-        writeln!(ptx, "\tmax.s32 %r10, %r10, 0;").map_err(write_err)?;
-        // avail = in_len - start0   (bytes available from the start offset)
-        writeln!(ptx, "\tsub.s32 %r11, %r7, %r10;").map_err(write_err)?;
-        writeln!(ptx, "\tmax.s32 %r11, %r11, 0;").map_err(write_err)?;
-        // out_len = min(avail, sub_len)
-        writeln!(ptx, "\tmin.s32 %r12, %r11, %r9;").map_err(write_err)?;
-        writeln!(ptx, "\tmov.u32 %r13, %r12;").map_err(write_err)?;
+        // %r12 = byte_start (unused here), %r13 = out_len (byte copy length).
+        emit_substring_char_window(
+            &mut ptx, "LEN", "%r7", "%rd10", "%r8", "%r9", "%r12", "%r13",
+        )?;
     } else {
         // UPPER / LOWER: out_len == in_len (ASCII case folding).
         writeln!(ptx, "\tmov.u32 %r13, %r7;").map_err(write_err)?;
@@ -989,19 +1087,18 @@ pub fn compile_varwidth_write_pass(kind: ScalarFnKind) -> BoltResult<String> {
         writeln!(ptx, "\tmul.wide.u32 %rd17, %r24, 1;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd10, %rd10, %rd17;").map_err(write_err)?;
     } else if is_substring {
-        writeln!(ptx, "\tld.param.u32 %r20, [{}_param_5];", entry).map_err(write_err)?; // start (1-based)
-        writeln!(ptx, "\tld.param.u32 %r21, [{}_param_6];", entry).map_err(write_err)?; // sub_len
-        // start0 = max(start - 1, 0)
-        writeln!(ptx, "\tsub.s32 %r22, %r20, 1;").map_err(write_err)?;
-        writeln!(ptx, "\tmax.s32 %r22, %r22, 0;").map_err(write_err)?;
-        // src_ptr += start0
+        writeln!(ptx, "\tld.param.u32 %r20, [{}_param_5];", entry).map_err(write_err)?; // start (1-based char)
+        writeln!(ptx, "\tld.param.u32 %r21, [{}_param_6];", entry).map_err(write_err)?; // sub_len (char count)
+        // Character-indexed window: walk whole UTF-8 characters to find the
+        // byte start offset (%r22) and byte copy length (%r9). This MUST match
+        // the length pass byte-for-byte (same helper) so the bytes written
+        // exactly fill the region `out_offsets` reserved.
+        emit_substring_char_window(
+            &mut ptx, "SUB", "%r7", "%rd10", "%r20", "%r21", "%r22", "%r9",
+        )?;
+        // src_ptr += byte_start so the copy loop begins at the first kept byte.
         writeln!(ptx, "\tmul.wide.u32 %rd17, %r22, 1;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd10, %rd10, %rd17;").map_err(write_err)?;
-        // avail = max(in_len - start0, 0)
-        writeln!(ptx, "\tsub.s32 %r23, %r7, %r22;").map_err(write_err)?;
-        writeln!(ptx, "\tmax.s32 %r23, %r23, 0;").map_err(write_err)?;
-        // copy_len = min(avail, sub_len)
-        writeln!(ptx, "\tmin.s32 %r9, %r23, %r21;").map_err(write_err)?;
     } else {
         // UPPER / LOWER copy the whole (length-preserving) slice.
         writeln!(ptx, "\tmov.u32 %r9, %r7;").map_err(write_err)?;
@@ -1130,9 +1227,13 @@ mod tests {
         // 6-param ABI: offsets, bytes, row_lens, n_rows, start, sub_len.
         assert!(ptx.contains(".param .u32 bolt_str_len_pass_substring_param_4,"), "{ptx}");
         assert!(ptx.contains(".param .u32 bolt_str_len_pass_substring_param_5"), "{ptx}");
-        // Clamp arithmetic: max for the start clamp, min for the length cap.
+        // Character-indexed window: `max` clamps start0/want to >= 0, and the
+        // start/take scan loops walk whole UTF-8 characters (a byte begins a
+        // char iff `(b & 0xC0) != 0x80`, tested via `and.b32 ..., 192`).
         assert!(ptx.contains("max.s32"), "missing clamp max\n{ptx}");
-        assert!(ptx.contains("min.s32"), "missing length-cap min\n{ptx}");
+        assert!(ptx.contains("LEN_SKIP:"), "missing char-skip scan\n{ptx}");
+        assert!(ptx.contains("LEN_TAKE:"), "missing char-take scan\n{ptx}");
+        assert!(ptx.contains("and.b32 %r28, %r28, 192"), "missing UTF-8 boundary test\n{ptx}");
     }
 
     #[test]

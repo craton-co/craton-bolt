@@ -638,53 +638,66 @@ fn golden_partition_reduce_fences_set_key_race() {
     //
     // This test pins the contract: regressing it reopens the
     // correctness bug.
+    //
+    // NOTE — the VALIDATED fix (commits be85833 / e3db739, compute-sanitizer
+    // clean) is a 3-state `set` flag (0=empty, 1=claiming, 2=published):
+    //   * WINNER (CLAIM): `st key; membar.cta; st set:=2` — one release fence
+    //     so any reader observing set==2 also sees the published key.
+    //   * LOSER: spin in `PUBLISH_WAIT` re-reading `set` via
+    //     `ld.volatile.shared.u32` until it equals 2, THEN read the key.
+    // An earlier design used a SECOND membar + `ld.acquire.cta` on the MATCH
+    // path, but `ld.acquire` defaults to GLOBAL space and faulted on the shared
+    // address ("invalid __global__ read"); the volatile-spin protocol replaced
+    // it. So the kernel now emits exactly ONE `membar.cta` (the CLAIM release),
+    // and the loser's acquire is the volatile spin — this test guards that.
     use craton_bolt::jit::partition_reduce_kernel::compile_partition_reduce_kernel;
     let ptx = compile_partition_reduce_kernel().expect("kernel compiles");
-    let mb_count = ptx.matches("membar.cta").count();
-    assert!(
-        mb_count >= 2,
-        "partition-reduce kernel must emit >=2 membar.cta (CLAIM + MATCH \
-         paths); saw {mb_count}:\n{ptx}"
-    );
-    // Ordering: the MATCH-path membar must sit between the CAS and the
-    // key load. Search anchored at the CAS to dodge false hits in
-    // comments at the top of the file.
-    let cas_pos = ptx
-        .find("atom.shared.cas.b32")
-        .expect("partition-reduce kernel must issue atom.shared.cas.b32");
-    let tail = &ptx[cas_pos..];
-    let mb_after_cas = tail
-        .find("membar.cta")
-        .expect("missing MATCH-path membar.cta after CAS");
-    // MATCH-path key load is `ld.acquire.cta.s32 %r35` — the acquire
-    // variant pairs with the publisher's atomic store to make the
-    // read-of-published-value contract explicit at the PTX level (the
-    // membar.cta still precedes it; acquire is in ADDITION, not
-    // replacement).
-    let key_load = tail
-        .find("ld.acquire.cta.s32 %r35")
-        .expect("missing MATCH-path acquire key load");
-    assert!(
-        mb_after_cas < key_load,
-        "membar.cta must precede the MATCH-path key load:\n{ptx}"
-    );
-    // Ordering: the CLAIM-path membar must sit between the key store
-    // and the f64 val atomic. CLAIM-path key store is the
-    // `st.shared.u32 [%rd36], %r31;` line.
+
+    // (1) CLAIM release fence: key store -> membar.cta -> set:=2 -> val atomic.
     let claim_label = ptx.find("CLAIM:").expect("missing CLAIM: label");
     let claim_tail = &ptx[claim_label..];
     let key_store = claim_tail
         .find("st.shared.u32")
         .expect("missing CLAIM-path key store");
-    let mb_after_store = claim_tail[key_store..]
+    let after_store = &claim_tail[key_store..];
+    let membar = after_store
         .find("membar.cta")
-        .expect("missing CLAIM-path membar.cta after key store");
-    let val_atomic = claim_tail[key_store..]
+        .expect("missing CLAIM-path membar.cta after the key store");
+    let set_publish = after_store
+        .find("], 2;")
+        .expect("missing CLAIM-path set:=2 publish store");
+    let val_atomic = after_store
         .find("atom.shared.add.f64")
         .expect("missing CLAIM-path val atomic");
     assert!(
-        mb_after_store < val_atomic,
-        "membar.cta must precede the CLAIM-path val atomic:\n{ptx}"
+        membar < set_publish,
+        "CLAIM: membar.cta must precede the set:=2 publish (release order):\n{ptx}"
+    );
+    assert!(
+        membar < val_atomic,
+        "CLAIM: membar.cta must precede the f64 val atomic:\n{ptx}"
+    );
+
+    // (2) LOSER acquire: the PUBLISH_WAIT spin re-reads the set flag via
+    //     ld.volatile.shared.u32 until it observes the published value 2 — this
+    //     replaces the old MATCH-path membar/ld.acquire and is the load-bearing
+    //     half of the publish protocol.
+    let wait = ptx
+        .find("PUBLISH_WAIT:")
+        .expect("missing PUBLISH_WAIT spin (loser acquire path)");
+    let wait_tail = &ptx[wait..];
+    let vol = wait_tail
+        .find("ld.volatile.shared.u32")
+        .expect("PUBLISH_WAIT must re-read the set flag via ld.volatile.shared.u32");
+    assert!(
+        wait_tail[vol..].contains(", 2;"),
+        "PUBLISH_WAIT must spin until the set flag equals the published value 2:\n{ptx}"
+    );
+
+    // And the kernel must still issue the slot-claim CAS on the set flag.
+    assert!(
+        ptx.contains("atom.shared.cas.b32"),
+        "partition-reduce kernel must issue atom.shared.cas.b32 to claim a slot:\n{ptx}"
     );
 }
 
@@ -1654,15 +1667,21 @@ fn golden_string_upper_len_pass_is_length_preserving() {
 
 #[test]
 fn golden_string_substring_len_pass_clamps_with_start_len() {
-    // Pass 1 for SUBSTRING takes start + sub_len params and clamps the output
-    // length via max (start clamp) and min (length cap).
+    // Pass 1 for SUBSTRING takes start + sub_len params and computes the output
+    // byte length by walking WHOLE UTF-8 characters (1-based char start, char
+    // length) — NOT byte offsets — so a multi-byte char is never split/leaked.
     let ptx = compile_varwidth_len_pass(ScalarFnKind::Substring).expect("compile");
     assert!(ptx.contains(".visible .entry bolt_str_len_pass_substring("));
     // 6-arg ABI: ..., n_rows, start, sub_len.
     assert!(ptx.contains(".param .u32 bolt_str_len_pass_substring_param_4,"));
     assert!(ptx.contains(".param .u32 bolt_str_len_pass_substring_param_5"));
-    assert!(ptx.contains("max.s32"), "missing start clamp\n{ptx}");
-    assert!(ptx.contains("min.s32"), "missing length cap\n{ptx}");
+    // Char-window walk: skip (start-1) whole chars to the byte start, then take
+    // sub_len whole chars, using the UTF-8 lead-byte test `(b & 0xC0) != 0x80`
+    // (mask 0xC0 == 192). This replaced the old byte-offset max/min clamp that
+    // could splice adjacent bytes of a multi-byte character.
+    assert!(ptx.contains("LEN_SKIP:"), "missing char-skip loop\n{ptx}");
+    assert!(ptx.contains("LEN_TAKE:"), "missing char-take loop\n{ptx}");
+    assert!(ptx.contains(", 192"), "missing UTF-8 continuation-byte mask (0xC0)\n{ptx}");
 }
 
 #[test]
