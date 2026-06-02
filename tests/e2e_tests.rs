@@ -1560,11 +1560,38 @@ fn e2e_groupby_with_nulls() {
         .sql("SELECT k, SUM(v) FROM t GROUP BY k")
         .expect("sql ok");
     let out = result.record_batch();
-    // Expected: 2 groups (k=1 -> 40, k=2 -> 60). The null row drops out.
+    // Standard SQL (DuckDB / Postgres): a NULL group key forms its OWN distinct
+    // group — it is NOT excluded. So k=[1,2,NULL,1,2], v=[10,20,99,30,40] yields
+    // THREE groups: (1 -> 40), (2 -> 60), (NULL -> 99).
     assert_eq!(
         out.num_rows(),
-        2,
-        "null group key should be excluded; only k=1 and k=2 survive"
+        3,
+        "NULL key forms its own group: expect k=1, k=2, and a NULL group"
+    );
+    let keys = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("key col Int32");
+    let sums = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum col Int64");
+    let mut got: Vec<(Option<i32>, i64)> = (0..out.num_rows())
+        .map(|i| {
+            (
+                if keys.is_null(i) { None } else { Some(keys.value(i)) },
+                sums.value(i),
+            )
+        })
+        .collect();
+    got.sort_by_key(|(k, _)| k.unwrap_or(i32::MAX)); // NULL group sorts last
+    assert!(got.contains(&(Some(1), 40)), "group k=1 -> SUM=40; got {got:?}");
+    assert!(got.contains(&(Some(2), 60)), "group k=2 -> SUM=60; got {got:?}");
+    assert!(
+        got.contains(&(None, 99)),
+        "NULL group -> SUM=99 (the single null-keyed row); got {got:?}"
     );
 }
 
