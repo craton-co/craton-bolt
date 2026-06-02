@@ -30,30 +30,40 @@
 //! Both variants share the same histogram kernel — the histogram only counts
 //! digits in the keys, so it doesn't need the index payload.
 //!
-//! ## Algorithm — standard histogram / scan / scatter
+//! ## Algorithm — stable multi-block LSD radix (histogram / scan / scatter)
 //!
 //! For each 4-bit radix step (LSB to MSB, 8 steps for u32/i32, 16 for i64):
 //!
-//! 1. **Histogram.** Every thread reads its key, extracts the current 4-bit
-//!    digit (`(key >> shift) & 0xF`), and `atomicAdd`s 1 to the digit's bucket
-//!    in a global histogram of 16 `u32` counters.
-//! 2. **Scan.** The host runs an exclusive prefix-scan over the 16-bucket
-//!    histogram, producing the per-digit starting offsets in the output array.
-//!    (We reuse the existing [`crate::jit::prefix_scan`] machinery for this.)
-//! 3. **Scatter.** Every thread reads its key + digit, `atomicAdd`s 1 to the
-//!    digit's running counter (initialised from the scan), and writes the key
-//!    into `out[offset]`. After scatter, swap input/output buffers and move to
-//!    the next radix step.
+//! 1. **Histogram.** Every block privately counts its 256 threads' digits in
+//!    shared memory, then writes the 16 counts to a *per-block-per-digit*
+//!    global histogram `block_hist[num_blocks * 16]` at `[blockIdx*16 + digit]`.
+//!    There is no global atomic — each block owns its 16 output slots.
+//! 2. **Scan.** The host turns `block_hist` into per-block-per-digit *exclusive*
+//!    output offsets `block_offsets[num_blocks * 16]`: column sums give the
+//!    per-digit base, and a running prefix across blocks (in ascending
+//!    `blockIdx` order) gives each block's run start within its digit's region.
+//! 3. **Scatter.** Each block reads its precomputed bases
+//!    `block_offsets[blockIdx*16 + digit]` (no global atomic), computes a
+//!    deterministic per-block stable rank for each element, and writes the key
+//!    (and the row-index payload) to `base[digit] + rank`. After scatter, swap
+//!    input/output buffers and move to the next radix step.
+//!
+//! This is the standard stable multi-block LSD radix: placement is fully
+//! deterministic and ordered by `(blockIdx, threadIdx)`, so equal-digit
+//! elements keep their input order — the invariant LSD radix needs to be
+//! correct across passes.
 //!
 //! Signed types (`i32`/`i64`) need a one-time MSB flip on entry and again on
 //! exit so the bit-pattern compare matches the value-order compare — same
 //! standard "flip top bit" trick used in Thrust's radix sort. Floats need the
 //! full IEEE-monotonic transform (flip all bits if sign==1, else flip just the
-//! sign bit). The float transform is **deferred**; this kernel rejects
-//! `Float32`/`Float64` and the host falls back to the bitonic sort or the host
-//! sort. Bool / Utf8 are likewise rejected — bools have only 2 distinct keys
-//! (cheaper to count), and Utf8 needs dictionary-decoding before it reaches
-//! any device-side sort.
+//! sign bit). That float transform is now **implemented and unit-tested**
+//! host-side (`radix_float_key_f32` / `radix_float_key_f64` in
+//! `crate::exec::gpu_sort`), but it is **not yet wired into the dispatch
+//! predicate**, so this kernel still rejects `Float32`/`Float64` and the host
+//! falls back to the bitonic sort or the host sort. Bool / Utf8 are likewise
+//! rejected — bools have only 2 distinct keys (cheaper to count), and Utf8
+//! needs dictionary-decoding before it reaches any device-side sort.
 //!
 //! ## What this PTX module emits
 //!
@@ -61,24 +71,27 @@
 //! "histogram / scan / scatter" loop is multi-kernel and multi-launch — this
 //! module emits the per-step PTX that the executor will drive. Per dtype:
 //!
-//! - `bolt_radix_histogram_<dty>` — read each key, bump its 4-bit digit bucket
-//!   in a global 16-counter histogram. Used at the start of every radix step.
+//! - `bolt_radix_histogram_<dty>` — read each key, privately count its 4-bit
+//!   digit in a per-block shared histogram, then write the block's 16 counts to
+//!   `block_hist[blockIdx*16 + digit]`. Used at the start of every radix step.
 //!   Keys-only and keys+indices variants share this kernel.
-//! - `bolt_radix_scatter_<dty>` — keys-only scatter: read each key, look up
-//!   its digit's running offset (atomic-bumped), and write the key into the
-//!   output buffer. Kept for the ORDER BY single-key shortcut.
-//! - `bolt_radix_scatter_<dty>_with_indices` — keys+indices scatter: read
-//!   each `(key, val)` pair from `(keys_in, vals_in)`, atomic-bump the
-//!   digit's offset to claim a single output slot, then write both `key` and
-//!   `val` at that slot in `(keys_out, vals_out)`. `val` is a `u32`
-//!   row-index; this is the standard path for multi-column ORDER BY.
+//! - `bolt_radix_scatter_<dty>` — keys-only scatter: read each key, read its
+//!   digit's precomputed block base `block_offsets[blockIdx*16 + digit]`, add a
+//!   deterministic per-block stable rank, and write the key into the output
+//!   buffer. Kept for the ORDER BY single-key shortcut.
+//! - `bolt_radix_scatter_<dty>_with_indices` — keys+indices scatter: read each
+//!   `(key, val)` pair from `(keys_in, vals_in)`, compute the same stable
+//!   `out_idx`, then write both `key` and `val` at that slot in
+//!   `(keys_out, vals_out)`. `val` is a `u32` row-index; this is the standard
+//!   path for multi-column ORDER BY.
 //! - `bolt_radix_msb_flip_<dty>` — signed-key fixup: XOR every key with the
 //!   MSB constant. Run once on the input before pass 0 and once on the final
 //!   output after the last pass. See [`compile_radix_msb_flip`] for the
 //!   rationale.
 //!
-//! The host-side scan over 16 buckets is trivial enough to run on the CPU or
-//! to reuse the engine's existing prefix-scan kernel — we don't emit a
+//! The host-side scan turns the `num_blocks * 16` per-block-per-digit histogram
+//! into per-block-per-digit exclusive output offsets. It is cheap enough to run
+//! on the CPU (the driver in `gpu_sort.rs` does exactly this) — we don't emit a
 //! dedicated scan kernel here.
 //!
 //! ## ABI
@@ -86,7 +99,8 @@
 //! ```text
 //! .visible .entry bolt_radix_histogram_<dty>(
 //!     .param .u64 keys_ptr,       // input keys buffer
-//!     .param .u64 hist_ptr,       // 16-entry u32 histogram (atomic-added)
+//!     .param .u64 block_hist_ptr, // (num_blocks * 16) u32 per-block-per-digit
+//!                                 //   counts, written [blockIdx*16 + digit]
 //!     .param .u32 n_rows,         // number of valid keys
 //!     .param .u32 shift           // bit-shift for the current radix step
 //! )
@@ -94,7 +108,8 @@
 //! .visible .entry bolt_radix_scatter_<dty>(
 //!     .param .u64 keys_in_ptr,    // input keys
 //!     .param .u64 keys_out_ptr,   // output keys (sorted by current radix step)
-//!     .param .u64 offsets_ptr,    // 16-entry u32 running offsets (atomic-bumped)
+//!     .param .u64 block_offsets_ptr, // (num_blocks*16) precomputed per-block-
+//!                                 //   per-digit exclusive output offsets
 //!     .param .u32 n_rows,
 //!     .param .u32 shift
 //! )
@@ -104,7 +119,8 @@
 //!     .param .u64 keys_out_ptr,   // output keys (sorted by current radix step)
 //!     .param .u64 vals_in_ptr,    // input row-index payload (u32 per row)
 //!     .param .u64 vals_out_ptr,   // output row-index payload (lock-step with keys)
-//!     .param .u64 offsets_ptr,    // 16-entry u32 running offsets (atomic-bumped)
+//!     .param .u64 block_offsets_ptr, // (num_blocks*16) precomputed per-block-
+//!                                 //   per-digit exclusive output offsets
 //!     .param .u32 n_rows,
 //!     .param .u32 shift
 //! )
@@ -206,13 +222,21 @@ impl RadixFlavour {
             // is set, flip every bit; else flip just the sign bit. This makes
             // the bit-pattern unsigned compare agree with the floating-point
             // value compare for normals + zeros (NaNs sort to the end either
-            // way). Deferred to v0.7 — `try_gpu_radix_sort` falls back to the
-            // host path when it sees a float dtype.
+            // way). The transform itself is implemented and unit-tested
+            // host-side (`radix_float_key_f32` / `radix_float_key_f64` in
+            // `crate::exec::gpu_sort`), but it is NOT yet wired into the radix
+            // dispatch predicate, so the executor still falls back to the
+            // bitonic / host path for float ORDER BY. See the F2 integration
+            // note: enabling it end-to-end means widening
+            // `radix_dispatch_predicate` (and its tests, which live in the
+            // executor crate) to admit Float32/Float64, then routing F32/F64
+            // through the bit-blob pipeline with the float key transform in
+            // place of the signed-int pre-transform.
             DataType::Float32 | DataType::Float64 => {
                 return Err(BoltError::Other(format!(
-                    "sort_kernel_radix: dtype {:?} requires the IEEE-monotonic \
-                     bit transform which is deferred to v0.7; \
-                     fall back to host or bitonic sort",
+                    "sort_kernel_radix: dtype {:?} float radix transform is \
+                     implemented host-side but not yet wired into the radix \
+                     dispatch predicate; fall back to host or bitonic sort",
                     dtype
                 )))
             }
@@ -401,7 +425,7 @@ fn dtype_tag(dtype: DataType) -> BoltResult<&'static str> {
 
 /// Emit the PTX for the radix-sort **histogram** kernel for `dtype`.
 ///
-/// Per-block logic (shared-memory **privatized** — see PERF note below):
+/// Per-block logic (shared-memory **privatized**, per-block-per-digit output):
 ///
 /// ```text
 ///   __shared__ u32 s_hist[16]
@@ -414,25 +438,35 @@ fn dtype_tag(dtype: DataType) -> BoltResult<&'static str> {
 ///       digit = (key >> shift) & 0xF
 ///       atomicAdd(&s_hist[digit], 1u32)     // SHARED atomic — fast, per-block
 ///   __syncthreads()
-///   if lane < 16: atomicAdd(&hist[lane], s_hist[lane])  // reduce to global
+///   if lane < 16:
+///       block_hist[blockIdx.x * 16 + lane] = s_hist[lane]   // per-block output
 /// ```
 ///
-/// **PERF (C / histogram privatization).** The previous version bumped the
-/// 16-entry histogram directly in GLOBAL memory with `atom.global.add`. Under
-/// skewed digit distributions (e.g. a column where most keys share a digit)
-/// every thread serializes on the *same* global counter, which is the dominant
-/// cost of the pass. Privatizing the histogram in shared memory turns the hot
-/// per-element bump into a `atom.shared.add` (an order of magnitude cheaper and
-/// contended only within a block) and collapses the global traffic to exactly
-/// 16 `atom.global.add`s per block in the reduction step. The emitted global
-/// histogram is bit-identical to the old kernel's (sum over all blocks), so the
-/// host-side exclusive-scan that follows is unchanged.
+/// **STABILITY (the load-bearing fix).** The output is a *per-block-per-digit*
+/// histogram `block_hist[num_blocks * 16]` indexed `[blockIdx.x * 16 + digit]`,
+/// NOT a single shared 16-entry global histogram. The host (driver) then turns
+/// it into per-block-per-digit *exclusive* output offsets so the scatter places
+/// every block's run for a given digit in strictly ascending `blockIdx` order.
+/// Combined with the per-block stable rank in the scatter, this makes the LSD
+/// radix sort **fully stable across blocks** — equal-key rows keep their input
+/// order globally, which is what the multi-pass LSD radix requires to be
+/// correct (and what the two-key tie-break tests depend on).
 ///
-/// **Barrier / divergence note.** Because the kernel now contains
-/// `bar.sync`, out-of-range threads (`tid >= n_rows`) must NOT early-`ret`
-/// before the barriers or the block would hang. We therefore guard only the
-/// per-element increment with a predicate and let every thread fall through
-/// both barriers and the reduction.
+/// The previous version atomic-added each block's private histogram into a
+/// single 16-entry global histogram; that lost the per-block decomposition, so
+/// blocks reserved their per-digit runs in nondeterministic scheduling order
+/// during scatter and equal-digit rows were reordered across blocks. Writing
+/// the un-reduced per-block counts here is the first half of the fix.
+///
+/// **PERF.** The hot per-element bump stays an `atom.shared.add` (contended
+/// only within a block). The global traffic is exactly 16 plain stores per
+/// block (no global atomics at all in this kernel now).
+///
+/// **Barrier / divergence note.** Because the kernel contains `bar.sync`,
+/// out-of-range threads (`tid >= n_rows`) must NOT early-`ret` before the
+/// barriers or the block would hang. We therefore guard only the per-element
+/// increment with a predicate and let every thread fall through both barriers
+/// and the per-block store.
 ///
 /// The MSB-flip transform is **not** done inside this kernel — the executor
 /// runs the dedicated [`compile_radix_msb_flip`] kernel once before pass 0
@@ -452,13 +486,13 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
     // -- Signature ----------------------------------------------------
     writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
     writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?; // keys
-    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?; // hist
+    writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?; // block_hist
     writeln!(p, "\t.param .u32 {entry}_param_2,").map_err(write_err)?; // n_rows
     writeln!(p, "\t.param .u32 {entry}_param_3").map_err(write_err)?; // shift
     writeln!(p, ")").map_err(write_err)?;
     writeln!(p, "{{").map_err(write_err)?;
 
-    // -- Shared-memory private histogram (C). 16 u32 buckets per block. -----
+    // -- Shared-memory private histogram. 16 u32 buckets per block. ---------
     writeln!(p, "\t.shared .align 4 .b32 s_hist[{}];", RADIX_BUCKETS)
         .map_err(write_err)?;
 
@@ -526,16 +560,21 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
     writeln!(p, "\t@%p0 atom.shared.add.u32 %r9, [%rd9], 1;").map_err(write_err)?;
     writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
 
-    // Reduce the private histogram into the global one: lanes 0..15 each add
-    // their bucket's block-local count to hist[lane]. Skip the global atomic
-    // when the count is zero so empty digits cost no global traffic.
+    // Per-block-per-digit store (STABILITY): lanes 0..15 each write their
+    // bucket's block-local count to block_hist[blockIdx.x * 16 + lane]. This
+    // preserves the per-block decomposition the host scan needs to build
+    // cross-block-stable output offsets — a plain store, no global atomic.
+    //   row_base = blockIdx.x * RADIX_BUCKETS  (in u32 elements)
+    //   addr     = block_hist + (row_base + lane) * 4
     writeln!(p, "\tld.param.u64 %rd10, [{entry}_param_1];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd10, %rd10;").map_err(write_err)?;
+    // row_base = ctaid.x * RADIX_BUCKETS -> %r12 ; (row_base + lane) -> %r13
+    writeln!(p, "\tmul.lo.u32 %r12, %r0, {};", RADIX_BUCKETS).map_err(write_err)?;
+    writeln!(p, "\tadd.u32 %r13, %r12, %r2;").map_err(write_err)?;
+    writeln!(p, "\tmul.wide.u32 %rd11, %r13, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd12, %rd10, %rd11;").map_err(write_err)?;
     writeln!(p, "\t@%p1 ld.shared.u32 %r10, [%rd7];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ne.u32 %p2, %r10, 0;").map_err(write_err)?;
-    writeln!(p, "\tand.pred %p3, %p1, %p2;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd11, %rd10, %rd6;").map_err(write_err)?;
-    writeln!(p, "\t@%p3 atom.global.add.u32 %r11, [%rd11], %r10;").map_err(write_err)?;
+    writeln!(p, "\t@%p1 st.global.u32 [%rd12], %r10;").map_err(write_err)?;
 
     writeln!(p, "DONE:").map_err(write_err)?;
     writeln!(p, "\tret;").map_err(write_err)?;
@@ -546,12 +585,12 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
 
 /// Emit the PTX for the radix-sort **scatter** kernel for `dtype`.
 ///
-/// Per-block logic (**block-stable** — see stability note):
+/// Per-block logic (**fully stable** — see stability note):
 ///
 /// ```text
 ///   __shared__ u32 s_digit[BLOCK]      // each lane's digit (0xFFFF = inactive)
-///   __shared__ u32 s_hist[16]          // per-block digit counts
-///   __shared__ u32 s_base[16]          // reserved global base per digit
+///   __shared__ u32 s_hist[16]          // per-block digit counts (perf only)
+///   __shared__ u32 s_base[16]          // precomputed global base per digit
 ///   tid  = blockIdx.x*blockDim.x + lane ; lane = threadIdx.x
 ///   active = tid < n_rows
 ///   digit  = active ? (keys_in[tid] >> shift) & 0xF : 0xFFFF
@@ -560,8 +599,8 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
 ///   __syncthreads()
 ///   if active: atomicAdd(&s_hist[digit], 1)       // shared, per-block count
 ///   __syncthreads()
-///   if lane < 16 && s_hist[lane] != 0:
-///       s_base[lane] = atomicAdd(&offsets[lane], s_hist[lane])  // reserve range
+///   if lane < 16:
+///       s_base[lane] = block_offsets[blockIdx.x*16 + lane]  // precomputed base
 ///   __syncthreads()
 ///   if active:
 ///       rank = #{ j < lane : s_digit[j] == digit }   // STABLE within block
@@ -569,32 +608,30 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
 ///       keys_out[out_idx] = key
 /// ```
 ///
-/// `offsets[]` is still initialised on the host to the exclusive-scan of the
-/// histogram. Each block reserves a contiguous run inside its digit's region
-/// via a single `atom.global.add(offsets[digit], block_count)` (instead of one
-/// global atomic *per element*), then places its own elements inside that run
-/// in **input (tid) order** using a deterministic per-block rank.
+/// `block_offsets[]` is a `num_blocks * 16` buffer the host (driver) fills with
+/// a **per-block-per-digit exclusive prefix sum** (see `gpu_sort.rs`): for each
+/// digit `d`, `block_offsets[b*16 + d]` is the global output position where
+/// block `b`'s run of digit `d` begins, and the runs are laid out in ascending
+/// `blockIdx` order. Each block reads its base directly — **no global atomic** —
+/// then places its own elements inside that run in **input (tid) order** using a
+/// deterministic per-block rank.
 ///
-/// **Stability — read this.** The old kernel claimed each output slot with a
-/// racing `atom.global.add` per element, so two equal-digit elements landed in
+/// **Stability — read this.** The original kernel claimed each output slot with
+/// a racing `atom.global.add` per element, so equal-digit elements landed in
 /// nondeterministic relative order: every LSD pass was non-stable and the
-/// multi-pass sort could be **wrong** for `ORDER BY non_unique_key`. This
-/// version is **stable within a block**: the rank loop counts only lanes with a
-/// strictly smaller `threadIdx.x`, so equal-digit elements in the same block
-/// keep their input order deterministically.
+/// multi-pass sort could be **wrong** for `ORDER BY non_unique_key`. An interim
+/// version was stable *within* a block but reserved per-digit runs in
+/// `atom.global.add` arrival order, so it was still non-stable *across* blocks.
+/// This version is **fully stable**: the per-block-per-digit offsets are
+/// computed deterministically on the host ordered by `blockIdx`, and the rank
+/// loop counts only lanes with a strictly smaller `threadIdx.x`, so equal-digit
+/// elements keep their input order both within and across blocks. That is the
+/// invariant the multi-pass LSD radix requires to be correct, and it matches the
+/// host `lexsort_to_indices` fallback for `ORDER BY non_unique_key [LIMIT k]`.
 ///
-/// **Residual limitation (documented, not yet fixed).** Ordering is *not* yet
-/// stable **across** blocks: blocks reserve their per-digit runs in
-/// `atom.global.add` arrival order, which is scheduling-dependent, so a higher-
-/// `blockIdx` block can occupy an earlier run than a lower one. Full global
-/// stability needs a per-block-per-digit exclusive prefix sum
-/// (`block_digit_offsets[num_blocks][16]`) computed in a separate pass so each
-/// block's run is ordered by `blockIdx` — that requires an extra buffer and
-/// kernel launch in the executor (`gpu_sort.rs`) and is deferred. Until then
-/// the radix path stays gated behind `BOLT_GPU_SORT=1` (default OFF); it must
-/// reach full cross-block stability before being promoted to default-on so
-/// `ORDER BY non_unique_key [LIMIT k]` matches the host `lexsort_to_indices`
-/// fallback. The per-element race, however, is gone.
+/// The radix path remains gated behind `BOLT_GPU_SORT=1` (default OFF) until the
+/// orchestrator validates it on hardware; correctness no longer depends on
+/// scheduling.
 pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     let entry = radix_scatter_entry(dtype)?;
@@ -609,7 +646,7 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     writeln!(p, ".visible .entry {entry}(").map_err(write_err)?;
     writeln!(p, "\t.param .u64 {entry}_param_0,").map_err(write_err)?; // keys_in
     writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?; // keys_out
-    writeln!(p, "\t.param .u64 {entry}_param_2,").map_err(write_err)?; // offsets
+    writeln!(p, "\t.param .u64 {entry}_param_2,").map_err(write_err)?; // block_offsets
     writeln!(p, "\t.param .u32 {entry}_param_3,").map_err(write_err)?; // n_rows
     writeln!(p, "\t.param .u32 {entry}_param_4").map_err(write_err)?; // shift
     writeln!(p, ")").map_err(write_err)?;
@@ -751,19 +788,26 @@ fn emit_block_stable_scatter_prologue(
     writeln!(p, "\t@%p0 atom.shared.add.u32 %r10, [%rd15], 1;").map_err(write_err)?;
     writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
 
-    // Reserve a contiguous global run per non-empty digit: lanes 0..15.
-    //   s_base[lane] = atomicAdd(&offsets[lane], s_hist[lane])
+    // Cross-block-stable run base per digit (STABILITY): lanes 0..15 each read
+    // their digit's precomputed global output offset from
+    //   block_offsets[blockIdx.x * RADIX_BUCKETS + lane]
+    // and stage it in s_base[lane]. The host (driver) built block_offsets as a
+    // per-block-per-digit *exclusive* prefix sum ordered by blockIdx, so block
+    // `b`'s run for digit `d` begins exactly where block `b-1`'s run for `d`
+    // ends. No global atomic — placement is fully deterministic, so equal-digit
+    // rows keep their input order across blocks as well as within a block.
+    //   row_base = blockIdx.x * RADIX_BUCKETS  (in u32 elements)
+    //   addr     = block_offsets + (row_base + lane) * 4
     writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_{offsets_param}];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
-    writeln!(p, "\t@%p1 ld.shared.u32 %r11, [%rd13];").map_err(write_err)?; // block count
-    writeln!(p, "\tsetp.ne.u32 %p2, %r11, 0;").map_err(write_err)?;
-    writeln!(p, "\tand.pred %p3, %p1, %p2;").map_err(write_err)?;
-    writeln!(p, "\tadd.s64 %rd9, %rd8, %rd11;").map_err(write_err)?; // &offsets[lane]
-    // Reserve (only non-empty buckets touch global memory). %r12 = run base.
+    writeln!(p, "\tmul.lo.u32 %r11, %r0, {};", RADIX_BUCKETS).map_err(write_err)?; // row_base
+    writeln!(p, "\tadd.u32 %r12, %r11, %r2;").map_err(write_err)?; // row_base + lane
+    writeln!(p, "\tmul.wide.u32 %rd9, %r12, 4;").map_err(write_err)?;
+    writeln!(p, "\tadd.s64 %rd10, %rd8, %rd9;").map_err(write_err)?; // &block_offsets[..]
     writeln!(p, "\tmov.u32 %r12, 0;").map_err(write_err)?;
-    writeln!(p, "\t@%p3 atom.global.add.u32 %r12, [%rd9], %r11;").map_err(write_err)?;
-    // s_base[lane] = run base (write for all 16 lanes; empty buckets store 0,
-    // and no active thread will read an empty bucket's base anyway).
+    writeln!(p, "\t@%p1 ld.global.u32 %r12, [%rd10];").map_err(write_err)?; // run base
+    // s_base[lane] = run base (write for all 16 lanes; inactive/empty buckets
+    // store whatever they read, never consulted by an active thread).
     writeln!(p, "\tadd.s64 %rd10, %rd7, %rd11;").map_err(write_err)?; // &s_base[lane]
     writeln!(p, "\t@%p1 st.shared.u32 [%rd10], %r12;").map_err(write_err)?;
     writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
@@ -821,15 +865,15 @@ fn emit_block_stable_scatter_prologue(
 /// The key and its row-index payload are written to the **same** `out_idx`
 /// computed once by the prologue, so the pairing is preserved.
 ///
-/// **Stability.** This path now shares the **block-stable** scatter prologue
-/// with the keys-only kernel: equal-key rows within a block keep their input
-/// order via the deterministic per-block rank, eliminating the previous
-/// per-element `atom.global.add` race. The same residual limitation applies —
-/// ordering is not yet stable across blocks (block runs are reserved in
-/// scheduling order), which requires a per-block-per-digit prefix-sum pass in
-/// the executor and is deferred. The radix path stays gated behind
-/// `BOLT_GPU_SORT=1` (default OFF) until that lands. See
-/// [`compile_radix_scatter`] for the full discussion.
+/// **Stability.** This path shares the **fully stable** scatter prologue with
+/// the keys-only kernel: it reads precomputed per-block-per-digit output offsets
+/// (`block_offsets[blockIdx*16 + digit]`, built host-side ordered by `blockIdx`)
+/// and applies a deterministic per-block rank, so equal-key rows keep their
+/// input order both within and across blocks. There is no global atomic and no
+/// scheduling dependence — the previous per-element `atom.global.add` race and
+/// the interim cross-block ordering gap are both gone. The radix path stays
+/// gated behind `BOLT_GPU_SORT=1` (default OFF) until the orchestrator validates
+/// it on hardware. See [`compile_radix_scatter`] for the full discussion.
 pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     let entry = radix_scatter_with_indices_entry(dtype)?;
@@ -846,7 +890,7 @@ pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String>
     writeln!(p, "\t.param .u64 {entry}_param_1,").map_err(write_err)?; // keys_out
     writeln!(p, "\t.param .u64 {entry}_param_2,").map_err(write_err)?; // vals_in
     writeln!(p, "\t.param .u64 {entry}_param_3,").map_err(write_err)?; // vals_out
-    writeln!(p, "\t.param .u64 {entry}_param_4,").map_err(write_err)?; // offsets
+    writeln!(p, "\t.param .u64 {entry}_param_4,").map_err(write_err)?; // block_offsets
     writeln!(p, "\t.param .u32 {entry}_param_5,").map_err(write_err)?; // n_rows
     writeln!(p, "\t.param .u32 {entry}_param_6").map_err(write_err)?; // shift
     writeln!(p, ")").map_err(write_err)?;
@@ -1153,9 +1197,11 @@ mod tests {
         // 4-bit digit extraction.
         assert!(ptx.contains("and.b32"));
         assert!(ptx.contains(", 15;"));
-        // (C) Privatized histogram: a per-block shared histogram bumped with
-        // atom.shared.add, two barriers, then a global reduction with
-        // atom.global.add over the 16 buckets.
+        // Privatized histogram: a per-block shared histogram bumped with
+        // atom.shared.add, two barriers, then a per-block-per-digit GLOBAL
+        // STORE (not an atomic) of the 16 counts. The stable multi-block radix
+        // keeps each block's counts separate, so there is NO global atomic in
+        // this kernel any more.
         assert!(ptx.contains(".shared .align 4 .b32 s_hist"));
         assert!(ptx.contains("atom.shared.add.u32"));
         assert_eq!(
@@ -1163,7 +1209,14 @@ mod tests {
             2,
             "privatized histogram needs two barriers (post-zero, post-count)",
         );
-        assert!(ptx.contains("atom.global.add.u32"));
+        assert!(
+            !ptx.contains("atom.global.add"),
+            "stable per-block histogram must not use a global atomic",
+        );
+        assert!(
+            ptx.contains("st.global.u32"),
+            "per-block-per-digit counts are written with a plain global store",
+        );
         // The b32 load suffix for an Int32 key.
         assert!(ptx.contains("ld.global.b32"));
         assert!(ptx.contains("DONE:"));
@@ -1177,7 +1230,8 @@ mod tests {
         assert!(ptx.contains(".visible .entry bolt_radix_histogram_i64("));
         assert!(ptx.contains("ld.global.b64"));
         assert!(ptx.contains("shr.u64"));
-        assert!(ptx.contains("atom.global.add.u32"));
+        assert!(!ptx.contains("atom.global.add"));
+        assert!(ptx.contains("st.global.u32"));
     }
 
     /// Scatter PTX shape — atomic offset bump, store of the key into
@@ -1186,21 +1240,24 @@ mod tests {
     fn scatter_ptx_shape_i32() {
         let ptx = compile_radix_scatter(DataType::Int32).unwrap();
         assert!(ptx.contains(".visible .entry bolt_radix_scatter_i32("));
-        // Block-stable scatter: a per-block shared histogram, three barriers,
-        // a single global atomic to RESERVE the per-digit run (no longer a
-        // per-element bump), and the deterministic per-block rank loop.
+        // Fully stable scatter: a per-block shared histogram, three barriers,
+        // precomputed per-block-per-digit bases read from block_offsets (NO
+        // global atomic at all), and the deterministic per-block rank loop.
         assert!(ptx.contains("st.global.b32"));
         assert!(ptx.contains("ld.global.b32"));
         assert!(ptx.contains("atom.shared.add.u32"));
-        assert!(ptx.contains("atom.global.add.u32"));
         assert_eq!(
             ptx.matches("bar.sync").count(),
             3,
-            "block-stable scatter needs exactly three bar.sync barriers",
+            "stable scatter needs exactly three bar.sync barriers",
         );
         assert!(ptx.contains("RANK_LOOP:"));
-        // Exactly one GLOBAL atomic: the per-digit run reservation.
-        assert_eq!(ptx.matches("atom.global.add.u32").count(), 1);
+        // No GLOBAL atomic: placement is fully deterministic from the
+        // host-computed per-block-per-digit offsets.
+        assert!(
+            !ptx.contains("atom.global.add"),
+            "stable scatter must not reserve runs with a global atomic",
+        );
     }
 
     /// Keys+indices scatter PTX shape for `i32` (block-stable):
@@ -1228,15 +1285,15 @@ mod tests {
         // Existing key-side ABI preserved.
         assert!(ptx.contains("ld.global.b32"));
         assert!(ptx.contains("st.global.b32"));
-        // Exactly one GLOBAL atomic: the per-digit run reservation. Key and val
-        // writes both use the prologue's single `out_idx`, so they stay paired.
-        assert_eq!(
-            ptx.matches("atom.global.add.u32").count(),
-            1,
-            "keys+indices scatter must reserve its per-digit run with exactly \
-             one global atomicAdd so keys and vals land at the same slot",
+        // No GLOBAL atomic: the per-block-per-digit bases are precomputed on the
+        // host, so key and val writes both use the prologue's deterministic
+        // single `out_idx` and stay paired without any atomic.
+        assert!(
+            !ptx.contains("atom.global.add"),
+            "keys+indices scatter must place rows from precomputed offsets, \
+             not a global atomicAdd reservation",
         );
-        // Block-stable machinery.
+        // Stable scatter machinery.
         assert!(ptx.contains("atom.shared.add.u32"));
         assert_eq!(ptx.matches("bar.sync").count(), 3);
         assert!(ptx.contains("RANK_LOOP:"));
@@ -1268,11 +1325,10 @@ mod tests {
         // Row-index payload is still u32 even for 64-bit keys.
         assert!(ptx.contains("ld.global.u32"));
         assert!(ptx.contains("st.global.u32"));
-        assert_eq!(
-            ptx.matches("atom.global.add.u32").count(),
-            1,
-            "keys+indices scatter (i64) must reserve its per-digit run with \
-             exactly one global atomicAdd",
+        assert!(
+            !ptx.contains("atom.global.add"),
+            "keys+indices scatter (i64) must place rows from precomputed \
+             offsets, not a global atomicAdd reservation",
         );
         assert!(ptx.contains("atom.shared.add.u32"));
         assert_eq!(ptx.matches("bar.sync").count(), 3);

@@ -389,10 +389,7 @@ fn emit_probe_head(
 ) -> BoltResult<()> {
     let rd_pkeys = layout.rd_pkeys;
     let rd_pvals_base = layout.rd_pvals_base;
-    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
-    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_loop_head(ptx)?;
 
     match key_width {
         KeyWidth::I32 => {
@@ -432,12 +429,11 @@ fn emit_probe_head(
             writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
         }
     }
-    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
-
-    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.gt.u32 %p2, %r33, {mp};", mp = max_probes).map_err(write_err)?;
-    writeln!(ptx, "\t@%p2 bra {overflow_target};").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_probe_bound_check(
+        ptx,
+        max_probes,
+        overflow_target,
+    )?;
     Ok(())
 }
 
@@ -466,9 +462,7 @@ fn emit_slot_cas(ptx: &mut String, key_width: KeyWidth, layout: &RegLayout) -> B
         }
     }
 
-    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd93], 0, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_slot_claim_cas(ptx, "%rd93")?;
     Ok(())
 }
 
@@ -537,8 +531,7 @@ fn emit_claim(ptx: &mut String, key_width: KeyWidth, n_vals: u32) -> BoltResult<
             writeln!(ptx, "\tst.shared.u64 [%rd94], %rd60;").map_err(write_err)?;
         }
     }
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd93], 2;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_claim_publish(ptx, "%rd93")?;
     emit_accumulate(ptx, n_vals, 16)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
     Ok(())

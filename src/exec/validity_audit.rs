@@ -80,7 +80,96 @@
 
 use arrow_array::Array;
 
-use crate::jit::valid_flag_kernels::pack_validity_bits;
+use crate::jit::valid_flag_kernels::{pack_validity_bits, unpacked_to_packed_validity};
+
+/// The two on-device validity buffer formats the engine uses.
+///
+/// Validity bitmaps live on the device in one of two shapes, and confusing
+/// them is the root cause of the "kernel flags input as needing validity but
+/// the GPU column has no validity bitmap on device" class of failure: the
+/// column *does* carry a device bitmap, but in the format the consuming
+/// kernel doesn't read.
+///
+/// * [`Self::Unpacked`] — one `u8` per row (`0` = NULL, non-zero = present),
+///   buffer length `n_rows`. Stored by `GpuColumnData::{I32,I64,F32,F64}`
+///   (their `validity` field) and `BoolNullable`; read directly by
+///   `emit_is_null_check`.
+/// * [`Self::Packed`] — Arrow-LE bits (bit `i % 8` of byte `i / 8`), buffer
+///   length `ceil(n_rows / 8)`. Stored by `GpuColumnData::{DictUtf8,
+///   Decimal128}` (their `valid_mask` field); the ONLY format the
+///   `*_with_validity` valid-flag kernels
+///   ([`crate::jit::valid_flag_kernels`] /
+///   [`crate::jit::valid_flag_float`]) consume.
+///
+/// A nullable primitive column whose device validity is [`Self::Unpacked`] is
+/// recognised as *having device validity* — it is repacked into
+/// [`Self::Packed`] via [`normalize_device_validity_to_packed`] (host-side)
+/// before being threaded into a valid-flag kernel, rather than being reported
+/// as "no validity bitmap on device".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceValidityFormat {
+    /// One `u8` per row (`0` = NULL, non-zero = present); length `n_rows`.
+    Unpacked,
+    /// Arrow-LE packed bits; length `ceil(n_rows / 8)`.
+    Packed,
+}
+
+impl DeviceValidityFormat {
+    /// Expected device buffer length (in bytes) for `n_rows` rows in this
+    /// format. Useful for asserting a downloaded / uploaded buffer has the
+    /// shape the consuming kernel expects.
+    pub fn buffer_len(self, n_rows: usize) -> usize {
+        match self {
+            DeviceValidityFormat::Unpacked => n_rows,
+            DeviceValidityFormat::Packed => n_rows.div_ceil(8),
+        }
+    }
+}
+
+/// Normalise a device-validity buffer of either [`DeviceValidityFormat`] into
+/// the **packed** Arrow-LE layout the `*_with_validity` valid-flag kernels
+/// consume.
+///
+/// A [`DeviceValidityFormat::Packed`] input is already in the target layout
+/// and is returned (truncated / zero-extended) to exactly `ceil(n_rows / 8)`
+/// bytes. A [`DeviceValidityFormat::Unpacked`] input (the primitive-column
+/// shape) is repacked via
+/// [`crate::jit::valid_flag_kernels::unpacked_to_packed_validity`].
+///
+/// This is the host-side bridge that lets a nullable primitive column — whose
+/// device validity is stored unpacked — be threaded into the packed-bit
+/// kernel ABI without erroring on the format mismatch.
+pub fn normalize_device_validity_to_packed(
+    buf: &[u8],
+    format: DeviceValidityFormat,
+    n_rows: usize,
+) -> Vec<u8> {
+    match format {
+        DeviceValidityFormat::Unpacked => unpacked_to_packed_validity(buf, n_rows),
+        DeviceValidityFormat::Packed => {
+            let n_bytes = n_rows.div_ceil(8);
+            let mut out = vec![0u8; n_bytes];
+            let copy = n_bytes.min(buf.len());
+            out[..copy].copy_from_slice(&buf[..copy]);
+            out
+        }
+    }
+}
+
+/// Does an Arrow array carry validity that the GPU side must honour?
+///
+/// `true` iff the array has at least one NULL (`null_count() > 0`). This is
+/// the host-side predicate the validity-aware launch paths gate on BEFORE
+/// building / uploading a device bitmap: a NULL-free array needs no bitmap at
+/// all (every row is implicitly valid), so the upload is skipped entirely.
+///
+/// A `true` here means the column WILL have a device validity bitmap once
+/// uploaded — so an audit / dispatch site should treat it as
+/// "validity-present on device" rather than reporting the missing-bitmap
+/// error.
+pub fn array_needs_device_validity(arr: &dyn Array) -> bool {
+    arr.null_count() > 0
+}
 
 /// Build the Arrow-LE packed-bit validity bitmap for `arr` (bit `i` of byte
 /// `i / 8` is `1` iff row `i` is present / non-NULL), ready to upload as a
@@ -148,5 +237,76 @@ mod tests {
             Arc::new(Int32Array::from(vec![Option::<i32>::None; 8]));
         let packed = packed_validity_for(arr.as_ref());
         assert_eq!(packed, vec![0x00u8]);
+    }
+
+    /// Normalising an UNPACKED device buffer must produce the same packed
+    /// Arrow-LE bytes as packing the source array directly — proving the
+    /// primitive-column unpacked bitmap is interchangeable with a freshly
+    /// built packed one.
+    #[test]
+    fn normalize_unpacked_matches_packed_for_same_validity() {
+        // present, null, present, null, ... over 8 rows.
+        let arr = Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(2),
+            None,
+            Some(3),
+            None,
+            Some(4),
+            None,
+        ]);
+        let want = packed_validity_for(&arr); // = [0x55]
+
+        // The unpacked on-device form: one u8 per row (1 = present, 0 = NULL).
+        let unpacked: Vec<u8> =
+            (0..arr.len()).map(|i| if arr.is_null(i) { 0 } else { 1 }).collect();
+        let got = normalize_device_validity_to_packed(
+            &unpacked,
+            DeviceValidityFormat::Unpacked,
+            arr.len(),
+        );
+        assert_eq!(got, want);
+    }
+
+    /// Normalising an already-PACKED buffer is an identity (resized to
+    /// `ceil(n_rows/8)`).
+    #[test]
+    fn normalize_packed_is_identity() {
+        let packed = vec![0x55u8];
+        let got = normalize_device_validity_to_packed(
+            &packed,
+            DeviceValidityFormat::Packed,
+            8,
+        );
+        assert_eq!(got, vec![0x55u8]);
+
+        // A packed buffer covering 17 rows is 3 bytes; a short input
+        // zero-extends, a long input truncates.
+        let got = normalize_device_validity_to_packed(
+            &[0xFFu8],
+            DeviceValidityFormat::Packed,
+            17,
+        );
+        assert_eq!(got, vec![0xFF, 0x00, 0x00]);
+    }
+
+    /// `buffer_len` reflects the two formats' byte footprints.
+    #[test]
+    fn device_validity_format_buffer_len() {
+        assert_eq!(DeviceValidityFormat::Unpacked.buffer_len(17), 17);
+        assert_eq!(DeviceValidityFormat::Packed.buffer_len(17), 3);
+        assert_eq!(DeviceValidityFormat::Packed.buffer_len(8), 1);
+        assert_eq!(DeviceValidityFormat::Packed.buffer_len(0), 0);
+    }
+
+    /// `array_needs_device_validity` mirrors `null_count() > 0`.
+    #[test]
+    fn array_needs_device_validity_tracks_null_count() {
+        let with_nulls = Int32Array::from(vec![Some(1), None, Some(3)]);
+        assert!(array_needs_device_validity(&with_nulls));
+
+        let no_nulls = Int64Array::from((0..8i64).collect::<Vec<_>>());
+        assert!(!array_needs_device_validity(&no_nulls));
     }
 }

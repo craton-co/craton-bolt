@@ -31,37 +31,20 @@
 //!
 //! ## Prometheus
 //!
-//! A textfile / `/metrics` handler maps the snapshot to exposition format. Each
-//! counter is a Prometheus *counter*; each histogram bucket is a cumulative
-//! `_bucket{le=...}` series. Cheap pseudocode:
+//! A textfile / `/metrics` handler maps the snapshot to exposition format via
+//! [`render_prometheus`] — no external metrics crate, no new dependency. Each
+//! counter becomes a Prometheus *counter* (`craton_<name>`); each phase
+//! histogram becomes a Prometheus *histogram* with cumulative
+//! `craton_phase_latency_seconds_bucket{phase="…",le="…"}` series plus the
+//! conventional `_count` / `_sum` companions. The whole `/metrics` body is one
+//! call:
 //!
 //! ```ignore
-//! use craton_bolt::metrics_snapshot; // = craton_bolt::snapshot(), re-exported
+//! use craton_bolt::{metrics_snapshot, render_prometheus};
 //!
-//! let s = metrics_snapshot();
-//! let mut out = String::new();
-//! for (name, value) in s.counters() {
-//!     out += &format!("# TYPE bolt_{name} counter\nbolt_{name} {value}\n");
-//! }
-//! for h in s.histograms() {
-//!     out += &format!("# TYPE bolt_phase_latseconds_{} histogram\n", h.phase.as_str());
-//!     let mut cumulative = 0u64;
-//!     for (upper_us, count) in h.buckets() {
-//!         cumulative += count;
-//!         let le = upper_us as f64 / 1e6; // bucket upper bound, seconds
-//!         out += &format!(
-//!             "bolt_phase_latseconds_{}_bucket{{le=\"{le}\"}} {cumulative}\n",
-//!             h.phase.as_str()
-//!         );
-//!     }
-//!     out += &format!(
-//!         "bolt_phase_latseconds_{}_bucket{{le=\"+Inf\"}} {}\n",
-//!         h.phase.as_str(), h.count
-//!     );
-//!     out += &format!("bolt_phase_latseconds_{}_count {}\n", h.phase.as_str(), h.count);
-//!     out += &format!("bolt_phase_latseconds_{}_sum {}\n",
-//!         h.phase.as_str(), h.sum_micros as f64 / 1e6);
-//! }
+//! // GET /metrics
+//! let body = render_prometheus(&metrics_snapshot());
+//! // -> Content-Type: text/plain; version=0.0.4
 //! ```
 //!
 //! ## Structured logs
@@ -138,8 +121,8 @@ impl Counter {
         Counter::HostFallbacksTotal,
     ];
 
-    /// Stable snake_case name, suitable as a metric key (no `bolt_` prefix —
-    /// add your own namespace at export time).
+    /// Stable snake_case name, suitable as a metric key (no `craton_` prefix —
+    /// add your own namespace at export time, e.g. [`render_prometheus`]).
     pub const fn as_str(self) -> &'static str {
         match self {
             Counter::QueriesTotal => "queries_total",
@@ -148,6 +131,23 @@ impl Counter {
             Counter::PtxCacheMisses => "ptx_cache_misses",
             Counter::GpuLaunchesTotal => "gpu_launches_total",
             Counter::HostFallbacksTotal => "host_fallbacks_total",
+        }
+    }
+
+    /// One-line, human-readable description for the Prometheus `# HELP` line.
+    ///
+    /// Stable prose; safe to surface in a dashboard. Kept free of `\n` and `\`
+    /// so it needs no exposition-format escaping.
+    pub const fn help(self) -> &'static str {
+        match self {
+            Counter::QueriesTotal => "Total queries accepted for execution (success or failure).",
+            Counter::QueriesFailed => "Queries that returned an error from any phase.",
+            Counter::PtxCacheHits => "PTX module cache lookups that hit a warm entry.",
+            Counter::PtxCacheMisses => "PTX module cache lookups that had to compile or load.",
+            Counter::GpuLaunchesTotal => "Kernel grid launches issued to the driver.",
+            Counter::HostFallbacksTotal => {
+                "Queries or sub-plans that fell back to the host execution path."
+            }
         }
     }
 }
@@ -198,6 +198,16 @@ impl Phase {
             Phase::Plan => "plan",
             Phase::Lower => "lower",
             Phase::Materialize => "materialize",
+        }
+    }
+
+    /// One-line description for the Prometheus `# HELP` line.
+    pub const fn help(self) -> &'static str {
+        match self {
+            Phase::Parse => "SQL text to LogicalPlan latency.",
+            Phase::Plan => "Logical-plan rewrite pipeline latency.",
+            Phase::Lower => "LogicalPlan to PhysicalPlan lowering latency.",
+            Phase::Materialize => "Arrow array packing (result materialization) latency.",
         }
     }
 }
@@ -414,6 +424,163 @@ pub fn metrics() -> &'static Metrics {
 /// internals.
 pub fn snapshot() -> MetricsSnapshot {
     metrics().snapshot()
+}
+
+/// Metric-name prefix applied to every series rendered by
+/// [`render_prometheus`]. Kept as one constant so the namespace is changed in
+/// exactly one place.
+const PROM_PREFIX: &str = "craton_";
+
+/// Fully-qualified name of the per-phase latency histogram (without the
+/// `_bucket` / `_count` / `_sum` suffixes Prometheus appends to a histogram).
+/// Latency is reported in **seconds** per Prometheus base-unit convention,
+/// converted from the registry's internal micro-second accounting.
+const PROM_PHASE_HISTOGRAM: &str = "craton_phase_latency_seconds";
+
+/// Render `snap` as a Prometheus text-exposition (`text/plain; version=0.0.4`)
+/// document.
+///
+/// This is the production replacement for the old hand-rolled scraping
+/// pseudocode: pure host code, zero new dependencies, always available (no
+/// cargo feature gate). It renders **exactly** what the snapshot holds — every
+/// live [`Counter`] and every [`Phase`] histogram — and invents nothing that is
+/// not recorded.
+///
+/// ## Shape
+///
+/// Each counter emits the canonical three lines:
+///
+/// ```text
+/// # HELP craton_queries_total Total queries accepted for execution (success or failure).
+/// # TYPE craton_queries_total counter
+/// craton_queries_total 7
+/// ```
+///
+/// Each phase histogram emits a single `# HELP`/`# TYPE … histogram` header
+/// (the metric is shared across phases, distinguished by a `phase` label),
+/// followed, for every phase, by cumulative `_bucket{phase,le}` series — bucket
+/// upper bounds converted µs → seconds, terminating in `le="+Inf"` — plus the
+/// conventional `_sum` (seconds) and `_count` companions:
+///
+/// ```text
+/// # HELP craton_phase_latency_seconds Per-phase pipeline latency in seconds.
+/// # TYPE craton_phase_latency_seconds histogram
+/// craton_phase_latency_seconds_bucket{phase="parse",le="0.000001"} 0
+/// ...
+/// craton_phase_latency_seconds_bucket{phase="parse",le="+Inf"} 0
+/// craton_phase_latency_seconds_sum{phase="parse"} 0
+/// craton_phase_latency_seconds_count{phase="parse"} 0
+/// ```
+///
+/// The output always ends with a trailing newline, as required by the
+/// exposition format.
+pub fn render_prometheus(snap: &MetricsSnapshot) -> String {
+    let mut out = String::new();
+
+    // --- Counters -----------------------------------------------------------
+    for &c in Counter::ALL.iter() {
+        let name = c.as_str();
+        let value = snap.counter(c);
+        out.push_str("# HELP ");
+        out.push_str(PROM_PREFIX);
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(c.help());
+        out.push('\n');
+
+        out.push_str("# TYPE ");
+        out.push_str(PROM_PREFIX);
+        out.push_str(name);
+        out.push_str(" counter\n");
+
+        out.push_str(PROM_PREFIX);
+        out.push_str(name);
+        out.push(' ');
+        push_u64(&mut out, value);
+        out.push('\n');
+    }
+
+    // --- Phase histograms ---------------------------------------------------
+    //
+    // One metric (`craton_phase_latency_seconds`) keyed by a `phase` label, so
+    // the HELP/TYPE header is emitted once and every phase contributes its own
+    // labelled bucket/sum/count series. This is the idiomatic way to expose a
+    // family of same-shape histograms in Prometheus.
+    out.push_str("# HELP ");
+    out.push_str(PROM_PHASE_HISTOGRAM);
+    out.push_str(" Per-phase pipeline latency in seconds.\n");
+    out.push_str("# TYPE ");
+    out.push_str(PROM_PHASE_HISTOGRAM);
+    out.push_str(" histogram\n");
+
+    for h in snap.histograms() {
+        let phase = h.phase.as_str();
+
+        // Cumulative buckets: Prometheus `_bucket{le}` series are monotone
+        // non-decreasing, so we accumulate the per-bucket (non-cumulative)
+        // counts the snapshot stores.
+        let mut cumulative: u64 = 0;
+        for (upper_us, count) in h.buckets() {
+            cumulative += count;
+            out.push_str(PROM_PHASE_HISTOGRAM);
+            out.push_str("_bucket{phase=\"");
+            out.push_str(phase);
+            out.push_str("\",le=\"");
+            push_seconds(&mut out, upper_us);
+            out.push_str("\"} ");
+            push_u64(&mut out, cumulative);
+            out.push('\n');
+        }
+        // The final, mandatory `+Inf` bucket equals the total observation
+        // count. The last finite bucket is the overflow class, so its
+        // cumulative total already equals `h.count`; emitting `+Inf`
+        // explicitly is required by the format regardless.
+        out.push_str(PROM_PHASE_HISTOGRAM);
+        out.push_str("_bucket{phase=\"");
+        out.push_str(phase);
+        out.push_str("\",le=\"+Inf\"} ");
+        push_u64(&mut out, h.count);
+        out.push('\n');
+
+        // `_sum` in seconds, `_count` as the raw observation total.
+        out.push_str(PROM_PHASE_HISTOGRAM);
+        out.push_str("_sum{phase=\"");
+        out.push_str(phase);
+        out.push_str("\"} ");
+        push_seconds(&mut out, h.sum_micros);
+        out.push('\n');
+
+        out.push_str(PROM_PHASE_HISTOGRAM);
+        out.push_str("_count{phase=\"");
+        out.push_str(phase);
+        out.push_str("\"} ");
+        push_u64(&mut out, h.count);
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Append the decimal form of `v` to `out` without an intermediate allocation
+/// beyond the formatter's own.
+#[inline]
+fn push_u64(out: &mut String, v: u64) {
+    use std::fmt::Write as _;
+    // Writing to a `String` is infallible.
+    let _ = write!(out, "{v}");
+}
+
+/// Append `micros` micro-seconds as a Prometheus-friendly seconds value.
+///
+/// Uses Rust's `f64` `Display` (`{}`), which emits fixed-point decimal — never
+/// scientific notation — so values render as `0.000001`, `0.001048576`,
+/// `8.388608`, all of which the Prometheus text parser accepts. Zero renders as
+/// `0`.
+#[inline]
+fn push_seconds(out: &mut String, micros: u64) {
+    use std::fmt::Write as _;
+    let seconds = micros as f64 / 1e6;
+    let _ = write!(out, "{seconds}");
 }
 
 /// Owned, plain-data snapshot of all counters and histograms.
@@ -658,5 +825,208 @@ mod tests {
         // snapshot() convenience matches metrics().snapshot() shape.
         let s = snapshot();
         assert_eq!(s.histograms().count(), Phase::ALL.len());
+    }
+
+    // ---- Prometheus exposition rendering ----------------------------------
+
+    /// Helper: collect non-comment metric sample lines (drop `# HELP`/`# TYPE`).
+    fn sample_lines(text: &str) -> Vec<&str> {
+        text.lines().filter(|l| !l.starts_with('#')).collect()
+    }
+
+    #[test]
+    fn render_prometheus_empty_snapshot_is_well_formed() {
+        let snap = Metrics::default().snapshot();
+        let out = render_prometheus(&snap);
+
+        // Trailing newline is mandatory in the exposition format.
+        assert!(out.ends_with('\n'), "exposition body must end with a newline");
+        assert!(!out.is_empty());
+
+        // Every counter is present as a fully-qualified three-line block, all
+        // at value 0.
+        for c in Counter::ALL {
+            let name = format!("craton_{}", c.as_str());
+            assert!(
+                out.contains(&format!("# HELP {name} ")),
+                "missing HELP for {name}"
+            );
+            assert!(
+                out.contains(&format!("# TYPE {name} counter\n")),
+                "missing TYPE for {name}"
+            );
+            assert!(
+                out.contains(&format!("\n{name} 0\n")) || out.starts_with(&format!("{name} 0\n")),
+                "missing zero sample line for {name}\n---\n{out}"
+            );
+        }
+
+        // The histogram header appears exactly once.
+        assert_eq!(
+            out.matches("# TYPE craton_phase_latency_seconds histogram\n")
+                .count(),
+            1,
+            "histogram TYPE header must be emitted exactly once"
+        );
+
+        // Each phase contributes a +Inf bucket, a sum and a count, all 0.
+        for p in Phase::ALL {
+            let ph = p.as_str();
+            assert!(out.contains(&format!(
+                "craton_phase_latency_seconds_bucket{{phase=\"{ph}\",le=\"+Inf\"}} 0\n"
+            )));
+            assert!(out.contains(&format!(
+                "craton_phase_latency_seconds_count{{phase=\"{ph}\"}} 0\n"
+            )));
+            assert!(out.contains(&format!(
+                "craton_phase_latency_seconds_sum{{phase=\"{ph}\"}} 0\n"
+            )));
+        }
+    }
+
+    #[test]
+    fn render_prometheus_counter_values_and_help() {
+        let m = Metrics::default();
+        m.add(Counter::QueriesTotal, 7);
+        m.add(Counter::QueriesFailed, 2);
+        m.inc(Counter::PtxCacheHits);
+        m.add(Counter::GpuLaunchesTotal, 4196);
+
+        let out = render_prometheus(&m.snapshot());
+
+        // Exact HELP + TYPE + sample triple for a representative counter.
+        assert!(out.contains(
+            "# HELP craton_queries_total Total queries accepted for execution (success or failure).\n\
+             # TYPE craton_queries_total counter\n\
+             craton_queries_total 7\n"
+        ));
+        // Other recorded values render verbatim.
+        assert!(out.contains("craton_queries_failed 2\n"));
+        assert!(out.contains("craton_ptx_cache_hits 1\n"));
+        assert!(out.contains("craton_gpu_launches_total 4196\n"));
+        // Untouched counter still appears at 0.
+        assert!(out.contains("craton_host_fallbacks_total 0\n"));
+
+        // Counters are emitted in declaration order, before any histogram.
+        let q_total = out.find("craton_queries_total 7").unwrap();
+        let hist = out.find("craton_phase_latency_seconds").unwrap();
+        assert!(q_total < hist, "counters must precede histograms");
+    }
+
+    #[test]
+    fn render_prometheus_histogram_cumulative_buckets_and_seconds() {
+        let m = Metrics::default();
+        // 16 µs -> bucket 4 (covers (8,16]); 17 µs -> bucket 5.
+        m.observe(Phase::Lower, 16);
+        m.observe(Phase::Lower, 17);
+
+        let out = render_prometheus(&m.snapshot());
+
+        // `_count` and `_sum` (seconds) for the touched phase.
+        assert!(out.contains("craton_phase_latency_seconds_count{phase=\"lower\"} 2\n"));
+        // 33 µs = 0.000033 s.
+        assert!(out.contains("craton_phase_latency_seconds_sum{phase=\"lower\"} 0.000033\n"));
+
+        // Buckets are cumulative and monotone non-decreasing. Reconstruct the
+        // (le, cumulative-count) series for the `lower` phase and check it.
+        let lower_buckets: Vec<(String, u64)> = out
+            .lines()
+            .filter(|l| l.starts_with("craton_phase_latency_seconds_bucket{phase=\"lower\","))
+            .map(|l| {
+                let le_start = l.find("le=\"").unwrap() + 4;
+                let le_end = l[le_start..].find('"').unwrap() + le_start;
+                let le = l[le_start..le_end].to_string();
+                let count: u64 = l.rsplit(' ').next().unwrap().parse().unwrap();
+                (le, count)
+            })
+            .collect();
+
+        // Monotone non-decreasing cumulative counts.
+        let mut prev = 0u64;
+        for (_, c) in &lower_buckets {
+            assert!(*c >= prev, "bucket counts must be cumulative/monotone");
+            prev = *c;
+        }
+        // Final +Inf bucket equals total count (2).
+        let inf = lower_buckets.last().unwrap();
+        assert_eq!(inf.0, "+Inf");
+        assert_eq!(inf.1, 2);
+
+        // The first observation (16µs, bucket 4 -> le 16µs = 0.000016 s) is the
+        // first le at which the cumulative count reaches 1.
+        let first_nonzero = lower_buckets.iter().find(|(_, c)| *c >= 1).unwrap();
+        assert_eq!(first_nonzero.0, "0.000016");
+        assert_eq!(first_nonzero.1, 1);
+
+        // Every finite bucket has 24 entries + 1 for +Inf.
+        assert_eq!(lower_buckets.len(), HISTOGRAM_BUCKETS + 1);
+    }
+
+    #[test]
+    fn render_prometheus_names_are_valid() {
+        // Render a fully-populated snapshot and validate every metric name and
+        // label against the Prometheus name grammar.
+        let m = Metrics::default();
+        for c in Counter::ALL {
+            m.add(c, 3);
+        }
+        for p in Phase::ALL {
+            m.observe(p, 5);
+        }
+        let out = render_prometheus(&m.snapshot());
+
+        // Metric name: [a-zA-Z_][a-zA-Z0-9_]* (suffixes/labels stripped).
+        fn valid_metric_name(name: &str) -> bool {
+            let mut chars = name.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+                _ => return false,
+            }
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+
+        for line in sample_lines(&out) {
+            assert!(!line.is_empty());
+            // Series := <name>[{labels}] <value>
+            let (series, value) = line.rsplit_once(' ').expect("sample line has a value");
+            assert!(!value.is_empty());
+
+            let metric = match series.split_once('{') {
+                Some((name, labels)) => {
+                    assert!(labels.ends_with('}'), "label set must close: {line}");
+                    name
+                }
+                None => series,
+            };
+            assert!(
+                valid_metric_name(metric),
+                "invalid metric name {metric:?} in line {line:?}"
+            );
+            assert!(
+                metric.starts_with("craton_"),
+                "metric {metric:?} must carry the craton_ prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn render_prometheus_renders_only_recorded_metrics() {
+        // No surprise series: the only metric families are the six counters and
+        // the single phase-latency histogram. Count distinct `# TYPE` headers.
+        let out = render_prometheus(&Metrics::default().snapshot());
+        let type_lines: Vec<&str> = out.lines().filter(|l| l.starts_with("# TYPE ")).collect();
+        // 6 counters + 1 histogram family.
+        assert_eq!(type_lines.len(), Counter::ALL.len() + 1);
+        assert_eq!(
+            type_lines
+                .iter()
+                .filter(|l| l.ends_with(" histogram"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            type_lines.iter().filter(|l| l.ends_with(" counter")).count(),
+            Counter::ALL.len()
+        );
     }
 }

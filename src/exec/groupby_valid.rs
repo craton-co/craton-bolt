@@ -1669,6 +1669,19 @@ fn run_typed_agg(
     }
 }
 
+/// Build the packed Arrow-LE validity bitmap for a native-validity agg
+/// launch from a per-row `value_valid` mask (`true` = present).
+///
+/// The output is exactly `ceil(value_valid.len() / 8)` bytes, bit `i % 8`
+/// of byte `i / 8` set iff row `i` is present — the
+/// [`crate::exec::validity_audit::DeviceValidityFormat::Packed`] layout the
+/// `*_with_validity` valid-flag kernels read. Thin wrapper over
+/// [`crate::jit::valid_flag_kernels::pack_validity_bits`] kept as a named
+/// host-testable seam so the threading contract is exercised without a GPU.
+fn build_native_validity_bitmap(value_valid: &[bool]) -> Vec<u8> {
+    pack_validity_bits(value_valid)
+}
+
 /// PV-stage-f: sentinel-free native-validity dispatch. Upload the FULL
 /// value column verbatim + the packed Arrow LE bitmap and let the GPU
 /// kernel skip NULL rows on the device. Mirror of `groupby.rs`'s helper
@@ -1702,8 +1715,13 @@ fn run_typed_agg_native_validity(
 ) -> BoltResult<AccDownload> {
     debug_assert_eq!(value_valid.len(), n_rows);
 
-    // Pack to Arrow LE bytes — `valid_flag_kernels` consumes `Vec<u8>`.
-    let packed_bytes = pack_validity_bits(value_valid);
+    // Build the packed Arrow-LE bitmap the valid-flag `_with_validity`
+    // kernels consume. `build_native_validity_bitmap` centralises the
+    // per-row-bool -> packed-bit contract (one bit per row, bit `i % 8` of
+    // byte `i / 8`, `1` = present) so the host-built bitmap is bit-identical
+    // to what an on-device unpacked->packed repack would produce — see
+    // `crate::exec::validity_audit::DeviceValidityFormat`.
+    let packed_bytes = build_native_validity_bitmap(value_valid);
     let validity_gpu = GpuVec::<u8>::from_slice_async(&packed_bytes, stream.raw())?;
     let validity_ptr = Some(validity_gpu.device_ptr());
 
@@ -2720,6 +2738,44 @@ mod tests {
         let batch2 = one_col_batch("v", arr2);
         let mask = column_null_mask(&io, &batch2).unwrap().expect("mask");
         assert_eq!(mask, vec![true, false, true]);
+    }
+
+    /// The native-validity bitmap built from a per-row mask must be the
+    /// packed Arrow-LE layout the `_with_validity` kernels consume, and must
+    /// agree bit-for-bit with `validity_audit::packed_validity_for` over the
+    /// equivalent nullable column. This is the host side of the threading
+    /// contract that lets a nullable primitive column carry a real device
+    /// validity bitmap rather than tripping the "no validity bitmap on
+    /// device" error.
+    #[test]
+    fn build_native_validity_bitmap_matches_arrow_le() {
+        // present, null, present, null, ... over 8 rows -> 0x55.
+        let arr = Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(2),
+            None,
+            Some(3),
+            None,
+            Some(4),
+            None,
+        ]);
+        let value_valid: Vec<bool> =
+            (0..arr.len()).map(|i| !arr.is_null(i)).collect();
+
+        let bitmap = build_native_validity_bitmap(&value_valid);
+        assert_eq!(bitmap, vec![0x55u8]);
+        // Same bytes as the audit-module builder over the source column.
+        assert_eq!(
+            bitmap,
+            crate::exec::validity_audit::packed_validity_for(&arr)
+        );
+
+        // Length is ceil(n/8) for a non-byte-aligned row count.
+        let value_valid = vec![true; 17];
+        let bitmap = build_native_validity_bitmap(&value_valid);
+        assert_eq!(bitmap.len(), 3);
+        assert_eq!(bitmap[2], 0x01);
     }
 
     /// `collect_filtered_primitive` drops positions where EITHER mask is

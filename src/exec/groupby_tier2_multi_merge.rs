@@ -2,11 +2,29 @@
 
 //! Tier-2 hash-partitioned GROUP BY **multi-SUM** result merger.
 //!
-//! Sibling of [`crate::exec::groupby_tier2_merge`]: concatenates per-partition
+//! Sibling of [`crate::exec::groupby_tier2_merge`]: combines per-partition
 //! partial results into a final `RecordBatch`, but with `N` Float64 SUM output
 //! columns instead of one. The Tier-2 partition invariant (each input key
-//! hashes to exactly one partition) still holds — the per-partition key sets
-//! are pairwise disjoint, so concatenation suffices; no second-level reduce.
+//! hashes to exactly one partition) means the per-partition key sets *should*
+//! be pairwise disjoint — but the merge does NOT rely on that for correctness.
+//!
+//! ## Defensive key dedup (Tier-2 phantom-group fix)
+//!
+//! At ~10M-row / ~1M-distinct-key scale a per-partition open-addressing
+//! REDUCE kernel can, under a publish/probe race, mint the *same* key into
+//! two distinct slots of one block's table. Each populated slot is exported
+//! independently, so the orchestrator's per-partition slot walk hands us two
+//! `(key, sums)` rows for that key — a phantom/duplicate group. A naive
+//! concatenate-and-sort would surface both rows in the final batch (the q2
+//! stress test saw ~1519 such phantoms for ≤1M keys).
+//!
+//! The merge therefore SUMS rows that share a key rather than appending them.
+//! After the stable sort by key, equal keys are adjacent, so a single linear
+//! fold collapses any duplicate-key rows into one — adding their N sum columns
+//! componentwise. This is the same reduction the per-partition table would
+//! have produced had the slot race not split the key, so the result matches
+//! the CPU model whether or not the kernel emitted a phantom slot. In the
+//! common (race-free) case every key is unique and the fold is a pure copy.
 //!
 //! Output ordering: sorted by key ASC (matches the SQL canonical and what
 //! DuckDB/Polars produce for `ORDER BY 1`). The sort uses a `permutation`
@@ -88,28 +106,44 @@ pub fn build_tier2_multi_result(
         }
     }
 
-    // 3. Sort by key ASC using a permutation index. We materialise the
-    //    permutation once, then apply it to the key column and each of the
-    //    N sum columns. This avoids the `Vec<(i32, [f64; N])>` zip+sort+unzip
-    //    intermediate, which would move 8 + 8*N bytes per row twice and is
-    //    measurably slower for N >= 2.
+    // 3. Sort by key ASC using a permutation index, then fold duplicate keys.
+    //    We materialise the permutation once, then walk it in sorted order
+    //    accumulating N sum columns per distinct key. This avoids the
+    //    `Vec<(i32, [f64; N])>` zip+sort+unzip intermediate (which would move
+    //    8 + 8*N bytes per row twice) and, in the same pass, collapses any
+    //    rows that share a key — the defensive phantom-group dedup described
+    //    in the module docs. Two rows with the same key (e.g. a per-partition
+    //    REDUCE kernel that minted the key into two slots under a publish
+    //    race) are summed into one output row rather than both surfacing.
     if keys_out.len() > 1 {
         let mut perm: Vec<usize> = (0..keys_out.len()).collect();
-        perm.sort_unstable_by_key(|&i| keys_out[i]);
+        // Stable sort so that, among rows sharing a key, the accumulation
+        // order is deterministic (input/partition order) — keeps the f64
+        // add ordering reproducible across runs.
+        perm.sort_by_key(|&i| keys_out[i]);
 
-        // Apply the permutation. We allocate fresh output vecs of the same
-        // capacity and gather in permutation order; in-place permutation
-        // would save the allocation but is fiddly with multiple columns of
-        // differing types. The extra allocation is bounded by the result
-        // size (already much smaller than the input GPU buffers).
+        // Allocate fresh output vecs; capacity is the pre-dedup count (an
+        // upper bound on distinct keys). The extra headroom is bounded by the
+        // result size, already far smaller than the input GPU buffers.
         let mut new_keys: Vec<i32> = Vec::with_capacity(keys_out.len());
         let mut new_sums: Vec<Vec<f64>> = (0..n_vals)
             .map(|_| Vec::with_capacity(keys_out.len()))
             .collect();
         for &i in &perm {
-            new_keys.push(keys_out[i]);
-            for j in 0..n_vals {
-                new_sums[j].push(sums_out[j][i]);
+            let key = keys_out[i];
+            // Fold into the previous output row when this key repeats the
+            // last emitted key (adjacent after the sort). Otherwise start a
+            // new output row.
+            if new_keys.last() == Some(&key) {
+                let last = new_keys.len() - 1;
+                for j in 0..n_vals {
+                    new_sums[j][last] += sums_out[j][i];
+                }
+            } else {
+                new_keys.push(key);
+                for j in 0..n_vals {
+                    new_sums[j].push(sums_out[j][i]);
+                }
             }
         }
         keys_out = new_keys;
@@ -253,6 +287,114 @@ mod tests {
         assert_eq!(keys, vec![1, 2]);
         assert_eq!(sums[0], vec![5.0, 6.0]);
         assert_eq!(sums[1], vec![50.0, 60.0]);
+    }
+
+    // --- Phantom-group dedup regression tests (Tier-2 fix) ------------------
+    //
+    // These directly attack the bug the fix targets: a per-partition REDUCE
+    // kernel minting the SAME key into two exported slots (within one
+    // partition, or — defensively — across partitions). The merge must SUM
+    // such rows into one output group, never append both. A pre-fix merge
+    // would surface duplicate keys here.
+
+    #[test]
+    fn duplicate_key_within_one_partition_is_summed_n2() {
+        // One partition exports key 5 twice (the phantom slot) plus key 3
+        // once. The merge must collapse the two key-5 rows into a single
+        // group whose sums are the componentwise total.
+        let schema = out_schema_n(2);
+        let partial = Tier2MultiPartial {
+            per_partition: vec![(
+                vec![5, 3, 5],
+                vec![
+                    vec![10.0, 7.0, 1.0], // v0: key5=10+1=11, key3=7
+                    vec![20.0, 8.0, 2.0], // v1: key5=20+2=22, key3=8
+                ],
+            )],
+            n_vals: 2,
+        };
+        let batch = build_tier2_multi_result(partial, &schema).expect("build ok");
+        let (keys, sums) = extract(&batch, 2);
+        assert_eq!(keys, vec![3, 5], "duplicate key 5 must collapse to one row");
+        assert_eq!(sums[0], vec![7.0, 11.0]);
+        assert_eq!(sums[1], vec![8.0, 22.0]);
+    }
+
+    #[test]
+    fn duplicate_key_across_partitions_is_summed_n3() {
+        // A key appearing in two partitions' outputs (e.g. a hypothetical
+        // partition-hash leak) must also be merged, not appended.
+        let schema = out_schema_n(3);
+        let partial = Tier2MultiPartial {
+            per_partition: vec![
+                (vec![9], vec![vec![1.0], vec![10.0], vec![100.0]]),
+                (vec![9], vec![vec![2.0], vec![20.0], vec![200.0]]),
+                (vec![4], vec![vec![5.0], vec![50.0], vec![500.0]]),
+            ],
+            n_vals: 3,
+        };
+        let batch = build_tier2_multi_result(partial, &schema).expect("build ok");
+        let (keys, sums) = extract(&batch, 3);
+        assert_eq!(keys, vec![4, 9], "key 9 from two partitions collapses");
+        assert_eq!(sums[0], vec![5.0, 3.0]);
+        assert_eq!(sums[1], vec![50.0, 30.0]);
+        assert_eq!(sums[2], vec![500.0, 300.0]);
+    }
+
+    #[test]
+    fn three_way_duplicate_key_is_summed_n1() {
+        // Same key minted three times — fold must accumulate all three.
+        let schema = out_schema_n(1);
+        let partial = Tier2MultiPartial {
+            per_partition: vec![
+                (vec![7, 7], vec![vec![1.0, 2.0]]),
+                (vec![7], vec![vec![4.0]]),
+            ],
+            n_vals: 1,
+        };
+        let batch = build_tier2_multi_result(partial, &schema).expect("build ok");
+        let (keys, sums) = extract(&batch, 1);
+        assert_eq!(keys, vec![7]);
+        assert_eq!(sums[0], vec![7.0], "1+2+4 across three phantom slots");
+    }
+
+    #[test]
+    fn no_duplicates_is_pure_passthrough_n2() {
+        // Race-free common case: every key unique → fold is a sorted copy,
+        // exactly the pre-fix behaviour. Guards against the dedup pass
+        // accidentally dropping or merging distinct keys.
+        let schema = out_schema_n(2);
+        let partial = Tier2MultiPartial {
+            per_partition: vec![(
+                vec![3, 1, 2],
+                vec![vec![30.0, 10.0, 20.0], vec![300.0, 100.0, 200.0]],
+            )],
+            n_vals: 2,
+        };
+        let batch = build_tier2_multi_result(partial, &schema).expect("build ok");
+        let (keys, sums) = extract(&batch, 2);
+        assert_eq!(keys, vec![1, 2, 3]);
+        assert_eq!(sums[0], vec![10.0, 20.0, 30.0]);
+        assert_eq!(sums[1], vec![100.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    fn duplicate_negative_and_zero_keys_summed_n2() {
+        // Phantom dedup must work for key 0 (the value a stale-read race
+        // would surface) and negative keys.
+        let schema = out_schema_n(2);
+        let partial = Tier2MultiPartial {
+            per_partition: vec![(
+                vec![0, -7, 0, -7],
+                vec![vec![1.0, 3.0, 1.0, 3.0], vec![2.0, 4.0, 2.0, 4.0]],
+            )],
+            n_vals: 2,
+        };
+        let batch = build_tier2_multi_result(partial, &schema).expect("build ok");
+        let (keys, sums) = extract(&batch, 2);
+        assert_eq!(keys, vec![-7, 0]);
+        assert_eq!(sums[0], vec![6.0, 2.0]);
+        assert_eq!(sums[1], vec![8.0, 4.0]);
     }
 
     #[test]

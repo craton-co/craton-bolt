@@ -225,6 +225,96 @@ pub(crate) fn emit_loop_next_done(ptx: &mut String) -> BoltResult<()> {
     Ok(())
 }
 
+/// Emit the grid-stride row-loop head, shared verbatim by every
+/// `partition_reduce_kernel*` op family (SUM, COUNT, MIN/MAX-int,
+/// MIN/MAX-float, MULTI), in both key widths and spill variants:
+///
+/// ```text
+/// \tadd.u32 %r30, %r10, %r2;
+/// LOOP_TOP:
+/// \tsetp.ge.u32 %p1, %r30, %r11;
+/// \t@%p1 bra LOOP_DONE;
+/// ```
+///
+/// `%r30` is the per-thread row cursor (`start + tid`), `%r10`/`%r11` hold
+/// the partition slice `[start, end)`, and the loop exits to `LOOP_DONE`.
+/// Every byte is fixed (no register or label substitution), so all callers
+/// share the identical sequence.
+pub(crate) fn emit_loop_head(ptx: &mut String) -> BoltResult<()> {
+    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
+    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit the probe-counter init + `PROBE_TOP` bound-check head shared verbatim
+/// by every op family:
+///
+/// ```text
+/// \tmov.u32 %r33, 0;
+/// PROBE_TOP:
+/// \tadd.u32 %r33, %r33, 1;
+/// \tsetp.gt.u32 %p2, %r33, {max_probes};
+/// \t@%p2 bra {overflow_target};
+/// ```
+///
+/// `%r33` is the per-row probe counter; on exceeding `max_probes` the kernel
+/// branches to `overflow_target` (`"LOOP_NEXT"` for the non-spill kernels,
+/// which silently drop the row, or `"SPILL_BUMP"` for the spill kernels).
+/// Both operands are substituted verbatim, reproducing the prior inline bytes.
+pub(crate) fn emit_probe_bound_check(
+    ptx: &mut String,
+    max_probes: u32,
+    overflow_target: &str,
+) -> BoltResult<()> {
+    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
+    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p2, %r33, {max_probes};").map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 bra {overflow_target};").map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit the slot-claim `atom.shared.cas.b32` + the `@%p3 bra CLAIM;` branch,
+/// shared verbatim by every op family (only the set-flag address operand
+/// differs — `%rd35` for the scalar/min-max kernels, `%rd93` for MULTI):
+///
+/// ```text
+/// \tatom.shared.cas.b32 %r34, [{set_addr_reg}], 0, 1;
+/// \tsetp.eq.s32 %p3, %r34, 0;
+/// \t@%p3 bra CLAIM;
+/// ```
+///
+/// `%r34` receives the prior set value; `%p3` is true (→ `CLAIM`) when this
+/// thread won the empty slot. `set_addr_reg` is the full `%rd*` token for the
+/// `block_set[slot]` address.
+pub(crate) fn emit_slot_claim_cas(ptx: &mut String, set_addr_reg: &str) -> BoltResult<()> {
+    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [{set_addr_reg}], 0, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+    Ok(())
+}
+
+/// Emit the CLAIM-path publish fence + `set:=2` release, shared verbatim by
+/// every op family (only the set-flag address operand differs — `%rd35` for
+/// the scalar/min-max kernels, `%rd93` for MULTI):
+///
+/// ```text
+/// \tmembar.cta;
+/// \tst.shared.u32 [{set_addr_reg}], 2;
+/// ```
+///
+/// This is emitted AFTER the CLAIM key store and BEFORE the op-specific value
+/// accumulate. The `membar.cta` orders the key store ahead of the `set:=2`
+/// publish so a racing prober that observes `set==2` is guaranteed to read the
+/// published key (the 3-state publish protocol's release half).
+pub(crate) fn emit_claim_publish(ptx: &mut String, set_addr_reg: &str) -> BoltResult<()> {
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u32 [{set_addr_reg}], 2;").map_err(write_err)?;
+    Ok(())
+}
+
 /// Register / type tokens that vary between the i32-key and i64-key SUM
 /// kernels when emitting the 3-state publish/probe protocol
 /// ([`emit_publish_probe_protocol`]).
@@ -455,6 +545,85 @@ mod tests {
              \tsetp.eq.s64 %p4, %rd61, %rd60;\n\
              \t@%p4 bra MATCH;\n"
         );
+    }
+
+    #[test]
+    fn loop_head_emits_expected_bytes() {
+        let mut s = String::new();
+        emit_loop_head(&mut s).unwrap();
+        assert_eq!(
+            s,
+            "\tadd.u32 %r30, %r10, %r2;\n\
+             LOOP_TOP:\n\
+             \tsetp.ge.u32 %p1, %r30, %r11;\n\
+             \t@%p1 bra LOOP_DONE;\n"
+        );
+    }
+
+    #[test]
+    fn probe_bound_check_emits_expected_bytes_loop_next() {
+        let mut s = String::new();
+        emit_probe_bound_check(&mut s, 1024, "LOOP_NEXT").unwrap();
+        assert_eq!(
+            s,
+            "\tmov.u32 %r33, 0;\n\
+             PROBE_TOP:\n\
+             \tadd.u32 %r33, %r33, 1;\n\
+             \tsetp.gt.u32 %p2, %r33, 1024;\n\
+             \t@%p2 bra LOOP_NEXT;\n"
+        );
+    }
+
+    #[test]
+    fn probe_bound_check_emits_expected_bytes_spill_bump() {
+        let mut s = String::new();
+        emit_probe_bound_check(&mut s, 1024, "SPILL_BUMP").unwrap();
+        assert_eq!(
+            s,
+            "\tmov.u32 %r33, 0;\n\
+             PROBE_TOP:\n\
+             \tadd.u32 %r33, %r33, 1;\n\
+             \tsetp.gt.u32 %p2, %r33, 1024;\n\
+             \t@%p2 bra SPILL_BUMP;\n"
+        );
+    }
+
+    #[test]
+    fn slot_claim_cas_emits_expected_bytes_rd35() {
+        let mut s = String::new();
+        emit_slot_claim_cas(&mut s, "%rd35").unwrap();
+        assert_eq!(
+            s,
+            "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;\n\
+             \tsetp.eq.s32 %p3, %r34, 0;\n\
+             \t@%p3 bra CLAIM;\n"
+        );
+    }
+
+    #[test]
+    fn slot_claim_cas_emits_expected_bytes_rd93() {
+        let mut s = String::new();
+        emit_slot_claim_cas(&mut s, "%rd93").unwrap();
+        assert_eq!(
+            s,
+            "\tatom.shared.cas.b32 %r34, [%rd93], 0, 1;\n\
+             \tsetp.eq.s32 %p3, %r34, 0;\n\
+             \t@%p3 bra CLAIM;\n"
+        );
+    }
+
+    #[test]
+    fn claim_publish_emits_expected_bytes_rd35() {
+        let mut s = String::new();
+        emit_claim_publish(&mut s, "%rd35").unwrap();
+        assert_eq!(s, "\tmembar.cta;\n\tst.shared.u32 [%rd35], 2;\n");
+    }
+
+    #[test]
+    fn claim_publish_emits_expected_bytes_rd93() {
+        let mut s = String::new();
+        emit_claim_publish(&mut s, "%rd93").unwrap();
+        assert_eq!(s, "\tmembar.cta;\n\tst.shared.u32 [%rd93], 2;\n");
     }
 
     #[test]

@@ -1079,6 +1079,131 @@ fn radix_pre_transform_i64(val: i64, dir: SortDirection) -> i64 {
     }
 }
 
+/// IEEE-monotonic key transform for an `f32`, producing a `u32` bit-blob whose
+/// **unsigned** ascending order equals the floating-point value order.
+///
+/// Radix sort compares keys as unsigned bit patterns, but IEEE-754 floats do
+/// not sort that way directly: negative floats have the sign bit set (so they
+/// would sort *after* positives), and within the negatives larger magnitudes
+/// have larger bit patterns (so they would sort backwards). The standard fix
+/// (Thrust / CUB `radix_sort`): if the sign bit is set, flip **every** bit;
+/// otherwise flip **only** the sign bit. After this, unsigned ascending order
+/// over the transformed bits is exactly value-ascending over the floats, with
+/// `-0.0` and `+0.0` adjacent and NaNs sorting to one end.
+///
+/// `dir` composes exactly as the integer pre-transform does: DESC is the
+/// bitwise-NOT of the ASC key, which inverts the unsigned order.
+///
+/// This is the float counterpart of [`radix_pre_transform_i32`]. It is unit
+/// tested below; wiring it into the dispatch predicate is the remaining F2
+/// step (see the `RadixFlavour::for_dtype` float arm in
+/// `crate::jit::sort_kernel_radix`).
+// Implemented + unit-tested but not yet called by the dispatch path (floats
+// still fall back to bitonic/host); silence the unused warning until wired.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn radix_float_key_f32(f: f32, dir: SortDirection) -> u32 {
+    let b = f.to_bits();
+    // Arithmetic shift of the sign bit gives 0xFFFF_FFFF for negatives, else 0;
+    // OR-in the sign bit so positives still flip just their sign.
+    let mask = ((b as i32) >> 31) as u32 | 0x8000_0000;
+    let asc = b ^ mask;
+    match dir {
+        SortDirection::Asc => asc,
+        SortDirection::Desc => !asc,
+    }
+}
+
+/// IEEE-monotonic key transform for an `f64`. Same algebra as
+/// [`radix_float_key_f32`], scaled to 64 bits.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn radix_float_key_f64(f: f64, dir: SortDirection) -> u64 {
+    let b = f.to_bits();
+    let mask = ((b as i64) >> 63) as u64 | 0x8000_0000_0000_0000;
+    let asc = b ^ mask;
+    match dir {
+        SortDirection::Asc => asc,
+        SortDirection::Desc => !asc,
+    }
+}
+
+/// Turn a per-block-per-digit histogram into per-block-per-digit **exclusive
+/// output offsets** for the stable multi-block LSD radix scatter.
+///
+/// `block_hist` is laid out block-major: `block_hist[b * RADIX_BUCKETS + d]` is
+/// the count of digit `d` in block `b`. `num_blocks` is the launch grid size.
+///
+/// The output `block_offsets` (same layout) gives, for each `(block, digit)`,
+/// the global output position where that block's run of that digit begins. The
+/// scatter kernel reads `block_offsets[blockIdx * 16 + digit]` directly (no
+/// atomic) and lays its elements down at `base + per_block_stable_rank`.
+///
+/// Construction (the standard stable-radix prefix sum):
+///   1. `digit_total[d]` = sum over all blocks of `count(b, d)`.
+///   2. `digit_base[d]`  = exclusive prefix sum of `digit_total` — the start of
+///      digit `d`'s contiguous region in the output array.
+///   3. For each digit `d`, walk blocks in ascending order accumulating a
+///      running offset seeded at `digit_base[d]`:
+///        `block_offsets[b*16 + d] = digit_base[d] + sum_{b'<b} count(b', d)`.
+///
+/// Because the per-digit runs are laid out in ascending `blockIdx` order and
+/// each block then fills its run in ascending `threadIdx` order (the kernel's
+/// stable per-block rank), equal-digit elements keep their input order globally.
+///
+/// Errors if any running offset would overflow `u32` — it cannot in practice
+/// (the grand total is exactly `n_rows <= u32::MAX`), but we make the invariant
+/// load-bearing rather than silently wrapping a garbage readback.
+fn compute_block_offsets(
+    block_hist: &[u32],
+    num_blocks: usize,
+    block_offsets: &mut [u32],
+) -> BoltResult<()> {
+    let buckets = RADIX_BUCKETS as usize;
+    debug_assert_eq!(block_hist.len(), num_blocks * buckets);
+    debug_assert_eq!(block_offsets.len(), num_blocks * buckets);
+
+    // Step 1+2: per-digit totals, then exclusive prefix sum into digit_base.
+    // We fold the two loops together: first accumulate totals, then scan.
+    let mut digit_total = [0u32; RADIX_BUCKETS as usize];
+    for b in 0..num_blocks {
+        let row = &block_hist[b * buckets..b * buckets + buckets];
+        for d in 0..buckets {
+            digit_total[d] = digit_total[d].checked_add(row[d]).ok_or_else(|| {
+                BoltError::Other(
+                    "radix block histogram digit total overflowed u32".into(),
+                )
+            })?;
+        }
+    }
+    let mut digit_base = [0u32; RADIX_BUCKETS as usize];
+    let mut running_base: u32 = 0;
+    for d in 0..buckets {
+        digit_base[d] = running_base;
+        running_base = running_base.checked_add(digit_total[d]).ok_or_else(|| {
+            BoltError::Other(
+                "radix digit base prefix overflowed u32 (invariant: sum == n_rows)".into(),
+            )
+        })?;
+    }
+
+    // Step 3: per digit, accumulate a running offset across blocks. We iterate
+    // digit-outer / block-inner so the running counter resets per digit; the
+    // writes still target the block-major layout `[b*16 + d]`.
+    for d in 0..buckets {
+        let mut running = digit_base[d];
+        for b in 0..num_blocks {
+            block_offsets[b * buckets + d] = running;
+            running = running.checked_add(block_hist[b * buckets + d]).ok_or_else(|| {
+                BoltError::Other(
+                    "radix per-block offset prefix overflowed u32".into(),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Inner pipeline for Int32 keys. Separated from the Int64 variant so the
 /// monomorphic GpuVec types stay statically typed throughout the loop.
 ///
@@ -1131,12 +1256,20 @@ fn run_radix_pipeline_i32(
     // NEW running permutation.
     let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
     let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
-    // Histogram + offsets buffers (16 u32 entries each, reused per pass).
-    // Use `zeros(RADIX_BUCKETS)` so the GpuVec's bookkeeping len is the
-    // full 16-entry size — required for any future to_vec(), and
-    // harmless for the memset_d8 / memcpy_d2h paths we take below.
-    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
-    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
+
+    // Launch shape. `grid_x` (= num_blocks) sizes the per-block-per-digit
+    // histogram / offsets buffers below, so we compute it before allocating.
+    let block_size = RADIX_BLOCK_SIZE;
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
+    let block_hist_len = (grid_x as usize) * (RADIX_BUCKETS as usize);
+
+    // Per-block-per-digit histogram + offsets buffers (num_blocks * 16 u32
+    // entries each, reused per pass). The stable multi-block radix keeps every
+    // block's 16 digit counts separate so the host can build deterministic,
+    // blockIdx-ordered output offsets. `zeros(...)` populates the GpuVec's
+    // bookkeeping len for the memset_d8 / memcpy paths below.
+    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
+    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
 
     // ----- modules + entry points -------------------------------------
     //
@@ -1178,38 +1311,37 @@ fn run_radix_pipeline_i32(
     // a one-shot kernel pre-pass since we already touch every key on the
     // host during gather (for multi-key) or upload (for single-key).
 
-    let block_size = RADIX_BLOCK_SIZE;
-    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
-
-    // PERF (radix round-trip): hoist the two 16-entry host scratch buffers
-    // out of the per-pass loop so we allocate them exactly once for the
-    // whole sort instead of churning a fresh `vec![0u32; 16]` (×2) on every
-    // pass. They are page-locked (`PinnedHostBuffer`) so the per-pass D2H of
-    // the histogram and H2D of the offsets can run as *real* async DMAs on
-    // the sort stream (`cuMemcpy*Async` requires pinned host memory to
-    // overlap — a pageable copy silently degrades to a synchronizing
-    // staging copy). The contents are fully overwritten each pass (the D2H
-    // fills `hist_host`, the scan rewrites `offsets_host` from index 0), so
-    // carrying stale bytes across passes is benign.
+    // PERF (radix round-trip): hoist the two (num_blocks * 16) host scratch
+    // buffers out of the per-pass loop so we allocate them exactly once for the
+    // whole sort instead of churning a fresh Vec on every pass. They are
+    // page-locked (`PinnedHostBuffer`) so the per-pass D2H of the per-block
+    // histogram and H2D of the per-block offsets can run as *real* async DMAs
+    // on the sort stream (`cuMemcpy*Async` requires pinned host memory to
+    // overlap — a pageable copy silently degrades to a synchronizing staging
+    // copy). The contents are fully overwritten each pass (the D2H fills
+    // `hist_host`, `compute_block_offsets` rewrites `offsets_host` from index
+    // 0), so carrying stale bytes across passes is benign.
     let mut hist_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(RADIX_BUCKETS as usize)?;
+        PinnedHostBuffer::<u32>::new(block_hist_len)?;
     let mut offsets_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(RADIX_BUCKETS as usize)?;
+        PinnedHostBuffer::<u32>::new(block_hist_len)?;
 
     // ----- per-pass loop: histogram → host-scan → scatter -------------
     for step in 0..radix_steps {
         let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
 
-        // Zero the histogram buffer for this pass. The same GpuVec is
-        // reused across passes — `memset_d8` directly on the device
-        // pointer avoids the 64-byte allocation churn of re-creating
-        // it. The buffer's GpuVec `len` is already RADIX_BUCKETS
-        // (allocated via `zeros`) so the bytes we zero match the bytes
-        // we later D2H out.
-        let hist_bytes = (RADIX_BUCKETS as usize) * std::mem::size_of::<u32>();
-        // SAFETY: hist_dev was allocated with `zeros(RADIX_BUCKETS)`,
-        // so the underlying allocation has at least RADIX_BUCKETS u32
-        // entries; we zero exactly that many bytes.
+        // Zero the per-block histogram buffer for this pass. The same GpuVec is
+        // reused across passes — `memset_d8` directly on the device pointer
+        // avoids allocation churn. The buffer's GpuVec `len` is `block_hist_len`
+        // (allocated via `zeros`) so the bytes we zero match the bytes we later
+        // D2H out. Zeroing matters: the histogram kernel only writes the 16
+        // slots for blocks that actually launched, and a partial final block
+        // still writes all 16 of its slots, so a stale buffer would not corrupt
+        // results — but zeroing keeps the readback unambiguous.
+        let hist_bytes = block_hist_len * std::mem::size_of::<u32>();
+        // SAFETY: hist_dev was allocated with `zeros(block_hist_len)`, so the
+        // underlying allocation has at least block_hist_len u32 entries; we zero
+        // exactly that many bytes.
         unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
 
         launch_radix_histogram(
@@ -1223,61 +1355,35 @@ fn run_radix_pipeline_i32(
             &stream,
         )?;
 
-        // PERF (radix round-trip): D2H the 16 histogram counts as an *async*
-        // copy on the sort stream into the hoisted pinned buffer, then take
-        // exactly ONE synchronize — this is the single unavoidable serialize
-        // point, because the host prefix-scan below reads `hist_host`. The
-        // old code used `memcpy_d2h` (a synchronizing copy) here AND another
-        // synchronizing `memcpy_h2d` for the offsets, i.e. two stream
-        // serializations per pass; we collapse that to one.
-        // SAFETY: hist_dev is a u32 allocation of RADIX_BUCKETS entries and
-        // hist_host is a pinned buffer of RADIX_BUCKETS u32s; we copy exactly
+        // PERF (radix round-trip): D2H the per-block-per-digit histogram as an
+        // *async* copy on the sort stream into the hoisted pinned buffer, then
+        // take exactly ONE synchronize — the single unavoidable serialize point,
+        // because the host offset computation below reads `hist_host`.
+        // SAFETY: hist_dev is a u32 allocation of block_hist_len entries and
+        // hist_host is a pinned buffer of block_hist_len u32s; we copy exactly
         // that many elements. The pinned host pages stay live until the sync
         // below retires the DMA.
         unsafe {
             cuda_sys::memcpy_d2h_async::<u32>(
                 hist_host.as_mut_ptr(),
                 hist_dev.device_ptr(),
-                RADIX_BUCKETS as usize,
+                block_hist_len,
                 stream.raw(),
             )?;
         }
         stream.synchronize()?;
 
-        // Exclusive prefix scan on host (16 elements — cheaper than a
-        // kernel launch). The device-side scan kernel (a 16-element exclusive
-        // scan launched on `stream`) would eliminate this host leg entirely,
-        // but it requires a new JIT kernel + GPU validation and is out of
-        // scope for this host-only change (see module notes).
-        let hist_slice = hist_host.as_slice();
-        let offsets_slice = offsets_host.as_mut_slice();
-        let mut running: u32 = 0;
-        for i in 0..RADIX_BUCKETS as usize {
-            offsets_slice[i] = running;
-            // PERF (radix round-trip): the original used `wrapping_add`. The
-            // sum of all bucket counts is exactly `n_rows` (every key lands in
-            // one of the 16 buckets), and `n_rows <= u32::MAX`, so `running`
-            // can never exceed `n_rows` and the add never actually wraps. Use
-            // `checked_add` to make that invariant load-bearing rather than
-            // silently masked. A buggy/garbage histogram readback would
-            // otherwise overflow here; map it to a recoverable `BoltError`
-            // (returned via `?`) so the sort degrades gracefully instead of
-            // panicking. The `debug_assert` documents the bound at the point
-            // it must hold.
-            debug_assert!(
-                running <= n_rows_u32,
-                "radix histogram prefix exceeded n_rows: {running} > {n_rows_u32}",
-            );
-            running = running.checked_add(hist_slice[i]).ok_or_else(|| {
-                BoltError::Other(
-                    "radix histogram bucket-sum overflowed u32 (invariant: sum == n_rows)".into(),
-                )
-            })?;
-        }
-        debug_assert_eq!(
-            running, n_rows_u32,
-            "radix histogram bucket-sum != n_rows ({running} != {n_rows_u32})",
-        );
+        // Build per-block-per-digit exclusive output offsets on the host (cheap
+        // — `num_blocks * 16` u32s). This is what makes the scatter stable
+        // across blocks: each block's run for a digit starts where the previous
+        // block's run for that digit ended, in ascending blockIdx order. A
+        // device-side scan kernel would remove this host leg but needs a new
+        // JIT kernel + GPU validation and is out of scope here.
+        compute_block_offsets(
+            hist_host.as_slice(),
+            grid_x as usize,
+            offsets_host.as_mut_slice(),
+        )?;
 
         // PERF (radix round-trip): H2D the offsets as an *async* copy on the
         // same stream. We deliberately do NOT synchronize here — the scatter
@@ -1285,14 +1391,14 @@ fn run_radix_pipeline_i32(
         // ordering guarantees it observes the completed H2D. The final
         // `stream.synchronize()` after the loop fences the last pass's pinned
         // source pages before they are reused / dropped.
-        // SAFETY: offsets_dev has RADIX_BUCKETS u32 entries; offsets_host is a
-        // pinned buffer of RADIX_BUCKETS u32s. The pinned source stays live
+        // SAFETY: offsets_dev has block_hist_len u32 entries; offsets_host is a
+        // pinned buffer of block_hist_len u32s. The pinned source stays live
         // until the post-loop synchronize (the buffer outlives the loop).
         unsafe {
             cuda_sys::memcpy_h2d_async::<u32>(
                 offsets_dev.device_ptr(),
                 offsets_host.as_ptr(),
-                RADIX_BUCKETS as usize,
+                block_hist_len,
                 stream.raw(),
             )?;
         }
@@ -1365,8 +1471,14 @@ fn run_radix_pipeline_i64(
     let mut keys_pong: GpuVec<i64> = GpuVec::<i64>::from_slice(&gathered)?;
     let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
     let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
-    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
-    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(RADIX_BUCKETS as usize)?;
+
+    // Launch shape + per-block-per-digit buffer sizing — see the i32 mirror.
+    let block_size = RADIX_BLOCK_SIZE;
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
+    let block_hist_len = (grid_x as usize) * (RADIX_BUCKETS as usize);
+
+    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
+    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
 
     let stream = CudaStream::null();
     // See `run_radix_pipeline_i32` for the cache-layer rationale; this is
@@ -1397,25 +1509,22 @@ fn run_radix_pipeline_i64(
     // applied during gather above subsumes both signed-MSB and DESC
     // bit-not in a single XOR.
 
-    let block_size = RADIX_BLOCK_SIZE;
-    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
-
-    // PERF (radix round-trip): hoist the two 16-entry host scratch buffers
-    // out of the per-pass loop (i64 mirror of the i32 driver) — allocate the
-    // pinned histogram / offsets scratch once for all 16 passes instead of a
-    // fresh `vec![0u32; 16]` (×2) per pass, and use page-locked memory so the
-    // per-pass D2H/H2D run as real async DMAs on the sort stream. Contents
-    // are fully overwritten each pass, so stale carry-over is benign.
+    // PERF (radix round-trip): hoist the two (num_blocks * 16) host scratch
+    // buffers out of the per-pass loop (i64 mirror of the i32 driver) —
+    // allocate the pinned histogram / offsets scratch once for all 16 passes,
+    // and use page-locked memory so the per-pass D2H/H2D run as real async DMAs
+    // on the sort stream. Contents are fully overwritten each pass, so stale
+    // carry-over is benign.
     let mut hist_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(RADIX_BUCKETS as usize)?;
+        PinnedHostBuffer::<u32>::new(block_hist_len)?;
     let mut offsets_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(RADIX_BUCKETS as usize)?;
+        PinnedHostBuffer::<u32>::new(block_hist_len)?;
 
     for step in 0..radix_steps {
         let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
 
-        let hist_bytes = (RADIX_BUCKETS as usize) * std::mem::size_of::<u32>();
-        // SAFETY: hist_dev was allocated with RADIX_BUCKETS u32 entries.
+        let hist_bytes = block_hist_len * std::mem::size_of::<u32>();
+        // SAFETY: hist_dev was allocated with block_hist_len u32 entries.
         unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
         let _ = hist_bytes;
 
@@ -1430,64 +1539,41 @@ fn run_radix_pipeline_i64(
             &stream,
         )?;
 
-        // PERF (radix round-trip): async D2H of the histogram + exactly one
-        // synchronize (the host scan depends on it), mirroring the i32 driver.
-        // Replaces the old pair of synchronizing `memcpy_d2h` / `memcpy_h2d`
-        // calls (two serializations per pass) with a single sync per pass.
-        // SAFETY: hist_dev has RADIX_BUCKETS u32 elements; hist_host is a
-        // pinned buffer of RADIX_BUCKETS u32s. Pinned pages stay live until
+        // PERF (radix round-trip): async D2H of the per-block histogram +
+        // exactly one synchronize (the host offset computation depends on it),
+        // mirroring the i32 driver.
+        // SAFETY: hist_dev has block_hist_len u32 elements; hist_host is a
+        // pinned buffer of block_hist_len u32s. Pinned pages stay live until
         // the sync below retires the DMA.
         unsafe {
             cuda_sys::memcpy_d2h_async::<u32>(
                 hist_host.as_mut_ptr(),
                 hist_dev.device_ptr(),
-                RADIX_BUCKETS as usize,
+                block_hist_len,
                 stream.raw(),
             )?;
         }
         stream.synchronize()?;
 
-        // Exclusive prefix scan on host. A device-side 16-element scan kernel
-        // would remove this leg but needs a new JIT kernel + GPU validation —
-        // deliberately out of scope here (see module notes).
-        let hist_slice = hist_host.as_slice();
-        let offsets_slice = offsets_host.as_mut_slice();
-        let mut running: u32 = 0;
-        for i in 0..RADIX_BUCKETS as usize {
-            offsets_slice[i] = running;
-            // PERF (radix round-trip): bucket sums total exactly `n_rows`
-            // (<= u32::MAX), so `running` never wraps. Use `checked_add` to
-            // make that invariant load-bearing instead of masking it with
-            // `wrapping_add`. A buggy/garbage histogram readback would
-            // otherwise overflow here; map it to a recoverable `BoltError`
-            // (returned via `?`) so the sort degrades gracefully instead of
-            // panicking.
-            debug_assert!(
-                running <= n_rows_u32,
-                "radix histogram prefix exceeded n_rows: {running} > {n_rows_u32}",
-            );
-            running = running.checked_add(hist_slice[i]).ok_or_else(|| {
-                BoltError::Other(
-                    "radix histogram bucket-sum overflowed u32 (invariant: sum == n_rows)".into(),
-                )
-            })?;
-        }
-        debug_assert_eq!(
-            running, n_rows_u32,
-            "radix histogram bucket-sum != n_rows ({running} != {n_rows_u32})",
-        );
+        // Per-block-per-digit exclusive output offsets (cross-block stable).
+        // See the i32 mirror and `compute_block_offsets` for the construction.
+        compute_block_offsets(
+            hist_host.as_slice(),
+            grid_x as usize,
+            offsets_host.as_mut_slice(),
+        )?;
 
         // PERF (radix round-trip): async H2D of the offsets on the same
         // stream — no synchronize; same-stream ordering makes the scatter
         // below observe the completed copy. The post-loop synchronize fences
         // the last pass's pinned source before reuse / drop.
-        // SAFETY: offsets_dev has RADIX_BUCKETS u32 entries; offsets_host is a
-        // pinned buffer of RADIX_BUCKETS u32s that outlives the loop.
+        // SAFETY: offsets_dev has block_hist_len u32 entries; offsets_host is a
+        // pinned buffer of block_hist_len u32s that outlives the loop.
         unsafe {
             cuda_sys::memcpy_h2d_async::<u32>(
                 offsets_dev.device_ptr(),
                 offsets_host.as_ptr(),
-                RADIX_BUCKETS as usize,
+                block_hist_len,
                 stream.raw(),
             )?;
         }
@@ -3057,6 +3143,200 @@ mod tests {
             .map(|v| radix_pre_transform_i64(*v, SortDirection::Desc) as u64)
             .collect();
         assert_eq!(from_desc_sorted, transformed_desc);
+    }
+
+    // -- F2 — IEEE-monotonic float radix key transform. Pure host. --
+
+    /// `radix_float_key_f32` ASC: unsigned ascending order of the transformed
+    /// keys must equal value-ascending order of the original floats, including
+    /// negatives, signed zeros and infinities.
+    #[test]
+    fn radix_float_key_f32_asc_orders_floats() {
+        let mut samples: Vec<f32> = vec![
+            f32::NEG_INFINITY,
+            -1e30,
+            -1.5,
+            -0.0,
+            0.0,
+            1.5,
+            1e30,
+            f32::INFINITY,
+        ];
+        let mut keys: Vec<u32> = samples
+            .iter()
+            .map(|&f| radix_float_key_f32(f, SortDirection::Asc))
+            .collect();
+        // Sort both independently; the transform must preserve the relation.
+        keys.sort();
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let from_sorted: Vec<u32> = samples
+            .iter()
+            .map(|&f| radix_float_key_f32(f, SortDirection::Asc))
+            .collect();
+        assert_eq!(from_sorted, keys);
+        // The keys must be strictly increasing (no two distinct values collide;
+        // -0.0/+0.0 differ in one ulp here so they stay distinct, which is fine
+        // for a stable sort — equal *values* are not in this sample).
+        for w in from_sorted.windows(2) {
+            assert!(w[0] < w[1], "f32 asc keys not strictly increasing");
+        }
+    }
+
+    /// `radix_float_key_f32` DESC is the bitwise-NOT of the ASC key, so its
+    /// unsigned ascending order equals value-descending order.
+    #[test]
+    fn radix_float_key_f32_desc_reverses_order() {
+        let samples: Vec<f32> = vec![-2.0, -0.5, 0.0, 0.5, 2.0];
+        for w in samples.windows(2) {
+            // w[0] < w[1] in value, so DESC key of w[0] must be GREATER.
+            let ka = radix_float_key_f32(w[0], SortDirection::Desc);
+            let kb = radix_float_key_f32(w[1], SortDirection::Desc);
+            assert!(ka > kb, "f32 desc must invert order: {} vs {}", w[0], w[1]);
+        }
+    }
+
+    /// Same ASC ordering property for f64.
+    #[test]
+    fn radix_float_key_f64_asc_orders_floats() {
+        let mut samples: Vec<f64> = vec![
+            f64::NEG_INFINITY,
+            -1e300,
+            -3.25,
+            -0.0,
+            0.0,
+            3.25,
+            1e300,
+            f64::INFINITY,
+        ];
+        let mut keys: Vec<u64> = samples
+            .iter()
+            .map(|&f| radix_float_key_f64(f, SortDirection::Asc))
+            .collect();
+        keys.sort();
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let from_sorted: Vec<u64> = samples
+            .iter()
+            .map(|&f| radix_float_key_f64(f, SortDirection::Asc))
+            .collect();
+        assert_eq!(from_sorted, keys);
+        for w in from_sorted.windows(2) {
+            assert!(w[0] < w[1], "f64 asc keys not strictly increasing");
+        }
+    }
+
+    // -- F2 — stable multi-block radix offset construction. Pure host. --
+    //
+    // `compute_block_offsets` is the load-bearing piece of the cross-block
+    // stable radix scatter: it turns a per-block-per-digit histogram into the
+    // per-block-per-digit *exclusive* output offsets the scatter kernel reads.
+    // These tests simulate the scatter deterministically on the host (each
+    // block lays its elements down at `base[digit] + per_block_rank` in tid
+    // order) and assert the result is a stable counting-sort by digit — the
+    // exact invariant LSD radix needs each pass to satisfy.
+
+    /// A single block degenerates to a plain stable counting sort: offsets are
+    /// the exclusive prefix sum of the digit totals.
+    #[test]
+    fn compute_block_offsets_single_block_is_exclusive_scan() {
+        let buckets = RADIX_BUCKETS as usize;
+        // One block, counts: digit 0 -> 3, digit 1 -> 0, digit 2 -> 5, rest 0.
+        let mut hist = vec![0u32; buckets];
+        hist[0] = 3;
+        hist[2] = 5;
+        let mut offs = vec![0u32; buckets];
+        compute_block_offsets(&hist, 1, &mut offs).unwrap();
+        // Exclusive scan: 0 starts at 0, 1 starts at 3, 2 starts at 3, 3+ at 8.
+        assert_eq!(offs[0], 0);
+        assert_eq!(offs[1], 3);
+        assert_eq!(offs[2], 3);
+        for d in 3..buckets {
+            assert_eq!(offs[d], 8, "empty trailing digits all start past the data");
+        }
+    }
+
+    /// Two blocks: block 0's run for a digit must precede block 1's run for the
+    /// same digit (cross-block stability), and the per-digit regions must be
+    /// laid out in digit order with no gaps or overlaps.
+    #[test]
+    fn compute_block_offsets_two_blocks_orders_runs_by_block_then_digit() {
+        let buckets = RADIX_BUCKETS as usize;
+        // block 0: digit0=2, digit1=1 ; block 1: digit0=1, digit1=3.
+        let mut hist = vec![0u32; 2 * buckets];
+        hist[0 * buckets + 0] = 2;
+        hist[0 * buckets + 1] = 1;
+        hist[1 * buckets + 0] = 1;
+        hist[1 * buckets + 1] = 3;
+        let mut offs = vec![0u32; 2 * buckets];
+        compute_block_offsets(&hist, 2, &mut offs).unwrap();
+        // digit 0 region [0,3): block0 at 0 (len 2), block1 at 2 (len 1).
+        assert_eq!(offs[0 * buckets + 0], 0);
+        assert_eq!(offs[1 * buckets + 0], 2);
+        // digit 1 region [3,7): block0 at 3 (len 1), block1 at 4 (len 3).
+        assert_eq!(offs[0 * buckets + 1], 3);
+        assert_eq!(offs[1 * buckets + 1], 4);
+    }
+
+    /// End-to-end host simulation: drive `compute_block_offsets` exactly as the
+    /// kernel would, then verify the scatter is a *stable* sort by digit across
+    /// many blocks with heavy digit collisions. This is the property the GPU
+    /// kernel relies on for LSD correctness.
+    #[test]
+    fn compute_block_offsets_simulated_scatter_is_stable() {
+        let buckets = RADIX_BUCKETS as usize;
+        let block = RADIX_BLOCK_SIZE as usize;
+        let n = 3 * block + 37; // 3 full blocks + a partial tail.
+        let num_blocks = (n + block - 1) / block;
+
+        // Deterministic pseudo-random digits in 0..16.
+        let digits: Vec<u32> = (0..n)
+            .map(|i| (((i as u64).wrapping_mul(2654435761) >> 13) & 0xF) as u32)
+            .collect();
+
+        // Build the per-block-per-digit histogram exactly like the kernel.
+        let mut hist = vec![0u32; num_blocks * buckets];
+        for (i, &d) in digits.iter().enumerate() {
+            let b = i / block;
+            hist[b * buckets + d as usize] += 1;
+        }
+
+        let mut offs = vec![0u32; num_blocks * buckets];
+        compute_block_offsets(&hist, num_blocks, &mut offs).unwrap();
+
+        // Simulate the scatter: each block places its rows at
+        // base[digit] + (count of same-digit rows earlier in the block).
+        let mut out = vec![u32::MAX; n]; // out[pos] = source row index
+        for b in 0..num_blocks {
+            let mut local_rank = [0u32; RADIX_BUCKETS as usize];
+            let lo = b * block;
+            let hi = (lo + block).min(n);
+            for i in lo..hi {
+                let d = digits[i] as usize;
+                let pos = offs[b * buckets + d] + local_rank[d];
+                assert_eq!(out[pos as usize], u32::MAX, "two rows claimed slot {pos}");
+                out[pos as usize] = i as u32;
+                local_rank[d] += 1;
+            }
+        }
+
+        // Every slot filled exactly once.
+        assert!(out.iter().all(|&x| x != u32::MAX), "scatter left a hole");
+
+        // Output digits are non-decreasing (counting-sorted by digit).
+        for w in out.windows(2) {
+            assert!(
+                digits[w[0] as usize] <= digits[w[1] as usize],
+                "scatter not sorted by digit",
+            );
+        }
+        // Stability: within each digit, source row indices stay ascending.
+        let mut last_for_digit = [None::<u32>; RADIX_BUCKETS as usize];
+        for &src in &out {
+            let d = digits[src as usize] as usize;
+            if let Some(prev) = last_for_digit[d] {
+                assert!(prev < src, "unstable: digit {d} saw {src} after {prev}");
+            }
+            last_for_digit[d] = Some(src);
+        }
     }
 
     // -- Stage 5 — high-cardinality sampling gate. Pure host, no CUDA. --

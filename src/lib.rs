@@ -108,15 +108,14 @@ pub use observability::install_pool_stats_observer;
 /// docs for the Prometheus / structured-log scraping recipes.
 ///
 /// ```ignore
-/// use craton_bolt::{metrics, metrics_snapshot, Counter, Phase};
+/// use craton_bolt::{metrics, metrics_snapshot, render_prometheus, Counter, Phase};
 /// metrics().inc(Counter::QueriesTotal);
 /// metrics().observe(Phase::Parse, 42); // 42 µs
 /// let s = metrics_snapshot();
-/// for (name, value) in s.counters() {
-///     println!("bolt_{name} {value}");
-/// }
+/// // Prometheus text-exposition format (craton_-prefixed):
+/// print!("{}", render_prometheus(&s));
 /// ```
-pub use metrics::{metrics, Counter, MetricsSnapshot, Phase};
+pub use metrics::{metrics, render_prometheus, Counter, MetricsSnapshot, Phase};
 
 /// Owned, plain-data metrics snapshot for export. Re-exported from
 /// [`metrics::snapshot`] under a disambiguated name (the pool surface and the

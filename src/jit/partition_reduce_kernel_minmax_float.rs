@@ -436,10 +436,7 @@ fn emit_probe_loop(
     vbpw: u32,
     spill: bool,
 ) -> BoltResult<()> {
-    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
-    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_loop_head(ptx)?;
 
     // key load + slot derivation. i32 loads an s32 key straight into %r31 and
     // masks it directly; i64 loads an s64 key into %rd60 then derives the slot
@@ -469,13 +466,12 @@ fn emit_probe_loop(
             writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
         }
     }
-    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
-
-    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.gt.u32 %p2, %r33, {mp};", mp = max_probes).map_err(write_err)?;
     let overflow_target = if spill { "SPILL_BUMP" } else { "LOOP_NEXT" };
-    writeln!(ptx, "\t@%p2 bra {overflow_target};").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_probe_bound_check(
+        ptx,
+        max_probes,
+        overflow_target,
+    )?;
 
     // Slot-address compute. addr_set is ×4 in both; addr_key is ×4 reusing
     // %rd34 for i32 vs a separate ×8 (%rd39) for i64; addr_val is ×vbpw.
@@ -497,9 +493,7 @@ fn emit_probe_loop(
         }
     }
 
-    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_slot_claim_cas(ptx, "%rd35")?;
 
     // 3-state publish protocol (claim-then-write race fix; see
     // partition_reduce_kernel.rs). VOLATILE SHARED re-read of set (not
@@ -540,8 +534,7 @@ fn emit_probe_loop(
             writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
         }
     }
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_claim_publish(ptx, "%rd35")?;
     emit_cas_loop(ptx, op, dtype, "CLAIM_CAS", val_reg)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 

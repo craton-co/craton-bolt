@@ -94,6 +94,19 @@
 //!     .param .u32 max_spill             // capacity of the spill buffer
 //! )
 //! ```
+//!
+//! # Validity bitmap format
+//!
+//! The trailing `validity_ptr` of the `_with_validity` variant is an
+//! **Arrow-LE packed-bit** bitmap (bit `i % 8` of byte `i / 8` is row `i`'s
+//! flag, `1` = present), length `ceil(n_rows / 8)`. This is the SAME packed
+//! format consumed by
+//! [`crate::jit::valid_flag_kernels::compile_agg_valid_kernel_with_validity`]
+//! and produced by
+//! [`crate::jit::valid_flag_kernels::pack_validity_bits`]. It is NOT the
+//! one-`u8`-per-row *unpacked* form that nullable primitive `GpuColumn`s store
+//! on device; a caller holding an unpacked device bitmap must repack it first
+//! (see [`crate::exec::validity_audit::normalize_device_validity_to_packed`]).
 
 use std::fmt::Write;
 

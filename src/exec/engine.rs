@@ -736,6 +736,146 @@ fn finalize_numeric(
     })
 }
 
+/// Combine per-morsel scalar-aggregate partials into the final single-row
+/// result batch.
+///
+/// Each element of `partials` is the single-row output of running the *same*
+/// scalar aggregate executor over one morsel (see
+/// [`Engine::execute_streaming_scalar_aggregate`]). Because the streaming gate
+/// ([`Engine::streamable_scalar_aggregate`]) only admits **distributive**
+/// aggregates (`COUNT`/`SUM`/`MIN`/`MAX`) with a primitive numeric output
+/// dtype, the whole-table result is recoverable by re-folding the partials:
+///
+/// * `COUNT` / `SUM` → **add** the per-morsel partials. (A `COUNT` partial is
+///   that morsel's non-NULL count; summing the counts is the whole-table
+///   count. A `SUM` partial is that morsel's sum; summing the sums is the
+///   total — NULL partials, from an empty/all-NULL morsel, are skipped, which
+///   is `SUM`'s SQL semantics.)
+/// * `MIN` / `MAX` → take the **min** / **max** across partials (NULL skipped).
+///
+/// An empty `partials` (a table with zero morsels — i.e. zero rows) yields a
+/// single all-NULL row, except `COUNT`, whose empty-input value is `0`,
+/// matching the whole-table aggregate over an empty table.
+///
+/// TODO(F1-streaming, grouped + decimal): this folds only the primitive
+/// numeric output dtypes (Int32/Int64/Float32/Float64) via [`AggNum`]. A
+/// Decimal128 output (also distributive for SUM/MIN/MAX) needs an i128 fold and
+/// scale-aware finalisation; until then the gate rejects Decimal outputs and
+/// they keep the whole-table drain. GROUP BY streaming is likewise out of scope
+/// here — a grouped partial is a multi-row keyed batch that needs a hash-merge,
+/// not a scalar fold.
+fn combine_scalar_aggregate_partials(
+    aggregate: &crate::plan::physical_plan::AggregateSpec,
+    partials: &[RecordBatch],
+) -> BoltResult<RecordBatch> {
+    use crate::exec::distinct::ColumnReader;
+    use crate::plan::logical_plan::AggregateExpr;
+
+    let n_aggs = aggregate.aggregates.len();
+    if aggregate.output_schema.fields.len() != n_aggs {
+        return Err(BoltError::Other(format!(
+            "combine_scalar_aggregate_partials: output schema has {} fields but \
+             plan has {} aggregates",
+            aggregate.output_schema.fields.len(),
+            n_aggs
+        )));
+    }
+
+    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+
+    // What fold to apply per aggregate column.
+    #[derive(Clone, Copy)]
+    enum Fold {
+        Add,
+        Min,
+        Max,
+    }
+
+    let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(n_aggs);
+    for (i, agg) in aggregate.aggregates.iter().enumerate() {
+        let field = &aggregate.output_schema.fields[i];
+        let fold = match agg {
+            // COUNT(*) and SUM both reduce by addition across morsels; a COUNT
+            // partial is a non-NULL i64 count, so adding the counts is correct.
+            AggregateExpr::Count(_) | AggregateExpr::Sum(_) => Fold::Add,
+            AggregateExpr::Min(_) => Fold::Min,
+            AggregateExpr::Max(_) => Fold::Max,
+            other => {
+                return Err(BoltError::Other(format!(
+                    "combine_scalar_aggregate_partials: aggregate {other:?} is not \
+                     distributive (the streaming gate should have rejected it)"
+                )))
+            }
+        };
+
+        // Fold the per-morsel partial value for column `i` across all partials.
+        let mut acc: Option<AggNum> = None;
+        for (m, batch) in partials.iter().enumerate() {
+            if batch.num_columns() != n_aggs {
+                return Err(BoltError::Other(format!(
+                    "combine_scalar_aggregate_partials: morsel {m} partial has {} \
+                     columns, expected {n_aggs}",
+                    batch.num_columns()
+                )));
+            }
+            if batch.num_rows() != 1 {
+                return Err(BoltError::Other(format!(
+                    "combine_scalar_aggregate_partials: morsel {m} partial has {} \
+                     rows, expected exactly 1 (scalar aggregate)",
+                    batch.num_rows()
+                )));
+            }
+            let reader = ColumnReader::new(batch.column(i).as_ref())?;
+            let Some(v) = agg_num_at(&reader, 0)? else {
+                // NULL partial (empty / all-NULL morsel): skip it, matching the
+                // NULL-ignoring semantics of SUM/MIN/MAX.
+                continue;
+            };
+            acc = Some(match (acc, fold) {
+                (None, _) => v,
+                (Some(a), Fold::Add) => agg_add(a, v),
+                (Some(a), Fold::Min) => {
+                    if agg_lt(v, a) {
+                        v
+                    } else {
+                        a
+                    }
+                }
+                (Some(a), Fold::Max) => {
+                    if agg_lt(a, v) {
+                        v
+                    } else {
+                        a
+                    }
+                }
+            });
+        }
+
+        // COUNT over an empty table is 0, not NULL — its output field is
+        // non-nullable Int64. SUM/MIN/MAX over an empty table is NULL.
+        let final_value: Option<AggNum> = match (acc, agg) {
+            (None, AggregateExpr::Count(_)) => Some(AggNum::Int(0)),
+            (other, _) => other,
+        };
+
+        let op_name = match agg {
+            AggregateExpr::Count(_) => "COUNT",
+            AggregateExpr::Sum(_) => "SUM",
+            AggregateExpr::Min(_) => "MIN",
+            AggregateExpr::Max(_) => "MAX",
+            _ => unreachable!("fold matched above"),
+        };
+        let col = finalize_numeric(std::iter::once(final_value), field.dtype, op_name)?;
+        out_cols.push(col);
+    }
+
+    RecordBatch::try_new(arrow_schema, out_cols).map_err(|e| {
+        BoltError::Other(format!(
+            "combine_scalar_aggregate_partials: result build failed: {e}"
+        ))
+    })
+}
+
 /// Stage 7 (P1b): default interval between pool-stats emits in
 /// [`Engine::sql`].
 ///
@@ -3941,9 +4081,14 @@ impl Engine {
     /// * [`PhysicalPlan::StringLength`] — `LENGTH(col)` + passthroughs.
     /// * [`PhysicalPlan::StringProject`] — `UPPER`/`LOWER`/passthroughs.
     ///
-    /// Every *other* variant is **not** returned here and therefore drains the
-    /// whole table (status quo): `Aggregate` (global/grouped fold crosses all
-    /// rows), `Sort`/`Distinct`/`SetOp`/`Union`/`Window` (cross-row ordering or
+    /// Every *other* variant is **not** returned here. A scalar `Aggregate`
+    /// over a distributive function (`SUM`/`COUNT`/`MIN`/`MAX`) has its OWN
+    /// streaming hook ([`Engine::streamable_scalar_aggregate`] /
+    /// [`Engine::execute_streaming_scalar_aggregate`], which folds per-morsel
+    /// partials), so it does not need to appear here. Everything else drains the
+    /// whole table (status quo): non-distributive / grouped `Aggregate`
+    /// (`AVG`/variance, or any GROUP BY — a cross-row fold),
+    /// `Sort`/`Distinct`/`SetOp`/`Union`/`Window` (cross-row ordering or
     /// dedup), `Join` (build side must be resident), `Limit`/`Filter`/`Project`/
     /// `CountRows`/`StringLikeFilter` (wrap a child sub-plan whose own scan would
     /// have to be threaded — out of scope for this minimal, correctness-first
@@ -4055,6 +4200,150 @@ impl Engine {
         Ok(QueryHandle { batch })
     }
 
+    /// If `phys` is a **streamable scalar aggregate** — a no-GROUP-BY aggregate
+    /// whose every aggregate function is *distributive* (combinable from
+    /// per-morsel partials by re-applying a simple fold) — return the scanned
+    /// table's name. Otherwise `None` (the caller drains the whole table).
+    ///
+    /// The distributive set is exactly `COUNT` / `SUM` / `MIN` / `MAX`:
+    ///
+    /// * `COUNT(e)` — partial is each morsel's non-NULL count; the whole-table
+    ///   count is the **sum** of the partials.
+    /// * `SUM(e)` — partial is each morsel's sum; the total is the **sum** of
+    ///   the partials (NULL partials — an all-NULL/empty morsel — are ignored,
+    ///   matching `SUM` SQL semantics).
+    /// * `MIN(e)` / `MAX(e)` — partial is each morsel's extremum; the total is
+    ///   the **min**/**max** of the partials (NULL partials ignored).
+    ///
+    /// `AVG`, `VAR_POP`/`VAR_SAMP`, `STDDEV_POP`/`STDDEV_SAMP` are **not**
+    /// distributive over their *finalised* scalar output (an average of
+    /// per-morsel averages is not the whole-table average), so they return
+    /// `None` here and keep the legacy whole-table drain. A `WHERE` filter
+    /// (carried in `pre`) is fine — it is row-wise, so per-morsel filtering
+    /// then combining the survivors' partials is identical to filtering the
+    /// whole table.
+    ///
+    /// `pre` is *not* inspected here beyond the aggregate-function check: the
+    /// per-morsel executor (`execute_leaf_whole`) runs the exact same
+    /// `pre`+reduce pipeline the whole-table path would, just on one morsel at a
+    /// time, so any `pre` shape the whole-table aggregate accepts is accepted
+    /// here too.
+    fn streamable_scalar_aggregate<'p>(phys: &'p PhysicalPlan) -> Option<&'p str> {
+        use crate::plan::logical_plan::AggregateExpr;
+        let PhysicalPlan::Aggregate {
+            table, aggregate, ..
+        } = phys
+        else {
+            return None;
+        };
+        if !aggregate.group_by.is_empty() {
+            return None;
+        }
+        if aggregate.aggregates.is_empty() {
+            return None;
+        }
+        // Every aggregate must be distributive (combinable from finalised
+        // per-morsel partials) AND emit one of the primitive numeric output
+        // dtypes the host combiner ([`combine_scalar_aggregate_partials`])
+        // folds. Decimal128 SUM/MIN/MAX are *also* distributive, but the host
+        // combiner does not yet fold i128 partials, so a Decimal output keeps
+        // the whole-table drain (see TODO in `combine_scalar_aggregate_partials`).
+        if aggregate.output_schema.fields.len() != aggregate.aggregates.len() {
+            return None;
+        }
+        let all_streamable =
+            aggregate
+                .aggregates
+                .iter()
+                .zip(aggregate.output_schema.fields.iter())
+                .all(|(a, f)| {
+                    let distributive = matches!(
+                        a,
+                        AggregateExpr::Count(_)
+                            | AggregateExpr::Sum(_)
+                            | AggregateExpr::Min(_)
+                            | AggregateExpr::Max(_)
+                    );
+                    let foldable_dtype = matches!(
+                        f.dtype,
+                        DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+                    );
+                    distributive && foldable_dtype
+                });
+        if all_streamable {
+            Some(table.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Drive a streamable **scalar aggregate** morsel-by-morsel instead of
+    /// materialising the whole table on the device at once.
+    ///
+    /// Mirrors [`Engine::execute_streaming_leaf`]'s overlay-swap discipline: for
+    /// each morsel the streaming-overlay entry for `table` is temporarily
+    /// replaced with a single-batch view of that morsel, the *same* per-morsel
+    /// aggregate executor the whole-table path uses (`run_morsel`) runs against
+    /// it producing a single-row **partial** batch, and the whole-table overlay
+    /// is always restored afterwards (including on the error path).
+    ///
+    /// The per-morsel partials are then folded into the final single-row result
+    /// by [`combine_scalar_aggregate_partials`]. Because every aggregate is
+    /// distributive (see [`Engine::streamable_scalar_aggregate`]) the combined
+    /// result equals the whole-table aggregate exactly.
+    ///
+    /// Precondition (enforced by the caller in [`Engine::execute`]): `table` is
+    /// a streaming-registered overlay table and `aggregate.group_by` is empty.
+    fn execute_streaming_scalar_aggregate(
+        &self,
+        table: &str,
+        morsel_rows: usize,
+        run_morsel: impl Fn() -> BoltResult<QueryHandle>,
+        aggregate: &crate::plan::physical_plan::AggregateSpec,
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::streaming::{BatchStream, TableSource};
+
+        // Snapshot the whole-table batches and original overlay entry so we can
+        // restore it. Owned (cheap Arc clones) so we never hold the overlay
+        // borrow across `run_morsel` (which re-borrows the overlay).
+        let whole: Vec<RecordBatch> = {
+            let overlay = self.streaming_sources.borrow();
+            match overlay.get(table) {
+                Some(TableSource::Materialized(b)) => b.clone(),
+                _ => {
+                    return Err(BoltError::Other(format!(
+                        "execute_streaming_scalar_aggregate: table '{table}' is not a \
+                         materialised streaming-overlay table"
+                    )))
+                }
+            }
+        };
+
+        let mut partials: Vec<RecordBatch> = Vec::new();
+
+        let loop_result: BoltResult<()> = (|| {
+            let stream = BatchStream::new(&whole, morsel_rows)?;
+            for morsel in stream.morsels() {
+                self.streaming_sources
+                    .borrow_mut()
+                    .insert(table.to_string(), TableSource::Materialized(vec![morsel]));
+                let handle = run_morsel()?;
+                partials.push(handle.batch);
+            }
+            Ok(())
+        })();
+
+        // Always restore the whole-table view.
+        self.streaming_sources
+            .borrow_mut()
+            .insert(table.to_string(), TableSource::Materialized(whole));
+
+        loop_result?;
+
+        let batch = combine_scalar_aggregate_partials(aggregate, &partials)?;
+        Ok(QueryHandle { batch })
+    }
+
     /// Execute a pre-built `PhysicalPlan`.
     pub fn execute(&self, phys: &PhysicalPlan) -> BoltResult<QueryHandle> {
         // Streaming / morsel opt-in. The whole-table path below is the default
@@ -4085,6 +4374,29 @@ impl Engine {
                             || self.execute_leaf_whole(phys),
                             &output_schema,
                         );
+                    }
+                }
+            }
+            // Streamable scalar aggregate (SUM/COUNT/MIN/MAX, no GROUP BY):
+            // process the table morsel-by-morsel, accumulate per-morsel
+            // partials, and combine — identical to the whole-table fold because
+            // the aggregates are distributive. Same overlay-only / over-budget
+            // gating as the leaf-scan hook above.
+            if let Some(table) = Self::streamable_scalar_aggregate(phys) {
+                let is_overlay_only = !self.tables.contains_key(table)
+                    && self.streaming_sources.borrow().contains_key(table);
+                if is_overlay_only {
+                    if let Some(morsel_rows) =
+                        self.morsel_plan_for_table(table)?.morsel_rows()
+                    {
+                        if let PhysicalPlan::Aggregate { aggregate, .. } = phys {
+                            return self.execute_streaming_scalar_aggregate(
+                                table,
+                                morsel_rows,
+                                || self.execute_leaf_whole(phys),
+                                aggregate,
+                            );
+                        }
                     }
                 }
             }
@@ -7968,6 +8280,149 @@ mod tests {
         assert_eq!(Engine::streamable_leaf_scan(&limit), None);
     }
 
+    // ---- streaming scalar-aggregate classification + combine (host-only) ----
+
+    use crate::plan::logical_plan::{AggregateExpr, Expr};
+    use crate::plan::physical_plan::AggregateSpec;
+
+    /// Build a scalar `Aggregate` plan over table `t` for the given aggregates,
+    /// with an output schema parallel to them (all Int64, nullable). `pre` is
+    /// `None`. Used only to exercise the host-side classifier / combiner.
+    fn scalar_agg_plan(table: &str, aggs: Vec<AggregateExpr>) -> PhysicalPlan {
+        let fields: Vec<Field> = aggs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| Field::new(format!("a{i}"), DataType::Int64, true))
+            .collect();
+        PhysicalPlan::Aggregate {
+            table: table.to_string(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![col_io("x", DataType::Int64)],
+                group_by: Vec::new(),
+                aggregates: aggs,
+                output_schema: Schema::new(fields),
+                input_has_validity: Vec::new(),
+            },
+        }
+    }
+
+    /// A single-row Int64 partial batch with the given (nullable) cells, schema
+    /// matching `scalar_agg_plan`'s output.
+    fn int64_partial(cells: &[Option<i64>]) -> RecordBatch {
+        let fields: Vec<ArrowField> = (0..cells.len())
+            .map(|i| ArrowField::new(format!("a{i}"), ArrowDataType::Int64, true))
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let cols: Vec<ArrayRef> = cells
+            .iter()
+            .map(|c| Arc::new(Int64Array::from(vec![*c])) as ArrayRef)
+            .collect();
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    #[test]
+    fn streamable_scalar_aggregate_accepts_distributive() {
+        let p = scalar_agg_plan(
+            "t",
+            vec![
+                AggregateExpr::Count(Expr::Column("x".into())),
+                AggregateExpr::Sum(Expr::Column("x".into())),
+                AggregateExpr::Min(Expr::Column("x".into())),
+                AggregateExpr::Max(Expr::Column("x".into())),
+            ],
+        );
+        assert_eq!(Engine::streamable_scalar_aggregate(&p), Some("t"));
+    }
+
+    #[test]
+    fn streamable_scalar_aggregate_rejects_avg_and_groupby() {
+        // AVG is not distributive over finalised partials.
+        let avg = scalar_agg_plan("t", vec![AggregateExpr::Avg(Expr::Column("x".into()))]);
+        assert_eq!(Engine::streamable_scalar_aggregate(&avg), None);
+
+        // A GROUP BY (non-empty group_by) is out of scope for scalar streaming.
+        let mut grouped =
+            scalar_agg_plan("t", vec![AggregateExpr::Sum(Expr::Column("x".into()))]);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut grouped {
+            aggregate.group_by = vec![0];
+        }
+        assert_eq!(Engine::streamable_scalar_aggregate(&grouped), None);
+    }
+
+    #[test]
+    fn combine_partials_sum_and_count_add() {
+        // Two aggregates: COUNT(x), SUM(x). Three morsels.
+        let aggregate = match scalar_agg_plan(
+            "t",
+            vec![
+                AggregateExpr::Count(Expr::Column("x".into())),
+                AggregateExpr::Sum(Expr::Column("x".into())),
+            ],
+        ) {
+            PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
+            _ => unreachable!(),
+        };
+        let partials = vec![
+            int64_partial(&[Some(4), Some(10)]),
+            int64_partial(&[Some(4), Some(26)]),
+            int64_partial(&[Some(2), Some(9)]),
+        ];
+        let out = combine_scalar_aggregate_partials(&aggregate, &partials).unwrap();
+        assert_eq!(out.num_rows(), 1);
+        let cnt = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sum = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(cnt.value(0), 10, "COUNT partials add");
+        assert_eq!(sum.value(0), 45, "SUM partials add");
+    }
+
+    #[test]
+    fn combine_partials_min_max_skip_nulls() {
+        let aggregate = match scalar_agg_plan(
+            "t",
+            vec![
+                AggregateExpr::Min(Expr::Column("x".into())),
+                AggregateExpr::Max(Expr::Column("x".into())),
+            ],
+        ) {
+            PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
+            _ => unreachable!(),
+        };
+        // A morsel that produced all-NULL (empty/all-NULL morsel) must be
+        // skipped, not treated as a value.
+        let partials = vec![
+            int64_partial(&[Some(7), Some(7)]),
+            int64_partial(&[None, None]),
+            int64_partial(&[Some(3), Some(99)]),
+        ];
+        let out = combine_scalar_aggregate_partials(&aggregate, &partials).unwrap();
+        let min = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let max = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(min.value(0), 3, "MIN ignores NULL partials");
+        assert_eq!(max.value(0), 99, "MAX ignores NULL partials");
+    }
+
+    #[test]
+    fn combine_partials_empty_count_is_zero_sum_is_null() {
+        let aggregate = match scalar_agg_plan(
+            "t",
+            vec![
+                AggregateExpr::Count(Expr::Column("x".into())),
+                AggregateExpr::Sum(Expr::Column("x".into())),
+            ],
+        ) {
+            PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
+            _ => unreachable!(),
+        };
+        // Zero morsels (zero-row table).
+        let out = combine_scalar_aggregate_partials(&aggregate, &[]).unwrap();
+        use arrow_array::Array;
+        let cnt = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sum = out.column(1);
+        assert_eq!(cnt.value(0), 0, "COUNT over empty table is 0");
+        assert!(sum.is_null(0), "SUM over empty table is NULL");
+    }
+
     /// Build a replayable single-batch producer for an `int64_batch`-shaped
     /// table holding `[start, start+n)`.
     fn int64_producer(start: i64, n: usize) -> crate::exec::streaming::BatchProducer {
@@ -8013,15 +8468,16 @@ mod tests {
         assert_eq!(got_v, want_v, "morsel-streamed values must equal whole-table values");
     }
 
-    /// The drain-fallback path: an operator whose result is NOT a row-wise leaf
-    /// scan (here a global `SUM` aggregate) drains the streaming source to a
-    /// whole table and produces the correct global result even under a small
-    /// budget. This documents that "anything not safely streamable drains".
+    /// End-to-end equivalence for the **streaming scalar-aggregate** path: a
+    /// distributive global `SUM` over a streaming-registered table under a
+    /// budget small enough to force morsel chunking is processed
+    /// morsel-by-morsel (per-morsel partials combined by addition) and yields
+    /// the same result as the whole-table fold.
     ///
-    /// GPU-gated: builds an `Engine` and runs the aggregate kernel.
+    /// GPU-gated: builds an `Engine` and runs the aggregate kernel per morsel.
     #[test]
-    #[ignore = "gpu:aggregate — drain-fallback aggregate over streaming source"]
-    fn streaming_drain_fallback_global_aggregate() {
+    #[ignore = "gpu:aggregate — streaming morsel SUM equals whole-table SUM"]
+    fn streaming_morsel_matches_materialized_sum() {
         let total = 500usize;
         let mut engine = Engine::builder()
             .memory_budget(4096)
@@ -8030,14 +8486,78 @@ mod tests {
         engine
             .register_table_stream_lazy("t", x_schema(), int64_producer(0, total))
             .expect("register stream");
-        // SUM is a global fold — `streamable_leaf_scan` returns None for
-        // `Aggregate`, so the whole table is drained (status quo) and summed.
+        // SUM is distributive — `streamable_scalar_aggregate` returns Some("t"),
+        // so under the budget the table is streamed morsel-by-morsel and the
+        // per-morsel partials are summed.
         let h = engine.sql("SELECT SUM(x) FROM t").expect("aggregate query");
         let out = h.record_batch();
         assert_eq!(out.num_rows(), 1, "scalar aggregate yields one row");
         let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let expected: i64 = (0..total as i64).sum();
-        assert_eq!(col.value(0), expected, "global SUM over the drained stream");
+        assert_eq!(col.value(0), expected, "streamed SUM equals whole-table SUM");
+    }
+
+    /// Streaming a scalar aggregate WITH a `WHERE` filter: the per-morsel
+    /// executor runs the same `pre`+reduce pipeline on each morsel, so the
+    /// combined COUNT/SUM over the survivors equals the whole-table result.
+    ///
+    /// GPU-gated.
+    #[test]
+    #[ignore = "gpu:aggregate — streaming filtered COUNT/SUM equals whole-table"]
+    fn streaming_morsel_matches_materialized_filtered_aggregate() {
+        let total = 400usize;
+        let mut engine = Engine::builder()
+            .memory_budget(4096)
+            .build()
+            .expect("ctx with budget");
+        engine
+            .register_table_stream_lazy("t", x_schema(), int64_producer(0, total))
+            .expect("register stream");
+        let h = engine
+            .sql("SELECT COUNT(x), SUM(x), MIN(x), MAX(x) FROM t WHERE x >= 100")
+            .expect("filtered aggregate query");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 1);
+        let want_count = (100..total as i64).count() as i64;
+        let want_sum: i64 = (100..total as i64).sum();
+        let cnt = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sum = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let min = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let max = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(cnt.value(0), want_count, "streamed filtered COUNT");
+        assert_eq!(sum.value(0), want_sum, "streamed filtered SUM");
+        assert_eq!(min.value(0), 100, "streamed filtered MIN");
+        assert_eq!(max.value(0), total as i64 - 1, "streamed filtered MAX");
+    }
+
+    /// The drain-fallback path: a NON-distributive aggregate (`AVG`) is NOT
+    /// streamable (an average of per-morsel averages is not the whole-table
+    /// average), so `streamable_scalar_aggregate` returns `None` and the whole
+    /// table is drained and folded — the correct result even under a tiny
+    /// budget. Documents "anything not safely combinable drains".
+    ///
+    /// GPU-gated: builds an `Engine` and runs the aggregate kernel.
+    #[test]
+    #[ignore = "gpu:aggregate — drain-fallback AVG over streaming source"]
+    fn streaming_drain_fallback_avg_aggregate() {
+        use arrow_array::Float64Array;
+        let total = 500usize;
+        let mut engine = Engine::builder()
+            .memory_budget(4096)
+            .build()
+            .expect("ctx with budget");
+        engine
+            .register_table_stream_lazy("t", x_schema(), int64_producer(0, total))
+            .expect("register stream");
+        let h = engine.sql("SELECT AVG(x) FROM t").expect("aggregate query");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 1, "scalar aggregate yields one row");
+        let col = out.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        let expected = (0..total as i64).sum::<i64>() as f64 / total as f64;
+        assert!(
+            (col.value(0) - expected).abs() < 1e-6,
+            "global AVG over the drained stream"
+        );
     }
 
     /// After a morsel-streamed query the whole-table overlay entry must be

@@ -805,6 +805,51 @@ pub fn pack_validity_bits(validity: &[bool]) -> Vec<u8> {
     out
 }
 
+/// Repack an **unpacked** per-row validity buffer (one `u8` per row, `0` =
+/// NULL / non-zero = present) into the **packed** Arrow-LE bit layout the
+/// `_with_validity` kernels consume.
+///
+/// # Two on-device validity formats
+///
+/// The engine carries device validity in two distinct shapes, and the
+/// valid-flag kernel family only understands the second one:
+///
+/// * **Unpacked** — one `u8` per row (`0` = NULL, `1` = present). This is
+///   what `GpuColumnData::{I32,I64,F32,F64}.validity` and `BoolNullable`
+///   store on the device, and what `emit_is_null_check` reads. A buffer of
+///   length `n_rows`.
+/// * **Packed** — Arrow-LE bits, bit `i % 8` of byte `i / 8` is row `i`'s
+///   flag. This is what [`pack_validity_bits`] / [`packed_validity_for`]
+///   produce, what `GpuColumnData::{DictUtf8,Decimal128}.valid_mask` stores,
+///   and the ONLY shape the `*_with_validity` valid-flag kernels read
+///   ([`VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY`] and friends). A buffer of
+///   length `ceil(n_rows / 8)`.
+///
+/// A nullable primitive column that already has an unpacked device bitmap is
+/// therefore "validity-present on device" — it simply needs this host-side
+/// (or, in a future device kernel, on-device) repack before it can be threaded
+/// into a valid-flag kernel. Keeping the conversion next to
+/// [`pack_validity_bits`] makes the bit layout the single source of truth.
+///
+/// `unpacked` is interpreted as exactly `n_rows` rows: any bytes past
+/// `n_rows` are ignored, and if `unpacked` is shorter than `n_rows` the
+/// missing rows are treated as NULL (bit `0`). The output is always
+/// `ceil(n_rows / 8)` bytes.
+pub fn unpacked_to_packed_validity(unpacked: &[u8], n_rows: usize) -> Vec<u8> {
+    let n_bytes = (n_rows + 7) / 8;
+    let mut out = vec![0u8; n_bytes];
+    let limit = n_rows.min(unpacked.len());
+    for i in 0..limit {
+        // Any non-zero byte means "present" — match the `0`/`1` convention
+        // used by `GpuColumnData::*.validity` without assuming the high bits
+        // are clear.
+        if unpacked[i] != 0 {
+            out[i / 8] |= 1u8 << (i % 8);
+        }
+    }
+    out
+}
+
 /// Generate PTX for the keys-building kernel with a packed-bit validity
 /// input.
 ///
@@ -1271,6 +1316,54 @@ mod with_validity_tests {
         // Empty input -> empty output.
         let packed = pack_validity_bits(&[]);
         assert!(packed.is_empty());
+    }
+
+    /// `unpacked_to_packed_validity` must produce the same Arrow-LE bytes
+    /// as packing the equivalent bool vector — the two device formats must
+    /// agree bit-for-bit so a primitive column's unpacked bitmap and a
+    /// freshly-built packed bitmap are interchangeable for the kernels.
+    #[test]
+    fn unpacked_to_packed_matches_pack_bits() {
+        // present, null, present, null, ... -> 0b0101_0101 = 0x55.
+        let unpacked = vec![1u8, 0, 1, 0, 1, 0, 1, 0];
+        let packed = unpacked_to_packed_validity(&unpacked, unpacked.len());
+        assert_eq!(packed, vec![0x55u8]);
+
+        // Equivalence with pack_validity_bits over the matching bool vec.
+        let as_bools: Vec<bool> = unpacked.iter().map(|&b| b != 0).collect();
+        assert_eq!(packed, pack_validity_bits(&as_bools));
+
+        // Non-1 truthy bytes still count as "present".
+        let truthy = vec![0u8, 255, 0, 7];
+        let packed = unpacked_to_packed_validity(&truthy, 4);
+        // bit1 and bit3 set -> 0b0000_1010 = 0x0A.
+        assert_eq!(packed, vec![0x0Au8]);
+    }
+
+    /// Output length is `ceil(n_rows / 8)`; a short input zero-fills the
+    /// missing (trailing) rows, and trailing rows past `n_rows` are dropped.
+    #[test]
+    fn unpacked_to_packed_length_and_bounds() {
+        // 17 valid rows -> 3 bytes, last byte holds only bit 0 (row 16).
+        let unpacked = vec![1u8; 17];
+        let packed = unpacked_to_packed_validity(&unpacked, 17);
+        assert_eq!(packed.len(), 3);
+        assert_eq!(packed[0], 0xFF);
+        assert_eq!(packed[1], 0xFF);
+        assert_eq!(packed[2], 0x01);
+
+        // Short input (5 bytes) but n_rows = 8: missing rows 5..8 are NULL.
+        let short = vec![1u8, 1, 1, 1, 1];
+        let packed = unpacked_to_packed_validity(&short, 8);
+        assert_eq!(packed, vec![0b0001_1111u8]);
+
+        // Extra input bytes past n_rows are ignored.
+        let long = vec![1u8; 12];
+        let packed = unpacked_to_packed_validity(&long, 4);
+        assert_eq!(packed, vec![0b0000_1111u8]);
+
+        // Zero rows -> empty output.
+        assert!(unpacked_to_packed_validity(&[], 0).is_empty());
     }
 
     /// The keys-with-validity kernel must export its entry name AND test

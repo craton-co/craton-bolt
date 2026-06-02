@@ -515,10 +515,7 @@ fn emit_probe_loop(ptx: &mut String, layout: &Layout, spill: bool) -> BoltResult
     let val_reg = layout.val_reg;
 
     // Phase 2: probe + atomic {min,max}.
-    writeln!(ptx, "\tadd.u32 %r30, %r10, %r2;").map_err(write_err)?;
-    writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 %p1, %r30, %r11;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_loop_head(ptx)?;
 
     let val_load = layout_load(val_reg);
     match layout.key_width {
@@ -552,14 +549,13 @@ fn emit_probe_loop(ptx: &mut String, layout: &Layout, spill: bool) -> BoltResult
             writeln!(ptx, "\tand.b32 %r32, %r31, 0x{mask:X};", mask = mask).map_err(write_err)?;
         }
     }
-    writeln!(ptx, "\tmov.u32 %r33, 0;").map_err(write_err)?;
-
-    writeln!(ptx, "PROBE_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tadd.u32 %r33, %r33, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.gt.u32 %p2, %r33, {mp};", mp = max_probes).map_err(write_err)?;
     // Overflow: non-spill drops the row (`LOOP_NEXT`); spill bumps a counter.
     let overflow_label = if spill { "SPILL_BUMP" } else { "LOOP_NEXT" };
-    writeln!(ptx, "\t@%p2 bra {overflow_label};").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_probe_bound_check(
+        ptx,
+        max_probes,
+        overflow_label,
+    )?;
 
     // Addrs. set: ×4, key: ×4 (i32) or ×8 (i64), val: ×vbpw. The key-slot
     // address scratch register order is the only key-width divergence.
@@ -582,9 +578,7 @@ fn emit_probe_loop(ptx: &mut String, layout: &Layout, spill: bool) -> BoltResult
     }
 
     // CAS the set flag.
-    writeln!(ptx, "\tatom.shared.cas.b32 %r34, [%rd35], 0, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.eq.s32 %p3, %r34, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra CLAIM;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_slot_claim_cas(ptx, "%rd35")?;
 
     // 3-state publish protocol (claim-then-write race fix; see
     // partition_reduce_kernel.rs). Spin on a VOLATILE SHARED re-read of set
@@ -627,8 +621,7 @@ fn emit_probe_loop(ptx: &mut String, layout: &Layout, spill: bool) -> BoltResult
             writeln!(ptx, "\tst.shared.u64 [%rd36], %rd60;").map_err(write_err)?;
         }
     }
-    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u32 [%rd35], 2;").map_err(write_err)?;
+    super::partition_reduce_kernel_spill_common::emit_claim_publish(ptx, "%rd35")?;
     writeln!(
         ptx,
         "\t{atom_op} {scratch_reg}, [%rd38], {val_reg};",

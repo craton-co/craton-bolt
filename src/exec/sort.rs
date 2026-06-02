@@ -36,14 +36,17 @@
 //!
 //! ## ⚠️ TEMPORARY SAFETY GATE — GPU sort is opt-in only
 //!
-//! The GPU sort kernels currently MIS-SORT and must not silently corrupt
-//! `ORDER BY` results, so [`execute_sort`] only runs them under an explicit
-//! `BOLT_GPU_SORT=1` opt-in; every other sort falls through to the correct host
-//! `lexsort_to_indices`. The [`should_use_gpu_sort`] heuristic below is retained
-//! unchanged (it still answers "would the heuristic pick GPU?") for an easy
-//! re-enable once the kernels are fixed. The known kernel bugs:
-//!   * the radix scatter is non-stable (a global per-digit `atom.global.add`
-//!     race), so the LSD radix sort returns wrong results; and
+//! `ORDER BY` correctness must never be silently corrupted, so [`execute_sort`]
+//! only runs the GPU path under an explicit `BOLT_GPU_SORT=1` opt-in; every
+//! other sort falls through to the correct host `lexsort_to_indices`. The
+//! [`should_use_gpu_sort`] heuristic below is retained unchanged for an easy
+//! re-enable. Kernel status (updated after the stable-radix fix):
+//!   * the radix scatter is now CROSS-BLOCK STABLE (per-block-per-digit
+//!     histogram + global block-offset scan; the old per-digit
+//!     `atom.global.add` race is gone). Non-null Int32/Int64 ASC/DESC and
+//!     two-key `ORDER BY` are GPU-validated correct. The gate stays ON pending
+//!     NULLS FIRST/LAST device-validity wiring (nullable primitives carry no
+//!     device validity bitmap yet) and float-radix dispatch.
 //!   * the bitonic kernel is only verified for Int32 ASC at a power-of-two row
 //!     count — DESC, 64-bit, float, and padded inputs mis-sort.
 //! See the `gpu-validation-known-issues` notes. To re-enable GPU sort by
@@ -163,16 +166,16 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
     // first, then bitonic; any precondition miss falls through to the host
     // sort, which always produces a correct result.
     if let Some((key_dtypes, directions)) = resolve_key_shape(&batch, sort_exprs) {
-        // SAFETY GATE (see gpu-validation known issues): the GPU sort kernels
-        // are known to mis-sort and must NOT silently corrupt ORDER BY results.
-        //   * The radix scatter is non-stable — every thread `atom.global.add`s
-        //     into a shared per-digit offset, so equal-digit rows race; LSD
-        //     radix requires stable passes, so the result is wrong.
-        //   * The bitonic kernel is only verified correct for Int32 ASC with a
-        //     power-of-two row count; DESC, 64-bit, float, and padded
-        //     (non-power-of-two) inputs mis-sort.
-        // Until the kernels are fixed and validated, run the GPU path ONLY under
-        // an explicit `BOLT_GPU_SORT=1` opt-in (for benchmarking / kernel
+        // SAFETY GATE (see gpu-validation known issues): the radix scatter is
+        // now cross-block STABLE (per-block-per-digit histogram + global
+        // block-offset scan) and non-null Int32/Int64 ASC/DESC + two-key
+        // ORDER BY are GPU-validated correct. Remaining gaps keeping the gate
+        // ON: (a) NULLS FIRST/LAST needs device-validity wiring (nullable
+        // primitives carry no device validity bitmap yet); (b) float radix is
+        // implemented but not yet routed through dispatch; (c) the bitonic
+        // kernel is only verified for Int32 ASC at a power-of-two row count.
+        // So run the GPU path ONLY under an explicit `BOLT_GPU_SORT=1` opt-in
+        // (for benchmarking / kernel
         // validation). Every production ORDER BY falls through to the correct
         // host `lexsort_to_indices` below. The lib-level kernel tests call the
         // `sort_indices_on_gpu_*` entry points directly, so they still exercise
