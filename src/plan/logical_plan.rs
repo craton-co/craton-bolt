@@ -581,6 +581,56 @@ impl DateTruncUnit {
     }
 }
 
+/// One token of a `CAST(... FORMAT '<pattern>')` pattern (feature CAST FORMAT).
+///
+/// The vocabulary is deliberately small and well-defined so the host
+/// formatter / parser is unambiguous and round-trips. Field tokens consume a
+/// fixed number of digits when *parsing* and emit a zero-padded fixed width
+/// when *formatting*; literal tokens match / emit themselves verbatim.
+///
+/// Supported field tokens and their formatted widths:
+///   * [`FormatToken::Year4`]  — `YYYY`, 4 digits.
+///   * [`FormatToken::Month`]  — `MM`, 2 digits, 1..=12.
+///   * [`FormatToken::Day`]    — `DD`, 2 digits, 1..=31.
+///   * [`FormatToken::Hour24`] — `HH` / `HH24`, 2 digits, 0..=23.
+///   * [`FormatToken::Minute`] — `MI`, 2 digits, 0..=59.
+///   * [`FormatToken::Second`] — `SS`, 2 digits, 0..=59.
+///
+/// Literal separators are restricted to `-`, `/`, `:` and a single space,
+/// carried in [`FormatToken::Literal`]. Any other character or unknown
+/// alphabetic run is rejected at lowering time (see
+/// [`crate::plan::sql_frontend`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FormatToken {
+    /// `YYYY` — 4-digit calendar year.
+    Year4,
+    /// `MM` — 2-digit month of year (1..=12).
+    Month,
+    /// `DD` — 2-digit day of month (1..=31).
+    Day,
+    /// `HH` / `HH24` — 2-digit hour of day (0..=23). Requires a `Timestamp`
+    /// operand / target (a bare `Date32` has no time-of-day component).
+    Hour24,
+    /// `MI` — 2-digit minute of hour (0..=59). `Timestamp` only.
+    Minute,
+    /// `SS` — 2-digit second of minute (0..=59). `Timestamp` only.
+    Second,
+    /// A literal separator character (one of `-`, `/`, `:`, space) emitted /
+    /// matched verbatim.
+    Literal(char),
+}
+
+impl FormatToken {
+    /// True for the intra-day field tokens that are only meaningful on a
+    /// `Timestamp` (a `Date32` carries no time-of-day component).
+    pub fn is_intraday(self) -> bool {
+        matches!(
+            self,
+            FormatToken::Hour24 | FormatToken::Minute | FormatToken::Second
+        )
+    }
+}
+
 /// Scalar expression tree.
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -661,6 +711,41 @@ pub enum Expr {
         /// `CAST` / `::`), conversion failures error and the output dtype is
         /// the declared `target` unchanged.
         safe: bool,
+    },
+    /// SQL `CAST(<expr> AS <type> FORMAT '<pattern>')` — a *host-only*
+    /// temporal ⇄ string conversion driven by an explicit format pattern
+    /// (feature "CAST FORMAT").
+    ///
+    /// Unlike plain [`Expr::Cast`], this never lowers to a GPU `cvt.*`
+    /// instruction: the formatting / parsing is inherently string-shaped and
+    /// runs on the host evaluator
+    /// ([`crate::exec::expr_agg::eval_expr`]). The physical-plan boundary
+    /// routes any projection carrying a `CastFormat` to the host-side
+    /// [`crate::plan::physical_plan`] `Project` (mirroring how `TRY_CAST` and
+    /// the host-only string scalar functions are routed).
+    ///
+    /// Two directions are supported, distinguished by `target`:
+    ///   * `to_text = true`  — `<Date32|Timestamp>  → Utf8` (format).
+    ///   * `to_text = false` — `Utf8 → <Date32|Timestamp>` (parse).
+    ///
+    /// `pattern` is a bounded token string validated at lowering time (see
+    /// [`crate::plan::sql_frontend`] `parse_cast_format_pattern` and
+    /// [`FormatToken`]). The supported vocabulary is: `YYYY` (4-digit year),
+    /// `MM` (2-digit month), `DD` (2-digit day), `HH` / `HH24` (2-digit
+    /// 24-hour hour), `MI` (2-digit minute), `SS` (2-digit second), and the
+    /// literal separators `-`, `/`, `:` and space. Unknown tokens are
+    /// rejected at lowering with a message naming the token.
+    CastFormat {
+        /// Inner expression whose value is converted.
+        expr: Box<Expr>,
+        /// Target dtype the conversion produces. For `to_text = true` this is
+        /// `Utf8`; for `to_text = false` it is `Date32` or `Timestamp`.
+        target: DataType,
+        /// Pre-parsed, validated format tokens (source order).
+        pattern: Vec<FormatToken>,
+        /// `true` when formatting a temporal value *to* text; `false` when
+        /// parsing text *into* a temporal value.
+        to_text: bool,
     },
     /// Scalar string function call (UPPER / LOWER / LENGTH / SUBSTRING /
     /// CONCAT). v0.5 MVP scope: parser + type-check only — the physical
@@ -1090,6 +1175,77 @@ impl Expr {
                     )));
                 }
                 Ok(*target)
+            }
+            Expr::CastFormat {
+                expr,
+                target,
+                pattern,
+                to_text,
+            } => {
+                // A NULL operand is tolerated like every other cast: the
+                // result type is purely the declared `target`.
+                if matches!(expr.as_ref(), Expr::Literal(Literal::Null)) {
+                    return Ok(*target);
+                }
+                let src = expr.dtype_depth(schema, depth + 1)?;
+                if *to_text {
+                    // Formatting a temporal value to text: source must be a
+                    // temporal type; result is always Utf8.
+                    match src {
+                        DataType::Date32 => {
+                            // A Date32 carries no time-of-day, so an intra-day
+                            // token would format garbage. Reject precisely.
+                            if let Some(tok) = pattern.iter().find(|t| t.is_intraday()) {
+                                return Err(BoltError::Type(format!(
+                                    "CAST(... FORMAT ...): pattern uses a time-of-day \
+                                     token {tok:?} but the operand is Date32 (no time \
+                                     component); use a Timestamp operand"
+                                )));
+                            }
+                        }
+                        DataType::Timestamp(_, _) => {}
+                        other => {
+                            return Err(BoltError::Type(format!(
+                                "CAST(... AS VARCHAR FORMAT ...) requires a Date32 or \
+                                 Timestamp operand, got {other:?}"
+                            )));
+                        }
+                    }
+                    if *target != DataType::Utf8 {
+                        return Err(BoltError::Type(format!(
+                            "CAST(... FORMAT ...) temporal→string must target Utf8, \
+                             got {target:?}"
+                        )));
+                    }
+                    Ok(DataType::Utf8)
+                } else {
+                    // Parsing text into a temporal value: source must be Utf8.
+                    if src != DataType::Utf8 {
+                        return Err(BoltError::Type(format!(
+                            "CAST(... AS DATE/TIMESTAMP FORMAT ...) requires a Utf8 \
+                             operand, got {src:?}"
+                        )));
+                    }
+                    match target {
+                        DataType::Date32 => {
+                            if let Some(tok) = pattern.iter().find(|t| t.is_intraday()) {
+                                return Err(BoltError::Type(format!(
+                                    "CAST(... AS DATE FORMAT ...): pattern uses a \
+                                     time-of-day token {tok:?} but the target Date32 has \
+                                     no time component; target TIMESTAMP instead"
+                                )));
+                            }
+                            Ok(DataType::Date32)
+                        }
+                        DataType::Timestamp(_, _) => Ok(*target),
+                        other => {
+                            return Err(BoltError::Type(format!(
+                                "CAST(... FORMAT ...) string→temporal must target Date32 \
+                                 or Timestamp, got {other:?}"
+                            )));
+                        }
+                    }
+                }
             }
             Expr::ScalarFn { kind, args } => scalar_fn_dtype(*kind, args, schema, depth + 1),
             Expr::Extract { field, expr } => {

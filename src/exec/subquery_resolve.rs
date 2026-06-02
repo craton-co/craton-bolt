@@ -473,6 +473,12 @@ where
             target,
             safe,
         },
+        Expr::CastFormat { expr, target, pattern, to_text } => Expr::CastFormat {
+            expr: Box::new(resolve_expr(*expr, exec)?),
+            target,
+            pattern,
+            to_text,
+        },
         Expr::ScalarFn { kind, args } => Expr::ScalarFn {
             kind,
             args: resolve_exprs(args, exec)?,

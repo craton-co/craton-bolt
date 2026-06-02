@@ -179,6 +179,41 @@ pub(crate) fn arrow_array_to_host_column(arr: &dyn Array, n_rows: usize) -> Bolt
                 .collect();
             Ok(HostColumn::Utf8(v))
         }
+        // Temporal columns decode to their underlying integer storage so the
+        // host evaluator (e.g. CAST ... FORMAT) can read them: Date32 -> i32
+        // days, Timestamp -> i64 ticks (unit/tz are carried on the schema).
+        ArrowDataType::Date32 => {
+            let a = arr.as_any().downcast_ref::<arrow_array::Date32Array>().ok_or_else(|| {
+                BoltError::Type("PhysicalPlan::Filter: expected Date32 array".into())
+            })?;
+            let v: Vec<Option<i32>> = (0..n_rows)
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect();
+            Ok(HostColumn::I32(v))
+        }
+        ArrowDataType::Timestamp(unit, _) => {
+            use arrow_array::{
+                TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+                TimestampSecondArray,
+            };
+            macro_rules! decode_ts {
+                ($ty:ty) => {{
+                    let a = arr.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                        BoltError::Type("PhysicalPlan::Filter: timestamp array downcast".into())
+                    })?;
+                    (0..n_rows)
+                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                        .collect::<Vec<Option<i64>>>()
+                }};
+            }
+            let v = match unit {
+                arrow_schema::TimeUnit::Second => decode_ts!(TimestampSecondArray),
+                arrow_schema::TimeUnit::Millisecond => decode_ts!(TimestampMillisecondArray),
+                arrow_schema::TimeUnit::Microsecond => decode_ts!(TimestampMicrosecondArray),
+                arrow_schema::TimeUnit::Nanosecond => decode_ts!(TimestampNanosecondArray),
+            };
+            Ok(HostColumn::I64(v))
+        }
         other => Err(BoltError::Type(format!(
             "PhysicalPlan::Filter: unsupported Arrow dtype {:?}",
             other

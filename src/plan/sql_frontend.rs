@@ -9,7 +9,7 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType as SqlDataType, Distinct,
+    BinaryOperator, CastFormat as SqlCastFormat, CastKind, DataType as SqlDataType, Distinct,
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     GroupByWithModifier, Ident,
     JoinConstraint, JoinOperator, ObjectName, Offset, OrderByExpr, Query, Select, SelectItem,
@@ -22,8 +22,8 @@ use sqlparser::tokenizer::Tokenizer;
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     aggregate_output_name, apply_column_aliases, group_key_output_name, join_rename, AggregateExpr,
-    BinaryOp, DataType, Expr, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SetOpKind,
-    SortExpr, TimeUnit, UnaryOp, WindowExpr, WindowFunc,
+    BinaryOp, DataType, Expr, FormatToken, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema,
+    SetOpKind, SortExpr, TimeUnit, UnaryOp, WindowExpr, WindowFunc,
 };
 use sqlparser::ast::{WindowFrameBound, WindowFrameUnits, WindowType};
 
@@ -2441,12 +2441,30 @@ fn plan_recursive_query(
         .as_ref()
         .expect("plan_recursive_query called without a WITH clause");
 
-    // Single-CTE restriction: more than one would permit mutual recursion,
-    // which the host orchestrator does not implement.
+    // Single-CTE restriction: more than one CTE in a `WITH RECURSIVE` list
+    // would permit *mutual recursion* (CTE A's recursive term references B and
+    // vice-versa), which is an intentional, documented limitation.
+    //
+    // Why this stays rejected (assessment, feature B): the fixpoint executor
+    // in [`crate::exec::engine::Engine::execute_recursive_cte`] drives a
+    // SINGLE working-set relation — it binds one CTE name to one accumulating
+    // table and iterates one recursive subplan to a fixpoint. Mutual recursion
+    // needs a *system* of relations advanced in lockstep: N working sets, each
+    // recursive term re-planned against the others' current iterates, with a
+    // combined termination test (all sets stable). That is a different
+    // execution shape (a vector fixpoint, not a scalar one) and a different
+    // planner contract (each CTE's Scan must resolve to its own per-iteration
+    // working set). Neither the single-relation orchestrator nor the
+    // single-`scope.defs` binding here can express it without a correlated /
+    // multi-relation rewrite, so a half-implementation would silently compute
+    // wrong results. It is left as a clean, named rejection rather than a
+    // broken partial.
     if with.cte_tables.len() != 1 {
         return Err(BoltError::Sql(format!(
             "unsupported: WITH RECURSIVE with {} CTEs — only a single \
-             recursive CTE is supported (no mutual recursion)",
+             recursive CTE is supported (mutual recursion between multiple \
+             recursive CTEs requires a multi-relation lockstep fixpoint the \
+             single-working-set executor does not implement)",
             with.cte_tables.len()
         )));
     }
@@ -2552,11 +2570,30 @@ fn plan_recursive_query(
              never recurse)"
         )));
     }
+    // Linearity restriction: >1 top-level self-reference is *non-linear*
+    // recursion (e.g. `r JOIN r` in the recursive term).
+    //
+    // Why this stays rejected (assessment, feature B): the orchestrator feeds
+    // the PREVIOUS iteration's output as the working set bound to the single
+    // CTE Scan, then runs the recursive subplan once per step. With two
+    // self-references in one term, the two Scans would need DIFFERENT bindings
+    // — the standard SQL semantics evaluate every self-reference against the
+    // *full accumulated* relation, but a naive "bind both to the last delta"
+    // is wrong and "bind both to the full accumulation" requires materialising
+    // and re-scanning the whole accumulation per step (a semi-naive vs. naive
+    // evaluation choice) plus a self-join inside the fixpoint. The single
+    // `scope.defs` binding here resolves *one* relation for the name, so both
+    // Scans collapse to the same working set and the join semantics are
+    // undefined. Implementing it correctly needs per-self-reference binding +
+    // a documented naive/semi-naive evaluation strategy, so it is left as a
+    // clean rejection.
     if self_refs > 1 {
         return Err(BoltError::Sql(format!(
             "unsupported: WITH RECURSIVE recursive term references '{name}' \
              {self_refs} times — only a single (linear) self-reference is \
-             supported"
+             supported (non-linear recursion needs a self-join inside the \
+             fixpoint with per-reference working-set bindings, which the \
+             single-relation executor does not implement)"
         )));
     }
 
@@ -4593,10 +4630,27 @@ fn lower_table_factor(
             subquery,
             alias,
         } => {
+            // Why LATERAL stays rejected (assessment, feature B): a LATERAL
+            // derived table may reference columns from FROM items to its LEFT
+            // (`FROM t, LATERAL (SELECT ... WHERE x = t.c) d`), so the subquery
+            // must be re-evaluated *per outer row* with the outer row's values
+            // bound in. The engine has no correlated-execution path at all —
+            // every derived table / subquery here is lowered to a
+            // self-contained, uncorrelated subplan executed once (see
+            // [`crate::plan::subquery::reject_if_correlated`], which rejects any
+            // outer-column reference). Supporting LATERAL would require either a
+            // per-row nested-loop apply (re-planning + re-running the subplan
+            // for each outer row, with the outer schema threaded into name
+            // resolution) or a decorrelation rewrite into a join — both are
+            // substantial new machinery (correlated planning + an Apply
+            // operator), so this is a clean, documented limitation rather than a
+            // partial implementation.
             if *lateral {
                 return Err(BoltError::Sql(
-                    "unsupported: LATERAL derived table (correlated subqueries in FROM \
-                     are not supported)"
+                    "unsupported: LATERAL derived table — correlated subqueries in \
+                     FROM require a per-row apply / decorrelation path the engine \
+                     does not implement (all derived tables are executed once as \
+                     uncorrelated subplans)"
                         .into(),
                 ));
             }
@@ -6429,10 +6483,14 @@ fn lower_expr_in_having(
             data_type,
             format,
         } => {
-            if format.is_some() {
-                return Err(BoltError::Sql(
-                    "CAST with FORMAT clause not supported".into(),
-                ));
+            // `CAST(... FORMAT '<pattern>')` is a host-only temporal ⇄ string
+            // conversion (feature CAST FORMAT). It lowers to `Expr::CastFormat`
+            // regardless of HAVING context; the inner is lowered with the
+            // aggregate-aware lowerer so `HAVING CAST(ts AS VARCHAR FORMAT ...)`
+            // still resolves any aggregate aliases beneath it.
+            if let Some(fmt) = format {
+                let inner = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
+                return lower_cast_format(kind, inner, data_type, fmt);
             }
             // `TRY_CAST` / `SAFE_CAST` are synonyms carrying NULL-on-failure
             // semantics (`safe = true`); plain `CAST` / `::` keep the
@@ -6647,6 +6705,7 @@ fn validate_having_columns(predicate: &Expr, project_schema: &Schema) -> BoltRes
             }
             Expr::Like { expr, .. } => stack.push(expr),
             Expr::Cast { expr, .. } => stack.push(expr),
+            Expr::CastFormat { expr, .. } => stack.push(expr),
             Expr::ScalarFn { args, .. } => {
                 for a in args {
                     stack.push(a);
@@ -7057,17 +7116,18 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
         // `SAFE_CAST` (synonyms) carry NULL-on-failure semantics: a
         // conversion failure on a non-null input yields SQL NULL instead of
         // an error. They lower to the same `Expr::Cast` shape with
-        // `safe = true`. `CAST ... FORMAT` remains out of scope.
+        // `safe = true`. `CAST(... FORMAT '<pattern>')` is the bounded,
+        // host-only temporal ⇄ string conversion (feature CAST FORMAT) and
+        // lowers to `Expr::CastFormat` via `lower_cast_format`.
         SqlExpr::Cast {
             kind,
             expr,
             data_type,
             format,
         } => {
-            if format.is_some() {
-                return Err(BoltError::Sql(
-                    "CAST with FORMAT clause not supported".into(),
-                ));
+            if let Some(fmt) = format {
+                let inner = lower_expr(expr, resolver, depth + 1)?;
+                return lower_cast_format(kind, inner, data_type, fmt);
             }
             let safe = match kind {
                 CastKind::Cast | CastKind::DoubleColon => false,
@@ -7510,6 +7570,182 @@ fn lower_value(v: &Value) -> BoltResult<Expr> {
 ///   * `DOUBLE`, `DOUBLE PRECISION`,
 ///     `FLOAT8`, `FLOAT64`                 -> [`DataType::Float64`]
 ///   * `BOOL`, `BOOLEAN`                   -> [`DataType::Bool`]
+/// Lower a `CAST(<inner> AS <data_type> FORMAT '<pattern>')` into an
+/// [`Expr::CastFormat`] (feature CAST FORMAT).
+///
+/// This is a **host-only** conversion (no GPU codegen): the physical-plan
+/// boundary routes any projection carrying a `CastFormat` to the host
+/// `PhysicalPlan::Project`. Two directions are recognised, keyed off the
+/// declared target type:
+///   * target is a string type (`VARCHAR` / `TEXT` / `CHAR` / `STRING`):
+///     format a `Date32` / `Timestamp` operand *to* text (`to_text = true`).
+///   * target is `DATE` / `TIMESTAMP`: parse a `Utf8` operand *into* a
+///     temporal value (`to_text = false`).
+///
+/// `TRY_CAST` / `SAFE_CAST` spellings are rejected with FORMAT (the
+/// NULL-on-failure envelope is not defined for the format path); only plain
+/// `CAST` / `::` carry FORMAT. `AT TIME ZONE` inside the FORMAT clause
+/// (`CastFormat::ValueAtTimeZone`) is rejected. The pattern string is parsed
+/// and validated by [`parse_cast_format_pattern`]; unknown tokens are rejected
+/// there with a message naming the offending token.
+fn lower_cast_format(
+    kind: &CastKind,
+    inner: Expr,
+    data_type: &SqlDataType,
+    fmt: &SqlCastFormat,
+) -> BoltResult<Expr> {
+    // Only plain CAST carries a FORMAT clause; TRY_CAST/SAFE_CAST + FORMAT has
+    // no defined NULL-on-failure contract here, so reject it precisely.
+    match kind {
+        CastKind::Cast | CastKind::DoubleColon => {}
+        CastKind::TryCast | CastKind::SafeCast => {
+            return Err(BoltError::Sql(
+                "TRY_CAST / SAFE_CAST with a FORMAT clause is not supported \
+                 (FORMAT is only defined for plain CAST)"
+                    .into(),
+            ));
+        }
+    }
+    // Extract the pattern string. `AT TIME ZONE` is not modelled.
+    let pattern_str = match fmt {
+        SqlCastFormat::Value(Value::SingleQuotedString(s))
+        | SqlCastFormat::Value(Value::DoubleQuotedString(s)) => s.clone(),
+        SqlCastFormat::Value(other) => {
+            return Err(BoltError::Sql(format!(
+                "CAST(... FORMAT ...) pattern must be a string literal, got {other}"
+            )));
+        }
+        SqlCastFormat::ValueAtTimeZone(_, _) => {
+            return Err(BoltError::Sql(
+                "CAST(... FORMAT ... AT TIME ZONE ...) is not supported".into(),
+            ));
+        }
+    };
+    let pattern = parse_cast_format_pattern(&pattern_str)?;
+
+    // Resolve the target dtype and the conversion direction from the declared
+    // SQL type. String targets ⇒ format (to_text); temporal targets ⇒ parse.
+    let (target, to_text) = match data_type {
+        SqlDataType::Varchar(_)
+        | SqlDataType::Nvarchar(_)
+        | SqlDataType::Char(_)
+        | SqlDataType::CharVarying(_)
+        | SqlDataType::CharacterVarying(_)
+        | SqlDataType::Character(_)
+        | SqlDataType::Text
+        | SqlDataType::String(_) => (DataType::Utf8, true),
+        SqlDataType::Date => (DataType::Date32, false),
+        // Timestamp FORMAT parses into a naive nanosecond timestamp (matching
+        // the `TIMESTAMP '...'` literal path); timezone info on the type is
+        // not modelled here.
+        SqlDataType::Timestamp(_, _) => {
+            (DataType::Timestamp(TimeUnit::Nanosecond, None), false)
+        }
+        other => {
+            return Err(BoltError::Sql(format!(
+                "CAST(... FORMAT ...) target type must be VARCHAR/TEXT (format) or \
+                 DATE/TIMESTAMP (parse), got {other}"
+            )));
+        }
+    };
+
+    Ok(Expr::CastFormat {
+        expr: Box::new(inner),
+        target,
+        pattern,
+        to_text,
+    })
+}
+
+/// Parse a `CAST(... FORMAT '<pattern>')` pattern string into a bounded,
+/// validated [`FormatToken`] sequence (feature CAST FORMAT).
+///
+/// Supported vocabulary (case-insensitive for the field tokens):
+///   * `YYYY` → 4-digit year
+///   * `MM`   → 2-digit month
+///   * `DD`   → 2-digit day
+///   * `HH24` / `HH` → 2-digit 24-hour hour
+///   * `MI`   → 2-digit minute
+///   * `SS`   → 2-digit second
+///   * literal separators: `-`, `/`, `:`, and space
+///
+/// The scan is greedy and longest-match (`HH24` before `HH`, `YYYY` before a
+/// shorter year). Any unrecognised character or alphabetic run is rejected
+/// with a `BoltError::Sql` that names the offending token, rather than being
+/// silently mis-formatted.
+fn parse_cast_format_pattern(pat: &str) -> BoltResult<Vec<FormatToken>> {
+    if pat.is_empty() {
+        return Err(BoltError::Sql(
+            "CAST(... FORMAT ...) pattern must not be empty".into(),
+        ));
+    }
+    let bytes = pat.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    // ASCII-only matching: every supported token and separator is ASCII, and a
+    // non-ASCII byte can never be a continuation of one, so byte indexing is
+    // safe here.
+    let upper = pat.to_ascii_uppercase();
+    let ub = upper.as_bytes();
+    while i < bytes.len() {
+        // Longest-match field tokens first.
+        let matched = if ub[i..].starts_with(b"YYYY") {
+            out.push(FormatToken::Year4);
+            4
+        } else if ub[i..].starts_with(b"HH24") {
+            out.push(FormatToken::Hour24);
+            4
+        } else if ub[i..].starts_with(b"HH") {
+            out.push(FormatToken::Hour24);
+            2
+        } else if ub[i..].starts_with(b"MM") {
+            out.push(FormatToken::Month);
+            2
+        } else if ub[i..].starts_with(b"DD") {
+            out.push(FormatToken::Day);
+            2
+        } else if ub[i..].starts_with(b"MI") {
+            out.push(FormatToken::Minute);
+            2
+        } else if ub[i..].starts_with(b"SS") {
+            out.push(FormatToken::Second);
+            2
+        } else {
+            let c = bytes[i] as char;
+            match c {
+                '-' | '/' | ':' | ' ' => {
+                    out.push(FormatToken::Literal(c));
+                    1
+                }
+                // An alphabetic run that did not match a known token: surface
+                // the whole run so the error names the offending token rather
+                // than a single character.
+                _ if c.is_ascii_alphabetic() => {
+                    let start = i;
+                    let mut j = i;
+                    while j < bytes.len() && (bytes[j] as char).is_ascii_alphabetic() {
+                        j += 1;
+                    }
+                    return Err(BoltError::Sql(format!(
+                        "CAST(... FORMAT ...): unsupported pattern token '{}' \
+                         (supported: YYYY, MM, DD, HH/HH24, MI, SS and the \
+                         separators - / : space)",
+                        &pat[start..j]
+                    )));
+                }
+                _ => {
+                    return Err(BoltError::Sql(format!(
+                        "CAST(... FORMAT ...): unsupported separator '{c}' \
+                         (only - / : and space are allowed)"
+                    )));
+                }
+            }
+        };
+        i += matched;
+    }
+    Ok(out)
+}
+
 fn lower_cast_data_type(t: &SqlDataType) -> BoltResult<DataType> {
     Ok(match t {
         SqlDataType::Int(_)
@@ -7835,6 +8071,85 @@ mod date_validation_tests {
             parse_timestamp_literal("2024-01-01 00:00:60").is_err(),
             ":60 seconds must be rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod cast_format_pattern_tests {
+    //! Host-side tests for the CAST FORMAT pattern vocabulary
+    //! (`parse_cast_format_pattern`). No GPU / provider involved.
+    use super::*;
+
+    #[test]
+    fn parses_full_datetime_pattern() {
+        let toks = parse_cast_format_pattern("YYYY-MM-DD HH24:MI:SS").expect("valid pattern");
+        assert_eq!(
+            toks,
+            vec![
+                FormatToken::Year4,
+                FormatToken::Literal('-'),
+                FormatToken::Month,
+                FormatToken::Literal('-'),
+                FormatToken::Day,
+                FormatToken::Literal(' '),
+                FormatToken::Hour24,
+                FormatToken::Literal(':'),
+                FormatToken::Minute,
+                FormatToken::Literal(':'),
+                FormatToken::Second,
+            ]
+        );
+    }
+
+    #[test]
+    fn hh_and_hh24_both_map_to_hour24() {
+        assert_eq!(
+            parse_cast_format_pattern("HH:MI").unwrap(),
+            vec![FormatToken::Hour24, FormatToken::Literal(':'), FormatToken::Minute]
+        );
+        assert_eq!(
+            parse_cast_format_pattern("HH24").unwrap(),
+            vec![FormatToken::Hour24]
+        );
+    }
+
+    #[test]
+    fn is_case_insensitive_for_field_tokens() {
+        assert_eq!(
+            parse_cast_format_pattern("yyyy/mm/dd").unwrap(),
+            vec![
+                FormatToken::Year4,
+                FormatToken::Literal('/'),
+                FormatToken::Month,
+                FormatToken::Literal('/'),
+                FormatToken::Day,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_alphabetic_token_naming_it() {
+        let err = parse_cast_format_pattern("YYYY-WW").expect_err("WW is not supported");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported pattern token 'WW'"),
+            "error must name the offending token, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_separator() {
+        let err = parse_cast_format_pattern("YYYY.MM").expect_err("'.' is not allowed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported separator '.'"),
+            "error must name the bad separator, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_pattern() {
+        assert!(parse_cast_format_pattern("").is_err());
     }
 }
 
@@ -8555,6 +8870,138 @@ mod wave7_tests {
         assert!(
             matches!(plain, PhysicalPlan::Projection { .. }),
             "plain CAST projection must stay on GPU Projection, got {plain:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Feature CAST FORMAT — frontend lowering + routing.
+    // -------------------------------------------------------------------
+
+    /// A provider with a temporal (`d` Date32, `ts` Timestamp) and a Utf8
+    /// (`s`) column so both CAST FORMAT directions can be lowered + typed.
+    fn temporal_provider() -> MemTableProvider {
+        use crate::plan::logical_plan::Field;
+        let t = Schema::new(vec![
+            Field::new("d", DataType::Date32, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("s", DataType::Utf8, false),
+        ]);
+        MemTableProvider::new().with_table("tt", t)
+    }
+
+    fn tp_lp(sql: &str) -> LogicalPlan {
+        parse(sql, &temporal_provider())
+            .unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
+    }
+
+    /// `CAST(d AS VARCHAR FORMAT 'YYYY-MM-DD')` lowers to `Expr::CastFormat`
+    /// (to_text, target Utf8) and type-checks to Utf8.
+    #[test]
+    fn cast_format_date_to_string_lowers() {
+        let plan = tp_lp("SELECT CAST(d AS VARCHAR FORMAT 'YYYY-MM-DD') FROM tt");
+        match nth_proj_expr(&plan, 0) {
+            Expr::CastFormat {
+                target,
+                to_text,
+                pattern,
+                ..
+            } => {
+                assert!(to_text, "temporal→string must set to_text = true");
+                assert_eq!(target, DataType::Utf8);
+                assert_eq!(pattern.first(), Some(&FormatToken::Year4));
+            }
+            other => panic!("expected Expr::CastFormat, got {other:?}"),
+        }
+        // Whole plan type-checks (the projected column is Utf8).
+        assert!(plan.schema().is_ok(), "CAST FORMAT plan must type-check");
+    }
+
+    /// `CAST(s AS DATE FORMAT 'YYYY-MM-DD')` lowers to `Expr::CastFormat`
+    /// (parse direction, target Date32).
+    #[test]
+    fn cast_format_string_to_date_lowers() {
+        let plan = tp_lp("SELECT CAST(s AS DATE FORMAT 'YYYY-MM-DD') FROM tt");
+        match nth_proj_expr(&plan, 0) {
+            Expr::CastFormat { target, to_text, .. } => {
+                assert!(!to_text, "string→temporal must set to_text = false");
+                assert_eq!(target, DataType::Date32);
+            }
+            other => panic!("expected Expr::CastFormat, got {other:?}"),
+        }
+    }
+
+    /// A CAST FORMAT projection routes to the host-side `PhysicalPlan::Project`
+    /// (it is host-only; no GPU codegen).
+    #[test]
+    fn cast_format_routes_to_host_project() {
+        let logical = tp_lp("SELECT CAST(d AS VARCHAR FORMAT 'YYYY-MM-DD') FROM tt");
+        let phys = lower(&logical).expect("CAST FORMAT must lower without error");
+        assert!(
+            matches!(phys, PhysicalPlan::Project { .. }),
+            "CAST FORMAT projection must lower to host Project, got {phys:?}"
+        );
+    }
+
+    /// An unknown pattern token is rejected at lowering, naming the token.
+    #[test]
+    fn cast_format_unknown_token_rejected() {
+        let err = parse(
+            "SELECT CAST(d AS VARCHAR FORMAT 'YYYY-QQ') FROM tt",
+            &temporal_provider(),
+        )
+        .expect_err("unknown token QQ must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported pattern token 'QQ'"),
+            "error must name the bad token, got: {msg}"
+        );
+    }
+
+    /// An intra-day token against a Date32 operand is an unsupported type/
+    /// pattern combination — rejected cleanly at type-check (the projection
+    /// lowers, but `schema()` type-checks the CAST FORMAT and rejects it).
+    #[test]
+    fn cast_format_intraday_token_on_date32_rejected() {
+        let plan = tp_lp("SELECT CAST(d AS VARCHAR FORMAT 'YYYY-MM-DD HH24:MI') FROM tt");
+        let err = plan
+            .schema()
+            .expect_err("HH/MI on a Date32 operand must type-error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("time-of-day token") && msg.contains("Date32"),
+            "error must explain the Date32 / intra-day mismatch, got: {msg}"
+        );
+    }
+
+    /// Formatting a non-temporal operand (Utf8) to string via FORMAT is an
+    /// unsupported type combination — rejected cleanly at type-check.
+    #[test]
+    fn cast_format_nontemporal_operand_rejected() {
+        // `s` is Utf8; formatting a Utf8 *to* VARCHAR via FORMAT is nonsense
+        // (the to_text direction requires a temporal operand).
+        let plan = tp_lp("SELECT CAST(s AS VARCHAR FORMAT 'YYYY-MM-DD') FROM tt");
+        let err = plan
+            .schema()
+            .expect_err("formatting a Utf8 operand to text must type-error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("requires a Date32 or") && msg.contains("Timestamp"),
+            "error must require a temporal operand, got: {msg}"
+        );
+    }
+
+    /// `TRY_CAST(... FORMAT ...)` is rejected (FORMAT is plain-CAST only).
+    #[test]
+    fn try_cast_with_format_rejected() {
+        let err = parse(
+            "SELECT TRY_CAST(d AS VARCHAR FORMAT 'YYYY-MM-DD') FROM tt",
+            &temporal_provider(),
+        )
+        .expect_err("TRY_CAST + FORMAT must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("TRY_CAST") && msg.contains("FORMAT"),
+            "error must explain TRY_CAST/FORMAT is unsupported, got: {msg}"
         );
     }
 
@@ -9282,6 +9729,7 @@ mod wave7_tests {
                         }
                         Expr::Like { expr, .. } => stack.push(expr),
                         Expr::Cast { expr, .. } => stack.push(expr),
+                        Expr::CastFormat { expr, .. } => stack.push(expr),
                         Expr::ScalarFn { args, .. } => {
                             for a in args {
                                 stack.push(a);
@@ -10974,6 +11422,12 @@ mod root_setop_schema_tests {
             msg.contains("LATERAL"),
             "expected LATERAL rejection, got: {msg}"
         );
+        // Feature B (assessment): the improved message explains *why* — the
+        // engine has no per-row apply / decorrelation path.
+        assert!(
+            msg.contains("correlated") && msg.contains("apply"),
+            "improved LATERAL message should explain the correlated/apply limitation, got: {msg}"
+        );
     }
 
     /// A derived-table alias with a column list `AS d(x, y)` requires field
@@ -11179,6 +11633,47 @@ mod recursive_cte_tests {
         assert_eq!(rec.cte_schema.fields.len(), 1);
         assert_eq!(rec.cte_schema.fields[0].name, "node");
         assert_eq!(rec.cte_schema.fields[0].dtype, DataType::Int64);
+    }
+
+    // -------------------------------------------------------------------
+    // Feature B (assessment): the recursion-extension rejections stay, but
+    // the messages now explain *why* (documented, intentional limitations).
+    // These pin the improved wording so the rejection is clearly scoped.
+    // -------------------------------------------------------------------
+
+    /// Mutual recursion: the message explains the multi-relation lockstep
+    /// fixpoint the single-working-set executor does not implement.
+    #[test]
+    fn mutual_recursion_message_explains_limitation() {
+        let sql = "WITH RECURSIVE \
+                     a(n) AS (SELECT src FROM edges WHERE src=1 UNION ALL SELECT n+1 FROM a WHERE n<3), \
+                     b(m) AS (SELECT src FROM edges WHERE src=1 UNION ALL SELECT m+1 FROM b WHERE m<3) \
+                   SELECT n FROM a";
+        let err = plan_recursive_cte(sql, &provider())
+            .expect_err("mutual recursion must be rejected (cleanly, no panic)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mutual recursion") && msg.contains("lockstep fixpoint"),
+            "improved mutual-recursion message expected, got: {msg}"
+        );
+    }
+
+    /// Non-linear recursion: the message explains the self-join-in-fixpoint
+    /// requirement.
+    #[test]
+    fn non_linear_recursion_message_explains_limitation() {
+        let sql = "WITH RECURSIVE r(n) AS (\
+                       SELECT src FROM edges WHERE src = 1 \
+                       UNION ALL \
+                       SELECT r1.n + 1 FROM r AS r1, r AS r2 WHERE r1.n < 3\
+                   ) SELECT n FROM r";
+        let err = plan_recursive_cte(sql, &provider())
+            .expect_err("non-linear recursion must be rejected (cleanly, no panic)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-linear recursion") && msg.contains("self-join"),
+            "improved non-linear message expected, got: {msg}"
+        );
     }
 }
 

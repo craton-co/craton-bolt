@@ -783,6 +783,17 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 safe: *safe,
             })
         }
+        Expr::CastFormat { expr: inner, target, pattern, to_text } => {
+            // Like CAST, recurse into the operand to normalise any rewritable
+            // sub-expression; the FORMAT pattern itself has no rewrite surface.
+            let new_inner = rewrite_expr_with(inner, r, depth + 1)?;
+            Ok(Expr::CastFormat {
+                expr: Box::new(new_inner),
+                target: *target,
+                pattern: pattern.clone(),
+                to_text: *to_text,
+            })
+        }
         Expr::Unary { op, operand } => {
             // The `IS NULL` / `IS NOT NULL` surface has no string-literal
             // operand to dictionary-rewrite — the operand is the value whose

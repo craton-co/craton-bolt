@@ -131,7 +131,7 @@ use std::collections::HashMap;
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, DataType, Expr, Literal, ScalarFnKind, UnaryOp,
+    AggregateExpr, BinaryOp, DataType, Expr, FormatToken, Literal, ScalarFnKind, TimeUnit, UnaryOp,
 };
 
 // ---------------------------------------------------------------------------
@@ -359,6 +359,23 @@ fn eval_inner(
                 cast_column(inner, *target)
             }
         }
+        // CAST FORMAT: host-only temporal ⇄ string conversion (feature
+        // CAST FORMAT). The physical-plan boundary routes any projection
+        // carrying a `CastFormat` here (see
+        // `physical_plan::expr_contains_cast_format`). NULL propagates as NULL.
+        //
+        // IMPORTANT: temporals live in `HostColumn` as their fixed-width
+        // storage — `Date32` as `I32` (days since epoch), `Timestamp` as `I64`
+        // (ticks). So the *string→temporal* arm returns `I32`/`I64` and the
+        // *temporal→string* arm returns `Utf8`; the caller's `eval_expr`
+        // out-dtype coercion is a no-op in both cases (Date32/Timestamp out
+        // fields surface as I32/I64; Utf8 stays Utf8).
+        Expr::CastFormat {
+            expr,
+            target,
+            pattern,
+            to_text,
+        } => eval_cast_format(expr, *target, pattern, *to_text, env, n_rows),
         // String scalar functions evaluated host-side. SUBSTRING and TRIM are
         // wired here (the physical-plan boundary routes Projects carrying them
         // to `PhysicalPlan::Project`, whose executor calls `eval_expr`).
@@ -446,6 +463,319 @@ fn eval_like(
         })
         .collect();
     Ok(HostColumn::Bool(out))
+}
+
+// ---------------------------------------------------------------------------
+// CAST FORMAT (feature CAST FORMAT) — host-only temporal ⇄ string conversion
+// ---------------------------------------------------------------------------
+
+/// Days since the Unix epoch (1970-01-01) for `(year, month, day)`, proleptic
+/// Gregorian (Hinnant's `days_from_civil`). Returns `None` if outside the
+/// `i32` Date32 range. Mirrors `sql_frontend::days_since_epoch` but is local so
+/// this module has no dependency on the SQL frontend.
+fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i32> {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    i32::try_from(days).ok()
+}
+
+/// Inverse: `(year, month, day)` for a Date32 day count (Hinnant's
+/// `civil_from_days`). Exact across the whole `i32` day range.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d)
+}
+
+/// A decomposed civil date-time used by the format / parse routines.
+#[derive(Debug, Clone, Copy, Default)]
+struct CivilDateTime {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+}
+
+/// Format one [`CivilDateTime`] using the validated token sequence.
+fn format_civil(parts: &CivilDateTime, pattern: &[FormatToken]) -> String {
+    let mut s = String::with_capacity(pattern.len() * 2);
+    for tok in pattern {
+        match tok {
+            FormatToken::Year4 => {
+                // 4-digit zero-padded year. Negative / >9999 years still emit
+                // their full digits (the leading sign / extra digits are
+                // tolerated rather than truncated).
+                if parts.year < 0 {
+                    s.push('-');
+                    s.push_str(&format!("{:04}", -parts.year));
+                } else {
+                    s.push_str(&format!("{:04}", parts.year));
+                }
+            }
+            FormatToken::Month => s.push_str(&format!("{:02}", parts.month)),
+            FormatToken::Day => s.push_str(&format!("{:02}", parts.day)),
+            FormatToken::Hour24 => s.push_str(&format!("{:02}", parts.hour)),
+            FormatToken::Minute => s.push_str(&format!("{:02}", parts.minute)),
+            FormatToken::Second => s.push_str(&format!("{:02}", parts.second)),
+            FormatToken::Literal(c) => s.push(*c),
+        }
+    }
+    s
+}
+
+/// Parse a string against the validated token sequence into a
+/// [`CivilDateTime`]. Field tokens consume their fixed digit width; literal
+/// tokens must match verbatim. Returns `None` on any structural mismatch,
+/// non-digit field, or out-of-range field value (months 1..=12, days against
+/// the real month length, hour 0..=23, minute/second 0..=59).
+fn parse_civil(input: &str, pattern: &[FormatToken]) -> Option<CivilDateTime> {
+    let b = input.as_bytes();
+    let mut i = 0usize;
+    let mut p = CivilDateTime {
+        // Defaults for fields a pattern may omit (e.g. a date-only pattern
+        // leaves the clock at midnight).
+        year: 1970,
+        month: 1,
+        day: 1,
+        ..Default::default()
+    };
+    // Read `width` ASCII digits starting at `i`, advancing it. ASCII digits
+    // are single-byte so byte indexing is UTF-8-safe.
+    fn take_digits(b: &[u8], i: &mut usize, width: usize) -> Option<i64> {
+        if *i + width > b.len() {
+            return None;
+        }
+        let mut v: i64 = 0;
+        for _ in 0..width {
+            let c = b[*i];
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (c - b'0') as i64;
+            *i += 1;
+        }
+        Some(v)
+    }
+    for tok in pattern {
+        match tok {
+            FormatToken::Year4 => p.year = take_digits(b, &mut i, 4)?,
+            FormatToken::Month => p.month = take_digits(b, &mut i, 2)?,
+            FormatToken::Day => p.day = take_digits(b, &mut i, 2)?,
+            FormatToken::Hour24 => p.hour = take_digits(b, &mut i, 2)?,
+            FormatToken::Minute => p.minute = take_digits(b, &mut i, 2)?,
+            FormatToken::Second => p.second = take_digits(b, &mut i, 2)?,
+            FormatToken::Literal(c) => {
+                // The literal must match exactly one byte (all literals are
+                // ASCII).
+                if i >= b.len() || b[i] != (*c as u8) {
+                    return None;
+                }
+                i += 1;
+            }
+        }
+    }
+    // The whole input must be consumed (no trailing garbage).
+    if i != b.len() {
+        return None;
+    }
+    // Range-validate the decomposed fields.
+    if !(1..=12).contains(&p.month) {
+        return None;
+    }
+    let dim = days_in_month_local(p.year, p.month as u32);
+    if p.day < 1 || p.day > dim as i64 {
+        return None;
+    }
+    if p.hour > 23 || p.minute > 59 || p.second > 59 || p.hour < 0 || p.minute < 0 || p.second < 0 {
+        return None;
+    }
+    Some(p)
+}
+
+/// Local copy of the proleptic-Gregorian month length used by `parse_civil`.
+fn days_in_month_local(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Evaluate a `CAST(... FORMAT ...)` expression host-side.
+///
+/// `to_text = true`  → format `Date32`(I32) / `Timestamp`(I64) → `Utf8`.
+/// `to_text = false` → parse `Utf8` → `Date32`(I32) / `Timestamp`(I64).
+///
+/// NULL cells propagate as NULL. A parse failure on a non-null cell is a hard
+/// error (plain CAST semantics — FORMAT is only carried by plain CAST; see
+/// `sql_frontend::lower_cast_format`).
+fn eval_cast_format(
+    expr: &Expr,
+    target: DataType,
+    pattern: &[FormatToken],
+    to_text: bool,
+    env: &ColumnEnv<'_>,
+    n_rows: usize,
+) -> BoltResult<HostColumn> {
+    let inner = eval_inner(expr, env, n_rows)?;
+    if to_text {
+        // Temporal → string. Source is I32 (Date32 days) or I64 (Timestamp
+        // ticks, nanoseconds).
+        let out: Vec<Option<String>> = match inner {
+            HostColumn::I32(v) => v
+                .into_iter()
+                .map(|cell| {
+                    cell.map(|days| {
+                        let (y, m, d) = civil_from_days(days as i64);
+                        format_civil(
+                            &CivilDateTime {
+                                year: y,
+                                month: m,
+                                day: d,
+                                ..Default::default()
+                            },
+                            pattern,
+                        )
+                    })
+                })
+                .collect(),
+            HostColumn::I64(v) => v
+                .into_iter()
+                .map(|cell| cell.map(|ticks| format_civil(&civil_from_ticks_ns(ticks), pattern)))
+                .collect(),
+            other => {
+                return Err(BoltError::Type(format!(
+                    "CAST(... FORMAT ...) temporal→string requires a Date32/Timestamp \
+                     operand (stored as I32/I64), got {:?}",
+                    other.dtype()
+                )));
+            }
+        };
+        Ok(HostColumn::Utf8(out))
+    } else {
+        // String → temporal. Source must be Utf8.
+        let utf8 = match inner {
+            HostColumn::Utf8(v) => v,
+            other => {
+                return Err(BoltError::Type(format!(
+                    "CAST(... FORMAT ...) string→temporal requires a Utf8 operand, \
+                     got {:?}",
+                    other.dtype()
+                )));
+            }
+        };
+        match target {
+            DataType::Date32 => {
+                let mut out: Vec<Option<i32>> = Vec::with_capacity(utf8.len());
+                for cell in utf8 {
+                    match cell {
+                        None => out.push(None),
+                        Some(s) => {
+                            let parts = parse_civil(s.trim(), pattern).ok_or_else(|| {
+                                BoltError::Other(format!(
+                                    "CAST(... AS DATE FORMAT ...): value '{s}' does not \
+                                     match the format pattern"
+                                ))
+                            })?;
+                            let days = days_from_civil(parts.year, parts.month, parts.day)
+                                .ok_or_else(|| {
+                                    BoltError::Other(format!(
+                                        "CAST(... AS DATE FORMAT ...): value '{s}' is out \
+                                         of the supported Date32 range"
+                                    ))
+                                })?;
+                            out.push(Some(days));
+                        }
+                    }
+                }
+                Ok(HostColumn::I32(out))
+            }
+            DataType::Timestamp(unit, _tz) => {
+                let mut out: Vec<Option<i64>> = Vec::with_capacity(utf8.len());
+                for cell in utf8 {
+                    match cell {
+                        None => out.push(None),
+                        Some(s) => {
+                            let parts = parse_civil(s.trim(), pattern).ok_or_else(|| {
+                                BoltError::Other(format!(
+                                    "CAST(... AS TIMESTAMP FORMAT ...): value '{s}' does \
+                                     not match the format pattern"
+                                ))
+                            })?;
+                            let ticks = civil_to_ticks(&parts, unit).ok_or_else(|| {
+                                BoltError::Other(format!(
+                                    "CAST(... AS TIMESTAMP FORMAT ...): value '{s}' is out \
+                                     of the supported range"
+                                ))
+                            })?;
+                            out.push(Some(ticks));
+                        }
+                    }
+                }
+                Ok(HostColumn::I64(out))
+            }
+            other => Err(BoltError::Type(format!(
+                "CAST(... FORMAT ...) string→temporal target must be Date32 or \
+                 Timestamp, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Decompose a nanosecond Timestamp tick count into civil fields. Uses
+/// floor-division so negative (pre-epoch) timestamps decompose correctly.
+fn civil_from_ticks_ns(ticks: i64) -> CivilDateTime {
+    let secs = ticks.div_euclid(1_000_000_000);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400); // seconds-of-day, 0..86399
+    let (y, m, d) = civil_from_days(days);
+    CivilDateTime {
+        year: y,
+        month: m,
+        day: d,
+        hour: sod / 3600,
+        minute: (sod % 3600) / 60,
+        second: sod % 60,
+    }
+}
+
+/// Recompose civil fields into a Timestamp tick count at `unit` resolution.
+/// Returns `None` on i64 overflow. Only whole-second precision is produced
+/// (the supported pattern vocabulary has no sub-second token).
+fn civil_to_ticks(p: &CivilDateTime, unit: TimeUnit) -> Option<i64> {
+    let days = days_from_civil(p.year, p.month, p.day)? as i64;
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(p.hour * 3600 + p.minute * 60 + p.second)?;
+    let mul = match unit {
+        TimeUnit::Second => 1i64,
+        TimeUnit::Millisecond => 1_000,
+        TimeUnit::Microsecond => 1_000_000,
+        TimeUnit::Nanosecond => 1_000_000_000,
+    };
+    secs.checked_mul(mul)
 }
 
 /// Evaluate a string scalar function host-side.
@@ -2365,5 +2695,196 @@ mod tests {
             ),
             other => panic!("expected Bool, got {:?}", other.dtype()),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // CAST FORMAT host evaluator (Expr::CastFormat). Feature CAST FORMAT.
+    // These exercise `eval_cast_format` directly via `eval_expr` over a
+    // HostColumn env (no GPU, no Arrow round-trip). Temporals live as their
+    // storage in HostColumn: Date32 as I32 (days), Timestamp as I64 (ticks).
+    // -----------------------------------------------------------------
+
+    use crate::plan::logical_plan::FormatToken;
+
+    /// `parse_civil` / `format_civil` round-trip helper: build a date pattern.
+    fn date_pattern() -> Vec<FormatToken> {
+        vec![
+            FormatToken::Year4,
+            FormatToken::Literal('-'),
+            FormatToken::Month,
+            FormatToken::Literal('-'),
+            FormatToken::Day,
+        ]
+    }
+
+    fn cast_format(expr: Expr, target: DataType, pattern: Vec<FormatToken>, to_text: bool) -> Expr {
+        Expr::CastFormat {
+            expr: Box::new(expr),
+            target,
+            pattern,
+            to_text,
+        }
+    }
+
+    /// Date32 → string: format the day count `0` (1970-01-01) and a known
+    /// reference (`10957` = 2000-01-01) with `YYYY-MM-DD`.
+    #[test]
+    fn cast_format_date32_to_string() {
+        // Day 0 = 1970-01-01; day 10957 = 2000-01-01; day -1 = 1969-12-31.
+        let d = HostColumn::I32(vec![Some(0), Some(10_957), Some(-1), None]);
+        let env = env_of(&[("d", &d)]);
+        let expr = cast_format(col("d"), DataType::Utf8, date_pattern(), true);
+        let out = eval_expr(&expr, &env, DataType::Utf8, 4).unwrap();
+        match out {
+            HostColumn::Utf8(v) => assert_eq!(
+                v,
+                vec![
+                    Some("1970-01-01".to_string()),
+                    Some("2000-01-01".to_string()),
+                    Some("1969-12-31".to_string()),
+                    None,
+                ]
+            ),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    /// String → Date32 → string round-trips losslessly for the supported
+    /// `YYYY-MM-DD` pattern.
+    #[test]
+    fn cast_format_string_to_date32_round_trip() {
+        let s = utf8(&[Some("1970-01-01"), Some("2000-01-01"), Some("2024-02-29"), None]);
+        let env = env_of(&[("s", &s)]);
+        // string → Date32 (I32 storage)
+        let to_date = cast_format(col("s"), DataType::Date32, date_pattern(), false);
+        let days = eval_expr(&to_date, &env, DataType::Int32, 4).unwrap();
+        let day_vals = match &days {
+            HostColumn::I32(v) => v.clone(),
+            other => panic!("expected I32, got {:?}", other.dtype()),
+        };
+        assert_eq!(
+            day_vals,
+            vec![Some(0), Some(10_957), Some(19_782), None],
+            "parsed day counts (2024-02-29 = day 19782)"
+        );
+        // Date32 → string brings us back to the original text.
+        let env2 = env_of(&[("d", &days)]);
+        let back = cast_format(col("d"), DataType::Utf8, date_pattern(), true);
+        let out = eval_expr(&back, &env2, DataType::Utf8, 4).unwrap();
+        match out {
+            HostColumn::Utf8(v) => assert_eq!(
+                v,
+                vec![
+                    Some("1970-01-01".to_string()),
+                    Some("2000-01-01".to_string()),
+                    Some("2024-02-29".to_string()),
+                    None,
+                ]
+            ),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Timestamp (nanosecond ticks) → string with a full date-time pattern.
+    #[test]
+    fn cast_format_timestamp_to_string() {
+        // 2000-01-01 00:00:00 UTC = 946684800 s = 946684800_000_000_000 ns.
+        // Add 13h 37m 09s within the day.
+        let base_secs: i64 = 946_684_800 + 13 * 3600 + 37 * 60 + 9;
+        let ts = HostColumn::I64(vec![Some(base_secs * 1_000_000_000), None]);
+        let env = env_of(&[("ts", &ts)]);
+        let pattern = vec![
+            FormatToken::Year4,
+            FormatToken::Literal('-'),
+            FormatToken::Month,
+            FormatToken::Literal('-'),
+            FormatToken::Day,
+            FormatToken::Literal(' '),
+            FormatToken::Hour24,
+            FormatToken::Literal(':'),
+            FormatToken::Minute,
+            FormatToken::Literal(':'),
+            FormatToken::Second,
+        ];
+        let expr = cast_format(col("ts"), DataType::Utf8, pattern, true);
+        let out = eval_expr(&expr, &env, DataType::Utf8, 2).unwrap();
+        match out {
+            HostColumn::Utf8(v) => assert_eq!(
+                v,
+                vec![Some("2000-01-01 13:37:09".to_string()), None]
+            ),
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    /// String → Timestamp (nanosecond) parses the full date-time pattern and
+    /// round-trips back to the same string.
+    #[test]
+    fn cast_format_string_to_timestamp_round_trip() {
+        let s = utf8(&[Some("2000-01-01 13:37:09")]);
+        let env = env_of(&[("s", &s)]);
+        let pattern = vec![
+            FormatToken::Year4,
+            FormatToken::Literal('-'),
+            FormatToken::Month,
+            FormatToken::Literal('-'),
+            FormatToken::Day,
+            FormatToken::Literal(' '),
+            FormatToken::Hour24,
+            FormatToken::Literal(':'),
+            FormatToken::Minute,
+            FormatToken::Literal(':'),
+            FormatToken::Second,
+        ];
+        let to_ts = cast_format(
+            col("s"),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            pattern.clone(),
+            false,
+        );
+        let ticks = eval_expr(&to_ts, &env, DataType::Int64, 1).unwrap();
+        let base_secs: i64 = 946_684_800 + 13 * 3600 + 37 * 60 + 9;
+        match &ticks {
+            HostColumn::I64(v) => {
+                assert_eq!(v, &vec![Some(base_secs * 1_000_000_000)])
+            }
+            other => panic!("expected I64, got {:?}", other.dtype()),
+        }
+        let env2 = env_of(&[("ts", &ticks)]);
+        let back = cast_format(col("ts"), DataType::Utf8, pattern, true);
+        let out = eval_expr(&back, &env2, DataType::Utf8, 1).unwrap();
+        match out {
+            HostColumn::Utf8(v) => {
+                assert_eq!(v, vec![Some("2000-01-01 13:37:09".to_string())])
+            }
+            other => panic!("expected Utf8, got {:?}", other.dtype()),
+        }
+    }
+
+    /// A string that does not match the pattern is a hard error (plain-CAST
+    /// semantics — FORMAT is only carried by plain CAST).
+    #[test]
+    fn cast_format_string_to_date32_bad_input_errors() {
+        let s = utf8(&[Some("not-a-date")]);
+        let env = env_of(&[("s", &s)]);
+        let expr = cast_format(col("s"), DataType::Date32, date_pattern(), false);
+        let err = eval_expr(&expr, &env, DataType::Int32, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not match the format pattern"),
+            "expected a parse-failure error, got: {msg}"
+        );
+    }
+
+    /// An impossible calendar date (Feb 30) is rejected by the range check.
+    #[test]
+    fn cast_format_string_to_date32_rejects_impossible_date() {
+        let s = utf8(&[Some("2023-02-30")]);
+        let env = env_of(&[("s", &s)]);
+        let expr = cast_format(col("s"), DataType::Date32, date_pattern(), false);
+        assert!(
+            eval_expr(&expr, &env, DataType::Int32, 1).is_err(),
+            "Feb 30 must not parse"
+        );
     }
 }

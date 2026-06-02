@@ -42,7 +42,7 @@ pub fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::Like { expr, .. } => collect_columns(expr, out),
-        Expr::Cast { expr, .. } => collect_columns(expr, out),
+        Expr::Cast { expr, .. } | Expr::CastFormat { expr, .. } => collect_columns(expr, out),
         Expr::ScalarFn { args, .. } => {
             for a in args {
                 collect_columns(a, out);

@@ -143,6 +143,33 @@ pub fn format_expr(expr: &Expr) -> String {
         Expr::Cast { expr, target, .. } => {
             format!("CAST({} AS {})", format_expr(expr), format_dtype(*target))
         }
+        Expr::CastFormat {
+            expr,
+            target,
+            pattern,
+            ..
+        } => {
+            // Render the validated tokens back to a readable pattern string.
+            let mut pat = String::new();
+            for tok in pattern {
+                use crate::plan::logical_plan::FormatToken::*;
+                match tok {
+                    Year4 => pat.push_str("YYYY"),
+                    Month => pat.push_str("MM"),
+                    Day => pat.push_str("DD"),
+                    Hour24 => pat.push_str("HH24"),
+                    Minute => pat.push_str("MI"),
+                    Second => pat.push_str("SS"),
+                    Literal(c) => pat.push(*c),
+                }
+            }
+            format!(
+                "CAST({} AS {} FORMAT '{}')",
+                format_expr(expr),
+                format_dtype(*target),
+                pat
+            )
+        }
         Expr::ScalarFn { kind, args } => {
             let rendered: Vec<String> = args.iter().map(format_expr).collect();
             format!("{}({})", scalar_fn_name(*kind), rendered.join(", "))

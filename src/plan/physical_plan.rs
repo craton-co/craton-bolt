@@ -1616,6 +1616,14 @@ impl<'a> Codegen<'a> {
             Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => Err(BoltError::Plan(
                 "GPU codegen: EXTRACT/DATE_TRUNC/subquery not lowered to the fused projection kernel".into(),
             )),
+            // CAST FORMAT is host-only (temporal ⇄ string); any Project
+            // carrying one is routed to the host `PhysicalPlan::Project` before
+            // codegen (see `expr_contains_cast_format`). Reaching here means a
+            // hand-built plan bypassed lowering.
+            Expr::CastFormat { .. } => Err(BoltError::Plan(
+                "GPU codegen: CAST(... FORMAT ...) is host-only and must route through \
+                 the host PhysicalPlan::Project".into(),
+            )),
             Expr::Literal(lit) => self.emit_literal(lit),
             Expr::Binary { op, left, right } => self.emit_binary(*op, left, right),
             Expr::Unary { op, operand } => self.emit_unary(*op, operand),
@@ -3330,6 +3338,17 @@ fn substitute_one_depth(
             target: *target,
             safe: *safe,
         },
+        Expr::CastFormat {
+            expr,
+            target,
+            pattern,
+            to_text,
+        } => Expr::CastFormat {
+            expr: Box::new(substitute_one_depth(expr, map, depth + 1)),
+            target: *target,
+            pattern: pattern.clone(),
+            to_text: *to_text,
+        },
         Expr::ScalarFn { kind, args } => Expr::ScalarFn {
             kind: *kind,
             args: args
@@ -3889,6 +3908,9 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
         // routing decision over a Cast-bearing predicate. Recurse for
         // safety — the answer is the same as for any transparent wrapper.
         Expr::Cast { expr, .. } => predicate_contains_unary(expr),
+        // CAST FORMAT is host-only and never appears in a GPU-lowerable
+        // predicate; recurse into its inner like the plain-Cast arm.
+        Expr::CastFormat { expr, .. } => predicate_contains_unary(expr),
         // ScalarFn predicates are rejected at `lower()` outright (no
         // host-fallback path yet), so the unary-detection routing decision
         // is moot here. Recurse into the args for completeness — if a
@@ -3970,6 +3992,7 @@ fn case_needs_null_output(expr: &Expr) -> bool {
         Expr::Alias(inner, _) => case_needs_null_output(inner),
         Expr::Like { expr, .. } => case_needs_null_output(expr),
         Expr::Cast { expr, .. } => case_needs_null_output(expr),
+        Expr::CastFormat { expr, .. } => case_needs_null_output(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(case_needs_null_output),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
@@ -4045,6 +4068,7 @@ fn expr_contains_concat(expr: &Expr) -> bool {
         }
         Expr::Like { expr, .. } => expr_contains_concat(expr),
         Expr::Cast { expr, .. } => expr_contains_concat(expr),
+        Expr::CastFormat { expr, .. } => expr_contains_concat(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_concat),
         // The subquery subplan is a separate query; its internal `||` (if any)
         // is that plan's own concern. Only the `InSubquery` probe is in this
@@ -4085,12 +4109,55 @@ fn expr_contains_safe_cast(expr: &Expr) -> bool {
                 || else_branch.as_deref().map(expr_contains_safe_cast).unwrap_or(false)
         }
         Expr::Like { expr, .. } => expr_contains_safe_cast(expr),
+        // A CAST FORMAT is never a safe cast (FORMAT is carried only by plain
+        // CAST), but recurse into its inner so a safe cast *beneath* one is
+        // still detected.
+        Expr::CastFormat { expr, .. } => expr_contains_safe_cast(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_safe_cast),
         // The subquery subplan is a separate query; its internal safe casts
         // are that plan's own concern. Only the `InSubquery` probe is in this
         // query's expression namespace.
         Expr::ScalarSubquery(_) => false,
         Expr::InSubquery { expr, .. } => expr_contains_safe_cast(expr),
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
+/// True if `expr` contains a `CAST(... FORMAT ...)` (`Expr::CastFormat`)
+/// anywhere in its subtree (feature CAST FORMAT).
+///
+/// CAST FORMAT is a host-only temporal ⇄ string conversion with no GPU
+/// codegen path, so `lower()` routes any projection carrying one through the
+/// host-side `PhysicalPlan::Project`, whose executor evaluates it via
+/// [`crate::exec::expr_agg::eval_expr`] (see its `Expr::CastFormat` arm).
+/// Mirrors [`expr_contains_safe_cast`].
+fn expr_contains_cast_format(expr: &Expr) -> bool {
+    match expr {
+        Expr::CastFormat { .. } => true,
+        Expr::Cast { expr, .. } => expr_contains_cast_format(expr),
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
+            expr_contains_cast_format(expr)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_contains_cast_format(left) || expr_contains_cast_format(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_cast_format(operand),
+        Expr::Alias(inner, _) => expr_contains_cast_format(inner),
+        Expr::Case { branches, else_branch } => {
+            branches
+                .iter()
+                .any(|(w, t)| expr_contains_cast_format(w) || expr_contains_cast_format(t))
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_cast_format)
+                    .unwrap_or(false)
+        }
+        Expr::Like { expr, .. } => expr_contains_cast_format(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_cast_format),
+        // The subquery subplan is a separate query; only the `InSubquery` probe
+        // is in this query's expression namespace.
+        Expr::ScalarSubquery(_) => false,
+        Expr::InSubquery { expr, .. } => expr_contains_cast_format(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -4112,6 +4179,7 @@ fn expr_contains_case(expr: &Expr) -> bool {
         Expr::Alias(inner, _) => expr_contains_case(inner),
         Expr::Like { expr, .. } => expr_contains_case(expr),
         Expr::Cast { expr, .. } => expr_contains_case(expr),
+        Expr::CastFormat { expr, .. } => expr_contains_case(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_case),
         Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => expr_contains_case(expr),
         Expr::InSubquery { expr, .. } => expr_contains_case(expr),
@@ -4157,6 +4225,7 @@ fn expr_contains_utf8_literal(expr: &Expr) -> bool {
         }
         Expr::Like { expr, .. } => expr_contains_utf8_literal(expr),
         Expr::Cast { expr, .. } => expr_contains_utf8_literal(expr),
+        Expr::CastFormat { expr, .. } => expr_contains_utf8_literal(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_utf8_literal),
         Expr::ScalarSubquery(_) => false,
         Expr::InSubquery { expr, .. } => expr_contains_utf8_literal(expr),
@@ -4207,6 +4276,7 @@ fn expr_contains_scalar_fn(expr: &Expr) -> bool {
         }
         Expr::Like { expr, .. } => expr_contains_scalar_fn(expr),
         Expr::Cast { expr, .. } => expr_contains_scalar_fn(expr),
+        Expr::CastFormat { expr, .. } => expr_contains_scalar_fn(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -4259,6 +4329,7 @@ fn all_scalar_fns_host_evaluable(exprs: &[Expr]) -> bool {
             }
             Expr::Like { expr, .. } => walk(expr),
             Expr::Cast { expr, .. } => walk(expr),
+            Expr::CastFormat { expr, .. } => walk(expr),
             Expr::Column(_) | Expr::Literal(_) => true,
         }
     }
@@ -4287,6 +4358,7 @@ fn first_scalar_fn_kind(exprs: &[Expr]) -> Option<ScalarFnKind> {
                 .or_else(|| else_branch.as_deref().and_then(walk)),
             Expr::Like { expr, .. } => walk(expr),
             Expr::Cast { expr, .. } => walk(expr),
+            Expr::CastFormat { expr, .. } => walk(expr),
             Expr::Column(_) | Expr::Literal(_) => None,
         }
     }
@@ -5145,6 +5217,9 @@ fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
         // truncation can trap / be UB on out-of-range inputs that a
         // short-circuit would have skipped. Conservatively unsafe.
         Expr::Cast { .. } => false,
+        // CAST FORMAT is host-only and never reaches a GPU AND/OR kernel;
+        // conservatively unsafe (off the allowlist).
+        Expr::CastFormat { .. } => false,
         // Scalar string functions are not provably fault-free here (and don't
         // reach GPU AND/OR kernels), so treat them as unsafe.
         Expr::ScalarFn { .. } => false,
@@ -5196,6 +5271,7 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
         }
         Expr::Like { expr, .. } => expr_has_unsafe_eager_shortcircuit(expr),
         Expr::Cast { expr, .. } => expr_has_unsafe_eager_shortcircuit(expr),
+        Expr::CastFormat { expr, .. } => expr_has_unsafe_eager_shortcircuit(expr),
         // No And/Or wrapper inside a ScalarFn can short-circuit a sibling
         // operand of the *function call*, but the arguments themselves
         // might contain the unsafe pattern, so recurse.
@@ -5466,6 +5542,11 @@ fn logical_plan_contains_unsupported_cast_target(plan: &LogicalPlan) -> Option<D
                 }
                 expr_bad_cast(expr)
             }
+            // CAST FORMAT targets Date32/Timestamp/Utf8 by construction, but it
+            // is host-routed before GPU codegen (see
+            // `expr_contains_cast_format`), so its own target must NOT be
+            // flagged as an unsupported GPU cast. Only recurse into its inner.
+            Expr::CastFormat { expr, .. } => expr_bad_cast(expr),
             Expr::Column(_) | Expr::Literal(_) => None,
             Expr::Binary { left, right, .. } => expr_bad_cast(left).or_else(|| expr_bad_cast(right)),
             Expr::Unary { operand, .. } => expr_bad_cast(operand),
@@ -5656,6 +5737,37 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 if project_is_identity(exprs, inner.output_schema(), &output_schema) {
                     return Ok(inner);
                 }
+                return Ok(PhysicalPlan::Project {
+                    input: Box::new(inner),
+                    exprs: exprs.clone(),
+                    output_schema,
+                });
+            }
+            // CAST FORMAT (feature CAST FORMAT): a host-only temporal ⇄ string
+            // conversion. It is inherently string-shaped and has no GPU `cvt.*`
+            // lowering, so any SELECT-list expression carrying a `CastFormat`
+            // routes the whole Project to the host-side `PhysicalPlan::Project`,
+            // whose executor evaluates each output column via
+            // `expr_agg::eval_expr` (see its `Expr::CastFormat` arm). Mirrors
+            // the TRY_CAST / scalar-string host-routing below. We lower the
+            // inner plan with NO projection override so every scan column the
+            // cast operand references is surfaced for the host evaluator.
+            //
+            // NOTE: the host `PhysicalPlan::Project` executor currently lifts /
+            // emits temporal columns through `filter::arrow_array_to_host_column`
+            // and `engine_support::host_column_to_arrow_array`, which do not yet
+            // carry the Arrow Date32/Timestamp <-> HostColumn(I32/I64) mapping;
+            // the *string→temporal* direction and any temporal *source* column
+            // therefore need those two host helpers extended (reported to the
+            // orchestrator). The lowering + host evaluator are correct and unit-
+            // tested directly; this routing makes them reachable.
+            if exprs.iter().any(expr_contains_cast_format) {
+                log::debug!(
+                    "physical_plan: CAST(... FORMAT ...) in Project; lowering to \
+                     host-side PhysicalPlan::Project (host-only temporal/string conv)"
+                );
+                let inner = lower(input)?;
+                let output_schema = plan.schema()?;
                 return Ok(PhysicalPlan::Project {
                     input: Box::new(inner),
                     exprs: exprs.clone(),

@@ -600,6 +600,12 @@ fn rename_columns(
             target: *target,
             safe: *safe,
         },
+        Expr::CastFormat { expr, target, pattern, to_text } => Expr::CastFormat {
+            expr: Box::new(rename_columns(expr, map)),
+            target: *target,
+            pattern: pattern.clone(),
+            to_text: *to_text,
+        },
         Expr::ScalarFn { kind, args } => Expr::ScalarFn {
             kind: *kind,
             args: args.iter().map(|a| rename_columns(a, map)).collect(),

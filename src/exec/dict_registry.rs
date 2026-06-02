@@ -449,6 +449,9 @@ fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashS
     fn is_host_bound_string_expr(e: &Expr) -> bool {
         match e {
             Expr::ScalarFn { .. } => true,
+            // CAST ... FORMAT is host-materialised (host evaluator), like a
+            // scalar string fn.
+            Expr::CastFormat { .. } => true,
             Expr::Binary { op: BinaryOp::Concat, .. } => true,
             Expr::Binary { left, right, .. } => {
                 is_host_bound_string_expr(left) || is_host_bound_string_expr(right)
@@ -487,7 +490,7 @@ fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashS
             }
             Expr::Unary { operand, .. } => collect_column_refs(operand, out),
             Expr::Alias(inner, _) => collect_column_refs(inner, out),
-            Expr::Cast { expr, .. } | Expr::Like { expr, .. } => {
+            Expr::Cast { expr, .. } | Expr::Like { expr, .. } | Expr::CastFormat { expr, .. } => {
                 collect_column_refs(expr, out)
             }
             Expr::ScalarFn { args, .. } => {

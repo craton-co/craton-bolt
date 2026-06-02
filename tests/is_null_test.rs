@@ -572,7 +572,7 @@ fn contains_unary(expr: &Expr) -> bool {
                 .any(|(w, t)| contains_unary(w) || contains_unary(t))
                 || else_branch.as_deref().is_some_and(contains_unary)
         }
-        Expr::Cast { expr, .. } => contains_unary(expr),
+        Expr::Cast { expr, .. } | Expr::CastFormat { expr, .. } => contains_unary(expr),
         Expr::ScalarFn { args, .. } => args.iter().any(contains_unary),
         // LIKE's operand can itself contain a unary; recurse into it (the
         // pattern is a literal). Mirrors the wrapper-recursion of the arms

@@ -3385,7 +3385,41 @@ impl Engine {
                         out_field.dtype,
                         n_rows,
                     )?;
-                    columns.push(host_column_to_arrow_array(computed)?);
+                    // Temporal-typed outputs (e.g. CAST(<str> AS DATE/TIMESTAMP
+                    // FORMAT ...)) carry their value as the underlying i32/i64
+                    // HostColumn; rebuild the declared temporal Arrow type so the
+                    // column matches the output schema. All other dtypes use the
+                    // standard HostColumn->Arrow mapping.
+                    use crate::exec::expr_agg::HostColumn as HC;
+                    use crate::plan::logical_plan::{DataType as PDT, TimeUnit as PTU};
+                    let arr: ArrayRef = match (out_field.dtype, computed) {
+                        (PDT::Date32, HC::I32(v)) => {
+                            Arc::new(arrow_array::Date32Array::from(v)) as ArrayRef
+                        }
+                        (PDT::Timestamp(unit, tz), HC::I64(v)) => {
+                            let tz_owned = tz.map(|s| std::sync::Arc::<str>::from(s));
+                            match unit {
+                                PTU::Second => Arc::new(
+                                    arrow_array::TimestampSecondArray::from(v)
+                                        .with_timezone_opt(tz_owned),
+                                ) as ArrayRef,
+                                PTU::Millisecond => Arc::new(
+                                    arrow_array::TimestampMillisecondArray::from(v)
+                                        .with_timezone_opt(tz_owned),
+                                ) as ArrayRef,
+                                PTU::Microsecond => Arc::new(
+                                    arrow_array::TimestampMicrosecondArray::from(v)
+                                        .with_timezone_opt(tz_owned),
+                                ) as ArrayRef,
+                                PTU::Nanosecond => Arc::new(
+                                    arrow_array::TimestampNanosecondArray::from(v)
+                                        .with_timezone_opt(tz_owned),
+                                ) as ArrayRef,
+                            }
+                        }
+                        (_, other) => host_column_to_arrow_array(other)?,
+                    };
+                    columns.push(arr);
                 }
                 let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
                 let out = RecordBatch::try_new(arrow_schema, columns).map_err(|e| {
