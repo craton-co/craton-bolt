@@ -246,6 +246,26 @@ fn materialize_values_relation(
     .map_err(|e| BoltError::Plan(format!("VALUES materialize: {e}")))
 }
 
+/// Materialise a
+/// [`GenerateSeriesRelation`](crate::plan::sql_frontend::GenerateSeriesRelation)
+/// into a single-column, non-nullable `Int64` Arrow `RecordBatch` (feature
+/// GENERATE_SERIES). The row count was already capped at plan time. Pure (no GPU
+/// / engine state) so it is host-testable directly.
+fn materialize_generate_series_relation(
+    relation: &crate::plan::sql_frontend::GenerateSeriesRelation,
+) -> BoltResult<RecordBatch> {
+    let schema = relation.schema();
+    let arrow_schema = plan_schema_to_arrow_schema(&schema)?;
+    let n_rows = relation.values.len();
+    let array: ArrayRef = Arc::new(Int64Array::from(relation.values.clone()));
+    RecordBatch::try_new_with_options(
+        arrow_schema,
+        vec![array],
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(n_rows)),
+    )
+    .map_err(|e| BoltError::Plan(format!("generate_series materialize: {e}")))
+}
+
 /// Host-side per-group distinct count for feature F3-finish
 /// (`COUNT(DISTINCT col)` with `GROUP BY`).
 ///
@@ -2436,6 +2456,28 @@ impl Engine {
             }
         }
 
+        // GENERATE_SERIES: a `SELECT ... FROM generate_series(start, stop[, step])`
+        // is materialised host-side (a dense Int64 series bound as an ephemeral
+        // table the outer query scans) — mirroring the VALUES hook above (a
+        // table-valued row source has no `LogicalPlan` variant). `Ok(None)` for
+        // every non-generate_series query falls straight through (so an
+        // unhandled TVF still hits `lower_table_factor`'s rejection).
+        match crate::plan::sql_frontend::plan_generate_series_query(query, &self.provider) {
+            Ok(Some(gp)) => {
+                let result = self.execute_generate_series_query(&gp);
+                if result.is_err() {
+                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                }
+                self.maybe_emit_pool_stats(Instant::now());
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                return Err(e);
+            }
+        }
+
         // DISTINCT ON: a `SELECT DISTINCT ON (keys) ... [ORDER BY ...]` is
         // detected and orchestrated host-side (sort, then keep the first row per
         // key) before the ordinary pipeline. `Ok(None)` for every other query
@@ -2655,6 +2697,15 @@ impl Engine {
             return Ok(format!(
                 "VALUES plan:\n{}",
                 crate::plan::explain::format_values_query(&vp)
+            ));
+        }
+        // GENERATE_SERIES: render the host-materialised series descriptor.
+        if let Some(gp) =
+            crate::plan::sql_frontend::plan_generate_series_query(query, &self.provider)?
+        {
+            return Ok(format!(
+                "generate_series plan:\n{}",
+                crate::plan::explain::format_generate_series_query(&gp)
             ));
         }
         // DISTINCT ON: render the host-orchestrated DISTINCT ON descriptor.
@@ -3673,6 +3724,39 @@ impl Engine {
             .borrow_mut()
             .insert(name.clone(), TableSource::Materialized(vec![batch]));
         let out = self.run_subplan(plan);
+        self.streaming_sources.borrow_mut().remove(name);
+        self.gpu_tables.borrow_mut().remove(name);
+        Ok(QueryHandle::from_record_batch(out?))
+    }
+
+    /// Execute a `generate_series`-sourced query (feature GENERATE_SERIES).
+    ///
+    /// Mirrors the FROM form of [`Engine::execute_values_query`]: materialise the
+    /// series into a single-column Int64 batch, bind it under the relation name in
+    /// the streaming overlay, run the outer query template through
+    /// [`Engine::run_subplan`], and always clear the overlay entry afterwards.
+    fn execute_generate_series_query(
+        &self,
+        gp: &crate::plan::sql_frontend::GenerateSeriesQueryPlan,
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::streaming::TableSource;
+
+        let batch = materialize_generate_series_relation(&gp.relation)?;
+
+        // Refuse to shadow a real table under the bind name.
+        let name = &gp.bind_name;
+        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+            return Err(BoltError::Plan(format!(
+                "generate_series: relation name '{name}' collides with a registered table — \
+                 add an alias (e.g. `AS gs`)"
+            )));
+        }
+
+        self.gpu_tables.borrow_mut().remove(name);
+        self.streaming_sources
+            .borrow_mut()
+            .insert(name.clone(), TableSource::Materialized(vec![batch]));
+        let out = self.run_subplan(gp.post.clone());
         self.streaming_sources.borrow_mut().remove(name);
         self.gpu_tables.borrow_mut().remove(name);
         Ok(QueryHandle::from_record_batch(out?))

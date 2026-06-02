@@ -2035,6 +2035,357 @@ impl<'a> TableProvider for SchemaOverlayProvider<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// generate_series(start, stop[, step]) as a row source (feature GENERATE_SERIES)
+// ---------------------------------------------------------------------------
+
+/// Default PostgreSQL column name a `generate_series` relation exposes when the
+/// query does not supply a column-list alias (`AS t(n)`). Also the default
+/// relation name when no table alias is given (so `generate_series.generate_series`
+/// and a bare `generate_series` both resolve).
+pub const GENERATE_SERIES_DEFAULT_NAME: &str = "generate_series";
+
+/// Default per-process cap on the number of rows a `generate_series` may
+/// materialise. A series like `generate_series(1, 10^18)` is astronomically
+/// large; without a cap it would attempt an unbounded host allocation. The cap
+/// is checked with the *computed* row count (checked arithmetic) before any
+/// allocation. Overridable via [`GENERATE_SERIES_MAX_ROWS_ENV`].
+pub const GENERATE_SERIES_MAX_ROWS: usize = 10_000_000;
+
+/// Environment variable overriding [`GENERATE_SERIES_MAX_ROWS`] at runtime.
+/// Parsed as a base-10 `usize`; `0` / empty / unparseable fall back to default.
+pub const GENERATE_SERIES_MAX_ROWS_ENV: &str = "CRATON_GENERATE_SERIES_MAX_ROWS";
+
+/// Resolve the `generate_series` row cap, honouring
+/// [`GENERATE_SERIES_MAX_ROWS_ENV`]. Re-parsed on each call (cheap env lookup,
+/// no hot loop) so the cap stays per-process overridable without a global latch.
+fn generate_series_max_rows() -> usize {
+    match std::env::var(GENERATE_SERIES_MAX_ROWS_ENV) {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) | Err(_) => GENERATE_SERIES_MAX_ROWS,
+            Ok(n) => n,
+        },
+        Err(_) => GENERATE_SERIES_MAX_ROWS,
+    }
+}
+
+/// Enforce the `generate_series` row cap. Kept PURE (the cap is passed in) so it
+/// is testable without mutating the process-global [`GENERATE_SERIES_MAX_ROWS_ENV`]
+/// — mutating that env var in a test would race the other parallel tests reading
+/// the cap. Mirrors [`enforce_values_row_cap`].
+fn enforce_generate_series_row_cap(n_rows: u64, cap: usize) -> BoltResult<()> {
+    if n_rows > cap as u64 {
+        return Err(BoltError::Sql(format!(
+            "generate_series would produce {n_rows} rows, exceeding the {cap}-row cap \
+             (override via {GENERATE_SERIES_MAX_ROWS_ENV})"
+        )));
+    }
+    Ok(())
+}
+
+/// Number of rows an integer `generate_series(start, stop, step)` emits, computed
+/// with checked arithmetic so endpoints / steps near `i64::MIN`/`i64::MAX` cannot
+/// overflow. Returns:
+///   * `Err` if `step == 0` (PostgreSQL: "step size cannot be zero").
+///   * `Ok(0)` for an empty direction (start > stop with step > 0, or
+///     start < stop with step < 0).
+///   * `Ok(count)` otherwise, where the count is `(stop - start) / step + 1`
+///     evaluated in `i128` (so the span `stop - start`, which can exceed
+///     `i64::MAX` in magnitude, never overflows).
+///
+/// Pure: takes the three bounds, no I/O, no allocation — host-testable directly.
+fn generate_series_row_count(start: i64, stop: i64, step: i64) -> BoltResult<u64> {
+    if step == 0 {
+        return Err(BoltError::Sql(
+            "generate_series: step size cannot be zero".into(),
+        ));
+    }
+    // Empty direction → 0 rows (not an error), matching PostgreSQL.
+    if (step > 0 && start > stop) || (step < 0 && start < stop) {
+        return Ok(0);
+    }
+    // span and the +1 are exact in i128 (i64 range is far inside i128).
+    let span = (stop as i128) - (start as i128);
+    let step128 = step as i128;
+    // span and step have the same sign here, so the quotient is >= 0.
+    let count = span / step128 + 1;
+    // count is at most |i64::MIN..i64::MAX| + 1 = 2^64, which fits i128; clamp
+    // into u64 for the cap comparison (anything beyond u64 trivially exceeds the
+    // cap, but we never reach the cast unscathed because count <= 2^64).
+    Ok(u64::try_from(count).unwrap_or(u64::MAX))
+}
+
+/// Build the `Vec<i64>` of series values for `generate_series(start, stop, step)`.
+/// `n_rows` is the pre-computed (and cap-checked) row count from
+/// [`generate_series_row_count`]. Values are produced with checked addition so a
+/// final step that would overflow `i64` cannot wrap (it simply does not extend
+/// past the last representable value — but `n_rows` already bounds the loop, so
+/// overflow can only be the unreachable final increment). Pure / host-testable.
+fn generate_series_values(start: i64, step: i64, n_rows: u64) -> Vec<i64> {
+    let mut out = Vec::with_capacity(n_rows as usize);
+    let mut cur = start;
+    for _ in 0..n_rows {
+        out.push(cur);
+        // Checked: on the very last iteration `cur + step` may overflow i64
+        // (e.g. start near i64::MAX). The loop ends after this push regardless,
+        // so a saturating fallback is harmless and never observed.
+        cur = cur.checked_add(step).unwrap_or(cur);
+    }
+    out
+}
+
+/// A host-materialisable integer `generate_series` relation: the resolved column
+/// name plus the dense `Int64` series values (non-nullable). The engine turns
+/// this into a single-column Arrow `RecordBatch`.
+#[derive(Debug, Clone)]
+pub struct GenerateSeriesRelation {
+    /// Output column name (the column-list alias if present, else
+    /// [`GENERATE_SERIES_DEFAULT_NAME`]).
+    pub column_name: String,
+    /// The series values, already bounded by the row cap. Non-nullable `Int64`.
+    pub values: Vec<i64>,
+}
+
+impl GenerateSeriesRelation {
+    /// Single-column, non-nullable `Int64` schema for this relation.
+    pub fn schema(&self) -> Schema {
+        Schema::new(vec![Field::new(
+            self.column_name.clone(),
+            DataType::Int64,
+            false,
+        )])
+    }
+}
+
+/// Descriptor for a query whose row source is an integer `generate_series` TVF
+/// (feature GENERATE_SERIES), executed as a host-orchestrated engine special-case
+/// rather than a plan node — mirroring [`ValuesQueryPlan`] (an inline relation
+/// has no `LogicalPlan`/`Expr` variant, and adding one would touch shared files
+/// and break exhaustive matches).
+///
+/// The series is materialised host-side, bound under [`Self::bind_name`] in the
+/// streaming overlay, and the outer query template [`Self::post`] (the SELECT /
+/// WHERE / ORDER BY / LIMIT lowered over a synthetic `Scan` of that name) runs
+/// through the ordinary subplan executor.
+#[derive(Debug, Clone)]
+pub struct GenerateSeriesQueryPlan {
+    /// The materialisable series relation (column name + Int64 values).
+    pub relation: GenerateSeriesRelation,
+    /// Name the relation is bound under (the table alias `t`, or
+    /// [`GENERATE_SERIES_DEFAULT_NAME`] when none was given).
+    pub bind_name: String,
+    /// The outer query lowered over a synthetic `Scan` of [`Self::bind_name`].
+    pub post: LogicalPlan,
+}
+
+impl GenerateSeriesQueryPlan {
+    /// Overall output schema (the post plan's schema).
+    pub fn schema(&self) -> BoltResult<Schema> {
+        self.post.schema()
+    }
+}
+
+/// Fold a single `generate_series` argument to a constant `i64`. Reuses the
+/// VALUES literal-lowering path (`lower_expr` over an empty resolver) so a
+/// constant integer expression folds and any column reference / non-constant
+/// errors cleanly. `Int32` widens to `Int64`. Non-integer constants (float,
+/// string, bool, NULL) are rejected — only integer bounds are supported.
+fn fold_generate_series_arg(expr: &SqlExpr, which: &str) -> BoltResult<i64> {
+    let empty = NameResolver::empty();
+    let lowered = lower_expr(expr, &empty, 0)?;
+    match lowered {
+        Expr::Literal(Literal::Int64(v)) => Ok(v),
+        Expr::Literal(Literal::Int32(v)) => Ok(v as i64),
+        Expr::Literal(other) => Err(BoltError::Sql(format!(
+            "generate_series: {which} argument must be an integer constant, got {other:?}"
+        ))),
+        _ => Err(BoltError::Sql(format!(
+            "generate_series: {which} argument must be a constant integer expression; \
+             a column-correlated generate_series is not supported"
+        ))),
+    }
+}
+
+/// Extract the bare `Expr` of an unnamed positional function argument, rejecting
+/// named args (`=> x`) and `*` / qualified-wildcard forms (`generate_series(*)`).
+fn generate_series_arg_expr(arg: &FunctionArg) -> BoltResult<&SqlExpr> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+        _ => Err(BoltError::Sql(
+            "generate_series: arguments must be positional integer expressions".into(),
+        )),
+    }
+}
+
+/// Detect and plan a top-level query whose single row source is an integer
+/// `generate_series(start, stop[, step])` TVF (feature GENERATE_SERIES).
+///
+/// Returns `Ok(Some(plan))` for the supported shape
+/// (`SELECT ... FROM generate_series(...) [AS t(n)] [WHERE/ORDER BY/LIMIT]`),
+/// `Ok(None)` for every other query (so the engine falls through to the ordinary
+/// pipeline, which still rejects an unhandled TVF in `lower_table_factor`), and
+/// `Err` for a `generate_series` of the right shape that is malformed (wrong arg
+/// count, non-integer / non-constant args, `step == 0`, or a series exceeding the
+/// row cap).
+pub fn plan_generate_series_query(
+    sql: &str,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<GenerateSeriesQueryPlan>> {
+    guard_sql_size(sql)?;
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    if stmts.len() != 1 {
+        return Ok(None);
+    }
+    let query = match stmts.remove(0) {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    plan_generate_series_query_inner(&query, provider)
+}
+
+fn plan_generate_series_query_inner(
+    query: &Query,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<GenerateSeriesQueryPlan>> {
+    // No top-level WITH (a CTE wrapping generate_series is out of scope here).
+    if query.with.is_some() {
+        return Ok(None);
+    }
+    // Exactly one SELECT body with a single, join-free FROM item.
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Ok(None),
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Ok(None);
+    }
+    // The FROM item must be a function-style table factor named generate_series.
+    let (name, alias, fn_args) = match &select.from[0].relation {
+        TableFactor::Table {
+            name,
+            alias,
+            args: Some(args),
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+        } if with_hints.is_empty()
+            && version.is_none()
+            && !*with_ordinality
+            && partitions.is_empty() =>
+        {
+            (name, alias, &args.args)
+        }
+        // A function-style factor with hints / version / WITH ORDINALITY /
+        // PARTITION is out of scope here; decline so the ordinary pipeline
+        // surfaces its own (more specific) rejection.
+        _ => return Ok(None),
+    };
+    // Match the function name case-insensitively; decline other TVFs so they keep
+    // their existing rejection path.
+    let fn_name = match single_ident_from_object_name(name) {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    if !fn_name.eq_ignore_ascii_case(GENERATE_SERIES_DEFAULT_NAME) {
+        return Ok(None);
+    }
+
+    // From here the shape IS generate_series: malformed forms are clean errors.
+    if fn_args.len() != 2 && fn_args.len() != 3 {
+        return Err(BoltError::Sql(format!(
+            "generate_series expects 2 or 3 integer arguments (start, stop[, step]), got {}",
+            fn_args.len()
+        )));
+    }
+    let start = fold_generate_series_arg(generate_series_arg_expr(&fn_args[0])?, "start")?;
+    let stop = fold_generate_series_arg(generate_series_arg_expr(&fn_args[1])?, "stop")?;
+    let step = if fn_args.len() == 3 {
+        fold_generate_series_arg(generate_series_arg_expr(&fn_args[2])?, "step")?
+    } else {
+        1
+    };
+
+    // Checked row count + cap (pure helpers; cap passed in for test purity).
+    let n_rows = generate_series_row_count(start, stop, step)?;
+    enforce_generate_series_row_cap(n_rows, generate_series_max_rows())?;
+    let values = generate_series_values(start, step, n_rows);
+
+    // Naming: the table alias names the relation (else `generate_series`); the
+    // column-list alias names the column (else the PostgreSQL default
+    // `generate_series`). `AS t(n)` → relation `t`, column `n`.
+    let (bind_name, column_name) = match alias {
+        None => (
+            GENERATE_SERIES_DEFAULT_NAME.to_string(),
+            GENERATE_SERIES_DEFAULT_NAME.to_string(),
+        ),
+        Some(a) => {
+            let rel = ident_to_name(&a.name);
+            let col = match a.columns.len() {
+                0 => GENERATE_SERIES_DEFAULT_NAME.to_string(),
+                1 => ident_to_name(&a.columns[0]),
+                n => {
+                    return Err(BoltError::Sql(format!(
+                        "generate_series produces a single column but the alias column list \
+                         has {n} names"
+                    )))
+                }
+            };
+            (rel, col)
+        }
+    };
+
+    let relation = GenerateSeriesRelation {
+        column_name,
+        values,
+    };
+    let schema = relation.schema();
+    let post = build_generate_series_post_plan(query, &bind_name, &schema, provider)?;
+    Ok(Some(GenerateSeriesQueryPlan {
+        relation,
+        bind_name,
+        post,
+    }))
+}
+
+/// Lower the outer query of a `FROM generate_series(...)` form into a `post`
+/// [`LogicalPlan`] over a synthetic `Scan` of the bound relation, mirroring
+/// [`build_values_post_plan`]: rewrite the function-style FROM item into a bare
+/// table reference to `bind_name`, then lower the whole query through
+/// [`plan_query`] over a [`SchemaOverlayProvider`] so every SELECT feature is
+/// reused.
+fn build_generate_series_post_plan(
+    query: &Query,
+    bind_name: &str,
+    relation_schema: &Schema,
+    provider: &dyn TableProvider,
+) -> BoltResult<LogicalPlan> {
+    let mut rewritten = query.clone();
+    if let SetExpr::Select(select) = rewritten.body.as_mut() {
+        let from0 = &mut select.from[0];
+        from0.relation = TableFactor::Table {
+            name: ObjectName(vec![Ident::new(bind_name.to_string())]),
+            alias: None,
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            with_ordinality: false,
+            partitions: Vec::new(),
+        };
+    }
+    let overlay = SchemaOverlayProvider {
+        base: provider,
+        name: bind_name.to_string(),
+        schema: relation_schema.clone(),
+    };
+    let ctes = CteScope::new();
+    let plan = plan_query(&rewritten, &overlay, &ctes, 0)?;
+    let _ = plan.schema()?;
+    Ok(plan)
+}
+
 /// Lower a bare query tail's `LIMIT [OFFSET]` into `Option<(limit, offset)>`.
 /// Mirrors the LIMIT handling in [`plan_query`].
 fn lower_bare_limit(query: &Query) -> BoltResult<Option<(usize, usize)>> {
@@ -15789,6 +16140,209 @@ mod values_and_distinct_on_tests {
         assert!(plan_values_query("SELECT a FROM t", &provider())
             .unwrap()
             .is_none());
+    }
+
+    // ---- generate_series TVF ---------------------------------------------
+
+    fn gs_plan(sql: &str) -> GenerateSeriesQueryPlan {
+        plan_generate_series_query(sql, &provider())
+            .expect("planning must not error")
+            .expect("must be a generate_series query")
+    }
+
+    fn gs_err(sql: &str) -> String {
+        match plan_generate_series_query(sql, &provider()) {
+            Err(e) => e.to_string(),
+            Ok(other) => panic!("expected a generate_series error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gs_row_count_ascending_descending_and_step() {
+        // Inclusive of both endpoints, step = 1.
+        assert_eq!(generate_series_row_count(1, 5, 1).unwrap(), 5);
+        // Step that lands exactly on stop.
+        assert_eq!(generate_series_row_count(0, 10, 2).unwrap(), 6);
+        // Step that overshoots stop (last value <= stop).
+        assert_eq!(generate_series_row_count(1, 10, 3).unwrap(), 4); // 1,4,7,10
+        assert_eq!(generate_series_row_count(1, 9, 3).unwrap(), 3); // 1,4,7
+        // Descending.
+        assert_eq!(generate_series_row_count(5, 1, -1).unwrap(), 5);
+        assert_eq!(generate_series_row_count(10, 0, -2).unwrap(), 6);
+        // Single element (start == stop).
+        assert_eq!(generate_series_row_count(7, 7, 1).unwrap(), 1);
+        assert_eq!(generate_series_row_count(7, 7, -1).unwrap(), 1);
+    }
+
+    #[test]
+    fn gs_empty_direction_is_zero_rows() {
+        // start > stop with positive step → empty (not an error).
+        assert_eq!(generate_series_row_count(5, 1, 1).unwrap(), 0);
+        // start < stop with negative step → empty.
+        assert_eq!(generate_series_row_count(1, 5, -1).unwrap(), 0);
+    }
+
+    #[test]
+    fn gs_step_zero_rejected() {
+        let msg = generate_series_row_count(1, 5, 0)
+            .expect_err("step 0 must be rejected")
+            .to_string();
+        assert!(
+            msg.contains("step size cannot be zero"),
+            "step=0 must be a clean error: {msg}"
+        );
+    }
+
+    #[test]
+    fn gs_row_count_near_extremes_does_not_overflow() {
+        // Full i64 span with step 1 → count = 2^64 - 1 + 1 = 2^64, clamped to
+        // u64::MAX. Must not panic / overflow.
+        let n = generate_series_row_count(i64::MIN, i64::MAX, 1).unwrap();
+        assert_eq!(n, u64::MAX);
+        // Large descending span with a large step.
+        assert_eq!(
+            generate_series_row_count(i64::MAX, i64::MIN, i64::MIN).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn gs_values_match_count_and_endpoints() {
+        let n = generate_series_row_count(2, 8, 2).unwrap();
+        let v = generate_series_values(2, 2, n);
+        assert_eq!(v, vec![2, 4, 6, 8]);
+        let n = generate_series_row_count(5, 1, -2).unwrap();
+        let v = generate_series_values(5, -2, n);
+        assert_eq!(v, vec![5, 3, 1]);
+        // Values near i64::MAX: final increment must not wrap.
+        let n = generate_series_row_count(i64::MAX - 2, i64::MAX, 1).unwrap();
+        assert_eq!(n, 3);
+        let v = generate_series_values(i64::MAX - 2, 1, n);
+        assert_eq!(v, vec![i64::MAX - 2, i64::MAX - 1, i64::MAX]);
+    }
+
+    #[test]
+    fn gs_row_cap_enforced_via_pure_helper() {
+        // Pure cap check — no env mutation, so this never races parallel tests.
+        let msg = enforce_generate_series_row_cap(11, 10)
+            .expect_err("cap must be exceeded")
+            .to_string();
+        assert!(msg.contains("cap"), "row-cap error must mention the cap: {msg}");
+        assert!(enforce_generate_series_row_cap(10, 10).is_ok());
+    }
+
+    #[test]
+    fn gs_from_two_args_default_naming() {
+        let gp = gs_plan("SELECT * FROM generate_series(1, 4)");
+        // No alias → relation and column both default to `generate_series`.
+        assert_eq!(gp.bind_name, "generate_series");
+        assert_eq!(gp.relation.column_name, "generate_series");
+        assert_eq!(gp.relation.values, vec![1, 2, 3, 4]);
+        let schema = gp.relation.schema();
+        assert_eq!(schema.fields.len(), 1);
+        assert_eq!(schema.fields[0].dtype, DataType::Int64);
+        assert!(!schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn gs_three_arg_descending() {
+        let gp = gs_plan("SELECT * FROM generate_series(10, 0, -5)");
+        assert_eq!(gp.relation.values, vec![10, 5, 0]);
+    }
+
+    #[test]
+    fn gs_alias_names_relation_and_column_with_where() {
+        // `AS t(n)`: relation `t`, column `n`; plus a WHERE over it.
+        let gp = gs_plan("SELECT n FROM generate_series(1, 10) AS t(n) WHERE n > 5");
+        assert_eq!(gp.bind_name, "t");
+        assert_eq!(gp.relation.column_name, "n");
+        assert_eq!(gp.relation.values, (1..=10).collect::<Vec<i64>>());
+        // The outer query lowered to a Project over a Filter over a Scan of the
+        // bound relation (no optimizer runs on the frontend `plan_query` output).
+        assert!(
+            matches!(&gp.post, LogicalPlan::Project { input, .. } if matches!(input.as_ref(), LogicalPlan::Filter { .. })),
+            "post plan should be a Project over a Filter: {:?}",
+            gp.post
+        );
+        // Output schema exposes `n`.
+        let out = gp.schema().expect("schema");
+        assert_eq!(out.fields[0].name, "n");
+    }
+
+    #[test]
+    fn gs_table_alias_only_names_relation_column_defaults() {
+        let gp = gs_plan("SELECT * FROM generate_series(1, 3) AS gs");
+        assert_eq!(gp.bind_name, "gs");
+        assert_eq!(gp.relation.column_name, "generate_series");
+    }
+
+    #[test]
+    fn gs_empty_direction_plan_has_zero_rows() {
+        let gp = gs_plan("SELECT * FROM generate_series(5, 1)");
+        assert!(gp.relation.values.is_empty());
+    }
+
+    #[test]
+    fn gs_step_zero_rejected_in_from() {
+        let msg = gs_err("SELECT * FROM generate_series(1, 10, 0)");
+        assert!(
+            msg.contains("step size cannot be zero"),
+            "step=0 must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn gs_non_constant_arg_rejected() {
+        // A column reference is not a constant integer bound.
+        let msg = gs_err("SELECT * FROM generate_series(a, 10)");
+        assert!(
+            msg.contains("constant integer") || msg.contains("column-correlated"),
+            "non-constant arg must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn gs_non_integer_arg_rejected() {
+        let msg = gs_err("SELECT * FROM generate_series(1, 10.5)");
+        assert!(
+            msg.contains("integer"),
+            "non-integer arg must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn gs_wrong_arg_count_rejected() {
+        let msg = gs_err("SELECT * FROM generate_series(1)");
+        assert!(
+            msg.contains("2 or 3"),
+            "wrong arg count must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn gs_negative_literal_bounds_fold() {
+        // Unary-minus literals fold to integer constants.
+        let gp = gs_plan("SELECT * FROM generate_series(-3, 3, 3)");
+        assert_eq!(gp.relation.values, vec![-3, 0, 3]);
+    }
+
+    #[test]
+    fn gs_non_generate_series_query_declines() {
+        // A non-TVF query is not a generate_series plan.
+        assert!(plan_generate_series_query("SELECT a FROM t", &provider())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn gs_row_cap_rejected_in_from() {
+        // The default cap is 10_000_000; a 20M-row series must be rejected
+        // (this exercises the cap via the planner, with the default env cap).
+        let msg = gs_err("SELECT * FROM generate_series(1, 20000000)");
+        assert!(
+            msg.contains("cap"),
+            "an over-cap series must be rejected: {msg}"
+        );
     }
 
     // ---- DISTINCT ON ------------------------------------------------------

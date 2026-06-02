@@ -555,6 +555,32 @@ pub fn format_values_query(vp: &crate::plan::sql_frontend::ValuesQueryPlan) -> S
 }
 
 // ---------------------------------------------------------------------------
+// generate_series as a row source (feature GENERATE_SERIES)
+// ---------------------------------------------------------------------------
+
+/// Render a
+/// [`GenerateSeriesQueryPlan`](crate::plan::sql_frontend::GenerateSeriesQueryPlan)
+/// for `EXPLAIN`. The header names the materialised row count, the bound relation
+/// name, and the output column; a `Post:` sub-header renders the outer query
+/// template lowered over the series scan.
+pub fn format_generate_series_query(
+    gp: &crate::plan::sql_frontend::GenerateSeriesQueryPlan,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "GenerateSeries: rows={} as '{}' column='{}':Int64",
+        gp.relation.values.len(),
+        gp.bind_name,
+        gp.relation.column_name,
+    );
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Post:");
+    format_logical_into(&gp.post, 2, &mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // DISTINCT ON (Postgres)
 // ---------------------------------------------------------------------------
 
