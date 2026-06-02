@@ -124,6 +124,14 @@ const PRE_BLOCK_SIZE: u32 = 256;
 /// value in [`crate::jit::hash_kernels`] so dispatchers + PTX stay in sync.
 const EMPTY_KEY: i64 = I64_EMPTY_SENTINEL;
 
+/// Reserved encoded-key sentinel for the synthesised SQL NULL group. Mirrors
+/// `crate::exec::groupby::NULL_GROUP_KEY`. All NULL-keyed rows are remapped to
+/// this single value so they hash to one hash-table slot; `build_key_array`
+/// emits a NULL (not a decoded value) for that slot. `i64::MAX` is safe: a
+/// genuine single-column Int32/Int64 key only reaches it if it literally holds
+/// `i64::MAX`, which we detect and reject (no NULL-group synthesis there).
+const NULL_GROUP_KEY: i64 = i64::MAX;
+
 /// PV-stage-e: observability counter — increments once per agg launch that
 /// successfully dispatches through the native `_with_validity` GPU kernel
 /// path (i.e. uploads a packed-bit validity bitmap and skips the host strip).
@@ -317,42 +325,7 @@ pub fn execute_groupby_with_pre(
         )));
     }
 
-    // Option-A safety net (Stage B partial): a NULL group-key row would
-    // hash to a "NULL group" that the current open-addressing keys kernel
-    // cannot represent (it has only the `i64::MIN` empty sentinel + real
-    // key slots; NULL is a separate semantic group in SQL). Stage C
-    // should add an explicit NULL slot, or pre-strip NULL-keyed rows
-    // alongside their aggregate inputs. For now we reject with a clear
-    // message rather than silently accumulate NULL-keyed rows into
-    // whichever real group happens to collide.
-    //
-    // Determine real NULL keys from the ORIGINAL key column, NOT from
-    // `key_host.validity`: the pre-stage uses a blanket output-validity flag
-    // (if ANY input column carries validity, EVERY pre output — including the
-    // passthrough key — receives the *combined* input validity), so a
-    // null-free key's propagated bitmap is contaminated by a NULL-bearing
-    // *value* column. Reading the source key column's own `null_count` avoids
-    // that false positive, so `SUM(<nullable value>) GROUP BY <non-null key>`
-    // (the common case) runs instead of being wrongly rejected. A genuinely
-    // NULL-bearing key still trips the unimplemented "NULL group" path. The
-    // check is conservative: if the source key has nulls we reject even when a
-    // WHERE filter may have removed them (acceptable for the Stage B limit).
-    let key_src_idx = table_batch.schema().index_of(&key_io.name).map_err(|e| {
-        BoltError::Plan(format!(
-            "execute_groupby_with_pre: GROUP BY key '{}' not present in table batch: {}",
-            key_io.name, e
-        ))
-    })?;
-    if table_batch.column(key_src_idx).null_count() > 0 {
-        return Err(BoltError::Other(format!(
-            "groupby_with_pre: GROUP BY key column '{}' contains a NULL key, but \
-             the GPU group-by keys kernel does not yet represent the NULL group. \
-             NULL keys are a Stage C follow-up to Option B.",
-            key_io.name
-        )));
-    }
-
-    let host_keys: Vec<i64> = key_host.to_i64_for_key(&key_io.name)?;
+    let mut host_keys: Vec<i64> = key_host.to_i64_for_key(&key_io.name)?;
     let n_compacted = host_keys.len();
     if n_compacted != compacted.n_rows() {
         return Err(BoltError::Other(format!(
@@ -361,6 +334,64 @@ pub fn execute_groupby_with_pre(
             compacted.n_rows()
         )));
     }
+
+    // NULL-group synthesis (single-column GROUP BY): SQL groups ALL NULL-keyed
+    // rows into ONE group whose key is NULL, with aggregates computed over
+    // those rows. We remap each NULL-key row's encoded key to the reserved
+    // `NULL_GROUP_KEY` sentinel and KEEP every row (preserving row alignment
+    // with the per-aggregate value columns). The NULL-key rows then hash to a
+    // single slot like any real group; `build_key_array` emits NULL for that
+    // slot. Per-aggregate value-NULL masks are handled independently in
+    // `run_one_aggregate`, so `COUNT(v)` still excludes value-NULLs WITHIN the
+    // NULL group (the all-NULL-key case: COUNT(*) counts every row, COUNT(v)
+    // counts only non-NULL `v`).
+    //
+    // Row NULLs come from `key_host.validity` (the pre-stage's per-output
+    // validity, issue B): the key passthrough output depends only on the key
+    // `LoadColumn`, so its bitmap is the key's OWN nulls, post-compaction
+    // aligned with `host_keys`. We gate on the ORIGINAL key column's
+    // `null_count` first as a cheap belt-and-suspenders: a provably null-free
+    // source key never enters the remap, so `SUM(<nullable value>) GROUP BY
+    // <non-null key>` (the common case) is bit-identical to before.
+    let key_src_has_nulls = table_batch
+        .schema()
+        .index_of(&key_io.name)
+        .map(|idx| table_batch.column(idx).null_count() > 0)
+        .unwrap_or(false);
+    let synthesised_null_group = if key_src_has_nulls {
+        match &key_host.validity {
+            Some(vmask) if vmask.iter().any(|&b| b == 0) => {
+                // Sentinel collision: a genuine (valid) key literally equal to
+                // `NULL_GROUP_KEY` can't be told apart from the synthesised
+                // NULL group. No valid-flag-with-pre fallback exists yet, so
+                // reject with a clear error rather than miscount.
+                let collision = host_keys
+                    .iter()
+                    .zip(vmask.iter())
+                    .any(|(&kk, &ok)| ok != 0 && kk == NULL_GROUP_KEY);
+                if collision {
+                    return Err(BoltError::Other(format!(
+                        "GROUP BY key column '{}' contains a genuine key equal to \
+                         the reserved NULL-group sentinel (i64::MAX); cannot \
+                         synthesise the NULL group",
+                        key_io.name
+                    )));
+                }
+                for (kk, &ok) in host_keys.iter_mut().zip(vmask.iter()) {
+                    if ok == 0 {
+                        *kk = NULL_GROUP_KEY;
+                    }
+                }
+                true
+            }
+            // Source flagged nulls but the (post-compaction) key bitmap shows
+            // none — e.g. a WHERE filter removed every NULL-key row. Nothing to
+            // synthesise.
+            _ => false,
+        }
+    } else {
+        false
+    };
 
     // Validate no key collides with the EMPTY_KEY sentinel. Review C7:
     // unlike `execute_groupby` (which routes the colliding case to the
@@ -470,7 +501,11 @@ pub fn execute_groupby_with_pre(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + aggregate.aggregates.len());
 
     // Column 0: the GROUP BY key in its original dtype.
-    arrays.push(build_key_array(&groups, original_key_dtype)?);
+    arrays.push(build_key_array(
+        &groups,
+        original_key_dtype,
+        synthesised_null_group,
+    )?);
 
     // Columns 1..N+1: one per aggregate.
     for (i, agg) in aggregate.aggregates.iter().enumerate() {
@@ -1707,8 +1742,14 @@ fn resolve_agg_input_slow<'a>(
 
     let inner = inner_expr_of(agg);
 
-    // Fast path: bare column ref into pre outputs. The pre-stage has no
-    // NULL bitmap support — every cell is non-NULL, so no validity mask.
+    // Fast path: bare column ref into pre outputs. The pre-stage DOES carry a
+    // per-output NULL bitmap (issue B: each output's validity is the AND of only
+    // the inputs it depends on), downloaded into `HostCol::validity` by
+    // `to_host_col`. For a bare column `v`, that bitmap is `v`'s own nulls, so we
+    // must surface it — otherwise `COUNT(v)`/`MIN(v)`/`AVG(v)` would (wrongly)
+    // count/aggregate NULL rows. When the column has no nulls (`validity` is
+    // `None` or all-valid) we return the zero-alloc `Borrowed` form, bit-
+    // identical to the previous behaviour for the common null-free case.
     if let Some(name) = expr_agg::try_bare_column(inner) {
         if let Some(&pre_ord) = name_to_pre_ord.get(name) {
             let host_col = compacted.cols.get(pre_ord).ok_or_else(|| {
@@ -1718,7 +1759,17 @@ fn resolve_agg_input_slow<'a>(
                     compacted.cols.len()
                 ))
             })?;
-            return Ok((col_io, ResolvedHostCol::Borrowed(host_col)));
+            let resolved = match &host_col.validity {
+                Some(v) if v.iter().any(|&b| b == 0) => {
+                    let mask: Vec<bool> = v.iter().map(|&b| b != 0).collect();
+                    ResolvedHostCol::BorrowedWithValidity {
+                        col: host_col,
+                        validity: mask,
+                    }
+                }
+                _ => ResolvedHostCol::Borrowed(host_col),
+            };
+            return Ok((col_io, resolved));
         }
         // Bare-column but no matching pre output — preserve the legacy error
         // shape so plan-level mismatches surface the same way as before.
@@ -1791,8 +1842,17 @@ fn compacted_pre_output_name(
 /// `None` means "all rows valid" — used for the fast path where the pre
 /// stage cannot produce NULLs.
 enum ResolvedHostCol<'a> {
-    /// Borrowed view of a pre-stage output (no NULLs possible here).
+    /// Borrowed view of a pre-stage output with no NULLs (validity absent or
+    /// all-valid). Zero-alloc; the common case.
     Borrowed(&'a HostCol),
+    /// Borrowed pre-stage output values plus an owned per-row NULL mask
+    /// (`true` = valid) converted from the column's `Option<Vec<u8>>` bitmap.
+    /// Lets the bare-column fast path surface the pre-stage's per-output
+    /// validity without cloning the value buffer.
+    BorrowedWithValidity {
+        col: &'a HostCol,
+        validity: Vec<bool>,
+    },
     /// Freshly materialised slow-path column with an optional NULL mask.
     Owned {
         col: HostCol,
@@ -1805,6 +1865,7 @@ impl<'a> ResolvedHostCol<'a> {
     fn as_ref(&self) -> &HostCol {
         match self {
             ResolvedHostCol::Borrowed(c) => *c,
+            ResolvedHostCol::BorrowedWithValidity { col, .. } => *col,
             ResolvedHostCol::Owned { col, .. } => col,
         }
     }
@@ -1813,6 +1874,7 @@ impl<'a> ResolvedHostCol<'a> {
     fn validity(&self) -> Option<&[bool]> {
         match self {
             ResolvedHostCol::Borrowed(_) => None,
+            ResolvedHostCol::BorrowedWithValidity { validity, .. } => Some(validity),
             ResolvedHostCol::Owned { validity, .. } => validity.as_deref(),
         }
     }
@@ -1946,23 +2008,38 @@ fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
 fn build_key_array(
     groups: &[(i64, usize)],
     original_key_dtype: DataType,
+    synthesised_null_group: bool,
 ) -> BoltResult<ArrayRef> {
+    // A group whose encoded key is `NULL_GROUP_KEY` is the synthesised SQL NULL
+    // group — emit NULL for its key cell instead of decoding the sentinel. We
+    // only treat the sentinel as NULL when synthesis actually happened, so a
+    // genuine Int64 key literally holding `i64::MAX` (synthesis was not active)
+    // still round-trips as its real value.
+    let is_null_group = |k: i64| synthesised_null_group && k == NULL_GROUP_KEY;
     match original_key_dtype {
         DataType::Int32 => {
-            let mut out: Vec<i32> = Vec::with_capacity(groups.len());
-            for (k, _) in groups {
-                let v = i32::try_from(*k).map_err(|_| {
-                    BoltError::Type(format!(
-                        "GROUP BY: key {} does not fit in Int32 on output",
-                        k
-                    ))
-                })?;
-                out.push(v);
-            }
+            let out: Vec<Option<i32>> = groups
+                .iter()
+                .map(|(k, _)| {
+                    if is_null_group(*k) {
+                        Ok(None)
+                    } else {
+                        i32::try_from(*k).map(Some).map_err(|_| {
+                            BoltError::Type(format!(
+                                "GROUP BY: key {} does not fit in Int32 on output",
+                                k
+                            ))
+                        })
+                    }
+                })
+                .collect::<BoltResult<Vec<Option<i32>>>>()?;
             Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
         }
         DataType::Int64 => {
-            let out: Vec<i64> = groups.iter().map(|(k, _)| *k).collect();
+            let out: Vec<Option<i64>> = groups
+                .iter()
+                .map(|(k, _)| if is_null_group(*k) { None } else { Some(*k) })
+                .collect();
             Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
         }
         other => Err(BoltError::Type(format!(
