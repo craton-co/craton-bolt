@@ -1362,16 +1362,20 @@ fn emit_i128_to_f64(b: &mut PtxBuilder, dst: Reg, src_lo: Reg, src_hi: Reg) -> B
 /// 4. Reassemble the unsigned magnitude `(lo, hi)`, then negate the i128
 ///    (two's-complement over the pair) iff `x < 0`.
 ///
-/// OVERFLOW / NaN (non-trapping, per the `Op::Div128` convention): a
-/// magnitude `>= 2^128` saturates the high limb's `cvt.rzi.u64.f64` to
-/// `u64::MAX`, yielding a deterministic clamped value rather than faulting;
-/// NaN converts to 0. There is no per-row validity signal for cast overflow
-/// on this IR path (see the F5 CAST notes in `physical_plan`).
+/// OVERFLOW / NaN (non-trapping, per the `Op::Div128` convention): the
+/// conversion saturates to the i128 bounds. A magnitude `>= 2^127` (including
+/// `+inf`) yields `i128::MAX` (hi=`0x7FFF…FFFF`, lo=`0xFFFF…FFFF`); a value
+/// `<= -(2^127)` (including `-inf`) yields `i128::MIN` (hi=`0x8000…0000`,
+/// lo=`0`); NaN converts to 0. The magnitude is compared against `2^127`
+/// BEFORE the round-half-away `+0.5`, so the threshold tests the true
+/// magnitude. There is no per-row validity signal for cast overflow on this
+/// IR path (see the F5 CAST notes in `physical_plan`).
 fn emit_f64_to_i128(b: &mut PtxBuilder, dst_lo: Reg, dst_hi: Reg, src: Reg) -> BoltResult<()> {
     let src_n = b.alloc.get(src)?.to_string();
     let mag = b.alloc.alloc("fd");
     let m = b.alloc.alloc("fd");
     let half = b.alloc.alloc("fd");
+    let two127 = b.alloc.alloc("fd");
     let two64 = b.alloc.alloc("fd");
     let inv_two64 = b.alloc.alloc("fd");
     let hi_f = b.alloc.alloc("fd");
@@ -1379,6 +1383,7 @@ fn emit_f64_to_i128(b: &mut PtxBuilder, dst_lo: Reg, dst_hi: Reg, src: Reg) -> B
     let prod = b.alloc.alloc("fd");
     let neg = b.alloc.alloc("r");
     let p0 = b.alloc.alloc("p");
+    let psat = b.alloc.alloc("p");
     let (lo_n, hi_n) = b.alloc.assign_pair(dst_lo, dst_hi)?;
     // Unique label suffix per emission (the lo destination index is unique).
     let tag = lo_n.trim_start_matches('%').to_string();
@@ -1386,8 +1391,28 @@ fn emit_f64_to_i128(b: &mut PtxBuilder, dst_lo: Reg, dst_hi: Reg, src: Reg) -> B
     // sgn: is x negative? (setp on the original value; NaN compares false.)
     emit_fmt!(b, "setp.lt.f64 {}, {}, 0d0000000000000000;", p0, src_n)?;
     emit_fmt!(b, "selp.b32 {}, 1, 0, {};", neg, p0)?;
-    // mag = |x|; m = trunc(mag + 0.5)  (round half away from zero).
+    // mag = |x|  (true magnitude, BEFORE the +0.5 round addend).
     emit_fmt!(b, "abs.f64 {}, {};", mag, src_n)?;
+    // i128 saturation gate: |x| >= 2^127 -> clamp to i128::MIN/MAX.
+    // NaN compares false here, so NaN falls through to the normal path (-> 0).
+    emit_fmt!(b, "mov.f64 {}, 0d47E0000000000000;", two127)?; // 2^127
+    emit_fmt!(b, "setp.ge.f64 {}, {}, {};", psat, mag, two127)?;
+    emit_fmt!(b, "@!{} bra F2I_NOSAT_{};", psat, tag)?;
+    // Saturating branch: select i128::MAX (positive) or i128::MIN (negative)
+    // from the already-computed sign flag, then jump to the shared tail.
+    emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", p0, neg)?;
+    emit_fmt!(b, "@{} bra F2I_SATNEG_{};", p0, tag)?;
+    // x >= 2^127 (or +inf): i128::MAX.
+    emit_fmt!(b, "mov.u64 {}, 0xFFFFFFFFFFFFFFFF;", lo_n)?;
+    emit_fmt!(b, "mov.u64 {}, 0x7FFFFFFFFFFFFFFF;", hi_n)?;
+    emit_fmt!(b, "bra F2I_DONE_{};", tag)?;
+    b.emit_label(&format!("F2I_SATNEG_{}", tag))?;
+    // x <= -(2^127) (or -inf): i128::MIN.
+    emit_fmt!(b, "mov.u64 {}, 0x0000000000000000;", lo_n)?;
+    emit_fmt!(b, "mov.u64 {}, 0x8000000000000000;", hi_n)?;
+    emit_fmt!(b, "bra F2I_DONE_{};", tag)?;
+    b.emit_label(&format!("F2I_NOSAT_{}", tag))?;
+    // Normal in-range path. m = trunc(mag + 0.5)  (round half away from zero).
     emit_fmt!(b, "mov.f64 {}, 0d3FE0000000000000;", half)?; // 0.5
     emit_fmt!(b, "add.f64 {}, {}, {};", mag, mag, half)?;
     emit_fmt!(b, "cvt.rzi.f64.f64 {}, {};", m, mag)?;
@@ -1436,18 +1461,31 @@ fn emit_f64_to_i128(b: &mut PtxBuilder, dst_lo: Reg, dst_hi: Reg, src: Reg) -> B
 ///    `subc.u64` negate-the-pair tail.
 ///
 /// Contract (matches the `Op::F64ToI128` docs): rounds half away from zero;
-/// NaN → 0; non-trapping. The PTX saturates *per limb* at `u64::MAX`, so a
-/// magnitude `≥ 2^128` clamps to all-ones limbs (→ `-1` after reassembly /
-/// `i128::MAX` for the positive branch as computed here); `±inf` reaches the
-/// limb saturation and yields `i128::MAX` / `i128::MIN`.
+/// NaN → 0; non-trapping; saturates to the i128 bounds. A magnitude `>= 2^127`
+/// (including `+inf`) → `i128::MAX`; a value `<= -(2^127)` (including `-inf`) →
+/// `i128::MIN`; in-range values take the limb-decomposition path below.
 // `allow(dead_code)`: this is a host *reference* mirror of `emit_f64_to_i128`;
 // its only caller today is the `#[cfg(test)]` conversion test, so a plain
 // (non-test) build sees no use. Kept `pub(crate)` so non-test code can adopt
 // it as the canonical conversion if/when the IR path materialises i128 casts.
 #[allow(dead_code)]
 pub(crate) fn f64_to_i128_saturating(x: f64) -> i128 {
-    // Step 1: sign. NaN is not < 0, so `neg` is false and the NaN flows
-    // through `mag`/`m` as NaN, getting clamped to 0 limbs below.
+    // i128 saturation gate (mirrors the `setp.ge.f64` against 2^127 in the
+    // emitter, evaluated on the TRUE magnitude before the +0.5 round addend).
+    // NaN is not >= / <= anything, so it falls through to the normal path and
+    // clamps to 0 via the limb extractions below.
+    const TWO127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0; // 2^127
+    if x.is_nan() {
+        return 0;
+    }
+    if x >= TWO127 {
+        return i128::MAX;
+    }
+    if x <= -TWO127 {
+        return i128::MIN;
+    }
+
+    // Step 1: sign. (NaN already handled above.)
     let neg = x < 0.0;
 
     // Steps 2-3: round half away from zero on the magnitude.
@@ -4216,26 +4254,66 @@ mod decimal128_ir_tests {
             ptx.contains("0d3FE0000000000000"),
             "expected the 0.5 round constant\n{ptx}"
         );
+        // The i128-bound saturation gate: compare |x| against 2^127 and emit
+        // the clamp limbs (i128::MAX hi-limb 0x7FFF... / i128::MIN hi-limb
+        // 0x8000...). These guard against the per-limb-only overflow bug.
+        assert!(
+            ptx.contains("0d47E0000000000000"),
+            "expected the 2^127 saturation threshold constant\n{ptx}"
+        );
+        assert!(
+            ptx.to_uppercase().contains("0X7FFFFFFFFFFFFFFF")
+                && ptx.to_uppercase().contains("0X8000000000000000"),
+            "expected i128::MAX / i128::MIN saturation limbs\n{ptx}"
+        );
+    }
+
+    /// GPU-required smoke test: confirm the f64→i128 kernel PTX (including the
+    /// new saturation gate) is accepted by ptxas / the CUDA driver. Skipped by
+    /// default; run on a CUDA host with `BOLT_BENCH_GPU=1 <lib_exe> --ignored`.
+    #[test]
+    #[ignore = "gpu:f64i128 — requires a CUDA driver + BOLT_BENCH_GPU=1"]
+    fn f64_to_i128_ptx_loads_into_cuda_driver() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO { name: "f".into(), dtype: DataType::Float64 }],
+            outputs: vec![ColumnIO { name: "out".into(), dtype: dec(20, 0) }],
+            ops: vec![
+                Op::LoadColumn { dst: Reg(0), col_idx: 0, dtype: DataType::Float64 },
+                Op::F64ToI128 { dst_lo: Reg(1), dst_hi: Reg(2), src: Reg(0) },
+                Op::Store128 { src_lo: Reg(1), src_hi: Reg(2), col_idx: 0 },
+            ],
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_f64_to_i128").expect("kernel compiles");
+        let module = crate::jit::CudaModule::from_ptx(&ptx)
+            .expect("f64→i128 PTX (with saturation gate) should load via cuModuleLoadDataEx");
+        let _fn = module
+            .function("bolt_f64_to_i128")
+            .expect("kernel entry point should be reachable");
     }
 
     /// Value-level coverage for the f64→i128 conversion, exercised through the
     /// host reference mirror [`f64_to_i128_saturating`]. The PTX emitter
     /// `emit_f64_to_i128` is not host-runnable, so this asserts the mirror's
     /// arithmetic against the emitter's *actual* documented sequence (round
-    /// half away from zero, NaN→0, non-trapping, per-limb `u64` saturation).
+    /// half away from zero, NaN→0, non-trapping, i128-bound saturation).
     ///
-    /// NOTE on the saturation contract: the emitted PTX saturates each 64-bit
-    /// limb independently at `u64::MAX` (`cvt.rzi.u64.f64`), it does **not**
-    /// clamp the assembled value to `i128::MIN`/`i128::MAX`. Consequently a
-    /// magnitude in `[2^127, 2^128)` reassembles into the negative i128 range
-    /// (its top bit is set), and `±inf` lands on the `±2^64` limb pattern
-    /// rather than `i128::MIN`/`i128::MAX`. These expectations were computed
-    /// by replaying the exact f64 step sequence; they mirror what the kernel
-    /// produces today, which is *not* the i128-bound saturation the
-    /// `Op::F64ToI128` prose aspires to (flagged in integration notes).
+    /// SATURATION CONTRACT (true i128 bounds): the emitter compares the true
+    /// magnitude against `2^127` (`setp.ge.f64`) and clamps to `i128::MAX` /
+    /// `i128::MIN` (including `±inf`) before the limb-decomposition path. NaN
+    /// compares false and falls through to the normal path, clamping to 0.
     #[test]
     fn f64_to_i128_saturating_matches_emitter() {
         use super::f64_to_i128_saturating as f2i;
+
+        // Threshold sanity: confirm the boundary values used below straddle
+        // 2^127 ≈ 1.70e38 as claimed.
+        const TWO127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+        assert!(1.2e38 < TWO127); // in-range
+        assert!(2.0e38 > TWO127); // saturates
 
         // Exact small integers.
         assert_eq!(f2i(0.0), 0);
@@ -4267,29 +4345,22 @@ mod decimal128_ir_tests {
         assert_eq!(f2i(1.2e38), 120_000_000_000_000_008_632_251_347_034_389_348_352);
         assert_eq!(f2i(-1.2e38), -120_000_000_000_000_008_632_251_347_034_389_348_352);
 
-        // Magnitude in [2^127, 2^128): the per-limb u64 saturation has NOT yet
-        // kicked in (each limb < 2^64), so the assembled value's top bit is set
-        // and it lands in the NEGATIVE i128 range for a positive input — the
-        // emitter's actual (non-i128-bound) saturation behavior. 2e38 > 2^127.
-        assert!(2.0e38 >= 170_141_183_460_469_231_731_687_303_715_884_105_728.0); // ≥ 2^127
-        assert_eq!(f2i(2.0e38), -140_282_366_920_938_467_965_754_960_519_700_152_320);
-        assert_eq!(f2i(-2.0e38), 140_282_366_920_938_467_965_754_960_519_700_152_320);
+        // Magnitude at/above 2^127 saturates to the i128 bounds (NOT a wrapping
+        // limb pattern). 2e38 > 2^127 → i128::MAX / i128::MIN.
+        assert_eq!(f2i(2.0e38), i128::MAX);
+        assert_eq!(f2i(-2.0e38), i128::MIN);
 
-        // Magnitude ≥ 2^128: the high limb saturates to u64::MAX. 3.3e38 < 2^128
-        // (≈3.4e38) so this is still the wrapping region; the point is that no
-        // trap occurs and the result is deterministic.
-        assert_eq!(f2i(3.3e38), -10_282_366_920_938_472_781_248_783_174_713_999_360);
-        assert_eq!(f2i(-3.3e38), 10_282_366_920_938_472_781_248_783_174_713_999_360);
+        // Magnitude ≥ 2^128 (3.3e38 < 2^128 ≈ 3.4e38, but well above 2^127):
+        // still saturates, non-trapping, deterministic.
+        assert_eq!(f2i(3.3e38), i128::MAX);
+        assert_eq!(f2i(-3.3e38), i128::MIN);
 
-        // ±inf: |inf|+0.5 = inf, hi limb saturates to u64::MAX, the low limb
-        // is inf-inf = NaN → 0. So +inf → 0xFFFF…0000 = -(2^64) as i128, and
-        // -inf negates that to +(2^64). This MIRRORS THE EMITTER; it is NOT
-        // the i128::MAX/MIN the op-level prose claims (see note above).
-        assert_eq!(f2i(f64::INFINITY), -18_446_744_073_709_551_616); // -(2^64)
-        assert_eq!(f2i(f64::NEG_INFINITY), 18_446_744_073_709_551_616); // +(2^64)
+        // ±inf saturate to the i128 bounds (inf >= 2^127, -inf <= -(2^127)).
+        assert_eq!(f2i(f64::INFINITY), i128::MAX);
+        assert_eq!(f2i(f64::NEG_INFINITY), i128::MIN);
 
-        // NaN → 0 (non-trapping): NaN is not < 0, flows through trunc as NaN,
-        // and every limb extraction clamps NaN to 0.
+        // NaN → 0 (non-trapping): NaN compares false at the saturation gate,
+        // flows through trunc as NaN, and every limb extraction clamps to 0.
         assert_eq!(f2i(f64::NAN), 0);
     }
 
