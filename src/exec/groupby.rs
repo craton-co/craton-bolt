@@ -2470,10 +2470,31 @@ fn identity_i64(op: ReduceOp) -> i64 {
     }
 }
 
+// MIN float identity is NaN (not +inf): the no-validity float MIN/MAX path
+// (`run_min_max_aggregate`) seeds these accumulators and reduces them on the
+// device via the NaN-as-largest CAS kernel
+// (`jit::float_atomics::compile_groupby_float_atomic_kernel`). Under the DuckDB
+// total order that kernel and the scalar path (`aggregate.rs::float_total_cmp`)
+// implement, NaN is the *largest* value, so the correct MIN identity (the
+// maximum of the order, such that `min(identity, x) == x`) is NaN, not +inf.
+//
+// With a +inf seed the kernel's MIN rule never lets a NaN candidate replace the
+// seed (replace = `(!cand_nan & slot_nan) | ordered`), so an all-NaN group would
+// wrongly surface +inf. Seeding NaN makes the first finite candidate replace it
+// (finite beats a NaN slot) while an all-NaN group keeps NaN — matching the
+// scalar reduction, which seeds MIN from the first element rather than ±inf.
+//
+// MAX keeps the -inf identity (the minimum of the order); the MAX rule already
+// lets a NaN candidate beat -inf, so all-NaN MAX correctly yields NaN.
+//
+// NOTE: this only feeds the NaN-aware `float_atomics` kernel. The validity path
+// (`groupby_valid.rs`) has its own `identity_f64`/`identity_f32` seeding the
+// bare-`setp` `valid_flag_float` kernel, which still relies on a ±inf seed and
+// is intentionally left unchanged here.
 fn identity_f32(op: ReduceOp) -> f32 {
     match op {
         ReduceOp::Sum | ReduceOp::Count => 0.0,
-        ReduceOp::Min => f32::INFINITY,
+        ReduceOp::Min => f32::NAN,
         ReduceOp::Max => f32::NEG_INFINITY,
     }
 }
@@ -2481,7 +2502,7 @@ fn identity_f32(op: ReduceOp) -> f32 {
 fn identity_f64(op: ReduceOp) -> f64 {
     match op {
         ReduceOp::Sum | ReduceOp::Count => 0.0,
-        ReduceOp::Min => f64::INFINITY,
+        ReduceOp::Min => f64::NAN,
         ReduceOp::Max => f64::NEG_INFINITY,
     }
 }

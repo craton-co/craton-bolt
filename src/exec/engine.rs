@@ -3236,8 +3236,36 @@ impl Engine {
         // Download Int32 lengths and widen to the Int64 SQL contract.
         let lens_i32 = out_gpu.to_vec()?;
         check_len(lens_i32.len(), n_rows)?;
-        let lens_i64: Vec<i64> = lens_i32.into_iter().map(|v| v as i64).collect();
-        Ok(Arc::new(Int64Array::from(lens_i64)) as ArrayRef)
+
+        // Derive the output validity bitmap from the SOURCE column's NULLs so
+        // `LENGTH(NULL)` is SQL NULL, not a valid `0`. The kernel gathered a
+        // bare length for every row (a NULL row gathered length-table slot 0 =
+        // 0), so without re-applying validity here a NULL input would read back
+        // as a valid `0`. `LENGTH('')` is unaffected: an empty string is a real
+        // dictionary entry whose row is VALID, so it stays a valid `0`.
+        //
+        // * `OneBasedNullSlot0` (engine-managed `Utf8`): NULL ⇔ key == 0 (the
+        //   reserved NULL sentinel slot). Real strings — including `""` — have
+        //   key >= 1 and are valid.
+        // * `ZeroBased` (`DictUtf8`): `gpu_gather_layout` only selects the GPU
+        //   path when `valid_mask` is `None`, i.e. there are no NULLs, so every
+        //   row is valid.
+        let lens_opt: Vec<Option<i64>> = match layout {
+            KeyLayout::OneBasedNullSlot0 => {
+                let keys_host = keys_vec.to_vec()?;
+                check_len(keys_host.len(), n_rows)?;
+                lens_i32
+                    .into_iter()
+                    .zip(keys_host.into_iter())
+                    .map(|(len, key)| if key == 0 { None } else { Some(len as i64) })
+                    .collect()
+            }
+            // No NULLs on this path (see above): every length is valid.
+            KeyLayout::ZeroBased => lens_i32.into_iter().map(|v| Some(v as i64)).collect(),
+        };
+        // `Int64Array::from(Vec<Option<i64>>)` carries the validity bitmap, so
+        // NULL rows decode back to SQL NULL.
+        Ok(Arc::new(Int64Array::from(lens_opt)) as ArrayRef)
     }
 
     /// Execute a [`PhysicalPlan::StringProject`]: a `SELECT UPPER(<utf8_col>)` /

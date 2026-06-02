@@ -156,8 +156,10 @@ pub fn host_gather_lengths(keys: &[i32], length_table: &[i32]) -> BoltResult<Vec
 /// gather the wrong slot — or any non-Utf8 storage).
 pub fn gpu_gather_layout(data: &GpuColumnData) -> Option<KeyLayout> {
     match data {
-        // Engine-managed plain-string columns: slot-0 NULL sentinel means the
-        // gather is always correct (NULL rows have key 0 → length-table[0] = 0).
+        // Engine-managed plain-string columns: the slot-0 NULL sentinel means a
+        // NULL row gathers length-table[0] = 0, and the GPU caller re-derives
+        // the output null bit from `key == 0` so that NULL → SQL NULL (not a
+        // valid 0). Always safe to gather on the device.
         GpuColumnData::Utf8 { .. } => Some(KeyLayout::OneBasedNullSlot0),
         // Native dict columns: only safe to gather on the GPU when there are no
         // NULLs. A NULL row's key is zeroed to 0, which would gather dict[0]'s
