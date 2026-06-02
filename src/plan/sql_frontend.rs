@@ -1560,6 +1560,708 @@ impl CorrelatedWherePlan {
 }
 
 // ---------------------------------------------------------------------------
+// VALUES as a row source (feature: VALUES)
+// ---------------------------------------------------------------------------
+
+/// Reserved ephemeral table name the OUTER query template
+/// ([`ValuesQueryPlan::post`]) scans — the host-materialised VALUES relation
+/// (for the `FROM (VALUES ...) AS t` form, this is *also* bound under the
+/// user-supplied alias; the reserved name below is used only when the engine
+/// needs a name and the user gave none, which cannot happen for the FROM form).
+/// The leading `__` keeps it out of any user namespace.
+pub const VALUES_RESULT_TABLE: &str = "__values_result";
+
+/// Default per-process cap on the number of `VALUES` rows materialised, to keep
+/// a giant literal blob (`VALUES (1),(2),...,(10^9)`) from allocating without
+/// bound host-side. Overridable via [`VALUES_MAX_ROWS_ENV`].
+pub const VALUES_MAX_ROWS: usize = 1_000_000;
+
+/// Environment variable that overrides [`VALUES_MAX_ROWS`] at runtime. Parsed as
+/// a base-10 `usize`; `0` / empty / unparseable fall back to the default.
+pub const VALUES_MAX_ROWS_ENV: &str = "CRATON_VALUES_MAX_ROWS";
+
+/// Resolve the `VALUES` row cap, honouring [`VALUES_MAX_ROWS_ENV`]. Re-parsed on
+/// each call (cheap: one env lookup) — there is no hot loop here, and avoiding a
+/// process-global latch keeps the cap test-overridable per process.
+fn values_max_rows() -> usize {
+    match std::env::var(VALUES_MAX_ROWS_ENV) {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) | Err(_) => VALUES_MAX_ROWS,
+            Ok(n) => n,
+        },
+        Err(_) => VALUES_MAX_ROWS,
+    }
+}
+
+/// Enforce the `VALUES` row cap. Kept pure (the cap is passed in) so it is
+/// testable without mutating the process-global [`VALUES_MAX_ROWS_ENV`] —
+/// mutating that env var in a test would race the other parallel VALUES tests
+/// that read the cap.
+fn enforce_values_row_cap(n_rows: usize, cap: usize) -> BoltResult<()> {
+    if n_rows > cap {
+        return Err(BoltError::Sql(format!(
+            "VALUES has {n_rows} rows, exceeding the {cap}-row cap (override via {VALUES_MAX_ROWS_ENV})"
+        )));
+    }
+    Ok(())
+}
+
+/// A host-materialisable `VALUES` relation: an inferred [`Schema`] plus the
+/// per-row constant values (one [`Literal`] per column, row-major). The engine
+/// turns this into an Arrow `RecordBatch` (see
+/// [`crate::exec::engine::Engine::execute_values_query`]).
+///
+/// Type inference (see [`lower_values_relation`]): a column's dtype is the
+/// common type across all rows. Int32 promotes to Int64 when mixed; NULL takes
+/// the column type from the other rows; an all-NULL column defaults to a
+/// nullable `Int64` (documented choice — the widest integer is the least
+/// surprising default and is GPU-friendly). Genuinely incompatible mixes (e.g.
+/// Int vs Utf8) are a clean `BoltError`.
+#[derive(Debug, Clone)]
+pub struct ValuesRelation {
+    /// Inferred output schema (column names + common-type dtypes + nullability).
+    pub schema: Schema,
+    /// Row-major literal values; `rows[r][c]` is row `r`, column `c`. Each row
+    /// has exactly `schema.fields.len()` entries; `Literal::Null` marks a NULL.
+    /// Every non-null value is already coerced to the column's common dtype.
+    pub rows: Vec<Vec<Literal>>,
+}
+
+/// Descriptor for a query whose row source is a `VALUES` clause (feature
+/// VALUES), executed as a host-orchestrated engine special-case rather than a
+/// plan node (there is no `LogicalPlan`/`Expr` variant for an inline relation,
+/// and adding one would touch shared files and break exhaustive matches).
+///
+/// Two shapes (see [`plan_values_query`]):
+///   * **Bare** `VALUES (..),(..) [ORDER BY ..] [LIMIT ..]` — `post` is `None`;
+///     the engine returns the materialised relation directly (after the
+///     optional ORDER BY / LIMIT carried in `post_bare`).
+///   * **FROM form** `SELECT ... FROM (VALUES ..) AS t(a,b) ...` — `post` is the
+///     outer query lowered over a synthetic `Scan` of [`Self::bind_name`]; the
+///     engine binds the materialised relation under that name in the streaming
+///     overlay and runs `post` through the ordinary subplan executor (mirroring
+///     the WITH RECURSIVE / LATERAL overlay pattern).
+#[derive(Debug, Clone)]
+pub struct ValuesQueryPlan {
+    /// The materialisable VALUES relation (inferred schema + constant rows).
+    pub relation: ValuesRelation,
+    /// Name the relation is bound under for the FROM form (the user alias `t`);
+    /// for the bare form this is [`VALUES_RESULT_TABLE`] (used only if a `post`
+    /// scan is ever built, which the bare form does not do).
+    pub bind_name: String,
+    /// FROM form: the outer query lowered over a synthetic `Scan` of
+    /// [`Self::bind_name`]. `None` for the bare top-level VALUES form.
+    pub post: Option<LogicalPlan>,
+    /// Bare form: optional ORDER BY applied to the materialised relation.
+    pub order_by: Vec<SortExpr>,
+    /// Bare form: optional `(limit, offset)` applied after the ORDER BY.
+    pub limit: Option<(usize, usize)>,
+}
+
+impl ValuesQueryPlan {
+    /// Overall output schema.
+    pub fn schema(&self) -> BoltResult<Schema> {
+        match &self.post {
+            Some(p) => p.schema(),
+            None => Ok(self.relation.schema.clone()),
+        }
+    }
+}
+
+/// Promote two column dtypes to their common type for VALUES inference. Returns
+/// `None` when the two types are genuinely incompatible (e.g. Int vs Utf8).
+///
+/// Rules (intentionally conservative — only the promotions the executor can
+/// build cheaply): identical types collapse to themselves; Int32↔Int64 →
+/// Int64; Float32↔Float64 → Float64; Int32/Int64 ↔ Float32/Float64 → Float64
+/// (integers widen into the float column). Everything else (Bool, Utf8,
+/// temporal, decimal mixed with a different family) requires an exact match.
+fn values_common_type(a: DataType, b: DataType) -> Option<DataType> {
+    use DataType::*;
+    if a == b {
+        return Some(a);
+    }
+    Some(match (a, b) {
+        (Int32, Int64) | (Int64, Int32) => Int64,
+        (Float32, Float64) | (Float64, Float32) => Float64,
+        (Int32, Float32) | (Float32, Int32) => Float32,
+        (Int32, Float64)
+        | (Float64, Int32)
+        | (Int64, Float32)
+        | (Float32, Int64)
+        | (Int64, Float64)
+        | (Float64, Int64) => Float64,
+        _ => return None,
+    })
+}
+
+/// Coerce a folded literal to the column's inferred common dtype. NULL passes
+/// through unchanged (it carries the column type implicitly). Widening numeric
+/// promotions (Int32→Int64, Int→Float, Float32→Float64) are applied so the
+/// engine builds one typed array per column. A literal that does not match and
+/// cannot widen is an error (should not happen — `values_common_type` already
+/// validated compatibility — but kept as a clean guard).
+fn coerce_values_literal(lit: Literal, target: DataType) -> BoltResult<Literal> {
+    use DataType as D;
+    Ok(match (&lit, target) {
+        (Literal::Null, _) => Literal::Null,
+        // Exact-type fast paths.
+        (Literal::Int32(_), D::Int32)
+        | (Literal::Int64(_), D::Int64)
+        | (Literal::Float32(_), D::Float32)
+        | (Literal::Float64(_), D::Float64)
+        | (Literal::Bool(_), D::Bool)
+        | (Literal::Utf8(_), D::Utf8) => lit,
+        // Integer widening.
+        (Literal::Int32(v), D::Int64) => Literal::Int64(*v as i64),
+        // Integer → float.
+        (Literal::Int32(v), D::Float32) => Literal::Float32(*v as f32),
+        (Literal::Int32(v), D::Float64) => Literal::Float64(*v as f64),
+        (Literal::Int64(v), D::Float64) => Literal::Float64(*v as f64),
+        (Literal::Int64(v), D::Float32) => Literal::Float32(*v as f32),
+        // Float widening.
+        (Literal::Float32(v), D::Float64) => Literal::Float64(*v as f64),
+        _ => {
+            return Err(BoltError::Sql(format!(
+                "VALUES: cannot coerce literal {lit:?} to inferred column type {target:?}"
+            )))
+        }
+    })
+}
+
+/// Lower a parsed `VALUES` row list into a host-materialisable [`ValuesRelation`]
+/// (feature VALUES).
+///
+/// Steps:
+///   1. Reject an empty VALUES list and ragged rows (differing column counts).
+///   2. Enforce the row cap ([`values_max_rows`]).
+///   3. Fold each cell to a constant via [`lower_expr`] over an *empty* resolver
+///      (so a column reference / non-constant errors cleanly) and require an
+///      `Expr::Literal`.
+///   4. Infer each column's common dtype across all rows via
+///      [`values_common_type`]; NULLs do not constrain the type. An all-NULL
+///      column defaults to nullable `Int64` (documented).
+///   5. Coerce every non-NULL cell to its column's common dtype.
+///
+/// `col_names` supplies the output column names; when `None`, Postgres-style
+/// `column1, column2, ...` defaults are used.
+fn lower_values_relation(
+    values: &sqlparser::ast::Values,
+    col_names: Option<&[String]>,
+) -> BoltResult<ValuesRelation> {
+    if values.rows.is_empty() {
+        return Err(BoltError::Sql("VALUES requires at least one row".into()));
+    }
+    let n_cols = values.rows[0].len();
+    if n_cols == 0 {
+        return Err(BoltError::Sql("VALUES row must have at least one column".into()));
+    }
+    enforce_values_row_cap(values.rows.len(), values_max_rows())?;
+
+    // Fold every cell to a literal; reject ragged rows.
+    let empty = NameResolver::empty();
+    let mut lits: Vec<Vec<Literal>> = Vec::with_capacity(values.rows.len());
+    for (ri, row) in values.rows.iter().enumerate() {
+        if row.len() != n_cols {
+            return Err(BoltError::Sql(format!(
+                "VALUES row {} has {} columns but row 1 has {n_cols} (ragged VALUES)",
+                ri + 1,
+                row.len()
+            )));
+        }
+        let mut row_lits = Vec::with_capacity(n_cols);
+        for (ci, cell) in row.iter().enumerate() {
+            let lowered = lower_expr(cell, &empty, 0)?;
+            match lowered {
+                Expr::Literal(l) => row_lits.push(l),
+                _ => {
+                    return Err(BoltError::Sql(format!(
+                        "VALUES cell (row {}, column {}) is not a constant expression; \
+                         only literals / constant-folding expressions are supported",
+                        ri + 1,
+                        ci + 1
+                    )))
+                }
+            }
+        }
+        lits.push(row_lits);
+    }
+
+    // Infer each column's common dtype across all rows (NULLs don't constrain).
+    let mut col_types: Vec<Option<DataType>> = vec![None; n_cols];
+    for row in &lits {
+        for (ci, lit) in row.iter().enumerate() {
+            if let Some(dt) = lit.dtype() {
+                col_types[ci] = match col_types[ci] {
+                    None => Some(dt),
+                    Some(prev) => Some(values_common_type(prev, dt).ok_or_else(|| {
+                        BoltError::Sql(format!(
+                            "VALUES column {} mixes incompatible types {prev:?} and {dt:?}",
+                            ci + 1
+                        ))
+                    })?),
+                };
+            }
+        }
+    }
+
+    // A column-list alias (`AS v(a, b, ...)`) must name exactly as many columns
+    // as the VALUES rows have — otherwise reject cleanly (indexing `names[ci]`
+    // below would otherwise panic on a short list).
+    if let Some(names) = col_names {
+        if names.len() != n_cols {
+            return Err(BoltError::Sql(format!(
+                "VALUES alias column list has {} name(s) but the rows have {} column(s)",
+                names.len(),
+                n_cols
+            )));
+        }
+    }
+
+    // Build the schema. An all-NULL column (col_types[ci] == None) defaults to
+    // a nullable Int64 (documented). A column is nullable iff any row is NULL.
+    let mut fields = Vec::with_capacity(n_cols);
+    for ci in 0..n_cols {
+        let dtype = col_types[ci].unwrap_or(DataType::Int64);
+        let nullable = lits.iter().any(|r| matches!(r[ci], Literal::Null));
+        let name = match col_names {
+            Some(names) => names[ci].clone(),
+            None => format!("column{}", ci + 1),
+        };
+        fields.push(Field::new(name, dtype, nullable));
+    }
+    let schema = Schema::new(fields);
+
+    // Coerce every cell to its column's common dtype.
+    for row in &mut lits {
+        for ci in 0..n_cols {
+            let target = schema.fields[ci].dtype;
+            let coerced = coerce_values_literal(row[ci].clone(), target)?;
+            row[ci] = coerced;
+        }
+    }
+
+    Ok(ValuesRelation { schema, rows: lits })
+}
+
+/// Detect and plan a top-level query whose row source is a `VALUES` clause
+/// (feature VALUES). Returns `Ok(Some(plan))` for the two supported shapes (bare
+/// `VALUES ...` and `SELECT ... FROM (VALUES ...) AS t(a,b) ...`), `Ok(None)`
+/// for everything else (so the engine falls through to the ordinary pipeline),
+/// and `Err` for a VALUES of the right shape that is malformed (ragged rows,
+/// incompatible types, non-constant cells, row-cap overflow).
+pub fn plan_values_query(
+    sql: &str,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<ValuesQueryPlan>> {
+    guard_sql_size(sql)?;
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    if stmts.len() != 1 {
+        return Ok(None);
+    }
+    let stmt = stmts.remove(0);
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    plan_values_query_inner(&query, provider)
+}
+
+fn plan_values_query_inner(
+    query: &Query,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<ValuesQueryPlan>> {
+    // No top-level WITH (a CTE wrapping VALUES is out of scope for this hook).
+    if query.with.is_some() {
+        return Ok(None);
+    }
+
+    // Shape 1: bare top-level `VALUES ...` (the body IS a Values node).
+    if let SetExpr::Values(values) = query.body.as_ref() {
+        let relation = lower_values_relation(values, None)?;
+        let ctes = CteScope::new();
+        // Optional ORDER BY / LIMIT over the bare relation's schema.
+        let order_by = match &query.order_by {
+            Some(ob) => lower_order_by(
+                &ob.exprs,
+                SubqueryCtx { provider, ctes: &ctes },
+            )
+            .and_then(|sorts| {
+                // Type-check the sort refs against the relation schema.
+                validate_sort_columns(&sorts, &relation.schema)?;
+                Ok(sorts)
+            })?,
+            None => Vec::new(),
+        };
+        let limit = lower_bare_limit(query)?;
+        return Ok(Some(ValuesQueryPlan {
+            relation,
+            bind_name: VALUES_RESULT_TABLE.to_string(),
+            post: None,
+            order_by,
+            limit,
+        }));
+    }
+
+    // Shape 2: `SELECT ... FROM (VALUES ...) AS t(cols) ...` — exactly one FROM
+    // item, a non-lateral Derived whose subquery body is a bare VALUES, with an
+    // alias. Anything more complex (joins onto the VALUES, multiple FROM items,
+    // a WITH inside the derived subquery) declines to `Ok(None)` so the ordinary
+    // pipeline handles / rejects it.
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Ok(None),
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Ok(None);
+    }
+    let (subquery, alias) = match &select.from[0].relation {
+        TableFactor::Derived {
+            lateral: false,
+            subquery,
+            alias: Some(alias),
+        } => (subquery, alias),
+        _ => return Ok(None),
+    };
+    let values = match subquery.body.as_ref() {
+        SetExpr::Values(v) if subquery.with.is_none() && subquery.order_by.is_none() => v,
+        _ => return Ok(None),
+    };
+
+    // Column names from the alias column list `AS t(a, b)` if present; else
+    // Postgres-style `column1, column2, ...`.
+    let alias_cols: Option<Vec<String>> = if alias.columns.is_empty() {
+        None
+    } else {
+        Some(alias.columns.iter().map(ident_to_name).collect())
+    };
+    let relation = lower_values_relation(values, alias_cols.as_deref())?;
+    // If an alias column list was supplied it must match the column count.
+    if let Some(cols) = &alias_cols {
+        if cols.len() != relation.schema.fields.len() {
+            return Err(BoltError::Sql(format!(
+                "VALUES alias column list has {} names but the relation has {} columns",
+                cols.len(),
+                relation.schema.fields.len()
+            )));
+        }
+    }
+    let bind_name = ident_to_name(&alias.name);
+
+    // Build the outer query (projection / WHERE / GROUP BY / ORDER BY / LIMIT)
+    // over a synthetic Scan of the bound relation. We rebuild the query with the
+    // FROM rewritten to a bare table reference to `bind_name`, then lower it
+    // through the ordinary `plan_query` so every SELECT feature is reused.
+    let post = build_values_post_plan(query, &bind_name, &relation.schema, provider)?;
+    Ok(Some(ValuesQueryPlan {
+        relation,
+        bind_name,
+        post: Some(post),
+        order_by: Vec::new(),
+        limit: None,
+    }))
+}
+
+/// Lower the outer query of a `FROM (VALUES ...) AS t` form into a `post`
+/// [`LogicalPlan`] over a synthetic `Scan` of the bound relation. The synthetic
+/// scan is registered under `bind_name` in the engine's streaming overlay before
+/// the post-plan runs (mirroring [`build_count_distinct_post_plan`]).
+fn build_values_post_plan(
+    query: &Query,
+    bind_name: &str,
+    relation_schema: &Schema,
+    provider: &dyn TableProvider,
+) -> BoltResult<LogicalPlan> {
+    // Rewrite the FROM so the single derived (VALUES) item becomes a bare table
+    // reference to `bind_name`. We clone the query, swap the relation, and lower
+    // the whole thing with the relation schema registered as a base table via a
+    // schema-overlay provider — reusing the entire SELECT lowering path.
+    let mut rewritten = query.clone();
+    if let SetExpr::Select(select) = rewritten.body.as_mut() {
+        let from0 = &mut select.from[0];
+        from0.relation = TableFactor::Table {
+            name: ObjectName(vec![Ident::new(bind_name.to_string())]),
+            alias: None,
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            with_ordinality: false,
+            partitions: Vec::new(),
+        };
+    }
+    // Provider overlay: the bound relation appears as a base table named
+    // `bind_name` so `lower_table_factor` resolves the scan against it.
+    let overlay = SchemaOverlayProvider {
+        base: provider,
+        name: bind_name.to_string(),
+        schema: relation_schema.clone(),
+    };
+    let ctes = CteScope::new();
+    let plan = plan_query(&rewritten, &overlay, &ctes, 0)?;
+    let _ = plan.schema()?;
+    Ok(plan)
+}
+
+/// A [`TableProvider`] that overlays a single named relation schema on top of a
+/// base provider — used to lower a `post` plan over a host-materialised relation
+/// (VALUES / DISTINCT ON) whose schema is known at plan time but whose batch is
+/// bound at execution time. The base provider is consulted for every other name.
+struct SchemaOverlayProvider<'a> {
+    base: &'a dyn TableProvider,
+    name: String,
+    schema: Schema,
+}
+
+impl<'a> TableProvider for SchemaOverlayProvider<'a> {
+    fn schema(&self, name: &str) -> BoltResult<Schema> {
+        if name == self.name || name.eq_ignore_ascii_case(&self.name) {
+            return Ok(self.schema.clone());
+        }
+        self.base.schema(name)
+    }
+
+    fn has_nulls(&self, table_name: &str, col_idx: usize) -> bool {
+        if table_name == self.name || table_name.eq_ignore_ascii_case(&self.name) {
+            return self
+                .schema
+                .fields
+                .get(col_idx)
+                .map(|f| f.nullable)
+                .unwrap_or(false);
+        }
+        self.base.has_nulls(table_name, col_idx)
+    }
+}
+
+/// Lower a bare query tail's `LIMIT [OFFSET]` into `Option<(limit, offset)>`.
+/// Mirrors the LIMIT handling in [`plan_query`].
+fn lower_bare_limit(query: &Query) -> BoltResult<Option<(usize, usize)>> {
+    let limit_value = match &query.limit {
+        Some(e) => Some(usize_from_literal(e, "LIMIT")?),
+        None => None,
+    };
+    let offset_value = match &query.offset {
+        Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
+        None => None,
+    };
+    if limit_value.is_some() || offset_value.is_some() {
+        Ok(Some((limit_value.unwrap_or(usize::MAX), offset_value.unwrap_or(0))))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Validate that every column referenced by `sorts` exists in `schema` (so a
+/// bad ORDER BY over a bare VALUES surfaces at plan time, not execution).
+fn validate_sort_columns(sorts: &[SortExpr], schema: &Schema) -> BoltResult<()> {
+    for s in sorts {
+        validate_expr_columns(&s.expr, schema)?;
+    }
+    Ok(())
+}
+
+/// Recursively check that every `Expr::Column` in `expr` resolves in `schema`.
+fn validate_expr_columns(expr: &Expr, schema: &Schema) -> BoltResult<()> {
+    match expr {
+        Expr::Column(name) => {
+            schema.index_of(name)?;
+            Ok(())
+        }
+        Expr::Literal(_) => Ok(()),
+        Expr::Binary { left, right, .. } => {
+            validate_expr_columns(left, schema)?;
+            validate_expr_columns(right, schema)
+        }
+        Expr::Unary { operand, .. } => validate_expr_columns(operand, schema),
+        Expr::Cast { expr, .. } => validate_expr_columns(expr, schema),
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DISTINCT ON (Postgres) — first row per key under ORDER BY
+// ---------------------------------------------------------------------------
+
+/// Reserved ephemeral table name the OUTER projection template
+/// ([`DistinctOnPlan::post`]) is NOT needed for — DISTINCT ON post-processing is
+/// done entirely host-side over the base batch — but kept for symmetry / future
+/// use. The DISTINCT ON path binds nothing under a name.
+pub const DISTINCT_ON_RESULT_TABLE: &str = "__distinct_on_result";
+
+/// Descriptor for a `SELECT DISTINCT ON (key_exprs) ... [ORDER BY ...] [LIMIT ..]`
+/// (Postgres extension), executed host-side as an engine special-case.
+///
+/// Semantics (matching Postgres): keep the FIRST row of each group of rows that
+/// share the same `key_exprs` values, where "first" is the query's ORDER BY
+/// order. ORDER BY should lead with the DISTINCT ON keys for a deterministic
+/// representative; if it does not (or is absent) the chosen row is
+/// arbitrary-but-one-per-group (we still pick deterministically — the first row
+/// in the sorted-or-input order). A NULL key is its own group (like GROUP BY).
+///
+/// Execution (see [`crate::exec::engine::Engine::execute_distinct_on`]):
+///   1. Run [`Self::base`] — the SELECT lowered as if DISTINCT ON were absent,
+///      but with the DISTINCT ON key columns prepended to the projection (as
+///      `__diston_0..N`) and the query's ORDER BY applied. So the base batch is
+///      `[__diston_0..N, <user projection...>]` in ORDER BY order.
+///   2. Host-side, keep the first row per `__diston_*` key tuple, drop the key
+///      columns, and apply [`Self::limit`].
+#[derive(Debug, Clone)]
+pub struct DistinctOnPlan {
+    /// Base subplan producing `[__diston_0..N, <user projection columns...>]`
+    /// in the query's ORDER BY order. Flows through the ordinary pipeline.
+    pub base: LogicalPlan,
+    /// Number of leading DISTINCT ON key columns in `base`'s output.
+    pub n_keys: usize,
+    /// The user projection's output schema (== `base` schema minus the leading
+    /// `n_keys` key columns).
+    pub output_schema: Schema,
+    /// Optional `(limit, offset)` applied after dedup.
+    pub limit: Option<(usize, usize)>,
+}
+
+impl DistinctOnPlan {
+    /// Overall output schema (the user projection).
+    pub fn schema(&self) -> BoltResult<Schema> {
+        Ok(self.output_schema.clone())
+    }
+}
+
+/// Synthetic column-name prefix for the prepended DISTINCT ON key columns in
+/// [`DistinctOnPlan::base`].
+pub const DISTINCT_ON_KEY_PREFIX: &str = "__diston_";
+
+/// Detect and plan a top-level `SELECT DISTINCT ON (...)` query (feature DISTINCT
+/// ON). Returns `Ok(Some(plan))` for the supported shape, `Ok(None)` for any
+/// query without `DISTINCT ON`, and `Err` for a `DISTINCT ON` query of an
+/// unsupported shape (documented below).
+pub fn plan_distinct_on(
+    sql: &str,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<DistinctOnPlan>> {
+    guard_sql_size(sql)?;
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    if stmts.len() != 1 {
+        return Ok(None);
+    }
+    let stmt = stmts.remove(0);
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    plan_distinct_on_inner(&query, provider)
+}
+
+fn plan_distinct_on_inner(
+    query: &Query,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<DistinctOnPlan>> {
+    if query.with.is_some() {
+        return Ok(None);
+    }
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Ok(None),
+    };
+    let key_exprs = match &select.distinct {
+        Some(Distinct::On(exprs)) => exprs,
+        _ => return Ok(None), // plain SELECT / SELECT DISTINCT handled elsewhere.
+    };
+    if key_exprs.is_empty() {
+        return Err(BoltError::Sql(
+            "DISTINCT ON requires at least one key expression".into(),
+        ));
+    }
+
+    // Supported shape: a single SELECT whose DISTINCT ON keys are simple column
+    // references, and which has no GROUP BY / HAVING / window functions (those
+    // interact with DISTINCT ON in ways we do not model). The keys must appear
+    // in the SELECT projection by name so we can carry them through; rather than
+    // require that, we PREPEND them to the projection as synthetic columns.
+    let has_group_by = match &select.group_by {
+        GroupByExpr::All(_) => true,
+        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+    };
+    if has_group_by {
+        return Err(BoltError::Sql(
+            "unsupported: DISTINCT ON combined with GROUP BY".into(),
+        ));
+    }
+    if select.having.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: DISTINCT ON combined with HAVING".into(),
+        ));
+    }
+
+    // The DISTINCT ON key expressions must be simple column identifiers (the
+    // common Postgres usage). Computed-expression keys are rejected cleanly.
+    let mut key_names: Vec<String> = Vec::with_capacity(key_exprs.len());
+    for k in key_exprs {
+        match k {
+            SqlExpr::Identifier(id) => key_names.push(ident_to_name(id)),
+            SqlExpr::CompoundIdentifier(parts) if !parts.is_empty() => {
+                key_names.push(ident_to_name(parts.last().unwrap()))
+            }
+            _ => {
+                return Err(BoltError::Sql(
+                    "unsupported: DISTINCT ON key must be a simple column reference".into(),
+                ))
+            }
+        }
+    }
+
+    // Build the base SELECT with DISTINCT ON stripped and the key columns
+    // prepended to the projection. We clone the SELECT, drop the DISTINCT, and
+    // prepend `key AS __diston_<i>` projection items, then lower it (with the
+    // query's ORDER BY) through the ordinary `plan_query`.
+    let mut base_select = select.clone();
+    base_select.distinct = None;
+    let mut new_projection: Vec<SelectItem> = Vec::with_capacity(
+        key_names.len() + base_select.projection.len(),
+    );
+    for (i, k) in key_exprs.iter().enumerate() {
+        new_projection.push(SelectItem::ExprWithAlias {
+            expr: k.clone(),
+            alias: Ident::new(format!("{DISTINCT_ON_KEY_PREFIX}{i}")),
+        });
+    }
+    new_projection.extend(base_select.projection.iter().cloned());
+    base_select.projection = new_projection;
+
+    let mut base_query = query.clone();
+    *base_query.body = SetExpr::Select(Box::new(base_select));
+    // ORDER BY stays on `base_query` so the base batch arrives sorted. LIMIT is
+    // applied AFTER dedup (Postgres applies LIMIT to the DISTINCT ON result), so
+    // strip it from the base and carry it on the descriptor.
+    let limit = lower_bare_limit(&base_query)?;
+    base_query.limit = None;
+    base_query.offset = None;
+    base_query.fetch = None;
+
+    let ctes = CteScope::new();
+    let base = plan_query(&base_query, provider, &ctes, 0)?;
+    let base_schema = base.schema()?;
+    let n_keys = key_names.len();
+    if base_schema.fields.len() < n_keys {
+        return Err(BoltError::Sql(
+            "DISTINCT ON: internal — base projection lost key columns".into(),
+        ));
+    }
+    // The user output schema is the base schema minus the leading key columns.
+    let output_schema = Schema::new(base_schema.fields[n_keys..].to_vec());
+
+    Ok(Some(DistinctOnPlan {
+        base,
+        n_keys,
+        output_schema,
+        limit,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // COUNT(DISTINCT col) with GROUP BY (feature F3-finish)
 // ---------------------------------------------------------------------------
 
@@ -14940,5 +15642,214 @@ mod clause_acceptance_tests {
             msg.contains("table-valued function") && msg.contains("function-as-table-source"),
             "TVF message must explain the missing mechanism: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod values_and_distinct_on_tests {
+    //! Host-side tests for the VALUES row source and DISTINCT ON detector
+    //! (feature VALUES / DISTINCT ON). No GPU / engine; a standalone
+    //! [`MemTableProvider`] is used where a provider is needed.
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    fn provider() -> MemTableProvider {
+        MemTableProvider::new().with_table(
+            "t",
+            Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Utf8, true),
+            ]),
+        )
+    }
+
+    fn values_plan(sql: &str) -> ValuesQueryPlan {
+        plan_values_query(sql, &provider())
+            .expect("planning must not error")
+            .expect("must be a VALUES query")
+    }
+
+    fn values_err(sql: &str) -> String {
+        match plan_values_query(sql, &provider()) {
+            Err(e) => e.to_string(),
+            Ok(other) => panic!("expected a VALUES error, got {other:?}"),
+        }
+    }
+
+    // ---- VALUES type inference -------------------------------------------
+
+    #[test]
+    fn bare_values_basic_schema_and_names() {
+        let vp = values_plan("VALUES (1, 'a'), (2, 'b')");
+        assert!(vp.post.is_none());
+        let f = &vp.relation.schema.fields;
+        assert_eq!(f.len(), 2);
+        // Default Postgres-style names.
+        assert_eq!(f[0].name, "column1");
+        assert_eq!(f[1].name, "column2");
+        assert_eq!(f[0].dtype, DataType::Int64);
+        assert_eq!(f[1].dtype, DataType::Utf8);
+        assert_eq!(vp.relation.rows.len(), 2);
+    }
+
+    #[test]
+    fn int32_int64_promotion_widens_to_int64() {
+        // 5_000_000_000 does not fit i32, so it is Int64; the other row's small
+        // int folds to Int64 too — common type Int64.
+        let vp = values_plan("VALUES (1), (5000000000)");
+        assert_eq!(vp.relation.schema.fields[0].dtype, DataType::Int64);
+        // Both cells coerced to Int64.
+        assert!(matches!(vp.relation.rows[0][0], Literal::Int64(1)));
+        assert!(matches!(vp.relation.rows[1][0], Literal::Int64(5_000_000_000)));
+    }
+
+    #[test]
+    fn null_takes_type_from_other_rows_and_marks_nullable() {
+        let vp = values_plan("VALUES (1), (NULL), (3)");
+        let field = &vp.relation.schema.fields[0];
+        assert_eq!(field.dtype, DataType::Int64);
+        assert!(field.nullable, "a column with a NULL row must be nullable");
+        assert!(matches!(vp.relation.rows[1][0], Literal::Null));
+    }
+
+    #[test]
+    fn all_null_column_defaults_to_nullable_int64() {
+        let vp = values_plan("VALUES (NULL), (NULL)");
+        let field = &vp.relation.schema.fields[0];
+        assert_eq!(field.dtype, DataType::Int64, "all-NULL defaults to Int64");
+        assert!(field.nullable);
+    }
+
+    #[test]
+    fn incompatible_types_rejected() {
+        let msg = values_err("VALUES (1), ('a')");
+        assert!(
+            msg.contains("incompatible"),
+            "int-vs-utf8 mix must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn ragged_rows_rejected() {
+        let msg = values_err("VALUES (1, 2), (3)");
+        assert!(msg.contains("ragged"), "ragged rows must be rejected: {msg}");
+    }
+
+    #[test]
+    fn row_cap_enforced() {
+        // Pure cap check — no process-global env mutation, so this never races
+        // the other parallel VALUES tests that read the cap.
+        let msg = enforce_values_row_cap(3, 2)
+            .expect_err("cap must be exceeded")
+            .to_string();
+        assert!(msg.contains("cap"), "row-cap error must mention the cap: {msg}");
+    }
+
+    #[test]
+    fn int_to_float_promotion() {
+        let vp = values_plan("VALUES (1), (2.5)");
+        assert_eq!(vp.relation.schema.fields[0].dtype, DataType::Float64);
+        assert!(matches!(vp.relation.rows[0][0], Literal::Float64(_)));
+    }
+
+    // ---- FROM (VALUES ...) AS t(a, b) ------------------------------------
+
+    #[test]
+    fn from_values_with_column_aliases_resolves_columns() {
+        let vp = values_plan("SELECT x, y FROM (VALUES (1, 'a'), (2, 'b')) AS v(x, y)");
+        assert!(vp.post.is_some(), "FROM form has a post plan");
+        assert_eq!(vp.bind_name, "v");
+        // The relation schema carries the alias column names.
+        assert_eq!(vp.relation.schema.fields[0].name, "x");
+        assert_eq!(vp.relation.schema.fields[1].name, "y");
+        // The outer query's output schema is [x, y].
+        let out = vp.schema().expect("schema");
+        assert_eq!(out.fields[0].name, "x");
+        assert_eq!(out.fields[1].name, "y");
+    }
+
+    #[test]
+    fn from_values_filter_over_relation() {
+        // A WHERE over the VALUES relation lowers through the ordinary pipeline.
+        let vp = values_plan("SELECT x FROM (VALUES (1), (2), (3)) AS v(x) WHERE x > 1");
+        assert!(vp.post.is_some());
+    }
+
+    #[test]
+    fn from_values_alias_count_mismatch_rejected() {
+        let msg = values_err("SELECT * FROM (VALUES (1, 2)) AS v(only_one)");
+        assert!(
+            msg.contains("alias column list"),
+            "mismatched alias column count must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_values_query_declines() {
+        assert!(plan_values_query("SELECT a FROM t", &provider())
+            .unwrap()
+            .is_none());
+    }
+
+    // ---- DISTINCT ON ------------------------------------------------------
+
+    fn distinct_on_plan(sql: &str) -> DistinctOnPlan {
+        plan_distinct_on(sql, &provider())
+            .expect("planning must not error")
+            .expect("must be a DISTINCT ON query")
+    }
+
+    fn distinct_on_err(sql: &str) -> String {
+        match plan_distinct_on(sql, &provider()) {
+            Err(e) => e.to_string(),
+            Ok(other) => panic!("expected a DISTINCT ON error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_on_basic_shape() {
+        let dp = distinct_on_plan("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b");
+        assert_eq!(dp.n_keys, 1);
+        // Output is the user projection [a, b].
+        assert_eq!(dp.output_schema.fields.len(), 2);
+        assert_eq!(dp.output_schema.fields[0].name, "a");
+        assert_eq!(dp.output_schema.fields[1].name, "b");
+    }
+
+    #[test]
+    fn distinct_on_multi_key() {
+        let dp = distinct_on_plan("SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a, b");
+        assert_eq!(dp.n_keys, 2);
+    }
+
+    #[test]
+    fn distinct_on_with_limit_carries_limit() {
+        let dp = distinct_on_plan("SELECT DISTINCT ON (a) a FROM t ORDER BY a LIMIT 5");
+        assert_eq!(dp.limit, Some((5, 0)));
+    }
+
+    #[test]
+    fn distinct_on_computed_key_rejected() {
+        let msg = distinct_on_err("SELECT DISTINCT ON (a + 1) a FROM t ORDER BY a");
+        assert!(
+            msg.contains("simple column reference"),
+            "computed DISTINCT ON key must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn distinct_on_with_group_by_rejected() {
+        let msg = distinct_on_err("SELECT DISTINCT ON (a) a FROM t GROUP BY a");
+        assert!(msg.contains("GROUP BY"), "DISTINCT ON + GROUP BY rejected: {msg}");
+    }
+
+    #[test]
+    fn plain_select_declines_distinct_on() {
+        assert!(plan_distinct_on("SELECT a FROM t", &provider())
+            .unwrap()
+            .is_none());
+        assert!(plan_distinct_on("SELECT DISTINCT a FROM t", &provider())
+            .unwrap()
+            .is_none());
     }
 }

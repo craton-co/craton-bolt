@@ -645,6 +645,76 @@ fn execute_distinct_with_cap(input: QueryHandle, max_rows: usize) -> BoltResult<
     Ok(QueryHandle::from_record_batch(out))
 }
 
+/// DISTINCT ON / "first row per key" (Postgres `SELECT DISTINCT ON`).
+///
+/// Walks `batch` in row order and keeps the FIRST row of each group of rows
+/// that share the same values in the leading `n_keys` columns. "First" is
+/// whatever order `batch` already carries — the caller (the engine's DISTINCT
+/// ON executor) has applied the query's ORDER BY before calling here, so a row
+/// kept is the ORDER BY-first row of its key group (Postgres semantics). When
+/// ORDER BY is absent or does not lead with the keys, the kept row is the
+/// input-first one — deterministic, one-per-group, matching Postgres's
+/// "arbitrary but one" allowance.
+///
+/// Key equality reuses the engine-wide [`RowKey`] / [`RowKeyValue`]
+/// canonicalisation: a NULL key compares equal to another NULL key (so NULL
+/// keys form their own group, exactly like GROUP BY), and float keys fold
+/// `-0.0`/`+0.0` and all-NaN together. The output preserves the input column
+/// schema (all columns, including the key columns); the caller slices off the
+/// leading key columns to restore the user projection.
+///
+/// Bounded by [`distinct_host_max_rows`] on the number of distinct keys, same
+/// as [`execute_distinct`], so a high-cardinality key cannot grow the seen-set
+/// without limit.
+///
+/// Pure (no GPU / engine state) so it is host-testable directly.
+pub fn distinct_on_first_per_key(batch: &RecordBatch, n_keys: usize) -> BoltResult<RecordBatch> {
+    if n_keys == 0 {
+        return Err(BoltError::Other(
+            "DISTINCT ON requires at least one key column".into(),
+        ));
+    }
+    if n_keys > batch.num_columns() {
+        return Err(BoltError::Other(format!(
+            "DISTINCT ON: {n_keys} key columns requested but the batch has {}",
+            batch.num_columns()
+        )));
+    }
+    let n_rows = batch.num_rows();
+    if n_rows == 0 {
+        return Ok(batch.clone());
+    }
+
+    // Pre-downcast only the key columns once (the value columns are filtered
+    // wholesale by the keep-mask, so they need no per-row reader).
+    let key_readers: Vec<ColumnReader<'_>> = (0..n_keys)
+        .map(|i| ColumnReader::new(batch.column(i).as_ref()))
+        .collect::<BoltResult<Vec<_>>>()?;
+
+    let max_rows = distinct_host_max_rows();
+    let mut seen: HashSet<RowKey> = HashSet::with_capacity(n_rows.min(max_rows));
+    let mut keep: Vec<bool> = Vec::with_capacity(n_rows);
+    for row in 0..n_rows {
+        let key = RowKey::from_values(n_keys, key_readers.iter().map(|r| r.value_at(row)));
+        let is_new = seen.insert(key);
+        keep.push(is_new);
+        if seen.len() > max_rows {
+            return Err(BoltError::Other(format!(
+                "DISTINCT ON exceeded host bound of {max_rows} distinct keys \
+                 (override via {DISTINCT_HOST_MAX_ROWS_ENV})"
+            )));
+        }
+    }
+
+    let mask = BooleanArray::from(keep);
+    let filtered_cols: Vec<Arc<dyn Array>> = batch
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::filter(c.as_ref(), &mask).map_err(arrow_err))
+        .collect::<BoltResult<Vec<_>>>()?;
+    RecordBatch::try_new(batch.schema(), filtered_cols).map_err(arrow_err)
+}
+
 /// Collapse `-0.0` to `+0.0` so that signed-zero pairs hash identically
 /// under DISTINCT. F3: also fold every `NaN` bit pattern (any payload, either
 /// sign) to a single canonical quiet NaN so all NaN values dedupe to one
@@ -1325,5 +1395,82 @@ mod tests {
         let mut got = col_to_vec(&out, 0);
         got.sort();
         assert_eq!(got, vec![Some(0), Some(1)]);
+    }
+
+    // ---- DISTINCT ON / first-per-key -------------------------------------
+
+    /// Build a two-column (key Int32, value Int32) batch.
+    fn key_val_batch(keys: Vec<Option<i32>>, vals: Vec<Option<i32>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let k: Arc<dyn Array> = Arc::new(Int32Array::from(keys));
+        let v: Arc<dyn Array> = Arc::new(Int32Array::from(vals));
+        RecordBatch::try_new(schema, vec![k, v]).unwrap()
+    }
+
+    /// DISTINCT ON keeps exactly the FIRST row per key, in input (ORDER BY)
+    /// order. Input pre-sorted by (k, v) ascending — so the first row of each
+    /// key group is the one with the smallest v.
+    #[test]
+    fn distinct_on_keeps_first_row_per_key() {
+        // (1,10) (1,11) (2,20) (2,21) (3,30) — pre-sorted by (k,v).
+        let batch = key_val_batch(
+            vec![Some(1), Some(1), Some(2), Some(2), Some(3)],
+            vec![Some(10), Some(11), Some(20), Some(21), Some(30)],
+        );
+        let out = distinct_on_first_per_key(&batch, 1).unwrap();
+        assert_eq!(out.num_rows(), 3);
+        // The kept value column is the leading (smallest-v) row of each key.
+        assert_eq!(col_to_vec(&out, 1), vec![Some(10), Some(20), Some(30)]);
+    }
+
+    /// A NULL key forms its own group (like GROUP BY): the first NULL-key row
+    /// is kept, later NULL-key rows are dropped.
+    #[test]
+    fn distinct_on_null_key_is_its_own_group() {
+        // keys: NULL, 1, NULL, 1 — first NULL row and first key-1 row kept.
+        let batch = key_val_batch(
+            vec![None, Some(1), None, Some(1)],
+            vec![Some(100), Some(200), Some(101), Some(201)],
+        );
+        let out = distinct_on_first_per_key(&batch, 1).unwrap();
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(col_to_vec(&out, 0), vec![None, Some(1)]);
+        assert_eq!(col_to_vec(&out, 1), vec![Some(100), Some(200)]);
+    }
+
+    /// Multi-key DISTINCT ON: dedup on the leading two key columns.
+    #[test]
+    fn distinct_on_multi_key() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let k1: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 1, 1, 2]));
+        let k2: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 1, 2, 1]));
+        let v: Arc<dyn Array> = Arc::new(Int32Array::from(vec![10, 11, 12, 13]));
+        let batch = RecordBatch::try_new(schema, vec![k1, k2, v]).unwrap();
+        // Groups: (1,1) (1,2) (2,1) — three kept.
+        let out = distinct_on_first_per_key(&batch, 2).unwrap();
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(col_to_vec(&out, 2), vec![Some(10), Some(12), Some(13)]);
+    }
+
+    /// Empty input yields empty output.
+    #[test]
+    fn distinct_on_empty_input() {
+        let batch = key_val_batch(vec![], vec![]);
+        let out = distinct_on_first_per_key(&batch, 1).unwrap();
+        assert_eq!(out.num_rows(), 0);
+    }
+
+    /// Zero key columns is a clean error (the engine never builds this).
+    #[test]
+    fn distinct_on_zero_keys_errors() {
+        let batch = key_val_batch(vec![Some(1)], vec![Some(2)]);
+        assert!(distinct_on_first_per_key(&batch, 0).is_err());
     }
 }

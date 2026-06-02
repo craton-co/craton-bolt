@@ -509,6 +509,84 @@ pub fn format_correlated_where(
 }
 
 // ---------------------------------------------------------------------------
+// VALUES as a row source (feature VALUES)
+// ---------------------------------------------------------------------------
+
+/// Render a [`ValuesQueryPlan`](crate::plan::sql_frontend::ValuesQueryPlan) for
+/// `EXPLAIN`. The header names the inferred relation schema and row count; a
+/// `Post:` sub-header renders the FROM-form outer query template, while the bare
+/// form notes any ORDER BY / LIMIT applied to the relation directly.
+pub fn format_values_query(vp: &crate::plan::sql_frontend::ValuesQueryPlan) -> String {
+    let mut out = String::new();
+    let cols: Vec<String> = vp
+        .relation
+        .schema
+        .fields
+        .iter()
+        .map(|f| format!("{}:{:?}", f.name, f.dtype))
+        .collect();
+    let _ = writeln!(
+        out,
+        "Values: rows={} as '{}' schema=[{}]",
+        vp.relation.rows.len(),
+        vp.bind_name,
+        cols.join(", ")
+    );
+    match &vp.post {
+        Some(post) => {
+            indent(&mut out, 1);
+            let _ = writeln!(out, "Post:");
+            format_logical_into(post, 2, &mut out);
+        }
+        None => {
+            if !vp.order_by.is_empty() {
+                indent(&mut out, 1);
+                let keys: Vec<String> =
+                    vp.order_by.iter().map(|s| format_expr(&s.expr)).collect();
+                let _ = writeln!(out, "OrderBy: [{}]", keys.join(", "));
+            }
+            if let Some((limit, offset)) = vp.limit {
+                indent(&mut out, 1);
+                let _ = writeln!(out, "Limit: limit={limit} offset={offset}");
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// DISTINCT ON (Postgres)
+// ---------------------------------------------------------------------------
+
+/// Render a [`DistinctOnPlan`](crate::plan::sql_frontend::DistinctOnPlan) for
+/// `EXPLAIN`. The header names the key-column count and output schema; the
+/// `Base:` sub-header renders the subplan producing `[keys..., user cols...]` in
+/// ORDER BY order.
+pub fn format_distinct_on(dp: &crate::plan::sql_frontend::DistinctOnPlan) -> String {
+    let mut out = String::new();
+    let cols: Vec<&str> = dp
+        .output_schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let limit = match dp.limit {
+        Some((l, o)) => format!(" limit={l} offset={o}"),
+        None => String::new(),
+    };
+    let _ = writeln!(
+        out,
+        "DistinctOn: n_keys={} output=[{}]{limit}",
+        dp.n_keys,
+        cols.join(", ")
+    );
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Base:");
+    format_logical_into(&dp.base, 2, &mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // COUNT(DISTINCT col) with GROUP BY (feature F3-finish)
 // ---------------------------------------------------------------------------
 

@@ -129,6 +129,123 @@ fn concat_two_batches(a: &RecordBatch, b: &RecordBatch) -> BoltResult<RecordBatc
         .map_err(|e| BoltError::Plan(format!("WITH RECURSIVE concat: {e}")))
 }
 
+/// Materialise a [`ValuesRelation`](crate::plan::sql_frontend::ValuesRelation)
+/// (inferred schema + constant rows) into an Arrow `RecordBatch`.
+///
+/// Builds one typed, nullable Arrow array per column from the row-major literal
+/// values. Every non-null literal has already been coerced to the column's
+/// inferred common dtype by the frontend, so each column is uniform; a
+/// `Literal::Null` becomes a NULL cell. Only the primitive dtypes a VALUES
+/// literal can produce (Int32/Int64/Float32/Float64/Bool/Utf8) are built — any
+/// other inferred dtype is an internal error (the frontend never infers one).
+///
+/// Pure (no GPU / engine state) so it is host-testable directly.
+fn materialize_values_relation(
+    relation: &crate::plan::sql_frontend::ValuesRelation,
+) -> BoltResult<RecordBatch> {
+    use arrow_array::{
+        BooleanArray, Float32Array, Float64Array, Int32Array, StringArray,
+    };
+
+    use crate::plan::logical_plan::Literal;
+
+    let n_cols = relation.schema.fields.len();
+    let n_rows = relation.rows.len();
+    let arrow_schema = plan_schema_to_arrow_schema(&relation.schema)?;
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_cols);
+
+    for ci in 0..n_cols {
+        let dtype = relation.schema.fields[ci].dtype;
+        let array: ArrayRef = match dtype {
+            DataType::Int32 => {
+                let vals: Vec<Option<i32>> = relation
+                    .rows
+                    .iter()
+                    .map(|r| match &r[ci] {
+                        Literal::Null => None,
+                        Literal::Int32(v) => Some(*v),
+                        other => unreachable!("VALUES Int32 column got {other:?}"),
+                    })
+                    .collect();
+                Arc::new(Int32Array::from(vals))
+            }
+            DataType::Int64 => {
+                let vals: Vec<Option<i64>> = relation
+                    .rows
+                    .iter()
+                    .map(|r| match &r[ci] {
+                        Literal::Null => None,
+                        Literal::Int64(v) => Some(*v),
+                        other => unreachable!("VALUES Int64 column got {other:?}"),
+                    })
+                    .collect();
+                Arc::new(Int64Array::from(vals))
+            }
+            DataType::Float32 => {
+                let vals: Vec<Option<f32>> = relation
+                    .rows
+                    .iter()
+                    .map(|r| match &r[ci] {
+                        Literal::Null => None,
+                        Literal::Float32(v) => Some(*v),
+                        other => unreachable!("VALUES Float32 column got {other:?}"),
+                    })
+                    .collect();
+                Arc::new(Float32Array::from(vals))
+            }
+            DataType::Float64 => {
+                let vals: Vec<Option<f64>> = relation
+                    .rows
+                    .iter()
+                    .map(|r| match &r[ci] {
+                        Literal::Null => None,
+                        Literal::Float64(v) => Some(*v),
+                        other => unreachable!("VALUES Float64 column got {other:?}"),
+                    })
+                    .collect();
+                Arc::new(Float64Array::from(vals))
+            }
+            DataType::Bool => {
+                let vals: Vec<Option<bool>> = relation
+                    .rows
+                    .iter()
+                    .map(|r| match &r[ci] {
+                        Literal::Null => None,
+                        Literal::Bool(v) => Some(*v),
+                        other => unreachable!("VALUES Bool column got {other:?}"),
+                    })
+                    .collect();
+                Arc::new(BooleanArray::from(vals))
+            }
+            DataType::Utf8 => {
+                let vals: Vec<Option<String>> = relation
+                    .rows
+                    .iter()
+                    .map(|r| match &r[ci] {
+                        Literal::Null => None,
+                        Literal::Utf8(v) => Some(v.clone()),
+                        other => unreachable!("VALUES Utf8 column got {other:?}"),
+                    })
+                    .collect();
+                Arc::new(StringArray::from(vals))
+            }
+            other => {
+                return Err(BoltError::Type(format!(
+                    "VALUES: unsupported inferred column dtype {other:?}"
+                )))
+            }
+        };
+        cols.push(array);
+    }
+
+    RecordBatch::try_new_with_options(
+        arrow_schema,
+        cols,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(n_rows)),
+    )
+    .map_err(|e| BoltError::Plan(format!("VALUES materialize: {e}")))
+}
+
 /// Host-side per-group distinct count for feature F3-finish
 /// (`COUNT(DISTINCT col)` with `GROUP BY`).
 ///
@@ -2297,6 +2414,48 @@ impl Engine {
             }
         }
 
+        // VALUES: a query whose row source is a `VALUES` clause (bare
+        // `VALUES (..),(..)` or `FROM (VALUES ..) AS t(a,b)`) is materialised
+        // host-side and either returned directly or bound as an ephemeral table
+        // the outer query scans — mirroring the WITH RECURSIVE hook above (an
+        // inline relation has no `LogicalPlan` variant). `Ok(None)` for every
+        // non-VALUES query falls straight through.
+        match crate::plan::sql_frontend::plan_values_query(query, &self.provider) {
+            Ok(Some(vp)) => {
+                let result = self.execute_values_query(&vp);
+                if result.is_err() {
+                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                }
+                self.maybe_emit_pool_stats(Instant::now());
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                return Err(e);
+            }
+        }
+
+        // DISTINCT ON: a `SELECT DISTINCT ON (keys) ... [ORDER BY ...]` is
+        // detected and orchestrated host-side (sort, then keep the first row per
+        // key) before the ordinary pipeline. `Ok(None)` for every other query
+        // falls straight through.
+        match crate::plan::sql_frontend::plan_distinct_on(query, &self.provider) {
+            Ok(Some(dp)) => {
+                let result = self.execute_distinct_on(&dp);
+                if result.is_err() {
+                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                }
+                self.maybe_emit_pool_stats(Instant::now());
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                return Err(e);
+            }
+        }
+
         // F3-finish: a sole `COUNT(DISTINCT col)` with `GROUP BY` is detected
         // and orchestrated host-side (per-group distinct counting) before the
         // ordinary pipeline, mirroring the WITH RECURSIVE hook above. The
@@ -2489,6 +2648,20 @@ impl Engine {
             return Ok(format!(
                 "Correlated WHERE plan:\n{}",
                 crate::plan::explain::format_correlated_where(&cw)
+            ));
+        }
+        // VALUES: render the host-materialised VALUES relation descriptor.
+        if let Some(vp) = crate::plan::sql_frontend::plan_values_query(query, &self.provider)? {
+            return Ok(format!(
+                "VALUES plan:\n{}",
+                crate::plan::explain::format_values_query(&vp)
+            ));
+        }
+        // DISTINCT ON: render the host-orchestrated DISTINCT ON descriptor.
+        if let Some(dp) = crate::plan::sql_frontend::plan_distinct_on(query, &self.provider)? {
+            return Ok(format!(
+                "DISTINCT ON plan:\n{}",
+                crate::plan::explain::format_distinct_on(&dp)
             ));
         }
         // F3-finish: render the host-orchestrated COUNT(DISTINCT) + GROUP BY
@@ -3428,6 +3601,146 @@ impl Engine {
             .borrow_mut()
             .insert(name.to_string(), TableSource::Materialized(vec![result]));
         let out = self.run_subplan(post.clone());
+        self.streaming_sources.borrow_mut().remove(name);
+        self.gpu_tables.borrow_mut().remove(name);
+        Ok(QueryHandle::from_record_batch(out?))
+    }
+
+    /// Execute a `VALUES`-sourced query (feature VALUES).
+    ///
+    /// 1. **Materialise** the inferred relation into an Arrow `RecordBatch` via
+    ///    [`materialize_values_relation`].
+    /// 2. **Bare form** (`vp.post` is `None`): apply the optional ORDER BY /
+    ///    LIMIT carried on the descriptor by binding the relation under the
+    ///    reserved name and running a synthetic `Sort` / `Limit` subplan over it
+    ///    (so the ordinary sort / limit executors are reused); when there is no
+    ///    ORDER BY / LIMIT, return the materialised batch directly.
+    /// 3. **FROM form** (`vp.post` is `Some`): bind the relation under the user
+    ///    alias in the streaming overlay and run the outer query template through
+    ///    [`Engine::run_subplan`], mirroring the WITH RECURSIVE / LATERAL overlay
+    ///    pattern. The overlay entry is always cleared afterwards.
+    fn execute_values_query(
+        &self,
+        vp: &crate::plan::sql_frontend::ValuesQueryPlan,
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::streaming::TableSource;
+
+        let batch = materialize_values_relation(&vp.relation)?;
+
+        // Refuse to shadow a real table under the bind name.
+        let name = &vp.bind_name;
+        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+            return Err(BoltError::Plan(format!(
+                "VALUES: relation name '{name}' collides with a registered table — \
+                 rename the VALUES alias"
+            )));
+        }
+
+        // Build the plan to run over the bound relation: either the FROM-form
+        // `post` template, or (bare form) a synthetic Sort/Limit over a Scan of
+        // the relation. If the bare form has neither ORDER BY nor LIMIT, return
+        // the batch directly without an overlay round-trip.
+        let plan = match &vp.post {
+            Some(post) => post.clone(),
+            None => {
+                if vp.order_by.is_empty() && vp.limit.is_none() {
+                    return Ok(QueryHandle::from_record_batch(batch));
+                }
+                let mut p = LogicalPlan::Scan {
+                    table: name.clone(),
+                    projection: None,
+                    schema: vp.relation.schema.clone(),
+                };
+                if !vp.order_by.is_empty() {
+                    p = LogicalPlan::Sort {
+                        input: Box::new(p),
+                        sort_exprs: vp.order_by.clone(),
+                    };
+                }
+                if let Some((limit, offset)) = vp.limit {
+                    p = LogicalPlan::Limit {
+                        input: Box::new(p),
+                        limit,
+                        offset,
+                    };
+                }
+                p
+            }
+        };
+
+        self.gpu_tables.borrow_mut().remove(name);
+        self.streaming_sources
+            .borrow_mut()
+            .insert(name.clone(), TableSource::Materialized(vec![batch]));
+        let out = self.run_subplan(plan);
+        self.streaming_sources.borrow_mut().remove(name);
+        self.gpu_tables.borrow_mut().remove(name);
+        Ok(QueryHandle::from_record_batch(out?))
+    }
+
+    /// Execute a `SELECT DISTINCT ON (keys) ...` query (feature DISTINCT ON).
+    ///
+    /// 1. **Run the base** subplan — `[__diston_0..N, <user projection...>]` in
+    ///    the query's ORDER BY order — through the ordinary pipeline.
+    /// 2. **Dedup (host).** Keep the first row per leading-key tuple via
+    ///    [`crate::exec::distinct::distinct_on_first_per_key`] (NULL keys form
+    ///    their own group, matching GROUP BY).
+    /// 3. **Project away the key columns** to restore the user projection.
+    /// 4. **Apply the optional LIMIT / OFFSET** (Postgres applies LIMIT to the
+    ///    DISTINCT ON result), reusing the overlay + synthetic `Limit` subplan.
+    fn execute_distinct_on(
+        &self,
+        dp: &crate::plan::sql_frontend::DistinctOnPlan,
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::streaming::TableSource;
+
+        // --- 1. Base batch: [keys..., user cols...] in ORDER BY order. ---
+        let base = self.run_subplan(dp.base.clone())?;
+
+        // --- 2. Keep the first row per key tuple. ---
+        let deduped = crate::exec::distinct::distinct_on_first_per_key(&base, dp.n_keys)?;
+
+        // --- 3. Drop the leading key columns to restore the user projection. ---
+        let user_cols: Vec<ArrayRef> = deduped
+            .columns()
+            .iter()
+            .skip(dp.n_keys)
+            .cloned()
+            .collect();
+        let out_schema = plan_schema_to_arrow_schema(&dp.output_schema)?;
+        let projected = RecordBatch::try_new_with_options(
+            out_schema,
+            user_cols,
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(deduped.num_rows())),
+        )
+        .map_err(|e| BoltError::Plan(format!("DISTINCT ON projection: {e}")))?;
+
+        // --- 4. Optional LIMIT / OFFSET via the overlay + a synthetic Limit. ---
+        let (limit, offset) = match dp.limit {
+            None => return Ok(QueryHandle::from_record_batch(projected)),
+            Some(lo) => lo,
+        };
+        let name = crate::plan::sql_frontend::DISTINCT_ON_RESULT_TABLE;
+        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+            return Err(BoltError::Plan(format!(
+                "DISTINCT ON: reserved result table name '{name}' collides with a \
+                 registered table"
+            )));
+        }
+        let plan = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Scan {
+                table: name.to_string(),
+                projection: None,
+                schema: dp.output_schema.clone(),
+            }),
+            limit,
+            offset,
+        };
+        self.gpu_tables.borrow_mut().remove(name);
+        self.streaming_sources
+            .borrow_mut()
+            .insert(name.to_string(), TableSource::Materialized(vec![projected]));
+        let out = self.run_subplan(plan);
         self.streaming_sources.borrow_mut().remove(name);
         self.gpu_tables.borrow_mut().remove(name);
         Ok(QueryHandle::from_record_batch(out?))
@@ -5629,6 +5942,44 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("Int64 count column");
         assert_eq!(col.value(0), 7);
+    }
+
+    /// `materialize_values_relation` builds one typed, nullable Arrow array per
+    /// column from the inferred VALUES relation. Pure host (no GPU). Covers a
+    /// mixed Int64 / Utf8 relation with a NULL cell.
+    #[test]
+    fn materialize_values_relation_builds_typed_batch() {
+        use crate::plan::logical_plan::Literal;
+        use crate::plan::sql_frontend::ValuesRelation;
+
+        let schema = Schema::new(vec![
+            Field::new("column1", DataType::Int64, true),
+            Field::new("column2", DataType::Utf8, true),
+        ]);
+        let relation = ValuesRelation {
+            schema,
+            rows: vec![
+                vec![Literal::Int64(1), Literal::Utf8("a".into())],
+                vec![Literal::Null, Literal::Utf8("b".into())],
+            ],
+        };
+        let batch = materialize_values_relation(&relation).expect("materialize");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 2);
+        let c0 = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 col");
+        assert_eq!(c0.value(0), 1);
+        assert!(arrow_array::Array::is_null(c0, 1), "NULL cell must materialise as a null");
+        let c1 = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("Utf8 col");
+        assert_eq!(c1.value(0), "a");
+        assert_eq!(c1.value(1), "b");
     }
 
     /// Zero rows in the child plan -> COUNT == 0 (not NULL).
