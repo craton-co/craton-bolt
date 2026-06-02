@@ -1640,6 +1640,726 @@ fn build_count_distinct_post_plan(
     Ok(Some(plan))
 }
 
+// ---------------------------------------------------------------------------
+// Multi / mixed COUNT(DISTINCT) with GROUP BY (feature F3-finish, generalized)
+// ---------------------------------------------------------------------------
+
+/// Reserved ephemeral table name used by [`MultiAggGroupByPlan::post`] to
+/// reference the host-built aggregate result (sibling of
+/// [`COUNT_DISTINCT_GROUPBY_RESULT_TABLE`] for the generalized path).
+pub const MULTI_AGG_GROUPBY_RESULT_TABLE: &str = "__multi_agg_groupby_result";
+
+/// One aggregate the host computes per group in the generalized
+/// COUNT(DISTINCT) + GROUP BY path (feature F3-finish, generalized).
+///
+/// Each variant carries the index of its *input* column in the materialised
+/// base batch (`[group_keys..., input_0, input_1, ...]`) — i.e. an index in
+/// `n_keys..n_cols`. `CountStar` is a `COUNT(*)`: it counts rows regardless of
+/// any column value, but still carries a (sentinel) input column so the base
+/// projection stays uniform.
+#[derive(Debug, Clone)]
+pub enum CdAgg {
+    /// `COUNT(DISTINCT col)` — distinct non-NULL values of the input column.
+    CountDistinct { base_col: usize },
+    /// `COUNT(col)` — non-NULL row count of the input column.
+    Count { base_col: usize },
+    /// `COUNT(*)` — total row count of the group.
+    CountStar { base_col: usize },
+    /// `SUM(col)` — output preserves the (numeric) input dtype.
+    Sum { base_col: usize },
+    /// `MIN(col)` — output preserves the input dtype.
+    Min { base_col: usize },
+    /// `MAX(col)` — output preserves the input dtype.
+    Max { base_col: usize },
+    /// `AVG(col)` — output `Float64`.
+    Avg { base_col: usize },
+}
+
+impl CdAgg {
+    /// Index of this aggregate's input column in the base batch.
+    pub fn base_col(&self) -> usize {
+        match self {
+            CdAgg::CountDistinct { base_col }
+            | CdAgg::Count { base_col }
+            | CdAgg::CountStar { base_col }
+            | CdAgg::Sum { base_col }
+            | CdAgg::Min { base_col }
+            | CdAgg::Max { base_col }
+            | CdAgg::Avg { base_col } => *base_col,
+        }
+    }
+}
+
+/// One output column of the generalized result, in SELECT order: either a
+/// projected group key (index into the group-key list) or a host-computed
+/// aggregate (index into the `aggs` list).
+#[derive(Debug, Clone, Copy)]
+pub enum CdOutputCol {
+    /// A group key: `group_key_names[idx]` / base column `idx`.
+    GroupKey(usize),
+    /// An aggregate: `aggs[idx]`.
+    Agg(usize),
+}
+
+/// Descriptor for the *generalized* COUNT(DISTINCT) + GROUP BY shape — multiple
+/// distinct counts and/or a mix with plain aggregates (feature F3-finish,
+/// generalized). The single-sole-`COUNT(DISTINCT)` case stays on the dedicated
+/// [`CountDistinctGroupByPlan`] path; this descriptor handles everything the
+/// single-CD detector declines but which is still a plain `GROUP BY` whose
+/// SELECT list is group keys plus host-computable aggregates including at
+/// least one `COUNT(DISTINCT)`.
+///
+/// The engine ([`crate::exec::engine::Engine::execute_multi_agg_groupby`])
+/// runs [`Self::base`] to materialise `[group_keys..., agg_inputs...]`, groups
+/// host-side, computes every [`CdAgg`] per group, assembles the output columns
+/// in [`Self::output_layout`] order, and (optionally) runs [`Self::post`] for
+/// HAVING / ORDER BY / LIMIT.
+#[derive(Debug, Clone)]
+pub struct MultiAggGroupByPlan {
+    /// Base subplan: `SELECT <group_keys...>, <agg_input_exprs...> FROM <table>
+    /// [WHERE ...]`. Output columns are the group keys (first `n_keys`)
+    /// followed by one input column per aggregate (in `aggs` order).
+    pub base: LogicalPlan,
+    /// Number of leading group-key columns in `base`.
+    pub n_keys: usize,
+    /// Output names of the group-key columns, in `base` order.
+    pub group_key_names: Vec<String>,
+    /// The per-group aggregates to compute, in input-column order.
+    pub aggs: Vec<CdAgg>,
+    /// The output columns in SELECT order (group keys + aggregates interleaved
+    /// exactly as written).
+    pub output_layout: Vec<CdOutputCol>,
+    /// Schema of the host-built result (one field per `output_layout` entry).
+    pub result_schema: Schema,
+    /// Optional HAVING / ORDER BY / LIMIT post-plan over a synthetic `Scan` of
+    /// `result_schema` named [`MULTI_AGG_GROUPBY_RESULT_TABLE`].
+    pub post: Option<LogicalPlan>,
+}
+
+impl MultiAggGroupByPlan {
+    /// Overall output schema.
+    pub fn schema(&self) -> BoltResult<Schema> {
+        match &self.post {
+            Some(p) => p.schema(),
+            None => Ok(self.result_schema.clone()),
+        }
+    }
+}
+
+/// A host-computable plain-aggregate kind for the generalized
+/// COUNT(DISTINCT)+GROUP BY shape. Recognised purely by function NAME (no
+/// argument lowering) so qualified arguments (`SUM(t.x)`) classify correctly;
+/// the argument expression is lowered later, by `plan_select` over the
+/// rewritten base, against a real resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlainAggTag {
+    /// `COUNT(col)` (a present, non-`*` argument).
+    Count,
+    /// `COUNT(*)` (no argument).
+    CountStar,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// Classify a SELECT item for the generalized COUNT(DISTINCT)+GROUP BY shape.
+enum CdSelectItem {
+    /// A group-key expression (matched structurally against GROUP BY).
+    GroupKey,
+    /// `COUNT(DISTINCT <expr>)` carrying its unlowered argument.
+    CountDistinct(SqlExpr),
+    /// A plain aggregate the host path computes; carries its kind tag (the
+    /// argument expression is recovered from the SELECT item later).
+    Plain(PlainAggTag),
+}
+
+/// Recognise a *plain* (non-DISTINCT) aggregate SELECT item by function name,
+/// WITHOUT lowering its argument. Returns:
+///   * `Ok(Some(tag))` — `e` is a host-computable plain aggregate;
+///   * `Ok(None)`       — `e` is not a (single-name) function call;
+///   * `Err(_)`         — `e` is an aggregate the host path can't compute
+///     under GROUP BY (e.g. `VAR_POP`, `STDDEV`), or a malformed aggregate
+///     argument shape (multi-arg, qualified `*`).
+///
+/// A DISTINCT quantifier is left for [`try_count_distinct`]; this returns
+/// `Ok(None)` for a DISTINCT-quantified call so the caller's COUNT(DISTINCT)
+/// branch (which runs first) owns it.
+fn try_plain_agg_tag(e: &SqlExpr) -> BoltResult<Option<PlainAggTag>> {
+    let func = match e {
+        SqlExpr::Function(f) => f,
+        _ => return Ok(None),
+    };
+    if func.name.0.len() != 1 || func.over.is_some() {
+        return Ok(None);
+    }
+    let fname = func.name.0[0].value.to_ascii_uppercase();
+    let arg_list = match &func.args {
+        FunctionArguments::List(list) => list,
+        _ => return Ok(None),
+    };
+    // A DISTINCT-quantified call is handled by `try_count_distinct`.
+    if arg_list.duplicate_treatment.is_some() {
+        return Ok(None);
+    }
+    match fname.as_str() {
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {}
+        // Aggregates with no host GROUP BY implementation here.
+        "VAR_POP" | "VAR_SAMP" | "VARIANCE" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" => {
+            return Err(BoltError::Sql(format!(
+                "unsupported: {fname} alongside COUNT(DISTINCT) under GROUP BY \
+                 (host path computes only COUNT / SUM / MIN / MAX / AVG)"
+            )));
+        }
+        _ => return Ok(None),
+    }
+    if arg_list.args.len() != 1 {
+        return Err(BoltError::Sql(format!(
+            "{fname} expects exactly one argument, got {}",
+            arg_list.args.len()
+        )));
+    }
+    match (&fname[..], &arg_list.args[0]) {
+        ("COUNT", FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => {
+            Ok(Some(PlainAggTag::CountStar))
+        }
+        (_, FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
+        | (_, FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_))) => {
+            Err(BoltError::Sql(format!("{fname}(*) is not supported")))
+        }
+        (_, FunctionArg::Unnamed(FunctionArgExpr::Expr(_))) => Ok(Some(match &fname[..] {
+            "COUNT" => PlainAggTag::Count,
+            "SUM" => PlainAggTag::Sum,
+            "MIN" => PlainAggTag::Min,
+            "MAX" => PlainAggTag::Max,
+            "AVG" => PlainAggTag::Avg,
+            _ => unreachable!("name already filtered"),
+        })),
+        (_, FunctionArg::Named { .. }) => Err(BoltError::Sql(format!(
+            "unsupported: named argument to {fname}"
+        ))),
+    }
+}
+
+/// Detect and plan the *generalized* COUNT(DISTINCT) + GROUP BY shape (feature
+/// F3-finish, generalized): multiple `COUNT(DISTINCT)` and/or a mix with plain
+/// aggregates under a plain `GROUP BY`.
+///
+/// Returns `Ok(Some(descriptor))` ONLY when the query is a plain `GROUP BY`
+/// whose SELECT list is, in any order, group keys plus aggregates where:
+/// * at least one aggregate is a `COUNT(DISTINCT col)` (otherwise it is an
+///   ordinary GROUP BY the normal pipeline already handles, so we fall
+///   through); and
+/// * the *non*-COUNT(DISTINCT) aggregates are all host-computable here:
+///   `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `MIN(col)`, `MAX(col)`, `AVG(col)`.
+///
+/// `Ok(None)` (fall through to the dedicated single-CD path / ordinary
+/// pipeline) for: no GROUP BY; super-aggregates / GROUP BY ALL; `SELECT
+/// DISTINCT`; CTE / set-op; a wildcard SELECT item; a non-group-key,
+/// non-aggregate SELECT item; or a query the single-sole-COUNT(DISTINCT)
+/// detector already handles (zero plain aggregates AND exactly one
+/// COUNT(DISTINCT) — that stays on the proven path). An aggregate the host
+/// path cannot compute here (e.g. `VAR_POP` / `STDDEV` under GROUP BY) yields
+/// a precise `Err`.
+pub fn plan_multi_agg_groupby(
+    sql: &str,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<MultiAggGroupByPlan>> {
+    guard_sql_size(sql)?;
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    if stmts.len() != 1 {
+        return Ok(None);
+    }
+    let query = match stmts.remove(0) {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    if query.with.is_some() {
+        return Ok(None);
+    }
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Ok(None),
+    };
+
+    // Plain GROUP BY only (reject super-aggregates / GROUP BY ALL by falling
+    // through to the ordinary path's message).
+    let parsed_group_by = match parse_group_by(&select.group_by) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    if parsed_group_by.is_super || parsed_group_by.all_cols.is_empty() {
+        return Ok(None);
+    }
+    if select.distinct.is_some() {
+        return Ok(None);
+    }
+
+    // Classification recognises aggregates by NAME only (never lowering their
+    // arguments) so qualified args like `SUM(t.x)` classify correctly; the
+    // real lowering happens later when `plan_select` lowers the rewritten base
+    // against a proper resolver. `try_count_distinct` / `contains_aggregate`
+    // take a resolver but don't consult it for detection, so an empty one
+    // suffices here.
+    let resolver = NameResolver::empty();
+
+    // Expand the SELECT list into (expr, alias).
+    let mut items: Vec<(SqlExpr, Option<String>)> = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) => items.push((e.clone(), None)),
+            SelectItem::ExprWithAlias { expr, alias } => {
+                items.push((expr.clone(), Some(ident_to_name(alias))))
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return Ok(None),
+        }
+    }
+
+    // Classify each SELECT item. A genuinely-unsupported aggregate (e.g.
+    // VAR_POP under GROUP BY) is a precise `Err`; a non-group-key,
+    // non-aggregate item falls through (`Ok(None)`) so the ordinary path
+    // emits its message.
+    let mut classified: Vec<CdSelectItem> = Vec::with_capacity(items.len());
+    let mut n_count_distinct = 0usize;
+    let mut n_plain = 0usize;
+    for (e, _alias) in &items {
+        // COUNT(DISTINCT ...) takes priority over the plain-aggregate match.
+        match try_count_distinct(e, &resolver) {
+            Ok(Some(inner)) => {
+                classified.push(CdSelectItem::CountDistinct(inner.clone()));
+                n_count_distinct += 1;
+                continue;
+            }
+            Ok(None) => {}
+            // Malformed DISTINCT form: let the ordinary path emit the message.
+            Err(_) => return Ok(None),
+        }
+        // Plain aggregate? Recognised by name (no argument lowering, so a
+        // qualified argument classifies correctly). An aggregate the host path
+        // can't compute under GROUP BY is a precise `Err`.
+        match try_plain_agg_tag(e) {
+            Ok(Some(tag)) => {
+                classified.push(CdSelectItem::Plain(tag));
+                n_plain += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
+        // Not an aggregate: must be a declared group key, else not our shape.
+        match contains_aggregate(e, &resolver, 0) {
+            Ok(true) => return Ok(None),
+            Ok(false) => {}
+            Err(_) => return Ok(None),
+        }
+        if !parsed_group_by.all_cols.iter().any(|g| g == e) {
+            return Ok(None);
+        }
+        classified.push(CdSelectItem::GroupKey);
+    }
+
+    // Need at least one COUNT(DISTINCT) to own this query at all.
+    if n_count_distinct == 0 {
+        return Ok(None);
+    }
+    // The single-sole-COUNT(DISTINCT) case (exactly one CD, no plain agg) stays
+    // on the dedicated `plan_count_distinct_groupby` path — but ONLY when that
+    // path actually accepts it (the CD must be the LAST SELECT item; otherwise
+    // it declines and this generalized path must handle the query). Defer only
+    // in the exact shape the dedicated path takes.
+    if n_count_distinct == 1 && n_plain == 0 {
+        let cd_is_last = matches!(classified.last(), Some(CdSelectItem::CountDistinct(_)));
+        if cd_is_last {
+            return Ok(None);
+        }
+    }
+
+    // Every declared GROUP BY key must be projected (the host base is built
+    // from the SELECTed group-key columns).
+    for g in &parsed_group_by.all_cols {
+        let projected = items.iter().zip(classified.iter()).any(|((e, _), c)| {
+            matches!(c, CdSelectItem::GroupKey) && e == g
+        });
+        if !projected {
+            return Ok(None);
+        }
+    }
+
+    // Build the base SELECT: group keys (in GROUP BY order) followed by one
+    // input column per aggregate (in SELECT order). We rewrite the projection
+    // wholesale rather than in place so the base layout is exactly
+    // `[keys..., agg_inputs...]` regardless of the SELECT interleaving.
+    let n_keys = parsed_group_by.all_cols.len();
+    let mut base_projection: Vec<SelectItem> = Vec::with_capacity(n_keys + items.len());
+    for g in &parsed_group_by.all_cols {
+        base_projection.push(SelectItem::UnnamedExpr(g.clone()));
+    }
+    // Aggregates in SELECT order; each contributes its input column. COUNT(*)
+    // has no column argument, so we feed a literal `1` sentinel.
+    let mut aggs: Vec<CdAgg> = Vec::new();
+    let mut output_layout: Vec<CdOutputCol> = Vec::new();
+    // group-key output index, assigned in SELECT order to the matching key.
+    for ((e, _alias), c) in items.iter().zip(classified.iter()) {
+        match c {
+            CdSelectItem::GroupKey => {
+                // Map this SELECT key to its GROUP BY position.
+                let key_idx = parsed_group_by
+                    .all_cols
+                    .iter()
+                    .position(|g| g == e)
+                    .expect("group key was validated to be in GROUP BY");
+                output_layout.push(CdOutputCol::GroupKey(key_idx));
+            }
+            CdSelectItem::CountDistinct(inner) => {
+                let base_col = n_keys + aggs.len();
+                base_projection.push(SelectItem::UnnamedExpr(inner.clone()));
+                output_layout.push(CdOutputCol::Agg(aggs.len()));
+                aggs.push(CdAgg::CountDistinct { base_col });
+            }
+            CdSelectItem::Plain(tag) => {
+                let base_col = n_keys + aggs.len();
+                let (arg_sql, kind) = plain_agg_input_and_kind(e, *tag, base_col)?;
+                base_projection.push(SelectItem::UnnamedExpr(arg_sql));
+                output_layout.push(CdOutputCol::Agg(aggs.len()));
+                aggs.push(kind);
+            }
+        }
+    }
+
+    let mut base_select = select.clone();
+    base_select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
+    base_select.having = None;
+    base_select.distinct = None;
+    base_select.projection = base_projection;
+
+    let base = plan_select(&base_select, provider, &CteScope::new(), 0)?;
+    let base_schema = base.schema()?;
+    let expected_cols = n_keys + aggs.len();
+    if base_schema.fields.len() != expected_cols || base_schema.fields.is_empty() {
+        return Ok(None);
+    }
+
+    // Group-key names / fields are the leading `n_keys` base fields.
+    let group_key_fields: Vec<crate::plan::logical_plan::Field> =
+        base_schema.fields[..n_keys].to_vec();
+    let group_key_names: Vec<String> =
+        group_key_fields.iter().map(|f| f.name.clone()).collect();
+
+    // Result schema, in SELECT (output_layout) order. Group keys carry their
+    // base dtype; aggregates carry the dtype the host produces.
+    let mut result_fields: Vec<crate::plan::logical_plan::Field> =
+        Vec::with_capacity(output_layout.len());
+    // Per-aggregate output field, computed from its input column's dtype.
+    for (out_idx, out) in output_layout.iter().enumerate() {
+        match out {
+            CdOutputCol::GroupKey(k) => result_fields.push(group_key_fields[*k].clone()),
+            CdOutputCol::Agg(a) => {
+                let agg = &aggs[*a];
+                let input_field = &base_schema.fields[agg.base_col()];
+                let (dtype, nullable) = multi_agg_output_type(agg, input_field)?;
+                let name = multi_agg_output_name(&items, out_idx);
+                result_fields.push(crate::plan::logical_plan::Field::new(name, dtype, nullable));
+            }
+        }
+    }
+    let result_schema = Schema::new(result_fields);
+
+    let post = build_multi_agg_post_plan(&query, select, &items, &result_schema, provider)?;
+
+    Ok(Some(MultiAggGroupByPlan {
+        base,
+        n_keys,
+        group_key_names,
+        aggs,
+        output_layout,
+        result_schema,
+        post,
+    }))
+}
+
+/// The output (dtype, nullable) for a host-computed [`CdAgg`] given its input
+/// column field. Mirrors [`AggregateExpr`]'s documented output types.
+fn multi_agg_output_type(
+    agg: &CdAgg,
+    input_field: &crate::plan::logical_plan::Field,
+) -> BoltResult<(DataType, bool)> {
+    Ok(match agg {
+        // Counts are non-nullable Int64.
+        CdAgg::CountDistinct { .. } | CdAgg::Count { .. } | CdAgg::CountStar { .. } => {
+            (DataType::Int64, false)
+        }
+        // AVG is Float64, nullable (NULL for an empty / all-NULL group).
+        CdAgg::Avg { .. } => (DataType::Float64, true),
+        // SUM / MIN / MAX preserve the input dtype, nullable (empty / all-NULL
+        // group yields NULL — matching the scalar host aggregate semantics).
+        CdAgg::Sum { .. } | CdAgg::Min { .. } | CdAgg::Max { .. } => {
+            (input_field.dtype, true)
+        }
+    })
+}
+
+/// Output column name for the aggregate at `items[out_idx]`: the SELECT alias
+/// if present, else the canonical aggregate name. The canonical name follows
+/// [`aggregate_output_name`]'s `<fn>_<col>` rule for a bare-column argument
+/// (e.g. `count_a`, `sum_x`) and bare `<fn>` for `COUNT(*)` / a non-column
+/// argument. Computed from the raw SQL (no resolver) so it works for
+/// qualified arguments too.
+fn multi_agg_output_name(items: &[(SqlExpr, Option<String>)], out_idx: usize) -> String {
+    let (expr, alias) = &items[out_idx];
+    if let Some(a) = alias {
+        return a.clone();
+    }
+    let resolver = NameResolver::empty();
+    // COUNT(DISTINCT col) → `count_<col>` (the canonical Count name).
+    if let Ok(Some(inner)) = try_count_distinct(expr, &resolver) {
+        return match simple_column_name(inner) {
+            Some(col) => format!("count_{col}"),
+            None => "count".to_string(),
+        };
+    }
+    // Plain aggregate → `<fn>_<col>` (or bare `<fn>` for `*` / non-column).
+    if let Ok(Some(tag)) = try_plain_agg_tag(expr) {
+        let prefix = match tag {
+            PlainAggTag::Count | PlainAggTag::CountStar => "count",
+            PlainAggTag::Sum => "sum",
+            PlainAggTag::Min => "min",
+            PlainAggTag::Max => "max",
+            PlainAggTag::Avg => "avg",
+        };
+        return match sql_function_single_arg(expr).and_then(simple_column_name) {
+            Some(col) => format!("{prefix}_{col}"),
+            None => prefix.to_string(),
+        };
+    }
+    format!("__agg_{out_idx}")
+}
+
+/// The lowercased column name if `e` is a bare (possibly qualified) column
+/// reference, else `None`. `a` → `a`; `t.a` → `a` (the trailing identifier,
+/// matching how `aggregate_output_name` names a column argument).
+fn simple_column_name(e: &SqlExpr) -> Option<String> {
+    match e {
+        SqlExpr::Identifier(id) => Some(ident_to_name(id)),
+        SqlExpr::CompoundIdentifier(parts) => parts.last().map(ident_to_name),
+        _ => None,
+    }
+}
+
+/// Given a plain-aggregate SELECT item and its [`PlainAggTag`], produce
+/// (input-column SQL expression, [`CdAgg`]). `COUNT(*)` feeds a literal `1`
+/// sentinel column; every other aggregate feeds its single (unlowered)
+/// argument expression so the base projection preserves exactly what the user
+/// wrote — including a qualified `t.col` — for `plan_select` to lower.
+fn plain_agg_input_and_kind(
+    sql_item: &SqlExpr,
+    tag: PlainAggTag,
+    base_col: usize,
+) -> BoltResult<(SqlExpr, CdAgg)> {
+    let arg = sql_function_single_arg(sql_item);
+    let one = SqlExpr::Value(Value::Number("1".to_string(), false));
+    Ok(match tag {
+        PlainAggTag::CountStar => (one, CdAgg::CountStar { base_col }),
+        PlainAggTag::Count => (clone_arg_or_err(arg, "COUNT")?, CdAgg::Count { base_col }),
+        PlainAggTag::Sum => (clone_arg_or_err(arg, "SUM")?, CdAgg::Sum { base_col }),
+        PlainAggTag::Min => (clone_arg_or_err(arg, "MIN")?, CdAgg::Min { base_col }),
+        PlainAggTag::Max => (clone_arg_or_err(arg, "MAX")?, CdAgg::Max { base_col }),
+        PlainAggTag::Avg => (clone_arg_or_err(arg, "AVG")?, CdAgg::Avg { base_col }),
+    })
+}
+
+/// The single function argument SQL expression of `e` if `e` is a one-arg
+/// function call `f(<expr>)`; `None` for `f()` / `f(*)` / non-functions.
+fn sql_function_single_arg(e: &SqlExpr) -> Option<&SqlExpr> {
+    let func = match e {
+        SqlExpr::Function(f) => f,
+        _ => return None,
+    };
+    let list = match &func.args {
+        FunctionArguments::List(l) => l,
+        _ => return None,
+    };
+    if list.args.len() != 1 {
+        return None;
+    }
+    match &list.args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
+        _ => None,
+    }
+}
+
+/// Clone the function argument or error (used for aggregates that require one).
+fn clone_arg_or_err(arg: Option<&SqlExpr>, kind: &str) -> BoltResult<SqlExpr> {
+    arg.cloned()
+        .ok_or_else(|| BoltError::Sql(format!("{kind} requires a column argument")))
+}
+
+/// Build the optional HAVING / ORDER BY / LIMIT post-plan for a
+/// [`MultiAggGroupByPlan`], over a synthetic `Scan` of the result schema named
+/// [`MULTI_AGG_GROUPBY_RESULT_TABLE`]. Aggregate references in HAVING / ORDER
+/// BY are rewritten to the result column whose SELECT-item aggregate they
+/// structurally match.
+fn build_multi_agg_post_plan(
+    query: &Query,
+    select: &Select,
+    items: &[(SqlExpr, Option<String>)],
+    result_schema: &Schema,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<LogicalPlan>> {
+    let has_having = select.having.is_some();
+    let has_order = query
+        .order_by
+        .as_ref()
+        .map(|o| !o.exprs.is_empty())
+        .unwrap_or(false);
+    let has_limit = query.limit.is_some() || query.offset.is_some();
+    if !has_having && !has_order && !has_limit {
+        return Ok(None);
+    }
+
+    let scan = LogicalPlan::Scan {
+        table: MULTI_AGG_GROUPBY_RESULT_TABLE.to_string(),
+        projection: None,
+        schema: result_schema.clone(),
+    };
+    let ctes = CteScope::new();
+    let mut plan = scan;
+
+    // HAVING → Filter. Rewrite aggregate calls to result columns by name.
+    if let Some(having_sql) = &select.having {
+        let mut resolver = NameResolver::empty();
+        resolver.ctx = Some(SubqueryCtx {
+            provider,
+            ctes: &ctes,
+        });
+        resolver.push_base(MULTI_AGG_GROUPBY_RESULT_TABLE.to_string(), result_schema);
+        let predicate = lower_multi_agg_having(having_sql, items, result_schema, &resolver, 0)?;
+        validate_having_columns(&predicate, result_schema)?;
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
+
+    // ORDER BY → Sort. ORDER BY references the result columns by name; an
+    // ORDER BY over an aggregate *call* is rejected (use the alias or the
+    // group-key name) to keep this path bounded.
+    if let Some(order_by) = &query.order_by {
+        let sort_exprs = lower_order_by(
+            &order_by.exprs,
+            SubqueryCtx {
+                provider,
+                ctes: &ctes,
+            },
+        )?;
+        if !sort_exprs.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                sort_exprs,
+            };
+        }
+    }
+
+    let limit_value = match &query.limit {
+        Some(e) => Some(usize_from_literal(e, "LIMIT")?),
+        None => None,
+    };
+    let offset_value = match &query.offset {
+        Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
+        None => None,
+    };
+    if limit_value.is_some() || offset_value.is_some() {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: limit_value.unwrap_or(usize::MAX),
+            offset: offset_value.unwrap_or(0),
+        };
+    }
+    Ok(Some(plan))
+}
+
+/// Lower a HAVING predicate for the generalized COUNT(DISTINCT)+GROUP BY path.
+///
+/// Any aggregate call (`COUNT(DISTINCT col)`, `SUM(x)`, `COUNT(*)`, …) that
+/// structurally matches one of the SELECT-list aggregate items is rewritten to
+/// a reference to that result column (by its result-schema name). Group-key
+/// references and literals lower ordinarily. An aggregate in HAVING that does
+/// NOT appear in the SELECT list is rejected (the host path only materialises
+/// the projected aggregates).
+fn lower_multi_agg_having(
+    e: &SqlExpr,
+    items: &[(SqlExpr, Option<String>)],
+    result_schema: &Schema,
+    resolver: &NameResolver<'_>,
+    depth: usize,
+) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    // If this subexpression is itself an aggregate call, map it to a result
+    // column. We detect aggregate-ness by NAME (no argument lowering — the
+    // result-schema resolver doesn't carry the base columns) and match by
+    // structural equality of the SQL aggregate expression against the SELECT
+    // items (the same conservative compare the detector uses for group keys).
+    let is_agg = matches!(try_count_distinct(e, resolver), Ok(Some(_)))
+        || matches!(try_plain_agg_tag(e), Ok(Some(_)));
+    if is_agg {
+        // Find the SELECT-list output column whose aggregate item equals `e`.
+        for (out_idx, (item_expr, _)) in items.iter().enumerate() {
+            if item_expr == e {
+                return Ok(Expr::Column(result_schema.fields[out_idx].name.clone()));
+            }
+        }
+        return Err(BoltError::Sql(
+            "HAVING references an aggregate that is not in the SELECT list; \
+             only projected aggregates may be filtered in a COUNT(DISTINCT) \
+             GROUP BY query"
+                .into(),
+        ));
+    }
+    match e {
+        SqlExpr::Nested(inner) => {
+            lower_multi_agg_having(inner, items, result_schema, resolver, depth + 1)
+        }
+        SqlExpr::BinaryOp { left, op, right } => {
+            let lop = lower_binary_op(op)?;
+            let l = lower_multi_agg_having(left, items, result_schema, resolver, depth + 1)?;
+            let r = lower_multi_agg_having(right, items, result_schema, resolver, depth + 1)?;
+            Ok(Expr::Binary {
+                op: lop,
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        }
+        SqlExpr::UnaryOp { op, expr } => {
+            let inner = lower_multi_agg_having(expr, items, result_schema, resolver, depth + 1)?;
+            match op {
+                UnaryOperator::Plus => Ok(inner),
+                // Negate structurally as `0 - operand` (mirrors the other
+                // HAVING lowerers; there is no `UnaryOp::Neg`).
+                UnaryOperator::Minus => Ok(Expr::Binary {
+                    op: BinaryOp::Sub,
+                    left: Box::new(Expr::Literal(Literal::Int64(0))),
+                    right: Box::new(inner),
+                }),
+                UnaryOperator::Not => Ok(Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(inner),
+                }),
+                other => Err(BoltError::Sql(format!(
+                    "unsupported unary operator in HAVING: {other:?}"
+                ))),
+            }
+        }
+        // IS [NOT] NULL and everything else defers to the ordinary lowerer,
+        // which resolves group-key column references against `result_schema`.
+        _ => lower_expr(e, resolver, depth + 1),
+    }
+}
+
 /// Detect and plan a top-level `WITH RECURSIVE` query (feature F1).
 ///
 /// Returns `Ok(Some(plan))` when `sql` is a single `SELECT` statement carrying
@@ -2881,12 +3601,20 @@ fn plan_select(
     }
     reject_unsupported_select(select)?;
 
-    // FROM: exactly one base table reference. JOINs hang off `twj.joins`.
-    if select.from.len() != 1 {
-        return Err(BoltError::Sql(format!(
-            "expected exactly one FROM table, got {}",
-            select.from.len()
-        )));
+    // FROM: at least one base table reference. JOINs hang off each
+    // `TableWithJoins.joins`. A comma-separated FROM list
+    // (`FROM a, b, c`) is the SQL spelling of a cross product: it
+    // desugars to a left-deep chain of CROSS JOINs
+    // `((a CROSS JOIN b) CROSS JOIN c)` — see the cross-join step
+    // synthesis after the base is built below. The optimizer's
+    // `filter-into-join` pass then folds any `WHERE a.x = b.y` over such
+    // a CROSS into the join's residual predicate (it is *not* promoted to
+    // a hash-join equi-pair; it routes through the nested-loop join
+    // executor), which is correct though not the hash-join fast path.
+    if select.from.is_empty() {
+        return Err(BoltError::Sql(
+            "expected at least one FROM table, got 0".into(),
+        ));
     }
     let twj = &select.from[0];
 
@@ -2917,34 +3645,76 @@ fn plan_select(
     // `BETWEEN`, …) populate the residual `filter` slot and switch the
     // executor to the nested-loop fallback (v0.6). See
     // `crate::exec::join` for both paths.
-    for join in &twj.joins {
-        if join.global {
+    // Flatten the FROM list into an ordered sequence of join "steps". Each
+    // step carries the right-side relation plus the join kind/constraint to
+    // splice it onto the accumulated left-deep plan:
+    //   * the first FROM item's explicit `JOIN`s (`twj.joins`) carry their
+    //     own join kind/constraint, exactly as before;
+    //   * every *subsequent* comma-separated FROM item desugars to a leading
+    //     CROSS-JOIN step on its `relation` (no constraint — a cartesian
+    //     product), followed by that item's own explicit `JOIN`s.
+    // `global` is the ClickHouse `GLOBAL JOIN` flag, rejected below; the
+    // synthetic CROSS steps are never global.
+    struct JoinStep<'a> {
+        join_type: JoinType,
+        constraint: Option<&'a JoinConstraint>,
+        relation: &'a TableFactor,
+        global: bool,
+    }
+    let mut steps: Vec<JoinStep> = Vec::new();
+    for (from_idx, item) in select.from.iter().enumerate() {
+        // A comma-separated FROM item past the first contributes a leading
+        // CROSS-JOIN step on its own `relation` (`a, b` ≡ `a CROSS JOIN b`);
+        // the first item's relation is already the base plan.
+        if from_idx > 0 {
+            steps.push(JoinStep {
+                join_type: JoinType::Cross,
+                constraint: None,
+                relation: &item.relation,
+                global: false,
+            });
+        }
+        // Then this item's explicit `JOIN`s, each carrying its own kind.
+        for join in &item.joins {
+            // Pick out the (join_type, join constraint) pair. CROSS JOIN has
+            // no constraint — sqlparser models it with its own variant. We
+            // keep the raw `&JoinConstraint` (rather than eagerly extracting
+            // an ON expr) so the `USING (...)` / `NATURAL` desugaring below
+            // can run *after* the RHS schema is in scope; an ON predicate
+            // still routes through `lower_join_on` exactly as before.
+            let (join_type, constraint): (JoinType, Option<&JoinConstraint>) =
+                match &join.join_operator {
+                    JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
+                    JoinOperator::LeftOuter(c) => (JoinType::LeftOuter, Some(c)),
+                    JoinOperator::RightOuter(c) => (JoinType::RightOuter, Some(c)),
+                    JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
+                    JoinOperator::CrossJoin => (JoinType::Cross, None),
+                    other => {
+                        return Err(BoltError::Sql(format!(
+                            "unsupported join kind: {other:?}; \
+                             supported: INNER, LEFT, RIGHT, FULL OUTER, CROSS"
+                        )));
+                    }
+                };
+            steps.push(JoinStep {
+                join_type,
+                constraint,
+                relation: &join.relation,
+                global: join.global,
+            });
+        }
+    }
+
+    for step in &steps {
+        if step.global {
             return Err(BoltError::Sql(
                 "unsupported: GLOBAL JOIN (ClickHouse extension)".into(),
             ));
         }
-        // Pick out the (join_type, join constraint) pair. CROSS JOIN has no
-        // constraint — sqlparser models it with its own variant. We keep the
-        // raw `&JoinConstraint` (rather than eagerly extracting an ON expr) so
-        // the `USING (...)` / `NATURAL` desugaring below can run *after* the
-        // RHS schema is in scope; an ON predicate still routes through
-        // `lower_join_on` exactly as before.
-        let (join_type, constraint): (JoinType, Option<&JoinConstraint>) =
-            match &join.join_operator {
-                JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
-                JoinOperator::LeftOuter(c) => (JoinType::LeftOuter, Some(c)),
-                JoinOperator::RightOuter(c) => (JoinType::RightOuter, Some(c)),
-                JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
-                JoinOperator::CrossJoin => (JoinType::Cross, None),
-                other => {
-                    return Err(BoltError::Sql(format!(
-                        "unsupported join kind: {other:?}; \
-                         supported: INNER, LEFT, RIGHT, FULL OUTER, CROSS"
-                    )));
-                }
-            };
+        let join_type = step.join_type;
+        let constraint = step.constraint;
         let (rhs_plan, rhs_qualifier, rhs_schema) =
-            lower_table_factor(&join.relation, provider, ctes, depth + 1)?;
+            lower_table_factor(step.relation, provider, ctes, depth + 1)?;
         // Extend the resolver before we move `rhs_*` into the right-side
         // plan, so it sees the same rename rule as `join_combined_schema`
         // applies to the actual plan output. The resolver records the
@@ -3001,7 +3771,7 @@ fn plan_select(
     // expansion when no JOIN is present; when a JOIN *is* present, wildcard
     // expansion uses the join's full schema. We compute `scan_schema_for_wildcard`
     // for the wildcard-expansion branch below.
-    let scan_schema_for_wildcard: Schema = if twj.joins.is_empty() {
+    let scan_schema_for_wildcard: Schema = if steps.is_empty() {
         scan_schema.clone()
     } else {
         plan.schema()?
@@ -8085,6 +8855,102 @@ mod wave7_tests {
         }
     }
 
+    /// `FROM t1, t2` desugars to a single CROSS JOIN (comma == cross product).
+    #[test]
+    fn comma_from_two_tables_desugars_to_cross_join() {
+        let plan = lp("SELECT * FROM t1, t2");
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        match join_plan {
+            LogicalPlan::Join {
+                join_type, on, filter, ..
+            } => {
+                assert_eq!(*join_type, JoinType::Cross);
+                assert!(on.is_empty(), "comma FROM has no ON predicate");
+                assert!(filter.is_none(), "no WHERE -> no residual filter");
+            }
+            other => panic!("expected Cross Join, got {other:?}"),
+        }
+    }
+
+    /// `FROM a, b, c` desugars to a LEFT-DEEP chain of CROSS JOINs:
+    /// `((a CROSS JOIN b) CROSS JOIN c)`.
+    #[test]
+    fn comma_from_three_tables_is_left_deep_cross_chain() {
+        use crate::plan::logical_plan::Field;
+        // Third table with a distinct column name to avoid extra renames.
+        let provider = MemTableProvider::new()
+            .with_table(
+                "t1",
+                Schema::new(vec![Field::new("a", DataType::Int32, false)]),
+            )
+            .with_table(
+                "t2",
+                Schema::new(vec![Field::new("d", DataType::Int32, false)]),
+            )
+            .with_table(
+                "t3",
+                Schema::new(vec![Field::new("e", DataType::Int32, false)]),
+            );
+        let plan = parse("SELECT * FROM t1, t2, t3", &provider).unwrap();
+        let top = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        // Top join: (… ) CROSS JOIN t3.
+        match top {
+            LogicalPlan::Join { join_type, left, .. } => {
+                assert_eq!(*join_type, JoinType::Cross);
+                // Left child is itself a CROSS join (t1 CROSS JOIN t2).
+                match left.as_ref() {
+                    LogicalPlan::Join { join_type, .. } => {
+                        assert_eq!(*join_type, JoinType::Cross)
+                    }
+                    other => panic!("expected nested Cross Join, got {other:?}"),
+                }
+            }
+            other => panic!("expected top Cross Join, got {other:?}"),
+        }
+    }
+
+    /// `FROM t1, t2 WHERE t1.a = t2.a` is correct as a cross-product + WHERE
+    /// Filter. `parse` (the frontend) lowers it to `Project(Filter(Cross
+    /// Join))`; the engine's `filter-into-join` optimizer later folds the
+    /// equality into the Cross join's residual filter (it is NOT promoted to a
+    /// hash equi-pair), which the nested-loop join evaluates. Here we assert
+    /// the truthful pre-optimization shape produced by `parse`.
+    #[test]
+    fn comma_from_with_where_equality_is_filter_over_cross_join() {
+        // The default `provider()` here gives t1(a,b) and t2(a,c); both have
+        // an `a`, so qualify to disambiguate.
+        let plan = lp("SELECT t1.b, t2.c FROM t1, t2 WHERE t1.a = t2.a");
+        // Project -> Filter -> Cross Join.
+        let filter = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        let join = match filter {
+            LogicalPlan::Filter { input, predicate } => {
+                // The WHERE equality is preserved as the Filter predicate.
+                assert!(
+                    matches!(predicate, Expr::Binary { op: BinaryOp::Eq, .. }),
+                    "expected an equality predicate, got {predicate:?}"
+                );
+                input.as_ref()
+            }
+            other => panic!("expected Filter over the join, got {other:?}"),
+        };
+        match join {
+            LogicalPlan::Join { join_type, on, filter, .. } => {
+                assert_eq!(*join_type, JoinType::Cross);
+                assert!(on.is_empty() && filter.is_none(), "pre-optimization Cross");
+            }
+            other => panic!("expected Cross Join, got {other:?}"),
+        }
+    }
+
     #[test]
     fn join_lowers_to_physical_join() {
         // `SELECT * FROM t1 INNER JOIN t2 ON ...` parses to
@@ -10460,6 +11326,138 @@ mod count_distinct_groupby_tests {
         assert!(detect(
             "WITH s AS (SELECT * FROM sales) \
              SELECT region, COUNT(DISTINCT customer) FROM s GROUP BY region"
+        )
+        .is_none());
+    }
+}
+
+#[cfg(test)]
+mod multi_agg_groupby_tests {
+    //! Frontend detection tests for the *generalized* COUNT(DISTINCT) + GROUP
+    //! BY shape (feature F3-finish, generalized): multiple distinct counts
+    //! and/or a mix with plain aggregates. These exercise
+    //! [`plan_multi_agg_groupby`] host-side (which shapes return
+    //! `Some(descriptor)`, which fall through, which error). Host-execution
+    //! correctness lives in the engine tests.
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    fn provider() -> MemTableProvider {
+        let sales = Schema::new(vec![
+            Field::new("region", DataType::Int32, true),
+            Field::new("customer", DataType::Int64, true),
+            Field::new("product", DataType::Int64, true),
+            Field::new("amount", DataType::Float64, true),
+        ]);
+        MemTableProvider::new().with_table("sales", sales)
+    }
+
+    fn detect(sql: &str) -> Option<MultiAggGroupByPlan> {
+        plan_multi_agg_groupby(sql, &provider())
+            .unwrap_or_else(|e| panic!("detection errored for {sql:?}: {e}"))
+    }
+
+    /// Two COUNT(DISTINCT) over different columns is recognised by the
+    /// generalized detector (the single-CD path declines it).
+    #[test]
+    fn two_count_distincts_recognised() {
+        let cd = detect(
+            "SELECT region, COUNT(DISTINCT customer), COUNT(DISTINCT product) \
+             FROM sales GROUP BY region",
+        )
+        .expect("two COUNT(DISTINCT) must be recognised");
+        assert_eq!(cd.n_keys, 1);
+        assert_eq!(cd.group_key_names, vec!["region".to_string()]);
+        assert_eq!(cd.aggs.len(), 2);
+        assert!(matches!(cd.aggs[0], CdAgg::CountDistinct { .. }));
+        assert!(matches!(cd.aggs[1], CdAgg::CountDistinct { .. }));
+        // Result: region + 2 Int64 counts.
+        assert_eq!(cd.result_schema.fields.len(), 3);
+        assert_eq!(cd.result_schema.fields[1].dtype, DataType::Int64);
+        // Base output is [region, customer, product] (keys + agg inputs).
+        assert_eq!(cd.base.schema().unwrap().fields.len(), 3);
+    }
+
+    /// COUNT(DISTINCT) mixed with plain aggregates (SUM / COUNT(*)).
+    #[test]
+    fn mixed_distinct_and_plain_recognised() {
+        let cd = detect(
+            "SELECT region, COUNT(DISTINCT customer), SUM(amount), COUNT(*) \
+             FROM sales GROUP BY region",
+        )
+        .expect("mixed COUNT(DISTINCT)+SUM+COUNT(*) must be recognised");
+        assert_eq!(cd.aggs.len(), 3);
+        assert!(matches!(cd.aggs[0], CdAgg::CountDistinct { .. }));
+        assert!(matches!(cd.aggs[1], CdAgg::Sum { .. }));
+        assert!(matches!(cd.aggs[2], CdAgg::CountStar { .. }));
+        // SUM(amount) is Float64 (preserves input dtype), nullable.
+        let sum_field = &cd.result_schema.fields[2];
+        assert_eq!(sum_field.dtype, DataType::Float64);
+        assert!(sum_field.nullable);
+        // COUNT(*) is non-nullable Int64.
+        assert_eq!(cd.result_schema.fields[3].dtype, DataType::Int64);
+        assert!(!cd.result_schema.fields[3].nullable);
+    }
+
+    /// The sole-single-COUNT(DISTINCT) case stays on the dedicated path: the
+    /// generalized detector declines it (`None`).
+    #[test]
+    fn single_sole_count_distinct_defers() {
+        assert!(detect(
+            "SELECT region, COUNT(DISTINCT customer) FROM sales GROUP BY region"
+        )
+        .is_none());
+    }
+
+    /// An ordinary GROUP BY with no COUNT(DISTINCT) is not ours.
+    #[test]
+    fn no_count_distinct_falls_through() {
+        assert!(detect("SELECT region, SUM(amount) FROM sales GROUP BY region").is_none());
+        assert!(detect(
+            "SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region"
+        )
+        .is_none());
+    }
+
+    /// A non-host-computable aggregate alongside COUNT(DISTINCT) is a precise
+    /// error (VAR_POP under GROUP BY is unsupported here).
+    #[test]
+    fn unsupported_aggregate_errors() {
+        let err = plan_multi_agg_groupby(
+            "SELECT region, COUNT(DISTINCT customer), VAR_POP(amount) \
+             FROM sales GROUP BY region",
+            &provider(),
+        )
+        .expect_err("VAR_POP under GROUP BY must be rejected precisely");
+        let msg = format!("{err}");
+        assert!(msg.contains("var_pop") || msg.contains("VAR_POP") || msg.contains("unsupported"),
+            "expected an unsupported-aggregate message, got: {msg}");
+    }
+
+    /// HAVING / ORDER BY / LIMIT produce a post-plan (outermost = Limit).
+    #[test]
+    fn having_order_limit_builds_post_plan() {
+        let cd = detect(
+            "SELECT region, COUNT(DISTINCT customer) AS c, SUM(amount) AS s \
+             FROM sales GROUP BY region HAVING COUNT(DISTINCT customer) > 1 \
+             ORDER BY c DESC LIMIT 5",
+        )
+        .expect("must be recognised");
+        let post = cd.post.expect("HAVING/ORDER BY/LIMIT ⇒ post-plan");
+        assert!(matches!(post, LogicalPlan::Limit { .. }), "post root = Limit, got {post:?}");
+    }
+
+    /// A super-aggregate / SELECT DISTINCT / set-op / CTE falls through.
+    #[test]
+    fn non_plain_groupby_shapes_fall_through() {
+        assert!(detect(
+            "SELECT region, COUNT(DISTINCT customer), SUM(amount) \
+             FROM sales GROUP BY ROLLUP(region)"
+        )
+        .is_none());
+        assert!(detect(
+            "SELECT DISTINCT region, COUNT(DISTINCT customer), SUM(amount) \
+             FROM sales GROUP BY region"
         )
         .is_none());
     }

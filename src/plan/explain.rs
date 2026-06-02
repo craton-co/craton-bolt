@@ -385,6 +385,49 @@ pub fn format_count_distinct_groupby(
     out
 }
 
+/// Render a
+/// [`MultiAggGroupByPlan`](crate::plan::sql_frontend::MultiAggGroupByPlan) for
+/// `EXPLAIN`: the generalized multi / mixed COUNT(DISTINCT) + GROUP BY shape.
+///
+/// The header names the group keys and the per-group aggregate kinds (in
+/// output order); the `Base:` sub-header renders the subplan that materialises
+/// `[group_keys..., agg_inputs...]`, and a `Post:` sub-header (when present)
+/// renders the HAVING / ORDER BY / LIMIT plan.
+pub fn format_multi_agg_groupby(
+    cd: &crate::plan::sql_frontend::MultiAggGroupByPlan,
+) -> String {
+    use crate::plan::sql_frontend::CdAgg;
+    let mut out = String::new();
+    let aggs: Vec<&str> = cd
+        .aggs
+        .iter()
+        .map(|a| match a {
+            CdAgg::CountDistinct { .. } => "COUNT(DISTINCT)",
+            CdAgg::Count { .. } => "COUNT",
+            CdAgg::CountStar { .. } => "COUNT(*)",
+            CdAgg::Sum { .. } => "SUM",
+            CdAgg::Min { .. } => "MIN",
+            CdAgg::Max { .. } => "MAX",
+            CdAgg::Avg { .. } => "AVG",
+        })
+        .collect();
+    let _ = writeln!(
+        out,
+        "MultiAggGroupBy: group_keys=[{}] aggs=[{}]",
+        cd.group_key_names.join(", "),
+        aggs.join(", ")
+    );
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Base:");
+    format_logical_into(&cd.base, 2, &mut out);
+    if let Some(post) = &cd.post {
+        indent(&mut out, 1);
+        let _ = writeln!(out, "Post:");
+        format_logical_into(post, 2, &mut out);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Physical plan
 // ---------------------------------------------------------------------------

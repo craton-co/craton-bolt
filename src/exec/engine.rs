@@ -200,6 +200,364 @@ fn host_count_distinct_groupby(
         .map_err(|e| BoltError::Plan(format!("COUNT(DISTINCT) GROUP BY result build: {e}")))
 }
 
+/// A numeric value read from a base column for a host plain-aggregate fold.
+///
+/// Integer columns (`Int32` / `Int64`) carry an `i128` so SUM accumulation
+/// cannot overflow before the range check at finalize; float columns
+/// (`Float32` / `Float64`) carry an `f64`. NULLs are not represented here —
+/// callers skip nulls before reading (SQL aggregates ignore NULLs).
+#[derive(Debug, Clone, Copy)]
+enum AggNum {
+    Int(i128),
+    Float(f64),
+}
+
+/// Per-group accumulator for one host plain aggregate (SUM / MIN / MAX / AVG /
+/// COUNT / COUNT(*)). One instance per (group, aggregate) cell.
+#[derive(Debug, Clone)]
+struct PlainAccum {
+    /// Non-NULL value count (also the plain `COUNT(col)` result, and the AVG
+    /// divisor); for `COUNT(*)` this counts every row regardless of nullness.
+    count: i64,
+    /// Running sum for SUM / AVG (None until the first non-NULL value).
+    sum: Option<AggNum>,
+    /// Running min / max (None until the first non-NULL value).
+    min: Option<AggNum>,
+    max: Option<AggNum>,
+}
+
+impl Default for PlainAccum {
+    fn default() -> Self {
+        PlainAccum {
+            count: 0,
+            sum: None,
+            min: None,
+            max: None,
+        }
+    }
+}
+
+/// Host-side per-group multi/mixed aggregate for the generalized
+/// COUNT(DISTINCT) + GROUP BY path (feature F3-finish, generalized).
+///
+/// `base` is the materialised `[group_keys..., agg_inputs...]` batch: the first
+/// `n_keys` columns are group keys; the remaining columns are one input column
+/// per aggregate, in `aggs` order (so `aggs[i].base_col() == n_keys + i`).
+/// Groups rows by the leading group-key tuple (same `RowKey` canonicalisation
+/// as DISTINCT, so NULL keys form their own group), then per group computes:
+///
+/// * `COUNT(DISTINCT col)` — number of distinct non-NULL values (NULLs ignored);
+/// * `COUNT(col)`          — non-NULL row count;
+/// * `COUNT(*)`            — total row count;
+/// * `SUM` / `MIN` / `MAX` — over non-NULL values, preserving the input dtype
+///   (empty / all-NULL group → SQL NULL); SUM range-checks integer output;
+/// * `AVG`                 — Float64 mean of non-NULL values (empty → NULL).
+///
+/// Output columns are assembled in `output_layout` order. Pure (no GPU / engine
+/// state) so it is host-testable directly.
+fn host_multi_agg_groupby(
+    base: &RecordBatch,
+    n_keys: usize,
+    aggs: &[crate::plan::sql_frontend::CdAgg],
+    output_layout: &[crate::plan::sql_frontend::CdOutputCol],
+    result_schema: &Schema,
+) -> BoltResult<RecordBatch> {
+    use std::collections::{HashMap, HashSet};
+
+    use arrow_array::{Float64Array, UInt32Array};
+
+    use crate::exec::distinct::{ColumnReader, RowKey, RowKeyValue};
+    use crate::plan::sql_frontend::{CdAgg, CdOutputCol};
+
+    let n_cols = base.num_columns();
+    if n_cols != n_keys + aggs.len() {
+        return Err(BoltError::Plan(format!(
+            "multi-agg GROUP BY: base produced {n_cols} columns, expected \
+             {n_keys} group keys + {} aggregate inputs",
+            aggs.len()
+        )));
+    }
+    let n_rows = base.num_rows();
+
+    let key_readers: Vec<ColumnReader> = (0..n_keys)
+        .map(|i| ColumnReader::new(base.column(i).as_ref()))
+        .collect::<BoltResult<_>>()?;
+    // One reader per aggregate input column (column `n_keys + i`).
+    let agg_readers: Vec<ColumnReader> = aggs
+        .iter()
+        .map(|a| ColumnReader::new(base.column(a.base_col()).as_ref()))
+        .collect::<BoltResult<_>>()?;
+
+    // Per group: first-row index, the distinct sets (one per COUNT(DISTINCT)
+    // aggregate, indexed by aggregate position), and the plain accumulators
+    // (one per aggregate position; unused for COUNT(DISTINCT) slots).
+    struct GroupState {
+        first_row: u32,
+        distinct: Vec<HashSet<RowKeyValue>>,
+        plain: Vec<PlainAccum>,
+    }
+    let mut groups: HashMap<RowKey, usize> = HashMap::new();
+    let mut order: Vec<GroupState> = Vec::new();
+
+    for row in 0..n_rows {
+        let key = RowKey::from_values(n_keys, key_readers.iter().map(|r| r.value_at(row)));
+        let slot = match groups.get(&key) {
+            Some(&s) => s,
+            None => {
+                let s = order.len();
+                groups.insert(key, s);
+                order.push(GroupState {
+                    first_row: row as u32,
+                    distinct: (0..aggs.len()).map(|_| HashSet::new()).collect(),
+                    plain: (0..aggs.len()).map(|_| PlainAccum::default()).collect(),
+                });
+                s
+            }
+        };
+        let g = &mut order[slot];
+        for (ai, agg) in aggs.iter().enumerate() {
+            let reader = &agg_readers[ai];
+            match agg {
+                CdAgg::CountDistinct { .. } => {
+                    let v = reader.value_at(row);
+                    if v != RowKeyValue::Null {
+                        g.distinct[ai].insert(v);
+                    }
+                }
+                CdAgg::CountStar { .. } => {
+                    g.plain[ai].count += 1;
+                }
+                CdAgg::Count { .. } => {
+                    if reader.value_at(row) != RowKeyValue::Null {
+                        g.plain[ai].count += 1;
+                    }
+                }
+                CdAgg::Sum { .. } | CdAgg::Min { .. } | CdAgg::Max { .. } | CdAgg::Avg { .. } => {
+                    if let Some(num) = agg_num_at(reader, row)? {
+                        let acc = &mut g.plain[ai];
+                        acc.count += 1;
+                        acc.sum = Some(match acc.sum {
+                            None => num,
+                            Some(s) => agg_add(s, num),
+                        });
+                        acc.min = Some(match acc.min {
+                            None => num,
+                            Some(m) => if agg_lt(num, m) { num } else { m },
+                        });
+                        acc.max = Some(match acc.max {
+                            None => num,
+                            Some(m) => if agg_lt(m, num) { num } else { m },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Build output columns in `output_layout` order.
+    let arrow_schema = plan_schema_to_arrow_schema(result_schema)?;
+    let take_idx = UInt32Array::from(order.iter().map(|g| g.first_row).collect::<Vec<u32>>());
+    let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(output_layout.len());
+
+    for (out_idx, out) in output_layout.iter().enumerate() {
+        match out {
+            CdOutputCol::GroupKey(k) => {
+                let gathered = arrow::compute::take(base.column(*k).as_ref(), &take_idx, None)
+                    .map_err(|e| {
+                        BoltError::Other(format!(
+                            "multi-agg GROUP BY: take on group key {k} failed: {e}"
+                        ))
+                    })?;
+                out_cols.push(gathered);
+            }
+            CdOutputCol::Agg(a) => {
+                let agg = &aggs[*a];
+                let field = &result_schema.fields[out_idx];
+                let col: ArrayRef = match agg {
+                    CdAgg::CountDistinct { .. } => {
+                        let v: Int64Array = order
+                            .iter()
+                            .map(|g| g.distinct[*a].len() as i64)
+                            .collect::<Vec<i64>>()
+                            .into();
+                        Arc::new(v) as ArrayRef
+                    }
+                    CdAgg::Count { .. } | CdAgg::CountStar { .. } => {
+                        let v: Int64Array = order
+                            .iter()
+                            .map(|g| g.plain[*a].count)
+                            .collect::<Vec<i64>>()
+                            .into();
+                        Arc::new(v) as ArrayRef
+                    }
+                    CdAgg::Avg { .. } => {
+                        let v: Float64Array = order
+                            .iter()
+                            .map(|g| {
+                                let acc = &g.plain[*a];
+                                if acc.count == 0 {
+                                    None
+                                } else {
+                                    let total = match acc.sum {
+                                        Some(AggNum::Int(i)) => i as f64,
+                                        Some(AggNum::Float(f)) => f,
+                                        None => 0.0,
+                                    };
+                                    Some(total / acc.count as f64)
+                                }
+                            })
+                            .collect::<Vec<Option<f64>>>()
+                            .into();
+                        Arc::new(v) as ArrayRef
+                    }
+                    CdAgg::Sum { .. } => {
+                        finalize_numeric(
+                            order.iter().map(|g| g.plain[*a].sum),
+                            field.dtype,
+                            "SUM",
+                        )?
+                    }
+                    CdAgg::Min { .. } => {
+                        finalize_numeric(
+                            order.iter().map(|g| g.plain[*a].min),
+                            field.dtype,
+                            "MIN",
+                        )?
+                    }
+                    CdAgg::Max { .. } => {
+                        finalize_numeric(
+                            order.iter().map(|g| g.plain[*a].max),
+                            field.dtype,
+                            "MAX",
+                        )?
+                    }
+                };
+                out_cols.push(col);
+            }
+        }
+    }
+
+    RecordBatch::try_new(Arc::clone(&arrow_schema), out_cols)
+        .map_err(|e| BoltError::Plan(format!("multi-agg GROUP BY result build: {e}")))
+}
+
+/// Read the numeric value at `row` from a `ColumnReader`, as an [`AggNum`].
+/// Returns `Ok(None)` for a NULL row; errors for a non-numeric column dtype
+/// (Bool / Utf8) under a SUM/MIN/MAX/AVG aggregate.
+fn agg_num_at(
+    reader: &crate::exec::distinct::ColumnReader<'_>,
+    row: usize,
+) -> BoltResult<Option<AggNum>> {
+    use crate::exec::distinct::RowKeyValue;
+    Ok(match reader.value_at(row) {
+        RowKeyValue::Null => None,
+        RowKeyValue::I32(v) => Some(AggNum::Int(v as i128)),
+        RowKeyValue::I64(v) => Some(AggNum::Int(v as i128)),
+        RowKeyValue::F32(v) => Some(AggNum::Float(f32::from_bits(v) as f64)),
+        RowKeyValue::F64(v) => Some(AggNum::Float(f64::from_bits(v))),
+        RowKeyValue::Bool(_) | RowKeyValue::Utf8(_) => {
+            return Err(BoltError::Type(
+                "SUM/MIN/MAX/AVG under GROUP BY require a numeric column".into(),
+            ))
+        }
+    })
+}
+
+/// Add two [`AggNum`]s (both produced from the same numeric column, so the
+/// variant is consistent).
+fn agg_add(a: AggNum, b: AggNum) -> AggNum {
+    match (a, b) {
+        (AggNum::Int(x), AggNum::Int(y)) => AggNum::Int(x + y),
+        (AggNum::Float(x), AggNum::Float(y)) => AggNum::Float(x + y),
+        // Mixed never happens (one column → one variant); fall back to float.
+        (AggNum::Int(x), AggNum::Float(y)) | (AggNum::Float(y), AggNum::Int(x)) => {
+            AggNum::Float(x as f64 + y)
+        }
+    }
+}
+
+/// `a < b` for two same-variant [`AggNum`]s. NaN floats sort as greater (so a
+/// real value is preferred as the MIN), matching the host scalar convention.
+fn agg_lt(a: AggNum, b: AggNum) -> bool {
+    match (a, b) {
+        (AggNum::Int(x), AggNum::Int(y)) => x < y,
+        (AggNum::Float(x), AggNum::Float(y)) => x < y,
+        (AggNum::Int(x), AggNum::Float(y)) | (AggNum::Float(y), AggNum::Int(x)) => (x as f64) < y,
+    }
+}
+
+/// Finalize a per-group SUM/MIN/MAX reduction into a typed, nullable array of
+/// `target` dtype. Integer targets range-check each value (a SUM that exceeds
+/// the target integer range errors rather than wraps, matching the scalar host
+/// aggregate). A `None` group value becomes a NULL output cell.
+fn finalize_numeric(
+    values: impl Iterator<Item = Option<AggNum>>,
+    target: DataType,
+    op: &str,
+) -> BoltResult<ArrayRef> {
+    use arrow_array::{Float32Array, Float64Array, Int32Array as I32, Int64Array as I64};
+    let vals: Vec<Option<AggNum>> = values.collect();
+    Ok(match target {
+        DataType::Int32 => {
+            let out: Vec<Option<i32>> = vals
+                .iter()
+                .map(|v| match v {
+                    None => Ok(None),
+                    Some(AggNum::Int(i)) => i32::try_from(*i).map(Some).map_err(|_| {
+                        BoltError::Type(format!("{op} result {i} overflows Int32"))
+                    }),
+                    Some(AggNum::Float(_)) => Err(BoltError::Type(format!(
+                        "{op}: float value for an Int32 column"
+                    ))),
+                })
+                .collect::<BoltResult<_>>()?;
+            Arc::new(I32::from(out)) as ArrayRef
+        }
+        DataType::Int64 => {
+            let out: Vec<Option<i64>> = vals
+                .iter()
+                .map(|v| match v {
+                    None => Ok(None),
+                    Some(AggNum::Int(i)) => i64::try_from(*i).map(Some).map_err(|_| {
+                        BoltError::Type(format!("{op} result {i} overflows Int64"))
+                    }),
+                    Some(AggNum::Float(_)) => Err(BoltError::Type(format!(
+                        "{op}: float value for an Int64 column"
+                    ))),
+                })
+                .collect::<BoltResult<_>>()?;
+            Arc::new(I64::from(out)) as ArrayRef
+        }
+        DataType::Float32 => {
+            let out: Vec<Option<f32>> = vals
+                .iter()
+                .map(|v| match v {
+                    None => None,
+                    Some(AggNum::Float(f)) => Some(*f as f32),
+                    Some(AggNum::Int(i)) => Some(*i as f32),
+                })
+                .collect();
+            Arc::new(Float32Array::from(out)) as ArrayRef
+        }
+        DataType::Float64 => {
+            let out: Vec<Option<f64>> = vals
+                .iter()
+                .map(|v| match v {
+                    None => None,
+                    Some(AggNum::Float(f)) => Some(*f),
+                    Some(AggNum::Int(i)) => Some(*i as f64),
+                })
+                .collect();
+            Arc::new(Float64Array::from(out)) as ArrayRef
+        }
+        other => {
+            return Err(BoltError::Type(format!(
+                "{op} under GROUP BY: unsupported output dtype {other:?}"
+            )))
+        }
+    })
+}
+
 /// Stage 7 (P1b): default interval between pool-stats emits in
 /// [`Engine::sql`].
 ///
@@ -1891,6 +2249,26 @@ impl Engine {
             }
         }
 
+        // Generalized COUNT(DISTINCT) + GROUP BY (multiple distinct counts
+        // and/or a mix with plain aggregates). The single-sole-COUNT(DISTINCT)
+        // case above declines these (`Ok(None)`); this detector picks them up.
+        // `Ok(None)` for everything else falls through to the ordinary path.
+        match crate::plan::sql_frontend::plan_multi_agg_groupby(query, &self.provider) {
+            Ok(Some(cd)) => {
+                let result = self.execute_multi_agg_groupby(&cd);
+                if result.is_err() {
+                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                }
+                self.maybe_emit_pool_stats(Instant::now());
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                return Err(e);
+            }
+        }
+
         // Time the parse phase (SQL text → LogicalPlan) into the Parse
         // histogram; mirrors the `parse` tracing span in `observability`.
         let parse_start = Instant::now();
@@ -2026,6 +2404,16 @@ impl Engine {
             return Ok(format!(
                 "COUNT(DISTINCT) GROUP BY plan:\n{}",
                 crate::plan::explain::format_count_distinct_groupby(&cd)
+            ));
+        }
+        // F3-finish (generalized): render the multi/mixed COUNT(DISTINCT) +
+        // GROUP BY descriptor.
+        if let Some(cd) =
+            crate::plan::sql_frontend::plan_multi_agg_groupby(query, &self.provider)?
+        {
+            return Ok(format!(
+                "multi-agg GROUP BY plan:\n{}",
+                crate::plan::explain::format_multi_agg_groupby(&cd)
             ));
         }
         let plan: LogicalPlan = parse_sql(query, &self.provider)?;
@@ -2400,6 +2788,52 @@ impl Engine {
         if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
             return Err(BoltError::Plan(format!(
                 "COUNT(DISTINCT) GROUP BY: reserved result table name '{name}' collides \
+                 with a registered table"
+            )));
+        }
+        self.gpu_tables.borrow_mut().remove(name);
+        self.streaming_sources
+            .borrow_mut()
+            .insert(name.to_string(), TableSource::Materialized(vec![result]));
+        let out = self.run_subplan(post.clone());
+        self.streaming_sources.borrow_mut().remove(name);
+        self.gpu_tables.borrow_mut().remove(name);
+        Ok(QueryHandle::from_record_batch(out?))
+    }
+
+    /// Execute the *generalized* COUNT(DISTINCT) + GROUP BY descriptor
+    /// (feature F3-finish, generalized): multiple distinct counts and/or a mix
+    /// with plain aggregates. Mirrors [`Engine::execute_count_distinct_groupby`]
+    /// but delegates the per-group work to [`host_multi_agg_groupby`] (which
+    /// computes every aggregate per group) and binds the result under
+    /// [`crate::plan::sql_frontend::MULTI_AGG_GROUPBY_RESULT_TABLE`] for the
+    /// optional HAVING / ORDER BY / LIMIT post-plan.
+    fn execute_multi_agg_groupby(
+        &self,
+        cd: &crate::plan::sql_frontend::MultiAggGroupByPlan,
+    ) -> BoltResult<QueryHandle> {
+        // --- 1. Run the base subplan: [group_keys..., agg_inputs...]. ---
+        let base = self.run_subplan(cd.base.clone())?;
+
+        // --- 2 + 3. Group + compute every aggregate host-side. ---
+        let result = host_multi_agg_groupby(
+            &base,
+            cd.n_keys,
+            &cd.aggs,
+            &cd.output_layout,
+            &cd.result_schema,
+        )?;
+
+        // --- 4. Optional HAVING / ORDER BY / LIMIT post-plan over the result. ---
+        let post = match &cd.post {
+            None => return Ok(QueryHandle::from_record_batch(result)),
+            Some(p) => p,
+        };
+        use crate::exec::streaming::TableSource;
+        let name = crate::plan::sql_frontend::MULTI_AGG_GROUPBY_RESULT_TABLE;
+        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+            return Err(BoltError::Plan(format!(
+                "multi-agg GROUP BY: reserved result table name '{name}' collides \
                  with a registered table"
             )));
         }
@@ -4568,6 +5002,154 @@ mod tests {
         assert!(host_count_distinct_groupby(&base, 2, &cd_result_schema()).is_err());
     }
 
+    // ---- F3-finish (generalized): host multi / mixed aggregates (no GPU) ----
+
+    /// Two distinct counts plus mixed plain aggregates per group, with NULL
+    /// handling, modelling `SELECT g, COUNT(DISTINCT a), COUNT(DISTINCT b),
+    /// SUM(x), COUNT(*)`. The base carries one input column per aggregate
+    /// (`COUNT(*)` feeds a sentinel column), so n_keys(1) + aggs(4) = 5 cols.
+    #[test]
+    fn host_multi_agg_distinct_and_plain_per_group() {
+        use crate::plan::sql_frontend::{CdAgg, CdOutputCol};
+        use arrow_array::Array;
+        // group 1: a in {10,10,20} -> distinct 2; b in {NULL,5,5} -> distinct 1;
+        //          x = 1+2+3 = 6; count(*) = 3.
+        // group 2: a in {30,30} -> distinct 1; b in {7,7} -> distinct 1;
+        //          x = 4 (one NULL ignored by SUM but counted by COUNT(*)=2).
+        let g: Int32Array = [Some(1), Some(1), Some(1), Some(2), Some(2)].into_iter().collect();
+        let a: Int64Array =
+            [Some(10), Some(10), Some(20), Some(30), Some(30)].into_iter().collect();
+        let b: Int64Array = [None, Some(5), Some(5), Some(7), Some(7)].into_iter().collect();
+        let x: Int64Array = [Some(1), Some(2), Some(3), Some(4), None].into_iter().collect();
+        let star: Int64Array = [Some(1), Some(1), Some(1), Some(1), Some(1)].into_iter().collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("g", ArrowDataType::Int32, true),
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new("b", ArrowDataType::Int64, true),
+            ArrowField::new("x", ArrowDataType::Int64, true),
+            ArrowField::new("star", ArrowDataType::Int64, false),
+        ]));
+        let base = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(g), Arc::new(a), Arc::new(b), Arc::new(x), Arc::new(star)],
+        )
+        .unwrap();
+        let aggs = vec![
+            CdAgg::CountDistinct { base_col: 1 },
+            CdAgg::CountDistinct { base_col: 2 },
+            CdAgg::Sum { base_col: 3 },
+            CdAgg::CountStar { base_col: 4 },
+        ];
+        let output_layout = vec![
+            CdOutputCol::GroupKey(0),
+            CdOutputCol::Agg(0),
+            CdOutputCol::Agg(1),
+            CdOutputCol::Agg(2),
+            CdOutputCol::Agg(3),
+        ];
+        let result_schema = Schema::new(vec![
+            Field::new("g", DataType::Int32, true),
+            Field::new("cda", DataType::Int64, false),
+            Field::new("cdb", DataType::Int64, false),
+            Field::new("sum_x", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, false),
+        ]);
+        let out =
+            host_multi_agg_groupby(&base, 1, &aggs, &output_layout, &result_schema).unwrap();
+        assert_eq!(out.num_rows(), 2);
+        let g = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let cda = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let cdb = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sumx = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let cnt = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
+        // First-occurrence order: group 1 then group 2.
+        assert_eq!(g.value(0), 1);
+        assert_eq!((cda.value(0), cdb.value(0), sumx.value(0), cnt.value(0)), (2, 1, 6, 3));
+        assert_eq!(g.value(1), 2);
+        assert_eq!((cda.value(1), cdb.value(1), sumx.value(1), cnt.value(1)), (1, 1, 4, 2));
+        // SUM(x) for group 2 ignored the NULL row but COUNT(*) counted it.
+        assert!(!sumx.is_null(1));
+    }
+
+    /// MIN / MAX / AVG per group with an all-NULL group: MIN/MAX → NULL, AVG →
+    /// NULL, COUNT(col) → 0 for that group.
+    #[test]
+    fn host_multi_agg_minmax_avg_and_all_null_group() {
+        use crate::plan::sql_frontend::{CdAgg, CdOutputCol};
+        use arrow_array::{Array, Float64Array};
+        // group 1: x = {2,4,6}; group 2: x = {NULL,NULL}.
+        let g: Int32Array = [Some(1), Some(1), Some(1), Some(2), Some(2)].into_iter().collect();
+        let x: Int64Array = [Some(2), Some(4), Some(6), None, None].into_iter().collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("g", ArrowDataType::Int32, true),
+            ArrowField::new("xmin", ArrowDataType::Int64, true),
+            ArrowField::new("xmax", ArrowDataType::Int64, true),
+            ArrowField::new("xavg", ArrowDataType::Int64, true),
+            ArrowField::new("xcnt", ArrowDataType::Int64, true),
+        ]));
+        let base = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(g),
+                Arc::new(x.clone()),
+                Arc::new(x.clone()),
+                Arc::new(x.clone()),
+                Arc::new(x),
+            ],
+        )
+        .unwrap();
+        let aggs = vec![
+            CdAgg::Min { base_col: 1 },
+            CdAgg::Max { base_col: 2 },
+            CdAgg::Avg { base_col: 3 },
+            CdAgg::Count { base_col: 4 },
+        ];
+        let output_layout = vec![
+            CdOutputCol::GroupKey(0),
+            CdOutputCol::Agg(0),
+            CdOutputCol::Agg(1),
+            CdOutputCol::Agg(2),
+            CdOutputCol::Agg(3),
+        ];
+        let result_schema = Schema::new(vec![
+            Field::new("g", DataType::Int32, true),
+            Field::new("mn", DataType::Int64, true),
+            Field::new("mx", DataType::Int64, true),
+            Field::new("av", DataType::Float64, true),
+            Field::new("c", DataType::Int64, false),
+        ]);
+        let out =
+            host_multi_agg_groupby(&base, 1, &aggs, &output_layout, &result_schema).unwrap();
+        let mn = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mx = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let av = out.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
+        let c = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
+        // group 1: min 2, max 6, avg 4.0, count 3.
+        assert_eq!((mn.value(0), mx.value(0)), (2, 6));
+        assert!((av.value(0) - 4.0).abs() < 1e-12);
+        assert_eq!(c.value(0), 3);
+        // group 2: all-NULL -> MIN/MAX/AVG NULL, COUNT 0.
+        assert!(mn.is_null(1) && mx.is_null(1) && av.is_null(1));
+        assert_eq!(c.value(1), 0);
+    }
+
+    /// A base whose column count does not match `n_keys + aggs.len()` is
+    /// rejected.
+    #[test]
+    fn host_multi_agg_rejects_wrong_column_count() {
+        use crate::plan::sql_frontend::{CdAgg, CdOutputCol};
+        let base = cd_base(&[(Some(1), Some(1))]); // 2 columns
+        let aggs = vec![CdAgg::CountDistinct { base_col: 1 }, CdAgg::Sum { base_col: 2 }];
+        let layout = vec![CdOutputCol::GroupKey(0), CdOutputCol::Agg(0), CdOutputCol::Agg(1)];
+        let rs = Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("cd", DataType::Int64, false),
+            Field::new("s", DataType::Int64, true),
+        ]);
+        // n_keys=1 + 2 aggs = 3 columns expected, base has 2 -> error.
+        assert!(host_multi_agg_groupby(&base, 1, &aggs, &layout, &rs).is_err());
+    }
+
     /// Build a single-column `RecordBatch` whose `x` column holds the half-open
     /// range `[start, start+n)` as `Int64`. The schema is shared across all
     /// fixtures so `register_batch`'s schema check passes.
@@ -6343,5 +6925,101 @@ mod tests {
             msg.contains("safety cap") || msg.contains("not terminating"),
             "expected iteration-cap error, got: {msg}"
         );
+    }
+
+    // ---- Feature 1: multi-table FROM (comma cross join) e2e ----
+
+    /// `FROM a, b WHERE a.k = b.k` produces the cartesian product filtered to
+    /// the matching pairs. End-to-end through the engine (child scans run on
+    /// the GPU execute path), so gpu-gated.
+    #[test]
+    #[ignore = "gpu:e2e — cross-join children run through the GPU execute path"]
+    fn comma_cross_join_with_where_filter_cartesian() {
+        use arrow_array::Int32Array;
+        let mut engine = Engine::new().expect("ctx");
+        // a(k, av): (1,10),(2,20); b(k, bv): (1,100),(1,101),(3,300).
+        let a_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("av", ArrowDataType::Int32, false),
+        ]));
+        let a = RecordBatch::try_new(
+            a_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let b_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("bv", ArrowDataType::Int32, false),
+        ]));
+        let b = RecordBatch::try_new(
+            b_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 3])),
+                Arc::new(Int32Array::from(vec![100, 101, 300])),
+            ],
+        )
+        .unwrap();
+        engine.register_table("a", a).expect("register a");
+        engine.register_table("b", b).expect("register b");
+
+        // Cross product is 2×3 = 6 rows; the WHERE keeps only a.k == b.k:
+        // (k=1, av=10) × (bv=100, bv=101) → two rows.
+        let h = engine
+            .sql("SELECT a.av, b.bv FROM a, b WHERE a.k = b.k")
+            .expect("cross-join query");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 2, "only k=1 pairs survive the filter");
+        let av = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let bv = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        let mut got: Vec<(i32, i32)> =
+            (0..out.num_rows()).map(|i| (av.value(i), bv.value(i))).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(10, 100), (10, 101)]);
+    }
+
+    // ---- Feature 2: multi / mixed COUNT(DISTINCT) + GROUP BY e2e ----
+
+    /// `SELECT g, COUNT(DISTINCT a), SUM(x), COUNT(*) FROM t GROUP BY g`
+    /// end-to-end (the base subplan runs through the GPU execute path).
+    #[test]
+    #[ignore = "gpu:e2e — multi-agg base subplan runs through the GPU execute path"]
+    fn multi_agg_groupby_mixed_e2e() {
+        use arrow_array::Int64Array;
+        let mut engine = Engine::new().expect("ctx");
+        // g, a, x: group 1 -> a {10,10,20}=2 distinct, x sum 1+2+3=6, 3 rows;
+        //          group 2 -> a {30}=1 distinct, x sum 4, 1 row.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("g", ArrowDataType::Int64, false),
+            ArrowField::new("a", ArrowDataType::Int64, false),
+            ArrowField::new("x", ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1, 2])),
+                Arc::new(Int64Array::from(vec![10, 10, 20, 30])),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .unwrap();
+        engine.register_table("t", batch).expect("register");
+
+        let h = engine
+            .sql(
+                "SELECT g, COUNT(DISTINCT a), SUM(x), COUNT(*) \
+                 FROM t GROUP BY g ORDER BY g",
+            )
+            .expect("multi-agg groupby query");
+        let out = h.record_batch();
+        assert_eq!(out.num_rows(), 2);
+        let g = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let cda = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sumx = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let cnt = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((g.value(0), cda.value(0), sumx.value(0), cnt.value(0)), (1, 2, 6, 3));
+        assert_eq!((g.value(1), cda.value(1), sumx.value(1), cnt.value(1)), (2, 1, 4, 1));
     }
 }
