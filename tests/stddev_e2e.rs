@@ -141,13 +141,16 @@ fn stddev_over_non_numeric_column_is_rejected() {
         nullable: true,
     }]);
     let provider = MemTableProvider::new().with_table("t", schema);
-    // Parsing succeeds — the numeric-operand check lives in
-    // `AggregateExpr::output_dtype`, which runs when the plan's schema is
-    // resolved during lowering (`lower_physical` → `plan.schema()`), not at
-    // the SQL-frontend / parse stage.
-    let plan = parse_sql("SELECT STDDEV_POP(name) FROM t", &provider)
-        .expect("parse is structural; type-check happens at schema resolution");
-    let err = lower_physical(&plan).expect_err("STDDEV over Utf8 must error");
+    // The numeric-operand check now fires at parse/plan time (the frontend
+    // resolves the aggregate's operand dtype eagerly), surfacing a clear
+    // `BoltError::Type` like "STDDEV requires a numeric operand, got Utf8"
+    // rather than deferring to `lower_physical`. Either layer rejecting is
+    // acceptable; accept whichever surfaces it first.
+    let err = match parse_sql("SELECT STDDEV_POP(name) FROM t", &provider) {
+        Ok(plan) => lower_physical(&plan)
+            .expect_err("STDDEV over Utf8 must error at parse or lowering"),
+        Err(e) => e,
+    };
     let msg = format!("{err}");
     assert!(
         msg.contains("STDDEV") || msg.contains("numeric"),

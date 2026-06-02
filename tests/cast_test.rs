@@ -7,9 +7,9 @@
 //!
 //! * The SQL frontend parses `CAST(<expr> AS <type>)` and the Postgres
 //!   `expr::type` shortcut, mapping the type name onto the engine's
-//!   internal [`DataType`]. `TRY_CAST` and `SAFE_CAST` are rejected
-//!   explicitly (they carry NULL-on-failure semantics the planner can't
-//!   honour yet), and the BigQuery `FORMAT` clause is rejected.
+//!   internal [`DataType`]. `TRY_CAST` is now supported and lowers to a
+//!   safe (`safe: true`) `Expr::Cast`; the BigQuery `FORMAT` clause is
+//!   still rejected.
 //! * The logical plane type-checks the source-target pair against
 //!   `cast_is_supported`; unsupported pairs (e.g. `Utf8 -> Int32`) error
 //!   with a `BoltError::Type` carrying the source and target types.
@@ -285,15 +285,27 @@ fn cast_float_to_bool_rejected_at_typecheck() {
 /// can't honour yet; the SQL frontend rejects them with a clear message
 /// pointing the user at the plain `CAST` form.
 #[test]
-fn try_cast_rejected_with_clear_message() {
+fn try_cast_lowers_as_safe_cast() {
+    // TRY_CAST is now supported: the frontend lowers it to the same
+    // `Expr::Cast` IR as plain CAST but with `safe: true` (non-trapping /
+    // NULL-on-failure semantics). It plans and lowers cleanly.
     let provider = fixture();
-    let err = parse_sql("SELECT TRY_CAST(i32 AS BIGINT) FROM t", &provider)
-        .expect_err("TRY_CAST must be rejected at parse");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.to_uppercase().contains("TRY_CAST") || msg.to_uppercase().contains("CAST"),
-        "expected TRY_CAST rejection to mention TRY_CAST or CAST, got: {msg}"
-    );
+    let plan = parse_sql("SELECT TRY_CAST(i32 AS BIGINT) FROM t", &provider)
+        .expect("TRY_CAST must parse and plan");
+    lower_physical(&plan).expect("TRY_CAST must lower cleanly");
+    // The projected expression must be a safe Int32 -> Int64 cast.
+    if let LogicalPlan::Project { exprs, .. } = &plan {
+        assert!(
+            matches!(
+                &exprs[0],
+                Expr::Cast { target: DataType::Int64, safe: true, .. }
+            ),
+            "TRY_CAST should lower to a safe Int64 cast, got: {:?}",
+            exprs[0]
+        );
+    } else {
+        panic!("expected a Project at the plan root, got {plan:?}");
+    }
 }
 
 // ---- 3. Physical-plan lowering --------------------------------------------
