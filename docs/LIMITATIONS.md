@@ -153,7 +153,10 @@ These are real, code-level behaviors to be aware of:
   intentional, test-pinned engine choice to keep the division kernel
   total/branch-free, and it diverges from standard SQL (and from DuckDB,
   which raises a divide-by-zero error). Integer **float** division is
-  unaffected (IEEE `div.rn` semantics).
+  unaffected (IEEE `div.rn` semantics). **`Decimal128` division** (the
+  0.7 GPU `Op::Div128` path) follows the same convention: a zero divisor
+  yields a deterministic **`0`** quotient for that lane (non-trapping)
+  rather than the standard-SQL error.
 - **Grouped `AVG` of an empty / all-NULL group returns `0.0`, not NULL
   (deliberate).** Standard SQL says `AVG` over zero contributing rows is
   `NULL`; the engine instead returns `0.0` to keep the `AVG` output column
@@ -172,14 +175,20 @@ These are real, code-level behaviors to be aware of:
   ordering matches `memcmp` rather than any natural-language collation; and
   ordering of *two* Utf8 columns (`a < b`) is not folded and stays a host
   string comparison.
-- **Temporal / decimal types partially lower.** `Decimal128`, `Date32`, and
-  `Timestamp` parse and **partially** lower to the GPU. GPU gather (filter /
-  compaction) and column upload are wired for all three, and `COUNT` over a
-  `Date32` / `Timestamp` column works end-to-end. Still not routed: `MIN` /
-  `MAX` over `Date32` / `Timestamp` (the GPU reduction codegen exists, but
-  the scalar and GROUP BY aggregate paths still reject temporal inputs, so
-  these currently error), `Decimal128` division and `SUM` (host-side), and
-  CAST to/from any of these types. See the type tiers in
+- **Temporal / decimal types: lowered, with residual gaps.** `Decimal128`,
+  `Date32`, and `Timestamp` parse and lower to the GPU. GPU gather (filter /
+  compaction) and column upload are wired for all three. As of the 0.7 wave:
+  `COUNT`, **`MIN`, and `MAX`** over a `Date32` / `Timestamp` column work
+  end-to-end (GPU reduction on the i32 / i64 storage; the result is rebuilt
+  preserving the date type, or the timestamp **unit + timezone** — scalar and
+  GROUP BY alike). `Decimal128` `+`, `-`, `*`, **`/`** (including mixed
+  Decimal/integer arithmetic), scale-aligned comparisons, and integer↔decimal
+  / decimal-rescale **CAST** lower to the GPU. **Residual gaps:** `SUM` over a
+  temporal column is rejected by design (undefined SQL); `SUM` / `MIN` / `MAX`
+  over `Decimal128` are **host-side**; a `CASE` whose result dtype is
+  `Decimal128` is not lowered (no host realisation yet); and `CAST` between
+  **Float and `Decimal128`** (and CAST to/from `Timestamp` / `String`) is still
+  rejected at the GPU lowering boundary. See the type tiers in
   [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md).
 - **Env-gated experimental paths.** Several kernels (e.g. GPU radix sort,
   CUDA-graph sort, alternate hash/scan algorithms) are gated behind

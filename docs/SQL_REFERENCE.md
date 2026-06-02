@@ -59,14 +59,17 @@ The plan's `DataType` enum is intentionally small.
 | `Float32`  | `Float32`       |                                                          |
 | `Float64`  | `Float64`       |                                                          |
 | `Utf8`     | `Utf8`          | Dictionary-encoded on register; i32 or i64 indices.      |
-| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, `*` lower to GPU (dual-register IR); comparisons lower to GPU in WHERE; `SUM` is host-side. GPU gather (filter/compaction) + upload are wired (16-byte interleaved layout). Div / CAST to-or-from decimal: parses; GPU lowering pending. |
-| `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)` works end-to-end; `MIN`/`MAX` over Date32 have GPU codegen but are not yet routed through the executor (see Aggregate functions). CAST to/from Date32: parses; GPU lowering pending. |
-| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)` works end-to-end; `MIN`/`MAX` over Timestamp have GPU codegen but are not yet routed through the executor. CAST to/from Timestamp: parses; GPU lowering pending. |
+| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, `*`, **`/`** all lower to GPU (dual-register 128-bit IR), including **mixed Decimal/integer** arithmetic (the integer side is auto-coerced); comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to GPU and are **scale-aligned** (differing scales are rescaled to `max(s)` before the i128 compare). `SUM`/`MIN`/`MAX` are host-side. **CAST** integer↔Decimal128 and Decimal128↔Decimal128 (rescale) lower to GPU; Float↔Decimal128 stays rejected. GPU gather (filter/compaction) + upload are wired (16-byte interleaved layout). **CASE** with a Decimal128 result: parses; GPU lowering pending. |
+| `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)`, **`MIN(date_col)` and `MAX(date_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i32 storage and the result is rebuilt as a `Date32`); `SUM` over a date is rejected by design. CAST integer→Date32 lowers via the Decimal/i128 path; CAST to/from Date32 (string, etc.): parses; GPU lowering pending. |
+| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)`, **`MIN(ts_col)` and `MAX(ts_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i64 storage and the result is rebuilt preserving unit + timezone); `SUM` over a timestamp is rejected by design. CAST to/from Timestamp: parses; GPU lowering pending. |
 
 `Decimal128`, `Date32`, and `Timestamp` arrived in 0.6 (plan + parser +
 type-check) and gained their GPU lowering in 0.7 (see the per-type notes
-above). Interval (beyond Day-INTERVAL on dates), time-of-day, list,
-struct, and map are still not modelled.
+above; the Decimal `/`, mixed Decimal/integer arithmetic, integer↔decimal
+and decimal-rescale CAST, scale-aligned Decimal comparison, and temporal
+`MIN`/`MAX` routing all landed in the 0.7 wave). Interval (beyond
+Day-INTERVAL on dates), time-of-day, list, struct, and map are still not
+modelled.
 
 ## Literals
 
@@ -93,9 +96,28 @@ Unary minus on a numeric literal is folded into a signed literal (`-5` becomes `
 
 Integer division by zero produces `NULL` (host evaluator) or undefined behaviour (GPU kernel — IEEE follows for floats, integer div by zero is the user's problem). Float division follows IEEE-754: `1.0 / 0.0 = +inf`, `0.0 / 0.0 = NaN`.
 
+#### Decimal128 arithmetic
+
+As of 0.7 `+`, `-`, `*`, **and `/`** over `Decimal128(p, s)` lower to the **GPU** via the dual-register (lo/hi) 128-bit IR (`Op::Add128` / `Sub128` / `Mul128` / `Div128`). **Mixed Decimal/integer** arithmetic is supported: an `Int32` / `Int64` peer is auto-coerced to `Decimal128(_, 0)` (Float peers are rejected — CAST explicitly to avoid losing exactness). Result-dtype rules follow the SQL convention (`logical_plan::decimal128_arith_result`):
+
+- **`+` / `-`**: operands rescaled to a common scale `s = max(s_l, s_r)`; result `Decimal128(min(max(p_l, p_r) + 1, 38), s)`.
+- **`*`**: result `Decimal128(min(p_l + p_r, 38), s_l + s_s)` (the raw i128 product carries the summed scale; no operand rescale).
+- **`/`**: result `Decimal128(min(max(p_l, 1), 38), max(s_l, 6))` — the quotient scale is the dividend's scale floored at **6** fractional digits, so an integer / low-scale dividend still gets fractional digits. The dividend is pre-scaled before a 128-bit truncating (toward zero) divide.
+
+**Division by zero on the eager GPU path yields a deterministic `0`** for that lane (`Op::Div128` branches a zero divisor to a zero-quotient tail — non-trapping), consistent with the engine's integer-div-by-zero convention rather than raising the standard-SQL error. A result precision > 38 (Arrow's `Decimal128` ceiling) is a hard error rather than a silent wrap, as is an overflowing decimal `SUM`.
+
+```sql
+SELECT price * qty            FROM line_items;   -- Decimal * Decimal (GPU)
+SELECT amount + 1             FROM ledger;        -- mixed Decimal + integer (GPU)
+SELECT total / count          FROM ledger;        -- Decimal / Decimal, scale max(s,6) (GPU)
+SELECT * FROM ledger WHERE amount > 100.00;       -- scale-aligned Decimal compare (GPU)
+SELECT CAST(qty AS DECIMAL(20, 4)) FROM line_items;        -- integer -> Decimal (GPU)
+SELECT CAST(price AS DECIMAL(10, 2)) FROM line_items;      -- Decimal rescale (GPU)
+```
+
 ### Comparison
 
-`=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above. Numeric comparisons run on the **GPU**. `Decimal128` comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to the **GPU** in `WHERE` predicates as of 0.7 (decimals must share the same scale).
+`=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above. Numeric comparisons run on the **GPU**. `Decimal128` comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to the **GPU** (`Op::Cmp128`) as of 0.7 and are **scale-aligned**: two decimals with *differing* scales are rescaled to the common scale `max(s_l, s_r)` (the smaller-scale side is multiplied by `10^Δ`) before the i128 compare, and an **integer peer** is auto-coerced (`WHERE dec_col > 5` works). Precision need not match. Float/Bool/temporal peers are rejected — CAST explicitly.
 
 For `Utf8` columns, equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time (**GPU**). As of 0.7, **ordering comparisons** (`<`, `>`, `<=`, `>=`) of a `Utf8` column against a string *literal* (`WHERE name < 'M'`, either operand order) are **also** supported (**GPU**): because dictionary indices reflect insertion order rather than lex order, the rewriter partitions the dictionary entries by the literal under **binary (UTF-8 byte) collation** at plan time and emits an OR-of-equalities over the matching dictionary indices (the same index-membership form `LIKE` uses). This is byte/binary collation, **not** locale-aware / ICU collation, and a `NULL` row never satisfies an ordering predicate (correct SQL 3VL). Column-vs-column Utf8 ordering (`WHERE a < b`, two string columns) is **not** folded — there is no single literal to partition by — and stays a host string comparison. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
 
@@ -117,8 +139,11 @@ For `Utf8` columns, equality (`=`, `<>`, `!=`) against string *literals* is supp
 
 ### CASE / CAST / COALESCE / NULLIF
 
-- `CASE WHEN cond THEN val [WHEN…] [ELSE val] END` (both the plain and simple/with-operand forms) is supported (0.5) and, as of 0.7, **lowers to the GPU** when the unified result dtype is numeric or `Bool` (emitted as a fold of PTX `selp.*`). A CASE whose result dtype is `Utf8`, `Decimal128`, `Date32`, or `Timestamp` parses but **GPU lowering is pending** (rejected with a `"CASE over … not yet lowered to GPU"` message).
-- `CAST(expr AS type)` is supported (0.5) for primitive numeric and `Bool` pairs, lowered to a PTX `cvt.*` on the **GPU**. CAST to or from `Decimal128`, `Date32`, `Timestamp`, or `String` parses but **GPU lowering is pending** (`"CAST to/from … not yet lowered to GPU"`).
+- `CASE WHEN cond THEN val [WHEN…] [ELSE val] END` (both the plain and simple/with-operand forms) is supported (0.5). Execution tier by result dtype:
+  - **GPU** when the unified result dtype is numeric, `Bool`, `Date32`, or `Timestamp` (emitted as a fold of PTX `selp.b32` / `selp.b64`; Date32/Timestamp ride along as plain bit-copies on their i32/i64 storage).
+  - **host-side** when the result dtype is `Utf8`: a bare-`Scan` SELECT-list Utf8 `CASE` lowers to the host-realized `PhysicalPlan::StringProject` (`CaseUtf8` output, evaluated by `string_project::eval_case_utf8`). It follows SQL three-valued logic — **only a TRUE `WHEN` fires**; a `FALSE` or `NULL` condition falls through, and a row that matches no `WHEN` with no `ELSE` yields SQL `NULL`. A *nested* `CASE` inside a branch is out of scope and falls back / errors. (Utf8 CASE under a Filter/Project chain, or feeding an aggregate, is not on this host path.)
+  - A `CASE` whose result dtype is **`Decimal128`** parses but **GPU lowering is pending** (rejected with `"CASE over Decimal128 … not yet lowered to GPU"`; the `selp` register classes have no `b128`, and there is no host realisation for it yet).
+- `CAST(expr AS type)` is supported (0.5) for primitive numeric and `Bool` pairs, lowered to a PTX `cvt.*` on the **GPU**. As of 0.7 **integer↔`Decimal128`** and **`Decimal128`↔`Decimal128`** (rescale) also lower to the **GPU** via the 128-bit widen / rescale (`Mul128`) / truncating-divide (`Div128`) path; integer→`Date32` rides the same i128 widen. Still pending: CAST between **Float and `Decimal128`** (rejected — a correct round-to-nearest i128 scaling is not expressible on the fixed `cvt` path; CAST through an integer or an intermediate decimal), and CAST to/from `Timestamp` / `String` (parses; GPU lowering pending).
 - `COALESCE(a, b, …)` and `NULLIF(a, b)` are supported (0.5), desugared to `CASE`, so they execute on the **GPU** under the same numeric/Bool result-dtype rule as CASE.
 
 ### LIKE
@@ -168,16 +193,20 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `MIN(int|float)` | Same dtype as input         | Float MIN via `atom.cas` loop on bit pattern (sm_70).      |
 | `MIN(bool)`    | `Bool`                        | `FALSE < TRUE`. NULL if all-null group.                    |
 | `MIN(utf8)`    | `Utf8`                        | Lexicographic; NULL if all-null group.                     |
+| `MIN(date32 \| timestamp)` | Same dtype as input | GPU reduction on the i32/i64 storage; result rebuilt preserving the date / (unit + tz). NULL if all-null group. Scalar + GROUP BY. |
+| `MIN(decimal)` | `Decimal128(p, s)`            | **Host-side** fold; preserves input `(p, s)`. NULL if all-null group. |
 | `MAX(int|float)` | Same dtype as input         | Same caveats as MIN.                                       |
 | `MAX(bool)`    | `Bool`                        | NULL if all-null group.                                    |
 | `MAX(utf8)`    | `Utf8`                        | NULL if all-null group.                                    |
+| `MAX(date32 \| timestamp)` | Same dtype as input | Same as `MIN` (temporal): GPU reduction, type/unit/tz preserved. Scalar + GROUP BY. |
+| `MAX(decimal)` | `Decimal128(p, s)`            | **Host-side** fold; preserves input `(p, s)`.              |
 | `AVG(numeric)` | `Float64`                     | Single fused kernel (on-device `SUM` + `COUNT` reduced together, divided on finalise); no longer split into separate host passes. |
 | `AVG(bool)`    | `Float64`                     | Fraction of `TRUE` rows. NULL if all-null group.           |
 | `SUM(decimal)` | `Decimal128`                  | **Host-side** reduction (0.7).                             |
 | `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP` | `Float64`  | **Host-side** Welford (0.5 scalar; 0.7 adds `GROUP BY` via per-group Welford). |
 | `VARIANCE`, `VAR_POP`, `VAR_SAMP`     | `Float64`  | **Host-side** Welford, shared state with STDDEV. Scalar (0.5) + grouped (0.7). |
 
-**Temporal MIN / MAX status.** `COUNT` over a `Date32` / `Timestamp` column works end-to-end (the count path is dtype-agnostic). `MIN` / `MAX` over a `Date32` / `Timestamp` column have GPU reduction codegen (`agg_kernels` collapses `Date32 → Int32` and `Timestamp → Int64` and reduces at the underlying integer width), but are **not yet routed** through the executor: the scalar reduction path and the GROUP BY output-schema builder still reject temporal aggregate inputs, so `MIN(date_col)` / `MAX(ts_col)` currently error rather than running. `SUM` over a temporal column is undefined SQL and is rejected by design.
+**Temporal MIN / MAX status.** `COUNT`, `MIN`, and `MAX` over a `Date32` / `Timestamp` column **all work end-to-end** as of the 0.7 wave. The reduction runs on the **GPU** over the normalised integer storage (`Date32 → Int32`, `Timestamp → Int64`), and the result is rebuilt as the original temporal type — a `Date32` for dates, and a `Timestamp` **preserving the unit and timezone** for timestamps (`src/exec/aggregate.rs`, `src/exec/groupby.rs`, and the temporal-output schema builder in `src/exec/schema_convert.rs` were all wired through). This holds in both the scalar and `GROUP BY` paths. `SUM` over a temporal column is undefined SQL and is **rejected by design** (`"SUM over Date32/Timestamp is not supported"`). (`MIN`/`MAX` over `Decimal128` are likewise supported, host-side, preserving the input precision/scale.)
 
 **NULL / empty-input semantics.** The target behaviour is standard SQL, matching DuckDB: `MIN` / `MAX` / `SUM` / `AVG` over an all-NULL group **or an empty input** return SQL `NULL`, and `COUNT` returns `0`. This is the contract to rely on. (Historically there were two divergences the engine is converging away from: scalar `SUM` over an empty/all-NULL input returned `0` rather than `NULL`, and primitive `MIN` / `MAX` returned a type sentinel rather than `NULL`. The correct, documented behaviour is SQL `NULL`.) The Bool/Utf8 inputs (which thread validity through `extended_agg`) already return SQL `NULL` for an all-NULL group in both the scalar and GROUP BY paths. As of 0.5, scalar primitive aggregates honour validity: `COUNT(col)` excludes NULLs via the bitmap and `SUM`/`MIN`/`MAX`/`AVG` over `Int*`/`Float*` host-strip NULL positions before the GPU reduction (with a zero-copy fast path when `null_count == 0`).
 
@@ -185,7 +214,12 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 
 Integer `SUM` overflow is a **hard error**, not silent wraparound and not undefined behaviour: if the running `i64` accumulator overflows, the query fails loudly with a `BoltError::Type("SUM(integer) overflow")`. The same applies to `SUM(Decimal128)` — an overflowing decimal sum errors rather than wrapping. (Float `SUM` follows IEEE-754 and saturates to `±inf` instead of erroring.) See [`LIMITATIONS.md`](LIMITATIONS.md) for the caveat on grouped-`SUM` overflow detection for streaming inputs the host cannot replicate.
 
-`COUNT(DISTINCT col)` is supported, but **only as the sole SELECT item** with no `GROUP BY`, no `HAVING`, and no `SELECT DISTINCT` alongside it. It lowers to `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` (NULL-excluding distinct count, executed via the host-side `Distinct` executor). `COUNT(DISTINCT *)`, `COUNT(DISTINCT a, b)`, `COUNT(DISTINCT col) OVER (...)`, and `DISTINCT` inside any other aggregate are rejected. Aggregate aliasing (`SUM(price) AS total`) is supported in v0.5: the alias renames the aggregate's plan-assigned name (e.g. `sum_price`) in a post-Aggregate Project, and the alias is visible to `HAVING` and `ORDER BY`.
+`COUNT(DISTINCT col)` is supported as the **sole SELECT item** (no other columns or aggregates alongside it). It lowers to `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` (NULL-excluding distinct count, executed via the host-side `Distinct` executor). As of the 0.7 wave (F3), two combined forms over the bare sole-item distinct-count are now accepted and lower on top of the same base plan:
+
+- **`SELECT DISTINCT COUNT(DISTINCT col)`** — the surrounding `DISTINCT` over a single-row result is a (correct) no-op, lowered to the existing `Distinct` node for plan uniformity.
+- **`... HAVING <pred over COUNT(DISTINCT col)>`** with **no `GROUP BY`** — the whole table is one implicit group, so `HAVING` filters that single result row (standard SQL). The predicate may reference the distinct-count via the same `COUNT(DISTINCT col)` call it was written with (comparison / boolean / `IS [NOT] NULL` shapes).
+
+Still **rejected**: `COUNT(DISTINCT col)` combined with **`GROUP BY`** (a per-group distinct count needs plan nodes that do not yet exist — `"COUNT(DISTINCT col) with GROUP BY is not supported"`), `COUNT(DISTINCT *)`, `COUNT(DISTINCT a, b)`, `COUNT(DISTINCT col) OVER (...)`, and `DISTINCT` inside any other aggregate. Aggregate aliasing (`SUM(price) AS total`) is supported in v0.5: the alias renames the aggregate's plan-assigned name (e.g. `sum_price`) in a post-Aggregate Project, and the alias is visible to `HAVING` and `ORDER BY`.
 
 ## GROUP BY
 
@@ -385,6 +419,13 @@ SELECT * FROM sales WHERE region_id IN (SELECT id FROM active_regions);
 
 -- COUNT(DISTINCT) — sole SELECT item only
 SELECT COUNT(DISTINCT region) FROM sales;
+SELECT DISTINCT COUNT(DISTINCT region) FROM sales;                   -- F3: SELECT DISTINCT over the sole count (no-op)
+SELECT COUNT(DISTINCT region) FROM sales HAVING COUNT(DISTINCT region) > 5;  -- F3: HAVING, no GROUP BY
+-- (COUNT(DISTINCT region) ... GROUP BY region_id  is still rejected)
+
+-- Temporal MIN/MAX (GPU; type + unit + tz preserved)
+SELECT MIN(order_date), MAX(order_date) FROM orders;                  -- Date32
+SELECT station, MIN(ts), MAX(ts) FROM readings GROUP BY station;      -- Timestamp, grouped
 
 -- Window functions (host-side, default frame)
 SELECT region_id, ROW_NUMBER() OVER (PARTITION BY region_id ORDER BY price) FROM sales;
@@ -392,7 +433,12 @@ SELECT region_id, SUM(price) OVER (PARTITION BY region_id) AS region_total FROM 
 
 -- String functions
 SELECT UPPER(region), LENGTH(region) FROM sales;          -- UPPER/LENGTH (GPU)
+SELECT SUBSTRING(region FROM 1 FOR 2) FROM sales;         -- SUBSTRING (host-realized StringProject)
+SELECT TRIM(region) FROM sales;                           -- single-arg TRIM (host-realized StringProject)
 SELECT CONCAT(region, '-', name) FROM sales;              -- CONCAT, NULL-if-any-arg-NULL (host mirror)
+
+-- CASE producing a string (host-realized over a bare scan; SQL 3VL)
+SELECT CASE WHEN active THEN 'on' ELSE 'off' END AS state FROM sales;
 
 -- Derived table (subquery in FROM) — alias required, non-lateral
 SELECT d.region_id, d.n
@@ -473,11 +519,11 @@ Still rejected (or only partially lowered):
 
 These type-check but the physical layer rejects them at the GPU lowering boundary (a clear `"… not yet lowered to GPU"` error, not a silent fallback):
 
-- `CAST` to or from `Decimal128`, `Date32`, `Timestamp`, or `String`.
-- `CASE` whose unified result dtype is `Utf8`, `Decimal128`, `Date32`, or `Timestamp`.
-- `Decimal128` division (`/`); only `+`, `-`, `*` and the comparisons lower to GPU.
+- `CAST` between **Float and `Decimal128`** (a correct round-to-nearest i128 scaling is not expressible on the fixed `cvt` path — CAST through an integer or an intermediate decimal), and `CAST` to or from `Timestamp` / `String`. (`CAST` integer↔`Decimal128`, `Decimal128`↔`Decimal128` rescale, and integer→`Date32` **do** lower to GPU as of 0.7 — see the CASE / CAST section.)
+- `CASE` whose unified result dtype is **`Decimal128`** (no `selp.b128` register class, and no host realisation yet). (A numeric / `Bool` / `Date32` / `Timestamp` result lowers to the GPU `selp` fold; a `Utf8` result is **host-realized** via `StringProject` over a bare scan — see the CASE / CAST section.)
 - GPU lowering of `NOT` in a predicate (runs host-side instead).
-- `SUBSTRING`, `TRIM`, and the `CONCAT` scalar function: these **execute end-to-end** but on a **host-side** projection rather than the GPU (so this is a host-execution tier, not a hard rejection). `CONCAT`'s dedicated GPU two-pass kernels exist and are PTX-shape-tested, but the executor uses the byte-identical host mirror for now (device launch wiring pending). The `||` concat operator likewise runs host-side. (`UPPER` / `LOWER` / `LENGTH` *do* lower to GPU as of 0.7 — see "String functions" below.)
+- `SUBSTRING`, single-arg `TRIM`, and the `CONCAT` scalar function: these **execute end-to-end** but on a **host-side** projection rather than the GPU (so this is a host-execution tier, not a hard rejection). As of the 0.7 wave, `SUBSTRING(col FROM start [FOR len])` (literal start/length) and the single-argument `TRIM` / `LTRIM` / `RTRIM` (default-whitespace) over a **bare `Utf8` scan** lower to the host-realized two-pass `PhysicalPlan::StringProject` producer; a custom trim-character set (`TRIM(chars FROM col)`) or computed `SUBSTRING` arguments fall back to the host `Project` evaluator. `CONCAT`'s dedicated GPU two-pass kernels exist and are PTX-shape-tested, but the executor uses the byte-identical host mirror for now (device launch wiring pending). The `||` concat operator likewise runs host-side. (`UPPER` / `LOWER` / `LENGTH` *do* lower to GPU as of 0.7 — see "String functions" below.)
+- `Decimal128` division (`/`) **now lowers to GPU** as of 0.7 (`Op::Div128`), so it is no longer in this list — see the "Decimal128 arithmetic" subsection.
 
 ### Types and values
 - Time-of-day / general interval (beyond Day-`INTERVAL` on dates) literals and arithmetic. `Date32`, `Timestamp`, and `Decimal128` *are* supported (see Data types).
@@ -500,7 +546,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 
 - **`UPPER` / `LOWER`** lower to the **GPU** via the two-pass `PhysicalPlan::StringProject` executor (variable-width device output).
 - **`LENGTH`** lowers to the **GPU** via `PhysicalPlan::StringLength` (dictionary-gather, `Int64` output).
-- **`SUBSTRING` / `TRIM`** (`TRIM BOTH` / `LEADING` / `TRAILING`) execute **host-side** end-to-end.
+- **`SUBSTRING` / `TRIM`** execute **host-side** end-to-end. As of the 0.7 wave, `SUBSTRING(col FROM start [FOR len])` (with **integer-literal** start/length) and the **single-argument** `TRIM` / `LTRIM` / `RTRIM` (`TRIM BOTH` / `LEADING` / `TRAILING`, default whitespace) over a **bare `Utf8` scan** lower to the host-realized two-pass `PhysicalPlan::StringProject` producer (one device-shaped pass mirrored on the host). A **custom trim-character set** (`TRIM(chars FROM col)`) or a computed (non-literal) `SUBSTRING` argument falls back to the host `Project` evaluator. Both are byte/character-correct and NULL-propagating.
 - **`CONCAT(a, b, ...)`** of `Utf8` columns executes end-to-end with **NULL-if-any-argument-NULL** semantics (standard SQL — a NULL in any source row makes the output row NULL). The dedicated N-input two-pass GPU producer kernels (`compile_concat_len_pass` / `compile_concat_write_pass`, supporting up to `CONCAT_MAX_INPUTS = 8` source columns) are implemented and PTX-shape-tested; the executor currently realises the result via the **byte-identical host mirror** (`string_project::host_concat_strings`), so results are correct and the device launch wiring is a follow-up. Arities beyond 8 source columns, computed/literal arguments, and non-Utf8 arguments take the host fallback (`string_ops_extended::concat`). The `||` concat operator likewise runs host-side.
 
 ### Additional scalar string functions

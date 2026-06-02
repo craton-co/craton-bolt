@@ -315,6 +315,41 @@ fn format_logical_into(plan: &LogicalPlan, depth: usize, out: &mut String) {
 }
 
 // ---------------------------------------------------------------------------
+// Recursive CTE (feature F1)
+// ---------------------------------------------------------------------------
+
+/// Render a [`RecursiveCtePlan`](crate::plan::sql_frontend::RecursiveCtePlan)
+/// as a tree-indented, human-readable string for `EXPLAIN`.
+///
+/// A `WITH RECURSIVE` query is not a single [`LogicalPlan`] — the engine
+/// orchestrates a host-side fixpoint over three standalone subplans — so it
+/// gets its own renderer. The output mirrors [`format_logical`]'s shape: a
+/// `RecursiveCte` header line naming the CTE (and `UNION` vs `UNION ALL`),
+/// then the `Anchor`, `Recursive`, and `Main` subplans each rendered one
+/// indent level deeper under a labelled sub-header.
+pub fn format_recursive_cte(rec: &crate::plan::sql_frontend::RecursiveCtePlan) -> String {
+    let mut out = String::new();
+    let cols: Vec<&str> = rec.cte_schema.fields.iter().map(|f| f.name.as_str()).collect();
+    let union = if rec.all { "UNION ALL" } else { "UNION" };
+    let _ = writeln!(
+        out,
+        "RecursiveCte: name={} ({}) {union}",
+        rec.name,
+        cols.join(", ")
+    );
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Anchor:");
+    format_logical_into(&rec.anchor, 2, &mut out);
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Recursive:");
+    format_logical_into(&rec.recursive, 2, &mut out);
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Main:");
+    format_logical_into(&rec.main, 2, &mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Physical plan
 // ---------------------------------------------------------------------------
 
@@ -624,6 +659,34 @@ mod tests {
         assert!(out.contains("predicate=yes"), "got: {out}");
         assert!(out.contains("inputs="));
         assert!(out.contains("outputs="));
+    }
+
+    #[test]
+    fn recursive_cte_renders_anchor_recursive_main() {
+        use crate::plan::logical_plan::Field;
+        use crate::plan::sql_frontend::RecursiveCtePlan;
+        let cte_schema = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+        // Minimal stand-in subplans (the renderer only walks them structurally).
+        let scan = LogicalPlan::Scan {
+            table: "seq".to_string(),
+            projection: None,
+            schema: cte_schema.clone(),
+        };
+        let rec = RecursiveCtePlan {
+            name: "seq".to_string(),
+            cte_schema,
+            anchor: scan.clone(),
+            recursive: scan.clone(),
+            all: true,
+            main: scan,
+        };
+        let out = format_recursive_cte(&rec);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "RecursiveCte: name=seq (n) UNION ALL");
+        assert_eq!(lines[1], "  Anchor:");
+        assert_eq!(lines[2], "    Scan: table=seq");
+        assert_eq!(lines[3], "  Recursive:");
+        assert_eq!(lines[5], "  Main:");
     }
 
     #[test]

@@ -2390,6 +2390,21 @@ impl LogicalPlan {
     }
 }
 
+/// Apply an optional column-list alias to a CTE relation schema.
+///
+/// `WITH RECURSIVE c(a, b) AS (...)` renames a CTE relation's output columns
+/// to `a, b` (dtypes/nullability preserved). Used by the SQL frontend's
+/// recursive-CTE lowering (feature F1). The caller validates that
+/// `aliases.len() == base.fields.len()`; a length mismatch here is guarded
+/// defensively by zipping (extra fields keep their original names).
+pub(crate) fn apply_column_aliases(base: &Schema, aliases: &[String]) -> Schema {
+    let mut fields = base.fields.clone();
+    for (f, new_name) in fields.iter_mut().zip(aliases.iter()) {
+        f.name = new_name.clone();
+    }
+    Schema::new(fields)
+}
+
 /// Build the output schema of a JOIN over `left` and `right`.
 ///
 /// Concatenates the two schemas in order, but disambiguates any right-side

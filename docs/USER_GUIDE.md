@@ -153,20 +153,32 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
 
 - `[WITH ...] SELECT [DISTINCT] ... FROM <table> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`.
 - Aggregates: `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (GPU), plus host-side
-  `STDDEV` / `VAR` (scalar and grouped) and `SUM(Decimal128)`.
-  `SUM(Int32)` widens to `Int64` to prevent silent wraparound.
-  `COUNT(DISTINCT col)` is supported as the sole SELECT item. `COUNT` over
-  a `Date32` / `Timestamp` column works end-to-end; `MIN` / `MAX` over
-  those temporal types have GPU codegen but are not yet routed through the
-  executor (they currently error — see `SQL_REFERENCE.md`).
-- Scalar expressions: arithmetic and comparisons (GPU), `IN` / `BETWEEN`
-  (desugar to GPU comparison chains), `CASE` / `CAST` / `COALESCE` /
-  `NULLIF` (GPU for numeric/Bool results; rejected at GPU lowering for
-  string/Decimal/Date/Timestamp results), `LIKE` (GPU over `Utf8`),
-  `||` (host-side), `NOT` (GPU). String functions: `UPPER` / `LOWER` /
-  `LENGTH` (GPU), `SUBSTRING` / `TRIM` / `CONCAT` (host-side; `CONCAT` of
-  Utf8 columns is NULL-if-any-arg-NULL, with GPU two-pass kernels
-  implemented but the executor using a byte-identical host mirror for now).
+  `STDDEV` / `VAR` (scalar and grouped) and `SUM` / `MIN` / `MAX`
+  over `Decimal128`. `SUM(Int32)` widens to `Int64` to prevent silent
+  wraparound. `COUNT(DISTINCT col)` is supported as the sole SELECT item —
+  and, as of the 0.7 wave, also with a surrounding `SELECT DISTINCT` or a
+  `HAVING` over the count (no `GROUP BY`); `COUNT(DISTINCT)` *with*
+  `GROUP BY` is still rejected. `COUNT`, **`MIN`, and `MAX`** over a
+  `Date32` / `Timestamp` column all work end-to-end now (GPU reduction;
+  the date type / timestamp unit + timezone is preserved), in both the
+  scalar and `GROUP BY` paths; `SUM` over a temporal column is rejected by
+  design (see `SQL_REFERENCE.md`).
+- Scalar expressions: arithmetic and comparisons (GPU), including
+  `Decimal128` `+` / `-` / `*` / `/` and mixed Decimal/integer arithmetic
+  (GPU; scale-aligned comparisons too), `IN` / `BETWEEN` (desugar to GPU
+  comparison chains), `CASE` / `CAST` / `COALESCE` / `NULLIF` (GPU for
+  numeric / `Bool` / `Date32` / `Timestamp` results; a `Utf8`-result `CASE`
+  over a bare scan is **host-realized** with SQL 3VL; a `Decimal128`-result
+  `CASE` is still rejected at GPU lowering), `CAST` (GPU for numeric/`Bool`
+  pairs and for integer↔`Decimal128` / `Decimal128` rescale / integer→`Date32`;
+  Float↔`Decimal128` and CAST to/from `Timestamp` / `String` rejected at GPU
+  lowering), `LIKE` (GPU over `Utf8`), `||` (host-side), `NOT` (GPU). String
+  functions: `UPPER` / `LOWER` / `LENGTH` (GPU); `SUBSTRING` (literal args)
+  and single-arg `TRIM` over a bare `Utf8` scan are **host-realized** via the
+  `StringProject` producer (custom-chars `TRIM` and computed `SUBSTRING` args
+  fall back to the host `Project`); `CONCAT` is host-side and NULL-if-any-arg-
+  NULL (GPU two-pass kernels implemented but the executor uses a byte-identical
+  host mirror for now).
 - Joins: one or more `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS`
   JOINs per `SELECT`, with `ON` / `USING (...)` / `NATURAL` constraints
   (equi-keys only). Each shape has a gated GPU fast path that falls back
@@ -187,9 +199,12 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
 - Types: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`, dictionary-
   encoded `Utf8`, plus `Decimal128`, `Date32`, and `Timestamp` (with the
   per-type GPU-lowering caveats in `SQL_REFERENCE.md`). `Decimal128`,
-  `Date32`, and `Timestamp` columns now have GPU gather (filter /
-  compaction) and upload wired, so they survive a filtered query
-  end-to-end.
+  `Date32`, and `Timestamp` columns have GPU gather (filter / compaction)
+  and upload wired, so they survive a filtered query end-to-end.
+  `Decimal128` arithmetic (`+` / `-` / `*` / `/`, mixed with integers),
+  scale-aligned comparisons, and integer↔decimal / decimal-rescale CAST now
+  run on the GPU; temporal `MIN` / `MAX` run on the GPU and preserve the date
+  type / timestamp unit + timezone.
 - Utf8 predicates: equality / inequality against string literals (folded
   to integer comparisons on the dictionary index at plan time, GPU),
   `LIKE` (GPU as of v0.7, with a host-side fallback), and — as of v0.7 —
@@ -218,12 +233,13 @@ Anything outside the supported surface returns a structured
 `BoltError::Sql(...)` or `BoltError::Plan(...)` with the unsupported
 construct quoted in the message. Some *supported* constructs execute on
 a host-side code path rather than the GPU — the `||` concat operator,
-`SUBSTRING` / `TRIM` / `CONCAT`, `STDDEV` / `VAR`, `SUM(Decimal128)`,
-set operations (`EXCEPT` / `INTERSECT`), window functions, and host-side
-join / sort fallbacks — and a few constructs parse and type-check but are
-rejected at the GPU lowering boundary with a clear `"… not yet lowered
-to GPU"` message (e.g. `CAST` to/from Decimal/Date/Timestamp, `CASE` over
-those result types). `SQL_REFERENCE.md` tags every feature with its
+`SUBSTRING` / `TRIM` / `CONCAT`, a `Utf8`-result `CASE`, `STDDEV` / `VAR`,
+`SUM` / `MIN` / `MAX` over `Decimal128`, set operations
+(`EXCEPT` / `INTERSECT`), window functions, and host-side join / sort
+fallbacks — and a few constructs parse and type-check but are rejected at
+the GPU lowering boundary with a clear `"… not yet lowered to GPU"` message
+(e.g. `CAST` between Float and Decimal or to/from Timestamp/String, and a
+`Decimal128`-result `CASE`). `SQL_REFERENCE.md` tags every feature with its
 execution tier (GPU / host-side / GPU lowering pending).
 
 ---

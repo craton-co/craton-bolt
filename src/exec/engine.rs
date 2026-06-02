@@ -72,6 +72,39 @@ const PREDICATE_ENTRY: &str = "bolt_predicate";
 /// Threads per CUDA block for the 1D launch.
 const BLOCK_SIZE: u32 = 256;
 
+/// Hard safety cap on `WITH RECURSIVE` fixpoint iterations (feature F1).
+///
+/// Recursive CTEs can loop forever on bad input (a recursive term that never
+/// reaches a fixpoint), so [`Engine::execute_recursive_cte`] refuses to run
+/// more than this many iterations and returns a clean [`BoltError`] instead of
+/// spinning / OOMing. Generous enough for any realistic graph/tree traversal
+/// or integer sequence; override with [`MAX_RECURSIVE_ITERATIONS_ENV`].
+pub(crate) const MAX_RECURSIVE_ITERATIONS: usize = 1000;
+
+/// Environment-variable override for [`MAX_RECURSIVE_ITERATIONS`]. A positive
+/// integer raises (or lowers) the cap; a missing / non-integer / zero value
+/// falls back to the default. Mirrors the `CRATON_*` env convention used by
+/// the SQL frontend's size guards.
+pub(crate) const MAX_RECURSIVE_ITERATIONS_ENV: &str = "CRATON_MAX_RECURSIVE_ITERATIONS";
+
+/// Resolve the effective recursive-CTE iteration cap (env override or default).
+fn max_recursive_iterations() -> usize {
+    std::env::var(MAX_RECURSIVE_ITERATIONS_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_RECURSIVE_ITERATIONS)
+}
+
+/// Concatenate two `RecordBatch`es sharing a schema into one.
+///
+/// Thin wrapper over `arrow::compute::concat_batches` used by the recursive
+/// CTE fixpoint (feature F1) to grow the accumulated relation.
+fn concat_two_batches(a: &RecordBatch, b: &RecordBatch) -> BoltResult<RecordBatch> {
+    arrow::compute::concat_batches(&a.schema(), [a, b])
+        .map_err(|e| BoltError::Plan(format!("WITH RECURSIVE concat: {e}")))
+}
+
 /// Stage 7 (P1b): default interval between pool-stats emits in
 /// [`Engine::sql`].
 ///
@@ -1715,6 +1748,29 @@ impl Engine {
         // below so the `?`-chain stays intact.
         crate::metrics::metrics().inc(crate::metrics::Counter::QueriesTotal);
 
+        // F1: a `WITH RECURSIVE` query is detected and orchestrated as a
+        // host-side fixpoint before the ordinary parse→optimize→lower→execute
+        // pipeline (the recursive structure does not fit a single LogicalPlan
+        // that flows through that pipeline). `plan_recursive_cte` returns
+        // `Ok(None)` for every non-recursive query, so the common path falls
+        // straight through. Failures bump `QueriesFailed` to mirror the
+        // ordinary error accounting below.
+        match crate::plan::sql_frontend::plan_recursive_cte(query, &self.provider) {
+            Ok(Some(rec)) => {
+                let result = self.execute_recursive_cte(&rec);
+                if result.is_err() {
+                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                }
+                self.maybe_emit_pool_stats(Instant::now());
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                return Err(e);
+            }
+        }
+
         // Time the parse phase (SQL text → LogicalPlan) into the Parse
         // histogram; mirrors the `parse` tracing span in `observability`.
         let parse_start = Instant::now();
@@ -1832,6 +1888,16 @@ impl Engine {
     /// yet support (e.g. `CASE`, `CAST`) still return their logical plan, with
     /// the lowering error noted in place of the physical section.
     pub fn explain_sql(&self, query: &str) -> BoltResult<String> {
+        // F1: a `WITH RECURSIVE` query has no single LogicalPlan; render its
+        // three subplans via the dedicated formatter instead.
+        if let Some(rec) =
+            crate::plan::sql_frontend::plan_recursive_cte(query, &self.provider)?
+        {
+            return Ok(format!(
+                "Recursive CTE plan:\n{}",
+                crate::plan::explain::format_recursive_cte(&rec)
+            ));
+        }
         let plan: LogicalPlan = parse_sql(query, &self.provider)?;
         let plan = self.dict_registry.rewrite_plan(&plan)?;
         let plan = self.rewrites.iter().try_fold(plan, |p, r| r.rewrite(p))?;
@@ -1990,6 +2056,169 @@ impl Engine {
         drop(nb);
         let handle = self.execute(&phys)?;
         Ok(handle.into_record_batch())
+    }
+
+    /// Execute a `WITH RECURSIVE` query (feature F1) by orchestrating a
+    /// host-side fixpoint, then running the main query over the accumulated
+    /// CTE relation.
+    ///
+    /// Algorithm (correctness-first, reusing the existing subplan executor):
+    ///
+    /// 1. **Seed.** Execute the anchor term → the initial working set (and the
+    ///    initial accumulated result). For `UNION` (distinct) the seed is
+    ///    deduplicated.
+    /// 2. **Iterate.** Register the *working set* (the previous iteration's
+    ///    newly-produced rows) as an ephemeral in-memory table named after the
+    ///    CTE, then execute the recursive term (its `cte` scan reads that
+    ///    table). For `UNION ALL` every produced row is appended and the new
+    ///    working set is the whole recursive output; iteration stops when an
+    ///    iteration produces zero rows. For `UNION` the recursive output is
+    ///    de-duplicated against the full accumulated result (via
+    ///    [`crate::exec::distinct::execute_distinct`]); iteration stops at the
+    ///    fixpoint (the de-duplicated result stops growing). See the inline
+    ///    comment on the `UNION` branch for why this uses a naive (whole-result)
+    ///    working set rather than a row-order-dependent delta.
+    /// 3. **Cap.** A hard cap ([`max_recursive_iterations`], default
+    ///    [`MAX_RECURSIVE_ITERATIONS`], env-overridable) bounds the loop and
+    ///    returns a clean [`BoltError`] if exceeded — recursive CTEs can loop
+    ///    forever on bad input, so this guard is mandatory.
+    /// 4. **Main.** Register the full accumulated relation as the CTE table and
+    ///    run the main query over it.
+    ///
+    /// The ephemeral CTE table lives only in the interior-mutable streaming
+    /// overlay (so this method can stay `&self`, matching [`Engine::sql`]); it
+    /// is removed before returning. A name collision with a real registered
+    /// table is rejected up front.
+    fn execute_recursive_cte(
+        &self,
+        rec: &crate::plan::sql_frontend::RecursiveCtePlan,
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::distinct::execute_distinct;
+        use crate::exec::streaming::TableSource;
+
+        // Refuse to shadow a real table — the ephemeral overlay registration
+        // would otherwise clobber the user's data for the duration of the
+        // query (and the cleanup below would wrongly delete a real table's
+        // overlay entry).
+        if self.tables.contains_key(&rec.name)
+            || self.streaming_sources.borrow().contains_key(&rec.name)
+        {
+            return Err(BoltError::Plan(format!(
+                "WITH RECURSIVE: CTE name '{}' collides with a registered \
+                 table — rename the CTE",
+                rec.name
+            )));
+        }
+
+        // The ephemeral CTE table must present exactly the CTE's declared
+        // column names (the recursive term / main query scan it by name). The
+        // anchor and recursive subplans may emit differently-named columns, so
+        // every produced batch is re-labelled to `rec.cte_schema` before it is
+        // registered.
+        let arrow_schema = plan_schema_to_arrow_schema(&rec.cte_schema)?;
+        let relabel = |batch: RecordBatch| -> BoltResult<RecordBatch> {
+            if batch.num_columns() != arrow_schema.fields().len() {
+                return Err(BoltError::Plan(format!(
+                    "WITH RECURSIVE: a term produced {} columns but the CTE \
+                     '{}' declares {}",
+                    batch.num_columns(),
+                    rec.name,
+                    arrow_schema.fields().len()
+                )));
+            }
+            RecordBatch::try_new(Arc::clone(&arrow_schema), batch.columns().to_vec())
+                .map_err(|e| BoltError::Plan(format!("WITH RECURSIVE relabel: {e}")))
+        };
+
+        // Run a subplan with the CTE table bound to `rows` in the overlay.
+        // The ephemeral table's contents change every iteration but reuse the
+        // same name, and the engine has no host-revision tracking for an
+        // overlay table — so we evict any GPU-resident copy from the previous
+        // iteration BEFORE and AFTER each run, forcing `ensure_gpu_table` to
+        // re-upload the current working set rather than reuse stale device
+        // columns. The overlay entry is always cleared afterwards so a failure
+        // mid-loop can't leak an ephemeral table into a later query.
+        let run_with_cte = |rows: &RecordBatch, plan: &LogicalPlan| -> BoltResult<RecordBatch> {
+            self.gpu_tables.borrow_mut().remove(&rec.name);
+            self.streaming_sources.borrow_mut().insert(
+                rec.name.clone(),
+                TableSource::Materialized(vec![rows.clone()]),
+            );
+            let out = self.run_subplan(plan.clone());
+            self.streaming_sources.borrow_mut().remove(&rec.name);
+            self.gpu_tables.borrow_mut().remove(&rec.name);
+            out
+        };
+
+        // --- 1. Seed: execute the anchor term. ---
+        let anchor_out = relabel(self.run_subplan(rec.anchor.clone())?)?;
+        // For UNION (distinct) the accumulated result is kept de-duplicated.
+        let mut result = if rec.all {
+            anchor_out.clone()
+        } else {
+            execute_distinct(QueryHandle::from_record_batch(anchor_out.clone()))?
+                .into_record_batch()
+        };
+        // The working set fed into the first recursive iteration is the seed
+        // (its de-duplicated form for UNION).
+        let mut working_set = result.clone();
+
+        let cap = max_recursive_iterations();
+        let mut iters = 0usize;
+
+        // --- 2. Iterate to a fixpoint. ---
+        loop {
+            if working_set.num_rows() == 0 {
+                break; // No rows to drive the next iteration → fixpoint.
+            }
+            iters += 1;
+            if iters > cap {
+                return Err(BoltError::Plan(format!(
+                    "WITH RECURSIVE: exceeded the {cap}-iteration safety cap \
+                     (set {MAX_RECURSIVE_ITERATIONS_ENV} to override) — the \
+                     recursion is not terminating"
+                )));
+            }
+
+            let rec_out = relabel(run_with_cte(&working_set, &rec.recursive)?)?;
+
+            if rec.all {
+                // UNION ALL: append every produced row; the next working set is
+                // the whole recursive output. Stop when it is empty.
+                if rec_out.num_rows() == 0 {
+                    break;
+                }
+                result = concat_two_batches(&result, &rec_out)?;
+                working_set = rec_out;
+            } else {
+                // UNION (distinct): de-duplicate the recursive output against
+                // the full accumulated result. The fixpoint is detected by row
+                // COUNT (order-independent, so this is robust whether
+                // `execute_distinct` ran the order-preserving host path or the
+                // sorted GPU path): if de-duplicating the union of the current
+                // result with the new output adds no rows, we are at the
+                // fixpoint. Otherwise the *whole* de-duplicated result becomes
+                // the next working set — a naive (rather than semi-naive)
+                // evaluation. It is correct for set semantics (re-deriving
+                // already-known rows is harmless under dedup) and terminates
+                // because the de-duplicated result is monotonically growing and
+                // bounded; we trade a little redundant work for correctness
+                // that does not depend on row ordering.
+                let prev_rows = result.num_rows();
+                let combined = concat_two_batches(&result, &rec_out)?;
+                let deduped = execute_distinct(QueryHandle::from_record_batch(combined))?
+                    .into_record_batch();
+                if deduped.num_rows() == prev_rows {
+                    break; // Fixpoint: no rows the result didn't already hold.
+                }
+                working_set = deduped.clone();
+                result = deduped;
+            }
+        }
+
+        // --- 4. Run the main query over the full accumulated relation. ---
+        let main_out = run_with_cte(&result, &rec.main)?;
+        Ok(QueryHandle::from_record_batch(main_out))
     }
 
     /// Emit a periodic pool-stats log line + observer notification if
@@ -5688,5 +5917,118 @@ mod tests {
         let h2 = engine.sql("SELECT COUNT(x) FROM t").expect("second query");
         let c = h2.record_batch().column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(c.value(0), total as i64, "overlay restored: full table visible");
+    }
+
+    // -----------------------------------------------------------------------
+    // F1: WITH RECURSIVE fixpoint execution
+    // -----------------------------------------------------------------------
+
+    /// `max_recursive_iterations()` parses the env override (positive only)
+    /// and otherwise returns the default. Host-only — no device needed.
+    #[test]
+    fn recursive_iteration_cap_env_parsing() {
+        // Default when unset.
+        std::env::remove_var(MAX_RECURSIVE_ITERATIONS_ENV);
+        assert_eq!(max_recursive_iterations(), MAX_RECURSIVE_ITERATIONS);
+        // A positive override is honoured.
+        std::env::set_var(MAX_RECURSIVE_ITERATIONS_ENV, "7");
+        assert_eq!(max_recursive_iterations(), 7);
+        // Zero / garbage fall back to the default.
+        std::env::set_var(MAX_RECURSIVE_ITERATIONS_ENV, "0");
+        assert_eq!(max_recursive_iterations(), MAX_RECURSIVE_ITERATIONS);
+        std::env::set_var(MAX_RECURSIVE_ITERATIONS_ENV, "not-a-number");
+        assert_eq!(max_recursive_iterations(), MAX_RECURSIVE_ITERATIONS);
+        std::env::remove_var(MAX_RECURSIVE_ITERATIONS_ENV);
+    }
+
+    /// A one-column `edges(src, dst)` fixture for the recursive execution
+    /// tests below.
+    #[cfg(test)]
+    fn register_edges(engine: &mut Engine) {
+        // edges: 1->2, 2->3, 3->4
+        let src: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
+        let dst: ArrayRef = Arc::new(Int64Array::from(vec![2_i64, 3, 4]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("src", ArrowDataType::Int64, false),
+            ArrowField::new("dst", ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![src, dst]).expect("edges batch");
+        engine.register_table("edges", batch).expect("register edges");
+    }
+
+    /// End-to-end: an integer sequence `1..=5` via UNION ALL accumulates
+    /// exactly five rows (1,2,3,4,5). Needs a device because the subplans run
+    /// through the normal GPU execute path.
+    #[test]
+    #[ignore = "gpu:e2e — recursive CTE subplans run through the GPU execute path"]
+    fn recursive_integer_sequence_accumulates_rows() {
+        let mut engine = Engine::new().expect("ctx");
+        register_edges(&mut engine); // base table so the provider is non-empty
+        // Seed from a base table (the frontend requires a FROM clause, so a
+        // bare `SELECT 1` anchor is not available): `src = 1` selects the
+        // single row valued 1 from `edges`.
+        let h = engine
+            .sql(
+                "WITH RECURSIVE seq(n) AS (\
+                     SELECT src FROM edges WHERE src = 1 \
+                     UNION ALL \
+                     SELECT n + 1 FROM seq WHERE n < 5\
+                 ) SELECT n FROM seq ORDER BY n",
+            )
+            .expect("recursive integer sequence must execute");
+        let b = h.record_batch();
+        assert_eq!(b.num_rows(), 5, "1..=5 is five rows");
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<i64> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// End-to-end: a graph reachability traversal from node 1 over `edges`
+    /// reaches {1,2,3,4}. UNION (distinct) dedups, so the result is a set.
+    #[test]
+    #[ignore = "gpu:e2e — recursive CTE subplans run through the GPU execute path"]
+    fn recursive_graph_reachability() {
+        let mut engine = Engine::new().expect("ctx");
+        register_edges(&mut engine);
+        let h = engine
+            .sql(
+                "WITH RECURSIVE reach(node) AS (\
+                     SELECT src FROM edges WHERE src = 1 \
+                     UNION \
+                     SELECT edges.dst FROM edges, reach WHERE edges.src = reach.node\
+                 ) SELECT node FROM reach ORDER BY node",
+            )
+            .expect("recursive reachability must execute");
+        let b = h.record_batch();
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<i64> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec![1, 2, 3, 4], "reachable set from node 1");
+    }
+
+    /// A non-terminating recursion (`n` grows without bound, never filtered)
+    /// must hit the iteration cap and return a clean error rather than
+    /// spinning forever. We lower the cap via the env override to keep the
+    /// test fast.
+    #[test]
+    #[ignore = "gpu:e2e — recursive CTE subplans run through the GPU execute path"]
+    fn recursive_non_terminating_hits_cap() {
+        let mut engine = Engine::new().expect("ctx");
+        register_edges(&mut engine);
+        std::env::set_var(MAX_RECURSIVE_ITERATIONS_ENV, "16");
+        let err = engine
+            .sql(
+                "WITH RECURSIVE seq(n) AS (\
+                     SELECT src FROM edges WHERE src = 1 \
+                     UNION ALL \
+                     SELECT n + 1 FROM seq\
+                 ) SELECT n FROM seq",
+            )
+            .expect_err("a non-terminating recursion must hit the cap");
+        std::env::remove_var(MAX_RECURSIVE_ITERATIONS_ENV);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("safety cap") || msg.contains("not terminating"),
+            "expected iteration-cap error, got: {msg}"
+        );
     }
 }
