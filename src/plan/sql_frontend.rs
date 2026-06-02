@@ -1213,6 +1213,432 @@ impl RecursiveCtePlan {
     }
 }
 
+// ---------------------------------------------------------------------------
+// COUNT(DISTINCT col) with GROUP BY (feature F3-finish)
+// ---------------------------------------------------------------------------
+
+/// Reserved ephemeral table name used by [`CountDistinctGroupByPlan::post`] to
+/// reference the host-built count result. Mirrors the WITH RECURSIVE pattern,
+/// where the engine binds an in-memory relation under a name the post-plan's
+/// `Scan` reads. The leading `__` keeps it out of any user namespace (user
+/// identifiers are case-folded but never synthesise this prefix).
+pub const COUNT_DISTINCT_GROUPBY_RESULT_TABLE: &str = "__count_distinct_groupby_result";
+
+/// Descriptor for a `COUNT(DISTINCT <col>)` query with a `GROUP BY` (feature
+/// F3-finish), executed as a host-orchestrated engine special-case rather than
+/// a plan node.
+///
+/// The plan-node route is blocked: `physical_plan.rs`'s `is_scan_chain`
+/// requires a GROUP BY `Aggregate` to sit directly on a Scan/Filter/Project
+/// chain (it rejects a `Distinct`/`Aggregate` child), and `AggregateExpr` has
+/// no `CountDistinct` variant — adding either would touch shared files and
+/// break exhaustive matches. So, exactly like [`RecursiveCtePlan`], this is a
+/// standalone descriptor the engine orchestrates host-side: it runs [`Self::base`]
+/// (an ordinary `LogicalPlan` that flows through the normal pipeline), groups
+/// the resulting rows host-side by the leading group-key columns, counts the
+/// DISTINCT non-NULL values of the trailing distinct column per group, and
+/// (optionally) runs [`Self::post`] over the count result to apply HAVING /
+/// ORDER BY / LIMIT.
+///
+/// See [`plan_count_distinct_groupby`] for the exact shape detected vs.
+/// rejected.
+#[derive(Debug, Clone)]
+pub struct CountDistinctGroupByPlan {
+    /// Base subplan: `SELECT <group_keys...>, <distinct_col> FROM <table>
+    /// [WHERE ...]`. The group-key columns come first (in SELECT/GROUP-BY
+    /// order), the distinct-counted column last. Flows through the ordinary
+    /// optimize → lower → execute pipeline as a normal `LogicalPlan`.
+    pub base: LogicalPlan,
+    /// Output names of the group-key columns, in order — these are the leading
+    /// columns of `base`'s output schema and of the result schema.
+    pub group_key_names: Vec<String>,
+    /// Output alias for the `Int64` count column appended after the group keys
+    /// in the result (the SELECT alias, or the canonical aggregate name).
+    pub count_alias: String,
+    /// Schema of the host-built count result: the group-key fields (carried
+    /// from `base`'s schema) followed by the `Int64` count column.
+    pub result_schema: Schema,
+    /// Optional post-processing plan (HAVING → `Filter`, ORDER BY → `Sort`,
+    /// LIMIT → `Limit`) layered over a synthetic `Scan` of `result_schema`
+    /// named [`COUNT_DISTINCT_GROUPBY_RESULT_TABLE`]. `None` when the query has
+    /// none of those clauses (the count result is returned directly).
+    pub post: Option<LogicalPlan>,
+}
+
+impl CountDistinctGroupByPlan {
+    /// Overall output schema. With a `post` plan the schema is that plan's
+    /// (HAVING/ORDER BY/LIMIT are schema-preserving here, but a future Project
+    /// would not be); otherwise it is the count-result schema.
+    pub fn schema(&self) -> BoltResult<Schema> {
+        match &self.post {
+            Some(p) => p.schema(),
+            None => Ok(self.result_schema.clone()),
+        }
+    }
+}
+
+/// Detect and plan a top-level single-`SELECT` carrying a `GROUP BY` whose
+/// aggregate list is *exactly one* `COUNT(DISTINCT <col>)` (feature
+/// F3-finish).
+///
+/// Returns `Ok(Some(descriptor))` ONLY for that precise shape; `Ok(None)` for
+/// everything else (the caller then falls through to the ordinary
+/// [`parse`]/`plan_select` pipeline, which keeps producing the precise
+/// rejections for the richer mixes this does not implement). A malformed query
+/// of the right *shape* (e.g. a bad LIMIT literal) returns `Err`.
+///
+/// # Supported shape
+///
+/// A single `SELECT`:
+/// * body is one `SELECT` (no UNION / set-op, no `WITH`);
+/// * a plain `GROUP BY <keys>` (not ROLLUP / CUBE / GROUPING SETS / ALL);
+/// * the SELECT list is the group keys (each a non-aggregate expression that is
+///   a declared group key, and every declared key must be projected) followed
+///   by exactly one `COUNT(DISTINCT <col>)` item as the **last** SELECT item,
+///   optionally aliased (count-last keeps the result-column order == SELECT
+///   order with no reprojection);
+/// * optional `WHERE`, `HAVING` (over the count and/or group keys), `ORDER BY`,
+///   `LIMIT`/`OFFSET`.
+///
+/// # Falls through (`Ok(None)`) — handled / rejected by the ordinary pipeline
+///
+/// * no `GROUP BY`, or no `COUNT(DISTINCT)` in the SELECT list (ordinary
+///   queries);
+/// * ROLLUP / CUBE / GROUPING SETS / `GROUP BY ALL`;
+/// * `COUNT(DISTINCT)` alongside any *other* aggregate, or *more than one*
+///   `COUNT(DISTINCT)`, or a non-group-key, non-`COUNT(DISTINCT)` SELECT item
+///   (these reach `plan_select`, whose existing messages reject them);
+/// * `SELECT DISTINCT` over this shape (kept to the existing path).
+pub fn plan_count_distinct_groupby(
+    sql: &str,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<CountDistinctGroupByPlan>> {
+    guard_sql_size(sql)?;
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    if stmts.len() != 1 {
+        // Let the ordinary pipeline produce the canonical multi-statement error.
+        return Ok(None);
+    }
+    let stmt = stmts.remove(0);
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    // No CTEs / set-ops / dialect tail clauses here — those route through the
+    // ordinary pipeline (or the recursive-CTE hook).
+    if query.with.is_some() {
+        return Ok(None);
+    }
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Ok(None),
+    };
+
+    // Must be a plain GROUP BY (reject super-aggregates / GROUP BY ALL by
+    // falling through, since `parse_group_by` rejects those and we only want
+    // to special-case the plain form).
+    let parsed_group_by = match parse_group_by(&select.group_by) {
+        Ok(p) => p,
+        // A super-aggregate / GROUP BY ALL shape: not ours — fall through so
+        // the ordinary path emits its message.
+        Err(_) => return Ok(None),
+    };
+    if parsed_group_by.is_super || parsed_group_by.all_cols.is_empty() {
+        // No plain GROUP BY keys → not the shape we handle.
+        return Ok(None);
+    }
+
+    // SELECT DISTINCT over this shape stays on the existing path.
+    if select.distinct.is_some() {
+        return Ok(None);
+    }
+
+    // We need a resolver to recognise COUNT(DISTINCT ...). `try_count_distinct`
+    // does not actually consult the resolver, but the signature requires one;
+    // an empty resolver is sufficient for detection.
+    let resolver = NameResolver::empty();
+
+    // Expand the SELECT list into (expr, alias). Wildcards can't be group-key
+    // SELECT items in a well-formed GROUP BY query of our shape; if present we
+    // fall through (the ordinary path will reject / expand as it sees fit).
+    let mut items: Vec<(SqlExpr, Option<String>)> = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) => items.push((e.clone(), None)),
+            SelectItem::ExprWithAlias { expr, alias } => {
+                items.push((expr.clone(), Some(ident_to_name(alias))))
+            }
+            // Wildcards / qualified wildcards in a COUNT(DISTINCT) GROUP BY
+            // SELECT list are not our shape — defer to the ordinary path.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return Ok(None),
+        }
+    }
+
+    // Locate the COUNT(DISTINCT ...) items. `try_count_distinct` returns an
+    // Err for malformed DISTINCT-quantified forms (e.g. `SUM(DISTINCT x)`,
+    // `COUNT(DISTINCT *)`); since detection runs before the ordinary pipeline
+    // and we want those precise messages to come from the ordinary path, we
+    // treat such an Err as "not our shape" and fall through.
+    let mut cd_positions: Vec<usize> = Vec::new();
+    for (i, (e, _)) in items.iter().enumerate() {
+        match try_count_distinct(e, &resolver) {
+            Ok(Some(_)) => cd_positions.push(i),
+            Ok(None) => {}
+            Err(_) => return Ok(None),
+        }
+    }
+    // Exactly one COUNT(DISTINCT) — zero means an ordinary query, more than one
+    // is an unsupported mix (the ordinary path rejects it precisely).
+    if cd_positions.len() != 1 {
+        return Ok(None);
+    }
+    let cd_index = cd_positions[0];
+    // We support the COUNT(DISTINCT) as the *last* SELECT item only (the common
+    // `SELECT keys..., COUNT(DISTINCT x)` form). When it appears earlier, the
+    // result-column order would diverge from the SELECT list; rather than emit
+    // columns in the wrong order we fall through (the ordinary path rejects the
+    // shape). Group keys then occupy SELECT positions `0..cd_index` and the
+    // count is last — so result order == SELECT order with no reprojection.
+    if cd_index != items.len() - 1 {
+        return Ok(None);
+    }
+
+    // Every *other* SELECT item must be a non-aggregate expression that is a
+    // declared GROUP BY key. We compare the *raw* SQL expressions structurally
+    // (sqlparser `SqlExpr: PartialEq`): a group key is normally written
+    // identically in SELECT and GROUP BY. Any item that
+    //   * contains an aggregate (a second aggregate alongside COUNT(DISTINCT)),
+    //     or
+    //   * does not match a GROUP BY expression (e.g. a non-grouped column,
+    //     which is not valid SQL for this shape),
+    // is NOT our shape: fall through so the ordinary `plan_select` path emits
+    // its precise message (the conservative structural compare also defers any
+    // equivalent-but-differently-spelled key to that path rather than risk a
+    // wrong host grouping).
+    for (i, (e, _)) in items.iter().enumerate() {
+        if i == cd_index {
+            continue;
+        }
+        match contains_aggregate(e, &resolver, 0) {
+            Ok(true) => return Ok(None),
+            Ok(false) => {}
+            Err(_) => return Ok(None),
+        }
+        if !parsed_group_by.all_cols.iter().any(|g| g == e) {
+            return Ok(None);
+        }
+    }
+
+    // Conversely, every declared GROUP BY key must appear in the SELECT list:
+    // the host orchestrator builds its base from the SELECTed columns, so a key
+    // that is grouped-by but not projected cannot be grouped on. If any GROUP
+    // BY key is missing from the (non-COUNT-DISTINCT) SELECT items, this is not
+    // our shape — fall through (the ordinary path rejects it precisely, rather
+    // than the engine silently ignoring the missing key).
+    let non_cd_items: Vec<&SqlExpr> = items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != cd_index)
+        .map(|(_, (e, _))| e)
+        .collect();
+    for g in &parsed_group_by.all_cols {
+        if !non_cd_items.iter().any(|e| *e == g) {
+            return Ok(None);
+        }
+    }
+
+    // The distinct-counted argument expression and the count column's output
+    // alias.
+    let distinct_arg = match try_count_distinct(&items[cd_index].0, &resolver)? {
+        Some(inner) => inner.clone(),
+        None => return Ok(None),
+    };
+    let count_alias = match &items[cd_index].1 {
+        Some(a) => a.clone(),
+        None => aggregate_output_name(&AggregateExpr::Count(Expr::Literal(Literal::Int64(1)))),
+    };
+
+    // Build the base SELECT by cloning the original and rewriting the
+    // projection so the COUNT(DISTINCT col) item becomes a bare `col`, and the
+    // GROUP BY / HAVING / DISTINCT are stripped (the base just materialises the
+    // (group_keys..., distinct_col) rows; grouping + counting happen
+    // host-side). This reuses the full `plan_select` machinery (FROM, WHERE,
+    // column resolution, type-checking) rather than re-deriving it.
+    let mut base_select = select.clone();
+    base_select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
+    base_select.having = None;
+    base_select.distinct = None;
+    base_select.projection = {
+        let mut p: Vec<SelectItem> = Vec::with_capacity(items.len());
+        for (i, item) in select.projection.iter().enumerate() {
+            if i == cd_index {
+                // Replace COUNT(DISTINCT <arg>) with the bare distinct argument
+                // (unaliased; we recover it positionally as the last column).
+                p.push(SelectItem::UnnamedExpr(distinct_arg.clone()));
+            } else {
+                p.push(item.clone());
+            }
+        }
+        p
+    };
+
+    // Lower the base SELECT. Since the COUNT(DISTINCT) item is the LAST SELECT
+    // item, the base output is already `[group_keys..., distinct_col]` — exactly
+    // the layout the host group-distinct-count step expects (leading keys,
+    // trailing distinct value). No reprojection is needed.
+    let base = plan_select(&base_select, provider, &CteScope::new(), 0)?;
+    let base_schema = base.schema()?;
+    if base_schema.fields.len() != items.len() || base_schema.fields.is_empty() {
+        // Should not happen for our shape, but guard rather than panic.
+        return Ok(None);
+    }
+
+    // Group keys are the leading `items.len() - 1` output columns; the distinct
+    // column is the last (at `cd_index`).
+    let group_key_fields: Vec<crate::plan::logical_plan::Field> =
+        base_schema.fields[..cd_index].to_vec();
+    let group_key_names: Vec<String> =
+        group_key_fields.iter().map(|f| f.name.clone()).collect();
+
+    // Result schema: group-key fields (carried through), then the Int64 count.
+    // The count is non-nullable (COUNT never produces SQL NULL).
+    let mut result_fields = group_key_fields;
+    result_fields.push(crate::plan::logical_plan::Field::new(
+        count_alias.clone(),
+        DataType::Int64,
+        false,
+    ));
+    let result_schema = Schema::new(result_fields);
+
+    // Build the optional post-plan (HAVING / ORDER BY / LIMIT) over a synthetic
+    // Scan of the result. Reuses the ordinary lowering helpers so HAVING /
+    // ORDER BY can reference the count by its `COUNT(DISTINCT col)` call, by
+    // alias, or a group key by name.
+    let post = build_count_distinct_post_plan(
+        &query,
+        select,
+        &distinct_arg,
+        &count_alias,
+        &result_schema,
+        provider,
+    )?;
+
+    Ok(Some(CountDistinctGroupByPlan {
+        base,
+        group_key_names,
+        count_alias,
+        result_schema,
+        post,
+    }))
+}
+
+/// Build the optional HAVING/ORDER BY/LIMIT post-plan for a
+/// [`CountDistinctGroupByPlan`], layered over a synthetic `Scan` of the count
+/// result. Returns `Ok(None)` when the query has none of those clauses.
+///
+/// The synthetic scan is named [`COUNT_DISTINCT_GROUPBY_RESULT_TABLE`]; the
+/// engine binds the host-built result batch under that name before running the
+/// post-plan through the ordinary subplan executor (mirroring the WITH
+/// RECURSIVE overlay). HAVING is lowered with
+/// [`lower_having_over_count_distinct`] so `COUNT(DISTINCT col)` in HAVING maps
+/// onto the result's count column; ORDER BY / LIMIT reuse the same helpers as
+/// the ordinary query tail.
+fn build_count_distinct_post_plan(
+    query: &Query,
+    select: &Select,
+    distinct_arg: &SqlExpr,
+    count_alias: &str,
+    result_schema: &Schema,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<LogicalPlan>> {
+    let has_having = select.having.is_some();
+    let has_order = query
+        .order_by
+        .as_ref()
+        .map(|o| !o.exprs.is_empty())
+        .unwrap_or(false);
+    let has_limit = query.limit.is_some() || query.offset.is_some();
+    if !has_having && !has_order && !has_limit {
+        return Ok(None);
+    }
+
+    // Synthetic scan over the result relation. A resolver scoped to this schema
+    // lets HAVING / ORDER BY reference the result columns (group keys + count).
+    let scan = LogicalPlan::Scan {
+        table: COUNT_DISTINCT_GROUPBY_RESULT_TABLE.to_string(),
+        projection: None,
+        schema: result_schema.clone(),
+    };
+    let ctes = CteScope::new();
+    let mut plan = scan;
+
+    // HAVING → Filter over the count column. `lower_having_over_count_distinct`
+    // resolves a `COUNT(DISTINCT col)` reference to `count_alias` (the result
+    // column) when its argument matches the SELECT's distinct argument; a group
+    // key referenced by name lowers as an ordinary column.
+    if let Some(having_sql) = &select.having {
+        let mut resolver = NameResolver::empty();
+        resolver.ctx = Some(SubqueryCtx {
+            provider,
+            ctes: &ctes,
+        });
+        resolver.push_base(COUNT_DISTINCT_GROUPBY_RESULT_TABLE.to_string(), result_schema);
+        let predicate = lower_having_over_count_distinct(
+            having_sql,
+            distinct_arg,
+            &resolver,
+            count_alias,
+            0,
+        )?;
+        validate_having_columns(&predicate, result_schema)?;
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
+
+    // ORDER BY → Sort over the result schema.
+    if let Some(order_by) = &query.order_by {
+        let sort_exprs = lower_order_by(
+            &order_by.exprs,
+            SubqueryCtx {
+                provider,
+                ctes: &ctes,
+            },
+        )?;
+        if !sort_exprs.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                sort_exprs,
+            };
+        }
+    }
+
+    // LIMIT [OFFSET] → Limit. Mirrors `plan_query`'s handling.
+    let limit_value = match &query.limit {
+        Some(e) => Some(usize_from_literal(e, "LIMIT")?),
+        None => None,
+    };
+    let offset_value = match &query.offset {
+        Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
+        None => None,
+    };
+    if limit_value.is_some() || offset_value.is_some() {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: limit_value.unwrap_or(usize::MAX),
+            offset: offset_value.unwrap_or(0),
+        };
+    }
+
+    // Force a type-check so a bad HAVING/ORDER BY reference surfaces at plan
+    // time rather than execution.
+    let _ = plan.schema()?;
+    Ok(Some(plan))
+}
+
 /// Detect and plan a top-level `WITH RECURSIVE` query (feature F1).
 ///
 /// Returns `Ok(Some(plan))` when `sql` is a single `SELECT` statement carrying
@@ -2473,21 +2899,41 @@ fn plan_select(
                         .into(),
                 ));
             }
-            // COUNT(DISTINCT col) combined with GROUP BY needs a per-group
-            // distinct count, which cannot be expressed with the existing
-            // logical/physical plan nodes: the natural lowering is a two-level
-            // aggregate (inner Distinct over (g, col), outer COUNT per g), but
-            // the physical planner's `lower_aggregate` requires a GROUP BY
-            // Aggregate to sit directly on a Scan/Filter/Project chain
-            // (`is_scan_chain`) — a Distinct child is rejected. A correct
-            // implementation requires a new `AggregateExpr::CountDistinct`
-            // variant plus planner + GROUP BY executor support (all in files
-            // outside this feature's edit set: logical_plan.rs, physical_plan.rs,
-            // and the dispatch in engine.rs). Kept as a precise rejection until
-            // those shared nodes exist (documented for the orchestrator).
+            // COUNT(DISTINCT col) with a *plain* GROUP BY — the common shape
+            // where the group keys also appear in the SELECT list — is now
+            // supported, but as a host-orchestrated engine special-case that is
+            // intercepted *before* this parse path (see
+            // [`plan_count_distinct_groupby`] and
+            // `Engine::execute_count_distinct_groupby`, feature F3-finish). Any
+            // query that reaches HERE with a GROUP BY is therefore one the
+            // detector deliberately declined and which this parse path CANNOT
+            // lower correctly, namely:
+            //
+            //   * a *super-aggregate* GROUP BY (ROLLUP / CUBE / GROUPING SETS) —
+            //     the per-set grouping-set combinatorics are not implemented for
+            //     the distinct count;
+            //   * a *plain* GROUP BY whose keys are NOT all present in the SELECT
+            //     list (e.g. `SELECT COUNT(DISTINCT x) FROM t GROUP BY k`) — the
+            //     host orchestrator builds its base projection from the SELECTed
+            //     group keys, so it cannot group by a key it cannot see;
+            //   * the raw `parse()` API (which bypasses the engine detector
+            //     entirely — like WITH RECURSIVE, this feature is only wired into
+            //     `Engine::sql` / `Engine::explain_sql`).
+            //
+            // All of these must be REJECTED here rather than fall through to the
+            // no-GROUP-BY lowering below (which would silently ignore the GROUP
+            // BY and return a single whole-table distinct count). A general
+            // plan-node lowering would still require a new
+            // `AggregateExpr::CountDistinct` variant plus planner / executor
+            // support in shared files outside this feature's edit set
+            // (logical_plan.rs, physical_plan.rs).
             if !group_by_sql.is_empty() || parsed_group_by.is_super {
                 return Err(BoltError::Sql(
-                    "COUNT(DISTINCT col) with GROUP BY is not supported".into(),
+                    "COUNT(DISTINCT col) with GROUP BY is only supported when the \
+                     group-key columns also appear in the SELECT list (and not with \
+                     ROLLUP/CUBE/GROUPING SETS); rewrite the query to project the \
+                     grouping columns"
+                        .into(),
                 ));
             }
             let (sql_expr, alias) = &items[0];
@@ -7985,20 +8431,23 @@ mod wave7_tests {
         );
     }
 
-    /// COUNT(DISTINCT col) combined with GROUP BY remains rejected (needs a new
-    /// `AggregateExpr::CountDistinct` variant + planner/executor support, all in
-    /// files outside this feature's edit set). Must be a clean `Err`, no panic.
+    /// COUNT(DISTINCT col) with GROUP BY through the *raw* `parse` API (which
+    /// bypasses the engine's host-orchestrated F3-finish detector — the feature
+    /// is wired into `Engine::sql` only, like WITH RECURSIVE) is rejected
+    /// cleanly. The same is true for a plain GROUP BY whose key (`a` here) is
+    /// not projected in the SELECT list, which the detector also declines.
+    /// Must be a clean `Err`, no panic.
     #[test]
     fn count_distinct_with_group_by_is_rejected_cleanly() {
         let err = parse(
             "SELECT COUNT(DISTINCT b) FROM t1 GROUP BY a",
             &provider(),
         )
-        .expect_err("COUNT(DISTINCT) with GROUP BY must be rejected");
+        .expect_err("COUNT(DISTINCT) with GROUP BY must be rejected on the parse path");
         let msg = format!("{err}");
         assert!(
-            msg.contains("GROUP BY is not supported"),
-            "expected GROUP BY rejection message, got: {msg}"
+            msg.contains("GROUP BY"),
+            "expected a GROUP BY rejection message, got: {msg}"
         );
     }
 
@@ -9366,5 +9815,154 @@ mod recursive_cte_tests {
         assert_eq!(rec.cte_schema.fields.len(), 1);
         assert_eq!(rec.cte_schema.fields[0].name, "node");
         assert_eq!(rec.cte_schema.fields[0].dtype, DataType::Int64);
+    }
+}
+
+#[cfg(test)]
+mod count_distinct_groupby_tests {
+    //! Frontend detection tests for feature F3-finish
+    //! (`COUNT(DISTINCT col)` with `GROUP BY`). These exercise
+    //! [`plan_count_distinct_groupby`] purely host-side: which shapes return
+    //! `Some(descriptor)` and which fall through (`None`) to the ordinary
+    //! pipeline. The host-execution correctness lives in the engine tests.
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    /// `sales(region Int32, customer Int64, amount Float64)`.
+    fn provider() -> MemTableProvider {
+        let sales = Schema::new(vec![
+            Field::new("region", DataType::Int32, true),
+            Field::new("customer", DataType::Int64, true),
+            Field::new("amount", DataType::Float64, true),
+        ]);
+        MemTableProvider::new().with_table("sales", sales)
+    }
+
+    fn detect(sql: &str) -> Option<CountDistinctGroupByPlan> {
+        plan_count_distinct_groupby(sql, &provider())
+            .unwrap_or_else(|e| panic!("detection errored for {sql:?}: {e}"))
+    }
+
+    #[test]
+    fn supported_shape_returns_some() {
+        let cd = detect("SELECT region, COUNT(DISTINCT customer) FROM sales GROUP BY region")
+            .expect("sole COUNT(DISTINCT) + GROUP BY must be recognised");
+        assert_eq!(cd.group_key_names, vec!["region".to_string()]);
+        // Default alias is the canonical aggregate output name.
+        assert_eq!(
+            cd.count_alias,
+            aggregate_output_name(&AggregateExpr::Count(Expr::Literal(Literal::Int64(1))))
+        );
+        // Result schema: group key + Int64 count (non-nullable).
+        assert_eq!(cd.result_schema.fields.len(), 2);
+        assert_eq!(cd.result_schema.fields[0].name, "region");
+        assert_eq!(cd.result_schema.fields[1].dtype, DataType::Int64);
+        assert!(!cd.result_schema.fields[1].nullable);
+        // No HAVING/ORDER BY/LIMIT ⇒ no post-plan.
+        assert!(cd.post.is_none());
+        // Base output is [group_key, distinct_col].
+        let base_schema = cd.base.schema().expect("base schema");
+        assert_eq!(base_schema.fields.len(), 2);
+    }
+
+    #[test]
+    fn supported_with_alias_uses_alias() {
+        let cd = detect(
+            "SELECT region, COUNT(DISTINCT customer) AS uniq FROM sales GROUP BY region",
+        )
+        .expect("aliased count must be recognised");
+        assert_eq!(cd.count_alias, "uniq");
+        assert_eq!(cd.result_schema.fields[1].name, "uniq");
+    }
+
+    #[test]
+    fn supported_multi_key() {
+        let cd = detect(
+            "SELECT region, amount, COUNT(DISTINCT customer) FROM sales \
+             GROUP BY region, amount",
+        )
+        .expect("multi-key shape must be recognised");
+        assert_eq!(cd.group_key_names, vec!["region".to_string(), "amount".to_string()]);
+        assert_eq!(cd.result_schema.fields.len(), 3);
+    }
+
+    #[test]
+    fn supported_with_where_and_having_and_order_limit() {
+        let cd = detect(
+            "SELECT region, COUNT(DISTINCT customer) AS c FROM sales \
+             WHERE amount > 0 GROUP BY region HAVING COUNT(DISTINCT customer) > 1 \
+             ORDER BY c DESC LIMIT 5",
+        )
+        .expect("WHERE+HAVING+ORDER BY+LIMIT shape must be recognised");
+        // WHERE is folded into the base plan (a Filter under the projection).
+        // HAVING/ORDER BY/LIMIT produce a post-plan.
+        let post = cd.post.expect("HAVING/ORDER BY/LIMIT ⇒ post-plan present");
+        // Outermost post node is the Limit.
+        assert!(matches!(post, LogicalPlan::Limit { .. }), "post root = Limit, got {post:?}");
+    }
+
+    #[test]
+    fn count_distinct_no_groupby_falls_through() {
+        // No GROUP BY ⇒ not our shape (the no-GROUP-BY COUNT(DISTINCT) path is
+        // handled by the ordinary pipeline).
+        assert!(detect("SELECT COUNT(DISTINCT customer) FROM sales").is_none());
+    }
+
+    #[test]
+    fn ordinary_groupby_aggregate_falls_through() {
+        // GROUP BY with a non-distinct aggregate ⇒ ordinary pipeline.
+        assert!(detect("SELECT region, COUNT(customer) FROM sales GROUP BY region").is_none());
+        assert!(detect("SELECT region, SUM(amount) FROM sales GROUP BY region").is_none());
+    }
+
+    #[test]
+    fn count_distinct_with_other_aggregate_falls_through() {
+        // COUNT(DISTINCT) alongside another aggregate is an unsupported mix:
+        // fall through so the ordinary path rejects it precisely.
+        assert!(detect(
+            "SELECT region, COUNT(DISTINCT customer), SUM(amount) FROM sales GROUP BY region"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn two_count_distincts_fall_through() {
+        assert!(detect(
+            "SELECT region, COUNT(DISTINCT customer), COUNT(DISTINCT amount) \
+             FROM sales GROUP BY region"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn super_aggregate_falls_through() {
+        // ROLLUP/CUBE/GROUPING SETS with COUNT(DISTINCT) is not our shape; it
+        // falls through to the ordinary path (which rejects it precisely).
+        assert!(detect(
+            "SELECT region, COUNT(DISTINCT customer) FROM sales GROUP BY ROLLUP(region)"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn select_distinct_falls_through() {
+        assert!(detect(
+            "SELECT DISTINCT region, COUNT(DISTINCT customer) FROM sales GROUP BY region"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn set_op_and_cte_fall_through() {
+        assert!(detect(
+            "SELECT region, COUNT(DISTINCT customer) FROM sales GROUP BY region \
+             UNION ALL SELECT region, COUNT(DISTINCT customer) FROM sales GROUP BY region"
+        )
+        .is_none());
+        assert!(detect(
+            "WITH s AS (SELECT * FROM sales) \
+             SELECT region, COUNT(DISTINCT customer) FROM s GROUP BY region"
+        )
+        .is_none());
     }
 }

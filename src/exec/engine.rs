@@ -105,6 +105,101 @@ fn concat_two_batches(a: &RecordBatch, b: &RecordBatch) -> BoltResult<RecordBatc
         .map_err(|e| BoltError::Plan(format!("WITH RECURSIVE concat: {e}")))
 }
 
+/// Host-side per-group distinct count for feature F3-finish
+/// (`COUNT(DISTINCT col)` with `GROUP BY`).
+///
+/// `base` is the materialised `[group_keys..., distinct_col]` batch (the first
+/// `n_keys` columns are group keys, the last is the distinct-counted column);
+/// `result_schema` is the group-key fields followed by the `Int64` count.
+///
+/// Groups rows by the leading group-key tuple using the same `RowKey` /
+/// `RowKeyValue` canonicalisation the `DISTINCT` operator uses — so NULL group
+/// keys form their own group and multi-key groups compose — and per group
+/// accumulates the set of DISTINCT **non-NULL** values of the distinct column.
+/// The count is `set.len()`: standard SQL `COUNT(DISTINCT x)` ignores NULLs, so
+/// an all-NULL (or empty) group yields 0. Output rows are in first-occurrence
+/// order; group-key values are gathered from `base` at each group's first row
+/// (preserving the exact dtype / value, including NULL keys).
+///
+/// Pure (no GPU / engine state) so it is host-testable directly.
+fn host_count_distinct_groupby(
+    base: &RecordBatch,
+    n_keys: usize,
+    result_schema: &Schema,
+) -> BoltResult<RecordBatch> {
+    use std::collections::{HashMap, HashSet};
+
+    use arrow_array::UInt32Array;
+
+    use crate::exec::distinct::{ColumnReader, RowKey, RowKeyValue};
+
+    let n_cols = base.num_columns();
+    if n_cols != n_keys + 1 {
+        return Err(BoltError::Plan(format!(
+            "COUNT(DISTINCT) GROUP BY: base produced {n_cols} columns, expected \
+             {n_keys} group keys + 1 distinct column"
+        )));
+    }
+    let n_rows = base.num_rows();
+
+    // Per-column readers: the first `n_keys` are group keys, the last is the
+    // distinct-counted column. `ColumnReader::new` rejects unsupported dtypes
+    // (should have been caught at plan time).
+    let key_readers: Vec<ColumnReader> = (0..n_keys)
+        .map(|i| ColumnReader::new(base.column(i).as_ref()))
+        .collect::<BoltResult<_>>()?;
+    let distinct_reader = ColumnReader::new(base.column(n_keys).as_ref())?;
+
+    // `groups` maps the group key to its slot index in `order`
+    // (first-occurrence order); `order` carries (first_row_index,
+    // distinct_value_set) per group.
+    let mut groups: HashMap<RowKey, usize> = HashMap::new();
+    let mut order: Vec<(u32, HashSet<RowKeyValue>)> = Vec::new();
+    for row in 0..n_rows {
+        let key = RowKey::from_values(n_keys, key_readers.iter().map(|r| r.value_at(row)));
+        let slot = match groups.get(&key) {
+            Some(&s) => s,
+            None => {
+                let s = order.len();
+                groups.insert(key, s);
+                order.push((row as u32, HashSet::new()));
+                s
+            }
+        };
+        // COUNT(DISTINCT x) ignores NULLs: only insert non-NULL values.
+        let v = distinct_reader.value_at(row);
+        if v != RowKeyValue::Null {
+            order[slot].1.insert(v);
+        }
+    }
+
+    // Build the result. Take indices = each group's first row; gather the
+    // group-key columns so the output keeps the base batch's exact dtype +
+    // value (including NULL group keys).
+    let arrow_schema = plan_schema_to_arrow_schema(result_schema)?;
+    let take_idx = UInt32Array::from(order.iter().map(|(r, _)| *r).collect::<Vec<u32>>());
+    let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(n_keys + 1);
+    for i in 0..n_keys {
+        let gathered =
+            arrow::compute::take(base.column(i).as_ref(), &take_idx, None).map_err(|e| {
+                BoltError::Other(format!(
+                    "COUNT(DISTINCT) GROUP BY: take on group key {i} failed: {e}"
+                ))
+            })?;
+        out_cols.push(gathered);
+    }
+    // The Int64 count column (non-nullable; COUNT never yields SQL NULL).
+    let counts: Int64Array = order
+        .iter()
+        .map(|(_, set)| set.len() as i64)
+        .collect::<Vec<i64>>()
+        .into();
+    out_cols.push(Arc::new(counts) as ArrayRef);
+
+    RecordBatch::try_new(Arc::clone(&arrow_schema), out_cols)
+        .map_err(|e| BoltError::Plan(format!("COUNT(DISTINCT) GROUP BY result build: {e}")))
+}
+
 /// Stage 7 (P1b): default interval between pool-stats emits in
 /// [`Engine::sql`].
 ///
@@ -1771,6 +1866,31 @@ impl Engine {
             }
         }
 
+        // F3-finish: a sole `COUNT(DISTINCT col)` with `GROUP BY` is detected
+        // and orchestrated host-side (per-group distinct counting) before the
+        // ordinary pipeline, mirroring the WITH RECURSIVE hook above. The
+        // per-group distinct count has no single LogicalPlan that flows through
+        // the normal lowering (the plan-node route is blocked — see
+        // `CountDistinctGroupByPlan`). `plan_count_distinct_groupby` returns
+        // `Ok(None)` for every other query, so the common path falls straight
+        // through. Failures bump `QueriesFailed` to mirror the accounting
+        // below.
+        match crate::plan::sql_frontend::plan_count_distinct_groupby(query, &self.provider) {
+            Ok(Some(cd)) => {
+                let result = self.execute_count_distinct_groupby(&cd);
+                if result.is_err() {
+                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                }
+                self.maybe_emit_pool_stats(Instant::now());
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                return Err(e);
+            }
+        }
+
         // Time the parse phase (SQL text → LogicalPlan) into the Parse
         // histogram; mirrors the `parse` tracing span in `observability`.
         let parse_start = Instant::now();
@@ -1896,6 +2016,16 @@ impl Engine {
             return Ok(format!(
                 "Recursive CTE plan:\n{}",
                 crate::plan::explain::format_recursive_cte(&rec)
+            ));
+        }
+        // F3-finish: render the host-orchestrated COUNT(DISTINCT) + GROUP BY
+        // descriptor via its dedicated formatter.
+        if let Some(cd) =
+            crate::plan::sql_frontend::plan_count_distinct_groupby(query, &self.provider)?
+        {
+            return Ok(format!(
+                "COUNT(DISTINCT) GROUP BY plan:\n{}",
+                crate::plan::explain::format_count_distinct_groupby(&cd)
             ));
         }
         let plan: LogicalPlan = parse_sql(query, &self.provider)?;
@@ -2219,6 +2349,68 @@ impl Engine {
         // --- 4. Run the main query over the full accumulated relation. ---
         let main_out = run_with_cte(&result, &rec.main)?;
         Ok(QueryHandle::from_record_batch(main_out))
+    }
+
+    /// Execute a sole `COUNT(DISTINCT col)` with `GROUP BY` (feature
+    /// F3-finish) as a host-orchestrated special-case.
+    ///
+    /// The per-group distinct count cannot be expressed as a single
+    /// `LogicalPlan` that flows through the ordinary pipeline (see
+    /// [`crate::plan::sql_frontend::CountDistinctGroupByPlan`]), so — exactly
+    /// like [`Engine::execute_recursive_cte`] — the engine orchestrates it:
+    ///
+    /// 1. **Base.** Run `cd.base` (an ordinary subplan) through
+    ///    [`Engine::run_subplan`] to materialise a `RecordBatch` of
+    ///    `[group_keys..., distinct_col]` rows.
+    /// 2. **Group + count (host).** Group rows by the leading group-key tuple
+    ///    (using the same `RowKey` / `RowKeyValue` canonicalisation the
+    ///    `DISTINCT` operator uses, so NULL group keys form their own group and
+    ///    composite keys compose), and per group accumulate the set of DISTINCT
+    ///    **non-NULL** values of `distinct_col`. The count is `set.len()`
+    ///    (standard SQL: `COUNT(DISTINCT x)` ignores NULLs, so an all-NULL or
+    ///    empty group yields 0).
+    /// 3. **Build result.** One row per group (in first-occurrence order): the
+    ///    group-key values (taken from the base batch at each group's first row
+    ///    via `arrow::compute::take`, preserving exact dtype/value) followed by
+    ///    the `Int64` count under `cd.count_alias`.
+    /// 4. **Post.** If `cd.post` is present (HAVING / ORDER BY / LIMIT), bind
+    ///    the result under the reserved ephemeral name in the streaming overlay
+    ///    and run the post-plan through [`Engine::run_subplan`] — reusing the
+    ///    ordinary Filter / Sort / Limit executors — then clear the overlay.
+    fn execute_count_distinct_groupby(
+        &self,
+        cd: &crate::plan::sql_frontend::CountDistinctGroupByPlan,
+    ) -> BoltResult<QueryHandle> {
+        // --- 1. Run the base subplan: [group_keys..., distinct_col]. ---
+        let base = self.run_subplan(cd.base.clone())?;
+
+        // --- 2 + 3. Group host-side and build the count-result batch. ---
+        let result =
+            host_count_distinct_groupby(&base, cd.group_key_names.len(), &cd.result_schema)?;
+
+        // --- 4. Apply the optional HAVING / ORDER BY / LIMIT post-plan over the
+        // result, bound under the reserved ephemeral name in the overlay (same
+        // pattern as the recursive-CTE main query). ---
+        let post = match &cd.post {
+            None => return Ok(QueryHandle::from_record_batch(result)),
+            Some(p) => p,
+        };
+        use crate::exec::streaming::TableSource;
+        let name = crate::plan::sql_frontend::COUNT_DISTINCT_GROUPBY_RESULT_TABLE;
+        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+            return Err(BoltError::Plan(format!(
+                "COUNT(DISTINCT) GROUP BY: reserved result table name '{name}' collides \
+                 with a registered table"
+            )));
+        }
+        self.gpu_tables.borrow_mut().remove(name);
+        self.streaming_sources
+            .borrow_mut()
+            .insert(name.to_string(), TableSource::Materialized(vec![result]));
+        let out = self.run_subplan(post.clone());
+        self.streaming_sources.borrow_mut().remove(name);
+        self.gpu_tables.borrow_mut().remove(name);
+        Ok(QueryHandle::from_record_batch(out?))
     }
 
     /// Emit a periodic pool-stats log line + observer notification if
@@ -4253,6 +4445,127 @@ mod tests {
             Field::new("b", DataType::Int64, false),
         ]);
         assert!(build_count_rows_batch(3, &schema).is_err());
+    }
+
+    // ---- F3-finish: host per-group distinct count (no GPU) ----
+
+    /// Build a `[key Int32, val Int64]` base batch from `(key, val)` rows where
+    /// `None` is a SQL NULL in that column. Mirrors the
+    /// `[group_keys..., distinct_col]` shape `host_count_distinct_groupby`
+    /// consumes.
+    fn cd_base(rows: &[(Option<i32>, Option<i64>)]) -> RecordBatch {
+        let keys: Int32Array = rows.iter().map(|(k, _)| *k).collect();
+        let vals: Int64Array = rows.iter().map(|(_, v)| *v).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, true),
+            ArrowField::new("v", ArrowDataType::Int64, true),
+        ]));
+        RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(vals)]).unwrap()
+    }
+
+    /// Result schema for the `cd_base` fixture: `[k Int32, cnt Int64]`.
+    fn cd_result_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("cnt", DataType::Int64, false),
+        ])
+    }
+
+    /// Read the `(key, count)` result rows out of a count-result batch.
+    fn cd_read(batch: &RecordBatch) -> Vec<(Option<i32>, i64)> {
+        use arrow_array::Array;
+        let keys = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let cnts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        (0..batch.num_rows())
+            .map(|i| {
+                let k = if keys.is_null(i) { None } else { Some(keys.value(i)) };
+                (k, cnts.value(i))
+            })
+            .collect()
+    }
+
+    /// Distinct-per-group counts: group 1 has values {10, 20} ⇒ 2; group 2 has
+    /// {30} (with a duplicate) ⇒ 1.
+    #[test]
+    fn host_cd_distinct_per_group() {
+        let base = cd_base(&[
+            (Some(1), Some(10)),
+            (Some(1), Some(20)),
+            (Some(1), Some(10)), // duplicate value in group 1
+            (Some(2), Some(30)),
+            (Some(2), Some(30)), // duplicate value in group 2
+        ]);
+        let out = host_count_distinct_groupby(&base, 1, &cd_result_schema()).unwrap();
+        let mut rows = cd_read(&out);
+        rows.sort_by_key(|(k, _)| k.unwrap());
+        assert_eq!(rows, vec![(Some(1), 2), (Some(2), 1)]);
+    }
+
+    /// NULLs in the counted column are ignored; a group whose values are all
+    /// NULL yields a count of 0 (standard SQL `COUNT(DISTINCT x)`).
+    #[test]
+    fn host_cd_ignores_nulls_and_all_null_group_is_zero() {
+        let base = cd_base(&[
+            (Some(1), Some(10)),
+            (Some(1), None), // ignored
+            (Some(2), None), // all-NULL group
+            (Some(2), None),
+        ]);
+        let out = host_count_distinct_groupby(&base, 1, &cd_result_schema()).unwrap();
+        let mut rows = cd_read(&out);
+        rows.sort_by_key(|(k, _)| k.unwrap());
+        assert_eq!(rows, vec![(Some(1), 1), (Some(2), 0)]);
+    }
+
+    /// A NULL group key forms its own distinct group (per SQL GROUP BY).
+    #[test]
+    fn host_cd_null_group_key_is_its_own_group() {
+        let base = cd_base(&[
+            (None, Some(1)),
+            (None, Some(2)),
+            (Some(5), Some(9)),
+        ]);
+        let out = host_count_distinct_groupby(&base, 1, &cd_result_schema()).unwrap();
+        let rows = cd_read(&out);
+        // First-occurrence order: NULL group first (count 2), then key 5 (count 1).
+        assert_eq!(rows, vec![(None, 2), (Some(5), 1)]);
+    }
+
+    /// Multi-key groups: the group is the composite (k1, k2) tuple.
+    #[test]
+    fn host_cd_multi_key_composite_group() {
+        use arrow_array::Array;
+        // base = [k1 Int32, k2 Int64, v Int64]; n_keys = 2.
+        let k1: Int32Array = [Some(1), Some(1), Some(1), Some(2)].into_iter().collect();
+        let k2: Int64Array = [Some(7), Some(7), Some(8), Some(7)].into_iter().collect();
+        let v: Int64Array = [Some(100), Some(200), Some(100), Some(100)].into_iter().collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k1", ArrowDataType::Int32, true),
+            ArrowField::new("k2", ArrowDataType::Int64, true),
+            ArrowField::new("v", ArrowDataType::Int64, true),
+        ]));
+        let base =
+            RecordBatch::try_new(schema, vec![Arc::new(k1), Arc::new(k2), Arc::new(v)]).unwrap();
+        let result_schema = Schema::new(vec![
+            Field::new("k1", DataType::Int32, true),
+            Field::new("k2", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, false),
+        ]);
+        let out = host_count_distinct_groupby(&base, 2, &result_schema).unwrap();
+        // Groups: (1,7)->{100,200}=2, (1,8)->{100}=1, (2,7)->{100}=1.
+        assert_eq!(out.num_rows(), 3);
+        let cnts = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut got: Vec<i64> = (0..out.num_rows()).map(|i| cnts.value(i)).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 1, 2]);
+    }
+
+    /// A base whose column count does not match `n_keys + 1` is rejected.
+    #[test]
+    fn host_cd_rejects_wrong_column_count() {
+        let base = cd_base(&[(Some(1), Some(1))]);
+        // Claim 2 group keys but the base has only 2 columns total (so 1 + 1).
+        assert!(host_count_distinct_groupby(&base, 2, &cd_result_schema()).is_err());
     }
 
     /// Build a single-column `RecordBatch` whose `x` column holds the half-open

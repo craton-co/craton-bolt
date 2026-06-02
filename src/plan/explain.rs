@@ -350,6 +350,42 @@ pub fn format_recursive_cte(rec: &crate::plan::sql_frontend::RecursiveCtePlan) -
 }
 
 // ---------------------------------------------------------------------------
+// COUNT(DISTINCT col) with GROUP BY (feature F3-finish)
+// ---------------------------------------------------------------------------
+
+/// Render a
+/// [`CountDistinctGroupByPlan`](crate::plan::sql_frontend::CountDistinctGroupByPlan)
+/// as a tree-indented, human-readable string for `EXPLAIN`.
+///
+/// A sole `COUNT(DISTINCT col)` with `GROUP BY` is not a single
+/// [`LogicalPlan`] — the engine orchestrates a host-side per-group distinct
+/// count (see `Engine::execute_count_distinct_groupby`) — so it gets its own
+/// renderer. The header names the group keys + the count alias; the `Base:`
+/// sub-header renders the subplan that materialises `[group_keys..., col]`,
+/// and (when present) a `Post:` sub-header renders the HAVING/ORDER BY/LIMIT
+/// plan applied to the count result.
+pub fn format_count_distinct_groupby(
+    cd: &crate::plan::sql_frontend::CountDistinctGroupByPlan,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "CountDistinctGroupBy: group_keys=[{}] count=COUNT(DISTINCT) AS {}",
+        cd.group_key_names.join(", "),
+        cd.count_alias
+    );
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Base:");
+    format_logical_into(&cd.base, 2, &mut out);
+    if let Some(post) = &cd.post {
+        indent(&mut out, 1);
+        let _ = writeln!(out, "Post:");
+        format_logical_into(post, 2, &mut out);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Physical plan
 // ---------------------------------------------------------------------------
 
@@ -687,6 +723,49 @@ mod tests {
         assert_eq!(lines[2], "    Scan: table=seq");
         assert_eq!(lines[3], "  Recursive:");
         assert_eq!(lines[5], "  Main:");
+    }
+
+    #[test]
+    fn count_distinct_groupby_renders_base_and_post() {
+        use crate::plan::logical_plan::Field;
+        use crate::plan::sql_frontend::CountDistinctGroupByPlan;
+        let result_schema = Schema::new(vec![
+            Field::new("region", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, false),
+        ]);
+        let base = LogicalPlan::Scan {
+            table: "sales".to_string(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("region", DataType::Int64, true),
+                Field::new("customer", DataType::Int64, true),
+            ]),
+        };
+        let cd = CountDistinctGroupByPlan {
+            base,
+            group_key_names: vec!["region".to_string()],
+            count_alias: "cnt".to_string(),
+            result_schema: result_schema.clone(),
+            post: Some(LogicalPlan::Limit {
+                input: Box::new(LogicalPlan::Scan {
+                    table: "__count_distinct_groupby_result".to_string(),
+                    projection: None,
+                    schema: result_schema,
+                }),
+                limit: 5,
+                offset: 0,
+            }),
+        };
+        let out = format_count_distinct_groupby(&cd);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0],
+            "CountDistinctGroupBy: group_keys=[region] count=COUNT(DISTINCT) AS cnt"
+        );
+        assert_eq!(lines[1], "  Base:");
+        assert_eq!(lines[2], "    Scan: table=sales");
+        assert_eq!(lines[3], "  Post:");
+        assert_eq!(lines[4], "    Limit: limit=5 offset=0");
     }
 
     #[test]
