@@ -357,10 +357,22 @@ pub(crate) struct PublishRegs<'a> {
 /// \tnanosleep.u32 {set_flag_reg};
 /// \tbra PUBLISH_WAIT;
 /// PUBLISH_DONE:
+/// \tmembar.cta;
 /// \tld.shared.{key_ty} {key_dst_reg}, [{key_addr_reg}];
 /// \tsetp.eq.{key_ty} %p4, {key_dst_reg}, {probe_key_reg};
 /// \t@%p4 bra MATCH;
 /// ```
+///
+/// The `membar.cta` after `PUBLISH_DONE:` is the ACQUIRE half of the
+/// release/acquire pair with the writer's `st key; membar.cta; st [set],2`
+/// (see [`emit_claim_publish`]). The reader observes `set == 2` via a
+/// `ld.volatile`, but on sm_70 a *volatile* load carries no ordering for the
+/// subsequent plain `ld.shared` of the key — without this fence the key load
+/// may be satisfied from stale (zero-initialised) shared memory, returning
+/// key 0. Since real keys include 0, a prober would then take the
+/// collision-advance path and CLAIM a duplicate slot for an already-present
+/// key, minting a phantom group (the Tier-2 ~1519-phantom bug at 1M-key
+/// scale). The fence orders the `set==2` observation ahead of the key read.
 ///
 /// `key_ty` is the signed-integer key-type token (`s32` for the i32-key
 /// kernel, `s64` for the i64-key kernel); it appears both as the
@@ -391,6 +403,11 @@ pub(crate) fn emit_publish_probe_protocol(
     writeln!(ptx, "\tnanosleep.u32 {set_flag_reg};").map_err(write_err)?;
     writeln!(ptx, "\tbra PUBLISH_WAIT;").map_err(write_err)?;
     writeln!(ptx, "PUBLISH_DONE:").map_err(write_err)?;
+    // ACQUIRE fence: pair with the writer's release (st key; membar.cta;
+    // st [set],2). A volatile load of `set==2` does not order the following
+    // plain `ld.shared` of the key on sm_70, so without this the key read can
+    // come from stale (zeroed) shared memory and mint a phantom group.
+    writeln!(ptx, "\tmembar.cta;").map_err(write_err)?;
     writeln!(ptx, "\tld.shared.{key_ty} {key_dst_reg}, [{key_addr_reg}];").map_err(write_err)?;
     writeln!(
         ptx,
@@ -510,6 +527,7 @@ mod tests {
              \tnanosleep.u32 %r36;\n\
              \tbra PUBLISH_WAIT;\n\
              PUBLISH_DONE:\n\
+             \tmembar.cta;\n\
              \tld.shared.s32 %r35, [%rd36];\n\
              \tsetp.eq.s32 %p4, %r35, %r31;\n\
              \t@%p4 bra MATCH;\n"
@@ -541,6 +559,7 @@ mod tests {
              \tnanosleep.u32 %r36;\n\
              \tbra PUBLISH_WAIT;\n\
              PUBLISH_DONE:\n\
+             \tmembar.cta;\n\
              \tld.shared.s64 %rd61, [%rd36];\n\
              \tsetp.eq.s64 %p4, %rd61, %rd60;\n\
              \t@%p4 bra MATCH;\n"

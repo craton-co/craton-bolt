@@ -8,23 +8,30 @@
 //! hashes to exactly one partition) means the per-partition key sets *should*
 //! be pairwise disjoint — but the merge does NOT rely on that for correctness.
 //!
-//! ## Defensive key dedup (Tier-2 phantom-group fix)
+//! ## Defensive key dedup (belt-and-suspenders behind the kernel fence)
 //!
-//! At ~10M-row / ~1M-distinct-key scale a per-partition open-addressing
-//! REDUCE kernel can, under a publish/probe race, mint the *same* key into
-//! two distinct slots of one block's table. Each populated slot is exported
-//! independently, so the orchestrator's per-partition slot walk hands us two
-//! `(key, sums)` rows for that key — a phantom/duplicate group. A naive
-//! concatenate-and-sort would surface both rows in the final batch (the q2
-//! stress test saw ~1519 such phantoms for ≤1M keys).
+//! ROOT CAUSE NOW FIXED IN THE KERNEL: the per-partition open-addressing
+//! REDUCE kernels' publish/probe protocol was missing an ACQUIRE fence — a
+//! prober that observed `set == 2` via a volatile load could read the slot's
+//! key from stale (zeroed) shared memory before the claimer's key store
+//! landed, take the collision-advance path, and mint the *same* key into a
+//! second slot (a phantom/duplicate group). A `membar.cta` after
+//! `PUBLISH_DONE:` (see
+//! `partition_reduce_kernel_spill_common::emit_publish_probe_protocol`) now
+//! orders the key load after the `set==2` observation. With that fence,
+//! `tier2_multi_pipeline_matches_cpu_model` passes at 10M rows / 1M keys
+//! WITHOUT the dedup below (verified on an RTX 2060 by isolating the fence).
 //!
-//! The merge therefore SUMS rows that share a key rather than appending them.
-//! After the stable sort by key, equal keys are adjacent, so a single linear
-//! fold collapses any duplicate-key rows into one — adding their N sum columns
-//! componentwise. This is the same reduction the per-partition table would
-//! have produced had the slot race not split the key, so the result matches
-//! the CPU model whether or not the kernel emitted a phantom slot. In the
-//! common (race-free) case every key is unique and the fold is a pure copy.
+//! This fold is therefore retained as cheap DEFENSE-IN-DEPTH for a
+//! scale-only GPU concurrency bug: should the fence ever regress or a future
+//! kernel re-introduce a duplicate-key path, the merge still produces the
+//! correct aggregate rather than the ~1519 phantom rows the q2 stress test
+//! once saw for ≤1M keys. It SUMS rows that share a key rather than appending
+//! them: after the stable sort by key, equal keys are adjacent, so a single
+//! linear fold collapses any duplicate-key rows into one — adding their N sum
+//! columns componentwise (the same reduction the per-partition table would
+//! have produced). In the race-free common case every key is unique and the
+//! fold is a pure copy.
 //!
 //! Output ordering: sorted by key ASC (matches the SQL canonical and what
 //! DuckDB/Polars produce for `ORDER BY 1`). The sort uses a `permutation`

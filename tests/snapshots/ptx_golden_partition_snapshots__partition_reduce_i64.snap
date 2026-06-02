@@ -99,6 +99,7 @@ PUBLISH_WAIT:
 	nanosleep.u32 %r{11};
 	bra PUBLISH_WAIT;
 PUBLISH_DONE:
+	membar.cta;
 	ld.shared.s64 %rd{26}, [%rd{24}];
 	setp.eq.s64 %p{5}, %rd{26}, %rd{19};
 	@%p{5} bra MATCH;
