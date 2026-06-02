@@ -142,11 +142,12 @@ pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
         DataType::Float32 => "bolt_gather_f32",
         DataType::Float64 => "bolt_gather_f64",
         DataType::Utf8 => "bolt_gather_utf8_unsupported",
-        // Decimal128 has no GPU gather kernel yet (v0.6 / M4 plan-only);
-        // surface an unsupported-named entry so any dispatch attempt fails
-        // loudly. The actual rejection happens in the executor before any
-        // gather is launched.
-        DataType::Decimal128(_, _) => "bolt_gather_decimal128_unsupported",
+        // F6: Decimal128 gathers through a dedicated 16-byte fixed-width
+        // copy kernel (two 64-bit load/store pairs per row). The entry name
+        // is distinct from the integer kernels because the PTX body differs
+        // (it copies two halves rather than one typed value), even though
+        // the 6-arg ABI is identical.
+        DataType::Decimal128(_, _) => "bolt_gather_decimal128",
         // v0.7: temporal gather reuses the matching integer kernel. The
         // gather kernel is type-agnostic apart from the load/store width,
         // so we route Date32 to the i32 kernel and Timestamp to the i64
@@ -1418,20 +1419,39 @@ pub fn compile_gather_kernel(dtype: DataType) -> BoltResult<String> {
     writeln!(ptx, "\tadd.s64 %rd14, %rd4, %rd13;").map_err(write_err)?;
 
     // value = *input_addr ; *output_addr = value
-    writeln!(
-        ptx,
-        "\tld.global.nc.{ld} %{rc}0, [%rd12];",
-        ld = ld_suffix,
-        rc = reg_class
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tst.global.{ld} [%rd14], %{rc}0;",
-        ld = ld_suffix,
-        rc = reg_class
-    )
-    .map_err(write_err)?;
+    //
+    // F6: Decimal128 is a 16-byte value with no single-register class. Copy
+    // it as TWO contiguous 64-bit halves (low at +0, high at +8). The byte
+    // addressing above already used `elem_bytes = 16`, so %rd12 / %rd14 point
+    // at the start of this row's 16-byte slot in input / output; the second
+    // half is `[+8]` from each. The two halves are an opaque bit-copy — the
+    // gather never interprets the i128 value — so `u64` loads/stores are
+    // exactly right regardless of precision / scale. We route the input
+    // loads through the read-only cache (`ld.global.nc`) like the scalar
+    // path; the output stores stay plain `st.global`.
+    if matches!(dtype, DataType::Decimal128(_, _)) {
+        // low half
+        writeln!(ptx, "\tld.global.nc.u64 %rd16, [%rd12];").map_err(write_err)?;
+        writeln!(ptx, "\tst.global.u64 [%rd14], %rd16;").map_err(write_err)?;
+        // high half (+8 bytes on both sides)
+        writeln!(ptx, "\tld.global.nc.u64 %rd17, [%rd12+8];").map_err(write_err)?;
+        writeln!(ptx, "\tst.global.u64 [%rd14+8], %rd17;").map_err(write_err)?;
+    } else {
+        writeln!(
+            ptx,
+            "\tld.global.nc.{ld} %{rc}0, [%rd12];",
+            ld = ld_suffix,
+            rc = reg_class
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tst.global.{ld} [%rd14], %{rc}0;",
+            ld = ld_suffix,
+            rc = reg_class
+        )
+        .map_err(write_err)?;
+    }
 
     writeln!(ptx, "DONE:").map_err(write_err)?;
     writeln!(ptx, "\tret;").map_err(write_err)?;
@@ -1457,11 +1477,15 @@ fn gather_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str, 
                 "prefix_scan: gather Utf8 not supported (variable-width)".into(),
             ))
         }
-        DataType::Decimal128(_, _) => {
-            return Err(BoltError::Plan(
-                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-            ))
-        }
+        // F6: Decimal128 is a 16-byte value that does NOT fit a single typed
+        // load/store register class. `compile_gather_kernel` special-cases it
+        // and emits two 64-bit (`u64`) load/store pairs against the generic
+        // `%rd` register bank, so the triple returned here is only a
+        // placeholder that keeps the shared register-decl logic happy — the
+        // `ld_suffix` / `reg_class` are never consumed on the Decimal128 path
+        // (`reg_class == "rd"` reuses the already-declared `b64` bank, so no
+        // extra `.reg` decl is emitted). See the `is_128` branch below.
+        DataType::Decimal128(_, _) => ("u64", "rd", "b64"),
         // v0.7: temporal gather lowers to integer gather on the underlying
         // days / ticks. Same register classes as Int32 / Int64.
         DataType::Date32 => ("s32", "r", "b32"),
@@ -1582,6 +1606,126 @@ mod tests {
         let err = compile_gather_kernel(DataType::Utf8)
             .expect_err("Utf8 gather must error: variable-width");
         assert!(format!("{}", err).contains("Utf8"));
+    }
+
+    /// F6: temporal gather entry names route Date32 → the i32 kernel and
+    /// Timestamp → the i64 kernel (the gather body is byte-width-agnostic
+    /// apart from the load/store width, so reusing the integer kernels is
+    /// exact). Decimal128 gets its OWN entry name because its body differs
+    /// (two 64-bit copies, not one typed value).
+    #[test]
+    fn gather_entry_names_for_temporal_and_decimal() {
+        use crate::plan::logical_plan::TimeUnit;
+        assert_eq!(gather_kernel_entry(DataType::Date32), "bolt_gather_i32");
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            assert_eq!(
+                gather_kernel_entry(DataType::Timestamp(unit, None)),
+                "bolt_gather_i64"
+            );
+        }
+        assert_eq!(
+            gather_kernel_entry(DataType::Decimal128(38, 10)),
+            "bolt_gather_decimal128"
+        );
+    }
+
+    /// F6: Date32 PTX is byte-identical to the Int32 gather (same entry, same
+    /// 4-byte typed copy) and Timestamp to the Int64 gather (8-byte copy). The
+    /// gather kernel is parameterised only by load/store width, so this is the
+    /// load-bearing invariant: temporal compaction reuses the integer codegen
+    /// verbatim.
+    #[test]
+    fn gather_temporal_ptx_matches_integer_ptx() {
+        use crate::plan::logical_plan::TimeUnit;
+        let date_ptx = compile_gather_kernel(DataType::Date32).expect("date32 gather");
+        let i32_ptx = compile_gather_kernel(DataType::Int32).expect("i32 gather");
+        assert_eq!(date_ptx, i32_ptx, "Date32 gather must reuse the i32 kernel");
+
+        let ts_ptx = compile_gather_kernel(DataType::Timestamp(TimeUnit::Microsecond, None))
+            .expect("timestamp gather");
+        let i64_ptx = compile_gather_kernel(DataType::Int64).expect("i64 gather");
+        assert_eq!(
+            ts_ptx, i64_ptx,
+            "Timestamp gather must reuse the i64 kernel"
+        );
+    }
+
+    /// F6: the Decimal128 gather copies a 16-byte value as TWO 64-bit halves
+    /// (low at `[+0]`, high at `[+8]`) on both the input load and the output
+    /// store, addressed at a 16-byte stride. This pins the kernel shape:
+    ///   * the dedicated entry name,
+    ///   * the `*16` byte-stride addressing (elem_bytes = 16),
+    ///   * exactly two `ld.global.nc.u64` loads + two `st.global.u64` stores,
+    ///   * the `[+8]` high-half offset on each side.
+    #[test]
+    fn gather_decimal128_emits_two_64bit_copies() {
+        let ptx = compile_gather_kernel(DataType::Decimal128(38, 10))
+            .expect("decimal128 gather PTX compiles");
+
+        // Dedicated entry name + 6-arg ABI (same as the integer kernels).
+        assert!(
+            ptx.contains(".visible .entry bolt_gather_decimal128("),
+            "missing decimal128 entry:\n{ptx}"
+        );
+        for i in 0..=4 {
+            assert!(
+                ptx.contains(&format!(".param .u64 bolt_gather_decimal128_param_{i},")),
+                "missing u64 param {i}"
+            );
+        }
+        assert!(ptx.contains(".param .u32 bolt_gather_decimal128_param_5"));
+
+        // 16-byte stride addressing for both input and output rows.
+        assert!(
+            ptx.contains("mul.wide.u32 %rd11, %r3, 16;"),
+            "input row stride must be 16 bytes:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("mul.wide.u32 %rd13, %r8, 16;"),
+            "output row stride must be 16 bytes:\n{ptx}"
+        );
+
+        // Two 64-bit loads (read-only cache) and two 64-bit stores.
+        assert_eq!(
+            ptx.matches("ld.global.nc.u64").count(),
+            2,
+            "expected exactly two 64-bit half-loads:\n{ptx}"
+        );
+        assert_eq!(
+            ptx.matches("st.global.u64").count(),
+            2,
+            "expected exactly two 64-bit half-stores:\n{ptx}"
+        );
+
+        // High-half offset on both sides.
+        assert!(ptx.contains("[%rd12+8]"), "missing input high-half [+8] load");
+        assert!(ptx.contains("[%rd14+8]"), "missing output high-half [+8] store");
+
+        // The single-value typed copy of the scalar path must NOT appear —
+        // the decimal kernel never emits a `.s32` / `.s64` value move.
+        assert!(
+            !ptx.contains("ld.global.nc.s64"),
+            "decimal128 kernel must not use the scalar typed-copy path:\n{ptx}"
+        );
+    }
+
+    /// F6: `DataType::byte_width()` drives the gather addressing stride. Pin the
+    /// widths the gather kernels parameterise on so a width regression surfaces
+    /// here rather than as a silent mis-addressed copy at runtime.
+    #[test]
+    fn gather_byte_widths_for_new_dtypes() {
+        use crate::plan::logical_plan::TimeUnit;
+        assert_eq!(DataType::Date32.byte_width(), Some(4));
+        assert_eq!(
+            DataType::Timestamp(TimeUnit::Nanosecond, None).byte_width(),
+            Some(8)
+        );
+        assert_eq!(DataType::Decimal128(38, 10).byte_width(), Some(16));
     }
 
     /// Structural smoke test for the Blelloch variant: header, signature,

@@ -152,35 +152,55 @@ fn collect_table_factor_scope(
     provider: &dyn crate::plan::sql_frontend::TableProvider,
     scope: &mut LocalScope,
 ) -> BoltResult<()> {
-    if let TableFactor::Table { name, alias, .. } = tf {
-        // Underlying table name (last path segment) and its alias both become
-        // valid local qualifiers.
-        if let Some(last) = name.0.last() {
-            scope
-                .qualifiers
-                .insert(last.value.to_ascii_lowercase());
-        }
-        let table_name = name
-            .0
-            .last()
-            .map(|i| i.value.clone())
-            .unwrap_or_default();
-        if let Some(a) = alias {
-            scope.qualifiers.insert(a.name.value.to_ascii_lowercase());
-        }
-        // Pull the table's columns from the provider so bare references can be
-        // classified as local. A lookup miss is tolerated — the subquery's
-        // own lowering will surface the unknown-table error with full context;
-        // here we just can't add its columns (the detector then conservatively
-        // treats unmatched bare names as correlation, which is the safe side).
-        if let Ok(s) = provider.schema(&table_name) {
-            for f in &s.fields {
-                scope.columns.insert(f.name.to_ascii_lowercase());
+    match tf {
+        TableFactor::Table { name, alias, .. } => {
+            // Underlying table name (last path segment) and its alias both
+            // become valid local qualifiers.
+            if let Some(last) = name.0.last() {
+                scope.qualifiers.insert(last.value.to_ascii_lowercase());
+            }
+            let table_name = name
+                .0
+                .last()
+                .map(|i| i.value.clone())
+                .unwrap_or_default();
+            if let Some(a) = alias {
+                scope.qualifiers.insert(a.name.value.to_ascii_lowercase());
+            }
+            // Pull the table's columns from the provider so bare references can
+            // be classified as local. A lookup miss is tolerated — the
+            // subquery's own lowering will surface the unknown-table error with
+            // full context; here we just can't add its columns (the detector
+            // then conservatively treats unmatched bare names as correlation,
+            // which is the safe side).
+            if let Ok(s) = provider.schema(&table_name) {
+                for f in &s.fields {
+                    scope.columns.insert(f.name.to_ascii_lowercase());
+                }
             }
         }
+        // F12: derived tables (`(SELECT ...) AS t`) are now accepted in FROM,
+        // so a subquery whose own FROM contains one must contribute that
+        // derived table's scope here — otherwise a bare reference to one of its
+        // columns would be conservatively (and wrongly) flagged as a
+        // correlation. Register the alias as a qualifier and recurse into the
+        // derived subquery's FROM so its base-table columns become local. This
+        // is conservative: any column we fail to register (e.g. a computed
+        // projection with no matching base column) simply falls back to the
+        // "treat unresolved bare name as correlation" safe side, which yields a
+        // clean error rather than a silently-wrong plan.
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            if let Some(a) = alias {
+                scope.qualifiers.insert(a.name.value.to_ascii_lowercase());
+            }
+            collect_query_scope(subquery, provider, scope, 0)?;
+        }
+        // TVFs / nested joins / other factors in FROM are rejected by the main
+        // frontend before we get here, so no other arms need scope collection.
+        _ => {}
     }
-    // Derived tables / TVFs / nested joins in FROM are rejected by the main
-    // frontend before we get here, so no other arms need scope collection.
     Ok(())
 }
 

@@ -772,6 +772,11 @@ fn compile_groupby_agg_kernel_inner(
     input_dtype: DataType,
     with_value_validity: bool,
 ) -> BoltResult<String> {
+    // F7: a temporal value column groups/aggregates at its underlying integer
+    // width (Date32 -> Int32 day count, Timestamp -> Int64 tick count). Collapse
+    // it here so the i32/i64 atomic + load codegen below serves MIN/MAX/COUNT
+    // unchanged; SUM(temporal) is rejected by `agg_storage_dtype`.
+    let input_dtype = agg_storage_dtype(op, input_dtype)?;
     // Reject unsupported (op, dtype) combinations up front with explicit errors.
     let atomic = atomic_for(op, input_dtype)?;
 
@@ -1169,10 +1174,13 @@ fn compile_groupby_agg_kernel_multi_inner(
     }
     let mut per: Vec<PerSpec> = Vec::with_capacity(n);
     for s in specs {
-        let atomic = atomic_for(s.op, s.input_dtype)?;
-        let (load_suffix, reg_class) = ptx_type_info(s.input_dtype)?;
-        let reg_decl_ty_s = reg_decl_ty(s.input_dtype)?;
-        let elem_bytes = s.input_dtype.byte_width().ok_or_else(|| {
+        // F7: collapse Date32 -> Int32 / Timestamp -> Int64 per spec (SUM over
+        // a temporal spec is rejected), mirroring the single-agg path.
+        let spec_dtype = agg_storage_dtype(s.op, s.input_dtype)?;
+        let atomic = atomic_for(s.op, spec_dtype)?;
+        let (load_suffix, reg_class) = ptx_type_info(spec_dtype)?;
+        let reg_decl_ty_s = reg_decl_ty(spec_dtype)?;
+        let elem_bytes = spec_dtype.byte_width().ok_or_else(|| {
             BoltError::Other(format!(
                 "hash_kernels: variable-width dtype {:?} not supported in fused multi-agg",
                 s.input_dtype
@@ -1485,6 +1493,30 @@ pub fn groupby_block_size() -> u32 {
     BLOCK_SIZE
 }
 
+/// F7: map a GROUP BY value-column dtype to the integer dtype the aggregate
+/// kernel actually loads + atomically updates for `op`.
+///
+/// Identical contract to `agg_kernels::reduction_storage_dtype` (scalar path):
+/// `Date32 -> Int32`, `Timestamp -> Int64` for MIN / MAX / COUNT, and
+/// `SUM(temporal)` is rejected (adding dates/timestamps is undefined SQL). All
+/// other dtypes pass through unchanged, so `atomic_for` / `ptx_type_info` keep
+/// their historical behaviour for the integer/float types and continue to
+/// reject Bool / Utf8 / Decimal128.
+fn agg_storage_dtype(op: ReduceOp, dtype: DataType) -> BoltResult<DataType> {
+    use DataType::*;
+    use ReduceOp::*;
+    match (op, dtype) {
+        (Sum, Date32) | (Sum, Timestamp(_, _)) => Err(BoltError::Type(format!(
+            "hash_kernels: SUM over temporal dtype {:?} is not supported \
+             (only MIN/MAX/COUNT are defined for dates/timestamps)",
+            dtype
+        ))),
+        (_, Date32) => Ok(Int32),
+        (_, Timestamp(_, _)) => Ok(Int64),
+        (_, other) => Ok(other),
+    }
+}
+
 /// PTX `atom.global.*` mnemonic (with no operands) for the given op + dtype.
 /// Returns an error for combinations the v1 implementation does not support
 /// (most notably float MIN/MAX, which would need a CAS loop).
@@ -1506,9 +1538,21 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> BoltResult<&'static str> {
         (Max, Int32) => "atom.global.max.s32",
         (Max, Int64) => "atom.global.max.s64",
 
+        // Float MIN/MAX has no native `atom.global.min/max.fXX` on sm_70, so it
+        // is NOT emitted by this integer-atomic kernel. It IS supported in
+        // GROUP BY — the executor (`exec::groupby::launch_agg_kernel`) detects
+        // the `(Min|Max, Float32|Float64)` combo and reroutes to the CAS-loop
+        // emitter `jit::float_atomics::compile_groupby_float_atomic_kernel`
+        // (which shares this kernel's `bolt_groupby_agg` entry + ABI) BEFORE
+        // calling `atomic_for`. Reaching this arm therefore means a caller
+        // bypassed that reroute (e.g. the fused multi-agg path, which must keep
+        // float MIN/MAX out per its doc comment); surface it loudly.
         (Min, Float32) | (Min, Float64) | (Max, Float32) | (Max, Float64) => {
             return Err(BoltError::Other(
-                "MIN/MAX over float not yet supported in GROUP BY".into(),
+                "hash_kernels: MIN/MAX over float is not emitted by the integer-atomic \
+                 GROUP BY kernel; the executor must reroute to \
+                 jit::float_atomics::compile_groupby_float_atomic_kernel"
+                    .into(),
             ))
         }
 
@@ -1890,6 +1934,97 @@ mod ptx_shape_tests {
         assert_eq!(packed_validity_word_count(64), 2);
         assert_eq!(packed_validity_word_count(65), 3);
         assert_eq!(packed_validity_word_count(1_000_000), 31_250);
+    }
+
+    // -----------------------------------------------------------------
+    // F7: temporal (Date32 / Timestamp) GROUP BY aggregate codegen +
+    // float MIN/MAX reroute contract. Host-only PTX-shape tests.
+    // -----------------------------------------------------------------
+
+    use crate::plan::logical_plan::TimeUnit;
+    const TS_NS: DataType = DataType::Timestamp(TimeUnit::Nanosecond, None);
+
+    /// MIN(Date32) GROUP BY must collapse to the Int32 atomic kernel — the
+    /// emitted PTX is byte-identical to MIN(Int32).
+    #[test]
+    fn groupby_min_date32_matches_int32() {
+        let date = compile_groupby_agg_kernel(ReduceOp::Min, DataType::Date32)
+            .expect("MIN(Date32) GROUP BY should compile via Int32");
+        let i32_ref = compile_groupby_agg_kernel(ReduceOp::Min, DataType::Int32)
+            .expect("MIN(Int32) reference");
+        assert_eq!(date, i32_ref);
+        assert!(date.contains("atom.global.min.s32"), "expected s32 min atomic:\n{date}");
+    }
+
+    /// MAX(Timestamp) GROUP BY must collapse to the Int64 atomic kernel.
+    #[test]
+    fn groupby_max_timestamp_matches_int64() {
+        let ts = compile_groupby_agg_kernel(ReduceOp::Max, TS_NS)
+            .expect("MAX(Timestamp) GROUP BY should compile via Int64");
+        let i64_ref = compile_groupby_agg_kernel(ReduceOp::Max, DataType::Int64)
+            .expect("MAX(Int64) reference");
+        assert_eq!(ts, i64_ref);
+        assert!(ts.contains("atom.global.max.s64"), "expected s64 max atomic:\n{ts}");
+    }
+
+    /// COUNT over temporal value columns routes through the integer add atomic.
+    #[test]
+    fn groupby_count_temporal_routes_to_integer() {
+        assert_eq!(
+            compile_groupby_agg_kernel(ReduceOp::Count, DataType::Date32).unwrap(),
+            compile_groupby_agg_kernel(ReduceOp::Count, DataType::Int32).unwrap(),
+        );
+        assert_eq!(
+            compile_groupby_agg_kernel(ReduceOp::Count, TS_NS).unwrap(),
+            compile_groupby_agg_kernel(ReduceOp::Count, DataType::Int64).unwrap(),
+        );
+    }
+
+    /// SUM over a temporal dtype is undefined SQL and must be rejected by the
+    /// GROUP BY agg-kernel emitter (both single and fused paths).
+    #[test]
+    fn groupby_sum_temporal_is_rejected() {
+        for dt in [DataType::Date32, TS_NS] {
+            let err = compile_groupby_agg_kernel(ReduceOp::Sum, dt)
+                .expect_err("SUM(temporal) GROUP BY must be rejected");
+            assert!(
+                err.to_string().contains("SUM over temporal"),
+                "unexpected SUM(temporal) error for {dt:?}: {err}"
+            );
+            // Fused multi-agg path rejects it too.
+            let specs = [AggSpec { op: ReduceOp::Sum, input_dtype: dt }];
+            assert!(compile_groupby_agg_kernel_multi(&specs).is_err());
+        }
+    }
+
+    /// The temporal normalisation must not let Bool/Utf8/Decimal128 through —
+    /// they stay rejected by `atomic_for` (out of scope for F7).
+    #[test]
+    fn groupby_still_rejects_bool_utf8_decimal() {
+        for dt in [DataType::Bool, DataType::Utf8, DataType::Decimal128(10, 2)] {
+            assert!(compile_groupby_agg_kernel(ReduceOp::Min, dt).is_err());
+            assert!(compile_groupby_agg_kernel(ReduceOp::Count, dt).is_err());
+        }
+    }
+
+    /// `atomic_for` rejects float MIN/MAX (it has no native integer atomic) and
+    /// the error message documents the executor's reroute to `float_atomics`.
+    /// This is the F7(1) reroute contract: the single-pass executor intercepts
+    /// `(Min|Max, Float*)` and never calls this integer kernel for them.
+    #[test]
+    fn groupby_float_min_max_rejected_with_reroute_hint() {
+        for dt in [DataType::Float32, DataType::Float64] {
+            for op in [ReduceOp::Min, ReduceOp::Max] {
+                let err = compile_groupby_agg_kernel(op, dt)
+                    .expect_err("integer kernel must not emit float MIN/MAX");
+                assert!(
+                    err.to_string().contains("float_atomics"),
+                    "error should point at the float_atomics reroute, got: {err}"
+                );
+            }
+        }
+        // SUM/COUNT over float stay on this integer kernel via atom.add.fXX.
+        assert!(compile_groupby_agg_kernel(ReduceOp::Sum, DataType::Float64).is_ok());
     }
 
     // -----------------------------------------------------------------

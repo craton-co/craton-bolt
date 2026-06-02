@@ -59,6 +59,61 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+/// Compute the byte-lexicographic collation rank permutation of a dictionary
+/// slice (finding F10).
+///
+/// `dictionary[p]` is the string at insertion slot `p` (GPU index `p + 1`).
+/// The returned `ranks[p]` is the 0-based position of that string in the
+/// byte-sorted order of all distinct dictionary entries. Ordering is binary
+/// (raw UTF-8 bytes via `str`'s `Ord`), NOT locale-aware — see
+/// [`DictionaryColumn::collation_ranks`].
+///
+/// Shared by the i32 and i64 dictionary variants (and the `Any` wrapper) so
+/// the collation definition lives in exactly one place.
+pub(crate) fn collation_ranks_of(dictionary: &[String]) -> Vec<usize> {
+    // Sort the insertion slots by their string value; the position of slot `p`
+    // within that sorted order is its rank.
+    let mut order: Vec<usize> = (0..dictionary.len()).collect();
+    order.sort_by(|&a, &b| dictionary[a].cmp(&dictionary[b]));
+    let mut ranks = vec![0usize; dictionary.len()];
+    for (rank, &slot) in order.iter().enumerate() {
+        ranks[slot] = rank;
+    }
+    ranks
+}
+
+/// GPU indices (1-based) of every entry in `dictionary` satisfying
+/// `entry OP probe` under byte-lexicographic collation (finding F10).
+///
+/// `op` must be one of the four ordering comparisons; any other op returns an
+/// empty vector (the rewriter only ever calls this for ordering ops). Slot 0
+/// (NULL) is never represented in `dictionary` and so is never returned. The
+/// result is in ascending GPU-index order. Shared by both dictionary variants.
+pub(crate) fn indices_satisfying_in(
+    dictionary: &[String],
+    op: crate::plan::logical_plan::BinaryOp,
+    probe: &str,
+) -> Vec<usize> {
+    use crate::plan::logical_plan::BinaryOp;
+    let keep = |s: &str| -> bool {
+        match op {
+            BinaryOp::Lt => s < probe,
+            BinaryOp::LtEq => s <= probe,
+            BinaryOp::Gt => s > probe,
+            BinaryOp::GtEq => s >= probe,
+            // Non-ordering ops are not this helper's responsibility.
+            _ => false,
+        }
+    };
+    dictionary
+        .iter()
+        .enumerate()
+        // GPU index of insertion slot `p` is `p + 1` (slot 0 = NULL).
+        .filter(|(_, s)| keep(s.as_str()))
+        .map(|(p, _)| p + 1)
+        .collect()
+}
+
 /// On-host string dictionary + on-device i32 indices.
 ///
 /// Strings are encoded as `i32` indices on the GPU; the host holds the
@@ -171,6 +226,75 @@ impl DictionaryColumn {
             .position(|d| d == s)
             // position is 0-based; real indices start at 1.
             .map(|p| (p as i32) + 1)
+    }
+
+    /// Collation rank array (finding F10).
+    ///
+    /// Returns a vector `ranks` of length `dictionary.len()` where `ranks[p]`
+    /// is the 0-based position of `dictionary[p]` in the byte-lexicographically
+    /// sorted order of all distinct dictionary entries. In other words, it is
+    /// the permutation that maps each entry's *insertion* slot (`p`, i.e. GPU
+    /// index `p + 1`) to its *sort* rank.
+    ///
+    /// This is **binary collation**: entries are ordered by raw UTF-8 byte
+    /// sequence (`str`'s `Ord`, which is `[u8]` lexicographic), NOT a
+    /// locale-aware / ICU collation. `'Z' < 'a'` and combining sequences are
+    /// compared bytewise. Locale collation is explicitly out of scope.
+    ///
+    /// The NULL slot (GPU index 0) is not represented here — it has no string
+    /// to rank. Callers that need a NULL-aware mapping treat slot 0 separately
+    /// (a NULL value compares as SQL NULL, never satisfying an ordering
+    /// predicate; see [`crate::plan::string_literal_rewrite`]).
+    ///
+    /// Cost: `O(N log N)` over the dictionary. Intended for query-plan time,
+    /// not a per-row hot path.
+    pub fn collation_ranks(&self) -> Vec<usize> {
+        collation_ranks_of(&self.dictionary)
+    }
+
+    /// Byte-lexicographic insertion rank of a probe literal (finding F10).
+    ///
+    /// Returns the number of distinct dictionary entries that sort strictly
+    /// before `probe` under binary (UTF-8 byte) collation — equivalently, the
+    /// half-open insertion point of `probe` in the sorted distinct-value
+    /// sequence. The result is in `0..=dictionary.len()` and is well defined
+    /// whether or not `probe` is itself present in the dictionary.
+    ///
+    /// This is the value an ordering rewrite compares ranks against: for a
+    /// `col < probe` predicate the matching entries are exactly those whose
+    /// sort rank is `< insertion_rank(probe)`; for `col <= probe` the bound is
+    /// the count of entries that sort `<= probe`, which is
+    /// `insertion_rank(probe)` plus one when `probe` is present. See
+    /// [`Self::indices_satisfying`].
+    pub fn insertion_rank(&self, probe: &str) -> usize {
+        self.dictionary.iter().filter(|d| d.as_str() < probe).count()
+    }
+
+    /// GPU indices of every dictionary entry that satisfies `entry OP probe`
+    /// under byte-lexicographic collation (finding F10).
+    ///
+    /// `op` is one of the four ordering comparisons (`<`, `<=`, `>`, `>=`),
+    /// expressed as a [`crate::plan::logical_plan::BinaryOp`]. The returned
+    /// indices are 1-based GPU indices (slot 0 / NULL is never included — a
+    /// NULL row must yield SQL NULL, not a match), in ascending index order so
+    /// the caller can lower them to a deterministic OR-of-equalities.
+    ///
+    /// This is the dictionary-precompute that lets `col OP 'lit'` over a
+    /// dict-encoded Utf8 column be evaluated by the existing integer-index GPU
+    /// machinery: the host computes the matching index set once and the GPU
+    /// only ever does integer compares. The literal need not be present in the
+    /// dictionary — the comparison is against the actual entry strings, so an
+    /// absent literal still partitions the entries correctly (half-open
+    /// insertion semantics fall out of the per-entry `<` / `<=` test).
+    pub fn indices_satisfying(
+        &self,
+        op: crate::plan::logical_plan::BinaryOp,
+        probe: &str,
+    ) -> Vec<i32> {
+        indices_satisfying_in(&self.dictionary, op, probe)
+            .into_iter()
+            .map(|p| p as i32)
+            .collect()
     }
 
     /// Batched variant of [`Self::index_of`].
@@ -402,6 +526,95 @@ mod tests {
         let col = DictionaryColumn::new_host_only(dict, 0);
         let got = col.index_of_many(&[]);
         assert!(got.is_empty());
+    }
+
+    // ---- F10: byte-lexicographic collation (host-only) -------------------
+
+    #[test]
+    fn collation_ranks_is_byte_lexicographic_permutation() {
+        // Insertion order is deliberately unsorted. Byte order puts the
+        // uppercase 'Z' (0x5A) before any lowercase letter (>= 0x61) — the
+        // binary-collation signature, distinct from locale collation.
+        // slots:            0        1        2        3
+        let dict = vec![
+            "delta".to_string(),
+            "apple".to_string(),
+            "Zebra".to_string(),
+            "mango".to_string(),
+        ];
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        // sorted: Zebra(2) < apple(1) < delta(0) < mango(3)
+        assert_eq!(col.collation_ranks(), vec![2, 1, 0, 3]);
+    }
+
+    #[test]
+    fn collation_ranks_empty_dictionary_is_empty() {
+        let col = DictionaryColumn::new_host_only(Vec::new(), 0);
+        assert!(col.collation_ranks().is_empty());
+    }
+
+    #[test]
+    fn insertion_rank_present_and_absent() {
+        let dict = vec![
+            "apple".to_string(),
+            "delta".to_string(),
+            "mango".to_string(),
+        ];
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        // present
+        assert_eq!(col.insertion_rank("apple"), 0);
+        assert_eq!(col.insertion_rank("mango"), 2);
+        // absent: half-open insertion point
+        assert_eq!(col.insertion_rank("aardvark"), 0);
+        assert_eq!(col.insertion_rank("cat"), 1);
+        assert_eq!(col.insertion_rank("zzz"), 3);
+    }
+
+    #[test]
+    fn indices_satisfying_matches_direct_byte_comparison() {
+        use crate::plan::logical_plan::BinaryOp;
+        let entries = ["delta", "apple", "Zebra", "mango"];
+        let dict: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+        let col = DictionaryColumn::new_host_only(dict, 0);
+
+        let oracle = |op: BinaryOp, lit: &str| -> Vec<i32> {
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| match op {
+                    BinaryOp::Lt => **s < lit,
+                    BinaryOp::LtEq => **s <= lit,
+                    BinaryOp::Gt => **s > lit,
+                    BinaryOp::GtEq => **s >= lit,
+                    _ => unreachable!(),
+                })
+                .map(|(p, _)| (p as i32) + 1)
+                .collect()
+        };
+
+        for &lit in &["mango", "cat", "Zebra", "zzz", "AAA"] {
+            for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+                let mut got = col.indices_satisfying(op, lit);
+                got.sort_unstable();
+                let mut want = oracle(op, lit);
+                want.sort_unstable();
+                assert_eq!(got, want, "op {op:?} lit {lit:?}");
+            }
+            // The NULL slot 0 must never appear in any match set.
+            for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+                assert!(!col.indices_satisfying(op, lit).contains(&0));
+            }
+        }
+    }
+
+    #[test]
+    fn indices_satisfying_non_ordering_op_is_empty() {
+        use crate::plan::logical_plan::BinaryOp;
+        let dict = vec!["a".to_string(), "b".to_string()];
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        // Eq/NotEq are not this helper's responsibility — empty result.
+        assert!(col.indices_satisfying(BinaryOp::Eq, "a").is_empty());
+        assert!(col.indices_satisfying(BinaryOp::NotEq, "a").is_empty());
     }
 
     // ---- Construction-time dedupe ----------------------------------------

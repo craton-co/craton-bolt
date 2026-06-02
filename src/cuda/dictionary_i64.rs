@@ -191,6 +191,36 @@ impl DictionaryColumnI64 {
             .map(|p| (p as i64) + 1)
     }
 
+    /// Collation rank array (finding F10). i64 sibling of
+    /// [`crate::cuda::dictionary::DictionaryColumn::collation_ranks`]; see that
+    /// method for the full contract. Byte-lexicographic (binary) ordering, NOT
+    /// locale-aware.
+    pub fn collation_ranks(&self) -> Vec<usize> {
+        crate::cuda::dictionary::collation_ranks_of(&self.dictionary)
+    }
+
+    /// Byte-lexicographic insertion rank of a probe literal (finding F10).
+    /// i64 sibling of
+    /// [`crate::cuda::dictionary::DictionaryColumn::insertion_rank`].
+    pub fn insertion_rank(&self, probe: &str) -> usize {
+        self.dictionary.iter().filter(|d| d.as_str() < probe).count()
+    }
+
+    /// GPU indices (as `i64`) of every dictionary entry satisfying
+    /// `entry OP probe` under byte-lexicographic collation (finding F10). i64
+    /// sibling of
+    /// [`crate::cuda::dictionary::DictionaryColumn::indices_satisfying`].
+    pub fn indices_satisfying(
+        &self,
+        op: crate::plan::logical_plan::BinaryOp,
+        probe: &str,
+    ) -> Vec<i64> {
+        crate::cuda::dictionary::indices_satisfying_in(&self.dictionary, op, probe)
+            .into_iter()
+            .map(|p| p as i64)
+            .collect()
+    }
+
     /// Batched variant of [`Self::index_of`].
     ///
     /// Mirrors [`crate::cuda::dictionary::DictionaryColumn::index_of_many`]:
@@ -539,6 +569,46 @@ mod tests {
             assert_eq!(col.index_of(s), Some((i as i64) + 1));
         }
         assert_eq!(col.index_of("missing-literal"), None);
+    }
+
+    // ---- F10: byte-lexicographic collation parity with i32 sibling -------
+
+    #[test]
+    fn collation_and_ordering_agree_with_i32_sibling() {
+        use crate::cuda::dictionary::DictionaryColumn;
+        use crate::plan::logical_plan::BinaryOp;
+
+        let dict = vec![
+            "delta".to_string(),
+            "apple".to_string(),
+            "Zebra".to_string(),
+            "mango".to_string(),
+        ];
+        let i32_col = DictionaryColumn::new_host_only(dict.clone(), 0);
+        let i64_col = DictionaryColumnI64::new_host_only(dict, 0)
+            .expect("host-only constructor");
+
+        // Ranks are integer positions — identical across widths.
+        assert_eq!(i32_col.collation_ranks(), i64_col.collation_ranks());
+
+        // insertion_rank is width-independent.
+        for lit in ["apple", "cat", "zzz", "AAA"] {
+            assert_eq!(i32_col.insertion_rank(lit), i64_col.insertion_rank(lit));
+        }
+
+        // indices_satisfying must agree slot-for-slot (modulo the index
+        // integer width).
+        for lit in ["mango", "cat", "Zebra", "zzz"] {
+            for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+                let a: Vec<i64> = i32_col
+                    .indices_satisfying(op, lit)
+                    .into_iter()
+                    .map(|x| x as i64)
+                    .collect();
+                let b = i64_col.indices_satisfying(op, lit);
+                assert_eq!(a, b, "op {op:?} lit {lit:?}");
+            }
+        }
     }
 
     #[test]

@@ -82,6 +82,20 @@ const LEN_PASS_PREFIX: &str = "bolt_str_len_pass";
 /// `bolt_str_write_pass_upper`).
 const WRITE_PASS_PREFIX: &str = "bolt_str_write_pass";
 
+/// Entry-point name prefix for the N-input CONCAT **length pass**. The concrete
+/// name appends the input arity (e.g. `bolt_str_concat_len_pass_2`).
+const CONCAT_LEN_PASS_PREFIX: &str = "bolt_str_concat_len_pass";
+
+/// Entry-point name prefix for the N-input CONCAT **write pass** (e.g.
+/// `bolt_str_concat_write_pass_2`).
+const CONCAT_WRITE_PASS_PREFIX: &str = "bolt_str_concat_write_pass";
+
+/// Maximum number of CONCAT input columns the GPU two-pass producer supports in
+/// a single kernel. Beyond this the executor keeps the host fallback
+/// ([`crate::exec::string_ops_extended::concat`]) — the register/parameter
+/// budget per launch grows linearly with `N`, and very wide CONCATs are rare.
+pub const CONCAT_MAX_INPUTS: usize = 8;
+
 /// Adapt a `std::fmt::Error` into a `BoltError`.
 fn write_err(e: std::fmt::Error) -> BoltError {
     BoltError::Other(format!("string_kernel: write failed: {}", e))
@@ -122,34 +136,19 @@ fn varwidth_tag(kind: ScalarFnKind) -> BoltResult<&'static str> {
             "string_kernel: LENGTH is fixed-width; use compile_length_gather_kernel".into(),
         )),
         ScalarFnKind::Concat => Err(BoltError::Plan(
-            // TODO(string-concat-gpu): CONCAT is a multi-input two-pass
-            // producer and is intentionally still deferred. Precise design
-            // note for a future implementation:
-            //
-            //   * ABI differs from the single-input passes — the length pass
-            //     needs TWO source-slice descriptors (offsets+bytes per input
-            //     arg, N of them for variadic CONCAT; start with N=2 binary
-            //     CONCAT), plus a per-row NULL channel. SQL CONCAT returns NULL
-            //     if ANY arg is NULL, so the kernel needs each input's validity
-            //     (e.g. an `i8* null_mask` per arg, or the row-aligned encoding
-            //     the executor already uses) to emit `row_lens[tid] = 0` AND a
-            //     side `is_null[tid] = 1` for NULL rows.
-            //   * Length pass: `row_lens[tid] = sum_k in_len_k(tid)` for
-            //     non-NULL rows (reuse `emit_load_src_slice` once per input arg,
-            //     summing the `len` outputs); `0` for NULL rows.
-            //   * Prefix scan (`jit::prefix_scan`, reused as-is) over `row_lens`
-            //     to produce `out_offsets` and the total `out_bytes` size.
-            //   * Write pass: `dst = out_bytes + out_offsets[tid]`; for each
-            //     input arg k in order, byte-copy its slice into `dst` advancing
-            //     a running cursor (a sequence of inner WRITE_LOOPs mirroring
-            //     the single-input copy loop). NULL rows write nothing (their
-            //     out_len is 0). The executor must still rebuild the output
-            //     dictionary / validity from the downloaded offsets+bytes.
-            //   * The host fallback in `exec::string_ops_extended::concat`
-            //     remains the supported path until the above is implemented and
-            //     GPU-validated.
-            "string_kernel: CONCAT GPU two-pass codegen not yet implemented; \
-             host fallback remains reachable"
+            // CONCAT is a multi-input two-pass producer with a fundamentally
+            // different ABI (N offsets+bytes descriptor pairs, not one), so it
+            // does NOT share the single-input `LEN_PASS_PREFIX` mangling /
+            // `compile_varwidth_{len,write}_pass` path. Its GPU producer lives
+            // in the dedicated [`compile_concat_len_pass`] /
+            // [`compile_concat_write_pass`] (keyed by input arity N) — call
+            // those, not this helper. The host fallback in
+            // `exec::string_ops_extended::concat` remains the supported path for
+            // arities beyond [`CONCAT_MAX_INPUTS`] and on any kernel/launch
+            // error.
+            "string_kernel: CONCAT uses the dedicated N-input \
+             compile_concat_len_pass / compile_concat_write_pass producers, \
+             not the single-input varwidth path"
                 .into(),
         )),
         // New scalar string fns (OCTET_LENGTH, POSITION, REPLACE, LEFT/RIGHT,
@@ -1165,6 +1164,299 @@ pub fn compile_varwidth_write_pass(kind: ScalarFnKind) -> BoltResult<String> {
     Ok(ptx)
 }
 
+// ---------------------------------------------------------------------------
+// 3. N-input variable-output-width two-pass: CONCAT.
+// ---------------------------------------------------------------------------
+//
+// `CONCAT(a_0, a_1, ..., a_{N-1})` glues N `Utf8` inputs per row. Unlike the
+// single-input two-pass producers (UPPER/LOWER/SUBSTRING/TRIM) the ABI carries
+// **N** Arrow-`Utf8`-shaped source-slice descriptors (an `offsets`+`bytes`
+// pointer pair per input). The output row width is the SUM of the N input byte
+// lengths, so the same two-pass pattern applies:
+//
+//   * Length pass: `row_lens[tid] = sum_{k} (off_k[tid+1] - off_k[tid])`.
+//   * Host exclusive-scan of `row_lens` → `out_offsets` + total `out_bytes`
+//     size (reuses [`crate::exec::string_project::exclusive_scan_lens`], the
+//     same helper UPPER/LOWER use).
+//   * Write pass: `dst = out_bytes + out_offsets[tid]`; for each input k in
+//     order, byte-copy its slice into `dst` advancing a running cursor.
+//
+// ## NULL semantics (matches the host fallback EXACTLY)
+//
+// Standard SQL `CONCAT(...)` returns NULL if ANY argument is NULL — this is the
+// behaviour [`crate::exec::string_ops_extended::concat`] implements (it pushes
+// index 0 / NULL whenever either side's index is 0). The GPU kernels carry **no
+// validity channel**: a NULL input row decodes to an EMPTY slice on the host
+// (see [`crate::exec::string_project::build_row_aligned_input`]), so the kernel
+// happily sums/copies a zero-length contribution for it. The NULL-if-any-arg-
+// NULL rule is then re-applied HOST-SIDE by the executor when it rebuilds the
+// output array (it ORs the N input validity bitmaps and marks the row NULL).
+// This mirrors the LIKE / UPPER NULL convention and keeps the length pass and
+// the write pass byte-identical (no NULL-conditional branch to drift between
+// the two passes).
+//
+// ## CRITICAL: length/write byte-length agreement
+//
+// Both passes compute each input's per-row byte length with the IDENTICAL
+// `emit_load_src_slice` arithmetic (`off_k[tid+1] - off_k[tid]`). The length
+// pass sums those; the write pass copies exactly that many bytes per input.
+// Because the source of truth is the same offsets array read the same way, the
+// total the write pass emits can never exceed the region `out_offsets`
+// reserved — no out-of-bounds write.
+
+/// Entry-point name of the CONCAT **length pass** for `n` inputs (e.g.
+/// `bolt_str_concat_len_pass_2`). Host launchers use this to look up the
+/// compiled function by name.
+pub fn concat_len_pass_entry(n: usize) -> String {
+    format!("{}_{}", CONCAT_LEN_PASS_PREFIX, n)
+}
+
+/// Entry-point name of the CONCAT **write pass** for `n` inputs (e.g.
+/// `bolt_str_concat_write_pass_2`). See [`concat_len_pass_entry`].
+pub fn concat_write_pass_entry(n: usize) -> String {
+    format!("{}_{}", CONCAT_WRITE_PASS_PREFIX, n)
+}
+
+/// Validate the CONCAT input arity, shared by both pass compilers.
+fn check_concat_arity(n: usize) -> BoltResult<()> {
+    if n < 2 {
+        return Err(BoltError::Plan(format!(
+            "string_kernel: CONCAT needs >= 2 inputs, got {n}"
+        )));
+    }
+    if n > CONCAT_MAX_INPUTS {
+        return Err(BoltError::Plan(format!(
+            "string_kernel: CONCAT GPU producer supports at most {} inputs, got {} \
+             (use the host fallback for wider CONCATs)",
+            CONCAT_MAX_INPUTS, n
+        )));
+    }
+    Ok(())
+}
+
+/// Compile **pass 1** (the length pass) of the N-input CONCAT two-pass producer.
+///
+/// Each thread sums the per-row byte length of all `n` input slices and writes
+/// the total to `row_lens[tid]` (a `u32`). NULL inputs decode host-side to empty
+/// slices and contribute `0` (see the module section above); the SQL
+/// NULL-if-any-arg-NULL rule is re-applied host-side, not here.
+///
+/// ## ABI (`n` inputs)
+///
+/// ```text
+/// .visible .entry bolt_str_concat_len_pass_<n>(
+///     .param .u64 ..._param_0,    // src_offsets_0 (i32*, n_rows+1 entries)
+///     .param .u64 ..._param_1,    // src_bytes_0   (u8*)
+///     .param .u64 ..._param_2,    // src_offsets_1 (i32*)
+///     .param .u64 ..._param_3,    // src_bytes_1   (u8*)
+///     ...                          // (offsets, bytes) pair per input, in order
+///     .param .u64 ..._param_{2n},   // row_lens (u32*) -- OUTPUT, per-row out length
+///     .param .u32 ..._param_{2n+1}  // n_rows
+/// )
+/// ```
+///
+/// Grid is 1-D, one thread per row, block size [`BLOCK_SIZE`].
+pub fn compile_concat_len_pass(n: usize) -> BoltResult<String> {
+    check_concat_arity(n)?;
+    let entry = concat_len_pass_entry(n);
+
+    let mut ptx = String::new();
+    emit_header(&mut ptx)?;
+
+    let row_lens_param = 2 * n; // param index of row_lens
+    let n_rows_param = 2 * n + 1; // param index of n_rows
+
+    writeln!(ptx, ".visible .entry {}(", entry).map_err(write_err)?;
+    // N (offsets, bytes) pointer pairs.
+    for k in 0..(2 * n) {
+        writeln!(ptx, "\t.param .u64 {}_param_{},", entry, k).map_err(write_err)?;
+    }
+    // row_lens output pointer.
+    writeln!(ptx, "\t.param .u64 {}_param_{},", entry, row_lens_param).map_err(write_err)?;
+    // n_rows (last, no trailing comma).
+    writeln!(ptx, "\t.param .u32 {}_param_{}", entry, n_rows_param).map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    writeln!(ptx, "\t.reg .pred  %p<4>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<40>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<40>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // gid + n_rows guard.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_{}];", entry, n_rows_param).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // total = 0 (accumulated in %r13, matching the single-input convention).
+    writeln!(ptx, "\tmov.u32 %r13, 0;").map_err(write_err)?;
+
+    // For each input k: load offsets/bytes, compute in_len, add to total.
+    for k in 0..n {
+        let off_param = 2 * k;
+        let bytes_param = 2 * k + 1;
+        // Globalize this input's offsets (%rd0) and bytes (%rd1). `emit_load_src_slice`
+        // only reads offsets; %rd1 is unused in the length pass but globalized for
+        // symmetry / cheap and to keep the helper's signature satisfied.
+        writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_{}];", entry, off_param).map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd1, [{}_param_{}];", entry, bytes_param)
+            .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
+        // %r5=begin, %r6=end, %r7=in_len_k, %rd10=slice_ptr (ptr unused here).
+        emit_load_src_slice(&mut ptx, "%r5", "%r6", "%r7", "%rd10", "%rd0", "%rd1")?;
+        // total += in_len_k
+        writeln!(ptx, "\tadd.s32 %r13, %r13, %r7;").map_err(write_err)?;
+    }
+
+    // row_lens[tid] = total. row_lens pointer is param_{2n}.
+    writeln!(ptx, "\tld.param.u64 %rd2, [{}_param_{}];", entry, row_lens_param)
+        .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd11, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd12, %rd2, %rd11;").map_err(write_err)?;
+    writeln!(ptx, "\tst.global.u32 [%rd12], %r13;").map_err(write_err)?;
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
+/// Compile **pass 2** (the write pass) of the N-input CONCAT two-pass producer.
+///
+/// After the host has exclusive-scanned the pass-1 `row_lens` into `out_offsets`
+/// and allocated `out_bytes`, this kernel copies each input slice, in input
+/// order, into the row's destination region:
+///
+/// ```text
+/// dst = out_bytes + out_offsets[tid]
+/// cursor = 0
+/// for k in 0..n:
+///     for i in 0 .. in_len_k(tid):
+///         dst[cursor + i] = src_slice_k[i]
+///     cursor += in_len_k(tid)
+/// ```
+///
+/// The per-input copy uses a `CONCAT_WRITE_LOOP_k:` / `CONCAT_WRITE_DONE_k:`
+/// structure so golden tests can pin the loop body and confirm one copy loop is
+/// emitted per input.
+///
+/// ## ABI (`n` inputs)
+///
+/// ```text
+/// .visible .entry bolt_str_concat_write_pass_<n>(
+///     .param .u64 ..._param_0,    // src_offsets_0 (i32*)
+///     .param .u64 ..._param_1,    // src_bytes_0   (u8*)
+///     ...                          // (offsets, bytes) pair per input, in order
+///     .param .u64 ..._param_{2n},   // out_offsets (i32*, exclusive scan of row_lens)
+///     .param .u64 ..._param_{2n+1}, // out_bytes   (u8*) -- OUTPUT buffer
+///     .param .u32 ..._param_{2n+2}  // n_rows
+/// )
+/// ```
+///
+/// Grid is 1-D, one thread per row, block size [`BLOCK_SIZE`].
+pub fn compile_concat_write_pass(n: usize) -> BoltResult<String> {
+    check_concat_arity(n)?;
+    let entry = concat_write_pass_entry(n);
+
+    let mut ptx = String::new();
+    emit_header(&mut ptx)?;
+
+    let out_off_param = 2 * n; // out_offsets pointer
+    let out_bytes_param = 2 * n + 1; // out_bytes pointer
+    let n_rows_param = 2 * n + 2; // n_rows
+
+    writeln!(ptx, ".visible .entry {}(", entry).map_err(write_err)?;
+    for k in 0..(2 * n) {
+        writeln!(ptx, "\t.param .u64 {}_param_{},", entry, k).map_err(write_err)?;
+    }
+    writeln!(ptx, "\t.param .u64 {}_param_{},", entry, out_off_param).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_{},", entry, out_bytes_param).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {}_param_{}", entry, n_rows_param).map_err(write_err)?;
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    writeln!(ptx, "\t.reg .pred  %p<4>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b16   %rs<4>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<40>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // gid + n_rows guard.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_{}];", entry, n_rows_param).map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
+
+    // dst base = out_bytes + out_offsets[tid].
+    writeln!(ptx, "\tld.param.u64 %rd2, [{}_param_{}];", entry, out_off_param).map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd3, [{}_param_{}];", entry, out_bytes_param)
+        .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd13, %r3, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd14, %rd2, %rd13;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.u32 %r8, [%rd14];").map_err(write_err)?; // out_offset
+    writeln!(ptx, "\tmul.wide.u32 %rd15, %r8, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd16, %rd3, %rd15;").map_err(write_err)?; // dst base ptr
+
+    // cursor (running byte offset within the row's output region) = 0. Held in
+    // %rd30 as a 64-bit byte offset added to the dst base.
+    writeln!(ptx, "\tmov.u64 %rd30, 0;").map_err(write_err)?;
+
+    // For each input k: load its slice and append it at the running cursor.
+    for k in 0..n {
+        let off_param = 2 * k;
+        let bytes_param = 2 * k + 1;
+        // Globalize input k's offsets (%rd0) and bytes (%rd1).
+        writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_{}];", entry, off_param).map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd1, [{}_param_{}];", entry, bytes_param)
+            .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
+        // %r5=begin, %r6=end, %r9=in_len_k (copy_len), %rd10=src_ptr.
+        // NOTE: %r9 holds the copy length — the IDENTICAL `end-begin` the length
+        // pass summed for this input, so the bytes written exactly fill the
+        // reserved region.
+        emit_load_src_slice(&mut ptx, "%r5", "%r6", "%r9", "%rd10", "%rd0", "%rd1")?;
+
+        // Per-byte copy loop for input k. i in [0, in_len_k).
+        writeln!(ptx, "\tmov.u32 %r10, 0;").map_err(write_err)?; // i = 0
+        writeln!(ptx, "CONCAT_WRITE_LOOP_{}:", k).map_err(write_err)?;
+        writeln!(ptx, "\tsetp.ge.s32 %p1, %r10, %r9;").map_err(write_err)?;
+        writeln!(ptx, "\t@%p1 bra CONCAT_WRITE_DONE_{};", k).map_err(write_err)?;
+        // b = src_ptr[i]
+        writeln!(ptx, "\tmul.wide.u32 %rd18, %r10, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd19, %rd10, %rd18;").map_err(write_err)?;
+        writeln!(ptx, "\tld.global.nc.u8 %rs0, [%rd19];").map_err(write_err)?;
+        // dst[cursor + i] = b
+        writeln!(ptx, "\tadd.s64 %rd24, %rd16, %rd30;").map_err(write_err)?; // dst + cursor
+        writeln!(ptx, "\tadd.s64 %rd24, %rd24, %rd18;").map_err(write_err)?; // + i
+        writeln!(ptx, "\tst.global.u8 [%rd24], %rs0;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s32 %r10, %r10, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tbra CONCAT_WRITE_LOOP_{};", k).map_err(write_err)?;
+        writeln!(ptx, "CONCAT_WRITE_DONE_{}:", k).map_err(write_err)?;
+        // cursor += in_len_k (advance the running output offset).
+        writeln!(ptx, "\tcvt.u64.u32 %rd25, %r9;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd30, %rd30, %rd25;").map_err(write_err)?;
+    }
+
+    writeln!(ptx, "DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,6 +1805,134 @@ mod tests {
         let negated = compile_like_match_kernel(LikeMode::Prefix, true).expect("compile");
         assert!(!plain.contains("xor.b32 %r9, %r9, 1"), "non-negated must not XOR\n{plain}");
         assert!(negated.contains("xor.b32 %r9, %r9, 1"), "NOT LIKE must XOR the 0/1\n{negated}");
+    }
+
+    // ---- N-input CONCAT two-pass producer ---------------------------------
+
+    #[test]
+    fn concat_len_pass_2_input_abi_and_sum() {
+        let ptx = compile_concat_len_pass(2).expect("compile");
+        assert!(ptx.contains(".version 7.5"), "{ptx}");
+        assert!(ptx.contains(".visible .entry bolt_str_concat_len_pass_2("), "{ptx}");
+        // 2 inputs -> 4 pointer params (off0,bytes0,off1,bytes1), then row_lens
+        // at param_4 and n_rows at param_5.
+        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_0,"), "{ptx}");
+        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_3,"), "{ptx}");
+        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_4,"), "row_lens\n{ptx}");
+        assert!(ptx.contains(".param .u32 bolt_str_concat_len_pass_2_param_5"), "n_rows\n{ptx}");
+        assert!(
+            !ptx.contains("bolt_str_concat_len_pass_2_param_6"),
+            "2-input len pass must NOT have a 7th param\n{ptx}"
+        );
+        // The length sum: each input's in_len = end - begin (sub.s32) is added
+        // into the running total (add.s32 %r13, %r13, %r7), once per input.
+        assert_eq!(
+            ptx.matches("add.s32 %r13, %r13, %r7").count(),
+            2,
+            "expected one length-accumulate per input\n{ptx}"
+        );
+        // A single u32 row_lens store at the end.
+        assert!(ptx.contains("st.global.u32 [%rd12], %r13"), "missing row_lens store\n{ptx}");
+        // n_rows guard precedes the store.
+        let guard = ptx.find("bra DONE").expect("guard");
+        let store = ptx.find("st.global.u32 [%rd12]").expect("store");
+        assert!(guard < store, "n_rows guard must precede store\n{ptx}");
+    }
+
+    #[test]
+    fn concat_len_pass_3_input_has_three_accumulates() {
+        let ptx = compile_concat_len_pass(3).expect("compile");
+        assert!(ptx.contains(".visible .entry bolt_str_concat_len_pass_3("), "{ptx}");
+        // 3 inputs -> 6 pointer params; row_lens at param_6, n_rows at param_7.
+        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_3_param_5,"), "{ptx}");
+        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_3_param_6,"), "row_lens\n{ptx}");
+        assert!(ptx.contains(".param .u32 bolt_str_concat_len_pass_3_param_7"), "n_rows\n{ptx}");
+        assert_eq!(
+            ptx.matches("add.s32 %r13, %r13, %r7").count(),
+            3,
+            "expected one length-accumulate per input\n{ptx}"
+        );
+    }
+
+    #[test]
+    fn concat_write_pass_2_input_abi_and_loops() {
+        let ptx = compile_concat_write_pass(2).expect("compile");
+        assert!(ptx.contains(".visible .entry bolt_str_concat_write_pass_2("), "{ptx}");
+        // 2 inputs -> 4 pointer params, then out_offsets (param_4), out_bytes
+        // (param_5), n_rows (param_6).
+        assert!(ptx.contains(".param .u64 bolt_str_concat_write_pass_2_param_4,"), "out_offsets\n{ptx}");
+        assert!(ptx.contains(".param .u64 bolt_str_concat_write_pass_2_param_5,"), "out_bytes\n{ptx}");
+        assert!(ptx.contains(".param .u32 bolt_str_concat_write_pass_2_param_6"), "n_rows\n{ptx}");
+        // One copy loop per input, in order.
+        assert!(ptx.contains("CONCAT_WRITE_LOOP_0:"), "missing input-0 copy loop\n{ptx}");
+        assert!(ptx.contains("CONCAT_WRITE_DONE_0:"), "{ptx}");
+        assert!(ptx.contains("CONCAT_WRITE_LOOP_1:"), "missing input-1 copy loop\n{ptx}");
+        assert!(ptx.contains("CONCAT_WRITE_DONE_1:"), "{ptx}");
+        assert!(
+            !ptx.contains("CONCAT_WRITE_LOOP_2:"),
+            "2-input write pass must NOT emit a third loop\n{ptx}"
+        );
+        // Plain byte copy (no case fold): loads u8 then stores u8.
+        assert!(ptx.contains("ld.global.nc.u8 %rs0"), "{ptx}");
+        assert!(ptx.contains("st.global.u8 [%rd24], %rs0"), "{ptx}");
+        // Running cursor advances by the same in_len (%r9) the length pass summed.
+        assert!(ptx.contains("add.s64 %rd30, %rd30, %rd25"), "cursor advance\n{ptx}");
+    }
+
+    #[test]
+    fn concat_write_pass_3_input_has_three_loops() {
+        let ptx = compile_concat_write_pass(3).expect("compile");
+        assert!(ptx.contains("CONCAT_WRITE_LOOP_0:"), "{ptx}");
+        assert!(ptx.contains("CONCAT_WRITE_LOOP_1:"), "{ptx}");
+        assert!(ptx.contains("CONCAT_WRITE_LOOP_2:"), "{ptx}");
+        assert!(!ptx.contains("CONCAT_WRITE_LOOP_3:"), "{ptx}");
+    }
+
+    #[test]
+    fn concat_len_and_write_use_identical_per_input_length() {
+        // CRITICAL OOB-safety property: both passes derive each input's byte
+        // length from the SAME `end - begin` slice arithmetic via
+        // `emit_load_src_slice`. The length pass sums `%r7` (its in_len reg);
+        // the write pass copies `%r9` bytes (its in_len reg) per input. Both
+        // come from the identical helper, so the totals agree by construction.
+        let len = compile_concat_len_pass(2).unwrap();
+        let write = compile_concat_write_pass(2).unwrap();
+        // Both passes emit `sub.s32 <len>, %r6, %r5` (end - begin) per input.
+        assert!(len.contains("sub.s32 %r7, %r6, %r5"), "len pass in_len calc\n{len}");
+        assert!(write.contains("sub.s32 %r9, %r6, %r5"), "write pass in_len calc\n{write}");
+        // Same number of slice loads (one per input) in each pass.
+        assert_eq!(len.matches("sub.s32 %r7, %r6, %r5").count(), 2, "{len}");
+        assert_eq!(write.matches("sub.s32 %r9, %r6, %r5").count(), 2, "{write}");
+    }
+
+    #[test]
+    fn concat_entry_name_helpers_match_emitted_entries() {
+        for n in 2..=CONCAT_MAX_INPUTS {
+            let len_name = concat_len_pass_entry(n);
+            let write_name = concat_write_pass_entry(n);
+            assert_eq!(len_name, format!("bolt_str_concat_len_pass_{n}"));
+            assert_eq!(write_name, format!("bolt_str_concat_write_pass_{n}"));
+            let len_ptx = compile_concat_len_pass(n).unwrap();
+            assert!(
+                len_ptx.contains(&format!(".visible .entry {len_name}(")),
+                "len entry mismatch for n={n}\n{len_ptx}"
+            );
+            let write_ptx = compile_concat_write_pass(n).unwrap();
+            assert!(
+                write_ptx.contains(&format!(".visible .entry {write_name}(")),
+                "write entry mismatch for n={n}\n{write_ptx}"
+            );
+        }
+    }
+
+    #[test]
+    fn concat_rejects_arity_below_two_and_above_max() {
+        assert!(compile_concat_len_pass(0).is_err());
+        assert!(compile_concat_len_pass(1).is_err());
+        assert!(compile_concat_write_pass(1).is_err());
+        let e = compile_concat_len_pass(CONCAT_MAX_INPUTS + 1).unwrap_err();
+        assert!(format!("{e}").contains("at most"), "{e}");
+        assert!(compile_concat_write_pass(CONCAT_MAX_INPUTS + 1).is_err());
     }
 
     #[test]

@@ -385,6 +385,18 @@ fn reduce_gathered(op: ReduceOp, gathered: &GatheredCol) -> BoltResult<Scalar> {
         GatheredCol::Bool(_) | GatheredCol::BoolNullable { .. } => Err(BoltError::Other(
             "resident on-device aggregate: cannot reduce a Bool gathered column".into(),
         )),
+        // F6: Date32 reduces as i32, Timestamp as i64 (MIN/MAX/COUNT are
+        // integer ops at the dtype's byte width; SUM over temporal is rejected
+        // upstream). The on-device layout is identical to I32/I64.
+        GatheredCol::Date32(v) => reduce_gpu_vec::<i32>(op, DataType::Int32, v, n),
+        GatheredCol::Timestamp { values, .. } => {
+            reduce_gpu_vec::<i64>(op, DataType::Int64, values, n)
+        }
+        // Decimal128 has no scalar reduce in this resident path (16-byte rows
+        // are not a primitive GpuVec element); host fallback handles it.
+        GatheredCol::Decimal128 { .. } => Err(BoltError::Other(
+            "resident on-device aggregate: cannot reduce a Decimal128 gathered column".into(),
+        )),
     }
 }
 

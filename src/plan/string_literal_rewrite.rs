@@ -52,10 +52,25 @@
 //! correct host string comparison. A literal that IS in the dictionary always
 //! folds to its index regardless of completeness — that fast path is exact.
 //!
-//! Unsupported (returns `BoltError::Plan`):
-//!   * `< <= > >=` on Utf8 columns with Utf8 literals — dictionary indices
-//!     reflect insertion order, not lexicographic order, so these can't be
-//!     reduced to integer comparison without a collation pass.
+//! Ordering comparisons (finding F10):
+//!   * `< <= > >=` on a Utf8 column against a Utf8 literal (the common
+//!     `col OP 'lit'` case, either orientation) are lowered via a
+//!     **byte-lexicographic collation** precompute. Dictionary indices reflect
+//!     insertion order, not sort order, so instead of comparing indices the
+//!     host partitions the dictionary entries by the literal under binary
+//!     (UTF-8 byte) collation and emits an OR-of-equalities on the
+//!     `__idx_<col>` integer column — the same form the LIKE precompute uses,
+//!     so no collation-rank column or new kernel is needed. The literal need
+//!     not be in the dictionary (half-open insertion partition). NULL rows
+//!     (GPU index 0) are never in the match set, so a NULL value never passes
+//!     an ordering predicate — the correct projection of SQL 3VL into a boolean
+//!     filter. This is **binary** collation, NOT locale-aware / ICU collation,
+//!     which is out of scope.
+//!   * Column-vs-column Utf8 ordering (`col_a < col_b`, both dict columns) is
+//!     NOT folded: there is no single literal to partition one dictionary by,
+//!     and the two columns' index spaces are unrelated. Such a comparison does
+//!     not match the `col OP 'lit'` shape, so it is left intact and routed to
+//!     the host string-comparison path (always correct, no rejection).
 //!
 //! Deferred:
 //!   * `IN ('a','b','c')` — would lower to OR-of-equalities; not in scope.
@@ -169,6 +184,40 @@ pub trait LiteralResolver {
         escape: Option<char>,
     ) -> Option<Vec<LiteralIndex>> {
         let _ = (column, pattern, escape);
+        None
+    }
+
+    /// Byte-lexicographic ordering precompute (finding F10): the
+    /// [`LiteralIndex`]es (matching the dictionary's index width) of every
+    /// entry of `column`'s dictionary that satisfies `entry OP literal` under
+    /// **binary** (UTF-8 byte) collation.
+    ///
+    /// `op` is one of the four ordering comparisons (`Lt`/`LtEq`/`Gt`/`GtEq`);
+    /// the rewriter only calls this for those. This lets `col OP 'lit'` over a
+    /// dict-encoded Utf8 column lower to an OR-of-equalities on the
+    /// `__idx_<col>` integer column (the same form the LIKE precompute emits) —
+    /// no collation rank column or new kernel is needed, because the host has
+    /// already partitioned the dictionary by the literal.
+    ///
+    /// The NULL slot (GPU index `0`) is never included: a NULL string compares
+    /// as SQL NULL, never satisfying an ordering predicate, and the
+    /// OR-of-equalities form the rewriter emits would otherwise turn a slot-0
+    /// hit into `true`. The probe literal need not be present in the
+    /// dictionary — the per-entry comparison partitions the entries correctly
+    /// (half-open insertion semantics), so strict (`<`) vs non-strict (`<=`)
+    /// bounds are exact whether or not the literal is itself an entry.
+    ///
+    /// This is **binary collation**, NOT locale-aware / ICU collation, which is
+    /// out of scope. Returns `None` when `column` is not a registered
+    /// dictionary column (caller keeps the original host-evaluated comparison).
+    /// The default returns `None` so non-dict resolvers keep the host path.
+    fn ordering_match_indices(
+        &self,
+        column: &str,
+        op: BinaryOp,
+        literal: &str,
+    ) -> Option<Vec<LiteralIndex>> {
+        let _ = (column, op, literal);
         None
     }
 
@@ -384,6 +433,33 @@ impl<'a> LiteralResolver for StringPredicateRewriter<'a> {
         Some(out)
     }
 
+    fn ordering_match_indices(
+        &self,
+        column: &str,
+        op: BinaryOp,
+        literal: &str,
+    ) -> Option<Vec<LiteralIndex>> {
+        let dict = self.dicts.get(column)?;
+        // Map the BinaryOp into the dictionary layer (it owns the byte-wise
+        // partition and the slot-0/NULL exclusion). `indices_satisfying_any`
+        // returns 1-based GPU indices widened to i64; re-narrow per the
+        // dictionary's index width so the emitted literals match the
+        // `__idx_<col>` column.
+        let is_i32 = dict.is_i32();
+        let out = dict
+            .indices_satisfying_any(op, literal)
+            .into_iter()
+            .map(|idx| {
+                if is_i32 {
+                    LiteralIndex::I32(idx as i32)
+                } else {
+                    LiteralIndex::I64(idx)
+                }
+            })
+            .collect();
+        Some(out)
+    }
+
     fn is_complete(&self, column: &str) -> bool {
         // Only columns explicitly opted in via `mark_complete` are trusted as
         // having observed every distinct value. A `DictionaryColumnAny` alone
@@ -411,12 +487,28 @@ fn is_eq_or_neq(op: BinaryOp) -> bool {
     matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
 }
 
-/// True for ordering comparisons we cannot reduce via dictionary indices.
+/// True for ordering comparisons.
 fn is_ordering(op: BinaryOp) -> bool {
     matches!(
         op,
         BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
     )
+}
+
+/// Reflect an ordering op about its operands: the op `x` such that
+/// `a OP b` ⇔ `b (reflect OP) a`. Used when the string literal sits on the
+/// LEFT of an ordering comparison (`'lit' < col`): we always partition the
+/// dictionary as `entry OP literal`, so a left-literal shape must reflect the
+/// op first (`'lit' < col` ⇔ `col > 'lit'`). Non-ordering ops are returned
+/// unchanged (the caller only reflects ordering ops).
+fn reflect_ordering(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
 }
 
 /// Peel `Alias(inner, _)` wrappers off `e`, returning the innermost non-alias
@@ -529,7 +621,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
 
             // Try to match a `col <op> 'lit'` (or reversed) shape against a
             // registered Utf8 column.
-            if let Some((col_name, lit_str, _swapped)) =
+            if let Some((col_name, lit_str, swapped)) =
                 extract_col_and_string_lit(&new_left, &new_right)
             {
                 if r.knows(&col_name) {
@@ -602,11 +694,51 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                                 // host string-comparison path stays correct.
                             }
                         }
-                    } else if is_ordering(*op) {
-                        return Err(BoltError::Plan(format!(
-                            "ordering comparison {op:?} on Utf8 column '{col_name}' \
-                             requires dictionary collation (not yet implemented)"
-                        )));
+                    } else if is_ordering(*op) && r.predicate_rewrite_allowed(&col_name) {
+                        // Finding F10: byte-lexicographic ordering. The
+                        // dictionary precompute partitions the entries by the
+                        // literal under binary (UTF-8 byte) collation and the
+                        // rewriter lowers `col OP 'lit'` to an OR-of-equalities
+                        // on the `__idx_<col>` integer column — the same form
+                        // the LIKE precompute emits, so the existing GPU/host
+                        // integer machinery executes it with no collation-rank
+                        // column or new kernel.
+                        //
+                        // NULL handling: the matching set never contains GPU
+                        // index 0, so a NULL row's index (slot 0) matches no
+                        // equality and the predicate is false for it — which is
+                        // the correct projection of SQL 3VL into a boolean
+                        // filter (a NULL ordering compares as NULL, i.e. the row
+                        // does not pass). Equality semantics with the existing
+                        // index-membership LIKE path are preserved verbatim.
+                        //
+                        // Absent literal: handled inside the dictionary layer —
+                        // the per-entry byte comparison gives the half-open
+                        // insertion partition, so strict vs non-strict bounds
+                        // are exact whether or not 'lit' is itself an entry. No
+                        // completeness signal is needed: every entry is tested
+                        // against the real literal, so a literal the dictionary
+                        // never saw still partitions the known entries
+                        // correctly. (Rows whose value is absent from a *partial*
+                        // dictionary cannot occur here — the index column only
+                        // ever holds slots the dictionary defines.)
+                        //
+                        // NOTE: this is binary collation, NOT locale-aware ICU
+                        // collation, which is out of scope.
+                        // The dictionary always partitions as `entry OP lit`.
+                        // If the literal was on the LEFT (`'lit' OP col`), the
+                        // predicate is `lit OP entry` ⇔ `entry (reflect OP) lit`,
+                        // so reflect the op before asking the dictionary.
+                        let probe_op = if swapped { reflect_ordering(*op) } else { *op };
+                        if let Some(indices) =
+                            r.ordering_match_indices(&col_name, probe_op, &lit_str)
+                        {
+                            let mangled = r.index_column_name(&col_name);
+                            return Ok(build_index_membership(&mangled, &indices));
+                        }
+                        // Resolver declined (not a dict column it can partition):
+                        // fall through and preserve the original comparison for
+                        // the host path.
                     }
                     // Other ops (arithmetic, logical) against a Utf8 column
                     // are type errors elsewhere; fall through and let the
@@ -969,6 +1101,10 @@ mod tests {
         /// index `p + 1`, mirroring the production `DictionaryColumnAny`
         /// layout. Used to exercise `like_match_indices` without CUDA.
         dict_entries: HashMap<String, Vec<String>>,
+        /// columns whose string predicates are protected from the integer fold
+        /// (mirrors `StringPredicateRewriter::protect_predicate`). Empty by
+        /// default so the mock keeps folding unless a test opts a column in.
+        protected: std::collections::HashSet<String>,
     }
 
     impl MockResolver {
@@ -978,6 +1114,7 @@ mod tests {
                 columns: HashMap::new(),
                 complete: std::collections::HashSet::new(),
                 dict_entries: HashMap::new(),
+                protected: std::collections::HashSet::new(),
             }
         }
 
@@ -1054,6 +1191,10 @@ mod tests {
             self.columns.contains_key(column)
         }
 
+        fn predicate_rewrite_allowed(&self, column: &str) -> bool {
+            !self.protected.contains(column)
+        }
+
         fn like_match_indices(
             &self,
             column: &str,
@@ -1066,6 +1207,36 @@ mod tests {
             let mut out = Vec::new();
             for (p, s) in entries.iter().enumerate() {
                 if matcher.matches(s) {
+                    let idx = (p + 1) as i64;
+                    out.push(match width {
+                        MockWidth::I32 => LiteralIndex::I32(idx as i32),
+                        MockWidth::I64 => LiteralIndex::I64(idx),
+                    });
+                }
+            }
+            Some(out)
+        }
+
+        fn ordering_match_indices(
+            &self,
+            column: &str,
+            op: BinaryOp,
+            literal: &str,
+        ) -> Option<Vec<LiteralIndex>> {
+            let entries = self.dict_entries.get(column)?;
+            let width = self.columns.get(column).copied()?;
+            let keep = |s: &str| -> bool {
+                match op {
+                    BinaryOp::Lt => s < literal,
+                    BinaryOp::LtEq => s <= literal,
+                    BinaryOp::Gt => s > literal,
+                    BinaryOp::GtEq => s >= literal,
+                    _ => false,
+                }
+            };
+            let mut out = Vec::new();
+            for (p, s) in entries.iter().enumerate() {
+                if keep(s) {
                     let idx = (p + 1) as i64;
                     out.push(match width {
                         MockWidth::I32 => LiteralIndex::I32(idx as i32),
@@ -1288,20 +1459,26 @@ mod tests {
         }
     }
 
+    /// F10: ordering over a registered column with NO scannable dictionary
+    /// entries (the resolver can't partition it) is no longer a hard error —
+    /// the resolver declines and the original comparison is preserved for the
+    /// host path. (The `with_i32` mock registers a literal→index map but no
+    /// `dict_entries`, so `ordering_match_indices` returns `None`.)
     #[test]
-    fn reject_lt_on_string_column() {
+    fn ordering_without_dict_entries_preserves_comparison() {
         let r = MockResolver::new().with_i32("region", "US", 5);
         let expr = col("region").lt(lit("US"));
-        let err = rewrite_expr_with(&expr, &r, 0).unwrap_err();
-        match err {
-            BoltError::Plan(msg) => {
-                assert!(
-                    msg.contains("ordering comparison"),
-                    "expected ordering message, got: {msg}"
-                );
-                assert!(msg.contains("region"), "expected column name in: {msg}");
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        match out {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Lt);
+                assert_column(&left, "region");
+                match *right {
+                    Expr::Literal(Literal::Utf8(s)) => assert_eq!(s, "US"),
+                    other => panic!("expected preserved Utf8 literal, got {other:?}"),
+                }
             }
-            other => panic!("expected BoltError::Plan, got {other:?}"),
+            other => panic!("expected preserved Binary, got {other:?}"),
         }
     }
 
@@ -2056,5 +2233,277 @@ mod tests {
 
         // An unregistered column returns None (host fallback).
         assert!(rw.like_match_indices("unknown", "a%", None).is_none());
+    }
+
+    // ---- F10: byte-lexicographic ordering collation ----
+
+    /// Collect the `Int32` index literals out of an ordering membership tree
+    /// (or a single bare `Eq`) and return them sorted ascending. Shares the
+    /// `Eq`/`Or` shape `build_index_membership` emits with the LIKE path.
+    fn collect_membership_i32_sorted(e: &Expr, column: &str) -> Vec<i32> {
+        let mut v = collect_membership_i32(e, column);
+        v.sort_unstable();
+        v
+    }
+
+    /// Direct (oracle) byte-lexicographic evaluation of `entry OP literal`
+    /// over a dictionary, returning the GPU indices (1-based) that match —
+    /// the ground truth the rewrite must reproduce.
+    fn oracle_indices(entries: &[&str], op: BinaryOp, literal: &str) -> Vec<i32> {
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| match op {
+                BinaryOp::Lt => **s < literal,
+                BinaryOp::LtEq => **s <= literal,
+                BinaryOp::Gt => **s > literal,
+                BinaryOp::GtEq => **s >= literal,
+                _ => unreachable!("oracle is ordering-only"),
+            })
+            .map(|(p, _)| (p as i32) + 1)
+            .collect()
+    }
+
+    /// Rank computation over a known set of strings, via the real i32
+    /// dictionary. Insertion order is deliberately NOT sorted, so the
+    /// permutation is non-trivial. Byte order: "Zebra" < "apple" (uppercase
+    /// 'Z' = 0x5A precedes lowercase 'a' = 0x61) — the binary-collation
+    /// hallmark, distinct from a locale collation.
+    #[test]
+    fn f10_collation_ranks_known_set() {
+        use crate::cuda::dictionary::DictionaryColumn;
+        // Insertion slots:   0       1        2       3
+        let dict = vec![
+            "delta".to_string(),
+            "apple".to_string(),
+            "Zebra".to_string(),
+            "mango".to_string(),
+        ];
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        // Sorted byte order: "Zebra"(slot2) < "apple"(slot1) < "delta"(slot0)
+        // < "mango"(slot3). So ranks by insertion slot:
+        //   slot0 "delta" -> rank 2
+        //   slot1 "apple" -> rank 1
+        //   slot2 "Zebra" -> rank 0
+        //   slot3 "mango" -> rank 3
+        assert_eq!(col.collation_ranks(), vec![2, 1, 0, 3]);
+    }
+
+    /// Insertion rank for present and absent literals (the half-open
+    /// insertion point), via the real i32 dictionary.
+    #[test]
+    fn f10_insertion_rank_present_and_absent() {
+        use crate::cuda::dictionary::DictionaryColumn;
+        let dict = vec![
+            "apple".to_string(),
+            "delta".to_string(),
+            "mango".to_string(),
+        ]; // already sorted for clarity
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        // Present literals: rank == count of strictly-smaller entries.
+        assert_eq!(col.insertion_rank("apple"), 0);
+        assert_eq!(col.insertion_rank("delta"), 1);
+        assert_eq!(col.insertion_rank("mango"), 2);
+        // Absent literals: half-open insertion point.
+        assert_eq!(col.insertion_rank("aardvark"), 0); // before all
+        assert_eq!(col.insertion_rank("cat"), 1); // between apple, delta
+        assert_eq!(col.insertion_rank("zzz"), 3); // after all
+    }
+
+    /// `indices_satisfying` on the real i32 dictionary must agree with a
+    /// direct byte comparison for every ordering op, for both a present and
+    /// an absent literal.
+    #[test]
+    fn f10_indices_satisfying_matches_direct_comparison() {
+        use crate::cuda::dictionary::DictionaryColumn;
+        let entries = ["delta", "apple", "Zebra", "mango"];
+        let dict: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+        let col = DictionaryColumn::new_host_only(dict, 0);
+
+        for &lit in &["mango", "cat", "Zebra", "zzz", "AAA"] {
+            for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+                let mut got = col.indices_satisfying(op, lit);
+                got.sort_unstable();
+                let mut want = oracle_indices(&entries, op, lit);
+                want.sort_unstable();
+                assert_eq!(
+                    got, want,
+                    "indices_satisfying({op:?}, {lit:?}) mismatch"
+                );
+            }
+        }
+    }
+
+    /// End-to-end: `col < 'lit'` over a dict column lowers to the index
+    /// membership of entries that sort before the literal, and the boolean
+    /// result of the rewritten predicate matches a direct string comparison
+    /// on sample data (each dictionary entry stands in for a sample row).
+    #[test]
+    fn f10_lt_rewrites_to_membership_and_matches_oracle() {
+        let entries = ["delta", "apple", "Zebra", "mango"];
+        let r = MockResolver::new().with_dict("region", &entries);
+        let lit_val = "mango";
+        let out = rewrite_expr_with(&col("region").lt(lit(lit_val)), &r, 0).unwrap();
+        let got = collect_membership_i32_sorted(&out, "__idx_region");
+        let mut want = oracle_indices(&entries, BinaryOp::Lt, lit_val);
+        want.sort_unstable();
+        assert_eq!(got, want);
+        // "Zebra"(3) and "apple"(1) and "delta"(2) sort before "mango"; the
+        // membership is exactly {1,2,3}. ("mango" itself excluded for strict.)
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    /// All four ordering ops fold correctly through the rewriter, present and
+    /// absent literal, and the resulting membership matches the oracle.
+    #[test]
+    fn f10_all_ops_present_and_absent_literal() {
+        let entries = ["banana", "apple", "cherry"];
+        let r = MockResolver::new().with_dict("fruit", &entries);
+        for &lit_val in &["banana", "blueberry", "aaa", "zzz"] {
+            for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+                let expr = Expr::Binary {
+                    op,
+                    left: Box::new(col("fruit")),
+                    right: Box::new(lit(lit_val)),
+                };
+                let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+                // Empty match set folds to Bool(false); otherwise a membership.
+                let got = match &out {
+                    Expr::Literal(Literal::Bool(false)) => Vec::new(),
+                    other => collect_membership_i32_sorted(other, "__idx_fruit"),
+                };
+                let mut want = oracle_indices(&entries, op, lit_val);
+                want.sort_unstable();
+                assert_eq!(
+                    got, want,
+                    "op {op:?} lit {lit_val:?}: rewrite disagrees with oracle"
+                );
+            }
+        }
+    }
+
+    /// Literal-on-the-left orientation (`'lit' < col`) must reflect the op so
+    /// the partition is correct: `'mango' < col` ⇔ `col > 'mango'`.
+    #[test]
+    fn f10_reversed_literal_reflects_op() {
+        let entries = ["delta", "apple", "Zebra", "mango", "pear"];
+        let r = MockResolver::new().with_dict("region", &entries);
+        // `'mango' < region`  ⇔  `region > 'mango'`.
+        let expr = Expr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(lit("mango")),
+            right: Box::new(col("region")),
+        };
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        let got = collect_membership_i32_sorted(&out, "__idx_region");
+        let mut want = oracle_indices(&entries, BinaryOp::Gt, "mango");
+        want.sort_unstable();
+        assert_eq!(got, want, "reversed literal must reflect the op to '>'");
+        // Only "pear" (slot 4, index 5) sorts strictly after "mango".
+        assert_eq!(got, vec![5]);
+    }
+
+    /// A `>` predicate whose literal sorts after every entry yields an empty
+    /// match set, which folds to Bool(false) — and crucially the NULL slot 0
+    /// is never in any match set (a NULL row never passes an ordering pred).
+    #[test]
+    fn f10_no_match_folds_false_and_null_excluded() {
+        let entries = ["apple", "banana"];
+        let r = MockResolver::new().with_dict("region", &entries);
+        let out = rewrite_expr_with(&col("region").gt(lit("zzz")), &r, 0).unwrap();
+        assert!(
+            matches!(out, Expr::Literal(Literal::Bool(false))),
+            "nothing sorts after 'zzz' → Bool(false), got {out:?}"
+        );
+
+        // A predicate that matches everything still never includes slot 0.
+        let all = rewrite_expr_with(&col("region").gt(lit("")), &r, 0).unwrap();
+        let idxs = collect_membership_i32_sorted(&all, "__idx_region");
+        assert_eq!(idxs, vec![1, 2]);
+        assert!(!idxs.contains(&0), "NULL slot 0 must never be in the set");
+    }
+
+    /// Column-vs-column Utf8 ordering is NOT folded: it doesn't match the
+    /// `col OP 'lit'` shape, so it is preserved verbatim for the host path
+    /// (no rewrite, no rejection).
+    #[test]
+    fn f10_col_vs_col_is_left_for_host() {
+        let r = MockResolver::new()
+            .with_dict("a", &["x", "y"])
+            .with_dict("b", &["x", "y"]);
+        let expr = col("a").lt(col("b"));
+        let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+        match out {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Lt);
+                assert_column(&left, "a");
+                assert_column(&right, "b");
+            }
+            other => panic!("col-vs-col must stay a Utf8 comparison, got {other:?}"),
+        }
+    }
+
+    /// An ordering predicate over a column the query projects as a bare Utf8
+    /// output is protected from the fold (the integer filter can't emit Utf8
+    /// rows) — the comparison is preserved for the host path.
+    #[test]
+    fn f10_protected_column_is_not_folded() {
+        let mut r = MockResolver::new().with_dict("region", &["apple", "mango"]);
+        r.protected.insert("region".to_string());
+        let out = rewrite_expr_with(&col("region").lt(lit("mango")), &r, 0).unwrap();
+        match out {
+            Expr::Binary { op, left, right } => {
+                assert_eq!(op, BinaryOp::Lt);
+                assert_column(&left, "region");
+                match *right {
+                    Expr::Literal(Literal::Utf8(s)) => assert_eq!(s, "mango"),
+                    other => panic!("expected preserved Utf8 literal, got {other:?}"),
+                }
+            }
+            other => panic!("protected column must not fold, got {other:?}"),
+        }
+    }
+
+    /// The production `StringPredicateRewriter::ordering_match_indices` over a
+    /// host-only `DictionaryColumnAny` builds the correct set, and the
+    /// end-to-end rewrite matches a direct comparison on the dictionary.
+    #[test]
+    fn f10_real_rewriter_orders_from_dictionary() {
+        use crate::cuda::dictionary_any::DictionaryColumnAny;
+        let entries = ["delta", "apple", "Zebra", "mango"];
+        let dict = DictionaryColumnAny::new_host_only(
+            entries.iter().map(|s| s.to_string()).collect(),
+            4,
+        )
+        .expect("host-only dict");
+        let mut rw = StringPredicateRewriter::new();
+        rw.register("region", &dict);
+
+        // `region <= 'mango'`: entries that sort <= "mango".
+        let idxs = rw
+            .ordering_match_indices("region", BinaryOp::LtEq, "mango")
+            .expect("dict column resolves an ordering set");
+        // Expect Int32 literals (i32 dict), sorted by GPU index.
+        let mut got: Vec<i32> = idxs
+            .iter()
+            .map(|li| match li {
+                LiteralIndex::I32(n) => *n,
+                LiteralIndex::I64(n) => *n as i32,
+            })
+            .collect();
+        got.sort_unstable();
+        let mut want = oracle_indices(&entries, BinaryOp::LtEq, "mango");
+        want.sort_unstable();
+        assert_eq!(got, want);
+
+        // End-to-end fold.
+        let out = rewrite_expr_with(&col("region").lt_eq(lit("mango")), &rw, 0).unwrap();
+        let collected = collect_membership_i32_sorted(&out, "__idx_region");
+        assert_eq!(collected, want);
+
+        // Unregistered column → None (host fallback).
+        assert!(rw
+            .ordering_match_indices("unknown", BinaryOp::Lt, "x")
+            .is_none());
     }
 }

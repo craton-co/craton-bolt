@@ -1285,7 +1285,13 @@ fn plan_query(
 
     // ORDER BY: appended *outside* the body so it sees the final schema.
     if let Some(order_by) = &query.order_by {
-        let sort_exprs = lower_order_by(&order_by.exprs)?;
+        let sort_exprs = lower_order_by(
+            &order_by.exprs,
+            SubqueryCtx {
+                provider,
+                ctes: active_ctes,
+            },
+        )?;
         if !sort_exprs.is_empty() {
             plan = LogicalPlan::Sort {
                 input: Box::new(plan),
@@ -1336,7 +1342,7 @@ fn lower_set_expr(
         )));
     }
     match expr {
-        SetExpr::Select(s) => plan_select(s.as_ref(), provider, ctes),
+        SetExpr::Select(s) => plan_select(s.as_ref(), provider, ctes, depth + 1),
         SetExpr::Query(q) => plan_query(q.as_ref(), provider, ctes, depth + 1),
         SetExpr::SetOperation {
             op,
@@ -1458,13 +1464,28 @@ fn collect_union_branches(
 /// Lower a list of `OrderByExpr` into our `SortExpr`s. The default sort
 /// direction is ASC; the default NULL placement follows SQL convention
 /// (NULLS FIRST for ASC, NULLS LAST for DESC) when the user omits it.
-fn lower_order_by(exprs: &[OrderByExpr]) -> BoltResult<Vec<SortExpr>> {
+fn lower_order_by(
+    exprs: &[OrderByExpr],
+    ctx: SubqueryCtx<'_>,
+) -> BoltResult<Vec<SortExpr>> {
     // ORDER BY runs outside the FROM-tree (after projection), so no table
-    // qualifiers are in scope. We pass an empty resolver; bare identifiers
-    // still lower as column refs against the post-projection schema, and
-    // any stray `table.col` ref will fall through to a clean "unknown
-    // table qualifier" error.
-    let resolver = NameResolver::empty();
+    // qualifiers are in scope. We pass a resolver with no table scopes; bare
+    // identifiers still lower as column refs against the post-projection
+    // schema, and any stray `table.col` ref will fall through to a clean
+    // "unknown table qualifier" error.
+    //
+    // F12: the resolver carries the subquery lowering context (provider + CTE
+    // scope) so an uncorrelated `(SELECT ...)` / `x IN (SELECT ...)` in ORDER
+    // BY lowers its own nested plan. The exec-side subquery resolver already
+    // walks `LogicalPlan::Sort`'s sort_exprs (see
+    // `crate::exec::subquery_resolve::resolve_plan`), so these fold to
+    // constants before physical lowering just like WHERE/SELECT subqueries.
+    // With no outer table scope the correlation detector sees an empty
+    // outer-column set, so a stray correlated reference is not silently
+    // accepted — it surfaces as a normal unknown-column error during the
+    // subquery's own lowering.
+    let mut resolver = NameResolver::empty();
+    resolver.ctx = Some(ctx);
     let mut out = Vec::with_capacity(exprs.len());
     for OrderByExpr {
         expr,
@@ -1527,7 +1548,13 @@ fn plan_select(
     select: &Select,
     provider: &dyn TableProvider,
     ctes: &CteScope,
+    depth: usize,
 ) -> BoltResult<LogicalPlan> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     reject_unsupported_select(select)?;
 
     // FROM: exactly one base table reference. JOINs hang off `twj.joins`.
@@ -1544,7 +1571,7 @@ fn plan_select(
     // inlines (clones) the CTE's already-lowered plan. `base_qualifier` is the
     // alias (if any) the user-typed `qualifier.col` references must match.
     let (base_plan, base_qualifier, scan_schema) =
-        lower_table_factor(&twj.relation, provider, ctes)?;
+        lower_table_factor(&twj.relation, provider, ctes, depth + 1)?;
     // The name resolver tracks the FROM-tree's `table.col` namespace so we
     // can resolve qualified references in WHERE / SELECT / GROUP BY / HAVING.
     // The ON-clause lowerer also consults the resolver (see `lower_join_on`
@@ -1593,7 +1620,7 @@ fn plan_select(
                 }
             };
         let (rhs_plan, rhs_qualifier, rhs_schema) =
-            lower_table_factor(&join.relation, provider, ctes)?;
+            lower_table_factor(&join.relation, provider, ctes, depth + 1)?;
         // Extend the resolver before we move `rhs_*` into the right-side
         // plan, so it sees the same rename rule as `join_combined_schema`
         // applies to the actual plan output. The resolver records the
@@ -2144,7 +2171,13 @@ fn lower_table_factor(
     tf: &TableFactor,
     provider: &dyn TableProvider,
     ctes: &CteScope,
+    depth: usize,
 ) -> BoltResult<(LogicalPlan, String, Schema)> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
     match tf {
         TableFactor::Table {
             name,
@@ -2199,8 +2232,55 @@ fn lower_table_factor(
             };
             Ok((base_plan, qualifier, schema))
         }
-        TableFactor::Derived { .. } => Err(BoltError::Sql(
-            "unsupported: subquery in FROM (derived table); use a WITH/CTE instead".into(),
+        // F12: derived table `(SELECT ...) AS alias`. We recursively plan the
+        // subquery as a child `LogicalPlan` and expose its output schema under
+        // the alias — reusing the same pipeline a CTE reference uses (a CTE is
+        // just a named, pre-lowered derived table). No new exec machinery is
+        // needed: the produced plan is an ordinary self-contained subtree.
+        //
+        // Restrictions:
+        //   * LATERAL derived tables are correlated (they may reference earlier
+        //     FROM items) and the engine has no correlated-execution path, so we
+        //     reject them with a precise message.
+        //   * An alias is required (standard SQL — a derived table must be
+        //     named) so qualified `alias.col` references can resolve.
+        //   * Column-list aliases `AS t(c1, c2)` would require renaming the
+        //     subquery's output fields, which we do not implement (mirrors the
+        //     base-table arm above).
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+        } => {
+            if *lateral {
+                return Err(BoltError::Sql(
+                    "unsupported: LATERAL derived table (correlated subqueries in FROM \
+                     are not supported)"
+                        .into(),
+                ));
+            }
+            let alias = alias.as_ref().ok_or_else(|| {
+                BoltError::Sql(
+                    "subquery in FROM (derived table) requires an alias, e.g. \
+                     `(SELECT ...) AS t`"
+                        .into(),
+                )
+            })?;
+            if !alias.columns.is_empty() {
+                return Err(BoltError::Sql(
+                    "unsupported: derived-table alias with column list (AS t(c1, c2))".into(),
+                ));
+            }
+            let qualifier = alias.name.value.clone();
+            // Recursively plan the subquery. The MAX_RECURSION_DEPTH guard on
+            // this function (checked at entry) and on `plan_query` bounds the
+            // nesting depth of stacked derived tables.
+            let sub_plan = plan_query(subquery, provider, ctes, depth + 1)?;
+            let schema = sub_plan.schema()?;
+            Ok((sub_plan, qualifier, schema))
+        }
+        TableFactor::NestedJoin { .. } => Err(BoltError::Sql(
+            "unsupported: parenthesised / nested join in FROM".into(),
         )),
         _ => Err(BoltError::Sql(
             "unsupported: only bare table references are allowed in FROM".into(),
@@ -2580,11 +2660,12 @@ fn collect_join_eq(
 }
 
 /// Lower one side of an equi-join predicate and report which side of the
-/// join it lives on. We accept either a bare identifier or a `table.column`
-/// qualified identifier so users can disambiguate same-named columns; both
-/// lower to a plain `Column` ref (qualified column lookups beyond bare-name
-/// matching aren't supported in 0.1.x but the parser accepts them so error
-/// messages stay friendly).
+/// join it lives on. We accept a bare identifier, a `table.column` /
+/// `alias.column` qualified identifier, or the schema-qualified
+/// `schema.table.column` form (the leading single-catalog segment is dropped)
+/// so users can disambiguate same-named columns; all lower to a plain `Column`
+/// ref. Four-or-more-segment references have no namespace to collapse and are
+/// rejected as "deeply qualified".
 ///
 /// Side classification:
 ///   - `CompoundIdentifier([qual, col])` with `qual == rhs_table` → `Right`.
@@ -2619,18 +2700,12 @@ fn lower_join_side(
                 })?;
                 return Ok((Expr::Column(ident_to_name(last)), JoinSide::Unknown));
             }
-            if parts.len() > 2 {
+            if parts.len() > 3 {
                 let full = parts
                     .iter()
                     .map(|p| p.value.as_str())
                     .collect::<Vec<_>>()
                     .join(".");
-                if parts.len() == 3 {
-                    return Err(BoltError::Sql(format!(
-                        "schema-qualified names not supported: '{full}' in JOIN ON \
-                         (only `table.col` / `alias.col` is accepted)"
-                    )));
-                }
                 return Err(BoltError::Sql(format!(
                     "unsupported: deeply qualified column reference '{full}' in JOIN ON"
                 )));
@@ -2639,8 +2714,21 @@ fn lower_join_side(
             // folded independently. The qualifier match against the
             // resolver is ASCII case-insensitive so a folded `t1` still
             // matches a table the host registered as `T1`.
-            let qualifier = ident_to_name(&parts[0]);
-            let col = ident_to_name(&parts[1]);
+            //
+            // F12: accept the schema-qualified `schema.table.col` spelling too.
+            // The engine is single-catalog, so a leading schema/catalog segment
+            // carries no meaning — we drop it and resolve by the trailing
+            // `table.col` pair exactly as the two-part form does (mirrors the
+            // 3-segment handling in `lower_expr`'s `CompoundIdentifier` arm). An
+            // unknown table/alias in the middle slot still produces the standard
+            // "unknown table" error below.
+            let (qual_ident, col_ident) = if parts.len() == 3 {
+                (&parts[1], &parts[2])
+            } else {
+                (&parts[0], &parts[1])
+            };
+            let qualifier = ident_to_name(qual_ident);
+            let col = ident_to_name(col_ident);
             // Verify the qualifier exists somewhere in the FROM-tree
             // (resolver already contains every in-scope table, including
             // the rhs we just pushed). This catches `t3.a` when only `t1`
@@ -4112,7 +4200,9 @@ fn lower_uncorrelated_subquery(
     }
     let ctx = resolver.ctx.ok_or_else(|| {
         BoltError::Sql(
-            "subqueries are not supported in this position (only WHERE / SELECT)".into(),
+            "subqueries are not supported in this position (supported: WHERE, SELECT, \
+             GROUP BY, HAVING, JOIN ON, ORDER BY)"
+                .into(),
         )
     })?;
     // Reject correlated subqueries before lowering. The outer scope's column
@@ -6616,7 +6706,7 @@ mod wave7_tests {
         };
         match join_plan {
             LogicalPlan::Join { on, join_type, .. } => {
-                assert_eq!(*join_type, JoinType::Inner);
+                assert!(matches!(join_type, JoinType::Inner));
                 assert_eq!(on.len(), 1, "expected one equi pair, got {on:?}");
                 match &on[0] {
                     (Expr::Column(l), Expr::Column(r)) => {
@@ -7383,6 +7473,28 @@ mod root_setop_schema_tests {
         MemTableProvider::new().with_table("sales", sales)
     }
 
+    /// Provider for the F12 frontend-acceptance tests below, which query
+    /// `t1`/`t2` (not `sales`). Mirrors the `wave7_tests` fixture.
+    fn f12_provider() -> MemTableProvider {
+        let t1 = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int64, false),
+        ]);
+        let t2 = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("c", DataType::Float64, false),
+        ]);
+        MemTableProvider::new()
+            .with_table("t1", t1)
+            .with_table("t2", t2)
+    }
+
+    /// Parse + unwrap helper for the positive F12 tests.
+    fn lp(sql: &str) -> LogicalPlan {
+        parse(sql, &f12_provider())
+            .unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
+    }
+
     #[test]
     fn except_incompatible_arity_rejected() {
         let p = provider();
@@ -7443,5 +7555,199 @@ mod root_setop_schema_tests {
                 "valid plan schema must recompute cleanly for {sql:?}"
             );
         }
+    }
+
+    // ===================================================================
+    // F12 — frontend acceptance gaps
+    // ===================================================================
+
+    // ---- F12.1: schema-qualified names in JOIN ON ---------------------
+
+    /// `schema.table.col` in a JOIN ON predicate now resolves: the leading
+    /// single-catalog segment is dropped and the trailing `table.col` pair is
+    /// used (same as the 3-segment handling in plain expression lowering). The
+    /// ON pair keeps the bare column names.
+    #[test]
+    fn join_on_schema_qualified_resolves() {
+        let plan = lp("SELECT * FROM t1 JOIN t2 ON public.t1.a = public.t2.a");
+        let join_plan = match &plan {
+            LogicalPlan::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        match join_plan {
+            LogicalPlan::Join { on, join_type, .. } => {
+                assert!(matches!(join_type, JoinType::Inner));
+                assert_eq!(on.len(), 1, "expected one equi pair, got {on:?}");
+                match &on[0] {
+                    (Expr::Column(l), Expr::Column(r)) => {
+                        assert_eq!(l, "a", "left key uses bare column name");
+                        assert_eq!(r, "a", "right key uses bare column name");
+                    }
+                    other => panic!("expected two Column refs, got {other:?}"),
+                }
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    /// A schema-qualified JOIN ON reference whose middle (table) segment names
+    /// no in-scope table still errors with the unknown-table message — the
+    /// dropped schema segment does not paper over a bad table name.
+    #[test]
+    fn join_on_schema_qualified_unknown_table_rejected() {
+        let err = parse(
+            "SELECT * FROM t1 JOIN t2 ON public.t3.a = public.t2.a",
+            &f12_provider(),
+        )
+        .expect_err("schema-qualified ON ref to unknown table must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown table 't3'"),
+            "expected 'unknown table t3' message, got: {msg}"
+        );
+    }
+
+    /// Four-or-more-segment column references in JOIN ON have no namespace to
+    /// collapse and are still rejected as "deeply qualified".
+    #[test]
+    fn join_on_deeply_qualified_still_rejected() {
+        let err = parse(
+            "SELECT * FROM t1 JOIN t2 ON cat.public.t1.a = t2.a",
+            &f12_provider(),
+        )
+        .expect_err("4-segment ON ref must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("deeply qualified"),
+            "expected 'deeply qualified' message, got: {msg}"
+        );
+    }
+
+    // ---- F12.2: scalar function calls --------------------------------
+
+    /// A genuinely-unsupported scalar function keeps a clean error naming the
+    /// function (no panic). `SQRT` has no downstream support, so it must be
+    /// rejected — verifying the catch-all path still guards the binder.
+    #[test]
+    fn unsupported_scalar_function_rejected_cleanly() {
+        let err = parse("SELECT SQRT(b) FROM t1", &f12_provider())
+            .expect_err("SQRT has no downstream support and must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scalar function") && msg.to_ascii_uppercase().contains("SQRT"),
+            "expected clean message naming SQRT, got: {msg}"
+        );
+    }
+
+    // ---- F12.3: scalar subqueries in ORDER BY ------------------------
+
+    /// An uncorrelated scalar subquery in ORDER BY now lowers: it produces a
+    /// `Sort` whose sort-expr carries a `ScalarSubquery` (the exec-side
+    /// resolver folds it to a constant before physical lowering).
+    #[test]
+    fn order_by_scalar_subquery_lowers() {
+        let plan = lp("SELECT a FROM t1 ORDER BY (SELECT MAX(a) FROM t2)");
+        match plan {
+            LogicalPlan::Sort { sort_exprs, .. } => {
+                assert_eq!(sort_exprs.len(), 1);
+                assert!(
+                    matches!(sort_exprs[0].expr, Expr::ScalarSubquery(_)),
+                    "expected ScalarSubquery sort key, got {:?}",
+                    sort_exprs[0].expr
+                );
+            }
+            other => panic!("expected Sort, got {other:?}"),
+        }
+    }
+
+    /// `ORDER BY x IN (SELECT ...)` also lowers, carrying an `InSubquery` sort
+    /// key (resolved to a boolean constant fold by the exec-side pass).
+    #[test]
+    fn order_by_in_subquery_lowers() {
+        let plan = lp("SELECT a FROM t1 ORDER BY a IN (SELECT a FROM t2)");
+        match plan {
+            LogicalPlan::Sort { sort_exprs, .. } => {
+                assert_eq!(sort_exprs.len(), 1);
+                assert!(
+                    matches!(sort_exprs[0].expr, Expr::InSubquery { .. }),
+                    "expected InSubquery sort key, got {:?}",
+                    sort_exprs[0].expr
+                );
+            }
+            other => panic!("expected Sort, got {other:?}"),
+        }
+    }
+
+    // ---- F12.4: derived tables (subquery in FROM) --------------------
+
+    /// A non-correlated derived table `(SELECT ...) AS d` lowers by recursively
+    /// planning the subquery as a child plan and exposing it under the alias.
+    /// The top-level Project sits over the recursively-planned subtree.
+    #[test]
+    fn derived_table_in_from_lowers() {
+        let plan = lp("SELECT a FROM (SELECT a FROM t1) AS d");
+        // Outer Project over the inner subquery's plan (itself a Project/Scan).
+        match plan {
+            LogicalPlan::Project { input, .. } => {
+                // The recursively-planned subquery is the child; it must carry
+                // column `a` in its output schema.
+                let schema = input.schema().expect("derived subtree schema");
+                assert!(
+                    schema.fields.iter().any(|f| f.name == "a"),
+                    "derived table must expose column 'a', got {schema:?}"
+                );
+            }
+            other => panic!("expected Project over derived table, got {other:?}"),
+        }
+    }
+
+    /// A derived table can be referenced through its alias in WHERE.
+    #[test]
+    fn derived_table_alias_resolves_in_where() {
+        let plan = lp("SELECT d.a FROM (SELECT a, b FROM t1) AS d WHERE d.b > 0");
+        assert!(
+            plan.schema().is_ok(),
+            "derived-table query must produce a recomputable schema"
+        );
+    }
+
+    /// A derived table without an alias is rejected with a precise message
+    /// (standard SQL requires the alias so `alias.col` can resolve).
+    #[test]
+    fn derived_table_without_alias_rejected() {
+        let err = parse("SELECT a FROM (SELECT a FROM t1)", &provider())
+            .expect_err("unaliased derived table must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("requires an alias"),
+            "expected 'requires an alias' message, got: {msg}"
+        );
+    }
+
+    /// A LATERAL derived table is correlated and stays rejected with a precise
+    /// message (no correlated-execution path exists). Used as the sole FROM
+    /// item so the rejection comes from the derived-table arm itself.
+    #[test]
+    fn lateral_derived_table_rejected() {
+        let err = parse("SELECT a FROM LATERAL (SELECT a FROM t2) AS d", &provider())
+            .expect_err("LATERAL derived table must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LATERAL"),
+            "expected LATERAL rejection, got: {msg}"
+        );
+    }
+
+    /// A derived-table alias with a column list `AS d(x, y)` requires field
+    /// renaming we don't implement, so it stays rejected.
+    #[test]
+    fn derived_table_column_list_alias_rejected() {
+        let err = parse("SELECT x FROM (SELECT a FROM t1) AS d(x)", &provider())
+            .expect_err("derived-table column-list alias must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("column list"),
+            "expected 'column list' message, got: {msg}"
+        );
     }
 }

@@ -864,6 +864,19 @@ pub enum StringProjectOutput {
         /// Which case transform to apply.
         transform: crate::exec::string_project::StringTransform,
     },
+    /// `CONCAT(s0, s1, ...)` — N (>= 2) Utf8 source columns glued per row,
+    /// produced on the GPU via the dedicated N-input two-pass kernels
+    /// ([`crate::jit::string_kernel::compile_concat_len_pass`] /
+    /// [`crate::jit::string_kernel::compile_concat_write_pass`]). Output dtype is
+    /// `Utf8`. NULL on ANY source row makes the output row NULL (standard SQL),
+    /// re-applied host-side. The executor falls back to
+    /// [`crate::exec::string_project::host_concat_strings`] when the arity
+    /// exceeds [`crate::jit::string_kernel::CONCAT_MAX_INPUTS`] or a source is
+    /// not GPU-resident in a supported layout (no panic).
+    Concat {
+        /// Source Utf8 column names, in concatenation order (>= 2).
+        sources: Vec<String>,
+    },
 }
 
 /// The top-level physical plan: a small ordered pipeline of kernels.
@@ -3713,11 +3726,15 @@ fn try_lower_string_length(
 ///     dictionary-encoded source back into a plain `Utf8` array, out of scope
 ///     for this path (bail so the dtype-faithful host projection handles it), or
 ///   * `UPPER(Column(name))` / `LOWER(Column(name))` (optionally aliased) where
-///     `name` is a `Utf8` column of the scanned table.
+///     `name` is a `Utf8` column of the scanned table, or
+///   * `CONCAT(Column(a), Column(b), ...)` (optionally aliased) with >= 2 Utf8
+///     column arguments of the scanned table (the GPU two-pass N-input producer;
+///     the executor falls back to the host concat for unsupported arities /
+///     layouts).
 ///
-/// At least one output must be an `UPPER`/`LOWER` (otherwise this is a plain
-/// projection the existing codegen path handles). Anything else — `SUBSTRING` /
-/// `CONCAT` / `LENGTH`, a transform over a non-column argument, a computed
+/// At least one output must be an `UPPER`/`LOWER`/`CONCAT` (otherwise this is a
+/// plain projection the existing codegen path handles). Anything else —
+/// `SUBSTRING` / `LENGTH`, a transform over a non-column argument, a computed
 /// expression, a Filter in the chain — returns `Ok(None)`.
 fn try_lower_string_project(
     plan: &LogicalPlan,
@@ -3774,8 +3791,31 @@ fn try_lower_string_project(
                     transform,
                 });
             }
-            // Anything else (LENGTH/SUBSTRING/CONCAT, computed exprs, a
-            // transform over a non-column, literals, ...) is out of scope.
+            Expr::ScalarFn { kind: ScalarFnKind::Concat, args } => {
+                // CONCAT(col0, col1, ...): >= 2 bare Utf8 column args. Anything
+                // else (a literal arg, a computed arg, a non-Utf8 arg, < 2 args)
+                // bails so the host fallback (expr_agg / string_ops_extended)
+                // handles it.
+                if args.len() < 2 {
+                    return Ok(None);
+                }
+                let mut sources: Vec<String> = Vec::with_capacity(args.len());
+                for arg in args {
+                    let name = match peel_aliases(arg) {
+                        Expr::Column(name) => name.clone(),
+                        _ => return Ok(None),
+                    };
+                    let idx = scan_schema.index_of(&name)?;
+                    if scan_schema.fields[idx].dtype != DataType::Utf8 {
+                        return Ok(None);
+                    }
+                    sources.push(name);
+                }
+                any_transform = true;
+                outputs.push(StringProjectOutput::Concat { sources });
+            }
+            // Anything else (LENGTH/SUBSTRING, computed exprs, a transform over a
+            // non-column, literals, ...) is out of scope.
             _ => return Ok(None),
         }
     }

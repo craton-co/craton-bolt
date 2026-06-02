@@ -1544,16 +1544,25 @@ fn emit_binary(
             )
         }
         Concat => {
-            // String concat lives entirely on the host (see
-            // `crate::exec::string_ops::host_concat_strings`); the
-            // physical-plan lowerer routes any expression that contains
-            // `BinaryOp::Concat` through `PhysicalPlan::Project` (SELECT
-            // list, v0.5) or `PhysicalPlan::Filter` (WHERE predicate,
-            // v0.7) — both backed by `expr_agg::eval_expr`. Reaching this
-            // arm therefore indicates a missing route; surface a clear
-            // error rather than emitting nonsense PTX.
+            // The `||` BINARY OPERATOR (this arm) is a fused-kernel scalar op
+            // that has no variable-width output-buffer allocation, so it stays
+            // host-routed: the physical-plan lowerer routes any expression that
+            // contains `BinaryOp::Concat` through `PhysicalPlan::Project` (SELECT
+            // list, v0.5) or `PhysicalPlan::Filter` (WHERE predicate, v0.7) —
+            // both backed by `expr_agg::eval_expr`. Reaching this arm therefore
+            // indicates a missing route; surface a clear error rather than
+            // emitting nonsense PTX.
+            //
+            // NOTE: the CONCAT *function* (`ScalarFnKind::Concat`,
+            // `CONCAT(a, b, ...)`) is a SEPARATE path — it now HAS a GPU
+            // producer via the N-input two-pass kernels
+            // (`jit::string_kernel::compile_concat_{len,write}_pass`) wired
+            // through `PhysicalPlan::StringProject` (see
+            // `physical_plan::try_lower_string_project`), with a host fallback
+            // (`exec::string_project::host_concat_strings`). That path never
+            // reaches `emit_binary`; only the `||` operator does.
             Err(BoltError::Other(
-                "ptx_gen: string concat (||) is not lowered to GPU; \
+                "ptx_gen: string concat operator (||) is not lowered to GPU; \
                  the planner should route this through the host-side \
                  PhysicalPlan::Project (SELECT) or PhysicalPlan::Filter \
                  (WHERE) executor"
@@ -2926,11 +2935,9 @@ mod scalar_string_fn_substrate_tests {
     ///
     ///   * the now-SUPPORTED kinds lower WITHOUT error to the expected
     ///     physical node (UPPER/LOWER → `StringProject`, LENGTH → `StringLength`,
-    ///     SUBSTRING/TRIM → host-side `Project`), and
-    ///   * the one kind STILL rejected at GPU lowering — `CONCAT` in
-    ///     `Expr::ScalarFn` form — produces an *actionable* rejection that NAMES
-    ///     the function (the original test's purpose) plus the shared follow-up
-    ///     marker.
+    ///     SUBSTRING/TRIM → host-side `Project`, and — newly — `CONCAT(col, col)`
+    ///     over a bare scan → GPU `StringProject` via the N-input two-pass
+    ///     producer).
     ///
     /// This keeps the assertion meaningful (not a tautology) while matching the
     /// behavior the code actually has now.
@@ -3020,27 +3027,19 @@ mod scalar_string_fn_substrate_tests {
             );
         }
 
-        // ---- STILL REJECTED: CONCAT in `Expr::ScalarFn` form is the one kind
-        // that has no GPU producer and is not host-evaluable here, so `lower()`
-        // returns an actionable Err that NAMES the function — the original
-        // test's purpose, preserved against the kind that still exercises it. ----
+        // ---- Now-SUPPORTED: CONCAT(<col>, <col>) over a bare scan lowers to
+        // the GPU `StringProject` via the N-input two-pass producer
+        // (`jit::string_kernel::compile_concat_{len,write}_pass`). The executor
+        // keeps a host fallback for unsupported arities / layouts. ----
         let concat_plan = project(Expr::ScalarFn {
             kind: ScalarFnKind::Concat,
             args: vec![s_col.clone(), s_col.clone()],
         });
-        let err = lower(&concat_plan).expect_err("CONCAT(ScalarFn) must still be rejected at GPU lowering");
-        let msg = format!("{err}");
-        // The function's SQL name must be in the message — a generic "scalar
-        // function" rejection wouldn't be actionable for the caller.
+        let phys = lower(&concat_plan)
+            .expect("CONCAT(<col>, <col>) should lower to GPU StringProject now");
         assert!(
-            msg.contains("CONCAT"),
-            "rejection for CONCAT should name the function; got: {msg}"
-        );
-        // Shared follow-up marker (same family as CAST / CASE / Date rejections).
-        assert!(
-            msg.to_ascii_lowercase().contains("not yet lowered to gpu")
-                || msg.to_ascii_lowercase().contains("follow-up"),
-            "rejection for CONCAT should be flagged as a follow-up; got: {msg}"
+            matches!(phys, PhysicalPlan::StringProject { .. }),
+            "CONCAT should lower to PhysicalPlan::StringProject; got: {phys:?}"
         );
     }
 }

@@ -337,6 +337,193 @@ pub fn host_transform_strings(
     Ok(StringArray::from(out))
 }
 
+// ---------------------------------------------------------------------------
+// N-input CONCAT two-pass executor helpers.
+//
+// `CONCAT(a_0, ..., a_{n-1})` over n dictionary-encoded Utf8 columns. The GPU
+// producer (jit::string_kernel::compile_concat_{len,write}_pass) consumes n
+// row-aligned (offsets, bytes) pairs and writes one new Utf8 array. The shape
+// mirrors the UPPER/LOWER two-pass exactly: build n row-aligned inputs, sum the
+// per-row byte lengths (length pass), exclusive-scan to out_offsets + total
+// (reuse `exclusive_scan_lens`), copy each input slice in order (write pass),
+// then reconstruct the StringArray. NULL is handled HOST-SIDE: per standard SQL
+// CONCAT semantics the output row is NULL if ANY input row is NULL (matching
+// `exec::string_ops_extended::concat`), re-applied below regardless of the empty
+// slices NULL rows decode to on the device.
+// ---------------------------------------------------------------------------
+
+/// One CONCAT input column, already decoded into the row-aligned Arrow-`Utf8`
+/// shape the GPU passes consume, plus its per-row validity (NULL channel).
+///
+/// `offsets` has `n_rows + 1` entries; `offsets[r]..offsets[r+1]` is row `r`'s
+/// slice in `bytes`. `validity[r]` is `false` for a SQL NULL row (whose slice is
+/// empty). `validity` always has `n_rows` entries (the row count is
+/// `offsets.len() - 1`).
+#[derive(Debug, Clone)]
+pub struct ConcatInput {
+    /// Row-aligned `i32` offsets (`n_rows + 1` entries).
+    pub offsets: Vec<i32>,
+    /// Row-aligned UTF-8 bytes.
+    pub bytes: Vec<u8>,
+    /// Per-row validity (`false` = SQL NULL).
+    pub validity: Vec<bool>,
+}
+
+/// Sum the per-row output byte lengths across all `n` CONCAT inputs — the host
+/// stand-in for the GPU length pass
+/// ([`crate::jit::string_kernel::compile_concat_len_pass`]).
+///
+/// `row_lens[r] = sum_k (inputs[k].offsets[r+1] - inputs[k].offsets[r])`. NULL
+/// rows contribute 0 (their device slice is empty); the SQL NULL-if-any-arg-NULL
+/// rule is applied separately in [`concat_output_validity`] / the array rebuild.
+///
+/// Errors if `inputs` is empty or the inputs disagree on row count — the planner
+/// should never emit those, but we surface rather than panic.
+pub fn concat_row_lens(inputs: &[ConcatInput]) -> BoltResult<Vec<u32>> {
+    if inputs.is_empty() {
+        return Err(BoltError::Other("CONCAT: at least one input is required".into()));
+    }
+    let n_rows = inputs[0].offsets.len().saturating_sub(1);
+    for (k, inp) in inputs.iter().enumerate() {
+        if inp.offsets.len().saturating_sub(1) != n_rows {
+            return Err(BoltError::Other(format!(
+                "CONCAT: n_rows mismatch (input 0 = {}, input {} = {})",
+                n_rows,
+                k,
+                inp.offsets.len().saturating_sub(1)
+            )));
+        }
+    }
+    let mut row_lens = vec![0u32; n_rows];
+    for inp in inputs {
+        for (r, slot) in row_lens.iter_mut().enumerate() {
+            let len = (inp.offsets[r + 1] - inp.offsets[r]) as u32;
+            *slot = slot.checked_add(len).ok_or_else(|| {
+                BoltError::Other("CONCAT: per-row length overflow".into())
+            })?;
+        }
+    }
+    Ok(row_lens)
+}
+
+/// Compute the output validity for CONCAT: row `r` is valid iff EVERY input row
+/// `r` is valid (standard SQL — NULL if ANY arg is NULL). Matches
+/// [`crate::exec::string_ops_extended::concat`].
+pub fn concat_output_validity(inputs: &[ConcatInput]) -> Vec<bool> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    let n_rows = inputs[0].offsets.len().saturating_sub(1);
+    (0..n_rows)
+        .map(|r| inputs.iter().all(|inp| inp.validity.get(r).copied().unwrap_or(false)))
+        .collect()
+}
+
+/// Host implementation of the GPU CONCAT two-pass path, byte-for-byte: sum the
+/// per-row lengths, exclusive-scan to offsets, copy each input slice in order,
+/// then reconstruct the `StringArray` re-applying NULL-if-any-arg-NULL. The GPU
+/// launch must produce an identical `out_bytes`/`out_offsets`; this is the
+/// reference used by unit tests (no CUDA runtime needed).
+pub fn gpu_path_concat_pure(inputs: &[ConcatInput]) -> BoltResult<StringArray> {
+    let row_lens = concat_row_lens(inputs)?;
+    let (out_offsets, total) = exclusive_scan_lens(&row_lens)?;
+    let n_rows = row_lens.len();
+
+    // Write pass: copy each input slice, in input order, into the row's region.
+    let mut out_bytes = vec![0u8; total];
+    for r in 0..n_rows {
+        let mut cursor = out_offsets[r] as usize;
+        for inp in inputs {
+            let begin = inp.offsets[r] as usize;
+            let end = inp.offsets[r + 1] as usize;
+            let slice = inp.bytes.get(begin..end).ok_or_else(|| {
+                BoltError::Other(format!(
+                    "CONCAT: input slice [{begin}..{end}] out of bytes range {}",
+                    inp.bytes.len()
+                ))
+            })?;
+            out_bytes[cursor..cursor + slice.len()].copy_from_slice(slice);
+            cursor += slice.len();
+        }
+    }
+
+    let validity = concat_output_validity(inputs);
+    string_array_from_offsets(&out_offsets, &out_bytes, Some(&validity))
+}
+
+/// Full host fallback for CONCAT when the GPU path is unavailable (column not
+/// resident in a supported layout, arity beyond
+/// [`crate::jit::string_kernel::CONCAT_MAX_INPUTS`], or any non-Utf8 arg).
+///
+/// Concatenates the decoded UTF-8 slices per row and re-applies
+/// NULL-if-any-arg-NULL. Functionally identical to [`gpu_path_concat_pure`] for
+/// any input (both honour the same NULL rule); kept as a distinct entry point so
+/// the executor can call it without first materialising scan/offset buffers.
+pub fn host_concat_strings(inputs: &[ConcatInput]) -> BoltResult<StringArray> {
+    if inputs.is_empty() {
+        return Err(BoltError::Other("CONCAT: at least one input is required".into()));
+    }
+    let n_rows = inputs[0].offsets.len().saturating_sub(1);
+    let validity = concat_output_validity(inputs);
+    let mut out: Vec<Option<String>> = Vec::with_capacity(n_rows);
+    for r in 0..n_rows {
+        if !validity[r] {
+            out.push(None);
+            continue;
+        }
+        let mut s = String::new();
+        for inp in inputs {
+            let begin = inp.offsets[r] as usize;
+            let end = inp.offsets[r + 1] as usize;
+            let slice = inp.bytes.get(begin..end).ok_or_else(|| {
+                BoltError::Other(format!(
+                    "CONCAT: input slice [{begin}..{end}] out of bytes range {}",
+                    inp.bytes.len()
+                ))
+            })?;
+            let piece = std::str::from_utf8(slice).map_err(|e| {
+                BoltError::Other(format!("CONCAT: input row {r} is not valid UTF-8: {e}"))
+            })?;
+            s.push_str(piece);
+        }
+        out.push(Some(s));
+    }
+    Ok(StringArray::from(out))
+}
+
+/// Build a [`ConcatInput`] for one CONCAT source column from its host-side
+/// dictionary + keys + layout (+ optional validity), reusing the same row-
+/// alignment decode the UPPER/LOWER path uses ([`build_row_aligned_input`]).
+///
+/// This is the per-column adapter the executor calls once per CONCAT argument
+/// before handing the `Vec<ConcatInput>` to [`gpu_path_concat_pure`] (GPU) or
+/// [`host_concat_strings`] (fallback). The validity it records is the row's SQL
+/// validity (NULL channel), independent of the empty slice a NULL row decodes
+/// to — so the NULL-if-any-arg-NULL rule can be applied downstream.
+pub fn build_concat_input(
+    dict: &[String],
+    keys: &[i32],
+    layout: KeyLayout,
+    validity: Option<&[bool]>,
+) -> BoltResult<ConcatInput> {
+    let (offsets, bytes) = build_row_aligned_input(dict, keys, layout, validity)?;
+    let row_validity: Vec<bool> = (0..keys.len())
+        .map(|row| {
+            // Honour an explicit validity slice; otherwise derive NULL from the
+            // 1-based layout's slot-0 sentinel (matching `decode_row`).
+            if let Some(v) = validity {
+                v.get(row).copied().unwrap_or(false)
+            } else {
+                match layout {
+                    KeyLayout::OneBasedNullSlot0 => keys[row] != 0,
+                    KeyLayout::ZeroBased => true,
+                }
+            }
+        })
+        .collect();
+    Ok(ConcatInput { offsets, bytes, validity: row_validity })
+}
+
 /// Whether the GPU ASCII case-fold path is correct for `dict`.
 ///
 /// The GPU kernels fold byte-wise and assume the output byte length equals the
@@ -485,6 +672,164 @@ mod tests {
         // executor avoids the byte-wise GPU fold.
         assert!(dict_is_ascii(&owned(&["abc", "DEF"])));
         assert!(!dict_is_ascii(&owned(&["abc", "straße"])));
+    }
+
+    // ---- CONCAT two-pass executor helpers --------------------------------
+
+    fn concat_input(strs: &[Option<&str>]) -> ConcatInput {
+        // Build a row-aligned input from a column of Option<&str>; None = NULL
+        // row (empty slice, validity=false), matching the device decode.
+        let mut offsets = vec![0i32];
+        let mut bytes = Vec::new();
+        let mut validity = Vec::new();
+        for s in strs {
+            match s {
+                Some(v) => {
+                    bytes.extend_from_slice(v.as_bytes());
+                    validity.push(true);
+                }
+                None => validity.push(false),
+            }
+            offsets.push(bytes.len() as i32);
+        }
+        ConcatInput { offsets, bytes, validity }
+    }
+
+    #[test]
+    fn concat_row_lens_sums_inputs() {
+        // a = ["us","eu","x"], b = ["NY","BERLIN","y"]
+        let a = concat_input(&[Some("us"), Some("eu"), Some("x")]);
+        let b = concat_input(&[Some("NY"), Some("BERLIN"), Some("y")]);
+        let lens = concat_row_lens(&[a, b]).unwrap();
+        // 2+2, 2+6, 1+1
+        assert_eq!(lens, vec![4, 8, 2]);
+    }
+
+    #[test]
+    fn concat_row_lens_null_contributes_zero() {
+        // NULL rows decode to empty slices -> contribute 0 to the sum (the SQL
+        // NULL propagation is separate, applied in concat_output_validity).
+        let a = concat_input(&[Some("ab"), None]);
+        let b = concat_input(&[None, Some("cd")]);
+        let lens = concat_row_lens(&[a, b]).unwrap();
+        assert_eq!(lens, vec![2, 2]);
+    }
+
+    #[test]
+    fn concat_output_validity_is_and_of_inputs() {
+        let a = concat_input(&[Some("a"), None, Some("c"), None]);
+        let b = concat_input(&[Some("x"), Some("y"), None, None]);
+        // Row valid iff BOTH inputs valid.
+        assert_eq!(
+            concat_output_validity(&[a, b]),
+            vec![true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn gpu_path_concat_basic_two_inputs() {
+        // Mirrors the host concat_pure spec example.
+        let a = concat_input(&[Some("us"), Some("eu"), Some("us")]);
+        let b = concat_input(&[Some("NY"), Some("BERLIN"), Some("BERLIN")]);
+        let arr = gpu_path_concat_pure(&[a, b]).unwrap();
+        assert_eq!(
+            collect(&arr),
+            vec![
+                Some("usNY".to_string()),
+                Some("euBERLIN".to_string()),
+                Some("usBERLIN".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn gpu_path_concat_propagates_null_if_any_arg_null() {
+        // Standard SQL: NULL on EITHER side -> NULL output. Must match
+        // exec::string_ops_extended::concat_pure exactly.
+        let a = concat_input(&[None, Some("a"), Some("a"), None]);
+        let b = concat_input(&[Some("x"), None, Some("y"), None]);
+        let arr = gpu_path_concat_pure(&[a, b]).unwrap();
+        assert_eq!(
+            collect(&arr),
+            vec![None, None, Some("ay".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn gpu_path_concat_three_inputs_in_order() {
+        let a = concat_input(&[Some("a"), Some("1")]);
+        let b = concat_input(&[Some("b"), Some("2")]);
+        let c = concat_input(&[Some("c"), Some("3")]);
+        let arr = gpu_path_concat_pure(&[a, b, c]).unwrap();
+        assert_eq!(
+            collect(&arr),
+            vec![Some("abc".to_string()), Some("123".to_string())]
+        );
+    }
+
+    #[test]
+    fn gpu_path_concat_equals_host_concat() {
+        // The GPU two-pass host mirror and the plain host fallback must agree on
+        // every row, including NULL propagation.
+        let a = concat_input(&[Some("foo"), None, Some(""), Some("z")]);
+        let b = concat_input(&[Some("bar"), Some("q"), Some("w"), None]);
+        let gpu = gpu_path_concat_pure(&[a.clone(), b.clone()]).unwrap();
+        let host = host_concat_strings(&[a, b]).unwrap();
+        assert_eq!(collect(&gpu), collect(&host));
+    }
+
+    #[test]
+    fn gpu_path_concat_empty_strings_and_zero_rows() {
+        // All-empty inputs: every row is "" (non-NULL).
+        let a = concat_input(&[Some(""), Some("")]);
+        let b = concat_input(&[Some(""), Some("")]);
+        let arr = gpu_path_concat_pure(&[a, b]).unwrap();
+        assert_eq!(collect(&arr), vec![Some("".to_string()), Some("".to_string())]);
+
+        // Zero rows.
+        let a0 = concat_input(&[]);
+        let b0 = concat_input(&[]);
+        let arr0 = gpu_path_concat_pure(&[a0, b0]).unwrap();
+        assert_eq!(arr0.len(), 0);
+    }
+
+    #[test]
+    fn build_concat_input_one_based_layout_decodes_nulls() {
+        // dict ["us","eu"], 1-based keys, 0 = NULL.
+        let dict = owned(&["us", "eu"]);
+        let keys = vec![1i32, 0, 2]; // us, NULL, eu
+        let inp = build_concat_input(&dict, &keys, KeyLayout::OneBasedNullSlot0, None).unwrap();
+        assert_eq!(inp.offsets, vec![0, 2, 2, 4]); // "us","",  "eu"
+        assert_eq!(&inp.bytes, b"useu");
+        assert_eq!(inp.validity, vec![true, false, true]);
+    }
+
+    #[test]
+    fn build_concat_input_round_trips_through_gpu_path() {
+        // Two 1-based columns concatenate exactly like the host concat_pure spec.
+        let a_dict = owned(&["us", "eu"]);
+        let a_keys = vec![1i32, 2, 1]; // us, eu, us
+        let b_dict = owned(&["NY", "BERLIN"]);
+        let b_keys = vec![1i32, 2, 2]; // NY, BERLIN, BERLIN
+        let a = build_concat_input(&a_dict, &a_keys, KeyLayout::OneBasedNullSlot0, None).unwrap();
+        let b = build_concat_input(&b_dict, &b_keys, KeyLayout::OneBasedNullSlot0, None).unwrap();
+        let arr = gpu_path_concat_pure(&[a, b]).unwrap();
+        assert_eq!(
+            collect(&arr),
+            vec![
+                Some("usNY".to_string()),
+                Some("euBERLIN".to_string()),
+                Some("usBERLIN".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn concat_row_lens_rejects_row_count_mismatch() {
+        let a = concat_input(&[Some("a"), Some("b")]);
+        let b = concat_input(&[Some("x")]);
+        let err = concat_row_lens(&[a, b]).unwrap_err();
+        assert!(format!("{err}").contains("n_rows mismatch"), "{err}");
     }
 
     #[test]

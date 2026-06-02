@@ -603,32 +603,80 @@ impl GpuColumn {
                     valid_mask,
                 }
             }
-            DataType::Date32 | DataType::Timestamp(_, _) => {
-                // F11 fallback-gap fix: Date32 / Timestamp upload is not yet
-                // wired on the GPU. Previously this was a hard `BoltError::Type`
-                // that propagated up through `ensure_gpu_table` and failed the
-                // whole query — inconsistent with every other GPU gate in the
-                // engine, which decline with the typed "retry on host" marker
-                // rather than erroring (see `gpu_join.rs`'s
-                // `BoltError::GpuCapacity` overshoot path, and `window.rs`,
-                // which already supports these temporal dtypes host-side).
-                //
-                // We now emit `BoltError::GpuCapacity` — the typed
-                // capacity-fallback marker (see `error.rs`) whose entire purpose
-                // is to signal "the GPU path declined; the host handles this
-                // input fine, retry there". This makes the projection/upload
-                // path consistent with the join gates: the orchestrator maps
-                // this variant to its host fallback exactly as
-                // `execute_inner_join` / `execute_outer_join` map the join
-                // kernels' `GpuCapacity`. Correctness of the supported dtypes is
-                // unchanged — only this unsupported-dtype arm changes its error
-                // *kind* from a fatal type error to a graceful decline.
-                return Err(BoltError::GpuCapacity(format!(
-                    "GPU upload of temporal column '{}' (dtype {:?}) not yet \
-                     supported; decline to host (window.rs handles temporal \
-                     dtypes host-side)",
-                    name, dtype
-                )));
+            DataType::Date32 => {
+                // F6: Date32 is `i32` days-since-epoch on the device — the
+                // exact same fixed-width buffer layout as `Int32`. We store it
+                // in the `I32` storage variant (the `GpuColumnData` enum has no
+                // dedicated temporal variant, and adding one would ripple into
+                // every cross-module `match` on the enum); the real
+                // `DataType::Date32` rides on `GpuColumn::dtype`, so consumers
+                // that care about the temporal-ness branch on the dtype, not on
+                // the storage discriminant. The download/gather paths read the
+                // dtype and rebuild a `Date32Array`.
+                let pa = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::Date32Array>()
+                    .ok_or_else(|| type_mismatch_err(arr, "Date32"))?;
+                let buf = primitive_to_gpu(pa)?;
+                let validity = unpacked_validity_from_arrow(pa)?;
+                GpuColumnData::I32 {
+                    values: GpuVec::from_buffer(buf),
+                    validity,
+                }
+            }
+            DataType::Timestamp(unit, _tz) => {
+                // F6: Timestamp is `i64` ticks-since-epoch on the device — the
+                // same fixed-width layout as `Int64`. Stored in the `I64`
+                // storage variant for the same reason Date32 reuses `I32` (no
+                // dedicated enum variant; the real dtype rides on
+                // `GpuColumn::dtype`). The concrete Arrow `Timestamp*Array`
+                // depends on the `TimeUnit`, so we downcast per unit; the
+                // timezone never changes the stored bits (it is interpretation
+                // only) so we ignore it here — the dtype carries it for the
+                // download-side reconstruction.
+                use crate::plan::logical_plan::TimeUnit;
+                let buf = match unit {
+                    TimeUnit::Second => {
+                        let pa = arr
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampSecondArray>()
+                            .ok_or_else(|| type_mismatch_err(arr, "TimestampSecond"))?;
+                        let b = primitive_to_gpu(pa)?;
+                        let validity = unpacked_validity_from_arrow(pa)?;
+                        (GpuVec::from_buffer(b), validity)
+                    }
+                    TimeUnit::Millisecond => {
+                        let pa = arr
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                            .ok_or_else(|| type_mismatch_err(arr, "TimestampMillisecond"))?;
+                        let b = primitive_to_gpu(pa)?;
+                        let validity = unpacked_validity_from_arrow(pa)?;
+                        (GpuVec::from_buffer(b), validity)
+                    }
+                    TimeUnit::Microsecond => {
+                        let pa = arr
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                            .ok_or_else(|| type_mismatch_err(arr, "TimestampMicrosecond"))?;
+                        let b = primitive_to_gpu(pa)?;
+                        let validity = unpacked_validity_from_arrow(pa)?;
+                        (GpuVec::from_buffer(b), validity)
+                    }
+                    TimeUnit::Nanosecond => {
+                        let pa = arr
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                            .ok_or_else(|| type_mismatch_err(arr, "TimestampNanosecond"))?;
+                        let b = primitive_to_gpu(pa)?;
+                        let validity = unpacked_validity_from_arrow(pa)?;
+                        (GpuVec::from_buffer(b), validity)
+                    }
+                };
+                GpuColumnData::I64 {
+                    values: buf.0,
+                    validity: buf.1,
+                }
             }
         };
         Ok(Self {
@@ -817,6 +865,31 @@ impl GpuTable {
                 arr.as_ref(),
                 DataType::Decimal128(*p, *s),
             )?,
+            // F6: temporal columns. Date32 maps 1:1; Timestamp maps the Arrow
+            // `TimeUnit` to the plan `TimeUnit` and interns the optional
+            // timezone (so the plan `DataType` stays `Copy`). The byte width
+            // (i32 / i64) is what the upload path keys off — the dtype carries
+            // the temporal semantics through to the download-side
+            // reconstruction.
+            arrow_schema::DataType::Date32 => {
+                GpuColumn::upload(field.name().clone(), arr.as_ref(), DataType::Date32)?
+            }
+            arrow_schema::DataType::Timestamp(arrow_unit, arrow_tz) => {
+                use crate::plan::logical_plan::{intern_timezone, TimeUnit};
+                let unit = match arrow_unit {
+                    arrow_schema::TimeUnit::Second => TimeUnit::Second,
+                    arrow_schema::TimeUnit::Millisecond => TimeUnit::Millisecond,
+                    arrow_schema::TimeUnit::Microsecond => TimeUnit::Microsecond,
+                    arrow_schema::TimeUnit::Nanosecond => TimeUnit::Nanosecond,
+                };
+                let tz: Option<&'static str> =
+                    arrow_tz.as_ref().map(|s| intern_timezone(s.as_ref()));
+                GpuColumn::upload(
+                    field.name().clone(),
+                    arr.as_ref(),
+                    DataType::Timestamp(unit, tz),
+                )?
+            }
             other => {
                 return Err(BoltError::Type(format!(
                     "GpuTable: unsupported Arrow dtype {:?} for column '{}'",
@@ -888,34 +961,67 @@ mod tests {
         assert_eq!(packed, vec![0xCDu8, 0x01u8]);
     }
 
-    /// F11 fallback-gap fix: uploading a temporal column declines with the
-    /// typed `BoltError::GpuCapacity` "retry on host" marker rather than a hard
-    /// `BoltError::Type`, so the orchestrator routes a projection over a
-    /// Date32 / Timestamp column to the host executor (window.rs already
-    /// supports these dtypes host-side) instead of failing the query.
+    /// F6: a temporal upload with a MISMATCHED Arrow array must surface a clean
+    /// `BoltError::Type` from the downcast (not a panic), before any device
+    /// allocation. Passing an `Int32Array` where a `Date32Array` /
+    /// `Timestamp*Array` is expected exercises the `type_mismatch_err` path.
     ///
-    /// Pure-host: the temporal match arm returns the decline *before* touching
-    /// the array contents or allocating any device buffer, so this needs no
-    /// CUDA context (no `#[ignore]`). We pass an empty `Int32Array` purely as a
-    /// stand-in `&dyn Array`; the temporal arm never downcasts it.
+    /// Pure-host: the downcast fails before `primitive_to_gpu`, so no CUDA
+    /// context is needed.
     #[test]
-    fn temporal_upload_declines_to_host() {
+    fn temporal_upload_type_mismatch_is_clean_error() {
         use crate::plan::logical_plan::TimeUnit;
         let placeholder = Int32Array::from(Vec::<i32>::new());
         for dtype in [
             DataType::Date32,
             DataType::Timestamp(TimeUnit::Nanosecond, None),
         ] {
-            let res = GpuColumn::upload("ts".to_string(), &placeholder, dtype);
-            match res {
-                Ok(_) => panic!("{dtype:?} upload should decline, not succeed"),
-                Err(BoltError::GpuCapacity(_)) => { /* expected host-fallback signal */ }
+            match GpuColumn::upload("ts".to_string(), &placeholder, dtype) {
+                Ok(_) => panic!("{dtype:?} upload of an Int32Array must fail the downcast"),
+                Err(BoltError::Type(_)) => { /* expected clean downcast error */ }
                 Err(other) => panic!(
-                    "{dtype:?} must decline with GpuCapacity (host-fallback marker), \
-                     got a different error kind: {other:?}"
+                    "{dtype:?} downcast mismatch must be BoltError::Type, got: {other:?}"
                 ),
             }
         }
+    }
+
+    /// F6: GPU round-trip for Date32 — a `Date32Array` uploads to the i32
+    /// storage variant (same device layout) while `GpuColumn::dtype` keeps the
+    /// real `Date32` so downstream gather/download rebuilds the right Arrow
+    /// type. Allocates on the device, so `gpu:`-ignored.
+    #[test]
+    #[ignore = "gpu:tier1 — GpuVec upload allocates on device"]
+    fn date32_uploads_as_i32_storage_with_date_dtype() {
+        use arrow_array::Date32Array;
+        let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
+        let arr = Date32Array::from(vec![19000i32, 19001, 19002]);
+        let col = GpuColumn::upload("d".into(), &arr, DataType::Date32).expect("upload");
+        assert!(matches!(col.dtype, DataType::Date32));
+        // Storage reuses the I32 variant (no dedicated temporal enum variant).
+        assert!(matches!(col.data, GpuColumnData::I32 { .. }));
+    }
+
+    /// F6: GPU round-trip for Timestamp — a `TimestampMicrosecondArray` uploads
+    /// to the i64 storage variant; the dtype carries the unit/tz.
+    #[test]
+    #[ignore = "gpu:tier1 — GpuVec upload allocates on device"]
+    fn timestamp_uploads_as_i64_storage_with_ts_dtype() {
+        use crate::plan::logical_plan::TimeUnit;
+        use arrow_array::TimestampMicrosecondArray;
+        let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
+        let arr = TimestampMicrosecondArray::from(vec![1_000i64, 2_000, 3_000]);
+        let col = GpuColumn::upload(
+            "ts".into(),
+            &arr,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .expect("upload");
+        assert!(matches!(
+            col.dtype,
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        ));
+        assert!(matches!(col.data, GpuColumnData::I64 { .. }));
     }
 
     /// Stage 5 — registering a `DictionaryArray<i32, Utf8>` column produces

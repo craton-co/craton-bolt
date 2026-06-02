@@ -134,6 +134,38 @@ pub enum GatheredCol {
         /// length as `values`.
         validity: GpuVec<u8>,
     },
+    /// F6: compacted `Date32` column. Stored as `i32` days-since-epoch (the
+    /// same on-device layout as [`GatheredCol::I32`]); the distinct variant
+    /// exists so [`download`](GatheredCol::download) can rebuild a
+    /// `Date32Array` rather than a plain `Int32Array`.
+    Date32(GpuVec<i32>),
+    /// F6: compacted `Timestamp` column. Stored as `i64` ticks-since-epoch
+    /// (the same on-device layout as [`GatheredCol::I64`]); the carried
+    /// `TimeUnit` + optional interned timezone let `download` rebuild the
+    /// matching concrete Arrow `Timestamp*Array` with the right unit/tz.
+    Timestamp {
+        /// Gathered i64 ticks-since-epoch values, length = surviving rows.
+        values: GpuVec<i64>,
+        /// Tick resolution (Second / Milli / Micro / Nano).
+        unit: crate::plan::logical_plan::TimeUnit,
+        /// Optional process-interned IANA timezone (`None` = naive/local).
+        tz: Option<&'static str>,
+    },
+    /// F6: compacted `Decimal128` column. Stored as an interleaved
+    /// `[lo0, hi0, lo1, hi1, ...]` little-endian `u64` buffer of length
+    /// `2 * surviving_rows` — the SAME 16-bytes-per-row layout
+    /// `GpuColumnData::Decimal128` uses, so the gather kernel copies each
+    /// row's two 64-bit halves with no reinterpretation. `download`
+    /// reassembles each `(lo, hi)` pair into an `i128` and reattaches the
+    /// plan `(precision, scale)`.
+    Decimal128 {
+        /// Interleaved 16-bytes-per-row buffer, length `2 * surviving_rows`.
+        values: GpuVec<u64>,
+        /// Plan-level precision (digits of significance, 1..=38).
+        precision: u8,
+        /// Plan-level scale (digits right of the decimal point).
+        scale: i8,
+    },
 }
 
 impl GatheredCol {
@@ -153,6 +185,9 @@ impl GatheredCol {
             GatheredCol::F64(v) => v.device_ptr(),
             GatheredCol::Bool(v) => v.device_ptr(),
             GatheredCol::BoolNullable { values, .. } => values.device_ptr(),
+            GatheredCol::Date32(v) => v.device_ptr(),
+            GatheredCol::Timestamp { values, .. } => values.device_ptr(),
+            GatheredCol::Decimal128 { values, .. } => values.device_ptr(),
         }
     }
 
@@ -183,6 +218,12 @@ impl GatheredCol {
             // validity.len() == scan.total_count`. We pick `values` here as
             // the canonical row count.
             GatheredCol::BoolNullable { values, .. } => values.len(),
+            GatheredCol::Date32(v) => v.len(),
+            GatheredCol::Timestamp { values, .. } => values.len(),
+            // Decimal128 stores 2 u64s (16 bytes) per row, so the row count
+            // is half the buffer length. `alloc_gathered` always allocates an
+            // even length (`2 * total_count`), so the division is exact.
+            GatheredCol::Decimal128 { values, .. } => values.len() / 2,
         }
     }
 
@@ -261,7 +302,106 @@ impl GatheredCol {
                     .collect();
                 Ok(Arc::new(arr) as arrow_array::ArrayRef)
             }
+            // F6: Date32 reuses the i32 device layout but reconstructs a
+            // `Date32Array` so the output dtype round-trips (a plain
+            // `Int32Array` would silently downgrade days-since-epoch to a
+            // generic integer).
+            GatheredCol::Date32(v) => {
+                let host = v.to_vec()?;
+                Ok(Arc::new(arrow_array::Date32Array::from(host)) as arrow_array::ArrayRef)
+            }
+            // F6: Timestamp reuses the i64 device layout; rebuild the concrete
+            // `Timestamp*Array` matching the carried `TimeUnit` and reattach
+            // the optional timezone.
+            GatheredCol::Timestamp { values, unit, tz } => {
+                let host = values.to_vec()?;
+                Ok(timestamp_array_from_i64(host, *unit, *tz))
+            }
+            // F6: Decimal128 reassembles each interleaved `(lo, hi)` u64 pair
+            // back into an i128 (`lo | (hi << 64)`, sign-preserving because the
+            // high half carries the sign bits) and reattaches `(precision,
+            // scale)`. Mirrors `engine_device_col::decimal128_from_interleaved`,
+            // minus the validity bitmap (the fixed-width gather pipeline does
+            // not carry per-row validity — see the variant docs).
+            GatheredCol::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => {
+                let host = values.to_vec()?;
+                let arr = decimal128_array_from_interleaved(&host, *precision, *scale)?;
+                Ok(Arc::new(arr) as arrow_array::ArrayRef)
+            }
         }
+    }
+}
+
+/// Reassemble an interleaved `[lo0, hi0, lo1, hi1, ...]` little-endian `u64`
+/// buffer into a non-nullable `Decimal128Array` with the given precision /
+/// scale.
+///
+/// Each `(lo, hi)` pair becomes one `i128` via `lo | (hi << 64)` then `as
+/// i128` — the unsigned→signed cast preserves the value because the high half
+/// already carries the sign bits. This is the gather/compaction-side twin of
+/// `engine_device_col::decimal128_from_interleaved`; it omits the validity
+/// bitmap because the fixed-width gather pipeline does not gather per-row
+/// validity (the gathered values are dense over the surviving rows).
+fn decimal128_array_from_interleaved(
+    host: &[u64],
+    precision: u8,
+    scale: i8,
+) -> BoltResult<arrow_array::Decimal128Array> {
+    if host.len() % 2 != 0 {
+        return Err(BoltError::Other(format!(
+            "gpu_compact: Decimal128 gather buffer length {} is not even \
+             (expected 2 u64s per row)",
+            host.len()
+        )));
+    }
+    let n_rows = host.len() / 2;
+    let mut out: Vec<i128> = Vec::with_capacity(n_rows);
+    for row in 0..n_rows {
+        let lo = host[2 * row];
+        let hi = host[2 * row + 1];
+        let bits = (lo as u128) | ((hi as u128) << 64);
+        out.push(bits as i128);
+    }
+    arrow_array::Decimal128Array::from(out)
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| {
+            BoltError::Type(format!(
+                "gpu_compact: Decimal128 download precision/scale ({precision}, {scale}) \
+                 rejected by Arrow: {e}"
+            ))
+        })
+}
+
+/// Build the concrete Arrow `Timestamp*Array` for a gathered i64 tick buffer,
+/// dispatching on `TimeUnit` and reattaching the optional timezone.
+///
+/// Kept as a free function (not a method) so both [`GatheredCol::download`] and
+/// the pinned [`download_columns`] path can share one reconstruction.
+fn timestamp_array_from_i64(
+    host: Vec<i64>,
+    unit: crate::plan::logical_plan::TimeUnit,
+    tz: Option<&'static str>,
+) -> arrow_array::ArrayRef {
+    use crate::plan::logical_plan::TimeUnit;
+    use std::sync::Arc;
+    let tz_owned: Option<std::sync::Arc<str>> = tz.map(|s| Arc::from(s));
+    match unit {
+        TimeUnit::Second => Arc::new(
+            arrow_array::TimestampSecondArray::from(host).with_timezone_opt(tz_owned),
+        ) as arrow_array::ArrayRef,
+        TimeUnit::Millisecond => Arc::new(
+            arrow_array::TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned),
+        ) as arrow_array::ArrayRef,
+        TimeUnit::Microsecond => Arc::new(
+            arrow_array::TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned),
+        ) as arrow_array::ArrayRef,
+        TimeUnit::Nanosecond => Arc::new(
+            arrow_array::TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned),
+        ) as arrow_array::ArrayRef,
     }
 }
 
@@ -961,6 +1101,21 @@ pub fn download_columns(
             values: crate::cuda::PinnedHostBuffer<u8>,
             validity: crate::cuda::PinnedHostBuffer<u8>,
         },
+        // F6 temporal / decimal staging buffers. Date32 and Timestamp reuse
+        // the i32 / i64 pinned hops; Decimal128 stages its interleaved
+        // 16-bytes-per-row u64 buffer and carries the plan dtype metadata so
+        // phase 3 can rebuild the typed Arrow array.
+        Date32(crate::cuda::PinnedHostBuffer<i32>),
+        Timestamp {
+            values: crate::cuda::PinnedHostBuffer<i64>,
+            unit: crate::plan::logical_plan::TimeUnit,
+            tz: Option<&'static str>,
+        },
+        Decimal128 {
+            values: crate::cuda::PinnedHostBuffer<u64>,
+            precision: u8,
+            scale: i8,
+        },
     }
 
     let raw = stream.raw();
@@ -976,6 +1131,21 @@ pub fn download_columns(
             GatheredCol::BoolNullable { values, validity } => Pinned::BoolNullable {
                 values: values.to_pinned_async(raw)?,
                 validity: validity.to_pinned_async(raw)?,
+            },
+            GatheredCol::Date32(v) => Pinned::Date32(v.to_pinned_async(raw)?),
+            GatheredCol::Timestamp { values, unit, tz } => Pinned::Timestamp {
+                values: values.to_pinned_async(raw)?,
+                unit: *unit,
+                tz: *tz,
+            },
+            GatheredCol::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => Pinned::Decimal128 {
+                values: values.to_pinned_async(raw)?,
+                precision: *precision,
+                scale: *scale,
             },
         };
         staged.push(p);
@@ -1024,6 +1194,24 @@ pub fn download_columns(
                     .map(|(&v, &m)| if m == 1 { Some(v == 1) } else { None })
                     .collect();
                 Arc::new(a)
+            }
+            Pinned::Date32(b) => {
+                Arc::new(arrow_array::Date32Array::from(b.as_slice().to_vec()))
+            }
+            Pinned::Timestamp { values, unit, tz } => {
+                timestamp_array_from_i64(values.as_slice().to_vec(), *unit, *tz)
+            }
+            Pinned::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => {
+                let arr = decimal128_array_from_interleaved(
+                    values.as_slice(),
+                    *precision,
+                    *scale,
+                )?;
+                Arc::new(arr)
             }
         };
         out.push(arr);
@@ -1129,40 +1317,26 @@ fn alloc_gathered(dtype: DataType, len: usize) -> BoltResult<GatheredCol> {
                 "gpu_compact: gather Utf8 not supported (variable-width)".into(),
             ))
         }
-        // F11 fallback-gap fix: Decimal128 gather is not yet lowered to the
-        // GPU. Previously this was a hard `BoltError::Plan` that propagated up
-        // through `compact_columns_on_gpu` → `execute_projection` and failed
-        // the whole query. We now decline with the typed `BoltError::GpuCapacity`
-        // marker — the same "GPU path declined, retry on host" signal the join
-        // gates use (`gpu_join.rs`) — so a filter+project over a Decimal128
-        // column routes to the host executor (which handles it correctly)
-        // rather than erroring. The supported gather dtypes above are unchanged.
-        DataType::Decimal128(_, _) => {
-            return Err(BoltError::GpuCapacity(
-                "GPU gather of Decimal128 not yet supported; decline to host"
-                    .into(),
-            ))
-        }
-        // v0.7: Date32 / Timestamp arithmetic (subtraction) is wired in the
-        // mainline projection codegen, but the gather/compact download path
-        // here still emits the underlying Int32 / Int64 Arrow array — there
-        // is no Date32Array / TimestampArray reconstruction yet. Decline at
-        // the compaction boundary so a filter+project over a temporal column
-        // lands on the host executor path (which handles the dtype round-trip
-        // correctly) rather than silently downgrading to plain integers.
-        //
-        // F11 fallback-gap fix: emit the typed `BoltError::GpuCapacity` decline
-        // marker (mirroring the join gates and the Decimal128 arm above) rather
-        // than an opaque `BoltError::Other`, so the orchestrator routes this to
-        // its host fallback with the same type-safe pattern-match it uses for
-        // the GPU join overshoot path.
-        DataType::Date32 | DataType::Timestamp(_, _) => {
-            return Err(BoltError::GpuCapacity(
-                "GPU gather of Date/Timestamp not yet supported; decline to \
-                 host (host executor handles the temporal dtype round-trip)"
-                    .into(),
-            ))
-        }
+        // F6: Decimal128 gathers as an interleaved 16-bytes-per-row u64 buffer.
+        // The gather kernel copies two 64-bit halves per surviving row, so the
+        // output buffer holds `2 * len` u64 elements. `download` reassembles
+        // each `(lo, hi)` pair into an i128 and reattaches `(precision, scale)`.
+        DataType::Decimal128(precision, scale) => GatheredCol::Decimal128 {
+            values: GpuVec::<u64>::zeros(2 * len)?,
+            precision,
+            scale,
+        },
+        // F6: Date32 reuses the i32 fixed-width gather path (4-byte copy) but
+        // is tracked as its own variant so `download` rebuilds a `Date32Array`.
+        DataType::Date32 => GatheredCol::Date32(GpuVec::<i32>::zeros(len)?),
+        // F6: Timestamp reuses the i64 fixed-width gather path (8-byte copy);
+        // the carried unit/tz let `download` rebuild the concrete
+        // `Timestamp*Array`.
+        DataType::Timestamp(unit, tz) => GatheredCol::Timestamp {
+            values: GpuVec::<i64>::zeros(len)?,
+            unit,
+            tz,
+        },
     })
 }
 
@@ -1330,32 +1504,128 @@ mod tests {
         }
     }
 
-    /// F11 fallback-gap fix: an unsupported-for-gather dtype must decline with
-    /// the typed `BoltError::GpuCapacity` "retry on host" marker (NOT a hard
-    /// `BoltError::Plan` / `BoltError::Other`), so the orchestrator routes a
-    /// filter+project over a Decimal128 / temporal column to the host executor
-    /// instead of failing the query. This is the same decline signal the GPU
-    /// join gates emit.
+    /// Utf8 remains the only gather dtype that declines up-front — it is
+    /// variable-width and has no fixed-width gather kernel. F6 wired
+    /// Decimal128 / Date32 / Timestamp through, so they must NOT decline here
+    /// anymore (their happy path allocates device memory, exercised in the
+    /// `gpu:` test below).
     ///
-    /// Pure-host: the error returns *before* any device allocation, so this
-    /// runs without a GPU (no `#[ignore]`).
+    /// Pure-host: the Utf8 rejection returns before any device allocation.
     #[test]
-    fn alloc_gathered_declines_unsupported_dtypes_to_host() {
-        use crate::plan::logical_plan::TimeUnit;
-        for dtype in [
-            DataType::Decimal128(38, 10),
-            DataType::Date32,
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-        ] {
-            match alloc_gathered(dtype, 1) {
-                Ok(_) => panic!("{dtype:?} gather should decline, not succeed"),
-                Err(BoltError::GpuCapacity(_)) => { /* expected host-fallback signal */ }
-                Err(other) => panic!(
-                    "{dtype:?} must decline with GpuCapacity (host-fallback marker), \
-                     got a different error kind: {other:?}"
-                ),
-            }
+    fn alloc_gathered_still_declines_utf8() {
+        match alloc_gathered(DataType::Utf8, 1) {
+            Ok(_) => panic!("Utf8 gather must not be supported (variable-width)"),
+            Err(e) => assert!(
+                format!("{e}").contains("Utf8"),
+                "Utf8 rejection must mention Utf8, got: {e}"
+            ),
         }
+    }
+
+    /// F6: the Decimal128 reassembly helper rebuilds an i128 from each
+    /// interleaved `(lo, hi)` u64 pair (little-endian, sign-preserving) and
+    /// reattaches `(precision, scale)`. Pure host — no CUDA.
+    #[test]
+    fn decimal128_from_interleaved_reassembles_signed_values() {
+        // Rows: 1, -1, 2^70 (needs the high half), and a large negative.
+        let neg_one = (-1i128) as u128;
+        let big: i128 = 1i128 << 70;
+        let big_bits = big as u128;
+        let host: Vec<u64> = vec![
+            1u64, 0u64, // 1
+            neg_one as u64, (neg_one >> 64) as u64, // -1
+            big_bits as u64, (big_bits >> 64) as u64, // 2^70
+        ];
+        let arr = decimal128_array_from_interleaved(&host, 38, 10).expect("reassemble");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.value(0), 1i128);
+        assert_eq!(arr.value(1), -1i128);
+        assert_eq!(arr.value(2), big);
+        assert_eq!(arr.precision(), 38);
+        assert_eq!(arr.scale(), 10);
+    }
+
+    /// F6: an odd-length interleaved buffer is a kernel-contract violation
+    /// (each row is exactly two u64s) and must surface a structured error
+    /// rather than silently dropping the trailing half.
+    #[test]
+    fn decimal128_from_interleaved_rejects_odd_length() {
+        let host: Vec<u64> = vec![1, 0, 5]; // 1.5 rows
+        let err = decimal128_array_from_interleaved(&host, 10, 2)
+            .expect_err("odd-length buffer must error");
+        assert!(
+            format!("{err}").contains("not even"),
+            "error must mention the even-length contract: {err}"
+        );
+    }
+
+    /// F6: the Timestamp reconstruction dispatches on `TimeUnit` to the matching
+    /// concrete Arrow array type and reattaches the timezone. Pure host — no
+    /// CUDA. We assert the resulting Arrow dtype (unit + tz) is correct.
+    #[test]
+    fn timestamp_array_from_i64_dispatches_unit_and_tz() {
+        use crate::plan::logical_plan::TimeUnit;
+        use arrow_array::Array;
+
+        let values = vec![10i64, 20, 30];
+
+        // Microsecond, no tz.
+        let arr = timestamp_array_from_i64(values.clone(), TimeUnit::Microsecond, None);
+        assert_eq!(arr.len(), 3);
+        match arr.data_type() {
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None) => {}
+            other => panic!("expected Timestamp(Microsecond, None), got {other:?}"),
+        }
+
+        // Nanosecond with a timezone.
+        let tz: &'static str = "UTC";
+        let arr = timestamp_array_from_i64(values.clone(), TimeUnit::Nanosecond, Some(tz));
+        match arr.data_type() {
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some(z)) => {
+                assert_eq!(z.as_ref(), "UTC");
+            }
+            other => panic!("expected Timestamp(Nanosecond, Some(UTC)), got {other:?}"),
+        }
+
+        // Second + Millisecond units round-trip to the right concrete dtype.
+        let arr = timestamp_array_from_i64(values.clone(), TimeUnit::Second, None);
+        assert!(matches!(
+            arr.data_type(),
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Second, None)
+        ));
+        let arr = timestamp_array_from_i64(values, TimeUnit::Millisecond, None);
+        assert!(matches!(
+            arr.data_type(),
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
+        ));
+    }
+
+    /// F6: GPU happy-path allocation — `alloc_gathered` for the three new
+    /// dtypes must return the matching variant with the right reported row
+    /// length. Decimal128's underlying buffer is `2 * len` u64s but `.len()`
+    /// reports the row count. Allocates device memory, so `gpu:`-ignored.
+    #[test]
+    #[ignore = "gpu:projection — GpuVec::zeros allocates on device"]
+    fn alloc_gathered_new_dtypes_have_correct_len() {
+        use crate::plan::logical_plan::TimeUnit;
+
+        let g = alloc_gathered(DataType::Date32, 4).expect("alloc date32");
+        assert!(matches!(g, GatheredCol::Date32(_)));
+        assert_eq!(g.len(), 4);
+
+        let g = alloc_gathered(DataType::Timestamp(TimeUnit::Nanosecond, None), 3)
+            .expect("alloc timestamp");
+        assert!(matches!(g, GatheredCol::Timestamp { .. }));
+        assert_eq!(g.len(), 3);
+
+        let g = alloc_gathered(DataType::Decimal128(38, 10), 5).expect("alloc decimal128");
+        match &g {
+            GatheredCol::Decimal128 { values, .. } => {
+                assert_eq!(values.len(), 10, "2 u64s per row");
+            }
+            _ => panic!("expected Decimal128 variant"),
+        }
+        assert_eq!(g.len(), 5, "row count is half the u64 buffer length");
     }
 
     /// `compact_columns_on_gpu` with no columns and `n_rows = 0` must take the

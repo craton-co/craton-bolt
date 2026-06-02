@@ -43,6 +43,39 @@ pub fn reduction_output_dtype(op: ReduceOp, input_dtype: DataType) -> DataType {
     }
 }
 
+/// F7: map an input column dtype to the integer dtype the reduction kernels
+/// actually load/combine/store for `op`.
+///
+/// Temporal columns are stored as plain integers — `Date32` is an `i32` day
+/// count and `Timestamp` is an `i64` tick count — and `MIN` / `MAX` / `COUNT`
+/// over them are just the corresponding integer extrema / count. Rather than
+/// teach every per-dtype PTX arm about temporal types, we collapse
+/// `Date32 -> Int32` and `Timestamp -> Int64` here and let the existing i32 /
+/// i64 codegen handle them unchanged.
+///
+/// `SUM` over a temporal dtype is not meaningful SQL (you cannot add two
+/// dates), so it is rejected with the same message the per-dtype arms used to
+/// emit. Every non-temporal dtype is returned unchanged so the caller's match
+/// behaves exactly as before for the historically-supported types.
+fn reduction_storage_dtype(op: ReduceOp, dtype: DataType) -> BoltResult<DataType> {
+    use DataType::*;
+    use ReduceOp::*;
+    match (op, dtype) {
+        // SUM(temporal) is undefined SQL — keep rejecting it.
+        (Sum, Date32) | (Sum, Timestamp(_, _)) => Err(BoltError::Type(format!(
+            "agg_kernels: SUM over temporal dtype {:?} is not supported \
+             (only MIN/MAX/COUNT are defined for dates/timestamps)",
+            dtype
+        ))),
+        // MIN/MAX/COUNT(temporal) reduce at the underlying integer width.
+        (_, Date32) => Ok(Int32),
+        (_, Timestamp(_, _)) => Ok(Int64),
+        // Everything else is unchanged (incl. the still-unsupported Bool /
+        // Utf8 / Decimal128, which the caller's match continues to reject).
+        (_, other) => Ok(other),
+    }
+}
+
 /// Threads per block for every reduction kernel.
 ///
 /// The phase-2 warp-shuffle path emits `shfl.sync.down.b32` with membermask
@@ -123,6 +156,13 @@ impl ReduceOp {
     pub fn identity_ptx(self, dtype: DataType) -> BoltResult<String> {
         use DataType::*;
         use ReduceOp::*;
+        // F7: temporal columns reduce at their underlying integer width —
+        // Date32 is an i32 day count, Timestamp an i64 tick count. MIN/MAX/
+        // COUNT are well-defined integer extrema/counts; SUM over a temporal
+        // column is not meaningful SQL and is rejected below. Normalising
+        // here lets the existing i32/i64 identity/combine arms serve them
+        // without duplicating the literals.
+        let dtype = reduction_storage_dtype(self, dtype)?;
         match (self, dtype) {
             // Additive identities.
             (Sum, Int32) | (Count, Int32) => Ok("0".to_string()),
@@ -142,6 +182,9 @@ impl ReduceOp {
             (Max, Float32) => Ok(format!("0f{:08X}", f32::NEG_INFINITY.to_bits())),
             (Max, Float64) => Ok(format!("0d{:016X}", f64::NEG_INFINITY.to_bits())),
 
+            // `reduction_storage_dtype` has already collapsed Date32/Timestamp
+            // to Int32/Int64 (or errored for SUM(temporal)); only the truly
+            // unsupported dtypes remain here.
             (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) | (_, Date32) | (_, Timestamp(_, _)) => Err(BoltError::Type(format!(
                 "agg_kernels: reduction over dtype {:?} is not supported",
                 dtype
@@ -153,6 +196,10 @@ impl ReduceOp {
     pub fn combine_ptx(self, dtype: DataType) -> BoltResult<String> {
         use DataType::*;
         use ReduceOp::*;
+        // F7: collapse Date32 -> Int32, Timestamp -> Int64 for MIN/MAX/COUNT
+        // (SUM over a temporal dtype is rejected). Identical normalisation to
+        // `identity_ptx` so the two stay in lock-step.
+        let dtype = reduction_storage_dtype(self, dtype)?;
         let s = match (self, dtype) {
             (Sum, Int32) | (Count, Int32) => "add.s32",
             (Sum, Int64) | (Count, Int64) => "add.s64",
@@ -237,6 +284,16 @@ fn emit_reduction_kernel(
     dtype: DataType,
     with_validity: bool,
 ) -> BoltResult<String> {
+    // F7: a temporal input column reduces at its underlying integer width
+    // (Date32 -> Int32 day count, Timestamp -> Int64 tick count). Normalise
+    // the input dtype up front so every downstream helper here
+    // (`ptx_type_info`, `reduction_output_dtype`, `byte_width`, the
+    // warp-shuffle match on `acc_dtype`) operates on the integer dtype and
+    // emits exactly the i32/i64 reduction code. MIN/MAX/COUNT are the only
+    // ops that reach this for temporal inputs (SUM(temporal) is rejected by
+    // `reduction_storage_dtype`), and for those the accumulator dtype equals
+    // the input dtype, so collapsing the input is sound.
+    let dtype = reduction_storage_dtype(op, dtype)?;
     let entry = if with_validity {
         REDUCTION_KERNEL_WITH_VALIDITY_ENTRY
     } else {
@@ -1155,5 +1212,133 @@ mod validity_reduction_tests {
             ptx.contains("@%p7 bra LOAD_IDENTITY;"),
             "MIN(Float32) validity kernel must guard NULL rows:\n{ptx}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F7: temporal (Date32 / Timestamp) scalar reduction codegen. Host-only PTX
+// shape + eligibility tests — no CUDA required. Date32 must reduce as Int32
+// (4-byte loads), Timestamp as Int64 (8-byte loads); SUM over a temporal dtype
+// stays rejected.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod temporal_reduction_tests {
+    use super::*;
+    use crate::plan::logical_plan::TimeUnit;
+
+    const TS_US: DataType = DataType::Timestamp(TimeUnit::Microsecond, None);
+
+    /// `reduction_output_dtype` already returns the input dtype for MIN/MAX;
+    /// the *kernel* must collapse Date32->Int32 so it emits 4-byte i32 code,
+    /// byte-identical to a real `MIN(Int32)` reduction.
+    #[test]
+    fn min_date32_emits_int32_kernel() {
+        let date = compile_reduction_kernel(ReduceOp::Min, DataType::Date32)
+            .expect("MIN(Date32) should compile via the Int32 path");
+        let i32_ref = compile_reduction_kernel(ReduceOp::Min, DataType::Int32)
+            .expect("MIN(Int32) reference");
+        assert_eq!(
+            date, i32_ref,
+            "MIN(Date32) PTX must match MIN(Int32) PTX byte-for-byte"
+        );
+        // s32 MIN combine + i32::MAX identity must be present.
+        assert!(date.contains("min.s32"), "expected min.s32 combine:\n{date}");
+        assert!(
+            date.contains(&i32::MAX.to_string()),
+            "expected i32::MAX MIN identity:\n{date}"
+        );
+    }
+
+    /// MAX(Timestamp) must collapse to the Int64 kernel (8-byte loads,
+    /// `max.s64`, i64::MIN identity), matching `MAX(Int64)` exactly.
+    #[test]
+    fn max_timestamp_emits_int64_kernel() {
+        let ts = compile_reduction_kernel(ReduceOp::Max, TS_US)
+            .expect("MAX(Timestamp) should compile via the Int64 path");
+        let i64_ref = compile_reduction_kernel(ReduceOp::Max, DataType::Int64)
+            .expect("MAX(Int64) reference");
+        assert_eq!(
+            ts, i64_ref,
+            "MAX(Timestamp) PTX must match MAX(Int64) PTX byte-for-byte"
+        );
+        assert!(ts.contains("max.s64"), "expected max.s64 combine:\n{ts}");
+    }
+
+    /// COUNT over temporal dtypes is just the integer count path.
+    #[test]
+    fn count_temporal_routes_to_integer_path() {
+        assert_eq!(
+            compile_reduction_kernel(ReduceOp::Count, DataType::Date32).unwrap(),
+            compile_reduction_kernel(ReduceOp::Count, DataType::Int32).unwrap(),
+        );
+        assert_eq!(
+            compile_reduction_kernel(ReduceOp::Count, TS_US).unwrap(),
+            compile_reduction_kernel(ReduceOp::Count, DataType::Int64).unwrap(),
+        );
+    }
+
+    /// The validity-aware variant must compose with the temporal normalisation:
+    /// MIN(Date32) with validity == MIN(Int32) with validity.
+    #[test]
+    fn validity_min_date32_matches_int32() {
+        let date = compile_reduction_kernel_with_validity(ReduceOp::Min, DataType::Date32)
+            .expect("MIN(Date32) with validity should compile");
+        let i32_ref = compile_reduction_kernel_with_validity(ReduceOp::Min, DataType::Int32)
+            .expect("MIN(Int32) with validity reference");
+        assert_eq!(date, i32_ref);
+        assert!(date.contains("bfe.u32"), "validity gate must survive:\n{date}");
+    }
+
+    /// SUM over a temporal dtype is undefined SQL and must be rejected at both
+    /// the codegen entry point and the `identity_ptx`/`combine_ptx` helpers.
+    #[test]
+    fn sum_temporal_is_rejected() {
+        for dt in [DataType::Date32, TS_US] {
+            let err = compile_reduction_kernel(ReduceOp::Sum, dt)
+                .expect_err("SUM(temporal) must be rejected");
+            assert!(
+                err.to_string().contains("SUM over temporal"),
+                "unexpected SUM(temporal) error for {dt:?}: {err}"
+            );
+            assert!(ReduceOp::Sum.identity_ptx(dt).is_err());
+            assert!(ReduceOp::Sum.combine_ptx(dt).is_err());
+        }
+    }
+
+    /// `identity_ptx` / `combine_ptx` accept MIN/MAX/COUNT over temporal and
+    /// produce the integer-typed PTX literals/mnemonics.
+    #[test]
+    fn identity_and_combine_accept_temporal_minmax_count() {
+        // Date32 -> Int32 mnemonics.
+        assert_eq!(ReduceOp::Min.combine_ptx(DataType::Date32).unwrap(), "min.s32");
+        assert_eq!(ReduceOp::Max.combine_ptx(DataType::Date32).unwrap(), "max.s32");
+        assert_eq!(
+            ReduceOp::Min.identity_ptx(DataType::Date32).unwrap(),
+            i32::MAX.to_string()
+        );
+        // Timestamp -> Int64 mnemonics.
+        assert_eq!(ReduceOp::Max.combine_ptx(TS_US).unwrap(), "max.s64");
+        assert_eq!(
+            ReduceOp::Max.identity_ptx(TS_US).unwrap(),
+            i64::MIN.to_string()
+        );
+        // COUNT over temporal lowers to the additive (integer) identity 0.
+        assert_eq!(ReduceOp::Count.identity_ptx(DataType::Date32).unwrap(), "0");
+        assert_eq!(ReduceOp::Count.identity_ptx(TS_US).unwrap(), "0");
+    }
+
+    /// Bool / Utf8 / Decimal128 remain rejected (out of scope for F7) — the
+    /// normalisation must not accidentally let them through.
+    #[test]
+    fn still_rejects_bool_utf8_decimal() {
+        for dt in [
+            DataType::Bool,
+            DataType::Utf8,
+            DataType::Decimal128(10, 2),
+        ] {
+            assert!(compile_reduction_kernel(ReduceOp::Min, dt).is_err());
+            assert!(compile_reduction_kernel(ReduceOp::Max, dt).is_err());
+            assert!(compile_reduction_kernel(ReduceOp::Sum, dt).is_err());
+        }
     }
 }

@@ -137,6 +137,40 @@ impl DictionaryColumnAny {
         }
     }
 
+    /// GPU indices of every dictionary entry satisfying `entry OP probe` under
+    /// byte-lexicographic collation (finding F10), widened to `i64`.
+    ///
+    /// `op` is one of the four ordering comparisons (`<`, `<=`, `>`, `>=`).
+    /// Slot 0 (NULL) is never included — a NULL row yields SQL NULL, never an
+    /// ordering match. Indices come back in ascending order. The result is
+    /// always widened to `i64` (lossless for the i32 variant) so a single
+    /// return type spares callers from branching on the variant just to forward
+    /// the set to the planner; the caller re-narrows per [`Self::index_dtype`]
+    /// when emitting the rewritten predicate's literals.
+    ///
+    /// This is the ordering-comparison analogue of the equality `index_of_any`
+    /// / LIKE `like_match_indices` precompute: the host partitions the
+    /// dictionary once and the GPU only ever does integer-index compares. The
+    /// probe literal need not be present in the dictionary — the per-entry
+    /// comparison handles the absent-literal (half-open insertion) case
+    /// correctly. Ordering is binary (UTF-8 bytes), NOT locale-aware ICU
+    /// collation, which is out of scope.
+    pub fn indices_satisfying_any(
+        &self,
+        op: crate::plan::logical_plan::BinaryOp,
+        probe: &str,
+    ) -> Vec<i64> {
+        match self {
+            // i32 → i64 widening is lossless.
+            Self::I32(d) => d
+                .indices_satisfying(op, probe)
+                .into_iter()
+                .map(|i| i as i64)
+                .collect(),
+            Self::I64(d) => d.indices_satisfying(op, probe),
+        }
+    }
+
     /// **Stage 7 (S1)** — build a `DictionaryColumnAny` directly from an
     /// Arrow `DictionaryArray<Int32Type>` without re-scanning the values.
     ///
@@ -472,6 +506,48 @@ mod tests {
         // n_rows is independent of dictionary length; the caller-supplied
         // value must round-trip too.
         assert_eq!(any.n_rows(), 42);
+    }
+
+    /// F10: `indices_satisfying_any` over an i32-backed wrapper returns the
+    /// 1-based GPU indices (widened to i64) of every entry that satisfies
+    /// `entry OP probe` under byte collation, excluding the NULL slot, and
+    /// agrees with a direct comparison.
+    #[test]
+    fn indices_satisfying_any_byte_collation() {
+        use crate::plan::logical_plan::BinaryOp;
+        let entries = ["delta", "apple", "Zebra", "mango"];
+        let any = DictionaryColumnAny::new_host_only(
+            entries.iter().map(|s| s.to_string()).collect(),
+            4,
+        )
+        .expect("host-only build");
+        assert!(any.is_i32());
+
+        let oracle = |op: BinaryOp, lit: &str| -> Vec<i64> {
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| match op {
+                    BinaryOp::Lt => **s < lit,
+                    BinaryOp::LtEq => **s <= lit,
+                    BinaryOp::Gt => **s > lit,
+                    BinaryOp::GtEq => **s >= lit,
+                    _ => unreachable!(),
+                })
+                .map(|(p, _)| (p as i64) + 1)
+                .collect()
+        };
+
+        for lit in ["mango", "cat", "Zebra", "zzz"] {
+            for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+                let mut got = any.indices_satisfying_any(op, lit);
+                got.sort_unstable();
+                let mut want = oracle(op, lit);
+                want.sort_unstable();
+                assert_eq!(got, want, "op {op:?} lit {lit:?}");
+                assert!(!got.contains(&0), "NULL slot 0 must be excluded");
+            }
+        }
     }
 
     /// Edge case: an empty dictionary must still dispatch (not panic), and —

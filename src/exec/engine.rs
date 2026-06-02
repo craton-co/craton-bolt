@@ -3338,6 +3338,9 @@ impl Engine {
                 StringProjectOutput::Transform { source, transform } => {
                     arrays.push(self.string_transform_column(table, source, *transform, n_rows)?);
                 }
+                StringProjectOutput::Concat { sources } => {
+                    arrays.push(self.string_concat_column(table, sources, n_rows)?);
+                }
             }
         }
 
@@ -3555,6 +3558,89 @@ impl Engine {
         // `out_bytes_gpu` was padded to >= 1 byte; truncate to the real total.
         let out_bytes = &out_bytes[..total_bytes.min(out_bytes.len())];
         let arr = string_array_from_offsets(&out_offsets, out_bytes, validity_slice)?;
+        Ok(Arc::new(arr) as ArrayRef)
+    }
+
+    /// Compute `CONCAT(s0, s1, ...)` for the GPU-resident `Utf8` source columns
+    /// of `table`, returning a `Utf8` `ArrayRef` of `n_rows` rows with
+    /// NULL-if-any-arg-NULL semantics (standard SQL, matching the host path).
+    ///
+    /// Resolution of each column's dictionary + device keys + layout + per-row
+    /// validity mirrors [`string_transform_column`](Self::string_transform_column).
+    /// The N-input two-pass GPU concat kernels
+    /// ([`crate::jit::string_kernel::compile_concat_len_pass`] /
+    /// `compile_concat_write_pass`) exist and are PTX-shape-tested; this executor
+    /// currently realises the result via the byte-identical host mirror
+    /// ([`crate::exec::string_project::host_concat_strings`]) so the path is
+    /// correctness-guaranteed (the device concat kernel is unvalidated on
+    /// hardware, like the LIKE matcher). Wiring the device launch here is a
+    /// follow-up; results are identical either way.
+    fn string_concat_column(
+        &self,
+        table: &str,
+        sources: &[String],
+        n_rows: usize,
+    ) -> BoltResult<ArrayRef> {
+        use crate::exec::string_project::{build_concat_input, host_concat_strings, KeyLayout};
+
+        let gpu_table_ref = self.ensure_gpu_table(table)?;
+        let gpu_table: &crate::exec::gpu_table::GpuTable = &gpu_table_ref;
+
+        let mut inputs = Vec::with_capacity(sources.len());
+        for source in sources {
+            let column = gpu_table.column(source).ok_or_else(|| {
+                BoltError::Plan(format!(
+                    "StringProject(Concat): column '{source}' not in GPU table '{table}'"
+                ))
+            })?;
+            let dict = column.utf8_dictionary().ok_or_else(|| {
+                BoltError::Plan(format!(
+                    "StringProject(Concat): column '{source}' is not a Utf8 column"
+                ))
+            })?;
+            // Same (keys, layout, validity) resolution as `string_transform_column`.
+            let (keys_host, layout, validity): (Vec<i32>, KeyLayout, Option<Vec<bool>>) =
+                match &column.data {
+                    crate::exec::gpu_table::GpuColumnData::Utf8 { indices, .. } => {
+                        let keys = indices.to_vec()?;
+                        let valid: Vec<bool> = keys.iter().map(|&k| k != 0).collect();
+                        (keys, KeyLayout::OneBasedNullSlot0, Some(valid))
+                    }
+                    crate::exec::gpu_table::GpuColumnData::DictUtf8 {
+                        keys, valid_mask, ..
+                    } => {
+                        let keys = keys.to_vec()?;
+                        let valid = match valid_mask {
+                            None => None,
+                            Some(mask) => {
+                                let bits = mask.to_vec()?;
+                                let v: Vec<bool> = (0..keys.len())
+                                    .map(|row| {
+                                        let byte = bits.get(row / 8).copied().unwrap_or(0);
+                                        (byte >> (row % 8)) & 1 == 1
+                                    })
+                                    .collect();
+                                Some(v)
+                            }
+                        };
+                        (keys, KeyLayout::ZeroBased, valid)
+                    }
+                    _ => {
+                        return Err(BoltError::Plan(format!(
+                            "StringProject(Concat): column '{source}' has non-Utf8 GPU storage"
+                        )))
+                    }
+                };
+            check_len(keys_host.len(), n_rows)?;
+            inputs.push(build_concat_input(
+                dict,
+                &keys_host,
+                layout,
+                validity.as_deref(),
+            )?);
+        }
+
+        let arr = host_concat_strings(&inputs)?;
         Ok(Arc::new(arr) as ArrayRef)
     }
 
