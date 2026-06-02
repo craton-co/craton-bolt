@@ -588,22 +588,12 @@ fn run_reduce_phase_i64(
     let keys: Vec<i32> = pairs.iter().map(|(k, _)| *k).collect();
     let vals: Vec<i64> = pairs.iter().map(|(_, v)| *v).collect();
 
-    let aggregate = match plan {
-        PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
-        _ => unreachable!(),
-    };
-    let arrow_schema =
-        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
-    RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(keys)),
-            Arc::new(Int64Array::from(vals)),
-        ],
+    crate::exec::groupby_tier2_common::build_tier2_keyed_output(
+        plan,
+        keys,
+        Arc::new(Int64Array::from(vals)),
+        "groupby_tier2_minmax_exec",
     )
-    .map_err(|e| {
-        BoltError::Other(format!("groupby_tier2_minmax_exec(i64): build error: {e}"))
-    })
 }
 
 // ---------------------------------------------------------------------------

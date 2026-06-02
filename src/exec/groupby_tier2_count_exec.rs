@@ -328,26 +328,17 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
     let keys_out: Vec<i32> = pairs.iter().map(|(k, _)| *k).collect();
     let counts_out: Vec<i64> = pairs.iter().map(|(_, c)| *c as i64).collect();
 
-    let aggregate = match plan {
-        PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
-        _ => unreachable!("try_execute guards this"),
-    };
-    // dedup (tier2): shared converter in
-    // `groupby_tier2_common::plan_schema_to_arrow_schema`.
-    let arrow_schema =
-        crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
-    RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(keys_out)),
-            Arc::new(Int64Array::from(counts_out)),
-        ],
+    // dedup (tier2): shared keyed-output assembly (plan-match + schema +
+    // two-column RecordBatch::try_new + error wrap) in
+    // `groupby_tier2_common::build_tier2_keyed_output`. COUNT's aggregate
+    // column is the Int64 cast counts, built here exactly as before.
+    let agg_col: arrow_array::ArrayRef = Arc::new(Int64Array::from(counts_out));
+    crate::exec::groupby_tier2_common::build_tier2_keyed_output(
+        plan,
+        keys_out,
+        agg_col,
+        "groupby_tier2_count_exec",
     )
-    .map_err(|e| {
-        BoltError::Other(format!(
-            "groupby_tier2_count_exec: failed to build RecordBatch: {e}"
-        ))
-    })
 }
 
 // ---------------------------------------------------------------------------

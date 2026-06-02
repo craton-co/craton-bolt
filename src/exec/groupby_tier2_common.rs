@@ -300,6 +300,55 @@ pub(crate) fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSch
     )
 }
 
+/// dedup (tier2): the single-Int32-key + single-aggregate-column output
+/// assembly tail that the single-key Tier-2 reduce executors ran verbatim
+/// after `collect_populated_slots_sorted`.
+///
+/// Each converted executor previously inlined, byte-for-byte:
+///
+/// ```ignore
+/// let aggregate = match plan {
+///     PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
+///     _ => unreachable!("try_execute guards this"),
+/// };
+/// let arrow_schema =
+///     crate::exec::groupby_tier2_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+/// RecordBatch::try_new(
+///     arrow_schema,
+///     vec![Arc::new(Int32Array::from(keys_out)), <AGG_COL>],
+/// )
+/// .map_err(|e| BoltError::Other(format!("<exec_name>: failed to build RecordBatch: {e}")))
+/// ```
+///
+/// The op-specific aggregate column is built by the caller (as an
+/// [`arrow_array::ArrayRef`], exactly as before) and handed in as `agg_col`;
+/// the keys are extracted by the caller into `keys`. Only the plan-match,
+/// schema conversion, two-column `RecordBatch::try_new`, and the
+/// `"{exec_name}: failed to build RecordBatch: {e}"` error wrapping move here.
+/// The `exec_name` is the per-file module string each call site passes, so the
+/// produced error text is byte-identical to the inlined code.
+///
+/// Pure host assembly — no GPU calls, no launch parameters produced.
+pub(crate) fn build_tier2_keyed_output(
+    plan: &crate::plan::physical_plan::PhysicalPlan,
+    keys: Vec<i32>,
+    agg_col: arrow_array::ArrayRef,
+    exec_name: &str,
+) -> BoltResult<arrow_array::RecordBatch> {
+    let aggregate = match plan {
+        crate::plan::physical_plan::PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
+        _ => unreachable!("try_execute guards this"),
+    };
+    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![Arc::new(arrow_array::Int32Array::from(keys)), agg_col],
+    )
+    .map_err(|e| {
+        crate::error::BoltError::Other(format!("{exec_name}: failed to build RecordBatch: {e}"))
+    })
+}
+
 /// dedup (tier2): the single-key partition-kernel selection predicate that
 /// every single-Int32-key Tier-2 executor / orchestrator carried verbatim
 /// inside its private `partition_spec_for`.
