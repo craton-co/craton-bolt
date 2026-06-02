@@ -10,10 +10,11 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use sqlparser::ast::{
     BinaryOperator, CastFormat as SqlCastFormat, CastKind, DataType as SqlDataType, Distinct,
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    Expr as SqlExpr, Fetch, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     GroupByWithModifier, Ident,
-    JoinConstraint, JoinOperator, ObjectName, Offset, OrderByExpr, Query, Select, SelectItem,
-    SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, UnaryOperator, Value,
+    JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, Offset, OrderByExpr, Query, Select,
+    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Top, TopQuantity,
+    UnaryOperator, Value, WindowSpec,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -3506,12 +3507,11 @@ fn build_corr_where_post(
     if !query.limit_by.is_empty() {
         return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
     }
-    if query.fetch.is_some() {
-        return Err(BoltError::Sql("unsupported: FETCH".into()));
-    }
+    // FETCH folds into LIMIT, as in `plan_query`.
+    let fetch_value = fetch_limit_value(query.fetch.as_ref(), query.limit.is_some())?;
     let limit_value = match &query.limit {
         Some(e) => Some(usize_from_literal(e, "LIMIT")?),
-        None => None,
+        None => fetch_value,
     };
     let offset_value = match &query.offset {
         Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
@@ -3771,12 +3771,11 @@ fn build_lateral_post(
     if !query.limit_by.is_empty() {
         return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
     }
-    if query.fetch.is_some() {
-        return Err(BoltError::Sql("unsupported: FETCH".into()));
-    }
+    // FETCH folds into LIMIT, as in `plan_query`.
+    let fetch_value = fetch_limit_value(query.fetch.as_ref(), query.limit.is_some())?;
     let limit_value = match &query.limit {
         Some(e) => Some(usize_from_literal(e, "LIMIT")?),
-        None => None,
+        None => fetch_value,
     };
     let offset_value = match &query.offset {
         Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
@@ -4431,12 +4430,10 @@ fn plan_single_recursive_query(
     if !query.limit_by.is_empty() {
         return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
     }
-    if query.fetch.is_some() {
-        return Err(BoltError::Sql("unsupported: FETCH".into()));
-    }
-    if !query.locks.is_empty() {
-        return Err(BoltError::Sql("unsupported: FOR UPDATE/SHARE".into()));
-    }
+    // FETCH folds into LIMIT and FOR UPDATE/SHARE is an accepted no-op, exactly
+    // as in the non-recursive `plan_query` path.
+    let fetch_value = fetch_limit_value(query.fetch.as_ref(), query.limit.is_some())?;
+    let _ = &query.locks;
     let mut main = lower_set_expr(query.body.as_ref(), provider, &scope, depth + 1)?;
     if let Some(order_by) = &query.order_by {
         let sort_exprs = lower_order_by(
@@ -4455,7 +4452,7 @@ fn plan_single_recursive_query(
     }
     let limit_value = match &query.limit {
         Some(e) => Some(usize_from_literal(e, "LIMIT")?),
-        None => None,
+        None => fetch_value,
     };
     let offset_value = match &query.offset {
         Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
@@ -4726,12 +4723,10 @@ fn plan_mutual_recursive_query(
     if !query.limit_by.is_empty() {
         return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
     }
-    if query.fetch.is_some() {
-        return Err(BoltError::Sql("unsupported: FETCH".into()));
-    }
-    if !query.locks.is_empty() {
-        return Err(BoltError::Sql("unsupported: FOR UPDATE/SHARE".into()));
-    }
+    // FETCH folds into LIMIT and FOR UPDATE/SHARE is an accepted no-op, exactly
+    // as in the non-recursive `plan_query` path.
+    let fetch_value = fetch_limit_value(query.fetch.as_ref(), query.limit.is_some())?;
+    let _ = &query.locks;
     let mut main = lower_set_expr(query.body.as_ref(), provider, &scope, depth + 1)?;
     if let Some(order_by) = &query.order_by {
         let sort_exprs = lower_order_by(
@@ -4750,7 +4745,7 @@ fn plan_mutual_recursive_query(
     }
     let limit_value = match &query.limit {
         Some(e) => Some(usize_from_literal(e, "LIMIT")?),
-        None => None,
+        None => fetch_value,
     };
     let offset_value = match &query.offset {
         Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
@@ -4918,12 +4913,31 @@ fn plan_query(
     if !query.limit_by.is_empty() {
         return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
     }
-    if query.fetch.is_some() {
-        return Err(BoltError::Sql("unsupported: FETCH".into()));
-    }
-    if !query.locks.is_empty() {
-        return Err(BoltError::Sql("unsupported: FOR UPDATE/SHARE".into()));
-    }
+    // FETCH FIRST/NEXT n ROWS ONLY is standard-SQL LIMIT. We fold it into the
+    // same `Limit` node the `LIMIT` keyword uses (see the LIMIT [OFFSET] block
+    // below). `WITH TIES` / `PERCENT` are out of scope and rejected precisely
+    // by `fetch_limit_value`; mixing FETCH with a `LIMIT` keyword is ambiguous
+    // and rejected there too.
+    let fetch_value = fetch_limit_value(query.fetch.as_ref(), query.limit.is_some())?;
+    // T-SQL `SELECT TOP n ...` is a row limit too. The `TOP` keyword lives on
+    // the SELECT body, but T-SQL applies it *after* ORDER BY, so we lower it
+    // here at the query level (above the Sort node added below), folding it into
+    // the same `Limit` node as LIMIT / FETCH. A body that is not a bare SELECT
+    // (e.g. a UNION) carries no TOP, so this is `None` there. `PERCENT` /
+    // `WITH TIES` and a TOP combined with LIMIT/FETCH are rejected precisely by
+    // `top_limit_value`.
+    let top_value = match query.body.as_ref() {
+        SetExpr::Select(s) => {
+            top_limit_value(s.top.as_ref(), query.limit.is_some() || query.fetch.is_some())?
+        }
+        _ => None,
+    };
+    // FOR UPDATE / FOR SHARE: row-level locking is a no-op for this read-only
+    // OLAP engine — there is no concurrent writer to lock out and we never
+    // mutate base data, so accepting and ignoring the clause leaves results
+    // identical. (Standard SQL permits a lock clause to be a hint; here it has
+    // no observable effect.)
+    let _ = &query.locks;
     if query.for_clause.is_some() {
         return Err(BoltError::Sql("unsupported: FOR clause".into()));
     }
@@ -4960,9 +4974,17 @@ fn plan_query(
     // executor can implement the offset as a skip without needing a separate
     // operator. Either clause alone is legal; OFFSET without LIMIT is
     // represented as `Limit { limit: usize::MAX, offset }`.
+    //
+    // `query.limit` (the `LIMIT` keyword) and `query.fetch` (`FETCH FIRST n
+    // ROWS ONLY`) are mutually exclusive (the ambiguous combination is rejected
+    // by `fetch_limit_value`), so at most one of the two is `Some`; they share
+    // the same `Limit` lowering and both compose with ORDER BY because this
+    // block runs *after* the Sort node is layered on above.
+    // At most one of LIMIT / FETCH / TOP is set (the ambiguous combinations are
+    // rejected above), so `.or` collapses them into a single effective limit.
     let limit_value = match &query.limit {
         Some(e) => Some(usize_from_literal(e, "LIMIT")?),
-        None => None,
+        None => fetch_value.or(top_value),
     };
     let offset_value = match &query.offset {
         Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
@@ -5176,6 +5198,105 @@ fn lower_order_by(
 /// Parse a SQL `LIMIT` / `OFFSET` clause value into a `usize`. The clause
 /// must be a non-negative integer literal; anything else is rejected (no
 /// dynamic LIMITs, no expressions). `kind` is used for error messages.
+/// Resolve a `FETCH FIRST/NEXT n ROWS ONLY` clause into an optional row limit,
+/// to be folded into the same `LogicalPlan::Limit` the `LIMIT` keyword uses.
+///
+/// `FETCH` is the SQL-standard synonym for `LIMIT`; `FETCH FIRST n ROWS ONLY`
+/// and `FETCH NEXT n ROWS ONLY` are identical (the `FIRST`/`NEXT` spelling is
+/// cosmetic). Returns `None` when there is no FETCH clause.
+///
+/// Rejected precisely (genuinely out of scope, not oversights):
+///   * `WITH TIES` — would require carrying the ORDER BY peer-group boundary
+///     into the limit operator so tied rows at the cutoff are all kept; the
+///     `Limit` operator is a plain row-count truncation and cannot express it.
+///   * `PERCENT` — a fractional limit (`FETCH FIRST 10 PERCENT ...`) needs the
+///     post-sort cardinality to size the cut, which the static `Limit` node
+///     does not carry.
+///   * a `FETCH` alongside a `LIMIT` keyword (`has_limit_keyword`) — two row
+///     limits on one query are ambiguous, so we reject rather than silently
+///     pick one.
+fn fetch_limit_value(
+    fetch: Option<&Fetch>,
+    has_limit_keyword: bool,
+) -> BoltResult<Option<usize>> {
+    let fetch = match fetch {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    if has_limit_keyword {
+        return Err(BoltError::Sql(
+            "ambiguous row limit: a query may use LIMIT or FETCH FIRST, not both".into(),
+        ));
+    }
+    if fetch.with_ties {
+        return Err(BoltError::Sql(
+            "unsupported: FETCH FIRST ... WITH TIES (the row-count Limit operator \
+             cannot keep ORDER BY ties at the cutoff); use FETCH FIRST n ROWS ONLY"
+                .into(),
+        ));
+    }
+    if fetch.percent {
+        return Err(BoltError::Sql(
+            "unsupported: FETCH FIRST n PERCENT (a fractional limit needs the \
+             post-sort row count, which the static Limit operator does not carry); \
+             use an absolute FETCH FIRST n ROWS ONLY"
+                .into(),
+        ));
+    }
+    // `FETCH FIRST ROWS ONLY` with no quantity defaults to 1 row (SQL standard).
+    match &fetch.quantity {
+        Some(e) => Ok(Some(usize_from_literal(e, "FETCH FIRST")?)),
+        None => Ok(Some(1)),
+    }
+}
+
+/// Resolve a T-SQL `SELECT TOP n [PERCENT] [WITH TIES] ...` clause into an
+/// optional row limit, folded into the same `LogicalPlan::Limit` as LIMIT /
+/// FETCH. Returns `None` when there is no TOP clause.
+///
+/// Rejected precisely:
+///   * `PERCENT` / `WITH TIES` — same limitations as FETCH (see
+///     [`fetch_limit_value`]): the static row-count `Limit` operator cannot
+///     express a fractional cut or keep ORDER BY ties at the cutoff.
+///   * a `TOP` alongside a `LIMIT` / `FETCH` clause (`has_other_limit`) — two
+///     row limits on one query are ambiguous, so we reject rather than guess.
+fn top_limit_value(top: Option<&Top>, has_other_limit: bool) -> BoltResult<Option<usize>> {
+    let top = match top {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    if has_other_limit {
+        return Err(BoltError::Sql(
+            "ambiguous row limit: a query may use TOP or LIMIT/FETCH, not both".into(),
+        ));
+    }
+    if top.percent {
+        return Err(BoltError::Sql(
+            "unsupported: TOP n PERCENT (a fractional limit needs the post-sort \
+             row count, which the static Limit operator does not carry); use an \
+             absolute TOP n"
+                .into(),
+        ));
+    }
+    if top.with_ties {
+        return Err(BoltError::Sql(
+            "unsupported: TOP n WITH TIES (the row-count Limit operator cannot keep \
+             ORDER BY ties at the cutoff); use a plain TOP n"
+                .into(),
+        ));
+    }
+    match &top.quantity {
+        Some(TopQuantity::Constant(n)) => Ok(Some(
+            usize::try_from(*n)
+                .map_err(|_| BoltError::Sql(format!("TOP value {n} exceeds usize range")))?,
+        )),
+        Some(TopQuantity::Expr(e)) => Ok(Some(usize_from_literal(e, "TOP")?)),
+        // `SELECT TOP ... ` with no quantity is not valid T-SQL; treat a
+        // missing count defensively as "no limit" rather than erroring.
+        None => Ok(None),
+    }
+}
+
 fn usize_from_literal(e: &SqlExpr, kind: &str) -> BoltResult<usize> {
     let value = match e {
         SqlExpr::Value(Value::Number(n, _)) => n,
@@ -5915,9 +6036,24 @@ fn plan_select(
         plan.schema()?
     };
 
-    // WHERE
-    if let Some(filter_sql) = &select.selection {
-        let predicate = lower_expr(filter_sql, &resolver, 0)?;
+    // WHERE (+ PREWHERE). PREWHERE is ClickHouse's early-filter clause: it
+    // restricts rows *before* the rest of the SELECT runs, but the result set
+    // is identical to applying the same predicate in WHERE (only the evaluation
+    // order — and thus performance — differs). We therefore fold PREWHERE into
+    // the same single `Filter`, ANDing it ahead of WHERE
+    // (`PREWHERE p1 WHERE p2` => filter on `p1 AND p2`); PREWHERE alone becomes
+    // the filter predicate on its own. Both predicates resolve against the same
+    // FROM-tree namespace, so this is a pure conjunction with no reordering of
+    // semantics.
+    let predicate = match (&select.prewhere, &select.selection) {
+        (Some(pre), Some(whr)) => {
+            Some(lower_expr(pre, &resolver, 0)?.and(lower_expr(whr, &resolver, 0)?))
+        }
+        (Some(pre), None) => Some(lower_expr(pre, &resolver, 0)?),
+        (None, Some(whr)) => Some(lower_expr(whr, &resolver, 0)?),
+        (None, None) => None,
+    };
+    if let Some(predicate) = predicate {
         // Trigger type-checking on the predicate. `Expr::dtype` recurses
         // through the operand tree, so per-arm rules like the Utf8 check on
         // `Expr::Like` fire here. Without this call the lower-level type
@@ -6199,6 +6335,26 @@ fn plan_select(
         .any(|&b| b);
 
     if has_agg_in_select || !group_by_sql.is_empty() || parsed_group_by.is_super {
+        // Window functions, a named WINDOW clause, and QUALIFY are lowered only
+        // in the scalar-projection branch below (which stacks the Window nodes).
+        // Combining them with GROUP BY / aggregates (window-over-aggregate) is
+        // out of scope, so we reject precisely here rather than silently drop
+        // the clause.
+        if !select.named_window.is_empty() {
+            return Err(BoltError::Sql(
+                "unsupported: a named WINDOW clause combined with GROUP BY / \
+                 aggregates (window functions over an aggregate result are not lowered)"
+                    .into(),
+            ));
+        }
+        if select.qualify.is_some() {
+            return Err(BoltError::Sql(
+                "unsupported: QUALIFY combined with GROUP BY / aggregates (QUALIFY \
+                 filters a window-function result, which is not lowered in aggregate \
+                 mode); use HAVING to filter aggregates"
+                    .into(),
+            ));
+        }
         // Aggregate mode. Each SELECT item is one of:
         //   * a bare aggregate call (`SUM(v)`),
         //   * a bare group key already listed in GROUP BY (`k`),
@@ -6392,6 +6548,12 @@ fn plan_select(
                 group_by,
                 aggregates: aggregates.clone(),
             };
+            // Validate the aggregate's output dtypes at parse time (this runs
+            // `AggregateExpr::output_dtype` over every aggregate), so semantically
+            // undefined aggregates — e.g. SUM/AVG over a temporal type — are
+            // rejected here with a clear message rather than slipping through to
+            // execution.
+            let _ = aggregate_plan.schema()?;
             let group_by_out: &[Expr] = match &aggregate_plan {
                 LogicalPlan::Aggregate { group_by, .. } => group_by,
                 _ => unreachable!("just constructed an Aggregate"),
@@ -6550,19 +6712,23 @@ fn plan_select(
         let mut window_groups: Vec<WindowGroup> = Vec::new();
         let mut next_window_id: usize = 0;
 
-        // First, lower each SELECT item to a projection expr. For window
-        // items the expr becomes `Column("__window_N")` referencing the
-        // appended window column.
-        let mut proj_exprs: Vec<Expr> = Vec::with_capacity(items.len());
-        for (sql_expr, alias) in &items {
-            if let Some(pw) = try_window(sql_expr, &resolver, 0)? {
-                let out_name = format!("__window_{next_window_id}");
-                next_window_id += 1;
+        // Resolve the named WINDOW clause (`WINDOW w AS (...)`) so an `OVER w`
+        // reference in any SELECT item — or in QUALIFY — lowers to the named
+        // spec. Empty when there is no WINDOW clause.
+        let named_windows = build_named_window_map(&select.named_window)?;
+
+        // `add_window` registers a parsed window function into the (deduped)
+        // group set and returns the synthesized output column name. Shared by
+        // the SELECT-item pass and the QUALIFY pass so a window function used
+        // only in QUALIFY materializes a hidden column the same way.
+        let mut add_window =
+            |pw: ParsedWindow, window_groups: &mut Vec<WindowGroup>, next_id: &mut usize| {
+                let out_name = format!("__window_{next_id}");
+                *next_id += 1;
                 let we = WindowExpr {
                     func: pw.func,
                     output_name: out_name.clone(),
                 };
-                // Find (or create) the group with a matching spec.
                 let group_idx = window_groups.iter().position(|g| {
                     window_specs_eq(&g.partition_by, &g.order_by, &pw.partition_by, &pw.order_by)
                 });
@@ -6573,6 +6739,27 @@ fn plan_select(
                         order_by: pw.order_by,
                         exprs: vec![we],
                     }),
+                }
+                out_name
+            };
+
+        // First, lower each SELECT item to a projection expr. For window
+        // items the expr becomes `Column("__window_N")` referencing the
+        // appended window column.
+        //
+        // `window_aliases` records `SELECT-alias -> __window_N` so a QUALIFY
+        // predicate may reference a window function by the alias it was given in
+        // the SELECT list (`... AS rn ... QUALIFY rn = 1`). The alias does not
+        // exist at the Window node's output (it is applied only by the final
+        // Project, which sits *above* the QUALIFY Filter), so the QUALIFY lowerer
+        // rewrites such references back to the underlying window column.
+        let mut proj_exprs: Vec<Expr> = Vec::with_capacity(items.len());
+        let mut window_aliases: HashMap<String, String> = HashMap::new();
+        for (sql_expr, alias) in &items {
+            if let Some(pw) = try_window(sql_expr, &resolver, &named_windows, 0)? {
+                let out_name = add_window(pw, &mut window_groups, &mut next_window_id);
+                if let Some(name) = alias {
+                    window_aliases.insert(name.clone(), out_name.clone());
                 }
                 let col_ref = Expr::Column(out_name);
                 proj_exprs.push(match alias {
@@ -6597,6 +6784,33 @@ fn plan_select(
             });
         }
 
+        // QUALIFY: filters rows on a window-function result, exactly as HAVING
+        // filters on an aggregate. We lower it as a `Filter` applied *after* the
+        // Window nodes (so the window columns exist) but *before* the final
+        // Project, then project away any helper columns the predicate
+        // materialized that are not part of the SELECT list.
+        //
+        // The predicate may reference a window function (`QUALIFY ROW_NUMBER()
+        // OVER (...) = 1`) that is not in the SELECT list; such a call is
+        // materialized as a hidden `__window_N` column (via `add_window`) which
+        // the filter references and the trailing Project drops. A window call
+        // already present in the SELECT list reuses its column through the same
+        // spec-dedup in `add_window`.
+        //
+        // The number of SELECT-list output columns: the trailing Project must
+        // restore exactly these (dropping any hidden window helpers) so the
+        // output schema is unaffected by QUALIFY.
+        let qualify_predicate = match &select.qualify {
+            Some(q) => Some(lower_qualify_predicate(
+                q,
+                &resolver,
+                &named_windows,
+                &window_aliases,
+                &mut |pw| add_window(pw, &mut window_groups, &mut next_window_id),
+            )?),
+            None => None,
+        };
+
         // Stack the Window nodes (if any) over the current plan.
         for g in window_groups {
             plan = LogicalPlan::Window {
@@ -6604,6 +6818,22 @@ fn plan_select(
                 window_exprs: g.exprs,
                 partition_by: g.partition_by,
                 order_by: g.order_by,
+            };
+        }
+
+        // Apply QUALIFY as a Filter over the window projection (before the
+        // SELECT-list Project, so the hidden window columns are still in scope).
+        if let Some(predicate) = qualify_predicate {
+            let input_schema = plan.schema()?;
+            let predicate_dtype = predicate.dtype(&input_schema)?;
+            if predicate_dtype != DataType::Bool {
+                return Err(BoltError::Type(format!(
+                    "QUALIFY predicate must be Bool, got {predicate_dtype:?}"
+                )));
+            }
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate,
             };
         }
 
@@ -6668,7 +6898,20 @@ fn lower_table_factor(
             partitions,
         } => {
             if args.is_some() {
-                return Err(BoltError::Sql("unsupported: table-valued function".into()));
+                // A table-valued function (`FROM generate_series(1, 10)`,
+                // `FROM unnest(arr)`, …) produces its rows from a function call
+                // rather than a registered table. Supporting it would require a
+                // function-as-table-source mechanism: a registry of set-returning
+                // functions plus a logical "function scan" operator that
+                // evaluates the call and exposes its output schema. The engine
+                // scans only registered base tables / CTEs / derived tables, so
+                // this is scoped out rather than missing by oversight.
+                return Err(BoltError::Sql(
+                    "unsupported: table-valued function in FROM (would require a \
+                     function-as-table-source mechanism; only registered tables, \
+                     CTEs, and derived tables are scannable)"
+                        .into(),
+                ));
             }
             if !with_hints.is_empty() {
                 return Err(BoltError::Sql("unsupported: WITH hints".into()));
@@ -7308,18 +7551,20 @@ fn reject_unsupported_select(select: &Select) -> BoltResult<()> {
     if let Some(Distinct::On(_)) = &select.distinct {
         return Err(BoltError::Sql("unsupported: DISTINCT ON".into()));
     }
-    if select.top.is_some() {
-        return Err(BoltError::Sql("unsupported: TOP".into()));
-    }
+    // T-SQL `SELECT TOP n` is a row limit, lowered to `LogicalPlan::Limit` by
+    // [`plan_query`] *above* any top-level ORDER BY (T-SQL applies TOP after the
+    // sort). It is therefore not rejected here. `PERCENT` / `WITH TIES` and a
+    // TOP combined with LIMIT/FETCH are rejected precisely in `top_limit_value`.
     if select.into.is_some() {
         return Err(BoltError::Sql("unsupported: SELECT INTO".into()));
     }
     if !select.lateral_views.is_empty() {
         return Err(BoltError::Sql("unsupported: LATERAL VIEW".into()));
     }
-    if select.prewhere.is_some() {
-        return Err(BoltError::Sql("unsupported: PREWHERE".into()));
-    }
+    // PREWHERE (ClickHouse early-filter) is semantically equivalent to WHERE —
+    // it only changes *when* the predicate is applied, not the result set — so
+    // it is folded into the WHERE predicate by [`plan_select`] (PREWHERE AND
+    // WHERE) rather than rejected here.
     if !select.cluster_by.is_empty() {
         return Err(BoltError::Sql("unsupported: CLUSTER BY".into()));
     }
@@ -7329,17 +7574,30 @@ fn reject_unsupported_select(select: &Select) -> BoltResult<()> {
     if !select.sort_by.is_empty() {
         return Err(BoltError::Sql("unsupported: SORT BY".into()));
     }
-    if !select.named_window.is_empty() {
-        return Err(BoltError::Sql("unsupported: WINDOW".into()));
-    }
-    if select.qualify.is_some() {
-        return Err(BoltError::Sql("unsupported: QUALIFY".into()));
-    }
+    // Named WINDOW clause (`... WINDOW w AS (PARTITION BY ...)`) is resolved at
+    // lowering time: an `OVER w` reference is replaced by the named spec and
+    // then lowered exactly like an inline `OVER (...)`. So it is not rejected
+    // here; see [`build_named_window_map`] and `try_window`.
+    //
+    // QUALIFY (`... QUALIFY <window-fn predicate>`) is to window functions what
+    // HAVING is to aggregates — lowered as a `Filter` over the window
+    // projection by [`plan_select`]. Not rejected here.
     if select.value_table_mode.is_some() {
         return Err(BoltError::Sql("unsupported: SELECT AS STRUCT/VALUE".into()));
     }
     if select.connect_by.is_some() {
-        return Err(BoltError::Sql("unsupported: CONNECT BY".into()));
+        // Oracle hierarchical queries (`START WITH ... CONNECT BY PRIOR ...`)
+        // are an iterative tree-walk: they would require the same fixpoint /
+        // recursive-CTE execution machinery as `WITH RECURSIVE` (seed the roots,
+        // then repeatedly join children onto the frontier until it stops
+        // growing), plus Oracle pseudo-columns (LEVEL, CONNECT_BY_ROOT). That
+        // recursive execution path is not wired up for the CONNECT BY surface —
+        // express the hierarchy as a `WITH RECURSIVE` CTE instead.
+        return Err(BoltError::Sql(
+            "unsupported: CONNECT BY hierarchical queries (would require \
+             recursive-CTE-style fixpoint execution; rewrite as WITH RECURSIVE)"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -7604,6 +7862,212 @@ fn try_count_distinct<'a>(
     }
 }
 
+/// Resolved named-window definitions for a single SELECT: maps a window name
+/// (as written in `WINDOW w AS (...)`) to its concrete [`WindowSpec`]. An
+/// `OVER w` reference is resolved against this map by [`resolve_named_window`].
+/// Empty when the SELECT has no WINDOW clause (the common case).
+type NamedWindowMap<'a> = HashMap<String, &'a WindowSpec>;
+
+/// Build the [`NamedWindowMap`] for a SELECT's `WINDOW w AS (...)` clause.
+///
+/// Each definition is either a direct spec (`WINDOW w AS (PARTITION BY ...)`)
+/// or a chained reference to another named window (`WINDOW w2 AS w1`, BigQuery).
+/// Chained references are resolved transitively to the underlying spec; a cycle
+/// or a dangling reference is rejected precisely. Definitions are processed in
+/// source order, so a chain may only reference an *earlier* definition (matching
+/// the parse-order scoping every supporting dialect uses).
+fn build_named_window_map(
+    defs: &[sqlparser::ast::NamedWindowDefinition],
+) -> BoltResult<NamedWindowMap<'_>> {
+    let mut map: NamedWindowMap = HashMap::with_capacity(defs.len());
+    for def in defs {
+        let name = ident_to_name(&def.0);
+        let spec: &WindowSpec = match &def.1 {
+            NamedWindowExpr::WindowSpec(s) => s,
+            NamedWindowExpr::NamedWindow(other) => {
+                // Chain reference: must resolve to an already-defined window.
+                let other_name = ident_to_name(other);
+                *map.get(&other_name).ok_or_else(|| {
+                    BoltError::Sql(format!(
+                        "WINDOW '{name}' references window '{other_name}', which is \
+                         not defined earlier in the WINDOW clause"
+                    ))
+                })?
+            }
+        };
+        if map.insert(name.clone(), spec).is_some() {
+            return Err(BoltError::Sql(format!(
+                "duplicate WINDOW definition for '{name}'"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+/// Resolve an `OVER w` reference (and the `OVER (w ORDER BY ...)` extension
+/// form) into a concrete owned [`WindowSpec`].
+///
+/// * `name` is the referenced window name.
+/// * `inline` is `Some(spec)` for the extension form `OVER (w ...)` — an inline
+///   spec whose `window_name` is `w`. The SQL rule is that the referenced
+///   window supplies PARTITION BY (and ORDER BY); the inline part may *add* an
+///   ORDER BY only when the base supplied none, and may not re-state PARTITION
+///   BY or a frame. We support exactly that simple extension and reject anything
+///   more involved precisely. `None` is the bare `OVER w` form.
+fn resolve_named_window(
+    name: &Ident,
+    inline: Option<&WindowSpec>,
+    named_windows: &NamedWindowMap,
+) -> BoltResult<WindowSpec> {
+    let key = ident_to_name(name);
+    let base = named_windows.get(&key).ok_or_else(|| {
+        BoltError::Sql(format!(
+            "window '{key}' referenced by OVER is not defined in a WINDOW clause"
+        ))
+    })?;
+    // A base window must itself be a plain spec, not a further name reference
+    // (chains are already flattened by `build_named_window_map`).
+    let mut resolved = (*base).clone();
+    if let Some(inline) = inline {
+        // Extension form `OVER (w ...)`. Only the simple ORDER-BY-extension is
+        // supported.
+        if !inline.partition_by.is_empty() {
+            return Err(BoltError::Sql(format!(
+                "OVER ({key} ...) may not re-state PARTITION BY (it is inherited \
+                 from the named window)"
+            )));
+        }
+        if inline.window_frame.is_some() {
+            return Err(BoltError::Sql(format!(
+                "unsupported: OVER ({key} ...) adding an explicit window frame"
+            )));
+        }
+        if !inline.order_by.is_empty() {
+            if !resolved.order_by.is_empty() {
+                return Err(BoltError::Sql(format!(
+                    "OVER ({key} ORDER BY ...) conflicts: the named window '{key}' \
+                     already defines an ORDER BY"
+                )));
+            }
+            resolved.order_by = inline.order_by.clone();
+        }
+    }
+    // Clear the name so downstream lowering sees a fully-inlined spec.
+    resolved.window_name = None;
+    Ok(resolved)
+}
+
+/// Lower a QUALIFY predicate into an [`Expr`] over the window projection.
+///
+/// QUALIFY filters rows on window-function results (it is to window functions
+/// what HAVING is to aggregates). Any window-function call in the predicate is
+/// materialized as a `__window_N` column via `add_window` (the SELECT-item pass
+/// already registered the SELECT-list windows under the same spec-dedup, so a
+/// window call shared with the SELECT list reuses the existing column); the
+/// call subtree is then replaced by a reference to that column. Non-window
+/// parts of the predicate lower through the ordinary [`lower_expr`] path against
+/// the FROM-tree namespace.
+///
+/// The rewrite walks the common boolean / comparison composite shapes; a
+/// window function buried in an unsupported position surfaces through the
+/// normal lowering (an `OVER` left in the tree would reach `lower_expr`, which
+/// does not lower window calls, and error cleanly).
+fn lower_qualify_predicate(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    named_windows: &NamedWindowMap,
+    window_aliases: &HashMap<String, String>,
+    add_window: &mut dyn FnMut(ParsedWindow) -> String,
+) -> BoltResult<Expr> {
+    // Build a copy of the predicate with each window-function subtree replaced
+    // by a synthetic quoted identifier naming its materialized column, then
+    // lower the rewritten tree. `lower_expr` maps a bare identifier straight to
+    // `Expr::Column(name)`, so the `__window_N` reference resolves against the
+    // post-Window schema during type-checking.
+    let rewritten =
+        rewrite_qualify_windows(e, resolver, named_windows, window_aliases, add_window, 0)?;
+    lower_expr(&rewritten, resolver, 0)
+}
+
+/// Recursively replace every window-function call in `e` with a synthetic
+/// identifier naming the `__window_N` column produced by `add_window`. A bare
+/// identifier that matches a SELECT-list window alias is likewise rewritten to
+/// the underlying window column (the alias does not exist below the final
+/// Project). Returns an owned, rewritten `SqlExpr` ready for [`lower_expr`].
+fn rewrite_qualify_windows(
+    e: &SqlExpr,
+    resolver: &NameResolver,
+    named_windows: &NamedWindowMap,
+    window_aliases: &HashMap<String, String>,
+    add_window: &mut dyn FnMut(ParsedWindow) -> String,
+    depth: usize,
+) -> BoltResult<SqlExpr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    // A window-function call at this node: materialize it and substitute a
+    // reference to the generated column.
+    if let Some(pw) = try_window(e, resolver, named_windows, depth + 1)? {
+        let out_name = add_window(pw);
+        return Ok(SqlExpr::Identifier(Ident::with_quote('"', out_name)));
+    }
+    // A bare identifier naming a SELECT-list window alias: rewrite to the
+    // underlying `__window_N` column so the filter sees the value the Window
+    // node produced (the alias is applied only by the Project above the filter).
+    if let SqlExpr::Identifier(id) = e {
+        if let Some(col) = window_aliases.get(&ident_to_name(id)) {
+            return Ok(SqlExpr::Identifier(Ident::with_quote('"', col.clone())));
+        }
+    }
+    // Otherwise recurse through the boolean / comparison composite shapes a
+    // QUALIFY predicate is built from. Leaf nodes (identifiers, literals,
+    // non-window function calls) are returned verbatim for `lower_expr`.
+    let rec = |sub: &SqlExpr,
+               add_window: &mut dyn FnMut(ParsedWindow) -> String|
+     -> BoltResult<Box<SqlExpr>> {
+        Ok(Box::new(rewrite_qualify_windows(
+            sub,
+            resolver,
+            named_windows,
+            window_aliases,
+            add_window,
+            depth + 1,
+        )?))
+    };
+    let out = match e {
+        SqlExpr::BinaryOp { left, op, right } => SqlExpr::BinaryOp {
+            left: rec(left, add_window)?,
+            op: op.clone(),
+            right: rec(right, add_window)?,
+        },
+        SqlExpr::UnaryOp { op, expr } => SqlExpr::UnaryOp {
+            op: *op,
+            expr: rec(expr, add_window)?,
+        },
+        SqlExpr::Nested(inner) => SqlExpr::Nested(rec(inner, add_window)?),
+        SqlExpr::IsNull(inner) => SqlExpr::IsNull(rec(inner, add_window)?),
+        SqlExpr::IsNotNull(inner) => SqlExpr::IsNotNull(rec(inner, add_window)?),
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => SqlExpr::Between {
+            expr: rec(expr, add_window)?,
+            negated: *negated,
+            low: rec(low, add_window)?,
+            high: rec(high, add_window)?,
+        },
+        // Any other shape is returned unchanged. If it nonetheless contains a
+        // window call in a position we don't rewrite, the leftover `OVER` reaches
+        // `lower_expr`, which rejects window calls cleanly.
+        other => other.clone(),
+    };
+    Ok(out)
+}
+
 /// A window function call recognised in a SELECT item: the function plus its
 /// parsed `OVER (...)` spec. Produced by [`try_window`] and consumed by the
 /// window-lowering block in [`plan_select`].
@@ -7629,6 +8093,7 @@ struct ParsedWindow {
 fn try_window(
     e: &SqlExpr,
     resolver: &NameResolver,
+    named_windows: &NamedWindowMap,
     depth: usize,
 ) -> BoltResult<Option<ParsedWindow>> {
     if depth > MAX_RECURSION_DEPTH {
@@ -7674,20 +8139,34 @@ fn try_window(
         ));
     }
 
-    // Parse the OVER (...) spec.
-    let spec = match over {
-        WindowType::WindowSpec(s) => s,
+    // Parse / resolve the OVER (...) spec into a concrete `WindowSpec`.
+    //
+    //   * `OVER (PARTITION BY ... ORDER BY ...)`  — an inline spec, used as-is.
+    //   * `OVER w`                                — a bare named-window
+    //     reference; resolved to the spec defined by `WINDOW w AS (...)`.
+    //   * `OVER (w ORDER BY ...)`                 — an inline spec that *extends*
+    //     a named window `w`; handled for the simple case where the inline part
+    //     only adds an ORDER BY (and the named window supplied no ORDER BY), and
+    //     rejected precisely otherwise.
+    //
+    // `resolve_named_window` returns an owned `WindowSpec` so both the bare
+    // reference and the inline cases flow through the identical
+    // partition/order/frame lowering below.
+    let resolved;
+    let spec: &WindowSpec = match over {
+        WindowType::WindowSpec(s) => {
+            if let Some(base_name) = &s.window_name {
+                resolved = resolve_named_window(base_name, Some(s), named_windows)?;
+                &resolved
+            } else {
+                s
+            }
+        }
         WindowType::NamedWindow(name) => {
-            return Err(BoltError::Sql(format!(
-                "unsupported: named window reference 'OVER {name}'"
-            )));
+            resolved = resolve_named_window(name, None, named_windows)?;
+            &resolved
         }
     };
-    if spec.window_name.is_some() {
-        return Err(BoltError::Sql(
-            "unsupported: named window in OVER (...)".into(),
-        ));
-    }
     // Frame handling: only the SQL default frame is supported (RANGE/ROWS
     // UNBOUNDED PRECEDING [AND CURRENT ROW]). Anything else is rejected
     // cleanly so we never silently compute the wrong frame.
@@ -14109,5 +14588,357 @@ mod multi_agg_groupby_tests {
              FROM sales GROUP BY region"
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod clause_acceptance_tests {
+    //! Host-side lowering tests for the query-clause acceptance features:
+    //! FETCH / TOP (→ Limit), FOR UPDATE/SHARE (accepted no-op), PREWHERE
+    //! (folded into the WHERE Filter), named WINDOW (`OVER w` → inline spec),
+    //! and QUALIFY (→ Filter over the Window projection). Plus the sharpened
+    //! out-of-scope rejection messages (SUM(temporal) / CONNECT BY / TVF /
+    //! PERCENT / WITH TIES). All pure-frontend — no GPU, no `Engine::new()`.
+    use super::*;
+
+    /// A provider with an int key, an int value, and a category column —
+    /// enough to exercise WHERE / window / qualify lowering.
+    fn provider() -> MemTableProvider {
+        let t = Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("g", DataType::Int32, false),
+        ]);
+        MemTableProvider::new().with_table("t", t)
+    }
+
+    fn plan(sql: &str) -> LogicalPlan {
+        parse(sql, &provider()).expect("plan must lower cleanly")
+    }
+
+    fn err(sql: &str) -> String {
+        format!("{}", parse(sql, &provider()).expect_err("must be rejected"))
+    }
+
+    // ---- FETCH → Limit ----------------------------------------------------
+
+    #[test]
+    fn fetch_first_lowers_to_limit() {
+        match plan("SELECT k FROM t FETCH FIRST 5 ROWS ONLY") {
+            LogicalPlan::Limit { limit, offset, .. } => {
+                assert_eq!(limit, 5);
+                assert_eq!(offset, 0);
+            }
+            other => panic!("FETCH FIRST must lower to Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_next_is_synonym_for_fetch_first() {
+        match plan("SELECT k FROM t FETCH NEXT 3 ROWS ONLY") {
+            LogicalPlan::Limit { limit, .. } => assert_eq!(limit, 3),
+            other => panic!("FETCH NEXT must lower to Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_composes_with_offset_and_order_by() {
+        // ORDER BY must sit *below* the Limit (limit applies after the sort).
+        match plan("SELECT k FROM t ORDER BY k OFFSET 2 ROWS FETCH NEXT 4 ROWS ONLY") {
+            LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                assert_eq!(limit, 4);
+                assert_eq!(offset, 2);
+                assert!(
+                    matches!(*input, LogicalPlan::Sort { .. }),
+                    "Limit must wrap the Sort so the limit applies after ORDER BY"
+                );
+            }
+            other => panic!("expected Limit over Sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_with_ties_rejected_cleanly() {
+        let msg = err("SELECT k FROM t ORDER BY k FETCH FIRST 5 ROWS WITH TIES");
+        assert!(msg.contains("WITH TIES"), "message must name WITH TIES: {msg}");
+    }
+
+    #[test]
+    fn fetch_percent_rejected_cleanly() {
+        let msg = err("SELECT k FROM t FETCH FIRST 5 PERCENT ROWS ONLY");
+        assert!(msg.contains("PERCENT"), "message must name PERCENT: {msg}");
+    }
+
+    #[test]
+    fn fetch_plus_limit_is_ambiguous() {
+        let msg = err("SELECT k FROM t LIMIT 3 FETCH FIRST 5 ROWS ONLY");
+        assert!(
+            msg.contains("ambiguous") || msg.contains("not both"),
+            "LIMIT + FETCH must be rejected as ambiguous: {msg}"
+        );
+    }
+
+    // ---- TOP → Limit ------------------------------------------------------
+
+    #[test]
+    fn top_lowers_to_limit() {
+        match plan("SELECT TOP 7 k FROM t") {
+            LogicalPlan::Limit { limit, offset, .. } => {
+                assert_eq!(limit, 7);
+                assert_eq!(offset, 0);
+            }
+            other => panic!("TOP must lower to Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_applies_after_order_by() {
+        match plan("SELECT TOP 2 k FROM t ORDER BY k") {
+            LogicalPlan::Limit { input, limit, .. } => {
+                assert_eq!(limit, 2);
+                assert!(
+                    matches!(*input, LogicalPlan::Sort { .. }),
+                    "TOP must wrap the Sort (T-SQL applies TOP after ORDER BY)"
+                );
+            }
+            other => panic!("expected Limit over Sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_percent_rejected_cleanly() {
+        let msg = err("SELECT TOP 10 PERCENT k FROM t");
+        assert!(msg.contains("PERCENT"), "message must name PERCENT: {msg}");
+    }
+
+    #[test]
+    fn top_with_ties_rejected_cleanly() {
+        let msg = err("SELECT TOP 3 WITH TIES k FROM t ORDER BY k");
+        assert!(msg.contains("WITH TIES"), "message must name WITH TIES: {msg}");
+    }
+
+    #[test]
+    fn top_plus_limit_is_ambiguous() {
+        let msg = err("SELECT TOP 3 k FROM t LIMIT 5");
+        assert!(
+            msg.contains("ambiguous") || msg.contains("not both"),
+            "TOP + LIMIT must be rejected as ambiguous: {msg}"
+        );
+    }
+
+    // ---- FOR UPDATE / FOR SHARE: accepted no-op ---------------------------
+
+    #[test]
+    fn for_update_is_accepted_and_changes_nothing() {
+        // The locked query must lower to exactly the same plan as the unlocked
+        // one — row locking is a no-op for this read-only engine.
+        let bare = plan("SELECT k FROM t WHERE v > 1");
+        let locked = plan("SELECT k FROM t WHERE v > 1 FOR UPDATE");
+        assert_eq!(
+            format!("{bare:?}"),
+            format!("{locked:?}"),
+            "FOR UPDATE must not alter the lowered plan"
+        );
+    }
+
+    #[test]
+    fn for_share_is_accepted_and_changes_nothing() {
+        let bare = plan("SELECT k FROM t");
+        let locked = plan("SELECT k FROM t FOR SHARE");
+        assert_eq!(format!("{bare:?}"), format!("{locked:?}"));
+    }
+
+    // ---- PREWHERE folded into the WHERE Filter ----------------------------
+
+    /// PREWHERE alone becomes the Filter predicate.
+    #[test]
+    fn prewhere_alone_becomes_the_filter() {
+        match plan("SELECT k FROM t PREWHERE v > 1") {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { predicate, .. } => {
+                    // A single comparison, not an AND.
+                    assert!(
+                        matches!(
+                            predicate,
+                            Expr::Binary { op: BinaryOp::Gt, .. }
+                        ),
+                        "PREWHERE-only predicate must be the comparison itself"
+                    );
+                }
+                other => panic!("expected Filter under Project, got {other:?}"),
+            },
+            other => panic!("expected Project root, got {other:?}"),
+        }
+    }
+
+    /// PREWHERE + WHERE AND together into a single Filter.
+    #[test]
+    fn prewhere_and_where_are_anded() {
+        match plan("SELECT k FROM t PREWHERE v > 1 WHERE k < 10") {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { predicate, .. } => {
+                    assert!(
+                        matches!(
+                            predicate,
+                            Expr::Binary { op: BinaryOp::And, .. }
+                        ),
+                        "PREWHERE AND WHERE must fold into a conjunction, got {predicate:?}"
+                    );
+                }
+                other => panic!("expected Filter under Project, got {other:?}"),
+            },
+            other => panic!("expected Project root, got {other:?}"),
+        }
+    }
+
+    // ---- Named WINDOW: `OVER w` resolves to the inline spec ---------------
+
+    /// `OVER w` must lower to the *identical* plan as the equivalent inline
+    /// `OVER (PARTITION BY ... ORDER BY ...)`.
+    #[test]
+    fn named_window_resolves_to_inline_spec() {
+        let named = plan(
+            "SELECT ROW_NUMBER() OVER w AS rn FROM t \
+             WINDOW w AS (PARTITION BY g ORDER BY v)",
+        );
+        let inline = plan(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t",
+        );
+        assert_eq!(
+            format!("{named:?}"),
+            format!("{inline:?}"),
+            "OVER w must lower identically to the inline window spec"
+        );
+    }
+
+    /// The `OVER (w ORDER BY ...)` extension form: base supplies PARTITION BY,
+    /// inline adds the ORDER BY.
+    #[test]
+    fn named_window_order_by_extension() {
+        let extended = plan(
+            "SELECT ROW_NUMBER() OVER (w ORDER BY v) AS rn FROM t \
+             WINDOW w AS (PARTITION BY g)",
+        );
+        let inline = plan(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t",
+        );
+        assert_eq!(format!("{extended:?}"), format!("{inline:?}"));
+    }
+
+    /// Re-stating PARTITION BY in the extension form is rejected precisely.
+    #[test]
+    fn named_window_extension_repartition_rejected() {
+        let msg = err(
+            "SELECT ROW_NUMBER() OVER (w PARTITION BY k) AS rn FROM t \
+             WINDOW w AS (PARTITION BY g)",
+        );
+        assert!(
+            msg.contains("PARTITION BY"),
+            "extension may not re-state PARTITION BY: {msg}"
+        );
+    }
+
+    /// An `OVER w` naming an undefined window is a clean error.
+    #[test]
+    fn undefined_named_window_rejected() {
+        let msg = err("SELECT ROW_NUMBER() OVER nope AS rn FROM t");
+        assert!(
+            msg.contains("not defined") || msg.contains("WINDOW"),
+            "undefined window ref must error: {msg}"
+        );
+    }
+
+    // ---- QUALIFY → Filter over the Window projection ----------------------
+
+    /// QUALIFY referencing a window function already in the SELECT list:
+    /// the Filter sits above the Window, below the final Project.
+    #[test]
+    fn qualify_lowers_to_filter_over_window() {
+        // ROW_NUMBER is in the SELECT list; QUALIFY filters on its column.
+        match plan(
+            "SELECT k, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn \
+             FROM t QUALIFY rn = 1",
+        ) {
+            LogicalPlan::Project { input, .. } => {
+                assert!(
+                    matches!(*input, LogicalPlan::Filter { .. }),
+                    "QUALIFY must place a Filter directly under the Project"
+                );
+                if let LogicalPlan::Filter { input, .. } = *input {
+                    assert!(
+                        matches!(*input, LogicalPlan::Window { .. }),
+                        "the QUALIFY Filter must sit over the Window node"
+                    );
+                }
+            }
+            other => panic!("expected Project root, got {other:?}"),
+        }
+    }
+
+    /// QUALIFY referencing a window function NOT in the SELECT list: the
+    /// helper window column is materialized for the filter and the final
+    /// Project restores only the SELECT-list columns.
+    #[test]
+    fn qualify_materializes_hidden_window_then_filters() {
+        match plan(
+            "SELECT k FROM t \
+             QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) = 1",
+        ) {
+            LogicalPlan::Project { input, exprs } => {
+                // The Project restores exactly the SELECT list (one column).
+                assert_eq!(exprs.len(), 1, "output schema must be the SELECT list only");
+                assert!(matches!(*input, LogicalPlan::Filter { .. }));
+                if let LogicalPlan::Filter { input, .. } = *input {
+                    assert!(
+                        matches!(*input, LogicalPlan::Window { .. }),
+                        "hidden window column must be produced by a Window node"
+                    );
+                }
+            }
+            other => panic!("expected Project root, got {other:?}"),
+        }
+    }
+
+    // ---- Sharpened out-of-scope rejection messages ------------------------
+
+    #[test]
+    fn sum_over_temporal_is_rejected_by_design() {
+        let p = MemTableProvider::new().with_table(
+            "d",
+            Schema::new(vec![Field::new("dt", DataType::Date32, false)]),
+        );
+        let msg = format!(
+            "{}",
+            parse("SELECT SUM(dt) FROM d", &p).expect_err("SUM(Date32) must be rejected")
+        );
+        assert!(
+            msg.contains("undefined in SQL") && msg.contains("by design"),
+            "SUM(temporal) message must read as an intentional limitation: {msg}"
+        );
+    }
+
+    #[test]
+    fn connect_by_rejection_explains_recursion() {
+        let msg = err(
+            "SELECT k FROM t START WITH k = 1 CONNECT BY PRIOR k = v",
+        );
+        assert!(
+            msg.contains("CONNECT BY") && msg.contains("RECURSIVE"),
+            "CONNECT BY message must point at WITH RECURSIVE: {msg}"
+        );
+    }
+
+    #[test]
+    fn tvf_rejection_explains_mechanism() {
+        // A function-as-table-source in FROM.
+        let msg = err("SELECT * FROM generate_series(1, 10)");
+        assert!(
+            msg.contains("table-valued function") && msg.contains("function-as-table-source"),
+            "TVF message must explain the missing mechanism: {msg}"
+        );
     }
 }

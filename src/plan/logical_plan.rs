@@ -2019,7 +2019,24 @@ impl AggregateExpr {
     fn output_dtype(&self, input: &Schema) -> BoltResult<DataType> {
         match self {
             AggregateExpr::Count(_) => Ok(DataType::Int64),
-            AggregateExpr::Sum(e) => Ok(sum_output_dtype(e.dtype(input)?)),
+            AggregateExpr::Sum(e) => {
+                // SUM over a temporal type (Date32 / Timestamp) is *undefined*
+                // in SQL: there is no value a sum of calendar instants could
+                // return — "the total of two dates" is not a date, a duration,
+                // or any type the engine carries. This is rejected by design,
+                // not a missing feature. (The GPU reduce path and host
+                // aggregate path reject it too; surfacing it here at the logical
+                // layer gives the clearest, earliest error.)
+                let dt = e.dtype(input)?;
+                if matches!(dt, DataType::Date32 | DataType::Timestamp(_, _)) {
+                    return Err(BoltError::Type(format!(
+                        "SUM over a temporal type is undefined in SQL — there is no \
+                         value to return for the sum of {dt:?} instants (rejected by \
+                         design, not an unimplemented feature)"
+                    )));
+                }
+                Ok(sum_output_dtype(dt))
+            }
             AggregateExpr::Min(e) | AggregateExpr::Max(e) => e.dtype(input),
             AggregateExpr::Avg(e) => {
                 // v0.7: AVG over Date / Timestamp is non-standard SQL — the
