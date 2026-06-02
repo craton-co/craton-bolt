@@ -604,6 +604,36 @@ fn emit_op(
             b_lo,
             b_hi,
         } => emit_cmp_128(b, *dst, *op, *a_lo, *a_hi, *b_lo, *b_hi),
+        // ---- Decimal128 / i128 ops added by F5 ----
+        Op::WidenToI128 {
+            dst_lo,
+            dst_hi,
+            src,
+            from,
+        } => emit_widen_to_i128(b, *dst_lo, *dst_hi, *src, *from),
+        Op::NarrowI128ToInt {
+            dst,
+            src_lo,
+            src_hi,
+            to,
+        } => emit_narrow_i128_to_int(b, *dst, *src_lo, *src_hi, *to),
+        Op::Div128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => emit_div_128(b, *dst_lo, *dst_hi, *a_lo, *a_hi, *b_lo, *b_hi),
+        Op::Select128 {
+            dst_lo,
+            dst_hi,
+            cond,
+            then_lo,
+            then_hi,
+            else_lo,
+            else_hi,
+        } => emit_select_128(b, *dst_lo, *dst_hi, *cond, *then_lo, *then_hi, *else_lo, *else_hi),
     }
 }
 
@@ -998,6 +1028,283 @@ fn emit_cmp_128(
             )));
         }
     }
+    Ok(())
+}
+
+/// Emit `Op::WidenToI128` — sign-extend a 32/64-bit signed integer into an
+/// i128 `(lo, hi)` pair.
+///
+/// Wire shape:
+///
+/// ```text
+///   // lo half: bring the value into a b64 register (sign-extending if i32)
+///   cvt.s64.s32 lo, src        // (Int32 / Date32)
+///   mov.u64     lo, src        // (Int64)
+///   // hi half: arithmetic shift right by 63 splats the sign bit
+///   shr.s64     hi, lo, 63
+/// ```
+///
+/// The `shr.s64 ..., 63` produces all-zero for non-negative values and
+/// all-ones (`0xFFFF...`) for negatives, which is exactly the i128 high
+/// half of a sign-extended 64-bit value.
+fn emit_widen_to_i128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    src: Reg,
+    from: DataType,
+) -> BoltResult<()> {
+    let src_name = b.alloc.get(src)?.to_string();
+    let (lo_name, hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    match from {
+        // Int32 lives in the b32 (`r`) class; sign-extend into the b64 lo.
+        // Date32 (i32 days) rides the same path.
+        DataType::Int32 | DataType::Date32 | DataType::Bool => {
+            emit_fmt!(b, "cvt.s64.s32 {}, {};", lo_name, src_name)?;
+        }
+        // Int64 (and Timestamp ticks) already occupy a b64 register.
+        DataType::Int64 | DataType::Timestamp(_, _) => {
+            emit_fmt!(b, "mov.u64 {}, {};", lo_name, src_name)?;
+        }
+        other => {
+            return Err(BoltError::Other(format!(
+                "ptx_gen: WidenToI128 source must be an integer dtype, got {other:?}"
+            )));
+        }
+    }
+    // Splat the sign bit of the (now 64-bit) lo half across the whole hi half.
+    emit_fmt!(b, "shr.s64 {}, {}, 63;", hi_name, lo_name)?;
+    Ok(())
+}
+
+/// Emit `Op::NarrowI128ToInt` — take the low 64 bits of an i128 pair as the
+/// integer result (truncating, matching `as i64` / `as i32`).
+///
+/// For `Int64` the low half *is* the result. For `Int32` we additionally
+/// truncate the low half to 32 bits via `cvt.s32.s64` (the `_hi` operand is
+/// unused — the value bits already live in the low half once the caller has
+/// divided the scale out).
+fn emit_narrow_i128_to_int(
+    b: &mut PtxBuilder,
+    dst: Reg,
+    src_lo: Reg,
+    _src_hi: Reg,
+    to: DataType,
+) -> BoltResult<()> {
+    let lo_name = b.alloc.get(src_lo)?.to_string();
+    let dst_name = b.alloc.assign(dst, to)?;
+    match to {
+        DataType::Int64 => emit_fmt!(b, "mov.u64 {}, {};", dst_name, lo_name),
+        DataType::Int32 => emit_fmt!(b, "cvt.s32.s64 {}, {};", dst_name, lo_name),
+        other => Err(BoltError::Other(format!(
+            "ptx_gen: NarrowI128ToInt target must be Int32/Int64, got {other:?}"
+        ))),
+    }
+}
+
+/// Emit `Op::Select128` — predicated 128-bit selection, the i128 twin of
+/// `Op::Select`. Two `selp.b64` (one per half) gated on the same predicate.
+///
+/// ```text
+///   setp.ne.s32 p, cond, 0
+///   selp.b64    dst_lo, then_lo, else_lo, p
+///   selp.b64    dst_hi, then_hi, else_hi, p
+/// ```
+fn emit_select_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    cond: Reg,
+    then_lo: Reg,
+    then_hi: Reg,
+    else_lo: Reg,
+    else_hi: Reg,
+) -> BoltResult<()> {
+    let cond_name = b.alloc.get(cond)?.to_string();
+    let then_lo_name = b.alloc.get(then_lo)?.to_string();
+    let then_hi_name = b.alloc.get(then_hi)?.to_string();
+    let else_lo_name = b.alloc.get(else_lo)?.to_string();
+    let else_hi_name = b.alloc.get(else_hi)?.to_string();
+    let pred = b.alloc.alloc("p");
+    let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", pred, cond_name)?;
+    emit_fmt!(
+        b,
+        "selp.b64 {}, {}, {}, {};",
+        dst_lo_name,
+        then_lo_name,
+        else_lo_name,
+        pred
+    )?;
+    emit_fmt!(
+        b,
+        "selp.b64 {}, {}, {}, {};",
+        dst_hi_name,
+        then_hi_name,
+        else_hi_name,
+        pred
+    )?;
+    Ok(())
+}
+
+/// Emit `Op::Div128` — 128-bit signed truncating division.
+///
+/// sm_70 has no native 128-bit divide, so we emit a sign-fixup wrapper
+/// around an unsigned restoring shift-subtract long division operating on
+/// the `(lo, hi)` halves:
+///
+/// 1. Compute the signs of dividend (`a`) and divisor (`b`) from the top
+///    bit of each high half; the quotient sign is their XOR.
+/// 2. Take the absolute value of both operands (negate the i128 if the
+///    sign bit is set — two's-complement negate is `~x + 1` over the pair).
+/// 3. Guard a zero divisor: if `|b| == 0`, branch to a "store zero quotient"
+///    tail (deterministic, non-trapping — see `Op::Div128` rustdoc).
+/// 4. Restoring long division, 128 iterations, MSB-first: shift the running
+///    remainder left by one and pull in the next dividend bit; if the
+///    remainder >= divisor, subtract and set the quotient bit.
+/// 5. Negate the unsigned quotient back if the quotient sign is negative.
+///
+/// The loop is emitted as straight PTX with a back-edge label and a 32-bit
+/// counter; all arithmetic is on the two-`u64`-half representation already
+/// used by `emit_add_128` / `emit_sub_128`.
+fn emit_div_128(
+    b: &mut PtxBuilder,
+    dst_lo: Reg,
+    dst_hi: Reg,
+    a_lo: Reg,
+    a_hi: Reg,
+    b_lo: Reg,
+    b_hi: Reg,
+) -> BoltResult<()> {
+    // Snapshot operand names (the loop allocates many temporaries, so a held
+    // `&str` borrow would not survive the interleaved `&mut b.alloc` calls).
+    let a_lo_n = b.alloc.get(a_lo)?.to_string();
+    let a_hi_n = b.alloc.get(a_hi)?.to_string();
+    let b_lo_n = b.alloc.get(b_lo)?.to_string();
+    let b_hi_n = b.alloc.get(b_hi)?.to_string();
+
+    // A unique label suffix per emission so multiple Div128 ops in one kernel
+    // don't collide. `b.alloc` register indices are monotonic and unique, so
+    // the first quotient register's index is a convenient discriminator.
+    let (q_lo, q_hi) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    let tag = q_lo.trim_start_matches('%').to_string();
+
+    // Working registers for |a| (running dividend / remainder feed) and |b|.
+    let ua_lo = b.alloc.alloc("rl");
+    let ua_hi = b.alloc.alloc("rl");
+    let ub_lo = b.alloc.alloc("rl");
+    let ub_hi = b.alloc.alloc("rl");
+    // Quotient-sign flag (1 if result should be negated).
+    let qsign = b.alloc.alloc("r");
+    let sa = b.alloc.alloc("r");
+    let sb = b.alloc.alloc("r");
+    // Remainder pair, current quotient pair (built up), shift temporaries.
+    let rem_lo = b.alloc.alloc("rl");
+    let rem_hi = b.alloc.alloc("rl");
+    let i = b.alloc.alloc("r");
+    let bit = b.alloc.alloc("rl");
+    let tmp_lo = b.alloc.alloc("rl");
+    let tmp_hi = b.alloc.alloc("rl");
+    let carry = b.alloc.alloc("rl");
+    let p0 = b.alloc.alloc("p");
+    let p1 = b.alloc.alloc("p");
+    let p2 = b.alloc.alloc("p");
+
+    // ---- sign extraction: sign = (hi >> 63) & 1, via shr.u64 ... 63 ----
+    emit_fmt!(b, "shr.u64 {}, {}, 63;", tmp_lo, a_hi_n)?;
+    emit_fmt!(b, "cvt.u32.u64 {}, {};", sa, tmp_lo)?;
+    emit_fmt!(b, "shr.u64 {}, {}, 63;", tmp_hi, b_hi_n)?;
+    emit_fmt!(b, "cvt.u32.u64 {}, {};", sb, tmp_hi)?;
+    emit_fmt!(b, "xor.b32 {}, {}, {};", qsign, sa, sb)?;
+
+    // ---- |a|: negate the i128 if sa==1 (two's complement over the pair) ----
+    // ua = a; if (sa) ua = 0 - a
+    emit_fmt!(b, "mov.u64 {}, {};", ua_lo, a_lo_n)?;
+    emit_fmt!(b, "mov.u64 {}, {};", ua_hi, a_hi_n)?;
+    emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", p0, sa)?;
+    emit_fmt!(b, "@!{} bra DIV_A_POS_{};", p0, tag)?;
+    emit_fmt!(b, "sub.cc.u64 {}, 0, {};", ua_lo, a_lo_n)?;
+    emit_fmt!(b, "subc.u64 {}, 0, {};", ua_hi, a_hi_n)?;
+    b.emit_label(&format!("DIV_A_POS_{}", tag))?;
+
+    // ---- |b|: same ----
+    emit_fmt!(b, "mov.u64 {}, {};", ub_lo, b_lo_n)?;
+    emit_fmt!(b, "mov.u64 {}, {};", ub_hi, b_hi_n)?;
+    emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", p0, sb)?;
+    emit_fmt!(b, "@!{} bra DIV_B_POS_{};", p0, tag)?;
+    emit_fmt!(b, "sub.cc.u64 {}, 0, {};", ub_lo, b_lo_n)?;
+    emit_fmt!(b, "subc.u64 {}, 0, {};", ub_hi, b_hi_n)?;
+    b.emit_label(&format!("DIV_B_POS_{}", tag))?;
+
+    // ---- init quotient = 0, remainder = 0 ----
+    emit_fmt!(b, "mov.u64 {}, 0;", q_lo)?;
+    emit_fmt!(b, "mov.u64 {}, 0;", q_hi)?;
+    emit_fmt!(b, "mov.u64 {}, 0;", rem_lo)?;
+    emit_fmt!(b, "mov.u64 {}, 0;", rem_hi)?;
+
+    // ---- div-by-zero guard: if |b| == 0, quotient stays 0 -> done ----
+    emit_fmt!(b, "or.b64 {}, {}, {};", tmp_lo, ub_lo, ub_hi)?;
+    emit_fmt!(b, "setp.eq.u64 {}, {}, 0;", p0, tmp_lo)?;
+    emit_fmt!(b, "@{} bra DIV_DONE_{};", p0, tag)?;
+
+    // ---- restoring long division, MSB first, 128 iterations ----
+    emit_fmt!(b, "mov.u32 {}, 0;", i)?;
+    b.emit_label(&format!("DIV_LOOP_{}", tag))?;
+    emit_fmt!(b, "setp.ge.u32 {}, {}, 128;", p0, i)?;
+    emit_fmt!(b, "@{} bra DIV_NEG_{};", p0, tag)?;
+
+    // rem = (rem << 1) | next-MSB-of-ua
+    //   shift rem left by 1 (carry low->high)
+    emit_fmt!(b, "shr.u64 {}, {}, 63;", carry, rem_lo)?; // bit leaving lo
+    emit_fmt!(b, "shl.b64 {}, {}, 1;", rem_hi, rem_hi)?;
+    emit_fmt!(b, "or.b64 {}, {}, {};", rem_hi, rem_hi, carry)?;
+    emit_fmt!(b, "shl.b64 {}, {}, 1;", rem_lo, rem_lo)?;
+    //   pull current MSB of ua (bit 127-i) into rem_lo bit 0.
+    //   We rotate ua left by 1 each iteration so its MSB is always bit 127.
+    emit_fmt!(b, "shr.u64 {}, {}, 63;", bit, ua_hi)?; // ua MSB
+    emit_fmt!(b, "or.b64 {}, {}, {};", rem_lo, rem_lo, bit)?;
+    //   ua <<= 1
+    emit_fmt!(b, "shr.u64 {}, {}, 63;", carry, ua_lo)?;
+    emit_fmt!(b, "shl.b64 {}, {}, 1;", ua_hi, ua_hi)?;
+    emit_fmt!(b, "or.b64 {}, {}, {};", ua_hi, ua_hi, carry)?;
+    emit_fmt!(b, "shl.b64 {}, {}, 1;", ua_lo, ua_lo)?;
+
+    // if rem >= |b| (unsigned 128-bit compare): rem -= |b|; set quotient bit.
+    //   compute (rem >= ub): rem_hi > ub_hi || (rem_hi==ub_hi && rem_lo>=ub_lo)
+    emit_fmt!(b, "setp.gt.u64 {}, {}, {};", p0, rem_hi, ub_hi)?;
+    emit_fmt!(b, "setp.eq.u64 {}, {}, {};", p1, rem_hi, ub_hi)?;
+    emit_fmt!(b, "setp.ge.u64 {}, {}, {};", p2, rem_lo, ub_lo)?;
+    emit_fmt!(b, "and.pred {}, {}, {};", p1, p1, p2)?;
+    emit_fmt!(b, "or.pred {}, {}, {};", p0, p0, p1)?;
+    emit_fmt!(b, "@!{} bra DIV_NOSUB_{};", p0, tag)?;
+    //   rem -= ub (128-bit borrow chain)
+    emit_fmt!(b, "sub.cc.u64 {}, {}, {};", rem_lo, rem_lo, ub_lo)?;
+    emit_fmt!(b, "subc.u64 {}, {}, {};", rem_hi, rem_hi, ub_hi)?;
+    //   q = (q << 1) | 1   — but we build q MSB-first too: shift then set bit0.
+    emit_fmt!(b, "shr.u64 {}, {}, 63;", carry, q_lo)?;
+    emit_fmt!(b, "shl.b64 {}, {}, 1;", q_hi, q_hi)?;
+    emit_fmt!(b, "or.b64 {}, {}, {};", q_hi, q_hi, carry)?;
+    emit_fmt!(b, "shl.b64 {}, {}, 1;", q_lo, q_lo)?;
+    emit_fmt!(b, "or.b64 {}, {}, 1;", q_lo, q_lo)?;
+    emit_fmt!(b, "bra DIV_NEXT_{};", tag)?;
+    b.emit_label(&format!("DIV_NOSUB_{}", tag))?;
+    //   q = (q << 1) | 0
+    emit_fmt!(b, "shr.u64 {}, {}, 63;", carry, q_lo)?;
+    emit_fmt!(b, "shl.b64 {}, {}, 1;", q_hi, q_hi)?;
+    emit_fmt!(b, "or.b64 {}, {}, {};", q_hi, q_hi, carry)?;
+    emit_fmt!(b, "shl.b64 {}, {}, 1;", q_lo, q_lo)?;
+    b.emit_label(&format!("DIV_NEXT_{}", tag))?;
+    emit_fmt!(b, "add.u32 {}, {}, 1;", i, i)?;
+    emit_fmt!(b, "bra DIV_LOOP_{};", tag)?;
+
+    // ---- apply quotient sign: if qsign==1, negate q ----
+    b.emit_label(&format!("DIV_NEG_{}", tag))?;
+    emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", p0, qsign)?;
+    emit_fmt!(b, "@!{} bra DIV_DONE_{};", p0, tag)?;
+    emit_fmt!(b, "sub.cc.u64 {}, 0, {};", q_lo, q_lo)?;
+    emit_fmt!(b, "subc.u64 {}, 0, {};", q_hi, q_hi)?;
+
+    b.emit_label(&format!("DIV_DONE_{}", tag))?;
     Ok(())
 }
 
@@ -3775,6 +4082,44 @@ fn walk_store_deps(
                 stack.push(b_lo.id());
                 stack.push(b_hi.id());
             }
+            // F5 Decimal128 ops. WidenToI128 reads one integer source;
+            // NarrowI128ToInt reads an i128 (lo, hi) pair; Div128 reads four
+            // operand halves (like Add128); Select128 reads the cond Bool plus
+            // both branch (lo, hi) pairs. Push every operand so the validity
+            // walk reaches the underlying LoadColumn / LoadColumn128 leaves.
+            Op::WidenToI128 { src, .. } => {
+                stack.push(src.id());
+            }
+            Op::NarrowI128ToInt { src_lo, src_hi, .. } => {
+                stack.push(src_lo.id());
+                stack.push(src_hi.id());
+            }
+            Op::Div128 {
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                ..
+            } => {
+                stack.push(a_lo.id());
+                stack.push(a_hi.id());
+                stack.push(b_lo.id());
+                stack.push(b_hi.id());
+            }
+            Op::Select128 {
+                cond,
+                then_lo,
+                then_hi,
+                else_lo,
+                else_hi,
+                ..
+            } => {
+                stack.push(cond.id());
+                stack.push(then_lo.id());
+                stack.push(then_hi.id());
+                stack.push(else_lo.id());
+                stack.push(else_hi.id());
+            }
         }
     }
     found
@@ -3848,9 +4193,21 @@ pub fn output_input_dependencies(
             | Op::Const128 { dst_lo, dst_hi, .. }
             | Op::Add128 { dst_lo, dst_hi, .. }
             | Op::Sub128 { dst_lo, dst_hi, .. }
-            | Op::Mul128 { dst_lo, dst_hi, .. } => {
+            | Op::Mul128 { dst_lo, dst_hi, .. }
+            // F5: WidenToI128 / Div128 / Select128 each produce an i128
+            // (lo, hi) destination pair — register both halves so a Store128
+            // (or downstream i128 consumer) walking back from either half
+            // lands on this producer.
+            | Op::WidenToI128 { dst_lo, dst_hi, .. }
+            | Op::Div128 { dst_lo, dst_hi, .. }
+            | Op::Select128 { dst_lo, dst_hi, .. } => {
                 reg_to_op.insert(dst_lo.id(), op);
                 reg_to_op.insert(dst_hi.id(), op);
+            }
+            // NarrowI128ToInt collapses an i128 pair to a single 64-bit int
+            // dst — register it as a single-register producer.
+            Op::NarrowI128ToInt { dst, .. } => {
+                reg_to_op.insert(dst.id(), op);
             }
         }
     }

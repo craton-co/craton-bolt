@@ -167,10 +167,19 @@ These are real, code-level behaviors to be aware of:
   (`UPPER` / `LOWER` / `LENGTH`) are byte/ASCII-oriented. Treat non-ASCII /
   multi-byte UTF-8 case-folding and length-in-characters semantics as
   unverified — `LENGTH` is byte-length, and case conversion is ASCII-range.
-- **Temporal types partially lower; host fallback on upload.** `Decimal128`,
-  `Date32`, and `Timestamp` parse and **partially** lower to the GPU. Some
-  temporal paths fall back to a host upload/compute step rather than running
-  fully on-device. See the type tiers in
+  Utf8 ordering comparisons against a literal (`WHERE name < 'M'`) use
+  **binary (UTF-8 byte) collation**, not locale-aware / ICU collation, so the
+  ordering matches `memcmp` rather than any natural-language collation; and
+  ordering of *two* Utf8 columns (`a < b`) is not folded and stays a host
+  string comparison.
+- **Temporal / decimal types partially lower.** `Decimal128`, `Date32`, and
+  `Timestamp` parse and **partially** lower to the GPU. GPU gather (filter /
+  compaction) and column upload are wired for all three, and `COUNT` over a
+  `Date32` / `Timestamp` column works end-to-end. Still not routed: `MIN` /
+  `MAX` over `Date32` / `Timestamp` (the GPU reduction codegen exists, but
+  the scalar and GROUP BY aggregate paths still reject temporal inputs, so
+  these currently error), `Decimal128` division and `SUM` (host-side), and
+  CAST to/from any of these types. See the type tiers in
   [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md).
 - **Env-gated experimental paths.** Several kernels (e.g. GPU radix sort,
   CUDA-graph sort, alternate hash/scan algorithms) are gated behind
@@ -199,8 +208,10 @@ silent wrong answer. If you depend on any of these, expect an error and
 rewrite the query (see [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md) for the
 supported alternatives):
 
-- **Derived tables / subqueries in `FROM`** — use a `WITH`/CTE instead.
-- **Correlated subqueries** (and `EXISTS` / `NOT EXISTS`).
+- **Correlated subqueries** (and `EXISTS` / `NOT EXISTS`). (Non-lateral
+  **derived tables** `(SELECT ...) AS alias` are now **supported** — alias
+  required; `LATERAL` derived tables and column-list aliases `AS d(x, y)`
+  remain rejected.)
 - **`GROUP BY ROLLUP` / `CUBE` / `ALL`** (and `TOTALS`).
 - **`WINDOW` clause / `QUALIFY` / named windows** (`OVER <named_window>`), and
   non-default window frames.

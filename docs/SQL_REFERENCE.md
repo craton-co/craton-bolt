@@ -39,12 +39,12 @@ Two queries can be combined with `UNION` / `UNION ALL` / `EXCEPT [ALL]` / `INTER
 **Hard restrictions** (everything else returns a `BoltError`):
 
 - Exactly one base table in `FROM`, optionally widened by one or more JOINs per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an `ON` / `USING (...)` / `NATURAL` constraint, or `CROSS JOIN` (no constraint). Every shape has a gated GPU fast path with a host-side fallback (see the [JOIN](#join) section). `JOIN ... USING (...)` and `NATURAL JOIN` desugar to equi `<left.col> = <right.col>` pairs; computed join keys are still rejected. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities (a small-cardinality non-equi INNER predicate is handled by a capped host nested-loop).
-- **Uncorrelated** scalar (`(SELECT ...)`) and `[NOT] IN (SELECT ...)` subqueries in `SELECT` / `WHERE` are supported (resolved to constants before lowering). **Correlated** subqueries, `EXISTS` / `NOT EXISTS`, and subqueries in `FROM` (derived tables — use a `WITH`/CTE instead) are rejected.
+- **Uncorrelated** scalar (`(SELECT ...)`) and `[NOT] IN (SELECT ...)` subqueries in `SELECT` / `WHERE` are supported (resolved to constants before lowering). An uncorrelated **scalar subquery** is also accepted in `ORDER BY`. **Correlated** subqueries and `EXISTS` / `NOT EXISTS` are rejected. **Derived tables** (a subquery in `FROM`, `(SELECT ...) AS alias`) are supported as of 0.7, with restrictions: the alias is **required**, `LATERAL` (correlated) derived tables are rejected, and a column-list alias (`AS d(x, y)`) is rejected.
 - Non-recursive CTEs (`WITH name AS (...)`) are supported. `WITH RECURSIVE`, CTE column-list aliases (`WITH c (a, b) AS ...`), and the materialization hint are rejected.
 - `EXCEPT [ALL]` and `INTERSECT [ALL]` are supported (host-side). `UNION BY NAME` (and `EXCEPT`/`INTERSECT BY NAME`) are rejected.
 - Window functions (`OVER`) are supported host-side for a fixed function set under the default frame only (see the [Window functions](#window-functions) section). `QUALIFY`, the named `WINDOW` clause, and explicit/non-default frames are rejected. `LATERAL`, table-valued functions, `PREWHERE` (ClickHouse-ism), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `FETCH`, `FOR UPDATE/SHARE`, `INTO` remain rejected.
 - No `GROUP BY ALL`, `ROLLUP`, `CUBE`, `TOTALS`.
-- No schema-qualified table names. Single-level qualified column references (`t.col`) are supported in SELECT, WHERE, GROUP BY, HAVING, and `JOIN ... ON` predicates; the qualifier must match a FROM table and only the resolved column name survives lowering. Deeper qualifications (`db.t.col`, struct-field access) are rejected.
+- No schema-qualified *table* names in `FROM`. Single-level qualified column references (`t.col`) are supported in SELECT, WHERE, GROUP BY, HAVING, and `JOIN ... ON` predicates; the qualifier must match a FROM table and only the resolved column name survives lowering. In a `JOIN ... ON` predicate the **schema-qualified `schema.table.col`** form is also accepted (the leading single-catalog segment is dropped, so it resolves to `table.col`). Four-or-more-segment references (`catalog.db.t.col`) and struct-field access are rejected.
 - `LIMIT` and `OFFSET` must be integer literals; expressions and parameters are rejected.
 
 ## Data types
@@ -59,9 +59,9 @@ The plan's `DataType` enum is intentionally small.
 | `Float32`  | `Float32`       |                                                          |
 | `Float64`  | `Float64`       |                                                          |
 | `Utf8`     | `Utf8`          | Dictionary-encoded on register; i32 or i64 indices.      |
-| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, `*` lower to GPU (dual-register IR); comparisons lower to GPU in WHERE; `SUM` is host-side. Div / CAST to-or-from decimal: parses; GPU lowering pending. |
-| `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. CAST to/from Date32: parses; GPU lowering pending. |
-| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. CAST to/from Timestamp: parses; GPU lowering pending. |
+| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, `*` lower to GPU (dual-register IR); comparisons lower to GPU in WHERE; `SUM` is host-side. GPU gather (filter/compaction) + upload are wired (16-byte interleaved layout). Div / CAST to-or-from decimal: parses; GPU lowering pending. |
+| `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)` works end-to-end; `MIN`/`MAX` over Date32 have GPU codegen but are not yet routed through the executor (see Aggregate functions). CAST to/from Date32: parses; GPU lowering pending. |
+| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)` works end-to-end; `MIN`/`MAX` over Timestamp have GPU codegen but are not yet routed through the executor. CAST to/from Timestamp: parses; GPU lowering pending. |
 
 `Decimal128`, `Date32`, and `Timestamp` arrived in 0.6 (plan + parser +
 type-check) and gained their GPU lowering in 0.7 (see the per-type notes
@@ -97,7 +97,7 @@ Integer division by zero produces `NULL` (host evaluator) or undefined behaviour
 
 `=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above. Numeric comparisons run on the **GPU**. `Decimal128` comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to the **GPU** in `WHERE` predicates as of 0.7 (decimals must share the same scale).
 
-For `Utf8` columns, only equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time (**GPU**). Ordering comparisons (`<`, `>`, `<=`, `>=`) on Utf8 columns are rejected, because dictionary indices reflect insertion order, not lex order. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
+For `Utf8` columns, equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time (**GPU**). As of 0.7, **ordering comparisons** (`<`, `>`, `<=`, `>=`) of a `Utf8` column against a string *literal* (`WHERE name < 'M'`, either operand order) are **also** supported (**GPU**): because dictionary indices reflect insertion order rather than lex order, the rewriter partitions the dictionary entries by the literal under **binary (UTF-8 byte) collation** at plan time and emits an OR-of-equalities over the matching dictionary indices (the same index-membership form `LIKE` uses). This is byte/binary collation, **not** locale-aware / ICU collation, and a `NULL` row never satisfies an ordering predicate (correct SQL 3VL). Column-vs-column Utf8 ordering (`WHERE a < b`, two string columns) is **not** folded — there is no single literal to partition by — and stays a host string comparison. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
 
 ### IN and BETWEEN
 
@@ -162,6 +162,7 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `COUNT(expr)`  | `Int64`                       | Excludes NULLs via the validity bitmap (0.5).              |
 | `COUNT(bool)`  | `Int64`                       | Honours nulls (host-side path).                            |
 | `COUNT(utf8)`  | `Int64`                       | Honours nulls (host-side path).                            |
+| `COUNT(date32 \| timestamp)` | `Int64`         | Counts non-NULL temporal rows; works end-to-end (dtype-agnostic count path). |
 | `SUM(int|float)` | Same dtype as input         | `SUM(Int32) -> Int64` widening; SUM(Int64), SUM(Float*) unchanged. |
 | `SUM(bool)`    | `Int64`                       | Count of `TRUE` rows.                                      |
 | `MIN(int|float)` | Same dtype as input         | Float MIN via `atom.cas` loop on bit pattern (sm_70).      |
@@ -175,6 +176,8 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `SUM(decimal)` | `Decimal128`                  | **Host-side** reduction (0.7).                             |
 | `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP` | `Float64`  | **Host-side** Welford (0.5 scalar; 0.7 adds `GROUP BY` via per-group Welford). |
 | `VARIANCE`, `VAR_POP`, `VAR_SAMP`     | `Float64`  | **Host-side** Welford, shared state with STDDEV. Scalar (0.5) + grouped (0.7). |
+
+**Temporal MIN / MAX status.** `COUNT` over a `Date32` / `Timestamp` column works end-to-end (the count path is dtype-agnostic). `MIN` / `MAX` over a `Date32` / `Timestamp` column have GPU reduction codegen (`agg_kernels` collapses `Date32 → Int32` and `Timestamp → Int64` and reduces at the underlying integer width), but are **not yet routed** through the executor: the scalar reduction path and the GROUP BY output-schema builder still reject temporal aggregate inputs, so `MIN(date_col)` / `MAX(ts_col)` currently error rather than running. `SUM` over a temporal column is undefined SQL and is rejected by design.
 
 **NULL / empty-input semantics.** The target behaviour is standard SQL, matching DuckDB: `MIN` / `MAX` / `SUM` / `AVG` over an all-NULL group **or an empty input** return SQL `NULL`, and `COUNT` returns `0`. This is the contract to rely on. (Historically there were two divergences the engine is converging away from: scalar `SUM` over an empty/all-NULL input returned `0` rather than `NULL`, and primitive `MIN` / `MAX` returned a type sentinel rather than `NULL`. The correct, documented behaviour is SQL `NULL`.) The Bool/Utf8 inputs (which thread validity through `extended_agg`) already return SQL `NULL` for an all-NULL group in both the scalar and GROUP BY paths. As of 0.5, scalar primitive aggregates honour validity: `COUNT(col)` excludes NULLs via the bitmap and `SUM`/`MIN`/`MAX`/`AVG` over `Int*`/`Float*` host-strip NULL positions before the GPU reduction (with a zero-copy fast path when `null_count == 0`).
 
@@ -262,7 +265,17 @@ Rejected: `QUALIFY`, the named `WINDOW` clause, `OVER <named_window>`, `COUNT(DI
 - **Scalar** `(SELECT ...)` — the subquery must produce a single column; 0 rows folds to SQL `NULL`, 1 row to that value, and `>1` row is a clean error.
 - **`<expr> [NOT] IN (SELECT ...)`** — the single-column result set is folded into an `OR`/`AND` chain of equalities over `expr` (`expr = v1 OR …` / `expr <> v1 AND …`). NULLs are dropped from the value set; this matches strict SQL exactly for `IN` under `WHERE`, and diverges only for `NOT IN` against a set containing NULLs (documented in the module).
 
-Nested subqueries resolve inner-first. **Correlated** subqueries (any reference to an outer column) are detected and rejected with a precise message. `EXISTS` / `NOT EXISTS` and subqueries in `FROM` (derived tables — use a `WITH`/CTE instead) are rejected.
+An uncorrelated **scalar subquery** is also accepted in `ORDER BY` (it folds to a constant before physical lowering, exactly like a SELECT / WHERE scalar subquery).
+
+Nested subqueries resolve inner-first. **Correlated** subqueries (any reference to an outer column) are detected and rejected with a precise message. `EXISTS` / `NOT EXISTS` are rejected.
+
+### Derived tables (subquery in FROM)
+
+A subquery may appear as a FROM item — `FROM (SELECT ...) AS alias` — as of 0.7. The subquery is planned recursively as a self-contained subtree and exposed under the alias (the same pipeline a CTE reference uses; a CTE is just a named, pre-lowered derived table), so qualified `alias.col` references resolve. Restrictions:
+
+- The **alias is required** (standard SQL — `(SELECT ...)` with no alias is rejected).
+- **`LATERAL`** derived tables are rejected: they are correlated (may reference earlier FROM items) and the engine has no correlated-execution path.
+- A **column-list alias** (`AS d(x, y)`) is rejected.
 
 ## INNER JOIN
 
@@ -275,7 +288,7 @@ SELECT <select_list>
 Supported:
 
 - Multiple joins per `SELECT` are supported: the frontend folds each `JOIN` in FROM order into a left-deep chain of `Join` nodes (see `sql_frontend.rs`, the `for join in &twj.joins` loop). Note: joins execute in written order — there is no cost-based join reordering yet (a conservative reorder pass exists but is a no-op until table statistics are wired in).
-- `ON` predicate must be a conjunction (`AND` only) of `<col> = <col>` equalities. Either side may be a bare or qualified column reference (`t1.a = t2.a` or `a = a`); only the trailing column name survives lowering and the executor matches it against each side's schema.
+- `ON` predicate must be a conjunction (`AND` only) of `<col> = <col>` equalities. Either side may be a bare, table-qualified, or **schema-qualified** column reference (`a = a`, `t1.a = t2.a`, or `schema.t1.a = schema.t2.a` — the leading single-catalog segment is dropped); only the trailing column name survives lowering and the executor matches it against each side's schema. Four-or-more-segment references have no namespace to collapse and are rejected.
 - The executor runs on the GPU hash-join path (`src/exec/gpu_join.rs`): build a hash table on the smaller input on-device, probe the larger, then materialise matches via `arrow::compute::take` on the host. Multi-key joins build a tuple key. Equi-join key dtypes must match on both sides; cross-dtype keys are rejected.
 - `NULL` keys never match (`NULL = NULL → UNKNOWN`, per SQL).
 - The combined output schema is left's columns followed by right's columns, with collision-safe naming: a clashing right-side `c` becomes `right.c` (and gets a `__2`, `__3`, … suffix if that itself collides).
@@ -297,7 +310,7 @@ For every `Utf8` column registered on a table, the engine builds a dictionary (i
 - `WHERE col = 'X'`  →  `WHERE __idx_col = i32/i64(idx_of_X)`
 - `WHERE col != 'X'` →  the same with `!=`
 
-After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `IN (...)` against a Utf8 column is still *not* folded through the dictionary rewriter (it defers this shape — see `src/plan/string_literal_rewrite.rs`); rewrite as an `OR` chain of literal equalities. `LIKE` on a Utf8 column *is* supported and, as of 0.7, **lowers to the GPU** (dictionary-precompute → index membership for dictionary columns, or the `StringLikeFilter` device matcher for non-dictionary `Utf8`), with a host-side `host_like` fallback (see the LIKE section above). Ordering comparisons (`<`, `>`) on Utf8 columns are still rejected.
+After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `IN (...)` against a Utf8 column is still *not* folded through the dictionary rewriter (it defers this shape — see `src/plan/string_literal_rewrite.rs`); rewrite as an `OR` chain of literal equalities. `LIKE` on a Utf8 column *is* supported and, as of 0.7, **lowers to the GPU** (dictionary-precompute → index membership for dictionary columns, or the `StringLikeFilter` device matcher for non-dictionary `Utf8`), with a host-side `host_like` fallback (see the LIKE section above). Ordering comparisons (`<`, `>`, `<=`, `>=`) of a Utf8 column against a string *literal* are also folded as of 0.7, via a **binary (UTF-8 byte) collation** precompute that partitions the dictionary by the literal and emits the same index-membership form (**GPU**; not locale/ICU collation). Column-vs-column Utf8 ordering remains a host string comparison.
 
 ## SELECT DISTINCT
 
@@ -325,6 +338,8 @@ SELECT CASE WHEN price > 100 THEN 1 ELSE 0 END FROM sales;            -- numeric
 SELECT CAST(region_id AS FLOAT8) FROM sales;                         -- numeric CAST (GPU)
 SELECT region || '-' || CAST(region_id AS VARCHAR) FROM sales;       -- || concat (host-side Project)
 SELECT name FROM sales WHERE name LIKE 'A%';                         -- LIKE (GPU, host fallback)
+SELECT region FROM sales WHERE region < 'M';                         -- Utf8 col < literal (GPU, byte collation)
+SELECT region FROM sales WHERE region >= 'US';                       -- Utf8 ordering vs literal (GPU)
 SELECT * FROM sales WHERE active;
 
 -- Scalar aggregates
@@ -377,6 +392,19 @@ SELECT region_id, SUM(price) OVER (PARTITION BY region_id) AS region_total FROM 
 
 -- String functions
 SELECT UPPER(region), LENGTH(region) FROM sales;          -- UPPER/LENGTH (GPU)
+SELECT CONCAT(region, '-', name) FROM sales;              -- CONCAT, NULL-if-any-arg-NULL (host mirror)
+
+-- Derived table (subquery in FROM) — alias required, non-lateral
+SELECT d.region_id, d.n
+  FROM (SELECT region_id, COUNT(*) AS n FROM sales GROUP BY region_id) AS d
+ WHERE d.n > 10;
+
+-- Scalar subquery in ORDER BY
+SELECT region_id FROM sales ORDER BY (SELECT AVG(price) FROM sales);
+
+-- Schema-qualified column in JOIN ON (leading catalog segment dropped)
+SELECT s.region_id, c.name
+  FROM sales INNER JOIN customers ON public.sales.customer_id = public.customers.id;
 
 -- INNER JOIN (ON / USING / NATURAL)
 SELECT s.region_id, c.name
@@ -417,7 +445,7 @@ These produce explicit errors at parse / plan time:
 - (`NATURAL JOIN`, `JOIN ... USING`, and multiple joins per `SELECT` are now **supported** — see the [JOIN](#join) section.)
 
 ### Query composition
-- **Correlated** subqueries, `EXISTS` / `NOT EXISTS`, and subqueries in `FROM` (derived tables). (Uncorrelated scalar and `[NOT] IN` subqueries are **supported** — see [Subqueries](#subqueries).)
+- **Correlated** subqueries and `EXISTS` / `NOT EXISTS`. (Uncorrelated scalar and `[NOT] IN` subqueries are **supported** in SELECT / WHERE, an uncorrelated scalar subquery is also accepted in ORDER BY, and non-lateral **derived tables** `(SELECT ...) AS alias` are **supported** — see [Subqueries](#subqueries). `LATERAL` derived tables and column-list aliases `AS d(x, y)` remain rejected.)
 - `WITH RECURSIVE`, CTE column-list aliases. (Non-recursive CTEs are **supported** — see [Common table expressions](#common-table-expressions-with).)
 - `UNION BY NAME` (and `EXCEPT` / `INTERSECT BY NAME`). (`EXCEPT [ALL]` / `INTERSECT [ALL]` are **supported** — see [Set operations](#set-operations-union--except--intersect).)
 - `QUALIFY`, the named `WINDOW` clause, `OVER <named_window>`, and non-default window frames. (`OVER (...)` with `ROW_NUMBER` / `RANK` / `DENSE_RANK` / `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` under the default frame is **supported** — see [Window functions](#window-functions).)
@@ -435,8 +463,8 @@ Still rejected (or only partially lowered):
 
 - `IFNULL`, `IIF` — not parsed (use `COALESCE` / `CASE`).
 - `IN (...)` against a `Utf8` column — not folded through the dictionary rewriter; rewrite as an `OR` chain of literal equalities.
-- Ordering comparisons on Utf8 columns (`WHERE name < 'M'`).
-- Schema- or multi-level qualified column references (`db.t.col`, struct-field access). Single-level `t.col` *is* supported — see "Hard restrictions" above.
+- Ordering comparisons of **two Utf8 columns** (`WHERE a < b`). (A Utf8 column vs a string *literal* — `WHERE name < 'M'` — *is* supported as of 0.7 via byte-collation folding; see the Comparison section.)
+- Multi-level qualified column references with four or more segments (`catalog.db.t.col`, struct-field access). Single-level `t.col` *and* the schema-qualified `schema.table.col` form (in SELECT/WHERE/GROUP BY/HAVING and `JOIN ... ON`, leading catalog segment dropped) *are* supported — see "Hard restrictions" above.
 - The "parses; GPU lowering pending" cases below.
 
 (`COUNT(DISTINCT col)` is now supported as the sole SELECT item — see [Aggregate functions](#aggregate-functions).)
@@ -449,7 +477,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 - `CASE` whose unified result dtype is `Utf8`, `Decimal128`, `Date32`, or `Timestamp`.
 - `Decimal128` division (`/`); only `+`, `-`, `*` and the comparisons lower to GPU.
 - GPU lowering of `NOT` in a predicate (runs host-side instead).
-- `SUBSTRING`, `TRIM`, and the `CONCAT` scalar function: routed to a **host-side** projection (not GPU). The `||` concat operator likewise runs host-side. (`UPPER` / `LOWER` / `LENGTH` *do* lower to GPU as of 0.7 — see "String functions" below.)
+- `SUBSTRING`, `TRIM`, and the `CONCAT` scalar function: these **execute end-to-end** but on a **host-side** projection rather than the GPU (so this is a host-execution tier, not a hard rejection). `CONCAT`'s dedicated GPU two-pass kernels exist and are PTX-shape-tested, but the executor uses the byte-identical host mirror for now (device launch wiring pending). The `||` concat operator likewise runs host-side. (`UPPER` / `LOWER` / `LENGTH` *do* lower to GPU as of 0.7 — see "String functions" below.)
 
 ### Types and values
 - Time-of-day / general interval (beyond Day-`INTERVAL` on dates) literals and arithmetic. `Date32`, `Timestamp`, and `Decimal128` *are* supported (see Data types).
@@ -473,7 +501,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 - **`UPPER` / `LOWER`** lower to the **GPU** via the two-pass `PhysicalPlan::StringProject` executor (variable-width device output).
 - **`LENGTH`** lowers to the **GPU** via `PhysicalPlan::StringLength` (dictionary-gather, `Int64` output).
 - **`SUBSTRING` / `TRIM`** (`TRIM BOTH` / `LEADING` / `TRAILING`) execute **host-side** end-to-end.
-- **`CONCAT`** (and the `||` concat operator) execute **host-side** via the `Project` executor.
+- **`CONCAT(a, b, ...)`** of `Utf8` columns executes end-to-end with **NULL-if-any-argument-NULL** semantics (standard SQL — a NULL in any source row makes the output row NULL). The dedicated N-input two-pass GPU producer kernels (`compile_concat_len_pass` / `compile_concat_write_pass`, supporting up to `CONCAT_MAX_INPUTS = 8` source columns) are implemented and PTX-shape-tested; the executor currently realises the result via the **byte-identical host mirror** (`string_project::host_concat_strings`), so results are correct and the device launch wiring is a follow-up. Arities beyond 8 source columns, computed/literal arguments, and non-Utf8 arguments take the host fallback (`string_ops_extended::concat`). The `||` concat operator likewise runs host-side.
 
 ### Additional scalar string functions
 

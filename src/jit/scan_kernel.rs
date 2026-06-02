@@ -560,6 +560,21 @@ fn emit_op(
              (predicates write 1-byte mask, never i128); planner bug if this fires"
                 .into(),
         )),
+        // F5 Decimal128 projection-only ops. Scale-aligned Decimal *comparison*
+        // in a WHERE predicate is lowered via the existing Mul128 (rescale) +
+        // Cmp128 path above, so these value-producing ops (Div / CAST widen-
+        // narrow / CASE-decimal select) are not expected in a predicate kernel.
+        // Decline cleanly so the planner routes such predicates to the
+        // projection path or host fallback rather than emitting wrong PTX.
+        Op::WidenToI128 { .. }
+        | Op::NarrowI128ToInt { .. }
+        | Op::Div128 { .. }
+        | Op::Select128 { .. } => Err(BoltError::Other(
+            "scan_kernel: Decimal128 Div / CAST / CASE-select ops are not \
+             lowered into a predicate kernel (use the projection path or host \
+             fallback); planner bug if this fires in a WHERE predicate"
+                .into(),
+        )),
     }
 }
 

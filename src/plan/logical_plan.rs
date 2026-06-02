@@ -1588,21 +1588,37 @@ pub(crate) fn decimal128_arith_result(
     if !l_dec && !r_dec {
         return None;
     }
-    let (p1, s1) = match l {
-        Decimal128(p, s) => (p, s),
-        other => {
+    // F5 sub-feature 2: MIXED Decimal128 / integer arithmetic. An integer
+    // operand is treated as `Decimal128(p_int, 0)` (using the integer type's
+    // max decimal width as its precision) so the SQL coercion rules below
+    // apply uniformly. Float/Bool/temporal peers are still rejected — mixing
+    // them with a decimal would lose exactness; the caller must CAST.
+    let int_as_decimal = |dt: DataType| -> Option<(u8, i8)> {
+        match dt {
+            Decimal128(p, s) => Some((p, s)),
+            // i32 spans up to 10 decimal digits, i64 up to 19.
+            Int32 | Date32 => Some((10, 0)),
+            Int64 => Some((19, 0)),
+            _ => None,
+        }
+    };
+    let (p1, s1) = match int_as_decimal(l) {
+        Some(ps) => ps,
+        None => {
             return Some(Err(BoltError::Type(format!(
-                "arithmetic {op:?} on mixed Decimal128 / {other:?} is not yet \
-                 supported; CAST to a common Decimal128(p, s) first"
+                "arithmetic {op:?} on mixed Decimal128 / {l:?} is not supported; \
+                 only integer peers are auto-coerced — CAST the {l:?} side to \
+                 Decimal128(p, s) first"
             ))));
         }
     };
-    let (p2, s2) = match r {
-        Decimal128(p, s) => (p, s),
-        other => {
+    let (p2, s2) = match int_as_decimal(r) {
+        Some(ps) => ps,
+        None => {
             return Some(Err(BoltError::Type(format!(
-                "arithmetic {op:?} on mixed Decimal128 / {other:?} is not yet \
-                 supported; CAST to a common Decimal128(p, s) first"
+                "arithmetic {op:?} on mixed Decimal128 / {r:?} is not supported; \
+                 only integer peers are auto-coerced — CAST the {r:?} side to \
+                 Decimal128(p, s) first"
             ))));
         }
     };
@@ -1610,32 +1626,22 @@ pub(crate) fn decimal128_arith_result(
     const MAX_P: u8 = 38;
     match op {
         BinaryOp::Add | BinaryOp::Sub => {
-            if s1 != s2 {
-                return Some(Err(BoltError::Type(format!(
-                    "Decimal128 {op:?} requires matching scale, \
-                     got Decimal128({p1}, {s1}) and Decimal128({p2}, {s2})"
-                ))));
-            }
+            // F5: scales need NOT match — we rescale the smaller-scale side up
+            // to the common scale `max(s1, s2)` at the physical layer. Result
+            // precision: `max(p1, p2) + 1` at the common scale (clamped to
+            // MAX_P; the +1 holds the widening carry).
+            let common_s = s1.max(s2);
             let p = p1.max(p2);
             let new_p = match p.checked_add(1) {
-                Some(v) if v <= MAX_P => v,
-                _ => {
-                    return Some(Err(BoltError::Type(format!(
-                        "Decimal128 {op:?} result precision exceeds {MAX_P} \
-                         (max({p1}, {p2}) + 1)"
-                    ))));
-                }
+                Some(v) => v.min(MAX_P),
+                None => MAX_P,
             };
-            Some(Ok(Decimal128(new_p, s1)))
+            Some(Ok(Decimal128(new_p, common_s)))
         }
         BinaryOp::Mul => {
             let new_p = match p1.checked_add(p2) {
-                Some(v) if v <= MAX_P => v,
-                _ => {
-                    return Some(Err(BoltError::Type(format!(
-                        "Decimal128 Mul result precision {p1} + {p2} exceeds {MAX_P}"
-                    ))));
-                }
+                Some(v) => v.min(MAX_P),
+                None => MAX_P,
             };
             let new_s = match s1.checked_add(s2) {
                 Some(v) => v,
@@ -1647,12 +1653,20 @@ pub(crate) fn decimal128_arith_result(
             };
             Some(Ok(Decimal128(new_p, new_s)))
         }
-        BinaryOp::Div => Some(Err(BoltError::Type(
-            "Decimal128 Div not yet lowered to GPU; only Add/Sub/Mul are wired in v0.7"
-                .into(),
-        ))),
+        BinaryOp::Div => {
+            // F5 sub-feature 3: Decimal division now lowers (GPU `Op::Div128`).
+            // RESULT SCALE RULE: `max(s1, 6)` — the dividend's scale, floored
+            // at 6 fractional digits so integer / low-scale dividends still
+            // get a fractional quotient. Result precision is the dividend's
+            // precision (clamped to MAX_P); the quotient never widens past
+            // the dividend's integer-digit count.
+            const MIN_DIV_SCALE: i8 = 6;
+            let new_s = s1.max(MIN_DIV_SCALE);
+            let new_p = p1.max(1).min(MAX_P);
+            Some(Ok(Decimal128(new_p, new_s)))
+        }
         other => Some(Err(BoltError::Type(format!(
-            "arithmetic {other:?} on Decimal128 operands is not supported in v0.7"
+            "arithmetic {other:?} on Decimal128 operands is not supported"
         )))),
     }
 }

@@ -155,13 +155,18 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
 - Aggregates: `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (GPU), plus host-side
   `STDDEV` / `VAR` (scalar and grouped) and `SUM(Decimal128)`.
   `SUM(Int32)` widens to `Int64` to prevent silent wraparound.
-  `COUNT(DISTINCT col)` is supported as the sole SELECT item.
+  `COUNT(DISTINCT col)` is supported as the sole SELECT item. `COUNT` over
+  a `Date32` / `Timestamp` column works end-to-end; `MIN` / `MAX` over
+  those temporal types have GPU codegen but are not yet routed through the
+  executor (they currently error — see `SQL_REFERENCE.md`).
 - Scalar expressions: arithmetic and comparisons (GPU), `IN` / `BETWEEN`
   (desugar to GPU comparison chains), `CASE` / `CAST` / `COALESCE` /
   `NULLIF` (GPU for numeric/Bool results; rejected at GPU lowering for
   string/Decimal/Date/Timestamp results), `LIKE` (GPU over `Utf8`),
   `||` (host-side), `NOT` (GPU). String functions: `UPPER` / `LOWER` /
-  `LENGTH` (GPU), `SUBSTRING` / `TRIM` / `CONCAT` (host-side).
+  `LENGTH` (GPU), `SUBSTRING` / `TRIM` / `CONCAT` (host-side; `CONCAT` of
+  Utf8 columns is NULL-if-any-arg-NULL, with GPU two-pass kernels
+  implemented but the executor using a byte-identical host mirror for now).
 - Joins: one or more `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS`
   JOINs per `SELECT`, with `ON` / `USING (...)` / `NATURAL` constraints
   (equi-keys only). Each shape has a gated GPU fast path that falls back
@@ -169,8 +174,11 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
 - Set ops: `UNION` (dedups), `UNION ALL` (concatenates),
   `EXCEPT [ALL]` / `INTERSECT [ALL]` (host-side).
 - Query composition: non-recursive CTEs (`WITH`); uncorrelated scalar
-  and `[NOT] IN` subqueries in `SELECT` / `WHERE`. (Correlated
-  subqueries, `EXISTS`, and derived tables in `FROM` are rejected.)
+  and `[NOT] IN` subqueries in `SELECT` / `WHERE` (and an uncorrelated
+  scalar subquery in `ORDER BY`); non-lateral **derived tables** in
+  `FROM` (`(SELECT ...) AS alias`, alias required). (Correlated
+  subqueries, `EXISTS`, `LATERAL` derived tables, and column-list aliases
+  `AS d(x, y)` are rejected.)
 - Window functions: `ROW_NUMBER` / `RANK` / `DENSE_RANK` /
   `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` `OVER (PARTITION BY ... ORDER
   BY ...)` (host-side, default frame only).
@@ -178,13 +186,19 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   `DESC`) run on the GPU radix sort; other shapes sort host-side.
 - Types: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`, dictionary-
   encoded `Utf8`, plus `Decimal128`, `Date32`, and `Timestamp` (with the
-  per-type GPU-lowering caveats in `SQL_REFERENCE.md`).
+  per-type GPU-lowering caveats in `SQL_REFERENCE.md`). `Decimal128`,
+  `Date32`, and `Timestamp` columns now have GPU gather (filter /
+  compaction) and upload wired, so they survive a filtered query
+  end-to-end.
 - Utf8 predicates: equality / inequality against string literals (folded
-  to integer comparisons on the dictionary index at plan time, GPU) and
-  `LIKE` (GPU as of v0.7, with a host-side fallback). `IN` against Utf8 and
-  ordering comparisons on Utf8 are still rejected.
+  to integer comparisons on the dictionary index at plan time, GPU),
+  `LIKE` (GPU as of v0.7, with a host-side fallback), and — as of v0.7 —
+  **ordering comparisons against a string literal** (`WHERE name < 'M'`,
+  GPU via byte/binary collation; not locale/ICU). `IN` against Utf8 and
+  ordering of *two* Utf8 columns (`a < b`) are still rejected.
 - Qualified column refs (`t.col`) and case-insensitive identifiers are
-  supported.
+  supported; `JOIN ... ON` also accepts the schema-qualified
+  `schema.table.col` form (leading catalog segment dropped).
 
 A representative query that exercises most of the working surface:
 

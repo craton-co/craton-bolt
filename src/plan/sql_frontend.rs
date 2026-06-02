@@ -1753,16 +1753,20 @@ fn plan_select(
     }
 
     // `COUNT(DISTINCT col)` — the one DISTINCT-quantified aggregate form we
-    // support. It is only handled as the *sole* SELECT item with *no* GROUP BY;
-    // anything richer (multiple SELECT items, a GROUP BY, or DISTINCT on a
-    // non-COUNT aggregate) is rejected with a precise message so the user is
-    // not left guessing. We lower it to
-    //   Aggregate(COUNT(*)) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)
+    // support. It is handled as the *sole* SELECT item; GROUP BY is still
+    // rejected (see below), but `HAVING` over the distinct-count and a
+    // surrounding `SELECT DISTINCT` are now accepted (F3) and lowered on top of
+    // the same base plan. Multiple SELECT items, a GROUP BY, or DISTINCT on a
+    // non-COUNT aggregate remain rejected with a precise message so the user is
+    // not left guessing. The base plan is
+    //   Project ∘ Aggregate(COUNT(*)) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)
     // which gives the SQL-standard NULL-excluding distinct count: the
     // pre-Distinct Filter drops NULL rows, Distinct dedupes the surviving
     // values (reusing the row-key / NULL canonicalisation in
     // `crate::exec::distinct`), and COUNT(*) over a single-column projection
-    // tallies them.
+    // tallies them. With no GROUP BY the whole table is one implicit group, so
+    // HAVING lowers to a `Filter` over the result Project and SELECT DISTINCT to
+    // a `Distinct` on top — both reuse existing operators (no new plan nodes).
     {
         // Detect COUNT(DISTINCT ...) anywhere in the SELECT list so we can
         // either special-case the sole-item form or reject the unsupported
@@ -1781,19 +1785,21 @@ fn plan_select(
                         .into(),
                 ));
             }
+            // COUNT(DISTINCT col) combined with GROUP BY needs a per-group
+            // distinct count, which cannot be expressed with the existing
+            // logical/physical plan nodes: the natural lowering is a two-level
+            // aggregate (inner Distinct over (g, col), outer COUNT per g), but
+            // the physical planner's `lower_aggregate` requires a GROUP BY
+            // Aggregate to sit directly on a Scan/Filter/Project chain
+            // (`is_scan_chain`) — a Distinct child is rejected. A correct
+            // implementation requires a new `AggregateExpr::CountDistinct`
+            // variant plus planner + GROUP BY executor support (all in files
+            // outside this feature's edit set: logical_plan.rs, physical_plan.rs,
+            // and the dispatch in engine.rs). Kept as a precise rejection until
+            // those shared nodes exist (documented for the orchestrator).
             if !group_by_sql.is_empty() {
                 return Err(BoltError::Sql(
                     "COUNT(DISTINCT col) with GROUP BY is not supported".into(),
-                ));
-            }
-            if select.having.is_some() {
-                return Err(BoltError::Sql(
-                    "COUNT(DISTINCT col) with HAVING is not supported".into(),
-                ));
-            }
-            if matches!(select.distinct, Some(Distinct::Distinct)) {
-                return Err(BoltError::Sql(
-                    "SELECT DISTINCT COUNT(DISTINCT col) is not supported".into(),
                 ));
             }
             let (sql_expr, alias) = &items[0];
@@ -1837,7 +1843,7 @@ fn plan_select(
             let out_name = aggregate_output_name(&AggregateExpr::Count(Expr::Literal(
                 Literal::Int64(1),
             )));
-            let col_ref = Expr::Column(out_name);
+            let col_ref = Expr::Column(out_name.clone());
             let proj = match alias {
                 Some(a) => col_ref.alias(a.clone()),
                 None => col_ref,
@@ -1846,6 +1852,48 @@ fn plan_select(
                 input: Box::new(aggregate_plan),
                 exprs: vec![proj],
             };
+
+            // HAVING over the bare COUNT(DISTINCT col) result. With no GROUP
+            // BY the whole table is one implicit group, so HAVING filters that
+            // single result row (standard SQL). The aggregate has already been
+            // materialised into the Project's output column (`proj_name`); the
+            // HAVING predicate references the distinct-count via the same
+            // `COUNT(DISTINCT col)` call it was written with, which we resolve
+            // to that output column. Reuses the existing `Filter` node — no new
+            // execution machinery. Predicate forms beyond the comparison /
+            // boolean / IS [NOT] NULL shapes are rejected cleanly inside
+            // `lower_having_over_count_distinct`.
+            if let Some(having_sql) = &select.having {
+                let proj_name = match alias {
+                    Some(a) => a.clone(),
+                    None => out_name.clone(),
+                };
+                let predicate = lower_having_over_count_distinct(
+                    having_sql,
+                    inner,
+                    &resolver,
+                    &proj_name,
+                    0,
+                )?;
+                // Type-check / column-validate against the Project's schema so a
+                // malformed HAVING surfaces here rather than at execution.
+                let project_schema = plan.schema()?;
+                validate_having_columns(&predicate, &project_schema)?;
+                plan = LogicalPlan::Filter {
+                    input: Box::new(plan),
+                    predicate,
+                };
+            }
+
+            // SELECT DISTINCT over a bare COUNT(DISTINCT col): the result is a
+            // single row, so DISTINCT is a (correct) no-op. We still lower it to
+            // the existing `Distinct` node so the plan shape is uniform and the
+            // operator's own semantics apply. Reuses `crate::exec::distinct`.
+            if matches!(select.distinct, Some(Distinct::Distinct)) {
+                plan = LogicalPlan::Distinct {
+                    input: Box::new(plan),
+                };
+            }
             return Ok(plan);
         }
     }
@@ -4116,6 +4164,153 @@ fn lower_expr_in_having(
         // Anything else is identical to a scalar HAVING fragment; defer to
         // the normal lowerer (which handles Identifier, Value, etc., and
         // still rejects bare non-aggregate Function calls).
+        _ => lower_expr(e, resolver, depth + 1),
+    }
+}
+
+/// Lower a HAVING predicate for the no-GROUP-BY, sole-`COUNT(DISTINCT col)`
+/// path (see the bare COUNT(DISTINCT) block in [`plan_select`]).
+///
+/// With no GROUP BY the whole input is one implicit group, so HAVING simply
+/// filters the single aggregate result row. The aggregate has already been
+/// materialised into the Project's output column named `count_out_name`; any
+/// `COUNT(DISTINCT <col>)` call in the HAVING predicate whose argument matches
+/// the SELECT's distinct-counted column is rewritten to `Column(count_out_name)`.
+/// Everything else is lowered structurally so the predicate references only
+/// that output column (and any literals).
+///
+/// Supported predicate shapes: binary operators (comparisons / arithmetic /
+/// AND / OR), unary `NOT` / unary `+` / unary `-`, parenthesised groups, and
+/// `IS [NOT] NULL`. Any other shape — in particular a *different* aggregate,
+/// or a raw column reference that is not the distinct-counted column — is
+/// rejected with a precise message rather than silently mis-lowered.
+///
+/// `select_inner` is the SELECT's (un-lowered) `COUNT(DISTINCT <select_inner>)`
+/// argument; a HAVING `COUNT(DISTINCT x)` only matches when `x` lowers to the
+/// same expression (`expr_eq`).
+fn lower_having_over_count_distinct(
+    e: &SqlExpr,
+    select_inner: &SqlExpr,
+    resolver: &NameResolver<'_>,
+    count_out_name: &str,
+    depth: usize,
+) -> BoltResult<Expr> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    // Does this subexpression name the distinct-counted aggregate? If so it
+    // resolves to the already-projected count column.
+    if let Some(inner) = try_count_distinct(e, resolver)? {
+        let inner_lowered = lower_expr(inner, resolver, depth + 1)?;
+        let select_lowered = lower_expr(select_inner, resolver, depth + 1)?;
+        if expr_eq(&inner_lowered, &select_lowered) {
+            return Ok(Expr::Column(count_out_name.to_string()));
+        }
+        return Err(BoltError::Sql(
+            "HAVING references a COUNT(DISTINCT ...) over a different column than \
+             the one in the SELECT list; only the projected distinct-count may \
+             be filtered"
+                .into(),
+        ));
+    }
+    match e {
+        SqlExpr::Nested(inner) => {
+            lower_having_over_count_distinct(inner, select_inner, resolver, count_out_name, depth + 1)
+        }
+        SqlExpr::BinaryOp { left, op, right } => {
+            let lop = lower_binary_op(op)?;
+            let l = lower_having_over_count_distinct(
+                left,
+                select_inner,
+                resolver,
+                count_out_name,
+                depth + 1,
+            )?;
+            let r = lower_having_over_count_distinct(
+                right,
+                select_inner,
+                resolver,
+                count_out_name,
+                depth + 1,
+            )?;
+            Ok(Expr::Binary {
+                op: lop,
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        }
+        SqlExpr::UnaryOp { op, expr } => match op {
+            UnaryOperator::Plus => lower_having_over_count_distinct(
+                expr,
+                select_inner,
+                resolver,
+                count_out_name,
+                depth + 1,
+            ),
+            UnaryOperator::Minus => {
+                let inner = lower_having_over_count_distinct(
+                    expr,
+                    select_inner,
+                    resolver,
+                    count_out_name,
+                    depth + 1,
+                )?;
+                Ok(Expr::Binary {
+                    op: BinaryOp::Sub,
+                    left: Box::new(Expr::Literal(Literal::Int64(0))),
+                    right: Box::new(inner),
+                })
+            }
+            UnaryOperator::Not => {
+                let inner = lower_having_over_count_distinct(
+                    expr,
+                    select_inner,
+                    resolver,
+                    count_out_name,
+                    depth + 1,
+                )?;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(inner),
+                })
+            }
+            other => Err(BoltError::Sql(format!(
+                "unsupported unary operator in HAVING: {other:?}"
+            ))),
+        },
+        SqlExpr::IsNull(inner) => {
+            let operand = lower_having_over_count_distinct(
+                inner,
+                select_inner,
+                resolver,
+                count_out_name,
+                depth + 1,
+            )?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(operand),
+            })
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let operand = lower_having_over_count_distinct(
+                inner,
+                select_inner,
+                resolver,
+                count_out_name,
+                depth + 1,
+            )?;
+            Ok(Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(operand),
+            })
+        }
+        // Literals (and any other purely-scalar fragment) lower normally. A
+        // bare column reference or aggregate call that is *not* the projected
+        // distinct-count would be lowered by `lower_expr`; for a column that
+        // is not in the (single-column) Project output, `validate_having_columns`
+        // rejects it afterwards with a friendly message.
         _ => lower_expr(e, resolver, depth + 1),
     }
 }
@@ -6871,6 +7066,134 @@ mod wave7_tests {
             }
             other => panic!("expected Project at top, got {other:?}"),
         }
+    }
+
+    // ---- F3: COUNT(DISTINCT col) combined with SELECT DISTINCT / HAVING ----
+
+    /// Bare `COUNT(DISTINCT col)` still lowers to the established shape:
+    /// Project over Aggregate(COUNT*) over Distinct over Project over Filter.
+    /// Locks the baseline the new combos build on.
+    #[test]
+    fn count_distinct_bare_lowers_to_project_over_aggregate() {
+        let plan = lp("SELECT COUNT(DISTINCT a) FROM t1");
+        match &plan {
+            LogicalPlan::Project { input, .. } => {
+                assert!(
+                    matches!(**input, LogicalPlan::Aggregate { .. }),
+                    "expected Aggregate under the result Project, got {input:?}"
+                );
+            }
+            other => panic!("expected Project at top, got {other:?}"),
+        }
+        // And it lowers physically (no rejection) through the dedicated
+        // CountRows-over-Distinct path. Assert the CountRows node is present
+        // rather than over-fitting the exact wrapper nesting.
+        let phys = lower(&plan).unwrap();
+        assert!(
+            format!("{phys:?}").contains("CountRows"),
+            "expected a CountRows node in the physical plan, got {phys:?}"
+        );
+    }
+
+    /// `SELECT DISTINCT COUNT(DISTINCT col)` (no GROUP BY) is now accepted and
+    /// lowers to a `Distinct` wrapping the bare distinct-count plan. Reuses the
+    /// existing `Distinct` operator — DISTINCT over the single result row is a
+    /// correct no-op.
+    #[test]
+    fn select_distinct_over_count_distinct_is_accepted() {
+        let plan = lp("SELECT DISTINCT COUNT(DISTINCT a) FROM t1");
+        assert!(
+            matches!(plan, LogicalPlan::Distinct { .. }),
+            "expected Distinct at top, got {plan:?}"
+        );
+        // Physical lowering succeeds end-to-end (no rejection).
+        let _ = lower(&plan).unwrap();
+    }
+
+    /// `HAVING` over a bare `COUNT(DISTINCT col)` (no GROUP BY) is now accepted:
+    /// the whole table is one implicit group, so HAVING filters the single
+    /// result row. Lowers to a `Filter` over the result `Project`, reusing the
+    /// existing `Filter` operator.
+    #[test]
+    fn having_over_count_distinct_is_accepted() {
+        let plan = lp("SELECT COUNT(DISTINCT a) FROM t1 HAVING COUNT(DISTINCT a) > 2");
+        match &plan {
+            LogicalPlan::Filter { input, .. } => {
+                assert!(
+                    matches!(**input, LogicalPlan::Project { .. }),
+                    "expected Project under the HAVING Filter, got {input:?}"
+                );
+            }
+            other => panic!("expected Filter at top, got {other:?}"),
+        }
+        let _ = lower(&plan).unwrap();
+    }
+
+    /// HAVING + SELECT DISTINCT stack together over the bare distinct-count:
+    /// Distinct over Filter over Project.
+    #[test]
+    fn having_and_select_distinct_stack_over_count_distinct() {
+        let plan =
+            lp("SELECT DISTINCT COUNT(DISTINCT a) FROM t1 HAVING COUNT(DISTINCT a) >= 1");
+        match &plan {
+            LogicalPlan::Distinct { input } => {
+                assert!(
+                    matches!(**input, LogicalPlan::Filter { .. }),
+                    "expected Filter under the top Distinct, got {input:?}"
+                );
+            }
+            other => panic!("expected Distinct at top, got {other:?}"),
+        }
+        let _ = lower(&plan).unwrap();
+    }
+
+    /// HAVING referencing a COUNT(DISTINCT ...) over a *different* column than
+    /// the projected one is rejected cleanly (no panic).
+    #[test]
+    fn having_over_mismatched_count_distinct_column_is_rejected() {
+        let err = parse(
+            "SELECT COUNT(DISTINCT a) FROM t1 HAVING COUNT(DISTINCT b) > 0",
+            &provider(),
+        )
+        .expect_err("mismatched HAVING distinct-count column must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("different column"),
+            "expected mismatched-column message, got: {msg}"
+        );
+    }
+
+    /// COUNT(DISTINCT col) combined with GROUP BY remains rejected (needs a new
+    /// `AggregateExpr::CountDistinct` variant + planner/executor support, all in
+    /// files outside this feature's edit set). Must be a clean `Err`, no panic.
+    #[test]
+    fn count_distinct_with_group_by_is_rejected_cleanly() {
+        let err = parse(
+            "SELECT COUNT(DISTINCT b) FROM t1 GROUP BY a",
+            &provider(),
+        )
+        .expect_err("COUNT(DISTINCT) with GROUP BY must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("GROUP BY is not supported"),
+            "expected GROUP BY rejection message, got: {msg}"
+        );
+    }
+
+    /// COUNT(DISTINCT col) alongside another SELECT item remains rejected
+    /// cleanly (the sole-item restriction is unchanged).
+    #[test]
+    fn count_distinct_with_extra_select_item_is_rejected_cleanly() {
+        let err = parse(
+            "SELECT a, COUNT(DISTINCT b) FROM t1",
+            &provider(),
+        )
+        .expect_err("COUNT(DISTINCT) alongside another item must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sole SELECT item"),
+            "expected sole-item rejection message, got: {msg}"
+        );
     }
 }
 

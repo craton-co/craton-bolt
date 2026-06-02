@@ -393,6 +393,90 @@ pub enum Op {
         /// Right operand high half.
         b_hi: Reg,
     },
+    // ---------------------------------------------------------------------
+    // Decimal128 / i128 dual-register ops (F5 — Decimal arithmetic that was
+    // previously rejected: scale-aligned compare, mixed arithmetic, Div,
+    // CAST to/from Decimal128, CASE over Decimal128). All stay on the GPU
+    // path: the host evaluator (`exec::expr_agg::HostColumn`) has no i128
+    // variant and adding one would change exhaustive matches in files
+    // outside this feature's edit set, so the pragmatic correct route is to
+    // keep Decimal entirely on-device.
+    // ---------------------------------------------------------------------
+    /// Sign-extend a 32/64-bit signed integer register `src` into an i128
+    /// `(lo, hi)` pair. `from` is the source dtype (`Int32` / `Int64` —
+    /// Date32 rides the Int32 path). Lowers to a `mov`/`cvt` of the low half
+    /// plus an arithmetic-shift-right-by-63 to splat the sign bit into the
+    /// high half (`shr.s64 hi, lo, 63`).
+    WidenToI128 {
+        /// Destination register for the low 64 bits.
+        dst_lo: Reg,
+        /// Destination register for the high 64 bits (sign-extension).
+        dst_hi: Reg,
+        /// Source integer register.
+        src: Reg,
+        /// Source integer dtype (`Int32` / `Int64` / `Date32`).
+        from: DataType,
+    },
+    /// Narrow an i128 `(lo, hi)` pair to a 64-bit signed integer by taking
+    /// the low half (`to == Int64`) or the low 32 bits (`to == Int32`).
+    /// Matches the truncating `as i64` / `as i32` host semantics — the
+    /// caller (CAST-from-Decimal lowering) is responsible for having already
+    /// divided out the scale so the magnitude fits.
+    NarrowI128ToInt {
+        /// Destination integer register.
+        dst: Reg,
+        /// Source i128 low half.
+        src_lo: Reg,
+        /// Source i128 high half (only consulted for the sign on Int32; the
+        /// low half already carries the value bits for both widths).
+        src_hi: Reg,
+        /// Target integer dtype (`Int32` / `Int64`).
+        to: DataType,
+    },
+    /// 128-bit signed division (truncating toward zero — matches Rust's
+    /// `i128` `/`). Lowered as a sign-fixup wrapper around an unsigned
+    /// shift-subtract long-division loop (no native PTX 128-bit divide).
+    ///
+    /// Divide-by-zero: the emitted PTX guards a zero divisor and yields a
+    /// zero quotient for that lane (the executor's per-row validity bitmap
+    /// is expected to mask such rows; this matches the engine's "produce a
+    /// deterministic, non-trapping value" convention for the eager GPU
+    /// path rather than faulting the kernel).
+    Div128 {
+        /// Destination quotient low half.
+        dst_lo: Reg,
+        /// Destination quotient high half.
+        dst_hi: Reg,
+        /// Dividend low half.
+        a_lo: Reg,
+        /// Dividend high half.
+        a_hi: Reg,
+        /// Divisor low half.
+        b_lo: Reg,
+        /// Divisor high half.
+        b_hi: Reg,
+    },
+    /// Predicated selection over a 128-bit value: the i128 analogue of
+    /// `Op::Select`. Picks the `(then_lo, then_hi)` pair when `cond` is the
+    /// Bool 1, else `(else_lo, else_hi)`. Lowers to two `selp.b64` (one per
+    /// half) gated on the same predicate. Used for `CASE` whose unified
+    /// result dtype is `Decimal128`.
+    Select128 {
+        /// Destination low half.
+        dst_lo: Reg,
+        /// Destination high half.
+        dst_hi: Reg,
+        /// Bool register (0/1) driving the choice.
+        cond: Reg,
+        /// THEN-branch low / high halves.
+        then_lo: Reg,
+        /// THEN-branch high half.
+        then_hi: Reg,
+        /// ELSE-branch low half.
+        else_lo: Reg,
+        /// ELSE-branch high half.
+        else_hi: Reg,
+    },
 }
 
 /// Description of an input column the kernel consumes.
@@ -1267,6 +1351,26 @@ fn decimal128_arith_result_dtype(
     }
 }
 
+/// F5: resolve the result dtype of a Decimal128 arithmetic op (including the
+/// mixed Decimal/integer and Div shapes) by delegating to the single source
+/// of truth [`logical_decimal128_arith_result`] with the ORIGINAL operand
+/// dtypes. Returns a `Plan` error if the helper reports neither side is
+/// decimal (a producer bug — this is only called from the decimal lowering
+/// path) or rejects the shape.
+fn decimal_arith_result_via_logical(
+    op: BinaryOp,
+    l: DataType,
+    r: DataType,
+) -> BoltResult<DataType> {
+    match logical_decimal128_arith_result(op, l, r) {
+        Some(result) => result,
+        None => Err(BoltError::Plan(format!(
+            "Decimal128 {op:?} result-dtype resolution: logical helper returned None \
+             for operands {l:?} / {r:?} — producer bug (neither side is Decimal128)"
+        ))),
+    }
+}
+
 /// Gate the source side of a CAST against the v0.7 GPU codegen surface.
 ///
 /// Accepted source dtypes: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`.
@@ -1284,9 +1388,10 @@ fn cast_source_is_supported(src: DataType) -> BoltResult<()> {
         | DataType::Int64
         | DataType::Float32
         | DataType::Float64 => Ok(()),
-        DataType::Decimal128(_, _) => Err(BoltError::Plan(
-            "CAST to/from Decimal128 not yet lowered to GPU".into(),
-        )),
+        // F5: Decimal128 source casts are handled by `emit_decimal_cast`
+        // (which dispatches before this guard); allow it here so the
+        // NULL-source / hand-built-plan paths don't spuriously reject.
+        DataType::Decimal128(_, _) => Ok(()),
         DataType::Date32 => Err(BoltError::Plan(
             "CAST to/from Date32 not yet lowered to GPU".into(),
         )),
@@ -1309,9 +1414,8 @@ fn cast_target_is_supported(target: DataType) -> BoltResult<()> {
         | DataType::Int64
         | DataType::Float32
         | DataType::Float64 => Ok(()),
-        DataType::Decimal128(_, _) => Err(BoltError::Plan(
-            "CAST to/from Decimal128 not yet lowered to GPU".into(),
-        )),
+        // F5: Decimal128 target casts are handled by `emit_decimal_cast`.
+        DataType::Decimal128(_, _) => Ok(()),
         DataType::Date32 => Err(BoltError::Plan(
             "CAST to/from Date32 not yet lowered to GPU".into(),
         )),
@@ -1322,6 +1426,25 @@ fn cast_target_is_supported(target: DataType) -> BoltResult<()> {
             "CAST to/from String not yet lowered to GPU".into(),
         )),
     }
+}
+
+/// `10^exp` as an `i128`, erroring (not wrapping) if it would overflow.
+///
+/// Used by the Decimal128 rescale paths (scale-aligned compare, mixed-type
+/// coercion, division pre-scale, CAST rescale). `i128` holds up to ~38
+/// decimal digits, so `exp <= 38` is the hard ceiling; anything larger (or
+/// any intermediate that overflows) is a `BoltError::Plan` rather than a
+/// silent wrap, satisfying the F5 "checked rescale" correctness note.
+fn pow10_i128(exp: u32) -> BoltResult<i128> {
+    let mut acc: i128 = 1;
+    for _ in 0..exp {
+        acc = acc.checked_mul(10).ok_or_else(|| {
+            BoltError::Plan(format!(
+                "Decimal128 rescale factor 10^{exp} overflows i128 (max ~38 digits)"
+            ))
+        })?;
+    }
+    Ok(acc)
 }
 
 /// v0.7: result dtype for an arithmetic op on Date32 / Timestamp operands.
@@ -1822,11 +1945,128 @@ impl<'a> Codegen<'a> {
         let value = self.emit_expr(inner)?;
         // Identity cast is always fine — emit_cast collapses it to no-op.
         if value.dtype == target {
+            // A Decimal128 identity cast must preserve the (lo, hi) pair —
+            // the single-register `emit_cast` no-op path would drop hi_reg.
+            if matches!(target, DataType::Decimal128(_, _)) {
+                return Ok(value);
+            }
             return Ok(self.emit_cast(value, target));
+        }
+        // F5 sub-feature 4: CAST to/from Decimal128 (integer<->decimal,
+        // decimal<->decimal rescale) lowers to the 128-bit widen / rescale /
+        // narrow ops below rather than the single-register PTX `cvt.*`.
+        if matches!(value.dtype, DataType::Decimal128(_, _))
+            || matches!(target, DataType::Decimal128(_, _))
+        {
+            return self.emit_decimal_cast(value, target);
         }
         cast_source_is_supported(value.dtype)?;
         cast_target_is_supported(target)?;
         Ok(self.emit_cast(value, target))
+    }
+
+    /// Lower a CAST that involves Decimal128 on the source or target side
+    /// (F5 sub-feature 4). Implemented entirely with the 128-bit IR ops:
+    ///
+    ///   * `Int{32,64}/Date32 -> Decimal128(p, s)`: sign-extend to i128
+    ///     (`WidenToI128`) then multiply by `10^s` (`Mul128`).
+    ///   * `Decimal128(p1, s1) -> Decimal128(p2, s2)`: rescale by
+    ///     `10^(s2-s1)` — multiply (`Mul128`) when widening the scale,
+    ///     divide (`Div128`, truncating toward zero) when shrinking it.
+    ///   * `Decimal128(p, s) -> Int{32,64}`: divide out the scale
+    ///     (`Div128` by `10^s`) then take the low half (`NarrowI128ToInt`).
+    ///
+    /// REJECTED (kept as precise errors): Float<->Decimal and Bool/Utf8/
+    /// Timestamp<->Decimal. A correct float<->decimal conversion needs
+    /// round-to-nearest i128 scaling that the fixed `cvt.rzi` PTX path
+    /// can't express without precision loss, so we require an explicit
+    /// two-step CAST through an integer/decimal of the intended scale.
+    fn emit_decimal_cast(&mut self, value: Value, target: DataType) -> BoltResult<Value> {
+        use DataType::*;
+        match (value.dtype, target) {
+            // Integer -> Decimal128(p, s): widen then scale up by 10^s.
+            (Int32 | Int64 | Date32, Decimal128(p, s)) => {
+                if s < 0 {
+                    return Err(BoltError::Plan(format!(
+                        "CAST integer -> Decimal128(_, {s}): negative scale unsupported"
+                    )));
+                }
+                let widened = self.emit_int_to_decimal(value, p);
+                self.emit_rescale_decimal_up(widened, 0, s, p)
+            }
+            // Decimal -> Decimal: rescale up (Mul) or down (Div, truncating).
+            (Decimal128(_, s1), Decimal128(p2, s2)) => {
+                let v_hi = value.hi_reg.ok_or_else(|| {
+                    BoltError::Other("physical_plan: decimal CAST source has no hi_reg".into())
+                })?;
+                if s2 >= s1 {
+                    self.emit_rescale_decimal_up(value, s1, s2, p2)
+                } else {
+                    // Scale down: divide by 10^(s1 - s2) (truncating).
+                    let factor = pow10_i128((s1 - s2) as u32)?;
+                    let factor_v = self.emit_const128_raw(factor);
+                    let factor_hi = factor_v.hi_reg.expect("const128 pair");
+                    let dst_lo = self.fresh();
+                    let dst_hi = self.fresh();
+                    self.ops.push(Op::Div128 {
+                        dst_lo,
+                        dst_hi,
+                        a_lo: value.reg,
+                        a_hi: v_hi,
+                        b_lo: factor_v.reg,
+                        b_hi: factor_hi,
+                    });
+                    Ok(Value::pair(dst_lo, dst_hi, Decimal128(p2, s2)))
+                }
+            }
+            // Decimal -> Integer: divide out the scale, take the low half.
+            (Decimal128(_, s), Int32 | Int64) => {
+                let v_hi = value.hi_reg.ok_or_else(|| {
+                    BoltError::Other("physical_plan: decimal CAST source has no hi_reg".into())
+                })?;
+                // Divide by 10^s (truncating toward zero) to drop the scale.
+                let (whole_lo, whole_hi) = if s > 0 {
+                    let factor = pow10_i128(s as u32)?;
+                    let factor_v = self.emit_const128_raw(factor);
+                    let factor_hi = factor_v.hi_reg.expect("const128 pair");
+                    let q_lo = self.fresh();
+                    let q_hi = self.fresh();
+                    self.ops.push(Op::Div128 {
+                        dst_lo: q_lo,
+                        dst_hi: q_hi,
+                        a_lo: value.reg,
+                        a_hi: v_hi,
+                        b_lo: factor_v.reg,
+                        b_hi: factor_hi,
+                    });
+                    (q_lo, q_hi)
+                } else {
+                    (value.reg, v_hi)
+                };
+                let dst = self.fresh();
+                self.ops.push(Op::NarrowI128ToInt {
+                    dst,
+                    src_lo: whole_lo,
+                    src_hi: whole_hi,
+                    to: target,
+                });
+                Ok(Value::single(dst, target))
+            }
+            (Float32 | Float64, Decimal128(_, _)) | (Decimal128(_, _), Float32 | Float64) => {
+                Err(BoltError::Plan(
+                    "CAST between Float and Decimal128 is not lowered to GPU (a correct \
+                     round-to-nearest i128 scaling is not expressible via the fixed cvt \
+                     PTX path); CAST through an integer or a Decimal128 of the intended \
+                     scale instead"
+                        .into(),
+                ))
+            }
+            (from, to) => Err(BoltError::Plan(format!(
+                "CAST {from:?} -> {to:?} involving Decimal128 is not supported on the GPU \
+                 path (only integer<->Decimal128 and Decimal128<->Decimal128 rescale are \
+                 wired)"
+            ))),
+        }
     }
 
     /// Emit a binary op, inserting casts and computing the result dtype.
@@ -1963,10 +2203,138 @@ impl<'a> Codegen<'a> {
         Ok(Value::single(dst, result_dtype))
     }
 
-    /// Lower an arithmetic op (`Add`/`Sub`/`Mul`) over a pair of
-    /// Decimal128 operands to a dual-register `Op::Add128` / `Op::Sub128`
-    /// / `Op::Mul128`. Rejects every other op shape (Div, comparisons,
-    /// mixed Decimal128 / non-Decimal) with a clear v0.7-envelope message.
+    /// Emit a 128-bit constant `value` (a positive power of ten, used as a
+    /// rescale factor) into a fresh register pair, returning the `(lo, hi)`
+    /// `Value`. The dtype is `Decimal128(38, 0)` — purely a carrier; only
+    /// the raw bits are consumed by the `Mul128`/`Div128` that follows.
+    fn emit_const128_raw(&mut self, value: i128) -> Value {
+        let bits = value as u128;
+        let dst_lo = self.fresh();
+        let dst_hi = self.fresh();
+        self.ops.push(Op::Const128 {
+            dst_lo,
+            dst_hi,
+            lo: bits as u64,
+            hi: (bits >> 64) as u64,
+        });
+        Value::pair(dst_lo, dst_hi, DataType::Decimal128(38, 0))
+    }
+
+    /// Rescale a Decimal128 `Value` from scale `from_s` to scale `to_s`
+    /// (`to_s >= from_s`) by multiplying its raw i128 by `10^(to_s-from_s)`.
+    ///
+    /// CORRECTNESS: the rescale factor is computed with `checked_pow` / a
+    /// guarded loop so a `Δscale` that overflows `i128` is a hard error, not
+    /// a silent wrap. The result `Value` carries `Decimal128(out_p, to_s)`.
+    fn emit_rescale_decimal_up(
+        &mut self,
+        v: Value,
+        from_s: i8,
+        to_s: i8,
+        out_p: u8,
+    ) -> BoltResult<Value> {
+        debug_assert!(to_s >= from_s);
+        if to_s == from_s {
+            return Ok(Value::pair(
+                v.reg,
+                v.hi_reg.ok_or_else(|| {
+                    BoltError::Other("physical_plan: decimal rescale operand has no hi_reg".into())
+                })?,
+                DataType::Decimal128(out_p, to_s),
+            ));
+        }
+        let delta = (to_s - from_s) as u32;
+        let factor = pow10_i128(delta)?;
+        let v_hi = v.hi_reg.ok_or_else(|| {
+            BoltError::Other("physical_plan: decimal rescale operand has no hi_reg".into())
+        })?;
+        let factor_v = self.emit_const128_raw(factor);
+        let factor_hi = factor_v.hi_reg.expect("emit_const128_raw returns a pair");
+        let dst_lo = self.fresh();
+        let dst_hi = self.fresh();
+        self.ops.push(Op::Mul128 {
+            dst_lo,
+            dst_hi,
+            a_lo: v.reg,
+            a_hi: v_hi,
+            b_lo: factor_v.reg,
+            b_hi: factor_hi,
+        });
+        Ok(Value::pair(dst_lo, dst_hi, DataType::Decimal128(out_p, to_s)))
+    }
+
+    /// Widen an integer `Value` (`Int32`/`Int64`/`Date32`) to a
+    /// `Decimal128(p, 0)` register pair via `Op::WidenToI128` (sign-extend).
+    /// The resulting decimal has scale 0; callers rescale further as needed.
+    fn emit_int_to_decimal(&mut self, v: Value, out_p: u8) -> Value {
+        let dst_lo = self.fresh();
+        let dst_hi = self.fresh();
+        self.ops.push(Op::WidenToI128 {
+            dst_lo,
+            dst_hi,
+            src: v.reg,
+            from: v.dtype,
+        });
+        Value::pair(dst_lo, dst_hi, DataType::Decimal128(out_p, 0))
+    }
+
+    /// Coerce a single operand of a mixed Decimal/other arithmetic or
+    /// comparison into a `Decimal128(_, target_scale)` register pair.
+    ///
+    /// * A `Decimal128(p, s)` operand is rescaled up to `target_scale`
+    ///   (multiply by `10^(target_scale - s)`); `s > target_scale` is a
+    ///   producer bug (the caller picks `target_scale = max(scales)`).
+    /// * An integer operand (`Int32`/`Int64`) is treated as a
+    ///   `Decimal128(_, 0)` then rescaled up to `target_scale`.
+    /// * Any other dtype (Float/Bool/Utf8/temporal) is rejected — decimal
+    ///   arithmetic with floats would lose exactness; cast explicitly.
+    fn coerce_to_decimal_scale(
+        &mut self,
+        v: Value,
+        target_scale: i8,
+    ) -> BoltResult<Value> {
+        match v.dtype {
+            DataType::Decimal128(p, s) => {
+                if s > target_scale {
+                    return Err(BoltError::Plan(format!(
+                        "physical_plan: decimal coerce target scale {target_scale} < operand \
+                         scale {s} — producer bug (target should be max of operand scales)"
+                    )));
+                }
+                self.emit_rescale_decimal_up(v, s, target_scale, p)
+            }
+            DataType::Int32 | DataType::Int64 | DataType::Date32 => {
+                let as_dec = self.emit_int_to_decimal(v, 38);
+                self.emit_rescale_decimal_up(as_dec, 0, target_scale, 38)
+            }
+            other => Err(BoltError::Plan(format!(
+                "mixed Decimal128 arithmetic with {other:?} is not supported on the GPU \
+                 path; CAST the {other:?} side to Decimal128 explicitly (float/decimal \
+                 mixing would lose exactness)"
+            ))),
+        }
+    }
+
+    /// Lower an arithmetic op (`Add`/`Sub`/`Mul`/`Div`) over a pair of
+    /// Decimal128 operands (or mixed Decimal128 / integer operands) to the
+    /// dual-register 128-bit ops.
+    ///
+    /// MIXED-TYPE COERCION (F5 sub-feature 2). When exactly one side is an
+    /// integer, it is widened to `Decimal128(_, 0)` and both sides are
+    /// rescaled to the common scale `max(s_l, s_r)` before the op. For
+    /// Add/Sub this aligns the radix points; for Mul we keep the SQL rule of
+    /// summing scales, so the integer side stays at scale 0 (no rescale) and
+    /// the result scale is the decimal side's scale.
+    ///
+    /// SCALE / PRECISION RULES (per SQL standard, via
+    /// `decimal128_arith_result`):
+    ///   * Add/Sub: operands rescaled to a common scale `s`; result
+    ///     `Decimal128(max(p1,p2)+1, s)`.
+    ///   * Mul: result `Decimal128(p1+p2, s1+s2)` (raw i128 product).
+    ///   * Div: result scale follows the SQL convention `max(s1, 6)` ... see
+    ///     `emit_binary_decimal128`'s Div arm for the exact rule applied.
+    ///
+    /// Rejects float/bool/temporal mixing with a clear message.
     ///
     /// Result-dtype rules follow the SQL convention:
     ///
@@ -1986,86 +2354,149 @@ impl<'a> Codegen<'a> {
         l: Value,
         r: Value,
     ) -> BoltResult<Value> {
-        let (l_p, l_s) = match l.dtype {
-            DataType::Decimal128(p, s) => (p, s),
-            other => {
-                return Err(BoltError::Plan(format!(
-                    "Decimal128 {op:?}: left operand must be Decimal128, got {other:?} \
-                     (mixed Decimal128 / non-Decimal arithmetic is not yet lowered to GPU)"
-                )));
+        // Extract the (precision, scale) of whichever side(s) are decimal,
+        // and the *logical* scale to attribute to an integer operand (0).
+        let dec_scale = |dt: DataType| -> Option<(u8, i8)> {
+            match dt {
+                DataType::Decimal128(p, s) => Some((p, s)),
+                _ => None,
             }
         };
-        let (r_p, r_s) = match r.dtype {
-            DataType::Decimal128(p, s) => (p, s),
-            other => {
-                return Err(BoltError::Plan(format!(
-                    "Decimal128 {op:?}: right operand must be Decimal128, got {other:?} \
-                     (mixed Decimal128 / non-Decimal arithmetic is not yet lowered to GPU)"
-                )));
-            }
+        let l_dec = dec_scale(l.dtype);
+        let r_dec = dec_scale(r.dtype);
+        // Reject the float/bool/temporal cases up front with a clear message
+        // (an integer peer is allowed and coerced below).
+        let is_intish = |dt: DataType| {
+            matches!(dt, DataType::Int32 | DataType::Int64 | DataType::Date32)
         };
-        // Pair-validity guard: every Decimal128 `Value` MUST carry a
-        // `hi_reg`. If it doesn't, the producer (column / literal / cast)
-        // forgot to call `Value::pair`, and the dual-register ops below
-        // would otherwise silently address the same register for both
-        // halves.
-        let l_hi = l.hi_reg.ok_or_else(|| {
-            BoltError::Other(
-                "physical_plan: Decimal128 lhs has no hi_reg — producer bug".into(),
-            )
-        })?;
-        let r_hi = r.hi_reg.ok_or_else(|| {
-            BoltError::Other(
-                "physical_plan: Decimal128 rhs has no hi_reg — producer bug".into(),
-            )
-        })?;
+        if l_dec.is_none() && !is_intish(l.dtype) {
+            return Err(BoltError::Plan(format!(
+                "Decimal128 {op:?}: left operand {:?} cannot be coerced to Decimal128 \
+                 (only integer peers are auto-coerced; CAST floats explicitly)",
+                l.dtype
+            )));
+        }
+        if r_dec.is_none() && !is_intish(r.dtype) {
+            return Err(BoltError::Plan(format!(
+                "Decimal128 {op:?}: right operand {:?} cannot be coerced to Decimal128 \
+                 (only integer peers are auto-coerced; CAST floats explicitly)",
+                r.dtype
+            )));
+        }
 
-        let result_dtype = decimal128_arith_result_dtype(op, (l_p, l_s), (r_p, r_s))?;
+        // Logical scales of each side for SQL coercion (integer = scale 0).
+        let l_s = l_dec.map(|(_, s)| s).unwrap_or(0);
+        let r_s = r_dec.map(|(_, s)| s).unwrap_or(0);
 
-        let dst_lo = self.fresh();
-        let dst_hi = self.fresh();
-        let new_op = match op {
-            BinaryOp::Add => Op::Add128 {
-                dst_lo,
-                dst_hi,
-                a_lo: l.reg,
-                a_hi: l_hi,
-                b_lo: r.reg,
-                b_hi: r_hi,
-            },
-            BinaryOp::Sub => Op::Sub128 {
-                dst_lo,
-                dst_hi,
-                a_lo: l.reg,
-                a_hi: l_hi,
-                b_lo: r.reg,
-                b_hi: r_hi,
-            },
-            BinaryOp::Mul => Op::Mul128 {
-                dst_lo,
-                dst_hi,
-                a_lo: l.reg,
-                a_hi: l_hi,
-                b_lo: r.reg,
-                b_hi: r_hi,
-            },
+        match op {
+            BinaryOp::Add | BinaryOp::Sub => {
+                // SQL Add/Sub: align both operands to the common scale
+                // `max(s_l, s_r)` (rescale the smaller-scale side up), then
+                // 128-bit add/sub. Result `Decimal128(max(p)+1, common_s)`.
+                let common_s = l_s.max(r_s);
+                let l_dt = l.dtype;
+                let r_dt = r.dtype;
+                let lv = self.coerce_to_decimal_scale(l, common_s)?;
+                let rv = self.coerce_to_decimal_scale(r, common_s)?;
+                // Result dtype: the SINGLE SOURCE OF TRUTH logical helper,
+                // fed the ORIGINAL operand dtypes so the schema the planner
+                // computed for this expression matches what we materialise.
+                let result_dtype = decimal_arith_result_via_logical(op, l_dt, r_dt)?;
+                let l_hi = lv.hi_reg.expect("coerced decimal has hi_reg");
+                let r_hi = rv.hi_reg.expect("coerced decimal has hi_reg");
+                let dst_lo = self.fresh();
+                let dst_hi = self.fresh();
+                let new_op = if matches!(op, BinaryOp::Add) {
+                    Op::Add128 { dst_lo, dst_hi, a_lo: lv.reg, a_hi: l_hi, b_lo: rv.reg, b_hi: r_hi }
+                } else {
+                    Op::Sub128 { dst_lo, dst_hi, a_lo: lv.reg, a_hi: l_hi, b_lo: rv.reg, b_hi: r_hi }
+                };
+                self.ops.push(new_op);
+                Ok(Value::pair(dst_lo, dst_hi, result_dtype))
+            }
+            BinaryOp::Mul => {
+                // SQL Mul: scales sum (no rescale), precisions sum. An
+                // integer peer is widened to Decimal128(_, 0) so the raw
+                // i128 product carries the decimal side's scale unchanged.
+                let l_dt = l.dtype;
+                let r_dt = r.dtype;
+                let lv = self.coerce_to_decimal_scale(l, l_s)?; // no rescale (target==own)
+                let rv = self.coerce_to_decimal_scale(r, r_s)?;
+                let result_dtype = decimal_arith_result_via_logical(op, l_dt, r_dt)?;
+                let l_hi = lv.hi_reg.expect("coerced decimal has hi_reg");
+                let r_hi = rv.hi_reg.expect("coerced decimal has hi_reg");
+                let dst_lo = self.fresh();
+                let dst_hi = self.fresh();
+                self.ops.push(Op::Mul128 {
+                    dst_lo,
+                    dst_hi,
+                    a_lo: lv.reg,
+                    a_hi: l_hi,
+                    b_lo: rv.reg,
+                    b_hi: r_hi,
+                });
+                Ok(Value::pair(dst_lo, dst_hi, result_dtype))
+            }
             BinaryOp::Div => {
-                return Err(BoltError::Plan(
-                    "Decimal128 Div not yet lowered to GPU; only Add/Sub/Mul \
-                     on Decimal128 are wired in v0.7 (Div needs a host fallback \
-                     for the wide division)"
-                        .into(),
-                ));
+                // SQL Decimal division (F5 sub-feature 3) on the GPU via
+                // `Op::Div128`. RESULT SCALE RULE: we follow the common
+                // engine convention `result_scale = max(s_l, MIN_DIV_SCALE)`
+                // with `MIN_DIV_SCALE = 6` (so integer/low-scale dividends
+                // still get fractional digits). To produce a quotient at
+                // `result_scale`, the dividend's raw i128 is pre-scaled by
+                // `10^(result_scale + s_r - s_l)` BEFORE the integer divide
+                // (the divisor's scale `s_r` cancels into the quotient).
+                //
+                // DIV-BY-ZERO: handled in the kernel — a zero divisor yields
+                // a zero quotient for that lane (deterministic, non-trapping;
+                // the per-row validity bitmap masks such rows). This matches
+                // the engine's eager-GPU convention rather than faulting.
+                const MIN_DIV_SCALE: i8 = 6;
+                let l_dt_div = l.dtype;
+                let r_dt_div = r.dtype;
+                let result_scale = l_s.max(MIN_DIV_SCALE);
+                // Pre-scale exponent for the dividend.
+                let pre_exp = (result_scale as i32) + (r_s as i32) - (l_s as i32);
+                if pre_exp < 0 {
+                    return Err(BoltError::Plan(format!(
+                        "Decimal128 Div: negative dividend pre-scale ({pre_exp}) for \
+                         scales l={l_s}, r={r_s}, result={result_scale} — unsupported \
+                         shape (CAST to align scales first)"
+                    )));
+                }
+                // Coerce both operands to decimals (integer -> Decimal(_,0)).
+                let lv = self.coerce_to_decimal_scale(l, l_s)?;
+                let rv = self.coerce_to_decimal_scale(r, r_s)?;
+                // Pre-scale the dividend by 10^pre_exp.
+                let lv = self.emit_rescale_decimal_up(
+                    lv,
+                    l_s,
+                    l_s.checked_add(pre_exp as i8).ok_or_else(|| {
+                        BoltError::Plan("Decimal128 Div: dividend pre-scale overflow".into())
+                    })?,
+                    38,
+                )?;
+                let _ = result_scale; // documented above; dtype via helper
+                let result_dtype = decimal_arith_result_via_logical(op, l_dt_div, r_dt_div)?;
+                let l_hi = lv.hi_reg.expect("rescaled dividend has hi_reg");
+                let r_hi = rv.hi_reg.expect("coerced divisor has hi_reg");
+                let dst_lo = self.fresh();
+                let dst_hi = self.fresh();
+                self.ops.push(Op::Div128 {
+                    dst_lo,
+                    dst_hi,
+                    a_lo: lv.reg,
+                    a_hi: l_hi,
+                    b_lo: rv.reg,
+                    b_hi: r_hi,
+                });
+                Ok(Value::pair(dst_lo, dst_hi, result_dtype))
             }
-            other => {
-                return Err(BoltError::Plan(format!(
-                    "Decimal128 {other:?} not yet lowered to GPU; only Add/Sub/Mul \
-                     on Decimal128 are wired in v0.7"
-                )));
-            }
-        };
-        self.ops.push(new_op);
-        Ok(Value::pair(dst_lo, dst_hi, result_dtype))
+            other => Err(BoltError::Plan(format!(
+                "Decimal128 {other:?} not lowered to GPU; only Add/Sub/Mul/Div \
+                 are wired"
+            ))),
+        }
     }
 
     /// Lower a comparison op (`Eq / NotEq / Lt / LtEq / Gt / GtEq`) over a
@@ -2092,49 +2523,43 @@ impl<'a> Codegen<'a> {
         l: Value,
         r: Value,
     ) -> BoltResult<Value> {
-        let (l_p, l_s) = match l.dtype {
-            DataType::Decimal128(p, s) => (p, s),
-            other => {
-                return Err(BoltError::Plan(format!(
-                    "Decimal128 {op:?}: left operand must be Decimal128, got {other:?}; \
-                     Decimal128 comparison requires matching scale, so mixed \
-                     Decimal128 / non-Decimal comparisons are not lowered to GPU \
-                     (wire an explicit CAST first)"
-                )));
+        // F5 sub-feature 1: SCALE-ALIGNED comparison. Both sides are coerced
+        // to a common scale `max(s_l, s_r)` by rescaling the smaller-scale
+        // side up (multiply its raw i128 by 10^Δscale) before the integer
+        // i128 compare. An integer peer is widened to Decimal128(_, 0) and
+        // rescaled the same way, so `WHERE dec_col > 5` works.
+        //
+        // Precision need NOT match: once both sides share a scale, their raw
+        // i128 magnitudes are directly comparable; the result is Bool, so the
+        // wider precision is irrelevant. Float/bool/temporal peers are
+        // rejected (would need lossy conversion — CAST explicitly).
+        let scale_of = |dt: DataType| -> Option<i8> {
+            match dt {
+                DataType::Decimal128(_, s) => Some(s),
+                DataType::Int32 | DataType::Int64 | DataType::Date32 => Some(0),
+                _ => None,
             }
         };
-        let (r_p, r_s) = match r.dtype {
-            DataType::Decimal128(p, s) => (p, s),
-            other => {
-                return Err(BoltError::Plan(format!(
-                    "Decimal128 {op:?}: right operand must be Decimal128, got {other:?}; \
-                     Decimal128 comparison requires matching scale, so mixed \
-                     Decimal128 / non-Decimal comparisons are not lowered to GPU \
-                     (wire an explicit CAST first)"
-                )));
-            }
-        };
-        if l_p != r_p || l_s != r_s {
-            return Err(BoltError::Type(format!(
-                "Decimal128 comparison requires matching scale, \
-                 got Decimal128({l_p}, {l_s}) and Decimal128({r_p}, {r_s}); \
-                 wire an explicit CAST to align precision and scale before comparing"
-            )));
-        }
-        // Pair-validity guard: every Decimal128 `Value` MUST carry a
-        // `hi_reg`. If it doesn't, the producer (column / literal / cast)
-        // forgot to call `Value::pair`, and `Op::Cmp128` would otherwise
-        // silently address the same register for both halves.
-        let l_hi = l.hi_reg.ok_or_else(|| {
-            BoltError::Other(
-                "physical_plan: Decimal128 cmp lhs has no hi_reg — producer bug".into(),
-            )
+        let l_s = scale_of(l.dtype).ok_or_else(|| {
+            BoltError::Plan(format!(
+                "Decimal128 {op:?}: left operand {:?} cannot be compared with a Decimal128 \
+                 (only decimal and integer peers are auto-coerced; CAST floats explicitly)",
+                l.dtype
+            ))
         })?;
-        let r_hi = r.hi_reg.ok_or_else(|| {
-            BoltError::Other(
-                "physical_plan: Decimal128 cmp rhs has no hi_reg — producer bug".into(),
-            )
+        let r_s = scale_of(r.dtype).ok_or_else(|| {
+            BoltError::Plan(format!(
+                "Decimal128 {op:?}: right operand {:?} cannot be compared with a Decimal128 \
+                 (only decimal and integer peers are auto-coerced; CAST floats explicitly)",
+                r.dtype
+            ))
         })?;
+        let common_s = l_s.max(r_s);
+        let lv = self.coerce_to_decimal_scale(l, common_s)?;
+        let rv = self.coerce_to_decimal_scale(r, common_s)?;
+        let l_hi = lv.hi_reg.expect("coerced decimal cmp lhs has hi_reg");
+        let r_hi = rv.hi_reg.expect("coerced decimal cmp rhs has hi_reg");
+        let (l, r) = (lv, rv);
         // Comparison must be one of the six recognised ops.
         if !matches!(
             op,
@@ -4366,7 +4791,17 @@ fn kernel_has_unsafe_eager_shortcircuit(kernel: &KernelSpec) -> bool {
             | Op::Add128 { .. }
             | Op::Sub128 { .. }
             | Op::Mul128 { .. }
-            | Op::Cmp128 { .. } => true,
+            | Op::Cmp128 { .. }
+            // F5: widen / narrow / 128-bit select are pure, total bit
+            // shuffles — fault-free, so eager-safe.
+            | Op::WidenToI128 { .. }
+            | Op::NarrowI128ToInt { .. }
+            | Op::Select128 { .. } => true,
+            // F5: 128-bit divide guards div-by-zero (yields 0, never traps),
+            // but mirror the scalar `Div` policy and treat it conservatively
+            // as eager-UNSAFE so it is never hoisted under a short-circuit
+            // AND/OR without the planned masking.
+            Op::Div128 { .. } => false,
             // Scalar binary ops are safe ONLY for the total/fault-free
             // operators. `Div` (and any future trapping op) is excluded.
             Op::Binary { op, .. } => matches!(
