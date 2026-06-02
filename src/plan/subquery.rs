@@ -433,6 +433,272 @@ fn check_expr_correlation(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Correlation *collection* for LATERAL apply (feature F3 — LATERAL).
+// ---------------------------------------------------------------------------
+//
+// The detector above *rejects* the first correlated reference it finds. The
+// LATERAL apply path instead needs the *set* of outer references a subquery
+// makes, so the host nested-loop apply (see
+// [`crate::exec::engine::Engine::execute_lateral_apply`]) can substitute each
+// one with the current outer row's value. The walk below reuses the same
+// scope-classification rule as the detector (a reference is "outer" iff it is
+// not resolvable inside the subquery's own FROM scope) but accumulates rather
+// than rejecting.
+
+/// One outer (correlated) reference collected from a LATERAL subquery: the
+/// optional qualifier (lower-cased, e.g. the `t` of `t.c`) and the column name
+/// as written (lower-cased for unquoted idents, verbatim for quoted ones,
+/// matching [`super::sql_frontend`]'s folding via the AST `Ident`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CorrRef {
+    /// Qualifier of a `qual.col` reference, lower-cased; `None` for a bare
+    /// `col` reference.
+    pub qualifier: Option<String>,
+    /// Column name (as it should be matched against an outer column).
+    pub column: String,
+}
+
+/// Collect the **distinct** outer (correlated) references made by `query`
+/// against the enclosing scope.
+///
+/// `outer_columns` is the set of (lower-cased) column names visible in the
+/// enclosing (LEFT) scope. A bare reference is treated as a correlation only
+/// when it is both *not* local to the subquery AND present in `outer_columns`
+/// (so a genuine typo keeps its ordinary unknown-column error path rather than
+/// being silently absorbed as a correlation). A qualified `q.col` reference is
+/// a correlation iff `q` is not one of the subquery's own table/alias
+/// qualifiers.
+///
+/// `provider` resolves the subquery's own FROM tables so the collector knows
+/// which names are local (identical to [`reject_if_correlated`]).
+pub(crate) fn collect_correlations(
+    query: &Query,
+    outer_columns: &HashSet<String>,
+    provider: &dyn crate::plan::sql_frontend::TableProvider,
+) -> BoltResult<Vec<CorrRef>> {
+    let mut scope = LocalScope::default();
+    collect_query_scope(query, provider, &mut scope, 0)?;
+    let mut out: Vec<CorrRef> = Vec::new();
+    collect_query_correlations(query, &scope, outer_columns, &mut out, 0)?;
+    Ok(out)
+}
+
+fn push_unique(out: &mut Vec<CorrRef>, r: CorrRef) {
+    if !out.contains(&r) {
+        out.push(r);
+    }
+}
+
+fn collect_query_correlations(
+    query: &Query,
+    scope: &LocalScope,
+    outer_columns: &HashSet<String>,
+    out: &mut Vec<CorrRef>,
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "subquery nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    collect_setexpr_correlations(query.body.as_ref(), scope, outer_columns, out, depth + 1)
+}
+
+fn collect_setexpr_correlations(
+    set: &SetExpr,
+    scope: &LocalScope,
+    outer_columns: &HashSet<String>,
+    out: &mut Vec<CorrRef>,
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "subquery nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    match set {
+        SetExpr::Select(s) => collect_select_correlations(s, scope, outer_columns, out, depth + 1),
+        SetExpr::Query(q) => collect_query_correlations(q, scope, outer_columns, out, depth + 1),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_setexpr_correlations(left, scope, outer_columns, out, depth + 1)?;
+            collect_setexpr_correlations(right, scope, outer_columns, out, depth + 1)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn collect_select_correlations(
+    select: &Select,
+    scope: &LocalScope,
+    outer_columns: &HashSet<String>,
+    out: &mut Vec<CorrRef>,
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "subquery nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                collect_expr_correlations(e, scope, outer_columns, out, depth + 1)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+        }
+    }
+    if let Some(w) = &select.selection {
+        collect_expr_correlations(w, scope, outer_columns, out, depth + 1)?;
+    }
+    if let Some(h) = &select.having {
+        collect_expr_correlations(h, scope, outer_columns, out, depth + 1)?;
+    }
+    if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        for e in exprs {
+            collect_expr_correlations(e, scope, outer_columns, out, depth + 1)?;
+        }
+    }
+    for twj in &select.from {
+        for join in &twj.joins {
+            if let Some(on) = join_on_expr(&join.join_operator) {
+                collect_expr_correlations(on, scope, outer_columns, out, depth + 1)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect every outer column reference in `e`. Mirrors
+/// [`check_expr_correlation`] exactly (same arms, same "do not descend into a
+/// nested subquery" rule) but accumulates into `out` instead of erroring.
+fn collect_expr_correlations(
+    e: &SqlExpr,
+    scope: &LocalScope,
+    outer_columns: &HashSet<String>,
+    out: &mut Vec<CorrRef>,
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "subquery nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    match e {
+        SqlExpr::Identifier(ident) => {
+            let name = &ident.value;
+            if !scope.has_column(name) && outer_columns.contains(&name.to_ascii_lowercase()) {
+                push_unique(
+                    out,
+                    CorrRef {
+                        qualifier: None,
+                        column: name.to_ascii_lowercase(),
+                    },
+                );
+            }
+            Ok(())
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            if parts.len() >= 2 {
+                let qualifier = &parts[0].value;
+                if !scope.has_qualifier(qualifier) {
+                    push_unique(
+                        out,
+                        CorrRef {
+                            qualifier: Some(qualifier.to_ascii_lowercase()),
+                            column: parts[1].value.to_ascii_lowercase(),
+                        },
+                    );
+                }
+            }
+            Ok(())
+        }
+        SqlExpr::Subquery(_) | SqlExpr::InSubquery { .. } | SqlExpr::Exists { .. } => Ok(()),
+        SqlExpr::Nested(inner) => {
+            collect_expr_correlations(inner, scope, outer_columns, out, depth + 1)
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_expr_correlations(left, scope, outer_columns, out, depth + 1)?;
+            collect_expr_correlations(right, scope, outer_columns, out, depth + 1)
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::Cast { expr, .. } => {
+            collect_expr_correlations(expr, scope, outer_columns, out, depth + 1)
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_correlations(expr, scope, outer_columns, out, depth + 1)?;
+            collect_expr_correlations(low, scope, outer_columns, out, depth + 1)?;
+            collect_expr_correlations(high, scope, outer_columns, out, depth + 1)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            collect_expr_correlations(expr, scope, outer_columns, out, depth + 1)?;
+            for v in list {
+                collect_expr_correlations(v, scope, outer_columns, out, depth + 1)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            collect_expr_correlations(expr, scope, outer_columns, out, depth + 1)?;
+            collect_expr_correlations(pattern, scope, outer_columns, out, depth + 1)
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_expr_correlations(op, scope, outer_columns, out, depth + 1)?;
+            }
+            for c in conditions {
+                collect_expr_correlations(c, scope, outer_columns, out, depth + 1)?;
+            }
+            for r in results {
+                collect_expr_correlations(r, scope, outer_columns, out, depth + 1)?;
+            }
+            if let Some(er) = else_result {
+                collect_expr_correlations(er, scope, outer_columns, out, depth + 1)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Function(func) => {
+            if let FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(ae))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(ae),
+                        ..
+                    } = arg
+                    {
+                        collect_expr_correlations(ae, scope, outer_columns, out, depth + 1)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_expr_correlations(expr, scope, outer_columns, out, depth + 1)?;
+            if let Some(f) = substring_from {
+                collect_expr_correlations(f, scope, outer_columns, out, depth + 1)?;
+            }
+            if let Some(f) = substring_for {
+                collect_expr_correlations(f, scope, outer_columns, out, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Build the canonical "correlated subquery rejected" error naming the
 /// offending reference.
 fn correlated_err(reference: &str) -> BoltError {

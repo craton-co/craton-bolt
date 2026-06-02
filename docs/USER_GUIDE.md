@@ -195,9 +195,10 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   (linear, non-linear, and mutual recursion, host-orchestrated with an
   iteration cap); uncorrelated scalar and `[NOT] IN` subqueries in
   `SELECT` / `WHERE` (and an uncorrelated scalar subquery in `ORDER BY`);
-  non-lateral **derived tables** in `FROM` (`(SELECT ...) AS alias`, alias
-  required); and a multi-table comma `FROM a, b` (desugars to `CROSS JOIN`).
-  (Correlated subqueries, `EXISTS`, `LATERAL` derived tables, and
+  **derived tables** in `FROM` (`(SELECT ...) AS alias`, alias required),
+  including **`LATERAL`** derived tables (correlated, run as a host
+  nested-loop apply); and a multi-table comma `FROM a, b` (desugars to
+  `CROSS JOIN`). (Correlated scalar / `EXISTS` subqueries and
   non-recursive-CTE column-list aliases `AS d(x, y)` are rejected.)
 - GROUP BY super-aggregates: `ROLLUP` / `CUBE` / `GROUPING SETS` /
   `GROUP BY ALL`, the `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` trailing

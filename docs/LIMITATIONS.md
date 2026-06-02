@@ -228,17 +228,17 @@ silent wrong answer. If you depend on any of these, expect an error and
 rewrite the query (see [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md) for the
 supported alternatives):
 
-- **Correlated subqueries** (and `EXISTS` / `NOT EXISTS`). (Non-lateral
-  **derived tables** `(SELECT ...) AS alias` are now **supported** — alias
-  required; `LATERAL` derived tables and column-list aliases `AS d(x, y)`
-  remain rejected.)
+- **Correlated scalar / `EXISTS` / `NOT EXISTS` subqueries** (in `SELECT` /
+  `WHERE`). (Non-lateral **derived tables** `(SELECT ...) AS alias` are
+  **supported** — alias required; **`LATERAL` derived tables** are now
+  **supported** too, executed as a host nested-loop apply — see below;
+  column-list aliases `AS d(x, y)` remain rejected.)
 - **`WINDOW` clause / `QUALIFY` / named windows** (`OVER <named_window>`), and
   non-default window frames.
 - **`VALUES` lists** (as a standalone row source).
 - **Table-valued functions.**
 - **`DISTINCT ON (...)`** (Postgres extension).
 - **`TOP`** (T-SQL row limit).
-- **`LATERAL`** (correlated derived tables — needs an Apply executor).
 - **`PREWHERE`** (ClickHouse extension).
 - **`GLOBAL JOIN`** (ClickHouse extension).
 - **`SUM(Date32 / Timestamp)`** — undefined in SQL; rejected by design.

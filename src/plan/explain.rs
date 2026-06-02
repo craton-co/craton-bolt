@@ -417,6 +417,53 @@ pub fn format_mutual_recursive_cte(
 }
 
 // ---------------------------------------------------------------------------
+// LATERAL apply (feature F3 — LATERAL)
+// ---------------------------------------------------------------------------
+
+/// Render a [`LateralApplyPlan`](crate::plan::sql_frontend::LateralApplyPlan) —
+/// a host nested-loop Apply for a LATERAL derived table — for `EXPLAIN`.
+///
+/// A LATERAL apply is not a single [`LogicalPlan`] (the engine re-runs the
+/// correlated subquery per left row; see `Engine::execute_lateral_apply`), so
+/// it gets its own renderer. The header names the apply kind (INNER vs LEFT),
+/// the subquery alias columns, and the correlated outer columns it threads in;
+/// the `Left:` sub-header renders the LEFT relation, `Lateral:` the per-row
+/// (correlation-rewritten) subplan, and `Outer:` the OUTER query template run
+/// over the applied relation.
+pub fn format_lateral_apply(la: &crate::plan::sql_frontend::LateralApplyPlan) -> String {
+    let mut out = String::new();
+    let kind = if la.left_join { "LEFT" } else { "INNER" };
+    let sub_cols: Vec<&str> = la
+        .subquery_schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let corr_cols: Vec<&str> = la
+        .outer_schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let _ = writeln!(
+        out,
+        "LateralApply: {kind} subquery=[{}] correlations=[{}]",
+        sub_cols.join(", "),
+        corr_cols.join(", ")
+    );
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Left:");
+    format_logical_into(&la.left, 2, &mut out);
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Lateral:");
+    format_logical_into(&la.lateral_subplan, 2, &mut out);
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Outer:");
+    format_logical_into(&la.post, 2, &mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // COUNT(DISTINCT col) with GROUP BY (feature F3-finish)
 // ---------------------------------------------------------------------------
 

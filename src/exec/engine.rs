@@ -96,6 +96,30 @@ fn max_recursive_iterations() -> usize {
         .unwrap_or(MAX_RECURSIVE_ITERATIONS)
 }
 
+/// Hard safety cap on the number of LEFT rows a LATERAL apply (feature F3) will
+/// drive (feature: LATERAL / correlated execution).
+///
+/// The apply is a host nested loop — it re-plans + re-runs the correlated
+/// subquery once per left row — so its cost is `O(left_rows × subquery)`. A
+/// huge left input would spin / OOM, so [`Engine::execute_lateral_apply`]
+/// refuses to run more than this many left rows and returns a clean
+/// [`BoltError`] instead. Override with [`MAX_APPLY_LEFT_ROWS_ENV`].
+pub(crate) const MAX_APPLY_LEFT_ROWS: usize = 100_000;
+
+/// Environment-variable override for [`MAX_APPLY_LEFT_ROWS`]. A positive
+/// integer raises (or lowers) the cap; a missing / non-integer / zero value
+/// falls back to the default.
+pub(crate) const MAX_APPLY_LEFT_ROWS_ENV: &str = "CRATON_MAX_APPLY_ROWS";
+
+/// Resolve the effective LATERAL-apply left-row cap (env override or default).
+fn max_apply_left_rows() -> usize {
+    std::env::var(MAX_APPLY_LEFT_ROWS_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_APPLY_LEFT_ROWS)
+}
+
 /// Concatenate two `RecordBatch`es sharing a schema into one.
 ///
 /// Thin wrapper over `arrow::compute::concat_batches` used by the recursive
@@ -2228,6 +2252,28 @@ impl Engine {
             }
         }
 
+        // F3 (LATERAL): a `FROM <left>, LATERAL (<subquery>) AS a` query is
+        // detected and orchestrated host-side as a nested-loop Apply (dependent
+        // join) before the ordinary pipeline, mirroring the WITH RECURSIVE hook
+        // above (the correlated subquery has no single LogicalPlan). Returns
+        // `Ok(None)` for every non-LATERAL query, so the common path falls
+        // straight through. Failures bump `QueriesFailed` to mirror accounting.
+        match crate::plan::sql_frontend::plan_lateral_apply(query, &self.provider) {
+            Ok(Some(la)) => {
+                let result = self.execute_lateral_apply(&la);
+                if result.is_err() {
+                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                }
+                self.maybe_emit_pool_stats(Instant::now());
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                return Err(e);
+            }
+        }
+
         // F3-finish: a sole `COUNT(DISTINCT col)` with `GROUP BY` is detected
         // and orchestrated host-side (per-group distinct counting) before the
         // ordinary pipeline, mirroring the WITH RECURSIVE hook above. The
@@ -2406,6 +2452,13 @@ impl Engine {
                     crate::plan::explain::format_mutual_recursive_cte(&rec)
                 ),
             });
+        }
+        // F3 (LATERAL): render the host-orchestrated LATERAL apply descriptor.
+        if let Some(la) = crate::plan::sql_frontend::plan_lateral_apply(query, &self.provider)? {
+            return Ok(format!(
+                "LATERAL apply plan:\n{}",
+                crate::plan::explain::format_lateral_apply(&la)
+            ));
         }
         // F3-finish: render the host-orchestrated COUNT(DISTINCT) + GROUP BY
         // descriptor via its dedicated formatter.
@@ -2767,6 +2820,192 @@ impl Engine {
         // --- 4. Run the main query over the full accumulated relation. ---
         let main_out = run_with_cte(&result, &rec.main)?;
         Ok(QueryHandle::from_record_batch(main_out))
+    }
+
+    /// Execute a LATERAL derived table (feature F3 — LATERAL) as a host
+    /// nested-loop **Apply** (dependent join), then run the OUTER query template
+    /// over the applied relation.
+    ///
+    /// Algorithm (correctness-first, reusing the existing subplan executor and
+    /// the streaming overlay, exactly like [`Engine::execute_recursive_cte`]):
+    ///
+    /// 1. **Left.** Run `la.left` → the LEFT relation.
+    /// 2. **Per-row apply.** For each left row (bounded by the mandatory
+    ///    [`max_apply_left_rows`] cap — the loop is `O(left_rows × subquery)`):
+    ///    bind a single-row [`LATERAL_OUTER_TABLE`] relation holding that row's
+    ///    correlated values (`__corr_0..N`), then run `la.lateral_subplan`
+    ///    through [`Engine::run_subplan`]. Its rewritten correlations are
+    ///    `(SELECT __corr_<i> FROM __lateral_outer)` scalar subqueries that
+    ///    `resolve_subqueries` folds to the row's *exact typed* value (so int
+    ///    width / NULL / Date / Timestamp all carry correctly).
+    /// 3. **Cross product.** Concatenate the left row (repeated once per
+    ///    produced subquery row) with the subquery rows. INNER LATERAL drops a
+    ///    left row with zero subquery rows; `la.left_join` keeps it once with
+    ///    the subquery columns NULL-filled.
+    /// 4. **Outer.** Bind the concatenated applied relation under
+    ///    [`LATERAL_APPLY_RESULT_TABLE`] in the streaming overlay and run
+    ///    `la.post` (the OUTER projection / WHERE / GROUP BY / ORDER BY / LIMIT)
+    ///    through [`Engine::run_subplan`] — reusing the ordinary executors —
+    ///    then clear the overlay.
+    ///
+    /// An empty left input yields an empty applied relation (the OUTER template
+    /// runs over zero rows). A name collision with a real registered table is
+    /// rejected up front.
+    fn execute_lateral_apply(
+        &self,
+        la: &crate::plan::sql_frontend::LateralApplyPlan,
+    ) -> BoltResult<QueryHandle> {
+        use arrow_array::{new_null_array, UInt32Array};
+
+        use crate::exec::streaming::TableSource;
+        use crate::plan::sql_frontend::{LATERAL_APPLY_RESULT_TABLE, LATERAL_OUTER_TABLE};
+
+        // Refuse to shadow real tables under either reserved ephemeral name.
+        for name in [LATERAL_OUTER_TABLE, LATERAL_APPLY_RESULT_TABLE] {
+            if self.tables.contains_key(name)
+                || self.streaming_sources.borrow().contains_key(name)
+            {
+                return Err(BoltError::Plan(format!(
+                    "LATERAL apply: reserved ephemeral table name '{name}' collides \
+                     with a registered table"
+                )));
+            }
+        }
+
+        // --- 1. Run the LEFT relation. ---
+        let left = self.run_subplan(la.left.clone())?;
+        let n_left = left.num_rows();
+
+        let outer_arrow = plan_schema_to_arrow_schema(&la.outer_schema)?;
+        let sub_arrow = plan_schema_to_arrow_schema(&la.subquery_schema)?;
+        let combined_arrow = plan_schema_to_arrow_schema(&la.combined_schema)?;
+
+        // Run a lateral subplan with the single-row outer relation bound. The
+        // overlay entry is always cleared afterwards (mirrors the recursive
+        // CTE's `run_with_cte`) so a failure mid-loop cannot leak it, and any
+        // GPU-resident copy is evicted before/after so each row re-uploads its
+        // own outer values rather than reusing the previous row's.
+        let run_lateral = |outer_row: &RecordBatch| -> BoltResult<RecordBatch> {
+            self.gpu_tables.borrow_mut().remove(LATERAL_OUTER_TABLE);
+            self.streaming_sources.borrow_mut().insert(
+                LATERAL_OUTER_TABLE.to_string(),
+                TableSource::Materialized(vec![outer_row.clone()]),
+            );
+            let out = self.run_subplan(la.lateral_subplan.clone());
+            self.streaming_sources
+                .borrow_mut()
+                .remove(LATERAL_OUTER_TABLE);
+            self.gpu_tables.borrow_mut().remove(LATERAL_OUTER_TABLE);
+            out
+        };
+
+        // --- 2 + 3. Per-left-row apply + cross product. ---
+        if n_left > max_apply_left_rows() {
+            return Err(BoltError::Plan(format!(
+                "LATERAL apply: left input has {n_left} rows, exceeding the \
+                 {}-row safety cap (set {MAX_APPLY_LEFT_ROWS_ENV} to override) — \
+                 the apply runs the correlated subquery once per left row",
+                max_apply_left_rows()
+            )));
+        }
+
+        let mut per_row: Vec<RecordBatch> = Vec::new();
+        for row in 0..n_left {
+            // Build the single-row outer relation: gather `corr_left_indices`
+            // from this row, renamed to the `__corr_<i>` schema.
+            let one = UInt32Array::from(vec![row as u32]);
+            let mut outer_cols: Vec<ArrayRef> = Vec::with_capacity(la.corr_left_indices.len());
+            for &li in &la.corr_left_indices {
+                let g = arrow::compute::take(left.column(li).as_ref(), &one, None)
+                    .map_err(|e| BoltError::Other(format!("LATERAL outer take: {e}")))?;
+                outer_cols.push(g);
+            }
+            // `try_new_with_options` carries an explicit row count so a LATERAL
+            // that correlates on *no* columns (an uncorrelated subquery written
+            // with LATERAL) still binds a well-formed single-row, zero-column
+            // outer relation rather than an ambiguous-length batch.
+            let outer_row = RecordBatch::try_new_with_options(
+                Arc::clone(&outer_arrow),
+                outer_cols,
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(1)),
+            )
+            .map_err(|e| BoltError::Plan(format!("LATERAL outer-row build: {e}")))?;
+
+            let right = run_lateral(&outer_row)?;
+            // Defensively re-shape the subquery output to the descriptor's
+            // declared schema (the run goes through GPU codegen / Arrow, which
+            // can produce equivalent-but-differently-named columns).
+            let right = RecordBatch::try_new(Arc::clone(&sub_arrow), right.columns().to_vec())
+                .map_err(|e| {
+                    BoltError::Plan(format!(
+                        "LATERAL subquery produced {} columns but its schema \
+                         declares {}: {e}",
+                        right.num_columns(),
+                        sub_arrow.fields().len()
+                    ))
+                })?;
+            let n_right = right.num_rows();
+
+            if n_right == 0 {
+                if !la.left_join {
+                    continue; // INNER LATERAL: drop a left row with no match.
+                }
+                // LEFT JOIN LATERAL ... ON true: emit the left row once with the
+                // subquery columns NULL-filled.
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(combined_arrow.fields().len());
+                for li in 0..left.num_columns() {
+                    let g = arrow::compute::take(left.column(li).as_ref(), &one, None)
+                        .map_err(|e| BoltError::Other(format!("LATERAL left take: {e}")))?;
+                    cols.push(g);
+                }
+                for f in sub_arrow.fields() {
+                    cols.push(new_null_array(f.data_type(), 1));
+                }
+                let batch = RecordBatch::try_new(Arc::clone(&combined_arrow), cols)
+                    .map_err(|e| BoltError::Plan(format!("LATERAL left-join row: {e}")))?;
+                per_row.push(batch);
+                continue;
+            }
+
+            // Repeat the left row `n_right` times and prepend it to the
+            // subquery columns → the per-row cross product.
+            let rep = UInt32Array::from(vec![row as u32; n_right]);
+            let mut cols: Vec<ArrayRef> = Vec::with_capacity(combined_arrow.fields().len());
+            for li in 0..left.num_columns() {
+                let g = arrow::compute::take(left.column(li).as_ref(), &rep, None)
+                    .map_err(|e| BoltError::Other(format!("LATERAL left repeat: {e}")))?;
+                cols.push(g);
+            }
+            cols.extend(right.columns().iter().cloned());
+            let batch = RecordBatch::try_new(Arc::clone(&combined_arrow), cols)
+                .map_err(|e| BoltError::Plan(format!("LATERAL cross-product row: {e}")))?;
+            per_row.push(batch);
+        }
+
+        // Concatenate the per-left-row batches into the applied relation. An
+        // empty left input (or all rows dropped) yields a zero-row relation
+        // with the combined schema so the OUTER template runs over nothing.
+        let applied = if per_row.is_empty() {
+            RecordBatch::new_empty(Arc::clone(&combined_arrow))
+        } else {
+            arrow::compute::concat_batches(&combined_arrow, per_row.iter())
+                .map_err(|e| BoltError::Plan(format!("LATERAL apply concat: {e}")))?
+        };
+
+        // --- 4. Bind the applied relation and run the OUTER template. ---
+        self.gpu_tables.borrow_mut().remove(LATERAL_APPLY_RESULT_TABLE);
+        self.streaming_sources.borrow_mut().insert(
+            LATERAL_APPLY_RESULT_TABLE.to_string(),
+            TableSource::Materialized(vec![applied]),
+        );
+        let out = self.run_subplan(la.post.clone());
+        self.streaming_sources
+            .borrow_mut()
+            .remove(LATERAL_APPLY_RESULT_TABLE);
+        self.gpu_tables
+            .borrow_mut()
+            .remove(LATERAL_APPLY_RESULT_TABLE);
+        Ok(QueryHandle::from_record_batch(out?))
     }
 
     /// Execute a mutually-recursive `WITH RECURSIVE` system (multiple CTEs that
@@ -7481,5 +7720,178 @@ mod tests {
         let cnt = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!((g.value(0), cda.value(0), sumx.value(0), cnt.value(0)), (1, 2, 6, 3));
         assert_eq!((g.value(1), cda.value(1), sumx.value(1), cnt.value(1)), (2, 1, 4, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // F3: LATERAL apply (host nested-loop dependent join)
+    // -----------------------------------------------------------------------
+
+    /// `left(k Int64, lbl Utf8)` and `vals(vk Int64, n Int64)` fixtures for the
+    /// LATERAL apply tests. `left` has a row (k=3) with no matching `vals`
+    /// rows, to exercise the INNER-drop / LEFT-keep behaviour.
+    fn register_lateral_fixtures(engine: &mut Engine) {
+        use arrow_array::StringArray;
+        let lk: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
+        let lbl: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let lschema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int64, false),
+            ArrowField::new("lbl", ArrowDataType::Utf8, false),
+        ]));
+        let left = RecordBatch::try_new(lschema, vec![lk, lbl]).expect("left batch");
+        engine.register_table("lft", left).expect("register lft");
+
+        // vals: (1,10),(1,11),(2,20) — k=1 has two, k=2 has one, k=3 has none.
+        let vk: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 1, 2]));
+        let n: ArrayRef = Arc::new(Int64Array::from(vec![10_i64, 11, 20]));
+        let vschema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("vk", ArrowDataType::Int64, false),
+            ArrowField::new("n", ArrowDataType::Int64, false),
+        ]));
+        let vals = RecordBatch::try_new(vschema, vec![vk, n]).expect("vals batch");
+        engine.register_table("vals", vals).expect("register vals");
+    }
+
+    /// Standalone provider (no Engine / no GPU) exposing `lft(k Int64, lbl Utf8)`
+    /// and `vals(vk Int64, n Int64)` for the host-only LATERAL detector tests.
+    fn lateral_provider() -> crate::plan::sql_frontend::MemTableProvider {
+        use crate::plan::logical_plan::{DataType, Field, Schema};
+        let lft = Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("lbl", DataType::Utf8, false),
+        ]);
+        let vals = Schema::new(vec![
+            Field::new("vk", DataType::Int64, false),
+            Field::new("n", DataType::Int64, false),
+        ]);
+        crate::plan::sql_frontend::MemTableProvider::new()
+            .with_table("lft", lft)
+            .with_table("vals", vals)
+    }
+
+    /// Parse → descriptor: a correlated LATERAL is detected and lowered to a
+    /// [`LateralApplyPlan`] (not the ordinary pipeline), with the LEFT relation,
+    /// the per-row subplan, the single correlation (`lft.k`), and INNER (not
+    /// LEFT) apply. Host-only: builds the descriptor without touching the GPU.
+    #[test]
+    fn lateral_apply_parse_descriptor() {
+        let provider = lateral_provider();
+        let la = crate::plan::sql_frontend::plan_lateral_apply(
+            "SELECT lft.k, d.n FROM lft, LATERAL (SELECT n FROM vals WHERE vk = lft.k) AS d",
+            &provider,
+        )
+        .expect("detector must not error")
+        .expect("a correlated LATERAL must produce a descriptor");
+        assert!(!la.left_join, "plain comma LATERAL is an INNER apply");
+        assert_eq!(la.outer_schema.fields.len(), 1, "one correlation: lft.k");
+        assert_eq!(la.corr_left_indices, vec![0], "lft.k is left column 0");
+        // The applied relation is left (k, lbl) ++ subquery (n) = 3 columns.
+        assert_eq!(la.combined_schema.fields.len(), 3);
+    }
+
+    /// A query with no LATERAL is declined by the detector (`Ok(None)`), so it
+    /// falls through to the ordinary pipeline. Host-only.
+    #[test]
+    fn lateral_apply_detector_declines_non_lateral() {
+        let provider = lateral_provider();
+        let got = crate::plan::sql_frontend::plan_lateral_apply("SELECT k FROM lft", &provider)
+            .expect("detector");
+        assert!(got.is_none(), "a non-LATERAL query must not be an apply");
+    }
+
+    /// Out-of-scope LATERAL shape: a non-`ON true` JOIN LATERAL predicate is
+    /// rejected precisely by the detector. Host-only.
+    #[test]
+    fn lateral_apply_rejects_non_on_true() {
+        let provider = lateral_provider();
+        let err = crate::plan::sql_frontend::plan_lateral_apply(
+            "SELECT lft.k, d.n FROM lft JOIN LATERAL (SELECT n FROM vals WHERE vk = lft.k) AS d \
+             ON lft.k = d.n",
+            &provider,
+        )
+        .expect_err("a residual JOIN LATERAL predicate must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("ON true"), "expected ON-true rejection, got: {msg}");
+    }
+
+    /// End-to-end correctness: a correlated LATERAL join. `k=1` yields two rows
+    /// (10,11), `k=2` one row (20), and `k=3` is DROPPED (INNER apply, no
+    /// matches). GPU-gated (subplans run through the device).
+    #[test]
+    #[ignore = "gpu:e2e — LATERAL apply subplans run through the GPU execute path"]
+    fn lateral_apply_inner_drops_unmatched() {
+        let mut engine = Engine::new().expect("ctx");
+        register_lateral_fixtures(&mut engine);
+        let h = engine
+            .sql(
+                "SELECT lft.k, d.n FROM lft, LATERAL (SELECT n FROM vals WHERE vk = lft.k) AS d \
+                 ORDER BY lft.k, d.n",
+            )
+            .expect("lateral apply must execute");
+        let b = h.record_batch();
+        assert_eq!(b.num_rows(), 3, "k=1 (2 rows) + k=2 (1 row); k=3 dropped");
+        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let n = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<(i64, i64)> = (0..b.num_rows()).map(|i| (k.value(i), n.value(i))).collect();
+        assert_eq!(got, vec![(1, 10), (1, 11), (2, 20)]);
+    }
+
+    /// LEFT JOIN LATERAL ... ON true keeps the unmatched left row (k=3) once
+    /// with the subquery column NULL. GPU-gated.
+    #[test]
+    #[ignore = "gpu:e2e — LATERAL apply subplans run through the GPU execute path"]
+    fn lateral_apply_left_join_keeps_unmatched() {
+        let mut engine = Engine::new().expect("ctx");
+        register_lateral_fixtures(&mut engine);
+        let h = engine
+            .sql(
+                "SELECT lft.k, d.n FROM lft LEFT JOIN LATERAL \
+                 (SELECT n FROM vals WHERE vk = lft.k) AS d ON true ORDER BY lft.k, d.n",
+            )
+            .expect("left join lateral must execute");
+        let b = h.record_batch();
+        // k=1 → 2 rows, k=2 → 1 row, k=3 → 1 NULL row = 4 total.
+        assert_eq!(b.num_rows(), 4, "unmatched left row kept once with NULL");
+        let n = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(
+            (0..b.num_rows()).filter(|&i| arrow_array::Array::is_null(n, i)).count() == 1,
+            "exactly one NULL subquery value (the k=3 left row)"
+        );
+    }
+
+    /// The mandatory per-left-row safety cap fires with a clean error when the
+    /// left input exceeds the (env-lowered) cap. GPU-gated (the left subplan
+    /// runs on the device before the cap check).
+    #[test]
+    #[ignore = "gpu:e2e — LATERAL apply left subplan runs through the GPU execute path"]
+    fn lateral_apply_left_row_cap() {
+        let mut engine = Engine::new().expect("ctx");
+        register_lateral_fixtures(&mut engine); // lft has 3 rows
+        std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "2");
+        let err = engine
+            .sql(
+                "SELECT lft.k, d.n FROM lft, LATERAL (SELECT n FROM vals WHERE vk = lft.k) AS d",
+            )
+            .expect_err("3 left rows must exceed the 2-row cap");
+        std::env::remove_var(MAX_APPLY_LEFT_ROWS_ENV);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("safety cap") && msg.contains("LATERAL"),
+            "expected LATERAL cap error, got: {msg}"
+        );
+    }
+
+    /// `max_apply_left_rows()` parses the env override (positive only) and
+    /// otherwise returns the default. Host-only.
+    #[test]
+    fn lateral_apply_cap_env_parsing() {
+        std::env::remove_var(MAX_APPLY_LEFT_ROWS_ENV);
+        assert_eq!(max_apply_left_rows(), MAX_APPLY_LEFT_ROWS);
+        std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "5");
+        assert_eq!(max_apply_left_rows(), 5);
+        std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "0");
+        assert_eq!(max_apply_left_rows(), MAX_APPLY_LEFT_ROWS, "zero falls back");
+        std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "nope");
+        assert_eq!(max_apply_left_rows(), MAX_APPLY_LEFT_ROWS, "non-int falls back");
+        std::env::remove_var(MAX_APPLY_LEFT_ROWS_ENV);
     }
 }

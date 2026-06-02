@@ -22,8 +22,8 @@ use sqlparser::tokenizer::Tokenizer;
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
     aggregate_output_name, apply_column_aliases, group_key_output_name, join_rename, AggregateExpr,
-    BinaryOp, DataType, Expr, FormatToken, JoinType, Literal, LogicalPlan, ScalarFnKind, Schema,
-    SetOpKind, SortExpr, TimeUnit, UnaryOp, WindowExpr, WindowFunc,
+    BinaryOp, DataType, Expr, Field, FormatToken, JoinType, Literal, LogicalPlan, ScalarFnKind,
+    Schema, SetOpKind, SortExpr, TimeUnit, UnaryOp, WindowExpr, WindowFunc,
 };
 use sqlparser::ast::{WindowFrameBound, WindowFrameUnits, WindowType};
 
@@ -469,6 +469,89 @@ impl<'a> NameResolver<'a> {
                 ))
             })?;
         Ok(resolved.output.clone())
+    }
+
+    /// Resolve a collected LATERAL correlation
+    /// ([`crate::plan::subquery::CorrRef`]) to the index of the matching column
+    /// in this (LEFT) resolver's *combined output schema* — i.e. the position
+    /// of its `output` name across all scopes in FROM order (base columns
+    /// first, then each joined table's). For a qualified `q.c` reference the
+    /// qualifier picks the scope; a bare `c` must be unambiguous across the
+    /// whole left relation.
+    ///
+    /// Uses the same case-folding convention as [`Self::resolve_compound`].
+    fn resolve_correlation(
+        &self,
+        corr: &crate::plan::subquery::CorrRef,
+    ) -> BoltResult<usize> {
+        // The output index of a column = the count of all output columns in
+        // earlier scopes + its position within its own scope.
+        let scope_base = |scope_i: usize| -> usize {
+            self.tables[..scope_i].iter().map(|t| t.cols.len()).sum()
+        };
+        match &corr.qualifier {
+            Some(q) => {
+                let q_lc = !q.chars().any(|c| c.is_ascii_uppercase());
+                let scope_i = self
+                    .tables
+                    .iter()
+                    .position(|t| t.name == *q)
+                    .or_else(|| {
+                        if !q_lc {
+                            return None;
+                        }
+                        self.tables
+                            .iter()
+                            .position(|t| t.name.eq_ignore_ascii_case(q))
+                    })
+                    .ok_or_else(|| {
+                        BoltError::Sql(format!("unknown table qualifier '{q}'"))
+                    })?;
+                let col_lc = !corr.column.chars().any(|c| c.is_ascii_uppercase());
+                let scope = &self.tables[scope_i];
+                let pos = scope
+                    .cols
+                    .iter()
+                    .position(|c| c.original == corr.column)
+                    .or_else(|| {
+                        if !col_lc {
+                            return None;
+                        }
+                        scope
+                            .cols
+                            .iter()
+                            .position(|c| c.original.eq_ignore_ascii_case(&corr.column))
+                    })
+                    .ok_or_else(|| {
+                        BoltError::Sql(format!(
+                            "unknown column '{}' in table '{q}'",
+                            corr.column
+                        ))
+                    })?;
+                Ok(scope_base(scope_i) + pos)
+            }
+            None => {
+                // Bare name: must be unambiguous across all scopes.
+                let mut found: Option<usize> = None;
+                for (scope_i, scope) in self.tables.iter().enumerate() {
+                    for (pos, c) in scope.cols.iter().enumerate() {
+                        if c.original.eq_ignore_ascii_case(&corr.column) {
+                            if found.is_some() {
+                                return Err(BoltError::Sql(format!(
+                                    "ambiguous outer column '{}' (appears in more \
+                                     than one left table)",
+                                    corr.column
+                                )));
+                            }
+                            found = Some(scope_base(scope_i) + pos);
+                        }
+                    }
+                }
+                found.ok_or_else(|| {
+                    BoltError::Sql(format!("unknown outer column '{}'", corr.column))
+                })
+            }
+        }
     }
 
     /// The set of (ASCII-lowercased) column names available in this resolver's
@@ -1292,6 +1375,104 @@ pub enum RecursiveQueryPlan {
     Single(RecursiveCtePlan),
     /// Two or more CTEs in the `WITH RECURSIVE` list (mutual recursion).
     Mutual(MutualRecursiveCtePlan),
+}
+
+// ---------------------------------------------------------------------------
+// LATERAL derived table — host nested-loop Apply (feature F3 — LATERAL)
+// ---------------------------------------------------------------------------
+
+/// Reserved ephemeral table name the per-left-row LATERAL subplan reads to pull
+/// the current outer row's correlated values. Each correlated outer reference
+/// in the LATERAL subquery is rewritten to a scalar subquery
+/// `(SELECT __corr_<i> FROM __lateral_outer)`; the engine binds a **single-row**
+/// relation under this name per left row, and `resolve_subqueries` folds those
+/// scalar subqueries to the row's exact typed value. The `__` prefix keeps it
+/// out of any user namespace.
+pub const LATERAL_OUTER_TABLE: &str = "__lateral_outer";
+
+/// Reserved ephemeral table name the OUTER query template
+/// ([`LateralApplyPlan::post`]) scans — the host-built applied relation
+/// (left columns ++ subquery columns). Mirrors
+/// [`COUNT_DISTINCT_GROUPBY_RESULT_TABLE`].
+pub const LATERAL_APPLY_RESULT_TABLE: &str = "__lateral_apply_result";
+
+/// Column-name prefix for the synthetic per-row outer-value columns bound under
+/// [`LATERAL_OUTER_TABLE`] (`__corr_0`, `__corr_1`, …), one per distinct
+/// correlated reference.
+pub const LATERAL_CORR_COL_PREFIX: &str = "__corr_";
+
+/// Descriptor for a `FROM <left>, LATERAL (<subquery>) AS <alias>` query
+/// (feature F3 — LATERAL), executed as a host-orchestrated nested-loop **Apply**
+/// (dependent join) rather than a single `LogicalPlan`.
+///
+/// A LATERAL derived table is *correlated*: its subquery may reference columns
+/// from the FROM items to its left, so it must be re-evaluated per left row with
+/// those outer values bound in. There is no single plan tree for that, so —
+/// exactly like [`RecursiveCtePlan`] and [`CountDistinctGroupByPlan`] — the
+/// engine orchestrates it host-side (see
+/// [`crate::exec::engine::Engine::execute_lateral_apply`]):
+///
+/// 1. Run [`Self::left`] → the left relation.
+/// 2. For each left row (bounded by a mandatory safety cap), bind a single-row
+///    [`LATERAL_OUTER_TABLE`] relation holding that row's correlated values
+///    (columns `__corr_0..N`, in [`Self::corr_left_indices`] order) and run
+///    [`Self::lateral_subplan`] — whose correlated references were rewritten to
+///    `(SELECT __corr_<i> FROM __lateral_outer)` scalar subqueries that
+///    `resolve_subqueries` folds to that row's exact typed value.
+/// 3. Emit the per-row cross product: the left row's columns concatenated with
+///    each produced subquery row. INNER LATERAL (plain comma / CROSS) drops a
+///    left row with zero subquery rows; `left_join` keeps it once with the
+///    subquery columns NULL-filled.
+/// 4. Bind the concatenated applied relation under [`LATERAL_APPLY_RESULT_TABLE`]
+///    and run [`Self::post`] (the OUTER query's projection / WHERE / GROUP BY /
+///    ORDER BY / LIMIT), whose `left.col` / `alias.col` references were
+///    pre-rewritten to the applied relation's bare column names.
+///
+/// Kept as a standalone descriptor (not a new `LogicalPlan`/`Expr` variant) so
+/// no exhaustive match in a shared file breaks.
+#[derive(Debug, Clone)]
+pub struct LateralApplyPlan {
+    /// The LEFT input: every FROM item before the LATERAL, lowered as an
+    /// ordinary self-contained `LogicalPlan`.
+    pub left: LogicalPlan,
+    /// Output schema of [`Self::left`] (the leading columns of the applied
+    /// relation).
+    pub left_schema: Schema,
+    /// The LATERAL subquery lowered to a `LogicalPlan` with every correlated
+    /// outer reference rewritten to a `(SELECT __corr_<i> FROM __lateral_outer)`
+    /// scalar subquery. Re-run per left row; its output is the subquery columns.
+    pub lateral_subplan: LogicalPlan,
+    /// Output schema of [`Self::lateral_subplan`] (the trailing columns of the
+    /// applied relation). Computed once by running the subplan with the outer
+    /// columns bound to typed NULLs.
+    pub subquery_schema: Schema,
+    /// Schema of the single-row [`LATERAL_OUTER_TABLE`] relation: one field
+    /// `__corr_<i>` per distinct correlation, carrying the matched left
+    /// column's dtype.
+    pub outer_schema: Schema,
+    /// For each `__corr_<i>` (in field order of [`Self::outer_schema`]), the
+    /// index into [`Self::left_schema`] of the left column whose value fills it
+    /// for the current row.
+    pub corr_left_indices: Vec<usize>,
+    /// Schema of the applied relation = [`Self::left_schema`] ++
+    /// [`Self::subquery_schema`], with duplicate names disambiguated (the same
+    /// `join_rename` rule the engine's JOIN output uses).
+    pub combined_schema: Schema,
+    /// OUTER query template: the user's projection / WHERE / GROUP BY / HAVING /
+    /// ORDER BY / LIMIT, lowered over a synthetic `Scan` of
+    /// [`LATERAL_APPLY_RESULT_TABLE`] (= [`Self::combined_schema`]).
+    pub post: LogicalPlan,
+    /// `true` for `LEFT JOIN LATERAL (...) ON true` (keep a left row with no
+    /// subquery match, subquery columns NULL); `false` for INNER (plain comma /
+    /// CROSS) LATERAL (drop such a left row).
+    pub left_join: bool,
+}
+
+impl LateralApplyPlan {
+    /// Overall output schema (== the OUTER template's schema).
+    pub fn schema(&self) -> BoltResult<Schema> {
+        self.post.schema()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2504,6 +2685,990 @@ pub fn plan_recursive_cte(
     }
     let plan = plan_recursive_query(&query, provider, &CteScope::new(), 0)?;
     Ok(Some(plan))
+}
+
+/// Detect a top-level LATERAL-apply query and build its [`LateralApplyPlan`]
+/// descriptor, mirroring [`plan_recursive_cte`]. Returns `Ok(None)` for every
+/// query that is not a LATERAL apply (the caller then falls through to the
+/// ordinary pipeline).
+pub fn plan_lateral_apply(
+    sql: &str,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<LateralApplyPlan>> {
+    guard_sql_size(sql)?;
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    if stmts.len() != 1 {
+        // Defer the canonical multi-statement error to the ordinary pipeline.
+        return Ok(None);
+    }
+    let stmt = stmts.remove(0);
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    plan_lateral_apply_query(&query, provider)
+}
+
+/// Detect and plan a top-level single-`SELECT` whose FROM contains a LATERAL
+/// derived table (feature F3 — LATERAL), returning a [`LateralApplyPlan`] the
+/// engine executes as a host nested-loop Apply.
+///
+/// Returns `Ok(Some(descriptor))` ONLY for the supported shape; `Ok(None)` for
+/// everything else (so [`Engine::sql`](crate::exec::engine::Engine::sql) falls
+/// through to the ordinary pipeline — where a *non-LATERAL* derived table is
+/// handled and a LATERAL one reached via the raw `parse()` API still hits the
+/// precise rejection in [`lower_table_factor`]). A malformed query of the right
+/// *shape* returns `Err`.
+///
+/// # Supported shape
+///
+/// A single `SELECT` (no top-level `WITH`, no set-op) whose FROM is
+/// `<left items> [, | CROSS JOIN | [LEFT] JOIN ... ON true] LATERAL (<subq>) AS a`
+/// where:
+/// * exactly one LATERAL derived table appears, and it is the **last** FROM
+///   item (a trailing comma item, or the relation of the last join of the last
+///   FROM item);
+/// * the join onto the LATERAL is a plain comma / `CROSS JOIN` (INNER apply) or
+///   `[INNER|LEFT] JOIN LATERAL (...) ON true` (the `ON true` is required —
+///   any other ON predicate is rejected, since the apply produces the
+///   correlated cross product and a residual join predicate is not modelled);
+/// * the LEFT items contain **no** LATERAL (nested LATERAL is rejected);
+/// * the LATERAL subquery alias is present and column-list-free.
+fn plan_lateral_apply_query(
+    query: &Query,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<LateralApplyPlan>> {
+    // Only a plain single SELECT (no WITH, no set-op) is in scope.
+    if query.with.is_some() {
+        return Ok(None);
+    }
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Ok(None),
+    };
+    if select.from.is_empty() {
+        return Ok(None);
+    }
+
+    // Locate the LATERAL derived table. We accept it only as the LAST FROM
+    // item — either a trailing comma item whose `relation` is LATERAL, or the
+    // `relation` of the last join of the last FROM item. Anything else
+    // (LATERAL not last, more than one LATERAL, LATERAL nested in the LEFT)
+    // is not our shape: `Ok(None)` for "no LATERAL at all", else `Err` with a
+    // precise message.
+    let is_lateral = |tf: &TableFactor| matches!(tf, TableFactor::Derived { lateral: true, .. });
+
+    // Count LATERAL occurrences across the whole FROM to reject the multi /
+    // not-last shapes precisely (and to short-circuit `Ok(None)` when none).
+    let mut lateral_count = 0usize;
+    for (i, twj) in select.from.iter().enumerate() {
+        if is_lateral(&twj.relation) {
+            // A LATERAL as a *base* FROM item (first comma item or any item's
+            // relation) only makes sense as a non-first comma item; a leading
+            // `FROM LATERAL (...)` has nothing to correlate against.
+            lateral_count += 1;
+            if i == 0 {
+                return Err(BoltError::Sql(
+                    "unsupported: leading LATERAL derived table (it has no \
+                     left-hand FROM item to correlate against)"
+                        .into(),
+                ));
+            }
+        }
+        for join in &twj.joins {
+            if is_lateral(&join.relation) {
+                lateral_count += 1;
+            }
+        }
+    }
+    if lateral_count == 0 {
+        return Ok(None);
+    }
+    if lateral_count > 1 {
+        return Err(BoltError::Sql(
+            "unsupported: more than one LATERAL derived table in FROM \
+             (only a single trailing LATERAL apply is supported)"
+                .into(),
+        ));
+    }
+
+    // Identify the single LATERAL and split the FROM into (left items, lateral
+    // factor, alias, left_join). We rebuild a "left" Select carrying every FROM
+    // item except the trailing LATERAL.
+    let last_idx = select.from.len() - 1;
+    let last_twj = &select.from[last_idx];
+
+    // Determine where the lateral sits and capture its (subquery, alias) plus
+    // the join kind (for INNER vs LEFT JOIN LATERAL and the `ON true` check).
+    let (lateral_subquery, lateral_alias, left_join): (&Query, &sqlparser::ast::TableAlias, bool) = {
+        if last_twj.joins.is_empty() {
+            // The trailing LATERAL must be the last comma item's relation.
+            if !is_lateral(&last_twj.relation) {
+                // LATERAL is somewhere earlier (not last) — reject precisely.
+                return Err(BoltError::Sql(
+                    "unsupported: LATERAL derived table must be the last FROM \
+                     item (apply runs the correlated subquery per left row)"
+                        .into(),
+                ));
+            }
+            match &last_twj.relation {
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let alias = alias.as_ref().ok_or_else(|| {
+                        BoltError::Sql(
+                            "LATERAL derived table requires an alias, e.g. \
+                             `LATERAL (SELECT ...) AS t`"
+                                .into(),
+                        )
+                    })?;
+                    (subquery.as_ref(), alias, false)
+                }
+                _ => unreachable!("is_lateral matched a Derived factor"),
+            }
+        } else {
+            // The trailing LATERAL is the relation of the LAST join of the last
+            // FROM item.
+            let last_join = last_twj.joins.last().unwrap();
+            if !is_lateral(&last_join.relation) {
+                return Err(BoltError::Sql(
+                    "unsupported: LATERAL derived table must be the last FROM \
+                     item (apply runs the correlated subquery per left row)"
+                        .into(),
+                ));
+            }
+            // The join onto the LATERAL must be CROSS / comma (INNER) or
+            // [INNER|LEFT] JOIN ... ON true. Any other ON predicate / kind is
+            // out of scope.
+            let left_join = match &last_join.join_operator {
+                JoinOperator::CrossJoin => false,
+                JoinOperator::Inner(c) => {
+                    require_on_true(c)?;
+                    false
+                }
+                JoinOperator::LeftOuter(c) => {
+                    require_on_true(c)?;
+                    true
+                }
+                other => {
+                    return Err(BoltError::Sql(format!(
+                        "unsupported: JOIN LATERAL kind {other:?}; supported: \
+                         comma / CROSS JOIN (INNER apply) or [INNER|LEFT] JOIN \
+                         LATERAL (...) ON true"
+                    )));
+                }
+            };
+            match &last_join.relation {
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let alias = alias.as_ref().ok_or_else(|| {
+                        BoltError::Sql(
+                            "LATERAL derived table requires an alias, e.g. \
+                             `LATERAL (SELECT ...) AS t`"
+                                .into(),
+                        )
+                    })?;
+                    (subquery.as_ref(), alias, left_join)
+                }
+                _ => unreachable!("is_lateral matched a Derived factor"),
+            }
+        }
+    };
+    if !lateral_alias.columns.is_empty() {
+        return Err(BoltError::Sql(
+            "unsupported: LATERAL alias with column list (AS t(c1, c2))".into(),
+        ));
+    }
+    let lateral_qualifier = lateral_alias.name.value.clone();
+
+    // --- Build the LEFT relation + a resolver describing its qualifiers /
+    // columns, by walking the FROM items minus the trailing LATERAL. ---
+    let ctes = CteScope::new();
+    let (left_plan, left_resolver) =
+        build_left_relation(select, last_idx, provider, &ctes, is_lateral)?;
+    let left_schema = left_plan.schema()?;
+
+    // --- Collect the LATERAL subquery's correlations against the LEFT scope. ---
+    let outer_columns = left_resolver.outer_column_names();
+    let corrs =
+        crate::plan::subquery::collect_correlations(lateral_subquery, &outer_columns, provider)?;
+
+    // Map each correlation to a LEFT output column (by qualifier+col, or by
+    // bare col). Build the synthetic outer schema (`__corr_<i>` fields with the
+    // matched left column's dtype) + the per-row source index list.
+    let mut outer_fields: Vec<Field> = Vec::with_capacity(corrs.len());
+    let mut corr_left_indices: Vec<usize> = Vec::with_capacity(corrs.len());
+    // The rewrite map: (corr) -> the `__corr_<i>` name to substitute it with.
+    let mut corr_to_synth: Vec<(crate::plan::subquery::CorrRef, String)> =
+        Vec::with_capacity(corrs.len());
+    for (i, corr) in corrs.iter().enumerate() {
+        let left_idx = left_resolver.resolve_correlation(corr).map_err(|e| {
+            BoltError::Sql(format!(
+                "LATERAL subquery references outer column it cannot resolve: {e}"
+            ))
+        })?;
+        let synth = format!("{LATERAL_CORR_COL_PREFIX}{i}");
+        outer_fields.push(Field::new(
+            synth.clone(),
+            left_schema.fields[left_idx].dtype,
+            true,
+        ));
+        corr_left_indices.push(left_idx);
+        corr_to_synth.push((corr.clone(), synth));
+    }
+    let outer_schema = Schema::new(outer_fields);
+
+    // --- Rewrite the LATERAL subquery AST: each correlated reference becomes a
+    // scalar subquery `(SELECT __corr_<i> FROM __lateral_outer)`. The single-row
+    // outer table the engine binds per row makes that fold (via
+    // `resolve_subqueries`) to the row's exact typed value. ---
+    let mut rewritten = lateral_subquery.clone();
+    rewrite_correlations_in_query(&mut rewritten, &corr_to_synth, &left_resolver, 0)?;
+
+    // Lower the rewritten subquery. The synthetic `__lateral_outer` scalar
+    // subqueries resolve against the provider extended with the outer schema.
+    let ext_provider = LateralProvider {
+        base: provider,
+        outer_schema: &outer_schema,
+    };
+    let lateral_subplan = plan_query(&rewritten, &ext_provider, &CteScope::new(), 1)?;
+    let subquery_schema = lateral_subplan.schema()?;
+
+    // --- Combined (applied) schema: left ++ subquery, with the same
+    // duplicate-name disambiguation the engine's JOIN output uses, so the
+    // OUTER template can reference both sides unambiguously. ---
+    let (combined_schema, sub_output_names) =
+        combine_lateral_schemas(&left_schema, &subquery_schema);
+
+    // --- Build the OUTER query template: rewrite the user's SELECT so its FROM
+    // is the single `__lateral_apply_result` table and its `left.col` /
+    // `alias.col` references become the applied relation's bare column names,
+    // then lower it normally. ---
+    let post = build_lateral_post(
+        select,
+        query,
+        &left_resolver,
+        &lateral_qualifier,
+        &subquery_schema,
+        &sub_output_names,
+        &combined_schema,
+    )?;
+
+    Ok(Some(LateralApplyPlan {
+        left: left_plan,
+        left_schema,
+        lateral_subplan,
+        subquery_schema,
+        outer_schema,
+        corr_left_indices,
+        combined_schema,
+        post,
+        left_join,
+    }))
+}
+
+/// Require that a JOIN constraint is exactly `ON true` (the only predicate a
+/// `JOIN LATERAL` apply models — it produces the correlated cross product, so a
+/// residual join predicate is out of scope). `USING` / `NATURAL` / a non-`true`
+/// ON expression are rejected precisely.
+fn require_on_true(c: &JoinConstraint) -> BoltResult<()> {
+    match c {
+        JoinConstraint::On(SqlExpr::Value(Value::Boolean(true))) => Ok(()),
+        JoinConstraint::None => Ok(()),
+        _ => Err(BoltError::Sql(
+            "unsupported: JOIN LATERAL requires `ON true` (a residual join \
+             predicate on a LATERAL apply is not supported — move it into the \
+             subquery's WHERE)"
+                .into(),
+        )),
+    }
+}
+
+/// A [`TableProvider`] wrapper that additionally resolves the synthetic
+/// per-row [`LATERAL_OUTER_TABLE`] to a fixed `outer_schema`, so the rewritten
+/// LATERAL subquery (whose correlations became
+/// `(SELECT __corr_<i> FROM __lateral_outer)`) lowers cleanly. Every other name
+/// delegates to the base provider.
+struct LateralProvider<'a> {
+    base: &'a dyn TableProvider,
+    outer_schema: &'a Schema,
+}
+
+impl TableProvider for LateralProvider<'_> {
+    fn schema(&self, name: &str) -> BoltResult<Schema> {
+        if name == LATERAL_OUTER_TABLE || name.eq_ignore_ascii_case(LATERAL_OUTER_TABLE) {
+            return Ok(self.outer_schema.clone());
+        }
+        self.base.schema(name)
+    }
+    fn schema_version(&self) -> u64 {
+        self.base.schema_version()
+    }
+}
+
+/// Build the LEFT relation (all FROM items except the trailing LATERAL) and a
+/// [`NameResolver`] describing its qualifier / column namespace.
+///
+/// This mirrors the base + join-step construction in [`plan_select`], but stops
+/// before the trailing LATERAL item: for the last FROM item it includes every
+/// join *except* the final one (which is the LATERAL). A LATERAL anywhere in
+/// the LEFT portion is rejected (nested LATERAL is out of scope).
+fn build_left_relation<'a>(
+    select: &Select,
+    last_idx: usize,
+    provider: &'a dyn TableProvider,
+    ctes: &'a CteScope,
+    is_lateral: impl Fn(&TableFactor) -> bool,
+) -> BoltResult<(LogicalPlan, NameResolver<'a>)> {
+    let first = &select.from[0];
+    if is_lateral(&first.relation) {
+        return Err(BoltError::Sql(
+            "unsupported: LATERAL as a base FROM item".into(),
+        ));
+    }
+    let (base_plan, base_qualifier, scan_schema) =
+        lower_table_factor(&first.relation, provider, ctes, 1)?;
+    let mut resolver = NameResolver::empty();
+    resolver.ctx = Some(SubqueryCtx { provider, ctes });
+    resolver.push_base(base_qualifier, &scan_schema);
+    let mut plan = base_plan;
+
+    // Walk the join steps exactly as `plan_select`, but excluding the trailing
+    // LATERAL (the last join of the last FROM item, or the last comma item).
+    for (from_idx, item) in select.from.iter().enumerate() {
+        // The trailing comma LATERAL item contributes no left step.
+        if from_idx == last_idx && item.joins.is_empty() {
+            // This is the LATERAL comma item — skip entirely.
+            continue;
+        }
+        if from_idx > 0 {
+            if is_lateral(&item.relation) {
+                return Err(BoltError::Sql(
+                    "unsupported: LATERAL as a non-trailing FROM item".into(),
+                ));
+            }
+            let (rhs_plan, rhs_qualifier, rhs_schema) =
+                lower_table_factor(&item.relation, provider, ctes, 1)?;
+            resolver.push_join(rhs_qualifier, &rhs_schema);
+            plan = LogicalPlan::Join {
+                left: Box::new(plan),
+                right: Box::new(rhs_plan),
+                join_type: JoinType::Cross,
+                on: Vec::new(),
+                filter: None,
+            };
+        }
+        // The number of joins to include: all of them, except — for the last
+        // FROM item — drop the final one (it is the LATERAL).
+        let join_limit = if from_idx == last_idx {
+            item.joins.len() - 1
+        } else {
+            item.joins.len()
+        };
+        for join in &item.joins[..join_limit] {
+            if is_lateral(&join.relation) {
+                return Err(BoltError::Sql(
+                    "unsupported: LATERAL as a non-trailing JOIN".into(),
+                ));
+            }
+            let (join_type, constraint): (JoinType, Option<&JoinConstraint>) =
+                match &join.join_operator {
+                    JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
+                    JoinOperator::LeftOuter(c) => (JoinType::LeftOuter, Some(c)),
+                    JoinOperator::RightOuter(c) => (JoinType::RightOuter, Some(c)),
+                    JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
+                    JoinOperator::CrossJoin => (JoinType::Cross, None),
+                    other => {
+                        return Err(BoltError::Sql(format!(
+                            "unsupported join kind: {other:?}; supported: \
+                             INNER, LEFT, RIGHT, FULL OUTER, CROSS"
+                        )));
+                    }
+                };
+            let (rhs_plan, rhs_qualifier, rhs_schema) =
+                lower_table_factor(&join.relation, provider, ctes, 1)?;
+            resolver.push_join(rhs_qualifier.clone(), &rhs_schema);
+            let rhs_qualifier_for_on = rhs_qualifier;
+            let (on_pairs, filter) = match constraint {
+                Some(JoinConstraint::On(e)) => {
+                    let lowered = lower_join_on(e, &resolver, &rhs_qualifier_for_on)?;
+                    (lowered.equi_pairs, lowered.filter)
+                }
+                Some(JoinConstraint::Using(cols)) => {
+                    (desugar_using_columns(cols, &resolver)?, None)
+                }
+                Some(JoinConstraint::Natural) => (desugar_natural_columns(&resolver)?, None),
+                Some(JoinConstraint::None) => {
+                    return Err(BoltError::Sql(
+                        "JOIN requires an ON, USING, or NATURAL clause".into(),
+                    ));
+                }
+                None => (Vec::new(), None),
+            };
+            plan = LogicalPlan::Join {
+                left: Box::new(plan),
+                right: Box::new(rhs_plan),
+                join_type,
+                on: on_pairs,
+                filter,
+            };
+        }
+    }
+    Ok((plan, resolver))
+}
+
+/// Combine the left + subquery schemas into the applied-relation schema using
+/// the same `join_rename` disambiguation the engine's JOIN output uses. Returns
+/// the combined schema and the *output* name each subquery column maps to (so
+/// the OUTER template can rewrite `alias.col` references).
+fn combine_lateral_schemas(left: &Schema, sub: &Schema) -> (Schema, Vec<String>) {
+    let mut taken: std::collections::HashSet<String> =
+        left.fields.iter().map(|f| f.name.clone()).collect();
+    let mut fields: Vec<Field> = left.fields.clone();
+    let mut sub_names: Vec<String> = Vec::with_capacity(sub.fields.len());
+    for f in &sub.fields {
+        let out = join_rename(&f.name, &mut taken);
+        sub_names.push(out.clone());
+        fields.push(Field::new(out, f.dtype, f.nullable));
+    }
+    (Schema::new(fields), sub_names)
+}
+
+/// Rewrite the OUTER query into a `post` [`LogicalPlan`]: replace its FROM with
+/// the single applied-relation table and its `left.col` / `alias.col`
+/// references with the applied relation's bare column names, then lower it via
+/// [`plan_select`] against a provider exposing that table.
+#[allow(clippy::too_many_arguments)]
+fn build_lateral_post(
+    select: &Select,
+    query: &Query,
+    left_resolver: &NameResolver<'_>,
+    lateral_qualifier: &str,
+    subquery_schema: &Schema,
+    sub_output_names: &[String],
+    combined_schema: &Schema,
+) -> BoltResult<LogicalPlan> {
+    // Rename map: every spelling the user may use for an applied-relation column
+    // → its bare combined-schema name.
+    //   * left `qual.col`  → left output name (already a combined name)
+    //   * left bare `col`  → left output name (when unambiguous)
+    //   * lateral `alias.col` / bare subquery `col` → its combined output name
+    let map = LateralRefMap::build(
+        left_resolver,
+        lateral_qualifier,
+        subquery_schema,
+        sub_output_names,
+        combined_schema,
+    );
+
+    // Clone + rewrite the SELECT so FROM is the single result table and all
+    // column references are bare combined names.
+    let mut out_select = select.clone();
+    out_select.from = vec![sqlparser::ast::TableWithJoins {
+        relation: TableFactor::Table {
+            name: ObjectName(vec![Ident::new(LATERAL_APPLY_RESULT_TABLE)]),
+            alias: None,
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            partitions: Vec::new(),
+            with_ordinality: false,
+        },
+        joins: Vec::new(),
+    }];
+    rewrite_refs_in_select(&mut out_select, &map)?;
+
+    // Lower the rewritten SELECT against a provider exposing the result table.
+    let result_provider = LateralResultProvider {
+        schema: combined_schema,
+    };
+    let ctes = CteScope::new();
+    let mut plan = plan_select(&out_select, &result_provider, &ctes, 1)?;
+
+    // Layer the outer query's ORDER BY / LIMIT (mirrors `plan_query`). They run
+    // over the projected result, so references are resolved post-projection;
+    // rewrite ORDER BY exprs to bare names too.
+    if let Some(order_by) = &query.order_by {
+        let mut order_exprs = order_by.exprs.clone();
+        for ob in &mut order_exprs {
+            rewrite_refs_in_expr(&mut ob.expr, &map, 0)?;
+        }
+        let sort_exprs = lower_order_by(
+            &order_exprs,
+            SubqueryCtx {
+                provider: &result_provider,
+                ctes: &ctes,
+            },
+        )?;
+        if !sort_exprs.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                sort_exprs,
+            };
+        }
+    }
+    if !query.limit_by.is_empty() {
+        return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
+    }
+    if query.fetch.is_some() {
+        return Err(BoltError::Sql("unsupported: FETCH".into()));
+    }
+    let limit_value = match &query.limit {
+        Some(e) => Some(usize_from_literal(e, "LIMIT")?),
+        None => None,
+    };
+    let offset_value = match &query.offset {
+        Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
+        None => None,
+    };
+    if limit_value.is_some() || offset_value.is_some() {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: limit_value.unwrap_or(usize::MAX),
+            offset: offset_value.unwrap_or(0),
+        };
+    }
+    let _ = plan.schema()?;
+    Ok(plan)
+}
+
+/// A [`TableProvider`] exposing exactly the applied-relation schema under
+/// [`LATERAL_APPLY_RESULT_TABLE`].
+struct LateralResultProvider<'a> {
+    schema: &'a Schema,
+}
+impl TableProvider for LateralResultProvider<'_> {
+    fn schema(&self, name: &str) -> BoltResult<Schema> {
+        if name == LATERAL_APPLY_RESULT_TABLE || name.eq_ignore_ascii_case(LATERAL_APPLY_RESULT_TABLE)
+        {
+            return Ok(self.schema.clone());
+        }
+        Err(BoltError::Plan(format!(
+            "LATERAL apply OUTER template referenced unknown table '{name}' \
+             (only the applied relation is in scope)"
+        )))
+    }
+}
+
+/// Maps each user-spellable applied-relation reference to its bare
+/// combined-schema column name, for rewriting the OUTER template.
+struct LateralRefMap {
+    /// `qualifier.col` (both lower-cased) → combined name.
+    qualified: HashMap<(String, String), String>,
+    /// bare `col` (lower-cased) → combined name, only for names unambiguous
+    /// across the whole applied relation.
+    bare: HashMap<String, String>,
+}
+
+impl LateralRefMap {
+    fn build(
+        left_resolver: &NameResolver<'_>,
+        lateral_qualifier: &str,
+        subquery_schema: &Schema,
+        sub_output_names: &[String],
+        combined_schema: &Schema,
+    ) -> Self {
+        let mut qualified: HashMap<(String, String), String> = HashMap::new();
+        // bare_counts tracks ambiguity across the *combined* relation.
+        let mut bare_counts: HashMap<String, usize> = HashMap::new();
+        let mut bare: HashMap<String, String> = HashMap::new();
+
+        // Left side: each (qualifier, original col) → its output (combined) name.
+        for scope in &left_resolver.tables {
+            let q = scope.name.to_ascii_lowercase();
+            for c in &scope.cols {
+                qualified.insert(
+                    (q.clone(), c.original.to_ascii_lowercase()),
+                    c.output.clone(),
+                );
+                *bare_counts.entry(c.original.to_ascii_lowercase()).or_insert(0) += 1;
+                bare.insert(c.original.to_ascii_lowercase(), c.output.clone());
+            }
+        }
+        // Lateral side: `alias.col` and bare `col` → its combined output name.
+        let q = lateral_qualifier.to_ascii_lowercase();
+        for (f, out) in subquery_schema.fields.iter().zip(sub_output_names) {
+            qualified.insert((q.clone(), f.name.to_ascii_lowercase()), out.clone());
+            *bare_counts.entry(f.name.to_ascii_lowercase()).or_insert(0) += 1;
+            bare.insert(f.name.to_ascii_lowercase(), out.clone());
+        }
+        // Keep only unambiguous bare names.
+        bare.retain(|k, _| bare_counts.get(k).copied().unwrap_or(0) == 1);
+        // Sanity: every combined field name is a valid bare target too (so a
+        // `SELECT *`-expanded reference resolves). Already covered by the loops.
+        let _ = combined_schema;
+        LateralRefMap { qualified, bare }
+    }
+
+    /// Resolve a bare identifier to its combined name (if unambiguous).
+    fn resolve_bare(&self, col: &str) -> Option<String> {
+        self.bare.get(&col.to_ascii_lowercase()).cloned()
+    }
+    /// Resolve a `qualifier.col` reference to its combined name.
+    fn resolve_qualified(&self, qual: &str, col: &str) -> Option<String> {
+        self.qualified
+            .get(&(qual.to_ascii_lowercase(), col.to_ascii_lowercase()))
+            .cloned()
+    }
+}
+
+/// Build the scalar-subquery AST `(SELECT <synth> FROM __lateral_outer)` used
+/// to replace a correlated reference. Parsed from SQL text (rather than
+/// hand-built) so it stays robust to sqlparser struct churn.
+fn lateral_corr_subquery(synth: &str) -> BoltResult<SqlExpr> {
+    let sql = format!("SELECT {synth} FROM {LATERAL_OUTER_TABLE}");
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, &sql).map_err(|e| parse_error_to_bolt_error(e, &sql))?;
+    let stmt = stmts.remove(0);
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => unreachable!("synthetic correlation subquery is always a SELECT"),
+    };
+    Ok(SqlExpr::Subquery(query))
+}
+
+/// Rewrite every correlated reference in a LATERAL subquery `Query` to its
+/// `(SELECT __corr_<i> FROM __lateral_outer)` scalar subquery. Does NOT descend
+/// into nested subqueries (each validates its own scope; the collector likewise
+/// stops at subquery boundaries, so a deeper correlation is not in scope here).
+fn rewrite_correlations_in_query(
+    query: &mut Query,
+    corr_to_synth: &[(crate::plan::subquery::CorrRef, String)],
+    left_resolver: &NameResolver<'_>,
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    let _ = left_resolver;
+    rewrite_correlations_in_setexpr(query.body.as_mut(), corr_to_synth, depth + 1)
+}
+
+fn rewrite_correlations_in_setexpr(
+    set: &mut SetExpr,
+    corr_to_synth: &[(crate::plan::subquery::CorrRef, String)],
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    match set {
+        SetExpr::Select(s) => {
+            let select = s.as_mut();
+            for item in &mut select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(e)
+                    | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        rewrite_corr_expr(e, corr_to_synth, depth + 1)?;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(w) = &mut select.selection {
+                rewrite_corr_expr(w, corr_to_synth, depth + 1)?;
+            }
+            if let Some(h) = &mut select.having {
+                rewrite_corr_expr(h, corr_to_synth, depth + 1)?;
+            }
+            if let GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
+                for e in exprs {
+                    rewrite_corr_expr(e, corr_to_synth, depth + 1)?;
+                }
+            }
+            for twj in &mut select.from {
+                for join in &mut twj.joins {
+                    if let Some(on) = join_on_expr_mut(&mut join.join_operator) {
+                        rewrite_corr_expr(on, corr_to_synth, depth + 1)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        SetExpr::Query(q) => {
+            rewrite_correlations_in_query(q, corr_to_synth, &NameResolver::empty(), depth + 1)
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            rewrite_correlations_in_setexpr(left, corr_to_synth, depth + 1)?;
+            rewrite_correlations_in_setexpr(right, corr_to_synth, depth + 1)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Pull a mutable ON expression out of a `JoinOperator`, if it carries one.
+fn join_on_expr_mut(op: &mut JoinOperator) -> Option<&mut SqlExpr> {
+    let constraint = match op {
+        JoinOperator::Inner(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c) => c,
+        _ => return None,
+    };
+    match constraint {
+        JoinConstraint::On(e) => Some(e),
+        _ => None,
+    }
+}
+
+/// Find the synthetic name for a (qualifier, column) correlation, if any.
+fn corr_synth_for<'a>(
+    corr_to_synth: &'a [(crate::plan::subquery::CorrRef, String)],
+    qualifier: Option<&str>,
+    column: &str,
+) -> Option<&'a str> {
+    let q = qualifier.map(|q| q.to_ascii_lowercase());
+    let c = column.to_ascii_lowercase();
+    corr_to_synth
+        .iter()
+        .find(|(r, _)| r.qualifier == q && r.column == c)
+        .map(|(_, s)| s.as_str())
+}
+
+/// Recursively replace correlated `Identifier`/`CompoundIdentifier` nodes in an
+/// expression. Subqueries are not descended into (matching the collector).
+fn rewrite_corr_expr(
+    e: &mut SqlExpr,
+    corr_to_synth: &[(crate::plan::subquery::CorrRef, String)],
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    let replacement: Option<SqlExpr> = match &*e {
+        SqlExpr::Identifier(ident) => corr_synth_for(corr_to_synth, None, &ident.value)
+            .map(lateral_corr_subquery)
+            .transpose()?,
+        SqlExpr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            corr_synth_for(corr_to_synth, Some(&parts[0].value), &parts[1].value)
+                .map(lateral_corr_subquery)
+                .transpose()?
+        }
+        _ => None,
+    };
+    if let Some(r) = replacement {
+        *e = r;
+        return Ok(());
+    }
+    match e {
+        SqlExpr::Nested(inner) => rewrite_corr_expr(inner, corr_to_synth, depth + 1),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            rewrite_corr_expr(left, corr_to_synth, depth + 1)?;
+            rewrite_corr_expr(right, corr_to_synth, depth + 1)
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::Cast { expr, .. } => rewrite_corr_expr(expr, corr_to_synth, depth + 1),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_corr_expr(expr, corr_to_synth, depth + 1)?;
+            rewrite_corr_expr(low, corr_to_synth, depth + 1)?;
+            rewrite_corr_expr(high, corr_to_synth, depth + 1)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            rewrite_corr_expr(expr, corr_to_synth, depth + 1)?;
+            for v in list {
+                rewrite_corr_expr(v, corr_to_synth, depth + 1)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            rewrite_corr_expr(expr, corr_to_synth, depth + 1)?;
+            rewrite_corr_expr(pattern, corr_to_synth, depth + 1)
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                rewrite_corr_expr(op, corr_to_synth, depth + 1)?;
+            }
+            for c in conditions {
+                rewrite_corr_expr(c, corr_to_synth, depth + 1)?;
+            }
+            for r in results {
+                rewrite_corr_expr(r, corr_to_synth, depth + 1)?;
+            }
+            if let Some(er) = else_result {
+                rewrite_corr_expr(er, corr_to_synth, depth + 1)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Function(func) => {
+            if let FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(ae))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(ae),
+                        ..
+                    } = arg
+                    {
+                        rewrite_corr_expr(ae, corr_to_synth, depth + 1)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            rewrite_corr_expr(expr, corr_to_synth, depth + 1)?;
+            if let Some(f) = substring_from {
+                rewrite_corr_expr(f, corr_to_synth, depth + 1)?;
+            }
+            if let Some(f) = substring_for {
+                rewrite_corr_expr(f, corr_to_synth, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Rewrite every applied-relation reference in the OUTER template SELECT to its
+/// bare combined-schema column name (so it resolves against the single
+/// `__lateral_apply_result` table). Wildcards expand naturally against that
+/// table's schema, so they are left untouched.
+fn rewrite_refs_in_select(select: &mut Select, map: &LateralRefMap) -> BoltResult<()> {
+    for item in &mut select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                rewrite_refs_in_expr(e, map, 0)?;
+            }
+            _ => {}
+        }
+    }
+    if let Some(w) = &mut select.selection {
+        rewrite_refs_in_expr(w, map, 0)?;
+    }
+    if let Some(h) = &mut select.having {
+        rewrite_refs_in_expr(h, map, 0)?;
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
+        for e in exprs {
+            rewrite_refs_in_expr(e, map, 0)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively rewrite `qualifier.col` / bare `col` references to their bare
+/// combined name. A reference that resolves to no applied-relation column is
+/// left as-is (so `plan_select`'s ordinary resolution produces the precise
+/// unknown-column error against the result schema).
+fn rewrite_refs_in_expr(e: &mut SqlExpr, map: &LateralRefMap, depth: usize) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    let replacement: Option<String> = match &*e {
+        SqlExpr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            map.resolve_qualified(&parts[0].value, &parts[1].value)
+        }
+        SqlExpr::Identifier(ident) => map.resolve_bare(&ident.value),
+        _ => None,
+    };
+    if let Some(name) = replacement {
+        *e = SqlExpr::Identifier(Ident::new(name));
+        return Ok(());
+    }
+    match e {
+        SqlExpr::Nested(inner) => rewrite_refs_in_expr(inner, map, depth + 1),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            rewrite_refs_in_expr(left, map, depth + 1)?;
+            rewrite_refs_in_expr(right, map, depth + 1)
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::Cast { expr, .. } => rewrite_refs_in_expr(expr, map, depth + 1),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_refs_in_expr(expr, map, depth + 1)?;
+            rewrite_refs_in_expr(low, map, depth + 1)?;
+            rewrite_refs_in_expr(high, map, depth + 1)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            rewrite_refs_in_expr(expr, map, depth + 1)?;
+            for v in list {
+                rewrite_refs_in_expr(v, map, depth + 1)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            rewrite_refs_in_expr(expr, map, depth + 1)?;
+            rewrite_refs_in_expr(pattern, map, depth + 1)
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                rewrite_refs_in_expr(op, map, depth + 1)?;
+            }
+            for c in conditions {
+                rewrite_refs_in_expr(c, map, depth + 1)?;
+            }
+            for r in results {
+                rewrite_refs_in_expr(r, map, depth + 1)?;
+            }
+            if let Some(er) = else_result {
+                rewrite_refs_in_expr(er, map, depth + 1)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Function(func) => {
+            if let FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(ae))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(ae),
+                        ..
+                    } = arg
+                    {
+                        rewrite_refs_in_expr(ae, map, depth + 1)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            rewrite_refs_in_expr(expr, map, depth + 1)?;
+            if let Some(f) = substring_from {
+                rewrite_refs_in_expr(f, map, depth + 1)?;
+            }
+            if let Some(f) = substring_for {
+                rewrite_refs_in_expr(f, map, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Plan a `WITH RECURSIVE` [`Query`] into a [`RecursiveQueryPlan`].
@@ -5008,49 +6173,33 @@ fn lower_table_factor(
             subquery,
             alias,
         } => {
-            // LATERAL decision (feature F3 — assessment outcome: REJECT
-            // cleanly, do not ship a half-correct apply).
+            // LATERAL (feature F3): the supported shapes
+            // (`FROM <left>, LATERAL (subq) AS a`, plus CROSS / [INNER|LEFT]
+            // JOIN LATERAL (...) ON true) are detected and orchestrated host-side
+            // as a nested-loop Apply *before* this ordinary lowering path runs —
+            // see [`plan_lateral_apply`] and `Engine::execute_lateral_apply`,
+            // wired into `Engine::sql` / `Engine::explain_sql` exactly like the
+            // WITH RECURSIVE hook. So a LATERAL reaching HERE is one the apply
+            // detector deliberately declined, namely:
             //
-            // A LATERAL derived table may reference columns from FROM items to
-            // its LEFT (`FROM t, LATERAL (SELECT ... WHERE x = t.c) d`), so the
-            // subquery is *correlated*: it must be re-evaluated per outer row
-            // with the outer row's values bound in. The engine has no
-            // correlated-execution path — every derived table / subquery here
-            // lowers to a self-contained, uncorrelated subplan executed exactly
-            // once (see [`crate::plan::subquery::reject_if_correlated`], which
-            // rejects any outer-column reference).
+            //   * the raw `parse()` API (which bypasses the engine detector
+            //     entirely — like WITH RECURSIVE / COUNT(DISTINCT) GROUP BY, this
+            //     feature is only wired into `Engine::sql` / `Engine::explain_sql`);
+            //   * an out-of-scope LATERAL shape the detector returned `Err` for
+            //     (more than one LATERAL, LATERAL not last, a non-`ON true` JOIN
+            //     LATERAL predicate, …) — those surface the detector's precise
+            //     message and never reach this arm.
             //
-            // Two correct paths were considered and BOTH deferred:
-            //   1. Decorrelate a *simple* equality-correlated LATERAL into an
-            //      inner join (`... WHERE d.x = t.c` ⇒ `t JOIN (uncorrelated d)
-            //      ON d.x = t.c`). This is only sound for the narrow shape where
-            //      the correlation is a conjunction of equalities and the inner
-            //      body is otherwise uncorrelated and duplicate-preserving; it
-            //      silently changes results for LATERALs with aggregates,
-            //      LIMIT, non-equality correlation, or that must produce a row
-            //      per outer row even with no match (LEFT-JOIN-LATERAL). The
-            //      frontend cannot yet detect that safe sub-shape reliably (the
-            //      correlation predicate is buried inside the subquery's WHERE
-            //      and is not surfaced as a join key by name resolution), so a
-            //      naive decorrelation here would be the "half-correct LATERAL"
-            //      the spec forbids.
-            //   2. A nested-loop apply (re-plan + re-run the inner subplan per
-            //      outer row with the outer schema threaded into resolution).
-            //      This is general and correct but needs a new correlated
-            //      planning contract + an Apply executor — substantial new
-            //      machinery outside the scope of these files.
-            //
-            // Unlike non-linear and mutual recursion (now implemented as
-            // host-orchestrated fixpoints that reuse the existing single-query
-            // executor), neither LATERAL path reuses existing machinery without
-            // a correctness risk, so this stays a precise, documented rejection.
+            // Either way this arm cannot run a correlated subquery as a plain
+            // uncorrelated subplan, so it stays a precise rejection that points
+            // at the engine path.
             if *lateral {
                 return Err(BoltError::Sql(
-                    "unsupported: LATERAL derived table — a correlated subquery in \
-                     FROM needs a per-row apply or a (safe-shape) decorrelation \
-                     into a join, neither of which the engine implements; all \
-                     derived tables are executed once as uncorrelated subplans. \
-                     Rewrite the correlation as an explicit JOIN where possible"
+                    "unsupported: LATERAL derived table on this code path — a \
+                     correlated LATERAL apply is executed host-side by the engine \
+                     (Engine::sql / Engine::explain_sql), not by the raw parse() \
+                     API; supported shapes are `FROM <left>, LATERAL (subq) AS a` \
+                     and `[INNER|LEFT] JOIN LATERAL (subq) AS a ON true`"
                         .into(),
                 ));
             }
@@ -11810,20 +12959,21 @@ mod root_setop_schema_tests {
         );
     }
 
-    /// A LATERAL derived table is correlated and stays rejected with a precise
-    /// message (no correlated-execution path exists). Used as the sole FROM
-    /// item so the rejection comes from the derived-table arm itself.
+    /// On the raw `parse()` path (which bypasses the engine's LATERAL-apply
+    /// detector) a LATERAL derived table stays rejected with a precise message
+    /// that points at the engine path. Used as the sole FROM item so the
+    /// rejection comes from the derived-table arm itself.
     #[test]
     fn lateral_derived_table_rejected() {
         let err = parse("SELECT a FROM LATERAL (SELECT a FROM t2) AS d", &provider())
-            .expect_err("LATERAL derived table must be rejected");
+            .expect_err("LATERAL derived table must be rejected on the parse() path");
         let msg = format!("{err}");
         assert!(
             msg.contains("LATERAL"),
             "expected LATERAL rejection, got: {msg}"
         );
-        // Feature B (assessment): the improved message explains *why* — the
-        // engine has no per-row apply / decorrelation path.
+        // The improved message explains *why* — a correlated LATERAL apply runs
+        // host-side in the engine, not via the raw parse() API.
         assert!(
             msg.contains("correlated") && msg.contains("apply"),
             "improved LATERAL message should explain the correlated/apply limitation, got: {msg}"
