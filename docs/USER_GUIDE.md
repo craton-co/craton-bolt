@@ -153,12 +153,15 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
 
 - `[WITH ...] SELECT [DISTINCT] ... FROM <table> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`.
 - Aggregates: `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (GPU), plus host-side
-  `STDDEV` / `VAR` (scalar and grouped) and `SUM` / `MIN` / `MAX`
-  over `Decimal128`. `SUM(Int32)` widens to `Int64` to prevent silent
-  wraparound. `COUNT(DISTINCT col)` is supported as the sole SELECT item —
-  and, as of the 0.7 wave, also with a surrounding `SELECT DISTINCT` or a
-  `HAVING` over the count (no `GROUP BY`); `COUNT(DISTINCT)` *with*
-  `GROUP BY` is still rejected. `COUNT`, **`MIN`, and `MAX`** over a
+  `STDDEV` / `VAR` (scalar and grouped). `SUM` / `MIN` / `MAX` over
+  `Decimal128` run on the **GPU** (i128 block-reduce kernels) in the scalar
+  path and **host-side** in the grouped path. `SUM(Int32)` widens to `Int64`
+  to prevent silent wraparound. `COUNT(DISTINCT col)` is supported as the sole
+  SELECT item — and, as of the 0.7 wave, also with a surrounding
+  `SELECT DISTINCT`, a `HAVING` over the count (no `GROUP BY`), and as the
+  **sole aggregate combined with `GROUP BY`**; `COUNT(DISTINCT)` under
+  `GROUP BY` *alongside another aggregate* (or more than one) is still
+  rejected. `COUNT`, **`MIN`, and `MAX`** over a
   `Date32` / `Timestamp` column all work end-to-end now (GPU reduction;
   the date type / timestamp unit + timezone is preserved), in both the
   scalar and `GROUP BY` paths; `SUM` over a temporal column is rejected by
@@ -167,12 +170,15 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   `Decimal128` `+` / `-` / `*` / `/` and mixed Decimal/integer arithmetic
   (GPU; scale-aligned comparisons too), `IN` / `BETWEEN` (desugar to GPU
   comparison chains), `CASE` / `CAST` / `COALESCE` / `NULLIF` (GPU for
-  numeric / `Bool` / `Date32` / `Timestamp` results; a `Utf8`-result `CASE`
-  over a bare scan is **host-realized** with SQL 3VL; a `Decimal128`-result
-  `CASE` is still rejected at GPU lowering), `CAST` (GPU for numeric/`Bool`
-  pairs and for integer↔`Decimal128` / `Decimal128` rescale / integer→`Date32`;
-  Float↔`Decimal128` and CAST to/from `Timestamp` / `String` rejected at GPU
-  lowering), `LIKE` (GPU over `Utf8`), `||` (host-side), `NOT` (GPU). String
+  numeric / `Bool` / `Date32` / `Timestamp` **and `Decimal128`** results — the
+  Decimal case folds via `Op::Select128`; a `Utf8`-result `CASE` over a bare
+  scan is **host-realized** with SQL 3VL), `CAST` (GPU for numeric/`Bool`
+  pairs, integer↔`Decimal128`, `Decimal128` rescale, integer→`Date32`, and
+  **plain Float↔`Decimal128`**; CAST to/from `Timestamp` / `String` rejected at
+  GPU lowering), `TRY_CAST` / `SAFE_CAST` (NULL-on-failure, host-evaluated;
+  Float↔`Decimal128` rejected at type-check) and `CAST(... FORMAT '<pattern>')`
+  (host-evaluated temporal⇄string, bounded pattern vocab),
+  `LIKE` (GPU over `Utf8`), `||` (host-side), `NOT` (GPU). String
   functions: `UPPER` / `LOWER` / `LENGTH` (GPU); `SUBSTRING` (literal args)
   and single-arg `TRIM` over a bare `Utf8` scan are **host-realized** via the
   `StringProject` producer (custom-chars `TRIM` and computed `SUBSTRING` args
@@ -185,12 +191,18 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   to a host executor on a gate miss.
 - Set ops: `UNION` (dedups), `UNION ALL` (concatenates),
   `EXCEPT [ALL]` / `INTERSECT [ALL]` (host-side).
-- Query composition: non-recursive CTEs (`WITH`); uncorrelated scalar
-  and `[NOT] IN` subqueries in `SELECT` / `WHERE` (and an uncorrelated
-  scalar subquery in `ORDER BY`); non-lateral **derived tables** in
-  `FROM` (`(SELECT ...) AS alias`, alias required). (Correlated
-  subqueries, `EXISTS`, `LATERAL` derived tables, and column-list aliases
-  `AS d(x, y)` are rejected.)
+- Query composition: non-recursive CTEs (`WITH`) and **`WITH RECURSIVE`**
+  (linear, non-linear, and mutual recursion, host-orchestrated with an
+  iteration cap); uncorrelated scalar and `[NOT] IN` subqueries in
+  `SELECT` / `WHERE` (and an uncorrelated scalar subquery in `ORDER BY`);
+  non-lateral **derived tables** in `FROM` (`(SELECT ...) AS alias`, alias
+  required); and a multi-table comma `FROM a, b` (desugars to `CROSS JOIN`).
+  (Correlated subqueries, `EXISTS`, `LATERAL` derived tables, and
+  non-recursive-CTE column-list aliases `AS d(x, y)` are rejected.)
+- GROUP BY super-aggregates: `ROLLUP` / `CUBE` / `GROUPING SETS` /
+  `GROUP BY ALL`, the `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` trailing
+  modifiers, and `GROUPING()` / `GROUPING_ID()` (host-expanded to a
+  UNION-ALL of per-set plans; max 12 grouping columns).
 - Window functions: `ROW_NUMBER` / `RANK` / `DENSE_RANK` /
   `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` `OVER (PARTITION BY ... ORDER
   BY ...)` (host-side, default frame only).
@@ -209,8 +221,10 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   to integer comparisons on the dictionary index at plan time, GPU),
   `LIKE` (GPU as of v0.7, with a host-side fallback), and — as of v0.7 —
   **ordering comparisons against a string literal** (`WHERE name < 'M'`,
-  GPU via byte/binary collation; not locale/ICU). `IN` against Utf8 and
-  ordering of *two* Utf8 columns (`a < b`) are still rejected.
+  GPU via byte/binary collation; not locale/ICU), and **ordering of two Utf8
+  columns** (`a < b`, GPU via a cross-dictionary rank compare — a NULL on
+  either side drops the row). `IN` against a Utf8 column is still rejected
+  (rewrite as an `OR` chain of literal equalities).
 - Qualified column refs (`t.col`) and case-insensitive identifiers are
   supported; `JOIN ... ON` also accepts the schema-qualified
   `schema.table.col` form (leading catalog segment dropped).
@@ -234,13 +248,14 @@ Anything outside the supported surface returns a structured
 construct quoted in the message. Some *supported* constructs execute on
 a host-side code path rather than the GPU — the `||` concat operator,
 `SUBSTRING` / `TRIM` / `CONCAT`, a `Utf8`-result `CASE`, `STDDEV` / `VAR`,
-`SUM` / `MIN` / `MAX` over `Decimal128`, set operations
-(`EXCEPT` / `INTERSECT`), window functions, and host-side join / sort
+`TRY_CAST` / `CAST(... FORMAT ...)`, *grouped* `SUM` / `MIN` / `MAX` over
+`Decimal128` (the *scalar* Decimal aggregates run on the GPU), set operations
+(`EXCEPT` / `INTERSECT`), `WITH RECURSIVE` orchestration, GROUP BY
+super-aggregate expansion, window functions, and host-side join / sort
 fallbacks — and a few constructs parse and type-check but are rejected at
 the GPU lowering boundary with a clear `"… not yet lowered to GPU"` message
-(e.g. `CAST` between Float and Decimal or to/from Timestamp/String, and a
-`Decimal128`-result `CASE`). `SQL_REFERENCE.md` tags every feature with its
-execution tier (GPU / host-side / GPU lowering pending).
+(e.g. `CAST` to/from Timestamp/String). `SQL_REFERENCE.md` tags every feature
+with its execution tier (GPU / host-side / GPU lowering pending).
 
 ---
 

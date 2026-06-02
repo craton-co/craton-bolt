@@ -172,9 +172,14 @@ These are real, code-level behaviors to be aware of:
   unverified — `LENGTH` is byte-length, and case conversion is ASCII-range.
   Utf8 ordering comparisons against a literal (`WHERE name < 'M'`) use
   **binary (UTF-8 byte) collation**, not locale-aware / ICU collation, so the
-  ordering matches `memcmp` rather than any natural-language collation; and
-  ordering of *two* Utf8 columns (`a < b`) is not folded and stays a host
-  string comparison.
+  ordering matches `memcmp` rather than any natural-language collation.
+  Ordering of *two* Utf8 columns (`a < b`) now folds to a **GPU** rank
+  comparison (finding F12): both columns are ranked against the de-duplicated
+  union of their dictionaries under binary collation, and the predicate becomes
+  a NULL-safe integer compare over the materialised per-row rank columns. A NULL
+  on either side fails the `>= 0` guard, so the row is dropped (correct SQL 3VL
+  projection of NULL → no row passes). Shapes the rank path can't cover (a
+  non-dict or protected column) still fall back to a host string comparison.
 - **Temporal / decimal types: lowered, with residual gaps.** `Decimal128`,
   `Date32`, and `Timestamp` parse and lower to the GPU. GPU gather (filter /
   compaction) and column upload are wired for all three. As of the 0.7 wave:
@@ -183,12 +188,18 @@ These are real, code-level behaviors to be aware of:
   preserving the date type, or the timestamp **unit + timezone** — scalar and
   GROUP BY alike). `Decimal128` `+`, `-`, `*`, **`/`** (including mixed
   Decimal/integer arithmetic), scale-aligned comparisons, and integer↔decimal
-  / decimal-rescale **CAST** lower to the GPU. **Residual gaps:** `SUM` over a
-  temporal column is rejected by design (undefined SQL); `SUM` / `MIN` / `MAX`
-  over `Decimal128` are **host-side**; a `CASE` whose result dtype is
-  `Decimal128` is not lowered (no host realisation yet); and `CAST` between
-  **Float and `Decimal128`** (and CAST to/from `Timestamp` / `String`) is still
-  rejected at the GPU lowering boundary. See the type tiers in
+  / decimal-rescale **CAST** lower to the GPU. **Scalar** `SUM` / `MIN` / `MAX`
+  over `Decimal128` now run on the **GPU** (dedicated i128 block-reduce kernels,
+  with a host-fold fallback inside). A `CASE` whose result dtype is `Decimal128`
+  now lowers to the **GPU** (a pair of `selp.b64` via `Op::Select128`). **Plain**
+  `CAST` between **Float and `Decimal128`** now lowers to the **GPU**
+  (`F64ToI128` / `I128ToF64`). **Residual gaps:** `SUM` over a temporal column
+  is rejected by design (undefined SQL); **grouped** `Decimal128`
+  `SUM` / `MIN` / `MAX` still run **host-side** (the grouped accumulator table
+  has no 16-byte slot path yet); `TRY_CAST` / `SAFE_CAST` of Float⇄`Decimal128`
+  is rejected at type-check (the host evaluator has no `Decimal128` column); and
+  `CAST` to/from `Timestamp` / `String` is still rejected at the GPU lowering
+  boundary. See the type tiers in
   [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md).
 - **Env-gated experimental paths.** Several kernels (e.g. GPU radix sort,
   CUDA-graph sort, alternate hash/scan algorithms) are gated behind
@@ -221,17 +232,38 @@ supported alternatives):
   **derived tables** `(SELECT ...) AS alias` are now **supported** — alias
   required; `LATERAL` derived tables and column-list aliases `AS d(x, y)`
   remain rejected.)
-- **`GROUP BY ROLLUP` / `CUBE` / `ALL`** (and `TOTALS`).
 - **`WINDOW` clause / `QUALIFY` / named windows** (`OVER <named_window>`), and
   non-default window frames.
 - **`VALUES` lists** (as a standalone row source).
-- **`WITH RECURSIVE`** and **CTE column-list aliases** (`WITH c (a, b) AS ...`).
 - **Table-valued functions.**
 - **`DISTINCT ON (...)`** (Postgres extension).
 - **`TOP`** (T-SQL row limit).
-- **`LATERAL`.**
+- **`LATERAL`** (correlated derived tables — needs an Apply executor).
 - **`PREWHERE`** (ClickHouse extension).
 - **`GLOBAL JOIN`** (ClickHouse extension).
+- **`SUM(Date32 / Timestamp)`** — undefined in SQL; rejected by design.
+
+The following are now **supported** (they were previously listed here as
+rejected); see [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md) for the per-feature
+detail and residual sub-rejections:
+
+- **`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` / `ALL`**, the trailing
+  `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` modifiers, and the
+  `GROUPING()` / `GROUPING_ID()` indicators. Expanded host-side to a UNION-ALL
+  of the per-set plans (max **12** grouping columns; `GROUPING()` without a
+  grouping construct stays rejected).
+- **`WITH RECURSIVE`** — linear, non-linear (self-join, naive evaluation), and
+  mutual (multi-CTE lockstep) recursion, with `UNION` / `UNION ALL`, an optional
+  recursive-CTE column-list alias, and an iteration cap
+  (`CRATON_MAX_RECURSIVE_ITERATIONS`, default 1000). Residual rejections: a
+  recursive anchor that seeds from a recursive member, a self-reference buried
+  in a subquery, and `UNION BY NAME`.
+- **`TRY_CAST` / `SAFE_CAST`** (NULL-on-failure, host-evaluated) and
+  **`CAST(... FORMAT '<pattern>')`** (bounded temporal⇄string pattern
+  vocabulary, host-evaluated). `TRY_CAST` of Float⇄`Decimal128` is rejected at
+  type-check; unknown `FORMAT` tokens are rejected.
+- **Multi-table `FROM a, b [WHERE ...]`** — the comma list desugars to a
+  left-deep chain of `CROSS JOIN`s.
 
 These return a clean error rather than crashing, so the engine gives you correct
 expectations up front.
